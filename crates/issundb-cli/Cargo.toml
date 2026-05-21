@@ -1,0 +1,19 @@
+[package]
+name = "issundb-cli"
+description = "IssunDB interactive REPL"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "issundb"
+path = "src/main.rs"
+
+[dependencies]
+issundb = { path = "../issundb" }
+rmp-serde.workspace = true
+serde.workspace = true
+serde_json = "1"
+rustyline = "14"

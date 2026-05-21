@@ -56,7 +56,7 @@ coverage.xml
 *.bak
 *.tmp
 temp/
-tmp/
+tmp/*
 
 # Database files (SQLite, DuckDB, etc.)
 *.duckdb
@@ -73,9 +73,6 @@ poetry.lock
 cobertura.xml
 tarpaulin-report.html
 
-# Comment out the next line if you want to checkin your lock file for Cargo
-Cargo.lock
-
 # Miscellaneous files and directories to ignore
 # Add any additional file patterns a directory names that should be ignored down here
 .DS_Store
@@ -87,4 +84,3 @@ tests/testdata/*.parquet
 .agents/
 .codex/
 .antigravitycli/
-NOTES.md

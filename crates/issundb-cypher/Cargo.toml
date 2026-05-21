@@ -1,0 +1,13 @@
+[package]
+name = "issundb-cypher"
+description = "Cypher parser, AST, logical/physical planner, and executor for IssunDB"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+issundb-core = { path = "../issundb-core" }
+thiserror.workspace = true
+# chumsky.workspace = true   # uncomment in phase 7

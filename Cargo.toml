@@ -1,53 +1,55 @@
-[package]
-name = "template-rust-project"
-version = "0.1.0"
-description = "A template for Rust projects"
-repository = "https://github.com/IssunDB/issun-db"
-license = "MIT OR Apache-2.0"
-readme = "README.md"
-keywords = ["project-template", "rust", "library", "application"]
-authors = ["Hassan Abedi <hassan.abedi.t@gmail.com>"]
-homepage = "https://github.com/IssunDB/issun-db"
-documentation = "https://docs.rs/template-rust-project"
-categories = ["development-tools"]
-edition = "2024"
-rust-version = "1.95"
-
+[workspace]
+members = ["crates/*"]
 resolver = "2"
 
-include = [
-    "assets/**/*",
-    "docs/**/*",
-    "src/**/*",
-    "Cargo.toml",
-    "README.md",
-    "LICENSE-MIT",
-    "LICENSE-APACHE"
-]
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["Hassan Abedi <hassan.abedi.t@gmail.com>"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/IssunDB/issun-db"
+homepage = "https://github.com/IssunDB/issun-db"
+rust-version = "1.85"
 
-[lib]
-name = "template_rust_project"
-path = "src/lib.rs"
+# ---------------------------------------------------------------------------
+# Shared dependencies — pin versions once, inherit everywhere
+# ---------------------------------------------------------------------------
+[workspace.dependencies]
+# Storage
+heed = "0.20"
+byteorder = "1"
 
-[[bin]]
-name = "template-rust-project"
-path = "src/main.rs"
+# Zero-copy fixed-size types (AdjEntry)
+zerocopy = { version = "0.7", features = ["derive"] }
 
-[features]
-default = []  # No features enabled by default
-binaries = []
+# Serialization (msgpack for property bags)
+rmp-serde = "1"
+serde = { version = "1", features = ["derive"] }
 
-[dependencies]
-ctor = "0.6.0"
-tracing = "0.1.41"
-tracing-subscriber = "0.3.19"
+# Concurrency
+parking_lot = "0.12"
+arc-swap = "1"
+crossbeam = "0.8"
 
-[dev-dependencies]
-criterion = { version = "0.7.0", features = ["html_reports"] }
+# Errors / logging
+thiserror = "1"
+anyhow = "1"
+tracing = "0.1"
 
-[[bench]]
-name = "project_benchmarks"
-harness = false
+# Fast hash maps (CSR id→dense maps)
+ahash = "0.8"
+
+# Testing
+tempfile = "3"
+proptest = "1"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+# ---------------------------------------------------------------------------
+# Heavy compute / vector deps — added in later phases
+graphblas_sparse_linear_algebra = "0.63.0" # phase 3: CSR + GraphBLAS
+usearch = "2"                              # phase 5: vector search
+# chumsky = "0.10"                         # phase 7: Cypher parser
+# ---------------------------------------------------------------------------
 
 [profile.release]
 strip = "debuginfo"
@@ -60,14 +62,3 @@ debug = true
 
 [profile.test]
 debug = true
-
-[profile.example]
-inherits = "release"
-
-[package.metadata.rustfmt]
-max_width = 100
-hard_tabs = false
-tab_spaces = 4
-
-[workspace]
-members = []

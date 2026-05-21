@@ -1,0 +1,202 @@
+use issundb::{Graph, NodeId};
+use serde_json::json;
+use tempfile::TempDir;
+
+fn open_tmp() -> (TempDir, Graph) {
+    let dir = TempDir::new().unwrap();
+    let g = Graph::open(dir.path(), 1).unwrap();
+    (dir, g)
+}
+
+// ---------------------------------------------------------------------------
+// Node CRUD
+// ---------------------------------------------------------------------------
+
+#[test]
+fn node_insert_and_fetch() {
+    let (_dir, g) = open_tmp();
+    let id = g.add_node("Person", &json!({ "name": "Alice" })).unwrap();
+    let record = g.get_node(id).unwrap().expect("node must exist");
+    let props: serde_json::Value = rmp_serde::from_slice(&record.props).unwrap();
+    assert_eq!(props["name"], "Alice");
+}
+
+#[test]
+fn get_node_returns_none_for_missing_id() {
+    let (_dir, g) = open_tmp();
+    assert!(g.get_node(9999).unwrap().is_none());
+}
+
+#[test]
+fn node_label_is_stored() {
+    let (_dir, g) = open_tmp();
+    let id = g.add_node("Company", &json!({})).unwrap();
+    let record = g.get_node(id).unwrap().unwrap();
+    // label is a u32 integer; verify it is non-zero (first label gets id 0).
+    // Two different labels must get different IDs.
+    let id2 = g.add_node("Person", &json!({})).unwrap();
+    let record2 = g.get_node(id2).unwrap().unwrap();
+    assert_ne!(record.label, record2.label);
+}
+
+// ---------------------------------------------------------------------------
+// Edge CRUD
+// ---------------------------------------------------------------------------
+
+#[test]
+fn edge_insert_and_fetch() {
+    let (_dir, g) = open_tmp();
+    let alice = g.add_node("Person", &json!({})).unwrap();
+    let bob = g.add_node("Person", &json!({})).unwrap();
+    let eid = g
+        .add_edge(alice, bob, "KNOWS", &json!({ "since": 2021 }))
+        .unwrap();
+    let edge = g.get_edge(eid).unwrap().expect("edge must exist");
+    assert_eq!(edge.src, alice);
+    assert_eq!(edge.dst, bob);
+    let props: serde_json::Value = rmp_serde::from_slice(&edge.props).unwrap();
+    assert_eq!(props["since"], 2021);
+}
+
+#[test]
+fn get_edge_returns_none_for_missing_id() {
+    let (_dir, g) = open_tmp();
+    assert!(g.get_edge(9999).unwrap().is_none());
+}
+
+// ---------------------------------------------------------------------------
+// Adjacency
+// ---------------------------------------------------------------------------
+
+#[test]
+fn out_neighbors_reflects_inserted_edge() {
+    let (_dir, g) = open_tmp();
+    let a = g.add_node("N", &json!({})).unwrap();
+    let b = g.add_node("N", &json!({})).unwrap();
+    let eid = g.add_edge(a, b, "REL", &json!({})).unwrap();
+
+    let out = g.out_neighbors(a).unwrap();
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].0, b);
+    assert_eq!(out[0].1, eid);
+}
+
+#[test]
+fn in_neighbors_reflects_inserted_edge() {
+    let (_dir, g) = open_tmp();
+    let a = g.add_node("N", &json!({})).unwrap();
+    let b = g.add_node("N", &json!({})).unwrap();
+    let eid = g.add_edge(a, b, "REL", &json!({})).unwrap();
+
+    let inc = g.in_neighbors(b).unwrap();
+    assert_eq!(inc.len(), 1);
+    assert_eq!(inc[0].0, a);
+    assert_eq!(inc[0].1, eid);
+}
+
+#[test]
+fn node_with_no_edges_has_empty_adjacency() {
+    let (_dir, g) = open_tmp();
+    let id = g.add_node("N", &json!({})).unwrap();
+    assert!(g.out_neighbors(id).unwrap().is_empty());
+    assert!(g.in_neighbors(id).unwrap().is_empty());
+}
+
+#[test]
+fn multiple_out_edges_are_all_returned() {
+    let (_dir, g) = open_tmp();
+    let src = g.add_node("N", &json!({})).unwrap();
+    let targets: Vec<NodeId> = (0..5)
+        .map(|_| g.add_node("N", &json!({})).unwrap())
+        .collect();
+    for &dst in &targets {
+        g.add_edge(src, dst, "E", &json!({})).unwrap();
+    }
+    let out = g.out_neighbors(src).unwrap();
+    assert_eq!(out.len(), 5);
+    let mut got: Vec<NodeId> = out.into_iter().map(|(n, _, _)| n).collect();
+    got.sort_unstable();
+    let mut expected = targets.clone();
+    expected.sort_unstable();
+    assert_eq!(got, expected);
+}
+
+#[test]
+fn adjacency_type_id_matches_edge_record() {
+    let (_dir, g) = open_tmp();
+    let a = g.add_node("N", &json!({})).unwrap();
+    let b = g.add_node("N", &json!({})).unwrap();
+    let eid = g.add_edge(a, b, "TYPED", &json!({})).unwrap();
+    let edge = g.get_edge(eid).unwrap().unwrap();
+    let out = g.out_neighbors(a).unwrap();
+    assert_eq!(out[0].2, edge.edge_type);
+}
+
+// ---------------------------------------------------------------------------
+// Secondary indexes
+// ---------------------------------------------------------------------------
+
+#[test]
+fn nodes_by_label_across_mixed_inserts() {
+    let (_dir, g) = open_tmp();
+    let p1 = g.add_node("Person", &json!({})).unwrap();
+    let _c = g.add_node("Company", &json!({})).unwrap();
+    let p2 = g.add_node("Person", &json!({})).unwrap();
+
+    let mut persons = g.nodes_by_label("Person").unwrap();
+    persons.sort_unstable();
+    assert_eq!(persons, vec![p1, p2]);
+    assert_eq!(g.nodes_by_label("Company").unwrap().len(), 1);
+    assert!(g.nodes_by_label("Robot").unwrap().is_empty());
+}
+
+#[test]
+fn edges_by_type_across_mixed_inserts() {
+    let (_dir, g) = open_tmp();
+    let a = g.add_node("N", &json!({})).unwrap();
+    let b = g.add_node("N", &json!({})).unwrap();
+    let e1 = g.add_edge(a, b, "KNOWS", &json!({})).unwrap();
+    let _e2 = g.add_edge(a, b, "LIKES", &json!({})).unwrap();
+    let e3 = g.add_edge(b, a, "KNOWS", &json!({})).unwrap();
+
+    let mut knows = g.edges_by_type("KNOWS").unwrap();
+    knows.sort_unstable();
+    assert_eq!(knows, vec![e1, e3]);
+    assert_eq!(g.edges_by_type("LIKES").unwrap().len(), 1);
+    assert!(g.edges_by_type("FOLLOWS").unwrap().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Persistence across reopens
+// ---------------------------------------------------------------------------
+
+#[test]
+fn data_survives_reopen() {
+    let dir = TempDir::new().unwrap();
+    let (node_id, edge_id) = {
+        let g = Graph::open(dir.path(), 1).unwrap();
+        let a = g.add_node("Person", &json!({ "x": 1 })).unwrap();
+        let b = g.add_node("Person", &json!({ "x": 2 })).unwrap();
+        let eid = g.add_edge(a, b, "KNOWS", &json!({})).unwrap();
+        (a, eid)
+    };
+
+    let g2 = Graph::open(dir.path(), 1).unwrap();
+    assert!(g2.get_node(node_id).unwrap().is_some());
+    assert!(g2.get_edge(edge_id).unwrap().is_some());
+    assert_eq!(g2.nodes_by_label("Person").unwrap().len(), 2);
+    assert_eq!(g2.edges_by_type("KNOWS").unwrap().len(), 1);
+}
+
+#[test]
+fn ids_continue_from_last_value_after_reopen() {
+    let dir = TempDir::new().unwrap();
+    let last_node = {
+        let g = Graph::open(dir.path(), 1).unwrap();
+        g.add_node("N", &json!({})).unwrap();
+        g.add_node("N", &json!({})).unwrap()
+    };
+    let g2 = Graph::open(dir.path(), 1).unwrap();
+    let next_node = g2.add_node("N", &json!({})).unwrap();
+    assert!(next_node > last_node);
+}
