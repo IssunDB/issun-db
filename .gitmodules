@@ -1,0 +1,6 @@
+[submodule "external/cozo"]
+	path = external/cozo
+	url = https://github.com/cozodb/cozo
+[submodule "external/FalkorDB"]
+	path = external/FalkorDB
+	url = https://github.com/FalkorDB/FalkorDB
