@@ -90,6 +90,19 @@ impl VectorIndex {
         Ok(())
     }
 
+    /// Remove the embedding for `node` from the index.
+    pub fn remove(&self, node: NodeId) -> Result<(), Error> {
+        let mut guard = self.inner.lock();
+        if let Inner::Ready { index, .. } = &mut *guard {
+            if index.contains(node) {
+                index
+                    .remove(node)
+                    .map_err(|e| Error::Vector(e.to_string()))?;
+            }
+        }
+        Ok(())
+    }
+
     /// Return the `k` approximate nearest neighbors to `q` by cosine distance.
     ///
     /// Returns an empty slice when the index has no vectors or `k == 0`.

@@ -1,6 +1,6 @@
 ## Datasets for Testing
 
-This directory contains the datasets used for the tests in the [`tests`](../) directory.
+This directory contains the datasets used for the tests in the [`tests`](..) directory.
 
 ### Downloading the Datasets
 

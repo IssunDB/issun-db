@@ -27,7 +27,11 @@ fn main() {
     };
 
     loop {
-        let prompt = if graph.is_some() { "issundb> " } else { "issundb (no db)> " };
+        let prompt = if graph.is_some() {
+            "issundb> "
+        } else {
+            "issundb (no db)> "
+        };
         match rl.readline(prompt) {
             Ok(line) => {
                 let line = line.trim().to_owned();
@@ -234,7 +238,10 @@ fn dispatch(g: &Graph, cmd: &str, rest: &str) {
                 (Ok(s), Ok(d)) => match g.shortest_path(NodeId::from(s), NodeId::from(d)) {
                     Ok(Some(p)) => println!(
                         "{}",
-                        p.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(" -> ")
+                        p.iter()
+                            .map(|n| n.to_string())
+                            .collect::<Vec<_>>()
+                            .join(" -> ")
                     ),
                     Ok(None) => println!("no path"),
                     Err(e) => eprintln!("error: {e}"),
@@ -326,7 +333,11 @@ fn dispatch(g: &Graph, cmd: &str, rest: &str) {
             let vec: Result<Vec<f32>, _> = tokens[2..].iter().map(|s| s.parse::<f32>()).collect();
             match (k, hops, vec) {
                 (Ok(k), Ok(h), Ok(v)) => {
-                    let opts = RetrieveOptions { k, hops: h, ..Default::default() };
+                    let opts = RetrieveOptions {
+                        k,
+                        hops: h,
+                        ..Default::default()
+                    };
                     match retrieve_with(g, &v, &opts) {
                         Ok(sub) => {
                             println!(

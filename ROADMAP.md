@@ -26,6 +26,8 @@ This document tracks what is complete and what remains for IssunDB.
 - [x] `Graph::add_node`, `get_node`, `add_edge`, `get_edge`, `out_neighbors`, and `in_neighbors`
 - [x] `Graph::nodes_by_label(label: &str) -> Result<Vec<NodeId>, Error>`
 - [x] `Graph::edges_by_type(etype: &str) -> Result<Vec<EdgeId>, Error>`
+- [x] `Graph::label_name(id: LabelId) -> Result<Option<String>, Error>`
+- [x] `Graph::type_name(id: TypeId) -> Result<Option<String>, Error>`
 - [x] `Graph::bfs(start: NodeId, hops: u8) -> Result<Vec<NodeId>, Error>`
 - [x] `Graph::shortest_path(src: NodeId, dst: NodeId) -> Result<Option<Vec<NodeId>>, Error>`
 - [x] `Graph::page_rank(iterations: u32, damping: f32) -> Result<HashMap<NodeId, f32>, Error>`
@@ -36,8 +38,8 @@ This document tracks what is complete and what remains for IssunDB.
 - [x] `CsrSnapshot`: `row_ptr`, `col_idx`, `edge_type`, `edge_id`, `dense_to_id`, and `id_to_dense` fields
 - [x] `CsrCache` backed by `arc-swap`; rebuilt from LMDB in a background thread when the dirty count exceeds a threshold
 - [x] `Graph::neighbors` hot path reading from the CSR snapshot
-- [ ] GraphBLAS context and per-type boolean matrix materialization from the CSR snapshot
-- [ ] GraphBLAS-backed BFS, PageRank, and SSSP via `graphblas_sparse_linear_algebra`
+- [x] GraphBLAS context and per-type boolean matrix materialization from the CSR snapshot; combined integer adjacency and column-stochastic float matrix also materialized in `MatrixSet`
+- [x] GraphBLAS-backed BFS (`bfs_graphblas`), PageRank (`page_rank_graphblas`), and SSSP (`shortest_path_graphblas`) via MinPlus and PlusTimes SpMV
 - [x] Microbenchmark: CSR BFS vs raw LMDB cursor
 
 ## Vector Index
@@ -52,19 +54,20 @@ This document tracks what is complete and what remains for IssunDB.
 - [x] `Subgraph` type: `nodes`, `edges`, and `scores` fields
 - [x] `retrieve(graph: &Graph, q: &[f32], k: usize, hops: u8) -> Result<Subgraph, Error>`
 - [x] `retrieve_with(graph: &Graph, q: &[f32], opts: &RetrieveOptions) -> Result<Subgraph, Error>`
-- [ ] k-hop BFS expansion using GraphBLAS SpMV over all edge types
+- [x] k-hop BFS expansion using GraphBLAS SpMV over all edge types
 - [x] Subgraph materialization from LMDB
 
 ## Cypher Query Language
 
-- [ ] AST node types in `crates/issundb-cypher/src/ast.rs`
-- [ ] `chumsky`-based parser for node patterns, relationship patterns, WHERE predicates, and RETURN projections
-- [ ] Parameter binding (`$param` syntax)
+- [x] AST node types in `crates/issundb-cypher/src/ast.rs`
+- [x] Hand-written recursive-descent parser for node patterns, relationship patterns, WHERE predicates, and RETURN projections
+- [x] Parameter binding (`$param` syntax)
+- [x] CREATE, SET, and DELETE execution
+- [x] `GraphQueryExt` trait on `Graph` exposing `execute(cypher, params) -> Result<QueryResult, String>` via the `issundb` facade
 - [ ] Logical planner: `LabelScan`, `Expand`, `LabelFilter`, and `Project` operators
 - [ ] Physical planner and optimizer: filter pushdown and operator reordering
 - [ ] `Expand` compiled to GraphBLAS SpMV; `LabelFilter` compiled to element-wise AND
-- [ ] CREATE, SET, and DELETE execution
-- [ ] Variable-length path patterns (`[:REL*1..3]`)
+- [x] Variable-length path patterns (`[:REL*1..3]`)
 - [ ] `WITH` and `UNWIND` clauses
 - [ ] Selectivity estimates from LMDB sub-database statistics
 - [ ] openCypher TCK subset in `tests/conformance/`, gated on `ISSUNDB_CONFORMANCE=1`

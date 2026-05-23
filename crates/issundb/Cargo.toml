@@ -1,6 +1,6 @@
 [package]
 name = "issundb"
-description = "IssunDB — embedded graph + vector database for AI/RAG workloads"
+description = "IssunDB's main crate; it exposes the public API for IssunDB"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

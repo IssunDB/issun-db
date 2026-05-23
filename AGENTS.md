@@ -58,11 +58,11 @@ Do not invent modules that do not yet exist when answering questions, but do pla
     - `src/matrices.rs` *(phase 3)*: GraphBLAS matrix materialization from the CSR snapshot.
     - `src/vector.rs` *(phase 5)*: `usearch` HNSW index wrapper.
     - `src/error.rs`: `Error` enum; all storage and serialization errors unify here.
-- `crates/issundb-cypher/` *(phase 7)*: Cypher parser, AST, logical and physical planner, and executor.
-    - `src/parser.rs`: `chumsky`-based parser for the MATCH, WHERE, RETURN, CREATE, SET, and DELETE subset.
+- `crates/issundb-cypher/`: Cypher parser, AST, and executor. Logical and physical planners are planned.
+    - `src/parser.rs`: hand-written recursive-descent parser for the MATCH, WHERE, RETURN, CREATE, SET, and DELETE subset.
     - `src/ast.rs`: AST node types.
-    - `src/plan/`: logical planner, physical planner, and optimizer.
-    - `src/exec.rs`: plan-to-GraphBLAS execution.
+    - `src/plan/` *(planned)*: logical planner, physical planner, and optimizer.
+    - `src/exec.rs`: pattern-matching executor driving `Graph` adjacency lookups directly.
 - `crates/issundb-rag/` *(phase 6)*: GraphRAG primitives.
     - `src/retrieve.rs`: vector hit to k-hop expansion to subgraph materialization.
 - `crates/issundb/`: public facade. Re-exports the deliberate public surface from `issundb-core`, `issundb-cypher`, and `issundb-rag`. Do not
@@ -123,12 +123,11 @@ All graph operations go through `Graph`; do not call `Storage` directly from out
 - `page_rank(iterations: u32, damping: f32) -> Result<HashMap<NodeId, f32>, Error>`
 - `connected_components() -> Result<HashMap<NodeId, u64>, Error>`
 
+- `label_name(id: LabelId) -> Result<Option<String>, Error>`
+- `type_name(id: TypeId) -> Result<Option<String>, Error>`
+
 - `upsert_vector(n: NodeId, v: &[f32]) -> Result<(), Error>`
 - `vector_search(q: &[f32], k: usize) -> Result<Vec<Hit>, Error>`
-
-Planned additions (phase 8):
-
-- `query(cypher: &str) -> Result<QueryResult, Error>`
 
 ### `issundb_rag`
 
@@ -138,6 +137,16 @@ GraphRAG primitives. Depends on `issundb-core`; must not be imported by `issundb
 - `retrieve_with(graph: &Graph, q: &[f32], opts: &RetrieveOptions) -> Result<Subgraph, Error>`
 - `Subgraph`: `nodes: Vec<NodeId>`, `edges: Vec<EdgeId>`, `scores: HashMap<NodeId, f32>`
 - `RetrieveOptions`: `k`, `hops`, `max_distance`, `max_nodes`
+
+### `issundb_cypher`
+
+Cypher query execution. Exposed through the `issundb` facade via the `GraphQueryExt` trait; do not call `issundb_cypher::execute` directly from outside `issundb`.
+
+- `execute(graph: &Graph, cypher: &str, params: &HashMap<String, serde_json::Value>) -> Result<QueryResult, String>`
+- `QueryResult`: `columns: Vec<String>`, `records: Vec<Record>`
+- `Record`: `values: Vec<serde_json::Value>`
+
+The executor resolves patterns by walking LMDB adjacency directly. GraphBLAS-backed plan execution is planned for a future phase.
 
 ### `issundb_core::Storage`
 

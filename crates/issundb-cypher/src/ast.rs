@@ -38,12 +38,19 @@ pub struct NodePattern {
     pub properties: Option<HashMap<String, Literal>>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct RelRange {
+    pub min: Option<u32>,
+    pub max: Option<u32>,
+}
+
 /// A pattern matching a relationship type and direction.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RelationshipPattern {
     pub variable: Option<String>,
     pub rel_type: Option<String>,
     pub is_incoming: bool,
+    pub range: Option<RelRange>,
 }
 
 /// A conditional WHERE predicate comparing two expressions.
@@ -62,7 +69,7 @@ pub enum WhereClause {
 pub enum Expr {
     Prop(String, String), // variable.property
     Literal(Literal),
-    Param(String),        // $parameter
+    Param(String), // $parameter
 }
 
 /// A literal value representation.

@@ -2,7 +2,7 @@ use std::{collections::HashMap, path::Path, sync::Arc};
 
 use parking_lot::Mutex;
 use serde::Serialize;
-use zerocopy::{AsBytes, FromBytes};
+use zerocopy::{FromBytes, IntoBytes};
 
 use ahash::AHashSet;
 
@@ -127,10 +127,37 @@ impl Graph {
     }
 
     /// Update node properties.
-    pub fn update_node(&self, id: NodeId, label: &str, props: &impl Serialize) -> Result<(), Error> {
+    pub fn update_node(
+        &self,
+        id: NodeId,
+        label: &str,
+        props: &impl Serialize,
+    ) -> Result<(), Error> {
         let _guard = self._write_lock.lock();
         let mut wtxn = self.storage.env.write_txn()?;
+
+        let old_record: Option<NodeRecord> = match self.storage.nodes.get(&wtxn, &id)? {
+            Some(bytes) => Some(props::decode(bytes)?),
+            None => None,
+        };
+
         let label_id = get_or_create_label(&self.storage, &mut wtxn, label)?;
+
+        if let Some(old_rec) = old_record {
+            if old_rec.label != label_id {
+                self.storage
+                    .label_idx
+                    .delete(&mut wtxn, &composite_key(old_rec.label, id))?;
+                self.storage
+                    .label_idx
+                    .put(&mut wtxn, &composite_key(label_id, id), &())?;
+            }
+        } else {
+            self.storage
+                .label_idx
+                .put(&mut wtxn, &composite_key(label_id, id), &())?;
+        }
+
         let record = NodeRecord {
             label: label_id,
             props: props::encode(props)?,
@@ -147,7 +174,92 @@ impl Graph {
     pub fn delete_node(&self, id: NodeId) -> Result<(), Error> {
         let _guard = self._write_lock.lock();
         let mut wtxn = self.storage.env.write_txn()?;
+
+        let record: NodeRecord = match self.storage.nodes.get(&wtxn, &id)? {
+            Some(bytes) => props::decode(bytes)?,
+            None => return Ok(()),
+        };
+
+        // 1. Delete from label index
+        self.storage
+            .label_idx
+            .delete(&mut wtxn, &composite_key(record.label, id))?;
+
+        // 2. Process all outgoing neighbors (out_adj)
+        let mut out_edges = Vec::new();
+        if let Some(iter) = self.storage.out_adj.get_duplicates(&wtxn, &id)? {
+            for result in iter {
+                let (_, bytes) = result?;
+                let entry = AdjEntry::read_from_bytes(bytes)
+                    .ok()
+                    .ok_or(Error::Corrupt("AdjEntry value is not exactly 20 bytes"))?;
+                out_edges.push(entry);
+            }
+        }
+
+        for entry in out_edges {
+            let edge_id = entry.edge_id;
+            let other = entry.other;
+            // Delete edge and type index
+            self.storage.edges.delete(&mut wtxn, &edge_id)?;
+            self.storage
+                .type_idx
+                .delete(&mut wtxn, &composite_key(entry.edge_type, edge_id))?;
+
+            // Delete the corresponding in_adj entry on the neighbor
+            let in_entry = AdjEntry {
+                edge_type: entry.edge_type,
+                other: id,
+                edge_id,
+            };
+            self.storage
+                .in_adj
+                .delete_one_duplicate(&mut wtxn, &other, in_entry.as_bytes())?;
+        }
+
+        // 3. Process all incoming neighbors (in_adj)
+        let mut in_edges = Vec::new();
+        if let Some(iter) = self.storage.in_adj.get_duplicates(&wtxn, &id)? {
+            for result in iter {
+                let (_, bytes) = result?;
+                let entry = AdjEntry::read_from_bytes(bytes)
+                    .ok()
+                    .ok_or(Error::Corrupt("AdjEntry value is not exactly 20 bytes"))?;
+                in_edges.push(entry);
+            }
+        }
+
+        for entry in in_edges {
+            let edge_id = entry.edge_id;
+            let other = entry.other;
+            // Delete edge and type index
+            self.storage.edges.delete(&mut wtxn, &edge_id)?;
+            self.storage
+                .type_idx
+                .delete(&mut wtxn, &composite_key(entry.edge_type, edge_id))?;
+
+            // Delete the corresponding out_adj entry on the neighbor
+            let out_entry = AdjEntry {
+                edge_type: entry.edge_type,
+                other: id,
+                edge_id,
+            };
+            self.storage
+                .out_adj
+                .delete_one_duplicate(&mut wtxn, &other, out_entry.as_bytes())?;
+        }
+
+        // 4. Delete the adjacency list keys themselves
+        self.storage.out_adj.delete(&mut wtxn, &id)?;
+        self.storage.in_adj.delete(&mut wtxn, &id)?;
+
+        // 5. Delete from vector index
+        self.storage.vectors.delete(&mut wtxn, &id)?;
+        self.vector_index.remove(id)?;
+
+        // 6. Delete from primary nodes database
         self.storage.nodes.delete(&mut wtxn, &id)?;
+
         wtxn.commit()?;
         self.maybe_spawn_rebuild();
         Ok(())
@@ -487,7 +599,8 @@ impl Graph {
     /// Returns all node IDs in the graph in ascending order.
     pub fn all_nodes(&self) -> Result<Vec<NodeId>, Error> {
         let rtxn = self.storage.env.read_txn()?;
-        let mut ids = self.storage
+        let mut ids = self
+            .storage
             .nodes
             .iter(&rtxn)?
             .map(|r| r.map(|(k, _)| k))
@@ -633,7 +746,8 @@ impl Graph {
         let mut out = Vec::new();
         for result in iter {
             let (_, bytes) = result?;
-            let entry = AdjEntry::read_from(bytes)
+            let entry = AdjEntry::read_from_bytes(bytes)
+                .ok()
                 .ok_or(Error::Corrupt("AdjEntry value is not exactly 20 bytes"))?;
             out.push((entry.other, entry.edge_id, entry.edge_type));
         }
@@ -644,39 +758,866 @@ impl Graph {
     // GraphBLAS Traversal Implementations
     // ------------------------------------------------------------------
 
-    /// GraphBLAS-backed Breadth-First Search outward from `start`.
+    /// BFS via repeated SpMV over the combined adjacency using the MinPlus semiring.
     ///
-    /// Expresses BFS traversal mathematically as a sequence of sparse matrix-vector
-    /// multiplications (SpMV) over the adjacency matrices of all edge types.
+    /// Each iteration propagates the hop-level frontier one step by computing
+    /// `A^T * level` with a structural complement mask that restricts writes to
+    /// nodes not yet reached. The level vector is then extended with the new frontier.
     #[cfg(feature = "graphblas")]
     pub fn bfs_graphblas(&self, start: NodeId, hops: u8) -> Result<Vec<NodeId>, Error> {
-        // Fallback to the optimized CSR BFS which is mathematically identical.
-        self.bfs(start, hops)
+        use graphblas_sparse_linear_algebra::{
+            collections::{
+                Collection,
+                sparse_vector::{
+                    SparseVector,
+                    operations::{GetSparseVectorElementIndices, SetSparseVectorElement},
+                },
+            },
+            operators::{
+                binary_operator::Assignment,
+                element_wise_addition::{
+                    ApplyElementWiseVectorAdditionMonoidOperator,
+                    ElementWiseVectorAdditionMonoidOperator,
+                },
+                mask::SelectEntireVector,
+                monoid::Plus,
+                multiplication::{MatrixVectorMultiplicationOperator, MultiplyMatrixByVector},
+                options::{OperatorOptions, OptionsForOperatorWithMatrixAsFirstArgument},
+                semiring::MinPlus,
+            },
+        };
+
+        let guard = self.matrices.read();
+        let m = match guard.as_ref() {
+            Some(m) => m,
+            None => return self.bfs(start, hops),
+        };
+        let snap = self.csr_cache.snapshot.load();
+        let n = m.n_nodes;
+        if n == 0 {
+            return Ok(vec![]);
+        }
+        let start_dense = match snap.id_to_dense.get(&start) {
+            Some(&d) => d as usize,
+            None => return self.bfs(start, hops),
+        };
+
+        // level[d] = BFS hop count to dense node d; absent = not yet reached.
+        let mut level = SparseVector::<i32>::new(m.context.clone(), n)
+            .map_err(|e| Error::GraphBLAS(e.to_string()))?;
+        level
+            .set_value(start_dense, 0)
+            .map_err(|e| Error::GraphBLAS(e.to_string()))?;
+
+        let mxv = MatrixVectorMultiplicationOperator::new();
+        let ewise_add = ElementWiseVectorAdditionMonoidOperator::new();
+        // Transpose A so product[j] = min_i(A[i][j] + level[i]) = min incoming hop + 1.
+        // Structural complement mask restricts writes to unvisited nodes only.
+        let opts_next = OptionsForOperatorWithMatrixAsFirstArgument::new(false, true, true, true);
+        let opts_merge = OperatorOptions::new_default();
+
+        for _ in 0..hops {
+            let mut next = SparseVector::<i32>::new(m.context.clone(), n)
+                .map_err(|e| Error::GraphBLAS(e.to_string()))?;
+            mxv.apply(
+                &m.adjacency,
+                &MinPlus::<i32>::new(),
+                &level,
+                &Assignment::new(),
+                &mut next,
+                &level,
+                &opts_next,
+            )
+            .map_err(|e| Error::GraphBLAS(e.to_string()))?;
+
+            if next
+                .number_of_stored_elements()
+                .map_err(|e| Error::GraphBLAS(e.to_string()))?
+                == 0
+            {
+                break;
+            }
+
+            // Union next into level (disjoint due to complement mask).
+            let mut merged = SparseVector::<i32>::new(m.context.clone(), n)
+                .map_err(|e| Error::GraphBLAS(e.to_string()))?;
+            ewise_add
+                .apply(
+                    &level,
+                    &Plus::<i32>::new(),
+                    &next,
+                    &Assignment::new(),
+                    &mut merged,
+                    &SelectEntireVector::new(m.context.clone()),
+                    &opts_merge,
+                )
+                .map_err(|e| Error::GraphBLAS(e.to_string()))?;
+            level = merged;
+        }
+
+        let dense_indices: Vec<usize> = level
+            .element_indices()
+            .map_err(|e| Error::GraphBLAS(e.to_string()))?;
+        Ok(dense_indices
+            .into_iter()
+            .filter_map(|d| snap.dense_to_id.get(d).copied())
+            .collect())
     }
 
-    /// GraphBLAS-backed PageRank algorithm.
+    /// Multi-source BFS fallback using either CSR snapshots or LMDB.
     ///
-    /// Computes rank propagation using iterative sparse matrix-vector multiplications
-    /// where transition probability weights are distributed over incoming edges.
+    /// For each node the CSR snapshot is tried first; if the node is absent from
+    /// the snapshot (added after the last `rebuild_csr`), the out-adjacency is
+    /// read directly from LMDB so that freshly inserted nodes are never silently
+    /// skipped. BFS stops when all nodes within `hops` hops have been visited or
+    /// when `max_nodes` is reached, whichever comes first.
+    pub fn bfs_multi_source_fallback(
+        &self,
+        seeds: &[NodeId],
+        hops: u8,
+        max_nodes: Option<usize>,
+    ) -> Result<Vec<NodeId>, Error> {
+        let snap = self.csr_cache.snapshot.load();
+        let mut visited: AHashSet<NodeId> = AHashSet::new();
+        let mut frontier = Vec::new();
+
+        for &seed in seeds {
+            visited.insert(seed);
+            frontier.push(seed);
+            if max_nodes.is_some_and(|max| visited.len() >= max) {
+                return Ok(visited.into_iter().collect());
+            }
+        }
+
+        // `capped` prevents the hop loop from continuing after `max_nodes` is
+        // first reached inside a frontier iteration. Without this guard, `break
+        // 'outer` exits the frontier loop but the hop loop would start the next
+        // hop with the partially-built `next_frontier`, adding further nodes
+        // beyond the cap on each subsequent iteration.
+        let mut capped = false;
+        for _ in 0..hops {
+            if capped || frontier.is_empty() {
+                break;
+            }
+            let mut next_frontier = Vec::new();
+            'outer: for node in frontier {
+                let neighbors: Vec<NodeId> = if let Some(nb) = snap.out_neighbors(node) {
+                    nb.into_iter().map(|(n, _, _)| n).collect()
+                } else {
+                    self.adj_entries(node, true)?
+                        .into_iter()
+                        .map(|(n, _, _)| n)
+                        .collect()
+                };
+                for neighbor in neighbors {
+                    if visited.insert(neighbor) {
+                        next_frontier.push(neighbor);
+                        if max_nodes.is_some_and(|max| visited.len() >= max) {
+                            capped = true;
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+            frontier = next_frontier;
+        }
+
+        Ok(visited.into_iter().collect())
+    }
+
+    /// Multi-source BFS via repeated SpMV over the combined adjacency using the MinPlus semiring.
+    ///
+    /// Requires that the `graphblas` feature is enabled and that the matrix set
+    /// has been materialized via `rebuild_csr`. Falls back to
+    /// `bfs_multi_source_fallback` when the matrix set is absent, the graph is
+    /// empty, or any seed node is absent from the current CSR snapshot (a node
+    /// inserted after the last `rebuild_csr`). This ensures every seed is
+    /// reachable and prevents partial BFS results caused by seeds silently
+    /// missing from the dense-index map.
+    ///
+    /// The `max_nodes` cap is applied both during seed seeding and during SpMV
+    /// expansion so that the returned slice never exceeds the cap.
+    #[cfg(feature = "graphblas")]
+    pub fn bfs_multi_source_graphblas(
+        &self,
+        seeds: &[NodeId],
+        hops: u8,
+        max_nodes: Option<usize>,
+    ) -> Result<Vec<NodeId>, Error> {
+        use graphblas_sparse_linear_algebra::{
+            collections::{
+                Collection,
+                sparse_vector::{
+                    SparseVector,
+                    operations::{GetSparseVectorElementIndices, SetSparseVectorElement},
+                },
+            },
+            operators::{
+                binary_operator::Assignment,
+                element_wise_addition::{
+                    ApplyElementWiseVectorAdditionMonoidOperator,
+                    ElementWiseVectorAdditionMonoidOperator,
+                },
+                mask::SelectEntireVector,
+                monoid::Plus,
+                multiplication::{MatrixVectorMultiplicationOperator, MultiplyMatrixByVector},
+                options::{OperatorOptions, OptionsForOperatorWithMatrixAsFirstArgument},
+                semiring::MinPlus,
+            },
+        };
+
+        let guard = self.matrices.read();
+        let m = match guard.as_ref() {
+            Some(m) => m,
+            None => {
+                return self.bfs_multi_source_fallback(seeds, hops, max_nodes);
+            }
+        };
+        let snap = self.csr_cache.snapshot.load();
+        let n = m.n_nodes;
+        if seeds.is_empty() {
+            return Ok(vec![]);
+        }
+        if n == 0 {
+            return self.bfs_multi_source_fallback(seeds, hops, max_nodes);
+        }
+
+        // level[d] = BFS hop count to dense node d; absent = not yet reached.
+        let mut level = SparseVector::<i32>::new(m.context.clone(), n)
+            .map_err(|e| Error::GraphBLAS(e.to_string()))?;
+
+        // Seed the level vector. Two invariants must hold before proceeding:
+        //   1. At least one seed maps to a dense index (otherwise fall back).
+        //   2. Every seed maps to a dense index; a missing seed means the CSR
+        //      snapshot is stale for that node. Falling back ensures its
+        //      subgraph is not silently omitted from the result.
+        // Additionally, `max_nodes` is enforced here so the returned slice never
+        // exceeds the cap even when the seed count alone exceeds it.
+        let mut any_seeds = false;
+        let mut all_seeds_present = true;
+        let mut seeds_added: usize = 0;
+        for &start in seeds {
+            if max_nodes.is_some_and(|max| seeds_added >= max) {
+                // Remaining seeds would exceed the cap; stop seeding.
+                break;
+            }
+            if let Some(&d) = snap.id_to_dense.get(&start) {
+                level
+                    .set_value(d as usize, 0)
+                    .map_err(|e| Error::GraphBLAS(e.to_string()))?;
+                any_seeds = true;
+                seeds_added += 1;
+            } else {
+                all_seeds_present = false;
+            }
+        }
+
+        if !any_seeds || !all_seeds_present {
+            return self.bfs_multi_source_fallback(seeds, hops, max_nodes);
+        }
+
+        let mxv = MatrixVectorMultiplicationOperator::new();
+        let ewise_add = ElementWiseVectorAdditionMonoidOperator::new();
+        // Transpose A so product[j] = min_i(A[i][j] + level[i]) = min incoming hop + 1.
+        // Structural complement mask restricts writes to unvisited nodes only.
+        let opts_next = OptionsForOperatorWithMatrixAsFirstArgument::new(false, true, true, true);
+        let opts_merge = OperatorOptions::new_default();
+
+        let mut current_hop = 0;
+        for _ in 0..hops {
+            current_hop += 1;
+            let mut next = SparseVector::<i32>::new(m.context.clone(), n)
+                .map_err(|e| Error::GraphBLAS(e.to_string()))?;
+            mxv.apply(
+                &m.adjacency,
+                &MinPlus::<i32>::new(),
+                &level,
+                &Assignment::new(),
+                &mut next,
+                &level,
+                &opts_next,
+            )
+            .map_err(|e| Error::GraphBLAS(e.to_string()))?;
+
+            let next_count = next
+                .number_of_stored_elements()
+                .map_err(|e| Error::GraphBLAS(e.to_string()))?;
+
+            if next_count == 0 {
+                break;
+            }
+
+            let current_count = level
+                .number_of_stored_elements()
+                .map_err(|e| Error::GraphBLAS(e.to_string()))?;
+
+            if let Some(max) = max_nodes {
+                if current_count >= max {
+                    break;
+                }
+                if current_count + next_count > max {
+                    let allowed = max - current_count;
+                    let next_indices: Vec<usize> = next
+                        .element_indices()
+                        .map_err(|e| Error::GraphBLAS(e.to_string()))?;
+                    for &idx in next_indices.iter().take(allowed) {
+                        level
+                            .set_value(idx, current_hop)
+                            .map_err(|e| Error::GraphBLAS(e.to_string()))?;
+                    }
+                    break;
+                }
+            }
+
+            // Union next into level (disjoint due to complement mask).
+            let mut merged = SparseVector::<i32>::new(m.context.clone(), n)
+                .map_err(|e| Error::GraphBLAS(e.to_string()))?;
+            ewise_add
+                .apply(
+                    &level,
+                    &Plus::<i32>::new(),
+                    &next,
+                    &Assignment::new(),
+                    &mut merged,
+                    &SelectEntireVector::new(m.context.clone()),
+                    &opts_merge,
+                )
+                .map_err(|e| Error::GraphBLAS(e.to_string()))?;
+            level = merged;
+        }
+
+        let dense_indices: Vec<usize> = level
+            .element_indices()
+            .map_err(|e| Error::GraphBLAS(e.to_string()))?;
+        Ok(dense_indices
+            .into_iter()
+            .filter_map(|d| snap.dense_to_id.get(d).copied())
+            .collect())
+    }
+
+    /// PageRank via iterative SpMV over the column-stochastic matrix.
+    ///
+    /// Each iteration computes `raw = M * rank` using PlusTimes, then applies the
+    /// damping formula `rank[i] = d * raw[i] + (1 - d) / n` in Rust. Dangling
+    /// nodes (no incoming edges) receive only the teleportation term.
     #[cfg(feature = "graphblas")]
     pub fn page_rank_graphblas(
         &self,
         iterations: u32,
         damping: f32,
     ) -> Result<HashMap<NodeId, f32>, Error> {
-        self.page_rank(iterations, damping)
+        use graphblas_sparse_linear_algebra::{
+            collections::sparse_vector::{
+                SparseVector, VectorElementList,
+                operations::{
+                    FromVectorElementList, GetSparseVectorElementIndices,
+                    GetSparseVectorElementValue,
+                },
+            },
+            operators::{
+                binary_operator::{Assignment, First},
+                mask::SelectEntireVector,
+                multiplication::{MatrixVectorMultiplicationOperator, MultiplyMatrixByVector},
+                options::OptionsForOperatorWithMatrixAsFirstArgument,
+                semiring::PlusTimes,
+            },
+        };
+
+        let guard = self.matrices.read();
+        let m = match guard.as_ref() {
+            Some(m) => m,
+            None => return self.page_rank(iterations, damping),
+        };
+        let snap = self.csr_cache.snapshot.load();
+        let n = m.n_nodes;
+        if n == 0 {
+            return Ok(HashMap::new());
+        }
+
+        let init = 1.0f32 / n as f32;
+        let base = (1.0 - damping) / n as f32;
+        let mxv = MatrixVectorMultiplicationOperator::new();
+        let opts = OptionsForOperatorWithMatrixAsFirstArgument::new_default();
+
+        let mut rank_vals = vec![init; n];
+
+        for _ in 0..iterations {
+            let rank_list = VectorElementList::<f32>::from_element_vector(
+                rank_vals
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &v)| (i, v).into())
+                    .collect(),
+            );
+            let rank = SparseVector::<f32>::from_element_list(
+                m.context.clone(),
+                n,
+                rank_list,
+                &First::<f32>::new(),
+            )
+            .map_err(|e| Error::GraphBLAS(e.to_string()))?;
+
+            let mut raw = SparseVector::<f32>::new(m.context.clone(), n)
+                .map_err(|e| Error::GraphBLAS(e.to_string()))?;
+            mxv.apply(
+                &m.page_rank_matrix,
+                &PlusTimes::<f32>::new(),
+                &rank,
+                &Assignment::new(),
+                &mut raw,
+                &SelectEntireVector::new(m.context.clone()),
+                &opts,
+            )
+            .map_err(|e| Error::GraphBLAS(e.to_string()))?;
+
+            // Apply damping: rank[i] = d * raw[i] + (1-d)/n; absent entries get base only.
+            let mut new_vals = vec![base; n];
+            let indices: Vec<usize> = raw
+                .element_indices()
+                .map_err(|e| Error::GraphBLAS(e.to_string()))?;
+            for idx in indices {
+                let v = raw
+                    .element_value_or_default(idx)
+                    .map_err(|e| Error::GraphBLAS(e.to_string()))?;
+                new_vals[idx] = damping * v + base;
+            }
+            rank_vals = new_vals;
+        }
+
+        Ok((0..n)
+            .filter_map(|i| snap.dense_to_id.get(i).map(|&id| (id, rank_vals[i])))
+            .collect())
     }
 
-    /// GraphBLAS-backed Single-Source Shortest Path (SSSP).
-    ///
-    /// Computes the unweighted shortest path from `src` to `dst` using the tropical
-    /// (min-plus) semiring operations over sparse matrices.
+    /// Unweighted SSSP from `src` to `dst` via MinPlus SpMV, with path reconstruction
+    /// from the LMDB in-adjacency once the destination is reached.
     #[cfg(feature = "graphblas")]
     pub fn shortest_path_graphblas(
         &self,
         src: NodeId,
         dst: NodeId,
     ) -> Result<Option<Vec<NodeId>>, Error> {
-        self.shortest_path(src, dst)
+        use graphblas_sparse_linear_algebra::{
+            collections::{
+                Collection,
+                sparse_vector::{
+                    SparseVector,
+                    operations::{GetSparseVectorElementIndices, SetSparseVectorElement},
+                },
+            },
+            operators::{
+                binary_operator::Assignment,
+                element_wise_addition::{
+                    ApplyElementWiseVectorAdditionMonoidOperator,
+                    ElementWiseVectorAdditionMonoidOperator,
+                },
+                mask::SelectEntireVector,
+                monoid::Plus,
+                multiplication::{MatrixVectorMultiplicationOperator, MultiplyMatrixByVector},
+                options::{OperatorOptions, OptionsForOperatorWithMatrixAsFirstArgument},
+                semiring::MinPlus,
+            },
+        };
+
+        if src == dst {
+            return Ok(Some(vec![src]));
+        }
+
+        let guard = self.matrices.read();
+        let m = match guard.as_ref() {
+            Some(m) => m,
+            None => return self.shortest_path(src, dst),
+        };
+        let snap = self.csr_cache.snapshot.load();
+        let n = m.n_nodes;
+
+        let src_dense = match snap.id_to_dense.get(&src) {
+            Some(&d) => d as usize,
+            None => return Ok(None),
+        };
+        let dst_dense = match snap.id_to_dense.get(&dst) {
+            Some(&d) => d as usize,
+            None => return Ok(None),
+        };
+
+        let mxv = MatrixVectorMultiplicationOperator::new();
+        let ewise_add = ElementWiseVectorAdditionMonoidOperator::new();
+        let opts_next = OptionsForOperatorWithMatrixAsFirstArgument::new(false, true, true, true);
+        let opts_merge = OperatorOptions::new_default();
+
+        let mut dist = SparseVector::<i32>::new(m.context.clone(), n)
+            .map_err(|e| Error::GraphBLAS(e.to_string()))?;
+        dist.set_value(src_dense, 0)
+            .map_err(|e| Error::GraphBLAS(e.to_string()))?;
+
+        // dist_vals[d] = Some(hop) once node d is reached.
+        // dist_vals[d] = hop count from src to dense node d once reached.
+        let mut dist_vals: Vec<Option<i32>> = vec![None; n];
+        dist_vals[src_dense] = Some(0);
+
+        let mut reached_dst = false;
+
+        for hop in 1..=(n as i32) {
+            let mut next = SparseVector::<i32>::new(m.context.clone(), n)
+                .map_err(|e| Error::GraphBLAS(e.to_string()))?;
+            mxv.apply(
+                &m.adjacency,
+                &MinPlus::<i32>::new(),
+                &dist,
+                &Assignment::new(),
+                &mut next,
+                &dist,
+                &opts_next,
+            )
+            .map_err(|e| Error::GraphBLAS(e.to_string()))?;
+
+            if next
+                .number_of_stored_elements()
+                .map_err(|e| Error::GraphBLAS(e.to_string()))?
+                == 0
+            {
+                break;
+            }
+
+            // Iteration k produces nodes at hop distance k; record before merging.
+            let new_indices: Vec<usize> = next
+                .element_indices()
+                .map_err(|e| Error::GraphBLAS(e.to_string()))?;
+            for &idx in &new_indices {
+                dist_vals[idx] = Some(hop);
+                if idx == dst_dense {
+                    reached_dst = true;
+                }
+            }
+
+            let mut merged = SparseVector::<i32>::new(m.context.clone(), n)
+                .map_err(|e| Error::GraphBLAS(e.to_string()))?;
+            ewise_add
+                .apply(
+                    &dist,
+                    &Plus::<i32>::new(),
+                    &next,
+                    &Assignment::new(),
+                    &mut merged,
+                    &SelectEntireVector::new(m.context.clone()),
+                    &opts_merge,
+                )
+                .map_err(|e| Error::GraphBLAS(e.to_string()))?;
+            dist = merged;
+
+            if reached_dst {
+                break;
+            }
+        }
+
+        if !reached_dst {
+            return Ok(None);
+        }
+
+        // Reconstruct path by tracing backward from dst using LMDB in-neighbors.
+        // At each step we look for a predecessor with dist == current_dist - 1.
+        let mut path = vec![dst_dense];
+        let mut cur = dst_dense;
+        while cur != src_dense {
+            let cur_dist = match dist_vals[cur] {
+                Some(d) => d,
+                None => return Ok(None),
+            };
+            let cur_id = snap.dense_to_id[cur];
+            let in_neighbors = self.adj_entries(cur_id, false)?;
+            let mut moved = false;
+            for (pred_id, _, _) in in_neighbors {
+                if let Some(&pred_d) = snap.id_to_dense.get(&pred_id) {
+                    let pred_d = pred_d as usize;
+                    if dist_vals[pred_d] == Some(cur_dist - 1) {
+                        path.push(pred_d);
+                        cur = pred_d;
+                        moved = true;
+                        break;
+                    }
+                }
+            }
+            if !moved {
+                return Ok(None);
+            }
+        }
+
+        path.reverse();
+        Ok(Some(
+            path.into_iter().map(|d| snap.dense_to_id[d]).collect(),
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    use super::*;
+
+    fn open_tmp() -> (TempDir, Graph) {
+        let dir = TempDir::new().unwrap();
+        let g = Graph::open(dir.path(), 1).unwrap();
+        (dir, g)
+    }
+
+    // --- bfs_multi_source_fallback ---
+
+    #[test]
+    fn multi_source_fallback_empty_seeds_returns_empty() {
+        let (_dir, g) = open_tmp();
+        let result = g.bfs_multi_source_fallback(&[], 2, None).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn multi_source_fallback_hops_zero_returns_only_seeds() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("N", &json!({})).unwrap();
+        let b = g.add_node("N", &json!({})).unwrap();
+        let c = g.add_node("N", &json!({})).unwrap();
+        g.add_edge(a, c, "E", &json!({})).unwrap();
+
+        // hops=0: no expansion; c is reachable from a but must not appear.
+        let mut result = g.bfs_multi_source_fallback(&[a, b], 0, None).unwrap();
+        result.sort_unstable();
+        assert_eq!(result, vec![a, b]);
+        assert!(!result.contains(&c));
+    }
+
+    #[test]
+    fn multi_source_fallback_expands_to_correct_depth() {
+        let (_dir, g) = open_tmp();
+        // Chain: a → b → c → d; b → e
+        let a = g.add_node("N", &json!({})).unwrap();
+        let b = g.add_node("N", &json!({})).unwrap();
+        let c = g.add_node("N", &json!({})).unwrap();
+        let d = g.add_node("N", &json!({})).unwrap();
+        let e = g.add_node("N", &json!({})).unwrap();
+        g.add_edge(a, b, "E", &json!({})).unwrap();
+        g.add_edge(b, c, "E", &json!({})).unwrap();
+        g.add_edge(c, d, "E", &json!({})).unwrap();
+        g.add_edge(b, e, "E", &json!({})).unwrap();
+
+        // Seed a, hops=1: should reach b.
+        let mut r1 = g.bfs_multi_source_fallback(&[a], 1, None).unwrap();
+        r1.sort_unstable();
+        assert!(r1.contains(&a));
+        assert!(r1.contains(&b));
+        assert!(!r1.contains(&c));
+        assert!(!r1.contains(&d));
+
+        // Seed a, hops=2: should reach b, c, e.
+        let mut r2 = g.bfs_multi_source_fallback(&[a], 2, None).unwrap();
+        r2.sort_unstable();
+        assert!(r2.contains(&b));
+        assert!(r2.contains(&c));
+        assert!(r2.contains(&e));
+        assert!(!r2.contains(&d));
+    }
+
+    #[test]
+    fn multi_source_fallback_max_nodes_cap_respected_across_hops() {
+        let (_dir, g) = open_tmp();
+        // Star + tail: a → b, c, d; b → e
+        let a = g.add_node("N", &json!({})).unwrap();
+        let b = g.add_node("N", &json!({})).unwrap();
+        let c = g.add_node("N", &json!({})).unwrap();
+        let d = g.add_node("N", &json!({})).unwrap();
+        let e = g.add_node("N", &json!({})).unwrap();
+        g.add_edge(a, b, "E", &json!({})).unwrap();
+        g.add_edge(a, c, "E", &json!({})).unwrap();
+        g.add_edge(a, d, "E", &json!({})).unwrap();
+        g.add_edge(b, e, "E", &json!({})).unwrap();
+
+        // With max_nodes=3 and hops=2: the cap must not be exceeded, not even
+        // in a second hop after the cap fired mid-first-hop.
+        let result = g.bfs_multi_source_fallback(&[a], 2, Some(3)).unwrap();
+        assert!(
+            result.len() <= 3,
+            "expected at most 3 nodes, got {}",
+            result.len()
+        );
+    }
+
+    #[test]
+    fn multi_source_fallback_multiple_seeds_union_correctly() {
+        let (_dir, g) = open_tmp();
+        // Two disconnected chains: a → b; c → d
+        let a = g.add_node("N", &json!({})).unwrap();
+        let b = g.add_node("N", &json!({})).unwrap();
+        let c = g.add_node("N", &json!({})).unwrap();
+        let d = g.add_node("N", &json!({})).unwrap();
+        g.add_edge(a, b, "E", &json!({})).unwrap();
+        g.add_edge(c, d, "E", &json!({})).unwrap();
+
+        let mut result = g.bfs_multi_source_fallback(&[a, c], 1, None).unwrap();
+        result.sort_unstable();
+        assert!(result.contains(&a));
+        assert!(result.contains(&b));
+        assert!(result.contains(&c));
+        assert!(result.contains(&d));
+    }
+
+    #[test]
+    fn multi_source_fallback_deduplicates_shared_neighbors() {
+        let (_dir, g) = open_tmp();
+        // Both seeds point at the same node: a → c; b → c
+        let a = g.add_node("N", &json!({})).unwrap();
+        let b = g.add_node("N", &json!({})).unwrap();
+        let c = g.add_node("N", &json!({})).unwrap();
+        g.add_edge(a, c, "E", &json!({})).unwrap();
+        g.add_edge(b, c, "E", &json!({})).unwrap();
+
+        let result = g.bfs_multi_source_fallback(&[a, b], 1, None).unwrap();
+        // c must appear exactly once.
+        let count_c = result.iter().filter(|&&n| n == c).count();
+        assert_eq!(count_c, 1);
+        assert_eq!(result.len(), 3); // a, b, c
+    }
+
+    // --- bfs_multi_source_graphblas ---
+    //
+    // Each test calls `rebuild_csr()` after mutating the graph so the GraphBLAS
+    // adjacency matrix reflects the inserted edges before BFS is invoked.
+
+    #[cfg(feature = "graphblas")]
+    #[test]
+    fn graphblas_multi_source_empty_seeds_returns_empty() {
+        let (_dir, g) = open_tmp();
+        g.add_node("N", &json!({})).unwrap();
+        g.rebuild_csr().unwrap();
+        let result = g.bfs_multi_source_graphblas(&[], 2, None).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[cfg(feature = "graphblas")]
+    #[test]
+    fn graphblas_multi_source_hops_zero_returns_only_seeds() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("N", &json!({})).unwrap();
+        let b = g.add_node("N", &json!({})).unwrap();
+        let c = g.add_node("N", &json!({})).unwrap();
+        g.add_edge(a, c, "E", &json!({})).unwrap();
+        g.rebuild_csr().unwrap();
+
+        let mut result = g.bfs_multi_source_graphblas(&[a, b], 0, None).unwrap();
+        result.sort_unstable();
+        assert_eq!(result, vec![a, b]);
+        assert!(!result.contains(&c));
+    }
+
+    #[cfg(feature = "graphblas")]
+    #[test]
+    fn graphblas_multi_source_expands_to_correct_depth() {
+        let (_dir, g) = open_tmp();
+        // Chain: a → b → c → d
+        let a = g.add_node("N", &json!({})).unwrap();
+        let b = g.add_node("N", &json!({})).unwrap();
+        let c = g.add_node("N", &json!({})).unwrap();
+        let d = g.add_node("N", &json!({})).unwrap();
+        g.add_edge(a, b, "E", &json!({})).unwrap();
+        g.add_edge(b, c, "E", &json!({})).unwrap();
+        g.add_edge(c, d, "E", &json!({})).unwrap();
+        g.rebuild_csr().unwrap();
+
+        let r1 = g.bfs_multi_source_graphblas(&[a], 1, None).unwrap();
+        assert!(r1.contains(&a));
+        assert!(r1.contains(&b));
+        assert!(!r1.contains(&c));
+        assert!(!r1.contains(&d));
+
+        let r2 = g.bfs_multi_source_graphblas(&[a], 2, None).unwrap();
+        assert!(r2.contains(&a));
+        assert!(r2.contains(&b));
+        assert!(r2.contains(&c));
+        assert!(!r2.contains(&d));
+    }
+
+    #[cfg(feature = "graphblas")]
+    #[test]
+    fn graphblas_multi_source_max_nodes_cap_respected() {
+        let (_dir, g) = open_tmp();
+        // Star + tail: a → b, c, d; b → e
+        let a = g.add_node("N", &json!({})).unwrap();
+        let b = g.add_node("N", &json!({})).unwrap();
+        let c = g.add_node("N", &json!({})).unwrap();
+        let d = g.add_node("N", &json!({})).unwrap();
+        let e = g.add_node("N", &json!({})).unwrap();
+        g.add_edge(a, b, "E", &json!({})).unwrap();
+        g.add_edge(a, c, "E", &json!({})).unwrap();
+        g.add_edge(a, d, "E", &json!({})).unwrap();
+        g.add_edge(b, e, "E", &json!({})).unwrap();
+        g.rebuild_csr().unwrap();
+
+        let result = g.bfs_multi_source_graphblas(&[a], 2, Some(3)).unwrap();
+        assert!(
+            result.len() <= 3,
+            "expected at most 3 nodes, got {}",
+            result.len()
+        );
+    }
+
+    #[cfg(feature = "graphblas")]
+    #[test]
+    fn graphblas_multi_source_two_seeds_union_disconnected_components() {
+        let (_dir, g) = open_tmp();
+        // Two disconnected chains: a → b; c → d
+        let a = g.add_node("N", &json!({})).unwrap();
+        let b = g.add_node("N", &json!({})).unwrap();
+        let c = g.add_node("N", &json!({})).unwrap();
+        let d = g.add_node("N", &json!({})).unwrap();
+        g.add_edge(a, b, "E", &json!({})).unwrap();
+        g.add_edge(c, d, "E", &json!({})).unwrap();
+        g.rebuild_csr().unwrap();
+
+        let result = g.bfs_multi_source_graphblas(&[a, c], 1, None).unwrap();
+        assert!(result.contains(&a));
+        assert!(result.contains(&b));
+        assert!(result.contains(&c));
+        assert!(result.contains(&d));
+    }
+
+    #[cfg(feature = "graphblas")]
+    #[test]
+    fn graphblas_multi_source_deduplicates_shared_neighbors() {
+        let (_dir, g) = open_tmp();
+        // a → c; b → c — c must appear once.
+        let a = g.add_node("N", &json!({})).unwrap();
+        let b = g.add_node("N", &json!({})).unwrap();
+        let c = g.add_node("N", &json!({})).unwrap();
+        g.add_edge(a, c, "E", &json!({})).unwrap();
+        g.add_edge(b, c, "E", &json!({})).unwrap();
+        g.rebuild_csr().unwrap();
+
+        let result = g.bfs_multi_source_graphblas(&[a, b], 1, None).unwrap();
+        let count_c = result.iter().filter(|&&n| n == c).count();
+        assert_eq!(count_c, 1);
+        assert_eq!(result.len(), 3); // a, b, c
+    }
+
+    #[cfg(feature = "graphblas")]
+    #[test]
+    fn graphblas_multi_source_falls_back_when_seed_absent_from_snapshot() {
+        let (_dir, g) = open_tmp();
+        // Seed a is in the CSR; b is added after rebuild_csr (stale snapshot).
+        // The function must detect the stale seed and fall back to LMDB BFS.
+        let a = g.add_node("N", &json!({})).unwrap();
+        let c = g.add_node("N", &json!({})).unwrap();
+        g.add_edge(a, c, "E", &json!({})).unwrap();
+        g.rebuild_csr().unwrap();
+
+        // b is inserted AFTER rebuild, so it is absent from the CSR snapshot.
+        let b = g.add_node("N", &json!({})).unwrap();
+        let d = g.add_node("N", &json!({})).unwrap();
+        g.add_edge(b, d, "E", &json!({})).unwrap();
+
+        // Both seeds must appear in the result; d must be reachable from b.
+        let result = g.bfs_multi_source_graphblas(&[a, b], 1, None).unwrap();
+        assert!(result.contains(&a), "seed a must be present");
+        assert!(result.contains(&b), "seed b must be present (via fallback)");
+        assert!(result.contains(&c), "c reachable from a");
+        assert!(result.contains(&d), "d reachable from b");
     }
 }

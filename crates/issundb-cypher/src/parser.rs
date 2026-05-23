@@ -162,15 +162,15 @@ fn parse_pattern(s: &str) -> Result<Pattern, String> {
 
     // Parse the seed node
     let (node, size) = parse_node_pattern(remainder)?;
-    remainder = &remainder[size..].trim();
+    remainder = remainder[size..].trim();
 
     let mut rels = Vec::new();
     while !remainder.is_empty() {
         let (rel, rel_size) = parse_relationship_pattern(remainder)?;
-        remainder = &remainder[rel_size..].trim();
+        remainder = remainder[rel_size..].trim();
 
         let (target, target_size) = parse_node_pattern(remainder)?;
-        remainder = &remainder[target_size..].trim();
+        remainder = remainder[target_size..].trim();
 
         rels.push((rel, target));
     }
@@ -221,7 +221,7 @@ fn parse_node_pattern(s: &str) -> Result<(NodePattern, usize), String> {
 fn parse_relationship_pattern(s: &str) -> Result<(RelationshipPattern, usize), String> {
     let mut remainder = s.trim();
     let is_incoming = remainder.starts_with("<-");
-    
+
     let left_dash = if is_incoming { "<-" } else { "-" };
     if !remainder.starts_with(left_dash) {
         return Err("invalid relationship syntax prefix".into());
@@ -231,8 +231,10 @@ fn parse_relationship_pattern(s: &str) -> Result<(RelationshipPattern, usize), S
     if !remainder.starts_with('[') {
         return Err("relationship pattern must contain type bracket '['".into());
     }
-    let bracket_end = remainder.find(']').ok_or("missing relationship bracket ']'")?;
-    let content = &remainder[1..bracket_end].trim();
+    let bracket_end = remainder
+        .find(']')
+        .ok_or("missing relationship bracket ']'")?;
+    let content = remainder[1..bracket_end].trim();
     remainder = &remainder[bracket_end + 1..];
 
     let is_outgoing = remainder.starts_with("->");
@@ -241,7 +243,16 @@ fn parse_relationship_pattern(s: &str) -> Result<(RelationshipPattern, usize), S
         return Err("invalid relationship syntax suffix".into());
     }
 
-    let parts: Vec<&str> = content.split(':').collect();
+    let (left_part, range_part) = if let Some(star_idx) = content.find('*') {
+        (
+            content[..star_idx].trim(),
+            Some(content[star_idx + 1..].trim()),
+        )
+    } else {
+        (content, None)
+    };
+
+    let parts: Vec<&str> = left_part.split(':').collect();
     let variable = if parts[0].trim().is_empty() {
         None
     } else {
@@ -254,12 +265,59 @@ fn parse_relationship_pattern(s: &str) -> Result<(RelationshipPattern, usize), S
         None
     };
 
+    let range = if let Some(r_str) = range_part {
+        let r_str = r_str.trim();
+        if r_str.is_empty() {
+            Some(RelRange {
+                min: Some(1),
+                max: None,
+            })
+        } else if r_str.contains("..") {
+            let range_parts: Vec<&str> = r_str.split("..").collect();
+            if range_parts.len() != 2 {
+                return Err("invalid relationship range syntax".into());
+            }
+            let min = if range_parts[0].trim().is_empty() {
+                Some(1)
+            } else {
+                Some(
+                    range_parts[0]
+                        .trim()
+                        .parse::<u32>()
+                        .map_err(|_| "invalid min range")?,
+                )
+            };
+            let max = if range_parts[1].trim().is_empty() {
+                None
+            } else {
+                Some(
+                    range_parts[1]
+                        .trim()
+                        .parse::<u32>()
+                        .map_err(|_| "invalid max range")?,
+                )
+            };
+            Some(RelRange { min, max })
+        } else {
+            let hops = r_str
+                .parse::<u32>()
+                .map_err(|_| "invalid range exact hops value")?;
+            Some(RelRange {
+                min: Some(hops),
+                max: Some(hops),
+            })
+        }
+    } else {
+        None
+    };
+
     let consumed = left_dash.len() + bracket_end + 1 + right_dash.len();
     Ok((
         RelationshipPattern {
             variable,
             rel_type,
             is_incoming,
+            range,
         },
         consumed,
     ))
@@ -289,11 +347,18 @@ fn parse_properties_map(s: &str) -> Result<HashMap<String, Literal>, String> {
 fn parse_where_clause(s: &str) -> Result<WhereClause, String> {
     let mut op_start = None;
     let mut op_len = 0;
-    
+
     // Find comparison operator
-    for &(op, len) in &[("=", 1), ("!=", 2), ("<=", 2), (">=", 2), ("<", 1), (">", 1)] {
+    for &(op, len) in &[
+        ("=", 1),
+        ("!=", 2),
+        ("<=", 2),
+        (">=", 2),
+        ("<", 1),
+        (">", 1),
+    ] {
         if let Some(idx) = s.find(op) {
-            if op_start.is_none() || idx < op_start.unwrap() {
+            if op_start.is_none_or(|best| idx < best) {
                 op_start = Some(idx);
                 op_len = len;
             }
@@ -321,13 +386,16 @@ fn parse_where_clause(s: &str) -> Result<WhereClause, String> {
 
 fn parse_expr(s: &str) -> Result<Expr, String> {
     let trimmed = s.trim();
-    if trimmed.starts_with('$') {
-        Ok(Expr::Param(trimmed[1..].to_string()))
+    if let Some(rest) = trimmed.strip_prefix('$') {
+        Ok(Expr::Param(rest.to_string()))
     } else if trimmed.contains('.') {
         // Variable property reference
         let parts: Vec<&str> = trimmed.split('.').collect();
         if parts.len() == 2 {
-            Ok(Expr::Prop(parts[0].trim().to_string(), parts[1].trim().to_string()))
+            Ok(Expr::Prop(
+                parts[0].trim().to_string(),
+                parts[1].trim().to_string(),
+            ))
         } else {
             Ok(Expr::Literal(parse_literal(trimmed)?))
         }
@@ -338,15 +406,15 @@ fn parse_expr(s: &str) -> Result<Expr, String> {
 
 fn parse_literal(s: &str) -> Result<Literal, String> {
     let trimmed = s.trim();
-    if trimmed.starts_with('"') && trimmed.ends_with('"') {
+    if (trimmed.starts_with('"') && trimmed.ends_with('"'))
+        || (trimmed.starts_with('\'') && trimmed.ends_with('\''))
+    {
         Ok(Literal::Str(trimmed[1..trimmed.len() - 1].to_string()))
-    } else if trimmed.starts_with('\'') && trimmed.ends_with('\'') {
-        Ok(Literal::Str(trimmed[1..trimmed.len() - 1].to_string()))
-    } else if trimmed.to_ascii_lowercase() == "true" {
+    } else if trimmed.eq_ignore_ascii_case("true") {
         Ok(Literal::Bool(true))
-    } else if trimmed.to_ascii_lowercase() == "false" {
+    } else if trimmed.eq_ignore_ascii_case("false") {
         Ok(Literal::Bool(false))
-    } else if trimmed.to_ascii_lowercase() == "null" {
+    } else if trimmed.eq_ignore_ascii_case("null") {
         Ok(Literal::Null)
     } else if let Ok(val) = trimmed.parse::<i64>() {
         Ok(Literal::Int(val))
@@ -364,7 +432,7 @@ fn parse_return_clause(s: &str) -> Result<ReturnClause, String> {
         // Parse alias "AS" if present
         let upper = trimmed.to_ascii_uppercase();
         let alias_part = upper.find(" AS ");
-        
+
         let (expr_str, alias) = if let Some(idx) = alias_part {
             let expr = trimmed[..idx].trim();
             let alias_name = trimmed[idx + " AS ".len()..].trim().to_string();

@@ -1,6 +1,6 @@
 [package]
 name = "issundb-core"
-description = "IssunDB storage engine: schema, LMDB persistence, CSR cache, graph CRUD"
+description = "IssunDB's storage engine and core data structures"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

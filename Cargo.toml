@@ -3,24 +3,24 @@ members = ["crates/*"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 edition = "2024"
 authors = ["Hassan Abedi <hassan.abedi.t@gmail.com>"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/IssunDB/issun-db"
 homepage = "https://github.com/IssunDB/issun-db"
-rust-version = "1.85"
+rust-version = "1.85.0"
 
 # ---------------------------------------------------------------------------
 # Shared dependencies — pin versions once, inherit everywhere
 # ---------------------------------------------------------------------------
 [workspace.dependencies]
 # Storage
-heed = "0.20"
+heed = "0.22"
 byteorder = "1"
 
 # Zero-copy fixed-size types (AdjEntry)
-zerocopy = { version = "0.7", features = ["derive"] }
+zerocopy = { version = "0.8.48", features = ["derive"] }
 
 # Serialization (msgpack for property bags)
 rmp-serde = "1"
@@ -31,8 +31,8 @@ parking_lot = "0.12"
 arc-swap = "1"
 crossbeam = "0.8"
 
-# Errors / logging
-thiserror = "1"
+# Errors and logging
+thiserror = "2"
 anyhow = "1"
 tracing = "0.1"
 
@@ -42,13 +42,13 @@ ahash = "0.8"
 # Testing
 tempfile = "3"
 proptest = "1"
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.5.1", features = ["html_reports"] }
 
 # ---------------------------------------------------------------------------
 # Heavy compute / vector deps — added in later phases
 graphblas_sparse_linear_algebra = "0.63.0" # phase 3: CSR + GraphBLAS
 usearch = "2"                              # phase 5: vector search
-chumsky = "0.10.0"                         # phase 7: Cypher parser
+chumsky = "0.13.0"                         # phase 7: Cypher parser
 # ---------------------------------------------------------------------------
 
 [profile.release]

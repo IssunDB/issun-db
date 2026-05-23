@@ -1,6 +1,6 @@
 [package]
 name = "issundb-rag"
-description = "GraphRAG primitives: vector hit → k-hop expansion → subgraph"
+description = "GraphRAG primitives and utilities for IssunDB"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use zerocopy::{AsBytes, FromBytes, FromZeroes};
+use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 pub type NodeId = u64;
 pub type EdgeId = u64;
@@ -11,7 +11,7 @@ pub type TypeId = u32;
 /// Fixed 20-byte `#[repr(C, packed)]` layout satisfies `DUPFIXED` (all
 /// duplicate values for a key must have identical size). `DUPSORT` orders
 /// duplicates lexicographically over these raw bytes.
-#[derive(Clone, Copy, Debug, AsBytes, FromBytes, FromZeroes)]
+#[derive(Clone, Copy, Debug, IntoBytes, FromBytes, Immutable)]
 #[repr(C, packed)]
 pub struct AdjEntry {
     pub edge_type: TypeId, // 4 bytes

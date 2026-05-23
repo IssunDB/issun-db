@@ -1,6 +1,7 @@
 pub mod csr;
 pub mod error;
 pub mod graph;
+
 #[cfg(feature = "graphblas")]
 pub mod matrices;
 pub mod schema;
@@ -495,13 +496,62 @@ mod tests {
         let b = g.add_node("N", &json!({})).unwrap();
         let eid = g.add_edge(a, b, "KNOWS", &json!({})).unwrap();
         let rec = g.get_edge(eid).unwrap().unwrap();
-        assert_eq!(g.type_name(rec.edge_type).unwrap().as_deref(), Some("KNOWS"));
+        assert_eq!(
+            g.type_name(rec.edge_type).unwrap().as_deref(),
+            Some("KNOWS")
+        );
     }
 
     #[test]
     fn label_name_unknown_id_returns_none() {
         let (_dir, g) = open_tmp();
         assert!(g.label_name(9999).unwrap().is_none());
+    }
+
+    #[cfg(feature = "graphblas")]
+    #[test]
+    fn graphblas_bfs_page_rank_sssp() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("Person", &json!({})).unwrap();
+        let b = g.add_node("Person", &json!({})).unwrap();
+        let c = g.add_node("Person", &json!({})).unwrap();
+        g.add_edge(a, b, "KNOWS", &json!({})).unwrap();
+        g.add_edge(b, c, "KNOWS", &json!({})).unwrap();
+        g.rebuild_csr().unwrap();
+
+        // BFS from a with 1 hop should reach a and b only.
+        let bfs1 = g.bfs_graphblas(a, 1).unwrap();
+        assert!(bfs1.contains(&a));
+        assert!(bfs1.contains(&b));
+        assert!(!bfs1.contains(&c));
+
+        // BFS from a with 2 hops should reach all three.
+        let bfs2 = g.bfs_graphblas(a, 2).unwrap();
+        assert!(bfs2.contains(&a));
+        assert!(bfs2.contains(&b));
+        assert!(bfs2.contains(&c));
+
+        // PageRank returns one entry per node.
+        let pr = g.page_rank_graphblas(10, 0.85).unwrap();
+        assert_eq!(pr.len(), 3);
+        for &id in &[a, b, c] {
+            assert!(pr.contains_key(&id));
+            assert!(*pr.get(&id).unwrap() > 0.0);
+        }
+
+        // SSSP a→c should return the two-hop path [a, b, c].
+        let path = g
+            .shortest_path_graphblas(a, c)
+            .unwrap()
+            .expect("path a→c must exist");
+        assert_eq!(path, vec![a, b, c]);
+
+        // SSSP a→a is a trivial path.
+        let trivial = g.shortest_path_graphblas(a, a).unwrap().unwrap();
+        assert_eq!(trivial, vec![a]);
+
+        // SSSP in reverse direction (no edge) returns None.
+        assert!(g.shortest_path_graphblas(c, a).unwrap().is_none());
     }
 }
 
@@ -643,36 +693,5 @@ mod prop_tests {
             prop_assert_eq!(after.len(), before + 1);
             prop_assert!(after.contains(&eid));
         });
-    }
-
-    #[cfg(feature = "graphblas")]
-    #[test]
-    fn graphblas_matrix_materialization_and_bfs() {
-        let (_dir, g) = open_tmp();
-        let a = g.add_node("Person", &json!({})).unwrap();
-        let b = g.add_node("Person", &json!({})).unwrap();
-        g.add_edge(a, b, "KNOWS", &json!({})).unwrap();
-
-        g.rebuild_csr().unwrap();
-
-        // Check MatrixSet materialization
-        let snap = g.csr_cache.snapshot.load();
-        let matrices = MatrixSet::materialize(&snap).unwrap();
-        assert_eq!(matrices.n_nodes, 2);
-        assert!(matrices.by_type.contains_key(&1)); // KNOWS type id is 1
-
-        // Check GraphBLAS-backed traversals
-        let bfs_res = g.bfs_graphblas(a, 1).unwrap();
-        assert!(bfs_res.contains(&a));
-        assert!(bfs_res.contains(&b));
-
-        let pr_res = g.page_rank_graphblas(10, 0.85).unwrap();
-        assert_eq!(pr_res.len(), 2);
-
-        let path = g
-            .shortest_path_graphblas(a, b)
-            .unwrap()
-            .expect("path should exist");
-        assert_eq!(path, vec![a, b]);
     }
 }
