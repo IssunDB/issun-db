@@ -48,7 +48,7 @@ criterion = { version = "0.5", features = ["html_reports"] }
 # Heavy compute / vector deps — added in later phases
 graphblas_sparse_linear_algebra = "0.63.0" # phase 3: CSR + GraphBLAS
 usearch = "2"                              # phase 5: vector search
-# chumsky = "0.10"                         # phase 7: Cypher parser
+chumsky = "0.10.0"                         # phase 7: Cypher parser
 # ---------------------------------------------------------------------------
 
 [profile.release]

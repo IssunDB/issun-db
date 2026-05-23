@@ -11,7 +11,7 @@ use crate::matrices::MatrixSet;
 use crate::{
     csr::{CsrCache, CsrSnapshot},
     error::Error,
-    schema::{AdjEntry, EdgeId, EdgeRecord, NodeId, NodeRecord},
+    schema::{AdjEntry, EdgeId, EdgeRecord, LabelId, NodeId, NodeRecord, TypeId},
     storage::{
         ids::{alloc_edge_id, alloc_node_id, get_or_create_label, get_or_create_type},
         lmdb::Storage,
@@ -124,6 +124,33 @@ impl Graph {
             Some(bytes) => Ok(Some(props::decode(bytes)?)),
             None => Ok(None),
         }
+    }
+
+    /// Update node properties.
+    pub fn update_node(&self, id: NodeId, label: &str, props: &impl Serialize) -> Result<(), Error> {
+        let _guard = self._write_lock.lock();
+        let mut wtxn = self.storage.env.write_txn()?;
+        let label_id = get_or_create_label(&self.storage, &mut wtxn, label)?;
+        let record = NodeRecord {
+            label: label_id,
+            props: props::encode(props)?,
+        };
+        self.storage
+            .nodes
+            .put(&mut wtxn, &id, &props::encode(&record)?)?;
+        wtxn.commit()?;
+        self.maybe_spawn_rebuild();
+        Ok(())
+    }
+
+    /// Delete a node.
+    pub fn delete_node(&self, id: NodeId) -> Result<(), Error> {
+        let _guard = self._write_lock.lock();
+        let mut wtxn = self.storage.env.write_txn()?;
+        self.storage.nodes.delete(&mut wtxn, &id)?;
+        wtxn.commit()?;
+        self.maybe_spawn_rebuild();
+        Ok(())
     }
 
     // ------------------------------------------------------------------
@@ -253,6 +280,42 @@ impl Graph {
             ids.push(u64::from_be_bytes(id_bytes));
         }
         Ok(ids)
+    }
+
+    // ------------------------------------------------------------------
+    // Registry reverse lookups
+    // ------------------------------------------------------------------
+
+    /// Resolves a `LabelId` back to its string name.
+    ///
+    /// Scans the `meta` sub-database for the matching `label:{name}` entry.
+    /// Returns `None` for ids that are not in the registry.
+    pub fn label_name(&self, id: LabelId) -> Result<Option<String>, Error> {
+        self.meta_reverse_lookup("label:", id)
+    }
+
+    /// Resolves a `TypeId` back to its string name.
+    ///
+    /// Scans the `meta` sub-database for the matching `type:{name}` entry.
+    /// Returns `None` for ids that are not in the registry.
+    pub fn type_name(&self, id: TypeId) -> Result<Option<String>, Error> {
+        self.meta_reverse_lookup("type:", id)
+    }
+
+    fn meta_reverse_lookup(&self, prefix: &str, id: u32) -> Result<Option<String>, Error> {
+        let rtxn = self.storage.env.read_txn()?;
+        for entry in self.storage.meta.iter(&rtxn)? {
+            let (key, val) = entry?;
+            if let Some(name) = key.strip_prefix(prefix) {
+                if val.len() == 4 {
+                    let stored = u32::from_be_bytes([val[0], val[1], val[2], val[3]]);
+                    if stored == id {
+                        return Ok(Some(name.to_owned()));
+                    }
+                }
+            }
+        }
+        Ok(None)
     }
 
     // ------------------------------------------------------------------
@@ -419,6 +482,18 @@ impl Graph {
             .enumerate()
             .map(|(i, &id)| (id, rank[i]))
             .collect())
+    }
+
+    /// Returns all node IDs in the graph in ascending order.
+    pub fn all_nodes(&self) -> Result<Vec<NodeId>, Error> {
+        let rtxn = self.storage.env.read_txn()?;
+        let mut ids = self.storage
+            .nodes
+            .iter(&rtxn)?
+            .map(|r| r.map(|(k, _)| k))
+            .collect::<Result<Vec<_>, _>>()?;
+        ids.sort_unstable();
+        Ok(ids)
     }
 
     /// Weakly connected components via BFS treating all edges as undirected.

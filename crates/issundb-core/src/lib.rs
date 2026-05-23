@@ -479,6 +479,30 @@ mod tests {
         assert_eq!(cc[&a], cc[&b]);
         assert_eq!(cc[&b], cc[&c]);
     }
+
+    #[test]
+    fn label_name_roundtrip() {
+        let (_dir, g) = open_tmp();
+        let id = g.add_node("Person", &json!({})).unwrap();
+        let rec = g.get_node(id).unwrap().unwrap();
+        assert_eq!(g.label_name(rec.label).unwrap().as_deref(), Some("Person"));
+    }
+
+    #[test]
+    fn type_name_roundtrip() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("N", &json!({})).unwrap();
+        let b = g.add_node("N", &json!({})).unwrap();
+        let eid = g.add_edge(a, b, "KNOWS", &json!({})).unwrap();
+        let rec = g.get_edge(eid).unwrap().unwrap();
+        assert_eq!(g.type_name(rec.edge_type).unwrap().as_deref(), Some("KNOWS"));
+    }
+
+    #[test]
+    fn label_name_unknown_id_returns_none() {
+        let (_dir, g) = open_tmp();
+        assert!(g.label_name(9999).unwrap().is_none());
+    }
 }
 
 #[cfg(test)]
