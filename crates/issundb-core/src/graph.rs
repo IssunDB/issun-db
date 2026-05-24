@@ -13,11 +13,13 @@ use crate::{
     error::Error,
     schema::{AdjEntry, EdgeId, EdgeRecord, LabelId, NodeId, NodeRecord, TypeId},
     storage::{
-        ids::{alloc_edge_id, alloc_node_id, get_or_create_label, get_or_create_type},
+        ids::{
+            adjust_label_count, adjust_type_count, alloc_edge_id, alloc_node_id,
+            get_or_create_label, get_or_create_type,
+        },
         lmdb::Storage,
         props,
     },
-    vector::{Hit, VectorIndex},
 };
 
 /// Builds a 12-byte composite key `(prefix u32 BE, id u64 BE)` for secondary index lookups.
@@ -34,7 +36,6 @@ pub struct Graph {
     storage: Arc<Storage>,
     _write_lock: Arc<Mutex<()>>,
     csr_cache: Arc<CsrCache>,
-    vector_index: Arc<VectorIndex>,
     #[cfg(feature = "graphblas")]
     matrices: Arc<parking_lot::RwLock<Option<MatrixSet>>>,
 }
@@ -43,20 +44,6 @@ impl Graph {
     pub fn open(path: &Path, map_size_gb: usize) -> Result<Self, Error> {
         let storage = Storage::open(path, map_size_gb)?;
         let initial = CsrSnapshot::build(&storage)?;
-        let vector_index = {
-            let vi = VectorIndex::new();
-            let rtxn = storage.env.read_txn()?;
-            for result in storage.vectors.iter(&rtxn)? {
-                let (node_id, bytes) = result?;
-                let v: Vec<f32> = bytes
-                    .chunks_exact(4)
-                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                    .collect();
-                vi.upsert(node_id, &v)?;
-            }
-            drop(rtxn);
-            Arc::new(vi)
-        };
         let storage = Arc::new(storage);
         let csr_cache = Arc::new(CsrCache::new(initial));
         #[cfg(feature = "graphblas")]
@@ -69,7 +56,6 @@ impl Graph {
             storage,
             _write_lock: Arc::new(Mutex::new(())),
             csr_cache,
-            vector_index,
             #[cfg(feature = "graphblas")]
             matrices,
         })
@@ -112,6 +98,8 @@ impl Graph {
             .label_idx
             .put(&mut wtxn, &composite_key(label_id, node_id), &())?;
 
+        adjust_label_count(&self.storage, &mut wtxn, label_id, 1)?;
+
         wtxn.commit()?;
         self.maybe_spawn_rebuild();
         Ok(node_id)
@@ -151,11 +139,16 @@ impl Graph {
                 self.storage
                     .label_idx
                     .put(&mut wtxn, &composite_key(label_id, id), &())?;
+
+                adjust_label_count(&self.storage, &mut wtxn, old_rec.label, -1)?;
+                adjust_label_count(&self.storage, &mut wtxn, label_id, 1)?;
             }
         } else {
             self.storage
                 .label_idx
                 .put(&mut wtxn, &composite_key(label_id, id), &())?;
+
+            adjust_label_count(&self.storage, &mut wtxn, label_id, 1)?;
         }
 
         let record = NodeRecord {
@@ -185,6 +178,8 @@ impl Graph {
             .label_idx
             .delete(&mut wtxn, &composite_key(record.label, id))?;
 
+        adjust_label_count(&self.storage, &mut wtxn, record.label, -1)?;
+
         // 2. Process all outgoing neighbors (out_adj)
         let mut out_edges = Vec::new();
         if let Some(iter) = self.storage.out_adj.get_duplicates(&wtxn, &id)? {
@@ -205,6 +200,8 @@ impl Graph {
             self.storage
                 .type_idx
                 .delete(&mut wtxn, &composite_key(entry.edge_type, edge_id))?;
+
+            adjust_type_count(&self.storage, &mut wtxn, entry.edge_type, -1)?;
 
             // Delete the corresponding in_adj entry on the neighbor
             let in_entry = AdjEntry {
@@ -238,6 +235,8 @@ impl Graph {
                 .type_idx
                 .delete(&mut wtxn, &composite_key(entry.edge_type, edge_id))?;
 
+            adjust_type_count(&self.storage, &mut wtxn, entry.edge_type, -1)?;
+
             // Delete the corresponding out_adj entry on the neighbor
             let out_entry = AdjEntry {
                 edge_type: entry.edge_type,
@@ -253,9 +252,8 @@ impl Graph {
         self.storage.out_adj.delete(&mut wtxn, &id)?;
         self.storage.in_adj.delete(&mut wtxn, &id)?;
 
-        // 5. Delete from vector index
+        // 5. Delete persisted vector bytes
         self.storage.vectors.delete(&mut wtxn, &id)?;
-        self.vector_index.remove(id)?;
 
         // 6. Delete from primary nodes database
         self.storage.nodes.delete(&mut wtxn, &id)?;
@@ -298,6 +296,8 @@ impl Graph {
 
         self.append_adj(&mut wtxn, src, dst, type_id, edge_id, true)?;
         self.append_adj(&mut wtxn, dst, src, type_id, edge_id, false)?;
+
+        adjust_type_count(&self.storage, &mut wtxn, type_id, 1)?;
 
         wtxn.commit()?;
         self.maybe_spawn_rebuild();
@@ -412,6 +412,36 @@ impl Graph {
     /// Returns `None` for ids that are not in the registry.
     pub fn type_name(&self, id: TypeId) -> Result<Option<String>, Error> {
         self.meta_reverse_lookup("type:", id)
+    }
+
+    /// Get the count of nodes matching a string label.
+    pub fn node_count_by_label(&self, label: &str) -> Result<u64, Error> {
+        let rtxn = self.storage.env.read_txn()?;
+        let meta_key = format!("label:{label}");
+        if let Some(b) = self.storage.meta.get(&rtxn, &meta_key)? {
+            let arr: [u8; 4] = b
+                .try_into()
+                .map_err(|_| Error::Corrupt("label id must be 4 bytes"))?;
+            let label_id = u32::from_be_bytes(arr);
+            crate::storage::ids::get_label_count(&self.storage, &rtxn, label_id)
+        } else {
+            Ok(0)
+        }
+    }
+
+    /// Get the count of edges matching a string type.
+    pub fn edge_count_by_type(&self, etype: &str) -> Result<u64, Error> {
+        let rtxn = self.storage.env.read_txn()?;
+        let meta_key = format!("type:{etype}");
+        if let Some(b) = self.storage.meta.get(&rtxn, &meta_key)? {
+            let arr: [u8; 4] = b
+                .try_into()
+                .map_err(|_| Error::Corrupt("type id must be 4 bytes"))?;
+            let type_id = u32::from_be_bytes(arr);
+            crate::storage::ids::get_type_count(&self.storage, &rtxn, type_id)
+        } else {
+            Ok(0)
+        }
     }
 
     fn meta_reverse_lookup(&self, prefix: &str, id: u32) -> Result<Option<String>, Error> {
@@ -653,26 +683,30 @@ impl Graph {
     }
 
     // ------------------------------------------------------------------
-    // Vector index
+    // Vector storage
     // ------------------------------------------------------------------
 
-    /// Persist `v` under `n` in LMDB and insert or replace it in the HNSW index.
+    /// Persist raw vector bytes for `n`.
     ///
-    /// All vectors stored in a single graph must have the same dimension;
-    /// the first `upsert_vector` call fixes it. Subsequent calls with a
-    /// different dimension return `Error::Vector`.
-    pub fn upsert_vector(&self, n: NodeId, v: &[f32]) -> Result<(), Error> {
+    /// Vector search crates own vector decoding, validation, and indexing.
+    /// `issundb-core` only owns the durable LMDB record.
+    pub fn put_vector_bytes(&self, n: NodeId, bytes: &[u8]) -> Result<(), Error> {
         let _guard = self._write_lock.lock();
-        let bytes: Vec<u8> = v.iter().flat_map(|f| f.to_le_bytes()).collect();
         let mut wtxn = self.storage.env.write_txn()?;
-        self.storage.vectors.put(&mut wtxn, &n, &bytes)?;
+        self.storage.vectors.put(&mut wtxn, &n, bytes)?;
         wtxn.commit()?;
-        self.vector_index.upsert(n, v)
+        Ok(())
     }
 
-    /// Return the `k` approximate nearest neighbors to `q` by cosine distance.
-    pub fn vector_search(&self, q: &[f32], k: usize) -> Result<Vec<Hit>, Error> {
-        self.vector_index.search(q, k)
+    /// Return all raw vector records in node ID order.
+    pub fn vector_bytes(&self) -> Result<Vec<(NodeId, Vec<u8>)>, Error> {
+        let rtxn = self.storage.env.read_txn()?;
+        let mut out = Vec::new();
+        for result in self.storage.vectors.iter(&rtxn)? {
+            let (node_id, bytes) = result?;
+            out.push((node_id, bytes.to_vec()));
+        }
+        Ok(out)
     }
 
     // ------------------------------------------------------------------
@@ -1092,6 +1126,314 @@ impl Graph {
         Ok(dense_indices
             .into_iter()
             .filter_map(|d| snap.dense_to_id.get(d).copied())
+            .collect())
+    }
+
+    /// Expand relationships for a set of source nodes using GraphBLAS SpMV.
+    ///
+    /// Returns a list of `(src_node_id, edge_id, dst_node_id)` triples.
+    #[cfg(feature = "graphblas")]
+    pub fn expand_spmv_graphblas(
+        &self,
+        src_nodes: &[NodeId],
+        rel_type: Option<&str>,
+        is_incoming: bool,
+    ) -> Result<Vec<(NodeId, EdgeId, NodeId)>, Error> {
+        use graphblas_sparse_linear_algebra::{
+            collections::sparse_vector::{
+                SparseVector,
+                operations::{GetSparseVectorElementIndices, SetSparseVectorElement},
+            },
+            operators::{
+                binary_operator::Assignment,
+                mask::SelectEntireVector,
+                multiplication::{MatrixVectorMultiplicationOperator, MultiplyMatrixByVector},
+                options::OptionsForOperatorWithMatrixAsFirstArgument,
+                semiring::MinPlus,
+            },
+        };
+        use std::collections::HashMap as StdHashMap;
+
+        let guard = self.matrices.read();
+        let m = match guard.as_ref() {
+            Some(m) => m,
+            None => {
+                // Fall back to LMDB if matrices are not yet materialized.
+                let mut results = Vec::new();
+                for &src in src_nodes {
+                    let neighbors = if is_incoming {
+                        self.in_neighbors(src)?
+                    } else {
+                        self.out_neighbors(src)?
+                    };
+                    for (nb, edge_id, type_id) in neighbors {
+                        if let Some(t) = rel_type {
+                            let actual_name = self.type_name(type_id)?;
+                            if actual_name.as_deref() != Some(t) {
+                                continue;
+                            }
+                        }
+                        results.push((src, edge_id, nb));
+                    }
+                }
+                return Ok(results);
+            }
+        };
+
+        let snap = self.csr_cache.snapshot.load();
+        let n = m.n_nodes;
+        if src_nodes.is_empty() || n == 0 {
+            return Ok(vec![]);
+        }
+
+        // If a rel_type is specified, fetch typed neighbors via direct LMDB lookups to
+        // avoid GraphBLAS boolean-semiring limitations. EdgeId is available directly.
+        if let Some(t) = rel_type {
+            let rtxn = self.storage.env.read_txn()?;
+            let meta_key = format!("type:{t}");
+            let type_id = match self.storage.meta.get(&rtxn, &meta_key)? {
+                Some(b) => {
+                    let arr: [u8; 4] = b
+                        .try_into()
+                        .map_err(|_| Error::Corrupt("type id must be 4 bytes"))?;
+                    u32::from_be_bytes(arr)
+                }
+                None => return Ok(vec![]),
+            };
+
+            let mut results = Vec::new();
+            for &src in src_nodes {
+                let neighbors = if is_incoming {
+                    self.in_neighbors(src)?
+                } else {
+                    self.out_neighbors(src)?
+                };
+                for (nb, edge_id, tid) in neighbors {
+                    if tid == type_id {
+                        results.push((src, edge_id, nb));
+                    }
+                }
+            }
+            return Ok(results);
+        }
+
+        let mxv = MatrixVectorMultiplicationOperator::new();
+        // Propagate outgoing edges via the transposed adjacency matrix;
+        // incoming edges use the original. See `bfs_multi_source_graphblas` for the derivation.
+        let opts =
+            OptionsForOperatorWithMatrixAsFirstArgument::new(!is_incoming, false, false, false);
+
+        let mut results = Vec::new();
+
+        for &src in src_nodes {
+            let src_dense = match snap.id_to_dense.get(&src) {
+                Some(&d) => d as usize,
+                None => continue,
+            };
+
+            // Build a dense-index → EdgeId lookup so the SpMV result can be paired with
+            // a correct EdgeId. Both directions read from LMDB so the lookup is always
+            // fresh: EdgeId 0 is the legitimate first allocated edge (alloc_edge_id starts
+            // from 0), so it must never be used as a "missing" sentinel.
+            let edge_lookup: StdHashMap<usize, EdgeId> = if is_incoming {
+                self.in_neighbors(src)?
+                    .into_iter()
+                    .filter_map(|(nb, eid, _)| {
+                        snap.id_to_dense.get(&nb).map(|&d| (d as usize, eid))
+                    })
+                    .collect()
+            } else {
+                self.out_neighbors(src)?
+                    .into_iter()
+                    .filter_map(|(nb, eid, _)| {
+                        snap.id_to_dense.get(&nb).map(|&d| (d as usize, eid))
+                    })
+                    .collect()
+            };
+
+            let mut level = SparseVector::<i32>::new(m.context.clone(), n)
+                .map_err(|e| Error::GraphBLAS(e.to_string()))?;
+            level
+                .set_value(src_dense, 0)
+                .map_err(|e| Error::GraphBLAS(e.to_string()))?;
+
+            let mut next = SparseVector::<i32>::new(m.context.clone(), n)
+                .map_err(|e| Error::GraphBLAS(e.to_string()))?;
+
+            // next = adjacency * level (or adjacency^T * level) with MinPlus semiring.
+            // SelectEntireVector passes all output positions through without masking so
+            // that neighbors at any dense index are written into `next`.
+            mxv.apply(
+                &m.adjacency,
+                &MinPlus::<i32>::new(),
+                &level,
+                &Assignment::new(),
+                &mut next,
+                &SelectEntireVector::new(m.context.clone()),
+                &opts,
+            )
+            .map_err(|e| Error::GraphBLAS(e.to_string()))?;
+
+            let target_indices: Vec<usize> = next
+                .element_indices()
+                .map_err(|e| Error::GraphBLAS(e.to_string()))?;
+
+            for idx in target_indices {
+                if let Some(&dst) = snap.dense_to_id.get(idx) {
+                    // Skip entries whose EdgeId is not in the LMDB-backed lookup; this
+                    // can only happen if the edge was deleted between the LMDB query and
+                    // the SpMV pass, which is not possible in a single-writer model.
+                    if let Some(&edge_id) = edge_lookup.get(&idx) {
+                        results.push((src, edge_id, dst));
+                    }
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Filter a set of nodes by label using GraphBLAS element-wise AND (multiplication).
+    #[cfg(feature = "graphblas")]
+    pub fn label_filter_and_graphblas(
+        &self,
+        nodes: &[NodeId],
+        label: &str,
+    ) -> Result<Vec<NodeId>, Error> {
+        use graphblas_sparse_linear_algebra::{
+            collections::sparse_vector::{
+                SparseVector,
+                operations::{GetSparseVectorElementIndices, SetSparseVectorElement},
+            },
+            operators::{
+                binary_operator::{Assignment, First},
+                element_wise_multiplication::{
+                    ApplyElementWiseVectorMultiplicationBinaryOperator,
+                    ElementWiseVectorMultiplicationBinaryOperator,
+                },
+                options::OperatorOptions,
+            },
+        };
+
+        let guard = self.matrices.read();
+        let m = match guard.as_ref() {
+            Some(m) => m,
+            None => {
+                // Fall back to standard label matching.
+                let label_nodes = self.nodes_by_label(label)?;
+                return Ok(nodes
+                    .iter()
+                    .filter(|&n| label_nodes.contains(n))
+                    .copied()
+                    .collect());
+            }
+        };
+
+        let snap = self.csr_cache.snapshot.load();
+        let n = m.n_nodes;
+        if nodes.is_empty() || n == 0 {
+            return Ok(vec![]);
+        }
+
+        // 1. Build sparse vector `v` for input active nodes.
+        let mut v = SparseVector::<i32>::new(m.context.clone(), n)
+            .map_err(|e| Error::GraphBLAS(e.to_string()))?;
+        let mut any_v = false;
+        for &node in nodes {
+            if let Some(&d) = snap.id_to_dense.get(&node) {
+                v.set_value(d as usize, 1)
+                    .map_err(|e| Error::GraphBLAS(e.to_string()))?;
+                any_v = true;
+            }
+        }
+        if !any_v {
+            return Ok(vec![]);
+        }
+
+        // 2. Build sparse vector `u` for nodes matching the label.
+        let label_nodes = self.nodes_by_label(label)?;
+        let mut u = SparseVector::<i32>::new(m.context.clone(), n)
+            .map_err(|e| Error::GraphBLAS(e.to_string()))?;
+        let mut any_u = false;
+        for node in label_nodes {
+            if let Some(&d) = snap.id_to_dense.get(&node) {
+                u.set_value(d as usize, 1)
+                    .map_err(|e| Error::GraphBLAS(e.to_string()))?;
+                any_u = true;
+            }
+        }
+        if !any_u {
+            return Ok(vec![]);
+        }
+
+        // 3. Compute element-wise multiplication (intersection/AND) using First binary operator:
+        // w = v .* u
+        let mut w = SparseVector::<i32>::new(m.context.clone(), n)
+            .map_err(|e| Error::GraphBLAS(e.to_string()))?;
+
+        let ewise_mult = ElementWiseVectorMultiplicationBinaryOperator::new();
+        ewise_mult
+            .apply(
+                &v,
+                &First::<i32>::new(),
+                &u,
+                &Assignment::new(),
+                &mut w,
+                &v,
+                &OperatorOptions::new_default(),
+            )
+            .map_err(|e| Error::GraphBLAS(e.to_string()))?;
+
+        let filtered_indices: Vec<usize> = w
+            .element_indices()
+            .map_err(|e| Error::GraphBLAS(e.to_string()))?;
+
+        Ok(filtered_indices
+            .into_iter()
+            .filter_map(|d| snap.dense_to_id.get(d).copied())
+            .collect())
+    }
+
+    /// Expand relationships for a set of source nodes using direct cursor matching.
+    #[cfg(not(feature = "graphblas"))]
+    pub fn expand_spmv_graphblas(
+        &self,
+        src_nodes: &[NodeId],
+        rel_type: Option<&str>,
+        is_incoming: bool,
+    ) -> Result<Vec<(NodeId, EdgeId, NodeId)>, Error> {
+        let mut results = Vec::new();
+        for &src in src_nodes {
+            let neighbors = if is_incoming {
+                self.in_neighbors(src)?
+            } else {
+                self.out_neighbors(src)?
+            };
+            for (nb, edge_id, type_id) in neighbors {
+                if let Some(t) = rel_type {
+                    let actual_name = self.type_name(type_id)?;
+                    if actual_name.as_deref() != Some(t) {
+                        continue;
+                    }
+                }
+                results.push((src, edge_id, nb));
+            }
+        }
+        Ok(results)
+    }
+
+    /// Filter a set of nodes by label using in-memory set intersection.
+    #[cfg(not(feature = "graphblas"))]
+    pub fn label_filter_and_graphblas(
+        &self,
+        nodes: &[NodeId],
+        label: &str,
+    ) -> Result<Vec<NodeId>, Error> {
+        let label_nodes = self.nodes_by_label(label)?;
+        Ok(nodes
+            .iter()
+            .filter(|&n| label_nodes.contains(n))
+            .copied()
             .collect())
     }
 
@@ -1619,5 +1961,94 @@ mod tests {
         assert!(result.contains(&b), "seed b must be present (via fallback)");
         assert!(result.contains(&c), "c reachable from a");
         assert!(result.contains(&d), "d reachable from b");
+    }
+
+    // --- node_count_by_label / edge_count_by_type stats ---
+
+    #[test]
+    fn label_count_increments_on_add_node() {
+        let (_dir, g) = open_tmp();
+        assert_eq!(g.node_count_by_label("Person").unwrap(), 0);
+        g.add_node("Person", &json!({})).unwrap();
+        assert_eq!(g.node_count_by_label("Person").unwrap(), 1);
+        g.add_node("Person", &json!({})).unwrap();
+        assert_eq!(g.node_count_by_label("Person").unwrap(), 2);
+        // Other labels are not affected.
+        assert_eq!(g.node_count_by_label("Company").unwrap(), 0);
+    }
+
+    #[test]
+    fn label_count_decrements_on_delete_node() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("Person", &json!({})).unwrap();
+        let b = g.add_node("Person", &json!({})).unwrap();
+        assert_eq!(g.node_count_by_label("Person").unwrap(), 2);
+
+        g.delete_node(a).unwrap();
+        assert_eq!(g.node_count_by_label("Person").unwrap(), 1);
+
+        g.delete_node(b).unwrap();
+        assert_eq!(g.node_count_by_label("Person").unwrap(), 0);
+
+        // Deleting a non-existent node is a no-op; count stays at 0.
+        g.delete_node(b).unwrap();
+        assert_eq!(g.node_count_by_label("Person").unwrap(), 0);
+    }
+
+    #[test]
+    fn label_count_transfers_on_update_node_label_change() {
+        let (_dir, g) = open_tmp();
+        let id = g.add_node("Person", &json!({})).unwrap();
+        assert_eq!(g.node_count_by_label("Person").unwrap(), 1);
+        assert_eq!(g.node_count_by_label("Employee").unwrap(), 0);
+
+        // Relabel to "Employee".
+        g.update_node(id, "Employee", &json!({})).unwrap();
+        assert_eq!(g.node_count_by_label("Person").unwrap(), 0);
+        assert_eq!(g.node_count_by_label("Employee").unwrap(), 1);
+    }
+
+    #[test]
+    fn label_count_unchanged_on_same_label_update() {
+        let (_dir, g) = open_tmp();
+        let id = g.add_node("Person", &json!({})).unwrap();
+        assert_eq!(g.node_count_by_label("Person").unwrap(), 1);
+
+        // Updating properties without changing the label must not alter the count.
+        g.update_node(id, "Person", &json!({"name": "Alice"}))
+            .unwrap();
+        assert_eq!(g.node_count_by_label("Person").unwrap(), 1);
+    }
+
+    #[test]
+    fn type_count_increments_on_add_edge() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("N", &json!({})).unwrap();
+        let b = g.add_node("N", &json!({})).unwrap();
+        let c = g.add_node("N", &json!({})).unwrap();
+        assert_eq!(g.edge_count_by_type("KNOWS").unwrap(), 0);
+
+        g.add_edge(a, b, "KNOWS", &json!({})).unwrap();
+        assert_eq!(g.edge_count_by_type("KNOWS").unwrap(), 1);
+
+        g.add_edge(b, c, "KNOWS", &json!({})).unwrap();
+        assert_eq!(g.edge_count_by_type("KNOWS").unwrap(), 2);
+
+        // Different type is not affected.
+        assert_eq!(g.edge_count_by_type("WORKS_AT").unwrap(), 0);
+    }
+
+    #[test]
+    fn type_count_decrements_on_delete_node_cascade() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("N", &json!({})).unwrap();
+        let b = g.add_node("N", &json!({})).unwrap();
+        g.add_edge(a, b, "KNOWS", &json!({})).unwrap();
+        g.add_edge(b, a, "KNOWS", &json!({})).unwrap();
+        assert_eq!(g.edge_count_by_type("KNOWS").unwrap(), 2);
+
+        // Deleting node a cascades and removes both edges touching a.
+        g.delete_node(a).unwrap();
+        assert_eq!(g.edge_count_by_type("KNOWS").unwrap(), 0);
     }
 }

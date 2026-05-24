@@ -20,51 +20,271 @@ pub fn parse(cypher: &str) -> Result<Statement, String> {
             let query = parse_read_query(normalized)?;
             Ok(Statement::Query(query))
         }
+    } else if upper.starts_with("UNWIND") || upper.starts_with("WITH") {
+        // Queries that begin with UNWIND or WITH (followed by a RETURN) are read
+        // queries without a leading MATCH clause.
+        let query = parse_read_query(normalized)?;
+        Ok(Statement::Query(query))
     } else {
         Err(format!("unsupported statement type in query: {}", cypher))
     }
 }
 
 fn parse_read_query(cypher: &str) -> Result<Query, String> {
-    let upper = cypher.to_ascii_uppercase();
-    let match_idx = upper.find("MATCH").ok_or("missing MATCH clause")?;
-    let return_idx = upper.find("RETURN").ok_or("missing RETURN clause")?;
+    let boundaries = find_clause_boundaries(cypher)?;
+    if boundaries.is_empty() {
+        return Err("missing query clauses".into());
+    }
 
-    let match_clause_str = if let Some(where_idx) = upper.find("WHERE") {
-        if where_idx > match_idx && where_idx < return_idx {
-            &cypher[match_idx + "MATCH".len()..where_idx]
-        } else {
-            return Err("WHERE clause must be placed between MATCH and RETURN".into());
+    // The query must end with a RETURN clause.
+    let (last_kw, last_idx) = &boundaries[boundaries.len() - 1];
+    if last_kw != "RETURN" {
+        return Err("Cypher read query must end with a RETURN clause".into());
+    }
+
+    let mut parts = Vec::new();
+
+    // Iterate through all intermediate clauses before RETURN
+    for i in 0..boundaries.len() - 1 {
+        let (kw, start) = &boundaries[i];
+        let end = boundaries[i + 1].1;
+        let content = cypher[*start + kw.len()..end].trim();
+
+        match kw.as_str() {
+            "MATCH" => {
+                let (match_str, where_str) = split_optional_where(content);
+                let match_clauses = parse_match_clauses(match_str)?;
+                let where_clause = where_str.map(parse_where_clause).transpose()?;
+                parts.push(QueryPart::Match {
+                    match_clauses,
+                    where_clause,
+                });
+            }
+            "WITH" => {
+                let (with_str, where_str) = split_optional_where(content);
+                let items = parse_return_items(with_str)?;
+                let where_clause = where_str.map(parse_where_clause).transpose()?;
+                parts.push(QueryPart::With {
+                    items,
+                    where_clause,
+                });
+            }
+            "UNWIND" => {
+                let as_idx = find_keyword_root_level(content, "AS")?.ok_or_else(|| {
+                    format!("UNWIND clause missing AS keyword: UNWIND {}", content)
+                })?;
+                let expr_str = content[..as_idx].trim();
+                let var_str = content[as_idx + "AS".len()..].trim();
+
+                let expr = parse_expr(expr_str)?;
+                let variable = var_str.to_string();
+                parts.push(QueryPart::Unwind { expr, variable });
+            }
+            other => return Err(format!("unexpected intermediate query clause: {}", other)),
         }
-    } else {
-        &cypher[match_idx + "MATCH".len()..return_idx]
-    };
+    }
 
-    let match_clauses = parse_match_clauses(match_clause_str)?;
+    // Parse the final RETURN clause
+    let return_content = cypher[*last_idx + "RETURN".len()..].trim();
+    let return_clause = parse_return_clause(return_content)?;
 
-    let where_clause = if let Some(where_idx) = upper.find("WHERE") {
-        let where_clause_str = &cypher[where_idx + "WHERE".len()..return_idx];
-        Some(parse_where_clause(where_clause_str)?)
-    } else {
-        None
-    };
+    // For backwards compatibility:
+    let mut match_clauses = Vec::new();
+    let mut where_clause = None;
 
-    let return_clause_str = &cypher[return_idx + "RETURN".len()..];
-    let return_clause = parse_return_clause(return_clause_str)?;
+    if !parts.is_empty() {
+        if let QueryPart::Match {
+            match_clauses: m,
+            where_clause: w,
+        } = &parts[0]
+        {
+            match_clauses = m.clone();
+            where_clause = w.clone();
+        }
+    }
 
     Ok(Query {
         match_clauses,
         where_clause,
         return_clause,
+        parts,
     })
 }
 
-fn parse_set_statement(cypher: &str) -> Result<Statement, String> {
-    let upper = cypher.to_ascii_uppercase();
-    let match_idx = upper.find("MATCH").ok_or("missing MATCH clause")?;
-    let set_idx = upper.find("SET").ok_or("missing SET clause")?;
+fn split_optional_where(content: &str) -> (&str, Option<&str>) {
+    if let Ok(Some(idx)) = find_keyword_root_level(content, "WHERE") {
+        let before = &content[..idx].trim();
+        let after = &content[idx + "WHERE".len()..].trim();
+        (*before, Some(*after))
+    } else {
+        (content, None)
+    }
+}
 
-    let match_clause_str = if let Some(where_idx) = upper.find("WHERE") {
+fn find_keyword_root_level(text: &str, kw: &str) -> Result<Option<usize>, String> {
+    // Returns a **byte offset** into `text` so callers can use it directly for
+    // `&str` slicing.  Previously returned a char index which caused panics on
+    // input containing non-ASCII characters before the keyword.
+    //
+    // All keywords are pure ASCII, so `kw.len()` equals both byte length and
+    // char length; `ci + kw.len()` as a char index is therefore valid.
+    let kw_byte_len = kw.len();
+
+    let char_positions: Vec<(usize, char)> = text.char_indices().collect();
+    let n = char_positions.len();
+
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut paren_depth: usize = 0;
+    let mut bracket_depth: usize = 0;
+    let mut brace_depth: usize = 0;
+
+    let mut ci = 0usize;
+    while ci < n {
+        let (byte_pos, c) = char_positions[ci];
+
+        if c == '\'' && !in_double_quote {
+            in_single_quote = !in_single_quote;
+            ci += 1;
+            continue;
+        }
+        if c == '"' && !in_single_quote {
+            in_double_quote = !in_double_quote;
+            ci += 1;
+            continue;
+        }
+
+        if !in_single_quote && !in_double_quote {
+            match c {
+                '(' => paren_depth += 1,
+                ')' => paren_depth = paren_depth.saturating_sub(1),
+                '[' => bracket_depth += 1,
+                ']' => bracket_depth = bracket_depth.saturating_sub(1),
+                '{' => brace_depth += 1,
+                '}' => brace_depth = brace_depth.saturating_sub(1),
+                _ => {}
+            }
+
+            if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 {
+                // Use `str::get` rather than direct indexing: it returns `None`
+                // when the range crosses a multi-byte char boundary, which is
+                // safe even if the keyword byte length overshoots the text end.
+                if let Some(candidate) = text.get(byte_pos..byte_pos + kw_byte_len) {
+                    if candidate.eq_ignore_ascii_case(kw) {
+                        let is_start = ci == 0 || char_positions[ci - 1].1.is_ascii_whitespace();
+                        // kw is pure ASCII so its char count == its byte count;
+                        // the char after the keyword is at char index ci + kw_byte_len.
+                        let after_ci = ci + kw_byte_len;
+                        let is_end = after_ci >= n
+                            || char_positions[after_ci].1.is_ascii_whitespace()
+                            // Also treat `(` as a valid word boundary so that
+                            // `WHERE(` is recognised (consistent with find_clause_boundaries).
+                            || char_positions[after_ci].1 == '(';
+                        if is_start && is_end {
+                            return Ok(Some(byte_pos));
+                        }
+                    }
+                }
+            }
+        }
+        ci += 1;
+    }
+    Ok(None)
+}
+
+fn find_clause_boundaries(cypher: &str) -> Result<Vec<(String, usize)>, String> {
+    // Returns a list of (keyword, byte_offset) pairs.  Previously returned char
+    // indices, which caused panics when callers used them as byte offsets on
+    // input that contains non-ASCII characters before a clause keyword.
+    let mut clauses = Vec::new();
+    let cypher_byte_len = cypher.len();
+
+    let char_positions: Vec<(usize, char)> = cypher.char_indices().collect();
+    let n = char_positions.len();
+
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut paren_depth: usize = 0;
+    let mut bracket_depth: usize = 0;
+    let mut brace_depth: usize = 0;
+
+    let mut ci = 0usize;
+    while ci < n {
+        let (byte_pos, c) = char_positions[ci];
+
+        if c == '\'' && !in_double_quote {
+            in_single_quote = !in_single_quote;
+            ci += 1;
+            continue;
+        }
+        if c == '"' && !in_single_quote {
+            in_double_quote = !in_double_quote;
+            ci += 1;
+            continue;
+        }
+
+        if !in_single_quote && !in_double_quote {
+            match c {
+                '(' => paren_depth += 1,
+                ')' => paren_depth = paren_depth.saturating_sub(1),
+                '[' => bracket_depth += 1,
+                ']' => bracket_depth = bracket_depth.saturating_sub(1),
+                '{' => brace_depth += 1,
+                '}' => brace_depth = brace_depth.saturating_sub(1),
+                _ => {}
+            }
+
+            if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 {
+                let mut matched_kw: Option<&str> = None;
+                for kw in &["MATCH", "WITH", "UNWIND", "RETURN"] {
+                    let kw_byte_len = kw.len(); // keywords are ASCII; byte len == char len
+                    let end_byte = byte_pos + kw_byte_len;
+                    if end_byte <= cypher_byte_len {
+                        if let Some(candidate) = cypher.get(byte_pos..end_byte) {
+                            if candidate.eq_ignore_ascii_case(kw) {
+                                let is_start = ci == 0
+                                    || char_positions[ci - 1].1.is_ascii_whitespace()
+                                    || char_positions[ci - 1].1 == ';';
+                                let after_ci = ci + kw_byte_len;
+                                let is_end = after_ci >= n
+                                    || char_positions[after_ci].1.is_ascii_whitespace()
+                                    || char_positions[after_ci].1 == '('
+                                    || char_positions[after_ci].1 == '{';
+                                if is_start && is_end {
+                                    matched_kw = Some(kw);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if let Some(kw) = matched_kw {
+                    clauses.push((kw.to_string(), byte_pos));
+                    // kw is pure ASCII so kw.len() == kw char count; advance ci
+                    // past all keyword chars to avoid re-matching a prefix.
+                    ci += kw.len();
+                    continue;
+                }
+            }
+        }
+
+        ci += 1;
+    }
+
+    Ok(clauses)
+}
+
+fn parse_set_statement(cypher: &str) -> Result<Statement, String> {
+    // Use find_keyword_root_level for all keyword searches so that label names
+    // or variable names that contain the keyword as a substring (e.g., "RESET"
+    // containing "SET") are not mistaken for the actual clause keyword.
+    let match_idx = find_keyword_root_level(cypher, "MATCH")?.ok_or("missing MATCH clause")?;
+    let set_idx = find_keyword_root_level(cypher, "SET")?.ok_or("missing SET clause")?;
+
+    let where_idx_opt = find_keyword_root_level(cypher, "WHERE")?;
+
+    let match_clause_str = if let Some(where_idx) = where_idx_opt {
         if where_idx > match_idx && where_idx < set_idx {
             &cypher[match_idx + "MATCH".len()..where_idx]
         } else {
@@ -76,7 +296,7 @@ fn parse_set_statement(cypher: &str) -> Result<Statement, String> {
 
     let match_clauses = parse_match_clauses(match_clause_str)?;
 
-    let where_clause = if let Some(where_idx) = upper.find("WHERE") {
+    let where_clause = if let Some(where_idx) = where_idx_opt {
         let where_clause_str = &cypher[where_idx + "WHERE".len()..set_idx];
         Some(parse_where_clause(where_clause_str)?)
     } else {
@@ -112,11 +332,15 @@ fn parse_set_statement(cypher: &str) -> Result<Statement, String> {
 }
 
 fn parse_delete_statement(cypher: &str) -> Result<Statement, String> {
-    let upper = cypher.to_ascii_uppercase();
-    let match_idx = upper.find("MATCH").ok_or("missing MATCH clause")?;
-    let delete_idx = upper.find("DELETE").ok_or("missing DELETE clause")?;
+    // Use find_keyword_root_level for all keyword searches so that label names
+    // or variable names that contain the keyword as a substring are not
+    // mistaken for the actual clause keyword.
+    let match_idx = find_keyword_root_level(cypher, "MATCH")?.ok_or("missing MATCH clause")?;
+    let delete_idx = find_keyword_root_level(cypher, "DELETE")?.ok_or("missing DELETE clause")?;
 
-    let match_clause_str = if let Some(where_idx) = upper.find("WHERE") {
+    let where_idx_opt = find_keyword_root_level(cypher, "WHERE")?;
+
+    let match_clause_str = if let Some(where_idx) = where_idx_opt {
         if where_idx > match_idx && where_idx < delete_idx {
             &cypher[match_idx + "MATCH".len()..where_idx]
         } else {
@@ -128,7 +352,7 @@ fn parse_delete_statement(cypher: &str) -> Result<Statement, String> {
 
     let match_clauses = parse_match_clauses(match_clause_str)?;
 
-    let where_clause = if let Some(where_idx) = upper.find("WHERE") {
+    let where_clause = if let Some(where_idx) = where_idx_opt {
         let where_clause_str = &cypher[where_idx + "WHERE".len()..delete_idx];
         Some(parse_where_clause(where_clause_str)?)
     } else {
@@ -388,8 +612,15 @@ fn parse_expr(s: &str) -> Result<Expr, String> {
     let trimmed = s.trim();
     if let Some(rest) = trimmed.strip_prefix('$') {
         Ok(Expr::Param(rest.to_string()))
+    } else if let Ok(lit) = parse_literal(trimmed) {
+        // Attempt literal parsing before the `.contains('.')` branch so that
+        // float literals like `3.14` are never mistaken for property references:
+        // `3.14` contains a dot, would split into ["3","14"], and would be
+        // returned as `Expr::Prop("3","14")` without this guard.
+        Ok(Expr::Literal(lit))
     } else if trimmed.contains('.') {
-        // Variable property reference
+        // Variable property reference (e.g. `n.name`).  Non-literal inputs that
+        // contain a dot are property accesses.
         let parts: Vec<&str> = trimmed.split('.').collect();
         if parts.len() == 2 {
             Ok(Expr::Prop(
@@ -397,16 +628,78 @@ fn parse_expr(s: &str) -> Result<Expr, String> {
                 parts[1].trim().to_string(),
             ))
         } else {
-            Ok(Expr::Literal(parse_literal(trimmed)?))
+            Err(format!("invalid expression: {}", trimmed))
         }
+    } else if !trimmed.is_empty() && trimmed.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        Ok(Expr::Prop(trimmed.to_string(), "".to_string()))
     } else {
-        Ok(Expr::Literal(parse_literal(trimmed)?))
+        Err(format!("invalid expression: {}", trimmed))
     }
 }
 
 fn parse_literal(s: &str) -> Result<Literal, String> {
     let trimmed = s.trim();
-    if (trimmed.starts_with('"') && trimmed.ends_with('"'))
+    if trimmed.starts_with('[') && trimmed.ends_with(']') {
+        let content = &trimmed[1..trimmed.len() - 1].trim();
+        if content.is_empty() {
+            return Ok(Literal::List(Vec::new()));
+        }
+
+        let mut list = Vec::new();
+        let mut in_single_quote = false;
+        let mut in_double_quote = false;
+        let mut paren_depth = 0;
+        let mut bracket_depth = 0;
+        let mut brace_depth = 0;
+        let mut last_start = 0;
+        let chars: Vec<char> = content.chars().collect();
+        let n = chars.len();
+
+        let mut i = 0;
+        while i < n {
+            let c = chars[i];
+            if c == '\'' && !in_double_quote {
+                in_single_quote = !in_single_quote;
+            } else if c == '"' && !in_single_quote {
+                in_double_quote = !in_double_quote;
+            } else if !in_single_quote && !in_double_quote {
+                match c {
+                    '(' => paren_depth += 1,
+                    ')' => {
+                        if paren_depth > 0 {
+                            paren_depth -= 1;
+                        }
+                    }
+                    '[' => bracket_depth += 1,
+                    ']' => {
+                        if bracket_depth > 0 {
+                            bracket_depth -= 1;
+                        }
+                    }
+                    '{' => brace_depth += 1,
+                    '}' => {
+                        if brace_depth > 0 {
+                            brace_depth -= 1;
+                        }
+                    }
+                    ',' => {
+                        if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 {
+                            let element_str: String = chars[last_start..i].iter().collect();
+                            list.push(parse_literal(&element_str)?);
+                            last_start = i + 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            i += 1;
+        }
+        if last_start < n {
+            let element_str: String = chars[last_start..].iter().collect();
+            list.push(parse_literal(&element_str)?);
+        }
+        Ok(Literal::List(list))
+    } else if (trimmed.starts_with('"') && trimmed.ends_with('"'))
         || (trimmed.starts_with('\'') && trimmed.ends_with('\''))
     {
         Ok(Literal::Str(trimmed[1..trimmed.len() - 1].to_string()))
@@ -425,11 +718,10 @@ fn parse_literal(s: &str) -> Result<Literal, String> {
     }
 }
 
-fn parse_return_clause(s: &str) -> Result<ReturnClause, String> {
+fn parse_return_items(s: &str) -> Result<Vec<ReturnItem>, String> {
     let mut items = Vec::new();
     for part in s.split(',') {
         let trimmed = part.trim();
-        // Parse alias "AS" if present
         let upper = trimmed.to_ascii_uppercase();
         let alias_part = upper.find(" AS ");
 
@@ -444,5 +736,10 @@ fn parse_return_clause(s: &str) -> Result<ReturnClause, String> {
         let expr = parse_expr(expr_str)?;
         items.push(ReturnItem { expr, alias });
     }
+    Ok(items)
+}
+
+fn parse_return_clause(s: &str) -> Result<ReturnClause, String> {
+    let items = parse_return_items(s)?;
     Ok(ReturnClause { items })
 }

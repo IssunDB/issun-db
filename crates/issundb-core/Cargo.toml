@@ -20,7 +20,6 @@ arc-swap.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 ahash.workspace = true
-usearch.workspace = true
 graphblas_sparse_linear_algebra = { workspace = true, optional = true }
 
 [features]

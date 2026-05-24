@@ -66,3 +66,89 @@ pub fn get_or_create_type(
     storage.meta.put(txn, &meta_key, &id.to_be_bytes())?;
     Ok(id)
 }
+
+/// Adjusts the count of a label in the meta database.
+pub fn adjust_label_count(
+    storage: &Storage,
+    txn: &mut heed::RwTxn,
+    label_id: LabelId,
+    delta: i64,
+) -> Result<(), Error> {
+    let key = format!("stats:l:{label_id}");
+    let current = storage
+        .meta
+        .get(txn, &key)?
+        .map(|b| {
+            let arr: [u8; 8] = b
+                .try_into()
+                .map_err(|_| Error::Corrupt("counter must be 8 bytes"))?;
+            Ok::<i64, Error>(i64::from_be_bytes(arr))
+        })
+        .transpose()?
+        .unwrap_or(0);
+    let new_count = (current + delta).max(0);
+    storage.meta.put(txn, &key, &new_count.to_be_bytes())?;
+    Ok(())
+}
+
+/// Retrieves the count of a label from the meta database.
+pub fn get_label_count(
+    storage: &Storage,
+    txn: &heed::RoTxn,
+    label_id: LabelId,
+) -> Result<u64, Error> {
+    let key = format!("stats:l:{label_id}");
+    let count = storage
+        .meta
+        .get(txn, &key)?
+        .map(|b| {
+            let arr: [u8; 8] = b
+                .try_into()
+                .map_err(|_| Error::Corrupt("counter must be 8 bytes"))?;
+            Ok::<i64, Error>(i64::from_be_bytes(arr))
+        })
+        .transpose()?
+        .unwrap_or(0);
+    Ok(count as u64)
+}
+
+/// Adjusts the count of an edge type in the meta database.
+pub fn adjust_type_count(
+    storage: &Storage,
+    txn: &mut heed::RwTxn,
+    type_id: TypeId,
+    delta: i64,
+) -> Result<(), Error> {
+    let key = format!("stats:t:{type_id}");
+    let current = storage
+        .meta
+        .get(txn, &key)?
+        .map(|b| {
+            let arr: [u8; 8] = b
+                .try_into()
+                .map_err(|_| Error::Corrupt("counter must be 8 bytes"))?;
+            Ok::<i64, Error>(i64::from_be_bytes(arr))
+        })
+        .transpose()?
+        .unwrap_or(0);
+    let new_count = (current + delta).max(0);
+    storage.meta.put(txn, &key, &new_count.to_be_bytes())?;
+    Ok(())
+}
+
+/// Retrieves the count of an edge type from the meta database.
+pub fn get_type_count(storage: &Storage, txn: &heed::RoTxn, type_id: TypeId) -> Result<u64, Error> {
+    let key = format!("stats:t:{type_id}");
+    let count = storage
+        .meta
+        .get(txn, &key)?
+        .map(|b| {
+            let arr: [u8; 8] = b
+                .try_into()
+                .map_err(|_| Error::Corrupt("counter must be 8 bytes"))?;
+            Ok::<i64, Error>(i64::from_be_bytes(arr))
+        })
+        .transpose()?
+        .unwrap_or(0);
+    Ok(count as u64)
+}

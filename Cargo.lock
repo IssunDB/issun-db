@@ -871,7 +871,9 @@ version = "0.1.0-alpha.1"
 dependencies = [
  "issundb-core",
  "issundb-cypher",
- "issundb-rag",
+ "issundb-retrieval",
+ "issundb-text",
+ "issundb-vector",
  "rmp-serde",
  "serde_json",
  "tempfile",
@@ -906,7 +908,6 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tracing",
- "usearch",
  "zerocopy",
 ]
 
@@ -926,12 +927,39 @@ dependencies = [
 name = "issundb-rag"
 version = "0.1.0-alpha.1"
 dependencies = [
+ "issundb-retrieval",
+]
+
+[[package]]
+name = "issundb-retrieval"
+version = "0.1.0-alpha.1"
+dependencies = [
  "ahash",
  "graphblas_sparse_linear_algebra",
  "issundb-core",
+ "issundb-vector",
  "serde_json",
  "tempfile",
  "thiserror",
+]
+
+[[package]]
+name = "issundb-text"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "issundb-core",
+ "thiserror",
+]
+
+[[package]]
+name = "issundb-vector"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "issundb-core",
+ "parking_lot",
+ "serde_json",
+ "tempfile",
+ "usearch",
 ]
 
 [[package]]

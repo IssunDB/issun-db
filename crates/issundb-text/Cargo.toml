@@ -1,0 +1,14 @@
+[package]
+name = "issundb-text"
+description = "Full-text search APIs and indexing for IssunDB"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+issundb-core = { path = "../issundb-core" }
+thiserror.workspace = true

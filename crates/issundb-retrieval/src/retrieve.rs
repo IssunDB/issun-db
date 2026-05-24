@@ -2,8 +2,9 @@ use std::collections::HashMap;
 
 use ahash::{AHashMap, AHashSet};
 use issundb_core::{EdgeId, Error, Graph, NodeId};
+use issundb_vector::VectorGraphExt;
 
-/// A subgraph extracted by a GraphRAG retrieve call.
+/// A subgraph extracted by a hybrid retrieval call.
 ///
 /// `nodes` and `edges` are deduplicated but unordered. `scores` maps each
 /// seed node (a direct vector-search hit) to its cosine distance from the
@@ -41,7 +42,7 @@ impl Default for RetrieveOptions {
     }
 }
 
-/// Convenience wrapper: vector search → k seeds → `hops`-hop BFS expansion →
+/// Convenience wrapper: vector search to k seeds, then `hops`-hop BFS expansion to
 /// subgraph materialization.
 pub fn retrieve(graph: &Graph, q: &[f32], k: usize, hops: u8) -> Result<Subgraph, Error> {
     retrieve_with(
@@ -58,7 +59,7 @@ pub fn retrieve(graph: &Graph, q: &[f32], k: usize, hops: u8) -> Result<Subgraph
 /// Full retrieve with configurable options.
 ///
 /// Algorithm:
-/// 1. `vector_search(q, k)` → seed hits.
+/// 1. `vector_search(q, k)` to seed hits.
 /// 2. Filter seeds by `max_distance`; record cosine distances in `scores`.
 /// 3. BFS from all seeds simultaneously up to `hops` hops, following
 ///    out-edges; stop early if `max_nodes` is reached.
@@ -113,7 +114,7 @@ pub fn retrieve_with(graph: &Graph, q: &[f32], opts: &RetrieveOptions) -> Result
     })
 }
 
-/// GraphBLAS SpMV k-hop BFS expansion.
+/// GraphBLAS SpMV k-hop expansion for hybrid retrieval.
 ///
 /// Runs multi-source SpMV BFS from the filtered seed nodes up to `hops` hops.
 /// Stops early or caps the results if `max_nodes` is specified and exceeded.
@@ -209,7 +210,7 @@ mod tests {
     #[test]
     fn retrieve_expands_bfs_to_correct_depth() {
         let (_dir, g) = open_tmp();
-        // Chain: a → b → c → d; only a has a vector.
+        // Chain: a to b to c to d; only a has a vector.
         let a = g.add_node("N", &json!({})).unwrap();
         let b = g.add_node("N", &json!({})).unwrap();
         let c = g.add_node("N", &json!({})).unwrap();
@@ -234,7 +235,7 @@ mod tests {
     #[test]
     fn retrieve_subgraph_edges_connect_only_nodes_in_set() {
         let (_dir, g) = open_tmp();
-        // a → b → c; only a and b are in the subgraph (hops=1 from a).
+        // a to b to c; only a and b are in the subgraph (hops=1 from a).
         let a = g.add_node("N", &json!({})).unwrap();
         let b = g.add_node("N", &json!({})).unwrap();
         let c = g.add_node("N", &json!({})).unwrap();
@@ -244,7 +245,7 @@ mod tests {
 
         let sub = retrieve(&g, &[1.0f32, 0.0], 1, 1).unwrap();
         assert!(sub.edges.contains(&e_ab));
-        // b→c edge must NOT appear: c is outside the 1-hop subgraph.
+        // b to c edge must NOT appear: c is outside the 1-hop subgraph.
         assert_eq!(sub.edges.len(), 1);
     }
 
@@ -288,7 +289,7 @@ mod tests {
     #[test]
     fn retrieve_with_max_nodes_caps_subgraph() {
         let (_dir, g) = open_tmp();
-        // Star: a → b, c, d, e
+        // Star: a to b, c, d, e
         let a = g.add_node("N", &json!({})).unwrap();
         let b = g.add_node("N", &json!({})).unwrap();
         let c = g.add_node("N", &json!({})).unwrap();
@@ -318,7 +319,7 @@ mod tests {
     #[test]
     fn retrieve_with_multiple_seeds_each_expand_independently() {
         let (_dir, g) = open_tmp();
-        // Two disconnected chains: a → b → c; d → e → f
+        // Two disconnected chains: a to b to c; d to e to f
         // Both a and d have vectors and qualify as seeds.
         // With hops=1 the subgraph must include {a, b, d, e} but not {c, f}.
         // With hops=2 it must include all six nodes.
@@ -467,7 +468,7 @@ mod tests {
     #[test]
     fn graphblas_retrieve_edges_connect_only_nodes_in_subgraph() {
         let (_dir, g) = open_tmp();
-        // Chain: a → b → c → d; seed is a (hops=1 → {a, b}).
+        // Chain: a to b to c to d; seed is a (hops=1 includes {a, b}).
         let a = g.add_node("N", &json!({})).unwrap();
         let b = g.add_node("N", &json!({})).unwrap();
         let c = g.add_node("N", &json!({})).unwrap();
@@ -493,8 +494,12 @@ mod tests {
         assert!(sub.nodes.contains(&a));
         assert!(sub.nodes.contains(&b));
         assert!(!sub.nodes.contains(&c));
-        assert!(sub.edges.contains(&e_ab), "edge a→b must be in subgraph");
-        assert_eq!(sub.edges.len(), 1, "only a→b is within the 1-hop subgraph");
+        assert!(sub.edges.contains(&e_ab), "edge a to b must be in subgraph");
+        assert_eq!(
+            sub.edges.len(),
+            1,
+            "only a to b is within the 1-hop subgraph"
+        );
     }
 
     #[cfg(feature = "graphblas")]
@@ -530,7 +535,7 @@ mod tests {
     #[test]
     fn graphblas_retrieve_max_nodes_caps_subgraph() {
         let (_dir, g) = open_tmp();
-        // Star: a → b, c, d, e
+        // Star: a to b, c, d, e
         let a = g.add_node("N", &json!({})).unwrap();
         let b = g.add_node("N", &json!({})).unwrap();
         let c = g.add_node("N", &json!({})).unwrap();
@@ -607,7 +612,7 @@ mod tests {
     fn graphblas_retrieve_multiple_seeds_each_expand_independently() {
         let (_dir, g) = open_tmp();
         // Mirrors the non-graphblas variant: two disconnected chains
-        // a → b → c; d → e → f, with vectors on a and d.
+        // a to b to c; d to e to f, with vectors on a and d.
         let a = g.add_node("N", &json!({})).unwrap();
         let b = g.add_node("N", &json!({})).unwrap();
         let c = g.add_node("N", &json!({})).unwrap();

@@ -364,4 +364,188 @@ mod tests {
             .collect();
         assert_eq!(names, vec!["Charlie".to_string()]);
     }
+
+    #[test]
+    fn execute_unwind_literal_list() {
+        let (_dir, g) = open_tmp();
+        let params = HashMap::new();
+
+        let res = execute(&g, "UNWIND [10, 20, 30] AS x RETURN x", &params).unwrap();
+        assert_eq!(res.columns, vec!["x"]);
+        assert_eq!(res.records.len(), 3);
+        assert_eq!(res.records[0].values[0], json!(10));
+        assert_eq!(res.records[1].values[0], json!(20));
+        assert_eq!(res.records[2].values[0], json!(30));
+    }
+
+    #[test]
+    fn execute_unwind_and_match() {
+        let (_dir, g) = open_tmp();
+        let alice = g.add_node("Person", &json!({ "name": "Alice" })).unwrap();
+        let bob = g.add_node("Person", &json!({ "name": "Bob" })).unwrap();
+        g.rebuild_csr().unwrap();
+
+        let params = HashMap::new();
+        let query = format!(
+            "UNWIND [{}, {}] AS node_id MATCH (p:Person) WHERE p.name = \"Bob\" RETURN p.name AS name",
+            alice, bob
+        );
+        let res = execute(&g, &query, &params).unwrap();
+
+        assert_eq!(res.columns, vec!["name"]);
+        assert_eq!(res.records.len(), 2);
+        let names: Vec<String> = res
+            .records
+            .iter()
+            .map(|r| r.values[0].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(names, vec!["Bob".to_string(), "Bob".to_string()]);
+    }
+
+    #[test]
+    fn execute_with_projection_barrier() {
+        let (_dir, g) = open_tmp();
+        let alice = g
+            .add_node("Person", &json!({ "name": "Alice", "age": 30 }))
+            .unwrap();
+        let bob = g
+            .add_node("Person", &json!({ "name": "Bob", "age": 25 }))
+            .unwrap();
+        g.add_edge(alice, bob, "KNOWS", &json!({})).unwrap();
+        g.rebuild_csr().unwrap();
+
+        let params = HashMap::new();
+
+        let query_empty = "MATCH (a:Person)-[:KNOWS]->(b:Person) WITH b, b.age AS age WHERE age > 26 RETURN b.name AS name, age";
+        let res_empty = execute(&g, query_empty, &params).unwrap();
+        assert_eq!(res_empty.records.len(), 0);
+
+        let query_match = "MATCH (a:Person)-[:KNOWS]->(b:Person) WITH b, b.age AS age WHERE age < 26 RETURN b.name AS name, age";
+        let res_match = execute(&g, query_match, &params).unwrap();
+        assert_eq!(res_match.records.len(), 1);
+        assert_eq!(res_match.records[0].values[0], json!("Bob"));
+        assert_eq!(res_match.records[0].values[1], json!(25));
+    }
+
+    // Regression: parse_set_statement used upper.find("SET") which matched "SET"
+    // inside a label name such as "RESET", returning a wrong byte offset.
+    #[test]
+    fn set_on_node_with_label_containing_set_substring() {
+        let (_dir, g) = open_tmp();
+        g.add_node("RESET", &json!({ "x": 1 })).unwrap();
+
+        let params = HashMap::new();
+        // Parser must find the actual SET keyword, not the one inside "RESET".
+        let res = execute(&g, "MATCH (n:RESET) SET n.x = 42", &params).unwrap();
+        assert_eq!(res.records[0].values[0], json!(1));
+
+        let after = execute(&g, "MATCH (n:RESET) RETURN n.x AS x", &params).unwrap();
+        assert_eq!(after.records[0].values[0], json!(42));
+    }
+
+    // Regression: execute_set resolved a node's label by scanning a hardcoded
+    // five-entry list. Nodes with labels outside that list were silently
+    // re-labeled to "Node", corrupting label_idx.
+    #[test]
+    fn set_preserves_unlisted_label() {
+        let (_dir, g) = open_tmp();
+        g.add_node("Employee", &json!({ "salary": 50000 })).unwrap();
+
+        let params = HashMap::new();
+        execute(&g, "MATCH (n:Employee) SET n.salary = 60000", &params).unwrap();
+
+        // The node must still be reachable under "Employee", not "Node".
+        let res = execute(&g, "MATCH (n:Employee) RETURN n.salary AS s", &params).unwrap();
+        assert_eq!(
+            res.records.len(),
+            1,
+            "node must still be indexed under Employee"
+        );
+        assert_eq!(res.records[0].values[0], json!(60000));
+
+        // And it must not appear under "Node".
+        let under_node = execute(&g, "MATCH (n:Node) RETURN n.salary AS s", &params).unwrap();
+        assert_eq!(
+            under_node.records.len(),
+            0,
+            "node must not be re-indexed under Node"
+        );
+    }
+
+    // Regression: variable-length Expand with min_hops=0 never emitted the
+    // source node itself and skipped source nodes with no outgoing edges.
+    #[test]
+    fn variable_length_zero_min_hops_includes_source() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("Person", &json!({ "name": "Alice" })).unwrap();
+        let b = g.add_node("Person", &json!({ "name": "Bob" })).unwrap();
+        g.add_edge(a, b, "KNOWS", &json!({})).unwrap();
+        g.rebuild_csr().unwrap();
+
+        let params = HashMap::new();
+        // *0..1 from Alice must include Alice herself (0-hop) and Bob (1-hop).
+        let res = execute(
+            &g,
+            "MATCH (a:Person {name: 'Alice'})-[:KNOWS*0..1]->(b) RETURN b.name AS name",
+            &params,
+        )
+        .unwrap();
+        let mut names: Vec<String> = res
+            .records
+            .iter()
+            .map(|r| r.values[0].as_str().unwrap().to_string())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["Alice", "Bob"]);
+
+        // Isolated node (no outgoing edges) must still appear for *0..2.
+        let c = g.add_node("Person", &json!({ "name": "Carol" })).unwrap();
+        let _ = c; // no edges
+        g.rebuild_csr().unwrap();
+        let res2 = execute(
+            &g,
+            "MATCH (a:Person {name: 'Carol'})-[*0..2]->(b) RETURN b.name AS name",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(res2.records.len(), 1);
+        assert_eq!(res2.records[0].values[0], json!("Carol"));
+    }
+
+    // Regression: collect_bound_vars for Expand unconditionally reported
+    // rel_var as bound even for variable-length paths, causing the optimizer
+    // to place filters referencing rel_var above the Expand where it is absent
+    // from the PathMap, producing "unbound variable" errors at runtime.
+    #[test]
+    fn variable_length_where_on_rel_var_errors_cleanly() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("Person", &json!({ "name": "Alice" })).unwrap();
+        let b = g.add_node("Person", &json!({ "name": "Bob" })).unwrap();
+        g.add_edge(a, b, "KNOWS", &json!({ "since": 2020 }))
+            .unwrap();
+        g.rebuild_csr().unwrap();
+
+        let params = HashMap::new();
+        // Querying only dst_var from a variable-length path must work.
+        let res = execute(
+            &g,
+            "MATCH (a:Person)-[:KNOWS*1..2]->(b:Person) RETURN b.name AS name",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(res.records.len(), 1);
+        assert_eq!(res.records[0].values[0], json!("Bob"));
+
+        // Referencing rel_var in a variable-length WHERE must produce a clear error,
+        // not a silent wrong result. (rel_var is undefined for multi-hop paths.)
+        let err = execute(
+            &g,
+            "MATCH (a:Person)-[r*1..2]->(b:Person) WHERE r.since = 2020 RETURN b.name AS name",
+            &params,
+        );
+        assert!(
+            err.is_err(),
+            "filter on rel_var in variable-length path should error"
+        );
+    }
 }

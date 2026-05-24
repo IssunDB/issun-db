@@ -15,6 +15,24 @@ pub struct Query {
     pub match_clauses: Vec<MatchClause>,
     pub where_clause: Option<WhereClause>,
     pub return_clause: ReturnClause,
+    pub parts: Vec<QueryPart>,
+}
+
+/// A clause/part in a sequential Cypher query sequence.
+#[derive(Debug, Clone, PartialEq)]
+pub enum QueryPart {
+    Match {
+        match_clauses: Vec<MatchClause>,
+        where_clause: Option<WhereClause>,
+    },
+    With {
+        items: Vec<ReturnItem>,
+        where_clause: Option<WhereClause>,
+    },
+    Unwind {
+        expr: Expr,
+        variable: String,
+    },
 }
 
 /// A MATCH clause containing a node and relationship pattern.
@@ -80,6 +98,29 @@ pub enum Literal {
     Float(f64),
     Bool(bool),
     Null,
+    List(Vec<Literal>),
+}
+
+impl std::fmt::Display for Literal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Literal::Str(s) => write!(f, "'{}'", s),
+            Literal::Int(i) => write!(f, "{}", i),
+            Literal::Float(v) => write!(f, "{}", v),
+            Literal::Bool(b) => write!(f, "{}", b),
+            Literal::Null => write!(f, "null"),
+            Literal::List(items) => {
+                write!(f, "[")?;
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ",")?;
+                    }
+                    write!(f, "{}", item)?;
+                }
+                write!(f, "]")
+            }
+        }
+    }
 }
 
 /// A RETURN clause containing projected variables or properties.

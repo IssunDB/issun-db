@@ -1,22 +1,17 @@
 [package]
 name = "issundb-rag"
-description = "GraphRAG primitives and utilities for IssunDB"
+description = "Compatibility crate for IssunDB hybrid retrieval APIs"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
 
 [dependencies]
-issundb-core = { path = "../issundb-core" }
-thiserror.workspace = true
-ahash.workspace = true
-graphblas_sparse_linear_algebra = { workspace = true, optional = true }
+issundb-retrieval = { path = "../issundb-retrieval" }
 
 [features]
 default = []
-graphblas = ["dep:graphblas_sparse_linear_algebra", "issundb-core/graphblas"]
-
-[dev-dependencies]
-tempfile.workspace = true
-serde_json = "1"
+graphblas = ["issundb-retrieval/graphblas"]

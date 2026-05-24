@@ -4,3 +4,6 @@
 [submodule "external/FalkorDB"]
 	path = external/FalkorDB
 	url = https://github.com/FalkorDB/FalkorDB
+[submodule "external/helix-db"]
+	path = external/helix-db
+	url = https://github.com/HelixDB/helix-db.git

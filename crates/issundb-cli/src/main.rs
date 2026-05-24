@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use issundb::{EdgeId, Graph, Hit, NodeId, RetrieveOptions, retrieve_with};
+use issundb::{EdgeId, Graph, Hit, NodeId, RetrieveOptions, VectorGraphExt, retrieve_with};
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 
@@ -434,7 +434,7 @@ fn print_help() {
   rebuild-csr                         rebuild the CSR cache
   upsert-vec <id> <f32>...            attach a vector embedding to a node
   vsearch <k> <f32>...                k-nearest-neighbor search
-  retrieve <k> <hops> <f32>...        GraphRAG: vector search + BFS expansion
+  retrieve <k> <hops> <f32>...        hybrid retrieval: vector search plus BFS expansion
   help                                show this message
   quit / exit                         exit"#
     );

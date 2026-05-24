@@ -1,9 +1,9 @@
 use parking_lot::Mutex;
 use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
 
-use crate::{error::Error, schema::NodeId};
+use issundb_core::{Error, Graph, NodeId};
 
-/// A single result from `Graph::vector_search`.
+/// A single result from vector search.
 pub struct Hit {
     pub node: NodeId,
     pub distance: f32,
@@ -133,5 +133,134 @@ impl VectorIndex {
                     .collect())
             }
         }
+    }
+}
+
+fn encode_vector(v: &[f32]) -> Result<Vec<u8>, Error> {
+    if v.is_empty() {
+        return Err(Error::Vector("embedding must not be empty".into()));
+    }
+    Ok(v.iter().flat_map(|f| f.to_le_bytes()).collect())
+}
+
+fn decode_vector(bytes: &[u8]) -> Result<Vec<f32>, Error> {
+    if bytes.len() % 4 != 0 {
+        return Err(Error::Vector(format!(
+            "stored embedding byte length must be divisible by 4, got {}",
+            bytes.len()
+        )));
+    }
+    let vector = bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    Ok(vector)
+}
+
+/// Vector search operations for `Graph`.
+pub trait VectorGraphExt {
+    /// Persist `v` under `n`.
+    fn upsert_vector(&self, n: NodeId, v: &[f32]) -> Result<(), Error>;
+
+    /// Return the `k` approximate nearest neighbors to `q` by cosine distance.
+    fn vector_search(&self, q: &[f32], k: usize) -> Result<Vec<Hit>, Error>;
+}
+
+impl VectorGraphExt for Graph {
+    fn upsert_vector(&self, n: NodeId, v: &[f32]) -> Result<(), Error> {
+        let bytes = encode_vector(v)?;
+        self.put_vector_bytes(n, &bytes)
+    }
+
+    fn vector_search(&self, q: &[f32], k: usize) -> Result<Vec<Hit>, Error> {
+        let index = VectorIndex::new();
+        for (node_id, bytes) in self.vector_bytes()? {
+            let vector = decode_vector(&bytes)?;
+            index.upsert(node_id, &vector)?;
+        }
+        index.search(q, k)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    use super::*;
+
+    fn open_tmp() -> (TempDir, Graph) {
+        let dir = TempDir::new().unwrap();
+        let graph = Graph::open(dir.path(), 1).unwrap();
+        (dir, graph)
+    }
+
+    #[test]
+    fn upsert_vector_and_search_finds_nearest() {
+        let (_dir, graph) = open_tmp();
+        let a = graph.add_node("N", &json!({})).unwrap();
+        let b = graph.add_node("N", &json!({})).unwrap();
+        let c = graph.add_node("N", &json!({})).unwrap();
+
+        graph.upsert_vector(a, &[1.0f32, 0.0, 0.0]).unwrap();
+        graph.upsert_vector(b, &[0.0f32, 1.0, 0.0]).unwrap();
+        graph.upsert_vector(c, &[0.0f32, 0.0, 1.0]).unwrap();
+
+        let hits = graph.vector_search(&[1.0f32, 0.0, 0.0], 1).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].node, a);
+    }
+
+    #[test]
+    fn vector_search_empty_index_returns_empty() {
+        let (_dir, graph) = open_tmp();
+        let hits = graph.vector_search(&[1.0f32, 0.0, 0.0], 5).unwrap();
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn vector_search_k_larger_than_index_returns_all() {
+        let (_dir, graph) = open_tmp();
+        let a = graph.add_node("N", &json!({})).unwrap();
+        let b = graph.add_node("N", &json!({})).unwrap();
+        graph.upsert_vector(a, &[1.0f32, 0.0]).unwrap();
+        graph.upsert_vector(b, &[0.0f32, 1.0]).unwrap();
+
+        let hits = graph.vector_search(&[1.0f32, 0.0], 100).unwrap();
+        assert_eq!(hits.len(), 2);
+    }
+
+    #[test]
+    fn upsert_vector_overwrites_existing_embedding() {
+        let (_dir, graph) = open_tmp();
+        let a = graph.add_node("N", &json!({})).unwrap();
+        let b = graph.add_node("N", &json!({})).unwrap();
+
+        graph.upsert_vector(a, &[1.0f32, 0.0, 0.0]).unwrap();
+        graph.upsert_vector(b, &[0.0f32, 1.0, 0.0]).unwrap();
+        graph.upsert_vector(a, &[0.0f32, 1.0, 0.0]).unwrap();
+
+        let hits = graph.vector_search(&[0.0f32, 1.0, 0.0], 1).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(
+            (hits[0].distance).abs() < 1e-5,
+            "distance to query should be near zero"
+        );
+    }
+
+    #[test]
+    fn vector_index_rebuilds_from_lmdb_on_reopen() {
+        let dir = TempDir::new().unwrap();
+        let a = {
+            let graph = Graph::open(dir.path(), 1).unwrap();
+            let a = graph.add_node("N", &json!({})).unwrap();
+            graph.upsert_vector(a, &[1.0f32, 0.0, 0.0]).unwrap();
+            a
+        };
+
+        let graph = Graph::open(dir.path(), 1).unwrap();
+        let hits = graph.vector_search(&[1.0f32, 0.0, 0.0], 1).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].node, a);
     }
 }

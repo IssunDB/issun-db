@@ -1,0 +1,25 @@
+[package]
+name = "issundb-retrieval"
+description = "Hybrid retrieval APIs for IssunDB"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+issundb-core = { path = "../issundb-core" }
+issundb-vector = { path = "../issundb-vector" }
+thiserror.workspace = true
+ahash.workspace = true
+graphblas_sparse_linear_algebra = { workspace = true, optional = true }
+
+[features]
+default = []
+graphblas = ["dep:graphblas_sparse_linear_algebra", "issundb-core/graphblas"]
+
+[dev-dependencies]
+tempfile.workspace = true
+serde_json = "1"

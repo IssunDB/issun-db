@@ -1,0 +1,19 @@
+[package]
+name = "issundb-vector"
+description = "Vector search APIs and indexing for IssunDB"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+issundb-core = { path = "../issundb-core" }
+parking_lot.workspace = true
+usearch.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+serde_json = "1"

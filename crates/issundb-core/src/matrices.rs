@@ -3,6 +3,7 @@
 // rustc from compiling it without the feature, but this inner attribute stops
 // rust-analyzer from reporting unresolved GraphBLAS imports in the IDE when the
 // feature is disabled (the default).
+#![allow(clippy::duplicated_attributes)]
 #![cfg(feature = "graphblas")]
 
 use std::collections::HashMap;

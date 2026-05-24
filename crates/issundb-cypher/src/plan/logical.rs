@@ -13,6 +13,14 @@ pub enum FilterExpr {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum LogicalOperator {
+    /// A single empty row to bootstrap queries.
+    SingleRow,
+    /// Unwind a list expression and bind each element to a variable.
+    Unwind {
+        input: Box<LogicalOperator>,
+        expr: Expr,
+        variable: String,
+    },
     /// Scan nodes by label: binds `variable` to nodes matching `label`.
     LabelScan {
         variable: String,
@@ -40,6 +48,7 @@ pub enum LogicalOperator {
     Project {
         input: Box<LogicalOperator>,
         items: Vec<(Expr, Option<String>)>, // (expression, alias)
+        is_barrier: bool,
     },
     /// Join two independent logical sub-plans (cross product / hash join).
     Join {
@@ -52,42 +61,151 @@ pub struct LogicalPlanner;
 
 impl LogicalPlanner {
     pub fn plan(query: &Query) -> Result<LogicalOperator, String> {
-        if query.match_clauses.is_empty() {
-            return Err("query must contain at least one MATCH clause".into());
-        }
+        let mut plan = if query.parts.is_empty() {
+            // Legacy single-MATCH planning flow
+            if query.match_clauses.is_empty() {
+                return Err("query must contain at least one MATCH clause".into());
+            }
 
-        let mut current_plan: Option<LogicalOperator> = None;
+            let mut current_plan: Option<LogicalOperator> = None;
 
-        for match_clause in &query.match_clauses {
-            let match_plan = Self::plan_match(match_clause)?;
-            current_plan = match current_plan {
-                Some(existing) => Some(LogicalOperator::Join {
-                    left: Box::new(existing),
-                    right: Box::new(match_plan),
-                }),
-                None => Some(match_plan),
-            };
-        }
+            for match_clause in &query.match_clauses {
+                let match_plan = Self::plan_match(match_clause)?;
+                current_plan = match current_plan {
+                    Some(existing) => Some(LogicalOperator::Join {
+                        left: Box::new(existing),
+                        right: Box::new(match_plan),
+                    }),
+                    None => Some(match_plan),
+                };
+            }
 
-        let mut plan = current_plan.ok_or_else(|| "failed to generate MATCH plan".to_string())?;
+            let mut p = current_plan.ok_or_else(|| "failed to generate MATCH plan".to_string())?;
 
-        // Apply WHERE clause if present
-        if let Some(ref where_clause) = query.where_clause {
-            let filter_expr = match where_clause {
-                WhereClause::Eq(l, r) => FilterExpr::Eq(l.clone(), r.clone()),
-                WhereClause::Ne(l, r) => FilterExpr::Ne(l.clone(), r.clone()),
-                WhereClause::Lt(l, r) => FilterExpr::Lt(l.clone(), r.clone()),
-                WhereClause::Gt(l, r) => FilterExpr::Gt(l.clone(), r.clone()),
-                WhereClause::Le(l, r) => FilterExpr::Le(l.clone(), r.clone()),
-                WhereClause::Ge(l, r) => FilterExpr::Ge(l.clone(), r.clone()),
-            };
-            plan = LogicalOperator::Filter {
-                input: Box::new(plan),
-                expression: filter_expr,
-            };
-        }
+            // Apply WHERE clause if present
+            if let Some(ref where_clause) = query.where_clause {
+                let filter_expr = match where_clause {
+                    WhereClause::Eq(l, r) => FilterExpr::Eq(l.clone(), r.clone()),
+                    WhereClause::Ne(l, r) => FilterExpr::Ne(l.clone(), r.clone()),
+                    WhereClause::Lt(l, r) => FilterExpr::Lt(l.clone(), r.clone()),
+                    WhereClause::Gt(l, r) => FilterExpr::Gt(l.clone(), r.clone()),
+                    WhereClause::Le(l, r) => FilterExpr::Le(l.clone(), r.clone()),
+                    WhereClause::Ge(l, r) => FilterExpr::Ge(l.clone(), r.clone()),
+                };
+                p = LogicalOperator::Filter {
+                    input: Box::new(p),
+                    expression: filter_expr,
+                };
+            }
+            p
+        } else {
+            // New multi-part sequence planning flow
+            use crate::ast::QueryPart;
+            let mut current_plan: Option<LogicalOperator> = None;
 
-        // Apply RETURN projection
+            for part in &query.parts {
+                match part {
+                    QueryPart::Match {
+                        match_clauses,
+                        where_clause,
+                    } => {
+                        if match_clauses.is_empty() {
+                            return Err("MATCH part must contain at least one MATCH clause".into());
+                        }
+                        let mut part_match_plan: Option<LogicalOperator> = None;
+                        for match_clause in match_clauses {
+                            let mp = Self::plan_match(match_clause)?;
+                            part_match_plan = match part_match_plan {
+                                Some(existing) => Some(LogicalOperator::Join {
+                                    left: Box::new(existing),
+                                    right: Box::new(mp),
+                                }),
+                                None => Some(mp),
+                            };
+                        }
+                        let mut match_plan = part_match_plan.ok_or_else(|| {
+                            "MATCH part must contain at least one MATCH clause".to_string()
+                        })?;
+                        if let Some(wc) = where_clause {
+                            let filter_expr = match wc {
+                                WhereClause::Eq(l, r) => FilterExpr::Eq(l.clone(), r.clone()),
+                                WhereClause::Ne(l, r) => FilterExpr::Ne(l.clone(), r.clone()),
+                                WhereClause::Lt(l, r) => FilterExpr::Lt(l.clone(), r.clone()),
+                                WhereClause::Gt(l, r) => FilterExpr::Gt(l.clone(), r.clone()),
+                                WhereClause::Le(l, r) => FilterExpr::Le(l.clone(), r.clone()),
+                                WhereClause::Ge(l, r) => FilterExpr::Ge(l.clone(), r.clone()),
+                            };
+                            match_plan = LogicalOperator::Filter {
+                                input: Box::new(match_plan),
+                                expression: filter_expr,
+                            };
+                        }
+
+                        current_plan = match current_plan {
+                            Some(existing) => Some(LogicalOperator::Join {
+                                left: Box::new(existing),
+                                right: Box::new(match_plan),
+                            }),
+                            None => Some(match_plan),
+                        };
+                    }
+                    QueryPart::With {
+                        items,
+                        where_clause,
+                    } => {
+                        // Bootstrap with SingleRow if WITH is the first clause in the
+                        // sequence (e.g., `WITH 1 AS x RETURN x`), matching the
+                        // behavior of the Unwind arm above.
+                        let mut p = current_plan.unwrap_or(LogicalOperator::SingleRow);
+
+                        // In Cypher semantics, the WHERE predicate of a WITH clause is
+                        // evaluated against the pre-projection rows: variables named in
+                        // the filter still refer to the current scope, not the projected
+                        // output. Apply the filter BEFORE the Project so that references
+                        // like `WITH a AS alias WHERE a.prop = …` resolve correctly.
+                        if let Some(wc) = where_clause {
+                            let filter_expr = match wc {
+                                WhereClause::Eq(l, r) => FilterExpr::Eq(l.clone(), r.clone()),
+                                WhereClause::Ne(l, r) => FilterExpr::Ne(l.clone(), r.clone()),
+                                WhereClause::Lt(l, r) => FilterExpr::Lt(l.clone(), r.clone()),
+                                WhereClause::Gt(l, r) => FilterExpr::Gt(l.clone(), r.clone()),
+                                WhereClause::Le(l, r) => FilterExpr::Le(l.clone(), r.clone()),
+                                WhereClause::Ge(l, r) => FilterExpr::Ge(l.clone(), r.clone()),
+                            };
+                            p = LogicalOperator::Filter {
+                                input: Box::new(p),
+                                expression: filter_expr,
+                            };
+                        }
+
+                        let project_items = items
+                            .iter()
+                            .map(|item| (item.expr.clone(), item.alias.clone()))
+                            .collect();
+
+                        p = LogicalOperator::Project {
+                            input: Box::new(p),
+                            items: project_items,
+                            is_barrier: true,
+                        };
+
+                        current_plan = Some(p);
+                    }
+                    QueryPart::Unwind { expr, variable } => {
+                        let p = current_plan.unwrap_or(LogicalOperator::SingleRow);
+                        current_plan = Some(LogicalOperator::Unwind {
+                            input: Box::new(p),
+                            expr: expr.clone(),
+                            variable: variable.clone(),
+                        });
+                    }
+                }
+            }
+
+            current_plan.ok_or_else(|| "failed to generate plan for parts".to_string())?
+        };
+
+        // Apply final RETURN projection
         let project_items = query
             .return_clause
             .items
@@ -98,6 +216,7 @@ impl LogicalPlanner {
         plan = LogicalOperator::Project {
             input: Box::new(plan),
             items: project_items,
+            is_barrier: false,
         };
 
         Ok(plan)
@@ -214,7 +333,7 @@ mod tests {
             //       Expand (KNOWS relationship)
             //         LabelScan (Person label for a)
 
-            if let LogicalOperator::Project { input, items } = plan {
+            if let LogicalOperator::Project { input, items, .. } = plan {
                 assert_eq!(items.len(), 1);
                 assert_eq!(items[0].1.as_deref(), Some("name"));
 

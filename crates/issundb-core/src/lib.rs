@@ -6,14 +6,12 @@ pub mod graph;
 pub mod matrices;
 pub mod schema;
 pub mod storage;
-pub mod vector;
 
 pub use error::Error;
 pub use graph::Graph;
 #[cfg(feature = "graphblas")]
 pub use matrices::MatrixSet;
 pub use schema::{AdjEntry, EdgeId, EdgeRecord, LabelId, NodeId, NodeRecord, TypeId};
-pub use vector::Hit;
 
 #[cfg(test)]
 mod tests {
@@ -386,83 +384,6 @@ mod tests {
         assert_eq!(cc[&a], cc[&b]);
         assert_eq!(cc[&c], cc[&d]);
         assert_ne!(cc[&a], cc[&c]);
-    }
-
-    // ------------------------------------------------------------------
-    // Vector index
-    // ------------------------------------------------------------------
-
-    #[test]
-    fn upsert_vector_and_search_finds_nearest() {
-        let (_dir, g) = open_tmp();
-        let a = g.add_node("N", &json!({})).unwrap();
-        let b = g.add_node("N", &json!({})).unwrap();
-        let c = g.add_node("N", &json!({})).unwrap();
-
-        // a and the query are almost identical; b and c point in orthogonal directions.
-        g.upsert_vector(a, &[1.0f32, 0.0, 0.0]).unwrap();
-        g.upsert_vector(b, &[0.0f32, 1.0, 0.0]).unwrap();
-        g.upsert_vector(c, &[0.0f32, 0.0, 1.0]).unwrap();
-
-        let hits = g.vector_search(&[1.0f32, 0.0, 0.0], 1).unwrap();
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].node, a);
-    }
-
-    #[test]
-    fn vector_search_empty_index_returns_empty() {
-        let (_dir, g) = open_tmp();
-        let hits = g.vector_search(&[1.0f32, 0.0, 0.0], 5).unwrap();
-        assert!(hits.is_empty());
-    }
-
-    #[test]
-    fn vector_search_k_larger_than_index_returns_all() {
-        let (_dir, g) = open_tmp();
-        let a = g.add_node("N", &json!({})).unwrap();
-        let b = g.add_node("N", &json!({})).unwrap();
-        g.upsert_vector(a, &[1.0f32, 0.0]).unwrap();
-        g.upsert_vector(b, &[0.0f32, 1.0]).unwrap();
-
-        let hits = g.vector_search(&[1.0f32, 0.0], 100).unwrap();
-        assert_eq!(hits.len(), 2);
-    }
-
-    #[test]
-    fn upsert_vector_overwrites_existing_embedding() {
-        let (_dir, g) = open_tmp();
-        let a = g.add_node("N", &json!({})).unwrap();
-        let b = g.add_node("N", &json!({})).unwrap();
-
-        // Insert a pointing in the x direction, b in the y direction.
-        g.upsert_vector(a, &[1.0f32, 0.0, 0.0]).unwrap();
-        g.upsert_vector(b, &[0.0f32, 1.0, 0.0]).unwrap();
-
-        // Overwrite a to now point in the y direction.
-        g.upsert_vector(a, &[0.0f32, 1.0, 0.0]).unwrap();
-
-        // Searching for the y direction should find a (or b), not return the old a.
-        let hits = g.vector_search(&[0.0f32, 1.0, 0.0], 1).unwrap();
-        assert_eq!(hits.len(), 1);
-        assert!(
-            (hits[0].distance).abs() < 1e-5,
-            "distance to query should be ~0"
-        );
-    }
-
-    #[test]
-    fn vector_index_rebuilds_from_lmdb_on_reopen() {
-        let dir = TempDir::new().unwrap();
-        let a = {
-            let g = Graph::open(dir.path(), 1).unwrap();
-            let a = g.add_node("N", &json!({})).unwrap();
-            g.upsert_vector(a, &[1.0f32, 0.0, 0.0]).unwrap();
-            a
-        };
-        let g2 = Graph::open(dir.path(), 1).unwrap();
-        let hits = g2.vector_search(&[1.0f32, 0.0, 0.0], 1).unwrap();
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].node, a);
     }
 
     #[test]
