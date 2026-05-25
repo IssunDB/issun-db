@@ -1,10 +1,4 @@
-// Compile this module only when the graphblas feature is active. The outer
-// `#[cfg(feature = "graphblas")] pub mod matrices;` in lib.rs already prevents
-// rustc from compiling it without the feature, but this inner attribute stops
-// rust-analyzer from reporting unresolved GraphBLAS imports in the IDE when the
-// feature is disabled (the default).
 #![allow(clippy::duplicated_attributes)]
-#![cfg(feature = "graphblas")]
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -29,11 +23,13 @@ pub struct MatrixSet {
     /// Per-type boolean matrices: `A[i][j] = true` for each edge i→j of that type.
     pub by_type: HashMap<TypeId, SparseMatrix<bool>>,
     /// Combined outgoing adjacency: `A[i][j] = 1` for any edge i→j.
-    /// Used with `transpose_matrix_argument = true` for MinPlus BFS and SSSP SpMV.
     pub adjacency: SparseMatrix<i32>,
+    /// Combined transpose adjacency: `A^T[i][j] = 1` if edge j→i exists.
+    pub adjacency_t: SparseMatrix<i32>,
     /// Column-stochastic matrix: `M[j][i] = 1 / out_degree(i)` for each edge i→j.
-    /// Used directly for PageRank: `r_new = M * r_old`.
     pub page_rank_matrix: SparseMatrix<f32>,
+    /// Weighted adjacency: `W[i][j] = weight` for each edge i→j.
+    pub weight_matrix: SparseMatrix<f64>,
     pub n_nodes: usize,
 }
 
@@ -46,6 +42,8 @@ impl MatrixSet {
 
         let mut elements_by_type: HashMap<TypeId, Vec<(usize, usize, bool)>> = HashMap::new();
         let mut adj_elements: Vec<(usize, usize, i32)> = Vec::new();
+        let mut adj_t_elements: Vec<(usize, usize, i32)> = Vec::new();
+        let mut weight_elements: Vec<(usize, usize, f64)> = Vec::new();
         // Accumulate PageRank weights in a map so that parallel edges i→j
         // sum their contributions rather than keeping only the first.
         let mut pr_map: HashMap<(usize, usize), f32> = HashMap::new();
@@ -62,6 +60,8 @@ impl MatrixSet {
                     .or_default()
                     .push((i, col, true));
                 adj_elements.push((i, col, 1i32));
+                adj_t_elements.push((col, i, 1i32));
+                weight_elements.push((i, col, csr.edge_weight[k]));
                 if out_deg > 0.0 {
                     // M[col][i] = 1/out_deg(i) so that M * r gives incoming rank.
                     *pr_map.entry((col, i)).or_insert(0.0) += 1.0f32 / out_deg;
@@ -103,6 +103,22 @@ impl MatrixSet {
             .map_err(|e| Error::GraphBLAS(e.to_string()))?
         };
 
+        let adjacency_t = if adj_t_elements.is_empty() {
+            SparseMatrix::<i32>::new(context.clone(), matrix_size)
+                .map_err(|e| Error::GraphBLAS(e.to_string()))?
+        } else {
+            let element_list = MatrixElementList::<i32>::from_element_vector(
+                adj_t_elements.into_iter().map(|c| c.into()).collect(),
+            );
+            SparseMatrix::<i32>::from_element_list(
+                context.clone(),
+                matrix_size,
+                element_list,
+                &First::<i32>::new(),
+            )
+            .map_err(|e| Error::GraphBLAS(e.to_string()))?
+        };
+
         let page_rank_matrix = if pr_elements.is_empty() {
             SparseMatrix::<f32>::new(context.clone(), matrix_size)
                 .map_err(|e| Error::GraphBLAS(e.to_string()))?
@@ -119,11 +135,29 @@ impl MatrixSet {
             .map_err(|e| Error::GraphBLAS(e.to_string()))?
         };
 
+        let weight_matrix = if weight_elements.is_empty() {
+            SparseMatrix::<f64>::new(context.clone(), matrix_size)
+                .map_err(|e| Error::GraphBLAS(e.to_string()))?
+        } else {
+            let element_list = MatrixElementList::<f64>::from_element_vector(
+                weight_elements.into_iter().map(|c| c.into()).collect(),
+            );
+            SparseMatrix::<f64>::from_element_list(
+                context.clone(),
+                matrix_size,
+                element_list,
+                &Plus::<f64>::new(),
+            )
+            .map_err(|e| Error::GraphBLAS(e.to_string()))?
+        };
+
         Ok(Self {
             context,
             by_type,
             adjacency,
+            adjacency_t,
             page_rank_matrix,
+            weight_matrix,
             n_nodes,
         })
     }

@@ -1,7 +1,7 @@
 [project]
 name = "issundb"
 version = "0.1.0"
-description = "Python environment for the IssunDB project"
+description = "The Python environment for the IssunDB project"
 readme = "README.md"
 license = { text = "MIT" }
 authors = [

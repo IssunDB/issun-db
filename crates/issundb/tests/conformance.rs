@@ -113,11 +113,11 @@ fn parse_feature_file(path: &Path) -> Result<Vec<Scenario>, String> {
             continue;
         }
 
-        if trimmed.starts_with("Scenario:") {
+        if let Some(stripped) = trimmed.strip_prefix("Scenario:") {
             if let Some(scen) = current_scenario.take() {
                 scenarios.push(scen);
             }
-            let name = trimmed["Scenario:".len()..].trim().to_string();
+            let name = stripped.trim().to_string();
             current_scenario = Some(Scenario {
                 name,
                 setup_queries: Vec::new(),

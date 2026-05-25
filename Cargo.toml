@@ -5,51 +5,35 @@ resolver = "2"
 [workspace.package]
 version = "0.1.0-alpha.1"
 edition = "2024"
-authors = ["Hassan Abedi <hassan.abedi.t@gmail.com>"]
+authors = ["Hassan Abedi <hassan.abedi.t+issundb@gmail.com>"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/IssunDB/issun-db"
 homepage = "https://github.com/IssunDB/issun-db"
 rust-version = "1.85.0"
 
-# ---------------------------------------------------------------------------
-# Shared dependencies — pin versions once, inherit everywhere
-# ---------------------------------------------------------------------------
+
 [workspace.dependencies]
-# Storage
 heed = "0.22"
 byteorder = "1"
-
-# Zero-copy fixed-size types (AdjEntry)
 zerocopy = { version = "0.8.48", features = ["derive"] }
-
-# Serialization (msgpack for property bags)
 rmp-serde = "1"
 serde = { version = "1", features = ["derive"] }
-
-# Concurrency
+serde_json = "1"
 parking_lot = "0.12"
 arc-swap = "1"
 crossbeam = "0.8"
-
-# Errors and logging
 thiserror = "2"
 anyhow = "1"
 tracing = "0.1"
-
-# Fast hash maps (CSR id→dense maps)
 ahash = "0.8"
-
-# Testing
 tempfile = "3"
 proptest = "1"
 criterion = { version = "0.5.1", features = ["html_reports"] }
-
-# ---------------------------------------------------------------------------
-# Heavy compute / vector deps — added in later phases
-graphblas_sparse_linear_algebra = "0.63.0" # phase 3: CSR + GraphBLAS
-usearch = "2"                              # phase 5: vector search
-chumsky = "0.13.0"                         # phase 7: Cypher parser
-# ---------------------------------------------------------------------------
+graphblas_sparse_linear_algebra = "0.63.0"
+usearch = "2"
+chumsky = "0.13.0"
+rust-stemmers = "1.2.0"
+unicode-segmentation = "1.13.2"
 
 [profile.release]
 strip = "debuginfo"

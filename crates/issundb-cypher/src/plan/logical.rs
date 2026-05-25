@@ -1,4 +1,4 @@
-use crate::ast::{Expr, MatchClause, Query, WhereClause};
+use crate::ast::{AggFn, Expr, MatchClause, Query, SortItem, WhereClause};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum FilterExpr {
@@ -54,6 +54,26 @@ pub enum LogicalOperator {
     Join {
         left: Box<LogicalOperator>,
         right: Box<LogicalOperator>,
+    },
+    /// Aggregate rows, grouping by non-aggregate expressions and computing
+    /// aggregation functions (count, sum, avg, min, max, collect) per group.
+    Aggregate {
+        input: Box<LogicalOperator>,
+        /// Non-aggregate RETURN items used as group-by keys.
+        group_by: Vec<(Expr, Option<String>)>,
+        /// Aggregate RETURN items: (agg_fn, inner_expr, output_column_name).
+        aggregations: Vec<(AggFn, Expr, String)>,
+    },
+    /// Sort rows by one or more expressions.
+    Sort {
+        input: Box<LogicalOperator>,
+        items: Vec<SortItem>,
+    },
+    /// Skip and limit the row stream.
+    Limit {
+        input: Box<LogicalOperator>,
+        skip: usize,
+        count: usize,
     },
 }
 
@@ -205,8 +225,21 @@ impl LogicalPlanner {
             current_plan.ok_or_else(|| "failed to generate plan for parts".to_string())?
         };
 
-        // Apply final RETURN projection
-        let project_items = query
+        // Split RETURN items into group-by keys and aggregations.
+        let (group_by_items, agg_items) = split_return_items(query);
+
+        // Insert Aggregate operator when at least one aggregation is present.
+        if !agg_items.is_empty() {
+            plan = LogicalOperator::Aggregate {
+                input: Box::new(plan),
+                group_by: group_by_items,
+                aggregations: agg_items,
+            };
+        }
+
+        // Apply final RETURN projection (only over non-aggregate expressions when
+        // aggregation is present; Aggregate already emits aggregate column names).
+        let project_items: Vec<(Expr, Option<String>)> = query
             .return_clause
             .items
             .iter()
@@ -218,6 +251,29 @@ impl LogicalPlanner {
             items: project_items,
             is_barrier: false,
         };
+
+        // INSERT ORDER BY above Project.
+        if let Some(ref ob) = query.order_by {
+            plan = LogicalOperator::Sort {
+                input: Box::new(plan),
+                items: ob.items.clone(),
+            };
+        }
+
+        // INSERT SKIP / LIMIT above Sort (or Project if no ORDER BY).
+        let skip_n = query.skip.as_ref().map(literal_usize).unwrap_or(0);
+        let limit_n = query
+            .limit
+            .as_ref()
+            .map(literal_usize)
+            .unwrap_or(usize::MAX);
+        if query.skip.is_some() || query.limit.is_some() {
+            plan = LogicalOperator::Limit {
+                input: Box::new(plan),
+                skip: skip_n,
+                count: limit_n,
+            };
+        }
 
         Ok(plan)
     }
@@ -283,6 +339,19 @@ impl LogicalPlanner {
                 max_hops,
             };
 
+            // Apply inline properties filter on relationship if specified
+            if let Some(ref props) = rel_pat.properties {
+                for (k, v) in props {
+                    plan = LogicalOperator::Filter {
+                        input: Box::new(plan),
+                        expression: FilterExpr::Eq(
+                            Expr::Prop(rel_var.clone(), k.clone()),
+                            Expr::Literal(v.clone()),
+                        ),
+                    };
+                }
+            }
+
             // Filter target node label if specified
             if let Some(ref label) = node_pat.label {
                 plan = LogicalOperator::Filter {
@@ -308,6 +377,48 @@ impl LogicalPlanner {
         }
 
         Ok(plan)
+    }
+}
+
+/// Group-by item: `(expression, optional alias)`.
+type GroupByItem = (Expr, Option<String>);
+/// Aggregation spec: `(function, inner expression, output column name)`.
+type AggItem = (AggFn, Expr, String);
+
+/// Classify RETURN items into group-by keys (non-aggregate) and aggregation specs.
+///
+/// Returns `(group_by, aggregations)` where:
+/// - `group_by` contains `(expr, alias)` pairs for non-aggregate items.
+/// - `aggregations` contains `(agg_fn, inner_expr, output_name)` triples for aggregate items.
+fn split_return_items(query: &Query) -> (Vec<GroupByItem>, Vec<AggItem>) {
+    let mut group_by = Vec::new();
+    let mut aggregations = Vec::new();
+
+    for item in &query.return_clause.items {
+        match &item.expr {
+            Expr::CountStar => {
+                let col = item.alias.clone().unwrap_or_else(|| "count(*)".to_string());
+                aggregations.push((AggFn::Count { distinct: false }, Expr::CountStar, col));
+            }
+            Expr::Agg(fn_, inner) => {
+                let col = item.alias.clone().unwrap_or_else(|| "agg".to_string());
+                aggregations.push((fn_.clone(), *inner.clone(), col));
+            }
+            other => {
+                group_by.push((other.clone(), item.alias.clone()));
+            }
+        }
+    }
+
+    (group_by, aggregations)
+}
+
+/// Extract a `usize` value from a literal `Expr::Literal(Int(...))`.
+/// Other expression forms are treated as 0.
+fn literal_usize(expr: &Expr) -> usize {
+    match expr {
+        Expr::Literal(crate::ast::Literal::Int(n)) => (*n).max(0) as usize,
+        _ => 0,
     }
 }
 

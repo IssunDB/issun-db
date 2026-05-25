@@ -28,4 +28,14 @@ pub enum Error {
 
     #[error("graphblas: {0}")]
     GraphBLAS(String),
+
+    #[error(
+        "unique constraint violation: node/edge with label/type {0} already has property '{1}' with value {2}"
+    )]
+    UniqueConstraintViolation(String, String, String),
+
+    #[error(
+        "required constraint violation: node/edge with label/type {0} is missing required property '{1}'"
+    )]
+    RequiredConstraintViolation(String, String),
 }

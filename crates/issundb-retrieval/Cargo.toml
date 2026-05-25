@@ -14,11 +14,10 @@ issundb-core = { path = "../issundb-core" }
 issundb-vector = { path = "../issundb-vector" }
 thiserror.workspace = true
 ahash.workspace = true
-graphblas_sparse_linear_algebra = { workspace = true, optional = true }
+graphblas_sparse_linear_algebra = { workspace = true }
 
 [features]
 default = []
-graphblas = ["dep:graphblas_sparse_linear_algebra", "issundb-core/graphblas"]
 
 [dev-dependencies]
 tempfile.workspace = true

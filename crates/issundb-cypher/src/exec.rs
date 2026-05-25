@@ -126,6 +126,8 @@ fn projected_key(expr: &Expr, alias: &Option<String>) -> String {
             }
             Expr::Literal(lit) => lit.to_string(),
             Expr::Param(p) => format!("${}", p),
+            Expr::CountStar => "count(*)".to_string(),
+            Expr::Agg(_, _) => "agg".to_string(),
         }
     }
 }
@@ -164,6 +166,26 @@ fn execute_physical(
     params: &HashMap<String, serde_json::Value>,
 ) -> Result<Vec<PathMap>, String> {
     match op {
+        PhysicalOperator::NodeIndexScan {
+            variable,
+            label,
+            property,
+            value,
+        } => {
+            let val = evaluate_expr(graph, &PathMap::new(), value, params)?;
+            let candidates = graph
+                .nodes_by_property(label, property, &val)
+                .map_err(|e| e.to_string())?;
+
+            Ok(candidates
+                .into_iter()
+                .map(|cand| {
+                    let mut path = PathMap::new();
+                    path.insert(variable.clone(), GraphBinding::Node(cand));
+                    path
+                })
+                .collect())
+        }
         PhysicalOperator::LabelScan { variable, label } => {
             let candidates = if let Some(lbl) = label {
                 graph.nodes_by_label(lbl).map_err(|e| e.to_string())?
@@ -454,18 +476,45 @@ fn execute_physical(
                             }
                             Expr::Literal(lit) => lit.to_string(),
                             Expr::Param(p) => format!("${}", p),
+                            Expr::CountStar => "count(*)".to_string(),
+                            Expr::Agg(_, _) => "agg".to_string(),
                         }
                     };
 
                     match expr {
+                        // For CountStar / Agg, the Aggregate operator has already placed
+                        // the computed value in the PathMap under `target_var`. Pull it
+                        // directly rather than trying to re-evaluate the expression.
+                        Expr::CountStar | Expr::Agg(_, _) => {
+                            if let Some(binding) = path.get(&target_var) {
+                                projected_path.insert(target_var, binding.clone());
+                            } else {
+                                projected_path.insert(
+                                    target_var,
+                                    GraphBinding::Scalar(serde_json::Value::Null),
+                                );
+                            }
+                        }
                         Expr::Prop(var, prop) if prop.is_empty() => {
+                            // Whole-variable reference: first try the node binding,
+                            // then fall back to a scalar already in the PathMap
+                            // (e.g., a group-by column emitted by Aggregate).
                             if let Some(binding) = path.get(var) {
+                                projected_path.insert(target_var, binding.clone());
+                            } else if let Some(binding) = path.get(&target_var) {
                                 projected_path.insert(target_var, binding.clone());
                             }
                         }
                         _ => {
-                            let val = evaluate_expr(graph, &path, expr, params)?;
-                            projected_path.insert(target_var, GraphBinding::Scalar(val));
+                            // For property expressions (n.age), first check whether the
+                            // Aggregate already emitted a scalar under the target column
+                            // name (e.g., the group-by key alias). If so, reuse it.
+                            if let Some(binding) = path.get(&target_var) {
+                                projected_path.insert(target_var, binding.clone());
+                            } else {
+                                let val = evaluate_expr(graph, &path, expr, params)?;
+                                projected_path.insert(target_var, GraphBinding::Scalar(val));
+                            }
                         }
                     }
                 }
@@ -474,6 +523,200 @@ fn execute_physical(
             }
 
             Ok(next_paths)
+        }
+        PhysicalOperator::Aggregate {
+            input,
+            group_by,
+            aggregations,
+        } => {
+            use std::collections::BTreeMap;
+
+            let child_paths = execute_physical(graph, input, params)?;
+
+            struct AggState {
+                count: i64,
+                sum: f64,
+                min: Option<serde_json::Value>,
+                max: Option<serde_json::Value>,
+                collect: Vec<serde_json::Value>,
+                distinct_seen: std::collections::HashSet<String>,
+            }
+            impl AggState {
+                fn new() -> Self {
+                    Self {
+                        count: 0,
+                        sum: 0.0,
+                        min: None,
+                        max: None,
+                        collect: Vec::new(),
+                        distinct_seen: std::collections::HashSet::new(),
+                    }
+                }
+            }
+
+            // group_key -> (group-by PathMap, per-aggregation state Vec)
+            let mut groups: BTreeMap<String, (PathMap, Vec<AggState>)> = BTreeMap::new();
+
+            for path in child_paths {
+                let mut key_parts = Vec::new();
+                let mut gb_path = PathMap::new();
+                for (expr, alias) in group_by {
+                    let val = evaluate_expr(graph, &path, expr, params)?;
+                    let col = if let Some(a) = alias {
+                        a.clone()
+                    } else {
+                        match expr {
+                            Expr::Prop(var, prop) if prop.is_empty() => var.clone(),
+                            Expr::Prop(var, prop) => format!("{}.{}", var, prop),
+                            Expr::Literal(lit) => lit.to_string(),
+                            Expr::Param(p) => format!("${}", p),
+                            _ => "key".to_string(),
+                        }
+                    };
+                    key_parts.push(val.to_string());
+                    gb_path.insert(col, GraphBinding::Scalar(val));
+                }
+                let group_key = key_parts.join("\x00");
+
+                let entry = groups.entry(group_key).or_insert_with(|| {
+                    let states = aggregations.iter().map(|_| AggState::new()).collect();
+                    (gb_path, states)
+                });
+
+                for (i, (agg_fn, inner_expr, _col)) in aggregations.iter().enumerate() {
+                    let state = &mut entry.1[i];
+                    match agg_fn {
+                        AggFn::Count { distinct } => {
+                            if matches!(inner_expr, Expr::CountStar) {
+                                state.count += 1;
+                            } else {
+                                let val = evaluate_expr(graph, &path, inner_expr, params)?;
+                                if val != serde_json::Value::Null {
+                                    if *distinct {
+                                        if state.distinct_seen.insert(val.to_string()) {
+                                            state.count += 1;
+                                        }
+                                    } else {
+                                        state.count += 1;
+                                    }
+                                }
+                            }
+                        }
+                        AggFn::Sum => {
+                            let val = evaluate_expr(graph, &path, inner_expr, params)?;
+                            if let Some(n) = val.as_f64() {
+                                state.sum += n;
+                            }
+                        }
+                        AggFn::Avg => {
+                            let val = evaluate_expr(graph, &path, inner_expr, params)?;
+                            if let Some(n) = val.as_f64() {
+                                state.sum += n;
+                                state.count += 1;
+                            }
+                        }
+                        AggFn::Min => {
+                            let val = evaluate_expr(graph, &path, inner_expr, params)?;
+                            if val != serde_json::Value::Null {
+                                state.min = Some(match state.min.take() {
+                                    None => val,
+                                    Some(prev) => {
+                                        if json_cmp(&val, &prev) == Some(std::cmp::Ordering::Less) {
+                                            val
+                                        } else {
+                                            prev
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                        AggFn::Max => {
+                            let val = evaluate_expr(graph, &path, inner_expr, params)?;
+                            if val != serde_json::Value::Null {
+                                state.max = Some(match state.max.take() {
+                                    None => val,
+                                    Some(prev) => {
+                                        if json_cmp(&val, &prev)
+                                            == Some(std::cmp::Ordering::Greater)
+                                        {
+                                            val
+                                        } else {
+                                            prev
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                        AggFn::Collect => {
+                            let val = evaluate_expr(graph, &path, inner_expr, params)?;
+                            if val != serde_json::Value::Null {
+                                state.collect.push(val);
+                            }
+                        }
+                    }
+                }
+            }
+
+            let mut result = Vec::new();
+            for (_key, (mut gb_path, states)) in groups {
+                for (i, (agg_fn, _inner, col)) in aggregations.iter().enumerate() {
+                    let state = &states[i];
+                    let agg_val = match agg_fn {
+                        AggFn::Count { .. } => serde_json::Value::Number(state.count.into()),
+                        AggFn::Sum => serde_json::Number::from_f64(state.sum)
+                            .map(serde_json::Value::Number)
+                            .unwrap_or(serde_json::Value::Null),
+                        AggFn::Avg => {
+                            if state.count == 0 {
+                                serde_json::Value::Null
+                            } else {
+                                let avg = state.sum / state.count as f64;
+                                serde_json::Number::from_f64(avg)
+                                    .map(serde_json::Value::Number)
+                                    .unwrap_or(serde_json::Value::Null)
+                            }
+                        }
+                        AggFn::Min => state.min.clone().unwrap_or(serde_json::Value::Null),
+                        AggFn::Max => state.max.clone().unwrap_or(serde_json::Value::Null),
+                        AggFn::Collect => serde_json::Value::Array(state.collect.clone()),
+                    };
+                    gb_path.insert(col.clone(), GraphBinding::Scalar(agg_val));
+                }
+                result.push(gb_path);
+            }
+
+            Ok(result)
+        }
+        PhysicalOperator::Sort { input, items } => {
+            let mut child_paths = execute_physical(graph, input, params)?;
+
+            let mut keyed: Vec<(Vec<serde_json::Value>, PathMap)> = child_paths
+                .drain(..)
+                .map(|path| {
+                    let keys: Vec<serde_json::Value> = items
+                        .iter()
+                        .map(|si| evaluate_sort_key(graph, &path, &si.expr, params))
+                        .collect();
+                    (keys, path)
+                })
+                .collect();
+
+            keyed.sort_by(|(ka, _), (kb, _)| {
+                for (i, si) in items.iter().enumerate() {
+                    let ord = json_cmp(&ka[i], &kb[i]).unwrap_or(std::cmp::Ordering::Equal);
+                    let ord = if si.ascending { ord } else { ord.reverse() };
+                    if ord != std::cmp::Ordering::Equal {
+                        return ord;
+                    }
+                }
+                std::cmp::Ordering::Equal
+            });
+
+            Ok(keyed.into_iter().map(|(_, path)| path).collect())
+        }
+        PhysicalOperator::Limit { input, skip, count } => {
+            let child_paths = execute_physical(graph, input, params)?;
+            Ok(child_paths.into_iter().skip(*skip).take(*count).collect())
         }
     }
 }
@@ -523,6 +766,50 @@ fn evaluate_where(
     }
 }
 
+/// Evaluate a sort-key expression. First tries a normal evaluate_expr; if the variable is
+/// unbound (because Project has already stripped node bindings), falls back to looking up
+/// the expression's natural projected column name as a pre-computed scalar in the PathMap.
+fn evaluate_sort_key(
+    graph: &Graph,
+    path: &PathMap,
+    expr: &Expr,
+    params: &HashMap<String, serde_json::Value>,
+) -> serde_json::Value {
+    // Fast path: expression evaluates directly.
+    if let Ok(val) = evaluate_expr(graph, path, expr, params) {
+        if val != serde_json::Value::Null {
+            return val;
+        }
+    }
+
+    // Fallback: look up the projected column name.
+    let col_name = match expr {
+        Expr::Prop(var, prop) if prop.is_empty() => var.clone(),
+        Expr::Prop(var, prop) => format!("{}.{}", var, prop),
+        Expr::Literal(lit) => return literal_to_value(lit),
+        Expr::Param(p) => {
+            return params.get(p).cloned().unwrap_or(serde_json::Value::Null);
+        }
+        Expr::CountStar => "count(*)".to_string(),
+        Expr::Agg(_, _) => return serde_json::Value::Null,
+    };
+
+    // Try the full `var.prop` column name, then just `prop` alone (alias forms).
+    if let Some(GraphBinding::Scalar(v)) = path.get(&col_name) {
+        return v.clone();
+    }
+    // Try just the property name as a fallback alias (e.g., `n.age` stored as `"age"`).
+    if let Expr::Prop(_, prop) = expr {
+        if !prop.is_empty() {
+            if let Some(GraphBinding::Scalar(v)) = path.get(prop) {
+                return v.clone();
+            }
+        }
+    }
+
+    serde_json::Value::Null
+}
+
 fn evaluate_expr(
     graph: &Graph,
     path: &PathMap,
@@ -535,6 +822,11 @@ fn evaluate_expr(
             .get(p)
             .cloned()
             .ok_or_else(|| format!("missing parameter: {}", p)),
+        // CountStar and Agg are resolved by the Aggregate operator, not here.
+        // If evaluate_expr is called on them outside of an aggregation context
+        // (e.g., in a sort key), return null rather than panic.
+        Expr::CountStar => Ok(serde_json::Value::Null),
+        Expr::Agg(_, inner) => evaluate_expr(graph, path, inner, params),
         Expr::Prop(var, prop) => {
             let binding = path
                 .get(var)
@@ -691,6 +983,9 @@ fn execute_set(
         where_clause: set.where_clause.clone(),
         return_clause: ReturnClause { items: vec![] },
         parts: Vec::new(),
+        order_by: None,
+        skip: None,
+        limit: None,
     };
     let logical = LogicalPlanner::plan(&synthetic_query)?;
     let physical = PhysicalPlanner::plan(&logical);
@@ -772,6 +1067,9 @@ fn execute_delete(
         where_clause: delete.where_clause.clone(),
         return_clause: ReturnClause { items: vec![] },
         parts: Vec::new(),
+        order_by: None,
+        skip: None,
+        limit: None,
     };
     let logical = LogicalPlanner::plan(&synthetic_query)?;
     let physical = PhysicalPlanner::plan(&logical);
@@ -814,4 +1112,177 @@ fn execute_delete(
             values: vec![serde_json::Value::Number(deleted_count.into())],
         }],
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use issundb_core::Graph;
+    use tempfile::TempDir;
+
+    fn setup_graph() -> (TempDir, Graph) {
+        let dir = TempDir::new().unwrap();
+        let graph = Graph::open(dir.path(), 1).unwrap();
+        (dir, graph)
+    }
+
+    fn insert_person(graph: &Graph, name: &str, age: i64, city: &str) -> issundb_core::NodeId {
+        let props = serde_json::json!({"name": name, "age": age, "city": city});
+        graph.add_node("Person", &props).unwrap()
+    }
+
+    // Helper: run a simple Cypher and return all records.
+    fn run(graph: &Graph, cypher: &str) -> Vec<Vec<serde_json::Value>> {
+        let params = HashMap::new();
+        execute(graph, cypher, &params)
+            .unwrap()
+            .records
+            .into_iter()
+            .map(|r| r.values)
+            .collect()
+    }
+
+    #[test]
+    fn order_by_age_asc() {
+        let (_dir, graph) = setup_graph();
+        insert_person(&graph, "Carol", 40, "NY");
+        insert_person(&graph, "Alice", 25, "NY");
+        insert_person(&graph, "Bob", 30, "LA");
+
+        let rows = run(
+            &graph,
+            "MATCH (n:Person) RETURN n.name AS name, n.age AS age ORDER BY n.age ASC",
+        );
+        let ages: Vec<i64> = rows.iter().map(|r| r[1].as_i64().unwrap()).collect();
+        assert_eq!(ages, vec![25, 30, 40]);
+    }
+
+    #[test]
+    fn order_by_name_desc() {
+        let (_dir, graph) = setup_graph();
+        insert_person(&graph, "Carol", 40, "NY");
+        insert_person(&graph, "Alice", 25, "NY");
+        insert_person(&graph, "Bob", 30, "LA");
+
+        let rows = run(
+            &graph,
+            "MATCH (n:Person) RETURN n.name AS name ORDER BY n.name DESC",
+        );
+        let names: Vec<&str> = rows.iter().map(|r| r[0].as_str().unwrap()).collect();
+        assert_eq!(names, vec!["Carol", "Bob", "Alice"]);
+    }
+
+    #[test]
+    fn limit_returns_at_most_n_rows() {
+        let (_dir, graph) = setup_graph();
+        for i in 0..10i64 {
+            graph
+                .add_node("Item", &serde_json::json!({"i": i}))
+                .unwrap();
+        }
+        let rows = run(&graph, "MATCH (n:Item) RETURN n.i AS i LIMIT 3");
+        assert_eq!(rows.len(), 3);
+    }
+
+    #[test]
+    fn skip_and_limit_pagination() {
+        let (_dir, graph) = setup_graph();
+        insert_person(&graph, "Alice", 25, "NY");
+        insert_person(&graph, "Bob", 30, "LA");
+        insert_person(&graph, "Carol", 40, "NY");
+        insert_person(&graph, "Dave", 35, "LA");
+        insert_person(&graph, "Eve", 28, "NY");
+
+        // ORDER BY age ASC, then SKIP 1 LIMIT 2 gives the 2nd and 3rd youngest: 28, 30.
+        let rows = run(
+            &graph,
+            "MATCH (n:Person) RETURN n.age AS age ORDER BY n.age ASC SKIP 1 LIMIT 2",
+        );
+        assert_eq!(rows.len(), 2);
+        let ages: Vec<i64> = rows.iter().map(|r| r[0].as_i64().unwrap()).collect();
+        assert_eq!(ages, vec![28, 30]);
+    }
+
+    #[test]
+    fn count_star_aggregation() {
+        let (_dir, graph) = setup_graph();
+        insert_person(&graph, "Alice", 25, "NY");
+        insert_person(&graph, "Bob", 30, "LA");
+        insert_person(&graph, "Carol", 40, "NY");
+
+        let rows = run(&graph, "MATCH (n:Person) RETURN count(*) AS c");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0].as_i64().unwrap(), 3);
+    }
+
+    #[test]
+    fn sum_aggregation() {
+        let (_dir, graph) = setup_graph();
+        insert_person(&graph, "Alice", 10, "X");
+        insert_person(&graph, "Bob", 20, "X");
+        insert_person(&graph, "Carol", 30, "X");
+
+        let rows = run(&graph, "MATCH (n:Person) RETURN sum(n.age) AS total");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0].as_f64().unwrap(), 60.0);
+    }
+
+    #[test]
+    fn avg_aggregation() {
+        let (_dir, graph) = setup_graph();
+        insert_person(&graph, "Alice", 10, "X");
+        insert_person(&graph, "Bob", 30, "X");
+
+        let rows = run(&graph, "MATCH (n:Person) RETURN avg(n.age) AS a");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0].as_f64().unwrap(), 20.0);
+    }
+
+    #[test]
+    fn min_max_aggregation() {
+        let (_dir, graph) = setup_graph();
+        insert_person(&graph, "Alice", 10, "X");
+        insert_person(&graph, "Bob", 30, "X");
+        insert_person(&graph, "Carol", 20, "X");
+
+        let rows = run(
+            &graph,
+            "MATCH (n:Person) RETURN min(n.age) AS lo, max(n.age) AS hi",
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0].as_f64().unwrap(), 10.0);
+        assert_eq!(rows[0][1].as_f64().unwrap(), 30.0);
+    }
+
+    #[test]
+    fn collect_aggregation() {
+        let (_dir, graph) = setup_graph();
+        insert_person(&graph, "Alice", 25, "NY");
+        insert_person(&graph, "Bob", 30, "NY");
+
+        let rows = run(&graph, "MATCH (n:Person) RETURN collect(n.name) AS names");
+        assert_eq!(rows.len(), 1);
+        let arr = rows[0][0].as_array().unwrap();
+        let mut names: Vec<&str> = arr.iter().map(|v| v.as_str().unwrap()).collect();
+        names.sort_unstable();
+        assert_eq!(names, vec!["Alice", "Bob"]);
+    }
+
+    #[test]
+    fn group_by_city_count() {
+        let (_dir, graph) = setup_graph();
+        insert_person(&graph, "Alice", 25, "NY");
+        insert_person(&graph, "Bob", 30, "LA");
+        insert_person(&graph, "Carol", 40, "NY");
+
+        let rows = run(
+            &graph,
+            "MATCH (n:Person) RETURN n.city AS city, count(*) AS c ORDER BY n.city ASC",
+        );
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0].as_str().unwrap(), "LA");
+        assert_eq!(rows[0][1].as_i64().unwrap(), 1);
+        assert_eq!(rows[1][0].as_str().unwrap(), "NY");
+        assert_eq!(rows[1][1].as_i64().unwrap(), 2);
+    }
 }

@@ -200,3 +200,77 @@ fn ids_continue_from_last_value_after_reopen() {
     let next_node = g2.add_node("N", &json!({})).unwrap();
     assert!(next_node > last_node);
 }
+
+#[test]
+fn test_cypher_index_scan_integration() {
+    use issundb::GraphQueryExt;
+
+    let (_dir, g) = open_tmp();
+
+    // 1. Create nodes
+    g.add_node("Person", &json!({"name": "Alice", "age": 30}))
+        .unwrap();
+    g.add_node("Person", &json!({"name": "Bob", "age": 25}))
+        .unwrap();
+    g.add_node("Person", &json!({"name": "Charlie", "age": 30}))
+        .unwrap();
+
+    // 2. Create index on Person(age)
+    g.create_node_property_index("Person", "age").unwrap();
+
+    // 3. Rebuild CSR
+    g.rebuild_csr().unwrap();
+
+    // 4. Run Cypher query filtering on age
+    let q = "MATCH (p:Person) WHERE p.age = 30 RETURN p.name AS name";
+    let res = g.query(q).unwrap();
+
+    // 5. Assert result
+    assert_eq!(res.columns, vec!["name".to_string()]);
+    let mut names: Vec<String> = res
+        .records
+        .into_iter()
+        .map(|r| r.values[0].as_str().unwrap().to_string())
+        .collect();
+    names.sort_unstable();
+    assert_eq!(names, vec!["Alice".to_string(), "Charlie".to_string()]);
+}
+
+#[test]
+fn test_facade_full_text_search_integration() {
+    use issundb::{TextGraphExt, TextSearchOptions};
+
+    let (_dir, g) = open_tmp();
+
+    // Create a node property text index
+    g.create_node_text_index("Movie", "synopsis").unwrap();
+
+    // Insert some nodes
+    let m1 = g
+        .add_node(
+            "Movie",
+            &json!({
+                "title": "Inception",
+                "synopsis": "A dream thief thief enters the dreams of targets to steal secrets"
+            }),
+        )
+        .unwrap();
+    let m2 = g.add_node("Movie", &json!({
+        "title": "Interstellar",
+        "synopsis": "An astronaut astronaut traverses a wormhole in search of a new home in space"
+    })).unwrap();
+
+    // Perform full-text search via the facade
+    let opts = TextSearchOptions {
+        label: Some("Movie".to_string()),
+        property: Some("synopsis".to_string()),
+        limit: 10,
+    };
+    let hits = g.text_search("astronaut space", &opts).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].node, m2);
+
+    let hits_thief = g.text_search("thief", &opts).unwrap();
+    assert_eq!(hits_thief.len(), 1);
+    assert_eq!(hits_thief[0].node, m1);
+}

@@ -5,6 +5,42 @@ pub type NodeId = u64;
 pub type EdgeId = u64;
 pub type LabelId = u32;
 pub type TypeId = u32;
+pub type PropKeyId = u32;
+
+/// Supported languages for Full-Text Search indexing and stemming.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum Language {
+    English = 1,
+    Spanish = 2,
+    French = 3,
+    German = 4,
+    Italian = 5,
+    Portuguese = 6,
+}
+
+impl Default for Language {
+    fn default() -> Self {
+        Self::English
+    }
+}
+
+impl Language {
+    pub fn from_u8(val: u8) -> Self {
+        match val {
+            2 => Self::Spanish,
+            3 => Self::French,
+            4 => Self::German,
+            5 => Self::Italian,
+            6 => Self::Portuguese,
+            _ => Self::English,
+        }
+    }
+
+    pub fn to_u8(self) -> u8 {
+        self as u8
+    }
+}
 
 /// One adjacency entry stored as a raw LMDB duplicate value.
 ///

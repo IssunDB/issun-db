@@ -25,6 +25,7 @@ pub struct CsrSnapshot {
     pub col_idx: Vec<u32>,
     pub edge_type: Vec<TypeId>,
     pub edge_id: Vec<EdgeId>,
+    pub edge_weight: Vec<f64>,
     pub dense_to_id: Vec<NodeId>,
     pub id_to_dense: AHashMap<NodeId, u32>,
 }
@@ -36,6 +37,7 @@ impl CsrSnapshot {
             col_idx: vec![],
             edge_type: vec![],
             edge_id: vec![],
+            edge_weight: vec![],
             dense_to_id: vec![],
             id_to_dense: AHashMap::new(),
         }
@@ -61,14 +63,24 @@ impl CsrSnapshot {
             .collect();
 
         // Bucket outgoing adjacency by dense source ID.
-        let mut adj: Vec<Vec<(u32, TypeId, EdgeId)>> = vec![vec![]; n];
+        let mut adj: Vec<Vec<(u32, TypeId, EdgeId, f64)>> = vec![vec![]; n];
         for result in storage.edges.iter(&rtxn)? {
             let (edge_id, bytes) = result?;
             let rec: EdgeRecord = props::decode(bytes)?;
             if let (Some(&src_d), Some(&dst_d)) =
                 (id_to_dense.get(&rec.src), id_to_dense.get(&rec.dst))
             {
-                adj[src_d as usize].push((dst_d, rec.edge_type, edge_id));
+                let weight: f64 = {
+                    let val: serde_json::Value =
+                        props::decode(&rec.props).unwrap_or(serde_json::Value::Null);
+                    val.get("weight")
+                        .or_else(|| val.get("cost"))
+                        .or_else(|| val.get("capacity"))
+                        .or_else(|| val.get("cap"))
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(1.0)
+                };
+                adj[src_d as usize].push((dst_d, rec.edge_type, edge_id, weight));
             }
         }
 
@@ -81,12 +93,14 @@ impl CsrSnapshot {
         let mut col_idx = vec![0u32; total];
         let mut edge_type = vec![0u32; total];
         let mut edge_id_arr = vec![0u64; total];
+        let mut edge_weight_arr = vec![0.0f64; total];
         for (i, neighbors) in adj.iter().enumerate() {
             let base = row_ptr[i];
-            for (j, &(dst_d, etype, eid)) in neighbors.iter().enumerate() {
+            for (j, &(dst_d, etype, eid, weight)) in neighbors.iter().enumerate() {
                 col_idx[base + j] = dst_d;
                 edge_type[base + j] = etype;
                 edge_id_arr[base + j] = eid;
+                edge_weight_arr[base + j] = weight;
             }
         }
 
@@ -95,6 +109,7 @@ impl CsrSnapshot {
             col_idx,
             edge_type,
             edge_id: edge_id_arr,
+            edge_weight: edge_weight_arr,
             dense_to_id,
             id_to_dense,
         })
@@ -141,8 +156,15 @@ impl CsrCache {
     /// rebuild threshold and no rebuild is already running; the caller must
     /// then perform the rebuild.
     pub fn mark_dirty(&self) -> bool {
-        let prev = self.dirty.fetch_add(1, Ordering::Relaxed);
-        prev + 1 >= REBUILD_THRESHOLD && !self.rebuilding.swap(true, Ordering::AcqRel)
+        self.mark_dirty_n(1)
+    }
+
+    /// Increment the dirty counter by `count`. Returns `true` if this call crosses
+    /// the rebuild threshold and no rebuild is already running; the caller must
+    /// then perform the rebuild.
+    pub fn mark_dirty_n(&self, count: u64) -> bool {
+        let prev = self.dirty.fetch_add(count, Ordering::Relaxed);
+        prev + count >= REBUILD_THRESHOLD && !self.rebuilding.swap(true, Ordering::AcqRel)
     }
 
     /// Install a freshly-built snapshot and reset the dirty counter and flag.

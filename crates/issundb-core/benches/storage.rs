@@ -128,12 +128,6 @@ fn bench_bfs(c: &mut Criterion) {
             g.rebuild_csr().unwrap(); // populate snapshot
             b.iter(|| g.bfs(start, HOPS).unwrap());
         });
-
-        group.bench_with_input(BenchmarkId::new("lmdb", n), &n, |b, _| {
-            let (_dir, g, start) = setup();
-            // No rebuild: snapshot is empty (open built it before any inserts).
-            b.iter(|| g.bfs_lmdb(start, HOPS).unwrap());
-        });
     }
 
     group.finish();

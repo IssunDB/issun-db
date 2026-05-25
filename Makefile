@@ -27,6 +27,11 @@ test: format ## Run the tests
 	@echo "Running tests..."
 	@DEBUG_PROJ=$(DEBUG_PROJ) RUST_BACKTRACE=$(RUST_BACKTRACE) cargo test --all-targets --workspace -- --nocapture
 
+.PHONY: test-conformance
+test-conformance: format ## Run the openCypher TCK conformance integration tests
+	@echo "Running openCypher TCK conformance integration tests..."
+	@DEBUG_PROJ=$(DEBUG_PROJ) RUST_BACKTRACE=$(RUST_BACKTRACE) ISSUNDB_CONFORMANCE=1 cargo test --test conformance -- --nocapture
+
 .PHONY: coverage
 coverage: format ## Generate test coverage report
 	@echo "Generating test coverage report..."

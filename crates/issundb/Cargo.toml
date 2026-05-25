@@ -17,7 +17,6 @@ serde_json = "1"
 
 [features]
 default = []
-graphblas = ["issundb-core/graphblas", "issundb-retrieval/graphblas"]
 
 [dev-dependencies]
 tempfile.workspace = true

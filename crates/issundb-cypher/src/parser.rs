@@ -36,18 +36,69 @@ fn parse_read_query(cypher: &str) -> Result<Query, String> {
         return Err("missing query clauses".into());
     }
 
-    // The query must end with a RETURN clause.
-    let (last_kw, last_idx) = &boundaries[boundaries.len() - 1];
-    if last_kw != "RETURN" {
-        return Err("Cypher read query must end with a RETURN clause".into());
+    // Find the RETURN clause (required) and optional ORDER BY / SKIP / LIMIT after it.
+    let return_idx = boundaries
+        .iter()
+        .position(|(kw, _)| kw == "RETURN")
+        .ok_or("Cypher read query must end with a RETURN clause")?;
+
+    let (_, return_start) = &boundaries[return_idx];
+
+    // Content between RETURN and the next recognised clause (ORDER BY / SKIP / LIMIT)
+    // or end-of-string.
+    let after_return_clauses = &boundaries[return_idx + 1..];
+
+    // Determine where RETURN content ends.
+    let return_content_end = after_return_clauses
+        .first()
+        .map(|(_, pos)| *pos)
+        .unwrap_or(cypher.len());
+
+    let return_content = cypher[*return_start + "RETURN".len()..return_content_end].trim();
+    let return_clause = parse_return_clause(return_content)?;
+
+    // Parse ORDER BY, SKIP, LIMIT from the trailing boundary clauses.
+    let mut order_by: Option<OrderBy> = None;
+    let mut skip_expr: Option<Expr> = None;
+    let mut limit_expr: Option<Expr> = None;
+
+    for i in 0..after_return_clauses.len() {
+        let (kw, start) = &after_return_clauses[i];
+        let end = after_return_clauses
+            .get(i + 1)
+            .map(|(_, p)| *p)
+            .unwrap_or(cypher.len());
+        let content = cypher[*start + kw.len()..end].trim();
+
+        match kw.as_str() {
+            "ORDER BY" => {
+                order_by = Some(parse_order_by(content)?);
+            }
+            "SKIP" => {
+                skip_expr = Some(parse_expr(content)?);
+            }
+            "LIMIT" => {
+                limit_expr = Some(parse_expr(content)?);
+            }
+            other => {
+                return Err(format!(
+                    "unexpected trailing clause after RETURN: {}",
+                    other
+                ));
+            }
+        }
     }
 
+    // Parse all intermediate clauses before RETURN.
+    let pre_return_boundaries = &boundaries[..return_idx];
     let mut parts = Vec::new();
 
-    // Iterate through all intermediate clauses before RETURN
-    for i in 0..boundaries.len() - 1 {
-        let (kw, start) = &boundaries[i];
-        let end = boundaries[i + 1].1;
+    for i in 0..pre_return_boundaries.len() {
+        let (kw, start) = &pre_return_boundaries[i];
+        let end = pre_return_boundaries
+            .get(i + 1)
+            .map(|(_, p)| *p)
+            .unwrap_or(*return_start);
         let content = cypher[*start + kw.len()..end].trim();
 
         match kw.as_str() {
@@ -84,10 +135,6 @@ fn parse_read_query(cypher: &str) -> Result<Query, String> {
         }
     }
 
-    // Parse the final RETURN clause
-    let return_content = cypher[*last_idx + "RETURN".len()..].trim();
-    let return_clause = parse_return_clause(return_content)?;
-
     // For backwards compatibility:
     let mut match_clauses = Vec::new();
     let mut where_clause = None;
@@ -108,7 +155,28 @@ fn parse_read_query(cypher: &str) -> Result<Query, String> {
         where_clause,
         return_clause,
         parts,
+        order_by,
+        skip: skip_expr,
+        limit: limit_expr,
     })
+}
+
+fn parse_order_by(s: &str) -> Result<OrderBy, String> {
+    let mut items = Vec::new();
+    for part in s.split(',') {
+        let part = part.trim();
+        let upper = part.to_ascii_uppercase();
+        let (expr_str, ascending) = if upper.ends_with(" DESC") {
+            (&part[..part.len() - " DESC".len()], false)
+        } else if upper.ends_with(" ASC") {
+            (&part[..part.len() - " ASC".len()], true)
+        } else {
+            (part, true)
+        };
+        let expr = parse_expr(expr_str.trim())?;
+        items.push(SortItem { expr, ascending });
+    }
+    Ok(OrderBy { items })
 }
 
 fn split_optional_where(content: &str) -> (&str, Option<&str>) {
@@ -196,6 +264,9 @@ fn find_clause_boundaries(cypher: &str) -> Result<Vec<(String, usize)>, String> 
     // Returns a list of (keyword, byte_offset) pairs.  Previously returned char
     // indices, which caused panics when callers used them as byte offsets on
     // input that contains non-ASCII characters before a clause keyword.
+    //
+    // ORDER BY is a two-word keyword; it is matched by scanning for "ORDER"
+    // and checking that the next non-space token is "BY".
     let mut clauses = Vec::new();
     let cypher_byte_len = cypher.len();
 
@@ -235,8 +306,9 @@ fn find_clause_boundaries(cypher: &str) -> Result<Vec<(String, usize)>, String> 
             }
 
             if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 {
+                // Try each single-word keyword first, then ORDER BY.
                 let mut matched_kw: Option<&str> = None;
-                for kw in &["MATCH", "WITH", "UNWIND", "RETURN"] {
+                for kw in &["MATCH", "WITH", "UNWIND", "RETURN", "SKIP", "LIMIT"] {
                     let kw_byte_len = kw.len(); // keywords are ASCII; byte len == char len
                     let end_byte = byte_pos + kw_byte_len;
                     if end_byte <= cypher_byte_len {
@@ -253,6 +325,57 @@ fn find_clause_boundaries(cypher: &str) -> Result<Vec<(String, usize)>, String> 
                                 if is_start && is_end {
                                     matched_kw = Some(kw);
                                     break;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Check for two-word "ORDER BY".
+                if matched_kw.is_none() {
+                    let order_len = "ORDER".len();
+                    if let Some(candidate) = cypher.get(byte_pos..byte_pos + order_len) {
+                        if candidate.eq_ignore_ascii_case("ORDER") {
+                            let is_start = ci == 0
+                                || char_positions[ci - 1].1.is_ascii_whitespace()
+                                || char_positions[ci - 1].1 == ';';
+                            let after_order_ci = ci + order_len;
+                            let is_end_order = after_order_ci >= n
+                                || char_positions[after_order_ci].1.is_ascii_whitespace();
+                            if is_start && is_end_order {
+                                // Scan forward for "BY".
+                                let mut scan_ci = after_order_ci;
+                                while scan_ci < n && char_positions[scan_ci].1.is_ascii_whitespace()
+                                {
+                                    scan_ci += 1;
+                                }
+                                if scan_ci < n {
+                                    let (by_byte, _) = char_positions[scan_ci];
+                                    let by_end = by_byte + "BY".len();
+                                    if by_end <= cypher_byte_len {
+                                        if let Some(by_cand) = cypher.get(by_byte..by_end) {
+                                            if by_cand.eq_ignore_ascii_case("BY") {
+                                                let after_by_ci = scan_ci + "BY".len();
+                                                let is_end_by = after_by_ci >= n
+                                                    || char_positions[after_by_ci]
+                                                        .1
+                                                        .is_ascii_whitespace();
+                                                if is_end_by {
+                                                    // Keyword spans from byte_pos to end of "BY".
+                                                    let kw_end_byte = by_end;
+                                                    clauses
+                                                        .push(("ORDER BY".to_string(), byte_pos));
+                                                    // kw_end_byte is a byte offset; advance ci
+                                                    // to the char index just past the keyword.
+                                                    let skip_chars = cypher[byte_pos..kw_end_byte]
+                                                        .chars()
+                                                        .count();
+                                                    ci += skip_chars;
+                                                    continue;
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -374,7 +497,7 @@ fn parse_delete_statement(cypher: &str) -> Result<Statement, String> {
 
 fn parse_match_clauses(s: &str) -> Result<Vec<MatchClause>, String> {
     let mut clauses = Vec::new();
-    for part in s.split(',') {
+    for part in split_by_comma_outside_braces(s) {
         let pattern = parse_pattern(part.trim())?;
         clauses.push(MatchClause { pattern });
     }
@@ -467,13 +590,23 @@ fn parse_relationship_pattern(s: &str) -> Result<(RelationshipPattern, usize), S
         return Err("invalid relationship syntax suffix".into());
     }
 
-    let (left_part, range_part) = if let Some(star_idx) = content.find('*') {
+    // Parse properties map if present in relationship bracket
+    let prop_start = content.find('{');
+    let (content_body, properties) = if let Some(idx) = prop_start {
+        let prop_str = &content[idx..];
+        let props = parse_properties_map(prop_str)?;
+        (&content[..idx].trim(), Some(props))
+    } else {
+        (&content, None)
+    };
+
+    let (left_part, range_part) = if let Some(star_idx) = content_body.find('*') {
         (
-            content[..star_idx].trim(),
-            Some(content[star_idx + 1..].trim()),
+            content_body[..star_idx].trim(),
+            Some(content_body[star_idx + 1..].trim()),
         )
     } else {
-        (content, None)
+        (*content_body, None)
     };
 
     let parts: Vec<&str> = left_part.split(':').collect();
@@ -542,6 +675,7 @@ fn parse_relationship_pattern(s: &str) -> Result<(RelationshipPattern, usize), S
             rel_type,
             is_incoming,
             range,
+            properties,
         },
         consumed,
     ))
@@ -556,7 +690,7 @@ fn parse_properties_map(s: &str) -> Result<HashMap<String, Literal>, String> {
     if inner.is_empty() {
         return Ok(map);
     }
-    for item in inner.split(',') {
+    for item in split_by_comma_outside_braces(inner) {
         let parts: Vec<&str> = item.split(':').collect();
         if parts.len() != 2 {
             return Err("properties map contains invalid key-value pair".into());
@@ -608,8 +742,15 @@ fn parse_where_clause(s: &str) -> Result<WhereClause, String> {
     }
 }
 
-fn parse_expr(s: &str) -> Result<Expr, String> {
+/// Parse a Cypher expression, including aggregate function calls.
+pub(crate) fn parse_expr(s: &str) -> Result<Expr, String> {
     let trimmed = s.trim();
+
+    // Aggregate function calls: count(*), count(expr), sum(x), avg(x), min(x), max(x), collect(x)
+    if let Some(expr) = try_parse_agg(trimmed)? {
+        return Ok(expr);
+    }
+
     if let Some(rest) = trimmed.strip_prefix('$') {
         Ok(Expr::Param(rest.to_string()))
     } else if let Ok(lit) = parse_literal(trimmed) {
@@ -635,6 +776,56 @@ fn parse_expr(s: &str) -> Result<Expr, String> {
     } else {
         Err(format!("invalid expression: {}", trimmed))
     }
+}
+
+/// Attempt to parse an aggregate function call expression. Returns `Ok(None)` if the
+/// input does not look like an aggregate call.
+fn try_parse_agg(s: &str) -> Result<Option<Expr>, String> {
+    // count(*) special case.
+    if s.eq_ignore_ascii_case("count(*)") {
+        return Ok(Some(Expr::CountStar));
+    }
+
+    // Generic `fn_name(inner)` or `fn_name(DISTINCT inner)`.
+    let paren_open = match s.find('(') {
+        Some(i) => i,
+        None => return Ok(None),
+    };
+    if !s.ends_with(')') {
+        return Ok(None);
+    }
+
+    let fn_name = s[..paren_open].trim();
+    let inner_raw = s[paren_open + 1..s.len() - 1].trim();
+
+    let agg_fn = match fn_name.to_ascii_uppercase().as_str() {
+        "COUNT" => AggFn::Count { distinct: false },
+        "SUM" => AggFn::Sum,
+        "AVG" => AggFn::Avg,
+        "MIN" => AggFn::Min,
+        "MAX" => AggFn::Max,
+        "COLLECT" => AggFn::Collect,
+        _ => return Ok(None),
+    };
+
+    // Handle COUNT(DISTINCT expr).
+    let (agg_fn, inner_str) =
+        if matches!(agg_fn, AggFn::Count { .. }) && inner_raw.len() > "DISTINCT ".len() {
+            let upper_inner = inner_raw.to_ascii_uppercase();
+            if upper_inner.starts_with("DISTINCT ") {
+                (
+                    AggFn::Count { distinct: true },
+                    inner_raw["DISTINCT ".len()..].trim(),
+                )
+            } else {
+                (agg_fn, inner_raw)
+            }
+        } else {
+            (agg_fn, inner_raw)
+        };
+
+    let inner_expr = parse_expr(inner_str)?;
+    Ok(Some(Expr::Agg(agg_fn, Box::new(inner_expr))))
 }
 
 fn parse_literal(s: &str) -> Result<Literal, String> {
@@ -720,7 +911,7 @@ fn parse_literal(s: &str) -> Result<Literal, String> {
 
 fn parse_return_items(s: &str) -> Result<Vec<ReturnItem>, String> {
     let mut items = Vec::new();
-    for part in s.split(',') {
+    for part in split_by_comma_outside_braces(s) {
         let trimmed = part.trim();
         let upper = trimmed.to_ascii_uppercase();
         let alias_part = upper.find(" AS ");
@@ -742,4 +933,61 @@ fn parse_return_items(s: &str) -> Result<Vec<ReturnItem>, String> {
 fn parse_return_clause(s: &str) -> Result<ReturnClause, String> {
     let items = parse_return_items(s)?;
     Ok(ReturnClause { items })
+}
+
+fn split_by_comma_outside_braces(s: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut paren_count = 0;
+    let mut bracket_count = 0;
+    let mut brace_count = 0;
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let chars: Vec<char> = s.chars().collect();
+    let n = chars.len();
+
+    let mut i = 0;
+    while i < n {
+        let c = chars[i];
+        if c == '\'' && !in_double_quote {
+            in_single_quote = !in_single_quote;
+        } else if c == '"' && !in_single_quote {
+            in_double_quote = !in_double_quote;
+        } else if !in_single_quote && !in_double_quote {
+            match c {
+                '(' => paren_count += 1,
+                ')' => {
+                    if paren_count > 0 {
+                        paren_count -= 1;
+                    }
+                }
+                '[' => bracket_count += 1,
+                ']' => {
+                    if bracket_count > 0 {
+                        bracket_count -= 1;
+                    }
+                }
+                '{' => brace_count += 1,
+                '}' => {
+                    if brace_count > 0 {
+                        brace_count -= 1;
+                    }
+                }
+                ',' => {
+                    if paren_count == 0 && bracket_count == 0 && brace_count == 0 {
+                        let part_str: String = chars[start..i].iter().collect();
+                        parts.push(part_str);
+                        start = i + 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    if start <= n {
+        let part_str: String = chars[start..].iter().collect();
+        parts.push(part_str);
+    }
+    parts
 }

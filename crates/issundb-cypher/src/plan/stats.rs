@@ -8,6 +8,11 @@ pub trait StatsProvider {
 
     /// Get the count of edges matching a string type.
     fn edge_count_by_type(&self, etype: &str) -> Option<u64>;
+
+    /// Check if a node property index exists.
+    fn has_node_property_index(&self, _label: &str, _property: &str) -> bool {
+        false
+    }
 }
 
 impl StatsProvider for Graph {
@@ -17,5 +22,10 @@ impl StatsProvider for Graph {
 
     fn edge_count_by_type(&self, etype: &str) -> Option<u64> {
         self.edge_count_by_type(etype).ok()
+    }
+
+    fn has_node_property_index(&self, label: &str, property: &str) -> bool {
+        self.has_node_property_index(label, property)
+            .unwrap_or(false)
     }
 }

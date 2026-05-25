@@ -1,4 +1,4 @@
-use crate::ast::Expr;
+use crate::ast::{AggFn, Expr, SortItem};
 use crate::plan::logical::{FilterExpr, LogicalOperator};
 
 /// A physical representation of a query execution operator.
@@ -16,6 +16,13 @@ pub enum PhysicalOperator {
     LabelScan {
         variable: String,
         label: Option<String>,
+    },
+    /// Scan nodes using a property index: binds `variable` to nodes matching `label` and `property` value.
+    NodeIndexScan {
+        variable: String,
+        label: String,
+        property: String,
+        value: Expr,
     },
     /// Expand relationships: starts from `src_var`, traverses relationship `rel_type`
     /// in direction `is_incoming` up to range bounds, and binds relationship to `rel_var`
@@ -45,6 +52,23 @@ pub enum PhysicalOperator {
     HashJoin {
         left: Box<PhysicalOperator>,
         right: Box<PhysicalOperator>,
+    },
+    /// Aggregate rows, grouping by non-aggregate keys and computing aggregate functions.
+    Aggregate {
+        input: Box<PhysicalOperator>,
+        group_by: Vec<(Expr, Option<String>)>,
+        aggregations: Vec<(AggFn, Expr, String)>,
+    },
+    /// Sort rows by one or more sort keys.
+    Sort {
+        input: Box<PhysicalOperator>,
+        items: Vec<SortItem>,
+    },
+    /// Skip and limit the row stream.
+    Limit {
+        input: Box<PhysicalOperator>,
+        skip: usize,
+        count: usize,
     },
 }
 
@@ -104,6 +128,24 @@ impl PhysicalPlanner {
             LogicalOperator::Join { left, right } => PhysicalOperator::HashJoin {
                 left: Box::new(Self::plan(left)),
                 right: Box::new(Self::plan(right)),
+            },
+            LogicalOperator::Aggregate {
+                input,
+                group_by,
+                aggregations,
+            } => PhysicalOperator::Aggregate {
+                input: Box::new(Self::plan(input)),
+                group_by: group_by.clone(),
+                aggregations: aggregations.clone(),
+            },
+            LogicalOperator::Sort { input, items } => PhysicalOperator::Sort {
+                input: Box::new(Self::plan(input)),
+                items: items.clone(),
+            },
+            LogicalOperator::Limit { input, skip, count } => PhysicalOperator::Limit {
+                input: Box::new(Self::plan(input)),
+                skip: *skip,
+                count: *count,
             },
         }
     }

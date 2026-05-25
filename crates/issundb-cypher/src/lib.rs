@@ -52,6 +52,24 @@ mod tests {
     }
 
     #[test]
+    fn parse_relationship_pattern_with_properties() {
+        let q = parser::parse(
+            "MATCH (a:Person)-[r:KNOWS {since: 2026, score: 0.95}]->(b:Person) RETURN r",
+        )
+        .unwrap();
+        if let ast::Statement::Query(query) = q {
+            let rel = &query.match_clauses[0].pattern.rels[0].0;
+            assert_eq!(rel.variable.as_deref(), Some("r"));
+            assert_eq!(rel.rel_type.as_deref(), Some("KNOWS"));
+            let props = rel.properties.as_ref().unwrap();
+            assert_eq!(props.get("since").unwrap(), &ast::Literal::Int(2026));
+            assert_eq!(props.get("score").unwrap(), &ast::Literal::Float(0.95));
+        } else {
+            panic!("expected read query statement");
+        }
+    }
+
+    #[test]
     fn parse_create_statement() {
         let c = parser::parse("CREATE (a:Person {name: \"Alice\", age: 30})").unwrap();
         if let ast::Statement::Create(create) = c {
@@ -116,6 +134,32 @@ mod tests {
         assert_eq!(res.records.len(), 1);
         assert_eq!(res.records[0].values[0], json!("Bob"));
         assert_eq!(res.records[0].values[1], json!(25));
+    }
+
+    #[test]
+    fn execute_match_relationship_with_properties() {
+        let (_dir, g) = open_tmp();
+        let alice = g.add_node("Person", &json!({ "name": "Alice" })).unwrap();
+        let bob = g.add_node("Person", &json!({ "name": "Bob" })).unwrap();
+        let charlie = g.add_node("Person", &json!({ "name": "Charlie" })).unwrap();
+        g.add_edge(alice, bob, "KNOWS", &json!({ "since": 2020 }))
+            .unwrap();
+        g.add_edge(alice, charlie, "KNOWS", &json!({ "since": 2026 }))
+            .unwrap();
+
+        g.rebuild_csr().unwrap();
+
+        let params = HashMap::new();
+        let res = execute(
+            &g,
+            "MATCH (a:Person)-[r:KNOWS {since: 2026}]->(b:Person) RETURN b.name AS name",
+            &params,
+        )
+        .unwrap();
+
+        assert_eq!(res.columns, vec!["name"]);
+        assert_eq!(res.records.len(), 1);
+        assert_eq!(res.records[0].values[0], json!("Charlie"));
     }
 
     #[test]

@@ -26,7 +26,7 @@ Priorities, in order:
 - Keep Python and Node.js binding code in `issundb-py` and `issundb-node` respectively; do not leak `pyo3` or `napi` types into `issundb-core` or
   `issundb`.
 - Add comments only when they clarify a non-obvious storage invariant, an LMDB lifetime constraint, or a GraphBLAS semiring choice.
-- Format with `rustfmt` (`cargo fmt`) and lint with Clippy (`cargo clippy -- -D warnings`) before declaring a change done.
+- Format with `rustfmt` (`make format`) and lint with Clippy (`make lint`) before declaring a change done.
 
 Quick examples:
 
@@ -56,7 +56,7 @@ Do not invent modules that do not yet exist when answering questions, but do pla
     - `src/storage/props.rs`: msgpack encode and decode helpers via `rmp-serde`.
     - `src/graph.rs`: `Graph`; all node, edge, and adjacency CRUD lives here.
     - `src/csr.rs`: in-memory CSR snapshot, rebuilt in the background and swapped via `arc-swap`.
-    - `src/matrices.rs`: optional GraphBLAS matrix materialization from the CSR snapshot behind the `graphblas` feature.
+    - `src/matrices.rs`: GraphBLAS matrix materialization from the CSR snapshot.
     - `src/error.rs`: `Error` enum; all storage and serialization errors unify here.
 - `crates/issundb-cypher/`: Cypher parser, AST, logical planner, physical planner, optimizer, and executor.
     - `src/parser.rs`: hand-written recursive-descent parser for the MATCH, WHERE, RETURN, CREATE, SET, and DELETE subset.
@@ -66,7 +66,6 @@ Do not invent modules that do not yet exist when answering questions, but do pla
 - `crates/issundb-vector/`: vector index abstraction, vector metadata, vector storage integration, and vector search APIs.
 - `crates/issundb-text/`: tokenization, full-text index storage, text search APIs, and ranking. Current API returns an explicit not-implemented error until index storage lands.
 - `crates/issundb-retrieval/`: hybrid retrieval over graph traversal, vector hits, text hits, property filters, score fusion, and subgraph materialization.
-- `crates/issundb-rag/` *(transitional)*: compatibility shim that re-exports `issundb-retrieval`. Do not add new public APIs under this transitional crate name.
 - `crates/issundb/`: public facade. Re-exports the deliberate public surface from `issundb-core`, `issundb-vector`, `issundb-text`,
   `issundb-retrieval`, and `issundb-cypher`. Do not re-export internal storage types like `Storage`.
 - `crates/issundb-py/` *(phase 13)*: `pyo3` Python bindings. Distributed as a wheel via `maturin`.
@@ -84,7 +83,7 @@ Do not invent modules that do not yet exist when answering questions, but do pla
   `tempfile::TempDir` and must not share state with other tests.
 - Integration tests that exercise multiple crates belong in `tests/` at the workspace root or in `crates/issundb/tests/`.
 - Cypher conformance tests belong in `crates/issundb/tests/conformance/` and are gated on the `ISSUNDB_CONFORMANCE=1` environment variable so the default
-  `cargo test` stays fast.
+  `make test` stays fast (run them via `make test-conformance`).
 - Property-based tests (via `proptest`) belong alongside the unit tests for the module whose invariants they exercise.
 - Do not reach into `issundb-core` internals from integration tests; drive behavior through the `issundb` public facade or the `Graph` API.
 - If you move code across modules, move or rewrite the unit tests with it.
@@ -96,11 +95,11 @@ Do not invent modules that do not yet exist when answering questions, but do pla
   one entry in O(log n); there is no read-modify-write of a blob.
 - Secondary indexes (`label_idx`, `type_idx`) use 12-byte composite keys `(u32 BE, u64 BE)` stored in plain LMDB databases with `Unit` values.
   Prefix-range scans via `prefix_iter` enumerate all nodes or edges for a given label or type in ascending ID order.
-- The CSR snapshot is the hot read path for outgoing traversal. GraphBLAS is optional behind the `graphblas` feature and operates on the CSR snapshot for
-  pattern matching and multi-source expansion. Default builds use CSR, LMDB cursor, and set-intersection fallbacks.
+- The CSR snapshot is the hot read path for outgoing traversal. GraphBLAS operates on the CSR snapshot for all graph algorithms,
+  pattern matching, and multi-source expansion.
 - `Storage::open` is the only entry point for LMDB. Do not call `heed::EnvOpenOptions` from outside `crates/issundb-core/src/storage/lmdb.rs`.
-- Heavy dependencies are tracked in the workspace `Cargo.toml`. `usearch` and `chumsky` are active dependencies; GraphBLAS is optional behind the
-  `graphblas` feature.
+- Heavy dependencies are tracked in the workspace `Cargo.toml`. `usearch`, `chumsky`, and GraphBLAS (`graphblas-sparse-linear-algebra`) are active,
+  non-optional dependencies.
 - Async is not used in the core engine. LMDB and GraphBLAS are synchronous. `tokio` is an optional dependency for server mode only; do not add
   `.await` inside `issundb-core`.
 
@@ -138,7 +137,6 @@ All graph operations go through `Graph`; do not call `Storage` directly from out
 - `edges_by_type(etype: &str) -> Result<Vec<EdgeId>, Error>`
 - `rebuild_csr() -> Result<(), Error>`
 - `bfs(start: NodeId, hops: u8) -> Result<Vec<NodeId>, Error>`
-- `bfs_lmdb(start: NodeId, hops: u8) -> Result<Vec<NodeId>, Error>`
 - `shortest_path(src: NodeId, dst: NodeId) -> Result<Option<Vec<NodeId>>, Error>`
 - `page_rank(iterations: u32, damping: f32) -> Result<HashMap<NodeId, f32>, Error>`
 - `connected_components() -> Result<HashMap<NodeId, u64>, Error>`
@@ -176,10 +174,6 @@ retrieve functions are free functions, not methods on `Graph`, to preserve the c
 - `Subgraph`: `nodes: Vec<NodeId>`, `edges: Vec<EdgeId>`, `scores: HashMap<NodeId, f32>`
 - `RetrieveOptions`: `k`, `hops`, `max_distance`, `max_nodes`
 
-### `issundb_rag`
-
-Transitional compatibility crate. Re-exports `issundb-retrieval`; do not add new APIs here.
-
 ### `issundb_cypher`
 
 Cypher query execution. Exposed through the `issundb` facade via the `GraphQueryExt` trait; do not call `issundb_cypher::execute` directly from
@@ -189,8 +183,7 @@ outside `issundb`.
 - `QueryResult`: `columns: Vec<String>`, `records: Vec<Record>`
 - `Record`: `values: Vec<serde_json::Value>`
 
-The executor resolves patterns through the physical plan. Expansion and label filtering use GraphBLAS helpers when the `graphblas` feature is enabled, and
-fall back to LMDB adjacency and set intersection in default builds.
+The executor resolves patterns through the physical plan. Expansion and label filtering use GraphBLAS SpMV and element-wise matrix operators unconditionally.
 
 ### `issundb_core::Storage`
 
@@ -220,17 +213,17 @@ Before coding:
 Implementation using red-green TDD:
 
 1. A failing `#[test]` that describes the expected behavior (red). For invariants, prefer a `proptest` property.
-2. Verification that the test fails for the right reason: `cargo test -p issundb-core -- <test_name>`.
+2. Verification that the test fails for the right reason: running `make test` or `cargo test -p issundb-core -- <test_name>` (red).
 3. The smallest implementation that makes the test pass (green).
 4. Refactor while keeping tests green.
-5. Narrowest relevant test while iterating, then `cargo test --workspace` and `cargo clippy -- -D warnings` before declaring done.
-6. `cargo fmt --all` before every commit.
+5. Narrowest relevant test while iterating, then `make test` and `make lint` before declaring done.
+6. `make format` before every commit.
 7. Update of `README.md` or `docs/` if behavior or workflow changed.
 
 Additional validation when relevant:
 
-- `cargo bench -p issundb-core` for performance-sensitive storage changes.
-- `ISSUNDB_CONFORMANCE=1 cargo test` for Cypher conformance coverage.
+- `make bench` for performance-sensitive storage changes.
+- `make test-conformance` for Cypher conformance coverage.
 - `maturin develop` in a virtual environment for Python binding changes.
 - `napi build --release` for Node.js binding changes.
 

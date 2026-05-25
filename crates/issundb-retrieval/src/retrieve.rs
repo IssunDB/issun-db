@@ -58,72 +58,11 @@ pub fn retrieve(graph: &Graph, q: &[f32], k: usize, hops: u8) -> Result<Subgraph
 
 /// Full retrieve with configurable options.
 ///
-/// Algorithm:
-/// 1. `vector_search(q, k)` to seed hits.
-/// 2. Filter seeds by `max_distance`; record cosine distances in `scores`.
-/// 3. BFS from all seeds simultaneously up to `hops` hops, following
-///    out-edges; stop early if `max_nodes` is reached.
-/// 4. For every node in the expanded set, emit any out-edge whose destination
-///    is also in the set.
-pub fn retrieve_with(graph: &Graph, q: &[f32], opts: &RetrieveOptions) -> Result<Subgraph, Error> {
-    let hits = graph.vector_search(q, opts.k)?;
-
-    let mut scores: AHashMap<NodeId, f32> = AHashMap::new();
-    for hit in &hits {
-        if hit.distance <= opts.max_distance {
-            scores.insert(hit.node, hit.distance);
-        }
-    }
-
-    let mut node_set: AHashSet<NodeId> = scores.keys().copied().collect();
-    let mut frontier: Vec<NodeId> = node_set.iter().copied().collect();
-
-    let mut capped = false;
-    for _ in 0..opts.hops {
-        if capped || frontier.is_empty() {
-            break;
-        }
-        let mut next: Vec<NodeId> = Vec::new();
-        'outer: for &node in &frontier {
-            for (nb, _, _) in graph.out_neighbors(node)? {
-                if node_set.insert(nb) {
-                    next.push(nb);
-                    if opts.max_nodes.is_some_and(|max| node_set.len() >= max) {
-                        capped = true;
-                        break 'outer;
-                    }
-                }
-            }
-        }
-        frontier = next;
-    }
-
-    let mut edge_set: AHashSet<EdgeId> = AHashSet::new();
-    for &node in &node_set {
-        for (nb, eid, _) in graph.out_neighbors(node)? {
-            if node_set.contains(&nb) {
-                edge_set.insert(eid);
-            }
-        }
-    }
-
-    Ok(Subgraph {
-        nodes: node_set.into_iter().collect(),
-        edges: edge_set.into_iter().collect(),
-        scores: scores.into_iter().collect(),
-    })
-}
-
 /// GraphBLAS SpMV k-hop expansion for hybrid retrieval.
 ///
 /// Runs multi-source SpMV BFS from the filtered seed nodes up to `hops` hops.
 /// Stops early or caps the results if `max_nodes` is specified and exceeded.
-#[cfg(feature = "graphblas")]
-pub fn retrieve_graphblas(
-    graph: &Graph,
-    q: &[f32],
-    opts: &RetrieveOptions,
-) -> Result<Subgraph, Error> {
+pub fn retrieve_with(graph: &Graph, q: &[f32], opts: &RetrieveOptions) -> Result<Subgraph, Error> {
     let hits = graph.vector_search(q, opts.k)?;
 
     let mut scores: AHashMap<NodeId, f32> = AHashMap::new();
@@ -373,12 +312,11 @@ mod tests {
         assert!(sub2.scores.contains_key(&d));
     }
 
-    // --- retrieve_graphblas ---
+    // --- retrieve_with (GraphBLAS) ---
     //
     // Each test calls `rebuild_csr()` after graph mutations so the GraphBLAS
-    // adjacency matrix is current before retrieve_graphblas is invoked.
+    // adjacency matrix is current before retrieve_with is invoked.
 
-    #[cfg(feature = "graphblas")]
     #[test]
     fn graphblas_retrieve_k_hop_expansion() {
         let (_dir, g) = open_tmp();
@@ -388,7 +326,7 @@ mod tests {
         g.add_edge(a, b, "E", &json!({})).unwrap();
         g.rebuild_csr().unwrap();
 
-        let sub = retrieve_graphblas(
+        let sub = retrieve_with(
             &g,
             &[1.0f32, 0.0],
             &RetrieveOptions {
@@ -405,7 +343,6 @@ mod tests {
         assert!(sub.nodes.contains(&b));
     }
 
-    #[cfg(feature = "graphblas")]
     #[test]
     fn graphblas_retrieve_hops_zero_returns_only_seed() {
         let (_dir, g) = open_tmp();
@@ -415,7 +352,7 @@ mod tests {
         g.add_edge(a, b, "E", &json!({})).unwrap();
         g.rebuild_csr().unwrap();
 
-        let sub = retrieve_graphblas(
+        let sub = retrieve_with(
             &g,
             &[1.0f32, 0.0],
             &RetrieveOptions {
@@ -431,7 +368,6 @@ mod tests {
         assert!(sub.edges.is_empty(), "no edges when hops=0");
     }
 
-    #[cfg(feature = "graphblas")]
     #[test]
     fn graphblas_retrieve_scores_keys_are_subset_of_nodes() {
         let (_dir, g) = open_tmp();
@@ -443,7 +379,7 @@ mod tests {
         g.add_edge(a, c, "E", &json!({})).unwrap();
         g.rebuild_csr().unwrap();
 
-        let sub = retrieve_graphblas(
+        let sub = retrieve_with(
             &g,
             &[1.0f32, 0.0, 0.0],
             &RetrieveOptions {
@@ -464,7 +400,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "graphblas")]
     #[test]
     fn graphblas_retrieve_edges_connect_only_nodes_in_subgraph() {
         let (_dir, g) = open_tmp();
@@ -479,7 +414,7 @@ mod tests {
         g.add_edge(c, d, "E", &json!({})).unwrap();
         g.rebuild_csr().unwrap();
 
-        let sub = retrieve_graphblas(
+        let sub = retrieve_with(
             &g,
             &[1.0f32, 0.0],
             &RetrieveOptions {
@@ -502,7 +437,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "graphblas")]
     #[test]
     fn graphblas_retrieve_max_distance_filters_far_seeds() {
         let (_dir, g) = open_tmp();
@@ -513,7 +447,7 @@ mod tests {
         g.upsert_vector(b, &[0.0f32, 1.0, 0.0]).unwrap();
         g.rebuild_csr().unwrap();
 
-        let sub = retrieve_graphblas(
+        let sub = retrieve_with(
             &g,
             &[1.0f32, 0.0, 0.0],
             &RetrieveOptions {
@@ -531,7 +465,6 @@ mod tests {
         assert!(!sub.scores.contains_key(&b));
     }
 
-    #[cfg(feature = "graphblas")]
     #[test]
     fn graphblas_retrieve_max_nodes_caps_subgraph() {
         let (_dir, g) = open_tmp();
@@ -548,7 +481,7 @@ mod tests {
         g.add_edge(a, e, "E", &json!({})).unwrap();
         g.rebuild_csr().unwrap();
 
-        let sub = retrieve_graphblas(
+        let sub = retrieve_with(
             &g,
             &[1.0f32, 0.0],
             &RetrieveOptions {
@@ -567,7 +500,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "graphblas")]
     #[test]
     fn graphblas_retrieve_scores_contain_seed_distances() {
         let (_dir, g) = open_tmp();
@@ -575,7 +507,7 @@ mod tests {
         g.upsert_vector(a, &[1.0f32, 0.0]).unwrap();
         g.rebuild_csr().unwrap();
 
-        let sub = retrieve_graphblas(
+        let sub = retrieve_with(
             &g,
             &[1.0f32, 0.0],
             &RetrieveOptions {
@@ -594,20 +526,18 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "graphblas")]
     #[test]
     fn graphblas_retrieve_empty_vector_index_returns_empty() {
         let (_dir, g) = open_tmp();
         g.rebuild_csr().unwrap();
 
-        let sub = retrieve_graphblas(&g, &[1.0f32, 0.0], &RetrieveOptions::default()).unwrap();
+        let sub = retrieve_with(&g, &[1.0f32, 0.0], &RetrieveOptions::default()).unwrap();
 
         assert!(sub.nodes.is_empty());
         assert!(sub.edges.is_empty());
         assert!(sub.scores.is_empty());
     }
 
-    #[cfg(feature = "graphblas")]
     #[test]
     fn graphblas_retrieve_multiple_seeds_each_expand_independently() {
         let (_dir, g) = open_tmp();
@@ -627,7 +557,7 @@ mod tests {
         g.add_edge(e, f, "E", &json!({})).unwrap();
         g.rebuild_csr().unwrap();
 
-        let sub1 = retrieve_graphblas(
+        let sub1 = retrieve_with(
             &g,
             &[1.0f32, 0.0, 0.0],
             &RetrieveOptions {
@@ -646,7 +576,7 @@ mod tests {
         assert!(!sub1.nodes.contains(&f), "f is 2 hops from d, out of range");
         assert_eq!(sub1.nodes.len(), 4);
 
-        let sub2 = retrieve_graphblas(
+        let sub2 = retrieve_with(
             &g,
             &[1.0f32, 0.0, 0.0],
             &RetrieveOptions {

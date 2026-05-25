@@ -24,6 +24,7 @@ impl Optimizer {
                 expression: filter_expr,
             };
         }
+        result = Self::optimize_index_scans(result, stats);
         result
     }
 
@@ -55,6 +56,20 @@ impl Optimizer {
             PhysicalOperator::LabelScan { variable, label } => {
                 (PhysicalOperator::LabelScan { variable, label }, Vec::new())
             }
+            PhysicalOperator::NodeIndexScan {
+                variable,
+                label,
+                property,
+                value,
+            } => (
+                PhysicalOperator::NodeIndexScan {
+                    variable,
+                    label,
+                    property,
+                    value,
+                },
+                Vec::new(),
+            ),
             PhysicalOperator::Expand {
                 input,
                 src_var,
@@ -105,6 +120,44 @@ impl Optimizer {
                         right: Box::new(right_op),
                     },
                     left_filters,
+                )
+            }
+            // Aggregate, Sort, and Limit live above the join/expand tree and
+            // never directly contain Filter nodes. Pass through without collecting.
+            PhysicalOperator::Aggregate {
+                input,
+                group_by,
+                aggregations,
+            } => {
+                let (inner, filters) = Self::extract_filters(*input);
+                (
+                    PhysicalOperator::Aggregate {
+                        input: Box::new(inner),
+                        group_by,
+                        aggregations,
+                    },
+                    filters,
+                )
+            }
+            PhysicalOperator::Sort { input, items } => {
+                let (inner, filters) = Self::extract_filters(*input);
+                (
+                    PhysicalOperator::Sort {
+                        input: Box::new(inner),
+                        items,
+                    },
+                    filters,
+                )
+            }
+            PhysicalOperator::Limit { input, skip, count } => {
+                let (inner, filters) = Self::extract_filters(*input);
+                (
+                    PhysicalOperator::Limit {
+                        input: Box::new(inner),
+                        skip,
+                        count,
+                    },
+                    filters,
                 )
             }
         }
@@ -181,6 +234,28 @@ impl Optimizer {
                 variable,
             },
             leaf @ PhysicalOperator::LabelScan { .. } => leaf,
+            leaf @ PhysicalOperator::NodeIndexScan { .. } => leaf,
+            // Aggregate, Sort, and Limit are placed above the plan by the logical planner
+            // after the Join/Expand/Filter tree is built. Reordering does not descend into
+            // them; they are transparent pass-throughs here.
+            PhysicalOperator::Aggregate {
+                input,
+                group_by,
+                aggregations,
+            } => PhysicalOperator::Aggregate {
+                input: Box::new(Self::reorder_operators(*input, stats)),
+                group_by,
+                aggregations,
+            },
+            PhysicalOperator::Sort { input, items } => PhysicalOperator::Sort {
+                input: Box::new(Self::reorder_operators(*input, stats)),
+                items,
+            },
+            PhysicalOperator::Limit { input, skip, count } => PhysicalOperator::Limit {
+                input: Box::new(Self::reorder_operators(*input, stats)),
+                skip,
+                count,
+            },
         }
     }
 
@@ -189,6 +264,7 @@ impl Optimizer {
         match op {
             PhysicalOperator::SingleRow => 1,
             PhysicalOperator::Unwind { input, .. } => 1 + Self::plan_weight(input, stats),
+            PhysicalOperator::NodeIndexScan { .. } => 2,
             PhysicalOperator::LabelScan { label, .. } => {
                 if let Some(lbl) = label {
                     if let Some(s) = stats {
@@ -227,12 +303,47 @@ impl Optimizer {
             PhysicalOperator::HashJoin { left, right } => {
                 Self::plan_weight(left, stats).saturating_mul(Self::plan_weight(right, stats))
             }
+            // These operators sit above the core traversal tree; weight them as their child.
+            PhysicalOperator::Aggregate { input, .. }
+            | PhysicalOperator::Sort { input, .. }
+            | PhysicalOperator::Limit { input, .. } => Self::plan_weight(input, stats),
         }
     }
 
     /// Push collected filters down the plan tree to the lowest possible nodes where they can be evaluated.
     fn push_down_filters(op: PhysicalOperator, pending: &mut Vec<FilterExpr>) -> PhysicalOperator {
         match op {
+            PhysicalOperator::NodeIndexScan {
+                variable,
+                label,
+                property,
+                value,
+            } => {
+                let mut current_node = PhysicalOperator::NodeIndexScan {
+                    variable: variable.clone(),
+                    label,
+                    property,
+                    value,
+                };
+
+                let bound = Self::bound_vars(&current_node);
+
+                let mut i = 0;
+                while i < pending.len() {
+                    let ref_vars = Self::referenced_vars(&pending[i]);
+                    if ref_vars.is_subset(&bound) {
+                        let filter_expr = pending.remove(i);
+                        current_node = PhysicalOperator::Filter {
+                            input: Box::new(current_node),
+                            expression: filter_expr,
+                        };
+                    } else {
+                        i += 1;
+                    }
+                }
+
+                current_node
+            }
             PhysicalOperator::LabelScan { variable, label } => {
                 let mut current_node = PhysicalOperator::LabelScan {
                     variable: variable.clone(),
@@ -480,6 +591,35 @@ impl Optimizer {
             PhysicalOperator::Filter { .. } => {
                 unreachable!("Filter operators must be extracted prior to pushdown optimization")
             }
+            // Aggregate, Sort, and Limit live above the join/expand tree. Pushdown does not
+            // reach inside them; pass through and recurse into their child.
+            PhysicalOperator::Aggregate {
+                input,
+                group_by,
+                aggregations,
+            } => {
+                let optimized = Self::push_down_filters(*input, pending);
+                PhysicalOperator::Aggregate {
+                    input: Box::new(optimized),
+                    group_by,
+                    aggregations,
+                }
+            }
+            PhysicalOperator::Sort { input, items } => {
+                let optimized = Self::push_down_filters(*input, pending);
+                PhysicalOperator::Sort {
+                    input: Box::new(optimized),
+                    items,
+                }
+            }
+            PhysicalOperator::Limit { input, skip, count } => {
+                let optimized = Self::push_down_filters(*input, pending);
+                PhysicalOperator::Limit {
+                    input: Box::new(optimized),
+                    skip,
+                    count,
+                }
+            }
         }
     }
 
@@ -501,6 +641,9 @@ impl Optimizer {
                 vars.insert(variable.clone());
             }
             PhysicalOperator::LabelScan { variable, .. } => {
+                vars.insert(variable.clone());
+            }
+            PhysicalOperator::NodeIndexScan { variable, .. } => {
                 vars.insert(variable.clone());
             }
             PhysicalOperator::Expand {
@@ -544,6 +687,8 @@ impl Optimizer {
                                 }
                                 Expr::Literal(lit) => lit.to_string(),
                                 Expr::Param(p) => format!("${}", p),
+                                Expr::CountStar => "count(*)".to_string(),
+                                Expr::Agg(_, _) => "agg".to_string(),
                             }
                         };
                         vars.insert(output_var);
@@ -564,6 +709,8 @@ impl Optimizer {
                                 }
                                 Expr::Literal(lit) => lit.to_string(),
                                 Expr::Param(p) => format!("${}", p),
+                                Expr::CountStar => "count(*)".to_string(),
+                                Expr::Agg(_, _) => "agg".to_string(),
                             }
                         };
                         vars.insert(output_var);
@@ -573,6 +720,34 @@ impl Optimizer {
             PhysicalOperator::HashJoin { left, right } => {
                 Self::collect_bound_vars(left, vars);
                 Self::collect_bound_vars(right, vars);
+            }
+            // Aggregate emits group-by column names as bound variables.
+            PhysicalOperator::Aggregate {
+                input,
+                group_by,
+                aggregations,
+            } => {
+                Self::collect_bound_vars(input, vars);
+                for (_fn, _inner, col) in aggregations {
+                    vars.insert(col.clone());
+                }
+                for (expr, alias) in group_by {
+                    let name = if let Some(a) = alias {
+                        a.clone()
+                    } else if let Expr::Prop(var, prop) = expr {
+                        if prop.is_empty() {
+                            var.clone()
+                        } else {
+                            format!("{}.{}", var, prop)
+                        }
+                    } else {
+                        continue;
+                    };
+                    vars.insert(name);
+                }
+            }
+            PhysicalOperator::Sort { input, .. } | PhysicalOperator::Limit { input, .. } => {
+                Self::collect_bound_vars(input, vars);
             }
         }
     }
@@ -604,6 +779,106 @@ impl Optimizer {
                 vars.insert(var.clone());
             }
             Expr::Literal(_) | Expr::Param(_) => {}
+            // Aggregate expressions and CountStar reference variables inside their
+            // inner expressions; delegate to recursive collection if needed.
+            Expr::CountStar => {}
+            Expr::Agg(_, inner) => Self::collect_expr_vars(inner, vars),
+        }
+    }
+
+    /// Recursively optimize LabelScan + Filter combinations into NodeIndexScan if an index is available.
+    fn optimize_index_scans(
+        op: PhysicalOperator,
+        stats: Option<&dyn StatsProvider>,
+    ) -> PhysicalOperator {
+        match op {
+            PhysicalOperator::Filter { input, expression } => {
+                let optimized_input = Self::optimize_index_scans(*input, stats);
+                if let PhysicalOperator::LabelScan {
+                    variable,
+                    label: Some(lbl),
+                } = &optimized_input
+                {
+                    if let Some(s) = stats {
+                        if let FilterExpr::Eq(l, r) = &expression {
+                            if let Expr::Prop(var, prop) = l {
+                                if var == variable {
+                                    if let Expr::Literal(_) | Expr::Param(_) = r {
+                                        if s.has_node_property_index(lbl, prop) {
+                                            return PhysicalOperator::NodeIndexScan {
+                                                variable: variable.clone(),
+                                                label: lbl.clone(),
+                                                property: prop.clone(),
+                                                value: r.clone(),
+                                            };
+                                        }
+                                    }
+                                }
+                            }
+                            if let Expr::Prop(var, prop) = r {
+                                if var == variable {
+                                    if let Expr::Literal(_) | Expr::Param(_) = l {
+                                        if s.has_node_property_index(lbl, prop) {
+                                            return PhysicalOperator::NodeIndexScan {
+                                                variable: variable.clone(),
+                                                label: lbl.clone(),
+                                                property: prop.clone(),
+                                                value: l.clone(),
+                                            };
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                PhysicalOperator::Filter {
+                    input: Box::new(optimized_input),
+                    expression,
+                }
+            }
+            PhysicalOperator::Unwind {
+                input,
+                expr,
+                variable,
+            } => PhysicalOperator::Unwind {
+                input: Box::new(Self::optimize_index_scans(*input, stats)),
+                expr,
+                variable,
+            },
+            PhysicalOperator::Expand {
+                input,
+                src_var,
+                rel_var,
+                dst_var,
+                rel_type,
+                is_incoming,
+                min_hops,
+                max_hops,
+            } => PhysicalOperator::Expand {
+                input: Box::new(Self::optimize_index_scans(*input, stats)),
+                src_var,
+                rel_var,
+                dst_var,
+                rel_type,
+                is_incoming,
+                min_hops,
+                max_hops,
+            },
+            PhysicalOperator::Project {
+                input,
+                items,
+                is_barrier,
+            } => PhysicalOperator::Project {
+                input: Box::new(Self::optimize_index_scans(*input, stats)),
+                items,
+                is_barrier,
+            },
+            PhysicalOperator::HashJoin { left, right } => PhysicalOperator::HashJoin {
+                left: Box::new(Self::optimize_index_scans(*left, stats)),
+                right: Box::new(Self::optimize_index_scans(*right, stats)),
+            },
+            leaf => leaf,
         }
     }
 }

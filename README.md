@@ -14,18 +14,9 @@
 
 IssunDB is an embedded graph database with vector and full-text search, written in Rust.
 
-IssunDB focuses on local graph storage, graph traversal, vector retrieval, full-text retrieval, and hybrid retrieval for applications that need
-connected and searchable data inside the same process.
-
 ### Key Features
 
-- Embedded Rust graph storage
-- Durable node, edge, label, type, and adjacency records
-- Vector search over node embeddings
-- Planned full-text search over selected string properties
-- Hybrid retrieval across graph traversal, vector search, full-text search, and property filters
-- Cypher query support through the public facade
-- Interactive CLI for local exploration
+To be added.
 
 ---
 
@@ -41,7 +32,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for details on how to make a contribution
 
 ### License
 
-This project is licensed under either of these:
+IssunDB is available under either of these licenses:
 
 * MIT License ([LICENSE-MIT](LICENSE-MIT))
 * Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
