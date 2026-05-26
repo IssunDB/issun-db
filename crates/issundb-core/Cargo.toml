@@ -36,3 +36,7 @@ criterion.workspace = true
 [[bench]]
 name = "storage"
 harness = false
+
+[build-dependencies]
+cmake = "0.1"
+

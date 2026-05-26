@@ -1,0 +1,19 @@
+[package]
+name = "issundb-gui"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+issundb = { path = "../issundb" }
+eframe = { version = "=0.32", default-features = false, features = ["wgpu", "glow", "x11"] }
+egui = "=0.32"
+egui_graphs = "=0.28.0"
+petgraph = "0.8"
+serde = { workspace = true }
+serde_json = { workspace = true }
+rfd = "=0.14.1"

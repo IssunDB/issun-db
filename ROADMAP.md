@@ -7,7 +7,7 @@ This document outlines the features implemented in IssunDB and the future goals 
 
 ---
 
-## Core Database Engine and Storage
+### Core Database Engine and Storage
 
 High-performance, transactional, and schema-flexible embedded storage foundation.
 
@@ -22,28 +22,28 @@ High-performance, transactional, and schema-flexible embedded storage foundation
 
 ---
 
-## Unified GraphBLAS Analytics
+### Unified GraphBLAS Analytics
 
 High-performance graph analysis executing mathematical operations directly on sparse adjacency matrices.
 
 - [x] Thread-safe in-memory Compressed Sparse Row (CSR) snapshot cache
 - [x] Dynamic, zero-overhead GraphBLAS matrix materialization triggered by database writes
 - [x] SuiteSparse:GraphBLAS algorithm suite executing via sparse matrix-vector multiplication (SpMV) kernels:
-  - [x] Breadth-first search (BFS) and multi-source BFS
-  - [x] Directed PageRank power iterations
-  - [x] Weighted shortest path using Dijkstra on a MinPlus semiring
-  - [x] Weakly connected components (WCC) label propagation
-  - [x] Strongly connected components (Kosaraju's algorithm)
-  - [x] Degree, betweenness, and harmonic centrality measures
-  - [x] Label-propagation community detection (CDLP)
-  - [x] Minimum and maximum spanning forests
-  - [x] Edmonds-Karp maximum flow
-  - [x] Yen's top-k path search
-  - [x] Longest path, cycle detection, and general DFS/all-paths traversals
+    - [x] Breadth-first search (BFS) and multi-source BFS
+    - [x] Directed PageRank power iterations
+    - [x] Weighted shortest path using Dijkstra on a MinPlus semiring
+    - [x] Weakly connected components (WCC) label propagation
+    - [x] Strongly connected components (Kosaraju's algorithm)
+    - [x] Degree, betweenness, and harmonic centrality measures
+    - [x] Label-propagation community detection (CDLP)
+    - [x] Minimum and maximum spanning forests
+    - [x] Edmonds-Karp maximum flow
+    - [x] Yen's top-k path search
+    - [x] Longest path, cycle detection, and general DFS/all-paths traversals
 
 ---
 
-## Advanced Retrieval and Vector Search
+### Advanced Retrieval and Vector Search
 
 Unified hybrid retrieval combining exact graph patterns, dense vector spaces, and ranked full-text indexing.
 
@@ -57,7 +57,7 @@ Unified hybrid retrieval combining exact graph patterns, dense vector spaces, an
 
 ---
 
-## Cypher Query Language and Planner
+### Cypher Query Language and Planner
 
 Declarative graph querying with compile-time optimization and vector-matrix execution.
 
@@ -69,13 +69,15 @@ Declarative graph querying with compile-time optimization and vector-matrix exec
 - [x] Variable-length path patterns, collection unwinding, and projection barriers
 - [x] Result shaping with order, skip, limit, and aggregation functions
 - [ ] Idempotent writes using the `MERGE` clause
+- [ ] `OPTIONAL MATCH` for outer-join pattern matching
 - [ ] Cypher DDL for administrative index and constraint creation
 - [ ] Query plan visualization for logical, physical, and optimized query paths
-- [ ] Broad openCypher TCK conformance validation suite
+- [x] openCypher TCK submodule integration and `make test-conformance` target
+- [x] Inline relationship property map filter pushdown: e.g. `-[:KNOWS {since: 2026}]->`
 
 ---
 
-## Ecosystem and Tooling
+### Ecosystem and Tooling
 
 Developer experience, integrations, and operational tools.
 

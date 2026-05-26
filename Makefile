@@ -80,6 +80,16 @@ publish: ## Publish the package to crates.io (requires CARGO_REGISTRY_TOKEN to b
 	@echo "Publishing the package to Cargo registry..."
 	@cargo publish --token $(CARGO_REGISTRY_TOKEN)
 
+.PHONY: repl
+repl: ## Launch the interactive REPL (pass REPL_PATH=<dir> to set the database path; defaults to ./issundb-data)
+	@echo "Starting IssunDB REPL (database: $(or $(REPL_PATH),./issundb-data))..."
+	@RUST_BACKTRACE=$(RUST_BACKTRACE) cargo run -p issundb-cli -- $(or $(REPL_PATH),./issundb-data)
+
+.PHONY: gui
+gui: ## Launch the graphical desktop user interface (pass GUI_PATH=<dir> to set the database path; defaults to ./issundb-data)
+	@echo "Starting IssunDB GUI (database: $(or $(GUI_PATH),./issundb-data))..."
+	@RUST_BACKTRACE=$(RUST_BACKTRACE) cargo run -p issundb-gui -- $(or $(GUI_PATH),./issundb-data)
+
 .PHONY: bench
 bench: ## Run the benchmarks
 	@echo "Running benchmarks..."

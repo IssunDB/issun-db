@@ -218,6 +218,37 @@ mod tests {
     }
 
     #[test]
+    fn execute_delete_edge() {
+        let (_dir, g) = open_tmp();
+        let alice = g.add_node("Person", &json!({ "name": "Alice" })).unwrap();
+        let bob = g.add_node("Person", &json!({ "name": "Bob" })).unwrap();
+        let eid = g.add_edge(alice, bob, "KNOWS", &json!({})).unwrap();
+        g.rebuild_csr().unwrap();
+
+        assert!(g.get_edge(eid).unwrap().is_some());
+
+        let params = HashMap::new();
+        let result = execute(
+            &g,
+            "MATCH (a:Person)-[r:KNOWS]->(b:Person) DELETE r",
+            &params,
+        )
+        .unwrap();
+
+        // Check return values
+        assert_eq!(
+            result.columns,
+            vec!["nodes_deleted", "relationships_deleted"]
+        );
+        assert_eq!(result.records.len(), 1);
+        assert_eq!(result.records[0].values[0], json!(0));
+        assert_eq!(result.records[0].values[1], json!(1));
+
+        // Check edge is gone in the graph
+        assert!(g.get_edge(eid).unwrap().is_none());
+    }
+
+    #[test]
     fn parse_variable_length_relationship_pattern() {
         let q1 = parser::parse("MATCH (a:Person)-[:KNOWS*1..3]->(b:Person) RETURN b.name").unwrap();
         if let ast::Statement::Query(query) = q1 {

@@ -1082,16 +1082,18 @@ fn execute_delete(
     };
     let bound_paths = execute_physical(graph, &binding_plan, params)?;
 
-    let mut deleted_count = 0;
+    let mut nodes_deleted = 0;
+    let mut relationships_deleted = 0;
     for path in bound_paths {
         for var in &delete.variables {
-            let node_id = match path.get(var) {
-                Some(GraphBinding::Node(id)) => *id,
-                Some(GraphBinding::Edge(_)) => {
-                    return Err(format!(
-                        "DELETE on edge variable '{}' is not supported",
-                        var
-                    ));
+            match path.get(var) {
+                Some(GraphBinding::Node(id)) => {
+                    graph.delete_node(*id).map_err(|e| e.to_string())?;
+                    nodes_deleted += 1;
+                }
+                Some(GraphBinding::Edge(id)) => {
+                    graph.delete_edge(*id).map_err(|e| e.to_string())?;
+                    relationships_deleted += 1;
                 }
                 Some(GraphBinding::Scalar(_)) => {
                     return Err(format!(
@@ -1100,16 +1102,20 @@ fn execute_delete(
                     ));
                 }
                 None => return Err(format!("unbound variable: {}", var)),
-            };
-            graph.delete_node(node_id).map_err(|e| e.to_string())?;
-            deleted_count += 1;
+            }
         }
     }
 
     Ok(QueryResult {
-        columns: vec!["nodes_deleted".to_string()],
+        columns: vec![
+            "nodes_deleted".to_string(),
+            "relationships_deleted".to_string(),
+        ],
         records: vec![Record {
-            values: vec![serde_json::Value::Number(deleted_count.into())],
+            values: vec![
+                serde_json::Value::Number(nodes_deleted.into()),
+                serde_json::Value::Number(relationships_deleted.into()),
+            ],
         }],
     })
 }

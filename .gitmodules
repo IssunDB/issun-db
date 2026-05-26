@@ -4,6 +4,9 @@
 [submodule "external/FalkorDB"]
 	path = external/FalkorDB
 	url = https://github.com/FalkorDB/FalkorDB
-[submodule "crates/issundb/tests/conformance/openCypher"]
-	path = crates/issundb/tests/conformance/openCypher
+[submodule "external/openCypher"]
+	path = external/openCypher
 	url = https://github.com/opencypher/openCypher
+[submodule "external/GraphBLAS"]
+	path = external/GraphBLAS
+	url = https://github.com/DrTimothyAldenDavis/GraphBLAS.git

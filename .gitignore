@@ -84,3 +84,5 @@ tests/testdata/*.parquet
 .agents/
 .codex/
 .antigravitycli/
+issundb-data/
+data/

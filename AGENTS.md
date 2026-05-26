@@ -46,7 +46,8 @@ Quick examples:
 
 ## Repository Layout
 
-The current tree includes storage, CSR snapshots, vector search, hybrid retrieval primitives, Cypher planning, and the CLI. This layout describes the current structure and target decoupled crate boundaries.
+The current tree includes storage, CSR snapshots, vector search, hybrid retrieval primitives, Cypher planning, and the CLI. This layout describes the
+current structure and target decoupled crate boundaries.
 Do not invent modules that do not yet exist when answering questions, but do place new modules according to this map.
 
 - `crates/issundb-core/`: storage engine. Public surface is `Graph` and the schema types.
@@ -59,13 +60,16 @@ Do not invent modules that do not yet exist when answering questions, but do pla
     - `src/matrices.rs`: GraphBLAS matrix materialization from the CSR snapshot.
     - `src/error.rs`: `Error` enum; all storage and serialization errors unify here.
 - `crates/issundb-cypher/`: Cypher parser, AST, logical planner, physical planner, optimizer, and executor.
-    - `src/parser.rs`: hand-written recursive-descent parser for the MATCH, WHERE, RETURN, CREATE, SET, and DELETE subset.
+    - `src/parser.rs`: hand-written recursive-descent parser for MATCH (including inline relationship property maps), WHERE, RETURN, CREATE, SET, and
+      DELETE.
     - `src/ast.rs`: AST node types.
     - `src/plan/`: logical planner, physical planner, optimizer, and statistics helpers.
     - `src/exec.rs`: physical-plan executor that drives `Graph` scans, expansion, filtering, mutation, and projection.
 - `crates/issundb-vector/`: vector index abstraction, vector metadata, vector storage integration, and vector search APIs.
-- `crates/issundb-text/`: tokenization, full-text index storage, text search APIs, and ranking. Current API returns an explicit not-implemented error until index storage lands.
-- `crates/issundb-retrieval/`: hybrid retrieval over graph traversal, vector hits, text hits, property filters, score fusion, and subgraph materialization.
+- `crates/issundb-text/`: tokenization, full-text index storage, text search APIs, and ranking. Current API returns an explicit not-implemented error
+  until index storage lands.
+- `crates/issundb-retrieval/`: hybrid retrieval over graph traversal, vector hits, text hits, property filters, score fusion, and subgraph
+  materialization.
 - `crates/issundb/`: public facade. Re-exports the deliberate public surface from `issundb-core`, `issundb-vector`, `issundb-text`,
   `issundb-retrieval`, and `issundb-cypher`. Do not re-export internal storage types like `Storage`.
 - `crates/issundb-py/` *(phase 13)*: `pyo3` Python bindings. Distributed as a wheel via `maturin`.
@@ -82,7 +86,8 @@ Do not invent modules that do not yet exist when answering questions, but do pla
 - Unit tests for `issundb-core` belong in `#[cfg(test)]` blocks inside the relevant source file. Each test that touches LMDB must open a fresh
   `tempfile::TempDir` and must not share state with other tests.
 - Integration tests that exercise multiple crates belong in `tests/` at the workspace root or in `crates/issundb/tests/`.
-- Cypher conformance tests belong in `crates/issundb/tests/conformance/` and are gated on the `ISSUNDB_CONFORMANCE=1` environment variable so the default
+- Cypher conformance tests belong in `crates/issundb/tests/conformance/` and are gated on the `ISSUNDB_CONFORMANCE=1` environment variable so the
+  default
   `make test` stays fast (run them via `make test-conformance`).
 - Property-based tests (via `proptest`) belong alongside the unit tests for the module whose invariants they exercise.
 - Do not reach into `issundb-core` internals from integration tests; drive behavior through the `issundb` public facade or the `Graph` API.
@@ -136,10 +141,6 @@ All graph operations go through `Graph`; do not call `Storage` directly from out
 - `nodes_by_label(label: &str) -> Result<Vec<NodeId>, Error>`
 - `edges_by_type(etype: &str) -> Result<Vec<EdgeId>, Error>`
 - `rebuild_csr() -> Result<(), Error>`
-- `bfs(start: NodeId, hops: u8) -> Result<Vec<NodeId>, Error>`
-- `shortest_path(src: NodeId, dst: NodeId) -> Result<Option<Vec<NodeId>>, Error>`
-- `page_rank(iterations: u32, damping: f32) -> Result<HashMap<NodeId, f32>, Error>`
-- `connected_components() -> Result<HashMap<NodeId, u64>, Error>`
 - `all_nodes() -> Result<Vec<NodeId>, Error>`
 - `label_name(id: LabelId) -> Result<Option<String>, Error>`
 - `type_name(id: TypeId) -> Result<Option<String>, Error>`
@@ -147,7 +148,25 @@ All graph operations go through `Graph`; do not call `Storage` directly from out
 - `edge_count_by_type(etype: &str) -> Result<u64, Error>`
 - `put_vector_bytes(n: NodeId, bytes: &[u8]) -> Result<(), Error>`
 - `vector_bytes() -> Result<Vec<(NodeId, Vec<u8>)>, Error>`
-
+- `bfs(start: NodeId, hops: u8) -> Result<Vec<NodeId>, Error>`
+- `dfs(start: NodeId, hops: u8) -> Result<Vec<NodeId>, Error>`
+- `shortest_path(src: NodeId, dst: NodeId) -> Result<Option<Vec<NodeId>>, Error>`
+- `shortest_path_dijkstra(src: NodeId, dst: NodeId, weight_property: &str) -> Result<Option<(Vec<NodeId>, f64)>, Error>`
+- `all_paths(src: NodeId, dst: NodeId) -> Result<Vec<Vec<NodeId>>, Error>`
+- `all_shortest_paths(src: NodeId, dst: NodeId) -> Result<Vec<Vec<NodeId>>, Error>`
+- `longest_path(src: NodeId, dst: NodeId) -> Result<Option<Vec<NodeId>>, Error>`
+- `shortest_path_top_k(src: NodeId, dst: NodeId, k: usize, weight_property: &str) -> Result<Vec<(Vec<NodeId>, f64)>, Error>`
+- `page_rank(iterations: u32, damping: f32) -> Result<HashMap<NodeId, f32>, Error>`
+- `connected_components() -> Result<HashMap<NodeId, u64>, Error>`
+- `strongly_connected_components() -> Result<HashMap<NodeId, u64>, Error>`
+- `detect_cycle() -> Result<bool, Error>`
+- `label_propagation(max_iterations: usize) -> Result<HashMap<NodeId, u64>, Error>`
+- `degree_centrality(direction: DegreeDirection) -> Result<HashMap<NodeId, u64>, Error>`
+- `betweenness_centrality() -> Result<HashMap<NodeId, f64>, Error>`
+- `harmonic_centrality() -> Result<HashMap<NodeId, f64>, Error>`
+- `spanning_forest(weight_property: &str, maximum: bool) -> Result<Vec<EdgeId>, Error>`
+- `maximum_flow(source: NodeId, sink: NodeId, capacity_property: &str) -> Result<f64, Error>`
+- `all_neighbors(node: NodeId) -> Result<Vec<(NodeId, EdgeId, u32, bool)>, Error>`
 
 ### `issundb_vector`
 
@@ -179,17 +198,18 @@ retrieve functions are free functions, not methods on `Graph`, to preserve the c
 Cypher query execution. Exposed through the `issundb` facade via the `GraphQueryExt` trait; do not call `issundb_cypher::execute` directly from
 outside `issundb`.
 
-- `query(cypher: &str) -> Result<QueryResult, String>` and `query_with_params(cypher: &str, params: &HashMap<String, serde_json::Value>) -> Result<QueryResult, String>`
+- `query(cypher: &str) -> Result<QueryResult, String>` and
+  `query_with_params(cypher: &str, params: &HashMap<String, serde_json::Value>) -> Result<QueryResult, String>`
 - `QueryResult`: `columns: Vec<String>`, `records: Vec<Record>`
 - `Record`: `values: Vec<serde_json::Value>`
 
-The executor resolves patterns through the physical plan. Expansion and label filtering use GraphBLAS SpMV and element-wise matrix operators unconditionally.
+The executor resolves patterns through the physical plan. Expansion and label filtering use GraphBLAS SpMV and element-wise matrix operators
+unconditionally.
 
 ### `issundb_core::Storage`
 
-Internal to `issundb-core`. Owns the LMDB environment and all eight sub-databases: `nodes`, `edges`, `out_adj`, `in_adj`, `label_idx`, `type_idx`,
-`vectors`, and `meta`. Do not
-expose `Storage` through the `issundb` facade.
+Internal to `issundb-core`. Owns the LMDB environment and twelve sub-databases: `nodes`, `edges`, `out_adj`, `in_adj`, `label_idx`, `type_idx`,
+`node_prop_idx`, `edge_prop_idx`, `fts_postings`, `fts_docs`, `vectors`, and `meta`. Do not expose `Storage` through the `issundb` facade.
 
 ### `issundb_core::error::Error`
 
@@ -200,7 +220,8 @@ error types through the public facade.
 ### Encapsulation Rule
 
 `Storage` and the `storage` module are implementation details, even though they are currently reachable from `issundb-core`. The `issundb`
-facade re-exports only `Graph`, `Error`, `Hit`, hybrid retrieval types and functions, Cypher result types, and the schema ID and record types. Do not add a
+facade re-exports only `Graph`, `Error`, `Hit`, hybrid retrieval types and functions, Cypher result types, and the schema ID and record types. Do not
+add a
 "just for now" re-export anywhere else; add a deliberate testing helper in `issundb-core` if a test needs internal access.
 
 ## Workflow

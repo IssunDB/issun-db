@@ -165,8 +165,16 @@ fn parse_fts_posting_val(bytes: &[u8]) -> Result<(NodeId, u32), Error> {
     if bytes.len() != 12 {
         return Err(Error::Corrupt("fts posting value must be 12 bytes"));
     }
-    let node_id = NodeId::from_be_bytes(bytes[0..8].try_into().unwrap());
-    let frequency = u32::from_be_bytes(bytes[8..12].try_into().unwrap());
+    let node_id = NodeId::from_be_bytes(
+        bytes[0..8]
+            .try_into()
+            .map_err(|_| Error::Corrupt("fts posting: node_id slice wrong size"))?,
+    );
+    let frequency = u32::from_be_bytes(
+        bytes[8..12]
+            .try_into()
+            .map_err(|_| Error::Corrupt("fts posting: frequency slice wrong size"))?,
+    );
     Ok((node_id, frequency))
 }
 
@@ -184,7 +192,9 @@ fn parse_fts_doc_val(bytes: &[u8]) -> Result<u32, Error> {
     if bytes.len() != 4 {
         return Err(Error::Corrupt("fts doc val must be 4 bytes"));
     }
-    Ok(u32::from_be_bytes(bytes.try_into().unwrap()))
+    Ok(u32::from_be_bytes(bytes.try_into().map_err(|_| {
+        Error::Corrupt("fts doc val: slice wrong size")
+    })?))
 }
 
 fn fts_stats_n_key(label_id: LabelId, prop_key_id: PropKeyId) -> String {
@@ -797,6 +807,59 @@ impl Graph {
 
         // 6. Delete from primary nodes database
         self.storage.nodes.delete(wtxn, &id)?;
+
+        Ok(())
+    }
+
+    /// Delete an edge.
+    pub fn delete_edge(&self, id: EdgeId) -> Result<(), Error> {
+        let _guard = self._write_lock.lock();
+        let mut wtxn = self.storage.env.write_txn()?;
+        self.delete_edge_impl(&mut wtxn, id)?;
+        wtxn.commit()?;
+        self.maybe_spawn_rebuild();
+        Ok(())
+    }
+
+    pub(crate) fn delete_edge_impl(&self, wtxn: &mut heed::RwTxn, id: EdgeId) -> Result<(), Error> {
+        let record: EdgeRecord = match self.get_edge_impl(wtxn, id)? {
+            Some(rec) => rec,
+            None => return Ok(()),
+        };
+
+        // 1. Delete from edge property index
+        self.delete_edge_index_entries(wtxn, id, &record)?;
+
+        // 2. Delete the edge record itself
+        self.storage.edges.delete(wtxn, &id)?;
+
+        // 3. Delete from the type index
+        self.storage
+            .type_idx
+            .delete(wtxn, &composite_key(record.edge_type, id))?;
+
+        // 4. Adjust the type count
+        adjust_type_count(&self.storage, wtxn, record.edge_type, -1)?;
+
+        // 5. Delete from out_adj (key is src, other is dst)
+        let out_entry = AdjEntry {
+            edge_type: record.edge_type,
+            other: record.dst,
+            edge_id: id,
+        };
+        self.storage
+            .out_adj
+            .delete_one_duplicate(wtxn, &record.src, out_entry.as_bytes())?;
+
+        // 6. Delete from in_adj (key is dst, other is src)
+        let in_entry = AdjEntry {
+            edge_type: record.edge_type,
+            other: record.src,
+            edge_id: id,
+        };
+        self.storage
+            .in_adj
+            .delete_one_duplicate(wtxn, &record.dst, in_entry.as_bytes())?;
 
         Ok(())
     }
@@ -1739,13 +1802,23 @@ impl Graph {
                 .storage
                 .meta
                 .get(wtxn, &n_key)?
-                .map(|b| u64::from_be_bytes(b.try_into().unwrap()))
+                .map(|b| -> Result<u64, Error> {
+                    Ok(u64::from_be_bytes(b.try_into().map_err(|_| {
+                        Error::Corrupt("fts stats n: wrong byte length")
+                    })?))
+                })
+                .transpose()?
                 .unwrap_or(0);
             let current_sum_dl = self
                 .storage
                 .meta
                 .get(wtxn, &sum_dl_key)?
-                .map(|b| u64::from_be_bytes(b.try_into().unwrap()))
+                .map(|b| -> Result<u64, Error> {
+                    Ok(u64::from_be_bytes(b.try_into().map_err(|_| {
+                        Error::Corrupt("fts stats sum_dl: wrong byte length")
+                    })?))
+                })
+                .transpose()?
                 .unwrap_or(0);
 
             self.storage
@@ -1792,13 +1865,23 @@ impl Graph {
                 .storage
                 .meta
                 .get(wtxn, &n_key)?
-                .map(|b| u64::from_be_bytes(b.try_into().unwrap()))
+                .map(|b| -> Result<u64, Error> {
+                    Ok(u64::from_be_bytes(b.try_into().map_err(|_| {
+                        Error::Corrupt("fts stats n: wrong byte length")
+                    })?))
+                })
+                .transpose()?
                 .unwrap_or(0);
             let current_sum_dl = self
                 .storage
                 .meta
                 .get(wtxn, &sum_dl_key)?
-                .map(|b| u64::from_be_bytes(b.try_into().unwrap()))
+                .map(|b| -> Result<u64, Error> {
+                    Ok(u64::from_be_bytes(b.try_into().map_err(|_| {
+                        Error::Corrupt("fts stats sum_dl: wrong byte length")
+                    })?))
+                })
+                .transpose()?
                 .unwrap_or(0);
 
             let next_n = current_n.saturating_sub(1);
@@ -1826,8 +1909,10 @@ impl Graph {
         if !self.has_node_text_index_impl(rtxn, label, property)? {
             return Ok(None);
         }
-        let label_id = get_label(&self.storage, rtxn, label)?.unwrap();
-        let prop_key_id = get_prop_key(&self.storage, rtxn, property)?.unwrap();
+        let label_id = get_label(&self.storage, rtxn, label)?
+            .ok_or(Error::Corrupt("fts_stats: label id not found"))?;
+        let prop_key_id = get_prop_key(&self.storage, rtxn, property)?
+            .ok_or(Error::Corrupt("fts_stats: prop key id not found"))?;
 
         let n_key = fts_stats_n_key(label_id, prop_key_id);
         let sum_dl_key = fts_stats_sum_dl_key(label_id, prop_key_id);
@@ -1836,13 +1921,23 @@ impl Graph {
             .storage
             .meta
             .get(rtxn, &n_key)?
-            .map(|b| u64::from_be_bytes(b.try_into().unwrap()))
+            .map(|b| -> Result<u64, Error> {
+                Ok(u64::from_be_bytes(b.try_into().map_err(|_| {
+                    Error::Corrupt("fts stats n: wrong byte length")
+                })?))
+            })
+            .transpose()?
             .unwrap_or(0);
         let sum_dl = self
             .storage
             .meta
             .get(rtxn, &sum_dl_key)?
-            .map(|b| u64::from_be_bytes(b.try_into().unwrap()))
+            .map(|b| -> Result<u64, Error> {
+                Ok(u64::from_be_bytes(b.try_into().map_err(|_| {
+                    Error::Corrupt("fts stats sum_dl: wrong byte length")
+                })?))
+            })
+            .transpose()?
             .unwrap_or(0);
 
         Ok(Some((n, sum_dl)))
@@ -2384,7 +2479,9 @@ impl Graph {
     pub fn dfs(&self, start: NodeId, hops: u8) -> Result<Vec<NodeId>, Error> {
         self.ensure_matrices()?;
         let guard = self.matrices.read();
-        let m = guard.as_ref().unwrap();
+        let m = guard
+            .as_ref()
+            .ok_or(Error::Corrupt("matrices not initialized"))?;
         let snap = self.csr_cache.snapshot.load();
         self.dfs_graphblas(m, &snap, start, hops)
     }
@@ -2393,7 +2490,9 @@ impl Graph {
     pub fn detect_cycle(&self) -> Result<bool, Error> {
         self.ensure_matrices()?;
         let guard = self.matrices.read();
-        let m = guard.as_ref().unwrap();
+        let m = guard
+            .as_ref()
+            .ok_or(Error::Corrupt("matrices not initialized"))?;
         let snap = self.csr_cache.snapshot.load();
         self.detect_cycle_graphblas(m, &snap)
     }
@@ -2415,7 +2514,9 @@ impl Graph {
     pub fn all_paths(&self, src: NodeId, dst: NodeId) -> Result<Vec<Vec<NodeId>>, Error> {
         self.ensure_matrices()?;
         let guard = self.matrices.read();
-        let m = guard.as_ref().unwrap();
+        let m = guard
+            .as_ref()
+            .ok_or(Error::Corrupt("matrices not initialized"))?;
         let snap = self.csr_cache.snapshot.load();
         self.all_paths_graphblas(m, &snap, src, dst)
     }
@@ -2424,7 +2525,9 @@ impl Graph {
     pub fn all_shortest_paths(&self, src: NodeId, dst: NodeId) -> Result<Vec<Vec<NodeId>>, Error> {
         self.ensure_matrices()?;
         let guard = self.matrices.read();
-        let m = guard.as_ref().unwrap();
+        let m = guard
+            .as_ref()
+            .ok_or(Error::Corrupt("matrices not initialized"))?;
         let snap = self.csr_cache.snapshot.load();
         self.all_shortest_paths_graphblas(m, &snap, src, dst)
     }
@@ -2433,7 +2536,9 @@ impl Graph {
     pub fn longest_path(&self, src: NodeId, dst: NodeId) -> Result<Option<Vec<NodeId>>, Error> {
         self.ensure_matrices()?;
         let guard = self.matrices.read();
-        let m = guard.as_ref().unwrap();
+        let m = guard
+            .as_ref()
+            .ok_or(Error::Corrupt("matrices not initialized"))?;
         let snap = self.csr_cache.snapshot.load();
         self.longest_path_graphblas(m, &snap, src, dst)
     }
@@ -2447,7 +2552,9 @@ impl Graph {
     ) -> Result<Option<(Vec<NodeId>, f64)>, Error> {
         self.ensure_matrices()?;
         let guard = self.matrices.read();
-        let m = guard.as_ref().unwrap();
+        let m = guard
+            .as_ref()
+            .ok_or(Error::Corrupt("matrices not initialized"))?;
         let snap = self.csr_cache.snapshot.load();
         self.shortest_path_dijkstra_graphblas(m, &snap, src, dst)
     }
@@ -2460,7 +2567,9 @@ impl Graph {
     ) -> Result<Vec<EdgeId>, Error> {
         self.ensure_matrices()?;
         let guard = self.matrices.read();
-        let m = guard.as_ref().unwrap();
+        let m = guard
+            .as_ref()
+            .ok_or(Error::Corrupt("matrices not initialized"))?;
         let snap = self.csr_cache.snapshot.load();
         self.spanning_forest_graphblas(m, &snap, weight_property, maximum)
     }
@@ -2469,7 +2578,9 @@ impl Graph {
     pub fn label_propagation(&self, max_iterations: usize) -> Result<HashMap<NodeId, u64>, Error> {
         self.ensure_matrices()?;
         let guard = self.matrices.read();
-        let m = guard.as_ref().unwrap();
+        let m = guard
+            .as_ref()
+            .ok_or(Error::Corrupt("matrices not initialized"))?;
         let snap = self.csr_cache.snapshot.load();
         self.label_propagation_graphblas(m, &snap, max_iterations)
     }
@@ -2478,7 +2589,9 @@ impl Graph {
     pub fn harmonic_centrality(&self) -> Result<HashMap<NodeId, f64>, Error> {
         self.ensure_matrices()?;
         let guard = self.matrices.read();
-        let m = guard.as_ref().unwrap();
+        let m = guard
+            .as_ref()
+            .ok_or(Error::Corrupt("matrices not initialized"))?;
         let snap = self.csr_cache.snapshot.load();
         self.harmonic_centrality_graphblas(m, &snap)
     }
@@ -2487,7 +2600,9 @@ impl Graph {
     pub fn betweenness_centrality(&self) -> Result<HashMap<NodeId, f64>, Error> {
         self.ensure_matrices()?;
         let guard = self.matrices.read();
-        let m = guard.as_ref().unwrap();
+        let m = guard
+            .as_ref()
+            .ok_or(Error::Corrupt("matrices not initialized"))?;
         let snap = self.csr_cache.snapshot.load();
         self.betweenness_centrality_graphblas(m, &snap)
     }
@@ -2496,7 +2611,9 @@ impl Graph {
     pub fn strongly_connected_components(&self) -> Result<HashMap<NodeId, u64>, Error> {
         self.ensure_matrices()?;
         let guard = self.matrices.read();
-        let m = guard.as_ref().unwrap();
+        let m = guard
+            .as_ref()
+            .ok_or(Error::Corrupt("matrices not initialized"))?;
         let snap = self.csr_cache.snapshot.load();
         self.strongly_connected_components_graphblas(m, &snap)
     }
@@ -2508,7 +2625,9 @@ impl Graph {
     ) -> Result<HashMap<NodeId, u64>, Error> {
         self.ensure_matrices()?;
         let guard = self.matrices.read();
-        let m = guard.as_ref().unwrap();
+        let m = guard
+            .as_ref()
+            .ok_or(Error::Corrupt("matrices not initialized"))?;
         let snap = self.csr_cache.snapshot.load();
         self.degree_centrality_graphblas(m, &snap, direction)
     }
@@ -2522,7 +2641,9 @@ impl Graph {
     ) -> Result<f64, Error> {
         self.ensure_matrices()?;
         let guard = self.matrices.read();
-        let m = guard.as_ref().unwrap();
+        let m = guard
+            .as_ref()
+            .ok_or(Error::Corrupt("matrices not initialized"))?;
         let snap = self.csr_cache.snapshot.load();
         self.maximum_flow_graphblas(m, &snap, source, sink, capacity_property)
     }
@@ -2537,7 +2658,9 @@ impl Graph {
     ) -> Result<Vec<(Vec<NodeId>, f64)>, Error> {
         self.ensure_matrices()?;
         let guard = self.matrices.read();
-        let m = guard.as_ref().unwrap();
+        let m = guard
+            .as_ref()
+            .ok_or(Error::Corrupt("matrices not initialized"))?;
         let snap = self.csr_cache.snapshot.load();
         self.shortest_path_top_k_graphblas(m, &snap, src, dst, k, weight_property)
     }
@@ -3746,11 +3869,13 @@ impl Graph {
                     strongconnect(v, env);
                     env.lowlinks[u] = std::cmp::min(env.lowlinks[u], env.lowlinks[v]);
                 } else if env.on_stack[v] {
-                    env.lowlinks[u] = std::cmp::min(env.lowlinks[u], env.indices[v].unwrap());
+                    if let Some(iv) = env.indices[v] {
+                        env.lowlinks[u] = std::cmp::min(env.lowlinks[u], iv);
+                    }
                 }
             }
 
-            if env.lowlinks[u] == env.indices[u].unwrap() {
+            if Some(env.lowlinks[u]) == env.indices[u] {
                 let comp_id = env.next_comp_id;
                 env.next_comp_id += 1;
 
@@ -4305,7 +4430,10 @@ impl Graph {
         let mut path = vec![dst_dense];
         let mut cur = dst_dense;
         while cur != src_dense {
-            let cur_dist = dist_vals[cur].unwrap();
+            let cur_dist = match dist_vals[cur] {
+                Some(d) => d,
+                None => return Ok(None),
+            };
             let cur_id = snap.dense_to_id[cur];
             let in_neighbors = self.adj_entries(cur_id, false)?;
             let mut moved = false;
@@ -4598,7 +4726,10 @@ impl Graph {
             }
 
             if let Some(&u_dense) = snap.id_to_dense.get(&u) {
-                let cur_dist = dist_vals[u_dense as usize].unwrap();
+                let cur_dist = match dist_vals[u_dense as usize] {
+                    Some(d) => d,
+                    None => return Ok(()),
+                };
                 let in_neighbors = graph.adj_entries(u, false)?;
                 for (pred_id, _, _) in in_neighbors {
                     if let Some(&pred_d) = snap.id_to_dense.get(&pred_id) {
@@ -4819,8 +4950,12 @@ impl Graph {
             let mut curr = sink;
             while curr != source {
                 let p = parent[&curr];
-                *residual.get_mut(&(p, curr)).unwrap() -= bottleneck;
-                *residual.get_mut(&(curr, p)).unwrap() += bottleneck;
+                if let Some(cap) = residual.get_mut(&(p, curr)) {
+                    *cap -= bottleneck;
+                }
+                if let Some(cap) = residual.get_mut(&(curr, p)) {
+                    *cap += bottleneck;
+                }
                 curr = p;
             }
 
@@ -5379,6 +5514,12 @@ impl WriteTxn<'_> {
         Ok(())
     }
 
+    pub fn delete_edge(&mut self, id: EdgeId) -> Result<(), Error> {
+        self.graph.delete_edge_impl(&mut self.wtxn, id)?;
+        self.mutations_count += 1;
+        Ok(())
+    }
+
     pub fn add_edge(
         &mut self,
         src: NodeId,
@@ -5765,6 +5906,44 @@ mod tests {
 
         // Deleting node a cascades and removes both edges touching a.
         g.delete_node(a).unwrap();
+        assert_eq!(g.edge_count_by_type("KNOWS").unwrap(), 0);
+    }
+
+    #[test]
+    fn delete_edge_correctness() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("Person", &json!({})).unwrap();
+        let b = g.add_node("Person", &json!({})).unwrap();
+        let eid = g.add_edge(a, b, "KNOWS", &json!({})).unwrap();
+
+        // 1. Verify exists
+        assert!(g.get_edge(eid).unwrap().is_some());
+        assert_eq!(g.edge_count_by_type("KNOWS").unwrap(), 1);
+
+        // 2. Verify adjacency lists
+        let out_neighs = g.out_neighbors(a).unwrap();
+        assert_eq!(out_neighs.len(), 1);
+        assert_eq!(out_neighs[0].0, b);
+        assert_eq!(out_neighs[0].1, eid);
+
+        let in_neighs = g.in_neighbors(b).unwrap();
+        assert_eq!(in_neighs.len(), 1);
+        assert_eq!(in_neighs[0].0, a);
+        assert_eq!(in_neighs[0].1, eid);
+
+        // 3. Delete the edge
+        g.delete_edge(eid).unwrap();
+
+        // 4. Verify gone
+        assert!(g.get_edge(eid).unwrap().is_none());
+        assert_eq!(g.edge_count_by_type("KNOWS").unwrap(), 0);
+
+        // 5. Verify adjacency lists updated
+        assert_eq!(g.out_neighbors(a).unwrap().len(), 0);
+        assert_eq!(g.in_neighbors(b).unwrap().len(), 0);
+
+        // 6. Idempotence: delete non-existent edge
+        g.delete_edge(eid).unwrap();
         assert_eq!(g.edge_count_by_type("KNOWS").unwrap(), 0);
     }
 
