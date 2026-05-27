@@ -1,0 +1,24 @@
+[package]
+name = "issundb-node"
+version = "0.1.0-alpha.1"
+edition = "2021"
+description = "Node.js bindings for IssunDB"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+napi-module = ["dep:napi", "dep:napi-derive"]
+
+[dependencies]
+napi = { version = "2", features = ["napi4"], optional = true }
+napi-derive = { version = "2", optional = true }
+issundb = { path = "../issundb" }
+issundb-vector = { path = "../issundb-vector" }
+issundb-text = { path = "../issundb-text" }
+serde_json = { workspace = true }
+rmp-serde = { workspace = true }
+
+[build-dependencies]
+napi-build = "=2.1.4"

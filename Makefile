@@ -61,8 +61,13 @@ install-snap: ## Install a few dependencies using Snapcraft
 	@sudo snap refresh
 	@sudo snap install rustup --classic
 
+.PHONY: submodules
+submodules: ## Initialize and update all git submodules recursively
+	@echo "Initializing and updating all git submodules..."
+	@git submodule update --init --recursive
+
 .PHONY: install-deps
-install-deps: install-snap ## Install development dependencies
+install-deps: install-snap submodules ## Install development dependencies
 	@echo "Installing dependencies..."
 	@rustup component add rustfmt clippy
 	@cargo install cargo-tarpaulin

@@ -10,3 +10,4 @@
 [submodule "external/GraphBLAS"]
 	path = external/GraphBLAS
 	url = https://github.com/DrTimothyAldenDavis/GraphBLAS.git
+	branch = v10.3.1

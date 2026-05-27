@@ -1,0 +1,26 @@
+{
+  "name": "issundb",
+  "version": "0.1.0-alpha.1",
+  "description": "Node.js bindings for IssunDB — embedded graph database with vector and full-text search",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "scripts": {
+    "build": "napi build --platform --release --features napi-module",
+    "build:debug": "napi build --platform --features napi-module",
+    "prepublishOnly": "napi build --platform --release --features napi-module"
+  },
+  "keywords": ["graph", "database", "vector-search", "full-text-search", "cypher"],
+  "license": "MIT",
+  "devDependencies": {
+    "@napi-rs/cli": "^2.18.0"
+  },
+  "engines": {
+    "node": ">= 16"
+  },
+  "napi": {
+    "name": "issundb",
+    "triples": {
+      "defaults": true
+    }
+  }
+}

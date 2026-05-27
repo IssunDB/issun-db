@@ -9,6 +9,8 @@ pub enum FilterExpr {
     Le(Expr, Expr),
     Ge(Expr, Expr),
     HasLabel(String, String), // Bounded variable has a specific label
+    /// Arbitrary boolean expression (IS NULL, OR, AND, NOT, quantifiers, etc.)
+    Expr(Expr),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -36,6 +38,9 @@ pub enum LogicalOperator {
         dst_var: String,
         rel_type: Option<String>,
         is_incoming: bool,
+        /// When true the relationship has no direction: traverse both outgoing and
+        /// incoming edges and deduplicate results.
+        is_undirected: bool,
         min_hops: usize,
         max_hops: usize,
     },
@@ -75,6 +80,12 @@ pub enum LogicalOperator {
         skip: usize,
         count: usize,
     },
+    /// Optional match: evaluate inner plan; if it produces no rows, emit one
+    /// null-filled row for each pattern variable in `null_vars`.
+    OptionalMatch {
+        input: Box<LogicalOperator>,
+        null_vars: Vec<String>,
+    },
 }
 
 pub struct LogicalPlanner;
@@ -82,9 +93,22 @@ pub struct LogicalPlanner;
 impl LogicalPlanner {
     pub fn plan(query: &Query) -> Result<LogicalOperator, String> {
         let mut plan = if query.parts.is_empty() {
-            // Legacy single-MATCH planning flow
+            // Legacy single-MATCH planning flow.
+            // When match_clauses is also empty this is a bare RETURN query (e.g. `RETURN 1 + 2`).
             if query.match_clauses.is_empty() {
-                return Err("query must contain at least one MATCH clause".into());
+                // Bare RETURN: start from a single empty row.
+                let p = LogicalOperator::SingleRow;
+                let items: Vec<(Expr, Option<String>)> = query
+                    .return_clause
+                    .items
+                    .iter()
+                    .map(|ri| (ri.expr.clone(), ri.alias.clone()))
+                    .collect();
+                return Ok(LogicalOperator::Project {
+                    input: Box::new(p),
+                    items,
+                    is_barrier: true,
+                });
             }
 
             let mut current_plan: Option<LogicalOperator> = None;
@@ -111,6 +135,7 @@ impl LogicalPlanner {
                     WhereClause::Gt(l, r) => FilterExpr::Gt(l.clone(), r.clone()),
                     WhereClause::Le(l, r) => FilterExpr::Le(l.clone(), r.clone()),
                     WhereClause::Ge(l, r) => FilterExpr::Ge(l.clone(), r.clone()),
+                    WhereClause::Expr(e) => FilterExpr::Expr(e.clone()),
                 };
                 p = LogicalOperator::Filter {
                     input: Box::new(p),
@@ -154,6 +179,7 @@ impl LogicalPlanner {
                                 WhereClause::Gt(l, r) => FilterExpr::Gt(l.clone(), r.clone()),
                                 WhereClause::Le(l, r) => FilterExpr::Le(l.clone(), r.clone()),
                                 WhereClause::Ge(l, r) => FilterExpr::Ge(l.clone(), r.clone()),
+                                WhereClause::Expr(e) => FilterExpr::Expr(e.clone()),
                             };
                             match_plan = LogicalOperator::Filter {
                                 input: Box::new(match_plan),
@@ -172,6 +198,9 @@ impl LogicalPlanner {
                     QueryPart::With {
                         items,
                         where_clause,
+                        order_by,
+                        skip,
+                        limit,
                     } => {
                         // Bootstrap with SingleRow if WITH is the first clause in the
                         // sequence (e.g., `WITH 1 AS x RETURN x`), matching the
@@ -191,6 +220,7 @@ impl LogicalPlanner {
                                 WhereClause::Gt(l, r) => FilterExpr::Gt(l.clone(), r.clone()),
                                 WhereClause::Le(l, r) => FilterExpr::Le(l.clone(), r.clone()),
                                 WhereClause::Ge(l, r) => FilterExpr::Ge(l.clone(), r.clone()),
+                                WhereClause::Expr(e) => FilterExpr::Expr(e.clone()),
                             };
                             p = LogicalOperator::Filter {
                                 input: Box::new(p),
@@ -209,7 +239,91 @@ impl LogicalPlanner {
                             is_barrier: true,
                         };
 
+                        // Apply optional ORDER BY attached to the WITH clause.
+                        if let Some(ob) = order_by {
+                            p = LogicalOperator::Sort {
+                                input: Box::new(p),
+                                items: ob.items.clone(),
+                            };
+                        }
+
+                        // Apply optional SKIP / LIMIT attached to the WITH clause.
+                        let skip_n = skip.as_ref().map(literal_usize).unwrap_or(0);
+                        let limit_n = limit.as_ref().map(literal_usize).unwrap_or(usize::MAX);
+                        if skip.is_some() || limit.is_some() {
+                            p = LogicalOperator::Limit {
+                                input: Box::new(p),
+                                skip: skip_n,
+                                count: limit_n,
+                            };
+                        }
+
                         current_plan = Some(p);
+                    }
+                    QueryPart::OptionalMatch {
+                        match_clauses,
+                        where_clause,
+                    } => {
+                        if match_clauses.is_empty() {
+                            return Err(
+                                "OPTIONAL MATCH part must contain at least one clause".into()
+                            );
+                        }
+                        let mut part_match_plan: Option<LogicalOperator> = None;
+                        // Collect all variables referenced in the pattern for null-filling.
+                        let mut null_vars: Vec<String> = Vec::new();
+                        for match_clause in match_clauses {
+                            if let Some(ref v) = match_clause.pattern.node.variable {
+                                null_vars.push(v.clone());
+                            }
+                            for (rel, target) in &match_clause.pattern.rels {
+                                if let Some(ref v) = rel.variable {
+                                    null_vars.push(v.clone());
+                                }
+                                if let Some(ref v) = target.variable {
+                                    null_vars.push(v.clone());
+                                }
+                            }
+                            let mp = Self::plan_match(match_clause)?;
+                            part_match_plan = match part_match_plan {
+                                Some(existing) => Some(LogicalOperator::Join {
+                                    left: Box::new(existing),
+                                    right: Box::new(mp),
+                                }),
+                                None => Some(mp),
+                            };
+                        }
+                        let mut match_plan = part_match_plan.ok_or_else(|| {
+                            "OPTIONAL MATCH part must contain at least one clause".to_string()
+                        })?;
+                        if let Some(wc) = where_clause {
+                            let filter_expr = match wc {
+                                WhereClause::Eq(l, r) => FilterExpr::Eq(l.clone(), r.clone()),
+                                WhereClause::Ne(l, r) => FilterExpr::Ne(l.clone(), r.clone()),
+                                WhereClause::Lt(l, r) => FilterExpr::Lt(l.clone(), r.clone()),
+                                WhereClause::Gt(l, r) => FilterExpr::Gt(l.clone(), r.clone()),
+                                WhereClause::Le(l, r) => FilterExpr::Le(l.clone(), r.clone()),
+                                WhereClause::Ge(l, r) => FilterExpr::Ge(l.clone(), r.clone()),
+                                WhereClause::Expr(e) => FilterExpr::Expr(e.clone()),
+                            };
+                            match_plan = LogicalOperator::Filter {
+                                input: Box::new(match_plan),
+                                expression: filter_expr,
+                            };
+                        }
+
+                        let optional_plan = LogicalOperator::OptionalMatch {
+                            input: Box::new(match_plan),
+                            null_vars,
+                        };
+
+                        current_plan = match current_plan {
+                            Some(existing) => Some(LogicalOperator::Join {
+                                left: Box::new(existing),
+                                right: Box::new(optional_plan),
+                            }),
+                            None => Some(optional_plan),
+                        };
                     }
                     QueryPart::Unwind { expr, variable } => {
                         let p = current_plan.unwrap_or(LogicalOperator::SingleRow);
@@ -335,6 +449,7 @@ impl LogicalPlanner {
                 dst_var: target_var.clone(),
                 rel_type: rel_pat.rel_type.clone(),
                 is_incoming: rel_pat.is_incoming,
+                is_undirected: rel_pat.is_undirected,
                 min_hops,
                 max_hops,
             };

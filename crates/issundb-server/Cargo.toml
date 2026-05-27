@@ -1,0 +1,25 @@
+[package]
+name = "issundb-server"
+version = "0.1.0-alpha.1"
+edition = "2021"
+description = "HTTP server for IssunDB"
+
+[[bin]]
+name = "issundb-server"
+path = "src/main.rs"
+
+[dependencies]
+issundb = { path = "../issundb" }
+issundb-vector = { path = "../issundb-vector" }
+issundb-text = { path = "../issundb-text" }
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+rmp-serde = "1"
+anyhow = "1"

@@ -2,14 +2,15 @@ pub mod csr;
 pub mod error;
 pub mod graph;
 pub mod matrices;
+pub mod metrics;
 pub mod schema;
 pub mod storage;
 
 pub use error::Error;
 pub use graph::{DegreeDirection, Graph, ReadTxn, WriteTxn};
-pub use matrices::MatrixSet;
 pub use schema::{
-    AdjEntry, EdgeId, EdgeRecord, LabelId, Language, NodeId, NodeRecord, PropKeyId, TypeId,
+    DirectedNeighborEntry, EdgeId, EdgeRecord, LabelId, Language, NeighborEntry, NodeId,
+    NodeRecord, PropValue, TypeId, WeightedPath,
 };
 
 #[cfg(test)]
@@ -56,8 +57,8 @@ mod tests {
 
         let neighbors = g.out_neighbors(alice).unwrap();
         assert_eq!(neighbors.len(), 1);
-        assert_eq!(neighbors[0].0, bob);
-        assert_eq!(neighbors[0].1, eid);
+        assert_eq!(neighbors[0].node, bob);
+        assert_eq!(neighbors[0].edge, eid);
     }
 
     #[test]
@@ -136,9 +137,9 @@ mod tests {
         g.rebuild_csr().unwrap();
 
         let mut out = g.out_neighbors(a).unwrap();
-        out.sort_unstable_by_key(|&(n, _, _)| n);
+        out.sort_unstable_by_key(|ne| ne.node);
         assert_eq!(out.len(), 2);
-        let edge_ids: Vec<_> = out.iter().map(|&(_, eid, _)| eid).collect();
+        let edge_ids: Vec<_> = out.iter().map(|ne| ne.edge).collect();
         assert!(edge_ids.contains(&e1));
         assert!(edge_ids.contains(&e2));
     }
@@ -154,7 +155,7 @@ mod tests {
 
         let out = g.out_neighbors(a).unwrap();
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].1, eid);
+        assert_eq!(out[0].edge, eid);
     }
 
     #[test]
@@ -170,8 +171,8 @@ mod tests {
         let g2 = Graph::open(dir.path(), 1).unwrap();
         let out = g2.out_neighbors(a).unwrap();
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].0, b);
-        assert_eq!(out[0].1, eid);
+        assert_eq!(out[0].node, b);
+        assert_eq!(out[0].edge, eid);
     }
 
     // ------------------------------------------------------------------
@@ -363,19 +364,19 @@ mod tests {
         g.rebuild_csr().unwrap();
 
         let mut neighbors = g.all_neighbors(a).unwrap();
-        neighbors.sort_by_key(|&(other, _, _, _)| other);
+        neighbors.sort_by_key(|ne| ne.node);
 
         assert_eq!(neighbors.len(), 2);
 
         // Neighbor b: outgoing edge
-        assert_eq!(neighbors[0].0, b);
-        assert_eq!(neighbors[0].1, e1);
-        assert!(neighbors[0].3); // is_outgoing == true
+        assert_eq!(neighbors[0].node, b);
+        assert_eq!(neighbors[0].edge, e1);
+        assert!(neighbors[0].outgoing); // is_outgoing == true
 
         // Neighbor c: incoming edge
-        assert_eq!(neighbors[1].0, c);
-        assert_eq!(neighbors[1].1, e2);
-        assert!(!neighbors[1].3); // is_outgoing == false
+        assert_eq!(neighbors[1].node, c);
+        assert_eq!(neighbors[1].edge, e2);
+        assert!(!neighbors[1].outgoing); // is_outgoing == false
     }
 
     // ------------------------------------------------------------------
@@ -490,9 +491,9 @@ mod tests {
     fn dijkstra_shortest_path_same_node() {
         let (_dir, g) = open_tmp();
         let a = g.add_node("N", &json!({})).unwrap();
-        let (path, cost) = g.shortest_path_dijkstra(a, a, "weight").unwrap().unwrap();
-        assert_eq!(path, vec![a]);
-        assert_eq!(cost, 0.0);
+        let wp = g.shortest_path_dijkstra(a, a, "weight").unwrap().unwrap();
+        assert_eq!(wp.nodes, vec![a]);
+        assert_eq!(wp.total_weight, 0.0);
     }
 
     #[test]
@@ -512,9 +513,9 @@ mod tests {
         g.rebuild_csr().unwrap();
 
         // Dijkstra must select the longer hop path (a → b → c) because its total cost (3.5) is smaller than 10.0
-        let (path, cost) = g.shortest_path_dijkstra(a, c, "cost").unwrap().unwrap();
-        assert_eq!(path, vec![a, b, c]);
-        assert_eq!(cost, 3.5);
+        let wp = g.shortest_path_dijkstra(a, c, "cost").unwrap().unwrap();
+        assert_eq!(wp.nodes, vec![a, b, c]);
+        assert_eq!(wp.total_weight, 3.5);
     }
 
     #[test]
@@ -532,9 +533,9 @@ mod tests {
 
         g.rebuild_csr().unwrap();
 
-        let (path, cost) = g.shortest_path_dijkstra(a, c, "cost").unwrap().unwrap();
-        assert_eq!(path, vec![a, b, c]);
-        assert_eq!(cost, 2.0);
+        let wp = g.shortest_path_dijkstra(a, c, "cost").unwrap().unwrap();
+        assert_eq!(wp.nodes, vec![a, b, c]);
+        assert_eq!(wp.total_weight, 2.0);
     }
 
     #[test]
@@ -1124,8 +1125,8 @@ mod tests {
         let a = g.add_node("N", &json!({})).unwrap();
         let paths = g.shortest_path_top_k(a, a, 3, "weight").unwrap();
         assert_eq!(paths.len(), 1);
-        assert_eq!(paths[0].0, vec![a]);
-        assert_eq!(paths[0].1, 0.0);
+        assert_eq!(paths[0].nodes, vec![a]);
+        assert_eq!(paths[0].total_weight, 0.0);
     }
 
     #[test]
@@ -1143,8 +1144,8 @@ mod tests {
 
         let paths = g.shortest_path_top_k(a, c, 3, "cost").unwrap();
         assert_eq!(paths.len(), 1);
-        assert_eq!(paths[0].0, vec![a, b, c]);
-        assert!((paths[0].1 - 5.0).abs() < 1e-6);
+        assert_eq!(paths[0].nodes, vec![a, b, c]);
+        assert!((paths[0].total_weight - 5.0).abs() < 1e-6);
     }
 
     #[test]
@@ -1171,12 +1172,12 @@ mod tests {
         assert_eq!(paths.len(), 2);
 
         // Path 1: A -> B -> D (cost 2.0)
-        assert_eq!(paths[0].0, vec![a, b, d]);
-        assert!((paths[0].1 - 2.0).abs() < 1e-6);
+        assert_eq!(paths[0].nodes, vec![a, b, d]);
+        assert!((paths[0].total_weight - 2.0).abs() < 1e-6);
 
         // Path 2: A -> C -> D (cost 4.0)
-        assert_eq!(paths[1].0, vec![a, c, d]);
-        assert!((paths[1].1 - 4.0).abs() < 1e-6);
+        assert_eq!(paths[1].nodes, vec![a, c, d]);
+        assert!((paths[1].total_weight - 4.0).abs() < 1e-6);
     }
 
     #[test]
@@ -1204,12 +1205,12 @@ mod tests {
         assert_eq!(paths.len(), 2);
 
         // Path 1: A -> B -> C -> D (cost 3.0)
-        assert_eq!(paths[0].0, vec![a, b, c, d]);
-        assert!((paths[0].1 - 3.0).abs() < 1e-6);
+        assert_eq!(paths[0].nodes, vec![a, b, c, d]);
+        assert!((paths[0].total_weight - 3.0).abs() < 1e-6);
 
         // Path 2: A -> C -> D (cost 4.0)
-        assert_eq!(paths[1].0, vec![a, c, d]);
-        assert!((paths[1].1 - 4.0).abs() < 1e-6);
+        assert_eq!(paths[1].nodes, vec![a, c, d]);
+        assert!((paths[1].total_weight - 4.0).abs() < 1e-6);
     }
 
     #[test]
@@ -1524,8 +1525,8 @@ mod prop_tests {
             let inc: Vec<_> = g.in_neighbors(dst).unwrap();
             prop_assert_eq!(out.len(), before_out + 1);
             prop_assert_eq!(inc.len(), before_in + 1);
-            prop_assert!(out.iter().any(|&(_, e, _)| e == eid));
-            prop_assert!(inc.iter().any(|&(_, e, _)| e == eid));
+            prop_assert!(out.iter().any(|ne| ne.edge == eid));
+            prop_assert!(inc.iter().any(|ne| ne.edge == eid));
         });
     }
 

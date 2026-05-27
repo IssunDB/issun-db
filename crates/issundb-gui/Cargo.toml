@@ -1,5 +1,6 @@
 [package]
 name = "issundb-gui"
+description = "A GUI for visualizing graphs and interacting with IssunDB"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

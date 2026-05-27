@@ -3,7 +3,7 @@ pub mod exec;
 pub mod parser;
 pub mod plan;
 
-pub use exec::{QueryResult, Record, execute};
+pub use exec::{QueryResult, Record, execute, explain};
 
 #[cfg(test)]
 mod tests {
@@ -585,6 +585,29 @@ mod tests {
         .unwrap();
         assert_eq!(res2.records.len(), 1);
         assert_eq!(res2.records[0].values[0], json!("Carol"));
+    }
+
+    #[test]
+    fn explain_returns_non_empty_plan_string() {
+        let (_dir, g) = open_tmp();
+        let plan = explain(
+            &g,
+            "MATCH (n:Person)-[:KNOWS]->(m:Person) WHERE n.age > 30 RETURN n.name, m.name",
+        )
+        .unwrap();
+        assert!(
+            !plan.is_empty(),
+            "explain must return a non-empty plan string"
+        );
+        // The plan must contain the label scan and the expand operator.
+        assert!(
+            plan.contains("Person"),
+            "plan must reference the Person label"
+        );
+        assert!(
+            plan.contains("KNOWS"),
+            "plan must reference the KNOWS relationship type"
+        );
     }
 
     // Regression: collect_bound_vars for Expand unconditionally reported

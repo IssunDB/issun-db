@@ -1,0 +1,21 @@
+[package]
+name = "issundb-py"
+version = "0.1.0-alpha.1"
+edition = "2021"
+description = "Python bindings for IssunDB"
+
+[lib]
+name = "issundb"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+extension-module = ["dep:pyo3", "pyo3/extension-module"]
+
+[dependencies]
+pyo3 = { workspace = true, optional = true }
+issundb = { path = "../issundb" }
+issundb-vector = { path = "../issundb-vector" }
+issundb-text = { path = "../issundb-text" }
+serde_json = { workspace = true }
+rmp-serde = { workspace = true }

@@ -12,7 +12,7 @@
 
 ---
 
-IssunDB is an embedded graph database with vector and full-text search, written in Rust.
+An embedded graph database with vector and full-text search, written in Rust.
 
 ### Key Features
 

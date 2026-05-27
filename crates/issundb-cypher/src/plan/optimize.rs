@@ -77,6 +77,7 @@ impl Optimizer {
                 dst_var,
                 rel_type,
                 is_incoming,
+                is_undirected,
                 min_hops,
                 max_hops,
             } => {
@@ -89,6 +90,7 @@ impl Optimizer {
                         dst_var,
                         rel_type,
                         is_incoming,
+                        is_undirected,
                         min_hops,
                         max_hops,
                     },
@@ -160,6 +162,18 @@ impl Optimizer {
                     filters,
                 )
             }
+            // OptionalMatch must not have filters extracted out of it; doing so would break
+            // the null-row semantics. Pass through transparently.
+            PhysicalOperator::OptionalMatch { input, null_vars } => {
+                let (inner, inner_filters) = Self::extract_filters(*input);
+                (
+                    PhysicalOperator::OptionalMatch {
+                        input: Box::new(inner),
+                        null_vars,
+                    },
+                    inner_filters,
+                )
+            }
         }
     }
 
@@ -197,6 +211,7 @@ impl Optimizer {
                 dst_var,
                 rel_type,
                 is_incoming,
+                is_undirected,
                 min_hops,
                 max_hops,
             } => PhysicalOperator::Expand {
@@ -206,6 +221,7 @@ impl Optimizer {
                 dst_var,
                 rel_type,
                 is_incoming,
+                is_undirected,
                 min_hops,
                 max_hops,
             },
@@ -256,6 +272,12 @@ impl Optimizer {
                 skip,
                 count,
             },
+            PhysicalOperator::OptionalMatch { input, null_vars } => {
+                PhysicalOperator::OptionalMatch {
+                    input: Box::new(Self::reorder_operators(*input, stats)),
+                    null_vars,
+                }
+            }
         }
     }
 
@@ -306,7 +328,8 @@ impl Optimizer {
             // These operators sit above the core traversal tree; weight them as their child.
             PhysicalOperator::Aggregate { input, .. }
             | PhysicalOperator::Sort { input, .. }
-            | PhysicalOperator::Limit { input, .. } => Self::plan_weight(input, stats),
+            | PhysicalOperator::Limit { input, .. }
+            | PhysicalOperator::OptionalMatch { input, .. } => Self::plan_weight(input, stats),
         }
     }
 
@@ -376,6 +399,7 @@ impl Optimizer {
                 dst_var,
                 rel_type,
                 is_incoming,
+                is_undirected,
                 min_hops,
                 max_hops,
             } => {
@@ -403,6 +427,7 @@ impl Optimizer {
                     dst_var,
                     rel_type,
                     is_incoming,
+                    is_undirected,
                     min_hops,
                     max_hops,
                 };
@@ -620,6 +645,13 @@ impl Optimizer {
                     count,
                 }
             }
+            // Do not push filters into an OptionalMatch; they must remain outside.
+            PhysicalOperator::OptionalMatch { input, null_vars } => {
+                PhysicalOperator::OptionalMatch {
+                    input: Box::new(*input),
+                    null_vars,
+                }
+            }
         }
     }
 
@@ -689,6 +721,7 @@ impl Optimizer {
                                 Expr::Param(p) => format!("${}", p),
                                 Expr::CountStar => "count(*)".to_string(),
                                 Expr::Agg(_, _) => "agg".to_string(),
+                                _ => "expr".to_string(),
                             }
                         };
                         vars.insert(output_var);
@@ -711,6 +744,7 @@ impl Optimizer {
                                 Expr::Param(p) => format!("${}", p),
                                 Expr::CountStar => "count(*)".to_string(),
                                 Expr::Agg(_, _) => "agg".to_string(),
+                                _ => "expr".to_string(),
                             }
                         };
                         vars.insert(output_var);
@@ -749,6 +783,12 @@ impl Optimizer {
             PhysicalOperator::Sort { input, .. } | PhysicalOperator::Limit { input, .. } => {
                 Self::collect_bound_vars(input, vars);
             }
+            PhysicalOperator::OptionalMatch { input, null_vars } => {
+                Self::collect_bound_vars(input, vars);
+                for var in null_vars {
+                    vars.insert(var.clone());
+                }
+            }
         }
     }
 
@@ -768,6 +808,9 @@ impl Optimizer {
             FilterExpr::HasLabel(var, _) => {
                 vars.insert(var.clone());
             }
+            FilterExpr::Expr(e) => {
+                Self::collect_expr_vars(e, &mut vars);
+            }
         }
         vars
     }
@@ -783,6 +826,7 @@ impl Optimizer {
             // inner expressions; delegate to recursive collection if needed.
             Expr::CountStar => {}
             Expr::Agg(_, inner) => Self::collect_expr_vars(inner, vars),
+            _ => {}
         }
     }
 
@@ -853,6 +897,7 @@ impl Optimizer {
                 dst_var,
                 rel_type,
                 is_incoming,
+                is_undirected,
                 min_hops,
                 max_hops,
             } => PhysicalOperator::Expand {
@@ -862,6 +907,7 @@ impl Optimizer {
                 dst_var,
                 rel_type,
                 is_incoming,
+                is_undirected,
                 min_hops,
                 max_hops,
             },
@@ -1071,6 +1117,7 @@ mod tests {
             dst_var: "c".to_string(),
             rel_type: Some("EMPLOYEE".to_string()),
             is_incoming: false,
+            is_undirected: false,
             min_hops: 1,
             max_hops: 1,
         };

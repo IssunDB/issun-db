@@ -77,8 +77,8 @@ fn out_neighbors_reflects_inserted_edge() {
 
     let out = g.out_neighbors(a).unwrap();
     assert_eq!(out.len(), 1);
-    assert_eq!(out[0].0, b);
-    assert_eq!(out[0].1, eid);
+    assert_eq!(out[0].node, b);
+    assert_eq!(out[0].edge, eid);
 }
 
 #[test]
@@ -90,8 +90,8 @@ fn in_neighbors_reflects_inserted_edge() {
 
     let inc = g.in_neighbors(b).unwrap();
     assert_eq!(inc.len(), 1);
-    assert_eq!(inc[0].0, a);
-    assert_eq!(inc[0].1, eid);
+    assert_eq!(inc[0].node, a);
+    assert_eq!(inc[0].edge, eid);
 }
 
 #[test]
@@ -114,7 +114,7 @@ fn multiple_out_edges_are_all_returned() {
     }
     let out = g.out_neighbors(src).unwrap();
     assert_eq!(out.len(), 5);
-    let mut got: Vec<NodeId> = out.into_iter().map(|(n, _, _)| n).collect();
+    let mut got: Vec<NodeId> = out.into_iter().map(|ne| ne.node).collect();
     got.sort_unstable();
     let mut expected = targets.clone();
     expected.sort_unstable();
@@ -129,7 +129,7 @@ fn adjacency_type_id_matches_edge_record() {
     let eid = g.add_edge(a, b, "TYPED", &json!({})).unwrap();
     let edge = g.get_edge(eid).unwrap().unwrap();
     let out = g.out_neighbors(a).unwrap();
-    assert_eq!(out[0].2, edge.edge_type);
+    assert_eq!(out[0].edge_type, edge.edge_type);
 }
 
 // ---------------------------------------------------------------------------
@@ -265,6 +265,7 @@ fn test_facade_full_text_search_integration() {
         label: Some("Movie".to_string()),
         property: Some("synopsis".to_string()),
         limit: 10,
+        ..Default::default()
     };
     let hits = g.text_search("astronaut space", &opts).unwrap();
     assert_eq!(hits.len(), 1);

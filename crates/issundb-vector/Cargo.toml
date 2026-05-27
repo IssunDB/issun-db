@@ -11,6 +11,7 @@ rust-version.workspace = true
 
 [dependencies]
 issundb-core = { path = "../issundb-core" }
+tracing.workspace = true
 parking_lot.workspace = true
 usearch.workspace = true
 

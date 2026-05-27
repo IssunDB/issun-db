@@ -11,7 +11,6 @@ Priorities, in order:
 2. Clear boundaries between the storage engine, query layer, vector index, and public facade.
 3. Reproducible, benchmark-backed performance; no premature optimization before correctness is covered.
 4. Idiomatic Rust: ownership, zero-cost abstractions, and `unsafe` only where necessary and documented.
-5. First-class Python and Node.js bindings that feel native in their host languages.
 
 ## Core Rules
 
@@ -23,8 +22,6 @@ Priorities, in order:
 - Keep all mutable state inside `Graph` and `Storage`; do not introduce module-level `static mut` or `lazy_static` globals for runtime state.
 - Writes are serialized via the `parking_lot::Mutex<()>` write lock on `Graph`; LMDB enforces the same constraint at the storage level. Do not bypass
   either.
-- Keep Python and Node.js binding code in `issundb-py` and `issundb-node` respectively; do not leak `pyo3` or `napi` types into `issundb-core` or
-  `issundb`.
 - Add comments only when they clarify a non-obvious storage invariant, an LMDB lifetime constraint, or a GraphBLAS semiring choice.
 - Format with `rustfmt` (`make format`) and lint with Clippy (`make lint`) before declaring a change done.
 
@@ -72,8 +69,6 @@ Do not invent modules that do not yet exist when answering questions, but do pla
   materialization.
 - `crates/issundb/`: public facade. Re-exports the deliberate public surface from `issundb-core`, `issundb-vector`, `issundb-text`,
   `issundb-retrieval`, and `issundb-cypher`. Do not re-export internal storage types like `Storage`.
-- `crates/issundb-py/` *(phase 13)*: `pyo3` Python bindings. Distributed as a wheel via `maturin`.
-- `crates/issundb-node/` *(phase 14)*: `napi-rs` Node.js bindings. Distributed via npm with prebuilt binaries.
 - `crates/issundb-cli/`: interactive REPL binary. Uses only the `issundb` public facade for manual exploration and demos.
 - `examples/` *(planned)*: standalone Rust examples (`hybrid_retrieval_quickstart.rs`, `neo4j_migration.rs`, `load_ldbc.rs`).
 - `crates/issundb-core/benches/`: Criterion storage benchmarks.
@@ -118,7 +113,7 @@ Target dependency direction:
 4. `issundb-retrieval` may depend on `issundb-core`, `issundb-vector`, and `issundb-text`.
 5. `issundb-cypher` may depend on public APIs from core, vector, text, and retrieval crates, but not storage internals.
 6. `issundb` composes and re-exports the stable public API.
-7. `issundb-cli`, Python bindings, and Node.js bindings use only the `issundb` facade.
+7. `issundb-cli` uses only the `issundb` facade.
 
 Lower-level crates must not know about higher-level crates.
 
@@ -245,8 +240,6 @@ Additional validation when relevant:
 
 - `make bench` for performance-sensitive storage changes.
 - `make test-conformance` for Cypher conformance coverage.
-- `maturin develop` in a virtual environment for Python binding changes.
-- `napi build --release` for Node.js binding changes.
 
 ## Testing Expectations
 

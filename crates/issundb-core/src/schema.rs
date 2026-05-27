@@ -1,4 +1,6 @@
+use deepsize::DeepSizeOf;
 use serde::{Deserialize, Serialize};
+use serde_json;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 pub type NodeId = u64;
@@ -55,18 +57,102 @@ pub struct AdjEntry {
     pub edge_id: EdgeId,   // 8 bytes
 }
 
+impl DeepSizeOf for AdjEntry {
+    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+        // AdjEntry is a fixed-size packed struct of primitives: no heap allocations.
+        0
+    }
+}
+
 /// Stored in the `nodes` LMDB sub-database as msgpack bytes.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, DeepSizeOf)]
 pub struct NodeRecord {
     pub label: LabelId,
     pub props: Vec<u8>, // msgpack-encoded user properties
 }
 
 /// Stored in the `edges` LMDB sub-database as msgpack bytes.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, DeepSizeOf)]
 pub struct EdgeRecord {
     pub src: NodeId,
     pub dst: NodeId,
     pub edge_type: TypeId,
     pub props: Vec<u8>, // msgpack-encoded user properties
+}
+
+/// The result of a single adjacency lookup entry returned by
+/// [`Graph::out_neighbors`] and [`Graph::in_neighbors`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct NeighborEntry {
+    pub node: NodeId,
+    pub edge: EdgeId,
+    pub edge_type: TypeId,
+}
+
+/// A neighbor entry with a direction flag, returned by [`Graph::all_neighbors`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct DirectedNeighborEntry {
+    pub node: NodeId,
+    pub edge: EdgeId,
+    pub edge_type: TypeId,
+    /// `true` for outgoing edges, `false` for incoming.
+    pub outgoing: bool,
+}
+
+/// A path with an associated total weight, returned by weighted path algorithms.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WeightedPath {
+    pub nodes: Vec<NodeId>,
+    pub total_weight: f64,
+}
+
+/// A typed property value used in index lookups and range queries.
+///
+/// Use this instead of raw `serde_json::Value` when querying nodes or edges
+/// by property.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PropValue {
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    Str(String),
+}
+
+impl PropValue {
+    /// Convert to the `serde_json::Value` representation used in internal
+    /// property encoding.
+    pub(crate) fn into_json(self) -> serde_json::Value {
+        match self {
+            PropValue::Bool(b) => serde_json::Value::Bool(b),
+            PropValue::Int(i) => serde_json::Value::Number(i.into()),
+            PropValue::Float(f) => serde_json::json!(f),
+            PropValue::Str(s) => serde_json::Value::String(s),
+        }
+    }
+}
+
+impl From<bool> for PropValue {
+    fn from(v: bool) -> Self {
+        PropValue::Bool(v)
+    }
+}
+impl From<i64> for PropValue {
+    fn from(v: i64) -> Self {
+        PropValue::Int(v)
+    }
+}
+impl From<f64> for PropValue {
+    fn from(v: f64) -> Self {
+        PropValue::Float(v)
+    }
+}
+impl From<String> for PropValue {
+    fn from(v: String) -> Self {
+        PropValue::Str(v)
+    }
+}
+impl<'a> From<&'a str> for PropValue {
+    fn from(v: &'a str) -> Self {
+        PropValue::Str(v.to_string())
+    }
 }

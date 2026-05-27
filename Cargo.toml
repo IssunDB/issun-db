@@ -28,12 +28,17 @@ tracing = "0.1"
 ahash = "0.8"
 tempfile = "3"
 proptest = "1"
+rand = "0.8"
 criterion = { version = "0.5.1", features = ["html_reports"] }
 graphblas_sparse_linear_algebra = "0.63.0"
 usearch = "2"
 chumsky = "0.13.0"
 rust-stemmers = "1.2.0"
 unicode-segmentation = "1.13.2"
+pyo3 = { version = "0.22", features = ["abi3-py38"] }
+walkdir = "2"
+roaring = "0.10"
+deepsize = { version = "0.2", features = ["derive"] }
 
 [profile.release]
 strip = "debuginfo"

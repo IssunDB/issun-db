@@ -1,17 +1,24 @@
-use std::{collections::HashMap, path::Path, sync::Arc};
+use std::{
+    any::{Any, TypeId as StdTypeId},
+    collections::HashMap,
+    path::Path,
+    sync::Arc,
+};
 
-use parking_lot::Mutex;
+use parking_lot::ReentrantMutex;
 use serde::Serialize;
+use tracing::instrument;
 use zerocopy::{FromBytes, IntoBytes};
 
-use ahash::AHashSet;
+use ahash::{AHashMap, AHashSet};
 
 use crate::matrices::MatrixSet;
 use crate::{
     csr::{CsrCache, CsrSnapshot},
     error::Error,
     schema::{
-        AdjEntry, EdgeId, EdgeRecord, LabelId, Language, NodeId, NodeRecord, PropKeyId, TypeId,
+        AdjEntry, DirectedNeighborEntry, EdgeId, EdgeRecord, LabelId, Language, NeighborEntry,
+        NodeId, NodeRecord, PropKeyId, PropValue, TypeId, WeightedPath,
     },
     storage::{
         fts,
@@ -209,9 +216,13 @@ fn fts_stats_sum_dl_key(label_id: LabelId, prop_key_id: PropKeyId) -> String {
 #[derive(Clone)]
 pub struct Graph {
     storage: Arc<Storage>,
-    _write_lock: Arc<Mutex<()>>,
+    _write_lock: Arc<ReentrantMutex<()>>,
     csr_cache: Arc<CsrCache>,
     matrices: Arc<parking_lot::RwLock<Option<MatrixSet>>>,
+    /// Type-erased extension cache. Higher-level crates use this to attach
+    /// caches (e.g. HNSW vector index) to a Graph without creating a circular
+    /// dependency. Keys are `std::any::TypeId`; values are `Arc<dyn Any + Send + Sync>`.
+    pub extensions: Arc<parking_lot::Mutex<AHashMap<StdTypeId, Box<dyn Any + Send + Sync>>>>,
 }
 
 /// A read-only transaction on the graph.
@@ -240,10 +251,28 @@ impl Graph {
         };
         Ok(Self {
             storage,
-            _write_lock: Arc::new(Mutex::new(())),
+            _write_lock: Arc::new(ReentrantMutex::new(())),
             csr_cache,
             matrices,
+            extensions: Arc::new(parking_lot::Mutex::new(AHashMap::new())),
         })
+    }
+
+    /// Store an extension value (as `Arc`) keyed by its concrete type.
+    /// Replaces any existing value of the same type.
+    pub fn set_extension<T: Any + Send + Sync>(&self, val: Arc<T>) {
+        self.extensions
+            .lock()
+            .insert(StdTypeId::of::<T>(), Box::new(val));
+    }
+
+    /// Retrieve an `Arc` to a previously stored extension value, or `None` if absent.
+    pub fn get_extension<T: Any + Send + Sync>(&self) -> Option<Arc<T>> {
+        self.extensions
+            .lock()
+            .get(&StdTypeId::of::<T>())
+            .and_then(|b| b.downcast_ref::<Arc<T>>())
+            .cloned()
     }
 
     /// Execute a read-only transaction inside a closure.
@@ -283,9 +312,21 @@ impl Graph {
         }
     }
 
+    /// Hold the write lock for the duration of `f`, executing `f` without
+    /// starting an LMDB transaction. Use this to make a multi-step read-then-write
+    /// sequence (such as MERGE) atomic with respect to other writers.
+    pub fn with_write_lock<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        let _guard = self._write_lock.lock();
+        f()
+    }
+
     /// Synchronously rebuild the CSR snapshot from LMDB. Useful after bulk
     /// loads or when tests need a consistent read view before the threshold
     /// has been crossed.
+    #[instrument(skip(self))]
     pub fn rebuild_csr(&self) -> Result<(), Error> {
         let snap = CsrSnapshot::build(&self.storage)?;
         let m = MatrixSet::materialize(&snap)?;
@@ -294,11 +335,53 @@ impl Graph {
         Ok(())
     }
 
+    /// Create a hot backup of this database to `destination`.
+    ///
+    /// `destination` is a **file path** for the backup snapshot (e.g.
+    /// `/backups/mydb_2026-05-27.mdb`). The file is a complete, portable
+    /// LMDB snapshot. Concurrent reads and writes are not blocked.
+    ///
+    /// To restore: create an empty directory, copy the snapshot file to
+    /// `<dir>/data.mdb`, then call `Graph::open(<dir>, map_size_gb)`.
+    pub fn backup(&self, destination: &Path) -> Result<(), Error> {
+        self.storage
+            .env
+            .copy_to_path(destination, heed::CompactionOption::Disabled)
+            .map(|_| ())
+            .map_err(Error::Storage)
+    }
+
+    /// Same as `backup` but compacts the database during the copy.
+    ///
+    /// The resulting file is smaller than a raw backup but the operation
+    /// takes longer because it rewrites every live page.
+    pub fn backup_compact(&self, destination: &Path) -> Result<(), Error> {
+        self.storage
+            .env
+            .copy_to_path(destination, heed::CompactionOption::Enabled)
+            .map(|_| ())
+            .map_err(Error::Storage)
+    }
+
+    /// Restore a backup snapshot created by `backup` or `backup_compact` into
+    /// a new database directory.
+    ///
+    /// Creates `dst_dir` if it does not exist, then copies `snapshot_file` into
+    /// `dst_dir/data.mdb`. After this call succeeds the caller can open the
+    /// restored database with `Graph::open(dst_dir, map_size_gb)`.
+    pub fn restore(snapshot_file: &Path, dst_dir: &Path) -> Result<(), Error> {
+        std::fs::create_dir_all(dst_dir)?;
+        let dst_file = dst_dir.join("data.mdb");
+        std::fs::copy(snapshot_file, &dst_file)?;
+        Ok(())
+    }
+
     // ------------------------------------------------------------------
     // Nodes
     // ------------------------------------------------------------------
 
     /// Insert a node with a string label and msgpack-serializable properties.
+    #[instrument(skip(self, props), fields(label = %label))]
     pub fn add_node(&self, label: &str, props: &impl Serialize) -> Result<NodeId, Error> {
         let _guard = self._write_lock.lock();
         let mut wtxn = self.storage.env.write_txn()?;
@@ -408,16 +491,16 @@ impl Graph {
         }
     }
 
-    /// Update node properties.
-    pub fn update_node(
-        &self,
-        id: NodeId,
-        label: &str,
-        props: &impl Serialize,
-    ) -> Result<(), Error> {
+    /// Update the properties of an existing node. The node's label is unchanged.
+    ///
+    /// # Deadlock warning
+    ///
+    /// Do not call this method from inside a [`Graph::update`] closure. Use
+    /// [`WriteTxn::update_node`] inside the closure instead.
+    pub fn update_node(&self, id: NodeId, props: &impl Serialize) -> Result<(), Error> {
         let _guard = self._write_lock.lock();
         let mut wtxn = self.storage.env.write_txn()?;
-        self.update_node_impl(&mut wtxn, id, label, props)?;
+        self.update_node_impl(&mut wtxn, id, props)?;
         wtxn.commit()?;
         self.maybe_spawn_rebuild();
         Ok(())
@@ -427,214 +510,60 @@ impl Graph {
         &self,
         wtxn: &mut heed::RwTxn,
         id: NodeId,
-        label: &str,
         props: &impl Serialize,
     ) -> Result<(), Error> {
-        let old_record: Option<NodeRecord> = match self.storage.nodes.get(wtxn, &id)? {
-            Some(bytes) => Some(props::decode(bytes)?),
-            None => None,
+        let old_rec: NodeRecord = match self.storage.nodes.get(wtxn, &id)? {
+            Some(bytes) => props::decode(bytes)?,
+            None => return Err(Error::NodeNotFound(id)),
         };
 
-        let label_id = get_or_create_label(&self.storage, wtxn, label)?;
+        let label_id = old_rec.label;
+        let label_name = self
+            .label_name_impl(wtxn, label_id)?
+            .unwrap_or_else(|| label_id.to_string());
         let encoded_props = props::encode(props)?;
         let props_json: serde_json::Value = props::decode(&encoded_props)?;
+        let old_props_json: serde_json::Value = props::decode(&old_rec.props)?;
 
-        if let Some(old_rec) = old_record {
-            let old_props_json: serde_json::Value = props::decode(&old_rec.props)?;
+        // Same label: delete old, validate and write new property index entries.
+        let active = self.get_active_node_indexes(wtxn, label_id)?;
+        for (prop_key_id, flags) in active {
+            if let Some(prop_name) = self.prop_key_name_impl(wtxn, prop_key_id)? {
+                let old_val = old_props_json.get(&prop_name);
+                let new_val = props_json.get(&prop_name);
 
-            if old_rec.label != label_id {
-                // Label changed! Delete all old label index entries
-                let old_active = self.get_active_node_indexes(wtxn, old_rec.label)?;
-                for (prop_key_id, _) in old_active {
-                    if let Some(prop_name) = self.prop_key_name_impl(wtxn, prop_key_id)? {
-                        if let Some(old_val) = old_props_json.get(&prop_name) {
-                            if let Some(encoded_old) = encode_property_value(old_val) {
-                                let idx_key = node_prop_index_key(
-                                    old_rec.label,
-                                    prop_key_id,
-                                    &encoded_old,
-                                    id,
-                                );
+                if old_val != new_val {
+                    // Property value changed.
+                    if flags == 0x02
+                        && (new_val.is_none() || new_val == Some(&serde_json::Value::Null))
+                    {
+                        return Err(Error::RequiredConstraintViolation(
+                            label_name.clone(),
+                            prop_name.to_string(),
+                        ));
+                    }
+
+                    // 1. Delete old
+                    if let Some(o_val) = old_val {
+                        if o_val != &serde_json::Value::Null {
+                            if let Some(encoded_old) = encode_property_value(o_val) {
+                                let idx_key =
+                                    node_prop_index_key(label_id, prop_key_id, &encoded_old, id);
                                 self.storage.node_prop_idx.delete(wtxn, &idx_key)?;
                             }
                         }
                     }
-                }
 
-                // Validate and write new label index entries
-                let new_active = self.get_active_node_indexes(wtxn, label_id)?;
-                for (prop_key_id, flags) in new_active {
-                    if let Some(prop_name) = self.prop_key_name_impl(wtxn, prop_key_id)? {
-                        let prop_val = props_json.get(&prop_name);
-                        if flags == 0x02
-                            && (prop_val.is_none() || prop_val == Some(&serde_json::Value::Null))
-                        {
-                            return Err(Error::RequiredConstraintViolation(
-                                label.to_string(),
-                                prop_name.to_string(),
-                            ));
-                        }
-                        if let Some(val) = prop_val {
-                            if val != &serde_json::Value::Null {
-                                if let Some(encoded) = encode_property_value(val) {
-                                    if flags == 0x01 {
-                                        // Unique check
-                                        let mut prefix = Vec::with_capacity(4 + 4 + encoded.len());
-                                        prefix.extend_from_slice(&label_id.to_be_bytes());
-                                        prefix.extend_from_slice(&prop_key_id.to_be_bytes());
-                                        prefix.extend_from_slice(&encoded);
-                                        for entry in
-                                            self.storage.node_prop_idx.prefix_iter(wtxn, &prefix)?
-                                        {
-                                            let (key, _) = entry?;
-                                            if key.len() >= 8 {
-                                                let mut node_id_bytes = [0u8; 8];
-                                                node_id_bytes
-                                                    .copy_from_slice(&key[key.len() - 8..]);
-                                                let found_node_id =
-                                                    u64::from_be_bytes(node_id_bytes);
-                                                if found_node_id != id {
-                                                    return Err(Error::UniqueConstraintViolation(
-                                                        label.to_string(),
-                                                        prop_name.to_string(),
-                                                        val.to_string(),
-                                                    ));
-                                                }
-                                            }
-                                        }
-                                    }
-                                    let idx_key =
-                                        node_prop_index_key(label_id, prop_key_id, &encoded, id);
-                                    self.storage.node_prop_idx.put(wtxn, &idx_key, &())?;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                self.storage
-                    .label_idx
-                    .delete(wtxn, &composite_key(old_rec.label, id))?;
-                self.storage
-                    .label_idx
-                    .put(wtxn, &composite_key(label_id, id), &())?;
-
-                adjust_label_count(&self.storage, wtxn, old_rec.label, -1)?;
-                adjust_label_count(&self.storage, wtxn, label_id, 1)?;
-            } else {
-                // Same label! Delete old, validate and write new
-                let active = self.get_active_node_indexes(wtxn, label_id)?;
-                for (prop_key_id, flags) in active {
-                    if let Some(prop_name) = self.prop_key_name_impl(wtxn, prop_key_id)? {
-                        let old_val = old_props_json.get(&prop_name);
-                        let new_val = props_json.get(&prop_name);
-
-                        if old_val != new_val {
-                            // Property value changed!
-                            if flags == 0x02
-                                && (new_val.is_none() || new_val == Some(&serde_json::Value::Null))
-                            {
-                                return Err(Error::RequiredConstraintViolation(
-                                    label.to_string(),
-                                    prop_name.to_string(),
-                                ));
-                            }
-
-                            // 1. Delete old
-                            if let Some(o_val) = old_val {
-                                if o_val != &serde_json::Value::Null {
-                                    if let Some(encoded_old) = encode_property_value(o_val) {
-                                        let idx_key = node_prop_index_key(
-                                            label_id,
-                                            prop_key_id,
-                                            &encoded_old,
-                                            id,
-                                        );
-                                        self.storage.node_prop_idx.delete(wtxn, &idx_key)?;
-                                    }
-                                }
-                            }
-
-                            // 2. Validate and write new
-                            if let Some(n_val) = new_val {
-                                if n_val != &serde_json::Value::Null {
-                                    if let Some(encoded_new) = encode_property_value(n_val) {
-                                        if flags == 0x01 {
-                                            // Unique check
-                                            let mut prefix =
-                                                Vec::with_capacity(4 + 4 + encoded_new.len());
-                                            prefix.extend_from_slice(&label_id.to_be_bytes());
-                                            prefix.extend_from_slice(&prop_key_id.to_be_bytes());
-                                            prefix.extend_from_slice(&encoded_new);
-                                            for entry in self
-                                                .storage
-                                                .node_prop_idx
-                                                .prefix_iter(wtxn, &prefix)?
-                                            {
-                                                let (key, _) = entry?;
-                                                if key.len() >= 8 {
-                                                    let mut node_id_bytes = [0u8; 8];
-                                                    node_id_bytes
-                                                        .copy_from_slice(&key[key.len() - 8..]);
-                                                    let found_node_id =
-                                                        u64::from_be_bytes(node_id_bytes);
-                                                    if found_node_id != id {
-                                                        return Err(
-                                                            Error::UniqueConstraintViolation(
-                                                                label.to_string(),
-                                                                prop_name.to_string(),
-                                                                n_val.to_string(),
-                                                            ),
-                                                        );
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        let idx_key = node_prop_index_key(
-                                            label_id,
-                                            prop_key_id,
-                                            &encoded_new,
-                                            id,
-                                        );
-                                        self.storage.node_prop_idx.put(wtxn, &idx_key, &())?;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            self.update_node_fts(
-                wtxn,
-                id,
-                old_rec.label,
-                label_id,
-                &old_props_json,
-                &props_json,
-            )?;
-        } else {
-            // New node! Validate and write
-            let active = self.get_active_node_indexes(wtxn, label_id)?;
-            for (prop_key_id, flags) in active {
-                if let Some(prop_name) = self.prop_key_name_impl(wtxn, prop_key_id)? {
-                    let prop_val = props_json.get(&prop_name);
-                    if flags == 0x02
-                        && (prop_val.is_none() || prop_val == Some(&serde_json::Value::Null))
-                    {
-                        return Err(Error::RequiredConstraintViolation(
-                            label.to_string(),
-                            prop_name.to_string(),
-                        ));
-                    }
-                    if let Some(val) = prop_val {
-                        if val != &serde_json::Value::Null {
-                            if let Some(encoded) = encode_property_value(val) {
+                    // 2. Validate and write new
+                    if let Some(n_val) = new_val {
+                        if n_val != &serde_json::Value::Null {
+                            if let Some(encoded_new) = encode_property_value(n_val) {
                                 if flags == 0x01 {
                                     // Unique check
-                                    let mut prefix = Vec::with_capacity(4 + 4 + encoded.len());
+                                    let mut prefix = Vec::with_capacity(4 + 4 + encoded_new.len());
                                     prefix.extend_from_slice(&label_id.to_be_bytes());
                                     prefix.extend_from_slice(&prop_key_id.to_be_bytes());
-                                    prefix.extend_from_slice(&encoded);
+                                    prefix.extend_from_slice(&encoded_new);
                                     for entry in
                                         self.storage.node_prop_idx.prefix_iter(wtxn, &prefix)?
                                     {
@@ -645,30 +574,32 @@ impl Graph {
                                             let found_node_id = u64::from_be_bytes(node_id_bytes);
                                             if found_node_id != id {
                                                 return Err(Error::UniqueConstraintViolation(
-                                                    label.to_string(),
+                                                    label_name.clone(),
                                                     prop_name.to_string(),
-                                                    val.to_string(),
+                                                    n_val.to_string(),
                                                 ));
                                             }
                                         }
                                     }
                                 }
                                 let idx_key =
-                                    node_prop_index_key(label_id, prop_key_id, &encoded, id);
+                                    node_prop_index_key(label_id, prop_key_id, &encoded_new, id);
                                 self.storage.node_prop_idx.put(wtxn, &idx_key, &())?;
                             }
                         }
                     }
                 }
             }
-
-            self.storage
-                .label_idx
-                .put(wtxn, &composite_key(label_id, id), &())?;
-
-            adjust_label_count(&self.storage, wtxn, label_id, 1)?;
-            self.index_node_fts(wtxn, id, label_id, &props_json)?;
         }
+
+        self.update_node_fts(
+            wtxn,
+            id,
+            old_rec.label,
+            label_id,
+            &old_props_json,
+            &props_json,
+        )?;
 
         let record = NodeRecord {
             label: label_id,
@@ -681,6 +612,7 @@ impl Graph {
     }
 
     /// Delete a node.
+    #[instrument(skip(self))]
     pub fn delete_node(&self, id: NodeId) -> Result<(), Error> {
         let _guard = self._write_lock.lock();
         let mut wtxn = self.storage.env.write_txn()?;
@@ -812,6 +744,7 @@ impl Graph {
     }
 
     /// Delete an edge.
+    #[instrument(skip(self))]
     pub fn delete_edge(&self, id: EdgeId) -> Result<(), Error> {
         let _guard = self._write_lock.lock();
         let mut wtxn = self.storage.env.write_txn()?;
@@ -869,6 +802,7 @@ impl Graph {
     // ------------------------------------------------------------------
 
     /// Insert a directed edge `src → dst` with a string type and properties.
+    #[instrument(skip(self, props), fields(src = %src, dst = %dst, etype = %etype))]
     pub fn add_edge(
         &self,
         src: NodeId,
@@ -992,11 +926,11 @@ impl Graph {
     // Traversal
     // ------------------------------------------------------------------
 
-    /// Returns `(other_node_id, edge_id, type_id)` for all outgoing edges of `node`.
+    /// Returns neighbor entries for all outgoing edges of `node`.
     ///
     /// Uses the in-memory CSR snapshot when the node is present in it; falls
     /// back to an LMDB cursor for nodes added since the last rebuild.
-    pub fn out_neighbors(&self, node: NodeId) -> Result<Vec<(NodeId, EdgeId, u32)>, Error> {
+    pub fn out_neighbors(&self, node: NodeId) -> Result<Vec<NeighborEntry>, Error> {
         let rtxn = self.storage.env.read_txn()?;
         self.out_neighbors_impl(&rtxn, node)
     }
@@ -1005,16 +939,23 @@ impl Graph {
         &self,
         rtxn: &heed::RoTxn,
         node: NodeId,
-    ) -> Result<Vec<(NodeId, EdgeId, u32)>, Error> {
+    ) -> Result<Vec<NeighborEntry>, Error> {
         let snap = self.csr_cache.snapshot.load();
         if let Some(neighbors) = snap.out_neighbors(node) {
-            return Ok(neighbors);
+            return Ok(neighbors
+                .into_iter()
+                .map(|(node, edge, edge_type)| NeighborEntry {
+                    node,
+                    edge,
+                    edge_type,
+                })
+                .collect());
         }
         self.adj_entries_impl(rtxn, node, true)
     }
 
-    /// Returns `(other_node_id, edge_id, type_id)` for all incoming edges of `node`.
-    pub fn in_neighbors(&self, node: NodeId) -> Result<Vec<(NodeId, EdgeId, u32)>, Error> {
+    /// Returns neighbor entries for all incoming edges of `node`.
+    pub fn in_neighbors(&self, node: NodeId) -> Result<Vec<NeighborEntry>, Error> {
         let rtxn = self.storage.env.read_txn()?;
         self.in_neighbors_impl(&rtxn, node)
     }
@@ -1023,7 +964,7 @@ impl Graph {
         &self,
         rtxn: &heed::RoTxn,
         node: NodeId,
-    ) -> Result<Vec<(NodeId, EdgeId, u32)>, Error> {
+    ) -> Result<Vec<NeighborEntry>, Error> {
         self.adj_entries_impl(rtxn, node, false)
     }
 
@@ -1443,6 +1384,19 @@ impl Graph {
         self.active_text_indexes_impl(&rtxn)
     }
 
+    /// Tokenize `text` using the stemmer and stop-word rules for `lang`,
+    /// returning a map from term to term-frequency count.
+    ///
+    /// Exposed on `Graph` so that higher-level crates (`issundb-text`) can
+    /// perform BM25 scoring without reaching into `storage::fts` directly.
+    pub fn tokenize_text(
+        &self,
+        text: &str,
+        lang: Language,
+    ) -> std::collections::HashMap<String, u32> {
+        fts::tokenize(text, lang)
+    }
+
     fn active_text_indexes_impl(
         &self,
         rtxn: &heed::RoTxn,
@@ -1650,15 +1604,22 @@ impl Graph {
         label_id: LabelId,
         props_json: &serde_json::Value,
     ) -> Result<(), Error> {
-        let rtxn = unsafe { std::mem::transmute::<&heed::RwTxn, &heed::RoTxn>(wtxn) };
-        let active_prop_keys = self.active_text_indexes_for_label(rtxn, label_id)?;
-
-        for prop_key_id in active_prop_keys {
-            if let Some(prop_name) = get_prop_key_name(&self.storage, rtxn, prop_key_id)? {
-                if let Some(serde_json::Value::String(text_val)) = props_json.get(&prop_name) {
-                    self.add_node_prop_fts_entry(wtxn, node_id, label_id, prop_key_id, text_val)?;
+        // Collect read-side data before taking a mutable borrow.
+        let adds: Vec<(PropKeyId, String)> = {
+            let rtxn: &heed::RoTxn = wtxn;
+            let active_prop_keys = self.active_text_indexes_for_label(rtxn, label_id)?;
+            let mut out = Vec::new();
+            for prop_key_id in active_prop_keys {
+                if let Some(prop_name) = get_prop_key_name(&self.storage, rtxn, prop_key_id)? {
+                    if let Some(serde_json::Value::String(text_val)) = props_json.get(&prop_name) {
+                        out.push((prop_key_id, text_val.clone()));
+                    }
                 }
             }
+            out
+        };
+        for (prop_key_id, text_val) in adds {
+            self.add_node_prop_fts_entry(wtxn, node_id, label_id, prop_key_id, &text_val)?;
         }
         Ok(())
     }
@@ -1672,71 +1633,85 @@ impl Graph {
         old_props: &serde_json::Value,
         new_props: &serde_json::Value,
     ) -> Result<(), Error> {
-        let rtxn = unsafe { std::mem::transmute::<&heed::RwTxn, &heed::RoTxn>(wtxn) };
-
+        // Collect all read-side data before any mutable borrow of wtxn.
         if old_label_id != new_label_id {
-            // Label changed! Delete FTS index entries for old label
-            let old_active = self.active_text_indexes_for_label(rtxn, old_label_id)?;
-            for prop_key_id in old_active {
-                if let Some(prop_name) = get_prop_key_name(&self.storage, rtxn, prop_key_id)? {
-                    if let Some(serde_json::Value::String(old_text)) = old_props.get(&prop_name) {
-                        self.remove_node_prop_fts_entry(
-                            wtxn,
-                            node_id,
-                            old_label_id,
-                            prop_key_id,
-                            old_text,
-                        )?;
+            // Label changed: collect entries to remove for old label.
+            let removes: Vec<(PropKeyId, String)> = {
+                let rtxn: &heed::RoTxn = wtxn;
+                let old_active = self.active_text_indexes_for_label(rtxn, old_label_id)?;
+                let mut out = Vec::new();
+                for prop_key_id in old_active {
+                    if let Some(prop_name) = get_prop_key_name(&self.storage, rtxn, prop_key_id)? {
+                        if let Some(serde_json::Value::String(old_text)) = old_props.get(&prop_name)
+                        {
+                            out.push((prop_key_id, old_text.clone()));
+                        }
                     }
                 }
+                out
+            };
+            for (prop_key_id, old_text) in removes {
+                self.remove_node_prop_fts_entry(
+                    wtxn,
+                    node_id,
+                    old_label_id,
+                    prop_key_id,
+                    &old_text,
+                )?;
             }
 
-            // Index FTS index entries for new label
-            let new_active = self.active_text_indexes_for_label(rtxn, new_label_id)?;
-            for prop_key_id in new_active {
-                if let Some(prop_name) = get_prop_key_name(&self.storage, rtxn, prop_key_id)? {
-                    if let Some(serde_json::Value::String(new_text)) = new_props.get(&prop_name) {
-                        self.add_node_prop_fts_entry(
-                            wtxn,
-                            node_id,
-                            new_label_id,
-                            prop_key_id,
-                            new_text,
-                        )?;
+            // Collect entries to add for new label.
+            let adds: Vec<(PropKeyId, String)> = {
+                let rtxn: &heed::RoTxn = wtxn;
+                let new_active = self.active_text_indexes_for_label(rtxn, new_label_id)?;
+                let mut out = Vec::new();
+                for prop_key_id in new_active {
+                    if let Some(prop_name) = get_prop_key_name(&self.storage, rtxn, prop_key_id)? {
+                        if let Some(serde_json::Value::String(new_text)) = new_props.get(&prop_name)
+                        {
+                            out.push((prop_key_id, new_text.clone()));
+                        }
                     }
                 }
+                out
+            };
+            for (prop_key_id, new_text) in adds {
+                self.add_node_prop_fts_entry(wtxn, node_id, new_label_id, prop_key_id, &new_text)?;
             }
         } else {
-            // Same label! Delete old and write new for properties that changed
-            let active = self.active_text_indexes_for_label(rtxn, new_label_id)?;
-            for prop_key_id in active {
-                if let Some(prop_name) = get_prop_key_name(&self.storage, rtxn, prop_key_id)? {
-                    let old_val = old_props.get(&prop_name);
-                    let new_val = new_props.get(&prop_name);
-
-                    if old_val != new_val {
-                        // Delete old if it was a string
-                        if let Some(serde_json::Value::String(old_text)) = old_val {
-                            self.remove_node_prop_fts_entry(
-                                wtxn,
-                                node_id,
-                                new_label_id,
-                                prop_key_id,
-                                old_text,
-                            )?;
-                        }
-
-                        // Write new if it is a string
-                        if let Some(serde_json::Value::String(new_text)) = new_val {
-                            self.add_node_prop_fts_entry(
-                                wtxn,
-                                node_id,
-                                new_label_id,
-                                prop_key_id,
-                                new_text,
-                            )?;
+            // Same label: collect changed properties.
+            #[allow(clippy::type_complexity)]
+            let changes: Vec<(PropKeyId, Option<String>, Option<String>)> = {
+                let rtxn: &heed::RoTxn = wtxn;
+                let active = self.active_text_indexes_for_label(rtxn, new_label_id)?;
+                let mut out = Vec::new();
+                for prop_key_id in active {
+                    if let Some(prop_name) = get_prop_key_name(&self.storage, rtxn, prop_key_id)? {
+                        let old_val = old_props.get(&prop_name);
+                        let new_val = new_props.get(&prop_name);
+                        if old_val != new_val {
+                            let old_text = if let Some(serde_json::Value::String(s)) = old_val {
+                                Some(s.clone())
+                            } else {
+                                None
+                            };
+                            let new_text = if let Some(serde_json::Value::String(s)) = new_val {
+                                Some(s.clone())
+                            } else {
+                                None
+                            };
+                            out.push((prop_key_id, old_text, new_text));
                         }
                     }
+                }
+                out
+            };
+            for (prop_key_id, old_text, new_text) in changes {
+                if let Some(ref t) = old_text {
+                    self.remove_node_prop_fts_entry(wtxn, node_id, new_label_id, prop_key_id, t)?;
+                }
+                if let Some(ref t) = new_text {
+                    self.add_node_prop_fts_entry(wtxn, node_id, new_label_id, prop_key_id, t)?;
                 }
             }
         }
@@ -1751,21 +1726,22 @@ impl Graph {
         label_id: LabelId,
         props_json: &serde_json::Value,
     ) -> Result<(), Error> {
-        let rtxn = unsafe { std::mem::transmute::<&heed::RwTxn, &heed::RoTxn>(wtxn) };
-        let active_prop_keys = self.active_text_indexes_for_label(rtxn, label_id)?;
-
-        for prop_key_id in active_prop_keys {
-            if let Some(prop_name) = get_prop_key_name(&self.storage, rtxn, prop_key_id)? {
-                if let Some(serde_json::Value::String(text_val)) = props_json.get(&prop_name) {
-                    self.remove_node_prop_fts_entry(
-                        wtxn,
-                        node_id,
-                        label_id,
-                        prop_key_id,
-                        text_val,
-                    )?;
+        // Collect read-side data before taking a mutable borrow.
+        let removes: Vec<(PropKeyId, String)> = {
+            let rtxn: &heed::RoTxn = wtxn;
+            let active_prop_keys = self.active_text_indexes_for_label(rtxn, label_id)?;
+            let mut out = Vec::new();
+            for prop_key_id in active_prop_keys {
+                if let Some(prop_name) = get_prop_key_name(&self.storage, rtxn, prop_key_id)? {
+                    if let Some(serde_json::Value::String(text_val)) = props_json.get(&prop_name) {
+                        out.push((prop_key_id, text_val.clone()));
+                    }
                 }
             }
+            out
+        };
+        for (prop_key_id, text_val) in removes {
+            self.remove_node_prop_fts_entry(wtxn, node_id, label_id, prop_key_id, &text_val)?;
         }
         Ok(())
     }
@@ -1778,8 +1754,10 @@ impl Graph {
         prop_key_id: PropKeyId,
         text: &str,
     ) -> Result<(), Error> {
-        let rtxn = unsafe { std::mem::transmute::<&heed::RwTxn, &heed::RoTxn>(wtxn) };
-        let lang = self.get_fts_index_language(rtxn, label_id, prop_key_id)?;
+        let lang = {
+            let rtxn: &heed::RoTxn = wtxn;
+            self.get_fts_index_language(rtxn, label_id, prop_key_id)?
+        };
         let terms = fts::tokenize(text, lang);
         let doc_len: u32 = terms.values().sum();
         if doc_len > 0 {
@@ -1846,8 +1824,10 @@ impl Graph {
             let doc_len = parse_fts_doc_val(bytes)?;
             self.storage.fts_docs.delete(wtxn, &d_key)?;
 
-            let rtxn = unsafe { std::mem::transmute::<&heed::RwTxn, &heed::RoTxn>(wtxn) };
-            let lang = self.get_fts_index_language(rtxn, label_id, prop_key_id)?;
+            let lang = {
+                let rtxn: &heed::RoTxn = wtxn;
+                self.get_fts_index_language(rtxn, label_id, prop_key_id)?
+            };
             let terms = fts::tokenize(text, lang);
             for (term, freq) in terms {
                 let p_key = fts_postings_key(label_id, prop_key_id, &term);
@@ -1895,6 +1875,7 @@ impl Graph {
         Ok(())
     }
 
+    #[doc(hidden)]
     pub fn fts_stats(&self, label: &str, property: &str) -> Result<Option<(u64, u64)>, Error> {
         let rtxn = self.storage.env.read_txn()?;
         self.fts_stats_impl(&rtxn, label, property)
@@ -1943,6 +1924,7 @@ impl Graph {
         Ok(Some((n, sum_dl)))
     }
 
+    #[doc(hidden)]
     pub fn fts_doc_len(
         &self,
         label: &str,
@@ -1978,6 +1960,7 @@ impl Graph {
         }
     }
 
+    #[doc(hidden)]
     pub fn fts_postings(
         &self,
         label: &str,
@@ -2170,7 +2153,7 @@ impl Graph {
         &self,
         label: &str,
         property: &str,
-        val: &serde_json::Value,
+        val: PropValue,
     ) -> Result<Vec<NodeId>, Error> {
         let rtxn = self.storage.env.read_txn()?;
         self.nodes_by_property_impl(&rtxn, label, property, val)
@@ -2181,8 +2164,9 @@ impl Graph {
         rtxn: &heed::RoTxn,
         label: &str,
         property: &str,
-        val: &serde_json::Value,
+        val: PropValue,
     ) -> Result<Vec<NodeId>, Error> {
+        let val = val.into_json();
         let label_key = format!("label:{label}");
         let label_id = match self.storage.meta.get(rtxn, &label_key)? {
             Some(b) => {
@@ -2205,7 +2189,7 @@ impl Graph {
             None => return Ok(Vec::new()),
         };
 
-        let encoded = match encode_property_value(val) {
+        let encoded = match encode_property_value(&val) {
             Some(e) => e,
             None => return Ok(Vec::new()),
         };
@@ -2231,8 +2215,8 @@ impl Graph {
         &self,
         label: &str,
         property: &str,
-        min_val: Option<&serde_json::Value>,
-        max_val: Option<&serde_json::Value>,
+        min_val: Option<PropValue>,
+        max_val: Option<PropValue>,
     ) -> Result<Vec<NodeId>, Error> {
         let rtxn = self.storage.env.read_txn()?;
         self.nodes_by_property_range_impl(&rtxn, label, property, min_val, max_val)
@@ -2243,8 +2227,8 @@ impl Graph {
         rtxn: &heed::RoTxn,
         label: &str,
         property: &str,
-        min_val: Option<&serde_json::Value>,
-        max_val: Option<&serde_json::Value>,
+        min_val: Option<PropValue>,
+        max_val: Option<PropValue>,
     ) -> Result<Vec<NodeId>, Error> {
         let label_key = format!("label:{label}");
         let label_id = match self.storage.meta.get(rtxn, &label_key)? {
@@ -2272,8 +2256,14 @@ impl Graph {
         prefix.extend_from_slice(&label_id.to_be_bytes());
         prefix.extend_from_slice(&prop_key_id.to_be_bytes());
 
-        let min_encoded = min_val.and_then(encode_property_value);
-        let max_encoded = max_val.and_then(encode_property_value);
+        let min_encoded = min_val
+            .map(|v| v.into_json())
+            .as_ref()
+            .and_then(encode_property_value);
+        let max_encoded = max_val
+            .map(|v| v.into_json())
+            .as_ref()
+            .and_then(encode_property_value);
 
         let mut result = Vec::new();
         for entry in self.storage.node_prop_idx.prefix_iter(rtxn, &prefix)? {
@@ -2341,7 +2331,7 @@ impl Graph {
         &self,
         etype: &str,
         property: &str,
-        val: &serde_json::Value,
+        val: PropValue,
     ) -> Result<Vec<EdgeId>, Error> {
         let rtxn = self.storage.env.read_txn()?;
         self.edges_by_property_impl(&rtxn, etype, property, val)
@@ -2352,8 +2342,9 @@ impl Graph {
         rtxn: &heed::RoTxn,
         etype: &str,
         property: &str,
-        val: &serde_json::Value,
+        val: PropValue,
     ) -> Result<Vec<EdgeId>, Error> {
+        let val = val.into_json();
         let type_key = format!("type:{etype}");
         let type_id = match self.storage.meta.get(rtxn, &type_key)? {
             Some(b) => {
@@ -2376,7 +2367,7 @@ impl Graph {
             None => return Ok(Vec::new()),
         };
 
-        let encoded = match encode_property_value(val) {
+        let encoded = match encode_property_value(&val) {
             Some(e) => e,
             None => return Ok(Vec::new()),
         };
@@ -2402,8 +2393,8 @@ impl Graph {
         &self,
         etype: &str,
         property: &str,
-        min_val: Option<&serde_json::Value>,
-        max_val: Option<&serde_json::Value>,
+        min_val: Option<PropValue>,
+        max_val: Option<PropValue>,
     ) -> Result<Vec<EdgeId>, Error> {
         let rtxn = self.storage.env.read_txn()?;
         self.edges_by_property_range_impl(&rtxn, etype, property, min_val, max_val)
@@ -2414,8 +2405,8 @@ impl Graph {
         rtxn: &heed::RoTxn,
         etype: &str,
         property: &str,
-        min_val: Option<&serde_json::Value>,
-        max_val: Option<&serde_json::Value>,
+        min_val: Option<PropValue>,
+        max_val: Option<PropValue>,
     ) -> Result<Vec<EdgeId>, Error> {
         let type_key = format!("type:{etype}");
         let type_id = match self.storage.meta.get(rtxn, &type_key)? {
@@ -2443,8 +2434,14 @@ impl Graph {
         prefix.extend_from_slice(&type_id.to_be_bytes());
         prefix.extend_from_slice(&prop_key_id.to_be_bytes());
 
-        let min_encoded = min_val.and_then(encode_property_value);
-        let max_encoded = max_val.and_then(encode_property_value);
+        let min_encoded = min_val
+            .map(|v| v.into_json())
+            .as_ref()
+            .and_then(encode_property_value);
+        let max_encoded = max_val
+            .map(|v| v.into_json())
+            .as_ref()
+            .and_then(encode_property_value);
 
         let mut result = Vec::new();
         for entry in self.storage.edge_prop_idx.prefix_iter(rtxn, &prefix)? {
@@ -2497,15 +2494,25 @@ impl Graph {
         self.detect_cycle_graphblas(m, &snap)
     }
 
-    /// Returns `(other_node_id, edge_id, type_id, is_outgoing)` for all outgoing and incoming edges of `node`.
-    pub fn all_neighbors(&self, node: NodeId) -> Result<Vec<(NodeId, EdgeId, u32, bool)>, Error> {
+    /// Returns directed neighbor entries for all outgoing and incoming edges of `node`.
+    pub fn all_neighbors(&self, node: NodeId) -> Result<Vec<DirectedNeighborEntry>, Error> {
         let rtxn = self.storage.env.read_txn()?;
         let mut neighbors = Vec::new();
-        for (other, edge, etype) in self.out_neighbors_impl(&rtxn, node)? {
-            neighbors.push((other, edge, etype, true));
+        for ne in self.out_neighbors_impl(&rtxn, node)? {
+            neighbors.push(DirectedNeighborEntry {
+                node: ne.node,
+                edge: ne.edge,
+                edge_type: ne.edge_type,
+                outgoing: true,
+            });
         }
-        for (other, edge, etype) in self.in_neighbors_impl(&rtxn, node)? {
-            neighbors.push((other, edge, etype, false));
+        for ne in self.in_neighbors_impl(&rtxn, node)? {
+            neighbors.push(DirectedNeighborEntry {
+                node: ne.node,
+                edge: ne.edge,
+                edge_type: ne.edge_type,
+                outgoing: false,
+            });
         }
         Ok(neighbors)
     }
@@ -2549,7 +2556,7 @@ impl Graph {
         src: NodeId,
         dst: NodeId,
         _weight_property: &str,
-    ) -> Result<Option<(Vec<NodeId>, f64)>, Error> {
+    ) -> Result<Option<WeightedPath>, Error> {
         self.ensure_matrices()?;
         let guard = self.matrices.read();
         let m = guard
@@ -2655,14 +2662,21 @@ impl Graph {
         dst: NodeId,
         k: usize,
         weight_property: &str,
-    ) -> Result<Vec<(Vec<NodeId>, f64)>, Error> {
+    ) -> Result<Vec<WeightedPath>, Error> {
         self.ensure_matrices()?;
         let guard = self.matrices.read();
         let m = guard
             .as_ref()
             .ok_or(Error::Corrupt("matrices not initialized"))?;
         let snap = self.csr_cache.snapshot.load();
-        self.shortest_path_top_k_graphblas(m, &snap, src, dst, k, weight_property)
+        let paths = self.shortest_path_top_k_graphblas(m, &snap, src, dst, k, weight_property)?;
+        Ok(paths
+            .into_iter()
+            .map(|(nodes, total_weight)| WeightedPath {
+                nodes,
+                total_weight,
+            })
+            .collect())
     }
 
     /// Breadth-first search outward from `start` up to `hops` levels deep.
@@ -2684,7 +2698,7 @@ impl Graph {
     }
 
     /// Dynamic matrices materialization guard to rebuild snapshot and matrices unconditionally.
-    pub fn ensure_matrices(&self) -> Result<(), Error> {
+    pub(crate) fn ensure_matrices(&self) -> Result<(), Error> {
         let needs_rebuild = {
             let guard = self.matrices.read();
             match guard.as_ref() {
@@ -2755,14 +2769,14 @@ impl Graph {
             component.insert(start, comp_id);
             let mut queue = vec![start];
             while let Some(node) = queue.pop() {
-                for (nb, _, _) in self.out_neighbors(node)? {
-                    if component.insert(nb, comp_id).is_none() {
-                        queue.push(nb);
+                for ne in self.out_neighbors(node)? {
+                    if component.insert(ne.node, comp_id).is_none() {
+                        queue.push(ne.node);
                     }
                 }
-                for (nb, _, _) in self.in_neighbors(node)? {
-                    if component.insert(nb, comp_id).is_none() {
-                        queue.push(nb);
+                for ne in self.in_neighbors(node)? {
+                    if component.insert(ne.node, comp_id).is_none() {
+                        queue.push(ne.node);
                     }
                 }
             }
@@ -2779,6 +2793,7 @@ impl Graph {
     ///
     /// Vector search crates own vector decoding, validation, and indexing.
     /// `issundb-core` only owns the durable LMDB record.
+    #[doc(hidden)]
     pub fn put_vector_bytes(&self, n: NodeId, bytes: &[u8]) -> Result<(), Error> {
         let _guard = self._write_lock.lock();
         let mut wtxn = self.storage.env.write_txn()?;
@@ -2797,7 +2812,23 @@ impl Graph {
         Ok(())
     }
 
+    /// Delete the raw vector bytes for `n` from LMDB. No-op if absent.
+    #[doc(hidden)]
+    pub fn delete_vector_bytes(&self, n: NodeId) -> Result<(), Error> {
+        let _guard = self._write_lock.lock();
+        let mut wtxn = self.storage.env.write_txn()?;
+        self.delete_vector_bytes_impl(&mut wtxn, n)?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    fn delete_vector_bytes_impl(&self, wtxn: &mut heed::RwTxn, n: NodeId) -> Result<(), Error> {
+        self.storage.vectors.delete(wtxn, &n)?;
+        Ok(())
+    }
+
     /// Return all raw vector records in node ID order.
+    #[doc(hidden)]
     pub fn vector_bytes(&self) -> Result<Vec<(NodeId, Vec<u8>)>, Error> {
         let rtxn = self.storage.env.read_txn()?;
         self.vector_bytes_impl(&rtxn)
@@ -2865,11 +2896,7 @@ impl Graph {
     }
 
     /// Iterate all duplicate `AdjEntry` values for `node` via LMDB cursor.
-    fn adj_entries(
-        &self,
-        node: NodeId,
-        outgoing: bool,
-    ) -> Result<Vec<(NodeId, EdgeId, u32)>, Error> {
+    fn adj_entries(&self, node: NodeId, outgoing: bool) -> Result<Vec<NeighborEntry>, Error> {
         let rtxn = self.storage.env.read_txn()?;
         self.adj_entries_impl(&rtxn, node, outgoing)
     }
@@ -2879,7 +2906,7 @@ impl Graph {
         rtxn: &heed::RoTxn,
         node: NodeId,
         outgoing: bool,
-    ) -> Result<Vec<(NodeId, EdgeId, u32)>, Error> {
+    ) -> Result<Vec<NeighborEntry>, Error> {
         let db = if outgoing {
             &self.storage.out_adj
         } else {
@@ -2897,7 +2924,11 @@ impl Graph {
             let entry = AdjEntry::read_from_bytes(bytes)
                 .ok()
                 .ok_or(Error::Corrupt("AdjEntry value is not exactly 20 bytes"))?;
-            out.push((entry.other, entry.edge_id, entry.edge_type));
+            out.push(NeighborEntry {
+                node: entry.other,
+                edge: entry.edge_id,
+                edge_type: entry.edge_type,
+            });
         }
         Ok(out)
     }
@@ -2911,6 +2942,7 @@ impl Graph {
     /// Each iteration propagates the hop-level frontier one step by computing
     /// `A^T * level` with a structural complement mask that restricts writes to
     /// nodes not yet reached. The level vector is then extended with the new frontier.
+    #[doc(hidden)]
     pub fn bfs_graphblas(&self, start: NodeId, hops: u8) -> Result<Vec<NodeId>, Error> {
         use graphblas_sparse_linear_algebra::{
             collections::{
@@ -3015,6 +3047,7 @@ impl Graph {
     ///
     /// The `max_nodes` cap is applied both during seed seeding and during SpMV
     /// expansion so that the returned slice never exceeds the cap.
+    #[doc(hidden)]
     pub fn bfs_multi_source_graphblas(
         &self,
         seeds: &[NodeId],
@@ -3160,6 +3193,7 @@ impl Graph {
     /// Expand relationships for a set of source nodes using GraphBLAS SpMV.
     ///
     /// Returns a list of `(src_node_id, edge_id, dst_node_id)` triples.
+    #[doc(hidden)]
     pub fn expand_spmv_graphblas(
         &self,
         src_nodes: &[NodeId],
@@ -3193,14 +3227,14 @@ impl Graph {
                     } else {
                         self.out_neighbors(src)?
                     };
-                    for (nb, edge_id, type_id) in neighbors {
+                    for ne in neighbors {
                         if let Some(t) = rel_type {
-                            let actual_name = self.type_name(type_id)?;
+                            let actual_name = self.type_name(ne.edge_type)?;
                             if actual_name.as_deref() != Some(t) {
                                 continue;
                             }
                         }
-                        results.push((src, edge_id, nb));
+                        results.push((src, ne.edge, ne.node));
                     }
                 }
                 return Ok(results);
@@ -3237,9 +3271,9 @@ impl Graph {
                 } else {
                     self.out_neighbors(src)?
                 };
-                for (nb, edge_id, tid) in neighbors {
-                    if tid == type_id {
-                        results.push((src, edge_id, nb));
+                for ne in neighbors {
+                    if ne.edge_type == type_id {
+                        results.push((src, ne.edge, ne.node));
                     }
                 }
             }
@@ -3267,15 +3301,19 @@ impl Graph {
             let edge_lookup: StdHashMap<usize, EdgeId> = if is_incoming {
                 self.in_neighbors(src)?
                     .into_iter()
-                    .filter_map(|(nb, eid, _)| {
-                        snap.id_to_dense.get(&nb).map(|&d| (d as usize, eid))
+                    .filter_map(|ne| {
+                        snap.id_to_dense
+                            .get(&ne.node)
+                            .map(|&d| (d as usize, ne.edge))
                     })
                     .collect()
             } else {
                 self.out_neighbors(src)?
                     .into_iter()
-                    .filter_map(|(nb, eid, _)| {
-                        snap.id_to_dense.get(&nb).map(|&d| (d as usize, eid))
+                    .filter_map(|ne| {
+                        snap.id_to_dense
+                            .get(&ne.node)
+                            .map(|&d| (d as usize, ne.edge))
                     })
                     .collect()
             };
@@ -3323,6 +3361,7 @@ impl Graph {
     }
 
     /// Filter a set of nodes by label using GraphBLAS element-wise AND (multiplication).
+    #[doc(hidden)]
     pub fn label_filter_and_graphblas(
         &self,
         nodes: &[NodeId],
@@ -3427,6 +3466,7 @@ impl Graph {
     /// Each iteration computes `raw = M * rank` using PlusTimes, then applies the
     /// damping formula `rank[i] = d * raw[i] + (1 - d) / n` in Rust. Dangling
     /// nodes (no incoming edges) receive only the teleportation term.
+    #[doc(hidden)]
     pub fn page_rank_graphblas(
         &self,
         iterations: u32,
@@ -3517,6 +3557,7 @@ impl Graph {
 
     /// Unweighted SSSP from `src` to `dst` via MinPlus SpMV, with path reconstruction
     /// from the LMDB in-adjacency once the destination is reached.
+    #[doc(hidden)]
     pub fn shortest_path_graphblas(
         &self,
         src: NodeId,
@@ -3651,7 +3692,8 @@ impl Graph {
             let cur_id = snap.dense_to_id[cur];
             let in_neighbors = self.adj_entries(cur_id, false)?;
             let mut moved = false;
-            for (pred_id, _, _) in in_neighbors {
+            for ne in in_neighbors {
+                let pred_id = ne.node;
                 if let Some(&pred_d) = snap.id_to_dense.get(&pred_id) {
                     let pred_d = pred_d as usize;
                     if dist_vals[pred_d] == Some(cur_dist - 1) {
@@ -4265,8 +4307,8 @@ impl Graph {
                 }
 
                 let mut counts: HashMap<u64, usize> = HashMap::new();
-                for &(neighbor, _, _, _) in &neighbors {
-                    if let Some(&label) = labels.get(&neighbor) {
+                for ne in &neighbors {
+                    if let Some(&label) = labels.get(&ne.node) {
                         *counts.entry(label).or_insert(0) += 1;
                     }
                 }
@@ -4305,7 +4347,7 @@ impl Graph {
         snap: &CsrSnapshot,
         src: NodeId,
         dst: NodeId,
-    ) -> Result<Option<(Vec<NodeId>, f64)>, Error> {
+    ) -> Result<Option<WeightedPath>, Error> {
         use graphblas_sparse_linear_algebra::{
             collections::sparse_vector::{
                 SparseVector,
@@ -4329,7 +4371,10 @@ impl Graph {
         };
 
         if src == dst {
-            return Ok(Some((vec![src], 0.0)));
+            return Ok(Some(WeightedPath {
+                nodes: vec![src],
+                total_weight: 0.0,
+            }));
         }
 
         let n = m.n_nodes;
@@ -4437,7 +4482,8 @@ impl Graph {
             let cur_id = snap.dense_to_id[cur];
             let in_neighbors = self.adj_entries(cur_id, false)?;
             let mut moved = false;
-            for (pred_id, edge_id, _) in in_neighbors {
+            for ne in in_neighbors {
+                let (pred_id, edge_id) = (ne.node, ne.edge);
                 if let Some(&pred_d) = snap.id_to_dense.get(&pred_id) {
                     let pred_d = pred_d as usize;
                     if let Some(pred_dist) = dist_vals[pred_d] {
@@ -4469,10 +4515,10 @@ impl Graph {
         }
 
         path.reverse();
-        Ok(Some((
-            path.into_iter().map(|d| snap.dense_to_id[d]).collect(),
-            total_cost,
-        )))
+        Ok(Some(WeightedPath {
+            nodes: path.into_iter().map(|d| snap.dense_to_id[d]).collect(),
+            total_weight: total_cost,
+        }))
     }
 
     /// Depth-First Search (DFS) optimized over contiguous CSR snapshot arrays.
@@ -4731,7 +4777,8 @@ impl Graph {
                     None => return Ok(()),
                 };
                 let in_neighbors = graph.adj_entries(u, false)?;
-                for (pred_id, _, _) in in_neighbors {
+                for ne in in_neighbors {
+                    let pred_id = ne.node;
                     if let Some(&pred_d) = snap.id_to_dense.get(&pred_id) {
                         if dist_vals[pred_d as usize] == Some(cur_dist - 1) {
                             current_path.push(pred_id);
@@ -5273,11 +5320,11 @@ impl ReadTxn<'_> {
         self.graph.get_edge_impl(&self.rtxn, id)
     }
 
-    pub fn out_neighbors(&self, node: NodeId) -> Result<Vec<(NodeId, EdgeId, u32)>, Error> {
+    pub fn out_neighbors(&self, node: NodeId) -> Result<Vec<NeighborEntry>, Error> {
         self.graph.out_neighbors_impl(&self.rtxn, node)
     }
 
-    pub fn in_neighbors(&self, node: NodeId) -> Result<Vec<(NodeId, EdgeId, u32)>, Error> {
+    pub fn in_neighbors(&self, node: NodeId) -> Result<Vec<NeighborEntry>, Error> {
         self.graph.in_neighbors_impl(&self.rtxn, node)
     }
 
@@ -5309,6 +5356,7 @@ impl ReadTxn<'_> {
         self.graph.all_nodes_impl(&self.rtxn)
     }
 
+    #[doc(hidden)]
     pub fn vector_bytes(&self) -> Result<Vec<(NodeId, Vec<u8>)>, Error> {
         self.graph.vector_bytes_impl(&self.rtxn)
     }
@@ -5322,7 +5370,7 @@ impl ReadTxn<'_> {
         &self,
         label: &str,
         property: &str,
-        val: &serde_json::Value,
+        val: PropValue,
     ) -> Result<Vec<NodeId>, Error> {
         self.graph
             .nodes_by_property_impl(&self.rtxn, label, property, val)
@@ -5332,8 +5380,8 @@ impl ReadTxn<'_> {
         &self,
         label: &str,
         property: &str,
-        min_val: Option<&serde_json::Value>,
-        max_val: Option<&serde_json::Value>,
+        min_val: Option<PropValue>,
+        max_val: Option<PropValue>,
     ) -> Result<Vec<NodeId>, Error> {
         self.graph
             .nodes_by_property_range_impl(&self.rtxn, label, property, min_val, max_val)
@@ -5343,7 +5391,7 @@ impl ReadTxn<'_> {
         &self,
         etype: &str,
         property: &str,
-        val: &serde_json::Value,
+        val: PropValue,
     ) -> Result<Vec<EdgeId>, Error> {
         self.graph
             .edges_by_property_impl(&self.rtxn, etype, property, val)
@@ -5353,8 +5401,8 @@ impl ReadTxn<'_> {
         &self,
         etype: &str,
         property: &str,
-        min_val: Option<&serde_json::Value>,
-        max_val: Option<&serde_json::Value>,
+        min_val: Option<PropValue>,
+        max_val: Option<PropValue>,
     ) -> Result<Vec<EdgeId>, Error> {
         self.graph
             .edges_by_property_range_impl(&self.rtxn, etype, property, min_val, max_val)
@@ -5365,10 +5413,12 @@ impl ReadTxn<'_> {
             .has_node_text_index_impl(&self.rtxn, label, property)
     }
 
+    #[doc(hidden)]
     pub fn fts_stats(&self, label: &str, property: &str) -> Result<Option<(u64, u64)>, Error> {
         self.graph.fts_stats_impl(&self.rtxn, label, property)
     }
 
+    #[doc(hidden)]
     pub fn fts_doc_len(
         &self,
         label: &str,
@@ -5379,6 +5429,7 @@ impl ReadTxn<'_> {
             .fts_doc_len_impl(&self.rtxn, label, property, node_id)
     }
 
+    #[doc(hidden)]
     pub fn fts_postings(
         &self,
         label: &str,
@@ -5403,11 +5454,11 @@ impl WriteTxn<'_> {
         self.graph.get_edge_impl(&self.wtxn, id)
     }
 
-    pub fn out_neighbors(&self, node: NodeId) -> Result<Vec<(NodeId, EdgeId, u32)>, Error> {
+    pub fn out_neighbors(&self, node: NodeId) -> Result<Vec<NeighborEntry>, Error> {
         self.graph.out_neighbors_impl(&self.wtxn, node)
     }
 
-    pub fn in_neighbors(&self, node: NodeId) -> Result<Vec<(NodeId, EdgeId, u32)>, Error> {
+    pub fn in_neighbors(&self, node: NodeId) -> Result<Vec<NeighborEntry>, Error> {
         self.graph.in_neighbors_impl(&self.wtxn, node)
     }
 
@@ -5439,6 +5490,7 @@ impl WriteTxn<'_> {
         self.graph.all_nodes_impl(&self.wtxn)
     }
 
+    #[doc(hidden)]
     pub fn vector_bytes(&self) -> Result<Vec<(NodeId, Vec<u8>)>, Error> {
         self.graph.vector_bytes_impl(&self.wtxn)
     }
@@ -5452,7 +5504,7 @@ impl WriteTxn<'_> {
         &self,
         label: &str,
         property: &str,
-        val: &serde_json::Value,
+        val: PropValue,
     ) -> Result<Vec<NodeId>, Error> {
         self.graph
             .nodes_by_property_impl(&self.wtxn, label, property, val)
@@ -5462,8 +5514,8 @@ impl WriteTxn<'_> {
         &self,
         label: &str,
         property: &str,
-        min_val: Option<&serde_json::Value>,
-        max_val: Option<&serde_json::Value>,
+        min_val: Option<PropValue>,
+        max_val: Option<PropValue>,
     ) -> Result<Vec<NodeId>, Error> {
         self.graph
             .nodes_by_property_range_impl(&self.wtxn, label, property, min_val, max_val)
@@ -5473,7 +5525,7 @@ impl WriteTxn<'_> {
         &self,
         etype: &str,
         property: &str,
-        val: &serde_json::Value,
+        val: PropValue,
     ) -> Result<Vec<EdgeId>, Error> {
         self.graph
             .edges_by_property_impl(&self.wtxn, etype, property, val)
@@ -5483,8 +5535,8 @@ impl WriteTxn<'_> {
         &self,
         etype: &str,
         property: &str,
-        min_val: Option<&serde_json::Value>,
-        max_val: Option<&serde_json::Value>,
+        min_val: Option<PropValue>,
+        max_val: Option<PropValue>,
     ) -> Result<Vec<EdgeId>, Error> {
         self.graph
             .edges_by_property_range_impl(&self.wtxn, etype, property, min_val, max_val)
@@ -5496,14 +5548,8 @@ impl WriteTxn<'_> {
         Ok(node_id)
     }
 
-    pub fn update_node(
-        &mut self,
-        id: NodeId,
-        label: &str,
-        props: &impl Serialize,
-    ) -> Result<(), Error> {
-        self.graph
-            .update_node_impl(&mut self.wtxn, id, label, props)?;
+    pub fn update_node(&mut self, id: NodeId, props: &impl Serialize) -> Result<(), Error> {
+        self.graph.update_node_impl(&mut self.wtxn, id, props)?;
         self.mutations_count += 1;
         Ok(())
     }
@@ -5534,8 +5580,17 @@ impl WriteTxn<'_> {
         Ok(edge_id)
     }
 
+    #[doc(hidden)]
     pub fn put_vector_bytes(&mut self, n: NodeId, bytes: &[u8]) -> Result<(), Error> {
         self.graph.put_vector_bytes_impl(&mut self.wtxn, n, bytes)?;
+        self.mutations_count += 1;
+        Ok(())
+    }
+
+    /// Delete the raw vector bytes for `n` from LMDB. No-op if absent.
+    #[doc(hidden)]
+    pub fn delete_vector_bytes(&mut self, n: NodeId) -> Result<(), Error> {
+        self.graph.delete_vector_bytes_impl(&mut self.wtxn, n)?;
         self.mutations_count += 1;
         Ok(())
     }
@@ -5559,32 +5614,35 @@ impl WriteTxn<'_> {
     }
 
     pub fn has_node_text_index(&self, label: &str, property: &str) -> Result<bool, Error> {
-        let rtxn = unsafe { std::mem::transmute::<&heed::RwTxn, &heed::RoTxn>(&self.wtxn) };
+        let rtxn: &heed::RoTxn = &self.wtxn;
         self.graph.has_node_text_index_impl(rtxn, label, property)
     }
 
+    #[doc(hidden)]
     pub fn fts_stats(&self, label: &str, property: &str) -> Result<Option<(u64, u64)>, Error> {
-        let rtxn = unsafe { std::mem::transmute::<&heed::RwTxn, &heed::RoTxn>(&self.wtxn) };
+        let rtxn: &heed::RoTxn = &self.wtxn;
         self.graph.fts_stats_impl(rtxn, label, property)
     }
 
+    #[doc(hidden)]
     pub fn fts_doc_len(
         &self,
         label: &str,
         property: &str,
         node_id: NodeId,
     ) -> Result<Option<u32>, Error> {
-        let rtxn = unsafe { std::mem::transmute::<&heed::RwTxn, &heed::RoTxn>(&self.wtxn) };
+        let rtxn: &heed::RoTxn = &self.wtxn;
         self.graph.fts_doc_len_impl(rtxn, label, property, node_id)
     }
 
+    #[doc(hidden)]
     pub fn fts_postings(
         &self,
         label: &str,
         property: &str,
         term: &str,
     ) -> Result<Vec<(NodeId, u32)>, Error> {
-        let rtxn = unsafe { std::mem::transmute::<&heed::RwTxn, &heed::RoTxn>(&self.wtxn) };
+        let rtxn: &heed::RoTxn = &self.wtxn;
         self.graph.fts_postings_impl(rtxn, label, property, term)
     }
 
@@ -5601,7 +5659,7 @@ impl WriteTxn<'_> {
     }
 
     pub fn active_text_indexes(&self) -> Result<Vec<(String, String, Language)>, Error> {
-        let rtxn = unsafe { std::mem::transmute::<&heed::RwTxn, &heed::RoTxn>(&self.wtxn) };
+        let rtxn: &heed::RoTxn = &self.wtxn;
         self.graph.active_text_indexes_impl(rtxn)
     }
 }
@@ -5663,7 +5721,7 @@ mod tests {
 
         let neighbors = g.out_neighbors(a).unwrap();
         assert_eq!(neighbors.len(), 1);
-        assert_eq!(neighbors[0].0, b);
+        assert_eq!(neighbors[0].node, b);
     }
 
     #[test]
@@ -5853,28 +5911,21 @@ mod tests {
     }
 
     #[test]
-    fn label_count_transfers_on_update_node_label_change() {
+    fn label_count_unchanged_on_update_node() {
         let (_dir, g) = open_tmp();
         let id = g.add_node("Person", &json!({})).unwrap();
         assert_eq!(g.node_count_by_label("Person").unwrap(), 1);
-        assert_eq!(g.node_count_by_label("Employee").unwrap(), 0);
 
-        // Relabel to "Employee".
-        g.update_node(id, "Employee", &json!({})).unwrap();
-        assert_eq!(g.node_count_by_label("Person").unwrap(), 0);
-        assert_eq!(g.node_count_by_label("Employee").unwrap(), 1);
+        // update_node does not change the label; the count must stay at 1.
+        g.update_node(id, &json!({"name": "Alice"})).unwrap();
+        assert_eq!(g.node_count_by_label("Person").unwrap(), 1);
     }
 
     #[test]
-    fn label_count_unchanged_on_same_label_update() {
+    fn update_node_returns_not_found_for_missing_node() {
         let (_dir, g) = open_tmp();
-        let id = g.add_node("Person", &json!({})).unwrap();
-        assert_eq!(g.node_count_by_label("Person").unwrap(), 1);
-
-        // Updating properties without changing the label must not alter the count.
-        g.update_node(id, "Person", &json!({"name": "Alice"}))
-            .unwrap();
-        assert_eq!(g.node_count_by_label("Person").unwrap(), 1);
+        let res = g.update_node(9999, &json!({}));
+        assert!(matches!(res, Err(Error::NodeNotFound(9999))));
     }
 
     #[test]
@@ -5923,13 +5974,13 @@ mod tests {
         // 2. Verify adjacency lists
         let out_neighs = g.out_neighbors(a).unwrap();
         assert_eq!(out_neighs.len(), 1);
-        assert_eq!(out_neighs[0].0, b);
-        assert_eq!(out_neighs[0].1, eid);
+        assert_eq!(out_neighs[0].node, b);
+        assert_eq!(out_neighs[0].edge, eid);
 
         let in_neighs = g.in_neighbors(b).unwrap();
         assert_eq!(in_neighs.len(), 1);
-        assert_eq!(in_neighs[0].0, a);
-        assert_eq!(in_neighs[0].1, eid);
+        assert_eq!(in_neighs[0].node, a);
+        assert_eq!(in_neighs[0].edge, eid);
 
         // 3. Delete the edge
         g.delete_edge(eid).unwrap();
@@ -5972,18 +6023,27 @@ mod tests {
         assert!(g.has_node_property_index("Person", "age").unwrap());
 
         // Point queries
-        let p30 = g.nodes_by_property("Person", "age", &json!(30)).unwrap();
+        let p30 = g
+            .nodes_by_property("Person", "age", PropValue::Int(30))
+            .unwrap();
         assert_eq!(p30.len(), 2);
         assert!(p30.contains(&n1));
         assert!(p30.contains(&n3));
 
-        let p25 = g.nodes_by_property("Person", "age", &json!(25)).unwrap();
+        let p25 = g
+            .nodes_by_property("Person", "age", PropValue::Int(25))
+            .unwrap();
         assert_eq!(p25.len(), 1);
         assert!(p25.contains(&n2));
 
         // Range queries (e.g. age between 20 and 28)
         let pr = g
-            .nodes_by_property_range("Person", "age", Some(&json!(20)), Some(&json!(28)))
+            .nodes_by_property_range(
+                "Person",
+                "age",
+                Some(PropValue::Int(20)),
+                Some(PropValue::Int(28)),
+            )
             .unwrap();
         assert_eq!(pr.len(), 1);
         assert!(pr.contains(&n2));
@@ -5991,7 +6051,7 @@ mod tests {
         // Let's create an index on Person(name) to test string sorting/prefix
         g.create_node_property_index("Person", "name").unwrap();
         let p_alice = g
-            .nodes_by_property("Person", "name", &json!("Alice"))
+            .nodes_by_property("Person", "name", PropValue::Str("Alice".to_string()))
             .unwrap();
         assert_eq!(p_alice.len(), 1);
         assert!(p_alice.contains(&n1));
@@ -6032,11 +6092,8 @@ mod tests {
             .unwrap();
 
         // Update u2 to have u1's email - should fail
-        let update_res = g.update_node(
-            u2,
-            "User",
-            &json!({"email": "user1@example.com", "name": "User 2"}),
-        );
+        let update_res =
+            g.update_node(u2, &json!({"email": "user1@example.com", "name": "User 2"}));
         assert!(update_res.is_err());
         assert!(matches!(
             update_res.unwrap_err(),
@@ -6065,7 +6122,7 @@ mod tests {
         ));
 
         // Update t1 to remove title - should fail
-        let update_res = g.update_node(t1, "Task", &json!({"done": true}));
+        let update_res = g.update_node(t1, &json!({"done": true}));
         assert!(update_res.is_err());
         assert!(matches!(
             update_res.unwrap_err(),
@@ -6089,5 +6146,32 @@ mod tests {
         // Now we should be able to reuse the account number because index was cleaned up!
         let a2 = g.add_node("Account", &json!({"number": "12345"}));
         assert!(a2.is_ok());
+    }
+
+    #[test]
+    fn backup_and_restore_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        let backup_file = dir.path().join("snapshot.mdb");
+        let restore_dir = dir.path().join("restored");
+
+        // Write data.
+        let n;
+        {
+            let g = Graph::open(&dir.path().join("primary"), 1).unwrap();
+            n = g
+                .add_node("BackupTest", &serde_json::json!({"x": 42}))
+                .unwrap();
+            g.backup(&backup_file).unwrap();
+        }
+
+        // Restore and verify.
+        Graph::restore(&backup_file, &restore_dir).unwrap();
+        let g2 = Graph::open(&restore_dir, 1).unwrap();
+        let rec = g2
+            .get_node(n)
+            .unwrap()
+            .expect("node must exist in restored graph");
+        let props: serde_json::Value = rmp_serde::from_slice(&rec.props).unwrap();
+        assert_eq!(props["x"], serde_json::json!(42));
     }
 }

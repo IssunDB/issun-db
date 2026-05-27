@@ -7,6 +7,12 @@ pub enum Statement {
     Create(CreateStatement),
     Set(SetStatement),
     Delete(DeleteStatement),
+    /// A MERGE statement: create the pattern if absent, otherwise update it.
+    Merge(MergeStatement),
+    /// CREATE INDEX FOR (n:Label) ON (n.property)
+    CreateIndex(CreateIndexStatement),
+    /// DROP INDEX FOR (n:Label) ON (n.property)
+    DropIndex(DropIndexStatement),
 }
 
 /// A read-only Cypher query containing MATCH, WHERE, RETURN, ORDER BY, SKIP, and LIMIT clauses.
@@ -41,9 +47,19 @@ pub enum QueryPart {
         match_clauses: Vec<MatchClause>,
         where_clause: Option<WhereClause>,
     },
+    OptionalMatch {
+        match_clauses: Vec<MatchClause>,
+        where_clause: Option<WhereClause>,
+    },
     With {
         items: Vec<ReturnItem>,
         where_clause: Option<WhereClause>,
+        /// Optional ORDER BY on the WITH clause output.
+        order_by: Option<OrderBy>,
+        /// Optional SKIP on the WITH clause output.
+        skip: Option<Expr>,
+        /// Optional LIMIT on the WITH clause output.
+        limit: Option<Expr>,
     },
     Unwind {
         expr: Expr,
@@ -83,7 +99,11 @@ pub struct RelRange {
 pub struct RelationshipPattern {
     pub variable: Option<String>,
     pub rel_type: Option<String>,
+    /// True when the relationship is directed inbound: `<-[...]-`.
     pub is_incoming: bool,
+    /// True when the relationship has no direction: `-[...]- `.
+    /// When `is_undirected` is true, `is_incoming` is ignored.
+    pub is_undirected: bool,
     pub range: Option<RelRange>,
     pub properties: Option<HashMap<String, Literal>>,
 }
@@ -97,12 +117,14 @@ pub enum WhereClause {
     Gt(Expr, Expr),
     Le(Expr, Expr),
     Ge(Expr, Expr),
+    /// A full boolean expression such as IS NULL, OR, AND, NOT, and quantifiers.
+    Expr(Expr),
 }
 
 /// An aggregation function applied to an expression.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AggFn {
-    /// `count(*)` or `count(expr)` — with optional `DISTINCT` for the expression form.
+    /// `count(*)` or `count(expr)`; with optional `DISTINCT` for the expression form.
     Count {
         distinct: bool,
     },
@@ -111,6 +133,15 @@ pub enum AggFn {
     Min,
     Max,
     Collect,
+}
+
+/// The kind of quantifier expression.
+#[derive(Debug, Clone, PartialEq)]
+pub enum QuantifierKind {
+    All,
+    Any,
+    None,
+    Single,
 }
 
 /// A Cypher expression (property reference, literal, parameter, or aggregation).
@@ -123,6 +154,48 @@ pub enum Expr {
     CountStar,
     /// Aggregation function applied to an inner expression.
     Agg(AggFn, Box<Expr>),
+    /// `all(x IN list WHERE predicate)`, `any(...)`, `none(...)`, `single(...)`.
+    Quantifier {
+        kind: QuantifierKind,
+        variable: String,
+        list: Box<Expr>,
+        predicate: Box<Expr>,
+    },
+    /// Built-in function call: `range(start, end)`, `range(start, end, step)`, `size(expr)`, etc.
+    FunctionCall {
+        name: String,
+        args: Vec<Expr>,
+    },
+    /// Binary arithmetic or logical operation.
+    BinaryOp {
+        op: BinaryOperator,
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+    /// `expr IS NULL`
+    IsNull(Box<Expr>),
+    /// `expr IS NOT NULL`
+    IsNotNull(Box<Expr>),
+    /// Unary negation: `NOT expr`.
+    Not(Box<Expr>),
+}
+
+/// Binary operator for use in expressions.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BinaryOperator {
+    Eq,
+    Ne,
+    Lt,
+    Gt,
+    Le,
+    Ge,
+    And,
+    Or,
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
 }
 
 /// A literal value representation.
@@ -199,4 +272,26 @@ pub struct DeleteStatement {
     pub match_clauses: Vec<MatchClause>,
     pub where_clause: Option<WhereClause>,
     pub variables: Vec<String>,
+}
+
+/// A MERGE statement with optional ON CREATE SET and ON MATCH SET sub-clauses.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MergeStatement {
+    pub pattern: Pattern,
+    pub on_create_set: Vec<SetItem>,
+    pub on_match_set: Vec<SetItem>,
+}
+
+/// A CREATE INDEX statement targeting a single label and property.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateIndexStatement {
+    pub label: String,
+    pub property: String,
+}
+
+/// A DROP INDEX statement targeting a single label and property.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropIndexStatement {
+    pub label: String,
+    pub property: String,
 }

@@ -1,7 +1,8 @@
 use std::{collections::HashMap, fs, io::Write, path::PathBuf};
 
 use issundb::{
-    EdgeId, Graph, GraphQueryExt, Hit, NodeId, RetrieveOptions, VectorGraphExt, retrieve_with,
+    DegreeDirection, EdgeId, Graph, GraphQueryExt, Hit, NodeId, RetrieveOptions, TextGraphExt,
+    TextSearchOptions, VectorGraphExt, retrieve_with,
 };
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
@@ -73,7 +74,7 @@ fn main() {
         let _ = rl.load_history(hp);
     }
 
-    println!("IssunDB REPL  —  type `help` for commands, `quit` to exit.");
+    println!("IssunDB REPL: type `help` for commands, `quit` to exit.");
 
     loop {
         let prompt = if state.graph.is_some() {
@@ -140,6 +141,78 @@ fn handle(state: &mut State, line: &str) -> bool {
                 eprintln!("usage: :run <file>");
             } else {
                 run_script(state, rest);
+            }
+        }
+
+        // --- batch import ---------------------------------------------------
+        ":import-jsonl" => {
+            if rest.is_empty() {
+                eprintln!("usage: :import-jsonl <file>");
+            } else {
+                cmd_import_jsonl(state, rest);
+            }
+        }
+        ":import-csv" => {
+            if rest.is_empty() {
+                eprintln!("usage: :import-csv <file>");
+            } else {
+                cmd_import_csv(state, rest);
+            }
+        }
+
+        ":explain" => {
+            let g = match state.graph.as_ref() {
+                Some(g) => g,
+                None => {
+                    eprintln!("no database open");
+                    return true;
+                }
+            };
+            if rest.is_empty() {
+                eprintln!("usage: :explain <cypher>");
+            } else {
+                match g.explain(rest) {
+                    Ok(plan) => print!("{}", plan),
+                    Err(e) => eprintln!("error: {e}"),
+                }
+            }
+        }
+
+        // --- backup / restore ------------------------------------------------
+        ":backup" => {
+            let g = match state.graph.as_ref() {
+                Some(g) => g,
+                None => {
+                    eprintln!("no database open");
+                    return true;
+                }
+            };
+            if rest.is_empty() {
+                eprintln!("usage: :backup <file>");
+            } else {
+                let path = std::path::Path::new(rest);
+                match g.backup(path) {
+                    Ok(_) => eprintln!("backup written to {}", path.display()),
+                    Err(e) => eprintln!("backup failed: {e}"),
+                }
+            }
+        }
+        ":backup-compact" => {
+            let g = match state.graph.as_ref() {
+                Some(g) => g,
+                None => {
+                    eprintln!("no database open");
+                    return true;
+                }
+            };
+            if rest.is_empty() {
+                eprintln!("usage: :backup-compact <file>");
+            } else {
+                let path = std::path::Path::new(rest);
+                match g.backup_compact(path) {
+                    Ok(_) => eprintln!("compact backup written to {}", path.display()),
+                    Err(e) => eprintln!("backup failed: {e}"),
+                }
             }
         }
 
@@ -371,16 +444,15 @@ fn dispatch(state: &mut State, cmd: &str, rest: &str) {
         "update-node" => {
             let mut s = rest;
             let id = next_token(&mut s).and_then(|t| t.parse::<u64>().ok());
-            let label = next_token(&mut s);
-            match (id, label) {
-                (Some(id), Some(lbl)) => match parse_props(s.trim()) {
+            match id {
+                Some(id) => match parse_props(s.trim()) {
                     Err(e) => eprintln!("invalid props: {e}"),
-                    Ok(props) => match g.update_node(NodeId::from(id), lbl, &props) {
+                    Ok(props) => match g.update_node(NodeId::from(id), &props) {
                         Ok(()) => println!("ok"),
                         Err(e) => eprintln!("error: {e}"),
                     },
                 },
-                _ => eprintln!("usage: update-node <id> <label> [json]"),
+                None => eprintln!("usage: update-node <id> [json]"),
             }
         }
         "delete-node" => match rest.parse::<u64>() {
@@ -397,19 +469,62 @@ fn dispatch(state: &mut State, cmd: &str, rest: &str) {
                 Err(e) => eprintln!("error: {e}"),
             },
         },
+        "add-edge" => {
+            let parts: Vec<&str> = rest.splitn(4, ' ').collect();
+            if parts.len() < 3 {
+                eprintln!("usage: add-edge <src> <dst> <type> [json]");
+                return;
+            }
+            let src = parts[0].trim().parse::<u64>();
+            let dst = parts[1].trim().parse::<u64>();
+            let etype = parts[2].trim();
+            let props_str = if parts.len() > 3 { parts[3].trim() } else { "" };
+            match (src, dst) {
+                (Ok(s), Ok(d)) => match parse_props(props_str) {
+                    Err(e) => eprintln!("invalid props: {e}"),
+                    Ok(props) => {
+                        match g.add_edge(NodeId::from(s), NodeId::from(d), etype, &props) {
+                            Ok(id) => println!("{id}"),
+                            Err(e) => eprintln!("error: {e}"),
+                        }
+                    }
+                },
+                _ => eprintln!("usage: add-edge <src> <dst> <type> [json]"),
+            }
+        }
+        "get-edge" => match rest.parse::<u64>() {
+            Err(_) => eprintln!("usage: get-edge <id>"),
+            Ok(id) => match g.get_edge(EdgeId::from(id)) {
+                Ok(Some(r)) => {
+                    let etype = g
+                        .type_name(r.edge_type)
+                        .ok()
+                        .flatten()
+                        .unwrap_or_else(|| r.edge_type.to_string());
+                    println!(
+                        "src={} dst={} type={etype} props={}",
+                        r.src,
+                        r.dst,
+                        decode_props(&r.props)
+                    );
+                }
+                Ok(None) => eprintln!("not found"),
+                Err(e) => eprintln!("error: {e}"),
+            },
+        },
 
         // --- adjacency -------------------------------------------------------
         "out" => match rest.parse::<u64>() {
             Err(_) => eprintln!("usage: out <id>"),
             Ok(id) => match g.out_neighbors(NodeId::from(id)) {
                 Ok(v) => {
-                    for (nb, eid, tid) in v {
+                    for ne in v {
                         let etype = g
-                            .type_name(tid)
+                            .type_name(ne.edge_type)
                             .ok()
                             .flatten()
-                            .unwrap_or_else(|| tid.to_string());
-                        println!("  node={nb} edge={eid} type={etype}");
+                            .unwrap_or_else(|| ne.edge_type.to_string());
+                        println!("  node={} edge={} type={etype}", ne.node, ne.edge);
                     }
                 }
                 Err(e) => eprintln!("error: {e}"),
@@ -419,13 +534,13 @@ fn dispatch(state: &mut State, cmd: &str, rest: &str) {
             Err(_) => eprintln!("usage: in <id>"),
             Ok(id) => match g.in_neighbors(NodeId::from(id)) {
                 Ok(v) => {
-                    for (nb, eid, tid) in v {
+                    for ne in v {
                         let etype = g
-                            .type_name(tid)
+                            .type_name(ne.edge_type)
                             .ok()
                             .flatten()
-                            .unwrap_or_else(|| tid.to_string());
-                        println!("  node={nb} edge={eid} type={etype}");
+                            .unwrap_or_else(|| ne.edge_type.to_string());
+                        println!("  node={} edge={} type={etype}", ne.node, ne.edge);
                     }
                 }
                 Err(e) => eprintln!("error: {e}"),
@@ -558,6 +673,141 @@ fn dispatch(state: &mut State, cmd: &str, rest: &str) {
             }
             Err(e) => eprintln!("error: {e}"),
         },
+        "scc" => match g.strongly_connected_components() {
+            Ok(map) => {
+                let n_comps = map.values().collect::<std::collections::HashSet<_>>().len();
+                println!(
+                    "{} node(s) in {n_comps} strongly connected component(s)",
+                    map.len()
+                );
+            }
+            Err(e) => eprintln!("error: {e}"),
+        },
+        "detect-cycle" => match g.detect_cycle() {
+            Ok(true) => println!("cycle detected"),
+            Ok(false) => println!("no cycle"),
+            Err(e) => eprintln!("error: {e}"),
+        },
+        "betweenness" => match g.betweenness_centrality() {
+            Ok(scores) => {
+                let mut sorted: Vec<_> = scores.iter().collect();
+                sorted.sort_unstable_by(|a, b| {
+                    b.1.partial_cmp(a.1).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                for (n, s) in sorted.iter().take(20) {
+                    println!("  node={n} betweenness={s:.6}");
+                }
+                if sorted.len() > 20 {
+                    println!("  ... ({} total)", sorted.len());
+                }
+            }
+            Err(e) => eprintln!("error: {e}"),
+        },
+        "harmonic" => match g.harmonic_centrality() {
+            Ok(scores) => {
+                let mut sorted: Vec<_> = scores.iter().collect();
+                sorted.sort_unstable_by(|a, b| {
+                    b.1.partial_cmp(a.1).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                for (n, s) in sorted.iter().take(20) {
+                    println!("  node={n} harmonic={s:.6}");
+                }
+                if sorted.len() > 20 {
+                    println!("  ... ({} total)", sorted.len());
+                }
+            }
+            Err(e) => eprintln!("error: {e}"),
+        },
+        "degree" => {
+            let direction = match rest.trim() {
+                "in" => DegreeDirection::In,
+                "out" => DegreeDirection::Out,
+                _ => DegreeDirection::Both,
+            };
+            match g.degree_centrality(direction) {
+                Ok(scores) => {
+                    let mut sorted: Vec<_> = scores.iter().collect();
+                    sorted.sort_unstable_by(|a, b| b.1.cmp(a.1));
+                    for (n, d) in sorted.iter().take(20) {
+                        println!("  node={n} degree={d}");
+                    }
+                    if sorted.len() > 20 {
+                        println!("  ... ({} total)", sorted.len());
+                    }
+                }
+                Err(e) => eprintln!("error: {e}"),
+            }
+        }
+        "community" => {
+            let max_iters: usize = rest.trim().parse().unwrap_or(10);
+            match g.label_propagation(max_iters) {
+                Ok(map) => {
+                    let n_comps = map.values().collect::<std::collections::HashSet<_>>().len();
+                    println!("{} node(s) in {n_comps} community/communities", map.len());
+                }
+                Err(e) => eprintln!("error: {e}"),
+            }
+        }
+        "spanning-forest" => {
+            let tokens: Vec<&str> = rest.split_whitespace().collect();
+            let (weight_prop, maximum) = match tokens.as_slice() {
+                [prop] => (*prop, false),
+                [prop, "max"] => (*prop, true),
+                _ => {
+                    eprintln!("usage: spanning-forest <weight_property> [max]");
+                    return;
+                }
+            };
+            match g.spanning_forest(weight_prop, maximum) {
+                Ok(edges) => {
+                    println!("{} edge(s) in spanning forest", edges.len());
+                    for e in &edges {
+                        println!("  edge={e}");
+                    }
+                }
+                Err(e) => eprintln!("error: {e}"),
+            }
+        }
+        "max-flow" => {
+            let tokens: Vec<&str> = rest.split_whitespace().collect();
+            if tokens.len() < 3 {
+                eprintln!("usage: max-flow <src> <dst> <capacity_property>");
+                return;
+            }
+            match (tokens[0].parse::<u64>(), tokens[1].parse::<u64>()) {
+                (Ok(s), Ok(d)) => match g.maximum_flow(NodeId::from(s), NodeId::from(d), tokens[2])
+                {
+                    Ok(flow) => println!("max flow = {flow:.6}"),
+                    Err(e) => eprintln!("error: {e}"),
+                },
+                _ => eprintln!("usage: max-flow <src> <dst> <capacity_property>"),
+            }
+        }
+        "wpath" => {
+            let tokens: Vec<&str> = rest.split_whitespace().collect();
+            if tokens.len() < 3 {
+                eprintln!("usage: wpath <src> <dst> <weight_property>");
+                return;
+            }
+            match (tokens[0].parse::<u64>(), tokens[1].parse::<u64>()) {
+                (Ok(s), Ok(d)) => {
+                    match g.shortest_path_dijkstra(NodeId::from(s), NodeId::from(d), tokens[2]) {
+                        Ok(Some(wp)) => println!(
+                            "cost={:.6} path={}",
+                            wp.total_weight,
+                            wp.nodes
+                                .iter()
+                                .map(|n| n.to_string())
+                                .collect::<Vec<_>>()
+                                .join(" -> ")
+                        ),
+                        Ok(None) => println!("no path"),
+                        Err(e) => eprintln!("error: {e}"),
+                    }
+                }
+                _ => eprintln!("usage: wpath <src> <dst> <weight_property>"),
+            }
+        }
         "rebuild-csr" => match g.rebuild_csr() {
             Ok(()) => println!("ok"),
             Err(e) => eprintln!("error: {e}"),
@@ -645,6 +895,72 @@ fn dispatch(state: &mut State, cmd: &str, rest: &str) {
             }
         }
 
+        // --- full-text search ------------------------------------------------
+        "text-index" => {
+            let tokens: Vec<&str> = rest.split_whitespace().collect();
+            if tokens.len() < 3 && !(tokens.len() == 1 && tokens[0] == "list") {
+                eprintln!("usage: text-index create|drop|list <label> <property>");
+                return;
+            }
+            match tokens.first().copied().unwrap_or("") {
+                "create" => match g.create_node_text_index(tokens[1], tokens[2]) {
+                    Ok(()) => println!("ok"),
+                    Err(e) => eprintln!("error: {e}"),
+                },
+                "drop" => match g.drop_node_text_index(tokens[1], tokens[2]) {
+                    Ok(()) => println!("ok"),
+                    Err(e) => eprintln!("error: {e}"),
+                },
+                "list" => match g.active_text_indexes() {
+                    Ok(idxs) => {
+                        if idxs.is_empty() {
+                            println!("(no text indexes)");
+                        } else {
+                            for (label, prop, _lang) in &idxs {
+                                println!("  {label}.{prop}");
+                            }
+                        }
+                    }
+                    Err(e) => eprintln!("error: {e}"),
+                },
+                other => eprintln!("unknown subcommand: {other}; use create, drop, or list"),
+            }
+        }
+        "text-search" => {
+            // text-search <query> [label] [prop] [limit]
+            let mut s = rest;
+            let query = match next_token(&mut s) {
+                Some(q) => q.to_owned(),
+                None => {
+                    eprintln!("usage: text-search <query> [label] [prop] [limit]");
+                    return;
+                }
+            };
+            let mut opts = TextSearchOptions::default();
+            let tok2 = next_token(&mut s).map(str::to_owned);
+            let tok3 = next_token(&mut s).map(str::to_owned);
+            let tok4 = next_token(&mut s).map(str::to_owned);
+            opts.label = tok2;
+            opts.property = tok3;
+            if let Some(lim) = tok4 {
+                if let Ok(n) = lim.parse::<usize>() {
+                    opts.limit = n;
+                }
+            }
+            match g.text_search(&query, &opts) {
+                Ok(hits) => {
+                    if hits.is_empty() {
+                        println!("(no results)");
+                    } else {
+                        for h in &hits {
+                            println!("  node={} score={:.6}", h.node, h.score);
+                        }
+                    }
+                }
+                Err(e) => eprintln!("error: {e}"),
+            }
+        }
+
         _ => eprintln!("unknown command: {cmd}; type `help` for a list"),
     }
 }
@@ -707,6 +1023,137 @@ fn print_hits(hits: &[Hit]) {
 }
 
 // ---------------------------------------------------------------------------
+// Batch import helpers
+// ---------------------------------------------------------------------------
+
+fn cmd_import_jsonl(state: &mut State, path: &str) {
+    let g = match state.graph.as_ref() {
+        Some(g) => g,
+        None => {
+            eprintln!("no database open");
+            return;
+        }
+    };
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("cannot read {path}: {e}");
+            return;
+        }
+    };
+
+    let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+    let total = lines.len();
+    let mut errors = 0usize;
+
+    // Parse all lines first to fail fast on malformed input.
+    let mut entries: Vec<(String, serde_json::Value)> = Vec::with_capacity(total);
+    for (i, line) in lines.iter().enumerate() {
+        match serde_json::from_str::<serde_json::Value>(line) {
+            Ok(v) => {
+                let label = v
+                    .get("label")
+                    .and_then(|l| l.as_str())
+                    .unwrap_or("Node")
+                    .to_owned();
+                let props = v
+                    .get("props")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Object(Default::default()));
+                entries.push((label, props));
+            }
+            Err(e) => {
+                eprintln!("line {}: parse error: {e}", i + 1);
+                errors += 1;
+            }
+        }
+    }
+
+    // Batch-insert in one write transaction.
+    let ok = entries.len();
+    match g.update(|txn| {
+        for (label, props) in &entries {
+            txn.add_node(label, props)?;
+        }
+        Ok(())
+    }) {
+        Ok(_) => eprintln!("imported {ok}/{total} nodes ({errors} parse errors)"),
+        Err(e) => eprintln!("import failed: {e}"),
+    }
+}
+
+fn cmd_import_csv(state: &mut State, path: &str) {
+    let g = match state.graph.as_ref() {
+        Some(g) => g,
+        None => {
+            eprintln!("no database open");
+            return;
+        }
+    };
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("cannot read {path}: {e}");
+            return;
+        }
+    };
+
+    let mut lines = content.lines().filter(|l| !l.trim().is_empty());
+    let header_line = match lines.next() {
+        Some(h) => h,
+        None => {
+            eprintln!("CSV file is empty");
+            return;
+        }
+    };
+
+    let headers: Vec<&str> = header_line.split(',').map(|s| s.trim()).collect();
+    if headers.is_empty() {
+        eprintln!("CSV has no columns");
+        return;
+    }
+
+    // First column contains the node label; remaining columns become properties.
+    let prop_headers = &headers[1..];
+    let mut entries: Vec<(String, serde_json::Value)> = Vec::new();
+
+    for line in lines {
+        let cols: Vec<&str> = line.split(',').collect();
+        let label = cols.first().map(|s| s.trim()).unwrap_or("Node").to_owned();
+        let mut props = serde_json::Map::new();
+        for (j, &header) in prop_headers.iter().enumerate() {
+            let val_str = cols.get(j + 1).map(|s| s.trim()).unwrap_or("");
+            let val = if val_str.is_empty() {
+                serde_json::Value::Null
+            } else if let Ok(n) = val_str.parse::<i64>() {
+                serde_json::Value::Number(n.into())
+            } else if let Ok(f) = val_str.parse::<f64>() {
+                serde_json::json!(f)
+            } else if val_str.eq_ignore_ascii_case("true") {
+                serde_json::Value::Bool(true)
+            } else if val_str.eq_ignore_ascii_case("false") {
+                serde_json::Value::Bool(false)
+            } else {
+                serde_json::Value::String(val_str.to_owned())
+            };
+            props.insert(header.to_owned(), val);
+        }
+        entries.push((label, serde_json::Value::Object(props)));
+    }
+
+    let total = entries.len();
+    match g.update(|txn| {
+        for (label, props) in &entries {
+            txn.add_node(label, props)?;
+        }
+        Ok(())
+    }) {
+        Ok(_) => eprintln!("imported {total} nodes from {path}"),
+        Err(e) => eprintln!("import failed: {e}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Help text
 // ---------------------------------------------------------------------------
 
@@ -720,6 +1167,17 @@ Scripting and output
   :run <file>                          execute a script file line by line
   :save <file>                         save output of the next query to a file
 
+Batch import
+  :import-jsonl <file>                 import nodes from a JSONL file (one JSON object per line: {{"label":"L","props":{{...}}}})
+  :import-csv <file>                   import nodes from a CSV file (first column = label, remaining = properties)
+
+Query planning
+  :explain <cypher>                    show the optimized physical query plan
+
+Backup and restore
+  :backup <file>                       write a hot backup snapshot to <file>
+  :backup-compact <file>               write a compacted backup snapshot to <file>
+
 Query parameters
   :params                              list all current parameters
   :set <name> <json>                   set a query parameter ($name)
@@ -732,7 +1190,7 @@ Cypher queries  (also accepted as bare Cypher keywords: MATCH, CREATE, ...)
 Node operations
   add-node <label> [json]              add a node; prints NodeId
   get-node <id>                        get a node by id
-  update-node <id> <label> [json]      overwrite a node's label and properties
+  update-node <id> [json]              overwrite a node's properties
   delete-node <id>                     delete a node and its adjacency entries
 
 Edge operations
@@ -753,8 +1211,24 @@ Graph algorithms
   bfs <id> <hops>                      breadth-first expansion
   dfs <id> <hops>                      depth-first expansion
   path <src> <dst>                     unweighted shortest path
+  wpath <src> <dst> <prop>             weighted shortest path (Dijkstra)
   pagerank [iters] [damping]           PageRank (default: 20 iters, 0.85 damping)
-  components                           weakly connected component count
+  components                           weakly connected components
+  scc                                  strongly connected components
+  detect-cycle                         cycle detection
+  betweenness                          betweenness centrality (top 20)
+  harmonic                             harmonic centrality (top 20)
+  degree [in|out]                      degree centrality (default: both directions, top 20)
+  community [max_iters]                community detection via label propagation (default: 10 iters)
+  spanning-forest <prop> [max]         minimum (or maximum) spanning forest by edge property
+  max-flow <src> <dst> <prop>          maximum flow by edge capacity property
+
+Full-text search
+  text-index create <label> <prop>     create a full-text index on a node property
+  text-index drop <label> <prop>       drop a full-text index
+  text-index list                      list all active full-text indexes
+  text-search <query> [label] [prop] [limit]
+                                       BM25 full-text search (defaults: all indexes, limit 10)
 
 Vector search
   upsert-vec <id> <f32>...             attach a vector embedding to a node

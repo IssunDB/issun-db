@@ -1,12 +1,21 @@
-pub use issundb_core::matrices::MatrixSet;
+pub use issundb_core::metrics::{MetricsCollector, NoOpMetrics};
 pub use issundb_core::{
-    AdjEntry, DegreeDirection, EdgeId, EdgeRecord, Error, Graph, LabelId, Language, NodeId,
-    NodeRecord, PropKeyId, ReadTxn, TypeId, WriteTxn,
+    DegreeDirection, DirectedNeighborEntry, EdgeId, EdgeRecord, Error, Graph, LabelId, Language,
+    NeighborEntry, NodeId, NodeRecord, PropValue, ReadTxn, TypeId, WeightedPath, WriteTxn,
 };
 pub use issundb_cypher::{QueryResult, Record};
-pub use issundb_retrieval::{RetrieveOptions, Subgraph, retrieve, retrieve_with};
-pub use issundb_text::{TextError, TextGraphExt, TextHit, TextSearchOptions};
-pub use issundb_vector::{Hit, VectorGraphExt, VectorIndex};
+pub use issundb_retrieval::{
+    FusionStrategy, HybridRetrieveOptions, RetrieveOptions, Subgraph, retrieve, retrieve_hybrid,
+    retrieve_with,
+};
+pub use issundb_text::{
+    Bm25Scorer, BooleanMode, Scorer, TextError, TextGraphExt, TextHit, TextSearchOptions,
+    TfIdfScorer,
+};
+pub use issundb_vector::{
+    Hit, VectorGraphExt, VectorIndex, VectorIndexOptions, VectorMetric, VectorQuantization,
+    VectorSearchOptions,
+};
 
 /// Extension trait to execute Cypher queries on the `Graph` handle.
 pub trait GraphQueryExt {
@@ -19,6 +28,10 @@ pub trait GraphQueryExt {
         cypher: &str,
         params: &std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<QueryResult, String>;
+
+    /// Parse `cypher`, compile and optimize the physical plan, and return it as
+    /// an indented human-readable tree. Useful for debugging query performance.
+    fn explain(&self, cypher: &str) -> Result<String, String>;
 }
 
 impl GraphQueryExt for Graph {
@@ -33,5 +46,9 @@ impl GraphQueryExt for Graph {
         params: &std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<QueryResult, String> {
         issundb_cypher::execute(self, cypher, params)
+    }
+
+    fn explain(&self, cypher: &str) -> Result<String, String> {
+        issundb_cypher::explain(self, cypher)
     }
 }

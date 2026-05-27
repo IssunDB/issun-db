@@ -237,11 +237,56 @@ fn map_algorithm(lang: Language) -> Algorithm {
     }
 }
 
+/// Map a single Unicode character with diacritics to its ASCII base.
+///
+/// Returns `Some(&'static str)` when a mapping is known, `None` otherwise.
+fn fold_char(c: char) -> Option<&'static str> {
+    match c {
+        'À' | 'Á' | 'Â' | 'Ã' | 'Ä' | 'Å' | 'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' => {
+            Some("a")
+        }
+        'Æ' | 'æ' => Some("ae"),
+        'Ç' | 'ç' => Some("c"),
+        'È' | 'É' | 'Ê' | 'Ë' | 'è' | 'é' | 'ê' | 'ë' => Some("e"),
+        'Ì' | 'Í' | 'Î' | 'Ï' | 'ì' | 'í' | 'î' | 'ï' => Some("i"),
+        'Ð' | 'ð' => Some("d"),
+        'Ñ' | 'ñ' => Some("n"),
+        'Ò' | 'Ó' | 'Ô' | 'Õ' | 'Ö' | 'Ø' | 'ò' | 'ó' | 'ô' | 'õ' | 'ö' | 'ø' => {
+            Some("o")
+        }
+        'Ù' | 'Ú' | 'Û' | 'Ü' | 'ù' | 'ú' | 'û' | 'ü' => Some("u"),
+        'Ý' | 'ý' | 'ÿ' => Some("y"),
+        'ß' => Some("ss"),
+        'Þ' | 'þ' => Some("th"),
+        _ => None,
+    }
+}
+
+/// Fold diacritics to their ASCII base characters.
+///
+/// For example, "café" becomes "cafe" and "über" becomes "uber". This
+/// normalization runs before tokenization so that accented and unaccented
+/// spellings of the same word produce identical index terms.
+pub fn fold_ascii(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match fold_char(c) {
+            Some(s) => out.push_str(s),
+            None => out.push(c),
+        }
+    }
+    out
+}
+
 /// Dynamic multi-language tokenizer that splits string properties using Unicode word boundaries,
 /// downcases terms, filters out language-specific stop words, and applies Snowball stemming.
+///
+/// Diacritics are folded to their ASCII base before segmentation so that
+/// "café" and "cafe" produce the same stem.
 pub fn tokenize(text: &str, lang: Language) -> HashMap<String, u32> {
+    let folded = fold_ascii(text);
     let mut terms = HashMap::new();
-    let words = text.unicode_words();
+    let words = folded.unicode_words();
     let stop_words = get_stop_words(lang);
     let stemmer = Stemmer::create(map_algorithm(lang));
 

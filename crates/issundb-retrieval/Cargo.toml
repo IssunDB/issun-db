@@ -12,6 +12,7 @@ rust-version.workspace = true
 [dependencies]
 issundb-core = { path = "../issundb-core" }
 issundb-vector = { path = "../issundb-vector" }
+issundb-text = { path = "../issundb-text" }
 thiserror.workspace = true
 ahash.workspace = true
 graphblas_sparse_linear_algebra = { workspace = true }

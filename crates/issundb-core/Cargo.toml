@@ -24,6 +24,7 @@ ahash.workspace = true
 graphblas_sparse_linear_algebra = { workspace = true }
 rust-stemmers.workspace = true
 unicode-segmentation.workspace = true
+deepsize.workspace = true
 
 [features]
 default = []
@@ -32,11 +33,20 @@ default = []
 tempfile.workspace = true
 proptest.workspace = true
 criterion.workspace = true
+rand.workspace = true
+serde_json.workspace = true
 
 [[bench]]
 name = "storage"
 harness = false
 
+[[bench]]
+name = "pokec"
+harness = false
+
+[[bench]]
+name = "wiki_pagerank"
+harness = false
+
 [build-dependencies]
 cmake = "0.1"
-

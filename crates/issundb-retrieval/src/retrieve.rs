@@ -2,7 +2,8 @@ use std::collections::HashMap;
 
 use ahash::{AHashMap, AHashSet};
 use issundb_core::{EdgeId, Error, Graph, NodeId};
-use issundb_vector::VectorGraphExt;
+use issundb_text::{TextGraphExt, TextSearchOptions};
+use issundb_vector::{VectorGraphExt, VectorSearchOptions};
 
 /// A subgraph extracted by a hybrid retrieval call.
 ///
@@ -93,9 +94,190 @@ pub fn retrieve_with(graph: &Graph, q: &[f32], opts: &RetrieveOptions) -> Result
 
     let mut edge_set: AHashSet<EdgeId> = AHashSet::new();
     for &node in &node_set {
-        for (nb, eid, _) in graph.out_neighbors(node)? {
-            if node_set.contains(&nb) {
-                edge_set.insert(eid);
+        for ne in graph.out_neighbors(node)? {
+            if node_set.contains(&ne.node) {
+                edge_set.insert(ne.edge);
+            }
+        }
+    }
+
+    Ok(Subgraph {
+        nodes: node_set.into_iter().collect(),
+        edges: edge_set.into_iter().collect(),
+        scores: scores.into_iter().collect(),
+    })
+}
+
+/// Strategy for fusing vector and text relevance scores.
+#[derive(Debug, Clone)]
+pub enum FusionStrategy {
+    /// Reciprocal Rank Fusion: score = Σ 1 / (k + rank).
+    /// `k` is a smoothing constant; default 60.
+    Rrf { k: u32 },
+    /// Weighted linear combination: score = α·vector_score + β·text_score.
+    WeightedSum {
+        vector_weight: f32,
+        text_weight: f32,
+    },
+}
+
+impl Default for FusionStrategy {
+    fn default() -> Self {
+        Self::Rrf { k: 60 }
+    }
+}
+
+/// Options for `retrieve_hybrid`.
+pub struct HybridRetrieveOptions {
+    /// Number of seed nodes from the vector search. `0` disables vector search.
+    pub vector_k: usize,
+    /// Number of seed nodes from the text search. `0` disables text search.
+    pub text_k: usize,
+    /// Label to restrict the text search. `None` searches all indexed labels.
+    pub text_label: Option<String>,
+    /// Property to restrict the text search. `None` searches all indexed properties.
+    pub text_property: Option<String>,
+    /// BFS expansion depth from each seed.
+    pub hops: u8,
+    /// Maximum cosine distance for a vector hit to qualify as a seed.
+    pub max_distance: f32,
+    /// Hard cap on total subgraph nodes.
+    pub max_nodes: Option<usize>,
+    /// If set, only nodes with this label qualify as vector-search seeds.
+    pub vector_label: Option<String>,
+    /// Score fusion strategy.
+    pub fusion: FusionStrategy,
+}
+
+impl Default for HybridRetrieveOptions {
+    fn default() -> Self {
+        Self {
+            vector_k: 10,
+            text_k: 10,
+            text_label: None,
+            text_property: None,
+            hops: 2,
+            max_distance: f32::MAX,
+            max_nodes: None,
+            vector_label: None,
+            fusion: FusionStrategy::default(),
+        }
+    }
+}
+
+/// Hybrid retrieval: merges vector search seeds with full-text search seeds,
+/// fuses their scores using `opts.fusion`, then expands via BFS.
+///
+/// Vector search is run when `opts.vector_k > 0` and `q` is non-empty.
+/// Text search is run when `opts.text_k > 0` and `text_query` is non-empty.
+/// Both may run simultaneously; their ranked lists are merged before BFS.
+pub fn retrieve_hybrid(
+    graph: &Graph,
+    q: &[f32],
+    text_query: &str,
+    opts: &HybridRetrieveOptions,
+) -> Result<Subgraph, Error> {
+    // ---- collect vector hits -----------------------------------------------
+    let mut vec_ranks: AHashMap<NodeId, usize> = AHashMap::new();
+    let mut vec_scores: AHashMap<NodeId, f32> = AHashMap::new();
+
+    if opts.vector_k > 0 && !q.is_empty() {
+        let hits = graph.vector_search_with(
+            q,
+            &VectorSearchOptions {
+                k: opts.vector_k,
+                label: opts.vector_label.clone(),
+            },
+        )?;
+        for (rank, hit) in hits.iter().enumerate() {
+            if hit.distance <= opts.max_distance {
+                vec_ranks.insert(hit.node, rank);
+                vec_scores.insert(hit.node, hit.distance);
+            }
+        }
+    }
+
+    // ---- collect text hits -------------------------------------------------
+    let mut text_ranks: AHashMap<NodeId, usize> = AHashMap::new();
+
+    if opts.text_k > 0 && !text_query.is_empty() {
+        let text_opts = TextSearchOptions {
+            label: opts.text_label.clone(),
+            property: opts.text_property.clone(),
+            limit: opts.text_k,
+            ..Default::default()
+        };
+        let text_hits = graph
+            .text_search(text_query, &text_opts)
+            .map_err(|e| match e {
+                issundb_text::TextError::Core(inner) => inner,
+            })?;
+        for (rank, hit) in text_hits.iter().enumerate() {
+            text_ranks.insert(hit.node, rank);
+        }
+    }
+
+    // ---- fuse scores -------------------------------------------------------
+    let mut fused: AHashMap<NodeId, f32> = AHashMap::new();
+
+    let all_nodes: AHashSet<NodeId> = vec_ranks.keys().chain(text_ranks.keys()).copied().collect();
+
+    for node in &all_nodes {
+        let score = match &opts.fusion {
+            FusionStrategy::Rrf { k } => {
+                let kf = *k as f32;
+                let vs = vec_ranks
+                    .get(node)
+                    .map(|r| 1.0 / (kf + *r as f32 + 1.0))
+                    .unwrap_or(0.0);
+                let ts = text_ranks
+                    .get(node)
+                    .map(|r| 1.0 / (kf + *r as f32 + 1.0))
+                    .unwrap_or(0.0);
+                vs + ts
+            }
+            FusionStrategy::WeightedSum {
+                vector_weight,
+                text_weight,
+            } => {
+                let total_vec = opts.vector_k.max(1) as f32;
+                let total_txt = opts.text_k.max(1) as f32;
+                let vs = vec_ranks
+                    .get(node)
+                    .map(|r| (total_vec - *r as f32) / total_vec)
+                    .unwrap_or(0.0);
+                let ts = text_ranks
+                    .get(node)
+                    .map(|r| (total_txt - *r as f32) / total_txt)
+                    .unwrap_or(0.0);
+                vector_weight * vs + text_weight * ts
+            }
+        };
+        fused.insert(*node, score);
+    }
+
+    let seeds: Vec<NodeId> = fused.keys().copied().collect();
+
+    if seeds.is_empty() {
+        return Ok(Subgraph {
+            nodes: Vec::new(),
+            edges: Vec::new(),
+            scores: HashMap::new(),
+        });
+    }
+
+    // ---- BFS expansion -----------------------------------------------------
+    let node_list = graph.bfs_multi_source_graphblas(&seeds, opts.hops, opts.max_nodes)?;
+    let node_set: AHashSet<NodeId> = node_list.into_iter().collect();
+
+    let mut scores: AHashMap<NodeId, f32> = fused;
+    scores.retain(|n, _| node_set.contains(n));
+
+    let mut edge_set: AHashSet<EdgeId> = AHashSet::new();
+    for &node in &node_set {
+        for ne in graph.out_neighbors(node)? {
+            if node_set.contains(&ne.node) {
+                edge_set.insert(ne.edge);
             }
         }
     }
@@ -590,5 +772,65 @@ mod tests {
         assert_eq!(sub2.nodes.len(), 6, "all six nodes reachable within 2 hops");
         assert!(sub2.scores.contains_key(&a));
         assert!(sub2.scores.contains_key(&d));
+    }
+
+    #[test]
+    fn hybrid_retrieve_vector_only_matches_pure_vector_search() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("N", &json!({})).unwrap();
+        let b = g.add_node("N", &json!({})).unwrap();
+        g.upsert_vector(a, &[1.0f32, 0.0, 0.0]).unwrap();
+        g.upsert_vector(b, &[0.0f32, 1.0, 0.0]).unwrap();
+        g.rebuild_csr().unwrap();
+
+        let sub = retrieve_hybrid(
+            &g,
+            &[1.0f32, 0.0, 0.0],
+            "",
+            &HybridRetrieveOptions {
+                vector_k: 1,
+                text_k: 0,
+                hops: 0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(sub.nodes.len(), 1);
+        assert_eq!(sub.nodes[0], a);
+    }
+
+    #[test]
+    fn hybrid_retrieve_fuses_both_sources() {
+        let (_dir, g) = open_tmp();
+        let a = g
+            .add_node("Doc", &json!({"body": "rust graph database storage"}))
+            .unwrap();
+        let b = g
+            .add_node("Doc", &json!({"body": "vector search nearest neighbor"}))
+            .unwrap();
+        g.upsert_vector(a, &[1.0f32, 0.0]).unwrap();
+        g.upsert_vector(b, &[0.0f32, 1.0]).unwrap();
+        g.update(|txn| txn.create_node_text_index("Doc", "body"))
+            .unwrap();
+        g.rebuild_csr().unwrap();
+
+        // b has text match for "vector"; a has vector match for [1, 0].
+        let sub = retrieve_hybrid(
+            &g,
+            &[1.0f32, 0.0],
+            "vector",
+            &HybridRetrieveOptions {
+                vector_k: 1,
+                text_k: 1,
+                text_label: Some("Doc".into()),
+                text_property: Some("body".into()),
+                hops: 0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // Both a (vector hit) and b (text hit) should be in the result.
+        assert!(sub.nodes.contains(&a), "vector hit a must be present");
+        assert!(sub.nodes.contains(&b), "text hit b must be present");
     }
 }

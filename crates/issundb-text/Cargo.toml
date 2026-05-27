@@ -12,6 +12,7 @@ rust-version.workspace = true
 [dependencies]
 issundb-core = { path = "../issundb-core" }
 thiserror.workspace = true
+roaring.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
