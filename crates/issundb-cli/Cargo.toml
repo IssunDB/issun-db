@@ -1,6 +1,6 @@
 [package]
 name = "issundb-cli"
-description = "IssunDB's interactive REPL"
+description = "IssunDB's command-line interface (CLI)"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

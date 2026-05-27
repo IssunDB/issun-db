@@ -1349,10 +1349,12 @@ impl Graph {
         Ok(())
     }
 
+    #[doc(hidden)]
     pub fn create_node_text_index(&self, label: &str, property: &str) -> Result<(), Error> {
         self.create_node_text_index_with_language(label, property, Language::English)
     }
 
+    #[doc(hidden)]
     pub fn create_node_text_index_with_language(
         &self,
         label: &str,
@@ -1366,6 +1368,7 @@ impl Graph {
         Ok(())
     }
 
+    #[doc(hidden)]
     pub fn drop_node_text_index(&self, label: &str, property: &str) -> Result<(), Error> {
         let _guard = self._write_lock.lock();
         let mut wtxn = self.storage.env.write_txn()?;
@@ -1374,11 +1377,13 @@ impl Graph {
         Ok(())
     }
 
+    #[doc(hidden)]
     pub fn has_node_text_index(&self, label: &str, property: &str) -> Result<bool, Error> {
         let rtxn = self.storage.env.read_txn()?;
         self.has_node_text_index_impl(&rtxn, label, property)
     }
 
+    #[doc(hidden)]
     pub fn active_text_indexes(&self) -> Result<Vec<(String, String, Language)>, Error> {
         let rtxn = self.storage.env.read_txn()?;
         self.active_text_indexes_impl(&rtxn)
@@ -1389,6 +1394,7 @@ impl Graph {
     ///
     /// Exposed on `Graph` so that higher-level crates (`issundb-text`) can
     /// perform BM25 scoring without reaching into `storage::fts` directly.
+    #[doc(hidden)]
     pub fn tokenize_text(
         &self,
         text: &str,
@@ -5408,6 +5414,7 @@ impl ReadTxn<'_> {
             .edges_by_property_range_impl(&self.rtxn, etype, property, min_val, max_val)
     }
 
+    #[doc(hidden)]
     pub fn has_node_text_index(&self, label: &str, property: &str) -> Result<bool, Error> {
         self.graph
             .has_node_text_index_impl(&self.rtxn, label, property)
@@ -5440,6 +5447,7 @@ impl ReadTxn<'_> {
             .fts_postings_impl(&self.rtxn, label, property, term)
     }
 
+    #[doc(hidden)]
     pub fn active_text_indexes(&self) -> Result<Vec<(String, String, Language)>, Error> {
         self.graph.active_text_indexes_impl(&self.rtxn)
     }
@@ -5595,6 +5603,7 @@ impl WriteTxn<'_> {
         Ok(())
     }
 
+    #[doc(hidden)]
     pub fn create_node_text_index(&mut self, label: &str, property: &str) -> Result<(), Error> {
         self.graph.create_node_text_index_impl(
             &mut self.wtxn,
@@ -5606,6 +5615,7 @@ impl WriteTxn<'_> {
         Ok(())
     }
 
+    #[doc(hidden)]
     pub fn drop_node_text_index(&mut self, label: &str, property: &str) -> Result<(), Error> {
         self.graph
             .drop_node_text_index_impl(&mut self.wtxn, label, property)?;
@@ -5613,6 +5623,7 @@ impl WriteTxn<'_> {
         Ok(())
     }
 
+    #[doc(hidden)]
     pub fn has_node_text_index(&self, label: &str, property: &str) -> Result<bool, Error> {
         let rtxn: &heed::RoTxn = &self.wtxn;
         self.graph.has_node_text_index_impl(rtxn, label, property)
@@ -5646,6 +5657,7 @@ impl WriteTxn<'_> {
         self.graph.fts_postings_impl(rtxn, label, property, term)
     }
 
+    #[doc(hidden)]
     pub fn create_node_text_index_with_language(
         &mut self,
         label: &str,
@@ -5658,6 +5670,7 @@ impl WriteTxn<'_> {
         Ok(())
     }
 
+    #[doc(hidden)]
     pub fn active_text_indexes(&self) -> Result<Vec<(String, String, Language)>, Error> {
         let rtxn: &heed::RoTxn = &self.wtxn;
         self.graph.active_text_indexes_impl(rtxn)

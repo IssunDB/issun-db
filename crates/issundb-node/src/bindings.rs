@@ -2,9 +2,9 @@
 
 use std::path::Path;
 
-use issundb::{Graph, GraphQueryExt};
-use issundb_text::{TextGraphExt, TextSearchOptions};
-use issundb_vector::VectorGraphExt;
+use issundb::{
+    Graph, GraphQueryExt, TextGraphExt, TextIndexExt, TextSearchOptions, VectorGraphExt,
+};
 use napi_derive::napi;
 
 /// Node.js handle for an IssunDB graph database.
@@ -28,23 +28,22 @@ impl IssunDB {
         Ok(Self { graph })
     }
 
-    /// Insert a node with `label` and JSON-encoded `props`. Returns the new node ID as u32.
+    /// Insert a node with `label` and JSON-encoded `props`. Returns the new node ID as u64.
     #[napi]
-    pub fn add_node(&self, label: String, props_json: String) -> napi::Result<u32> {
+    pub fn add_node(&self, label: String, props_json: String) -> napi::Result<u64> {
         let value: serde_json::Value = serde_json::from_str(&props_json)
             .map_err(|e| napi::Error::from_reason(e.to_string()))?;
         self.graph
             .add_node(&label, &value)
-            .map(|id| id as u32)
             .map_err(|e| napi::Error::from_reason(e.to_string()))
     }
 
     /// Return the JSON-encoded properties of node `id`, or `null` if the node does not exist.
     #[napi]
-    pub fn get_node(&self, id: u32) -> napi::Result<Option<String>> {
+    pub fn get_node(&self, id: u64) -> napi::Result<Option<String>> {
         let record = self
             .graph
-            .get_node(id as u64)
+            .get_node(id)
             .map_err(|e| napi::Error::from_reason(e.to_string()))?;
         match record {
             None => Ok(None),
@@ -60,37 +59,36 @@ impl IssunDB {
 
     /// Replace the properties of node `id` with JSON-encoded `props`.
     #[napi]
-    pub fn update_node(&self, id: u32, props_json: String) -> napi::Result<()> {
+    pub fn update_node(&self, id: u64, props_json: String) -> napi::Result<()> {
         let value: serde_json::Value = serde_json::from_str(&props_json)
             .map_err(|e| napi::Error::from_reason(e.to_string()))?;
         self.graph
-            .update_node(id as u64, &value)
+            .update_node(id, &value)
             .map_err(|e| napi::Error::from_reason(e.to_string()))
     }
 
     /// Delete node `id` and all of its incident edges.
     #[napi]
-    pub fn delete_node(&self, id: u32) -> napi::Result<()> {
+    pub fn delete_node(&self, id: u64) -> napi::Result<()> {
         self.graph
-            .delete_node(id as u64)
+            .delete_node(id)
             .map_err(|e| napi::Error::from_reason(e.to_string()))
     }
 
     /// Insert a directed edge from `src` to `dst` with edge type `etype` and JSON-encoded `props`.
-    /// Returns the new edge ID as u32.
+    /// Returns the new edge ID as u64.
     #[napi]
     pub fn add_edge(
         &self,
-        src: u32,
-        dst: u32,
+        src: u64,
+        dst: u64,
         etype: String,
         props_json: String,
-    ) -> napi::Result<u32> {
+    ) -> napi::Result<u64> {
         let value: serde_json::Value = serde_json::from_str(&props_json)
             .map_err(|e| napi::Error::from_reason(e.to_string()))?;
         self.graph
-            .add_edge(src as u64, dst as u64, &etype, &value)
-            .map(|id| id as u32)
+            .add_edge(src, dst, &etype, &value)
             .map_err(|e| napi::Error::from_reason(e.to_string()))
     }
 
@@ -130,10 +128,10 @@ impl IssunDB {
     /// converted to `f32` internally. Values outside the `f32` range are
     /// clamped silently by the cast.
     #[napi]
-    pub fn upsert_vector(&self, id: u32, vec: Vec<f64>) -> napi::Result<()> {
+    pub fn upsert_vector(&self, id: u64, vec: Vec<f64>) -> napi::Result<()> {
         let floats: Vec<f32> = vec.iter().map(|&v| v as f32).collect();
         self.graph
-            .upsert_vector(id as u64, &floats)
+            .upsert_vector(id, &floats)
             .map_err(|e| napi::Error::from_reason(e.to_string()))
     }
 
@@ -197,7 +195,7 @@ impl IssunDB {
     #[napi]
     pub fn create_text_index(&self, label: String, property: String) -> napi::Result<()> {
         self.graph
-            .create_node_text_index(&label, &property)
+            .create_text_index(&label, &property)
             .map_err(|e| napi::Error::from_reason(e.to_string()))
     }
 
@@ -205,7 +203,7 @@ impl IssunDB {
     #[napi]
     pub fn drop_text_index(&self, label: String, property: String) -> napi::Result<()> {
         self.graph
-            .drop_node_text_index(&label, &property)
+            .drop_text_index(&label, &property)
             .map_err(|e| napi::Error::from_reason(e.to_string()))
     }
 

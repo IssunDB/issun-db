@@ -237,16 +237,15 @@ fn collect_background(lines: &[&str]) -> Vec<String> {
             break;
         }
 
-        if in_background {
-            if trimmed.starts_with("Given ")
+        if in_background
+            && (trimmed.starts_with("Given ")
                 || trimmed.starts_with("And ")
-                || trimmed.starts_with("* ")
-            {
-                // Consume an optional docstring block.
-                if let Some(query) = consume_docstring(lines, &mut idx) {
-                    queries.push(query);
-                    continue;
-                }
+                || trimmed.starts_with("* "))
+        {
+            // Consume an optional docstring block.
+            if let Some(query) = consume_docstring(lines, &mut idx) {
+                queries.push(query);
+                continue;
             }
         }
 
@@ -829,7 +828,7 @@ fn run_scenario(scenario: &Scenario) -> Result<(), String> {
             if exec_result.is_err() {
                 return Ok(());
             }
-            return Err("expected an error but the query succeeded".into());
+            Err("expected an error but the query succeeded".into())
         }
 
         Assertion::Empty => {
@@ -840,7 +839,7 @@ fn run_scenario(scenario: &Scenario) -> Result<(), String> {
                     res.records.len()
                 ));
             }
-            return Ok(());
+            Ok(())
         }
 
         Assertion::Rows {
@@ -892,13 +891,13 @@ fn run_scenario(scenario: &Scenario) -> Result<(), String> {
                     exp, actual_rows
                 ));
             }
-            return Ok(());
+            Ok(())
         }
 
         Assertion::None => {
             // No assertion to check; just ensure the query does not error.
             exec_result.map_err(|e| e.to_string())?;
-            return Ok(());
+            Ok(())
         }
     }
 }

@@ -2,9 +2,9 @@
 
 use std::path::Path;
 
-use issundb::{Graph, GraphQueryExt};
-use issundb_text::{TextGraphExt, TextSearchOptions};
-use issundb_vector::VectorGraphExt;
+use issundb::{
+    Graph, GraphQueryExt, TextGraphExt, TextIndexExt, TextSearchOptions, VectorGraphExt,
+};
 use pyo3::prelude::*;
 
 /// Python-facing handle for an IssunDB graph database.
@@ -83,7 +83,7 @@ impl PyGraph {
         let result = self
             .graph
             .query(cypher)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+            .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
         serde_json::to_string(&result)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
@@ -92,7 +92,7 @@ impl PyGraph {
     fn explain(&self, cypher: &str) -> PyResult<String> {
         self.graph
             .explain(cypher)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+            .map_err(pyo3::exceptions::PyRuntimeError::new_err)
     }
 
     /// Index or update the float32 embedding for node `id`.
@@ -159,14 +159,14 @@ impl PyGraph {
     /// Create a full-text index on `property` for nodes with `label`.
     fn create_text_index(&self, label: &str, property: &str) -> PyResult<()> {
         self.graph
-            .create_node_text_index(label, property)
+            .create_text_index(label, property)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
 
     /// Drop the full-text index on `property` for nodes with `label`.
     fn drop_text_index(&self, label: &str, property: &str) -> PyResult<()> {
         self.graph
-            .drop_node_text_index(label, property)
+            .drop_text_index(label, property)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
 

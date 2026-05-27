@@ -2238,6 +2238,7 @@ name = "issundb-cypher"
 version = "0.1.0-alpha.1"
 dependencies = [
  "chumsky",
+ "criterion",
  "issundb-core",
  "rmp-serde",
  "serde",
@@ -2245,6 +2246,16 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tracing",
+]
+
+[[package]]
+name = "issundb-examples"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "issundb",
+ "rmp-serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -2266,8 +2277,6 @@ name = "issundb-node"
 version = "0.1.0-alpha.1"
 dependencies = [
  "issundb",
- "issundb-text",
- "issundb-vector",
  "napi",
  "napi-build",
  "napi-derive",
@@ -2280,8 +2289,6 @@ name = "issundb-py"
 version = "0.1.0-alpha.1"
 dependencies = [
  "issundb",
- "issundb-text",
- "issundb-vector",
  "pyo3",
  "rmp-serde",
  "serde_json",
@@ -2309,8 +2316,6 @@ dependencies = [
  "axum",
  "clap",
  "issundb",
- "issundb-text",
- "issundb-vector",
  "rmp-serde",
  "serde",
  "serde_json",
@@ -2322,9 +2327,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "issundb-testing"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "issundb-core",
+ "rand 0.8.6",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "issundb-text"
 version = "0.1.0-alpha.1"
 dependencies = [
+ "criterion",
  "issundb-core",
  "roaring",
  "serde_json",
@@ -2336,6 +2352,7 @@ dependencies = [
 name = "issundb-vector"
 version = "0.1.0-alpha.1"
 dependencies = [
+ "criterion",
  "issundb-core",
  "parking_lot",
  "serde_json",

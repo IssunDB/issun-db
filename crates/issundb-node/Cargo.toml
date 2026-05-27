@@ -15,8 +15,6 @@ napi-module = ["dep:napi", "dep:napi-derive"]
 napi = { version = "2", features = ["napi4"], optional = true }
 napi-derive = { version = "2", optional = true }
 issundb = { path = "../issundb" }
-issundb-vector = { path = "../issundb-vector" }
-issundb-text = { path = "../issundb-text" }
 serde_json = { workspace = true }
 rmp-serde = { workspace = true }
 

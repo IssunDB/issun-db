@@ -1,6 +1,6 @@
 [package]
-name = "issundb-text"
-description = "Full-text search APIs and indexing for IssunDB"
+name = "issundb-testing"
+description = "Shared test helpers and fixtures for IssunDB crates"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -8,17 +8,15 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 rust-version.workspace = true
+# This crate is test-only infrastructure; do not publish it.
+publish = false
 
 [dependencies]
 issundb-core = { path = "../issundb-core" }
-thiserror.workspace = true
-roaring.workspace = true
-
-[dev-dependencies]
 tempfile.workspace = true
 serde_json.workspace = true
-criterion.workspace = true
+rand.workspace = true
 
-[[bench]]
-name = "fts_search"
-harness = false
+[[bin]]
+name = "gen_testdata"
+path = "src/bin/gen_testdata.rs"

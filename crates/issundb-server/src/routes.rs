@@ -7,9 +7,9 @@ use axum::{
     routing::{delete, get, post, put},
     Json, Router,
 };
-use issundb::{Graph, GraphQueryExt};
-use issundb_text::{TextGraphExt, TextSearchOptions};
-use issundb_vector::{VectorGraphExt, VectorSearchOptions};
+use issundb::{
+    Graph, GraphQueryExt, TextGraphExt, TextSearchOptions, VectorGraphExt, VectorSearchOptions,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;

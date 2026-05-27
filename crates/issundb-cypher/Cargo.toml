@@ -18,3 +18,8 @@ rmp-serde.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "parse"
+harness = false

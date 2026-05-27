@@ -140,7 +140,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ---- 7. Run a Cypher query and print the result table ------------------
     println!("\n--- Cypher: MATCH (m:Movie) RETURN m.title, m.year ORDER BY m.year ---");
     let result = graph.query("MATCH (m:Movie) RETURN m.title, m.year ORDER BY m.year")?;
-    println!("{:<35} {}", "title", "year");
+    println!("{:<35} year", "title");
     println!("{}", "-".repeat(45));
     for record in &result.records {
         let title = record

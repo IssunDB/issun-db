@@ -17,8 +17,9 @@ Priorities, in order:
 - Use English for code, comments, docs, and tests.
 - Prefer small, focused changes over broad rewrites.
 - Keep the workspace modular: `issundb-core` owns graph storage, `issundb-vector` owns vector search, `issundb-text` owns full-text search,
-  `issundb-retrieval` owns hybrid retrieval, `issundb-cypher` owns the query layer, `issundb` is the public facade, and `issundb-cli`
-  uses only the public facade. Do not import across those boundaries in the wrong direction.
+  `issundb-retrieval` owns hybrid retrieval, `issundb-cypher` owns the query layer, `issundb` is the public facade, `issundb-cli` uses only
+  the public facade, and the binding crates (`issundb-server`, `issundb-gui`, `issundb-node`, `issundb-py`) consume only the `issundb` facade
+  and its extension crates. Do not import across those boundaries in the wrong direction.
 - Keep all mutable state inside `Graph` and `Storage`; do not introduce module-level `static mut` or `lazy_static` globals for runtime state.
 - Writes are serialized via the `parking_lot::Mutex<()>` write lock on `Graph`; LMDB enforces the same constraint at the storage level. Do not bypass
   either.
@@ -43,8 +44,8 @@ Quick examples:
 
 ## Repository Layout
 
-The current tree includes storage, CSR snapshots, vector search, hybrid retrieval primitives, Cypher planning, and the CLI. This layout describes the
-current structure and target decoupled crate boundaries.
+The current tree includes storage, CSR snapshots, vector search, hybrid retrieval primitives, Cypher planning, the CLI, an HTTP server, a desktop
+GUI, language bindings, and shared test utilities. This layout describes the current structure and target decoupled crate boundaries.
 Do not invent modules that do not yet exist when answering questions, but do place new modules according to this map.
 
 - `crates/issundb-core/`: storage engine. Public surface is `Graph` and the schema types.
@@ -52,9 +53,11 @@ Do not invent modules that do not yet exist when answering questions, but do pla
     - `src/storage/lmdb.rs`: `Storage` struct; opens and owns all LMDB sub-databases.
     - `src/storage/ids.rs`: monotonic ID allocation and string-to-integer registries for labels and edge types, persisted in the `meta` sub-database.
     - `src/storage/props.rs`: msgpack encode and decode helpers via `rmp-serde`.
+    - `src/storage/fts.rs`: full-text index storage primitives (postings and document tables) inside the LMDB environment.
     - `src/graph.rs`: `Graph`; all node, edge, and adjacency CRUD lives here.
     - `src/csr.rs`: in-memory CSR snapshot, rebuilt in the background and swapped via `arc-swap`.
     - `src/matrices.rs`: GraphBLAS matrix materialization from the CSR snapshot.
+    - `src/metrics.rs`: lightweight runtime counters for storage operations.
     - `src/error.rs`: `Error` enum; all storage and serialization errors unify here.
 - `crates/issundb-cypher/`: Cypher parser, AST, logical planner, physical planner, optimizer, and executor.
     - `src/parser.rs`: hand-written recursive-descent parser for MATCH (including inline relationship property maps), WHERE, RETURN, CREATE, SET, and
@@ -63,14 +66,23 @@ Do not invent modules that do not yet exist when answering questions, but do pla
     - `src/plan/`: logical planner, physical planner, optimizer, and statistics helpers.
     - `src/exec.rs`: physical-plan executor that drives `Graph` scans, expansion, filtering, mutation, and projection.
 - `crates/issundb-vector/`: vector index abstraction, vector metadata, vector storage integration, and vector search APIs.
-- `crates/issundb-text/`: tokenization, full-text index storage, text search APIs, and ranking. Current API returns an explicit not-implemented error
-  until index storage lands.
+- `crates/issundb-text/`: tokenization, full-text index storage, text search APIs, and ranking.
 - `crates/issundb-retrieval/`: hybrid retrieval over graph traversal, vector hits, text hits, property filters, score fusion, and subgraph
   materialization.
 - `crates/issundb/`: public facade. Re-exports the deliberate public surface from `issundb-core`, `issundb-vector`, `issundb-text`,
   `issundb-retrieval`, and `issundb-cypher`. Do not re-export internal storage types like `Storage`.
 - `crates/issundb-cli/`: interactive REPL binary. Uses only the `issundb` public facade for manual exploration and demos.
-- `examples/` *(planned)*: standalone Rust examples (`hybrid_retrieval_quickstart.rs`, `neo4j_migration.rs`, `load_ldbc.rs`).
+- `crates/issundb-server/`: Axum-based HTTP REST API server. Exposes node and edge CRUD, Cypher query execution, query plan explanation, vector
+  search, and full-text search over HTTP. Uses `tokio` as its async runtime; depends on `issundb`, `issundb-vector`, and `issundb-text`.
+- `crates/issundb-gui/`: egui desktop application for interactive graph exploration. Provides a Cypher query console, a graph visualization canvas
+  via `egui_graphs`, and a node or edge inspector. Depends only on `issundb`.
+- `crates/issundb-node/`: Node.js bindings via NAPI-RS. Exposes the `IssunDB` class with node, edge, query, vector search, text search, and
+  backup methods. Depends on `issundb`, `issundb-vector`, and `issundb-text`.
+- `crates/issundb-py/`: Python bindings via PyO3. Exposes the `IssunDB` class with the same surface as the Node.js bindings. Depends on
+  `issundb`, `issundb-vector`, and `issundb-text`.
+- `crates/issundb-testing/`: shared test fixtures and graph builders (`open_tmp`, `chain`, `clique`, `diamond`, `two_triangles`) used across
+  unit and integration tests. Depends on `issundb-core`; must not be imported by production crates.
+- `crates/issundb-examples/`: standalone example programs (`hybrid_retrieval_quickstart.rs`, `neo4j_migration.rs`, `load_ldbc.rs`).
 - `crates/issundb-core/benches/`: Criterion storage benchmarks.
 - `crates/issundb/tests/conformance/`: openCypher TCK subset integration tests.
 - `Cargo.toml`: workspace root with shared `[workspace.dependencies]`. All version pins live here.
@@ -107,13 +119,16 @@ Do not invent modules that do not yet exist when answering questions, but do pla
 
 Target dependency direction:
 
-1. `issundb-core` has no dependencies on vector, text, retrieval, Cypher, bindings, or CLI crates.
-2. `issundb-vector` may depend on `issundb-core`, but not on text, retrieval, Cypher, bindings, or CLI crates.
-3. `issundb-text` may depend on `issundb-core`, but not on vector, retrieval, Cypher, bindings, or CLI crates.
+1. `issundb-core` has no dependencies on vector, text, retrieval, Cypher, bindings, server, GUI, or CLI crates.
+2. `issundb-vector` may depend on `issundb-core`, but not on text, retrieval, Cypher, bindings, server, GUI, or CLI crates.
+3. `issundb-text` may depend on `issundb-core`, but not on vector, retrieval, Cypher, bindings, server, GUI, or CLI crates.
 4. `issundb-retrieval` may depend on `issundb-core`, `issundb-vector`, and `issundb-text`.
 5. `issundb-cypher` may depend on public APIs from core, vector, text, and retrieval crates, but not storage internals.
 6. `issundb` composes and re-exports the stable public API.
 7. `issundb-cli` uses only the `issundb` facade.
+8. `issundb-server`, `issundb-gui`, `issundb-node`, and `issundb-py` may depend on `issundb`, `issundb-vector`, and `issundb-text`; they must
+   not reach into lower-level crates directly.
+9. `issundb-testing` may depend on `issundb-core` for fixture setup; it must not be imported by any production crate.
 
 Lower-level crates must not know about higher-level crates.
 
@@ -200,6 +215,47 @@ outside `issundb`.
 
 The executor resolves patterns through the physical plan. Expansion and label filtering use GraphBLAS SpMV and element-wise matrix operators
 unconditionally.
+
+### `issundb_server`
+
+HTTP REST API server built on Axum and Tokio. Depends on `issundb`, `issundb-vector`, and `issundb-text`; must not import lower-level crates
+directly. All handlers share a single `Arc<Graph>` instance.
+
+Routes:
+
+- `POST /nodes`, `GET /nodes/:id`, `PUT /nodes/:id`, `DELETE /nodes/:id`
+- `POST /edges`, `GET /edges/:id`, `DELETE /edges/:id`
+- `POST /query` (Cypher execution), `POST /explain` (query plan)
+- `POST /search/text`, `POST /search/vector`
+- `GET /health`
+
+### `issundb_node`
+
+Node.js bindings via NAPI-RS. Exposes a single `IssunDB` class. Depends on `issundb`, `issundb-vector`, and `issundb-text`; the `napi-module`
+feature must be enabled for the NAPI entry point to compile.
+
+Methods: `add_node`, `get_node`, `update_node`, `delete_node`, `add_edge`, `query`, `explain`, `upsert_vector`, `vector_search`,
+`text_search`, `create_text_index`, `drop_text_index`, `backup`, `backup_compact`, `restore`.
+
+### `issundb_py`
+
+Python bindings via PyO3. Exposes a single `IssunDB` class with the same method surface as `issundb_node`. The `extension-module` feature must
+be enabled for the Python extension to compile. Depends on `issundb`, `issundb-vector`, and `issundb-text`.
+
+### `issundb_gui`
+
+Desktop application built with `eframe` and `egui`. Depends only on `issundb`. Provides a Cypher query console, an interactive graph
+visualization canvas via `egui_graphs`, and a node or edge inspector panel. Not part of the library surface; changes here do not affect the
+public API.
+
+### `issundb_testing`
+
+Shared test fixtures for unit and integration tests. Depends on `issundb-core`. Must not be imported by production crates.
+
+- `open_tmp() -> (Graph, TempDir)`: opens a fresh LMDB environment in a temporary directory.
+- `open_at(dir: &Path) -> Graph`: opens an environment at a known path.
+- `chain(graph, n)`, `clique(graph, n)`, `diamond(graph)`, `two_triangles(graph)`: graph fixture builders.
+- `assert_nodes_eq(...)`, `assert_valid_path(...)`: targeted assertion helpers.
 
 ### `issundb_core::Storage`
 

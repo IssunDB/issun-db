@@ -2,7 +2,7 @@ use std::{collections::HashMap, fs, io::Write, path::PathBuf};
 
 use issundb::{
     DegreeDirection, EdgeId, Graph, GraphQueryExt, Hit, NodeId, RetrieveOptions, TextGraphExt,
-    TextSearchOptions, VectorGraphExt, retrieve_with,
+    TextIndexExt, TextSearchOptions, VectorGraphExt, retrieve_with,
 };
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
@@ -903,15 +903,15 @@ fn dispatch(state: &mut State, cmd: &str, rest: &str) {
                 return;
             }
             match tokens.first().copied().unwrap_or("") {
-                "create" => match g.create_node_text_index(tokens[1], tokens[2]) {
+                "create" => match g.create_text_index(tokens[1], tokens[2]) {
                     Ok(()) => println!("ok"),
                     Err(e) => eprintln!("error: {e}"),
                 },
-                "drop" => match g.drop_node_text_index(tokens[1], tokens[2]) {
+                "drop" => match g.drop_text_index(tokens[1], tokens[2]) {
                     Ok(()) => println!("ok"),
                     Err(e) => eprintln!("error: {e}"),
                 },
-                "list" => match g.active_text_indexes() {
+                "list" => match g.list_text_indexes() {
                     Ok(idxs) => {
                         if idxs.is_empty() {
                             println!("(no text indexes)");

@@ -1,4 +1,4 @@
-use issundb_core::{Graph, NodeId};
+use issundb_core::{Graph, Language, NodeId};
 use roaring::RoaringTreemap;
 use std::{
     cmp::Reverse,
@@ -537,6 +537,50 @@ impl TextGraphExt for Graph {
     }
 }
 
+/// Text index lifecycle operations for `Graph`.
+///
+/// Implement text index creation, removal, and discovery through this trait
+/// rather than calling the corresponding storage methods on `Graph` directly.
+pub trait TextIndexExt {
+    fn create_text_index(&self, label: &str, property: &str) -> Result<(), issundb_core::Error>;
+    fn create_text_index_with_language(
+        &self,
+        label: &str,
+        property: &str,
+        lang: Language,
+    ) -> Result<(), issundb_core::Error>;
+    fn drop_text_index(&self, label: &str, property: &str) -> Result<(), issundb_core::Error>;
+    fn has_text_index(&self, label: &str, property: &str) -> Result<bool, issundb_core::Error>;
+    fn list_text_indexes(&self) -> Result<Vec<(String, String, Language)>, issundb_core::Error>;
+}
+
+impl TextIndexExt for Graph {
+    fn create_text_index(&self, label: &str, property: &str) -> Result<(), issundb_core::Error> {
+        self.create_node_text_index(label, property)
+    }
+
+    fn create_text_index_with_language(
+        &self,
+        label: &str,
+        property: &str,
+        lang: Language,
+    ) -> Result<(), issundb_core::Error> {
+        self.create_node_text_index_with_language(label, property, lang)
+    }
+
+    fn drop_text_index(&self, label: &str, property: &str) -> Result<(), issundb_core::Error> {
+        self.drop_node_text_index(label, property)
+    }
+
+    fn has_text_index(&self, label: &str, property: &str) -> Result<bool, issundb_core::Error> {
+        self.has_node_text_index(label, property)
+    }
+
+    fn list_text_indexes(&self) -> Result<Vec<(String, String, Language)>, issundb_core::Error> {
+        self.active_text_indexes()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -749,7 +793,7 @@ mod tests {
             label: Some("Doc".to_string()),
             property: Some("body".to_string()),
             limit: 5,
-            scorer: Some(Arc::new(TfIdfScorer::default())),
+            scorer: Some(Arc::new(TfIdfScorer)),
             ..Default::default()
         };
         let hits = graph.text_search("rust systems", &opts)?;

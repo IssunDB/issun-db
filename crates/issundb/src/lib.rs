@@ -9,8 +9,8 @@ pub use issundb_retrieval::{
     retrieve_with,
 };
 pub use issundb_text::{
-    Bm25Scorer, BooleanMode, Scorer, TextError, TextGraphExt, TextHit, TextSearchOptions,
-    TfIdfScorer,
+    Bm25Scorer, BooleanMode, Scorer, TextError, TextGraphExt, TextHit, TextIndexExt,
+    TextSearchOptions, TfIdfScorer,
 };
 pub use issundb_vector::{
     Hit, VectorGraphExt, VectorIndex, VectorIndexOptions, VectorMetric, VectorQuantization,

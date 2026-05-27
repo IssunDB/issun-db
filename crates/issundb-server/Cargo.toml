@@ -10,8 +10,6 @@ path = "src/main.rs"
 
 [dependencies]
 issundb = { path = "../issundb" }
-issundb-vector = { path = "../issundb-vector" }
-issundb-text = { path = "../issundb-text" }
 axum = "0.7"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }

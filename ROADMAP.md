@@ -72,8 +72,11 @@ This document outlines the features implemented in IssunDB and the future goals 
 ### Ecosystem and Tooling
 
 - [x] An interactive REPL
-- [x] A benchmarking suite that measurs throughput and load scaling
+- [x] An HTTP REST API server (Axum) with node, edge, query, vector search, and full-text search routes
+- [x] A desktop GUI (egui) with a Cypher console and interactive graph visualization
+- [x] A benchmarking suite that measures throughput and load scaling
 - [x] Property-based and integration tests
+- [x] Shared test fixture library (`issundb-testing`) with graph builders and assertion helpers
 - [x] Language bindings for Python (using PyO3)
 - [x] Language bindings for Node.js (using NAPI-RS)
 - [x] Batch data import utilities for JSONL and CSV formats

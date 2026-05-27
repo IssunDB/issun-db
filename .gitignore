@@ -86,3 +86,5 @@ tests/testdata/*.parquet
 .antigravitycli/
 issundb-data/
 data/
+test_data/*/db/lock.mdb
+*.mdb

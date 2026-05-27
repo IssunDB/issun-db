@@ -1,10 +1,10 @@
-pub mod csr;
+pub(crate) mod csr;
 pub mod error;
 pub mod graph;
 pub mod matrices;
 pub mod metrics;
 pub mod schema;
-pub mod storage;
+pub(crate) mod storage;
 
 pub use error::Error;
 pub use graph::{DegreeDirection, Graph, ReadTxn, WriteTxn};

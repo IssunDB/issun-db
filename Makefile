@@ -1,13 +1,18 @@
 # Variables
-PROJ_REPO = github.com/IssunDB/issun-db
-BINARY_NAME := $(or $(PROJ_BINARY), $(notdir $(PROJ_REPO)))
-BINARY := target/release/$(BINARY_NAME)
+BINARY := target/release/issun-db
 PATH := /snap/bin:$(PATH)
 DEBUG_PROJ := 0
 RUST_BACKTRACE := 1
 ASSET_DIR := assets
 TEST_DATA_DIR := tests/testdata
 SHELL := /bin/bash
+MSRV := 1.85.0
+
+# Pinned versions for development tools
+TARPAULIN_VERSION := 0.32.8
+NEXTEST_VERSION := 0.9.101
+AUDIT_VERSION := 0.21.2
+CAREFUL_VERSION := 0.4.8
 
 # Default target
 .DEFAULT_GOAL := help
@@ -22,8 +27,13 @@ format: ## Format Rust files
 	@echo "Formatting Rust files..."
 	@cargo fmt
 
+.PHONY: doctest
+doctest: ## Run documentation tests (code examples in comments)
+	@echo "Running documentation tests..."
+	@cargo test --doc --workspace
+
 .PHONY: test
-test: format ## Run the tests
+test: format doctest ## Run the tests
 	@echo "Running tests..."
 	@DEBUG_PROJ=$(DEBUG_PROJ) RUST_BACKTRACE=$(RUST_BACKTRACE) cargo test --all-targets --workspace -- --nocapture
 
@@ -70,10 +80,16 @@ submodules: ## Initialize and update all git submodules recursively
 install-deps: install-snap submodules ## Install development dependencies
 	@echo "Installing dependencies..."
 	@rustup component add rustfmt clippy
-	@cargo install cargo-tarpaulin
-	@cargo install cargo-audit
-	@cargo install cargo-careful
-	@cargo install cargo-nextest
+	@cargo install --locked cargo-tarpaulin --version $(TARPAULIN_VERSION)
+	@cargo install --locked cargo-audit --version $(AUDIT_VERSION)
+	@cargo install --locked cargo-careful --version $(CAREFUL_VERSION)
+	@cargo install --locked cargo-nextest --version $(NEXTEST_VERSION)
+
+.PHONY: install-msrv
+install-msrv: ## Install the minimum supported Rust version (MSRV=$(MSRV)) and set it as the default toolchain
+	@echo "Installing MSRV toolchain ($(MSRV))..."
+	@rustup toolchain install $(MSRV)
+	@rustup default $(MSRV)
 
 .PHONY: lint
 lint: format ## Run the linters
@@ -105,10 +121,15 @@ audit: ## Run security audit on Rust dependencies
 	@echo "Running security audit..."
 	@cargo audit
 
-.PHONY: rust-careful
-careful: ## Run security checks on Rust code
-	@echo "Running security checks..."
-	@cargo careful
+.PHONY: deny
+deny: ## Check dependencies for advisories, license compliance, and duplicates
+	@echo "Running cargo-deny..."
+	@cargo deny check
+
+.PHONY: careful
+careful: ## Run tests under cargo-careful (detects undefined behavior and unsafe misuse)
+	@echo "Running tests under cargo-careful..."
+	@DEBUG_PROJ=$(DEBUG_PROJ) RUST_BACKTRACE=$(RUST_BACKTRACE) cargo careful test --all-targets --workspace
 
 .PHONY: docs
 docs: format ## Generate the documentation
@@ -125,10 +146,54 @@ fix-lint: ## Fix the linter warnings
 	@echo "Fixing linter warnings..."
 	@cargo clippy --fix --allow-dirty --allow-staged --all-targets --workspace --all-features -- -D warnings -D clippy::unwrap_used -D clippy::expect_used
 
+.PHONY: run-examples
+run-examples: ## Run all examples in crates/issundb-examples one by one
+	@echo "Running all examples..."
+	@for example in crates/issundb-examples/*.rs; do \
+	   example_name=$$(basename $$example .rs); \
+	   echo "Running example: $$example_name"; \
+	   cargo run -p issundb-examples --example $$example_name; \
+	done
+
+.PHONY: check-module-deps
+check-module-deps: ## Verify crate boundary rules: lower-level crates must not import from higher-level crates
+	@echo "Checking crate dependency boundaries..."
+	@ERROR=0; \
+	declare -A FORBIDDEN; \
+	FORBIDDEN[issundb-core]="issundb_vector issundb_text issundb_retrieval issundb_cypher issundb_cli"; \
+	FORBIDDEN[issundb-vector]="issundb_text issundb_retrieval issundb_cypher issundb_cli"; \
+	FORBIDDEN[issundb-text]="issundb_vector issundb_retrieval issundb_cypher issundb_cli"; \
+	FORBIDDEN[issundb-retrieval]="issundb_cypher issundb_cli"; \
+	FORBIDDEN[issundb-cypher]="issundb_cli"; \
+	for crate in issundb-core issundb-vector issundb-text issundb-retrieval issundb-cypher; do \
+	   src_dir="crates/$$crate/src"; \
+	   if [ ! -d "$$src_dir" ]; then continue; fi; \
+	   for forbidden in $${FORBIDDEN[$$crate]}; do \
+	      VIOLATIONS=$$(grep -r "use $$forbidden" "$$src_dir/" 2>/dev/null || true); \
+	      if [ -n "$$VIOLATIONS" ]; then \
+	         echo "ERROR: $$crate has forbidden dependency on $$forbidden:"; \
+	         echo "$$VIOLATIONS" | sed 's/^/  /'; \
+	         ERROR=1; \
+	      fi; \
+	   done; \
+	done; \
+	if [ $$ERROR -eq 0 ]; then \
+	   echo "All crate dependency boundaries are valid."; \
+	else \
+	   echo "Crate boundary violations found. See AGENTS.md for the dependency rules."; \
+	   exit 1; \
+	fi
+
 .PHONY: testdata
-testdata: ## Download the datasets used in tests
-	@echo "Downloading test data..."
+testdata: ## Download benchmark datasets and regenerate versioned LMDB snapshots
+	@echo "Downloading benchmark datasets..."
 	@$(SHELL) $(TEST_DATA_DIR)/download_datasets.sh $(TEST_DATA_DIR)
+	@echo "Regenerating versioned test snapshots..."
+	@VERSION=$$(cargo metadata --no-deps --format-version 1 | python3 -c "import sys,json; print(json.load(sys.stdin)['packages'][0]['version'])"); \
+	 SNAP_DIR="test_data/v$$VERSION/db"; \
+	 mkdir -p "$$SNAP_DIR"; \
+	 cargo run -p issundb-testing --bin gen_testdata -- "$$SNAP_DIR"
+	@echo "Snapshot written. Commit test_data/ to record the current storage format."
 
 .PHONY: nextest
 nextest: ## Run tests using nextest
