@@ -33,6 +33,10 @@ pub enum Statement {
     DeleteAndReturn(DeleteAndReturnStatement),
     /// MATCH ... REMOVE ... RETURN ...
     RemoveAndReturn(RemoveAndReturnStatement),
+    /// A sequence of independent statements. Each statement is executed in order;
+    /// the result of the last statement is returned. This represents queries like
+    /// `CREATE (a) CREATE (b)` or setup scripts with multiple write clauses.
+    Pipeline(Vec<Statement>),
 }
 
 /// A read-only Cypher query containing MATCH, WHERE, RETURN, ORDER BY, SKIP, and LIMIT clauses.
@@ -87,6 +91,23 @@ pub enum QueryPart {
         expr: Expr,
         variable: String,
     },
+    /// A CREATE clause inside a pipeline query, e.g. `UNWIND list AS x CREATE (n {v: x}) RETURN n`.
+    Create {
+        patterns: Vec<Pattern>,
+    },
+    /// A MERGE clause inside a pipeline query.
+    Merge {
+        merges: Vec<MergeStatement>,
+    },
+    /// A SET clause inside a pipeline query.
+    Set {
+        items: Vec<SetItem>,
+    },
+    /// A DELETE clause inside a pipeline query.
+    Delete {
+        variables: Vec<String>,
+        detach: bool,
+    },
 }
 
 /// A MATCH clause containing a node and relationship pattern.
@@ -109,7 +130,7 @@ pub struct Pattern {
 pub struct NodePattern {
     pub variable: Option<String>,
     pub label: Option<String>,
-    pub properties: Option<HashMap<String, Literal>>,
+    pub properties: Option<HashMap<String, Expr>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -129,7 +150,7 @@ pub struct RelationshipPattern {
     /// When `is_undirected` is true, `is_incoming` is ignored.
     pub is_undirected: bool,
     pub range: Option<RelRange>,
-    pub properties: Option<HashMap<String, Literal>>,
+    pub properties: Option<HashMap<String, Expr>>,
 }
 
 /// A conditional WHERE predicate comparing two expressions.

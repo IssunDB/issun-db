@@ -59,6 +59,15 @@ pub(super) fn execute_read_query(
     //    contains the pre-projection variable names.
     let resolved_paths = execute_physical(graph, &optimized, params)?;
 
+    // A query with an empty RETURN clause is a write-only pipeline query. Execute it
+    // for its side effects but return an empty QueryResult (no columns, no rows).
+    if query.return_clause.items.is_empty() {
+        return Ok(QueryResult {
+            columns: vec![],
+            records: vec![],
+        });
+    }
+
     // Check whether the RETURN clause is RETURN * (the __star__ sentinel).
     let is_return_star = query.return_clause.items.len() == 1
         && matches!(
@@ -385,8 +394,7 @@ pub(super) fn execute_physical(
             // Bulk single-hop expansion for all required directions.
             let mut transition_map: HashMap<NodeId, Vec<(EdgeId, NodeId)>> = HashMap::new();
             for &dir in directions {
-                let transitions =
-                    expand_multi_type(graph, &src_nodes, rel_type.as_deref(), dir)?;
+                let transitions = expand_multi_type(graph, &src_nodes, rel_type.as_deref(), dir)?;
                 for (src, eid, dst) in transitions {
                     let entry = transition_map.entry(src).or_default();
                     if !entry.iter().any(|&(e, d)| e == eid && d == dst) {
@@ -616,7 +624,7 @@ pub(super) fn execute_physical(
         PhysicalOperator::Project {
             input,
             items,
-            is_barrier: _,
+            is_barrier,
         } => {
             let child_paths = execute_physical(graph, input, params)?;
             let mut next_paths = Vec::new();
@@ -633,7 +641,15 @@ pub(super) fn execute_physical(
                     continue;
                 }
 
-                let mut projected_path = PathMap::new();
+                // For non-barrier projects (intermediate projections in WITH-WHERE
+                // pipelines), start with all existing bindings so that the filter
+                // after this project can still see pre-projection variables.
+                // Barrier projects (WITH clause boundaries) always start fresh.
+                let mut projected_path: PathMap = if *is_barrier {
+                    PathMap::new()
+                } else {
+                    path.clone()
+                };
 
                 for (expr, alias) in items {
                     let target_var = if let Some(alias_name) = alias {
@@ -1015,6 +1031,96 @@ pub(super) fn execute_physical(
                 })
                 .collect();
             Ok(deduped)
+        }
+        PhysicalOperator::WritePart { input, part } => {
+            use super::write::execute_create_internal_with_context;
+            use super::write::execute_merge_internal_with_context;
+            use crate::ast::QueryPart;
+
+            let child_paths = execute_physical(graph, input, params)?;
+            let mut result_paths = Vec::new();
+
+            for path in child_paths {
+                match part {
+                    QueryPart::Create { patterns } => {
+                        let mut new_path = path.clone();
+                        for pattern in patterns {
+                            let created = execute_create_internal_with_context(
+                                graph, pattern, &path, params,
+                            )?;
+                            new_path.extend(created);
+                        }
+                        result_paths.push(new_path);
+                    }
+                    QueryPart::Merge { merges } => {
+                        let mut new_path = path.clone();
+                        for merge_stmt in merges {
+                            let created = execute_merge_internal_with_context(
+                                graph, merge_stmt, &path, params,
+                            )?;
+                            new_path.extend(created);
+                        }
+                        result_paths.push(new_path);
+                    }
+                    QueryPart::Set { items } => {
+                        // Apply SET for each row using existing set execution logic.
+                        for item in items {
+                            if let Some(GraphBinding::Node(nid)) = path.get(&item.variable) {
+                                let new_val = evaluate_expr(graph, &path, &item.expr, params)?;
+                                let record = graph
+                                    .get_node(*nid)
+                                    .map_err(|e| e.to_string())?
+                                    .ok_or_else(|| format!("node not found: {}", nid))?;
+                                let mut props: serde_json::Value =
+                                    rmp_serde::from_slice(&record.props)
+                                        .map_err(|e| e.to_string())?;
+                                if let Some(obj) = props.as_object_mut() {
+                                    obj.insert(item.property.clone(), new_val);
+                                }
+                                graph.update_node(*nid, &props).map_err(|e| e.to_string())?;
+                            }
+                        }
+                        result_paths.push(path);
+                    }
+                    QueryPart::Delete { variables, detach } => {
+                        for var in variables {
+                            match path.get(var.as_str()) {
+                                Some(GraphBinding::Node(nid)) => {
+                                    if *detach {
+                                        // Delete all edges first.
+                                        let out_neighbors =
+                                            graph.out_neighbors(*nid).map_err(|e| e.to_string())?;
+                                        for entry in out_neighbors {
+                                            graph
+                                                .delete_edge(entry.edge)
+                                                .map_err(|e| e.to_string())?;
+                                        }
+                                        let in_neighbors =
+                                            graph.in_neighbors(*nid).map_err(|e| e.to_string())?;
+                                        for entry in in_neighbors {
+                                            graph
+                                                .delete_edge(entry.edge)
+                                                .map_err(|e| e.to_string())?;
+                                        }
+                                    }
+                                    graph.delete_node(*nid).map_err(|e| e.to_string())?;
+                                }
+                                Some(GraphBinding::Edge(eid)) => {
+                                    graph.delete_edge(*eid).map_err(|e| e.to_string())?;
+                                }
+                                _ => {}
+                            }
+                        }
+                        result_paths.push(path);
+                    }
+                    _ => {
+                        // Other QueryPart variants are not write clauses; pass through.
+                        result_paths.push(path);
+                    }
+                }
+            }
+
+            Ok(result_paths)
         }
         PhysicalOperator::OptionalMatch { input, null_vars } => {
             let child_paths = execute_physical(graph, input, params)?;

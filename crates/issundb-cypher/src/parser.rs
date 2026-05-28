@@ -20,8 +20,8 @@ pub(crate) enum Tok {
     Integer(i64),
     Float(f64),
     Str(String),
-    Param(String),  // $name
-    Ident(String),  // identifier or keyword (already upper-cased in keyword slot)
+    Param(String), // $name
+    Ident(String), // identifier or keyword (already upper-cased in keyword slot)
 
     // Operators and punctuation
     Eq,      // =
@@ -87,26 +87,22 @@ fn lexer<'src>() -> impl Parser<'src, &'src str, Vec<Tok>, extra::Err<Rich<'src,
     let float_num = choice((
         // 1.5 / 1.5e3 — integer part, dot, one or more digits, optional exponent
         text::int(10)
-            .then(
-                choice((
-                    // dot followed by digits (NOT another dot)
-                    just('.')
-                        .then(text::digits(10))
-                        .then(exponent.clone().or_not())
-                        .to_slice()
-                        .map(Some),
-                    // exponent only (no dot): 1e3
-                    exponent.clone()
-                        .to_slice()
-                        .map(Some),
-                ))
-            )
+            .then(choice((
+                // dot followed by digits (NOT another dot)
+                just('.')
+                    .then(text::digits(10))
+                    .then(exponent.or_not())
+                    .to_slice()
+                    .map(Some),
+                // exponent only (no dot): 1e3
+                exponent.to_slice().map(Some),
+            )))
             .to_slice()
             .map(|s: &str| Tok::Float(s.parse().unwrap_or(0.0))),
         // .5 / .5e-3 (no integer part)
         just('.')
             .then(text::digits(10))
-            .then(exponent.clone().or_not())
+            .then(exponent.or_not())
             .to_slice()
             .map(|s: &str| Tok::Float(s.parse().unwrap_or(0.0))),
     ));
@@ -116,22 +112,56 @@ fn lexer<'src>() -> impl Parser<'src, &'src str, Vec<Tok>, extra::Err<Rich<'src,
         .to_slice()
         .map(|s: &str| Tok::Integer(s.parse().unwrap_or(0)));
 
+    // Escape sequence handler shared by single- and double-quoted strings.
+    // Handles \', \", \\, \n, \t, \r, and \uXXXX unicode escapes.
+    let escape_sq =
+        just('\\').ignore_then(choice((
+            just('\'').to('\''),
+            just('"').to('"'),
+            just('\\').to('\\'),
+            just('n').to('\n'),
+            just('t').to('\t'),
+            just('r').to('\r'),
+            just('b').to('\x08'),
+            just('f').to('\x0C'),
+            just('u').ignore_then(text::digits(16).at_least(4).at_most(4).to_slice().map(
+                |s: &str| {
+                    u32::from_str_radix(s, 16)
+                        .ok()
+                        .and_then(char::from_u32)
+                        .unwrap_or('\u{FFFD}')
+                },
+            )),
+            any().map(|c| c), // fallback: keep the character after backslash
+        )));
+
+    let escape_dq =
+        just('\\').ignore_then(choice((
+            just('\'').to('\''),
+            just('"').to('"'),
+            just('\\').to('\\'),
+            just('n').to('\n'),
+            just('t').to('\t'),
+            just('r').to('\r'),
+            just('b').to('\x08'),
+            just('f').to('\x0C'),
+            just('u').ignore_then(text::digits(16).at_least(4).at_most(4).to_slice().map(
+                |s: &str| {
+                    u32::from_str_radix(s, 16)
+                        .ok()
+                        .and_then(char::from_u32)
+                        .unwrap_or('\u{FFFD}')
+                },
+            )),
+            any().map(|c| c),
+        )));
+
     // Single-quoted string
     let sq_str = just('\'')
         .ignore_then(
-            choice((
-                just('\\')
-                    .ignore_then(any())
-                    .map(|c| match c {
-                        'n' => '\n',
-                        't' => '\t',
-                        'r' => '\r',
-                        other => other,
-                    }),
-                none_of("\\'"),
-            ))
-            .repeated()
-            .collect::<String>(),
+            choice((escape_sq, none_of("\\'")))
+                .repeated()
+                .collect::<String>(),
         )
         .then_ignore(just('\''))
         .map(Tok::Str);
@@ -139,19 +169,9 @@ fn lexer<'src>() -> impl Parser<'src, &'src str, Vec<Tok>, extra::Err<Rich<'src,
     // Double-quoted string
     let dq_str = just('"')
         .ignore_then(
-            choice((
-                just('\\')
-                    .ignore_then(any())
-                    .map(|c| match c {
-                        'n' => '\n',
-                        't' => '\t',
-                        'r' => '\r',
-                        other => other,
-                    }),
-                none_of("\\\""),
-            ))
-            .repeated()
-            .collect::<String>(),
+            choice((escape_dq, none_of("\\\"")))
+                .repeated()
+                .collect::<String>(),
         )
         .then_ignore(just('"'))
         .map(Tok::Str);
@@ -374,7 +394,87 @@ fn parse_expr_not(c: &mut Cursor<'_>) -> Result<Expr, String> {
     parse_expr_cmp(c)
 }
 
+// Operator precedence for comparisons (openCypher spec):
+//
+//   Comparisons (=, <>, <, >, <=, >=, =~) have lower precedence than string
+//   and list predicates (IN, NOT IN, STARTS WITH, ENDS WITH, CONTAINS, IS NULL,
+//   IS NOT NULL). This means `a = b IN c` parses as `a = (b IN c)`, not
+//   `(a = b) IN c`.
+//
+//   Level 1 (lower): =, <>, <, >, <=, >=, =~
+//   Level 2 (higher): IN, NOT IN, STARTS WITH, ENDS WITH, CONTAINS,
+//                     IS NULL, IS NOT NULL
+
 fn parse_expr_cmp(c: &mut Cursor<'_>) -> Result<Expr, String> {
+    let left = parse_expr_predicate(c)?;
+    // Track the previous right operand for chained comparisons:
+    // `a < b < c` means `(a < b) AND (b < c)` in openCypher.
+    let mut prev_right: Option<Expr> = None;
+    let mut accumulated: Option<Expr> = None;
+
+    loop {
+        // Symbolic comparisons (=, <>, <, >, <=, >=)
+        let op = match c.peek() {
+            Some(Tok::Ne) => Some(BinaryOperator::Ne),
+            Some(Tok::Le) => Some(BinaryOperator::Le),
+            Some(Tok::Ge) => Some(BinaryOperator::Ge),
+            Some(Tok::Lt) => Some(BinaryOperator::Lt),
+            Some(Tok::Gt) => Some(BinaryOperator::Gt),
+            Some(Tok::Eq) => Some(BinaryOperator::Eq),
+            _ => None,
+        };
+        if let Some(op) = op {
+            c.next();
+            let right = parse_expr_predicate(c)?;
+
+            // Build the comparison: use the accumulated right from the previous step
+            // as the left operand when chaining (e.g., b in `a < b < c`).
+            let cmp_left = prev_right.take().unwrap_or_else(|| left.clone());
+            let cmp = Expr::BinaryOp {
+                op,
+                left: Box::new(cmp_left),
+                right: Box::new(right.clone()),
+            };
+            // Chain with AND if there was a previous comparison.
+            accumulated = Some(match accumulated.take() {
+                None => cmp,
+                Some(prev) => Expr::BinaryOp {
+                    op: BinaryOperator::And,
+                    left: Box::new(prev),
+                    right: Box::new(cmp),
+                },
+            });
+            prev_right = Some(right);
+            continue;
+        }
+        // RegexEq =~
+        if c.peek() == Some(&Tok::RegexEq) {
+            c.next();
+            let right = parse_expr_predicate(c)?;
+            let cmp_left = prev_right.take().unwrap_or_else(|| left.clone());
+            let cmp = Expr::FunctionCall {
+                name: "__regex__".to_string(),
+                args: vec![cmp_left, right.clone()],
+            };
+            accumulated = Some(match accumulated.take() {
+                None => cmp,
+                Some(prev) => Expr::BinaryOp {
+                    op: BinaryOperator::And,
+                    left: Box::new(prev),
+                    right: Box::new(cmp),
+                },
+            });
+            prev_right = Some(right);
+            continue;
+        }
+        break;
+    }
+    Ok(accumulated.unwrap_or(left))
+}
+
+/// Parse string/list predicates at higher precedence than comparisons:
+/// IN, NOT IN, STARTS WITH, ENDS WITH, CONTAINS, IS NULL, IS NOT NULL.
+fn parse_expr_predicate(c: &mut Cursor<'_>) -> Result<Expr, String> {
     let mut left = parse_expr_add(c)?;
 
     loop {
@@ -382,18 +482,22 @@ fn parse_expr_cmp(c: &mut Cursor<'_>) -> Result<Expr, String> {
         if c.peek_kw("IS") {
             // Peek ahead: IS NULL or IS NOT NULL
             if c.peek_kw_at(1, "NOT") && c.peek_kw_at(2, "NULL") {
-                c.next(); c.next(); c.next(); // consume IS NOT NULL
+                c.next();
+                c.next();
+                c.next(); // consume IS NOT NULL
                 left = Expr::IsNotNull(Box::new(left));
                 continue;
             } else if c.peek_kw_at(1, "NULL") {
-                c.next(); c.next(); // consume IS NULL
+                c.next();
+                c.next(); // consume IS NULL
                 left = Expr::IsNull(Box::new(left));
                 continue;
             }
         }
         // STARTS WITH
         if c.peek_kw("STARTS") && c.peek_kw_at(1, "WITH") {
-            c.next(); c.next();
+            c.next();
+            c.next();
             let right = parse_expr_add(c)?;
             left = Expr::FunctionCall {
                 name: "__starts_with__".to_string(),
@@ -403,7 +507,8 @@ fn parse_expr_cmp(c: &mut Cursor<'_>) -> Result<Expr, String> {
         }
         // ENDS WITH
         if c.peek_kw("ENDS") && c.peek_kw_at(1, "WITH") {
-            c.next(); c.next();
+            c.next();
+            c.next();
             let right = parse_expr_add(c)?;
             left = Expr::FunctionCall {
                 name: "__ends_with__".to_string(),
@@ -423,7 +528,8 @@ fn parse_expr_cmp(c: &mut Cursor<'_>) -> Result<Expr, String> {
         }
         // NOT IN
         if c.peek_kw("NOT") && c.peek_kw_at(1, "IN") {
-            c.next(); c.next();
+            c.next();
+            c.next();
             let right = parse_expr_add(c)?;
             left = Expr::Not(Box::new(Expr::FunctionCall {
                 name: "__in__".to_string(),
@@ -437,36 +543,6 @@ fn parse_expr_cmp(c: &mut Cursor<'_>) -> Result<Expr, String> {
             let right = parse_expr_add(c)?;
             left = Expr::FunctionCall {
                 name: "__in__".to_string(),
-                args: vec![left, right],
-            };
-            continue;
-        }
-        // Symbolic comparisons
-        let op = match c.peek() {
-            Some(Tok::Ne) => Some(BinaryOperator::Ne),
-            Some(Tok::Le) => Some(BinaryOperator::Le),
-            Some(Tok::Ge) => Some(BinaryOperator::Ge),
-            Some(Tok::Lt) => Some(BinaryOperator::Lt),
-            Some(Tok::Gt) => Some(BinaryOperator::Gt),
-            Some(Tok::Eq) => Some(BinaryOperator::Eq),
-            _ => None,
-        };
-        if let Some(op) = op {
-            c.next();
-            let right = parse_expr_add(c)?;
-            left = Expr::BinaryOp {
-                op,
-                left: Box::new(left),
-                right: Box::new(right),
-            };
-            continue;
-        }
-        // RegexEq =~
-        if c.peek() == Some(&Tok::RegexEq) {
-            c.next();
-            let right = parse_expr_add(c)?;
-            left = Expr::FunctionCall {
-                name: "__regex__".to_string(),
                 args: vec![left, right],
             };
             continue;
@@ -618,7 +694,10 @@ fn parse_expr_postfix(c: &mut Cursor<'_>) -> Result<Expr, String> {
                         let var = var.clone();
                         c.next(); // consume :
                         let label = expect_any_ident(c)?;
-                        expr = Expr::HasLabel { variable: var, label };
+                        expr = Expr::HasLabel {
+                            variable: var,
+                            label,
+                        };
                         continue;
                     }
                 }
@@ -812,10 +891,8 @@ fn parse_ident_expr(c: &mut Cursor<'_>) -> Result<Expr, String> {
     }
 
     // Quantifiers: ALL, ANY, NONE, SINGLE followed by '('
-    if matches!(
-        name_upper.as_str(),
-        "ALL" | "ANY" | "NONE" | "SINGLE"
-    ) && c.peek_at(1) == Some(&Tok::LParen)
+    if matches!(name_upper.as_str(), "ALL" | "ANY" | "NONE" | "SINGLE")
+        && c.peek_at(1) == Some(&Tok::LParen)
     {
         return parse_quantifier_expr(c);
     }
@@ -826,7 +903,10 @@ fn parse_ident_expr(c: &mut Cursor<'_>) -> Result<Expr, String> {
         && c.peek_at(2) == Some(&Tok::Star)
         && c.peek_at(3) == Some(&Tok::RParen)
     {
-        c.next(); c.next(); c.next(); c.next(); // consume COUNT ( * )
+        c.next();
+        c.next();
+        c.next();
+        c.next(); // consume COUNT ( * )
         return Ok(Expr::CountStar);
     }
 
@@ -916,7 +996,7 @@ fn parse_agg_expr(c: &mut Cursor<'_>) -> Result<Expr, String> {
 
 fn parse_percentile_expr(c: &mut Cursor<'_>) -> Result<Expr, String> {
     let name = expect_any_ident(c)?;
-    let is_disc = name.to_ascii_uppercase() == "PERCENTILEDISC";
+    let is_disc = name.eq_ignore_ascii_case("PERCENTILEDISC");
     c.expect_tok(&Tok::LParen)?;
     let inner = parse_expr(c)?;
     c.expect_tok(&Tok::Comma)?;
@@ -1026,14 +1106,16 @@ fn parse_case_expr(c: &mut Cursor<'_>) -> Result<Expr, String> {
 
 // ─── Properties map ───────────────────────────────────────────────────────────
 
-fn parse_properties_map(c: &mut Cursor<'_>) -> Result<HashMap<String, Literal>, String> {
+fn parse_properties_map(c: &mut Cursor<'_>) -> Result<HashMap<String, Expr>, String> {
     c.expect_tok(&Tok::LBrace)?;
     let mut map = HashMap::new();
     if c.peek() != Some(&Tok::RBrace) {
         loop {
             let key = expect_any_ident(c)?;
             c.expect_tok(&Tok::Colon)?;
-            let val = parse_literal_value(c)?;
+            // Accept full expressions so that pipeline variable references
+            // like `CREATE (n {num: x})` where `x` is from UNWIND work correctly.
+            let val = parse_expr(c)?;
             map.insert(key, val);
             if !c.eat(&Tok::Comma) {
                 break;
@@ -1044,6 +1126,7 @@ fn parse_properties_map(c: &mut Cursor<'_>) -> Result<HashMap<String, Literal>, 
     Ok(map)
 }
 
+#[allow(dead_code)]
 fn parse_literal_value(c: &mut Cursor<'_>) -> Result<Literal, String> {
     // Handle negative numbers
     if c.peek() == Some(&Tok::Minus) {
@@ -1339,7 +1422,11 @@ fn parse_pattern(c: &mut Cursor<'_>) -> Result<Pattern, String> {
         rels.push((rel, target));
     }
 
-    Ok(Pattern { node, rels, path_variable })
+    Ok(Pattern {
+        node,
+        rels,
+        path_variable,
+    })
 }
 
 fn parse_multi_pattern(c: &mut Cursor<'_>) -> Result<Vec<Pattern>, String> {
@@ -1389,12 +1476,9 @@ fn parse_where_clause_from_cursor(c: &mut Cursor<'_>) -> Result<WhereClause, Str
 
 fn parse_set_items_from_cursor(c: &mut Cursor<'_>) -> Result<Vec<SetItem>, String> {
     let mut items = Vec::new();
-    loop {
+    while let Some(Tok::Ident(_)) = c.peek() {
         // variable.property = expr
-        let var = match c.peek() {
-            Some(Tok::Ident(_)) => expect_any_ident(c)?,
-            _ => break,
-        };
+        let var = expect_any_ident(c)?;
         // Check for label set `n:Label` or `n:Label1:Label2` (skip label assignments)
         if c.peek() == Some(&Tok::Colon) {
             // Consume all :Label tokens for this variable
@@ -1419,9 +1503,7 @@ fn parse_set_items_from_cursor(c: &mut Cursor<'_>) -> Result<Vec<SetItem>, Strin
         } else {
             // Could be `n += {prop: val}` or other forms; skip
             // consume until comma or end of SET
-            while !matches!(c.peek(), Some(Tok::Comma) | None)
-                && !is_clause_keyword(c)
-            {
+            while !matches!(c.peek(), Some(Tok::Comma) | None) && !is_clause_keyword(c) {
                 c.next();
             }
         }
@@ -1633,6 +1715,10 @@ fn validate_cross_clause_variable_types(parts: &[QueryPart]) -> Result<(), Strin
                 path_vars.clear();
                 None
             }
+            QueryPart::Create { .. }
+            | QueryPart::Merge { .. }
+            | QueryPart::Set { .. }
+            | QueryPart::Delete { .. } => None,
         };
 
         if let Some(clauses) = clauses {
@@ -1723,7 +1809,8 @@ fn parse_read_query(c: &mut Cursor<'_>) -> Result<Query, String> {
                 where_clause,
             });
         } else if c.peek_kw("OPTIONAL") && c.peek_kw_at(1, "MATCH") {
-            c.next(); c.next();
+            c.next();
+            c.next();
             let match_clauses = parse_match_clauses_from_cursor(c)?;
             let where_clause = if c.peek_kw("WHERE") {
                 c.next();
@@ -1777,14 +1864,86 @@ fn parse_read_query(c: &mut Cursor<'_>) -> Result<Query, String> {
             c.next(); // AS
             let variable = expect_any_ident(c)?;
             parts.push(QueryPart::Unwind { expr, variable });
-        } else if c.peek_kw("RETURN") {
-            break;
+        } else if c.peek_kw("CREATE") {
+            // CREATE clause embedded in a pipeline query (e.g. UNWIND ... CREATE ... RETURN ...).
+            c.next(); // CREATE
+            let patterns = parse_multi_pattern(c)?;
+            parts.push(QueryPart::Create { patterns });
+        } else if c.peek_kw("MERGE") {
+            c.next(); // MERGE
+            let first = parse_one_merge_block(c)?;
+            let mut merges = vec![first];
+            while c.peek_kw("MERGE") {
+                c.next();
+                merges.push(parse_one_merge_block(c)?);
+            }
+            parts.push(QueryPart::Merge { merges });
+        } else if c.peek_kw("SET") {
+            c.next(); // SET
+            let items = parse_set_items_from_cursor(c)?;
+            parts.push(QueryPart::Set { items });
+        } else if c.peek_kw("DETACH") || c.peek_kw("DELETE") {
+            let detach = c.peek_kw("DETACH");
+            if detach {
+                c.next(); // DETACH
+            }
+            c.next(); // DELETE
+            let mut variables = Vec::new();
+            loop {
+                variables.push(expect_any_ident(c)?);
+                if !c.eat(&Tok::Comma) {
+                    break;
+                }
+            }
+            parts.push(QueryPart::Delete { variables, detach });
         } else {
             break;
         }
     }
 
+    // RETURN is optional when there are write parts in the pipeline.
+    let has_write_parts = parts.iter().any(|p| {
+        matches!(
+            p,
+            QueryPart::Create { .. }
+                | QueryPart::Merge { .. }
+                | QueryPart::Set { .. }
+                | QueryPart::Delete { .. }
+        )
+    });
+
     if !c.peek_kw("RETURN") {
+        if has_write_parts || parts.is_empty() {
+            // Write-only pipeline or empty query: return empty result.
+            let return_clause = ReturnClause {
+                items: vec![],
+                distinct: false,
+            };
+            validate_cross_clause_variable_types(&parts)?;
+            let (match_clauses, where_clause) = parts
+                .first()
+                .and_then(|p| {
+                    if let QueryPart::Match {
+                        match_clauses,
+                        where_clause,
+                    } = p
+                    {
+                        Some((match_clauses.clone(), where_clause.clone()))
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_default();
+            return Ok(Query {
+                match_clauses,
+                where_clause,
+                return_clause,
+                parts,
+                order_by: None,
+                skip: None,
+                limit: None,
+            });
+        }
         return Err("read query requires a RETURN clause".into());
     }
     c.next(); // RETURN
@@ -1799,7 +1958,11 @@ fn parse_read_query(c: &mut Cursor<'_>) -> Result<Query, String> {
     let (match_clauses, where_clause) = parts
         .first()
         .and_then(|p| {
-            if let QueryPart::Match { match_clauses, where_clause } = p {
+            if let QueryPart::Match {
+                match_clauses,
+                where_clause,
+            } = p
+            {
                 Some((match_clauses.clone(), where_clause.clone()))
             } else {
                 None
@@ -1934,11 +2097,14 @@ fn parse_remove_statement(c: &mut Cursor<'_>) -> Result<Statement, String> {
         }
         // Allow multiple labels: REMOVE n:Label1:Label2
         while c.peek() == Some(&Tok::Colon) {
-            if let RemoveItem::Label { variable, .. } = items.last().unwrap() {
+            if let Some(RemoveItem::Label { variable, .. }) = items.last() {
                 let var = variable.clone();
                 c.next(); // :
                 let extra_label = expect_any_ident(c)?;
-                items.push(RemoveItem::Label { variable: var, label: extra_label });
+                items.push(RemoveItem::Label {
+                    variable: var,
+                    label: extra_label,
+                });
             } else {
                 break;
             }
@@ -1981,17 +2147,25 @@ fn parse_one_merge_block(c: &mut Cursor<'_>) -> Result<MergeStatement, String> {
 
     loop {
         if c.peek_kw("ON") && c.peek_kw_at(1, "CREATE") && c.peek_kw_at(2, "SET") {
-            c.next(); c.next(); c.next();
+            c.next();
+            c.next();
+            c.next();
             on_create_set.extend(parse_set_items_from_cursor(c)?);
         } else if c.peek_kw("ON") && c.peek_kw_at(1, "MATCH") && c.peek_kw_at(2, "SET") {
-            c.next(); c.next(); c.next();
+            c.next();
+            c.next();
+            c.next();
             on_match_set.extend(parse_set_items_from_cursor(c)?);
         } else {
             break;
         }
     }
 
-    Ok(MergeStatement { pattern, on_create_set, on_match_set })
+    Ok(MergeStatement {
+        pattern,
+        on_create_set,
+        on_match_set,
+    })
 }
 
 fn parse_merge_statement(c: &mut Cursor<'_>) -> Result<Statement, String> {
@@ -2061,7 +2235,10 @@ fn parse_create_statement(c: &mut Cursor<'_>) -> Result<Statement, String> {
         c.expect_tok(&Tok::Dot)?;
         let property = expect_any_ident(c)?;
         c.expect_tok(&Tok::RParen)?;
-        return Ok(Statement::CreateIndex(CreateIndexStatement { label, property }));
+        return Ok(Statement::CreateIndex(CreateIndexStatement {
+            label,
+            property,
+        }));
     }
 
     if c.peek_kw("CONSTRAINT") {
@@ -2359,12 +2536,63 @@ fn parse_match_then_merge_statement(c: &mut Cursor<'_>) -> Result<Statement, Str
 
 // ─── Top-level statement parser ───────────────────────────────────────────────
 
+/// Scan ahead from a CREATE keyword to determine whether this CREATE is the
+/// start of a pipeline query (e.g., `CREATE (a) SET a.x = 1 RETURN a.x`).
+/// Returns true if the CREATE should be parsed via `parse_read_query`.
+///
+/// A CREATE "starts a pipeline" only when it is followed by a non-CREATE
+/// write clause (SET, DELETE, REMOVE) or a RETURN clause at the top level.
+/// Multiple sequential CREATEs are left as independent Pipeline statements
+/// to avoid deep recursion in the physical plan.
+fn create_starts_pipeline(c: &Cursor<'_>) -> bool {
+    let tokens = c.tokens;
+    let mut pos = c.pos + 1; // skip CREATE
+    let mut depth_p = 0i32;
+    let mut depth_b = 0i32;
+    let mut depth_br = 0i32;
+
+    while pos < tokens.len() {
+        match &tokens[pos] {
+            Tok::LParen => depth_p += 1,
+            Tok::RParen => depth_p -= 1,
+            Tok::LBrack => depth_b += 1,
+            Tok::RBrack => depth_b -= 1,
+            Tok::LBrace => depth_br += 1,
+            Tok::RBrace => depth_br -= 1,
+            Tok::Ident(s) if depth_p == 0 && depth_b == 0 && depth_br == 0 => {
+                let u = s.to_ascii_uppercase();
+                match u.as_str() {
+                    // SET, DELETE, REMOVE, MERGE after a CREATE: true pipeline.
+                    "SET" | "DELETE" | "DETACH" | "REMOVE" | "MERGE" => {
+                        return true;
+                    }
+                    // RETURN after a CREATE: pipeline (CREATE ... RETURN ...).
+                    "RETURN" => return true,
+                    // Another CREATE or other clause: not a pipeline.
+                    _ => return false,
+                }
+            }
+            _ => {}
+        }
+        pos += 1;
+    }
+    false
+}
+
 fn parse_statement(c: &mut Cursor<'_>) -> Result<Statement, String> {
     match c.peek() {
         Some(Tok::Ident(s)) => {
             let upper = s.to_ascii_uppercase();
             match upper.as_str() {
-                "CREATE" => parse_create_statement(c),
+                "CREATE" => {
+                    if create_starts_pipeline(c) {
+                        // Parse as a pipeline read query so that variable bindings from
+                        // the CREATE can be referenced by subsequent SET, DELETE, or RETURN.
+                        Ok(Statement::Query(parse_read_query(c)?))
+                    } else {
+                        parse_create_statement(c)
+                    }
+                }
                 "DROP" => parse_drop_statement(c),
                 "MERGE" => parse_merge_statement(c),
                 "FOREACH" => parse_foreach_statement(c),
@@ -2384,15 +2612,12 @@ fn parse_statement(c: &mut Cursor<'_>) -> Result<Statement, String> {
 /// Parse a Cypher query string into a `Statement` AST.
 pub fn parse(cypher: &str) -> Result<Statement, String> {
     // Phase 1: lex using chumsky
-    let tokens = lexer()
-        .parse(cypher)
-        .into_result()
-        .map_err(|errs| {
-            errs.into_iter()
-                .map(|e| e.to_string())
-                .collect::<Vec<_>>()
-                .join("; ")
-        })?;
+    let tokens = lexer().parse(cypher).into_result().map_err(|errs| {
+        errs.into_iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join("; ")
+    })?;
 
     // Phase 2: recursive-descent parse over the flat token vector
     let mut cursor = Cursor::new(&tokens);
@@ -2418,6 +2643,43 @@ pub fn parse(cypher: &str) -> Result<Statement, String> {
     // Skip trailing semicolons
     while cursor.eat(&Tok::Semi) {}
 
+    // Additional statements in a multi-clause pipeline (e.g. `CREATE (a) CREATE (b)`).
+    // Collect any remaining top-level statements and wrap them in a Pipeline.
+    if !cursor.is_empty() && is_clause_keyword(&cursor) {
+        let mut stmts = vec![result];
+        while !cursor.is_empty() && is_clause_keyword(&cursor) {
+            let next_stmt = parse_statement(&mut cursor)?;
+
+            // Handle UNION after each statement.
+            let mut next = next_stmt;
+            while cursor.peek_kw("UNION") {
+                cursor.next();
+                let all = cursor.peek_kw("ALL");
+                if all {
+                    cursor.next();
+                }
+                let right = parse_statement(&mut cursor)?;
+                next = Statement::Union(UnionStatement {
+                    left: Box::new(next),
+                    right: Box::new(right),
+                    all,
+                });
+            }
+
+            stmts.push(next);
+            while cursor.eat(&Tok::Semi) {}
+        }
+
+        if !cursor.is_empty() {
+            return Err(format!(
+                "unexpected tokens after statement: {:?}",
+                cursor.peek()
+            ));
+        }
+
+        return Ok(Statement::Pipeline(stmts));
+    }
+
     if !cursor.is_empty() {
         return Err(format!(
             "unexpected tokens after statement: {:?}",
@@ -2427,7 +2689,6 @@ pub fn parse(cypher: &str) -> Result<Statement, String> {
 
     Ok(result)
 }
-
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
 

@@ -756,7 +756,12 @@ pub(super) fn eval_function_call(
             match val {
                 serde_json::Value::String(s) => Ok(serde_json::Value::String(s)),
                 serde_json::Value::Null => Ok(serde_json::Value::Null),
-                other => Ok(serde_json::Value::String(other.to_string())),
+                serde_json::Value::Bool(b) => Ok(serde_json::Value::String(b.to_string())),
+                serde_json::Value::Number(n) => Ok(serde_json::Value::String(n.to_string())),
+                // Lists, maps, nodes, and edges cannot be converted to string.
+                serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+                    Err("TypeError: toString() cannot convert list or map to string".into())
+                }
             }
         }
         "tointeger" | "toint" => {
@@ -764,19 +769,37 @@ pub(super) fn eval_function_call(
                 return Err("toInteger() requires exactly 1 argument".into());
             }
             let val = evaluate_expr(graph, path, &args[0], params)?;
-            match val {
-                serde_json::Value::Number(n) => {
-                    if let Some(i) = n.as_i64() {
-                        Ok(serde_json::Value::Number(i.into()))
-                    } else if let Some(f) = n.as_f64() {
-                        Ok(serde_json::Value::Number((f as i64).into()))
-                    } else {
-                        Ok(serde_json::Value::Null)
+            fn coerce_to_int(v: serde_json::Value) -> Result<serde_json::Value, String> {
+                match v {
+                    serde_json::Value::Number(n) => {
+                        if let Some(i) = n.as_i64() {
+                            Ok(serde_json::Value::Number(i.into()))
+                        } else if let Some(f) = n.as_f64() {
+                            Ok(serde_json::Value::Number((f as i64).into()))
+                        } else {
+                            Ok(serde_json::Value::Null)
+                        }
+                    }
+                    serde_json::Value::String(s) => {
+                        // Try parsing the string as an integer or float.
+                        if let Ok(i) = s.trim().parse::<i64>() {
+                            Ok(serde_json::Value::Number(i.into()))
+                        } else if let Ok(f) = s.trim().parse::<f64>() {
+                            Ok(serde_json::Value::Number((f as i64).into()))
+                        } else {
+                            Ok(serde_json::Value::Null)
+                        }
+                    }
+                    serde_json::Value::Null => Ok(serde_json::Value::Null),
+                    serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+                        Err("TypeError: toInteger() cannot convert list or map".into())
+                    }
+                    serde_json::Value::Bool(_) => {
+                        Err("TypeError: toInteger() cannot convert boolean".into())
                     }
                 }
-                serde_json::Value::Null => Ok(serde_json::Value::Null),
-                _ => Ok(serde_json::Value::Null),
             }
+            coerce_to_int(val)
         }
         "tofloat" => {
             if args.len() != 1 {
@@ -788,6 +811,16 @@ pub(super) fn eval_function_call(
                     Ok(serde_json::Number::from_f64(n.as_f64().unwrap_or(0.0))
                         .map(serde_json::Value::Number)
                         .unwrap_or(serde_json::Value::Null))
+                }
+                serde_json::Value::String(s) => {
+                    // Try parsing the string as a float.
+                    if let Ok(f) = s.trim().parse::<f64>() {
+                        Ok(serde_json::Number::from_f64(f)
+                            .map(serde_json::Value::Number)
+                            .unwrap_or(serde_json::Value::Null))
+                    } else {
+                        Ok(serde_json::Value::Null)
+                    }
                 }
                 serde_json::Value::Null => Ok(serde_json::Value::Null),
                 _ => Ok(serde_json::Value::Null),

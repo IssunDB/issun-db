@@ -1,5 +1,4 @@
 use super::expr::evaluate_expr;
-use super::expr::literal_to_value;
 use super::read::{binding_to_value, execute_physical, projected_key};
 use super::*;
 use crate::ast::{
@@ -7,78 +6,38 @@ use crate::ast::{
     RemoveAndReturnStatement, RemoveItem, RemoveStatement, SetAndReturnStatement,
 };
 
+/// Evaluate a property map `HashMap<String, Expr>` using the given path context.
+/// Returns a JSON object containing the evaluated properties.
+fn eval_properties(
+    graph: &Graph,
+    props: &HashMap<String, crate::ast::Expr>,
+    path: &PathMap,
+    params: &HashMap<String, serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let mut obj = serde_json::Map::new();
+    for (k, v) in props {
+        obj.insert(k.clone(), evaluate_expr(graph, path, v, params)?);
+    }
+    Ok(serde_json::Value::Object(obj))
+}
+
 pub(super) fn execute_create_internal(graph: &Graph, pattern: &Pattern) -> Result<PathMap, String> {
-    let mut bindings = HashMap::new();
-    let mut props_map = HashMap::new();
-    if let Some(ref props) = pattern.node.properties {
-        for (k, v) in props {
-            props_map.insert(k.clone(), literal_to_value(v));
-        }
-    }
-
-    let label = pattern
-        .node
-        .label
-        .clone()
-        .unwrap_or_else(|| "Node".to_string());
-    let seed_id = graph
-        .add_node(&label, &props_map)
-        .map_err(|e| e.to_string())?;
-
-    if let Some(ref var_name) = pattern.node.variable {
-        bindings.insert(var_name.clone(), GraphBinding::Node(seed_id));
-    }
-
-    let mut created_node_id = seed_id;
-    for (rel_pat, node_pat) in &pattern.rels {
-        let mut target_props = HashMap::new();
-        if let Some(ref props) = node_pat.properties {
-            for (k, v) in props {
-                target_props.insert(k.clone(), literal_to_value(v));
-            }
-        }
-        let target_label = node_pat.label.clone().unwrap_or_else(|| "Node".to_string());
-        let target_id = graph
-            .add_node(&target_label, &target_props)
-            .map_err(|e| e.to_string())?;
-
-        if let Some(ref var_name) = node_pat.variable {
-            bindings.insert(var_name.clone(), GraphBinding::Node(target_id));
-        }
-
-        let rel_type = rel_pat
-            .rel_type
-            .clone()
-            .unwrap_or_else(|| "EDGE".to_string());
-        let empty_props: HashMap<String, serde_json::Value> = HashMap::new();
-
-        let edge_id = if rel_pat.is_incoming {
-            graph
-                .add_edge(target_id, created_node_id, &rel_type, &empty_props)
-                .map_err(|e| e.to_string())?
-        } else {
-            graph
-                .add_edge(created_node_id, target_id, &rel_type, &empty_props)
-                .map_err(|e| e.to_string())?
-        };
-
-        if let Some(ref var_name) = rel_pat.variable {
-            bindings.insert(var_name.clone(), GraphBinding::Edge(edge_id));
-        }
-
-        created_node_id = target_id;
-    }
-
-    Ok(bindings)
+    execute_create_internal_with_context(graph, pattern, &PathMap::new(), &HashMap::new())
 }
 
 pub(super) fn execute_create(
     graph: &Graph,
     create: &CreateStatement,
-    _params: &HashMap<String, serde_json::Value>,
+    params: &HashMap<String, serde_json::Value>,
 ) -> Result<QueryResult, String> {
+    // Thread bindings across patterns so that variables created in one pattern
+    // (e.g., the first node in `CREATE (a:A), (a)-[:R]->(b:B)`) are available
+    // in subsequent patterns within the same CREATE clause.
+    let mut shared_bindings = PathMap::new();
     for pattern in &create.patterns {
-        execute_create_internal(graph, pattern)?;
+        let created =
+            execute_create_internal_with_context(graph, pattern, &shared_bindings, params)?;
+        shared_bindings.extend(created);
     }
     Ok(QueryResult {
         columns: vec![],
@@ -91,9 +50,10 @@ pub(super) fn execute_create_and_return(
     stmt: &CreateAndReturnStatement,
     params: &HashMap<String, serde_json::Value>,
 ) -> Result<QueryResult, String> {
+    // Thread bindings across patterns within the same CREATE clause.
     let mut bindings = PathMap::new();
     for pattern in &stmt.patterns {
-        let created = execute_create_internal(graph, pattern)?;
+        let created = execute_create_internal_with_context(graph, pattern, &bindings, params)?;
         bindings.extend(created);
     }
 
@@ -433,7 +393,10 @@ pub(super) fn execute_delete_and_return(
         let binding_query = Query {
             match_clauses: stmt.match_clauses.clone(),
             where_clause: stmt.where_clause.clone(),
-            return_clause: ReturnClause { items: vec![], distinct: false },
+            return_clause: ReturnClause {
+                items: vec![],
+                distinct: false,
+            },
             parts: Vec::new(),
             order_by: None,
             skip: None,
@@ -453,13 +416,11 @@ pub(super) fn execute_delete_and_return(
                 match path.get(var) {
                     Some(GraphBinding::Node(id)) => {
                         if stmt.detach {
-                            let out_edges =
-                                graph.out_neighbors(*id).map_err(|e| e.to_string())?;
+                            let out_edges = graph.out_neighbors(*id).map_err(|e| e.to_string())?;
                             for ne in out_edges {
                                 let _ = graph.delete_edge(ne.edge);
                             }
-                            let in_edges =
-                                graph.in_neighbors(*id).map_err(|e| e.to_string())?;
+                            let in_edges = graph.in_neighbors(*id).map_err(|e| e.to_string())?;
                             for ne in in_edges {
                                 let _ = graph.delete_edge(ne.edge);
                             }
@@ -591,7 +552,9 @@ pub(super) fn execute_merge_and_return(
         }
 
         // If we could not resolve by key, evaluate the expressions directly.
-        if values.iter().all(|v| *v == serde_json::Value::Null) && !stmt.return_clause.items.is_empty() {
+        if values.iter().all(|v| *v == serde_json::Value::Null)
+            && !stmt.return_clause.items.is_empty()
+        {
             values.clear();
             for item in &stmt.return_clause.items {
                 let val = evaluate_expr(graph, &bindings, &item.expr, params)
@@ -602,7 +565,11 @@ pub(super) fn execute_merge_and_return(
 
         Ok(QueryResult {
             columns,
-            records: if values.is_empty() { vec![] } else { vec![Record { values }] },
+            records: if values.is_empty() {
+                vec![]
+            } else {
+                vec![Record { values }]
+            },
         })
     })
 }
@@ -807,4 +774,120 @@ pub(super) fn apply_set_items(
             .map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+/// Create a node pattern with properties evaluated using an expression context (PathMap).
+///
+/// This function evaluates property expressions using the provided path bindings, which
+/// allows referencing pipeline variables (e.g., `CREATE (n {num: x})` where `x` is from UNWIND).
+pub(super) fn execute_create_internal_with_context(
+    graph: &Graph,
+    pattern: &Pattern,
+    path: &super::PathMap,
+    params: &HashMap<String, serde_json::Value>,
+) -> Result<super::PathMap, String> {
+    let mut bindings = super::PathMap::new();
+    let mut combined_path = path.clone();
+
+    // Evaluate the seed node's properties.
+    let props_map = if let Some(ref props) = pattern.node.properties {
+        eval_properties(graph, props, &combined_path, params)?
+    } else {
+        serde_json::Value::Object(serde_json::Map::new())
+    };
+
+    let label = pattern
+        .node
+        .label
+        .clone()
+        .unwrap_or_else(|| "Node".to_string());
+    let seed_id = graph
+        .add_node(&label, &props_map)
+        .map_err(|e| e.to_string())?;
+
+    if let Some(ref var_name) = pattern.node.variable {
+        bindings.insert(var_name.clone(), GraphBinding::Node(seed_id));
+        combined_path.insert(var_name.clone(), GraphBinding::Node(seed_id));
+    }
+
+    let mut created_node_id = seed_id;
+
+    for (rel_pat, node_pat) in &pattern.rels {
+        // Check if the target node is an existing variable.
+        let target_id = if let Some(ref var) = node_pat.variable {
+            if let Some(GraphBinding::Node(existing_id)) = combined_path.get(var.as_str()) {
+                // Reuse an existing node bound in this context.
+                *existing_id
+            } else {
+                // Create a new target node.
+                let target_props = if let Some(ref props) = node_pat.properties {
+                    eval_properties(graph, props, &combined_path, params)?
+                } else {
+                    serde_json::Value::Object(serde_json::Map::new())
+                };
+                let target_label = node_pat.label.clone().unwrap_or_else(|| "Node".to_string());
+                let tid = graph
+                    .add_node(&target_label, &target_props)
+                    .map_err(|e| e.to_string())?;
+                bindings.insert(var.clone(), GraphBinding::Node(tid));
+                combined_path.insert(var.clone(), GraphBinding::Node(tid));
+                tid
+            }
+        } else {
+            // Anonymous target node.
+            let target_props = if let Some(ref props) = node_pat.properties {
+                eval_properties(graph, props, &combined_path, params)?
+            } else {
+                serde_json::Value::Object(serde_json::Map::new())
+            };
+            let target_label = node_pat.label.clone().unwrap_or_else(|| "Node".to_string());
+            graph
+                .add_node(&target_label, &target_props)
+                .map_err(|e| e.to_string())?
+        };
+
+        let rel_type = rel_pat
+            .rel_type
+            .clone()
+            .unwrap_or_else(|| "EDGE".to_string());
+
+        let rel_props = if let Some(ref props) = rel_pat.properties {
+            eval_properties(graph, props, &combined_path, params)?
+        } else {
+            serde_json::Value::Object(serde_json::Map::new())
+        };
+
+        let edge_id = if rel_pat.is_incoming {
+            graph
+                .add_edge(target_id, created_node_id, &rel_type, &rel_props)
+                .map_err(|e| e.to_string())?
+        } else {
+            graph
+                .add_edge(created_node_id, target_id, &rel_type, &rel_props)
+                .map_err(|e| e.to_string())?
+        };
+
+        if let Some(ref var_name) = rel_pat.variable {
+            bindings.insert(var_name.clone(), GraphBinding::Edge(edge_id));
+            combined_path.insert(var_name.clone(), GraphBinding::Edge(edge_id));
+        }
+
+        created_node_id = target_id;
+    }
+
+    Ok(bindings)
+}
+
+/// Execute a MERGE operation with expression context from a pipeline PathMap.
+pub(super) fn execute_merge_internal_with_context(
+    graph: &Graph,
+    stmt: &crate::ast::MergeStatement,
+    _path: &super::PathMap,
+    params: &HashMap<String, serde_json::Value>,
+) -> Result<super::PathMap, String> {
+    // For now, delegate to the context-free merge. Full pipeline MERGE support
+    // would require evaluating pattern properties against the current path.
+    let result = execute_merge_inner(graph, stmt, params)?;
+    let _ = result;
+    Ok(super::PathMap::new())
 }

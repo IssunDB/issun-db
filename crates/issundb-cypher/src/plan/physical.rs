@@ -78,8 +78,12 @@ pub enum PhysicalOperator {
         null_vars: Vec<String>,
     },
     /// Deduplicate rows (DISTINCT).
-    Distinct {
+    Distinct { input: Box<PhysicalOperator> },
+    /// Execute write operations (CREATE, MERGE, SET, DELETE) for each input row.
+    /// Binds new nodes or edges from CREATE into the PathMap and passes each row downstream.
+    WritePart {
         input: Box<PhysicalOperator>,
+        part: crate::ast::QueryPart,
     },
 }
 
@@ -168,6 +172,10 @@ impl PhysicalPlanner {
             }
             LogicalOperator::Distinct { input } => PhysicalOperator::Distinct {
                 input: Box::new(Self::plan(input)),
+            },
+            LogicalOperator::WritePart { input, part } => PhysicalOperator::WritePart {
+                input: Box::new(Self::plan(input)),
+                part: part.clone(),
             },
         }
     }
@@ -328,6 +336,17 @@ pub fn format_physical_plan(op: &PhysicalOperator, depth: usize) -> String {
         }
         PhysicalOperator::Distinct { input } => {
             buf.push_str(&format!("{}Distinct\n", pad));
+            buf.push_str(&format_physical_plan(input, depth + 1));
+        }
+        PhysicalOperator::WritePart { input, part } => {
+            let part_name = match part {
+                crate::ast::QueryPart::Create { .. } => "Create",
+                crate::ast::QueryPart::Merge { .. } => "Merge",
+                crate::ast::QueryPart::Set { .. } => "Set",
+                crate::ast::QueryPart::Delete { .. } => "Delete",
+                _ => "WritePart",
+            };
+            buf.push_str(&format!("{}WritePart({})\n", pad, part_name));
             buf.push_str(&format_physical_plan(input, depth + 1));
         }
     }

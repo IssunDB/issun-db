@@ -13,13 +13,13 @@
 [![MSRV](https://img.shields.io/badge/msrv-1.85.0-informational?style=flat&labelColor=282c34&logo=rust)](https://www.rust-lang.org)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-007ec6?style=flat&labelColor=282c34&logo=open-source-initiative)](https://github.com/IssunDB/issun-db)
 
-A fast embedded graph database in Rust
+An fast embedded analytical graph database in Rust
 
 </div>
 
 ---
 
-An embedded graph database with property graph data model, Cypher support, vector and full-text search, written in Rust.
+IssunDB is a fast embedded OLAP graph database with property graph data model, Cypher support, vector and full-text search, written in Rust.
 
 ### Key Features
 

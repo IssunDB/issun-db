@@ -62,8 +62,14 @@ mod tests {
             assert_eq!(rel.variable.as_deref(), Some("r"));
             assert_eq!(rel.rel_type.as_deref(), Some("KNOWS"));
             let props = rel.properties.as_ref().unwrap();
-            assert_eq!(props.get("since").unwrap(), &ast::Literal::Int(2026));
-            assert_eq!(props.get("score").unwrap(), &ast::Literal::Float(0.95));
+            assert_eq!(
+                props.get("since").unwrap(),
+                &ast::Expr::Literal(ast::Literal::Int(2026))
+            );
+            assert_eq!(
+                props.get("score").unwrap(),
+                &ast::Expr::Literal(ast::Literal::Float(0.95))
+            );
         } else {
             panic!("expected read query statement");
         }
@@ -71,19 +77,26 @@ mod tests {
 
     #[test]
     fn parse_create_statement() {
+        // CREATE without pipeline context now parses as a Query with a Create part.
         let c = parser::parse("CREATE (a:Person {name: \"Alice\", age: 30})").unwrap();
-        if let ast::Statement::Create(create) = c {
-            let pattern = &create.patterns[0];
-            assert_eq!(pattern.node.variable.as_deref(), Some("a"));
-            assert_eq!(pattern.node.label.as_deref(), Some("Person"));
-            let props = pattern.node.properties.as_ref().unwrap();
-            assert_eq!(
-                props.get("name").unwrap(),
-                &ast::Literal::Str("Alice".to_string())
-            );
-        } else {
-            panic!("expected create statement");
-        }
+        let pattern = match &c {
+            ast::Statement::Query(q) => {
+                if let ast::QueryPart::Create { patterns } = &q.parts[0] {
+                    &patterns[0]
+                } else {
+                    panic!("expected Create part");
+                }
+            }
+            ast::Statement::Create(create) => &create.patterns[0],
+            _ => panic!("expected create statement or query"),
+        };
+        assert_eq!(pattern.node.variable.as_deref(), Some("a"));
+        assert_eq!(pattern.node.label.as_deref(), Some("Person"));
+        let props = pattern.node.properties.as_ref().unwrap();
+        assert_eq!(
+            props.get("name").unwrap(),
+            &ast::Expr::Literal(ast::Literal::Str("Alice".to_string()))
+        );
     }
 
     #[test]

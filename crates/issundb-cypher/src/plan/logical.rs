@@ -75,9 +75,7 @@ pub enum LogicalOperator {
         items: Vec<SortItem>,
     },
     /// Deduplicate rows (RETURN/WITH DISTINCT).
-    Distinct {
-        input: Box<LogicalOperator>,
-    },
+    Distinct { input: Box<LogicalOperator> },
     /// Skip and limit the row stream.
     Limit {
         input: Box<LogicalOperator>,
@@ -89,6 +87,12 @@ pub enum LogicalOperator {
     OptionalMatch {
         input: Box<LogicalOperator>,
         null_vars: Vec<String>,
+    },
+    /// A write clause (CREATE, MERGE, SET, DELETE) in a pipeline query. Executed
+    /// for each row produced by the input plan; new bindings are added to the PathMap.
+    WritePart {
+        input: Box<LogicalOperator>,
+        part: crate::ast::QueryPart,
     },
 }
 
@@ -212,11 +216,23 @@ impl LogicalPlanner {
                         // behavior of the Unwind arm above.
                         let mut p = current_plan.unwrap_or(LogicalOperator::SingleRow);
 
-                        // In Cypher semantics, the WHERE predicate of a WITH clause is
-                        // evaluated against the pre-projection rows: variables named in
-                        // the filter still refer to the current scope, not the projected
-                        // output. Apply the filter BEFORE the Project so that references
-                        // like `WITH a AS alias WHERE a.prop = …` resolve correctly.
+                        let project_items: Vec<(Expr, Option<String>)> = items
+                            .iter()
+                            .map(|item| (item.expr.clone(), item.alias.clone()))
+                            .collect();
+
+                        // Detect aggregations in the WITH items and insert an Aggregate
+                        // operator when any item contains an aggregation function (collect,
+                        // count, sum, avg, min, max, stDev, stDevP, percentile).
+                        let (with_group_by, with_aggs) = split_with_items(items);
+                        if !with_aggs.is_empty() {
+                            p = LogicalOperator::Aggregate {
+                                input: Box::new(p),
+                                group_by: with_group_by,
+                                aggregations: with_aggs,
+                            };
+                        }
+
                         if let Some(wc) = where_clause {
                             let filter_expr = match wc {
                                 WhereClause::Eq(l, r) => FilterExpr::Eq(l.clone(), r.clone()),
@@ -227,28 +243,39 @@ impl LogicalPlanner {
                                 WhereClause::Ge(l, r) => FilterExpr::Ge(l.clone(), r.clone()),
                                 WhereClause::Expr(e) => FilterExpr::Expr(e.clone()),
                             };
+
+                            // The WHERE clause of a WITH must see both pre-projection
+                            // variables (bound before the WITH) and post-projection aliases
+                            // (defined by the WITH items themselves). To support both, first
+                            // add the projected aliases into the PathMap without removing
+                            // pre-projection variables (non-barrier), then apply the filter,
+                            // then apply the barrier cleanup to remove pre-projection vars.
+                            p = LogicalOperator::Project {
+                                input: Box::new(p),
+                                items: project_items.clone(),
+                                is_barrier: false, // non-barrier: adds aliases, keeps old vars
+                            };
                             p = LogicalOperator::Filter {
                                 input: Box::new(p),
                                 expression: filter_expr,
                             };
+                            // Barrier cleanup: keep only the WITH-projected aliases.
+                            p = LogicalOperator::Project {
+                                input: Box::new(p),
+                                items: project_items,
+                                is_barrier: true,
+                            };
+                        } else {
+                            p = LogicalOperator::Project {
+                                input: Box::new(p),
+                                items: project_items,
+                                is_barrier: true,
+                            };
                         }
-
-                        let project_items = items
-                            .iter()
-                            .map(|item| (item.expr.clone(), item.alias.clone()))
-                            .collect();
-
-                        p = LogicalOperator::Project {
-                            input: Box::new(p),
-                            items: project_items,
-                            is_barrier: true,
-                        };
 
                         // Apply WITH DISTINCT deduplication after project.
                         if *distinct {
-                            p = LogicalOperator::Distinct {
-                                input: Box::new(p),
-                            };
+                            p = LogicalOperator::Distinct { input: Box::new(p) };
                         }
 
                         // Apply optional ORDER BY attached to the WITH clause.
@@ -345,10 +372,25 @@ impl LogicalPlanner {
                             variable: variable.clone(),
                         });
                     }
+                    // Write clause variants are passed through as-is for the physical planner
+                    // to compile into WritePart operators. They are not planned as logical
+                    // read operators.
+                    write_part @ (QueryPart::Create { .. }
+                    | QueryPart::Merge { .. }
+                    | QueryPart::Set { .. }
+                    | QueryPart::Delete { .. }) => {
+                        let p = current_plan.unwrap_or(LogicalOperator::SingleRow);
+                        current_plan = Some(LogicalOperator::WritePart {
+                            input: Box::new(p),
+                            part: write_part.clone(),
+                        });
+                    }
                 }
             }
 
-            current_plan.ok_or_else(|| "failed to generate plan for parts".to_string())?
+            // If no parts produced a plan, bootstrap with SingleRow for bare write queries
+            // (e.g., a pipeline query with only write parts that was dispatched as a Query).
+            current_plan.unwrap_or(LogicalOperator::SingleRow)
         };
 
         // Split RETURN items into group-by keys and aggregations.
@@ -424,15 +466,14 @@ impl LogicalPlanner {
             label: pattern.node.label.clone(),
         };
 
-        // Apply inline properties filter on the seed node if specified
+        // Apply inline properties filter on the seed node if specified.
+        // Properties are now arbitrary expressions (not just literals), so
+        // use FilterExpr::Eq with the expression value directly.
         if let Some(ref props) = pattern.node.properties {
             for (k, v) in props {
                 plan = LogicalOperator::Filter {
                     input: Box::new(plan),
-                    expression: FilterExpr::Eq(
-                        Expr::Prop(seed_var.clone(), k.clone()),
-                        Expr::Literal(v.clone()),
-                    ),
+                    expression: FilterExpr::Eq(Expr::Prop(seed_var.clone(), k.clone()), v.clone()),
                 };
             }
         }
@@ -473,14 +514,14 @@ impl LogicalPlanner {
                 max_hops,
             };
 
-            // Apply inline properties filter on relationship if specified
+            // Apply inline properties filter on relationship if specified.
             if let Some(ref props) = rel_pat.properties {
                 for (k, v) in props {
                     plan = LogicalOperator::Filter {
                         input: Box::new(plan),
                         expression: FilterExpr::Eq(
                             Expr::Prop(rel_var.clone(), k.clone()),
-                            Expr::Literal(v.clone()),
+                            v.clone(),
                         ),
                     };
                 }
@@ -494,14 +535,14 @@ impl LogicalPlanner {
                 };
             }
 
-            // Apply inline properties filter on target node
+            // Apply inline properties filter on target node.
             if let Some(ref props) = node_pat.properties {
                 for (k, v) in props {
                     plan = LogicalOperator::Filter {
                         input: Box::new(plan),
                         expression: FilterExpr::Eq(
                             Expr::Prop(target_var.clone(), k.clone()),
-                            Expr::Literal(v.clone()),
+                            v.clone(),
                         ),
                     };
                 }
@@ -568,7 +609,90 @@ fn split_return_items(query: &Query) -> (Vec<GroupByItem>, Vec<AggItem>) {
                 aggregations.push((AggFn::Count { distinct: false }, Expr::CountStar, col));
             }
             Expr::Agg(fn_, inner) => {
-                let col = item.alias.clone().unwrap_or_else(|| agg_display_name(fn_, inner));
+                let col = item
+                    .alias
+                    .clone()
+                    .unwrap_or_else(|| agg_display_name(fn_, inner));
+                aggregations.push((fn_.clone(), *inner.clone(), col));
+            }
+            other => {
+                group_by.push((other.clone(), item.alias.clone()));
+            }
+        }
+    }
+
+    (group_by, aggregations)
+}
+
+/// Return true when an expression contains any aggregation function (CountStar
+/// or Agg(...)) at any depth.
+#[allow(dead_code)]
+fn expr_has_aggregation(expr: &Expr) -> bool {
+    match expr {
+        Expr::CountStar | Expr::Agg(_, _) => true,
+        Expr::BinaryOp { left, right, .. } => {
+            expr_has_aggregation(left) || expr_has_aggregation(right)
+        }
+        Expr::Not(inner) | Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
+            expr_has_aggregation(inner)
+        }
+        Expr::FunctionCall { args, .. } => args.iter().any(expr_has_aggregation),
+        Expr::Case {
+            subject,
+            arms,
+            else_expr,
+        } => {
+            subject.as_ref().is_some_and(|s| expr_has_aggregation(s))
+                || arms
+                    .iter()
+                    .any(|a| expr_has_aggregation(&a.when) || expr_has_aggregation(&a.then))
+                || else_expr.as_ref().is_some_and(|e| expr_has_aggregation(e))
+        }
+        Expr::Subscript { expr, index } => {
+            expr_has_aggregation(expr) || expr_has_aggregation(index)
+        }
+        Expr::Slice { expr, start, end } => {
+            expr_has_aggregation(expr)
+                || start.as_ref().is_some_and(|s| expr_has_aggregation(s))
+                || end.as_ref().is_some_and(|e| expr_has_aggregation(e))
+        }
+        Expr::ListComprehension {
+            list,
+            predicate,
+            transform,
+            ..
+        } => {
+            expr_has_aggregation(list)
+                || predicate.as_ref().is_some_and(|p| expr_has_aggregation(p))
+                || transform.as_ref().is_some_and(|t| expr_has_aggregation(t))
+        }
+        Expr::Quantifier {
+            list, predicate, ..
+        } => expr_has_aggregation(list) || expr_has_aggregation(predicate),
+        _ => false,
+    }
+}
+
+/// Classify WITH items into group-by keys (non-aggregate) and aggregation specs.
+///
+/// Mirrors `split_return_items` but operates on a slice of `ReturnItem` rather than a `Query`.
+/// When a WITH item contains a nested aggregation expression (e.g., `$age + avg(n.age) AS agg`),
+/// the whole expression is treated as an aggregation so that the Aggregate operator is inserted.
+fn split_with_items(items: &[crate::ast::ReturnItem]) -> (Vec<GroupByItem>, Vec<AggItem>) {
+    let mut group_by = Vec::new();
+    let mut aggregations = Vec::new();
+
+    for item in items {
+        match &item.expr {
+            Expr::CountStar => {
+                let col = item.alias.clone().unwrap_or_else(|| "count(*)".to_string());
+                aggregations.push((AggFn::Count { distinct: false }, Expr::CountStar, col));
+            }
+            Expr::Agg(fn_, inner) => {
+                let col = item
+                    .alias
+                    .clone()
+                    .unwrap_or_else(|| agg_display_name(fn_, inner));
                 aggregations.push((fn_.clone(), *inner.clone(), col));
             }
             other => {

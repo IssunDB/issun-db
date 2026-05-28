@@ -102,15 +102,32 @@ impl Optimizer {
                 items,
                 is_barrier,
             } => {
-                let (inner_op, inner_filters) = Self::extract_filters(*input);
-                (
-                    PhysicalOperator::Project {
-                        input: Box::new(inner_op),
-                        items,
-                        is_barrier,
-                    },
-                    inner_filters,
-                )
+                if is_barrier {
+                    // Barrier projects represent WITH clause boundaries. Filters placed
+                    // between a barrier project and its child implement the WITH's WHERE
+                    // predicate, which sees pre-projection variables. Extracting those
+                    // filters would re-place them above the barrier, where the variables
+                    // they reference are no longer in scope. Treat barrier projects as
+                    // opaque: do not extract filters from inside them.
+                    (
+                        PhysicalOperator::Project {
+                            input,
+                            items,
+                            is_barrier,
+                        },
+                        Vec::new(),
+                    )
+                } else {
+                    let (inner_op, inner_filters) = Self::extract_filters(*input);
+                    (
+                        PhysicalOperator::Project {
+                            input: Box::new(inner_op),
+                            items,
+                            is_barrier,
+                        },
+                        inner_filters,
+                    )
+                }
             }
             PhysicalOperator::HashJoin { left, right } => {
                 let (left_op, mut left_filters) = Self::extract_filters(*left);
@@ -183,6 +200,10 @@ impl Optimizer {
                     inner_filters,
                 )
             }
+            // WritePart operators are opaque: do not extract filters from inside them.
+            PhysicalOperator::WritePart { input, part } => {
+                (PhysicalOperator::WritePart { input, part }, Vec::new())
+            }
         }
     }
 
@@ -243,11 +264,24 @@ impl Optimizer {
                 input,
                 items,
                 is_barrier,
-            } => PhysicalOperator::Project {
-                input: Box::new(Self::reorder_operators(*input, stats)),
-                items,
-                is_barrier,
-            },
+            } => {
+                if is_barrier {
+                    // Barrier projects are opaque scoping boundaries. Filters may remain
+                    // inside them (implementing the WITH clause's WHERE predicate). Do not
+                    // recurse into the child for reordering; leave the interior intact.
+                    PhysicalOperator::Project {
+                        input,
+                        items,
+                        is_barrier,
+                    }
+                } else {
+                    PhysicalOperator::Project {
+                        input: Box::new(Self::reorder_operators(*input, stats)),
+                        items,
+                        is_barrier,
+                    }
+                }
+            }
             leaf @ PhysicalOperator::SingleRow => leaf,
             PhysicalOperator::Unwind {
                 input,
@@ -290,6 +324,10 @@ impl Optimizer {
             PhysicalOperator::Distinct { input } => PhysicalOperator::Distinct {
                 input: Box::new(Self::reorder_operators(*input, stats)),
             },
+            // WritePart is opaque: do not descend into it for reordering.
+            PhysicalOperator::WritePart { input, part } => {
+                PhysicalOperator::WritePart { input, part }
+            }
         }
     }
 
@@ -342,7 +380,8 @@ impl Optimizer {
             | PhysicalOperator::Sort { input, .. }
             | PhysicalOperator::Limit { input, .. }
             | PhysicalOperator::OptionalMatch { input, .. }
-            | PhysicalOperator::Distinct { input, .. } => Self::plan_weight(input, stats),
+            | PhysicalOperator::Distinct { input, .. }
+            | PhysicalOperator::WritePart { input, .. } => Self::plan_weight(input, stats),
         }
     }
 
@@ -518,47 +557,80 @@ impl Optimizer {
                 items,
                 is_barrier,
             } => {
-                let child_bound = Self::bound_vars(&input);
+                if is_barrier {
+                    // Barrier projects are opaque scoping boundaries (WITH clauses).
+                    // Filters from outside must not be pushed through a barrier because the
+                    // variables they reference may not be available on the other side.
+                    // Do not recurse into the child for pushdown: the child may contain
+                    // Filter nodes that implement the WITH clause's WHERE predicate and
+                    // must remain exactly where the logical planner placed them.
+                    let mut current_node = PhysicalOperator::Project {
+                        input,
+                        items,
+                        is_barrier,
+                    };
 
-                let mut child_pending = Vec::new();
-                let mut remaining_pending = Vec::new();
-
-                for filter in pending.drain(..) {
-                    let ref_vars = Self::referenced_vars(&filter);
-                    if ref_vars.is_subset(&child_bound) {
-                        child_pending.push(filter);
-                    } else {
-                        remaining_pending.push(filter);
+                    // Filters from the outer pending set that reference post-barrier variables
+                    // can be applied above this barrier node.
+                    let bound = Self::bound_vars(&current_node);
+                    let mut i = 0;
+                    while i < pending.len() {
+                        let ref_vars = Self::referenced_vars(&pending[i]);
+                        if ref_vars.is_subset(&bound) {
+                            let filter_expr = pending.remove(i);
+                            current_node = PhysicalOperator::Filter {
+                                input: Box::new(current_node),
+                                expression: filter_expr,
+                            };
+                        } else {
+                            i += 1;
+                        }
                     }
-                }
 
-                let optimized_input = Self::push_down_filters(*input, &mut child_pending);
-                remaining_pending.extend(child_pending);
+                    current_node
+                } else {
+                    let child_bound = Self::bound_vars(&input);
 
-                let mut current_node = PhysicalOperator::Project {
-                    input: Box::new(optimized_input),
-                    items,
-                    is_barrier,
-                };
+                    let mut child_pending = Vec::new();
+                    let mut remaining_pending = Vec::new();
 
-                let bound = Self::bound_vars(&current_node);
-
-                let mut i = 0;
-                while i < remaining_pending.len() {
-                    let ref_vars = Self::referenced_vars(&remaining_pending[i]);
-                    if ref_vars.is_subset(&bound) {
-                        let filter_expr = remaining_pending.remove(i);
-                        current_node = PhysicalOperator::Filter {
-                            input: Box::new(current_node),
-                            expression: filter_expr,
-                        };
-                    } else {
-                        i += 1;
+                    for filter in pending.drain(..) {
+                        let ref_vars = Self::referenced_vars(&filter);
+                        if ref_vars.is_subset(&child_bound) {
+                            child_pending.push(filter);
+                        } else {
+                            remaining_pending.push(filter);
+                        }
                     }
-                }
 
-                *pending = remaining_pending;
-                current_node
+                    let optimized_input = Self::push_down_filters(*input, &mut child_pending);
+                    remaining_pending.extend(child_pending);
+
+                    let mut current_node = PhysicalOperator::Project {
+                        input: Box::new(optimized_input),
+                        items,
+                        is_barrier,
+                    };
+
+                    let bound = Self::bound_vars(&current_node);
+
+                    let mut i = 0;
+                    while i < remaining_pending.len() {
+                        let ref_vars = Self::referenced_vars(&remaining_pending[i]);
+                        if ref_vars.is_subset(&bound) {
+                            let filter_expr = remaining_pending.remove(i);
+                            current_node = PhysicalOperator::Filter {
+                                input: Box::new(current_node),
+                                expression: filter_expr,
+                            };
+                        } else {
+                            i += 1;
+                        }
+                    }
+
+                    *pending = remaining_pending;
+                    current_node
+                }
             }
             PhysicalOperator::SingleRow => {
                 let mut current_node = PhysicalOperator::SingleRow;
@@ -670,6 +742,10 @@ impl Optimizer {
                 PhysicalOperator::Distinct {
                     input: Box::new(optimized),
                 }
+            }
+            // WritePart is opaque: do not push filters through a write boundary.
+            PhysicalOperator::WritePart { input, part } => {
+                PhysicalOperator::WritePart { input, part }
             }
         }
     }
@@ -810,6 +886,45 @@ impl Optimizer {
             }
             PhysicalOperator::Distinct { input } => {
                 Self::collect_bound_vars(input, vars);
+            }
+            // WritePart binds variables from its input plus newly created node/edge variables.
+            // For simplicity, collect from input; newly created variables are added at execution time.
+            PhysicalOperator::WritePart { input, part } => {
+                Self::collect_bound_vars(input, vars);
+                // Add variables from CREATE patterns so that downstream operators can reference them.
+                match part {
+                    crate::ast::QueryPart::Create { patterns } => {
+                        for p in patterns {
+                            if let Some(ref v) = p.node.variable {
+                                vars.insert(v.clone());
+                            }
+                            for (rel, target) in &p.rels {
+                                if let Some(ref v) = rel.variable {
+                                    vars.insert(v.clone());
+                                }
+                                if let Some(ref v) = target.variable {
+                                    vars.insert(v.clone());
+                                }
+                            }
+                        }
+                    }
+                    crate::ast::QueryPart::Merge { merges } => {
+                        for m in merges {
+                            if let Some(ref v) = m.pattern.node.variable {
+                                vars.insert(v.clone());
+                            }
+                            for (rel, target) in &m.pattern.rels {
+                                if let Some(ref v) = rel.variable {
+                                    vars.insert(v.clone());
+                                }
+                                if let Some(ref v) = target.variable {
+                                    vars.insert(v.clone());
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
             }
         }
     }

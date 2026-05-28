@@ -511,7 +511,8 @@ fn build_scenario(
         }
 
         // Parameters table: `And parameters are:` followed by | key | value | rows.
-        if trimmed == "And parameters are:" || trimmed == "* parameters are:"
+        if trimmed == "And parameters are:"
+            || trimmed == "* parameters are:"
             || trimmed.ends_with("parameters are:")
         {
             idx += 1;
@@ -809,11 +810,64 @@ fn parse_table_value(trimmed: &str) -> serde_json::Value {
         return serde_json::Value::Bool(false);
     }
 
-    // Quoted string: 'text' or "text"
+    // Quoted string: 'text' or "text". Process Cypher escape sequences:
+    //   \' → '  (single quote)
+    //   \" → "  (double quote)
+    //   \\ → \  (backslash)
+    //   \n → newline
+    //   \t → tab
+    //   \r → carriage return
+    //   \uXXXX → unicode character
     if (trimmed.starts_with('\'') && trimmed.ends_with('\''))
         || (trimmed.starts_with('"') && trimmed.ends_with('"'))
     {
-        return serde_json::Value::String(trimmed[1..trimmed.len() - 1].to_string());
+        let inner = &trimmed[1..trimmed.len() - 1];
+        let mut result = String::with_capacity(inner.len());
+        let mut chars = inner.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                match chars.next() {
+                    Some('\'') => result.push('\''),
+                    Some('"') => result.push('"'),
+                    Some('\\') => result.push('\\'),
+                    Some('n') => result.push('\n'),
+                    Some('t') => result.push('\t'),
+                    Some('r') => result.push('\r'),
+                    Some('u') => {
+                        // \uXXXX unicode escape.
+                        let mut hex = String::new();
+                        for _ in 0..4 {
+                            if let Some(h) = chars.peek() {
+                                if h.is_ascii_hexdigit() {
+                                    hex.push(*h);
+                                    chars.next();
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
+                        if let Ok(code) = u32::from_str_radix(&hex, 16) {
+                            if let Some(ch) = char::from_u32(code) {
+                                result.push(ch);
+                                continue;
+                            }
+                        }
+                        // Invalid unicode escape: keep as-is.
+                        result.push('\\');
+                        result.push('u');
+                        result.push_str(&hex);
+                    }
+                    Some(other) => {
+                        result.push('\\');
+                        result.push(other);
+                    }
+                    None => result.push('\\'),
+                }
+            } else {
+                result.push(c);
+            }
+        }
+        return serde_json::Value::String(result);
     }
 
     // List: [...]

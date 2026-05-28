@@ -17,9 +17,10 @@ use ddl::{
 };
 use read::execute_read_query;
 use write::{
-    execute_create, execute_create_and_return, execute_delete, execute_delete_and_return,
-    execute_foreach, execute_merge, execute_merge_and_return, execute_remove,
-    execute_remove_and_return, execute_set, execute_set_and_return,
+    execute_create, execute_create_and_return, execute_create_internal_with_context,
+    execute_delete, execute_delete_and_return, execute_foreach, execute_merge,
+    execute_merge_and_return, execute_remove, execute_remove_and_return, execute_set,
+    execute_set_and_return,
 };
 
 /// The tabular result of a Cypher query execution.
@@ -78,29 +79,7 @@ pub fn execute(
     params: &HashMap<String, serde_json::Value>,
 ) -> Result<QueryResult, String> {
     let stmt = parser::parse(cypher)?;
-    match stmt {
-        Statement::Query(q) => execute_read_query(graph, &q, params),
-        Statement::Create(c) => graph.with_write_lock(|| execute_create(graph, &c, params)),
-        Statement::CreateAndReturn(c) => {
-            graph.with_write_lock(|| execute_create_and_return(graph, &c, params))
-        }
-        Statement::Set(s) => graph.with_write_lock(|| execute_set(graph, &s, params)),
-        Statement::SetAndReturn(s) => {
-            graph.with_write_lock(|| execute_set_and_return(graph, &s, params))
-        }
-        Statement::Delete(d) => graph.with_write_lock(|| execute_delete(graph, &d, params)),
-        Statement::DeleteAndReturn(d) => execute_delete_and_return(graph, &d, params),
-        Statement::Merge(m) => execute_merge(graph, &m, params),
-        Statement::MergeAndReturn(m) => execute_merge_and_return(graph, &m, params),
-        Statement::CreateIndex(ci) => execute_create_index(graph, &ci),
-        Statement::DropIndex(di) => execute_drop_index(graph, &di),
-        Statement::Remove(r) => graph.with_write_lock(|| execute_remove(graph, &r, params)),
-        Statement::RemoveAndReturn(r) => execute_remove_and_return(graph, &r, params),
-        Statement::Union(u) => execute_union(graph, &u, params),
-        Statement::Foreach(f) => graph.with_write_lock(|| execute_foreach(graph, &f, params)),
-        Statement::CreateConstraint(cc) => execute_create_constraint(graph, &cc),
-        Statement::DropConstraint(dc) => execute_drop_constraint(graph, &dc),
-    }
+    execute_statement(graph, &stmt, params)
 }
 
 /// Parse `cypher`, compile it into an optimized physical plan, and return the
@@ -140,6 +119,7 @@ pub fn explain(graph: &Graph, cypher: &str) -> Result<String, String> {
         Statement::DropConstraint(ref dc) => {
             Ok(format!("DropConstraint {}:{}\n", dc.label, dc.property))
         }
+        Statement::Pipeline(_) => Ok("Pipeline\n".into()),
     }
 }
 
@@ -175,6 +155,48 @@ fn execute_union(
     Ok(QueryResult { columns, records })
 }
 
+/// Execute a pipeline of statements, threading node/edge bindings created by
+/// CREATE statements so that later statements can reference nodes created earlier.
+fn execute_pipeline(
+    graph: &Graph,
+    stmts: &[Statement],
+    params: &HashMap<String, serde_json::Value>,
+) -> Result<QueryResult, String> {
+    let mut shared_bindings: PathMap = PathMap::new();
+    let mut last = QueryResult {
+        columns: vec![],
+        records: vec![],
+    };
+
+    for stmt in stmts {
+        match stmt {
+            Statement::Create(c) => {
+                graph.with_write_lock(|| {
+                    for pattern in &c.patterns {
+                        let created = execute_create_internal_with_context(
+                            graph,
+                            pattern,
+                            &shared_bindings,
+                            params,
+                        )?;
+                        shared_bindings.extend(created);
+                    }
+                    Ok::<(), String>(())
+                })?;
+                last = QueryResult {
+                    columns: vec![],
+                    records: vec![],
+                };
+            }
+            other => {
+                last = execute_statement(graph, other, params)?;
+            }
+        }
+    }
+
+    Ok(last)
+}
+
 fn execute_statement(
     graph: &Graph,
     stmt: &Statement,
@@ -202,6 +224,13 @@ fn execute_statement(
         Statement::Foreach(f) => graph.with_write_lock(|| execute_foreach(graph, f, params)),
         Statement::CreateConstraint(cc) => execute_create_constraint(graph, cc),
         Statement::DropConstraint(dc) => execute_drop_constraint(graph, dc),
+        Statement::Pipeline(stmts) => {
+            // Execute each statement in order, returning the last result.
+            // A shared PathMap threads variable bindings created by CREATE
+            // statements so that later statements in the pipeline can reference
+            // nodes created earlier (e.g., `CREATE (a:A) CREATE (a)-[:R]->(b:B)`).
+            execute_pipeline(graph, stmts, params)
+        }
     }
 }
 
