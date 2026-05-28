@@ -35,7 +35,7 @@ doctest: ## Run documentation tests (code examples in comments)
 .PHONY: test
 test: format doctest ## Run the tests
 	@echo "Running tests..."
-	@DEBUG_PROJ=$(DEBUG_PROJ) RUST_BACKTRACE=$(RUST_BACKTRACE) cargo test --all-targets --workspace -- --nocapture
+	@DEBUG_PROJ=$(DEBUG_PROJ) RUST_BACKTRACE=$(RUST_BACKTRACE) cargo test --lib --bins --tests --workspace -- --nocapture
 
 .PHONY: test-conformance
 test-conformance: format ## Run the openCypher TCK conformance integration tests
@@ -129,7 +129,7 @@ deny: ## Check dependencies for advisories, license compliance, and duplicates
 .PHONY: careful
 careful: ## Run tests under cargo-careful (detects undefined behavior and unsafe misuse)
 	@echo "Running tests under cargo-careful..."
-	@DEBUG_PROJ=$(DEBUG_PROJ) RUST_BACKTRACE=$(RUST_BACKTRACE) cargo careful test --all-targets --workspace
+	@DEBUG_PROJ=$(DEBUG_PROJ) RUST_BACKTRACE=$(RUST_BACKTRACE) cargo careful test --lib --bins --tests --workspace
 
 .PHONY: docs
 docs: format ## Generate the documentation

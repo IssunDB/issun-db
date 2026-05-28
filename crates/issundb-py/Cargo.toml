@@ -1,8 +1,9 @@
 [package]
 name = "issundb-py"
+description = "Python bindings for IssunDB"
 version = "0.1.0-alpha.1"
 edition = "2021"
-description = "Python bindings for IssunDB"
+publish = false
 
 [lib]
 name = "issundb"

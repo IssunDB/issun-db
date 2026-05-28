@@ -20,5 +20,5 @@ trim_trailing_whitespace = false
 [*.sh]
 indent_size = 2
 
-[*.{yaml,yml,json}]
+[*.{yaml,yml,json,jsonl}]
 indent_size = 2

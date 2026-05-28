@@ -13,6 +13,26 @@ pub enum Statement {
     CreateIndex(CreateIndexStatement),
     /// DROP INDEX FOR (n:Label) ON (n.property)
     DropIndex(DropIndexStatement),
+    /// REMOVE n.property or REMOVE n:Label
+    Remove(RemoveStatement),
+    /// MATCH ... RETURN ... UNION [ALL] MATCH ... RETURN ...
+    Union(UnionStatement),
+    /// CREATE ... RETURN ...
+    CreateAndReturn(CreateAndReturnStatement),
+    /// MATCH ... SET ... RETURN ...
+    SetAndReturn(SetAndReturnStatement),
+    /// FOREACH (var IN list | stmt ...)
+    Foreach(ForeachStatement),
+    /// CREATE CONSTRAINT ON (n:Label) ASSERT n.property IS UNIQUE | EXISTS(...)
+    CreateConstraint(CreateConstraintStatement),
+    /// DROP CONSTRAINT ON (n:Label) ASSERT n.property IS UNIQUE | EXISTS(...)
+    DropConstraint(DropConstraintStatement),
+    /// MERGE ... [ON CREATE SET ...] [ON MATCH SET ...] RETURN ...
+    MergeAndReturn(MergeAndReturnStatement),
+    /// MATCH ... DELETE ... RETURN ...
+    DeleteAndReturn(DeleteAndReturnStatement),
+    /// MATCH ... REMOVE ... RETURN ...
+    RemoveAndReturn(RemoveAndReturnStatement),
 }
 
 /// A read-only Cypher query containing MATCH, WHERE, RETURN, ORDER BY, SKIP, and LIMIT clauses.
@@ -60,6 +80,8 @@ pub enum QueryPart {
         skip: Option<Expr>,
         /// Optional LIMIT on the WITH clause output.
         limit: Option<Expr>,
+        /// When true, duplicate rows are removed from the WITH output.
+        distinct: bool,
     },
     Unwind {
         expr: Expr,
@@ -78,6 +100,8 @@ pub struct MatchClause {
 pub struct Pattern {
     pub node: NodePattern,
     pub rels: Vec<(RelationshipPattern, NodePattern)>,
+    /// Optional path variable: `p = (...)-[...]-(...)`.
+    pub path_variable: Option<String>,
 }
 
 /// A pattern matching a node with variable, label, and inline properties.
@@ -128,11 +152,37 @@ pub enum AggFn {
     Count {
         distinct: bool,
     },
-    Sum,
-    Avg,
-    Min,
-    Max,
-    Collect,
+    Sum {
+        distinct: bool,
+    },
+    Avg {
+        distinct: bool,
+    },
+    Min {
+        distinct: bool,
+    },
+    Max {
+        distinct: bool,
+    },
+    Collect {
+        distinct: bool,
+    },
+    /// Sample standard deviation.
+    StDev {
+        distinct: bool,
+    },
+    /// Population standard deviation.
+    StDevP {
+        distinct: bool,
+    },
+    /// Discrete percentile (nearest rank). The percentile value is stored here.
+    PercentileDisc {
+        percentile: f64,
+    },
+    /// Continuous percentile (linear interpolation). The percentile value is stored here.
+    PercentileCont {
+        percentile: f64,
+    },
 }
 
 /// The kind of quantifier expression.
@@ -178,6 +228,36 @@ pub enum Expr {
     IsNotNull(Box<Expr>),
     /// Unary negation: `NOT expr`.
     Not(Box<Expr>),
+    /// CASE [subject] WHEN ... THEN ... [ELSE ...] END
+    Case {
+        /// None for searched CASE; Some(expr) for simple CASE.
+        subject: Option<Box<Expr>>,
+        arms: Vec<CaseArm>,
+        else_expr: Option<Box<Expr>>,
+    },
+    /// `expr[index]` — list element or map key lookup.
+    Subscript {
+        expr: Box<Expr>,
+        index: Box<Expr>,
+    },
+    /// `expr[start..end]` — list slice (start and end are optional).
+    Slice {
+        expr: Box<Expr>,
+        start: Option<Box<Expr>>,
+        end: Option<Box<Expr>>,
+    },
+    /// `[variable IN list WHERE predicate | transform]` — list comprehension.
+    ListComprehension {
+        variable: String,
+        list: Box<Expr>,
+        predicate: Option<Box<Expr>>,
+        transform: Option<Box<Expr>>,
+    },
+    /// `variable:Label` — boolean check whether the node has the given label.
+    HasLabel {
+        variable: String,
+        label: String,
+    },
 }
 
 /// Binary operator for use in expressions.
@@ -191,11 +271,15 @@ pub enum BinaryOperator {
     Ge,
     And,
     Or,
+    /// Exclusive disjunction (`XOR`).
+    Xor,
     Add,
     Sub,
     Mul,
     Div,
     Mod,
+    /// Exponentiation (`^`).
+    Pow,
 }
 
 /// A literal value representation.
@@ -235,6 +319,8 @@ impl std::fmt::Display for Literal {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReturnClause {
     pub items: Vec<ReturnItem>,
+    /// When true, duplicate rows are removed from the result.
+    pub distinct: bool,
 }
 
 /// An individual item in the RETURN clause projection.
@@ -247,7 +333,18 @@ pub struct ReturnItem {
 /// A CREATE statement pattern for inserting new nodes and edges.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreateStatement {
-    pub pattern: Pattern,
+    /// All comma-separated patterns in the CREATE clause.
+    pub patterns: Vec<Pattern>,
+}
+
+/// A CREATE ... RETURN ... statement that creates nodes/edges and projects results.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateAndReturnStatement {
+    pub patterns: Vec<Pattern>,
+    pub return_clause: ReturnClause,
+    pub order_by: Option<OrderBy>,
+    pub skip: Option<Expr>,
+    pub limit: Option<Expr>,
 }
 
 /// A SET statement for updating node or edge properties.
@@ -272,6 +369,8 @@ pub struct DeleteStatement {
     pub match_clauses: Vec<MatchClause>,
     pub where_clause: Option<WhereClause>,
     pub variables: Vec<String>,
+    /// When true, incident edges are deleted before deleting the node itself.
+    pub detach: bool,
 }
 
 /// A MERGE statement with optional ON CREATE SET and ON MATCH SET sub-clauses.
@@ -294,4 +393,113 @@ pub struct CreateIndexStatement {
 pub struct DropIndexStatement {
     pub label: String,
     pub property: String,
+}
+
+/// Items that can appear in a REMOVE clause.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RemoveItem {
+    Property { variable: String, property: String },
+    Label { variable: String, label: String },
+}
+
+/// A REMOVE statement for deleting properties or labels from graph elements.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RemoveStatement {
+    pub match_clauses: Vec<MatchClause>,
+    pub where_clause: Option<WhereClause>,
+    pub items: Vec<RemoveItem>,
+}
+
+/// A single arm of a CASE expression.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CaseArm {
+    pub when: Expr,
+    pub then: Expr,
+}
+
+/// A SET statement combined with RETURN.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SetAndReturnStatement {
+    pub match_clauses: Vec<MatchClause>,
+    pub where_clause: Option<WhereClause>,
+    pub set_items: Vec<SetItem>,
+    pub return_clause: ReturnClause,
+    pub order_by: Option<OrderBy>,
+    pub skip: Option<Expr>,
+    pub limit: Option<Expr>,
+}
+
+/// Two queries composed with UNION or UNION ALL.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnionStatement {
+    pub left: Box<Statement>,
+    pub right: Box<Statement>,
+    /// When true, all rows from both sides are kept; when false, duplicates are removed.
+    pub all: bool,
+}
+
+/// A FOREACH statement that iterates over a list and executes write operations.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ForeachStatement {
+    pub variable: String,
+    pub list: Expr,
+    pub body: Vec<Statement>,
+}
+
+/// The kind of constraint on a node property.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConstraintKind {
+    Unique,
+    Exists,
+}
+
+/// A CREATE CONSTRAINT statement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateConstraintStatement {
+    pub label: String,
+    pub property: String,
+    pub kind: ConstraintKind,
+}
+
+/// A DROP CONSTRAINT statement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropConstraintStatement {
+    pub label: String,
+    pub property: String,
+    pub kind: ConstraintKind,
+}
+
+/// A REMOVE statement followed by a RETURN clause.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RemoveAndReturnStatement {
+    pub match_clauses: Vec<MatchClause>,
+    pub where_clause: Option<WhereClause>,
+    pub items: Vec<RemoveItem>,
+    pub return_clause: ReturnClause,
+    pub order_by: Option<OrderBy>,
+    pub skip: Option<Expr>,
+    pub limit: Option<Expr>,
+}
+
+/// A DELETE statement followed by a RETURN clause.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeleteAndReturnStatement {
+    pub match_clauses: Vec<MatchClause>,
+    pub where_clause: Option<WhereClause>,
+    pub variables: Vec<String>,
+    pub detach: bool,
+    pub return_clause: ReturnClause,
+    pub order_by: Option<OrderBy>,
+    pub skip: Option<Expr>,
+    pub limit: Option<Expr>,
+}
+
+/// One or more MERGE blocks followed by a RETURN clause.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MergeAndReturnStatement {
+    pub merges: Vec<MergeStatement>,
+    pub return_clause: ReturnClause,
+    pub order_by: Option<OrderBy>,
+    pub skip: Option<Expr>,
+    pub limit: Option<Expr>,
 }

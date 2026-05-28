@@ -1,4 +1,4 @@
-//! A demo showing how to migrate data from Neo4j into IssunDB.
+//! A demo that shows how to migrate data from Neo4j into IssunDB.
 //!
 //! In a real migration, replace the sample data below with output from
 //! `neo4j-admin dump` or the Neo4j Cypher export procedure. The sample
@@ -9,7 +9,7 @@
 //!   1. Define simulated Neo4j export structs (NeoNode, NeoEdge).
 //!   2. Open an IssunDB graph.
 //!   3. Import nodes and edges via `add_node` and `add_edge`.
-//!   4. Verify the import with a Cypher query.
+//!   4. Check the import with a Cypher query.
 //!   5. Print the result table.
 
 use std::collections::HashMap;
@@ -195,7 +195,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  Imported edge {:?}: {:?} -> {:?}", edge_id, src, dst);
     }
 
-    // ---- 4. Verify the import with a Cypher query --------------------------
+    // ---- 4. Verify the import by running a Cypher query --------------------------
     println!(
         "\n--- Cypher verification: MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a.name, b.name ---"
     );

@@ -174,6 +174,15 @@ impl Optimizer {
                     inner_filters,
                 )
             }
+            PhysicalOperator::Distinct { input } => {
+                let (inner, inner_filters) = Self::extract_filters(*input);
+                (
+                    PhysicalOperator::Distinct {
+                        input: Box::new(inner),
+                    },
+                    inner_filters,
+                )
+            }
         }
     }
 
@@ -278,6 +287,9 @@ impl Optimizer {
                     null_vars,
                 }
             }
+            PhysicalOperator::Distinct { input } => PhysicalOperator::Distinct {
+                input: Box::new(Self::reorder_operators(*input, stats)),
+            },
         }
     }
 
@@ -329,7 +341,8 @@ impl Optimizer {
             PhysicalOperator::Aggregate { input, .. }
             | PhysicalOperator::Sort { input, .. }
             | PhysicalOperator::Limit { input, .. }
-            | PhysicalOperator::OptionalMatch { input, .. } => Self::plan_weight(input, stats),
+            | PhysicalOperator::OptionalMatch { input, .. }
+            | PhysicalOperator::Distinct { input, .. } => Self::plan_weight(input, stats),
         }
     }
 
@@ -652,6 +665,12 @@ impl Optimizer {
                     null_vars,
                 }
             }
+            PhysicalOperator::Distinct { input } => {
+                let optimized = Self::push_down_filters(*input, pending);
+                PhysicalOperator::Distinct {
+                    input: Box::new(optimized),
+                }
+            }
         }
     }
 
@@ -788,6 +807,9 @@ impl Optimizer {
                 for var in null_vars {
                     vars.insert(var.clone());
                 }
+            }
+            PhysicalOperator::Distinct { input } => {
+                Self::collect_bound_vars(input, vars);
             }
         }
     }

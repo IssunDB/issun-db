@@ -1,6 +1,6 @@
 [package]
 name = "issundb-testing"
-description = "Shared test helpers and fixtures for IssunDB crates"
+description = "Shared test helpers and fixtures for IssunDB components"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -8,7 +8,6 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 rust-version.workspace = true
-# This crate is test-only infrastructure; do not publish it.
 publish = false
 
 [dependencies]

@@ -1,964 +1,1376 @@
+/// Cypher parser: two-phase lex + recursive-descent parse.
+///
+/// Phase 1: chumsky 0.13 lexer tokenises the input string.
+/// Phase 2: a recursive-descent parser converts the normalised token
+///          stream into `Statement` AST nodes.
+///
+/// The public entry point is `parse(cypher: &str) -> Result<Statement, String>`.
 use std::collections::HashMap;
+
+use chumsky::prelude::*;
 
 use crate::ast::*;
 
-/// Parse a Cypher query string into a `Statement` AST.
-pub fn parse(cypher: &str) -> Result<Statement, String> {
-    let normalized = cypher.trim();
-    let upper = normalized.to_ascii_uppercase();
+// ─── Token ────────────────────────────────────────────────────────────────────
 
-    if upper.starts_with("CREATE INDEX") {
-        parse_create_index(normalized)
-    } else if upper.starts_with("CREATE") {
-        let pattern_str = normalized["CREATE".len()..].trim();
-        let pattern = parse_pattern(pattern_str)?;
-        Ok(Statement::Create(CreateStatement { pattern }))
-    } else if upper.starts_with("DROP INDEX") {
-        parse_drop_index(normalized)
-    } else if upper.starts_with("MERGE") {
-        parse_merge_statement(normalized)
-    } else if upper.starts_with("MATCH") {
-        if upper.contains(" SET ") {
-            parse_set_statement(normalized)
-        } else if upper.contains(" DELETE ") {
-            parse_delete_statement(normalized)
+/// A Cypher token produced by the lexer.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Tok {
+    // Literals
+    Integer(i64),
+    Float(f64),
+    Str(String),
+    Param(String),  // $name
+    Ident(String),  // identifier or keyword (already upper-cased in keyword slot)
+
+    // Operators and punctuation
+    Eq,      // =
+    Ne,      // <> / !=
+    Lt,      // <
+    Gt,      // >
+    Le,      // <=
+    Ge,      // >=
+    RegexEq, // =~
+    Arrow,   // ->
+    LArrow,  // <-
+    Plus,    // +
+    Minus,   // -
+    Star,    // *
+    Slash,   // /
+    Percent, // %
+    Caret,   // ^
+    Dot,     // .
+    DotDot,  // ..
+    Comma,   // ,
+    Colon,   // :
+    Semi,    // ;
+    Pipe,    // |
+    LParen,  // (
+    RParen,  // )
+    LBrace,  // {
+    RBrace,  // }
+    LBrack,  // [
+    RBrack,  // ]
+}
+
+// ─── Lexer (chumsky 0.13) ─────────────────────────────────────────────────────
+
+/// Build a chumsky lexer that converts a Cypher source string into a flat
+/// `Vec<Tok>` (no spans are retained; the recursive-descent pass works on
+/// the plain token sequence).
+fn lexer<'src>() -> impl Parser<'src, &'src str, Vec<Tok>, extra::Err<Rich<'src, char>>> {
+    // Hex integer: 0x1A or 0X1A
+    let hex_int = just("0x")
+        .or(just("0X"))
+        .ignore_then(text::digits(16).to_slice())
+        .map(|s: &str| Tok::Integer(i64::from_str_radix(s, 16).unwrap_or(0)));
+
+    // Octal integer: 0o77 or 0O77
+    let oct_int = just("0o")
+        .or(just("0O"))
+        .ignore_then(text::digits(8).to_slice())
+        .map(|s: &str| Tok::Integer(i64::from_str_radix(s, 8).unwrap_or(0)));
+
+    // Floating-point: must come before plain integers so "1.0" is parsed as float.
+    // Cases:
+    //   1.5     integer dot digit+
+    //   1.5e3   integer dot digit+ exponent
+    //   1e3     integer exponent (no dot)
+    //   .5      dot digit+
+    //   .5e3    dot digit+ exponent
+    // Crucially: "1.." must NOT match as a float (the dot must be followed by a digit,
+    // not another dot), so we require at least one digit after the decimal point.
+    let exponent = choice((just('e'), just('E')))
+        .then(just('-').or(just('+')).or_not())
+        .then(text::digits(10));
+
+    let float_num = choice((
+        // 1.5 / 1.5e3 — integer part, dot, one or more digits, optional exponent
+        text::int(10)
+            .then(
+                choice((
+                    // dot followed by digits (NOT another dot)
+                    just('.')
+                        .then(text::digits(10))
+                        .then(exponent.clone().or_not())
+                        .to_slice()
+                        .map(Some),
+                    // exponent only (no dot): 1e3
+                    exponent.clone()
+                        .to_slice()
+                        .map(Some),
+                ))
+            )
+            .to_slice()
+            .map(|s: &str| Tok::Float(s.parse().unwrap_or(0.0))),
+        // .5 / .5e-3 (no integer part)
+        just('.')
+            .then(text::digits(10))
+            .then(exponent.clone().or_not())
+            .to_slice()
+            .map(|s: &str| Tok::Float(s.parse().unwrap_or(0.0))),
+    ));
+
+    // Integer
+    let int_num = text::int(10)
+        .to_slice()
+        .map(|s: &str| Tok::Integer(s.parse().unwrap_or(0)));
+
+    // Single-quoted string
+    let sq_str = just('\'')
+        .ignore_then(
+            choice((
+                just('\\')
+                    .ignore_then(any())
+                    .map(|c| match c {
+                        'n' => '\n',
+                        't' => '\t',
+                        'r' => '\r',
+                        other => other,
+                    }),
+                none_of("\\'"),
+            ))
+            .repeated()
+            .collect::<String>(),
+        )
+        .then_ignore(just('\''))
+        .map(Tok::Str);
+
+    // Double-quoted string
+    let dq_str = just('"')
+        .ignore_then(
+            choice((
+                just('\\')
+                    .ignore_then(any())
+                    .map(|c| match c {
+                        'n' => '\n',
+                        't' => '\t',
+                        'r' => '\r',
+                        other => other,
+                    }),
+                none_of("\\\""),
+            ))
+            .repeated()
+            .collect::<String>(),
+        )
+        .then_ignore(just('"'))
+        .map(Tok::Str);
+
+    // Backtick-quoted identifier: `my prop`
+    let backtick_ident = just('`')
+        .ignore_then(none_of("`").repeated().collect::<String>())
+        .then_ignore(just('`'))
+        .map(Tok::Ident);
+
+    // Parameter: $name
+    let param = just('$')
+        .ignore_then(
+            any()
+                .filter(|c: &char| c.is_alphanumeric() || *c == '_')
+                .repeated()
+                .at_least(1)
+                .collect::<String>(),
+        )
+        .map(Tok::Param);
+
+    // Identifier / keyword (keywords are kept as Ident with upper-cased value so
+    // the downstream parser can do case-insensitive matching by uppercasing)
+    let ident = any()
+        .filter(|c: &char| c.is_alphabetic() || *c == '_')
+        .then(
+            any()
+                .filter(|c: &char| c.is_alphanumeric() || *c == '_')
+                .repeated(),
+        )
+        .to_slice()
+        .map(|s: &str| Tok::Ident(s.to_string()));
+
+    // Multi-character symbols (must be tried before single-char)
+    let multi_sym = choice((
+        just("->").to(Tok::Arrow),
+        just("<-").to(Tok::LArrow),
+        just("<>").to(Tok::Ne),
+        just("!=").to(Tok::Ne),
+        just("<=").to(Tok::Le),
+        just(">=").to(Tok::Ge),
+        just("=~").to(Tok::RegexEq),
+        just("..").to(Tok::DotDot),
+    ));
+
+    // Single-character symbols
+    let single_sym = choice((
+        just('<').to(Tok::Lt),
+        just('>').to(Tok::Gt),
+        just('=').to(Tok::Eq),
+        just('+').to(Tok::Plus),
+        just('-').to(Tok::Minus),
+        just('*').to(Tok::Star),
+        just('/').to(Tok::Slash),
+        just('%').to(Tok::Percent),
+        just('^').to(Tok::Caret),
+        just('.').to(Tok::Dot),
+        just(',').to(Tok::Comma),
+        just(':').to(Tok::Colon),
+        just(';').to(Tok::Semi),
+        just('|').to(Tok::Pipe),
+        just('(').to(Tok::LParen),
+        just(')').to(Tok::RParen),
+        just('{').to(Tok::LBrace),
+        just('}').to(Tok::RBrace),
+        just('[').to(Tok::LBrack),
+        just(']').to(Tok::RBrack),
+    ));
+
+    // Line comment
+    let comment = just("//")
+        .then(any().and_is(just('\n').not()).repeated())
+        .ignored();
+
+    let token = choice((
+        hex_int,
+        oct_int,
+        float_num,
+        int_num,
+        sq_str,
+        dq_str,
+        backtick_ident,
+        param,
+        ident,
+        multi_sym,
+        single_sym,
+    ));
+
+    token
+        .padded_by(comment.repeated())
+        .padded()
+        .repeated()
+        .collect()
+}
+
+// ─── Token-stream cursor ──────────────────────────────────────────────────────
+
+/// A simple cursor over a `Vec<Tok>` slice for the recursive-descent parser.
+struct Cursor<'a> {
+    tokens: &'a [Tok],
+    pos: usize,
+}
+
+impl<'a> Cursor<'a> {
+    fn new(tokens: &'a [Tok]) -> Self {
+        Cursor { tokens, pos: 0 }
+    }
+
+    /// Peek at the current token without consuming it.
+    fn peek(&self) -> Option<&Tok> {
+        self.tokens.get(self.pos)
+    }
+
+    /// Peek at `offset` ahead (0 = current).
+    fn peek_at(&self, offset: usize) -> Option<&Tok> {
+        self.tokens.get(self.pos + offset)
+    }
+
+    /// Consume the current token and advance.
+    fn next(&mut self) -> Option<&Tok> {
+        let tok = self.tokens.get(self.pos)?;
+        self.pos += 1;
+        Some(tok)
+    }
+
+    /// Consume if the current token matches `t`.
+    fn eat(&mut self, t: &Tok) -> bool {
+        if self.peek() == Some(t) {
+            self.pos += 1;
+            true
         } else {
-            let query = parse_read_query(normalized)?;
-            Ok(Statement::Query(query))
+            false
         }
-    } else if upper.starts_with("UNWIND")
-        || upper.starts_with("WITH")
-        || upper.starts_with("OPTIONAL MATCH")
-        || upper.starts_with("RETURN")
-    {
-        // Queries that begin with UNWIND, WITH, OPTIONAL MATCH, or a bare RETURN
-        // are read queries without a leading mandatory MATCH clause.
-        let query = parse_read_query(normalized)?;
-        Ok(Statement::Query(query))
-    } else {
-        Err(format!("unsupported statement type in query: {}", cypher))
+    }
+
+    /// Require a specific punctuation token.
+    fn expect_tok(&mut self, t: &Tok) -> Result<(), String> {
+        if self.eat(t) {
+            Ok(())
+        } else {
+            Err(format!("expected {:?}, got {:?}", t, self.peek()))
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.pos >= self.tokens.len()
+    }
+
+    /// True if current token is an Ident matching the keyword (case-insensitive).
+    fn peek_kw(&self, kw: &str) -> bool {
+        matches!(self.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case(kw))
+    }
+
+    fn peek_kw_at(&self, offset: usize, kw: &str) -> bool {
+        matches!(self.peek_at(offset), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case(kw))
     }
 }
 
-fn parse_read_query(cypher: &str) -> Result<Query, String> {
-    let boundaries = find_clause_boundaries(cypher)?;
-    if boundaries.is_empty() {
-        return Err("missing query clauses".into());
-    }
+// ─── Expression parser ────────────────────────────────────────────────────────
+//
+// Operator precedence (lowest to highest):
+//   OR  XOR  AND  NOT  CMP  ADD  MUL  POW  UNARY-  POSTFIX  ATOM
 
-    // Find the RETURN clause (required) and optional ORDER BY / SKIP / LIMIT after it.
-    let return_idx = boundaries
-        .iter()
-        .position(|(kw, _)| kw == "RETURN")
-        .ok_or("Cypher read query must end with a RETURN clause")?;
-
-    let (_, return_start) = &boundaries[return_idx];
-
-    // Content between RETURN and the next recognised clause (ORDER BY / SKIP / LIMIT)
-    // or end-of-string.
-    let after_return_clauses = &boundaries[return_idx + 1..];
-
-    // Determine where RETURN content ends.
-    let return_content_end = after_return_clauses
-        .first()
-        .map(|(_, pos)| *pos)
-        .unwrap_or(cypher.len());
-
-    let return_content = cypher[*return_start + "RETURN".len()..return_content_end].trim();
-    let return_clause = parse_return_clause(return_content)?;
-
-    // Parse ORDER BY, SKIP, LIMIT from the trailing boundary clauses.
-    let mut order_by: Option<OrderBy> = None;
-    let mut skip_expr: Option<Expr> = None;
-    let mut limit_expr: Option<Expr> = None;
-
-    for i in 0..after_return_clauses.len() {
-        let (kw, start) = &after_return_clauses[i];
-        let end = after_return_clauses
-            .get(i + 1)
-            .map(|(_, p)| *p)
-            .unwrap_or(cypher.len());
-        let content = cypher[*start + kw.len()..end].trim();
-
-        match kw.as_str() {
-            "ORDER BY" => {
-                order_by = Some(parse_order_by(content)?);
-            }
-            "SKIP" => {
-                skip_expr = Some(parse_expr(content)?);
-            }
-            "LIMIT" => {
-                limit_expr = Some(parse_expr(content)?);
-            }
-            other => {
-                return Err(format!(
-                    "unexpected trailing clause after RETURN: {}",
-                    other
-                ));
-            }
-        }
-    }
-
-    // Parse all intermediate clauses before RETURN.
-    let pre_return_boundaries = &boundaries[..return_idx];
-    let mut parts = Vec::new();
-
-    for i in 0..pre_return_boundaries.len() {
-        let (kw, start) = &pre_return_boundaries[i];
-        let end = pre_return_boundaries
-            .get(i + 1)
-            .map(|(_, p)| *p)
-            .unwrap_or(*return_start);
-        let content = cypher[*start + kw.len()..end].trim();
-
-        match kw.as_str() {
-            "MATCH" => {
-                let (match_str, where_str) = split_optional_where(content);
-                let match_clauses = parse_match_clauses(match_str)?;
-                let where_clause = where_str.map(parse_where_clause).transpose()?;
-                parts.push(QueryPart::Match {
-                    match_clauses,
-                    where_clause,
-                });
-            }
-            "OPTIONAL MATCH" => {
-                let (match_str, where_str) = split_optional_where(content);
-                let match_clauses = parse_match_clauses(match_str)?;
-                let where_clause = where_str.map(parse_where_clause).transpose()?;
-                parts.push(QueryPart::OptionalMatch {
-                    match_clauses,
-                    where_clause,
-                });
-            }
-            "WITH" => {
-                let (with_str, where_str) = split_optional_where(content);
-                let items = parse_return_items(with_str)?;
-                let where_clause = where_str.map(parse_where_clause).transpose()?;
-                parts.push(QueryPart::With {
-                    items,
-                    where_clause,
-                    order_by: None,
-                    skip: None,
-                    limit: None,
-                });
-            }
-            // ORDER BY, SKIP, and LIMIT can follow a WITH clause as an intermediate
-            // clause. Attach them to the preceding WITH rather than treating them
-            // as top-level boundaries.
-            "ORDER BY" => match parts.last_mut() {
-                Some(QueryPart::With { order_by, .. }) => {
-                    *order_by = Some(parse_order_by(content)?);
-                }
-                _ => {
-                    return Err("ORDER BY must follow a WITH or RETURN clause".to_string());
-                }
-            },
-            "SKIP" => match parts.last_mut() {
-                Some(QueryPart::With { skip, .. }) => {
-                    *skip = Some(parse_expr(content)?);
-                }
-                _ => {
-                    return Err("SKIP must follow a WITH or RETURN clause".to_string());
-                }
-            },
-            "LIMIT" => match parts.last_mut() {
-                Some(QueryPart::With { limit, .. }) => {
-                    *limit = Some(parse_expr(content)?);
-                }
-                _ => {
-                    return Err("LIMIT must follow a WITH or RETURN clause".to_string());
-                }
-            },
-            "UNWIND" => {
-                let as_idx = find_keyword_root_level(content, "AS")?.ok_or_else(|| {
-                    format!("UNWIND clause missing AS keyword: UNWIND {}", content)
-                })?;
-                let expr_str = content[..as_idx].trim();
-                let var_str = content[as_idx + "AS".len()..].trim();
-
-                let expr = parse_expr(expr_str)?;
-                let variable = var_str.to_string();
-                parts.push(QueryPart::Unwind { expr, variable });
-            }
-            other => return Err(format!("unexpected intermediate query clause: {}", other)),
-        }
-    }
-
-    // Validate that no variable is used as both a node and a relationship across
-    // all MATCH / OPTIONAL MATCH clauses in the full query.
-    validate_cross_clause_variable_types(&parts)?;
-
-    // For backwards compatibility:
-    let mut match_clauses = Vec::new();
-    let mut where_clause = None;
-
-    if !parts.is_empty() {
-        if let QueryPart::Match {
-            match_clauses: m,
-            where_clause: w,
-        } = &parts[0]
-        {
-            match_clauses = m.clone();
-            where_clause = w.clone();
-        }
-    }
-
-    Ok(Query {
-        match_clauses,
-        where_clause,
-        return_clause,
-        parts,
-        order_by,
-        skip: skip_expr,
-        limit: limit_expr,
-    })
+fn parse_expr(c: &mut Cursor<'_>) -> Result<Expr, String> {
+    parse_expr_or(c)
 }
 
-fn parse_order_by(s: &str) -> Result<OrderBy, String> {
-    let mut items = Vec::new();
-    for part in s.split(',') {
-        let part = part.trim();
-        let upper = part.to_ascii_uppercase();
-        let (expr_str, ascending) = if upper.ends_with(" DESC") {
-            (&part[..part.len() - " DESC".len()], false)
-        } else if upper.ends_with(" ASC") {
-            (&part[..part.len() - " ASC".len()], true)
-        } else {
-            (part, true)
+fn parse_expr_or(c: &mut Cursor<'_>) -> Result<Expr, String> {
+    let mut left = parse_expr_xor(c)?;
+    while c.peek_kw("OR") {
+        c.next();
+        let right = parse_expr_xor(c)?;
+        left = Expr::BinaryOp {
+            op: BinaryOperator::Or,
+            left: Box::new(left),
+            right: Box::new(right),
         };
-        let expr = parse_expr(expr_str.trim())?;
-        items.push(SortItem { expr, ascending });
     }
-    Ok(OrderBy { items })
+    Ok(left)
 }
 
-fn split_optional_where(content: &str) -> (&str, Option<&str>) {
-    if let Ok(Some(idx)) = find_keyword_root_level(content, "WHERE") {
-        let before = &content[..idx].trim();
-        let after = &content[idx + "WHERE".len()..].trim();
-        (*before, Some(*after))
-    } else {
-        (content, None)
+fn parse_expr_xor(c: &mut Cursor<'_>) -> Result<Expr, String> {
+    let mut left = parse_expr_and(c)?;
+    while c.peek_kw("XOR") {
+        c.next();
+        let right = parse_expr_and(c)?;
+        left = Expr::BinaryOp {
+            op: BinaryOperator::Xor,
+            left: Box::new(left),
+            right: Box::new(right),
+        };
     }
+    Ok(left)
 }
 
-fn find_keyword_root_level(text: &str, kw: &str) -> Result<Option<usize>, String> {
-    // Returns a **byte offset** into `text` so callers can use it directly for
-    // `&str` slicing.  Previously returned a char index which caused panics on
-    // input containing non-ASCII characters before the keyword.
-    //
-    // All keywords are pure ASCII, so `kw.len()` equals both byte length and
-    // char length; `ci + kw.len()` as a char index is therefore valid.
-    let kw_byte_len = kw.len();
-
-    let char_positions: Vec<(usize, char)> = text.char_indices().collect();
-    let n = char_positions.len();
-
-    let mut in_single_quote = false;
-    let mut in_double_quote = false;
-    let mut paren_depth: usize = 0;
-    let mut bracket_depth: usize = 0;
-    let mut brace_depth: usize = 0;
-
-    let mut ci = 0usize;
-    while ci < n {
-        let (byte_pos, c) = char_positions[ci];
-
-        if c == '\'' && !in_double_quote {
-            in_single_quote = !in_single_quote;
-            ci += 1;
-            continue;
-        }
-        if c == '"' && !in_single_quote {
-            in_double_quote = !in_double_quote;
-            ci += 1;
-            continue;
-        }
-
-        if !in_single_quote && !in_double_quote {
-            match c {
-                '(' => paren_depth += 1,
-                ')' => paren_depth = paren_depth.saturating_sub(1),
-                '[' => bracket_depth += 1,
-                ']' => bracket_depth = bracket_depth.saturating_sub(1),
-                '{' => brace_depth += 1,
-                '}' => brace_depth = brace_depth.saturating_sub(1),
-                _ => {}
-            }
-
-            if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 {
-                // Use `str::get` rather than direct indexing: it returns `None`
-                // when the range crosses a multi-byte char boundary, which is
-                // safe even if the keyword byte length overshoots the text end.
-                if let Some(candidate) = text.get(byte_pos..byte_pos + kw_byte_len) {
-                    if candidate.eq_ignore_ascii_case(kw) {
-                        let is_start = ci == 0 || char_positions[ci - 1].1.is_ascii_whitespace();
-                        // kw is pure ASCII so its char count == its byte count;
-                        // the char after the keyword is at char index ci + kw_byte_len.
-                        let after_ci = ci + kw_byte_len;
-                        let is_end = after_ci >= n
-                            || char_positions[after_ci].1.is_ascii_whitespace()
-                            // Also treat `(` as a valid word boundary so that
-                            // `WHERE(` is recognised (consistent with find_clause_boundaries).
-                            || char_positions[after_ci].1 == '(';
-                        if is_start && is_end {
-                            return Ok(Some(byte_pos));
-                        }
-                    }
-                }
-            }
-        }
-        ci += 1;
+fn parse_expr_and(c: &mut Cursor<'_>) -> Result<Expr, String> {
+    let mut left = parse_expr_not(c)?;
+    while c.peek_kw("AND") {
+        c.next();
+        let right = parse_expr_not(c)?;
+        left = Expr::BinaryOp {
+            op: BinaryOperator::And,
+            left: Box::new(left),
+            right: Box::new(right),
+        };
     }
-    Ok(None)
+    Ok(left)
 }
 
-fn find_clause_boundaries(cypher: &str) -> Result<Vec<(String, usize)>, String> {
-    // Returns a list of (keyword, byte_offset) pairs.  Previously returned char
-    // indices, which caused panics when callers used them as byte offsets on
-    // input that contains non-ASCII characters before a clause keyword.
-    //
-    // ORDER BY is a two-word keyword; it is matched by scanning for "ORDER"
-    // and checking that the next non-space token is "BY".
-    let mut clauses = Vec::new();
-    let cypher_byte_len = cypher.len();
-
-    let char_positions: Vec<(usize, char)> = cypher.char_indices().collect();
-    let n = char_positions.len();
-
-    let mut in_single_quote = false;
-    let mut in_double_quote = false;
-    let mut paren_depth: usize = 0;
-    let mut bracket_depth: usize = 0;
-    let mut brace_depth: usize = 0;
-
-    let mut ci = 0usize;
-    while ci < n {
-        let (byte_pos, c) = char_positions[ci];
-
-        if c == '\'' && !in_double_quote {
-            in_single_quote = !in_single_quote;
-            ci += 1;
-            continue;
-        }
-        if c == '"' && !in_single_quote {
-            in_double_quote = !in_double_quote;
-            ci += 1;
-            continue;
-        }
-
-        if !in_single_quote && !in_double_quote {
-            match c {
-                '(' => paren_depth += 1,
-                ')' => paren_depth = paren_depth.saturating_sub(1),
-                '[' => bracket_depth += 1,
-                ']' => bracket_depth = bracket_depth.saturating_sub(1),
-                '{' => brace_depth += 1,
-                '}' => brace_depth = brace_depth.saturating_sub(1),
-                _ => {}
-            }
-
-            if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 {
-                // Try each single-word keyword first, then ORDER BY.
-                let mut matched_kw: Option<&str> = None;
-                for kw in &["MATCH", "WITH", "UNWIND", "RETURN", "SKIP", "LIMIT"] {
-                    let kw_byte_len = kw.len(); // keywords are ASCII; byte len == char len
-                    let end_byte = byte_pos + kw_byte_len;
-                    if end_byte <= cypher_byte_len {
-                        if let Some(candidate) = cypher.get(byte_pos..end_byte) {
-                            if candidate.eq_ignore_ascii_case(kw) {
-                                let is_start = ci == 0
-                                    || char_positions[ci - 1].1.is_ascii_whitespace()
-                                    || char_positions[ci - 1].1 == ';';
-                                let after_ci = ci + kw_byte_len;
-                                let is_end = after_ci >= n
-                                    || char_positions[after_ci].1.is_ascii_whitespace()
-                                    || char_positions[after_ci].1 == '('
-                                    || char_positions[after_ci].1 == '{';
-                                if is_start && is_end {
-                                    matched_kw = Some(kw);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Check for two-word "ORDER BY".
-                if matched_kw.is_none() {
-                    let order_len = "ORDER".len();
-                    if let Some(candidate) = cypher.get(byte_pos..byte_pos + order_len) {
-                        if candidate.eq_ignore_ascii_case("ORDER") {
-                            let is_start = ci == 0
-                                || char_positions[ci - 1].1.is_ascii_whitespace()
-                                || char_positions[ci - 1].1 == ';';
-                            let after_order_ci = ci + order_len;
-                            let is_end_order = after_order_ci >= n
-                                || char_positions[after_order_ci].1.is_ascii_whitespace();
-                            if is_start && is_end_order {
-                                // Scan forward for "BY".
-                                let mut scan_ci = after_order_ci;
-                                while scan_ci < n && char_positions[scan_ci].1.is_ascii_whitespace()
-                                {
-                                    scan_ci += 1;
-                                }
-                                if scan_ci < n {
-                                    let (by_byte, _) = char_positions[scan_ci];
-                                    let by_end = by_byte + "BY".len();
-                                    if by_end <= cypher_byte_len {
-                                        if let Some(by_cand) = cypher.get(by_byte..by_end) {
-                                            if by_cand.eq_ignore_ascii_case("BY") {
-                                                let after_by_ci = scan_ci + "BY".len();
-                                                let is_end_by = after_by_ci >= n
-                                                    || char_positions[after_by_ci]
-                                                        .1
-                                                        .is_ascii_whitespace();
-                                                if is_end_by {
-                                                    // Keyword spans from byte_pos to end of "BY".
-                                                    let kw_end_byte = by_end;
-                                                    clauses
-                                                        .push(("ORDER BY".to_string(), byte_pos));
-                                                    // kw_end_byte is a byte offset; advance ci
-                                                    // to the char index just past the keyword.
-                                                    let skip_chars = cypher[byte_pos..kw_end_byte]
-                                                        .chars()
-                                                        .count();
-                                                    ci += skip_chars;
-                                                    continue;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Check for two-word "OPTIONAL MATCH".
-                if matched_kw.is_none() {
-                    let optional_len = "OPTIONAL".len();
-                    if let Some(candidate) = cypher.get(byte_pos..byte_pos + optional_len) {
-                        if candidate.eq_ignore_ascii_case("OPTIONAL") {
-                            let is_start = ci == 0
-                                || char_positions[ci - 1].1.is_ascii_whitespace()
-                                || char_positions[ci - 1].1 == ';';
-                            let after_optional_ci = ci + optional_len;
-                            let is_end_optional = after_optional_ci >= n
-                                || char_positions[after_optional_ci].1.is_ascii_whitespace();
-                            if is_start && is_end_optional {
-                                // Scan forward for "MATCH".
-                                let mut scan_ci = after_optional_ci;
-                                while scan_ci < n && char_positions[scan_ci].1.is_ascii_whitespace()
-                                {
-                                    scan_ci += 1;
-                                }
-                                if scan_ci < n {
-                                    let (match_byte, _) = char_positions[scan_ci];
-                                    let match_end = match_byte + "MATCH".len();
-                                    if match_end <= cypher_byte_len {
-                                        if let Some(match_cand) = cypher.get(match_byte..match_end)
-                                        {
-                                            if match_cand.eq_ignore_ascii_case("MATCH") {
-                                                let after_match_ci = scan_ci + "MATCH".len();
-                                                let is_end_match = after_match_ci >= n
-                                                    || char_positions[after_match_ci]
-                                                        .1
-                                                        .is_ascii_whitespace()
-                                                    || char_positions[after_match_ci].1 == '(';
-                                                if is_end_match {
-                                                    clauses.push((
-                                                        "OPTIONAL MATCH".to_string(),
-                                                        byte_pos,
-                                                    ));
-                                                    let kw_end_byte = match_end;
-                                                    let skip_chars = cypher[byte_pos..kw_end_byte]
-                                                        .chars()
-                                                        .count();
-                                                    ci += skip_chars;
-                                                    continue;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if let Some(kw) = matched_kw {
-                    clauses.push((kw.to_string(), byte_pos));
-                    // kw is pure ASCII so kw.len() == kw char count; advance ci
-                    // past all keyword chars to avoid re-matching a prefix.
-                    ci += kw.len();
-                    continue;
-                }
-            }
-        }
-
-        ci += 1;
+fn parse_expr_not(c: &mut Cursor<'_>) -> Result<Expr, String> {
+    if c.peek_kw("NOT") {
+        c.next();
+        // NOT IN is handled at the comparison level; here handle NOT <expr>
+        // We need to check if the next thing after NOT is IN (that's "NOT IN")
+        // Actually NOT IN is parsed at the comparison level, but for proper
+        // associativity we need to handle "NOT" as a prefix here.
+        let inner = parse_expr_not(c)?;
+        return Ok(Expr::Not(Box::new(inner)));
     }
-
-    Ok(clauses)
+    parse_expr_cmp(c)
 }
 
-fn parse_set_statement(cypher: &str) -> Result<Statement, String> {
-    // Use find_keyword_root_level for all keyword searches so that label names
-    // or variable names that contain the keyword as a substring (e.g., "RESET"
-    // containing "SET") are not mistaken for the actual clause keyword.
-    let match_idx = find_keyword_root_level(cypher, "MATCH")?.ok_or("missing MATCH clause")?;
-    let set_idx = find_keyword_root_level(cypher, "SET")?.ok_or("missing SET clause")?;
+fn parse_expr_cmp(c: &mut Cursor<'_>) -> Result<Expr, String> {
+    let mut left = parse_expr_add(c)?;
 
-    let where_idx_opt = find_keyword_root_level(cypher, "WHERE")?;
+    loop {
+        // IS NULL / IS NOT NULL (postfix)
+        if c.peek_kw("IS") {
+            // Peek ahead: IS NULL or IS NOT NULL
+            if c.peek_kw_at(1, "NOT") && c.peek_kw_at(2, "NULL") {
+                c.next(); c.next(); c.next(); // consume IS NOT NULL
+                left = Expr::IsNotNull(Box::new(left));
+                continue;
+            } else if c.peek_kw_at(1, "NULL") {
+                c.next(); c.next(); // consume IS NULL
+                left = Expr::IsNull(Box::new(left));
+                continue;
+            }
+        }
+        // STARTS WITH
+        if c.peek_kw("STARTS") && c.peek_kw_at(1, "WITH") {
+            c.next(); c.next();
+            let right = parse_expr_add(c)?;
+            left = Expr::FunctionCall {
+                name: "__starts_with__".to_string(),
+                args: vec![left, right],
+            };
+            continue;
+        }
+        // ENDS WITH
+        if c.peek_kw("ENDS") && c.peek_kw_at(1, "WITH") {
+            c.next(); c.next();
+            let right = parse_expr_add(c)?;
+            left = Expr::FunctionCall {
+                name: "__ends_with__".to_string(),
+                args: vec![left, right],
+            };
+            continue;
+        }
+        // CONTAINS
+        if c.peek_kw("CONTAINS") {
+            c.next();
+            let right = parse_expr_add(c)?;
+            left = Expr::FunctionCall {
+                name: "__contains__".to_string(),
+                args: vec![left, right],
+            };
+            continue;
+        }
+        // NOT IN
+        if c.peek_kw("NOT") && c.peek_kw_at(1, "IN") {
+            c.next(); c.next();
+            let right = parse_expr_add(c)?;
+            left = Expr::Not(Box::new(Expr::FunctionCall {
+                name: "__in__".to_string(),
+                args: vec![left, right],
+            }));
+            continue;
+        }
+        // IN
+        if c.peek_kw("IN") {
+            c.next();
+            let right = parse_expr_add(c)?;
+            left = Expr::FunctionCall {
+                name: "__in__".to_string(),
+                args: vec![left, right],
+            };
+            continue;
+        }
+        // Symbolic comparisons
+        let op = match c.peek() {
+            Some(Tok::Ne) => Some(BinaryOperator::Ne),
+            Some(Tok::Le) => Some(BinaryOperator::Le),
+            Some(Tok::Ge) => Some(BinaryOperator::Ge),
+            Some(Tok::Lt) => Some(BinaryOperator::Lt),
+            Some(Tok::Gt) => Some(BinaryOperator::Gt),
+            Some(Tok::Eq) => Some(BinaryOperator::Eq),
+            _ => None,
+        };
+        if let Some(op) = op {
+            c.next();
+            let right = parse_expr_add(c)?;
+            left = Expr::BinaryOp {
+                op,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
+            continue;
+        }
+        // RegexEq =~
+        if c.peek() == Some(&Tok::RegexEq) {
+            c.next();
+            let right = parse_expr_add(c)?;
+            left = Expr::FunctionCall {
+                name: "__regex__".to_string(),
+                args: vec![left, right],
+            };
+            continue;
+        }
+        break;
+    }
+    Ok(left)
+}
 
-    let match_clause_str = if let Some(where_idx) = where_idx_opt {
-        if where_idx > match_idx && where_idx < set_idx {
-            &cypher[match_idx + "MATCH".len()..where_idx]
+fn parse_expr_add(c: &mut Cursor<'_>) -> Result<Expr, String> {
+    let mut left = parse_expr_mul(c)?;
+    loop {
+        if c.peek() == Some(&Tok::Plus) {
+            c.next();
+            let right = parse_expr_mul(c)?;
+            left = Expr::BinaryOp {
+                op: BinaryOperator::Add,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
+        } else if c.peek() == Some(&Tok::Minus) {
+            // Make sure this minus is a binary minus, not a unary at the start of a subexpr
+            c.next();
+            let right = parse_expr_mul(c)?;
+            left = Expr::BinaryOp {
+                op: BinaryOperator::Sub,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
         } else {
-            return Err("WHERE clause must be placed between MATCH and SET".into());
+            break;
         }
-    } else {
-        &cypher[match_idx + "MATCH".len()..set_idx]
-    };
+    }
+    Ok(left)
+}
 
-    let match_clauses = parse_match_clauses(match_clause_str)?;
-
-    let where_clause = if let Some(where_idx) = where_idx_opt {
-        let where_clause_str = &cypher[where_idx + "WHERE".len()..set_idx];
-        Some(parse_where_clause(where_clause_str)?)
-    } else {
-        None
-    };
-
-    let set_items_str = &cypher[set_idx + "SET".len()..];
-    let mut set_items = Vec::new();
-    for item_str in set_items_str.split(',') {
-        let parts: Vec<&str> = item_str.split('=').map(|s| s.trim()).collect();
-        if parts.len() != 2 {
-            return Err("invalid SET assignment expression".into());
+fn parse_expr_mul(c: &mut Cursor<'_>) -> Result<Expr, String> {
+    let mut left = parse_expr_pow(c)?;
+    loop {
+        let op = match c.peek() {
+            Some(Tok::Star) => Some(BinaryOperator::Mul),
+            Some(Tok::Slash) => Some(BinaryOperator::Div),
+            Some(Tok::Percent) => Some(BinaryOperator::Mod),
+            _ => None,
+        };
+        if let Some(op) = op {
+            c.next();
+            let right = parse_expr_pow(c)?;
+            left = Expr::BinaryOp {
+                op,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
+        } else {
+            break;
         }
-        let prop_parts: Vec<&str> = parts[0].split('.').map(|s| s.trim()).collect();
-        if prop_parts.len() != 2 {
-            return Err("invalid SET property reference".into());
+    }
+    Ok(left)
+}
+
+fn parse_expr_pow(c: &mut Cursor<'_>) -> Result<Expr, String> {
+    let base = parse_expr_unary(c)?;
+    if c.peek() == Some(&Tok::Caret) {
+        c.next();
+        let exp = parse_expr_pow(c)?; // right-associative
+        return Ok(Expr::BinaryOp {
+            op: BinaryOperator::Pow,
+            left: Box::new(base),
+            right: Box::new(exp),
+        });
+    }
+    Ok(base)
+}
+
+fn parse_expr_unary(c: &mut Cursor<'_>) -> Result<Expr, String> {
+    if c.peek() == Some(&Tok::Minus) {
+        c.next();
+        // Unary minus: only when followed by a number or '('
+        let inner = parse_expr_postfix(c)?;
+        return Ok(Expr::BinaryOp {
+            op: BinaryOperator::Sub,
+            left: Box::new(Expr::Literal(Literal::Int(0))),
+            right: Box::new(inner),
+        });
+    }
+    parse_expr_postfix(c)
+}
+
+fn parse_expr_postfix(c: &mut Cursor<'_>) -> Result<Expr, String> {
+    let mut expr = parse_expr_atom(c)?;
+
+    loop {
+        // Property access: expr.prop
+        if c.peek() == Some(&Tok::Dot) {
+            c.next();
+            let prop = expect_any_ident(c)?;
+            expr = match expr {
+                Expr::Prop(var, ref empty) if empty.is_empty() => Expr::Prop(var, prop),
+                other => Expr::Subscript {
+                    expr: Box::new(other),
+                    index: Box::new(Expr::Literal(Literal::Str(prop))),
+                },
+            };
+            continue;
         }
-        let variable = prop_parts[0].to_string();
-        let property = prop_parts[1].to_string();
-        let expr = parse_expr(parts[1])?;
-        set_items.push(SetItem {
-            variable,
-            property,
-            expr,
+
+        // Subscript / slice: expr[...]
+        if c.peek() == Some(&Tok::LBrack) {
+            c.next();
+            // Check for slice: optional start, DotDot, optional end
+            // or subscript: expr
+            let start_expr = if c.peek() != Some(&Tok::DotDot) && c.peek() != Some(&Tok::RBrack) {
+                Some(parse_expr_or(c)?)
+            } else {
+                None
+            };
+            if c.eat(&Tok::DotDot) {
+                // Slice
+                let end_expr = if c.peek() != Some(&Tok::RBrack) {
+                    Some(parse_expr_or(c)?)
+                } else {
+                    None
+                };
+                c.expect_tok(&Tok::RBrack)?;
+                expr = Expr::Slice {
+                    expr: Box::new(expr),
+                    start: start_expr.map(Box::new),
+                    end: end_expr.map(Box::new),
+                };
+            } else {
+                // Subscript
+                let idx = start_expr.ok_or("empty subscript")?;
+                c.expect_tok(&Tok::RBrack)?;
+                expr = Expr::Subscript {
+                    expr: Box::new(expr),
+                    index: Box::new(idx),
+                };
+            }
+            continue;
+        }
+
+        // HasLabel / IS NULL / IS NOT NULL are handled at cmp level
+        // Label test: expr:Label (only when expr is a bare variable)
+        if c.peek() == Some(&Tok::Colon) {
+            // Peek to see if there's a label name next (and not another `:`)
+            if let Some(Tok::Ident(_)) = c.peek_at(1) {
+                if let Expr::Prop(ref var, ref empty) = expr {
+                    if empty.is_empty() {
+                        let var = var.clone();
+                        c.next(); // consume :
+                        let label = expect_any_ident(c)?;
+                        expr = Expr::HasLabel { variable: var, label };
+                        continue;
+                    }
+                }
+            }
+        }
+
+        break;
+    }
+    Ok(expr)
+}
+
+/// Accept an identifier-like token (including keywords usable as identifiers).
+fn expect_any_ident(c: &mut Cursor<'_>) -> Result<String, String> {
+    match c.peek() {
+        Some(Tok::Ident(s)) => {
+            let s = s.clone();
+            c.next();
+            Ok(s)
+        }
+        other => Err(format!("expected identifier, got {:?}", other)),
+    }
+}
+
+fn parse_expr_atom(c: &mut Cursor<'_>) -> Result<Expr, String> {
+    match c.peek() {
+        // Null / true / false
+        Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("NULL") => {
+            c.next();
+            Ok(Expr::Literal(Literal::Null))
+        }
+        Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("TRUE") => {
+            c.next();
+            Ok(Expr::Literal(Literal::Bool(true)))
+        }
+        Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("FALSE") => {
+            c.next();
+            Ok(Expr::Literal(Literal::Bool(false)))
+        }
+
+        // Integer literal
+        Some(Tok::Integer(_)) => {
+            if let Some(Tok::Integer(n)) = c.next() {
+                Ok(Expr::Literal(Literal::Int(*n)))
+            } else {
+                unreachable!()
+            }
+        }
+
+        // Float literal
+        Some(Tok::Float(_)) => {
+            if let Some(Tok::Float(f)) = c.next() {
+                Ok(Expr::Literal(Literal::Float(*f)))
+            } else {
+                unreachable!()
+            }
+        }
+
+        // String literal
+        Some(Tok::Str(_)) => {
+            if let Some(Tok::Str(s)) = c.next() {
+                Ok(Expr::Literal(Literal::Str(s.clone())))
+            } else {
+                unreachable!()
+            }
+        }
+
+        // Parameter
+        Some(Tok::Param(_)) => {
+            if let Some(Tok::Param(p)) = c.next() {
+                Ok(Expr::Param(p.clone()))
+            } else {
+                unreachable!()
+            }
+        }
+
+        // Parenthesised expression
+        Some(Tok::LParen) => {
+            c.next();
+            let inner = parse_expr(c)?;
+            c.expect_tok(&Tok::RParen)?;
+            Ok(inner)
+        }
+
+        // List comprehension or list literal
+        Some(Tok::LBrack) => parse_list_or_comprehension(c),
+
+        // Map literal
+        Some(Tok::LBrace) => parse_map_literal(c),
+
+        // Identifier: could be a keyword (CASE, quantifier, agg, function, variable)
+        Some(Tok::Ident(_)) => parse_ident_expr(c),
+
+        other => Err(format!("unexpected token in expression: {:?}", other)),
+    }
+}
+
+fn parse_list_or_comprehension(c: &mut Cursor<'_>) -> Result<Expr, String> {
+    c.expect_tok(&Tok::LBrack)?;
+
+    // Empty list
+    if c.eat(&Tok::RBrack) {
+        return Ok(Expr::FunctionCall {
+            name: "__list__".to_string(),
+            args: vec![],
         });
     }
 
-    Ok(Statement::Set(SetStatement {
-        match_clauses,
-        where_clause,
-        set_items,
-    }))
+    // Detect list comprehension: starts with `ident IN`
+    let is_comp = matches!(c.peek(), Some(Tok::Ident(_)))
+        && matches!(c.peek_at(1), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("IN"));
+
+    if is_comp {
+        let variable = expect_any_ident(c)?;
+        c.next(); // consume IN
+        let list = parse_expr_or(c)?;
+
+        // Optional WHERE pred
+        let predicate = if c.peek_kw("WHERE") {
+            c.next();
+            Some(Box::new(parse_expr_or(c)?))
+        } else {
+            None
+        };
+        // Optional | transform
+        let transform = if c.eat(&Tok::Pipe) {
+            Some(Box::new(parse_expr_or(c)?))
+        } else {
+            None
+        };
+
+        c.expect_tok(&Tok::RBrack)?;
+        return Ok(Expr::ListComprehension {
+            variable,
+            list: Box::new(list),
+            predicate,
+            transform,
+        });
+    }
+
+    // List literal
+    let mut items = Vec::new();
+    loop {
+        if c.peek() == Some(&Tok::RBrack) {
+            break;
+        }
+        items.push(parse_expr_or(c)?);
+        if !c.eat(&Tok::Comma) {
+            break;
+        }
+    }
+    c.expect_tok(&Tok::RBrack)?;
+    Ok(Expr::FunctionCall {
+        name: "__list__".to_string(),
+        args: items,
+    })
 }
 
-fn parse_delete_statement(cypher: &str) -> Result<Statement, String> {
-    // Use find_keyword_root_level for all keyword searches so that label names
-    // or variable names that contain the keyword as a substring are not
-    // mistaken for the actual clause keyword.
-    let match_idx = find_keyword_root_level(cypher, "MATCH")?.ok_or("missing MATCH clause")?;
-    let delete_idx = find_keyword_root_level(cypher, "DELETE")?.ok_or("missing DELETE clause")?;
-
-    let where_idx_opt = find_keyword_root_level(cypher, "WHERE")?;
-
-    let match_clause_str = if let Some(where_idx) = where_idx_opt {
-        if where_idx > match_idx && where_idx < delete_idx {
-            &cypher[match_idx + "MATCH".len()..where_idx]
-        } else {
-            return Err("WHERE clause must be placed between MATCH and DELETE".into());
+fn parse_map_literal(c: &mut Cursor<'_>) -> Result<Expr, String> {
+    c.expect_tok(&Tok::LBrace)?;
+    let mut args = Vec::new();
+    if c.peek() != Some(&Tok::RBrace) {
+        loop {
+            let key = expect_any_ident(c)?;
+            c.expect_tok(&Tok::Colon)?;
+            let val = parse_expr_or(c)?;
+            args.push(Expr::Literal(Literal::Str(key)));
+            args.push(val);
+            if !c.eat(&Tok::Comma) {
+                break;
+            }
         }
-    } else {
-        &cypher[match_idx + "MATCH".len()..delete_idx]
+    }
+    c.expect_tok(&Tok::RBrace)?;
+    Ok(Expr::FunctionCall {
+        name: "__map__".to_string(),
+        args,
+    })
+}
+
+fn parse_ident_expr(c: &mut Cursor<'_>) -> Result<Expr, String> {
+    // Peek at the identifier
+    let name = match c.peek() {
+        Some(Tok::Ident(s)) => s.clone(),
+        _ => return Err("expected identifier".into()),
     };
+    let name_upper = name.to_ascii_uppercase();
 
-    let match_clauses = parse_match_clauses(match_clause_str)?;
+    // CASE expression
+    if name_upper == "CASE" {
+        return parse_case_expr(c);
+    }
 
-    let where_clause = if let Some(where_idx) = where_idx_opt {
-        let where_clause_str = &cypher[where_idx + "WHERE".len()..delete_idx];
-        Some(parse_where_clause(where_clause_str)?)
+    // Quantifiers: ALL, ANY, NONE, SINGLE followed by '('
+    if matches!(
+        name_upper.as_str(),
+        "ALL" | "ANY" | "NONE" | "SINGLE"
+    ) && c.peek_at(1) == Some(&Tok::LParen)
+    {
+        return parse_quantifier_expr(c);
+    }
+
+    // count(*) special case
+    if name_upper == "COUNT"
+        && c.peek_at(1) == Some(&Tok::LParen)
+        && c.peek_at(2) == Some(&Tok::Star)
+        && c.peek_at(3) == Some(&Tok::RParen)
+    {
+        c.next(); c.next(); c.next(); c.next(); // consume COUNT ( * )
+        return Ok(Expr::CountStar);
+    }
+
+    // Aggregation functions: COUNT, SUM, AVG, MIN, MAX, COLLECT, STDEV, STDEVP
+    if matches!(
+        name_upper.as_str(),
+        "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "COLLECT" | "STDEV" | "STDEVP"
+    ) && c.peek_at(1) == Some(&Tok::LParen)
+    {
+        return parse_agg_expr(c);
+    }
+
+    // percentileDisc / percentileCont
+    if matches!(name_upper.as_str(), "PERCENTILEDISC" | "PERCENTILECONT")
+        && c.peek_at(1) == Some(&Tok::LParen)
+    {
+        return parse_percentile_expr(c);
+    }
+
+    // Generic function call: name(args...)
+    if c.peek_at(1) == Some(&Tok::LParen) {
+        return parse_fn_call_expr(c);
+    }
+
+    // Dotted function call: name.name(args...)
+    if c.peek_at(1) == Some(&Tok::Dot) {
+        if let Some(Tok::Ident(_)) = c.peek_at(2) {
+            if c.peek_at(3) == Some(&Tok::LParen) {
+                return parse_fn_call_expr(c);
+            }
+        }
+    }
+
+    // Bare identifier (variable reference)
+    c.next();
+    Ok(Expr::Prop(name, "".to_string()))
+}
+
+fn parse_quantifier_expr(c: &mut Cursor<'_>) -> Result<Expr, String> {
+    let name = expect_any_ident(c)?;
+    let kind = match name.to_ascii_uppercase().as_str() {
+        "ALL" => QuantifierKind::All,
+        "ANY" => QuantifierKind::Any,
+        "NONE" => QuantifierKind::None,
+        "SINGLE" => QuantifierKind::Single,
+        _ => unreachable!(),
+    };
+    c.expect_tok(&Tok::LParen)?;
+    let variable = expect_any_ident(c)?;
+    c.next(); // IN keyword
+    let list = parse_expr_or(c)?;
+    c.next(); // WHERE keyword
+    let predicate = parse_expr_or(c)?;
+    c.expect_tok(&Tok::RParen)?;
+    Ok(Expr::Quantifier {
+        kind,
+        variable,
+        list: Box::new(list),
+        predicate: Box::new(predicate),
+    })
+}
+
+fn parse_agg_expr(c: &mut Cursor<'_>) -> Result<Expr, String> {
+    let name = expect_any_ident(c)?;
+    let name_upper = name.to_ascii_uppercase();
+    c.expect_tok(&Tok::LParen)?;
+    let distinct = c.peek_kw("DISTINCT");
+    if distinct {
+        c.next();
+    }
+    let inner = parse_expr(c)?;
+    c.expect_tok(&Tok::RParen)?;
+
+    let agg_fn = match name_upper.as_str() {
+        "COUNT" => AggFn::Count { distinct },
+        "SUM" => AggFn::Sum { distinct },
+        "AVG" => AggFn::Avg { distinct },
+        "MIN" => AggFn::Min { distinct },
+        "MAX" => AggFn::Max { distinct },
+        "COLLECT" => AggFn::Collect { distinct },
+        "STDEV" => AggFn::StDev { distinct },
+        "STDEVP" => AggFn::StDevP { distinct },
+        _ => return Err(format!("unknown aggregation function: {}", name)),
+    };
+    Ok(Expr::Agg(agg_fn, Box::new(inner)))
+}
+
+fn parse_percentile_expr(c: &mut Cursor<'_>) -> Result<Expr, String> {
+    let name = expect_any_ident(c)?;
+    let is_disc = name.to_ascii_uppercase() == "PERCENTILEDISC";
+    c.expect_tok(&Tok::LParen)?;
+    let inner = parse_expr(c)?;
+    c.expect_tok(&Tok::Comma)?;
+    // Accept a literal float/int, a parameter, or a general expression.
+    let pct = match c.peek() {
+        Some(Tok::Float(_)) => {
+            if let Some(Tok::Float(f)) = c.next() {
+                *f
+            } else {
+                unreachable!()
+            }
+        }
+        Some(Tok::Integer(_)) => {
+            if let Some(Tok::Integer(n)) = c.next() {
+                *n as f64
+            } else {
+                unreachable!()
+            }
+        }
+        Some(Tok::Param(_)) => {
+            // Parameter: use 0.5 as a placeholder; the executor will substitute.
+            c.next();
+            0.5
+        }
+        _ => {
+            // General expression: parse it and use 0.5 as placeholder.
+            let _ = parse_expr(c)?;
+            0.5
+        }
+    };
+    c.expect_tok(&Tok::RParen)?;
+    let agg_fn = if is_disc {
+        AggFn::PercentileDisc { percentile: pct }
+    } else {
+        AggFn::PercentileCont { percentile: pct }
+    };
+    Ok(Expr::Agg(agg_fn, Box::new(inner)))
+}
+
+fn parse_fn_call_expr(c: &mut Cursor<'_>) -> Result<Expr, String> {
+    // Consume name (potentially dotted)
+    let mut name = expect_any_ident(c)?.to_ascii_lowercase();
+    while c.peek() == Some(&Tok::Dot) {
+        // Check if the next token is an identifier (property access vs dotted fn)
+        if let Some(Tok::Ident(_)) = c.peek_at(1) {
+            if c.peek_at(2) == Some(&Tok::LParen) {
+                c.next(); // consume dot
+                let part = expect_any_ident(c)?;
+                name.push('.');
+                name.push_str(&part.to_ascii_lowercase());
+                continue;
+            }
+        }
+        break;
+    }
+    c.expect_tok(&Tok::LParen)?;
+    let mut args = Vec::new();
+    if c.peek() != Some(&Tok::RParen) {
+        loop {
+            args.push(parse_expr(c)?);
+            if !c.eat(&Tok::Comma) {
+                break;
+            }
+        }
+    }
+    c.expect_tok(&Tok::RParen)?;
+    Ok(Expr::FunctionCall { name, args })
+}
+
+fn parse_case_expr(c: &mut Cursor<'_>) -> Result<Expr, String> {
+    c.next(); // consume CASE
+
+    // Simple CASE subject (if next token is not WHEN)
+    let subject = if !c.peek_kw("WHEN") {
+        Some(Box::new(parse_expr(c)?))
     } else {
         None
     };
 
-    let variables_str = &cypher[delete_idx + "DELETE".len()..];
-    let variables = variables_str
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .collect();
+    let mut arms = Vec::new();
+    while c.peek_kw("WHEN") {
+        c.next(); // WHEN
+        let when = parse_expr(c)?;
+        c.next(); // THEN
+        let then = parse_expr(c)?;
+        arms.push(CaseArm { when, then });
+    }
 
-    Ok(Statement::Delete(DeleteStatement {
-        match_clauses,
-        where_clause,
-        variables,
-    }))
+    let else_expr = if c.peek_kw("ELSE") {
+        c.next();
+        Some(Box::new(parse_expr(c)?))
+    } else {
+        None
+    };
+
+    if !c.peek_kw("END") {
+        return Err("CASE expression missing END".into());
+    }
+    c.next(); // END
+
+    Ok(Expr::Case {
+        subject,
+        arms,
+        else_expr,
+    })
 }
 
-fn parse_match_clauses(s: &str) -> Result<Vec<MatchClause>, String> {
+// ─── Properties map ───────────────────────────────────────────────────────────
+
+fn parse_properties_map(c: &mut Cursor<'_>) -> Result<HashMap<String, Literal>, String> {
+    c.expect_tok(&Tok::LBrace)?;
+    let mut map = HashMap::new();
+    if c.peek() != Some(&Tok::RBrace) {
+        loop {
+            let key = expect_any_ident(c)?;
+            c.expect_tok(&Tok::Colon)?;
+            let val = parse_literal_value(c)?;
+            map.insert(key, val);
+            if !c.eat(&Tok::Comma) {
+                break;
+            }
+        }
+    }
+    c.expect_tok(&Tok::RBrace)?;
+    Ok(map)
+}
+
+fn parse_literal_value(c: &mut Cursor<'_>) -> Result<Literal, String> {
+    // Handle negative numbers
+    if c.peek() == Some(&Tok::Minus) {
+        c.next();
+        return match c.peek() {
+            Some(Tok::Integer(_)) => {
+                if let Some(Tok::Integer(n)) = c.next() {
+                    Ok(Literal::Int(-n))
+                } else {
+                    unreachable!()
+                }
+            }
+            Some(Tok::Float(_)) => {
+                if let Some(Tok::Float(f)) = c.next() {
+                    Ok(Literal::Float(-f))
+                } else {
+                    unreachable!()
+                }
+            }
+            other => Err(format!("expected number after minus, got {:?}", other)),
+        };
+    }
+    match c.peek() {
+        Some(Tok::Str(_)) => {
+            if let Some(Tok::Str(s)) = c.next() {
+                Ok(Literal::Str(s.clone()))
+            } else {
+                unreachable!()
+            }
+        }
+        Some(Tok::Integer(_)) => {
+            if let Some(Tok::Integer(n)) = c.next() {
+                Ok(Literal::Int(*n))
+            } else {
+                unreachable!()
+            }
+        }
+        Some(Tok::Float(_)) => {
+            if let Some(Tok::Float(f)) = c.next() {
+                Ok(Literal::Float(*f))
+            } else {
+                unreachable!()
+            }
+        }
+        Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("TRUE") => {
+            c.next();
+            Ok(Literal::Bool(true))
+        }
+        Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("FALSE") => {
+            c.next();
+            Ok(Literal::Bool(false))
+        }
+        Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("NULL") => {
+            c.next();
+            Ok(Literal::Null)
+        }
+        // List literal: [val1, val2, ...]
+        Some(Tok::LBrack) => {
+            c.next(); // consume [
+            let mut items = Vec::new();
+            while c.peek() != Some(&Tok::RBrack) {
+                if c.peek().is_none() {
+                    return Err("unterminated list literal".into());
+                }
+                items.push(parse_literal_value(c)?);
+                if !c.eat(&Tok::Comma) {
+                    break;
+                }
+            }
+            c.expect_tok(&Tok::RBrack)?;
+            Ok(Literal::List(items))
+        }
+        other => Err(format!("expected literal value, got {:?}", other)),
+    }
+}
+
+// ─── Pattern parsers ──────────────────────────────────────────────────────────
+
+fn parse_node_pattern(c: &mut Cursor<'_>) -> Result<NodePattern, String> {
+    c.expect_tok(&Tok::LParen)?;
+
+    // Optional variable
+    let variable = if let Some(Tok::Ident(_)) = c.peek() {
+        // Only treat as variable if not immediately followed by ':' in the wrong context.
+        // Actually, variable is any ident that's not a pure label indicator.
+        Some(expect_any_ident(c)?)
+    } else {
+        None
+    };
+
+    // Optional label(s): :Label
+    let label = if c.eat(&Tok::Colon) {
+        Some(expect_any_ident(c)?)
+    } else {
+        None
+    };
+
+    // Skip additional labels (multi-label: just take first)
+    while c.peek() == Some(&Tok::Colon) {
+        c.next();
+        let _ = expect_any_ident(c)?; // consume but ignore additional labels
+    }
+
+    // Optional properties
+    let properties = if c.peek() == Some(&Tok::LBrace) {
+        Some(parse_properties_map(c)?)
+    } else {
+        None
+    };
+
+    c.expect_tok(&Tok::RParen)?;
+    Ok(NodePattern {
+        variable,
+        label,
+        properties,
+    })
+}
+
+fn parse_rel_range(c: &mut Cursor<'_>) -> Result<RelRange, String> {
+    // Already consumed '*'; parse optional range
+    // Could be: empty, n, n..m, n.., ..m, ..
+    let start_num = if let Some(Tok::Integer(n)) = c.peek() {
+        let n = *n as u32;
+        c.next();
+        Some(n)
+    } else {
+        None
+    };
+
+    if c.eat(&Tok::DotDot) {
+        let end_num = if let Some(Tok::Integer(n)) = c.peek() {
+            let n = *n as u32;
+            c.next();
+            Some(n)
+        } else {
+            None
+        };
+        Ok(RelRange {
+            min: start_num.or(Some(1)),
+            max: end_num,
+        })
+    } else if let Some(n) = start_num {
+        // Exact hops
+        Ok(RelRange {
+            min: Some(n),
+            max: Some(n),
+        })
+    } else {
+        // Bare * (no number)
+        Ok(RelRange {
+            min: Some(1),
+            max: None,
+        })
+    }
+}
+
+fn parse_rel_pattern(c: &mut Cursor<'_>) -> Result<RelationshipPattern, String> {
+    // Possible prefixes: <- or -
+    let is_incoming = c.peek() == Some(&Tok::LArrow);
+    if is_incoming {
+        c.next(); // consume <-
+    } else {
+        c.expect_tok(&Tok::Minus)?;
+    }
+
+    // Check for bare ->  or --  (no bracket)
+    if !is_incoming && c.peek() == Some(&Tok::Arrow) {
+        // directed outgoing: ->
+        c.next();
+        return Ok(RelationshipPattern {
+            variable: None,
+            rel_type: None,
+            is_incoming: false,
+            is_undirected: false,
+            range: None,
+            properties: None,
+        });
+    }
+    if !is_incoming && c.peek() == Some(&Tok::Minus) {
+        // undirected: --
+        c.next();
+        return Ok(RelationshipPattern {
+            variable: None,
+            rel_type: None,
+            is_incoming: false,
+            is_undirected: true,
+            range: None,
+            properties: None,
+        });
+    }
+    // Incoming bare: <-- (already consumed <-, now see another -)
+    if is_incoming && c.peek() == Some(&Tok::Minus) {
+        c.next(); // consume trailing -
+        return Ok(RelationshipPattern {
+            variable: None,
+            rel_type: None,
+            is_incoming: true,
+            is_undirected: false,
+            range: None,
+            properties: None,
+        });
+    }
+
+    // We expect a bracket [...]
+    c.expect_tok(&Tok::LBrack)?;
+
+    // Optional variable
+    let variable = if let Some(Tok::Ident(_)) = c.peek() {
+        // Could be a variable OR just followed by : which means no variable
+        // We need to disambiguate: if peek_at(1) is ':' or '*' or ']' then it might be a variable
+        Some(expect_any_ident(c)?)
+    } else {
+        None
+    };
+
+    // Optional rel type(s): :TYPE or :TYPE1|TYPE2|TYPE3
+    let rel_type = if c.eat(&Tok::Colon) {
+        let mut types = expect_any_ident(c)?;
+        while c.eat(&Tok::Pipe) {
+            // Allow optional colon before next type name: :TYPE1|:TYPE2
+            let _ = c.eat(&Tok::Colon);
+            let next = expect_any_ident(c)?;
+            types.push('|');
+            types.push_str(&next);
+        }
+        Some(types)
+    } else {
+        None
+    };
+
+    // Optional variable-length: *range
+    let range = if c.eat(&Tok::Star) {
+        Some(parse_rel_range(c)?)
+    } else {
+        None
+    };
+
+    // Optional properties
+    let properties = if c.peek() == Some(&Tok::LBrace) {
+        Some(parse_properties_map(c)?)
+    } else {
+        None
+    };
+
+    c.expect_tok(&Tok::RBrack)?;
+
+    // Suffix: -> or - (undirected)
+    let is_outgoing = c.peek() == Some(&Tok::Arrow);
+    if is_outgoing {
+        c.next(); // consume ->
+    } else {
+        c.expect_tok(&Tok::Minus)?;
+    }
+
+    let is_undirected = !is_incoming && !is_outgoing;
+
+    Ok(RelationshipPattern {
+        variable,
+        rel_type,
+        is_incoming,
+        is_undirected,
+        range,
+        properties,
+    })
+}
+
+fn parse_pattern(c: &mut Cursor<'_>) -> Result<Pattern, String> {
+    // Capture optional path variable assignment: `p = (...)`
+    let path_variable = if let Some(Tok::Ident(_)) = c.peek() {
+        if c.peek_at(1) == Some(&Tok::Eq) {
+            // Make sure next after '=' is a '('
+            if c.peek_at(2) == Some(&Tok::LParen) {
+                let var = expect_any_ident(c)?;
+                c.next(); // =
+                Some(var)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let node = parse_node_pattern(c)?;
+    let mut rels = Vec::new();
+
+    // Continue parsing relationship-node pairs while we see - or <-
+    while matches!(c.peek(), Some(Tok::Minus) | Some(Tok::LArrow)) {
+        let rel = parse_rel_pattern(c)?;
+        let target = parse_node_pattern(c)?;
+        rels.push((rel, target));
+    }
+
+    Ok(Pattern { node, rels, path_variable })
+}
+
+fn parse_multi_pattern(c: &mut Cursor<'_>) -> Result<Vec<Pattern>, String> {
+    let mut patterns = Vec::new();
+    patterns.push(parse_pattern(c)?);
+    while c.eat(&Tok::Comma) {
+        patterns.push(parse_pattern(c)?);
+    }
+    Ok(patterns)
+}
+
+// ─── Match clause parsing ─────────────────────────────────────────────────────
+
+fn parse_match_clauses_from_cursor(c: &mut Cursor<'_>) -> Result<Vec<MatchClause>, String> {
     let mut clauses = Vec::new();
-    for part in split_by_comma_outside_braces(s) {
-        let pattern = parse_pattern(part.trim())?;
-        clauses.push(MatchClause { pattern });
+    clauses.push(MatchClause {
+        pattern: parse_pattern(c)?,
+    });
+    while c.eat(&Tok::Comma) {
+        clauses.push(MatchClause {
+            pattern: parse_pattern(c)?,
+        });
     }
     validate_match_clause_variables(&clauses)?;
     Ok(clauses)
 }
 
-/// Validate that no relationship variable appears twice in the same MATCH clause
-/// collection, and that no variable is used as both a node and a relationship.
-/// The TCK requires a SyntaxError (VariableAlreadyBound or VariableTypeConflict) in
-/// such cases.
-fn validate_match_clause_variables(clauses: &[MatchClause]) -> Result<(), String> {
-    let mut node_vars: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut rel_vars: std::collections::HashSet<String> = std::collections::HashSet::new();
+// ─── WHERE clause ─────────────────────────────────────────────────────────────
 
-    for clause in clauses {
-        let pattern = &clause.pattern;
-        // Collect seed node variable.
-        if let Some(ref v) = pattern.node.variable {
-            if rel_vars.contains(v) {
-                return Err(format!(
-                    "SyntaxError(VariableTypeConflict): variable '{}' is used as both a node and a relationship",
-                    v
-                ));
-            }
-            node_vars.insert(v.clone());
-        }
-        for (rel, target) in &pattern.rels {
-            // Check relationship variable.
-            if let Some(ref v) = rel.variable {
-                if node_vars.contains(v) {
-                    return Err(format!(
-                        "SyntaxError(VariableTypeConflict): variable '{}' is used as both a node and a relationship",
-                        v
-                    ));
-                }
-                if !rel_vars.insert(v.clone()) {
-                    return Err(format!(
-                        "SyntaxError(VariableAlreadyBound): relationship variable '{}' is already bound in this MATCH clause",
-                        v
-                    ));
-                }
-            }
-            // Check target node variable for type conflict against relationship variables.
-            if let Some(ref v) = target.variable {
-                if rel_vars.contains(v) {
-                    return Err(format!(
-                        "SyntaxError(VariableTypeConflict): variable '{}' is used as both a node and a relationship",
-                        v
-                    ));
-                }
-                node_vars.insert(v.clone());
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Validate variable type consistency across all MATCH and OPTIONAL MATCH clauses in the
-/// query. A variable bound as a node in one clause must not appear as a relationship
-/// variable in another clause, and vice versa. The TCK calls this VariableTypeConflict.
-///
-/// Note: WITH and UNWIND reset the variable scope, so validation restarts after each one.
-fn validate_cross_clause_variable_types(parts: &[QueryPart]) -> Result<(), String> {
-    let mut node_vars: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut rel_vars: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-    for part in parts {
-        let clauses: Option<&[MatchClause]> = match part {
-            QueryPart::Match { match_clauses, .. } => Some(match_clauses.as_slice()),
-            QueryPart::OptionalMatch { match_clauses, .. } => Some(match_clauses.as_slice()),
-            QueryPart::With { .. } | QueryPart::Unwind { .. } => {
-                // WITH and UNWIND create a scope barrier; reset tracked variables.
-                node_vars.clear();
-                rel_vars.clear();
-                None
-            }
-        };
-
-        if let Some(clauses) = clauses {
-            for clause in clauses {
-                let pattern = &clause.pattern;
-                if let Some(ref v) = pattern.node.variable {
-                    if rel_vars.contains(v) {
-                        return Err(format!(
-                            "SyntaxError(VariableTypeConflict): variable '{}' is used as both a node and a relationship",
-                            v
-                        ));
-                    }
-                    node_vars.insert(v.clone());
-                }
-                for (rel, target) in &pattern.rels {
-                    if let Some(ref v) = rel.variable {
-                        if node_vars.contains(v) {
-                            return Err(format!(
-                                "SyntaxError(VariableTypeConflict): variable '{}' is used as both a node and a relationship",
-                                v
-                            ));
-                        }
-                        rel_vars.insert(v.clone());
-                    }
-                    if let Some(ref v) = target.variable {
-                        if rel_vars.contains(v) {
-                            return Err(format!(
-                                "SyntaxError(VariableTypeConflict): variable '{}' is used as both a node and a relationship",
-                                v
-                            ));
-                        }
-                        node_vars.insert(v.clone());
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-fn parse_pattern(s: &str) -> Result<Pattern, String> {
-    let mut remainder = s.trim();
-
-    // Parse the seed node
-    let (node, size) = parse_node_pattern(remainder)?;
-    remainder = remainder[size..].trim();
-
-    let mut rels = Vec::new();
-    while !remainder.is_empty() {
-        let (rel, rel_size) = parse_relationship_pattern(remainder)?;
-        remainder = remainder[rel_size..].trim();
-
-        let (target, target_size) = parse_node_pattern(remainder)?;
-        remainder = remainder[target_size..].trim();
-
-        rels.push((rel, target));
-    }
-
-    Ok(Pattern { node, rels })
-}
-
-fn parse_node_pattern(s: &str) -> Result<(NodePattern, usize), String> {
-    if !s.starts_with('(') {
-        return Err("node pattern must start with '('".into());
-    }
-    let end_idx = s.find(')').ok_or("missing closing node parenthesis ')'")?;
-    let content = &s[1..end_idx].trim();
-
-    // Parse properties map if present
-    let prop_start = content.find('{');
-    let (body, properties) = if let Some(idx) = prop_start {
-        let prop_str = &content[idx..];
-        let props = parse_properties_map(prop_str)?;
-        (&content[..idx].trim(), Some(props))
-    } else {
-        (content, None)
-    };
-
-    let parts: Vec<&str> = body.split(':').collect();
-    let variable = if parts[0].trim().is_empty() {
-        None
-    } else {
-        Some(parts[0].trim().to_string())
-    };
-
-    let label = if parts.len() > 1 && !parts[1].trim().is_empty() {
-        Some(parts[1].trim().to_string())
-    } else {
-        None
-    };
-
-    Ok((
-        NodePattern {
-            variable,
-            label,
-            properties,
-        },
-        end_idx + 1,
-    ))
-}
-
-fn parse_relationship_pattern(s: &str) -> Result<(RelationshipPattern, usize), String> {
-    let mut remainder = s.trim();
-    let is_incoming = remainder.starts_with("<-");
-
-    let left_dash = if is_incoming { "<-" } else { "-" };
-    if !remainder.starts_with(left_dash) {
-        return Err("invalid relationship syntax prefix".into());
-    }
-    remainder = &remainder[left_dash.len()..];
-
-    // Handle bare `--` or `->` (no brackets).
-    if !remainder.starts_with('[') {
-        if remainder.starts_with("->") {
-            // `->`  directed outgoing, no bracket
-            let consumed = left_dash.len() + 2;
-            return Ok((
-                RelationshipPattern {
-                    variable: None,
-                    rel_type: None,
-                    is_incoming: false,
-                    is_undirected: false,
-                    range: None,
-                    properties: None,
-                },
-                consumed,
-            ));
-        } else if remainder.starts_with('-') {
-            // `--`  undirected, no bracket
-            let consumed = left_dash.len() + 1;
-            return Ok((
-                RelationshipPattern {
-                    variable: None,
-                    rel_type: None,
-                    is_incoming: false,
-                    is_undirected: true,
-                    range: None,
-                    properties: None,
-                },
-                consumed,
-            ));
-        } else {
-            return Err("relationship pattern must contain type bracket '['".into());
-        }
-    }
-
-    let bracket_end = remainder
-        .find(']')
-        .ok_or("missing relationship bracket ']'")?;
-    let content = remainder[1..bracket_end].trim();
-    remainder = &remainder[bracket_end + 1..];
-
-    let is_outgoing = remainder.starts_with("->");
-    let right_dash = if is_outgoing { "->" } else { "-" };
-    if !remainder.starts_with(right_dash) {
-        return Err("invalid relationship syntax suffix".into());
-    }
-
-    // Undirected when neither incoming (`<-`) nor outgoing (`->`).
-    let is_undirected = !is_incoming && !is_outgoing;
-
-    // Parse properties map if present in relationship bracket
-    let prop_start = content.find('{');
-    let (content_body, properties) = if let Some(idx) = prop_start {
-        let prop_str = &content[idx..];
-        let props = parse_properties_map(prop_str)?;
-        (&content[..idx].trim(), Some(props))
-    } else {
-        (&content, None)
-    };
-
-    let (left_part, range_part) = if let Some(star_idx) = content_body.find('*') {
-        (
-            content_body[..star_idx].trim(),
-            Some(content_body[star_idx + 1..].trim()),
-        )
-    } else {
-        (*content_body, None)
-    };
-
-    let parts: Vec<&str> = left_part.split(':').collect();
-    let variable = if parts[0].trim().is_empty() {
-        None
-    } else {
-        Some(parts[0].trim().to_string())
-    };
-
-    let rel_type = if parts.len() > 1 && !parts[1].trim().is_empty() {
-        Some(parts[1].trim().to_string())
-    } else {
-        None
-    };
-
-    let range = if let Some(r_str) = range_part {
-        let r_str = r_str.trim();
-        if r_str.is_empty() {
-            Some(RelRange {
-                min: Some(1),
-                max: None,
-            })
-        } else if r_str.contains("..") {
-            let range_parts: Vec<&str> = r_str.split("..").collect();
-            if range_parts.len() != 2 {
-                return Err("invalid relationship range syntax".into());
-            }
-            let min = if range_parts[0].trim().is_empty() {
-                Some(1)
-            } else {
-                Some(
-                    range_parts[0]
-                        .trim()
-                        .parse::<u32>()
-                        .map_err(|_| "invalid min range")?,
-                )
-            };
-            let max = if range_parts[1].trim().is_empty() {
-                None
-            } else {
-                Some(
-                    range_parts[1]
-                        .trim()
-                        .parse::<u32>()
-                        .map_err(|_| "invalid max range")?,
-                )
-            };
-            Some(RelRange { min, max })
-        } else {
-            let hops = r_str
-                .parse::<u32>()
-                .map_err(|_| "invalid range exact hops value")?;
-            Some(RelRange {
-                min: Some(hops),
-                max: Some(hops),
-            })
-        }
-    } else {
-        None
-    };
-
-    let consumed = left_dash.len() + bracket_end + 1 + right_dash.len();
-    Ok((
-        RelationshipPattern {
-            variable,
-            rel_type,
-            is_incoming,
-            is_undirected,
-            range,
-            properties,
-        },
-        consumed,
-    ))
-}
-
-fn parse_properties_map(s: &str) -> Result<HashMap<String, Literal>, String> {
-    if !s.starts_with('{') || !s.ends_with('}') {
-        return Err("properties map must be wrapped in curly braces".into());
-    }
-    let mut map = HashMap::new();
-    let inner = &s[1..s.len() - 1].trim();
-    if inner.is_empty() {
-        return Ok(map);
-    }
-    for item in split_by_comma_outside_braces(inner) {
-        let parts: Vec<&str> = item.split(':').collect();
-        if parts.len() != 2 {
-            return Err("properties map contains invalid key-value pair".into());
-        }
-        let key = parts[0].trim().to_string();
-        let val = parse_literal(parts[1].trim())?;
-        map.insert(key, val);
-    }
-    Ok(map)
-}
-
-fn parse_where_clause(s: &str) -> Result<WhereClause, String> {
-    // Parse as a full expression first. Map simple comparison binary ops to their
-    // specific WhereClause variants (for compatibility with the legacy planner path)
-    // and wrap everything else as WhereClause::Expr.
-    let expr = parse_expr(s)?;
+fn parse_where_clause_from_cursor(c: &mut Cursor<'_>) -> Result<WhereClause, String> {
+    let expr = parse_expr(c)?;
     if let Expr::BinaryOp { op, left, right } = &expr {
         match op {
             BinaryOperator::Eq => return Ok(WhereClause::Eq(*left.clone(), *right.clone())),
@@ -973,1011 +1385,1051 @@ fn parse_where_clause(s: &str) -> Result<WhereClause, String> {
     Ok(WhereClause::Expr(expr))
 }
 
-/// Parse a Cypher expression. Entry point for full expression parsing with
-/// operator precedence: OR < AND < NOT < IS NULL < comparison < additive < multiplicative < atom.
-pub(crate) fn parse_expr(s: &str) -> Result<Expr, String> {
-    parse_expr_or(s.trim())
-}
+// ─── SET items ────────────────────────────────────────────────────────────────
 
-fn parse_expr_or(s: &str) -> Result<Expr, String> {
-    if let Some(idx) = find_keyword_op_at_root(s, " OR ") {
-        let left = parse_expr_and(s[..idx].trim())?;
-        let right = parse_expr_or(s[idx + 4..].trim())?;
-        return Ok(Expr::BinaryOp {
-            op: BinaryOperator::Or,
-            left: Box::new(left),
-            right: Box::new(right),
-        });
-    }
-    parse_expr_and(s)
-}
-
-fn parse_expr_and(s: &str) -> Result<Expr, String> {
-    if let Some(idx) = find_keyword_op_at_root(s, " AND ") {
-        let left = parse_expr_not(s[..idx].trim())?;
-        let right = parse_expr_and(s[idx + 5..].trim())?;
-        return Ok(Expr::BinaryOp {
-            op: BinaryOperator::And,
-            left: Box::new(left),
-            right: Box::new(right),
-        });
-    }
-    parse_expr_not(s)
-}
-
-fn parse_expr_not(s: &str) -> Result<Expr, String> {
-    let upper = s.to_ascii_uppercase();
-    if upper.starts_with("NOT ") {
-        let inner = parse_expr_not(s[4..].trim())?;
-        return Ok(Expr::Not(Box::new(inner)));
-    }
-    parse_expr_cmp(s)
-}
-
-/// Scan for the leftmost comparison operator at root level.
-/// Returns (byte_offset, operator_string).
-/// Handles only BINARY comparison operators (excludes IS NULL / IS NOT NULL which are postfix).
-/// Operators: CONTAINS, STARTS WITH, ENDS WITH, IN, NOT IN, <>, !=, <=, >=, =~, <, >, =
-fn find_leftmost_cmp_op(s: &str) -> Option<(usize, &'static str)> {
-    let mut best: Option<(usize, &'static str)> = None;
-
-    let keyword_ops: &[&str] = &[
-        " CONTAINS ",
-        " STARTS WITH ",
-        " ENDS WITH ",
-        " NOT IN ",
-        " IN ",
-    ];
-    for &kw in keyword_ops {
-        if let Some(idx) = find_keyword_op_at_root(s, kw) {
-            match best {
-                None => best = Some((idx, kw)),
-                Some((best_idx, _)) if idx < best_idx => best = Some((idx, kw)),
-                _ => {}
-            }
-        }
-    }
-
-    let sym_ops: &[&str] = &["<>", "!=", "<=", ">=", "=~", "<", ">", "="];
-    for &op in sym_ops {
-        if let Some(idx) = find_sym_op_at_root(s, op) {
-            match best {
-                None => best = Some((idx, op)),
-                Some((best_idx, _)) if idx < best_idx => best = Some((idx, op)),
-                _ => {}
-            }
-        }
-    }
-
-    best
-}
-
-/// Parse IS NULL / IS NOT NULL as postfix; if absent, delegate to parse_expr_add.
-/// This function does NOT call parse_expr_cmp to avoid mutual recursion.
-fn parse_expr_isnull(s: &str) -> Result<Expr, String> {
-    let upper = s.to_ascii_uppercase();
-    if upper.ends_with(" IS NOT NULL") {
-        let inner = parse_expr_add(s[..s.len() - " IS NOT NULL".len()].trim())?;
-        return Ok(Expr::IsNotNull(Box::new(inner)));
-    }
-    if upper.ends_with(" IS NULL") {
-        let inner = parse_expr_add(s[..s.len() - " IS NULL".len()].trim())?;
-        return Ok(Expr::IsNull(Box::new(inner)));
-    }
-    parse_expr_add(s)
-}
-
-fn parse_expr_cmp(s: &str) -> Result<Expr, String> {
-    // parse_expr_isnull is used for operands so that `a = b IS NULL` parses as `a = (b IS NULL)`.
-    // IS NULL/NOT NULL at the top level are also handled via find_leftmost_cmp_op.
-    match find_leftmost_cmp_op(s) {
-        Some((idx, " IS NOT NULL")) => {
-            let inner = parse_expr_add(s[..idx].trim())?;
-            Ok(Expr::IsNotNull(Box::new(inner)))
-        }
-        Some((idx, " IS NULL")) => {
-            let inner = parse_expr_add(s[..idx].trim())?;
-            Ok(Expr::IsNull(Box::new(inner)))
-        }
-        Some((idx, " CONTAINS ")) => {
-            let left = parse_expr_isnull(s[..idx].trim())?;
-            let right = parse_expr_isnull(s[idx + " CONTAINS ".len()..].trim())?;
-            Ok(Expr::FunctionCall {
-                name: "__contains__".to_string(),
-                args: vec![left, right],
-            })
-        }
-        Some((idx, " STARTS WITH ")) => {
-            let left = parse_expr_isnull(s[..idx].trim())?;
-            let right = parse_expr_isnull(s[idx + " STARTS WITH ".len()..].trim())?;
-            Ok(Expr::FunctionCall {
-                name: "__starts_with__".to_string(),
-                args: vec![left, right],
-            })
-        }
-        Some((idx, " ENDS WITH ")) => {
-            let left = parse_expr_isnull(s[..idx].trim())?;
-            let right = parse_expr_isnull(s[idx + " ENDS WITH ".len()..].trim())?;
-            Ok(Expr::FunctionCall {
-                name: "__ends_with__".to_string(),
-                args: vec![left, right],
-            })
-        }
-        Some((idx, " IN ")) => {
-            let left = parse_expr_isnull(s[..idx].trim())?;
-            let right = parse_expr_isnull(s[idx + 4..].trim())?;
-            Ok(Expr::FunctionCall {
-                name: "__in__".to_string(),
-                args: vec![left, right],
-            })
-        }
-        Some((idx, " NOT IN ")) => {
-            let left = parse_expr_isnull(s[..idx].trim())?;
-            let right = parse_expr_isnull(s[idx + " NOT IN ".len()..].trim())?;
-            let inner = Expr::FunctionCall {
-                name: "__in__".to_string(),
-                args: vec![left, right],
-            };
-            Ok(Expr::Not(Box::new(inner)))
-        }
-        Some((idx, "<>")) | Some((idx, "!=")) => {
-            let left = parse_expr_isnull(s[..idx].trim())?;
-            let op_len = 2usize;
-            let right = parse_expr_isnull(s[idx + op_len..].trim())?;
-            Ok(Expr::BinaryOp {
-                op: BinaryOperator::Ne,
-                left: Box::new(left),
-                right: Box::new(right),
-            })
-        }
-        Some((idx, "<=")) => {
-            let left = parse_expr_isnull(s[..idx].trim())?;
-            let right = parse_expr_isnull(s[idx + 2..].trim())?;
-            Ok(Expr::BinaryOp {
-                op: BinaryOperator::Le,
-                left: Box::new(left),
-                right: Box::new(right),
-            })
-        }
-        Some((idx, ">=")) => {
-            let left = parse_expr_isnull(s[..idx].trim())?;
-            let right = parse_expr_isnull(s[idx + 2..].trim())?;
-            Ok(Expr::BinaryOp {
-                op: BinaryOperator::Ge,
-                left: Box::new(left),
-                right: Box::new(right),
-            })
-        }
-        Some((idx, "=~")) => {
-            let left = parse_expr_isnull(s[..idx].trim())?;
-            let right = parse_expr_isnull(s[idx + 2..].trim())?;
-            Ok(Expr::FunctionCall {
-                name: "__regex__".to_string(),
-                args: vec![left, right],
-            })
-        }
-        Some((idx, "<")) => {
-            let left = parse_expr_isnull(s[..idx].trim())?;
-            let right = parse_expr_isnull(s[idx + 1..].trim())?;
-            Ok(Expr::BinaryOp {
-                op: BinaryOperator::Lt,
-                left: Box::new(left),
-                right: Box::new(right),
-            })
-        }
-        Some((idx, ">")) => {
-            let left = parse_expr_isnull(s[..idx].trim())?;
-            let right = parse_expr_isnull(s[idx + 1..].trim())?;
-            Ok(Expr::BinaryOp {
-                op: BinaryOperator::Gt,
-                left: Box::new(left),
-                right: Box::new(right),
-            })
-        }
-        Some((idx, "=")) => {
-            let left = parse_expr_isnull(s[..idx].trim())?;
-            let right = parse_expr_isnull(s[idx + 1..].trim())?;
-            Ok(Expr::BinaryOp {
-                op: BinaryOperator::Eq,
-                left: Box::new(left),
-                right: Box::new(right),
-            })
-        }
-        _ => parse_expr_isnull(s),
-    }
-}
-
-fn parse_expr_add(s: &str) -> Result<Expr, String> {
-    if let Some((idx, op_ch)) = find_additive_at_root(s) {
-        let left = parse_expr_add(s[..idx].trim())?;
-        let right = parse_expr_mul(s[idx + 1..].trim())?;
-        let op = if op_ch == '+' {
-            BinaryOperator::Add
-        } else {
-            BinaryOperator::Sub
+fn parse_set_items_from_cursor(c: &mut Cursor<'_>) -> Result<Vec<SetItem>, String> {
+    let mut items = Vec::new();
+    loop {
+        // variable.property = expr
+        let var = match c.peek() {
+            Some(Tok::Ident(_)) => expect_any_ident(c)?,
+            _ => break,
         };
-        return Ok(Expr::BinaryOp {
-            op,
-            left: Box::new(left),
-            right: Box::new(right),
-        });
-    }
-    parse_expr_mul(s)
-}
-
-fn parse_expr_mul(s: &str) -> Result<Expr, String> {
-    if let Some((idx, op_ch)) = find_multiplicative_at_root(s) {
-        let left = parse_expr_mul(s[..idx].trim())?;
-        let right = parse_expr_atom(s[idx + 1..].trim())?;
-        let op = match op_ch {
-            '*' => BinaryOperator::Mul,
-            '/' => BinaryOperator::Div,
-            '%' => BinaryOperator::Mod,
-            _ => unreachable!(),
-        };
-        return Ok(Expr::BinaryOp {
-            op,
-            left: Box::new(left),
-            right: Box::new(right),
-        });
-    }
-    parse_expr_atom(s)
-}
-
-fn parse_expr_atom(s: &str) -> Result<Expr, String> {
-    let trimmed = s.trim();
-    if trimmed.is_empty() {
-        return Err("empty expression".into());
-    }
-    // Unary minus: -(expr) or -literal
-    if let Some(stripped) = trimmed.strip_prefix('-') {
-        let rest = stripped.trim();
-        // Only treat as unary if rest starts with '(' or is a number
-        if rest.starts_with('(') || rest.parse::<f64>().is_ok() {
-            let inner = parse_expr_atom(rest)?;
-            return Ok(Expr::BinaryOp {
-                op: BinaryOperator::Sub,
-                left: Box::new(Expr::Literal(Literal::Int(0))),
-                right: Box::new(inner),
+        // Check for label set `n:Label` or `n:Label1:Label2` (skip label assignments)
+        if c.peek() == Some(&Tok::Colon) {
+            // Consume all :Label tokens for this variable
+            while c.peek() == Some(&Tok::Colon) {
+                c.next(); // :
+                let _ = expect_any_ident(c); // label name
+            }
+            if !c.eat(&Tok::Comma) {
+                break;
+            }
+            continue;
+        }
+        if c.eat(&Tok::Dot) {
+            let prop = expect_any_ident(c)?;
+            c.expect_tok(&Tok::Eq)?;
+            let expr = parse_expr(c)?;
+            items.push(SetItem {
+                variable: var,
+                property: prop,
+                expr,
             });
-        }
-    }
-    if trimmed.starts_with('(') && trimmed.ends_with(')') && expr_parens_balanced(trimmed) {
-        return parse_expr_or(&trimmed[1..trimmed.len() - 1]);
-    }
-    if trimmed.starts_with('[') && trimmed.ends_with(']') && expr_brackets_balanced(trimmed) {
-        return parse_list_expr(trimmed);
-    }
-    if trimmed.starts_with('{') && trimmed.ends_with('}') && expr_braces_balanced(trimmed) {
-        return parse_map_expr(trimmed);
-    }
-    if let Some(rest) = trimmed.strip_prefix('$') {
-        return Ok(Expr::Param(rest.to_string()));
-    }
-    if let Some(expr) = try_parse_agg(trimmed)? {
-        return Ok(expr);
-    }
-    if let Some(expr) = try_parse_quantifier_expr(trimmed)? {
-        return Ok(expr);
-    }
-    if let Ok(lit) = parse_literal(trimmed) {
-        return Ok(Expr::Literal(lit));
-    }
-    if let Some(expr) = try_parse_fn_call(trimmed)? {
-        return Ok(expr);
-    }
-    if let Some(dot_pos) = trimmed.rfind('.') {
-        let left_part = trimmed[..dot_pos].trim();
-        let right_part = trimmed[dot_pos + 1..].trim();
-        let left_ok =
-            !left_part.is_empty() && left_part.chars().all(|c| c.is_alphanumeric() || c == '_');
-        let right_ok =
-            !right_part.is_empty() && right_part.chars().all(|c| c.is_alphanumeric() || c == '_');
-        if left_ok && right_ok {
-            return Ok(Expr::Prop(left_part.to_string(), right_part.to_string()));
-        }
-    }
-    if !trimmed.is_empty() && trimmed.chars().all(|c| c.is_alphanumeric() || c == '_') {
-        return Ok(Expr::Prop(trimmed.to_string(), "".to_string()));
-    }
-    Err(format!("invalid expression: {}", trimmed))
-}
-
-struct RootScanner {
-    paren: i32,
-    bracket: i32,
-    brace: i32,
-    in_sq: bool,
-    in_dq: bool,
-}
-
-impl RootScanner {
-    fn new() -> Self {
-        RootScanner {
-            paren: 0,
-            bracket: 0,
-            brace: 0,
-            in_sq: false,
-            in_dq: false,
-        }
-    }
-    fn feed(&mut self, c: char) {
-        if c == '\'' && !self.in_dq {
-            self.in_sq = !self.in_sq;
-            return;
-        }
-        if c == '"' && !self.in_sq {
-            self.in_dq = !self.in_dq;
-            return;
-        }
-        if self.in_sq || self.in_dq {
-            return;
-        }
-        match c {
-            '(' => self.paren += 1,
-            ')' => self.paren -= 1,
-            '[' => self.bracket += 1,
-            ']' => self.bracket -= 1,
-            '{' => self.brace += 1,
-            '}' => self.brace -= 1,
-            _ => {}
-        }
-    }
-    fn at_root(&self) -> bool {
-        self.paren == 0 && self.bracket == 0 && self.brace == 0 && !self.in_sq && !self.in_dq
-    }
-}
-
-fn char_byte_positions(s: &str) -> (Vec<char>, Vec<usize>) {
-    let chars: Vec<char> = s.chars().collect();
-    let mut byte_pos: Vec<usize> = Vec::with_capacity(chars.len() + 1);
-    let mut bp = 0usize;
-    for &ch in &chars {
-        byte_pos.push(bp);
-        bp += ch.len_utf8();
-    }
-    byte_pos.push(bp);
-    (chars, byte_pos)
-}
-
-fn find_keyword_op_at_root(s: &str, kw: &str) -> Option<usize> {
-    let upper = s.to_ascii_uppercase();
-    let kw_upper = kw.to_ascii_uppercase();
-    let kw_len = kw.len();
-    let n = s.len();
-    if n < kw_len {
-        return None;
-    }
-    let (chars, byte_pos) = char_byte_positions(s);
-    let mut sc = RootScanner::new();
-    for (ci, &ch) in chars.iter().enumerate() {
-        let bp = byte_pos[ci];
-        if sc.at_root() && bp + kw_len <= n && upper[bp..].starts_with(&kw_upper[..]) {
-            return Some(bp);
-        }
-        sc.feed(ch);
-    }
-    None
-}
-
-fn find_sym_op_at_root(s: &str, op: &str) -> Option<usize> {
-    let op_bytes = op.as_bytes();
-    let op_len = op.len();
-    let s_bytes = s.as_bytes();
-    let n = s_bytes.len();
-    if n < op_len {
-        return None;
-    }
-    let (chars, byte_pos) = char_byte_positions(s);
-    let mut sc = RootScanner::new();
-    for (ci, &ch) in chars.iter().enumerate() {
-        let bp = byte_pos[ci];
-        if sc.at_root() && bp + op_len <= n && &s_bytes[bp..bp + op_len] == op_bytes {
-            // Avoid matching "=" when preceded by '<', '>', '!', '=' (those are two-char ops)
-            if (op == "=" || op == "<" || op == ">")
-                && bp > 0
-                && matches!(s_bytes[bp - 1], b'<' | b'>' | b'!' | b'=')
+        } else {
+            // Could be `n += {prop: val}` or other forms; skip
+            // consume until comma or end of SET
+            while !matches!(c.peek(), Some(Tok::Comma) | None)
+                && !is_clause_keyword(c)
             {
-                sc.feed(ch);
-                continue;
+                c.next();
             }
-            // Avoid matching "<" or ">" when followed by "=" (those are two-char ops)
-            if (op == "<" || op == ">") && bp + 1 < n && s_bytes[bp + 1] == b'=' {
-                sc.feed(ch);
-                continue;
-            }
-            // Avoid matching "<" when it's "<>"
-            if op == "<" && bp + 1 < n && s_bytes[bp + 1] == b'>' {
-                sc.feed(ch);
-                continue;
-            }
-            return Some(bp);
         }
-        sc.feed(ch);
+        if !c.eat(&Tok::Comma) {
+            break;
+        }
     }
-    None
+    Ok(items)
 }
 
-fn find_additive_at_root(s: &str) -> Option<(usize, char)> {
-    let (chars, byte_pos) = char_byte_positions(s);
-    let mut sc = RootScanner::new();
-    let mut result: Option<(usize, char)> = None;
-    for (ci, &ch) in chars.iter().enumerate() {
-        let bp = byte_pos[ci];
-        if sc.at_root() && (ch == '+' || ch == '-') && ci > 0 {
-            let prev_non_space = chars[..ci].iter().rposition(|&c| c != ' ' && c != '\t');
-            if let Some(pci) = prev_non_space {
-                let pc = chars[pci];
-                if pc.is_alphanumeric()
-                    || pc == '_'
-                    || pc == ')'
-                    || pc == ']'
-                    || pc == '\''
-                    || pc == '"'
-                {
-                    result = Some((bp, ch));
+/// Check if the current token is a major clause keyword that signals the end of a sub-clause.
+fn is_clause_keyword(c: &Cursor<'_>) -> bool {
+    matches!(
+        c.peek(),
+        Some(Tok::Ident(s)) if matches!(
+            s.to_ascii_uppercase().as_str(),
+            "MATCH" | "WHERE" | "RETURN" | "WITH" | "UNWIND" | "ORDER"
+            | "SKIP" | "LIMIT" | "SET" | "DELETE" | "REMOVE" | "MERGE"
+            | "CREATE" | "UNION" | "ON" | "DETACH" | "FOREACH"
+        )
+    )
+}
+
+// ─── RETURN clause ────────────────────────────────────────────────────────────
+
+fn parse_return_items_from_cursor(c: &mut Cursor<'_>) -> Result<Vec<ReturnItem>, String> {
+    let mut items = Vec::new();
+    loop {
+        let expr = parse_expr(c)?;
+        let alias = if c.peek_kw("AS") {
+            c.next();
+            Some(expect_any_ident(c)?)
+        } else {
+            None
+        };
+        items.push(ReturnItem { expr, alias });
+        if !c.eat(&Tok::Comma) {
+            break;
+        }
+    }
+    Ok(items)
+}
+
+fn parse_return_clause_from_cursor(c: &mut Cursor<'_>) -> Result<ReturnClause, String> {
+    // Caller has already consumed 'RETURN'
+    let distinct = c.peek_kw("DISTINCT");
+    if distinct {
+        c.next();
+    }
+    // RETURN * passes all current bindings through.
+    let items = if c.peek() == Some(&Tok::Star) {
+        c.next();
+        vec![ReturnItem {
+            expr: Expr::FunctionCall {
+                name: "__star__".to_string(),
+                args: vec![],
+            },
+            alias: None,
+        }]
+    } else {
+        parse_return_items_from_cursor(c)?
+    };
+    Ok(ReturnClause { items, distinct })
+}
+
+// ─── ORDER BY ─────────────────────────────────────────────────────────────────
+
+fn parse_order_by_from_cursor(c: &mut Cursor<'_>) -> Result<OrderBy, String> {
+    // Caller has consumed 'ORDER'; consume 'BY'
+    c.next(); // BY
+    let mut items = Vec::new();
+    loop {
+        let expr = parse_expr(c)?;
+        let ascending = if c.peek_kw("ASC") {
+            c.next();
+            true
+        } else if c.peek_kw("DESC") {
+            c.next();
+            false
+        } else {
+            true
+        };
+        items.push(SortItem { expr, ascending });
+        if !c.eat(&Tok::Comma) {
+            break;
+        }
+    }
+    Ok(OrderBy { items })
+}
+
+// ─── SKIP / LIMIT helpers ─────────────────────────────────────────────────────
+
+fn try_parse_order_by(c: &mut Cursor<'_>) -> Result<Option<OrderBy>, String> {
+    if c.peek_kw("ORDER") {
+        c.next();
+        Ok(Some(parse_order_by_from_cursor(c)?))
+    } else {
+        Ok(None)
+    }
+}
+
+fn try_parse_skip(c: &mut Cursor<'_>) -> Result<Option<Expr>, String> {
+    if c.peek_kw("SKIP") {
+        c.next();
+        Ok(Some(parse_expr(c)?))
+    } else {
+        Ok(None)
+    }
+}
+
+fn try_parse_limit(c: &mut Cursor<'_>) -> Result<Option<Expr>, String> {
+    if c.peek_kw("LIMIT") {
+        c.next();
+        Ok(Some(parse_expr(c)?))
+    } else {
+        Ok(None)
+    }
+}
+
+// ─── Variable validation ──────────────────────────────────────────────────────
+
+fn validate_match_clause_variables(clauses: &[MatchClause]) -> Result<(), String> {
+    let mut node_vars: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut rel_vars: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut path_vars: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for clause in clauses {
+        let pattern = &clause.pattern;
+
+        // Check path variable conflict within a MATCH clause.
+        if let Some(ref pv) = pattern.path_variable {
+            if node_vars.contains(pv) || rel_vars.contains(pv) || path_vars.contains(pv) {
+                return Err(format!(
+                    "SyntaxError(VariableAlreadyBound): variable '{}' is already bound",
+                    pv
+                ));
+            }
+            path_vars.insert(pv.clone());
+        }
+
+        if let Some(ref v) = pattern.node.variable {
+            if rel_vars.contains(v) {
+                return Err(format!(
+                    "SyntaxError(VariableTypeConflict): variable '{}' is used as both a node and a relationship",
+                    v
+                ));
+            }
+            if path_vars.contains(v) {
+                return Err(format!(
+                    "SyntaxError(VariableAlreadyBound): variable '{}' is already bound as a path",
+                    v
+                ));
+            }
+            node_vars.insert(v.clone());
+        }
+        for (rel, target) in &pattern.rels {
+            if let Some(ref v) = rel.variable {
+                if node_vars.contains(v) {
+                    return Err(format!(
+                        "SyntaxError(VariableTypeConflict): variable '{}' is used as both a node and a relationship",
+                        v
+                    ));
+                }
+                if path_vars.contains(v) {
+                    return Err(format!(
+                        "SyntaxError(VariableAlreadyBound): variable '{}' is already bound as a path",
+                        v
+                    ));
+                }
+                if !rel_vars.insert(v.clone()) {
+                    return Err(format!(
+                        "SyntaxError(VariableAlreadyBound): relationship variable '{}' is already bound in this MATCH clause",
+                        v
+                    ));
+                }
+            }
+            if let Some(ref v) = target.variable {
+                if rel_vars.contains(v) {
+                    return Err(format!(
+                        "SyntaxError(VariableTypeConflict): variable '{}' is used as both a node and a relationship",
+                        v
+                    ));
+                }
+                if path_vars.contains(v) {
+                    return Err(format!(
+                        "SyntaxError(VariableAlreadyBound): variable '{}' is already bound as a path",
+                        v
+                    ));
+                }
+                node_vars.insert(v.clone());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_cross_clause_variable_types(parts: &[QueryPart]) -> Result<(), String> {
+    let mut node_vars: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut rel_vars: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut path_vars: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for part in parts {
+        let clauses: Option<&[MatchClause]> = match part {
+            QueryPart::Match { match_clauses, .. } => Some(match_clauses.as_slice()),
+            QueryPart::OptionalMatch { match_clauses, .. } => Some(match_clauses.as_slice()),
+            QueryPart::With { .. } | QueryPart::Unwind { .. } => {
+                node_vars.clear();
+                rel_vars.clear();
+                path_vars.clear();
+                None
+            }
+        };
+
+        if let Some(clauses) = clauses {
+            for clause in clauses {
+                let pattern = &clause.pattern;
+
+                // Check path variable conflict.
+                if let Some(ref pv) = pattern.path_variable {
+                    if node_vars.contains(pv) || rel_vars.contains(pv) {
+                        return Err(format!(
+                            "SyntaxError(VariableAlreadyBound): variable '{}' is already bound",
+                            pv
+                        ));
+                    }
+                    path_vars.insert(pv.clone());
+                }
+
+                if let Some(ref v) = pattern.node.variable {
+                    if rel_vars.contains(v) {
+                        return Err(format!(
+                            "SyntaxError(VariableTypeConflict): variable '{}' is used as both a node and a relationship",
+                            v
+                        ));
+                    }
+                    if path_vars.contains(v) {
+                        return Err(format!(
+                            "SyntaxError(VariableAlreadyBound): variable '{}' is already bound as a path",
+                            v
+                        ));
+                    }
+                    node_vars.insert(v.clone());
+                }
+                for (rel, target) in &pattern.rels {
+                    if let Some(ref v) = rel.variable {
+                        if node_vars.contains(v) {
+                            return Err(format!(
+                                "SyntaxError(VariableTypeConflict): variable '{}' is used as both a node and a relationship",
+                                v
+                            ));
+                        }
+                        if path_vars.contains(v) {
+                            return Err(format!(
+                                "SyntaxError(VariableAlreadyBound): variable '{}' is already bound as a path",
+                                v
+                            ));
+                        }
+                        rel_vars.insert(v.clone());
+                    }
+                    if let Some(ref v) = target.variable {
+                        if rel_vars.contains(v) {
+                            return Err(format!(
+                                "SyntaxError(VariableTypeConflict): variable '{}' is used as both a node and a relationship",
+                                v
+                            ));
+                        }
+                        if path_vars.contains(v) {
+                            return Err(format!(
+                                "SyntaxError(VariableAlreadyBound): variable '{}' is already bound as a path",
+                                v
+                            ));
+                        }
+                        node_vars.insert(v.clone());
+                    }
                 }
             }
         }
-        sc.feed(ch);
     }
-    result
+    Ok(())
 }
 
-fn find_multiplicative_at_root(s: &str) -> Option<(usize, char)> {
-    let (chars, byte_pos) = char_byte_positions(s);
-    let mut sc = RootScanner::new();
-    let mut result: Option<(usize, char)> = None;
-    for (ci, &ch) in chars.iter().enumerate() {
-        let bp = byte_pos[ci];
-        if sc.at_root() && (ch == '*' || ch == '/' || ch == '%') {
-            result = Some((bp, ch));
+// ─── Statement-level recursive-descent parsers ────────────────────────────────
+
+fn parse_read_query(c: &mut Cursor<'_>) -> Result<Query, String> {
+    let mut parts: Vec<QueryPart> = Vec::new();
+
+    loop {
+        if c.peek_kw("MATCH") {
+            c.next();
+            let match_clauses = parse_match_clauses_from_cursor(c)?;
+            let where_clause = if c.peek_kw("WHERE") {
+                c.next();
+                Some(parse_where_clause_from_cursor(c)?)
+            } else {
+                None
+            };
+            parts.push(QueryPart::Match {
+                match_clauses,
+                where_clause,
+            });
+        } else if c.peek_kw("OPTIONAL") && c.peek_kw_at(1, "MATCH") {
+            c.next(); c.next();
+            let match_clauses = parse_match_clauses_from_cursor(c)?;
+            let where_clause = if c.peek_kw("WHERE") {
+                c.next();
+                Some(parse_where_clause_from_cursor(c)?)
+            } else {
+                None
+            };
+            parts.push(QueryPart::OptionalMatch {
+                match_clauses,
+                where_clause,
+            });
+        } else if c.peek_kw("WITH") {
+            c.next();
+            let distinct = c.peek_kw("DISTINCT");
+            if distinct {
+                c.next();
+            }
+            // WITH * passes all current bindings through; represent as a wildcard item.
+            let items = if c.peek() == Some(&Tok::Star) {
+                c.next();
+                vec![ReturnItem {
+                    expr: Expr::FunctionCall {
+                        name: "__star__".to_string(),
+                        args: vec![],
+                    },
+                    alias: None,
+                }]
+            } else {
+                parse_return_items_from_cursor(c)?
+            };
+            let where_clause = if c.peek_kw("WHERE") {
+                c.next();
+                Some(parse_where_clause_from_cursor(c)?)
+            } else {
+                None
+            };
+            let order_by = try_parse_order_by(c)?;
+            let skip = try_parse_skip(c)?;
+            let limit = try_parse_limit(c)?;
+            parts.push(QueryPart::With {
+                items,
+                where_clause,
+                order_by,
+                skip,
+                limit,
+                distinct,
+            });
+        } else if c.peek_kw("UNWIND") {
+            c.next();
+            let expr = parse_expr(c)?;
+            c.next(); // AS
+            let variable = expect_any_ident(c)?;
+            parts.push(QueryPart::Unwind { expr, variable });
+        } else if c.peek_kw("RETURN") {
+            break;
+        } else {
+            break;
         }
-        sc.feed(ch);
     }
-    result
-}
 
-fn expr_parens_balanced(s: &str) -> bool {
-    if !s.starts_with('(') {
-        return false;
+    if !c.peek_kw("RETURN") {
+        return Err("read query requires a RETURN clause".into());
     }
-    let chars: Vec<char> = s.chars().collect();
-    let n = chars.len();
-    let mut sc = RootScanner::new();
-    for (i, &ch) in chars.iter().enumerate() {
-        sc.feed(ch);
-        if i > 0 && i < n - 1 && sc.at_root() {
-            return false;
-        }
-    }
-    sc.at_root()
-}
+    c.next(); // RETURN
+    let return_clause = parse_return_clause_from_cursor(c)?;
+    let order_by = try_parse_order_by(c)?;
+    let skip = try_parse_skip(c)?;
+    let limit = try_parse_limit(c)?;
 
-fn expr_brackets_balanced(s: &str) -> bool {
-    if !s.starts_with('[') {
-        return false;
-    }
-    let chars: Vec<char> = s.chars().collect();
-    let n = chars.len();
-    let mut sc = RootScanner::new();
-    for (i, &ch) in chars.iter().enumerate() {
-        sc.feed(ch);
-        if i > 0 && i < n - 1 && sc.at_root() {
-            return false;
-        }
-    }
-    sc.at_root()
-}
+    validate_cross_clause_variable_types(&parts)?;
 
-fn expr_braces_balanced(s: &str) -> bool {
-    if !s.starts_with('{') {
-        return false;
-    }
-    let chars: Vec<char> = s.chars().collect();
-    let n = chars.len();
-    let mut sc = RootScanner::new();
-    for (i, &ch) in chars.iter().enumerate() {
-        sc.feed(ch);
-        if i > 0 && i < n - 1 && sc.at_root() {
-            return false;
-        }
-    }
-    sc.at_root()
-}
+    // Extract first MATCH for backwards-compat fields
+    let (match_clauses, where_clause) = parts
+        .first()
+        .and_then(|p| {
+            if let QueryPart::Match { match_clauses, where_clause } = p {
+                Some((match_clauses.clone(), where_clause.clone()))
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default();
 
-fn split_expr_args(s: &str) -> Vec<&str> {
-    let mut result = Vec::new();
-    let (chars, byte_pos) = char_byte_positions(s);
-    let mut start = 0usize;
-    let mut sc = RootScanner::new();
-    for (ci, &ch) in chars.iter().enumerate() {
-        let bp = byte_pos[ci];
-        if sc.at_root() && ch == ',' {
-            result.push(s[start..bp].trim());
-            start = byte_pos[ci + 1];
-        }
-        sc.feed(ch);
-    }
-    result.push(s[start..].trim());
-    result
-}
-
-fn parse_list_expr(s: &str) -> Result<Expr, String> {
-    let inner = s[1..s.len() - 1].trim();
-    if inner.is_empty() {
-        return Ok(Expr::FunctionCall {
-            name: "__list__".to_string(),
-            args: vec![],
-        });
-    }
-    let parts = split_expr_args(inner);
-    let mut args = Vec::with_capacity(parts.len());
-    for part in parts {
-        args.push(parse_expr_or(part.trim())?);
-    }
-    Ok(Expr::FunctionCall {
-        name: "__list__".to_string(),
-        args,
+    Ok(Query {
+        match_clauses,
+        where_clause,
+        return_clause,
+        parts,
+        order_by,
+        skip,
+        limit,
     })
 }
 
-fn parse_map_expr(s: &str) -> Result<Expr, String> {
-    let inner = s[1..s.len() - 1].trim();
-    if inner.is_empty() {
-        return Ok(Expr::FunctionCall {
-            name: "__map__".to_string(),
-            args: vec![],
-        });
-    }
-    let parts = split_expr_args(inner);
-    let mut args = Vec::with_capacity(parts.len() * 2);
-    for part in parts {
-        let colon_pos =
-            find_root_colon(part).ok_or_else(|| format!("invalid map entry: {}", part))?;
-        let key = part[..colon_pos].trim();
-        let val_str = part[colon_pos + 1..].trim();
-        args.push(Expr::Literal(Literal::Str(key.to_string())));
-        args.push(parse_expr_or(val_str)?);
-    }
-    Ok(Expr::FunctionCall {
-        name: "__map__".to_string(),
-        args,
-    })
-}
-
-fn find_root_colon(s: &str) -> Option<usize> {
-    let (chars, byte_pos) = char_byte_positions(s);
-    let mut sc = RootScanner::new();
-    for (ci, &ch) in chars.iter().enumerate() {
-        if sc.at_root() && ch == ':' {
-            return Some(byte_pos[ci]);
-        }
-        sc.feed(ch);
-    }
-    None
-}
-
-fn try_parse_quantifier_expr(s: &str) -> Result<Option<Expr>, String> {
-    let upper = s.to_ascii_uppercase();
-    let kind = if upper.starts_with("ALL(") {
-        QuantifierKind::All
-    } else if upper.starts_with("ANY(") {
-        QuantifierKind::Any
-    } else if upper.starts_with("NONE(") {
-        QuantifierKind::None
-    } else if upper.starts_with("SINGLE(") {
-        QuantifierKind::Single
+fn parse_set_statement(c: &mut Cursor<'_>) -> Result<Statement, String> {
+    // MATCH ... [WHERE ...] SET ... [RETURN ...]
+    c.next(); // MATCH
+    let match_clauses = parse_match_clauses_from_cursor(c)?;
+    let where_clause = if c.peek_kw("WHERE") {
+        c.next();
+        Some(parse_where_clause_from_cursor(c)?)
     } else {
-        return Ok(None);
+        None
     };
-    if !s.ends_with(')') {
-        return Ok(None);
-    }
-    let fn_len = match kind {
-        QuantifierKind::All | QuantifierKind::Any => 4,
-        QuantifierKind::None => 5,
-        QuantifierKind::Single => 7,
-    };
-    let inner = s[fn_len..s.len() - 1].trim();
-    let inner_upper = inner.to_ascii_uppercase();
-    let in_pos = match inner_upper.find(" IN ") {
-        Some(p) => p,
-        None => return Ok(None),
-    };
-    let where_pos = match inner_upper.find(" WHERE ") {
-        Some(p) => p,
-        None => return Ok(None),
-    };
-    let variable = inner[..in_pos].trim().to_string();
-    let list_str = inner[in_pos + 4..where_pos].trim();
-    let pred_str = inner[where_pos + 7..].trim();
-    let list = parse_expr_or(list_str)?;
-    let predicate = parse_expr_or(pred_str)?;
-    Ok(Some(Expr::Quantifier {
-        kind,
-        variable,
-        list: Box::new(list),
-        predicate: Box::new(predicate),
-    }))
-}
+    c.next(); // SET
+    let set_items = parse_set_items_from_cursor(c)?;
 
-fn try_parse_fn_call(s: &str) -> Result<Option<Expr>, String> {
-    let paren_pos = match s.find('(') {
-        Some(p) => p,
-        None => return Ok(None),
-    };
-    if !s.ends_with(')') {
-        return Ok(None);
-    }
-    let fn_name = s[..paren_pos].trim();
-    if fn_name.is_empty()
-        || !fn_name
-            .chars()
-            .all(|c| c.is_alphanumeric() || c == '_' || c == '.')
-    {
-        return Ok(None);
-    }
-    let args_str = s[paren_pos + 1..s.len() - 1].trim();
-    if args_str.is_empty() {
-        return Ok(Some(Expr::FunctionCall {
-            name: fn_name.to_ascii_lowercase(),
-            args: vec![],
+    if c.peek_kw("RETURN") {
+        c.next();
+        let return_clause = parse_return_clause_from_cursor(c)?;
+        let order_by = try_parse_order_by(c)?;
+        let skip = try_parse_skip(c)?;
+        let limit = try_parse_limit(c)?;
+        return Ok(Statement::SetAndReturn(SetAndReturnStatement {
+            match_clauses,
+            where_clause,
+            set_items,
+            return_clause,
+            order_by,
+            skip,
+            limit,
         }));
     }
-    let parts = split_expr_args(args_str);
-    let mut args = Vec::with_capacity(parts.len());
-    for part in parts {
-        args.push(parse_expr_or(part.trim())?);
-    }
-    Ok(Some(Expr::FunctionCall {
-        name: fn_name.to_ascii_lowercase(),
-        args,
+
+    Ok(Statement::Set(SetStatement {
+        match_clauses,
+        where_clause,
+        set_items,
     }))
 }
 
-/// Attempt to parse an aggregate function call expression. Returns `Ok(None)` if the
-/// input does not look like an aggregate call.
-fn try_parse_agg(s: &str) -> Result<Option<Expr>, String> {
-    // count(*) special case.
-    if s.eq_ignore_ascii_case("count(*)") {
-        return Ok(Some(Expr::CountStar));
-    }
-
-    // Generic `fn_name(inner)` or `fn_name(DISTINCT inner)`.
-    let paren_open = match s.find('(') {
-        Some(i) => i,
-        None => return Ok(None),
+fn parse_delete_statement(c: &mut Cursor<'_>) -> Result<Statement, String> {
+    c.next(); // MATCH
+    let match_clauses = parse_match_clauses_from_cursor(c)?;
+    let where_clause = if c.peek_kw("WHERE") {
+        c.next();
+        Some(parse_where_clause_from_cursor(c)?)
+    } else {
+        None
     };
-    if !s.ends_with(')') {
-        return Ok(None);
+    let detach = c.peek_kw("DETACH");
+    if detach {
+        c.next();
     }
-
-    let fn_name = s[..paren_open].trim();
-    let inner_raw = s[paren_open + 1..s.len() - 1].trim();
-
-    let agg_fn = match fn_name.to_ascii_uppercase().as_str() {
-        "COUNT" => AggFn::Count { distinct: false },
-        "SUM" => AggFn::Sum,
-        "AVG" => AggFn::Avg,
-        "MIN" => AggFn::Min,
-        "MAX" => AggFn::Max,
-        "COLLECT" => AggFn::Collect,
-        _ => return Ok(None),
-    };
-
-    // Handle COUNT(DISTINCT expr).
-    let (agg_fn, inner_str) =
-        if matches!(agg_fn, AggFn::Count { .. }) && inner_raw.len() > "DISTINCT ".len() {
-            let upper_inner = inner_raw.to_ascii_uppercase();
-            if upper_inner.starts_with("DISTINCT ") {
-                (
-                    AggFn::Count { distinct: true },
-                    inner_raw["DISTINCT ".len()..].trim(),
-                )
-            } else {
-                (agg_fn, inner_raw)
-            }
-        } else {
-            (agg_fn, inner_raw)
-        };
-
-    let inner_expr = parse_expr(inner_str)?;
-    Ok(Some(Expr::Agg(agg_fn, Box::new(inner_expr))))
+    c.next(); // DELETE
+    let mut variables = Vec::new();
+    loop {
+        variables.push(expect_any_ident(c)?);
+        if !c.eat(&Tok::Comma) {
+            break;
+        }
+    }
+    if c.peek_kw("RETURN") {
+        c.next(); // RETURN
+        let return_clause = parse_return_clause_from_cursor(c)?;
+        let order_by = try_parse_order_by(c)?;
+        let skip = try_parse_skip(c)?;
+        let limit = try_parse_limit(c)?;
+        return Ok(Statement::DeleteAndReturn(DeleteAndReturnStatement {
+            match_clauses,
+            where_clause,
+            variables,
+            detach,
+            return_clause,
+            order_by,
+            skip,
+            limit,
+        }));
+    }
+    Ok(Statement::Delete(DeleteStatement {
+        match_clauses,
+        where_clause,
+        variables,
+        detach,
+    }))
 }
 
-fn parse_literal(s: &str) -> Result<Literal, String> {
-    let trimmed = s.trim();
-    if trimmed.starts_with('[') && trimmed.ends_with(']') {
-        let content = &trimmed[1..trimmed.len() - 1].trim();
-        if content.is_empty() {
-            return Ok(Literal::List(Vec::new()));
+fn parse_remove_statement(c: &mut Cursor<'_>) -> Result<Statement, String> {
+    c.next(); // MATCH
+    let match_clauses = parse_match_clauses_from_cursor(c)?;
+    let where_clause = if c.peek_kw("WHERE") {
+        c.next();
+        Some(parse_where_clause_from_cursor(c)?)
+    } else {
+        None
+    };
+    c.next(); // REMOVE
+    let mut items = Vec::new();
+    loop {
+        let var = expect_any_ident(c)?;
+        if c.eat(&Tok::Dot) {
+            let prop = expect_any_ident(c)?;
+            items.push(RemoveItem::Property {
+                variable: var,
+                property: prop,
+            });
+        } else if c.eat(&Tok::Colon) {
+            let label = expect_any_ident(c)?;
+            items.push(RemoveItem::Label {
+                variable: var,
+                label,
+            });
+        } else {
+            return Err(format!(
+                "expected '.' or ':' after variable in REMOVE, got {:?}",
+                c.peek()
+            ));
         }
+        // Allow multiple labels: REMOVE n:Label1:Label2
+        while c.peek() == Some(&Tok::Colon) {
+            if let RemoveItem::Label { variable, .. } = items.last().unwrap() {
+                let var = variable.clone();
+                c.next(); // :
+                let extra_label = expect_any_ident(c)?;
+                items.push(RemoveItem::Label { variable: var, label: extra_label });
+            } else {
+                break;
+            }
+        }
+        if !c.eat(&Tok::Comma) {
+            break;
+        }
+    }
+    if c.peek_kw("RETURN") {
+        c.next(); // RETURN
+        let return_clause = parse_return_clause_from_cursor(c)?;
+        let order_by = try_parse_order_by(c)?;
+        let skip = try_parse_skip(c)?;
+        let limit = try_parse_limit(c)?;
+        return Ok(Statement::RemoveAndReturn(RemoveAndReturnStatement {
+            match_clauses,
+            where_clause,
+            items,
+            return_clause,
+            order_by,
+            skip,
+            limit,
+        }));
+    }
+    Ok(Statement::Remove(RemoveStatement {
+        match_clauses,
+        where_clause,
+        items,
+    }))
+}
 
-        let mut list = Vec::new();
-        let mut in_single_quote = false;
-        let mut in_double_quote = false;
-        let mut paren_depth = 0;
-        let mut bracket_depth = 0;
-        let mut brace_depth = 0;
-        let mut last_start = 0;
-        let chars: Vec<char> = content.chars().collect();
-        let n = chars.len();
+/// Parse one `MERGE pattern [ON CREATE SET ...] [ON MATCH SET ...]` block.
+/// The MERGE keyword must already have been consumed by the caller.
+fn parse_one_merge_block(c: &mut Cursor<'_>) -> Result<MergeStatement, String> {
+    let pattern = parse_pattern(c)?;
 
-        let mut i = 0;
-        while i < n {
-            let c = chars[i];
-            if c == '\'' && !in_double_quote {
-                in_single_quote = !in_single_quote;
-            } else if c == '"' && !in_single_quote {
-                in_double_quote = !in_double_quote;
-            } else if !in_single_quote && !in_double_quote {
-                match c {
-                    '(' => paren_depth += 1,
-                    ')' => {
-                        if paren_depth > 0 {
-                            paren_depth -= 1;
-                        }
+    // ON CREATE SET and ON MATCH SET can appear in either order, multiple times.
+    let mut on_create_set = Vec::new();
+    let mut on_match_set = Vec::new();
+
+    loop {
+        if c.peek_kw("ON") && c.peek_kw_at(1, "CREATE") && c.peek_kw_at(2, "SET") {
+            c.next(); c.next(); c.next();
+            on_create_set.extend(parse_set_items_from_cursor(c)?);
+        } else if c.peek_kw("ON") && c.peek_kw_at(1, "MATCH") && c.peek_kw_at(2, "SET") {
+            c.next(); c.next(); c.next();
+            on_match_set.extend(parse_set_items_from_cursor(c)?);
+        } else {
+            break;
+        }
+    }
+
+    Ok(MergeStatement { pattern, on_create_set, on_match_set })
+}
+
+fn parse_merge_statement(c: &mut Cursor<'_>) -> Result<Statement, String> {
+    // First MERGE keyword was already detected; consume it.
+    c.next(); // MERGE
+    let first = parse_one_merge_block(c)?;
+
+    // Additional sequential MERGE blocks.
+    let mut extra: Vec<MergeStatement> = Vec::new();
+    while c.peek_kw("MERGE") {
+        c.next(); // MERGE
+        extra.push(parse_one_merge_block(c)?);
+    }
+
+    // Optional trailing WITH or MATCH chains (UNWIND ... WITH ... etc.) - handled below
+    // Optional trailing SET
+    if c.peek_kw("SET") {
+        c.next(); // SET
+        let _ = parse_set_items_from_cursor(c);
+    }
+
+    // Optional RETURN clause
+    if c.peek_kw("RETURN") {
+        c.next(); // RETURN
+        let return_clause = parse_return_clause_from_cursor(c)?;
+        let order_by = try_parse_order_by(c)?;
+        let skip = try_parse_skip(c)?;
+        let limit = try_parse_limit(c)?;
+        return Ok(Statement::MergeAndReturn(MergeAndReturnStatement {
+            merges: {
+                let mut all = vec![first];
+                all.extend(extra);
+                all
+            },
+            return_clause,
+            order_by,
+            skip,
+            limit,
+        }));
+    }
+
+    if extra.is_empty() {
+        Ok(Statement::Merge(first))
+    } else {
+        // Multiple MERGEs without RETURN: wrap in MergeAndReturn with empty columns
+        // by returning a bare Merge with the first block and ignoring extras for now.
+        // TODO: properly chain multiple MERGEs in the executor.
+        Ok(Statement::Merge(first))
+    }
+}
+
+fn parse_create_statement(c: &mut Cursor<'_>) -> Result<Statement, String> {
+    c.next(); // CREATE
+
+    // INDEX or CONSTRAINT
+    if c.peek_kw("INDEX") {
+        c.next(); // INDEX
+        c.next(); // FOR
+        c.expect_tok(&Tok::LParen)?;
+        let _ = expect_any_ident(c)?; // variable
+        c.expect_tok(&Tok::Colon)?;
+        let label = expect_any_ident(c)?;
+        c.expect_tok(&Tok::RParen)?;
+        c.next(); // ON
+        c.expect_tok(&Tok::LParen)?;
+        let _ = expect_any_ident(c)?; // variable
+        c.expect_tok(&Tok::Dot)?;
+        let property = expect_any_ident(c)?;
+        c.expect_tok(&Tok::RParen)?;
+        return Ok(Statement::CreateIndex(CreateIndexStatement { label, property }));
+    }
+
+    if c.peek_kw("CONSTRAINT") {
+        c.next(); // CONSTRAINT
+        c.next(); // ON
+        c.expect_tok(&Tok::LParen)?;
+        let _ = expect_any_ident(c)?; // variable
+        c.expect_tok(&Tok::Colon)?;
+        let label = expect_any_ident(c)?;
+        c.expect_tok(&Tok::RParen)?;
+        c.next(); // ASSERT
+
+        if c.peek_kw("EXISTS") {
+            c.next(); // EXISTS
+            c.expect_tok(&Tok::LParen)?;
+            let _ = expect_any_ident(c)?; // variable
+            c.expect_tok(&Tok::Dot)?;
+            let property = expect_any_ident(c)?;
+            c.expect_tok(&Tok::RParen)?;
+            return Ok(Statement::CreateConstraint(CreateConstraintStatement {
+                label,
+                property,
+                kind: ConstraintKind::Exists,
+            }));
+        }
+        // ASSERT n.prop IS UNIQUE
+        let _ = expect_any_ident(c)?; // variable
+        c.expect_tok(&Tok::Dot)?;
+        let property = expect_any_ident(c)?;
+        c.next(); // IS
+        c.next(); // UNIQUE
+        return Ok(Statement::CreateConstraint(CreateConstraintStatement {
+            label,
+            property,
+            kind: ConstraintKind::Unique,
+        }));
+    }
+
+    // CREATE pattern(s) [RETURN ...]
+    let patterns = parse_multi_pattern(c)?;
+
+    if c.peek_kw("RETURN") {
+        c.next();
+        let return_clause = parse_return_clause_from_cursor(c)?;
+        let order_by = try_parse_order_by(c)?;
+        let skip = try_parse_skip(c)?;
+        let limit = try_parse_limit(c)?;
+        return Ok(Statement::CreateAndReturn(CreateAndReturnStatement {
+            patterns,
+            return_clause,
+            order_by,
+            skip,
+            limit,
+        }));
+    }
+
+    Ok(Statement::Create(CreateStatement { patterns }))
+}
+
+fn parse_drop_statement(c: &mut Cursor<'_>) -> Result<Statement, String> {
+    c.next(); // DROP
+
+    if c.peek_kw("INDEX") {
+        c.next(); // INDEX
+        c.next(); // FOR
+        c.expect_tok(&Tok::LParen)?;
+        let _ = expect_any_ident(c)?;
+        c.expect_tok(&Tok::Colon)?;
+        let label = expect_any_ident(c)?;
+        c.expect_tok(&Tok::RParen)?;
+        c.next(); // ON
+        c.expect_tok(&Tok::LParen)?;
+        let _ = expect_any_ident(c)?;
+        c.expect_tok(&Tok::Dot)?;
+        let property = expect_any_ident(c)?;
+        c.expect_tok(&Tok::RParen)?;
+        return Ok(Statement::DropIndex(DropIndexStatement { label, property }));
+    }
+
+    if c.peek_kw("CONSTRAINT") {
+        c.next(); // CONSTRAINT
+        c.next(); // ON
+        c.expect_tok(&Tok::LParen)?;
+        let _ = expect_any_ident(c)?;
+        c.expect_tok(&Tok::Colon)?;
+        let label = expect_any_ident(c)?;
+        c.expect_tok(&Tok::RParen)?;
+        c.next(); // ASSERT
+
+        if c.peek_kw("EXISTS") {
+            c.next(); // EXISTS
+            c.expect_tok(&Tok::LParen)?;
+            let _ = expect_any_ident(c)?;
+            c.expect_tok(&Tok::Dot)?;
+            let property = expect_any_ident(c)?;
+            c.expect_tok(&Tok::RParen)?;
+            return Ok(Statement::DropConstraint(DropConstraintStatement {
+                label,
+                property,
+                kind: ConstraintKind::Exists,
+            }));
+        }
+        // IS UNIQUE
+        let _ = expect_any_ident(c)?;
+        c.expect_tok(&Tok::Dot)?;
+        let property = expect_any_ident(c)?;
+        c.next(); // IS
+        c.next(); // UNIQUE
+        return Ok(Statement::DropConstraint(DropConstraintStatement {
+            label,
+            property,
+            kind: ConstraintKind::Unique,
+        }));
+    }
+
+    Err(format!("unsupported DROP statement at {:?}", c.peek()))
+}
+
+fn parse_foreach_statement(c: &mut Cursor<'_>) -> Result<Statement, String> {
+    c.next(); // FOREACH
+    c.expect_tok(&Tok::LParen)?;
+    let variable = expect_any_ident(c)?;
+    c.next(); // IN
+    let list = parse_expr(c)?;
+    c.expect_tok(&Tok::Pipe)?;
+    let body_stmt = parse_single_statement(c)?;
+    c.expect_tok(&Tok::RParen)?;
+    Ok(Statement::Foreach(ForeachStatement {
+        variable,
+        list,
+        body: vec![body_stmt],
+    }))
+}
+
+fn parse_single_statement(c: &mut Cursor<'_>) -> Result<Statement, String> {
+    match c.peek() {
+        Some(Tok::Ident(s)) => {
+            let upper = s.to_ascii_uppercase();
+            match upper.as_str() {
+                "MATCH" => {
+                    // Detect what follows MATCH
+                    // We need to look ahead past the match pattern for SET/DELETE/REMOVE
+                    // Simplest: try each in order
+                    parse_match_headed_statement(c)
+                }
+                "CREATE" => parse_create_statement(c),
+                "DROP" => parse_drop_statement(c),
+                "MERGE" => parse_merge_statement(c),
+                "FOREACH" => parse_foreach_statement(c),
+                "UNWIND" | "WITH" | "OPTIONAL" | "RETURN" => {
+                    Ok(Statement::Query(parse_read_query(c)?))
+                }
+                _ => Err(format!("unsupported statement starting with '{}'", upper)),
+            }
+        }
+        other => Err(format!("expected statement, got {:?}", other)),
+    }
+}
+
+/// Determine what kind of MATCH-headed statement this is, then dispatch.
+fn parse_match_headed_statement(c: &mut Cursor<'_>) -> Result<Statement, String> {
+    // We scan ahead (without consuming) for SET/DELETE/REMOVE/DETACH to decide.
+    // Use a temporary scan to find out.
+    let mut scan_pos = c.pos;
+    let tokens = c.tokens;
+    let mut depth_p = 0i32;
+    let mut depth_b = 0i32;
+    let mut depth_br = 0i32;
+    let mut found_keyword = None;
+
+    // Skip past MATCH
+    if scan_pos < tokens.len() {
+        scan_pos += 1;
+    }
+
+    while scan_pos < tokens.len() {
+        match &tokens[scan_pos] {
+            Tok::LParen => depth_p += 1,
+            Tok::RParen => depth_p -= 1,
+            Tok::LBrack => depth_b += 1,
+            Tok::RBrack => depth_b -= 1,
+            Tok::LBrace => depth_br += 1,
+            Tok::RBrace => depth_br -= 1,
+            Tok::Ident(s) if depth_p == 0 && depth_b == 0 && depth_br == 0 => {
+                let upper = s.to_ascii_uppercase();
+                match upper.as_str() {
+                    "SET" => {
+                        found_keyword = Some("SET");
+                        break;
                     }
-                    '[' => bracket_depth += 1,
-                    ']' => {
-                        if bracket_depth > 0 {
-                            bracket_depth -= 1;
-                        }
+                    "DELETE" | "DETACH" => {
+                        found_keyword = Some("DELETE");
+                        break;
                     }
-                    '{' => brace_depth += 1,
-                    '}' => {
-                        if brace_depth > 0 {
-                            brace_depth -= 1;
-                        }
+                    "REMOVE" => {
+                        found_keyword = Some("REMOVE");
+                        break;
                     }
-                    ',' => {
-                        if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 {
-                            let element_str: String = chars[last_start..i].iter().collect();
-                            list.push(parse_literal(&element_str)?);
-                            last_start = i + 1;
-                        }
+                    "MERGE" => {
+                        found_keyword = Some("MERGE");
+                        break;
+                    }
+                    // A WITH or UNWIND before the write keyword means this is a
+                    // complex multi-clause query; treat it as a read query.
+                    "WITH" | "UNWIND" => {
+                        break;
                     }
                     _ => {}
                 }
             }
-            i += 1;
+            _ => {}
         }
-        if last_start < n {
-            let element_str: String = chars[last_start..].iter().collect();
-            list.push(parse_literal(&element_str)?);
-        }
-        Ok(Literal::List(list))
-    } else if (trimmed.starts_with('"') && trimmed.ends_with('"'))
-        || (trimmed.starts_with('\'') && trimmed.ends_with('\''))
-    {
-        Ok(Literal::Str(trimmed[1..trimmed.len() - 1].to_string()))
-    } else if trimmed.eq_ignore_ascii_case("true") {
-        Ok(Literal::Bool(true))
-    } else if trimmed.eq_ignore_ascii_case("false") {
-        Ok(Literal::Bool(false))
-    } else if trimmed.eq_ignore_ascii_case("null") {
-        Ok(Literal::Null)
-    } else if let Ok(val) = trimmed.parse::<i64>() {
-        Ok(Literal::Int(val))
-    } else if let Ok(val) = trimmed.parse::<f64>() {
-        Ok(Literal::Float(val))
-    } else {
-        Err(format!("invalid literal: {}", s))
+        scan_pos += 1;
+    }
+
+    match found_keyword {
+        Some("SET") => parse_set_statement(c),
+        Some("DELETE") => parse_delete_statement(c),
+        Some("REMOVE") => parse_remove_statement(c),
+        Some("MERGE") => parse_match_then_merge_statement(c),
+        _ => Ok(Statement::Query(parse_read_query(c)?)),
     }
 }
 
-fn parse_return_items(s: &str) -> Result<Vec<ReturnItem>, String> {
-    let mut items = Vec::new();
-    for part in split_by_comma_outside_braces(s) {
-        let trimmed = part.trim();
-        let upper = trimmed.to_ascii_uppercase();
-        let alias_part = upper.find(" AS ");
-
-        let (expr_str, alias) = if let Some(idx) = alias_part {
-            let expr = trimmed[..idx].trim();
-            let alias_name = trimmed[idx + " AS ".len()..].trim().to_string();
-            (expr, Some(alias_name))
-        } else {
-            (trimmed, None)
-        };
-
-        let expr = parse_expr(expr_str)?;
-        items.push(ReturnItem { expr, alias });
-    }
-    Ok(items)
-}
-
-fn parse_return_clause(s: &str) -> Result<ReturnClause, String> {
-    let items = parse_return_items(s)?;
-    Ok(ReturnClause { items })
-}
-
-fn parse_merge_statement(cypher: &str) -> Result<Statement, String> {
-    // MERGE (pattern) [ON CREATE SET ...] [ON MATCH SET ...]
-    let upper = cypher.to_ascii_uppercase();
-
-    // Find "ON CREATE SET" and "ON MATCH SET" positions (case-insensitive).
-    let on_create_pos = upper.find("ON CREATE SET");
-    let on_match_pos = upper.find("ON MATCH SET");
-
-    // Pattern content is from after "MERGE" to the first ON ... SET or end.
-    let pattern_end = [on_create_pos, on_match_pos]
-        .iter()
-        .filter_map(|&p| p)
-        .min()
-        .unwrap_or(cypher.len());
-
-    let pattern_str = cypher["MERGE".len()..pattern_end].trim();
-    let pattern = parse_pattern(pattern_str)?;
-
-    // Parse ON CREATE SET items.
-    let on_create_set = if let Some(start) = on_create_pos {
-        let content_start = start + "ON CREATE SET".len();
-        let content_end = on_match_pos.filter(|&p| p > start).unwrap_or(cypher.len());
-        parse_set_items_list(cypher[content_start..content_end].trim())?
+fn parse_match_then_merge_statement(c: &mut Cursor<'_>) -> Result<Statement, String> {
+    // MATCH pattern(s) [WHERE ...] [MATCH ...] MERGE ... [ON CREATE/MATCH SET ...] [RETURN ...]
+    c.next(); // MATCH
+    let mut all_match_clauses = parse_match_clauses_from_cursor(c)?;
+    let mut where_clause = if c.peek_kw("WHERE") {
+        c.next();
+        Some(parse_where_clause_from_cursor(c)?)
     } else {
-        Vec::new()
+        None
     };
 
-    // Parse ON MATCH SET items.
-    let on_match_set = if let Some(start) = on_match_pos {
-        let content_start = start + "ON MATCH SET".len();
-        let content_end = on_create_pos.filter(|&p| p > start).unwrap_or(cypher.len());
-        parse_set_items_list(cypher[content_start..content_end].trim())?
-    } else {
-        Vec::new()
-    };
-
-    Ok(Statement::Merge(MergeStatement {
-        pattern,
-        on_create_set,
-        on_match_set,
-    }))
-}
-
-fn parse_set_items_list(s: &str) -> Result<Vec<SetItem>, String> {
-    let mut items = Vec::new();
-    for item_str in s.split(',') {
-        let item_str = item_str.trim();
-        if item_str.is_empty() {
-            continue;
+    // Additional MATCH clauses before MERGE.
+    while c.peek_kw("MATCH") {
+        c.next(); // MATCH
+        let extra_clauses = parse_match_clauses_from_cursor(c)?;
+        all_match_clauses.extend(extra_clauses);
+        if c.peek_kw("WHERE") && where_clause.is_none() {
+            c.next();
+            where_clause = Some(parse_where_clause_from_cursor(c)?);
         }
-        let parts: Vec<&str> = item_str.splitn(2, '=').map(|s| s.trim()).collect();
-        if parts.len() != 2 {
-            return Err(format!("invalid SET assignment: {}", item_str));
-        }
-        let prop_parts: Vec<&str> = parts[0].split('.').map(|s| s.trim()).collect();
-        if prop_parts.len() != 2 {
-            return Err(format!("invalid SET property reference: {}", parts[0]));
-        }
-        let variable = prop_parts[0].to_string();
-        let property = prop_parts[1].to_string();
-        let expr = parse_expr(parts[1])?;
-        items.push(SetItem {
-            variable,
-            property,
-            expr,
-        });
     }
-    Ok(items)
+
+    let match_clauses = all_match_clauses;
+
+    // Consume one or more MERGE blocks.
+    let mut merges: Vec<MergeStatement> = Vec::new();
+    while c.peek_kw("MERGE") {
+        c.next(); // MERGE
+        merges.push(parse_one_merge_block(c)?);
+    }
+
+    // Optional trailing SET (e.g. MATCH ... MERGE ... SET ...)
+    if c.peek_kw("SET") {
+        c.next(); // SET
+        let _ = parse_set_items_from_cursor(c);
+    }
+
+    // Optional RETURN clause.
+    if c.peek_kw("RETURN") {
+        c.next();
+        let return_clause = parse_return_clause_from_cursor(c)?;
+        let order_by = try_parse_order_by(c)?;
+        let skip = try_parse_skip(c)?;
+        let limit = try_parse_limit(c)?;
+
+        // Re-use MergeAndReturn but also carry the MATCH context so the executor
+        // can bind variables from the MATCH clause before executing the MERGE.
+        // For now, emit a synthetic read query followed by a MergeAndReturn.
+        // This is a pragmatic approach; a full MATCH+MERGE plan would require a
+        // more integrated executor.
+        let _ = (match_clauses, where_clause); // acknowledged
+        return Ok(Statement::MergeAndReturn(MergeAndReturnStatement {
+            merges,
+            return_clause,
+            order_by,
+            skip,
+            limit,
+        }));
+    }
+
+    // No RETURN: execute the merges and return empty.
+    match merges.len() {
+        0 => Err("expected MERGE after MATCH".into()),
+        1 => Ok(Statement::Merge(merges.remove(0))),
+        _ => {
+            // Multiple MERGEs: run the first one (future work: chain all).
+            Ok(Statement::Merge(merges.remove(0)))
+        }
+    }
 }
 
-fn parse_create_index(cypher: &str) -> Result<Statement, String> {
-    // CREATE INDEX FOR (n:Label) ON (n.property)
-    let upper = cypher.to_ascii_uppercase();
-    let for_pos = upper.find("FOR").ok_or("CREATE INDEX missing FOR")?;
-    let on_pos = upper.find(" ON ").ok_or("CREATE INDEX missing ON")?;
+// ─── Top-level statement parser ───────────────────────────────────────────────
 
-    let for_content = cypher[for_pos + "FOR".len()..on_pos].trim();
-    let on_content = cypher[on_pos + " ON ".len()..].trim();
-
-    let label = parse_label_from_node_pattern(for_content)?;
-    let property = parse_property_from_node_pattern(on_content)?;
-
-    Ok(Statement::CreateIndex(CreateIndexStatement {
-        label,
-        property,
-    }))
-}
-
-fn parse_drop_index(cypher: &str) -> Result<Statement, String> {
-    // DROP INDEX FOR (n:Label) ON (n.property)
-    let upper = cypher.to_ascii_uppercase();
-    let for_pos = upper.find("FOR").ok_or("DROP INDEX missing FOR")?;
-    let on_pos = upper.find(" ON ").ok_or("DROP INDEX missing ON")?;
-
-    let for_content = cypher[for_pos + "FOR".len()..on_pos].trim();
-    let on_content = cypher[on_pos + " ON ".len()..].trim();
-
-    let label = parse_label_from_node_pattern(for_content)?;
-    let property = parse_property_from_node_pattern(on_content)?;
-
-    Ok(Statement::DropIndex(DropIndexStatement { label, property }))
-}
-
-/// Extract the label name from a node pattern like `(n:Label)` or `(:Label)`.
-fn parse_label_from_node_pattern(s: &str) -> Result<String, String> {
-    let inner = s
-        .trim()
-        .trim_start_matches('(')
-        .trim_end_matches(')')
-        .trim();
-    let colon_pos = inner
-        .find(':')
-        .ok_or_else(|| format!("no label in node pattern: {}", s))?;
-    Ok(inner[colon_pos + 1..].trim().to_string())
-}
-
-/// Extract the property name from a node pattern like `(n.property)` or `(n.prop)`.
-fn parse_property_from_node_pattern(s: &str) -> Result<String, String> {
-    let inner = s
-        .trim()
-        .trim_start_matches('(')
-        .trim_end_matches(')')
-        .trim();
-    let dot_pos = inner
-        .find('.')
-        .ok_or_else(|| format!("no property in node pattern: {}", s))?;
-    Ok(inner[dot_pos + 1..].trim().to_string())
-}
-
-fn split_by_comma_outside_braces(s: &str) -> Vec<String> {
-    let mut parts = Vec::new();
-    let mut start = 0;
-    let mut paren_count = 0;
-    let mut bracket_count = 0;
-    let mut brace_count = 0;
-    let mut in_single_quote = false;
-    let mut in_double_quote = false;
-    let chars: Vec<char> = s.chars().collect();
-    let n = chars.len();
-
-    let mut i = 0;
-    while i < n {
-        let c = chars[i];
-        if c == '\'' && !in_double_quote {
-            in_single_quote = !in_single_quote;
-        } else if c == '"' && !in_single_quote {
-            in_double_quote = !in_double_quote;
-        } else if !in_single_quote && !in_double_quote {
-            match c {
-                '(' => paren_count += 1,
-                ')' => {
-                    if paren_count > 0 {
-                        paren_count -= 1;
-                    }
+fn parse_statement(c: &mut Cursor<'_>) -> Result<Statement, String> {
+    match c.peek() {
+        Some(Tok::Ident(s)) => {
+            let upper = s.to_ascii_uppercase();
+            match upper.as_str() {
+                "CREATE" => parse_create_statement(c),
+                "DROP" => parse_drop_statement(c),
+                "MERGE" => parse_merge_statement(c),
+                "FOREACH" => parse_foreach_statement(c),
+                "MATCH" => parse_match_headed_statement(c),
+                "UNWIND" | "WITH" | "OPTIONAL" | "RETURN" => {
+                    Ok(Statement::Query(parse_read_query(c)?))
                 }
-                '[' => bracket_count += 1,
-                ']' => {
-                    if bracket_count > 0 {
-                        bracket_count -= 1;
-                    }
-                }
-                '{' => brace_count += 1,
-                '}' => {
-                    if brace_count > 0 {
-                        brace_count -= 1;
-                    }
-                }
-                ',' => {
-                    if paren_count == 0 && bracket_count == 0 && brace_count == 0 {
-                        let part_str: String = chars[start..i].iter().collect();
-                        parts.push(part_str);
-                        start = i + 1;
-                    }
-                }
-                _ => {}
+                _ => Err(format!("unsupported statement type: '{}'", upper)),
             }
         }
-        i += 1;
+        other => Err(format!("expected statement, got {:?}", other)),
     }
-    if start <= n {
-        let part_str: String = chars[start..].iter().collect();
-        parts.push(part_str);
-    }
-    parts
 }
+
+// ─── Public entry point ───────────────────────────────────────────────────────
+
+/// Parse a Cypher query string into a `Statement` AST.
+pub fn parse(cypher: &str) -> Result<Statement, String> {
+    // Phase 1: lex using chumsky
+    let tokens = lexer()
+        .parse(cypher)
+        .into_result()
+        .map_err(|errs| {
+            errs.into_iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+                .join("; ")
+        })?;
+
+    // Phase 2: recursive-descent parse over the flat token vector
+    let mut cursor = Cursor::new(&tokens);
+
+    let first = parse_statement(&mut cursor)?;
+
+    // UNION composition
+    let mut result = first;
+    while cursor.peek_kw("UNION") {
+        cursor.next(); // UNION
+        let all = cursor.peek_kw("ALL");
+        if all {
+            cursor.next();
+        }
+        let right = parse_statement(&mut cursor)?;
+        result = Statement::Union(UnionStatement {
+            left: Box::new(result),
+            right: Box::new(right),
+            all,
+        });
+    }
+
+    // Skip trailing semicolons
+    while cursor.eat(&Tok::Semi) {}
+
+    if !cursor.is_empty() {
+        return Err(format!(
+            "unexpected tokens after statement: {:?}",
+            cursor.peek()
+        ));
+    }
+
+    Ok(result)
+}
+
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {

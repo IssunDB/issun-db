@@ -28,7 +28,7 @@ Priorities, in order:
 
 Quick examples:
 
-- Good: add a `Graph::bfs` method in `crates/issundb-core/src/graph.rs` with unit tests using a temp LMDB directory.
+- Good: add a `Graph::bfs` method in `crates/issundb-core/src/graph/algo.rs` with unit tests using a temp LMDB directory.
 - Good: add a Cypher parser test in `crates/issundb-cypher/src/` against the openCypher TCK subset.
 - Bad: import `heed` directly in `crates/issundb/src/lib.rs` instead of going through `issundb-core`.
 - Bad: store a node cache in a `static` `HashMap` outside `Graph`.
@@ -45,7 +45,8 @@ Quick examples:
 ## Repository Layout
 
 The current tree includes storage, CSR snapshots, vector search, hybrid retrieval primitives, Cypher planning, the CLI, an HTTP server, a desktop
-GUI, language bindings, and shared test utilities. This layout describes the current structure and target decoupled crate boundaries.
+GUI, language bindings, and shared test utilities.
+This layout describes the current structure and target decoupled crate boundaries.
 Do not invent modules that do not yet exist when answering questions, but do place new modules according to this map.
 
 - `crates/issundb-core/`: storage engine. Public surface is `Graph` and the schema types.
@@ -54,7 +55,15 @@ Do not invent modules that do not yet exist when answering questions, but do pla
     - `src/storage/ids.rs`: monotonic ID allocation and string-to-integer registries for labels and edge types, persisted in the `meta` sub-database.
     - `src/storage/props.rs`: msgpack encode and decode helpers via `rmp-serde`.
     - `src/storage/fts.rs`: full-text index storage primitives (postings and document tables) inside the LMDB environment.
-    - `src/graph.rs`: `Graph`; all node, edge, and adjacency CRUD lives here.
+    - `src/graph/mod.rs`: `Graph`, `ReadTxn`, `WriteTxn` struct definitions and lifecycle methods (`open`, `view`, `update`, `backup`, `restore`, `rebuild_csr`).
+    - `src/graph/node.rs`: node CRUD (`add_node`, `get_node`, `update_node`, `delete_node`).
+    - `src/graph/edge.rs`: edge CRUD and adjacency (`add_edge`, `get_edge`, `delete_edge`, `out_neighbors`, `in_neighbors`).
+    - `src/graph/index.rs`: label and type indexes, property indexes, constraints, and property scan methods.
+    - `src/graph/fts_mod.rs`: full-text search index lifecycle and FTS storage primitives.
+    - `src/graph/vector.rs`: vector byte storage helpers.
+    - `src/graph/algo.rs`: public algorithm dispatch methods and internal traversal helpers.
+    - `src/graph/graphblas/`: GraphBLAS algorithm implementations split by family: `traversal.rs`, `analytics.rs`, `paths.rs`, and `flow.rs`.
+    - `src/graph/txn.rs`: `ReadTxn` and `WriteTxn` delegation impls and transaction tests.
     - `src/csr.rs`: in-memory CSR snapshot, rebuilt in the background and swapped via `arc-swap`.
     - `src/matrices.rs`: GraphBLAS matrix materialization from the CSR snapshot.
     - `src/metrics.rs`: lightweight runtime counters for storage operations.
@@ -64,7 +73,11 @@ Do not invent modules that do not yet exist when answering questions, but do pla
       DELETE.
     - `src/ast.rs`: AST node types.
     - `src/plan/`: logical planner, physical planner, optimizer, and statistics helpers.
-    - `src/exec.rs`: physical-plan executor that drives `Graph` scans, expansion, filtering, mutation, and projection.
+    - `src/exec/mod.rs`: public entry points (`execute`, `explain`), shared type definitions, and tests.
+    - `src/exec/read.rs`: `execute_physical` and read-path helpers (`evaluate_where`, `evaluate_sort_key`, `json_to_prop_value`).
+    - `src/exec/expr.rs`: expression evaluation (`evaluate_expr`, `eval_binary_op`, `eval_arithmetic`, `eval_function_call`).
+    - `src/exec/write.rs`: mutation execution (`execute_create`, `execute_set`, `execute_delete`, `execute_merge`).
+    - `src/exec/ddl.rs`: DDL execution (`execute_create_index`, `execute_drop_index`).
 - `crates/issundb-vector/`: vector index abstraction, vector metadata, vector storage integration, and vector search APIs.
 - `crates/issundb-text/`: tokenization, full-text index storage, text search APIs, and ranking.
 - `crates/issundb-retrieval/`: hybrid retrieval over graph traversal, vector hits, text hits, property filters, score fusion, and subgraph
@@ -73,13 +86,13 @@ Do not invent modules that do not yet exist when answering questions, but do pla
   `issundb-retrieval`, and `issundb-cypher`. Do not re-export internal storage types like `Storage`.
 - `crates/issundb-cli/`: interactive REPL binary. Uses only the `issundb` public facade for manual exploration and demos.
 - `crates/issundb-server/`: Axum-based HTTP REST API server. Exposes node and edge CRUD, Cypher query execution, query plan explanation, vector
-  search, and full-text search over HTTP. Uses `tokio` as its async runtime; depends on `issundb`, `issundb-vector`, and `issundb-text`.
+  search, and full-text search over HTTP. Uses `tokio` as its async runtime; depends only on `issundb`.
 - `crates/issundb-gui/`: egui desktop application for interactive graph exploration. Provides a Cypher query console, a graph visualization canvas
   via `egui_graphs`, and a node or edge inspector. Depends only on `issundb`.
 - `crates/issundb-node/`: Node.js bindings via NAPI-RS. Exposes the `IssunDB` class with node, edge, query, vector search, text search, and
-  backup methods. Depends on `issundb`, `issundb-vector`, and `issundb-text`.
-- `crates/issundb-py/`: Python bindings via PyO3. Exposes the `IssunDB` class with the same surface as the Node.js bindings. Depends on
-  `issundb`, `issundb-vector`, and `issundb-text`.
+  backup methods. Depends only on `issundb`.
+- `crates/issundb-py/`: Python bindings via PyO3. Exposes the `IssunDB` class with the same surface as the Node.js bindings. Depends only on
+  `issundb`.
 - `crates/issundb-testing/`: shared test fixtures and graph builders (`open_tmp`, `chain`, `clique`, `diamond`, `two_triangles`) used across
   unit and integration tests. Depends on `issundb-core`; must not be imported by production crates.
 - `crates/issundb-examples/`: standalone example programs (`hybrid_retrieval_quickstart.rs`, `neo4j_migration.rs`, `load_ldbc.rs`).
@@ -126,8 +139,8 @@ Target dependency direction:
 5. `issundb-cypher` may depend on public APIs from core, vector, text, and retrieval crates, but not storage internals.
 6. `issundb` composes and re-exports the stable public API.
 7. `issundb-cli` uses only the `issundb` facade.
-8. `issundb-server`, `issundb-gui`, `issundb-node`, and `issundb-py` may depend on `issundb`, `issundb-vector`, and `issundb-text`; they must
-   not reach into lower-level crates directly.
+8. `issundb-server`, `issundb-gui`, `issundb-node`, and `issundb-py` must depend only on `issundb`; they must not import `issundb-core`,
+   `issundb-vector`, `issundb-text`, `issundb-retrieval`, or `issundb-cypher` directly.
 9. `issundb-testing` may depend on `issundb-core` for fixture setup; it must not be imported by any production crate.
 
 Lower-level crates must not know about higher-level crates.
@@ -142,12 +155,12 @@ All graph operations go through `Graph`; do not call `Storage` directly from out
 - `Graph::open(path: &Path, map_size_gb: usize) -> Result<Self, Error>`
 - `add_node(label: &str, props: &impl Serialize) -> Result<NodeId, Error>`
 - `get_node(id: NodeId) -> Result<Option<NodeRecord>, Error>`
-- `update_node(id: NodeId, label: &str, props: &impl Serialize) -> Result<(), Error>`
+- `update_node(id: NodeId, props: &impl Serialize) -> Result<(), Error>`
 - `delete_node(id: NodeId) -> Result<(), Error>`
 - `add_edge(src: NodeId, dst: NodeId, etype: &str, props: &impl Serialize) -> Result<EdgeId, Error>`
 - `get_edge(id: EdgeId) -> Result<Option<EdgeRecord>, Error>`
-- `out_neighbors(node: NodeId) -> Result<Vec<(NodeId, EdgeId, TypeId)>, Error>`
-- `in_neighbors(node: NodeId) -> Result<Vec<(NodeId, EdgeId, TypeId)>, Error>`
+- `out_neighbors(node: NodeId) -> Result<Vec<NeighborEntry>, Error>`
+- `in_neighbors(node: NodeId) -> Result<Vec<NeighborEntry>, Error>`
 - `nodes_by_label(label: &str) -> Result<Vec<NodeId>, Error>`
 - `edges_by_type(etype: &str) -> Result<Vec<EdgeId>, Error>`
 - `rebuild_csr() -> Result<(), Error>`
@@ -161,11 +174,11 @@ All graph operations go through `Graph`; do not call `Storage` directly from out
 - `bfs(start: NodeId, hops: u8) -> Result<Vec<NodeId>, Error>`
 - `dfs(start: NodeId, hops: u8) -> Result<Vec<NodeId>, Error>`
 - `shortest_path(src: NodeId, dst: NodeId) -> Result<Option<Vec<NodeId>>, Error>`
-- `shortest_path_dijkstra(src: NodeId, dst: NodeId, weight_property: &str) -> Result<Option<(Vec<NodeId>, f64)>, Error>`
+- `shortest_path_dijkstra(src: NodeId, dst: NodeId, weight_property: &str) -> Result<Option<WeightedPath>, Error>`
 - `all_paths(src: NodeId, dst: NodeId) -> Result<Vec<Vec<NodeId>>, Error>`
 - `all_shortest_paths(src: NodeId, dst: NodeId) -> Result<Vec<Vec<NodeId>>, Error>`
 - `longest_path(src: NodeId, dst: NodeId) -> Result<Option<Vec<NodeId>>, Error>`
-- `shortest_path_top_k(src: NodeId, dst: NodeId, k: usize, weight_property: &str) -> Result<Vec<(Vec<NodeId>, f64)>, Error>`
+- `shortest_path_top_k(src: NodeId, dst: NodeId, k: usize, weight_property: &str) -> Result<Vec<WeightedPath>, Error>`
 - `page_rank(iterations: u32, damping: f32) -> Result<HashMap<NodeId, f32>, Error>`
 - `connected_components() -> Result<HashMap<NodeId, u64>, Error>`
 - `strongly_connected_components() -> Result<HashMap<NodeId, u64>, Error>`
@@ -176,7 +189,7 @@ All graph operations go through `Graph`; do not call `Storage` directly from out
 - `harmonic_centrality() -> Result<HashMap<NodeId, f64>, Error>`
 - `spanning_forest(weight_property: &str, maximum: bool) -> Result<Vec<EdgeId>, Error>`
 - `maximum_flow(source: NodeId, sink: NodeId, capacity_property: &str) -> Result<f64, Error>`
-- `all_neighbors(node: NodeId) -> Result<Vec<(NodeId, EdgeId, u32, bool)>, Error>`
+- `all_neighbors(node: NodeId) -> Result<Vec<DirectedNeighborEntry>, Error>`
 
 ### `issundb_vector`
 
@@ -192,6 +205,11 @@ Full-text search crate. Owns tokenization, inverted index storage, ranking, and 
 depend on `issundb-vector`, `issundb-retrieval`, `issundb-cypher`, bindings, or CLI crates.
 
 - `TextGraphExt::text_search(query: &str, opts: &TextSearchOptions) -> Result<Vec<TextHit>, TextError>`
+- `TextIndexExt::create_text_index(label: &str, property: &str) -> Result<(), Error>`
+- `TextIndexExt::create_text_index_with_language(label: &str, property: &str, lang: Language) -> Result<(), Error>`
+- `TextIndexExt::drop_text_index(label: &str, property: &str) -> Result<(), Error>`
+- `TextIndexExt::has_text_index(label: &str, property: &str) -> Result<bool, Error>`
+- `TextIndexExt::list_text_indexes() -> Result<Vec<(String, String, Language)>, Error>`
 
 ### `issundb_retrieval`
 
@@ -218,8 +236,8 @@ unconditionally.
 
 ### `issundb_server`
 
-HTTP REST API server built on Axum and Tokio. Depends on `issundb`, `issundb-vector`, and `issundb-text`; must not import lower-level crates
-directly. All handlers share a single `Arc<Graph>` instance.
+HTTP REST API server built on Axum and Tokio. Depends only on `issundb`; must not import lower-level crates directly.
+All handlers share a single `Arc<Graph>` instance.
 
 Routes:
 
@@ -231,8 +249,8 @@ Routes:
 
 ### `issundb_node`
 
-Node.js bindings via NAPI-RS. Exposes a single `IssunDB` class. Depends on `issundb`, `issundb-vector`, and `issundb-text`; the `napi-module`
-feature must be enabled for the NAPI entry point to compile.
+Node.js bindings via NAPI-RS. Exposes a single `IssunDB` class. Depends only on `issundb`; the `napi-module` feature must be enabled for the
+NAPI entry point to compile.
 
 Methods: `add_node`, `get_node`, `update_node`, `delete_node`, `add_edge`, `query`, `explain`, `upsert_vector`, `vector_search`,
 `text_search`, `create_text_index`, `drop_text_index`, `backup`, `backup_compact`, `restore`.
@@ -240,13 +258,13 @@ Methods: `add_node`, `get_node`, `update_node`, `delete_node`, `add_edge`, `quer
 ### `issundb_py`
 
 Python bindings via PyO3. Exposes a single `IssunDB` class with the same method surface as `issundb_node`. The `extension-module` feature must
-be enabled for the Python extension to compile. Depends on `issundb`, `issundb-vector`, and `issundb-text`.
+be enabled for the Python extension to compile. Depends only on `issundb`.
 
 ### `issundb_gui`
 
-Desktop application built with `eframe` and `egui`. Depends only on `issundb`. Provides a Cypher query console, an interactive graph
-visualization canvas via `egui_graphs`, and a node or edge inspector panel. Not part of the library surface; changes here do not affect the
-public API.
+Desktop application built with `eframe` and `egui`. Depends only on `issundb`.
+Provides a Cypher query console, an interactive graph visualization canvas via `egui_graphs`, and a node or edge inspector panel.
+Not part of the library surface; changes here do not affect the public API.
 
 ### `issundb_testing`
 
@@ -270,10 +288,9 @@ error types through the public facade.
 
 ### Encapsulation Rule
 
-`Storage` and the `storage` module are implementation details, even though they are currently reachable from `issundb-core`. The `issundb`
-facade re-exports only `Graph`, `Error`, `Hit`, hybrid retrieval types and functions, Cypher result types, and the schema ID and record types. Do not
-add a
-"just for now" re-export anywhere else; add a deliberate testing helper in `issundb-core` if a test needs internal access.
+`Storage` and the `storage` module are `pub(crate)` inside `issundb-core` and are not reachable from any other crate. The `issundb`
+facade re-exports only `Graph`, `Error`, `Hit`, hybrid retrieval types and functions, Cypher result types, and the schema ID and record types.
+Do not add a "just for now" re-export anywhere else; add a deliberate testing helper in `issundb-core` if a test needs internal access.
 
 ## Workflow
 

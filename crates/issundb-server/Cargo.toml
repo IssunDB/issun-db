@@ -1,8 +1,9 @@
 [package]
 name = "issundb-server"
+description = "HTTP server for IssunDB"
 version = "0.1.0-alpha.1"
 edition = "2021"
-description = "HTTP server for IssunDB"
+publish = false
 
 [[bin]]
 name = "issundb-server"

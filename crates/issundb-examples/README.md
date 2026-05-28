@@ -1,26 +1,19 @@
-# Examples
+## Examples
 
-Standalone runnable examples for IssunDB. Each example is self-contained and
-opens a temporary database, so no prior setup is required.
+| Example                       | Description                                                                                                                                                |
+|-------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `hybrid_retrieval_quickstart` | An end-to-end demo that shows how to create nodes and edges, build a full-text index, upsert vector data, run hybrid retrieval, and execute a Cypher query |
+| `load_ldbc`                   | Load a social netwrok graph and run a few graph analytics algorithms (including PageRank, BFS, and shortest path)                                          |
+| `neo4j_migration`             | Migrate sample data from a Neo4j-style JSON export into IssunDB                                                                                            |
 
-Run any example with:
+### Running Examples
 
 ```sh
 cargo run --example <name>
 ```
 
-## Available Examples
+For instance:
 
-| Example | Description |
-|---|---|
-| `hybrid_retrieval_quickstart` | End-to-end demo: create nodes and edges, build a full-text index, upsert vectors, run hybrid retrieval, execute a Cypher query |
-| `load_ldbc` | Load a hand-crafted LDBC Social Network Benchmark subset and run graph analytics (PageRank, BFS, shortest path) |
-| `neo4j_migration` | Migrate sample data from a Neo4j-style JSON export into IssunDB |
-
-## Adding a New Example
-
-1. Add a `.rs` file in this directory.
-2. Add a `[[example]]` entry in `examples/Cargo.toml`.
-3. Keep the example self-contained: open a `TempDir`, build a graph, demonstrate
-   the feature, then exit. Do not write to a persistent path without a CLI argument.
-4. Add a one-line description to the table above.
+```sh
+cargo run --example hybrid_retrieval_quickstart
+```

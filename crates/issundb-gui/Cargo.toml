@@ -1,6 +1,6 @@
 [package]
 name = "issundb-gui"
-description = "A GUI for visualizing graphs and interacting with IssunDB"
+description = "A GUI for visualizing and interacting with graphs stored in IssunDB"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -8,6 +8,7 @@ license.workspace = true
 homepage.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+publish = false
 
 [dependencies]
 issundb = { path = "../issundb" }

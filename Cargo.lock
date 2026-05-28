@@ -2240,6 +2240,7 @@ dependencies = [
  "chumsky",
  "criterion",
  "issundb-core",
+ "regex",
  "rmp-serde",
  "serde",
  "serde_json",

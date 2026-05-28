@@ -74,6 +74,10 @@ pub enum LogicalOperator {
         input: Box<LogicalOperator>,
         items: Vec<SortItem>,
     },
+    /// Deduplicate rows (RETURN/WITH DISTINCT).
+    Distinct {
+        input: Box<LogicalOperator>,
+    },
     /// Skip and limit the row stream.
     Limit {
         input: Box<LogicalOperator>,
@@ -201,6 +205,7 @@ impl LogicalPlanner {
                         order_by,
                         skip,
                         limit,
+                        distinct,
                     } => {
                         // Bootstrap with SingleRow if WITH is the first clause in the
                         // sequence (e.g., `WITH 1 AS x RETURN x`), matching the
@@ -238,6 +243,13 @@ impl LogicalPlanner {
                             items: project_items,
                             is_barrier: true,
                         };
+
+                        // Apply WITH DISTINCT deduplication after project.
+                        if *distinct {
+                            p = LogicalOperator::Distinct {
+                                input: Box::new(p),
+                            };
+                        }
 
                         // Apply optional ORDER BY attached to the WITH clause.
                         if let Some(ob) = order_by {
@@ -375,6 +387,13 @@ impl LogicalPlanner {
         }
 
         // INSERT SKIP / LIMIT above Sort (or Project if no ORDER BY).
+        // Validate SKIP/LIMIT expressions before using them.
+        if let Some(skip_expr) = &query.skip {
+            validate_skip_limit(skip_expr, "SKIP")?;
+        }
+        if let Some(limit_expr) = &query.limit {
+            validate_skip_limit(limit_expr, "LIMIT")?;
+        }
         let skip_n = query.skip.as_ref().map(literal_usize).unwrap_or(0);
         let limit_n = query
             .limit
@@ -500,6 +519,39 @@ type GroupByItem = (Expr, Option<String>);
 /// Aggregation spec: `(function, inner expression, output column name)`.
 type AggItem = (AggFn, Expr, String);
 
+/// Compute a display name for an aggregation expression (used as the default column name).
+fn agg_display_name(fn_: &AggFn, inner: &Expr) -> String {
+    let inner_name = inner_expr_name(inner);
+    match fn_ {
+        AggFn::Count { distinct: true } => format!("count(DISTINCT {})", inner_name),
+        AggFn::Count { distinct: false } => format!("count({})", inner_name),
+        AggFn::Sum { .. } => format!("sum({})", inner_name),
+        AggFn::Avg { .. } => format!("avg({})", inner_name),
+        AggFn::Min { .. } => format!("min({})", inner_name),
+        AggFn::Max { .. } => format!("max({})", inner_name),
+        AggFn::Collect { .. } => format!("collect({})", inner_name),
+        AggFn::StDev { .. } => format!("stDev({})", inner_name),
+        AggFn::StDevP { .. } => format!("stDevP({})", inner_name),
+        AggFn::PercentileDisc { .. } => format!("percentileDisc({})", inner_name),
+        AggFn::PercentileCont { .. } => format!("percentileCont({})", inner_name),
+    }
+}
+
+fn inner_expr_name(expr: &Expr) -> String {
+    match expr {
+        Expr::CountStar => "*".to_string(),
+        Expr::Prop(var, prop) => {
+            if prop.is_empty() {
+                var.clone()
+            } else {
+                format!("{}.{}", var, prop)
+            }
+        }
+        Expr::Literal(lit) => lit.to_string(),
+        _ => "expr".to_string(),
+    }
+}
+
 /// Classify RETURN items into group-by keys (non-aggregate) and aggregation specs.
 ///
 /// Returns `(group_by, aggregations)` where:
@@ -516,7 +568,7 @@ fn split_return_items(query: &Query) -> (Vec<GroupByItem>, Vec<AggItem>) {
                 aggregations.push((AggFn::Count { distinct: false }, Expr::CountStar, col));
             }
             Expr::Agg(fn_, inner) => {
-                let col = item.alias.clone().unwrap_or_else(|| "agg".to_string());
+                let col = item.alias.clone().unwrap_or_else(|| agg_display_name(fn_, inner));
                 aggregations.push((fn_.clone(), *inner.clone(), col));
             }
             other => {
@@ -534,6 +586,35 @@ fn literal_usize(expr: &Expr) -> usize {
     match expr {
         Expr::Literal(crate::ast::Literal::Int(n)) => (*n).max(0) as usize,
         _ => 0,
+    }
+}
+
+/// Validate a SKIP or LIMIT expression. Returns an error if the value is non-constant,
+/// negative, or a float.
+pub(crate) fn validate_skip_limit(expr: &Expr, keyword: &str) -> Result<(), String> {
+    match expr {
+        Expr::Literal(crate::ast::Literal::Int(n)) => {
+            if *n < 0 {
+                Err(format!(
+                    "SyntaxError: {} value must not be negative, got {}",
+                    keyword, n
+                ))
+            } else {
+                Ok(())
+            }
+        }
+        Expr::Literal(crate::ast::Literal::Float(_)) => Err(format!(
+            "SyntaxError: {} value must be an integer, not a float",
+            keyword
+        )),
+        Expr::Param(_) => {
+            // Parameter-based SKIP/LIMIT is allowed in Cypher; validation happens at runtime.
+            Ok(())
+        }
+        _ => Err(format!(
+            "SyntaxError: {} value must be a constant integer expression",
+            keyword
+        )),
     }
 }
 

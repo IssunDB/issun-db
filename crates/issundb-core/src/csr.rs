@@ -152,13 +152,6 @@ impl CsrCache {
         }
     }
 
-    /// Increment the dirty counter. Returns `true` if this call crosses the
-    /// rebuild threshold and no rebuild is already running; the caller must
-    /// then perform the rebuild.
-    pub fn mark_dirty(&self) -> bool {
-        self.mark_dirty_n(1)
-    }
-
     /// Increment the dirty counter by `count`. Returns `true` if this call crosses
     /// the rebuild threshold and no rebuild is already running; the caller must
     /// then perform the rebuild.

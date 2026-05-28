@@ -188,6 +188,8 @@ struct Scenario {
     setup_queries: Vec<String>,
     query: String,
     assertion: Assertion,
+    /// Query parameters from `And parameters are:` tables.
+    params: HashMap<String, serde_json::Value>,
 }
 
 // ---------------------------------------------------------------------------
@@ -463,6 +465,7 @@ fn build_scenario(
     let mut setup_queries: Vec<String> = background.to_vec();
     let mut query = String::new();
     let mut assertion = Assertion::None;
+    let mut params: HashMap<String, serde_json::Value> = HashMap::new();
 
     let mut idx = 0;
     let mut pending_query_kind: Option<&'static str> = None; // "setup" | "when"
@@ -504,6 +507,37 @@ fn build_scenario(
                 continue;
             }
             idx += 1;
+            continue;
+        }
+
+        // Parameters table: `And parameters are:` followed by | key | value | rows.
+        if trimmed == "And parameters are:" || trimmed == "* parameters are:"
+            || trimmed.ends_with("parameters are:")
+        {
+            idx += 1;
+            // ALL rows are data rows (key, value) - no header.
+            while idx < body.len() {
+                let t = body[idx].trim();
+                if t.starts_with('|') && t.ends_with('|') {
+                    let cells: Vec<&str> = t[1..t.len() - 1].split('|').collect();
+                    if cells.len() == 2 {
+                        let key = cells[0].trim().to_string();
+                        let raw_val = cells[1].trim();
+                        // Skip substitution placeholders like <elt> that weren't expanded.
+                        if raw_val.starts_with('<') && raw_val.ends_with('>') {
+                            idx += 1;
+                            continue;
+                        }
+                        let val = parse_table_value(raw_val);
+                        if !key.is_empty() {
+                            params.insert(key, val);
+                        }
+                    }
+                    idx += 1;
+                } else {
+                    break;
+                }
+            }
             continue;
         }
 
@@ -583,6 +617,7 @@ fn build_scenario(
         setup_queries,
         query,
         assertion,
+        params,
     })
 }
 
@@ -658,6 +693,13 @@ fn parse_then(lines: &[&str], idx: &mut usize) -> Assertion {
         || trimmed.contains("error should be raised")
         || trimmed.contains("TypeError should be raised")
         || trimmed.contains("EntityNotFound should be raised")
+        || trimmed.contains("ArgumentError should be raised")
+        || trimmed.contains("ParameterMissing should be raised")
+        || trimmed.contains("ProcedureError should be raised")
+        || trimmed.contains("SemanticError should be raised")
+        || trimmed.contains("ConstraintVerificationFailed should be raised")
+        || trimmed.contains("ConstraintValidationFailed should be raised")
+        || trimmed.contains("should be raised")
     {
         consume_and_clauses(lines, idx);
         return Assertion::ExpectError;
@@ -774,6 +816,35 @@ fn parse_table_value(trimmed: &str) -> serde_json::Value {
         return serde_json::Value::String(trimmed[1..trimmed.len() - 1].to_string());
     }
 
+    // List: [...]
+    if trimmed.starts_with('[') && trimmed.ends_with(']') {
+        let inner = trimmed[1..trimmed.len() - 1].trim();
+        if inner.is_empty() {
+            return serde_json::Value::Array(vec![]);
+        }
+        let items = split_table_list(inner);
+        let parsed: Vec<serde_json::Value> =
+            items.iter().map(|s| parse_table_value(s.trim())).collect();
+        return serde_json::Value::Array(parsed);
+    }
+
+    // Map: {...}
+    if trimmed.starts_with('{') && trimmed.ends_with('}') {
+        let inner = trimmed[1..trimmed.len() - 1].trim();
+        let mut map = serde_json::Map::new();
+        if !inner.is_empty() {
+            for entry in split_table_list(inner) {
+                let entry = entry.trim();
+                if let Some(colon) = entry.find(':') {
+                    let key = entry[..colon].trim().trim_matches('\'').trim_matches('"');
+                    let val = parse_table_value(entry[colon + 1..].trim());
+                    map.insert(key.to_string(), val);
+                }
+            }
+        }
+        return serde_json::Value::Object(map);
+    }
+
     // Integer (including negative).
     if let Ok(v) = trimmed.parse::<i64>() {
         return serde_json::Value::Number(v.into());
@@ -789,6 +860,56 @@ fn parse_table_value(trimmed: &str) -> serde_json::Value {
 
     // Bare identifier or anything else.
     serde_json::Value::String(trimmed.to_string())
+}
+
+/// Split a comma-separated list respecting nested brackets.
+fn split_table_list(s: &str) -> Vec<&str> {
+    let mut items = Vec::new();
+    let mut depth_b = 0i32;
+    let mut depth_p = 0i32;
+    let mut depth_br = 0i32;
+    let mut in_sq = false;
+    let mut in_dq = false;
+    let mut start = 0usize;
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        match c {
+            '\'' if !in_dq => {
+                in_sq = !in_sq;
+            }
+            '"' if !in_sq => {
+                in_dq = !in_dq;
+            }
+            '[' if !in_sq && !in_dq => {
+                depth_b += 1;
+            }
+            ']' if !in_sq && !in_dq => {
+                depth_b -= 1;
+            }
+            '(' if !in_sq && !in_dq => {
+                depth_p += 1;
+            }
+            ')' if !in_sq && !in_dq => {
+                depth_p -= 1;
+            }
+            '{' if !in_sq && !in_dq => {
+                depth_br += 1;
+            }
+            '}' if !in_sq && !in_dq => {
+                depth_br -= 1;
+            }
+            ',' if !in_sq && !in_dq && depth_b == 0 && depth_p == 0 && depth_br == 0 => {
+                items.push(&s[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    items.push(&s[start..]);
+    items
 }
 
 // ---------------------------------------------------------------------------
@@ -820,7 +941,7 @@ fn run_scenario(scenario: &Scenario) -> Result<(), String> {
         };
     }
 
-    let params: HashMap<String, serde_json::Value> = HashMap::new();
+    let params = scenario.params.clone();
     let exec_result = graph.query_with_params(&scenario.query, &params);
 
     match &scenario.assertion {

@@ -32,7 +32,7 @@ rand = "0.8"
 criterion = { version = "0.5.1", features = ["html_reports"] }
 graphblas_sparse_linear_algebra = "0.63.0"
 usearch = "2"
-chumsky = "0.13.0"
+chumsky = { version = "0.13.0", features = ["pratt"] }
 rust-stemmers = "1.2.0"
 unicode-segmentation = "1.13.2"
 pyo3 = { version = "0.22", features = ["abi3-py38"] }

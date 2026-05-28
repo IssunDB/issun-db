@@ -77,6 +77,10 @@ pub enum PhysicalOperator {
         input: Box<PhysicalOperator>,
         null_vars: Vec<String>,
     },
+    /// Deduplicate rows (DISTINCT).
+    Distinct {
+        input: Box<PhysicalOperator>,
+    },
 }
 
 /// A physical planner that compiles logical query plans into physical, executable plans.
@@ -162,6 +166,9 @@ impl PhysicalPlanner {
                     null_vars: null_vars.clone(),
                 }
             }
+            LogicalOperator::Distinct { input } => PhysicalOperator::Distinct {
+                input: Box::new(Self::plan(input)),
+            },
         }
     }
 }
@@ -319,6 +326,10 @@ pub fn format_physical_plan(op: &PhysicalOperator, depth: usize) -> String {
             ));
             buf.push_str(&format_physical_plan(input, depth + 1));
         }
+        PhysicalOperator::Distinct { input } => {
+            buf.push_str(&format!("{}Distinct\n", pad));
+            buf.push_str(&format_physical_plan(input, depth + 1));
+        }
     }
 
     buf
@@ -367,10 +378,14 @@ fn fmt_agg(f: &AggFn) -> String {
     match f {
         AggFn::Count { distinct: true } => "count(DISTINCT".to_string(),
         AggFn::Count { distinct: false } => "count".to_string(),
-        AggFn::Sum => "sum".to_string(),
-        AggFn::Avg => "avg".to_string(),
-        AggFn::Min => "min".to_string(),
-        AggFn::Max => "max".to_string(),
-        AggFn::Collect => "collect".to_string(),
+        AggFn::Sum { .. } => "sum".to_string(),
+        AggFn::Avg { .. } => "avg".to_string(),
+        AggFn::Min { .. } => "min".to_string(),
+        AggFn::Max { .. } => "max".to_string(),
+        AggFn::Collect { .. } => "collect".to_string(),
+        AggFn::StDev { .. } => "stDev".to_string(),
+        AggFn::StDevP { .. } => "stDevP".to_string(),
+        AggFn::PercentileDisc { .. } => "percentileDisc".to_string(),
+        AggFn::PercentileCont { .. } => "percentileCont".to_string(),
     }
 }
