@@ -85,6 +85,30 @@ pub enum PhysicalOperator {
         input: Box<PhysicalOperator>,
         part: crate::ast::QueryPart,
     },
+    /// Worst-case optimal join (WCOJ) for closing a cyclic pattern.
+    ///
+    /// Emitted by the optimizer when an `Expand` node's `dst_var` is already
+    /// bound by an earlier operator in the same plan (a "closing hop"). Instead
+    /// of iterating every neighbor of `closing_src_var` and filtering by value,
+    /// the executor bulk-fetches neighbor sets once per unique source node and
+    /// performs an O(1) hash-map lookup per row.
+    ///
+    /// For a triangle pattern `(a)-[r1]->(b)-[r2]->(c)-[r3]->(a)` this replaces
+    /// the final `Expand(c → a via r3)` with a `MultiwayJoin` that checks each
+    /// `(c, a)` pair in one pass over the pre-built neighbor index.
+    MultiwayJoin {
+        input: Box<PhysicalOperator>,
+        /// Node at the open end of the closing edge.
+        closing_src_var: String,
+        /// Already-bound node the closing edge must connect to.
+        closing_dst_var: String,
+        /// Relationship type of the closing edge; `None` matches any type.
+        closing_rel_type: Option<String>,
+        /// Variable to bind the closing edge's `EdgeId`.
+        closing_rel_var: String,
+        /// Direction of the closing edge: `true` = incoming to `closing_src_var`.
+        closing_is_incoming: bool,
+    },
 }
 
 /// A physical planner that compiles logical query plans into physical, executable plans.
@@ -347,6 +371,22 @@ pub fn format_physical_plan(op: &PhysicalOperator, depth: usize) -> String {
                 _ => "WritePart",
             };
             buf.push_str(&format!("{}WritePart({})\n", pad, part_name));
+            buf.push_str(&format_physical_plan(input, depth + 1));
+        }
+        PhysicalOperator::MultiwayJoin {
+            input,
+            closing_src_var,
+            closing_dst_var,
+            closing_rel_type,
+            closing_rel_var,
+            closing_is_incoming,
+        } => {
+            let dir = if *closing_is_incoming { "<-" } else { "->" };
+            let rel = closing_rel_type.as_deref().unwrap_or("*");
+            buf.push_str(&format!(
+                "{}MultiwayJoin ({}{dir}[{closing_rel_var}:{rel}]{dir}{closing_dst_var})\n",
+                pad, closing_src_var
+            ));
             buf.push_str(&format_physical_plan(input, depth + 1));
         }
     }

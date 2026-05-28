@@ -1,9 +1,15 @@
 {
-  description = "Ocelot: a Gameboy and Gameboy Color emulator in Haskell";
+  description = "IssunDB: a fast embedded analytical graph database in Rust";
 
-  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+  };
 
-  outputs = { self, nixpkgs }:
+  outputs = { self, nixpkgs, rust-overlay }:
     let
       systems = [
         "x86_64-linux"
@@ -12,37 +18,82 @@
         "aarch64-darwin"
       ];
       forAllSystems = f:
-        nixpkgs.lib.genAttrs systems
-          (system: f (import nixpkgs { inherit system; }));
+        nixpkgs.lib.genAttrs systems (system:
+          let
+            pkgs = import nixpkgs {
+              inherit system;
+              overlays = [ (import rust-overlay) ];
+            };
+          in
+          f pkgs
+        );
     in
     {
       devShells = forAllSystems (pkgs:
         let
-          ghc = pkgs.haskell.compiler.ghc967;
-          hsPkgs = pkgs.haskell.packages.ghc967;
+          # Retrieve the exact rust toolchain specified in rust-toolchain.toml
+          rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
+
+          # Runtime libraries required by eframe/egui GUI on Linux
+          guiLibs = with pkgs; lib.optionals stdenv.isLinux [
+            libxkbcommon
+            libGL
+            vulkan-loader
+            xorg.libX11
+            xorg.libXcursor
+            xorg.libXi
+            xorg.libXrandr
+            wayland
+          ];
+
+          # Darwin-specific frameworks for macOS development
+          darwinDeps = with pkgs; lib.optionals stdenv.isDarwin [
+            darwin.apple_sdk.frameworks.AppKit
+            darwin.apple_sdk.frameworks.CoreGraphics
+            darwin.apple_sdk.frameworks.CoreVideo
+            darwin.apple_sdk.frameworks.Foundation
+            darwin.apple_sdk.frameworks.Metal
+            darwin.apple_sdk.frameworks.Security
+            darwin.apple_sdk.frameworks.Cocoa
+          ];
         in
         {
           default = pkgs.mkShell {
-            name = "ocelot";
+            name = "issundb-dev";
 
             packages = [
-              ghc
-              pkgs.stack
-              pkgs.cabal-install
-              hsPkgs.haskell-language-server
-              hsPkgs.hlint
-              hsPkgs.fourmolu
-              pkgs.hpack
-              pkgs.zlib
+              rustToolchain
               pkgs.pkg-config
-              pkgs.binaryen
-              # SDL2 for the frontend (which is linked at runtime via sdl2 Haskell package).
-              pkgs.SDL2
-            ];
+              pkgs.cmake
+              pkgs.gnumake
+              pkgs.graphviz
+              pkgs.python3
+              pkgs.nodejs
+              pkgs.openssl
+              pkgs.llvmPackages.libclang
+              pkgs.clang
+              pkgs.pre-commit
 
-            # Stack picks up this GHC via system-ghc/install-ghc settings in stack.yaml, so no extra flags are needed at the command line.
+              # Dev tools used in Makefile
+              pkgs.cargo-tarpaulin
+              pkgs.cargo-audit
+              pkgs.cargo-careful
+              pkgs.cargo-nextest
+            ] ++ guiLibs ++ darwinDeps;
+
+            # We need to set the LD_LIBRARY_PATH so that the compiled GUI binary can find dynamic libraries on NixOS/Linux.
+            # We also set LIBCLANG_PATH for rust-bindgen to work properly.
             shellHook = ''
-              echo "Ocelot dev shell: ghc $(ghc --numeric-version), stack $(stack --numeric-version 2>/dev/null || true)"
+              export LIBCLANG_PATH="${pkgs.llvmPackages.libclang.lib}/lib"
+              ${pkgs.lib.optionalString pkgs.stdenv.isLinux ''
+                export LD_LIBRARY_PATH="$LD_LIBRARY_PATH:${pkgs.lib.makeLibraryPath guiLibs}"
+              ''}
+              echo "=========================================================="
+              echo "  Welcome to the IssunDB development environment!        "
+              echo "  Rust version:  $(rustc --version)                       "
+              echo "  Python:        $(python3 --version 2>/dev/null || echo 'not found')"
+              echo "  Node.js:       $(node --version 2>/dev/null || echo 'not found')"
+              echo "=========================================================="
             '';
           };
         });

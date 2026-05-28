@@ -9,6 +9,7 @@ use crate::plan::{FilterExpr, LogicalPlanner, Optimizer, PhysicalOperator, Physi
 
 mod ddl;
 mod expr;
+mod factorize;
 mod read;
 mod write;
 
@@ -751,6 +752,95 @@ mod tests {
             expected,
             sd
         );
+    }
+
+    // --- SIP (Sideways Information Passing) correctness ---
+
+    /// Two MATCH clauses sharing a variable: the SIP filter must restrict the
+    /// probe side's LabelScan to only the nodes produced by the build side,
+    /// while still returning the same rows as a brute-force equi-join.
+    #[test]
+    fn sip_multi_match_shared_variable_correctness() {
+        let (_dir, graph) = setup_graph();
+        // Insert 20 Person nodes; only two have age = 30.
+        for i in 0..20i64 {
+            let age = if i < 2 { 30 } else { i + 40 };
+            graph
+                .add_node("Person", &serde_json::json!({"name": format!("p{i}"), "age": age}))
+                .unwrap();
+        }
+
+        // Two separate MATCH clauses joined on `a`.  The second clause restricts
+        // to age = 30; the SIP filter should propagate those IDs to the first clause.
+        let rows = run(
+            &graph,
+            "MATCH (a:Person) MATCH (a:Person) WHERE a.age = 30 RETURN a.name AS name",
+        );
+        assert_eq!(rows.len(), 2, "expected exactly 2 rows with age=30, got {}", rows.len());
+        let mut names: Vec<String> = rows
+            .iter()
+            .map(|r| r[0].as_str().unwrap().to_string())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["p0", "p1"]);
+    }
+
+    /// Verifies that SIP does not produce spurious rows: a join on a shared
+    /// variable with no matching build-side rows must return an empty result.
+    #[test]
+    fn sip_empty_build_side_returns_no_rows() {
+        let (_dir, graph) = setup_graph();
+        for i in 0..10i64 {
+            graph
+                .add_node("Person", &serde_json::json!({"age": i + 50}))
+                .unwrap();
+        }
+
+        // No Person has age = 30, so the build side is empty — result must be empty.
+        let rows = run(
+            &graph,
+            "MATCH (a:Person) MATCH (a:Person) WHERE a.age = 30 RETURN a",
+        );
+        assert!(rows.is_empty(), "expected no rows, got {}", rows.len());
+    }
+
+    /// Multi-MATCH with an Expand on the probe side: SIP must thread through
+    /// the Expand and restrict its inner LabelScan, then the expansion must
+    /// produce only edges reachable from the SIP-filtered nodes.
+    #[test]
+    fn sip_probe_side_expand_correctness() {
+        let (_dir, graph) = setup_graph();
+        // p0 (age=30) -[:KNOWS]-> q0
+        // p1 (age=99) -[:KNOWS]-> q1
+        // SIP should restrict probe to p0 only, so result has exactly one (a, b) pair.
+        let p0 = graph
+            .add_node("Person", &serde_json::json!({"name": "p0", "age": 30}))
+            .unwrap();
+        let p1 = graph
+            .add_node("Person", &serde_json::json!({"name": "p1", "age": 99}))
+            .unwrap();
+        let q0 = graph
+            .add_node("Person", &serde_json::json!({"name": "q0", "age": 1}))
+            .unwrap();
+        let q1 = graph
+            .add_node("Person", &serde_json::json!({"name": "q1", "age": 2}))
+            .unwrap();
+        graph.add_edge(p0, q0, "KNOWS", &serde_json::json!({})).unwrap();
+        graph.add_edge(p1, q1, "KNOWS", &serde_json::json!({})).unwrap();
+        graph.rebuild_csr().unwrap();
+
+        // First MATCH expands to KNOWS neighbors (probe, heavier).
+        // Second MATCH finds age=30 persons (build, lighter).
+        // The shared WHERE restricts `a` to age=30; after filter pushdown
+        // both sides carry the predicate, so SIP propagates p0's NodeId
+        // into the Expand's inner LabelScan.
+        let rows = run(
+            &graph,
+            "MATCH (a:Person) MATCH (a)-[:KNOWS]->(b:Person) WHERE a.age = 30 RETURN a.name AS a, b.name AS b",
+        );
+        assert_eq!(rows.len(), 1, "expected 1 row, got {}", rows.len());
+        assert_eq!(rows[0][0].as_str().unwrap(), "p0");
+        assert_eq!(rows[0][1].as_str().unwrap(), "q0");
     }
 
     #[test]

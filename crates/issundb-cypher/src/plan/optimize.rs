@@ -25,6 +25,9 @@ impl Optimizer {
             };
         }
         result = Self::optimize_index_scans(result, stats);
+        // Rewrite closing Expand nodes into MultiwayJoin after index-scan optimization
+        // so that both passes benefit each other.
+        result = rewrite_closing_expands(result);
         result
     }
 
@@ -204,6 +207,27 @@ impl Optimizer {
             PhysicalOperator::WritePart { input, part } => {
                 (PhysicalOperator::WritePart { input, part }, Vec::new())
             }
+            PhysicalOperator::MultiwayJoin {
+                input,
+                closing_src_var,
+                closing_dst_var,
+                closing_rel_type,
+                closing_rel_var,
+                closing_is_incoming,
+            } => {
+                let (inner_op, inner_filters) = Self::extract_filters(*input);
+                (
+                    PhysicalOperator::MultiwayJoin {
+                        input: Box::new(inner_op),
+                        closing_src_var,
+                        closing_dst_var,
+                        closing_rel_type,
+                        closing_rel_var,
+                        closing_is_incoming,
+                    },
+                    inner_filters,
+                )
+            }
         }
     }
 
@@ -328,6 +352,21 @@ impl Optimizer {
             PhysicalOperator::WritePart { input, part } => {
                 PhysicalOperator::WritePart { input, part }
             }
+            PhysicalOperator::MultiwayJoin {
+                input,
+                closing_src_var,
+                closing_dst_var,
+                closing_rel_type,
+                closing_rel_var,
+                closing_is_incoming,
+            } => PhysicalOperator::MultiwayJoin {
+                input: Box::new(Self::reorder_operators(*input, stats)),
+                closing_src_var,
+                closing_dst_var,
+                closing_rel_type,
+                closing_rel_var,
+                closing_is_incoming,
+            },
         }
     }
 
@@ -382,6 +421,9 @@ impl Optimizer {
             | PhysicalOperator::OptionalMatch { input, .. }
             | PhysicalOperator::Distinct { input, .. }
             | PhysicalOperator::WritePart { input, .. } => Self::plan_weight(input, stats),
+            // MultiwayJoin is cheaper than a regular Expand because the closing check is O(1)
+            // per row after a single bulk expansion. Weight as the input cost.
+            PhysicalOperator::MultiwayJoin { input, .. } => Self::plan_weight(input, stats),
         }
     }
 
@@ -747,11 +789,63 @@ impl Optimizer {
             PhysicalOperator::WritePart { input, part } => {
                 PhysicalOperator::WritePart { input, part }
             }
+            PhysicalOperator::MultiwayJoin {
+                input,
+                closing_src_var,
+                closing_dst_var,
+                closing_rel_type,
+                closing_rel_var,
+                closing_is_incoming,
+            } => {
+                let child_bound = Self::bound_vars(&input);
+
+                let mut child_pending = Vec::new();
+                let mut remaining_pending = Vec::new();
+
+                for filter in pending.drain(..) {
+                    let ref_vars = Self::referenced_vars(&filter);
+                    if ref_vars.is_subset(&child_bound) {
+                        child_pending.push(filter);
+                    } else {
+                        remaining_pending.push(filter);
+                    }
+                }
+
+                let optimized_input = Self::push_down_filters(*input, &mut child_pending);
+                remaining_pending.extend(child_pending);
+
+                let mut current_node = PhysicalOperator::MultiwayJoin {
+                    input: Box::new(optimized_input),
+                    closing_src_var,
+                    closing_dst_var,
+                    closing_rel_type,
+                    closing_rel_var,
+                    closing_is_incoming,
+                };
+
+                let bound = Self::bound_vars(&current_node);
+                let mut i = 0;
+                while i < remaining_pending.len() {
+                    let ref_vars = Self::referenced_vars(&remaining_pending[i]);
+                    if ref_vars.is_subset(&bound) {
+                        let filter_expr = remaining_pending.remove(i);
+                        current_node = PhysicalOperator::Filter {
+                            input: Box::new(current_node),
+                            expression: filter_expr,
+                        };
+                    } else {
+                        i += 1;
+                    }
+                }
+
+                *pending = remaining_pending;
+                current_node
+            }
         }
     }
 
     /// Compute the set of variables that are bound or introduced by a physical operator.
-    fn bound_vars(op: &PhysicalOperator) -> HashSet<String> {
+    pub(crate) fn bound_vars(op: &PhysicalOperator) -> HashSet<String> {
         let mut vars = HashSet::new();
         Self::collect_bound_vars(op, &mut vars);
         vars
@@ -926,6 +1020,16 @@ impl Optimizer {
                     _ => {}
                 }
             }
+            PhysicalOperator::MultiwayJoin {
+                input,
+                closing_rel_var,
+                ..
+            } => {
+                Self::collect_bound_vars(input, vars);
+                // closing_src_var and closing_dst_var are already bound by input;
+                // the only new binding introduced here is the closing edge variable.
+                vars.insert(closing_rel_var.clone());
+            }
         }
     }
 
@@ -1061,8 +1165,140 @@ impl Optimizer {
                 left: Box::new(Self::optimize_index_scans(*left, stats)),
                 right: Box::new(Self::optimize_index_scans(*right, stats)),
             },
+            PhysicalOperator::MultiwayJoin {
+                input,
+                closing_src_var,
+                closing_dst_var,
+                closing_rel_type,
+                closing_rel_var,
+                closing_is_incoming,
+            } => PhysicalOperator::MultiwayJoin {
+                input: Box::new(Self::optimize_index_scans(*input, stats)),
+                closing_src_var,
+                closing_dst_var,
+                closing_rel_type,
+                closing_rel_var,
+                closing_is_incoming,
+            },
             leaf => leaf,
         }
+    }
+}
+
+/// Rewrite `Expand` nodes whose `dst_var` is already bound by an ancestor
+/// operator into `MultiwayJoin` nodes. Only applies to single-hop, directed
+/// patterns where the closing check would otherwise iterate all neighbors and
+/// filter by value.
+fn rewrite_closing_expands(op: PhysicalOperator) -> PhysicalOperator {
+    match op {
+        PhysicalOperator::Expand {
+            input,
+            src_var,
+            rel_var,
+            dst_var,
+            rel_type,
+            is_incoming,
+            is_undirected,
+            min_hops,
+            max_hops,
+        } => {
+            let new_input = rewrite_closing_expands(*input);
+            let input_bound = Optimizer::bound_vars(&new_input);
+            if min_hops == 1 && max_hops == 1 && !is_undirected && input_bound.contains(&dst_var) {
+                PhysicalOperator::MultiwayJoin {
+                    input: Box::new(new_input),
+                    closing_src_var: src_var,
+                    closing_dst_var: dst_var,
+                    closing_rel_type: rel_type,
+                    closing_rel_var: rel_var,
+                    closing_is_incoming: is_incoming,
+                }
+            } else {
+                PhysicalOperator::Expand {
+                    input: Box::new(new_input),
+                    src_var,
+                    rel_var,
+                    dst_var,
+                    rel_type,
+                    is_incoming,
+                    is_undirected,
+                    min_hops,
+                    max_hops,
+                }
+            }
+        }
+        PhysicalOperator::Filter { input, expression } => PhysicalOperator::Filter {
+            input: Box::new(rewrite_closing_expands(*input)),
+            expression,
+        },
+        PhysicalOperator::Project {
+            input,
+            items,
+            is_barrier,
+        } => PhysicalOperator::Project {
+            input: Box::new(rewrite_closing_expands(*input)),
+            items,
+            is_barrier,
+        },
+        PhysicalOperator::HashJoin { left, right } => PhysicalOperator::HashJoin {
+            left: Box::new(rewrite_closing_expands(*left)),
+            right: Box::new(rewrite_closing_expands(*right)),
+        },
+        PhysicalOperator::Aggregate {
+            input,
+            group_by,
+            aggregations,
+        } => PhysicalOperator::Aggregate {
+            input: Box::new(rewrite_closing_expands(*input)),
+            group_by,
+            aggregations,
+        },
+        PhysicalOperator::Sort { input, items } => PhysicalOperator::Sort {
+            input: Box::new(rewrite_closing_expands(*input)),
+            items,
+        },
+        PhysicalOperator::Limit { input, skip, count } => PhysicalOperator::Limit {
+            input: Box::new(rewrite_closing_expands(*input)),
+            skip,
+            count,
+        },
+        PhysicalOperator::Unwind {
+            input,
+            expr,
+            variable,
+        } => PhysicalOperator::Unwind {
+            input: Box::new(rewrite_closing_expands(*input)),
+            expr,
+            variable,
+        },
+        PhysicalOperator::OptionalMatch { input, null_vars } => PhysicalOperator::OptionalMatch {
+            input: Box::new(rewrite_closing_expands(*input)),
+            null_vars,
+        },
+        PhysicalOperator::Distinct { input } => PhysicalOperator::Distinct {
+            input: Box::new(rewrite_closing_expands(*input)),
+        },
+        PhysicalOperator::WritePart { input, part } => PhysicalOperator::WritePart {
+            input: Box::new(rewrite_closing_expands(*input)),
+            part,
+        },
+        // MultiwayJoin is already a closing join; recurse into its input only.
+        PhysicalOperator::MultiwayJoin {
+            input,
+            closing_src_var,
+            closing_dst_var,
+            closing_rel_type,
+            closing_rel_var,
+            closing_is_incoming,
+        } => PhysicalOperator::MultiwayJoin {
+            input: Box::new(rewrite_closing_expands(*input)),
+            closing_src_var,
+            closing_dst_var,
+            closing_rel_type,
+            closing_rel_var,
+            closing_is_incoming,
+        },
+        leaf => leaf,
     }
 }
 
@@ -1341,5 +1577,101 @@ mod tests {
         } else {
             panic!("expected HashJoin");
         }
+    }
+
+    #[test]
+    fn test_rewrite_closing_expands_triangle() {
+        // A triangle pattern MATCH (a)-[:KNOWS]->(b)-[:KNOWS]->(c)-[:KNOWS]->(a)
+        // should have its final Expand (c → a) rewritten to MultiwayJoin because
+        // `a` is already bound by the LabelScan.
+        let plan = PhysicalOperator::Expand {
+            input: Box::new(PhysicalOperator::Expand {
+                input: Box::new(PhysicalOperator::Expand {
+                    input: Box::new(PhysicalOperator::LabelScan {
+                        variable: "a".to_string(),
+                        label: Some("Person".to_string()),
+                    }),
+                    src_var: "a".to_string(),
+                    rel_var: "r1".to_string(),
+                    dst_var: "b".to_string(),
+                    rel_type: Some("KNOWS".to_string()),
+                    is_incoming: false,
+                    is_undirected: false,
+                    min_hops: 1,
+                    max_hops: 1,
+                }),
+                src_var: "b".to_string(),
+                rel_var: "r2".to_string(),
+                dst_var: "c".to_string(),
+                rel_type: Some("KNOWS".to_string()),
+                is_incoming: false,
+                is_undirected: false,
+                min_hops: 1,
+                max_hops: 1,
+            }),
+            src_var: "c".to_string(),
+            rel_var: "r3".to_string(),
+            dst_var: "a".to_string(), // already bound — this is the closing hop
+            rel_type: Some("KNOWS".to_string()),
+            is_incoming: false,
+            is_undirected: false,
+            min_hops: 1,
+            max_hops: 1,
+        };
+
+        let rewritten = rewrite_closing_expands(plan);
+
+        // The top-level operator must now be MultiwayJoin.
+        match rewritten {
+            PhysicalOperator::MultiwayJoin {
+                closing_src_var,
+                closing_dst_var,
+                closing_rel_type,
+                closing_is_incoming,
+                ..
+            } => {
+                assert_eq!(closing_src_var, "c");
+                assert_eq!(closing_dst_var, "a");
+                assert_eq!(closing_rel_type.as_deref(), Some("KNOWS"));
+                assert!(!closing_is_incoming);
+            }
+            other => panic!("expected MultiwayJoin, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_rewrite_closing_expands_open_chain_unchanged() {
+        // An open 3-hop chain (no cycle) must not be rewritten.
+        let plan = PhysicalOperator::Expand {
+            input: Box::new(PhysicalOperator::Expand {
+                input: Box::new(PhysicalOperator::LabelScan {
+                    variable: "a".to_string(),
+                    label: Some("Person".to_string()),
+                }),
+                src_var: "a".to_string(),
+                rel_var: "r1".to_string(),
+                dst_var: "b".to_string(),
+                rel_type: Some("KNOWS".to_string()),
+                is_incoming: false,
+                is_undirected: false,
+                min_hops: 1,
+                max_hops: 1,
+            }),
+            src_var: "b".to_string(),
+            rel_var: "r2".to_string(),
+            dst_var: "c".to_string(), // fresh variable
+            rel_type: Some("KNOWS".to_string()),
+            is_incoming: false,
+            is_undirected: false,
+            min_hops: 1,
+            max_hops: 1,
+        };
+
+        let rewritten = rewrite_closing_expands(plan);
+
+        assert!(
+            matches!(rewritten, PhysicalOperator::Expand { dst_var, .. } if dst_var == "c"),
+            "open chain must remain as Expand"
+        );
     }
 }

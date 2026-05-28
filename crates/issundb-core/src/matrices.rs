@@ -1,6 +1,7 @@
 #![allow(clippy::duplicated_attributes)]
 
 use std::collections::HashMap;
+use std::os::raw::c_int;
 use std::sync::Arc;
 
 use graphblas_sparse_linear_algebra::collections::sparse_matrix::operations::FromMatrixElementList;
@@ -9,6 +10,7 @@ use graphblas_sparse_linear_algebra::collections::sparse_matrix::{
 };
 use graphblas_sparse_linear_algebra::context::Context;
 use graphblas_sparse_linear_algebra::operators::binary_operator::{First, Plus};
+use suitesparse_graphblas_sys::{GxB_Global_Option_set, GxB_NTHREADS};
 
 use crate::{csr::CsrSnapshot, error::Error, schema::TypeId};
 
@@ -37,6 +39,24 @@ impl MatrixSet {
     /// Materialize all sparse matrices from the CSR snapshot.
     pub fn materialize(csr: &CsrSnapshot) -> Result<Self, Error> {
         let context = Context::init_default().map_err(|e| Error::GraphBLAS(e.to_string()))?;
+
+        // Threshold-gate OpenMP parallelism: enable multi-threading only when the
+        // graph is large enough that the per-thread overhead is amortized. Below
+        // 100 000 edges the single-threaded path avoids context-switching noise.
+        let n_edges = csr.col_idx.len();
+        let n_threads: c_int = if n_edges > 100_000 {
+            std::thread::available_parallelism()
+                .map(|n| n.get() as c_int)
+                .unwrap_or(1)
+        } else {
+            1
+        };
+        context
+            .call_without_detailed_error_information(|| unsafe {
+                GxB_Global_Option_set(GxB_NTHREADS as c_int, n_threads)
+            })
+            .map_err(|e| Error::GraphBLAS(e.to_string()))?;
+
         let n_nodes = csr.dense_to_id.len();
         let matrix_size = Size::from((n_nodes, n_nodes));
 

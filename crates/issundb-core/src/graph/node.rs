@@ -100,6 +100,21 @@ impl Graph {
 
         adjust_label_count(&self.storage, wtxn, label_id, 1)?;
 
+        // Auto-index: write every scalar property to node_prop_idx so the
+        // Cypher optimizer can use NodeIndexScan without a prior CREATE INDEX.
+        if let Some(obj) = props_json.as_object() {
+            for (prop_name, val) in obj {
+                if val.is_null() {
+                    continue;
+                }
+                if let Some(encoded) = encode_property_value(val) {
+                    let prop_key_id = get_or_create_prop_key(&self.storage, wtxn, prop_name)?;
+                    let idx_key = node_prop_index_key(label_id, prop_key_id, &encoded, node_id);
+                    self.storage.node_prop_idx.put(wtxn, &idx_key, &())?;
+                }
+            }
+        }
+
         Ok(node_id)
     }
 
@@ -230,6 +245,33 @@ impl Graph {
             &props_json,
         )?;
 
+        // Auto-index: delete old scalar entries and write new ones.
+        if let Some(obj) = old_props_json.as_object() {
+            for (prop_name, val) in obj {
+                if val.is_null() {
+                    continue;
+                }
+                if let Some(encoded) = encode_property_value(val) {
+                    if let Some(pkid) = get_prop_key(&self.storage, &*wtxn, prop_name)? {
+                        let idx_key = node_prop_index_key(label_id, pkid, &encoded, id);
+                        self.storage.node_prop_idx.delete(wtxn, &idx_key)?;
+                    }
+                }
+            }
+        }
+        if let Some(obj) = props_json.as_object() {
+            for (prop_name, val) in obj {
+                if val.is_null() {
+                    continue;
+                }
+                if let Some(encoded) = encode_property_value(val) {
+                    let prop_key_id = get_or_create_prop_key(&self.storage, wtxn, prop_name)?;
+                    let idx_key = node_prop_index_key(label_id, prop_key_id, &encoded, id);
+                    self.storage.node_prop_idx.put(wtxn, &idx_key, &())?;
+                }
+            }
+        }
+
         let record = NodeRecord {
             label: label_id,
             props: encoded_props,
@@ -273,6 +315,21 @@ impl Graph {
                                 node_prop_index_key(record.label, prop_key_id, &encoded, id);
                             self.storage.node_prop_idx.delete(wtxn, &idx_key)?;
                         }
+                    }
+                }
+            }
+        }
+
+        // Auto-index cleanup: delete all scalar property entries for this node.
+        if let Some(obj) = props_json.as_object() {
+            for (prop_name, val) in obj {
+                if val.is_null() {
+                    continue;
+                }
+                if let Some(encoded) = encode_property_value(val) {
+                    if let Some(pkid) = get_prop_key(&self.storage, &*wtxn, prop_name)? {
+                        let idx_key = node_prop_index_key(record.label, pkid, &encoded, id);
+                        self.storage.node_prop_idx.delete(wtxn, &idx_key)?;
                     }
                 }
             }
@@ -370,5 +427,83 @@ impl Graph {
         self.storage.nodes.delete(wtxn, &id)?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    use super::*;
+
+    fn open_tmp() -> (TempDir, Graph) {
+        let dir = TempDir::new().unwrap();
+        let g = Graph::open(dir.path(), 1).unwrap();
+        (dir, g)
+    }
+
+    /// Verify that scalar properties are automatically indexed on insert,
+    /// without a prior `create_node_property_index` call.
+    #[test]
+    fn auto_index_on_insert() {
+        let (_dir, g) = open_tmp();
+
+        let node_id = g
+            .add_node("Person", &json!({"name": "Alice", "age": 30}))
+            .unwrap();
+
+        // nodes_by_property must find the node without an explicit index call.
+        let hits = g
+            .nodes_by_property("Person", "age", PropValue::Int(30))
+            .unwrap();
+        assert_eq!(hits, vec![node_id]);
+
+        // has_node_property_index must report true based on stored data.
+        assert!(g.has_node_property_index("Person", "age").unwrap());
+        assert!(g.has_node_property_index("Person", "name").unwrap());
+    }
+
+    /// Verify that the auto-index is updated correctly when a node is updated.
+    #[test]
+    fn auto_index_on_update() {
+        let (_dir, g) = open_tmp();
+
+        let node_id = g
+            .add_node("Person", &json!({"name": "Bob", "age": 25}))
+            .unwrap();
+
+        // Update age to 26.
+        g.update_node(node_id, &json!({"name": "Bob", "age": 26}))
+            .unwrap();
+
+        // Old value must not be found.
+        let old_hits = g
+            .nodes_by_property("Person", "age", PropValue::Int(25))
+            .unwrap();
+        assert!(old_hits.is_empty());
+
+        // New value must be found.
+        let new_hits = g
+            .nodes_by_property("Person", "age", PropValue::Int(26))
+            .unwrap();
+        assert_eq!(new_hits, vec![node_id]);
+    }
+
+    /// Verify that the auto-index is cleaned up when a node is deleted.
+    #[test]
+    fn auto_index_on_delete() {
+        let (_dir, g) = open_tmp();
+
+        let node_id = g
+            .add_node("Person", &json!({"name": "Carol", "age": 40}))
+            .unwrap();
+
+        g.delete_node(node_id).unwrap();
+
+        let hits = g
+            .nodes_by_property("Person", "age", PropValue::Int(40))
+            .unwrap();
+        assert!(hits.is_empty());
     }
 }

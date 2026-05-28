@@ -13,7 +13,7 @@
 [![MSRV](https://img.shields.io/badge/msrv-1.85.0-informational?style=flat&labelColor=282c34&logo=rust)](https://www.rust-lang.org)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-007ec6?style=flat&labelColor=282c34&logo=open-source-initiative)](https://github.com/IssunDB/issun-db)
 
-An fast embedded analytical graph database in Rust
+A fast embedded analytical graph database in Rust
 
 </div>
 

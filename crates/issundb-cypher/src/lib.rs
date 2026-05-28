@@ -242,7 +242,7 @@ mod tests {
         assert!(g.get_edge(eid).unwrap().is_some());
 
         let params = HashMap::new();
-        let result = execute(
+        let _result = execute(
             &g,
             "MATCH (a:Person)-[r:KNOWS]->(b:Person) DELETE r",
             &params,
@@ -648,6 +648,99 @@ mod tests {
         assert!(
             err.is_err(),
             "filter on rel_var in variable-length path should error"
+        );
+    }
+
+    // Proposal B: the factorized Filter-over-Expand path must produce the same
+    // results as the default path for a property filter on the source node.
+    // The factorized path skips all destinations of rejected sources with zero
+    // PathMap clones; this test verifies correctness of that fast path.
+    #[test]
+    fn factorized_filter_over_expand_source_predicate() {
+        let (_dir, g) = open_tmp();
+
+        let a = g
+            .add_node("Person", &json!({ "name": "Alice", "age": 30 }))
+            .unwrap();
+        let b = g
+            .add_node("Person", &json!({ "name": "Bob", "age": 20 }))
+            .unwrap();
+        let c = g
+            .add_node("Person", &json!({ "name": "Carol", "age": 30 }))
+            .unwrap();
+
+        g.add_edge(a, b, "KNOWS", &json!({})).unwrap();
+        g.add_edge(a, c, "KNOWS", &json!({})).unwrap();
+        g.add_edge(b, c, "KNOWS", &json!({})).unwrap();
+        g.rebuild_csr().unwrap();
+
+        let params = HashMap::new();
+
+        // Filter on source (shared prefix): only Alice (age=30) passes.
+        // The factorized path evaluates the filter once for Alice, once for Bob.
+        // Bob is rejected and its destination (Carol) is skipped with no clone.
+        let res = execute(
+            &g,
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE a.age = 30 RETURN b.name AS name",
+            &params,
+        )
+        .unwrap();
+
+        let mut names: Vec<String> = res
+            .records
+            .iter()
+            .map(|r| r.values[0].as_str().unwrap().to_string())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["Bob", "Carol"]);
+
+        // Filter on destination (expansion variable): falls through to per-row path.
+        // Both Alice→Carol and Bob→Carol satisfy b.age = 30, so two rows are returned.
+        let res2 = execute(
+            &g,
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE b.age = 30 RETURN b.name AS name",
+            &params,
+        )
+        .unwrap();
+
+        let mut names2: Vec<String> = res2
+            .records
+            .iter()
+            .map(|r| r.values[0].as_str().unwrap().to_string())
+            .collect();
+        names2.sort();
+        assert_eq!(names2, vec!["Carol", "Carol"]);
+    }
+
+    // Proposal A: NodeIndexScan should activate for any property with data,
+    // not only properties with an explicit CREATE INDEX.
+    #[test]
+    fn auto_index_enables_node_index_scan_without_create_index() {
+        let (_dir, g) = open_tmp();
+
+        for i in 0..20i64 {
+            g.add_node("Person", &json!({ "age": i })).unwrap();
+        }
+        g.rebuild_csr().unwrap();
+
+        let params = HashMap::new();
+
+        // No CREATE INDEX has been run. The auto-index written on insertion must
+        // allow NodeIndexScan to serve this equality predicate.
+        let res = execute(
+            &g,
+            "MATCH (n:Person) WHERE n.age = 5 RETURN n.age AS age",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(res.records.len(), 1);
+        assert_eq!(res.records[0].values[0], json!(5));
+
+        // Confirm the plan uses NodeIndexScan, not a full LabelScan + Filter.
+        let plan = explain(&g, "MATCH (n:Person) WHERE n.age = 5 RETURN n.age").unwrap();
+        assert!(
+            plan.contains("NodeIndexScan"),
+            "plan must use NodeIndexScan when auto-index is present; got:\n{plan}"
         );
     }
 }

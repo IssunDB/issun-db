@@ -1,4 +1,5 @@
 use super::expr::*;
+use super::factorize::{FactorizedRecordGroup, filter_refs_in_expr};
 use super::*;
 
 /// Expand from a set of source nodes, handling pipe-separated OR relationship types.
@@ -313,6 +314,423 @@ pub(super) fn binding_to_value(
     }
 }
 
+/// Convert a `FilterExpr` to the `WhereClause` representation used by `evaluate_where`.
+fn filter_expr_to_where_clause(expression: &FilterExpr) -> WhereClause {
+    match expression {
+        FilterExpr::Eq(l, r) => WhereClause::Eq(l.clone(), r.clone()),
+        FilterExpr::Ne(l, r) => WhereClause::Ne(l.clone(), r.clone()),
+        FilterExpr::Lt(l, r) => WhereClause::Lt(l.clone(), r.clone()),
+        FilterExpr::Gt(l, r) => WhereClause::Gt(l.clone(), r.clone()),
+        FilterExpr::Le(l, r) => WhereClause::Le(l.clone(), r.clone()),
+        FilterExpr::Ge(l, r) => WhereClause::Ge(l.clone(), r.clone()),
+        FilterExpr::HasLabel(_, _) => {
+            unreachable!("HasLabel handled before filter_expr_to_where_clause")
+        }
+        FilterExpr::Expr(e) => WhereClause::Expr(e.clone()),
+    }
+}
+
+/// Parameters extracted from a single-hop `Expand` operator for the factorized filter executor.
+struct ExpandParams<'a> {
+    input: &'a PhysicalOperator,
+    src_var: &'a str,
+    rel_var: &'a str,
+    dst_var: &'a str,
+    rel_type: Option<&'a str>,
+    is_incoming: bool,
+}
+
+/// Optimized execution for `Filter { input: Expand(single-hop, directed), expression }`.
+///
+/// Evaluates the filter predicate once per source path when the predicate only
+/// references variables that are bound BEFORE the expansion (the shared prefix).
+/// Sources that fail are skipped with zero PathMap clones, avoiding the
+/// O(avg_degree) clone cost that the default path incurs per rejected source.
+///
+/// When the predicate references `rel_var` or `dst_var` (the new expansion
+/// bindings), falls back to per-row evaluation.
+fn execute_filter_over_expand(
+    graph: &Graph,
+    expand: ExpandParams<'_>,
+    expression: &FilterExpr,
+    params: &HashMap<String, serde_json::Value>,
+) -> Result<Vec<PathMap>, String> {
+    let ExpandParams {
+        input: expand_input,
+        src_var,
+        rel_var,
+        dst_var,
+        rel_type,
+        is_incoming,
+    } = expand;
+    // Determine whether the filter references the new hop-local bindings.
+    let refs = filter_refs_in_expr(expression);
+    let filter_touches_expansion = refs.contains(rel_var) || refs.contains(dst_var);
+
+    let child_paths = execute_physical(graph, expand_input, params)?;
+    if child_paths.is_empty() {
+        return Ok(vec![]);
+    }
+
+    // Bulk-expand from all unique source nodes.
+    let mut src_nodes: Vec<NodeId> = child_paths
+        .iter()
+        .filter_map(|p| match p.get(src_var) {
+            Some(GraphBinding::Node(n)) => Some(*n),
+            _ => None,
+        })
+        .collect();
+    src_nodes.sort_unstable();
+    src_nodes.dedup();
+
+    let transitions = expand_multi_type(graph, &src_nodes, rel_type, is_incoming)?;
+    let mut transition_map: HashMap<NodeId, Vec<(EdgeId, NodeId)>> = HashMap::new();
+    for (src, eid, dst) in transitions {
+        transition_map.entry(src).or_default().push((eid, dst));
+    }
+
+    let mut next_paths = Vec::new();
+
+    // HasLabel on a shared variable: bulk-filter sources with GraphBLAS, then expand survivors.
+    if let FilterExpr::HasLabel(variable, label) = expression {
+        if variable != rel_var && variable != dst_var {
+            let mut active: Vec<NodeId> = child_paths
+                .iter()
+                .filter_map(|p| match p.get(variable.as_str()) {
+                    Some(GraphBinding::Node(n)) => Some(*n),
+                    _ => None,
+                })
+                .collect();
+            active.sort_unstable();
+            active.dedup();
+            let filtered = graph
+                .label_filter_and_graphblas(&active, label)
+                .map_err(|e| e.to_string())?;
+            let pass_set: HashSet<NodeId> = filtered.into_iter().collect();
+
+            for path in &child_paths {
+                if let Some(GraphBinding::Node(n)) = path.get(variable.as_str()) {
+                    if !pass_set.contains(n) {
+                        continue;
+                    }
+                }
+                let src_node = match path.get(src_var) {
+                    Some(GraphBinding::Node(n)) => *n,
+                    _ => continue,
+                };
+                if let Some(dests) = transition_map.get(&src_node) {
+                    for &(eid, dst_node) in dests {
+                        let mut new_path = path.clone();
+                        new_path.insert(rel_var.to_string(), GraphBinding::Edge(eid));
+                        if new_path
+                            .insert(dst_var.to_string(), GraphBinding::Node(dst_node))
+                            .is_some_and(|e| e != GraphBinding::Node(dst_node))
+                        {
+                            continue;
+                        }
+                        next_paths.push(new_path);
+                    }
+                }
+            }
+            return Ok(next_paths);
+        }
+        // HasLabel on dst_var: fall through to per-row path below
+    }
+
+    if !filter_touches_expansion {
+        // Factorization fast path: predicate is on shared variables only.
+        // Evaluate once per source path; skip all destinations if the source fails.
+        // This avoids O(avg_degree) PathMap clones per rejected source.
+        let where_clause = filter_expr_to_where_clause(expression);
+        for path in &child_paths {
+            if !evaluate_where(graph, path, &where_clause, params)? {
+                continue; // source fails — skip every destination for free
+            }
+            let src_node = match path.get(src_var) {
+                Some(GraphBinding::Node(n)) => *n,
+                _ => continue,
+            };
+            if let Some(dests) = transition_map.get(&src_node) {
+                // Build factorized groups: `Arc` around the shared prefix so the
+                // PathMap bytes are owned once per source, not copied per destination.
+                let group = FactorizedRecordGroup {
+                    shared: std::sync::Arc::new(path.clone()),
+                    extensions: dests
+                        .iter()
+                        .filter_map(|&(eid, dst_node)| {
+                            // Guard closing-hop mismatches (normally handled by MultiwayJoin).
+                            if let Some(existing) = path.get(dst_var) {
+                                if *existing != GraphBinding::Node(dst_node) {
+                                    return None;
+                                }
+                            }
+                            Some((
+                                rel_var.to_string(),
+                                GraphBinding::Edge(eid),
+                                dst_var.to_string(),
+                                GraphBinding::Node(dst_node),
+                            ))
+                        })
+                        .collect(),
+                };
+                next_paths.extend(group.flatten());
+            }
+        }
+    } else {
+        // Per-row path: filter references expansion variables; evaluate after each expand.
+        let where_clause = filter_expr_to_where_clause(expression);
+        for path in &child_paths {
+            let src_node = match path.get(src_var) {
+                Some(GraphBinding::Node(n)) => *n,
+                _ => continue,
+            };
+            if let Some(dests) = transition_map.get(&src_node) {
+                for &(eid, dst_node) in dests {
+                    let mut new_path = path.clone();
+                    new_path.insert(rel_var.to_string(), GraphBinding::Edge(eid));
+                    if new_path
+                        .insert(dst_var.to_string(), GraphBinding::Node(dst_node))
+                        .is_some_and(|e| e != GraphBinding::Node(dst_node))
+                    {
+                        continue;
+                    }
+                    if evaluate_where(graph, &new_path, &where_clause, params)? {
+                        next_paths.push(new_path);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(next_paths)
+}
+
+/// Execute the body of an `Expand` operator given pre-computed child paths.
+///
+/// Extracted from `execute_physical` so it can be reused by `execute_with_sip`
+/// without duplicating the BFS and single-hop expansion logic.
+#[allow(clippy::too_many_arguments)]
+fn expand_from_paths(
+    graph: &Graph,
+    child_paths: Vec<PathMap>,
+    src_var: &str,
+    rel_var: &str,
+    dst_var: &str,
+    rel_type: Option<&str>,
+    is_incoming: bool,
+    is_undirected: bool,
+    min_hops: usize,
+    max_hops: usize,
+) -> Result<Vec<PathMap>, String> {
+    let mut next_paths = Vec::new();
+
+    let mut src_nodes: Vec<NodeId> = child_paths
+        .iter()
+        .filter_map(|p| match p.get(src_var) {
+            Some(GraphBinding::Node(n)) => Some(*n),
+            _ => None,
+        })
+        .collect();
+    src_nodes.sort_unstable();
+    src_nodes.dedup();
+
+    let directions: &[bool] = if is_undirected {
+        &[false, true]
+    } else {
+        std::slice::from_ref(&is_incoming)
+    };
+
+    let mut transition_map: HashMap<NodeId, Vec<(EdgeId, NodeId)>> = HashMap::new();
+    for &dir in directions {
+        let transitions = expand_multi_type(graph, &src_nodes, rel_type, dir)?;
+        for (src, eid, dst) in transitions {
+            let entry = transition_map.entry(src).or_default();
+            if !entry.iter().any(|&(e, d)| e == eid && d == dst) {
+                entry.push((eid, dst));
+            }
+        }
+    }
+
+    for path in child_paths {
+        let src_node = match path.get(src_var) {
+            Some(GraphBinding::Node(n)) => *n,
+            _ => continue,
+        };
+
+        if min_hops == 1 && max_hops == 1 {
+            if let Some(dests) = transition_map.get(&src_node) {
+                for &(eid, dst_node) in dests {
+                    let mut new_path = path.clone();
+                    new_path.insert(rel_var.to_string(), GraphBinding::Edge(eid));
+                    if new_path
+                        .insert(dst_var.to_string(), GraphBinding::Node(dst_node))
+                        .is_some_and(|existing| existing != GraphBinding::Node(dst_node))
+                    {
+                        continue;
+                    }
+                    next_paths.push(new_path);
+                }
+            }
+        } else {
+            let mut queue = vec![(src_node, vec![src_node])];
+            let mut completed_targets: HashSet<NodeId> = HashSet::new();
+
+            if min_hops == 0 {
+                completed_targets.insert(src_node);
+            }
+
+            for hop in 1..=max_hops {
+                let mut next_queue = Vec::new();
+                for (node, path_nodes) in queue {
+                    for &dir in directions {
+                        let neighbors = expand_multi_type(graph, &[node], rel_type, dir)?;
+                        for (_, _, neigh_node) in neighbors {
+                            if path_nodes.contains(&neigh_node) {
+                                continue;
+                            }
+                            let mut next_path_nodes = path_nodes.clone();
+                            next_path_nodes.push(neigh_node);
+                            if hop >= min_hops {
+                                completed_targets.insert(neigh_node);
+                            }
+                            if !next_queue.iter().any(|(n, _)| *n == neigh_node) {
+                                next_queue.push((neigh_node, next_path_nodes));
+                            }
+                        }
+                    }
+                }
+                queue = next_queue;
+                if queue.is_empty() {
+                    break;
+                }
+            }
+
+            for neigh_node in completed_targets {
+                let mut new_path = path.clone();
+                if new_path
+                    .insert(dst_var.to_string(), GraphBinding::Node(neigh_node))
+                    .is_some_and(|existing| existing != GraphBinding::Node(neigh_node))
+                {
+                    continue;
+                }
+                next_paths.push(new_path);
+            }
+        }
+    }
+
+    Ok(next_paths)
+}
+
+/// Execute a physical operator tree with a Sideways Information Passing (SIP) filter.
+///
+/// `sip` maps variable names to the set of `NodeId`s that the build side of a
+/// `HashJoin` produced for that variable.  Any `LabelScan` whose variable appears
+/// in `sip` is restricted to the intersection of the label's nodes and the allowed
+/// set, avoiding a full-table scan when the build side is selective.
+///
+/// The filter threads down through `Expand` and `Filter` operators (the two
+/// structural wrappers that appear between a `HashJoin` and its inner `LabelScan`)
+/// and delegates all other operators to `execute_physical` unchanged.
+fn execute_with_sip(
+    graph: &Graph,
+    op: &PhysicalOperator,
+    params: &HashMap<String, serde_json::Value>,
+    sip: &HashMap<String, HashSet<NodeId>>,
+) -> Result<Vec<PathMap>, String> {
+    match op {
+        PhysicalOperator::LabelScan { variable, label } => {
+            if let Some(allowed) = sip.get(variable) {
+                // Intersect the label scan with the SIP-allowed node IDs.
+                let candidates: Vec<NodeId> = if let Some(lbl) = label {
+                    let all = graph.nodes_by_label(lbl).map_err(|e| e.to_string())?;
+                    all.into_iter().filter(|id| allowed.contains(id)).collect()
+                } else {
+                    let mut ids: Vec<NodeId> = allowed.iter().copied().collect();
+                    ids.sort_unstable();
+                    ids
+                };
+                Ok(candidates
+                    .into_iter()
+                    .map(|id| {
+                        let mut path = PathMap::new();
+                        path.insert(variable.clone(), GraphBinding::Node(id));
+                        path
+                    })
+                    .collect())
+            } else {
+                execute_physical(graph, op, params)
+            }
+        }
+        PhysicalOperator::Expand {
+            input,
+            src_var,
+            rel_var,
+            dst_var,
+            rel_type,
+            is_incoming,
+            is_undirected,
+            min_hops,
+            max_hops,
+        } => {
+            // Thread SIP into the input so the inner LabelScan is restricted.
+            let child_paths = execute_with_sip(graph, input, params, sip)?;
+            expand_from_paths(
+                graph,
+                child_paths,
+                src_var,
+                rel_var,
+                dst_var,
+                rel_type.as_deref(),
+                *is_incoming,
+                *is_undirected,
+                *min_hops,
+                *max_hops,
+            )
+        }
+        PhysicalOperator::Filter { input, expression } => {
+            // Thread SIP into the input, then apply the predicate to the
+            // reduced result set.  Skip the factorized fast-path used by the
+            // normal executor — SIP has already shrunk the input, so the
+            // per-row cost is low.
+            let child_paths = execute_with_sip(graph, input, params, sip)?;
+            let mut next_paths = Vec::new();
+            if let FilterExpr::HasLabel(variable, label) = expression {
+                let mut active_nodes: Vec<NodeId> = child_paths
+                    .iter()
+                    .filter_map(|p| match p.get(variable) {
+                        Some(GraphBinding::Node(n)) => Some(*n),
+                        _ => None,
+                    })
+                    .collect();
+                active_nodes.sort_unstable();
+                active_nodes.dedup();
+                let filtered_nodes = graph
+                    .label_filter_and_graphblas(&active_nodes, label)
+                    .map_err(|e| e.to_string())?;
+                let filtered_set: HashSet<NodeId> = filtered_nodes.into_iter().collect();
+                for path in child_paths {
+                    if let Some(GraphBinding::Node(node)) = path.get(variable) {
+                        if filtered_set.contains(node) {
+                            next_paths.push(path);
+                        }
+                    }
+                }
+            } else {
+                let where_clause = filter_expr_to_where_clause(expression);
+                for path in child_paths {
+                    if evaluate_where(graph, &path, &where_clause, params)? {
+                        next_paths.push(path);
+                    }
+                }
+            }
+            Ok(next_paths)
+        }
+        // For all other operators (NodeIndexScan, MultiwayJoin, etc.) SIP cannot be
+        // applied structurally; delegate to the standard executor unchanged.
+        _ => execute_physical(graph, op, params),
+    }
+}
+
 pub(super) fn execute_physical(
     graph: &Graph,
     op: &PhysicalOperator,
@@ -369,122 +787,60 @@ pub(super) fn execute_physical(
             max_hops,
         } => {
             let child_paths = execute_physical(graph, input, params)?;
-            let mut next_paths = Vec::new();
-
-            // Collect unique source node IDs across all child rows for bulk expansion.
-            let mut src_nodes: Vec<NodeId> = child_paths
-                .iter()
-                .filter_map(|p| match p.get(src_var) {
-                    Some(GraphBinding::Node(n)) => Some(*n),
-                    _ => None,
-                })
-                .collect();
-            src_nodes.sort_unstable();
-            src_nodes.dedup();
-
-            // Build the set of directions to traverse. For undirected patterns both
-            // outgoing (is_incoming=false) and incoming (is_incoming=true) are traversed,
-            // and results are deduplicated by (edge_id, dst_node) key.
-            let directions: &[bool] = if *is_undirected {
-                &[false, true]
-            } else {
-                std::slice::from_ref(is_incoming)
-            };
-
-            // Bulk single-hop expansion for all required directions.
-            let mut transition_map: HashMap<NodeId, Vec<(EdgeId, NodeId)>> = HashMap::new();
-            for &dir in directions {
-                let transitions = expand_multi_type(graph, &src_nodes, rel_type.as_deref(), dir)?;
-                for (src, eid, dst) in transitions {
-                    let entry = transition_map.entry(src).or_default();
-                    if !entry.iter().any(|&(e, d)| e == eid && d == dst) {
-                        entry.push((eid, dst));
-                    }
-                }
-            }
-
-            for path in child_paths {
-                let src_node = match path.get(src_var) {
-                    Some(GraphBinding::Node(n)) => *n,
-                    _ => continue,
-                };
-
-                if *min_hops == 1 && *max_hops == 1 {
-                    // Single-hop: use the pre-built transition_map and bind rel_var to
-                    // the actual EdgeId.
-                    if let Some(dests) = transition_map.get(&src_node) {
-                        for &(eid, dst_node) in dests {
-                            let mut new_path = path.clone();
-                            new_path.insert(rel_var.clone(), GraphBinding::Edge(eid));
-                            if new_path
-                                .insert(dst_var.clone(), GraphBinding::Node(dst_node))
-                                .is_some_and(|existing| existing != GraphBinding::Node(dst_node))
-                            {
-                                continue;
-                            }
-                            next_paths.push(new_path);
-                        }
-                    }
-                } else {
-                    // Variable-length BFS. Each BFS state tracks visited nodes to
-                    // prevent cycles within a single path. The BFS runs unconditionally
-                    // (not gated on transition_map) so that min_hops=0 patterns correctly
-                    // include src_node itself even when it has no outgoing edges.
-                    let mut queue = vec![(src_node, vec![src_node])];
-                    let mut completed_targets: HashSet<NodeId> = HashSet::new();
-
-                    // A zero-hop path binds src_node to dst_var when min_hops == 0.
-                    if *min_hops == 0 {
-                        completed_targets.insert(src_node);
-                    }
-
-                    for hop in 1..=*max_hops {
-                        let mut next_queue = Vec::new();
-                        for (node, path_nodes) in queue {
-                            for &dir in directions {
-                                let neighbors =
-                                    expand_multi_type(graph, &[node], rel_type.as_deref(), dir)?;
-
-                                for (_, _, neigh_node) in neighbors {
-                                    if path_nodes.contains(&neigh_node) {
-                                        continue;
-                                    }
-                                    let mut next_path_nodes = path_nodes.clone();
-                                    next_path_nodes.push(neigh_node);
-
-                                    if hop >= *min_hops {
-                                        completed_targets.insert(neigh_node);
-                                    }
-                                    if !next_queue.iter().any(|(n, _)| *n == neigh_node) {
-                                        next_queue.push((neigh_node, next_path_nodes));
-                                    }
-                                }
-                            }
-                        }
-                        queue = next_queue;
-                        if queue.is_empty() {
-                            break;
-                        }
-                    }
-
-                    // Variable-length paths traverse multiple edges; rel_var is not
-                    // bound to a single EdgeId (only dst_var is bound).
-                    for neigh_node in completed_targets {
-                        let mut new_path = path.clone();
-                        if new_path
-                            .insert(dst_var.clone(), GraphBinding::Node(neigh_node))
-                            .is_some_and(|existing| existing != GraphBinding::Node(neigh_node))
-                        {
-                            continue;
-                        }
-                        next_paths.push(new_path);
-                    }
-                }
-            }
-
-            Ok(next_paths)
+            expand_from_paths(
+                graph,
+                child_paths,
+                src_var,
+                rel_var,
+                dst_var,
+                rel_type.as_deref(),
+                *is_incoming,
+                *is_undirected,
+                *min_hops,
+                *max_hops,
+            )
         }
         PhysicalOperator::Filter { input, expression } => {
+            // Factorization fast-path: when the child is a single-hop directed Expand
+            // and the filter touches only pre-expansion (shared-prefix) variables, apply
+            // the predicate once per source path rather than once per (src, dst) row.
+            // Sources that fail the predicate skip all their destinations with zero clones.
+            if let PhysicalOperator::Expand {
+                input: expand_input,
+                src_var,
+                rel_var,
+                dst_var,
+                rel_type,
+                is_incoming,
+                is_undirected,
+                min_hops,
+                max_hops,
+            } = input.as_ref()
+            {
+                // HasLabel is handled by the bulk GraphBLAS path below; only route
+                // non-HasLabel predicates through the factorized executor.
+                if *min_hops == 1
+                    && *max_hops == 1
+                    && !is_undirected
+                    && !matches!(expression, FilterExpr::HasLabel(..))
+                {
+                    return execute_filter_over_expand(
+                        graph,
+                        ExpandParams {
+                            input: expand_input,
+                            src_var,
+                            rel_var,
+                            dst_var,
+                            rel_type: rel_type.as_deref(),
+                            is_incoming: *is_incoming,
+                        },
+                        expression,
+                        params,
+                    );
+                }
+            }
+
+            // Default path: materialize child, then filter row by row.
             let child_paths = execute_physical(graph, input, params)?;
             let mut next_paths = Vec::new();
 
@@ -513,17 +869,7 @@ pub(super) fn execute_physical(
                     }
                 }
             } else {
-                let where_clause = match expression {
-                    FilterExpr::Eq(l, r) => WhereClause::Eq(l.clone(), r.clone()),
-                    FilterExpr::Ne(l, r) => WhereClause::Ne(l.clone(), r.clone()),
-                    FilterExpr::Lt(l, r) => WhereClause::Lt(l.clone(), r.clone()),
-                    FilterExpr::Gt(l, r) => WhereClause::Gt(l.clone(), r.clone()),
-                    FilterExpr::Le(l, r) => WhereClause::Le(l.clone(), r.clone()),
-                    FilterExpr::Ge(l, r) => WhereClause::Ge(l.clone(), r.clone()),
-                    FilterExpr::HasLabel(_, _) => unreachable!(),
-                    FilterExpr::Expr(e) => WhereClause::Expr(e.clone()),
-                };
-
+                let where_clause = filter_expr_to_where_clause(expression);
                 for path in child_paths {
                     if evaluate_where(graph, &path, &where_clause, params)? {
                         next_paths.push(path);
@@ -534,27 +880,22 @@ pub(super) fn execute_physical(
             Ok(next_paths)
         }
         PhysicalOperator::HashJoin { left, right } => {
-            let left_paths = execute_physical(graph, left, params)?;
-            let right_paths = execute_physical(graph, right, params)?;
-
-            // Determine common variables by sampling the first row of each side.
-            // All operators produce uniform-schema rows (every row from a given subtree
-            // carries the same key set), so sampling row 0 is sufficient.
-            let left_vars: HashSet<String> = left_paths
-                .first()
-                .map(|p| p.keys().cloned().collect())
-                .unwrap_or_default();
-            let right_vars: HashSet<String> = right_paths
-                .first()
-                .map(|p| p.keys().cloned().collect())
-                .unwrap_or_default();
-
-            let common_vars: Vec<String> = left_vars.intersection(&right_vars).cloned().collect();
+            // Determine common variables statically from plan trees before running either side.
+            // This is more reliable than sampling the first output row (which fails when the
+            // build side is empty) and is necessary so that the SIP filter can be built from
+            // the build side before the probe side executes.
+            let left_bound = Optimizer::bound_vars(left);
+            let right_bound = Optimizer::bound_vars(right);
+            let common_vars: Vec<String> =
+                left_bound.intersection(&right_bound).cloned().collect();
 
             let mut next_paths = Vec::new();
 
             if common_vars.is_empty() {
-                // Independent MATCH clauses: emit the Cartesian product.
+                // Independent MATCH clauses with no shared variables: Cartesian product.
+                // SIP has nothing to filter, so run both sides normally.
+                let left_paths = execute_physical(graph, left, params)?;
+                let right_paths = execute_physical(graph, right, params)?;
                 for lp in &left_paths {
                     for rp in &right_paths {
                         let mut merged = lp.clone();
@@ -563,12 +904,48 @@ pub(super) fn execute_physical(
                     }
                 }
             } else {
-                // Equi-join on shared variables. Build a hash table from the right side,
-                // then probe with each left row.
+                // Equi-join on shared variables.
+                //
+                // SIP (Sideways Information Passing): run the build side (right, lighter by
+                // optimizer invariant) first.  Collect the NodeIds it produces for every
+                // common variable, then pass that set into the probe side (left, heavier)
+                // so that any LabelScan inside it skips nodes that cannot possibly produce a
+                // join match.  The probe side's LabelScan cost drops from O(|label|) to
+                // O(|build set|) when the build side is selective.
+                let right_paths = execute_physical(graph, right, params)?;
+
+                // Build the SIP filter: one HashSet<NodeId> per common variable, populated
+                // from the build-side rows.  Variables bound to non-Node values (scalars,
+                // edges) are excluded — they participate in the equi-join key but cannot be
+                // used to restrict a LabelScan.
+                let sip: HashMap<String, HashSet<NodeId>> = common_vars
+                    .iter()
+                    .filter_map(|var| {
+                        let ids: HashSet<NodeId> = right_paths
+                            .iter()
+                            .filter_map(|p| match p.get(var) {
+                                Some(GraphBinding::Node(n)) => Some(*n),
+                                _ => None,
+                            })
+                            .collect();
+                        if ids.is_empty() { None } else { Some((var.clone(), ids)) }
+                    })
+                    .collect();
+
+                // Execute the probe side.  If there is a non-empty SIP filter, use the
+                // SIP-aware executor so that nested LabelScans are restricted before they
+                // read from LMDB.  If the build side produced no Node bindings for the
+                // common variables, fall back to normal execution.
+                let left_paths = if sip.is_empty() {
+                    execute_physical(graph, left, params)?
+                } else {
+                    execute_with_sip(graph, left, params, &sip)?
+                };
+
+                // Build hash table from the right side, probe with the (already SIP-filtered)
+                // left side.
                 let mut hash_table: HashMap<Vec<GraphBinding>, Vec<PathMap>> = HashMap::new();
                 for rp in right_paths {
-                    // skip rows missing any common variable (should not occur for uniform-schema
-                    // rows, but avoids a panic if an upstream operator ever produces sparse rows).
                     let key: Option<Vec<GraphBinding>> =
                         common_vars.iter().map(|v| rp.get(v).cloned()).collect();
                     if let Some(key) = key {
@@ -1134,6 +1511,67 @@ pub(super) fn execute_physical(
             } else {
                 Ok(child_paths)
             }
+        }
+        PhysicalOperator::MultiwayJoin {
+            input,
+            closing_src_var,
+            closing_dst_var,
+            closing_rel_type,
+            closing_rel_var,
+            closing_is_incoming,
+        } => {
+            let child_paths = execute_physical(graph, input, params)?;
+            if child_paths.is_empty() {
+                return Ok(vec![]);
+            }
+
+            // Collect unique closing-src node IDs for a single bulk expansion.
+            // Paying O(sum of degrees of unique sources) once is far cheaper than
+            // iterating all neighbors for every input row.
+            let mut src_nodes: Vec<NodeId> = child_paths
+                .iter()
+                .filter_map(|p| match p.get(closing_src_var) {
+                    Some(GraphBinding::Node(n)) => Some(*n),
+                    _ => None,
+                })
+                .collect();
+            src_nodes.sort_unstable();
+            src_nodes.dedup();
+
+            let transitions = expand_multi_type(
+                graph,
+                &src_nodes,
+                closing_rel_type.as_deref(),
+                *closing_is_incoming,
+            )?;
+
+            // Index the transitions as (closing_src, closing_dst) → EdgeId for O(1) lookup.
+            let mut join_map: HashMap<NodeId, HashMap<NodeId, EdgeId>> = HashMap::new();
+            for (src, eid, dst) in transitions {
+                join_map.entry(src).or_default().insert(dst, eid);
+            }
+
+            let mut next_paths = Vec::new();
+            for path in child_paths {
+                let closing_src = match path.get(closing_src_var) {
+                    Some(GraphBinding::Node(n)) => *n,
+                    _ => continue,
+                };
+                let closing_dst = match path.get(closing_dst_var) {
+                    Some(GraphBinding::Node(n)) => *n,
+                    _ => continue,
+                };
+
+                if let Some(dst_map) = join_map.get(&closing_src) {
+                    if let Some(&eid) = dst_map.get(&closing_dst) {
+                        let mut new_path = path.clone();
+                        new_path.insert(closing_rel_var.clone(), GraphBinding::Edge(eid));
+                        next_paths.push(new_path);
+                    }
+                }
+            }
+
+            Ok(next_paths)
         }
     }
 }

@@ -1,15 +1,10 @@
-/// Cypher parser: two-phase lex + recursive-descent parse.
-///
-/// Phase 1: chumsky 0.13 lexer tokenises the input string.
-/// Phase 2: a recursive-descent parser converts the normalised token
-///          stream into `Statement` AST nodes.
-///
-/// The public entry point is `parse(cypher: &str) -> Result<Statement, String>`.
-use std::collections::HashMap;
-
-use chumsky::prelude::*;
-
+/// Cypher parser implemented fully in Chumsky 0.13.
+/// This completely replaces the handwritten recursive-descent parser.
 use crate::ast::*;
+use chumsky::input::MappedInput;
+use chumsky::pratt::{infix, left, prefix};
+use chumsky::prelude::*;
+use std::collections::HashMap;
 
 // ─── Token ────────────────────────────────────────────────────────────────────
 
@@ -53,53 +48,47 @@ pub(crate) enum Tok {
     RBrack,  // ]
 }
 
-// ─── Lexer (chumsky 0.13) ─────────────────────────────────────────────────────
+type ParserInput<'a> = MappedInput<'a, Tok, SimpleSpan, &'a [(Tok, SimpleSpan)]>;
+type ParserError<'a> = extra::Err<Rich<'a, Tok>>;
 
-/// Build a chumsky lexer that converts a Cypher source string into a flat
-/// `Vec<Tok>` (no spans are retained; the recursive-descent pass works on
-/// the plain token sequence).
-fn lexer<'src>() -> impl Parser<'src, &'src str, Vec<Tok>, extra::Err<Rich<'src, char>>> {
+// ─── Phase 1: Spanned Lexer ───────────────────────────────────────────────────
+
+/// Build a spanned chumsky lexer that converts a Cypher source string into a
+/// sequence of `(Tok, SimpleSpan)` pairs to allow high-precision error highlighting.
+pub(crate) fn lexer<'src>()
+-> impl Parser<'src, &'src str, Vec<(Tok, SimpleSpan)>, extra::Err<Rich<'src, char>>> {
     // Hex integer: 0x1A or 0X1A
     let hex_int = just("0x")
         .or(just("0X"))
         .ignore_then(text::digits(16).to_slice())
-        .map(|s: &str| Tok::Integer(i64::from_str_radix(s, 16).unwrap_or(0)));
+        .map(|s: &str| Tok::Integer(u64::from_str_radix(s, 16).map(|v| v as i64).unwrap_or(0)));
 
     // Octal integer: 0o77 or 0O77
     let oct_int = just("0o")
         .or(just("0O"))
         .ignore_then(text::digits(8).to_slice())
-        .map(|s: &str| Tok::Integer(i64::from_str_radix(s, 8).unwrap_or(0)));
+        .map(|s: &str| Tok::Integer(u64::from_str_radix(s, 8).map(|v| v as i64).unwrap_or(0)));
 
-    // Floating-point: must come before plain integers so "1.0" is parsed as float.
-    // Cases:
-    //   1.5     integer dot digit+
-    //   1.5e3   integer dot digit+ exponent
-    //   1e3     integer exponent (no dot)
-    //   .5      dot digit+
-    //   .5e3    dot digit+ exponent
-    // Crucially: "1.." must NOT match as a float (the dot must be followed by a digit,
-    // not another dot), so we require at least one digit after the decimal point.
+    // Exponent for floats
     let exponent = choice((just('e'), just('E')))
         .then(just('-').or(just('+')).or_not())
         .then(text::digits(10));
 
+    // Floating-point literals
     let float_num = choice((
-        // 1.5 / 1.5e3 — integer part, dot, one or more digits, optional exponent
+        // 1.5 / 1.5e3
         text::int(10)
             .then(choice((
-                // dot followed by digits (NOT another dot)
                 just('.')
                     .then(text::digits(10))
                     .then(exponent.or_not())
                     .to_slice()
                     .map(Some),
-                // exponent only (no dot): 1e3
                 exponent.to_slice().map(Some),
             )))
             .to_slice()
             .map(|s: &str| Tok::Float(s.parse().unwrap_or(0.0))),
-        // .5 / .5e-3 (no integer part)
+        // .5 / .5e-3
         just('.')
             .then(text::digits(10))
             .then(exponent.or_not())
@@ -107,13 +96,12 @@ fn lexer<'src>() -> impl Parser<'src, &'src str, Vec<Tok>, extra::Err<Rich<'src,
             .map(|s: &str| Tok::Float(s.parse().unwrap_or(0.0))),
     ));
 
-    // Integer
+    // Plain integer literals
     let int_num = text::int(10)
         .to_slice()
-        .map(|s: &str| Tok::Integer(s.parse().unwrap_or(0)));
+        .map(|s: &str| Tok::Integer(s.parse::<u64>().map(|v| v as i64).unwrap_or(0)));
 
-    // Escape sequence handler shared by single- and double-quoted strings.
-    // Handles \', \", \\, \n, \t, \r, and \uXXXX unicode escapes.
+    // escape handler for strings
     let escape_sq =
         just('\\').ignore_then(choice((
             just('\'').to('\''),
@@ -132,7 +120,7 @@ fn lexer<'src>() -> impl Parser<'src, &'src str, Vec<Tok>, extra::Err<Rich<'src,
                         .unwrap_or('\u{FFFD}')
                 },
             )),
-            any().map(|c| c), // fallback: keep the character after backslash
+            any().map(|c| c),
         )));
 
     let escape_dq =
@@ -156,7 +144,7 @@ fn lexer<'src>() -> impl Parser<'src, &'src str, Vec<Tok>, extra::Err<Rich<'src,
             any().map(|c| c),
         )));
 
-    // Single-quoted string
+    // Single-quoted string literal
     let sq_str = just('\'')
         .ignore_then(
             choice((escape_sq, none_of("\\'")))
@@ -166,7 +154,7 @@ fn lexer<'src>() -> impl Parser<'src, &'src str, Vec<Tok>, extra::Err<Rich<'src,
         .then_ignore(just('\''))
         .map(Tok::Str);
 
-    // Double-quoted string
+    // Double-quoted string literal
     let dq_str = just('"')
         .ignore_then(
             choice((escape_dq, none_of("\\\"")))
@@ -193,8 +181,7 @@ fn lexer<'src>() -> impl Parser<'src, &'src str, Vec<Tok>, extra::Err<Rich<'src,
         )
         .map(Tok::Param);
 
-    // Identifier / keyword (keywords are kept as Ident with upper-cased value so
-    // the downstream parser can do case-insensitive matching by uppercasing)
+    // Standard identifiers
     let ident = any()
         .filter(|c: &char| c.is_alphabetic() || *c == '_')
         .then(
@@ -205,7 +192,7 @@ fn lexer<'src>() -> impl Parser<'src, &'src str, Vec<Tok>, extra::Err<Rich<'src,
         .to_slice()
         .map(|s: &str| Tok::Ident(s.to_string()));
 
-    // Multi-character symbols (must be tried before single-char)
+    // Multi-character symbols
     let multi_sym = choice((
         just("->").to(Tok::Arrow),
         just("<-").to(Tok::LArrow),
@@ -241,7 +228,7 @@ fn lexer<'src>() -> impl Parser<'src, &'src str, Vec<Tok>, extra::Err<Rich<'src,
         just(']').to(Tok::RBrack),
     ));
 
-    // Line comment
+    // Line comments
     let comment = just("//")
         .then(any().and_is(just('\n').not()).repeated())
         .ignored();
@@ -261,1066 +248,682 @@ fn lexer<'src>() -> impl Parser<'src, &'src str, Vec<Tok>, extra::Err<Rich<'src,
     ));
 
     token
+        .map_with(|tok, extra| (tok, extra.span()))
         .padded_by(comment.repeated())
         .padded()
         .repeated()
         .collect()
 }
 
-// ─── Token-stream cursor ──────────────────────────────────────────────────────
+// ─── Helper Token Extractors ─────────────────────────────────────────────────
 
-/// A simple cursor over a `Vec<Tok>` slice for the recursive-descent parser.
-struct Cursor<'a> {
-    tokens: &'a [Tok],
-    pos: usize,
+/// Matches specific symbolic tokens.
+fn sym<'a>(expected: Tok) -> impl Parser<'a, ParserInput<'a>, (), ParserError<'a>> + Clone {
+    any().filter(move |tok| *tok == expected).ignored()
 }
 
-impl<'a> Cursor<'a> {
-    fn new(tokens: &'a [Tok]) -> Self {
-        Cursor { tokens, pos: 0 }
-    }
-
-    /// Peek at the current token without consuming it.
-    fn peek(&self) -> Option<&Tok> {
-        self.tokens.get(self.pos)
-    }
-
-    /// Peek at `offset` ahead (0 = current).
-    fn peek_at(&self, offset: usize) -> Option<&Tok> {
-        self.tokens.get(self.pos + offset)
-    }
-
-    /// Consume the current token and advance.
-    fn next(&mut self) -> Option<&Tok> {
-        let tok = self.tokens.get(self.pos)?;
-        self.pos += 1;
-        Some(tok)
-    }
-
-    /// Consume if the current token matches `t`.
-    fn eat(&mut self, t: &Tok) -> bool {
-        if self.peek() == Some(t) {
-            self.pos += 1;
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Require a specific punctuation token.
-    fn expect_tok(&mut self, t: &Tok) -> Result<(), String> {
-        if self.eat(t) {
-            Ok(())
-        } else {
-            Err(format!("expected {:?}, got {:?}", t, self.peek()))
-        }
-    }
-
-    fn is_empty(&self) -> bool {
-        self.pos >= self.tokens.len()
-    }
-
-    /// True if current token is an Ident matching the keyword (case-insensitive).
-    fn peek_kw(&self, kw: &str) -> bool {
-        matches!(self.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case(kw))
-    }
-
-    fn peek_kw_at(&self, offset: usize, kw: &str) -> bool {
-        matches!(self.peek_at(offset), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case(kw))
-    }
+/// Extracts standard identifiers.
+fn identifier<'a>() -> impl Parser<'a, ParserInput<'a>, String, ParserError<'a>> + Clone {
+    any().filter_map(|tok| match tok {
+        Tok::Ident(name) => Some(name.clone()),
+        _ => None,
+    })
 }
 
-// ─── Expression parser ────────────────────────────────────────────────────────
-//
-// Operator precedence (lowest to highest):
-//   OR  XOR  AND  NOT  CMP  ADD  MUL  POW  UNARY-  POSTFIX  ATOM
-
-fn parse_expr(c: &mut Cursor<'_>) -> Result<Expr, String> {
-    parse_expr_or(c)
+/// Matches specific keywords case-insensitively.
+fn keyword<'a>(kw: &'static str) -> impl Parser<'a, ParserInput<'a>, (), ParserError<'a>> + Clone {
+    any().filter_map(move |tok| match tok {
+        Tok::Ident(name) if name.eq_ignore_ascii_case(kw) => Some(()),
+        _ => None,
+    })
 }
 
-fn parse_expr_or(c: &mut Cursor<'_>) -> Result<Expr, String> {
-    let mut left = parse_expr_xor(c)?;
-    while c.peek_kw("OR") {
-        c.next();
-        let right = parse_expr_xor(c)?;
-        left = Expr::BinaryOp {
-            op: BinaryOperator::Or,
-            left: Box::new(left),
-            right: Box::new(right),
-        };
+// ─── Primitive Literal Parsers ───────────────────────────────────────────────
+
+/// Parses basic Cypher literal values.
+fn literal<'a>() -> impl Parser<'a, ParserInput<'a>, Literal, ParserError<'a>> + Clone {
+    let int_lit = any().filter_map(|tok| match tok {
+        Tok::Integer(n) => Some(Literal::Int(n)),
+        _ => None,
+    });
+
+    let float_lit = any().filter_map(|tok| match tok {
+        Tok::Float(f) => Some(Literal::Float(f)),
+        _ => None,
+    });
+
+    let str_lit = any().filter_map(|tok| match tok {
+        Tok::Str(s) => Some(Literal::Str(s.clone())),
+        _ => None,
+    });
+
+    let bool_lit = choice((
+        keyword("TRUE").to(Literal::Bool(true)),
+        keyword("FALSE").to(Literal::Bool(false)),
+    ));
+
+    let null_lit = keyword("NULL").to(Literal::Null);
+
+    choice((int_lit, float_lit, str_lit, bool_lit, null_lit))
+}
+
+// ─── Phase 2: Expression Pratt Parser ─────────────────────────────────────────
+
+pub(crate) fn expr_parser<'a>() -> impl Parser<'a, ParserInput<'a>, Expr, ParserError<'a>> + Clone {
+    #[derive(Clone)]
+    enum SubscriptOrSlice {
+        Subscript(Expr),
+        Slice {
+            start: Option<Expr>,
+            end: Option<Expr>,
+        },
     }
-    Ok(left)
-}
 
-fn parse_expr_xor(c: &mut Cursor<'_>) -> Result<Expr, String> {
-    let mut left = parse_expr_and(c)?;
-    while c.peek_kw("XOR") {
-        c.next();
-        let right = parse_expr_and(c)?;
-        left = Expr::BinaryOp {
-            op: BinaryOperator::Xor,
-            left: Box::new(left),
-            right: Box::new(right),
-        };
+    #[derive(Clone)]
+    enum PostfixOp {
+        Dot(String),
+        Subscript(Expr),
+        Slice {
+            start: Option<Expr>,
+            end: Option<Expr>,
+        },
+        IsNull,
+        IsNotNull,
     }
-    Ok(left)
-}
 
-fn parse_expr_and(c: &mut Cursor<'_>) -> Result<Expr, String> {
-    let mut left = parse_expr_not(c)?;
-    while c.peek_kw("AND") {
-        c.next();
-        let right = parse_expr_not(c)?;
-        left = Expr::BinaryOp {
-            op: BinaryOperator::And,
-            left: Box::new(left),
-            right: Box::new(right),
-        };
-    }
-    Ok(left)
-}
+    recursive(|expr| {
+        // --- Core Atomic Elements ---
+        let lit_expr = literal().map(Expr::Literal);
 
-fn parse_expr_not(c: &mut Cursor<'_>) -> Result<Expr, String> {
-    if c.peek_kw("NOT") {
-        c.next();
-        // NOT IN is handled at the comparison level; here handle NOT <expr>
-        // We need to check if the next thing after NOT is IN (that's "NOT IN")
-        // Actually NOT IN is parsed at the comparison level, but for proper
-        // associativity we need to handle "NOT" as a prefix here.
-        let inner = parse_expr_not(c)?;
-        return Ok(Expr::Not(Box::new(inner)));
-    }
-    parse_expr_cmp(c)
-}
-
-// Operator precedence for comparisons (openCypher spec):
-//
-//   Comparisons (=, <>, <, >, <=, >=, =~) have lower precedence than string
-//   and list predicates (IN, NOT IN, STARTS WITH, ENDS WITH, CONTAINS, IS NULL,
-//   IS NOT NULL). This means `a = b IN c` parses as `a = (b IN c)`, not
-//   `(a = b) IN c`.
-//
-//   Level 1 (lower): =, <>, <, >, <=, >=, =~
-//   Level 2 (higher): IN, NOT IN, STARTS WITH, ENDS WITH, CONTAINS,
-//                     IS NULL, IS NOT NULL
-
-fn parse_expr_cmp(c: &mut Cursor<'_>) -> Result<Expr, String> {
-    let left = parse_expr_predicate(c)?;
-    // Track the previous right operand for chained comparisons:
-    // `a < b < c` means `(a < b) AND (b < c)` in openCypher.
-    let mut prev_right: Option<Expr> = None;
-    let mut accumulated: Option<Expr> = None;
-
-    loop {
-        // Symbolic comparisons (=, <>, <, >, <=, >=)
-        let op = match c.peek() {
-            Some(Tok::Ne) => Some(BinaryOperator::Ne),
-            Some(Tok::Le) => Some(BinaryOperator::Le),
-            Some(Tok::Ge) => Some(BinaryOperator::Ge),
-            Some(Tok::Lt) => Some(BinaryOperator::Lt),
-            Some(Tok::Gt) => Some(BinaryOperator::Gt),
-            Some(Tok::Eq) => Some(BinaryOperator::Eq),
+        let param_expr = any().filter_map(|tok| match tok {
+            Tok::Param(p) => Some(Expr::Param(p.clone())),
             _ => None,
-        };
-        if let Some(op) = op {
-            c.next();
-            let right = parse_expr_predicate(c)?;
+        });
 
-            // Build the comparison: use the accumulated right from the previous step
-            // as the left operand when chaining (e.g., b in `a < b < c`).
-            let cmp_left = prev_right.take().unwrap_or_else(|| left.clone());
-            let cmp = Expr::BinaryOp {
-                op,
-                left: Box::new(cmp_left),
-                right: Box::new(right.clone()),
-            };
-            // Chain with AND if there was a previous comparison.
-            accumulated = Some(match accumulated.take() {
-                None => cmp,
-                Some(prev) => Expr::BinaryOp {
-                    op: BinaryOperator::And,
-                    left: Box::new(prev),
-                    right: Box::new(cmp),
-                },
+        // Bare identifier is initially mapped to Prop(name, "") as per legacy parser design
+        let var_expr = identifier().map(|name| Expr::Prop(name, "".to_string()));
+
+        let paren_expr = sym(Tok::LParen)
+            .ignore_then(expr.clone())
+            .then_ignore(sym(Tok::RParen));
+
+        // count(*) special case
+        let count_star = keyword("COUNT")
+            .ignore_then(sym(Tok::LParen))
+            .ignore_then(sym(Tok::Star))
+            .ignore_then(sym(Tok::RParen))
+            .to(Expr::CountStar);
+
+        // Inline property maps: { key: val, ... }
+        let map_expr = sym(Tok::LBrace)
+            .ignore_then(
+                identifier()
+                    .then_ignore(sym(Tok::Colon))
+                    .then(expr.clone())
+                    .separated_by(sym(Tok::Comma))
+                    .allow_trailing()
+                    .collect::<Vec<(String, Expr)>>(),
+            )
+            .then_ignore(sym(Tok::RBrace))
+            .map(|pairs| {
+                let mut args = Vec::new();
+                for (key, val) in pairs {
+                    args.push(Expr::Literal(Literal::Str(key)));
+                    args.push(val);
+                }
+                Expr::FunctionCall {
+                    name: "__map__".to_string(),
+                    args,
+                }
             });
-            prev_right = Some(right);
-            continue;
-        }
-        // RegexEq =~
-        if c.peek() == Some(&Tok::RegexEq) {
-            c.next();
-            let right = parse_expr_predicate(c)?;
-            let cmp_left = prev_right.take().unwrap_or_else(|| left.clone());
-            let cmp = Expr::FunctionCall {
-                name: "__regex__".to_string(),
-                args: vec![cmp_left, right.clone()],
-            };
-            accumulated = Some(match accumulated.take() {
-                None => cmp,
-                Some(prev) => Expr::BinaryOp {
-                    op: BinaryOperator::And,
-                    left: Box::new(prev),
-                    right: Box::new(cmp),
-                },
+
+        // List literal or List comprehension: [ ... ]
+        let list_expr = sym(Tok::LBrack).ignore_then(choice((
+            // List comprehension: [x IN list WHERE predicate | transform]
+            identifier()
+                .then_ignore(keyword("IN"))
+                .then(expr.clone())
+                .then(keyword("WHERE").ignore_then(expr.clone()).or_not())
+                .then(sym(Tok::Pipe).ignore_then(expr.clone()).or_not())
+                .then_ignore(sym(Tok::RBrack))
+                .map(
+                    |(((var, list), predicate), transform)| Expr::ListComprehension {
+                        variable: var,
+                        list: Box::new(list),
+                        predicate: predicate.map(Box::new),
+                        transform: transform.map(Box::new),
+                    },
+                ),
+            // Plain list literal: [item1, item2, ...]
+            expr.clone()
+                .separated_by(sym(Tok::Comma))
+                .allow_trailing()
+                .collect::<Vec<Expr>>()
+                .then_ignore(sym(Tok::RBrack))
+                .map(|items| Expr::FunctionCall {
+                    name: "__list__".to_string(),
+                    args: items,
+                }),
+        )));
+
+        // CASE expression: CASE [subject] WHEN cond THEN result ... [ELSE default] END
+        let case_expr = keyword("CASE")
+            .ignore_then(keyword("WHEN").not().ignore_then(expr.clone()).or_not())
+            .then(
+                keyword("WHEN")
+                    .ignore_then(expr.clone())
+                    .then_ignore(keyword("THEN"))
+                    .then(expr.clone())
+                    .map(|(when, then)| CaseArm { when, then })
+                    .repeated()
+                    .at_least(1)
+                    .collect(),
+            )
+            .then(keyword("ELSE").ignore_then(expr.clone()).or_not())
+            .then_ignore(keyword("END"))
+            .map(|((subject, arms), else_expr)| Expr::Case {
+                subject: subject.map(Box::new),
+                arms,
+                else_expr: else_expr.map(Box::new),
             });
-            prev_right = Some(right);
-            continue;
-        }
-        break;
-    }
-    Ok(accumulated.unwrap_or(left))
-}
 
-/// Parse string/list predicates at higher precedence than comparisons:
-/// IN, NOT IN, STARTS WITH, ENDS WITH, CONTAINS, IS NULL, IS NOT NULL.
-fn parse_expr_predicate(c: &mut Cursor<'_>) -> Result<Expr, String> {
-    let mut left = parse_expr_add(c)?;
+        // Quantifier expressions: ALL, ANY, NONE, SINGLE
+        let quantifier_kind = choice((
+            keyword("ALL").to(QuantifierKind::All),
+            keyword("ANY").to(QuantifierKind::Any),
+            keyword("NONE").to(QuantifierKind::None),
+            keyword("SINGLE").to(QuantifierKind::Single),
+        ));
 
-    loop {
-        // IS NULL / IS NOT NULL (postfix)
-        if c.peek_kw("IS") {
-            // Peek ahead: IS NULL or IS NOT NULL
-            if c.peek_kw_at(1, "NOT") && c.peek_kw_at(2, "NULL") {
-                c.next();
-                c.next();
-                c.next(); // consume IS NOT NULL
-                left = Expr::IsNotNull(Box::new(left));
-                continue;
-            } else if c.peek_kw_at(1, "NULL") {
-                c.next();
-                c.next(); // consume IS NULL
-                left = Expr::IsNull(Box::new(left));
-                continue;
-            }
-        }
-        // STARTS WITH
-        if c.peek_kw("STARTS") && c.peek_kw_at(1, "WITH") {
-            c.next();
-            c.next();
-            let right = parse_expr_add(c)?;
-            left = Expr::FunctionCall {
-                name: "__starts_with__".to_string(),
-                args: vec![left, right],
-            };
-            continue;
-        }
-        // ENDS WITH
-        if c.peek_kw("ENDS") && c.peek_kw_at(1, "WITH") {
-            c.next();
-            c.next();
-            let right = parse_expr_add(c)?;
-            left = Expr::FunctionCall {
-                name: "__ends_with__".to_string(),
-                args: vec![left, right],
-            };
-            continue;
-        }
-        // CONTAINS
-        if c.peek_kw("CONTAINS") {
-            c.next();
-            let right = parse_expr_add(c)?;
-            left = Expr::FunctionCall {
-                name: "__contains__".to_string(),
-                args: vec![left, right],
-            };
-            continue;
-        }
-        // NOT IN
-        if c.peek_kw("NOT") && c.peek_kw_at(1, "IN") {
-            c.next();
-            c.next();
-            let right = parse_expr_add(c)?;
-            left = Expr::Not(Box::new(Expr::FunctionCall {
-                name: "__in__".to_string(),
-                args: vec![left, right],
-            }));
-            continue;
-        }
-        // IN
-        if c.peek_kw("IN") {
-            c.next();
-            let right = parse_expr_add(c)?;
-            left = Expr::FunctionCall {
-                name: "__in__".to_string(),
-                args: vec![left, right],
-            };
-            continue;
-        }
-        break;
-    }
-    Ok(left)
-}
+        let quantifier_expr = quantifier_kind
+            .then_ignore(sym(Tok::LParen))
+            .then(identifier())
+            .then_ignore(keyword("IN"))
+            .then(expr.clone())
+            .then_ignore(keyword("WHERE"))
+            .then(expr.clone())
+            .then_ignore(sym(Tok::RParen))
+            .map(|(((kind, variable), list), predicate)| Expr::Quantifier {
+                kind,
+                variable,
+                list: Box::new(list),
+                predicate: Box::new(predicate),
+            });
 
-fn parse_expr_add(c: &mut Cursor<'_>) -> Result<Expr, String> {
-    let mut left = parse_expr_mul(c)?;
-    loop {
-        if c.peek() == Some(&Tok::Plus) {
-            c.next();
-            let right = parse_expr_mul(c)?;
-            left = Expr::BinaryOp {
-                op: BinaryOperator::Add,
-                left: Box::new(left),
-                right: Box::new(right),
-            };
-        } else if c.peek() == Some(&Tok::Minus) {
-            // Make sure this minus is a binary minus, not a unary at the start of a subexpr
-            c.next();
-            let right = parse_expr_mul(c)?;
-            left = Expr::BinaryOp {
-                op: BinaryOperator::Sub,
-                left: Box::new(left),
-                right: Box::new(right),
-            };
-        } else {
-            break;
-        }
-    }
-    Ok(left)
-}
+        // Standard function calls & Aggregations (e.g. count(distinct x), sum(x), percentileDisc(0.95))
+        let distinct_flag = keyword("DISTINCT")
+            .to(true)
+            .or_not()
+            .map(|d| d.unwrap_or(false));
 
-fn parse_expr_mul(c: &mut Cursor<'_>) -> Result<Expr, String> {
-    let mut left = parse_expr_pow(c)?;
-    loop {
-        let op = match c.peek() {
-            Some(Tok::Star) => Some(BinaryOperator::Mul),
-            Some(Tok::Slash) => Some(BinaryOperator::Div),
-            Some(Tok::Percent) => Some(BinaryOperator::Mod),
+        let agg_fn_type = choice((
+            keyword("COUNT").to(AggFn::Count { distinct: false }),
+            keyword("SUM").to(AggFn::Sum { distinct: false }),
+            keyword("AVG").to(AggFn::Avg { distinct: false }),
+            keyword("MIN").to(AggFn::Min { distinct: false }),
+            keyword("MAX").to(AggFn::Max { distinct: false }),
+            keyword("COLLECT").to(AggFn::Collect { distinct: false }),
+            keyword("STDEV").to(AggFn::StDev { distinct: false }),
+            keyword("STDEVP").to(AggFn::StDevP { distinct: false }),
+        ));
+
+        // Normal aggregation: COUNT(DISTINCT x)
+        let normal_agg = agg_fn_type
+            .then_ignore(sym(Tok::LParen))
+            .then(distinct_flag)
+            .then(expr.clone())
+            .then_ignore(sym(Tok::RParen))
+            .map(|((fn_type, distinct), inner)| {
+                let fn_type = match fn_type {
+                    AggFn::Count { .. } => AggFn::Count { distinct },
+                    AggFn::Sum { .. } => AggFn::Sum { distinct },
+                    AggFn::Avg { .. } => AggFn::Avg { distinct },
+                    AggFn::Min { .. } => AggFn::Min { distinct },
+                    AggFn::Max { .. } => AggFn::Max { distinct },
+                    AggFn::Collect { .. } => AggFn::Collect { distinct },
+                    AggFn::StDev { .. } => AggFn::StDev { distinct },
+                    AggFn::StDevP { .. } => AggFn::StDevP { distinct },
+                    other => other,
+                };
+                Expr::Agg(fn_type, Box::new(inner))
+            });
+
+        // Percentile aggregation: percentileDisc(x, percentile)
+        let percentile_agg = choice((
+            keyword("PERCENTILEDISC").to(true),
+            keyword("PERCENTILECONT").to(false),
+        ))
+        .then_ignore(sym(Tok::LParen))
+        .then(expr.clone())
+        .then_ignore(sym(Tok::Comma))
+        .then(any().filter_map(|tok| match tok {
+            Tok::Float(f) => Some(f),
+            Tok::Integer(n) => Some(n as f64),
             _ => None,
-        };
-        if let Some(op) = op {
-            c.next();
-            let right = parse_expr_pow(c)?;
-            left = Expr::BinaryOp {
-                op,
-                left: Box::new(left),
-                right: Box::new(right),
+        }))
+        .then_ignore(sym(Tok::RParen))
+        .map(|((is_disc, inner), percentile)| {
+            let fn_type = if is_disc {
+                AggFn::PercentileDisc { percentile }
+            } else {
+                AggFn::PercentileCont { percentile }
             };
-        } else {
-            break;
-        }
-    }
-    Ok(left)
-}
-
-fn parse_expr_pow(c: &mut Cursor<'_>) -> Result<Expr, String> {
-    let base = parse_expr_unary(c)?;
-    if c.peek() == Some(&Tok::Caret) {
-        c.next();
-        let exp = parse_expr_pow(c)?; // right-associative
-        return Ok(Expr::BinaryOp {
-            op: BinaryOperator::Pow,
-            left: Box::new(base),
-            right: Box::new(exp),
+            Expr::Agg(fn_type, Box::new(inner))
         });
-    }
-    Ok(base)
-}
 
-fn parse_expr_unary(c: &mut Cursor<'_>) -> Result<Expr, String> {
-    if c.peek() == Some(&Tok::Minus) {
-        c.next();
-        // Unary minus: only when followed by a number or '('
-        let inner = parse_expr_postfix(c)?;
-        return Ok(Expr::BinaryOp {
-            op: BinaryOperator::Sub,
-            left: Box::new(Expr::Literal(Literal::Int(0))),
-            right: Box::new(inner),
-        });
-    }
-    parse_expr_postfix(c)
-}
+        // Standard scalar function call: range(1, 10)
+        let standard_fn_call = identifier()
+            .then_ignore(sym(Tok::LParen))
+            .then(
+                expr.clone()
+                    .separated_by(sym(Tok::Comma))
+                    .allow_trailing()
+                    .collect(),
+            )
+            .then_ignore(sym(Tok::RParen))
+            .map(|(name, args)| Expr::FunctionCall { name, args });
 
-fn parse_expr_postfix(c: &mut Cursor<'_>) -> Result<Expr, String> {
-    let mut expr = parse_expr_atom(c)?;
+        // Namespace-qualified function calls: date.truncate(...), duration.between(...), etc.
+        let dotted_fn_call = identifier()
+            .then_ignore(sym(Tok::Dot))
+            .then(identifier())
+            .then_ignore(sym(Tok::LParen))
+            .then(
+                expr.clone()
+                    .separated_by(sym(Tok::Comma))
+                    .allow_trailing()
+                    .collect::<Vec<Expr>>(),
+            )
+            .then_ignore(sym(Tok::RParen))
+            .map(|((namespace, func), args)| Expr::FunctionCall {
+                name: format!("{}.{}", namespace, func),
+                args,
+            });
 
-    loop {
-        // Property access: expr.prop
-        if c.peek() == Some(&Tok::Dot) {
-            c.next();
-            let prop = expect_any_ident(c)?;
-            expr = match expr {
-                Expr::Prop(var, ref empty) if empty.is_empty() => Expr::Prop(var, prop),
-                other => Expr::Subscript {
-                    expr: Box::new(other),
-                    index: Box::new(Expr::Literal(Literal::Str(prop))),
+        let atom_choices = choice((
+            count_star,
+            quantifier_expr,
+            case_expr,
+            list_expr,
+            map_expr,
+            normal_agg,
+            percentile_agg,
+            dotted_fn_call,
+            standard_fn_call,
+            lit_expr,
+            param_expr,
+            var_expr,
+            paren_expr,
+        ));
+
+        // Postfix operations (chained left-associatively):
+        let postfix = atom_choices.foldl(
+            choice((
+                // .property
+                sym(Tok::Dot).ignore_then(identifier()).map(PostfixOp::Dot),
+                // [index] or [start..end]
+                sym(Tok::LBrack)
+                    .ignore_then(choice((
+                        // [..end]
+                        sym(Tok::DotDot)
+                            .ignore_then(expr.clone().or_not())
+                            .map(|end| SubscriptOrSlice::Slice { start: None, end }),
+                        // [start..] or [start] or [start..end]
+                        expr.clone()
+                            .then(choice((
+                                sym(Tok::DotDot)
+                                    .ignore_then(expr.clone().or_not())
+                                    .map(Some),
+                                any().rewind().to(None),
+                            )))
+                            .map(|(start, opt_end)| match opt_end {
+                                Some(end) => SubscriptOrSlice::Slice {
+                                    start: Some(start),
+                                    end,
+                                },
+                                None => SubscriptOrSlice::Subscript(start),
+                            }),
+                    )))
+                    .then_ignore(sym(Tok::RBrack))
+                    .map(|sub_or_slice| match sub_or_slice {
+                        SubscriptOrSlice::Slice { start, end } => PostfixOp::Slice { start, end },
+                        SubscriptOrSlice::Subscript(idx) => PostfixOp::Subscript(idx),
+                    }),
+                // IS NULL / IS NOT NULL
+                keyword("IS").ignore_then(choice((
+                    keyword("NOT")
+                        .ignore_then(keyword("NULL"))
+                        .to(PostfixOp::IsNotNull),
+                    keyword("NULL").to(PostfixOp::IsNull),
+                ))),
+            ))
+            .repeated(),
+            |expr, op| match op {
+                PostfixOp::Dot(prop) => match expr {
+                    Expr::Prop(var, ref empty) if empty.is_empty() => {
+                        Expr::Prop(var.clone(), prop.clone())
+                    }
+                    other => Expr::Subscript {
+                        expr: Box::new(other),
+                        index: Box::new(Expr::Literal(Literal::Str(prop.clone()))),
+                    },
                 },
-            };
-            continue;
-        }
-
-        // Subscript / slice: expr[...]
-        if c.peek() == Some(&Tok::LBrack) {
-            c.next();
-            // Check for slice: optional start, DotDot, optional end
-            // or subscript: expr
-            let start_expr = if c.peek() != Some(&Tok::DotDot) && c.peek() != Some(&Tok::RBrack) {
-                Some(parse_expr_or(c)?)
-            } else {
-                None
-            };
-            if c.eat(&Tok::DotDot) {
-                // Slice
-                let end_expr = if c.peek() != Some(&Tok::RBrack) {
-                    Some(parse_expr_or(c)?)
-                } else {
-                    None
-                };
-                c.expect_tok(&Tok::RBrack)?;
-                expr = Expr::Slice {
-                    expr: Box::new(expr),
-                    start: start_expr.map(Box::new),
-                    end: end_expr.map(Box::new),
-                };
-            } else {
-                // Subscript
-                let idx = start_expr.ok_or("empty subscript")?;
-                c.expect_tok(&Tok::RBrack)?;
-                expr = Expr::Subscript {
+                PostfixOp::Subscript(idx) => Expr::Subscript {
                     expr: Box::new(expr),
                     index: Box::new(idx),
-                };
-            }
-            continue;
-        }
+                },
+                PostfixOp::Slice { start, end } => Expr::Slice {
+                    expr: Box::new(expr),
+                    start: start.map(Box::new),
+                    end: end.map(Box::new),
+                },
+                PostfixOp::IsNull => Expr::IsNull(Box::new(expr)),
+                PostfixOp::IsNotNull => Expr::IsNotNull(Box::new(expr)),
+            },
+        );
 
-        // HasLabel / IS NULL / IS NOT NULL are handled at cmp level
-        // Label test: expr:Label (only when expr is a bare variable)
-        if c.peek() == Some(&Tok::Colon) {
-            // Peek to see if there's a label name next (and not another `:`)
-            if let Some(Tok::Ident(_)) = c.peek_at(1) {
-                if let Expr::Prop(ref var, ref empty) = expr {
-                    if empty.is_empty() {
-                        let var = var.clone();
-                        c.next(); // consume :
-                        let label = expect_any_ident(c)?;
-                        expr = Expr::HasLabel {
-                            variable: var,
-                            label,
-                        };
-                        continue;
-                    }
+        // Pratt precedence rules for binary and unary operations.
+        //
+        // openCypher precedence order (tightest to loosest binding):
+        //   postfix (., []) > ^ > unary- > *, /, % > +, - >
+        //   comparisons/IN/CONTAINS/STARTS WITH/ENDS WITH > NOT > AND > XOR > OR
+        //
+        // Levels (higher number = tighter binding):
+        //   OR=10, XOR=11, AND=12, NOT(prefix)=12, comparisons+IN+etc=13,
+        //   +/-=14, */%=15, unary-=15, ^=16
+        //
+        // For prefix(P): the right operand is parsed consuming ops with bp > P.
+        // prefix(12) for NOT: AND(12) is NOT consumed (12 > 12 false), comparison(13)
+        // IS consumed (13 > 12 true), giving the correct NOT > AND but NOT < comparisons.
+        // openCypher Pratt precedence table (all levels; higher = tighter binding).
+        // Empirically chumsky's prefix(P) consumes infix(left(P)) (same level), so
+        // NOT must be at prefix(13) — one above AND(12) — to give (NOT a) AND b.
+        //
+        //  10: OR         11: XOR       12: AND
+        //  13: NOT (prefix — grabs comparisons 14 but not AND 12)
+        //  14: =,<>,<,>,<=,>=,=~
+        //  15: IN, CONTAINS, STARTS WITH, ENDS WITH  (tighter than =)
+        //  16: +, -  (binary)
+        //  17: *, /, %
+        //  18: unary -  (prefix — does NOT consume ^ 18 since same-level consumed)
+        //  18: ^  (left-assoc)
+        let pratt = postfix.pratt((
+            // Unary minus at 18: ^ is also 18, so same-level rule keeps (-a)^b correct.
+            // Fold negation into integer/float literals at parse time so that:
+            //   -1 becomes Literal(Int(-1)) rather than BinaryOp(Sub, 0, 1)
+            //   -1.5 becomes Literal(Float(-1.5))
+            // This also fixes the column display ("abs(-1)" instead of "abs(0 - 1)")
+            // and correctly handles i64::MIN (-9223372036854775808).
+            prefix(18, sym(Tok::Minus), |_, x, _| match x {
+                Expr::Literal(Literal::Int(n)) => Expr::Literal(Literal::Int(n.wrapping_neg())),
+                Expr::Literal(Literal::Float(f)) => Expr::Literal(Literal::Float(-f)),
+                other => Expr::BinaryOp {
+                    op: BinaryOperator::Sub,
+                    left: Box::new(Expr::Literal(Literal::Int(0))),
+                    right: Box::new(other),
+                },
+            }),
+            // Power: left-associative.
+            infix(left(18), sym(Tok::Caret), |l, _, r, _| Expr::BinaryOp {
+                op: BinaryOperator::Pow,
+                left: Box::new(l),
+                right: Box::new(r),
+            }),
+            // Multiplicative.
+            infix(left(17), sym(Tok::Star), |l, _, r, _| Expr::BinaryOp {
+                op: BinaryOperator::Mul,
+                left: Box::new(l),
+                right: Box::new(r),
+            }),
+            infix(left(17), sym(Tok::Slash), |l, _, r, _| Expr::BinaryOp {
+                op: BinaryOperator::Div,
+                left: Box::new(l),
+                right: Box::new(r),
+            }),
+            infix(left(17), sym(Tok::Percent), |l, _, r, _| Expr::BinaryOp {
+                op: BinaryOperator::Mod,
+                left: Box::new(l),
+                right: Box::new(r),
+            }),
+            // Additive.
+            infix(left(16), sym(Tok::Plus), |l, _, r, _| Expr::BinaryOp {
+                op: BinaryOperator::Add,
+                left: Box::new(l),
+                right: Box::new(r),
+            }),
+            infix(left(16), sym(Tok::Minus), |l, _, r, _| Expr::BinaryOp {
+                op: BinaryOperator::Sub,
+                left: Box::new(l),
+                right: Box::new(r),
+            }),
+            // Comparisons at 14; IN/CONTAINS/STARTS_WITH/ENDS_WITH at 15 (tighter).
+            infix(left(14), sym(Tok::Eq), |l, _, r, _| Expr::BinaryOp {
+                op: BinaryOperator::Eq,
+                left: Box::new(l),
+                right: Box::new(r),
+            }),
+            infix(left(14), sym(Tok::RegexEq), |l, _, r, _| {
+                Expr::FunctionCall {
+                    name: "__regex__".to_string(),
+                    args: vec![l, r],
                 }
-            }
-        }
+            }),
+            infix(left(14), sym(Tok::Ne), |l, _, r, _| Expr::BinaryOp {
+                op: BinaryOperator::Ne,
+                left: Box::new(l),
+                right: Box::new(r),
+            }),
+            infix(left(14), sym(Tok::Lt), |l, _, r, _| Expr::BinaryOp {
+                op: BinaryOperator::Lt,
+                left: Box::new(l),
+                right: Box::new(r),
+            }),
+            infix(left(14), sym(Tok::Gt), |l, _, r, _| Expr::BinaryOp {
+                op: BinaryOperator::Gt,
+                left: Box::new(l),
+                right: Box::new(r),
+            }),
+            infix(left(14), sym(Tok::Le), |l, _, r, _| Expr::BinaryOp {
+                op: BinaryOperator::Le,
+                left: Box::new(l),
+                right: Box::new(r),
+            }),
+            infix(left(14), sym(Tok::Ge), |l, _, r, _| Expr::BinaryOp {
+                op: BinaryOperator::Ge,
+                left: Box::new(l),
+                right: Box::new(r),
+            }),
+            // Membership and string-matching operators (level 15, tighter than comparisons 14).
+            // x IN list
+            infix(left(15), keyword("IN"), |l, _, r, _| Expr::FunctionCall {
+                name: "__in__".to_string(),
+                args: vec![l, r],
+            }),
+            // x NOT IN list
+            infix(
+                left(15),
+                keyword("NOT").then_ignore(keyword("IN")),
+                |l, _, r, _| {
+                    Expr::Not(Box::new(Expr::FunctionCall {
+                        name: "__in__".to_string(),
+                        args: vec![l, r],
+                    }))
+                },
+            ),
+            // x CONTAINS y
+            infix(left(15), keyword("CONTAINS"), |l, _, r, _| {
+                Expr::FunctionCall {
+                    name: "__contains__".to_string(),
+                    args: vec![l, r],
+                }
+            }),
+            // x NOT CONTAINS y
+            infix(
+                left(15),
+                keyword("NOT").then_ignore(keyword("CONTAINS")),
+                |l, _, r, _| {
+                    Expr::Not(Box::new(Expr::FunctionCall {
+                        name: "__contains__".to_string(),
+                        args: vec![l, r],
+                    }))
+                },
+            ),
+            // x STARTS WITH y
+            infix(
+                left(15),
+                keyword("STARTS").then_ignore(keyword("WITH")),
+                |l, _, r, _| Expr::FunctionCall {
+                    name: "__starts_with__".to_string(),
+                    args: vec![l, r],
+                },
+            ),
+            // x NOT STARTS WITH y
+            infix(
+                left(15),
+                keyword("NOT")
+                    .then_ignore(keyword("STARTS"))
+                    .then_ignore(keyword("WITH")),
+                |l, _, r, _| {
+                    Expr::Not(Box::new(Expr::FunctionCall {
+                        name: "__starts_with__".to_string(),
+                        args: vec![l, r],
+                    }))
+                },
+            ),
+            // x ENDS WITH y
+            infix(
+                left(15),
+                keyword("ENDS").then_ignore(keyword("WITH")),
+                |l, _, r, _| Expr::FunctionCall {
+                    name: "__ends_with__".to_string(),
+                    args: vec![l, r],
+                },
+            ),
+            // x NOT ENDS WITH y
+            infix(
+                left(15),
+                keyword("NOT")
+                    .then_ignore(keyword("ENDS"))
+                    .then_ignore(keyword("WITH")),
+                |l, _, r, _| {
+                    Expr::Not(Box::new(Expr::FunctionCall {
+                        name: "__ends_with__".to_string(),
+                        args: vec![l, r],
+                    }))
+                },
+            ),
+            // NOT: prefix(13) so it does not consume AND(12) but does consume comparisons(14).
+            prefix(13, keyword("NOT"), |_, x, _| Expr::Not(Box::new(x))),
+            // AND
+            infix(left(12), keyword("AND"), |l, _, r, _| Expr::BinaryOp {
+                op: BinaryOperator::And,
+                left: Box::new(l),
+                right: Box::new(r),
+            }),
+            // XOR
+            infix(left(11), keyword("XOR"), |l, _, r, _| Expr::BinaryOp {
+                op: BinaryOperator::Xor,
+                left: Box::new(l),
+                right: Box::new(r),
+            }),
+            // OR (lowest-precedence logical operator)
+            infix(left(10), keyword("OR"), |l, _, r, _| Expr::BinaryOp {
+                op: BinaryOperator::Or,
+                left: Box::new(l),
+                right: Box::new(r),
+            }),
+        ));
 
-        break;
-    }
-    Ok(expr)
+        pratt
+    })
 }
 
-/// Accept an identifier-like token (including keywords usable as identifiers).
-fn expect_any_ident(c: &mut Cursor<'_>) -> Result<String, String> {
-    match c.peek() {
-        Some(Tok::Ident(s)) => {
-            let s = s.clone();
-            c.next();
-            Ok(s)
-        }
-        other => Err(format!("expected identifier, got {:?}", other)),
-    }
+// ─── Phase 3: Structural Graph Patterns ───────────────────────────────────────
+
+/// Parses inline property maps `{ key: expr, ... }`
+fn property_map<'a>(
+    expr_parser: impl Parser<'a, ParserInput<'a>, Expr, ParserError<'a>> + Clone + 'a,
+) -> impl Parser<'a, ParserInput<'a>, HashMap<String, Expr>, ParserError<'a>> + Clone {
+    sym(Tok::LBrace)
+        .ignore_then(
+            identifier()
+                .then_ignore(sym(Tok::Colon))
+                .then(expr_parser)
+                .separated_by(sym(Tok::Comma))
+                .allow_trailing()
+                .collect::<HashMap<String, Expr>>(),
+        )
+        .then_ignore(sym(Tok::RBrace))
 }
 
-fn parse_expr_atom(c: &mut Cursor<'_>) -> Result<Expr, String> {
-    match c.peek() {
-        // Null / true / false
-        Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("NULL") => {
-            c.next();
-            Ok(Expr::Literal(Literal::Null))
-        }
-        Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("TRUE") => {
-            c.next();
-            Ok(Expr::Literal(Literal::Bool(true)))
-        }
-        Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("FALSE") => {
-            c.next();
-            Ok(Expr::Literal(Literal::Bool(false)))
-        }
-
-        // Integer literal
-        Some(Tok::Integer(_)) => {
-            if let Some(Tok::Integer(n)) = c.next() {
-                Ok(Expr::Literal(Literal::Int(*n)))
-            } else {
-                unreachable!()
-            }
-        }
-
-        // Float literal
-        Some(Tok::Float(_)) => {
-            if let Some(Tok::Float(f)) = c.next() {
-                Ok(Expr::Literal(Literal::Float(*f)))
-            } else {
-                unreachable!()
-            }
-        }
-
-        // String literal
-        Some(Tok::Str(_)) => {
-            if let Some(Tok::Str(s)) = c.next() {
-                Ok(Expr::Literal(Literal::Str(s.clone())))
-            } else {
-                unreachable!()
-            }
-        }
-
-        // Parameter
-        Some(Tok::Param(_)) => {
-            if let Some(Tok::Param(p)) = c.next() {
-                Ok(Expr::Param(p.clone()))
-            } else {
-                unreachable!()
-            }
-        }
-
-        // Parenthesised expression
-        Some(Tok::LParen) => {
-            c.next();
-            let inner = parse_expr(c)?;
-            c.expect_tok(&Tok::RParen)?;
-            Ok(inner)
-        }
-
-        // List comprehension or list literal
-        Some(Tok::LBrack) => parse_list_or_comprehension(c),
-
-        // Map literal
-        Some(Tok::LBrace) => parse_map_literal(c),
-
-        // Identifier: could be a keyword (CASE, quantifier, agg, function, variable)
-        Some(Tok::Ident(_)) => parse_ident_expr(c),
-
-        other => Err(format!("unexpected token in expression: {:?}", other)),
-    }
-}
-
-fn parse_list_or_comprehension(c: &mut Cursor<'_>) -> Result<Expr, String> {
-    c.expect_tok(&Tok::LBrack)?;
-
-    // Empty list
-    if c.eat(&Tok::RBrack) {
-        return Ok(Expr::FunctionCall {
-            name: "__list__".to_string(),
-            args: vec![],
-        });
-    }
-
-    // Detect list comprehension: starts with `ident IN`
-    let is_comp = matches!(c.peek(), Some(Tok::Ident(_)))
-        && matches!(c.peek_at(1), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("IN"));
-
-    if is_comp {
-        let variable = expect_any_ident(c)?;
-        c.next(); // consume IN
-        let list = parse_expr_or(c)?;
-
-        // Optional WHERE pred
-        let predicate = if c.peek_kw("WHERE") {
-            c.next();
-            Some(Box::new(parse_expr_or(c)?))
-        } else {
-            None
-        };
-        // Optional | transform
-        let transform = if c.eat(&Tok::Pipe) {
-            Some(Box::new(parse_expr_or(c)?))
-        } else {
-            None
-        };
-
-        c.expect_tok(&Tok::RBrack)?;
-        return Ok(Expr::ListComprehension {
+/// Parses node patterns: `(variable:Label { properties })`
+fn node_pattern<'a>(
+    expr_parser: impl Parser<'a, ParserInput<'a>, Expr, ParserError<'a>> + Clone + 'a,
+) -> impl Parser<'a, ParserInput<'a>, NodePattern, ParserError<'a>> + Clone {
+    sym(Tok::LParen)
+        .ignore_then(
+            identifier()
+                .or_not()
+                .then(sym(Tok::Colon).ignore_then(identifier()).or_not())
+                .then(property_map(expr_parser).or_not()),
+        )
+        .then_ignore(sym(Tok::RParen))
+        .map(|((variable, label), properties)| NodePattern {
             variable,
-            list: Box::new(list),
-            predicate,
-            transform,
-        });
-    }
-
-    // List literal
-    let mut items = Vec::new();
-    loop {
-        if c.peek() == Some(&Tok::RBrack) {
-            break;
-        }
-        items.push(parse_expr_or(c)?);
-        if !c.eat(&Tok::Comma) {
-            break;
-        }
-    }
-    c.expect_tok(&Tok::RBrack)?;
-    Ok(Expr::FunctionCall {
-        name: "__list__".to_string(),
-        args: items,
-    })
-}
-
-fn parse_map_literal(c: &mut Cursor<'_>) -> Result<Expr, String> {
-    c.expect_tok(&Tok::LBrace)?;
-    let mut args = Vec::new();
-    if c.peek() != Some(&Tok::RBrace) {
-        loop {
-            let key = expect_any_ident(c)?;
-            c.expect_tok(&Tok::Colon)?;
-            let val = parse_expr_or(c)?;
-            args.push(Expr::Literal(Literal::Str(key)));
-            args.push(val);
-            if !c.eat(&Tok::Comma) {
-                break;
-            }
-        }
-    }
-    c.expect_tok(&Tok::RBrace)?;
-    Ok(Expr::FunctionCall {
-        name: "__map__".to_string(),
-        args,
-    })
-}
-
-fn parse_ident_expr(c: &mut Cursor<'_>) -> Result<Expr, String> {
-    // Peek at the identifier
-    let name = match c.peek() {
-        Some(Tok::Ident(s)) => s.clone(),
-        _ => return Err("expected identifier".into()),
-    };
-    let name_upper = name.to_ascii_uppercase();
-
-    // CASE expression
-    if name_upper == "CASE" {
-        return parse_case_expr(c);
-    }
-
-    // Quantifiers: ALL, ANY, NONE, SINGLE followed by '('
-    if matches!(name_upper.as_str(), "ALL" | "ANY" | "NONE" | "SINGLE")
-        && c.peek_at(1) == Some(&Tok::LParen)
-    {
-        return parse_quantifier_expr(c);
-    }
-
-    // count(*) special case
-    if name_upper == "COUNT"
-        && c.peek_at(1) == Some(&Tok::LParen)
-        && c.peek_at(2) == Some(&Tok::Star)
-        && c.peek_at(3) == Some(&Tok::RParen)
-    {
-        c.next();
-        c.next();
-        c.next();
-        c.next(); // consume COUNT ( * )
-        return Ok(Expr::CountStar);
-    }
-
-    // Aggregation functions: COUNT, SUM, AVG, MIN, MAX, COLLECT, STDEV, STDEVP
-    if matches!(
-        name_upper.as_str(),
-        "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "COLLECT" | "STDEV" | "STDEVP"
-    ) && c.peek_at(1) == Some(&Tok::LParen)
-    {
-        return parse_agg_expr(c);
-    }
-
-    // percentileDisc / percentileCont
-    if matches!(name_upper.as_str(), "PERCENTILEDISC" | "PERCENTILECONT")
-        && c.peek_at(1) == Some(&Tok::LParen)
-    {
-        return parse_percentile_expr(c);
-    }
-
-    // Generic function call: name(args...)
-    if c.peek_at(1) == Some(&Tok::LParen) {
-        return parse_fn_call_expr(c);
-    }
-
-    // Dotted function call: name.name(args...)
-    if c.peek_at(1) == Some(&Tok::Dot) {
-        if let Some(Tok::Ident(_)) = c.peek_at(2) {
-            if c.peek_at(3) == Some(&Tok::LParen) {
-                return parse_fn_call_expr(c);
-            }
-        }
-    }
-
-    // Bare identifier (variable reference)
-    c.next();
-    Ok(Expr::Prop(name, "".to_string()))
-}
-
-fn parse_quantifier_expr(c: &mut Cursor<'_>) -> Result<Expr, String> {
-    let name = expect_any_ident(c)?;
-    let kind = match name.to_ascii_uppercase().as_str() {
-        "ALL" => QuantifierKind::All,
-        "ANY" => QuantifierKind::Any,
-        "NONE" => QuantifierKind::None,
-        "SINGLE" => QuantifierKind::Single,
-        _ => unreachable!(),
-    };
-    c.expect_tok(&Tok::LParen)?;
-    let variable = expect_any_ident(c)?;
-    c.next(); // IN keyword
-    let list = parse_expr_or(c)?;
-    c.next(); // WHERE keyword
-    let predicate = parse_expr_or(c)?;
-    c.expect_tok(&Tok::RParen)?;
-    Ok(Expr::Quantifier {
-        kind,
-        variable,
-        list: Box::new(list),
-        predicate: Box::new(predicate),
-    })
-}
-
-fn parse_agg_expr(c: &mut Cursor<'_>) -> Result<Expr, String> {
-    let name = expect_any_ident(c)?;
-    let name_upper = name.to_ascii_uppercase();
-    c.expect_tok(&Tok::LParen)?;
-    let distinct = c.peek_kw("DISTINCT");
-    if distinct {
-        c.next();
-    }
-    let inner = parse_expr(c)?;
-    c.expect_tok(&Tok::RParen)?;
-
-    let agg_fn = match name_upper.as_str() {
-        "COUNT" => AggFn::Count { distinct },
-        "SUM" => AggFn::Sum { distinct },
-        "AVG" => AggFn::Avg { distinct },
-        "MIN" => AggFn::Min { distinct },
-        "MAX" => AggFn::Max { distinct },
-        "COLLECT" => AggFn::Collect { distinct },
-        "STDEV" => AggFn::StDev { distinct },
-        "STDEVP" => AggFn::StDevP { distinct },
-        _ => return Err(format!("unknown aggregation function: {}", name)),
-    };
-    Ok(Expr::Agg(agg_fn, Box::new(inner)))
-}
-
-fn parse_percentile_expr(c: &mut Cursor<'_>) -> Result<Expr, String> {
-    let name = expect_any_ident(c)?;
-    let is_disc = name.eq_ignore_ascii_case("PERCENTILEDISC");
-    c.expect_tok(&Tok::LParen)?;
-    let inner = parse_expr(c)?;
-    c.expect_tok(&Tok::Comma)?;
-    // Accept a literal float/int, a parameter, or a general expression.
-    let pct = match c.peek() {
-        Some(Tok::Float(_)) => {
-            if let Some(Tok::Float(f)) = c.next() {
-                *f
-            } else {
-                unreachable!()
-            }
-        }
-        Some(Tok::Integer(_)) => {
-            if let Some(Tok::Integer(n)) = c.next() {
-                *n as f64
-            } else {
-                unreachable!()
-            }
-        }
-        Some(Tok::Param(_)) => {
-            // Parameter: use 0.5 as a placeholder; the executor will substitute.
-            c.next();
-            0.5
-        }
-        _ => {
-            // General expression: parse it and use 0.5 as placeholder.
-            let _ = parse_expr(c)?;
-            0.5
-        }
-    };
-    c.expect_tok(&Tok::RParen)?;
-    let agg_fn = if is_disc {
-        AggFn::PercentileDisc { percentile: pct }
-    } else {
-        AggFn::PercentileCont { percentile: pct }
-    };
-    Ok(Expr::Agg(agg_fn, Box::new(inner)))
-}
-
-fn parse_fn_call_expr(c: &mut Cursor<'_>) -> Result<Expr, String> {
-    // Consume name (potentially dotted)
-    let mut name = expect_any_ident(c)?.to_ascii_lowercase();
-    while c.peek() == Some(&Tok::Dot) {
-        // Check if the next token is an identifier (property access vs dotted fn)
-        if let Some(Tok::Ident(_)) = c.peek_at(1) {
-            if c.peek_at(2) == Some(&Tok::LParen) {
-                c.next(); // consume dot
-                let part = expect_any_ident(c)?;
-                name.push('.');
-                name.push_str(&part.to_ascii_lowercase());
-                continue;
-            }
-        }
-        break;
-    }
-    c.expect_tok(&Tok::LParen)?;
-    let mut args = Vec::new();
-    if c.peek() != Some(&Tok::RParen) {
-        loop {
-            args.push(parse_expr(c)?);
-            if !c.eat(&Tok::Comma) {
-                break;
-            }
-        }
-    }
-    c.expect_tok(&Tok::RParen)?;
-    Ok(Expr::FunctionCall { name, args })
-}
-
-fn parse_case_expr(c: &mut Cursor<'_>) -> Result<Expr, String> {
-    c.next(); // consume CASE
-
-    // Simple CASE subject (if next token is not WHEN)
-    let subject = if !c.peek_kw("WHEN") {
-        Some(Box::new(parse_expr(c)?))
-    } else {
-        None
-    };
-
-    let mut arms = Vec::new();
-    while c.peek_kw("WHEN") {
-        c.next(); // WHEN
-        let when = parse_expr(c)?;
-        c.next(); // THEN
-        let then = parse_expr(c)?;
-        arms.push(CaseArm { when, then });
-    }
-
-    let else_expr = if c.peek_kw("ELSE") {
-        c.next();
-        Some(Box::new(parse_expr(c)?))
-    } else {
-        None
-    };
-
-    if !c.peek_kw("END") {
-        return Err("CASE expression missing END".into());
-    }
-    c.next(); // END
-
-    Ok(Expr::Case {
-        subject,
-        arms,
-        else_expr,
-    })
-}
-
-// ─── Properties map ───────────────────────────────────────────────────────────
-
-fn parse_properties_map(c: &mut Cursor<'_>) -> Result<HashMap<String, Expr>, String> {
-    c.expect_tok(&Tok::LBrace)?;
-    let mut map = HashMap::new();
-    if c.peek() != Some(&Tok::RBrace) {
-        loop {
-            let key = expect_any_ident(c)?;
-            c.expect_tok(&Tok::Colon)?;
-            // Accept full expressions so that pipeline variable references
-            // like `CREATE (n {num: x})` where `x` is from UNWIND work correctly.
-            let val = parse_expr(c)?;
-            map.insert(key, val);
-            if !c.eat(&Tok::Comma) {
-                break;
-            }
-        }
-    }
-    c.expect_tok(&Tok::RBrace)?;
-    Ok(map)
-}
-
-#[allow(dead_code)]
-fn parse_literal_value(c: &mut Cursor<'_>) -> Result<Literal, String> {
-    // Handle negative numbers
-    if c.peek() == Some(&Tok::Minus) {
-        c.next();
-        return match c.peek() {
-            Some(Tok::Integer(_)) => {
-                if let Some(Tok::Integer(n)) = c.next() {
-                    Ok(Literal::Int(-n))
-                } else {
-                    unreachable!()
-                }
-            }
-            Some(Tok::Float(_)) => {
-                if let Some(Tok::Float(f)) = c.next() {
-                    Ok(Literal::Float(-f))
-                } else {
-                    unreachable!()
-                }
-            }
-            other => Err(format!("expected number after minus, got {:?}", other)),
-        };
-    }
-    match c.peek() {
-        Some(Tok::Str(_)) => {
-            if let Some(Tok::Str(s)) = c.next() {
-                Ok(Literal::Str(s.clone()))
-            } else {
-                unreachable!()
-            }
-        }
-        Some(Tok::Integer(_)) => {
-            if let Some(Tok::Integer(n)) = c.next() {
-                Ok(Literal::Int(*n))
-            } else {
-                unreachable!()
-            }
-        }
-        Some(Tok::Float(_)) => {
-            if let Some(Tok::Float(f)) = c.next() {
-                Ok(Literal::Float(*f))
-            } else {
-                unreachable!()
-            }
-        }
-        Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("TRUE") => {
-            c.next();
-            Ok(Literal::Bool(true))
-        }
-        Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("FALSE") => {
-            c.next();
-            Ok(Literal::Bool(false))
-        }
-        Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("NULL") => {
-            c.next();
-            Ok(Literal::Null)
-        }
-        // List literal: [val1, val2, ...]
-        Some(Tok::LBrack) => {
-            c.next(); // consume [
-            let mut items = Vec::new();
-            while c.peek() != Some(&Tok::RBrack) {
-                if c.peek().is_none() {
-                    return Err("unterminated list literal".into());
-                }
-                items.push(parse_literal_value(c)?);
-                if !c.eat(&Tok::Comma) {
-                    break;
-                }
-            }
-            c.expect_tok(&Tok::RBrack)?;
-            Ok(Literal::List(items))
-        }
-        other => Err(format!("expected literal value, got {:?}", other)),
-    }
-}
-
-// ─── Pattern parsers ──────────────────────────────────────────────────────────
-
-fn parse_node_pattern(c: &mut Cursor<'_>) -> Result<NodePattern, String> {
-    c.expect_tok(&Tok::LParen)?;
-
-    // Optional variable
-    let variable = if let Some(Tok::Ident(_)) = c.peek() {
-        // Only treat as variable if not immediately followed by ':' in the wrong context.
-        // Actually, variable is any ident that's not a pure label indicator.
-        Some(expect_any_ident(c)?)
-    } else {
-        None
-    };
-
-    // Optional label(s): :Label
-    let label = if c.eat(&Tok::Colon) {
-        Some(expect_any_ident(c)?)
-    } else {
-        None
-    };
-
-    // Skip additional labels (multi-label: just take first)
-    while c.peek() == Some(&Tok::Colon) {
-        c.next();
-        let _ = expect_any_ident(c)?; // consume but ignore additional labels
-    }
-
-    // Optional properties
-    let properties = if c.peek() == Some(&Tok::LBrace) {
-        Some(parse_properties_map(c)?)
-    } else {
-        None
-    };
-
-    c.expect_tok(&Tok::RParen)?;
-    Ok(NodePattern {
-        variable,
-        label,
-        properties,
-    })
-}
-
-fn parse_rel_range(c: &mut Cursor<'_>) -> Result<RelRange, String> {
-    // Already consumed '*'; parse optional range
-    // Could be: empty, n, n..m, n.., ..m, ..
-    let start_num = if let Some(Tok::Integer(n)) = c.peek() {
-        let n = *n as u32;
-        c.next();
-        Some(n)
-    } else {
-        None
-    };
-
-    if c.eat(&Tok::DotDot) {
-        let end_num = if let Some(Tok::Integer(n)) = c.peek() {
-            let n = *n as u32;
-            c.next();
-            Some(n)
-        } else {
-            None
-        };
-        Ok(RelRange {
-            min: start_num.or(Some(1)),
-            max: end_num,
+            label,
+            properties,
         })
-    } else if let Some(n) = start_num {
-        // Exact hops
-        Ok(RelRange {
-            min: Some(n),
-            max: Some(n),
-        })
-    } else {
-        // Bare * (no number)
-        Ok(RelRange {
+}
+
+/// Parses edge hop ranges: `*1..3` or `*..5` or `*2` or bare `*`
+fn rel_range<'a>() -> impl Parser<'a, ParserInput<'a>, RelRange, ParserError<'a>> + Clone {
+    let int_u32 = any().filter_map(|tok| match tok {
+        Tok::Integer(n) => Some(n as u32),
+        _ => None,
+    });
+
+    sym(Tok::Star).ignore_then(choice((
+        // *start..end or *start..
+        int_u32
+            .then(sym(Tok::DotDot).ignore_then(int_u32.or_not()).or_not())
+            .map(|(start, opt_range)| match opt_range {
+                Some(end) => RelRange {
+                    min: Some(start).or(Some(1)),
+                    max: end,
+                },
+                None => RelRange {
+                    min: Some(start),
+                    max: Some(start),
+                },
+            }),
+        // *..end or *..
+        sym(Tok::DotDot)
+            .ignore_then(int_u32.or_not())
+            .map(|end| RelRange {
+                min: Some(1),
+                max: end,
+            }),
+        // Bare *
+        any().rewind().to(RelRange {
             min: Some(1),
             max: None,
-        })
-    }
+        }),
+    )))
 }
 
-fn parse_rel_pattern(c: &mut Cursor<'_>) -> Result<RelationshipPattern, String> {
-    // Possible prefixes: <- or -
-    let is_incoming = c.peek() == Some(&Tok::LArrow);
-    if is_incoming {
-        c.next(); // consume <-
-    } else {
-        c.expect_tok(&Tok::Minus)?;
-    }
+/// Parses directional or undirected relationship patterns
+fn relationship_pattern<'a>(
+    expr_parser: impl Parser<'a, ParserInput<'a>, Expr, ParserError<'a>> + Clone + 'a,
+) -> impl Parser<'a, ParserInput<'a>, RelationshipPattern, ParserError<'a>> + Clone {
+    let prefix = choice((
+        sym(Tok::LArrow).to((true, false)), // inbound: <-
+        sym(Tok::Minus).to((false, false)), // outbound/undirected: -
+    ));
 
-    // Check for bare ->  or --  (no bracket)
-    if !is_incoming && c.peek() == Some(&Tok::Arrow) {
-        // directed outgoing: ->
-        c.next();
-        return Ok(RelationshipPattern {
-            variable: None,
-            rel_type: None,
-            is_incoming: false,
-            is_undirected: false,
-            range: None,
-            properties: None,
-        });
-    }
-    if !is_incoming && c.peek() == Some(&Tok::Minus) {
-        // undirected: --
-        c.next();
-        return Ok(RelationshipPattern {
-            variable: None,
-            rel_type: None,
-            is_incoming: false,
-            is_undirected: true,
-            range: None,
-            properties: None,
-        });
-    }
-    // Incoming bare: <-- (already consumed <-, now see another -)
-    if is_incoming && c.peek() == Some(&Tok::Minus) {
-        c.next(); // consume trailing -
-        return Ok(RelationshipPattern {
+    // Bare arrow edge patterns (with no brackets)
+    let bare_inbound = sym(Tok::LArrow)
+        .then_ignore(sym(Tok::Minus))
+        .map(|_| RelationshipPattern {
             variable: None,
             rel_type: None,
             is_incoming: true,
@@ -1328,304 +931,834 @@ fn parse_rel_pattern(c: &mut Cursor<'_>) -> Result<RelationshipPattern, String> 
             range: None,
             properties: None,
         });
-    }
 
-    // We expect a bracket [...]
-    c.expect_tok(&Tok::LBrack)?;
+    let bare_other = sym(Tok::Minus).ignore_then(choice((
+        sym(Tok::Arrow).to(RelationshipPattern {
+            variable: None,
+            rel_type: None,
+            is_incoming: false,
+            is_undirected: false,
+            range: None,
+            properties: None,
+        }),
+        sym(Tok::Minus).to(RelationshipPattern {
+            variable: None,
+            rel_type: None,
+            is_incoming: false,
+            is_undirected: true,
+            range: None,
+            properties: None,
+        }),
+    )));
 
-    // Optional variable
-    let variable = if let Some(Tok::Ident(_)) = c.peek() {
-        // Could be a variable OR just followed by : which means no variable
-        // We need to disambiguate: if peek_at(1) is ':' or '*' or ']' then it might be a variable
-        Some(expect_any_ident(c)?)
-    } else {
-        None
-    };
-
-    // Optional rel type(s): :TYPE or :TYPE1|TYPE2|TYPE3
-    let rel_type = if c.eat(&Tok::Colon) {
-        let mut types = expect_any_ident(c)?;
-        while c.eat(&Tok::Pipe) {
-            // Allow optional colon before next type name: :TYPE1|:TYPE2
-            let _ = c.eat(&Tok::Colon);
-            let next = expect_any_ident(c)?;
-            types.push('|');
-            types.push_str(&next);
-        }
-        Some(types)
-    } else {
-        None
-    };
-
-    // Optional variable-length: *range
-    let range = if c.eat(&Tok::Star) {
-        Some(parse_rel_range(c)?)
-    } else {
-        None
-    };
-
-    // Optional properties
-    let properties = if c.peek() == Some(&Tok::LBrace) {
-        Some(parse_properties_map(c)?)
-    } else {
-        None
-    };
-
-    c.expect_tok(&Tok::RBrack)?;
-
-    // Suffix: -> or - (undirected)
-    let is_outgoing = c.peek() == Some(&Tok::Arrow);
-    if is_outgoing {
-        c.next(); // consume ->
-    } else {
-        c.expect_tok(&Tok::Minus)?;
-    }
-
-    let is_undirected = !is_incoming && !is_outgoing;
-
-    Ok(RelationshipPattern {
-        variable,
-        rel_type,
-        is_incoming,
-        is_undirected,
-        range,
-        properties,
-    })
-}
-
-fn parse_pattern(c: &mut Cursor<'_>) -> Result<Pattern, String> {
-    // Capture optional path variable assignment: `p = (...)`
-    let path_variable = if let Some(Tok::Ident(_)) = c.peek() {
-        if c.peek_at(1) == Some(&Tok::Eq) {
-            // Make sure next after '=' is a '('
-            if c.peek_at(2) == Some(&Tok::LParen) {
-                let var = expect_any_ident(c)?;
-                c.next(); // =
-                Some(var)
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    let node = parse_node_pattern(c)?;
-    let mut rels = Vec::new();
-
-    // Continue parsing relationship-node pairs while we see - or <-
-    while matches!(c.peek(), Some(Tok::Minus) | Some(Tok::LArrow)) {
-        let rel = parse_rel_pattern(c)?;
-        let target = parse_node_pattern(c)?;
-        rels.push((rel, target));
-    }
-
-    Ok(Pattern {
-        node,
-        rels,
-        path_variable,
-    })
-}
-
-fn parse_multi_pattern(c: &mut Cursor<'_>) -> Result<Vec<Pattern>, String> {
-    let mut patterns = Vec::new();
-    patterns.push(parse_pattern(c)?);
-    while c.eat(&Tok::Comma) {
-        patterns.push(parse_pattern(c)?);
-    }
-    Ok(patterns)
-}
-
-// ─── Match clause parsing ─────────────────────────────────────────────────────
-
-fn parse_match_clauses_from_cursor(c: &mut Cursor<'_>) -> Result<Vec<MatchClause>, String> {
-    let mut clauses = Vec::new();
-    clauses.push(MatchClause {
-        pattern: parse_pattern(c)?,
-    });
-    while c.eat(&Tok::Comma) {
-        clauses.push(MatchClause {
-            pattern: parse_pattern(c)?,
-        });
-    }
-    validate_match_clause_variables(&clauses)?;
-    Ok(clauses)
-}
-
-// ─── WHERE clause ─────────────────────────────────────────────────────────────
-
-fn parse_where_clause_from_cursor(c: &mut Cursor<'_>) -> Result<WhereClause, String> {
-    let expr = parse_expr(c)?;
-    if let Expr::BinaryOp { op, left, right } = &expr {
-        match op {
-            BinaryOperator::Eq => return Ok(WhereClause::Eq(*left.clone(), *right.clone())),
-            BinaryOperator::Ne => return Ok(WhereClause::Ne(*left.clone(), *right.clone())),
-            BinaryOperator::Lt => return Ok(WhereClause::Lt(*left.clone(), *right.clone())),
-            BinaryOperator::Gt => return Ok(WhereClause::Gt(*left.clone(), *right.clone())),
-            BinaryOperator::Le => return Ok(WhereClause::Le(*left.clone(), *right.clone())),
-            BinaryOperator::Ge => return Ok(WhereClause::Ge(*left.clone(), *right.clone())),
-            _ => {}
-        }
-    }
-    Ok(WhereClause::Expr(expr))
-}
-
-// ─── SET items ────────────────────────────────────────────────────────────────
-
-fn parse_set_items_from_cursor(c: &mut Cursor<'_>) -> Result<Vec<SetItem>, String> {
-    let mut items = Vec::new();
-    while let Some(Tok::Ident(_)) = c.peek() {
-        // variable.property = expr
-        let var = expect_any_ident(c)?;
-        // Check for label set `n:Label` or `n:Label1:Label2` (skip label assignments)
-        if c.peek() == Some(&Tok::Colon) {
-            // Consume all :Label tokens for this variable
-            while c.peek() == Some(&Tok::Colon) {
-                c.next(); // :
-                let _ = expect_any_ident(c); // label name
-            }
-            if !c.eat(&Tok::Comma) {
-                break;
-            }
-            continue;
-        }
-        if c.eat(&Tok::Dot) {
-            let prop = expect_any_ident(c)?;
-            c.expect_tok(&Tok::Eq)?;
-            let expr = parse_expr(c)?;
-            items.push(SetItem {
-                variable: var,
-                property: prop,
-                expr,
-            });
-        } else {
-            // Could be `n += {prop: val}` or other forms; skip
-            // consume until comma or end of SET
-            while !matches!(c.peek(), Some(Tok::Comma) | None) && !is_clause_keyword(c) {
-                c.next();
-            }
-        }
-        if !c.eat(&Tok::Comma) {
-            break;
-        }
-    }
-    Ok(items)
-}
-
-/// Check if the current token is a major clause keyword that signals the end of a sub-clause.
-fn is_clause_keyword(c: &Cursor<'_>) -> bool {
-    matches!(
-        c.peek(),
-        Some(Tok::Ident(s)) if matches!(
-            s.to_ascii_uppercase().as_str(),
-            "MATCH" | "WHERE" | "RETURN" | "WITH" | "UNWIND" | "ORDER"
-            | "SKIP" | "LIMIT" | "SET" | "DELETE" | "REMOVE" | "MERGE"
-            | "CREATE" | "UNION" | "ON" | "DETACH" | "FOREACH"
+    // Standard bracketed relationship patterns: -[variable:Type*range { props }]->
+    let bracketed = prefix
+        .then(
+            sym(Tok::LBrack)
+                .ignore_then(
+                    identifier()
+                        .or_not()
+                        .then(
+                            sym(Tok::Colon)
+                                .ignore_then(
+                                    identifier()
+                                        .then(
+                                            sym(Tok::Pipe)
+                                                .ignore_then(sym(Tok::Colon).or_not())
+                                                .ignore_then(identifier())
+                                                .repeated()
+                                                .collect::<Vec<String>>(),
+                                        )
+                                        .map(|(first, rest)| {
+                                            let mut s = first;
+                                            for r in rest {
+                                                s.push('|');
+                                                s.push_str(&r);
+                                            }
+                                            s
+                                        }),
+                                )
+                                .or_not(),
+                        )
+                        .then(rel_range().or_not())
+                        .then(property_map(expr_parser).or_not()),
+                )
+                .then_ignore(sym(Tok::RBrack))
+                .then(choice((
+                    sym(Tok::Arrow).to(false), // -> (is_undirected = false)
+                    sym(Tok::Minus).to(true),  // -  (is_undirected = true)
+                ))),
         )
-    )
-}
-
-// ─── RETURN clause ────────────────────────────────────────────────────────────
-
-fn parse_return_items_from_cursor(c: &mut Cursor<'_>) -> Result<Vec<ReturnItem>, String> {
-    let mut items = Vec::new();
-    loop {
-        let expr = parse_expr(c)?;
-        let alias = if c.peek_kw("AS") {
-            c.next();
-            Some(expect_any_ident(c)?)
-        } else {
-            None
-        };
-        items.push(ReturnItem { expr, alias });
-        if !c.eat(&Tok::Comma) {
-            break;
-        }
-    }
-    Ok(items)
-}
-
-fn parse_return_clause_from_cursor(c: &mut Cursor<'_>) -> Result<ReturnClause, String> {
-    // Caller has already consumed 'RETURN'
-    let distinct = c.peek_kw("DISTINCT");
-    if distinct {
-        c.next();
-    }
-    // RETURN * passes all current bindings through.
-    let items = if c.peek() == Some(&Tok::Star) {
-        c.next();
-        vec![ReturnItem {
-            expr: Expr::FunctionCall {
-                name: "__star__".to_string(),
-                args: vec![],
+        .map(
+            |((is_incoming, _), ((((variable, rel_type), range), properties), is_minus_suffix))| {
+                let is_undirected = !is_incoming && is_minus_suffix;
+                RelationshipPattern {
+                    variable,
+                    rel_type,
+                    is_incoming,
+                    is_undirected,
+                    range,
+                    properties,
+                }
             },
-            alias: None,
-        }]
-    } else {
-        parse_return_items_from_cursor(c)?
-    };
-    Ok(ReturnClause { items, distinct })
+        );
+
+    choice((bare_inbound, bare_other, bracketed))
 }
 
-// ─── ORDER BY ─────────────────────────────────────────────────────────────────
+/// Parses path patterns
+fn pattern<'a>(
+    expr_parser: impl Parser<'a, ParserInput<'a>, Expr, ParserError<'a>> + Clone + 'a,
+) -> impl Parser<'a, ParserInput<'a>, Pattern, ParserError<'a>> + Clone {
+    let path_prefix = identifier().then_ignore(sym(Tok::Eq)).or_not();
 
-fn parse_order_by_from_cursor(c: &mut Cursor<'_>) -> Result<OrderBy, String> {
-    // Caller has consumed 'ORDER'; consume 'BY'
-    c.next(); // BY
-    let mut items = Vec::new();
-    loop {
-        let expr = parse_expr(c)?;
-        let ascending = if c.peek_kw("ASC") {
-            c.next();
-            true
-        } else if c.peek_kw("DESC") {
-            c.next();
-            false
-        } else {
-            true
-        };
-        items.push(SortItem { expr, ascending });
-        if !c.eat(&Tok::Comma) {
-            break;
-        }
-    }
-    Ok(OrderBy { items })
+    path_prefix
+        .then(node_pattern(expr_parser.clone()))
+        .then(
+            relationship_pattern(expr_parser.clone())
+                .then(node_pattern(expr_parser))
+                .repeated()
+                .collect(),
+        )
+        .map(|((path_variable, node), rels)| Pattern {
+            node,
+            rels,
+            path_variable,
+        })
 }
 
-// ─── SKIP / LIMIT helpers ─────────────────────────────────────────────────────
+// ─── Phase 4: Clause & Helper Combinators ─────────────────────────────────────
 
-fn try_parse_order_by(c: &mut Cursor<'_>) -> Result<Option<OrderBy>, String> {
-    if c.peek_kw("ORDER") {
-        c.next();
-        Ok(Some(parse_order_by_from_cursor(c)?))
-    } else {
-        Ok(None)
-    }
+/// Parses a RETURN projection item: `expr AS alias` or just `expr`
+fn return_item<'a>() -> impl Parser<'a, ParserInput<'a>, ReturnItem, ParserError<'a>> + Clone {
+    expr_parser()
+        .then(keyword("AS").ignore_then(identifier()).or_not())
+        .map(|(expr, alias)| ReturnItem { expr, alias })
 }
 
-fn try_parse_skip(c: &mut Cursor<'_>) -> Result<Option<Expr>, String> {
-    if c.peek_kw("SKIP") {
-        c.next();
-        Ok(Some(parse_expr(c)?))
-    } else {
-        Ok(None)
-    }
+/// Parses the complete `RETURN` clause
+fn return_clause<'a>() -> impl Parser<'a, ParserInput<'a>, ReturnClause, ParserError<'a>> + Clone {
+    keyword("RETURN")
+        .ignore_then(
+            keyword("DISTINCT")
+                .to(true)
+                .or_not()
+                .map(|d| d.unwrap_or(false)),
+        )
+        .then(
+            return_item()
+                .separated_by(sym(Tok::Comma))
+                .at_least(1)
+                .collect(),
+        )
+        .map(|(distinct, items)| ReturnClause { items, distinct })
 }
 
-fn try_parse_limit(c: &mut Cursor<'_>) -> Result<Option<Expr>, String> {
-    if c.peek_kw("LIMIT") {
-        c.next();
-        Ok(Some(parse_expr(c)?))
-    } else {
-        Ok(None)
-    }
+/// Parses `WHERE` filters
+fn where_clause<'a>() -> impl Parser<'a, ParserInput<'a>, WhereClause, ParserError<'a>> + Clone {
+    keyword("WHERE")
+        .ignore_then(expr_parser())
+        .map(|expr| match expr {
+            Expr::BinaryOp { op, left, right } => match op {
+                BinaryOperator::Eq => WhereClause::Eq(*left, *right),
+                BinaryOperator::Ne => WhereClause::Ne(*left, *right),
+                BinaryOperator::Lt => WhereClause::Lt(*left, *right),
+                BinaryOperator::Gt => WhereClause::Gt(*left, *right),
+                BinaryOperator::Le => WhereClause::Le(*left, *right),
+                BinaryOperator::Ge => WhereClause::Ge(*left, *right),
+                _ => WhereClause::Expr(Expr::BinaryOp { op, left, right }),
+            },
+            other => WhereClause::Expr(other),
+        })
+}
+
+/// Parses a `MATCH` clause
+fn match_clause<'a>() -> impl Parser<'a, ParserInput<'a>, MatchClause, ParserError<'a>> + Clone {
+    keyword("MATCH")
+        .ignore_then(pattern(expr_parser()))
+        .map(|pattern| MatchClause { pattern })
+}
+
+/// Parses the `ORDER BY` clause
+fn order_by_clause<'a>() -> impl Parser<'a, ParserInput<'a>, OrderBy, ParserError<'a>> + Clone {
+    keyword("ORDER")
+        .ignore_then(keyword("BY"))
+        .ignore_then(
+            expr_parser()
+                .then(
+                    choice((keyword("ASC").to(true), keyword("DESC").to(false)))
+                        .or_not()
+                        .map(|d| d.unwrap_or(true)),
+                )
+                .map(|(expr, ascending)| SortItem { expr, ascending })
+                .separated_by(sym(Tok::Comma))
+                .at_least(1)
+                .collect(),
+        )
+        .map(|items| OrderBy { items })
+}
+
+fn remove_item<'a>() -> impl Parser<'a, ParserInput<'a>, Vec<RemoveItem>, ParserError<'a>> + Clone {
+    identifier()
+        .then(choice((
+            sym(Tok::Dot).ignore_then(identifier()).map(|prop| {
+                vec![RemoveItem::Property {
+                    variable: String::new(),
+                    property: prop,
+                }]
+            }),
+            sym(Tok::Colon)
+                .ignore_then(
+                    identifier()
+                        .separated_by(sym(Tok::Colon))
+                        .at_least(1)
+                        .collect::<Vec<String>>(),
+                )
+                .map(|labels| {
+                    labels
+                        .into_iter()
+                        .map(|lbl| RemoveItem::Label {
+                            variable: String::new(),
+                            label: lbl,
+                        })
+                        .collect()
+                }),
+        )))
+        .map(|(var, mut items)| {
+            for item in &mut items {
+                match item {
+                    RemoveItem::Property { variable, .. } => *variable = var.clone(),
+                    RemoveItem::Label { variable, .. } => *variable = var.clone(),
+                }
+            }
+            items
+        })
+}
+
+fn query_part<'a>() -> impl Parser<'a, ParserInput<'a>, QueryPart, ParserError<'a>> + Clone {
+    choice((
+        choice((
+            keyword("OPTIONAL").ignore_then(keyword("MATCH")).to(true),
+            keyword("MATCH").to(false),
+        ))
+        .then(
+            pattern(expr_parser())
+                .separated_by(sym(Tok::Comma))
+                .at_least(1)
+                .collect::<Vec<_>>(),
+        )
+        .then(where_clause().or_not())
+        .map(|((is_optional, patterns), where_clause)| {
+            let match_clauses: Vec<MatchClause> = patterns
+                .into_iter()
+                .map(|pattern| MatchClause { pattern })
+                .collect();
+            if is_optional {
+                QueryPart::OptionalMatch {
+                    match_clauses,
+                    where_clause,
+                }
+            } else {
+                QueryPart::Match {
+                    match_clauses,
+                    where_clause,
+                }
+            }
+        }),
+        keyword("WITH")
+            .ignore_then(
+                keyword("DISTINCT")
+                    .to(true)
+                    .or_not()
+                    .map(|d| d.unwrap_or(false)),
+            )
+            .then(choice((
+                sym(Tok::Star).to(vec![ReturnItem {
+                    expr: Expr::FunctionCall {
+                        name: "__star__".to_string(),
+                        args: vec![],
+                    },
+                    alias: None,
+                }]),
+                return_item()
+                    .separated_by(sym(Tok::Comma))
+                    .at_least(1)
+                    .collect::<Vec<_>>(),
+            )))
+            .then(where_clause().or_not())
+            .then(order_by_clause().or_not())
+            .then(keyword("SKIP").ignore_then(expr_parser()).or_not())
+            .then(keyword("LIMIT").ignore_then(expr_parser()).or_not())
+            .map(
+                |(((((distinct, items), where_clause), order_by), skip), limit)| QueryPart::With {
+                    items,
+                    where_clause,
+                    order_by,
+                    skip,
+                    limit,
+                    distinct,
+                },
+            ),
+        keyword("UNWIND")
+            .ignore_then(expr_parser())
+            .then_ignore(keyword("AS"))
+            .then(identifier())
+            .map(|(expr, variable)| QueryPart::Unwind { expr, variable }),
+        keyword("CREATE")
+            .ignore_then(
+                pattern(expr_parser())
+                    .separated_by(sym(Tok::Comma))
+                    .at_least(1)
+                    .collect::<Vec<_>>(),
+            )
+            .map(|patterns| QueryPart::Create { patterns }),
+        merge_statement()
+            .separated_by(sym(Tok::Comma))
+            .at_least(1)
+            .collect::<Vec<_>>()
+            .map(|merges| QueryPart::Merge { merges }),
+        keyword("SET")
+            .ignore_then(
+                set_item()
+                    .separated_by(sym(Tok::Comma))
+                    .at_least(1)
+                    .collect::<Vec<_>>(),
+            )
+            .map(|items| QueryPart::Set { items }),
+        keyword("DETACH")
+            .to(true)
+            .or_not()
+            .map(|d| d.unwrap_or(false))
+            .then_ignore(keyword("DELETE"))
+            .then(
+                identifier()
+                    .separated_by(sym(Tok::Comma))
+                    .at_least(1)
+                    .collect::<Vec<_>>(),
+            )
+            .map(|(detach, variables)| QueryPart::Delete { variables, detach }),
+    ))
+}
+
+/// Parses read-only `Query` statements
+pub(super) fn query_parser<'a>() -> impl Parser<'a, ParserInput<'a>, Query, ParserError<'a>> + Clone
+{
+    query_part()
+        .repeated()
+        .collect::<Vec<_>>()
+        .then(return_clause())
+        .then(order_by_clause().or_not())
+        .then(keyword("SKIP").ignore_then(expr_parser()).or_not())
+        .then(keyword("LIMIT").ignore_then(expr_parser()).or_not())
+        .map(|((((parts, return_clause), order_by), skip), limit)| {
+            let (match_clauses, where_clause) = parts
+                .first()
+                .and_then(|p| {
+                    if let QueryPart::Match {
+                        match_clauses,
+                        where_clause,
+                    } = p
+                    {
+                        Some((match_clauses.clone(), where_clause.clone()))
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_default();
+
+            Query {
+                match_clauses,
+                where_clause,
+                return_clause,
+                parts,
+                order_by,
+                skip,
+                limit,
+            }
+        })
+}
+
+// ─── Phase 5: Write & Mutation Clauses ────────────────────────────────────────
+
+/// Parses individual items in a `SET` update: `n.prop = expr`
+fn set_item<'a>() -> impl Parser<'a, ParserInput<'a>, SetItem, ParserError<'a>> + Clone {
+    identifier()
+        .then_ignore(sym(Tok::Dot))
+        .then(identifier())
+        .then_ignore(sym(Tok::Eq))
+        .then(expr_parser())
+        .map(|((variable, property), expr)| SetItem {
+            variable,
+            property,
+            expr,
+        })
+}
+
+/// Parses a `CREATE INDEX` or `CREATE CONSTRAINT` or standard `CREATE` statement
+fn create_statement<'a>() -> impl Parser<'a, ParserInput<'a>, Statement, ParserError<'a>> + Clone {
+    let index_ddl = keyword("CREATE")
+        .ignore_then(keyword("INDEX"))
+        .ignore_then(keyword("FOR"))
+        .ignore_then(sym(Tok::LParen))
+        .ignore_then(identifier()) // var
+        .ignore_then(sym(Tok::Colon))
+        .ignore_then(identifier()) // label
+        .then_ignore(sym(Tok::RParen))
+        .then_ignore(keyword("ON"))
+        .then_ignore(sym(Tok::LParen))
+        .then_ignore(identifier()) // var
+        .then_ignore(sym(Tok::Dot))
+        .then(identifier()) // property
+        .then_ignore(sym(Tok::RParen))
+        .map(|(label, property)| Statement::CreateIndex(CreateIndexStatement { label, property }));
+
+    let constraint_ddl = keyword("CREATE")
+        .ignore_then(keyword("CONSTRAINT"))
+        .ignore_then(keyword("ON"))
+        .ignore_then(sym(Tok::LParen))
+        .ignore_then(identifier()) // var
+        .ignore_then(sym(Tok::Colon))
+        .ignore_then(identifier()) // label
+        .then_ignore(sym(Tok::RParen))
+        .then_ignore(keyword("ASSERT"))
+        .then(choice((
+            // EXISTS(n.prop)
+            keyword("EXISTS")
+                .ignore_then(sym(Tok::LParen))
+                .ignore_then(identifier())
+                .ignore_then(sym(Tok::Dot))
+                .ignore_then(identifier())
+                .then_ignore(sym(Tok::RParen))
+                .map(|prop| (prop, ConstraintKind::Exists)),
+            // n.prop IS UNIQUE
+            identifier()
+                .ignore_then(sym(Tok::Dot))
+                .ignore_then(identifier())
+                .then_ignore(keyword("IS"))
+                .then_ignore(keyword("UNIQUE"))
+                .map(|prop| (prop, ConstraintKind::Unique)),
+        )))
+        .map(|(label, (property, kind))| {
+            Statement::CreateConstraint(CreateConstraintStatement {
+                label,
+                property,
+                kind,
+            })
+        });
+
+    let normal_create = keyword("CREATE")
+        .ignore_then(
+            pattern(expr_parser())
+                .separated_by(sym(Tok::Comma))
+                .at_least(1)
+                .collect::<Vec<_>>(),
+        )
+        .map(|patterns| Statement::Create(CreateStatement { patterns }));
+
+    choice((index_ddl, constraint_ddl, normal_create))
+}
+
+/// Parses a `DROP INDEX` or `DROP CONSTRAINT` statement
+fn drop_statement<'a>() -> impl Parser<'a, ParserInput<'a>, Statement, ParserError<'a>> + Clone {
+    let index_ddl = keyword("DROP")
+        .ignore_then(keyword("INDEX"))
+        .ignore_then(keyword("FOR"))
+        .ignore_then(sym(Tok::LParen))
+        .ignore_then(identifier()) // var
+        .ignore_then(sym(Tok::Colon))
+        .ignore_then(identifier()) // label
+        .then_ignore(sym(Tok::RParen))
+        .then_ignore(keyword("ON"))
+        .then_ignore(sym(Tok::LParen))
+        .then_ignore(identifier()) // var
+        .then_ignore(sym(Tok::Dot))
+        .then(identifier()) // property
+        .then_ignore(sym(Tok::RParen))
+        .map(|(label, property)| Statement::DropIndex(DropIndexStatement { label, property }));
+
+    let constraint_ddl = keyword("DROP")
+        .ignore_then(keyword("CONSTRAINT"))
+        .ignore_then(keyword("ON"))
+        .ignore_then(sym(Tok::LParen))
+        .ignore_then(identifier()) // var
+        .ignore_then(sym(Tok::Colon))
+        .ignore_then(identifier()) // label
+        .then_ignore(sym(Tok::RParen))
+        .then_ignore(keyword("ASSERT"))
+        .then(choice((
+            // EXISTS(n.prop)
+            keyword("EXISTS")
+                .ignore_then(sym(Tok::LParen))
+                .ignore_then(identifier())
+                .ignore_then(sym(Tok::Dot))
+                .ignore_then(identifier())
+                .then_ignore(sym(Tok::RParen))
+                .map(|prop| (prop, ConstraintKind::Exists)),
+            // n.prop IS UNIQUE
+            identifier()
+                .ignore_then(sym(Tok::Dot))
+                .ignore_then(identifier())
+                .then_ignore(keyword("IS"))
+                .then_ignore(keyword("UNIQUE"))
+                .map(|prop| (prop, ConstraintKind::Unique)),
+        )))
+        .map(|(label, (property, kind))| {
+            Statement::DropConstraint(DropConstraintStatement {
+                label,
+                property,
+                kind,
+            })
+        });
+
+    choice((index_ddl, constraint_ddl))
+}
+
+/// Parses a `DELETE` clause / statement
+fn delete_statement<'a>() -> impl Parser<'a, ParserInput<'a>, Statement, ParserError<'a>> + Clone {
+    let detach = keyword("DETACH")
+        .to(true)
+        .or_not()
+        .map(|d| d.unwrap_or(false));
+
+    keyword("MATCH")
+        .ignore_then(
+            pattern(expr_parser())
+                .separated_by(sym(Tok::Comma))
+                .at_least(1)
+                .collect::<Vec<_>>(),
+        )
+        .then(where_clause().or_not())
+        .then(detach)
+        .then_ignore(keyword("DELETE"))
+        .then(
+            identifier()
+                .separated_by(sym(Tok::Comma))
+                .at_least(1)
+                .collect::<Vec<_>>(),
+        )
+        .map(|(((match_clauses, where_clause), detach), variables)| {
+            let mut clauses = Vec::new();
+            for pat in match_clauses {
+                clauses.push(MatchClause { pattern: pat });
+            }
+            Statement::Delete(DeleteStatement {
+                match_clauses: clauses,
+                where_clause,
+                variables,
+                detach,
+            })
+        })
+}
+
+/// Parses a `MERGE` clause / statement
+fn merge_statement<'a>() -> impl Parser<'a, ParserInput<'a>, MergeStatement, ParserError<'a>> + Clone
+{
+    let on_create = keyword("ON")
+        .ignore_then(keyword("CREATE"))
+        .ignore_then(keyword("SET"))
+        .ignore_then(
+            set_item()
+                .separated_by(sym(Tok::Comma))
+                .at_least(1)
+                .collect(),
+        )
+        .or_not()
+        .map(|opt| opt.unwrap_or_default());
+
+    let on_match = keyword("ON")
+        .ignore_then(keyword("MATCH"))
+        .ignore_then(keyword("SET"))
+        .ignore_then(
+            set_item()
+                .separated_by(sym(Tok::Comma))
+                .at_least(1)
+                .collect(),
+        )
+        .or_not()
+        .map(|opt| opt.unwrap_or_default());
+
+    keyword("MERGE")
+        .ignore_then(pattern(expr_parser()))
+        .then(on_create)
+        .then(on_match)
+        .map(|((pattern, on_create_set), on_match_set)| MergeStatement {
+            pattern,
+            on_create_set,
+            on_match_set,
+        })
+}
+
+// ─── Phase 6: UNION Chaining & Pipelines ───────────────────────────────────────
+
+/// Parses a top-level single statement (excluding pipeline chaining), supporting recursive `UNION` / `UNION ALL`
+fn statement_union_parser<'a>()
+-> impl Parser<'a, ParserInput<'a>, Statement, ParserError<'a>> + Clone {
+    recursive(|statement| {
+        let create_return = keyword("CREATE")
+            .ignore_then(
+                pattern(expr_parser())
+                    .separated_by(sym(Tok::Comma))
+                    .at_least(1)
+                    .collect(),
+            )
+            .then(return_clause())
+            .then(order_by_clause().or_not())
+            .then(keyword("SKIP").ignore_then(expr_parser()).or_not())
+            .then(keyword("LIMIT").ignore_then(expr_parser()).or_not())
+            .map(|((((patterns, return_clause), order_by), skip), limit)| {
+                Statement::CreateAndReturn(CreateAndReturnStatement {
+                    patterns,
+                    return_clause,
+                    order_by,
+                    skip,
+                    limit,
+                })
+            });
+
+        let match_set_return = match_clause()
+            .repeated()
+            .at_least(1)
+            .collect()
+            .then(where_clause().or_not())
+            .then_ignore(keyword("SET"))
+            .then(
+                set_item()
+                    .separated_by(sym(Tok::Comma))
+                    .at_least(1)
+                    .collect(),
+            )
+            .then(return_clause())
+            .then(order_by_clause().or_not())
+            .then(keyword("SKIP").ignore_then(expr_parser()).or_not())
+            .then(keyword("LIMIT").ignore_then(expr_parser()).or_not())
+            .map(
+                |(
+                    (((((match_clauses, where_clause), set_items), return_clause), order_by), skip),
+                    limit,
+                )| {
+                    Statement::SetAndReturn(SetAndReturnStatement {
+                        match_clauses,
+                        where_clause,
+                        set_items,
+                        return_clause,
+                        order_by,
+                        skip,
+                        limit,
+                    })
+                },
+            );
+
+        let match_delete_return = match_clause()
+            .repeated()
+            .at_least(1)
+            .collect()
+            .then(where_clause().or_not())
+            .then(
+                keyword("DETACH")
+                    .to(true)
+                    .or_not()
+                    .map(|d| d.unwrap_or(false)),
+            )
+            .then_ignore(keyword("DELETE"))
+            .then(
+                identifier()
+                    .separated_by(sym(Tok::Comma))
+                    .at_least(1)
+                    .collect(),
+            )
+            .then(return_clause())
+            .then(order_by_clause().or_not())
+            .then(keyword("SKIP").ignore_then(expr_parser()).or_not())
+            .then(keyword("LIMIT").ignore_then(expr_parser()).or_not())
+            .map(
+                |(
+                    (
+                        (
+                            ((((match_clauses, where_clause), detach), variables), return_clause),
+                            order_by,
+                        ),
+                        skip,
+                    ),
+                    limit,
+                )| {
+                    Statement::DeleteAndReturn(DeleteAndReturnStatement {
+                        match_clauses,
+                        where_clause,
+                        variables,
+                        detach,
+                        return_clause,
+                        order_by,
+                        skip,
+                        limit,
+                    })
+                },
+            );
+
+        let match_remove_return = match_clause()
+            .repeated()
+            .at_least(1)
+            .collect()
+            .then(where_clause().or_not())
+            .then_ignore(keyword("REMOVE"))
+            .then(
+                remove_item()
+                    .separated_by(sym(Tok::Comma))
+                    .at_least(1)
+                    .collect::<Vec<_>>(),
+            )
+            .then(return_clause())
+            .then(order_by_clause().or_not())
+            .then(keyword("SKIP").ignore_then(expr_parser()).or_not())
+            .then(keyword("LIMIT").ignore_then(expr_parser()).or_not())
+            .map(
+                |(
+                    (
+                        (
+                            (((match_clauses, where_clause), remove_items_list), return_clause),
+                            order_by,
+                        ),
+                        skip,
+                    ),
+                    limit,
+                )| {
+                    Statement::RemoveAndReturn(RemoveAndReturnStatement {
+                        match_clauses,
+                        where_clause,
+                        items: remove_items_list.into_iter().flatten().collect(),
+                        return_clause,
+                        order_by,
+                        skip,
+                        limit,
+                    })
+                },
+            );
+
+        let merge_return = merge_statement()
+            .then(return_clause())
+            .then(order_by_clause().or_not())
+            .then(keyword("SKIP").ignore_then(expr_parser()).or_not())
+            .then(keyword("LIMIT").ignore_then(expr_parser()).or_not())
+            .map(|((((merge, return_clause), order_by), skip), limit)| {
+                Statement::MergeAndReturn(MergeAndReturnStatement {
+                    merges: vec![merge],
+                    return_clause,
+                    order_by,
+                    skip,
+                    limit,
+                })
+            });
+
+        let foreach_stmt = keyword("FOREACH")
+            .ignore_then(sym(Tok::LParen))
+            .ignore_then(identifier())
+            .then_ignore(keyword("IN"))
+            .then(expr_parser())
+            .then_ignore(sym(Tok::Pipe))
+            .then(statement.clone())
+            .then_ignore(sym(Tok::RParen))
+            .map(|((variable, list), body_stmt)| {
+                Statement::Foreach(ForeachStatement {
+                    variable,
+                    list,
+                    body: vec![body_stmt],
+                })
+            });
+
+        let set_stmt = match_clause()
+            .repeated()
+            .at_least(1)
+            .collect()
+            .then(where_clause().or_not())
+            .then_ignore(keyword("SET"))
+            .then(
+                set_item()
+                    .separated_by(sym(Tok::Comma))
+                    .at_least(1)
+                    .collect::<Vec<_>>(),
+            )
+            .map(|((match_clauses, where_clause), set_items)| {
+                Statement::Set(SetStatement {
+                    match_clauses,
+                    where_clause,
+                    set_items,
+                })
+            });
+
+        let remove_stmt = match_clause()
+            .repeated()
+            .at_least(1)
+            .collect()
+            .then(where_clause().or_not())
+            .then_ignore(keyword("REMOVE"))
+            .then(
+                remove_item()
+                    .separated_by(sym(Tok::Comma))
+                    .at_least(1)
+                    .collect::<Vec<_>>(),
+            )
+            .map(|((match_clauses, where_clause), remove_items_list)| {
+                Statement::Remove(RemoveStatement {
+                    match_clauses,
+                    where_clause,
+                    items: remove_items_list.into_iter().flatten().collect(),
+                })
+            });
+
+        let write_stmt = choice((
+            create_statement(),
+            delete_statement(),
+            merge_statement().map(Statement::Merge),
+            set_stmt,
+            remove_stmt,
+            foreach_stmt,
+            drop_statement(),
+        ));
+
+        let base_stmt = choice((
+            create_return,
+            match_set_return,
+            match_delete_return,
+            match_remove_return,
+            merge_return,
+            query_parser().map(Statement::Query),
+            write_stmt,
+        ));
+
+        base_stmt.foldl(
+            keyword("UNION")
+                .ignore_then(keyword("ALL").to(true).or_not().map(|a| a.unwrap_or(false)))
+                .then(statement.clone())
+                .repeated(),
+            |left, (all, right)| {
+                Statement::Union(UnionStatement {
+                    left: Box::new(left),
+                    right: Box::new(right),
+                    all,
+                })
+            },
+        )
+    })
+}
+
+/// Parses one or more semicolon-separated statements (Cypher execution pipelines)
+pub(crate) fn pipeline_parser<'a>()
+-> impl Parser<'a, ParserInput<'a>, Statement, ParserError<'a>> + Clone {
+    statement_union_parser()
+        .separated_by(sym(Tok::Semi).repeated().at_least(1))
+        .allow_trailing()
+        .collect::<Vec<Statement>>()
+        .map(|mut stmts| {
+            if stmts.len() == 1 {
+                stmts.remove(0)
+            } else {
+                Statement::Pipeline(stmts)
+            }
+        })
 }
 
 // ─── Variable validation ──────────────────────────────────────────────────────
 
-fn validate_match_clause_variables(clauses: &[MatchClause]) -> Result<(), String> {
+pub(crate) fn validate_match_clause_variables(clauses: &[MatchClause]) -> Result<(), String> {
     let mut node_vars: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut rel_vars: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut path_vars: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -1700,7 +1833,7 @@ fn validate_match_clause_variables(clauses: &[MatchClause]) -> Result<(), String
     Ok(())
 }
 
-fn validate_cross_clause_variable_types(parts: &[QueryPart]) -> Result<(), String> {
+pub(crate) fn validate_cross_clause_variable_types(parts: &[QueryPart]) -> Result<(), String> {
     let mut node_vars: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut rel_vars: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut path_vars: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -1789,829 +1922,63 @@ fn validate_cross_clause_variable_types(parts: &[QueryPart]) -> Result<(), Strin
     Ok(())
 }
 
-// ─── Statement-level recursive-descent parsers ────────────────────────────────
-
-fn parse_read_query(c: &mut Cursor<'_>) -> Result<Query, String> {
-    let mut parts: Vec<QueryPart> = Vec::new();
-
-    loop {
-        if c.peek_kw("MATCH") {
-            c.next();
-            let match_clauses = parse_match_clauses_from_cursor(c)?;
-            let where_clause = if c.peek_kw("WHERE") {
-                c.next();
-                Some(parse_where_clause_from_cursor(c)?)
-            } else {
-                None
-            };
-            parts.push(QueryPart::Match {
-                match_clauses,
-                where_clause,
-            });
-        } else if c.peek_kw("OPTIONAL") && c.peek_kw_at(1, "MATCH") {
-            c.next();
-            c.next();
-            let match_clauses = parse_match_clauses_from_cursor(c)?;
-            let where_clause = if c.peek_kw("WHERE") {
-                c.next();
-                Some(parse_where_clause_from_cursor(c)?)
-            } else {
-                None
-            };
-            parts.push(QueryPart::OptionalMatch {
-                match_clauses,
-                where_clause,
-            });
-        } else if c.peek_kw("WITH") {
-            c.next();
-            let distinct = c.peek_kw("DISTINCT");
-            if distinct {
-                c.next();
-            }
-            // WITH * passes all current bindings through; represent as a wildcard item.
-            let items = if c.peek() == Some(&Tok::Star) {
-                c.next();
-                vec![ReturnItem {
-                    expr: Expr::FunctionCall {
-                        name: "__star__".to_string(),
-                        args: vec![],
-                    },
-                    alias: None,
-                }]
-            } else {
-                parse_return_items_from_cursor(c)?
-            };
-            let where_clause = if c.peek_kw("WHERE") {
-                c.next();
-                Some(parse_where_clause_from_cursor(c)?)
-            } else {
-                None
-            };
-            let order_by = try_parse_order_by(c)?;
-            let skip = try_parse_skip(c)?;
-            let limit = try_parse_limit(c)?;
-            parts.push(QueryPart::With {
-                items,
-                where_clause,
-                order_by,
-                skip,
-                limit,
-                distinct,
-            });
-        } else if c.peek_kw("UNWIND") {
-            c.next();
-            let expr = parse_expr(c)?;
-            c.next(); // AS
-            let variable = expect_any_ident(c)?;
-            parts.push(QueryPart::Unwind { expr, variable });
-        } else if c.peek_kw("CREATE") {
-            // CREATE clause embedded in a pipeline query (e.g. UNWIND ... CREATE ... RETURN ...).
-            c.next(); // CREATE
-            let patterns = parse_multi_pattern(c)?;
-            parts.push(QueryPart::Create { patterns });
-        } else if c.peek_kw("MERGE") {
-            c.next(); // MERGE
-            let first = parse_one_merge_block(c)?;
-            let mut merges = vec![first];
-            while c.peek_kw("MERGE") {
-                c.next();
-                merges.push(parse_one_merge_block(c)?);
-            }
-            parts.push(QueryPart::Merge { merges });
-        } else if c.peek_kw("SET") {
-            c.next(); // SET
-            let items = parse_set_items_from_cursor(c)?;
-            parts.push(QueryPart::Set { items });
-        } else if c.peek_kw("DETACH") || c.peek_kw("DELETE") {
-            let detach = c.peek_kw("DETACH");
-            if detach {
-                c.next(); // DETACH
-            }
-            c.next(); // DELETE
-            let mut variables = Vec::new();
-            loop {
-                variables.push(expect_any_ident(c)?);
-                if !c.eat(&Tok::Comma) {
-                    break;
-                }
-            }
-            parts.push(QueryPart::Delete { variables, detach });
-        } else {
-            break;
-        }
-    }
-
-    // RETURN is optional when there are write parts in the pipeline.
-    let has_write_parts = parts.iter().any(|p| {
-        matches!(
-            p,
-            QueryPart::Create { .. }
-                | QueryPart::Merge { .. }
-                | QueryPart::Set { .. }
-                | QueryPart::Delete { .. }
-        )
-    });
-
-    if !c.peek_kw("RETURN") {
-        if has_write_parts || parts.is_empty() {
-            // Write-only pipeline or empty query: return empty result.
-            let return_clause = ReturnClause {
-                items: vec![],
-                distinct: false,
-            };
-            validate_cross_clause_variable_types(&parts)?;
-            let (match_clauses, where_clause) = parts
-                .first()
-                .and_then(|p| {
-                    if let QueryPart::Match {
-                        match_clauses,
-                        where_clause,
-                    } = p
-                    {
-                        Some((match_clauses.clone(), where_clause.clone()))
-                    } else {
-                        None
+fn validate_statement(stmt: &Statement) -> Result<(), String> {
+    match stmt {
+        Statement::Query(q) => {
+            validate_cross_clause_variable_types(&q.parts)?;
+            for part in &q.parts {
+                match part {
+                    QueryPart::Match { match_clauses, .. } => {
+                        validate_match_clause_variables(match_clauses)?;
                     }
-                })
-                .unwrap_or_default();
-            return Ok(Query {
-                match_clauses,
-                where_clause,
-                return_clause,
-                parts,
-                order_by: None,
-                skip: None,
-                limit: None,
-            });
-        }
-        return Err("read query requires a RETURN clause".into());
-    }
-    c.next(); // RETURN
-    let return_clause = parse_return_clause_from_cursor(c)?;
-    let order_by = try_parse_order_by(c)?;
-    let skip = try_parse_skip(c)?;
-    let limit = try_parse_limit(c)?;
-
-    validate_cross_clause_variable_types(&parts)?;
-
-    // Extract first MATCH for backwards-compat fields
-    let (match_clauses, where_clause) = parts
-        .first()
-        .and_then(|p| {
-            if let QueryPart::Match {
-                match_clauses,
-                where_clause,
-            } = p
-            {
-                Some((match_clauses.clone(), where_clause.clone()))
-            } else {
-                None
-            }
-        })
-        .unwrap_or_default();
-
-    Ok(Query {
-        match_clauses,
-        where_clause,
-        return_clause,
-        parts,
-        order_by,
-        skip,
-        limit,
-    })
-}
-
-fn parse_set_statement(c: &mut Cursor<'_>) -> Result<Statement, String> {
-    // MATCH ... [WHERE ...] SET ... [RETURN ...]
-    c.next(); // MATCH
-    let match_clauses = parse_match_clauses_from_cursor(c)?;
-    let where_clause = if c.peek_kw("WHERE") {
-        c.next();
-        Some(parse_where_clause_from_cursor(c)?)
-    } else {
-        None
-    };
-    c.next(); // SET
-    let set_items = parse_set_items_from_cursor(c)?;
-
-    if c.peek_kw("RETURN") {
-        c.next();
-        let return_clause = parse_return_clause_from_cursor(c)?;
-        let order_by = try_parse_order_by(c)?;
-        let skip = try_parse_skip(c)?;
-        let limit = try_parse_limit(c)?;
-        return Ok(Statement::SetAndReturn(SetAndReturnStatement {
-            match_clauses,
-            where_clause,
-            set_items,
-            return_clause,
-            order_by,
-            skip,
-            limit,
-        }));
-    }
-
-    Ok(Statement::Set(SetStatement {
-        match_clauses,
-        where_clause,
-        set_items,
-    }))
-}
-
-fn parse_delete_statement(c: &mut Cursor<'_>) -> Result<Statement, String> {
-    c.next(); // MATCH
-    let match_clauses = parse_match_clauses_from_cursor(c)?;
-    let where_clause = if c.peek_kw("WHERE") {
-        c.next();
-        Some(parse_where_clause_from_cursor(c)?)
-    } else {
-        None
-    };
-    let detach = c.peek_kw("DETACH");
-    if detach {
-        c.next();
-    }
-    c.next(); // DELETE
-    let mut variables = Vec::new();
-    loop {
-        variables.push(expect_any_ident(c)?);
-        if !c.eat(&Tok::Comma) {
-            break;
-        }
-    }
-    if c.peek_kw("RETURN") {
-        c.next(); // RETURN
-        let return_clause = parse_return_clause_from_cursor(c)?;
-        let order_by = try_parse_order_by(c)?;
-        let skip = try_parse_skip(c)?;
-        let limit = try_parse_limit(c)?;
-        return Ok(Statement::DeleteAndReturn(DeleteAndReturnStatement {
-            match_clauses,
-            where_clause,
-            variables,
-            detach,
-            return_clause,
-            order_by,
-            skip,
-            limit,
-        }));
-    }
-    Ok(Statement::Delete(DeleteStatement {
-        match_clauses,
-        where_clause,
-        variables,
-        detach,
-    }))
-}
-
-fn parse_remove_statement(c: &mut Cursor<'_>) -> Result<Statement, String> {
-    c.next(); // MATCH
-    let match_clauses = parse_match_clauses_from_cursor(c)?;
-    let where_clause = if c.peek_kw("WHERE") {
-        c.next();
-        Some(parse_where_clause_from_cursor(c)?)
-    } else {
-        None
-    };
-    c.next(); // REMOVE
-    let mut items = Vec::new();
-    loop {
-        let var = expect_any_ident(c)?;
-        if c.eat(&Tok::Dot) {
-            let prop = expect_any_ident(c)?;
-            items.push(RemoveItem::Property {
-                variable: var,
-                property: prop,
-            });
-        } else if c.eat(&Tok::Colon) {
-            let label = expect_any_ident(c)?;
-            items.push(RemoveItem::Label {
-                variable: var,
-                label,
-            });
-        } else {
-            return Err(format!(
-                "expected '.' or ':' after variable in REMOVE, got {:?}",
-                c.peek()
-            ));
-        }
-        // Allow multiple labels: REMOVE n:Label1:Label2
-        while c.peek() == Some(&Tok::Colon) {
-            if let Some(RemoveItem::Label { variable, .. }) = items.last() {
-                let var = variable.clone();
-                c.next(); // :
-                let extra_label = expect_any_ident(c)?;
-                items.push(RemoveItem::Label {
-                    variable: var,
-                    label: extra_label,
-                });
-            } else {
-                break;
-            }
-        }
-        if !c.eat(&Tok::Comma) {
-            break;
-        }
-    }
-    if c.peek_kw("RETURN") {
-        c.next(); // RETURN
-        let return_clause = parse_return_clause_from_cursor(c)?;
-        let order_by = try_parse_order_by(c)?;
-        let skip = try_parse_skip(c)?;
-        let limit = try_parse_limit(c)?;
-        return Ok(Statement::RemoveAndReturn(RemoveAndReturnStatement {
-            match_clauses,
-            where_clause,
-            items,
-            return_clause,
-            order_by,
-            skip,
-            limit,
-        }));
-    }
-    Ok(Statement::Remove(RemoveStatement {
-        match_clauses,
-        where_clause,
-        items,
-    }))
-}
-
-/// Parse one `MERGE pattern [ON CREATE SET ...] [ON MATCH SET ...]` block.
-/// The MERGE keyword must already have been consumed by the caller.
-fn parse_one_merge_block(c: &mut Cursor<'_>) -> Result<MergeStatement, String> {
-    let pattern = parse_pattern(c)?;
-
-    // ON CREATE SET and ON MATCH SET can appear in either order, multiple times.
-    let mut on_create_set = Vec::new();
-    let mut on_match_set = Vec::new();
-
-    loop {
-        if c.peek_kw("ON") && c.peek_kw_at(1, "CREATE") && c.peek_kw_at(2, "SET") {
-            c.next();
-            c.next();
-            c.next();
-            on_create_set.extend(parse_set_items_from_cursor(c)?);
-        } else if c.peek_kw("ON") && c.peek_kw_at(1, "MATCH") && c.peek_kw_at(2, "SET") {
-            c.next();
-            c.next();
-            c.next();
-            on_match_set.extend(parse_set_items_from_cursor(c)?);
-        } else {
-            break;
-        }
-    }
-
-    Ok(MergeStatement {
-        pattern,
-        on_create_set,
-        on_match_set,
-    })
-}
-
-fn parse_merge_statement(c: &mut Cursor<'_>) -> Result<Statement, String> {
-    // First MERGE keyword was already detected; consume it.
-    c.next(); // MERGE
-    let first = parse_one_merge_block(c)?;
-
-    // Additional sequential MERGE blocks.
-    let mut extra: Vec<MergeStatement> = Vec::new();
-    while c.peek_kw("MERGE") {
-        c.next(); // MERGE
-        extra.push(parse_one_merge_block(c)?);
-    }
-
-    // Optional trailing WITH or MATCH chains (UNWIND ... WITH ... etc.) - handled below
-    // Optional trailing SET
-    if c.peek_kw("SET") {
-        c.next(); // SET
-        let _ = parse_set_items_from_cursor(c);
-    }
-
-    // Optional RETURN clause
-    if c.peek_kw("RETURN") {
-        c.next(); // RETURN
-        let return_clause = parse_return_clause_from_cursor(c)?;
-        let order_by = try_parse_order_by(c)?;
-        let skip = try_parse_skip(c)?;
-        let limit = try_parse_limit(c)?;
-        return Ok(Statement::MergeAndReturn(MergeAndReturnStatement {
-            merges: {
-                let mut all = vec![first];
-                all.extend(extra);
-                all
-            },
-            return_clause,
-            order_by,
-            skip,
-            limit,
-        }));
-    }
-
-    if extra.is_empty() {
-        Ok(Statement::Merge(first))
-    } else {
-        // Multiple MERGEs without RETURN: wrap in MergeAndReturn with empty columns
-        // by returning a bare Merge with the first block and ignoring extras for now.
-        // TODO: properly chain multiple MERGEs in the executor.
-        Ok(Statement::Merge(first))
-    }
-}
-
-fn parse_create_statement(c: &mut Cursor<'_>) -> Result<Statement, String> {
-    c.next(); // CREATE
-
-    // INDEX or CONSTRAINT
-    if c.peek_kw("INDEX") {
-        c.next(); // INDEX
-        c.next(); // FOR
-        c.expect_tok(&Tok::LParen)?;
-        let _ = expect_any_ident(c)?; // variable
-        c.expect_tok(&Tok::Colon)?;
-        let label = expect_any_ident(c)?;
-        c.expect_tok(&Tok::RParen)?;
-        c.next(); // ON
-        c.expect_tok(&Tok::LParen)?;
-        let _ = expect_any_ident(c)?; // variable
-        c.expect_tok(&Tok::Dot)?;
-        let property = expect_any_ident(c)?;
-        c.expect_tok(&Tok::RParen)?;
-        return Ok(Statement::CreateIndex(CreateIndexStatement {
-            label,
-            property,
-        }));
-    }
-
-    if c.peek_kw("CONSTRAINT") {
-        c.next(); // CONSTRAINT
-        c.next(); // ON
-        c.expect_tok(&Tok::LParen)?;
-        let _ = expect_any_ident(c)?; // variable
-        c.expect_tok(&Tok::Colon)?;
-        let label = expect_any_ident(c)?;
-        c.expect_tok(&Tok::RParen)?;
-        c.next(); // ASSERT
-
-        if c.peek_kw("EXISTS") {
-            c.next(); // EXISTS
-            c.expect_tok(&Tok::LParen)?;
-            let _ = expect_any_ident(c)?; // variable
-            c.expect_tok(&Tok::Dot)?;
-            let property = expect_any_ident(c)?;
-            c.expect_tok(&Tok::RParen)?;
-            return Ok(Statement::CreateConstraint(CreateConstraintStatement {
-                label,
-                property,
-                kind: ConstraintKind::Exists,
-            }));
-        }
-        // ASSERT n.prop IS UNIQUE
-        let _ = expect_any_ident(c)?; // variable
-        c.expect_tok(&Tok::Dot)?;
-        let property = expect_any_ident(c)?;
-        c.next(); // IS
-        c.next(); // UNIQUE
-        return Ok(Statement::CreateConstraint(CreateConstraintStatement {
-            label,
-            property,
-            kind: ConstraintKind::Unique,
-        }));
-    }
-
-    // CREATE pattern(s) [RETURN ...]
-    let patterns = parse_multi_pattern(c)?;
-
-    if c.peek_kw("RETURN") {
-        c.next();
-        let return_clause = parse_return_clause_from_cursor(c)?;
-        let order_by = try_parse_order_by(c)?;
-        let skip = try_parse_skip(c)?;
-        let limit = try_parse_limit(c)?;
-        return Ok(Statement::CreateAndReturn(CreateAndReturnStatement {
-            patterns,
-            return_clause,
-            order_by,
-            skip,
-            limit,
-        }));
-    }
-
-    Ok(Statement::Create(CreateStatement { patterns }))
-}
-
-fn parse_drop_statement(c: &mut Cursor<'_>) -> Result<Statement, String> {
-    c.next(); // DROP
-
-    if c.peek_kw("INDEX") {
-        c.next(); // INDEX
-        c.next(); // FOR
-        c.expect_tok(&Tok::LParen)?;
-        let _ = expect_any_ident(c)?;
-        c.expect_tok(&Tok::Colon)?;
-        let label = expect_any_ident(c)?;
-        c.expect_tok(&Tok::RParen)?;
-        c.next(); // ON
-        c.expect_tok(&Tok::LParen)?;
-        let _ = expect_any_ident(c)?;
-        c.expect_tok(&Tok::Dot)?;
-        let property = expect_any_ident(c)?;
-        c.expect_tok(&Tok::RParen)?;
-        return Ok(Statement::DropIndex(DropIndexStatement { label, property }));
-    }
-
-    if c.peek_kw("CONSTRAINT") {
-        c.next(); // CONSTRAINT
-        c.next(); // ON
-        c.expect_tok(&Tok::LParen)?;
-        let _ = expect_any_ident(c)?;
-        c.expect_tok(&Tok::Colon)?;
-        let label = expect_any_ident(c)?;
-        c.expect_tok(&Tok::RParen)?;
-        c.next(); // ASSERT
-
-        if c.peek_kw("EXISTS") {
-            c.next(); // EXISTS
-            c.expect_tok(&Tok::LParen)?;
-            let _ = expect_any_ident(c)?;
-            c.expect_tok(&Tok::Dot)?;
-            let property = expect_any_ident(c)?;
-            c.expect_tok(&Tok::RParen)?;
-            return Ok(Statement::DropConstraint(DropConstraintStatement {
-                label,
-                property,
-                kind: ConstraintKind::Exists,
-            }));
-        }
-        // IS UNIQUE
-        let _ = expect_any_ident(c)?;
-        c.expect_tok(&Tok::Dot)?;
-        let property = expect_any_ident(c)?;
-        c.next(); // IS
-        c.next(); // UNIQUE
-        return Ok(Statement::DropConstraint(DropConstraintStatement {
-            label,
-            property,
-            kind: ConstraintKind::Unique,
-        }));
-    }
-
-    Err(format!("unsupported DROP statement at {:?}", c.peek()))
-}
-
-fn parse_foreach_statement(c: &mut Cursor<'_>) -> Result<Statement, String> {
-    c.next(); // FOREACH
-    c.expect_tok(&Tok::LParen)?;
-    let variable = expect_any_ident(c)?;
-    c.next(); // IN
-    let list = parse_expr(c)?;
-    c.expect_tok(&Tok::Pipe)?;
-    let body_stmt = parse_single_statement(c)?;
-    c.expect_tok(&Tok::RParen)?;
-    Ok(Statement::Foreach(ForeachStatement {
-        variable,
-        list,
-        body: vec![body_stmt],
-    }))
-}
-
-fn parse_single_statement(c: &mut Cursor<'_>) -> Result<Statement, String> {
-    match c.peek() {
-        Some(Tok::Ident(s)) => {
-            let upper = s.to_ascii_uppercase();
-            match upper.as_str() {
-                "MATCH" => {
-                    // Detect what follows MATCH
-                    // We need to look ahead past the match pattern for SET/DELETE/REMOVE
-                    // Simplest: try each in order
-                    parse_match_headed_statement(c)
-                }
-                "CREATE" => parse_create_statement(c),
-                "DROP" => parse_drop_statement(c),
-                "MERGE" => parse_merge_statement(c),
-                "FOREACH" => parse_foreach_statement(c),
-                "UNWIND" | "WITH" | "OPTIONAL" | "RETURN" => {
-                    Ok(Statement::Query(parse_read_query(c)?))
-                }
-                _ => Err(format!("unsupported statement starting with '{}'", upper)),
-            }
-        }
-        other => Err(format!("expected statement, got {:?}", other)),
-    }
-}
-
-/// Determine what kind of MATCH-headed statement this is, then dispatch.
-fn parse_match_headed_statement(c: &mut Cursor<'_>) -> Result<Statement, String> {
-    // We scan ahead (without consuming) for SET/DELETE/REMOVE/DETACH to decide.
-    // Use a temporary scan to find out.
-    let mut scan_pos = c.pos;
-    let tokens = c.tokens;
-    let mut depth_p = 0i32;
-    let mut depth_b = 0i32;
-    let mut depth_br = 0i32;
-    let mut found_keyword = None;
-
-    // Skip past MATCH
-    if scan_pos < tokens.len() {
-        scan_pos += 1;
-    }
-
-    while scan_pos < tokens.len() {
-        match &tokens[scan_pos] {
-            Tok::LParen => depth_p += 1,
-            Tok::RParen => depth_p -= 1,
-            Tok::LBrack => depth_b += 1,
-            Tok::RBrack => depth_b -= 1,
-            Tok::LBrace => depth_br += 1,
-            Tok::RBrace => depth_br -= 1,
-            Tok::Ident(s) if depth_p == 0 && depth_b == 0 && depth_br == 0 => {
-                let upper = s.to_ascii_uppercase();
-                match upper.as_str() {
-                    "SET" => {
-                        found_keyword = Some("SET");
-                        break;
-                    }
-                    "DELETE" | "DETACH" => {
-                        found_keyword = Some("DELETE");
-                        break;
-                    }
-                    "REMOVE" => {
-                        found_keyword = Some("REMOVE");
-                        break;
-                    }
-                    "MERGE" => {
-                        found_keyword = Some("MERGE");
-                        break;
-                    }
-                    // A WITH or UNWIND before the write keyword means this is a
-                    // complex multi-clause query; treat it as a read query.
-                    "WITH" | "UNWIND" => {
-                        break;
+                    QueryPart::OptionalMatch { match_clauses, .. } => {
+                        validate_match_clause_variables(match_clauses)?;
                     }
                     _ => {}
                 }
             }
-            _ => {}
         }
-        scan_pos += 1;
-    }
-
-    match found_keyword {
-        Some("SET") => parse_set_statement(c),
-        Some("DELETE") => parse_delete_statement(c),
-        Some("REMOVE") => parse_remove_statement(c),
-        Some("MERGE") => parse_match_then_merge_statement(c),
-        _ => Ok(Statement::Query(parse_read_query(c)?)),
-    }
-}
-
-fn parse_match_then_merge_statement(c: &mut Cursor<'_>) -> Result<Statement, String> {
-    // MATCH pattern(s) [WHERE ...] [MATCH ...] MERGE ... [ON CREATE/MATCH SET ...] [RETURN ...]
-    c.next(); // MATCH
-    let mut all_match_clauses = parse_match_clauses_from_cursor(c)?;
-    let mut where_clause = if c.peek_kw("WHERE") {
-        c.next();
-        Some(parse_where_clause_from_cursor(c)?)
-    } else {
-        None
-    };
-
-    // Additional MATCH clauses before MERGE.
-    while c.peek_kw("MATCH") {
-        c.next(); // MATCH
-        let extra_clauses = parse_match_clauses_from_cursor(c)?;
-        all_match_clauses.extend(extra_clauses);
-        if c.peek_kw("WHERE") && where_clause.is_none() {
-            c.next();
-            where_clause = Some(parse_where_clause_from_cursor(c)?);
+        Statement::Set(s) => {
+            validate_match_clause_variables(&s.match_clauses)?;
         }
-    }
-
-    let match_clauses = all_match_clauses;
-
-    // Consume one or more MERGE blocks.
-    let mut merges: Vec<MergeStatement> = Vec::new();
-    while c.peek_kw("MERGE") {
-        c.next(); // MERGE
-        merges.push(parse_one_merge_block(c)?);
-    }
-
-    // Optional trailing SET (e.g. MATCH ... MERGE ... SET ...)
-    if c.peek_kw("SET") {
-        c.next(); // SET
-        let _ = parse_set_items_from_cursor(c);
-    }
-
-    // Optional RETURN clause.
-    if c.peek_kw("RETURN") {
-        c.next();
-        let return_clause = parse_return_clause_from_cursor(c)?;
-        let order_by = try_parse_order_by(c)?;
-        let skip = try_parse_skip(c)?;
-        let limit = try_parse_limit(c)?;
-
-        // Re-use MergeAndReturn but also carry the MATCH context so the executor
-        // can bind variables from the MATCH clause before executing the MERGE.
-        // For now, emit a synthetic read query followed by a MergeAndReturn.
-        // This is a pragmatic approach; a full MATCH+MERGE plan would require a
-        // more integrated executor.
-        let _ = (match_clauses, where_clause); // acknowledged
-        return Ok(Statement::MergeAndReturn(MergeAndReturnStatement {
-            merges,
-            return_clause,
-            order_by,
-            skip,
-            limit,
-        }));
-    }
-
-    // No RETURN: execute the merges and return empty.
-    match merges.len() {
-        0 => Err("expected MERGE after MATCH".into()),
-        1 => Ok(Statement::Merge(merges.remove(0))),
-        _ => {
-            // Multiple MERGEs: run the first one (future work: chain all).
-            Ok(Statement::Merge(merges.remove(0)))
+        Statement::Delete(d) => {
+            validate_match_clause_variables(&d.match_clauses)?;
         }
-    }
-}
-
-// ─── Top-level statement parser ───────────────────────────────────────────────
-
-/// Scan ahead from a CREATE keyword to determine whether this CREATE is the
-/// start of a pipeline query (e.g., `CREATE (a) SET a.x = 1 RETURN a.x`).
-/// Returns true if the CREATE should be parsed via `parse_read_query`.
-///
-/// A CREATE "starts a pipeline" only when it is followed by a non-CREATE
-/// write clause (SET, DELETE, REMOVE) or a RETURN clause at the top level.
-/// Multiple sequential CREATEs are left as independent Pipeline statements
-/// to avoid deep recursion in the physical plan.
-fn create_starts_pipeline(c: &Cursor<'_>) -> bool {
-    let tokens = c.tokens;
-    let mut pos = c.pos + 1; // skip CREATE
-    let mut depth_p = 0i32;
-    let mut depth_b = 0i32;
-    let mut depth_br = 0i32;
-
-    while pos < tokens.len() {
-        match &tokens[pos] {
-            Tok::LParen => depth_p += 1,
-            Tok::RParen => depth_p -= 1,
-            Tok::LBrack => depth_b += 1,
-            Tok::RBrack => depth_b -= 1,
-            Tok::LBrace => depth_br += 1,
-            Tok::RBrace => depth_br -= 1,
-            Tok::Ident(s) if depth_p == 0 && depth_b == 0 && depth_br == 0 => {
-                let u = s.to_ascii_uppercase();
-                match u.as_str() {
-                    // SET, DELETE, REMOVE, MERGE after a CREATE: true pipeline.
-                    "SET" | "DELETE" | "DETACH" | "REMOVE" | "MERGE" => {
-                        return true;
-                    }
-                    // RETURN after a CREATE: pipeline (CREATE ... RETURN ...).
-                    "RETURN" => return true,
-                    // Another CREATE or other clause: not a pipeline.
-                    _ => return false,
-                }
-            }
-            _ => {}
+        Statement::Remove(r) => {
+            validate_match_clause_variables(&r.match_clauses)?;
         }
-        pos += 1;
-    }
-    false
-}
-
-fn parse_statement(c: &mut Cursor<'_>) -> Result<Statement, String> {
-    match c.peek() {
-        Some(Tok::Ident(s)) => {
-            let upper = s.to_ascii_uppercase();
-            match upper.as_str() {
-                "CREATE" => {
-                    if create_starts_pipeline(c) {
-                        // Parse as a pipeline read query so that variable bindings from
-                        // the CREATE can be referenced by subsequent SET, DELETE, or RETURN.
-                        Ok(Statement::Query(parse_read_query(c)?))
-                    } else {
-                        parse_create_statement(c)
-                    }
-                }
-                "DROP" => parse_drop_statement(c),
-                "MERGE" => parse_merge_statement(c),
-                "FOREACH" => parse_foreach_statement(c),
-                "MATCH" => parse_match_headed_statement(c),
-                "UNWIND" | "WITH" | "OPTIONAL" | "RETURN" => {
-                    Ok(Statement::Query(parse_read_query(c)?))
-                }
-                _ => Err(format!("unsupported statement type: '{}'", upper)),
+        Statement::Union(u) => {
+            validate_statement(&u.left)?;
+            validate_statement(&u.right)?;
+        }
+        Statement::SetAndReturn(sr) => {
+            validate_match_clause_variables(&sr.match_clauses)?;
+        }
+        Statement::DeleteAndReturn(dr) => {
+            validate_match_clause_variables(&dr.match_clauses)?;
+        }
+        Statement::RemoveAndReturn(rr) => {
+            validate_match_clause_variables(&rr.match_clauses)?;
+        }
+        Statement::Foreach(f) => {
+            for s in &f.body {
+                validate_statement(s)?;
             }
         }
-        other => Err(format!("expected statement, got {:?}", other)),
+        Statement::Pipeline(stmts) => {
+            for s in stmts {
+                validate_statement(s)?;
+            }
+        }
+        _ => {}
     }
+    Ok(())
 }
 
 // ─── Public entry point ───────────────────────────────────────────────────────
 
 /// Parse a Cypher query string into a `Statement` AST.
 pub fn parse(cypher: &str) -> Result<Statement, String> {
-    // Phase 1: lex using chumsky
     let tokens = lexer().parse(cypher).into_result().map_err(|errs| {
         errs.into_iter()
             .map(|e| e.to_string())
@@ -2619,75 +1986,22 @@ pub fn parse(cypher: &str) -> Result<Statement, String> {
             .join("; ")
     })?;
 
-    // Phase 2: recursive-descent parse over the flat token vector
-    let mut cursor = Cursor::new(&tokens);
+    let eoi = SimpleSpan::from(cypher.len()..cypher.len());
+    let stream = tokens.as_slice().split_token_span(eoi);
 
-    let first = parse_statement(&mut cursor)?;
+    let statement = pipeline_parser()
+        .parse(stream)
+        .into_result()
+        .map_err(|errs| {
+            errs.into_iter()
+                .map(|e| format!("{:?}", e))
+                .collect::<Vec<_>>()
+                .join("; ")
+        })?;
 
-    // UNION composition
-    let mut result = first;
-    while cursor.peek_kw("UNION") {
-        cursor.next(); // UNION
-        let all = cursor.peek_kw("ALL");
-        if all {
-            cursor.next();
-        }
-        let right = parse_statement(&mut cursor)?;
-        result = Statement::Union(UnionStatement {
-            left: Box::new(result),
-            right: Box::new(right),
-            all,
-        });
-    }
+    validate_statement(&statement)?;
 
-    // Skip trailing semicolons
-    while cursor.eat(&Tok::Semi) {}
-
-    // Additional statements in a multi-clause pipeline (e.g. `CREATE (a) CREATE (b)`).
-    // Collect any remaining top-level statements and wrap them in a Pipeline.
-    if !cursor.is_empty() && is_clause_keyword(&cursor) {
-        let mut stmts = vec![result];
-        while !cursor.is_empty() && is_clause_keyword(&cursor) {
-            let next_stmt = parse_statement(&mut cursor)?;
-
-            // Handle UNION after each statement.
-            let mut next = next_stmt;
-            while cursor.peek_kw("UNION") {
-                cursor.next();
-                let all = cursor.peek_kw("ALL");
-                if all {
-                    cursor.next();
-                }
-                let right = parse_statement(&mut cursor)?;
-                next = Statement::Union(UnionStatement {
-                    left: Box::new(next),
-                    right: Box::new(right),
-                    all,
-                });
-            }
-
-            stmts.push(next);
-            while cursor.eat(&Tok::Semi) {}
-        }
-
-        if !cursor.is_empty() {
-            return Err(format!(
-                "unexpected tokens after statement: {:?}",
-                cursor.peek()
-            ));
-        }
-
-        return Ok(Statement::Pipeline(stmts));
-    }
-
-    if !cursor.is_empty() {
-        return Err(format!(
-            "unexpected tokens after statement: {:?}",
-            cursor.peek()
-        ));
-    }
-
-    Ok(result)
+    Ok(statement)
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────

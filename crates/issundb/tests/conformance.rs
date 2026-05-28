@@ -16,6 +16,30 @@ fn test_opencypher_conformance() {
         return;
     }
 
+    // The chumsky-based Cypher parser has deep call stacks on complex TCK queries.
+    // Run the actual test body in a thread with a large stack to prevent SIGSEGV.
+    let result = std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(conformance_body)
+        .expect("failed to spawn conformance thread")
+        .join();
+
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(msg)) => panic!("{}", msg),
+        Err(payload) => {
+            if let Some(s) = payload.downcast_ref::<String>() {
+                panic!("{}", s);
+            } else if let Some(s) = payload.downcast_ref::<&str>() {
+                panic!("{}", s);
+            } else {
+                panic!("conformance thread panicked");
+            }
+        }
+    }
+}
+
+fn conformance_body() -> Result<(), String> {
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
     let manifest_path = PathBuf::from(&manifest_dir);
 
@@ -139,11 +163,13 @@ fn test_opencypher_conformance() {
     );
     println!();
 
-    assert!(
-        total_failed == 0,
-        "{} TCK scenario(s) failed — see output above",
-        total_failed
-    );
+    if total_failed > 0 {
+        return Err(format!(
+            "{} TCK scenario(s) failed — see output above",
+            total_failed
+        ));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1040,8 +1066,11 @@ fn run_scenario(scenario: &Scenario) -> Result<(), String> {
                 ));
             }
 
-            let mut actual_rows: Vec<Vec<serde_json::Value>> =
-                res.records.into_iter().map(|r| r.values).collect();
+            let mut actual_rows: Vec<Vec<serde_json::Value>> = res
+                .records
+                .into_iter()
+                .map(|r| r.values.into_iter().map(normalize_value).collect())
+                .collect();
             let mut exp = expected_rows.clone();
 
             if !*ordered {
@@ -1074,5 +1103,20 @@ fn run_scenario(scenario: &Scenario) -> Result<(), String> {
             exec_result.map_err(|e| e.to_string())?;
             Ok(())
         }
+    }
+}
+
+/// Convert a temporal JSON object (produced by date/time/duration functions) to
+/// its canonical string representation so the conformance runner can compare it
+/// against the quoted string literals that appear in the TCK result tables.
+fn normalize_value(v: serde_json::Value) -> serde_json::Value {
+    match v {
+        serde_json::Value::Object(ref map) if map.contains_key("__str__") => {
+            map.get("__str__").cloned().unwrap_or(v)
+        }
+        serde_json::Value::Array(arr) => {
+            serde_json::Value::Array(arr.into_iter().map(normalize_value).collect())
+        }
+        other => other,
     }
 }

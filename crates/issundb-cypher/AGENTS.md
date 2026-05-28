@@ -18,11 +18,14 @@ source file:
    `LogicalOperator` into a `PhysicalOperator`, choosing access paths (label
    scan, index seek, adjacency expansion).
 4. **Optimize** (`src/plan/optimize.rs`): `Optimizer` rewrites the physical
-   tree. Current rewrites include predicate push-down and filter reordering.
+   tree. Passes run in this order: extract filters, reorder operators,
+   push-down filters, optimize index scans, then `rewrite_closing_expands`.
    The optimizer takes ownership of the physical tree and returns a new tree;
    it never mutates in place.
-5. **Execute** (`src/exec.rs`): `execute` drives the physical tree against a
-   `Graph` reference, producing a `QueryResult`.
+5. **Execute** (`src/exec/read.rs`): `execute_physical` drives the physical
+   tree against a `Graph` reference, producing a `Vec<PathMap>`. The
+   `Filter { input: Expand }` pattern uses a factorized fast path implemented
+   in `execute_filter_over_expand`.
 
 Keep each concern in its own file. Do not call `Graph` methods from
 `parser.rs`, `logical.rs`, or `physical.rs`.
@@ -112,6 +115,27 @@ WHERE positions:
 When lowering a `WhereClause` to a plan node, prefer `FilterExpr` variants for
 simple comparisons so the optimizer can inspect and reorder them. Fall back to
 `FilterExpr::Expr` only when no named variant applies.
+
+## `MultiwayJoin` and Cyclic Pattern Execution
+
+`PhysicalOperator::MultiwayJoin` is emitted by the `rewrite_closing_expands` pass (in `optimize.rs`) when a single-hop directed `Expand` node's `dst_var` is already bound by an earlier operator in the same plan tree. This is the "closing hop" of a cyclic pattern (triangles, cliques, etc.).
+
+The executor (`exec/read.rs`) handles `MultiwayJoin` by:
+1. Collecting unique `closing_src_var` node IDs from all input rows.
+2. Bulk-expanding from those nodes once via `expand_multi_type`.
+3. Building a `(src_node, dst_node) → EdgeId` hash map.
+4. For each input row, doing an O(1) lookup to check the closing edge and bind `closing_rel_var`.
+
+`MultiwayJoin` is optimizer-generated only: `PhysicalPlanner::plan` never emits it. Every match arm in `optimize.rs` that recurses into operator children must handle the `MultiwayJoin` variant.
+
+## Factorized Execution
+
+`exec/factorize.rs` defines `FactorizedRecordGroup`: a shared `Arc<PathMap>` prefix (bindings from ancestor hops) plus a `Vec` of per-row extensions `(rel_var, rel_binding, dst_var, dst_binding)` for the current hop. Using `Arc` avoids O(shared_vars) HashMap clone cost for every destination; only the two new bindings are paid per output row.
+
+`execute_filter_over_expand` (in `exec/read.rs`) handles the `Filter { input: Expand(single-hop, directed) }` pattern:
+- **Factorized fast path**: when the filter expression does not reference `rel_var` or `dst_var`, it is evaluated once per source path. Sources that fail skip all their destinations — zero PathMap clones for rejected sources.
+- **Per-row fallback**: when the filter touches the expansion variables, the full path is materialized before evaluation.
+- **`HasLabel` filters**: always route through the existing bulk-GraphBLAS path; `execute_filter_over_expand` is not called for `HasLabel` expressions.
 
 ## Executor Mutation Safety
 

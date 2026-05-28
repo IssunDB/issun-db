@@ -729,8 +729,14 @@ impl Graph {
             None => return Ok(false),
         };
 
-        let meta_key = format!("idx_meta:node:l:{label_id}:p:{prop_key_id}");
-        Ok(self.storage.meta.get(rtxn, &meta_key)?.is_some())
+        // Use a prefix seek on node_prop_idx: if any entry exists for this
+        // label+property combination the auto-index (or a user-created index)
+        // has data, so the optimizer may use NodeIndexScan.
+        let mut prefix = Vec::with_capacity(8);
+        prefix.extend_from_slice(&label_id.to_be_bytes());
+        prefix.extend_from_slice(&prop_key_id.to_be_bytes());
+        let mut iter = self.storage.node_prop_idx.prefix_iter(rtxn, &prefix)?;
+        Ok(iter.next().is_some())
     }
 
     pub fn edges_by_property(

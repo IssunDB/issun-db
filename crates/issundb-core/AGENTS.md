@@ -33,6 +33,8 @@ These invariants must hold after every successful write transaction:
    its `(LabelId, NodeId)` entry, and every `delete_node` must remove it.
    Same rule applies to `type_idx` for edges.
 
+5. **Property column consistency.** Every `add_node` must write a `node_prop_idx` entry for each non-null scalar property in `props_json`. Every `update_node` must delete old entries and write new ones for all changed scalar properties. Every `delete_node` must remove all `node_prop_idx` entries for the deleted node. Failing to maintain this invariant causes `has_node_property_index` to return stale results and the Cypher optimizer to emit incorrect `NodeIndexScan` plans.
+
 ## LMDB Lifetime Rules
 
 - Transactions must not escape the function that opened them. Open a
@@ -64,6 +66,10 @@ All mutations to the graph go through the `Graph` API. Inside `Graph`:
   ```
 
 - Do not bypass either lock. Do not open a `RwTxn` directly from outside `Graph` methods.
+
+## OpenMP Thread Count
+
+`MatrixSet::materialize` (in `matrices.rs`) calls `GxB_Global_Option_set(GxB_NTHREADS, n)` immediately after creating the SuiteSparse:GraphBLAS context. The thread count is threshold-gated: graphs with more than 100 000 edges use `std::thread::available_parallelism()` cores; smaller graphs use 1 thread to avoid scheduling overhead on short operations. This setting is global to the SuiteSparse runtime for the lifetime of the process; do not call `GxB_Global_Option_set` from anywhere else.
 
 ## CSR Snapshot vs. LMDB Adjacency
 
@@ -99,7 +105,7 @@ All sub-databases are opened once by `Storage::open` in `storage/lmdb.rs`:
 | `in_adj` | `u64 BE` (NodeId) | `AdjEntry` (20 B, DUPSORT + DUPFIXED) | Incoming adjacency; mirror of `out_adj`. |
 | `label_idx` | `(u32 BE, u64 BE)` = 12 B composite | `Unit` | Secondary index: `(LabelId, NodeId)`. |
 | `type_idx` | `(u32 BE, u64 BE)` = 12 B composite | `Unit` | Secondary index: `(TypeId, EdgeId)`. |
-| `node_prop_idx` | `(LabelId, PropKeyId, encoded_val, NodeId)` variable | `Unit` | Property range index for nodes. |
+| `node_prop_idx` | `(LabelId, PropKeyId, encoded_val, NodeId)` variable | `Unit` | Property range index for nodes. Auto-populated for every scalar property on every `add_node` and `update_node` (semi-columnar auto-index); also used for user-created unique and required constraints. |
 | `edge_prop_idx` | `(TypeId, PropKeyId, encoded_val, EdgeId)` variable | `Unit` | Property range index for edges. |
 | `fts_postings` | `(LabelId, PropKeyId, term)` variable (DUPSORT + DUPFIXED) | 12 B `(NodeId BE, frequency BE)` | Inverted posting lists for full-text search. |
 | `fts_docs` | 16 B `(LabelId, PropKeyId, NodeId BE)` | 4 B `u32 BE` doc length | Per-document term count for BM25. |

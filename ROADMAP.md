@@ -17,6 +17,7 @@ This document outlines the features implemented in IssunDB and the future goals 
 - [x] Unique and required property constraints on labels or types
 - [x] Multi-step database transactions with atomic commits and rollbacks
 - [x] Native full-text index database storage for terms, postings, and tokenizer configurations
+- [x] Semi-columnar auto-indexing: all scalar node properties are automatically written to `node_prop_idx` on every insert and update, enabling `NodeIndexScan` for any equality predicate without a prior `CREATE INDEX`
 
 ---
 
@@ -24,6 +25,7 @@ This document outlines the features implemented in IssunDB and the future goals 
 
 - [x] Thread-safe in-memory Compressed Sparse Row (CSR) snapshot cache
 - [x] Dynamic, zero-overhead GraphBLAS matrix materialization triggered by database writes
+- [x] Threshold-gated OpenMP multi-threading: graphs with more than 100k edges use all available CPU cores for SpMV; smaller graphs run single-threaded to avoid scheduling overhead
 - [x] SuiteSparse:GraphBLAS algorithm suite executing via sparse matrix-vector multiplication (SpMV) kernels:
     - [x] Breadth-first search (BFS) and multi-source BFS
     - [x] Directed PageRank power iterations
@@ -66,6 +68,8 @@ This document outlines the features implemented in IssunDB and the future goals 
 - [x] Query plan visualization for logical, physical, and optimized query paths
 - [x] openCypher TCK submodule integration and `make test-conformance` target
 - [x] Inline relationship property map filter pushdown: e.g. `-[:KNOWS {since: 2026}]->`
+- [x] Worst-case optimal join (`MultiwayJoin`) for closing hops in cyclic patterns (triangles, cliques): optimizer detects already-bound `dst_var` and rewrites to O(1) hash-map lookup per row
+- [x] Factorized Filter-over-Expand execution: source-predicate filters are evaluated once per source node; destinations of rejected sources are skipped with zero PathMap clones
 
 ---
 
