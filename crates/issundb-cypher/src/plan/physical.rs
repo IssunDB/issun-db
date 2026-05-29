@@ -24,6 +24,17 @@ pub enum PhysicalOperator {
         property: String,
         value: Expr,
     },
+    /// Scan nodes using a property range index: binds `variable` to nodes where `property` falls
+    /// within [`lo`, `hi`] (inclusive/exclusive per the flags). At least one bound must be `Some`.
+    NodeRangeScan {
+        variable: String,
+        label: String,
+        property: String,
+        lo: Option<Expr>,
+        lo_inclusive: bool,
+        hi: Option<Expr>,
+        hi_inclusive: bool,
+    },
     /// Expand relationships: starts from `src_var`, traverses relationship `rel_type`
     /// in direction `is_incoming` up to range bounds, and binds relationship to `rel_var`
     /// and target to `dst_var`.
@@ -295,6 +306,34 @@ pub fn format_physical_plan(op: &PhysicalOperator, depth: usize) -> String {
                 barrier
             ));
             buf.push_str(&format_physical_plan(input, depth + 1));
+        }
+        PhysicalOperator::NodeRangeScan {
+            variable,
+            label,
+            property,
+            lo,
+            lo_inclusive,
+            hi,
+            hi_inclusive,
+        } => {
+            let lo_s = match lo {
+                Some(e) => format!("{}{}", if *lo_inclusive { ">=" } else { ">" }, fmt_expr(e)),
+                None => String::new(),
+            };
+            let hi_s = match hi {
+                Some(e) => format!("{}{}", if *hi_inclusive { "<=" } else { "<" }, fmt_expr(e)),
+                None => String::new(),
+            };
+            let range = match (lo_s.is_empty(), hi_s.is_empty()) {
+                (false, false) => format!("{} AND {}", lo_s, hi_s),
+                (false, true) => lo_s,
+                (true, false) => hi_s,
+                (true, true) => "*".to_string(),
+            };
+            buf.push_str(&format!(
+                "{}NodeRangeScan {}:{}.{} {}\n",
+                pad, variable, label, property, range
+            ));
         }
         PhysicalOperator::HashJoin { left, right } => {
             buf.push_str(&format!("{}HashJoin\n", pad));

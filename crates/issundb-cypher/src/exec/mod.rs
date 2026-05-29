@@ -124,19 +124,36 @@ pub fn explain(graph: &Graph, cypher: &str) -> Result<String, String> {
     }
 }
 
+/// Return true if any Union node in the tree mixes UNION and UNION ALL.
+fn union_has_mixed_all(stmt: &UnionStatement) -> bool {
+    let check = |s: &Statement| -> bool {
+        if let Statement::Union(u) = s {
+            u.all != stmt.all || union_has_mixed_all(u)
+        } else {
+            false
+        }
+    };
+    check(&stmt.left) || check(&stmt.right)
+}
+
 fn execute_union(
     graph: &Graph,
     stmt: &UnionStatement,
     params: &HashMap<String, serde_json::Value>,
 ) -> Result<QueryResult, String> {
+    if union_has_mixed_all(stmt) {
+        return Err(
+            "SyntaxError: mixing UNION and UNION ALL in the same query is not allowed".to_string(),
+        );
+    }
+
     let left_result = execute_statement(graph, &stmt.left, params)?;
     let right_result = execute_statement(graph, &stmt.right, params)?;
 
-    if left_result.columns.len() != right_result.columns.len() {
+    if left_result.columns != right_result.columns {
         return Err(format!(
-            "UNION: column count mismatch ({} vs {})",
-            left_result.columns.len(),
-            right_result.columns.len()
+            "SyntaxError: UNION column mismatch — left {:?}, right {:?}",
+            left_result.columns, right_result.columns
         ));
     }
 
@@ -145,7 +162,6 @@ fn execute_union(
     records.extend(right_result.records);
 
     if !stmt.all {
-        // Deduplicate rows by serialized value.
         let mut seen: HashSet<String> = HashSet::new();
         records.retain(|r| {
             let key = serde_json::to_string(&r.values).unwrap_or_default();
@@ -261,6 +277,206 @@ mod tests {
             .into_iter()
             .map(|r| r.values)
             .collect()
+    }
+
+    // Helper: run a bare `RETURN <expr> AS v` and return the single scalar value.
+    fn scalar(graph: &Graph, expr: &str) -> serde_json::Value {
+        let cypher = format!("RETURN {} AS v", expr);
+        let rows = run(graph, &cypher);
+        assert_eq!(rows.len(), 1, "expected exactly one row for `{}`", expr);
+        rows.into_iter().next().unwrap().into_iter().next().unwrap()
+    }
+
+    // Cluster 1: toString() must serialize temporal values via their canonical ISO string,
+    // not reject them as "list or map".
+    #[test]
+    fn tostring_of_date_returns_iso_string() {
+        let (_dir, graph) = setup_graph();
+        assert_eq!(
+            scalar(&graph, "toString(date('1984-10-11'))"),
+            serde_json::Value::String("1984-10-11".to_string())
+        );
+    }
+
+    #[test]
+    fn tostring_of_duration_returns_iso_string() {
+        let (_dir, graph) = setup_graph();
+        assert_eq!(
+            scalar(&graph, "toString(duration('PT45S'))"),
+            serde_json::Value::String("PT45S".to_string())
+        );
+    }
+
+    // Cluster 2: fractional duration components must cascade into smaller units
+    // rather than being truncated and discarded.
+    #[test]
+    fn duration_fractional_day_cascades_to_hours() {
+        let (_dir, graph) = setup_graph();
+        // 0.5 days = 12 hours.
+        assert_eq!(
+            scalar(&graph, "toString(duration('P0.5D'))"),
+            serde_json::Value::String("PT12H".to_string())
+        );
+    }
+
+    #[test]
+    fn duration_fractional_minute_cascades_to_seconds() {
+        let (_dir, graph) = setup_graph();
+        // 0.75 minutes = 45 seconds.
+        assert_eq!(
+            scalar(&graph, "toString(duration('PT0.75M'))"),
+            serde_json::Value::String("PT45S".to_string())
+        );
+    }
+
+    #[test]
+    fn duration_fractional_year_cascades_to_months() {
+        let (_dir, graph) = setup_graph();
+        // 1.5 years = 1 year, 6 months.
+        assert_eq!(
+            scalar(&graph, "toString(duration('P1.5Y'))"),
+            serde_json::Value::String("P1Y6M".to_string())
+        );
+    }
+
+    #[test]
+    fn duration_mixed_fractional_day_with_months() {
+        let (_dir, graph) = setup_graph();
+        // 5 months + 1.5 days = 5 months, 1 day, 12 hours.
+        assert_eq!(
+            scalar(&graph, "toString(duration('P5M1.5D'))"),
+            serde_json::Value::String("P5M1DT12H".to_string())
+        );
+    }
+
+    // Cluster 4: selecting (projecting) a date from a base date plus a coarse override
+    // must inherit the finer components from the base, not reset them to defaults.
+    #[test]
+    fn date_select_week_inherits_day_of_week_from_base() {
+        let (_dir, graph) = setup_graph();
+        // Base 1984-11-11 is a Sunday; selecting week 1 keeps that weekday, so the result is
+        // the Sunday of ISO week 1 of 1984, which is 1984-01-08 (not the Monday 1984-01-02).
+        assert_eq!(
+            scalar(
+                &graph,
+                "toString(date({date: date({year: 1984, month: 11, day: 11}), week: 1}))"
+            ),
+            serde_json::Value::String("1984-01-08".to_string())
+        );
+    }
+
+    #[test]
+    fn date_select_quarter_inherits_day_of_quarter_from_base() {
+        let (_dir, graph) = setup_graph();
+        // Base 1984-11-11 has dayOfQuarter 42 (within Q4); selecting quarter 3 keeps that
+        // dayOfQuarter, so the result is Jul 1 + 41 days = 1984-08-11 (not 1984-07-11).
+        assert_eq!(
+            scalar(
+                &graph,
+                "toString(date({date: date({year: 1984, month: 11, day: 11}), quarter: 3}))"
+            ),
+            serde_json::Value::String("1984-08-11".to_string())
+        );
+    }
+
+    // Cluster 3 (offset rows only): a datetime string with an explicit numeric offset and a
+    // bracketed IANA zone name must preserve the offset (normalized to +HH:MM) and keep the
+    // zone-name suffix. Cases that require DST/historical resolution are out of scope here.
+    #[test]
+    fn datetime_named_zone_preserves_explicit_offset() {
+        let (_dir, graph) = setup_graph();
+        assert_eq!(
+            scalar(
+                &graph,
+                "toString(datetime('2015-07-21T21:40:32.142+02:00[Europe/Stockholm]'))"
+            ),
+            serde_json::Value::String(
+                "2015-07-21T21:40:32.142+02:00[Europe/Stockholm]".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn datetime_named_zone_normalizes_compact_offset() {
+        let (_dir, graph) = setup_graph();
+        // +0845 must normalize to +08:45.
+        assert_eq!(
+            scalar(
+                &graph,
+                "toString(datetime('2015-07-21T21:40:32.142+0845[Australia/Eucla]'))"
+            ),
+            serde_json::Value::String("2015-07-21T21:40:32.142+08:45[Australia/Eucla]".to_string())
+        );
+    }
+
+    #[test]
+    fn datetime_named_zone_normalizes_hour_only_offset() {
+        let (_dir, graph) = setup_graph();
+        // -04 must normalize to -04:00.
+        assert_eq!(
+            scalar(
+                &graph,
+                "toString(datetime('2015-07-21T21:40:32.142-04[America/New_York]'))"
+            ),
+            serde_json::Value::String(
+                "2015-07-21T21:40:32.142-04:00[America/New_York]".to_string()
+            )
+        );
+    }
+
+    // with-orderBy: after a WITH projection, ORDER BY may only reference variables that the
+    // WITH projects. Referencing an out-of-scope or never-defined variable is a compile error.
+    #[test]
+    fn order_by_out_of_scope_variable_after_with_is_error() {
+        let (_dir, graph) = setup_graph();
+        let params = HashMap::new();
+        // `c` is dropped by the intervening `WITH a, b`, so it is out of scope at the final
+        // WITH's ORDER BY (neither its input scope {a, b} nor its output scope {a}).
+        let res = execute(
+            &graph,
+            "WITH 1 AS a, 3 AS b, 5 AS c WITH a, b WITH a ORDER BY a, c RETURN a",
+            &params,
+        );
+        assert!(res.is_err(), "expected error, got {:?}", res);
+    }
+
+    #[test]
+    fn order_by_input_scope_variable_after_with_succeeds() {
+        // A variable in the immediate input scope (bound upstream, not projected) is still
+        // visible to ORDER BY, e.g. `ORDER BY a.count` after `WITH a.count AS count`.
+        let (_dir, graph) = setup_graph();
+        graph
+            .add_node("N", &serde_json::json!({"count": 1}))
+            .unwrap();
+        let params = HashMap::new();
+        let res = execute(
+            &graph,
+            "MATCH (a) WITH a.count AS count ORDER BY a.count RETURN count",
+            &params,
+        );
+        assert!(res.is_ok(), "expected ok, got {:?}", res);
+    }
+
+    #[test]
+    fn order_by_never_defined_variable_after_with_is_error() {
+        let (_dir, graph) = setup_graph();
+        let params = HashMap::new();
+        let res = execute(&graph, "WITH 1 AS a WITH a ORDER BY a, e RETURN a", &params);
+        assert!(res.is_err(), "expected error, got {:?}", res);
+    }
+
+    #[test]
+    fn order_by_in_scope_expression_after_with_succeeds() {
+        // Guard against over-eager validation: an ORDER BY expression over projected
+        // variables must still be accepted.
+        let (_dir, graph) = setup_graph();
+        let params = HashMap::new();
+        let res = execute(
+            &graph,
+            "WITH 1 AS a, 5 AS b WITH a, b ORDER BY a + b RETURN a",
+            &params,
+        );
+        assert!(res.is_ok(), "expected ok, got {:?}", res);
     }
 
     #[test]
@@ -754,6 +970,166 @@ mod tests {
         );
     }
 
+    // --- collect_expr_vars regression: compound WHERE must not be pushed below bound vars ---
+
+    #[test]
+    fn where_and_does_not_cause_unbound_variable() {
+        let (_dir, graph) = setup_graph();
+        graph.add_node("N", &serde_json::json!({"v": 10})).unwrap();
+        graph.add_node("N", &serde_json::json!({"v": 20})).unwrap();
+        graph.add_node("N", &serde_json::json!({})).unwrap();
+        // IS NOT NULL AND > in same WHERE must not push filter before the LabelScan.
+        let rows = run(
+            &graph,
+            "MATCH (n:N) WHERE n.v IS NOT NULL AND n.v > 15 RETURN n.v AS v",
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0].as_i64().unwrap(), 20);
+    }
+
+    #[test]
+    fn where_label_predicate_n_colon_label() {
+        let (_dir, graph) = setup_graph();
+        graph.add_node("A", &serde_json::json!({"x": 1})).unwrap();
+        graph.add_node("B", &serde_json::json!({"x": 2})).unwrap();
+        let rows = run(&graph, "MATCH (n) WHERE n:A RETURN n.x AS x");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0].as_i64().unwrap(), 1);
+    }
+
+    #[test]
+    fn optional_match_left_outer_join_nulls_unmatched() {
+        let (_dir, graph) = setup_graph();
+        let a = graph
+            .add_node("A", &serde_json::json!({"name": "a"}))
+            .unwrap();
+        let b = graph
+            .add_node("B", &serde_json::json!({"name": "b"}))
+            .unwrap();
+        graph.add_edge(a, b, "HAS", &serde_json::json!({})).unwrap();
+        graph.rebuild_csr().unwrap();
+
+        // MATCH finds the A node; OPTIONAL MATCH finds no MISSING edge → r should be null.
+        let rows = run(
+            &graph,
+            "MATCH (n:A) OPTIONAL MATCH (n)-[r:MISSING]->(x) RETURN n.name AS n, r",
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0].as_str().unwrap(), "a");
+        assert_eq!(rows[0][1], serde_json::Value::Null);
+    }
+
+    // --- Range predicate index pushdown (NodeRangeScan) ---
+
+    #[test]
+    fn range_scan_gt_filters_correctly() {
+        let (_dir, graph) = setup_graph();
+        for age in [10i64, 20, 30, 40, 50] {
+            graph
+                .add_node("Person", &serde_json::json!({"age": age}))
+                .unwrap();
+        }
+        let rows = run(
+            &graph,
+            "MATCH (n:Person) WHERE n.age > 25 RETURN n.age AS age",
+        );
+        let mut ages: Vec<i64> = rows.iter().map(|r| r[0].as_i64().unwrap()).collect();
+        ages.sort_unstable();
+        assert_eq!(ages, vec![30, 40, 50]);
+    }
+
+    #[test]
+    fn range_scan_lt_filters_correctly() {
+        let (_dir, graph) = setup_graph();
+        for age in [10i64, 20, 30, 40, 50] {
+            graph
+                .add_node("Person", &serde_json::json!({"age": age}))
+                .unwrap();
+        }
+        let rows = run(
+            &graph,
+            "MATCH (n:Person) WHERE n.age < 35 RETURN n.age AS age",
+        );
+        let mut ages: Vec<i64> = rows.iter().map(|r| r[0].as_i64().unwrap()).collect();
+        ages.sort_unstable();
+        assert_eq!(ages, vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn range_scan_between_inclusive_exclusive() {
+        let (_dir, graph) = setup_graph();
+        for age in [10i64, 20, 30, 40, 50] {
+            graph
+                .add_node("Person", &serde_json::json!({"age": age}))
+                .unwrap();
+        }
+        // >20 AND <=40: should include 30 and 40, not 20
+        let rows = run(
+            &graph,
+            "MATCH (n:Person) WHERE n.age > 20 AND n.age <= 40 RETURN n.age AS age",
+        );
+        let mut ages: Vec<i64> = rows.iter().map(|r| r[0].as_i64().unwrap()).collect();
+        ages.sort_unstable();
+        assert_eq!(ages, vec![30, 40]);
+    }
+
+    #[test]
+    fn range_scan_ge_le_both_inclusive() {
+        let (_dir, graph) = setup_graph();
+        for age in [10i64, 20, 30, 40, 50] {
+            graph
+                .add_node("Person", &serde_json::json!({"age": age}))
+                .unwrap();
+        }
+        let rows = run(
+            &graph,
+            "MATCH (n:Person) WHERE n.age >= 20 AND n.age <= 40 RETURN n.age AS age",
+        );
+        let mut ages: Vec<i64> = rows.iter().map(|r| r[0].as_i64().unwrap()).collect();
+        ages.sort_unstable();
+        assert_eq!(ages, vec![20, 30, 40]);
+    }
+
+    // --- Chained two-hop factorized expand ---
+
+    #[test]
+    fn chained_two_hop_expand_correctness() {
+        let (_dir, graph) = setup_graph();
+        let a = graph
+            .add_node("Person", &serde_json::json!({"name": "a"}))
+            .unwrap();
+        let b = graph
+            .add_node("Person", &serde_json::json!({"name": "b"}))
+            .unwrap();
+        let c = graph
+            .add_node("Person", &serde_json::json!({"name": "c"}))
+            .unwrap();
+        let d = graph
+            .add_node("Person", &serde_json::json!({"name": "d"}))
+            .unwrap();
+        graph
+            .add_edge(a, b, "KNOWS", &serde_json::json!({}))
+            .unwrap();
+        graph
+            .add_edge(b, c, "KNOWS", &serde_json::json!({}))
+            .unwrap();
+        graph
+            .add_edge(b, d, "KNOWS", &serde_json::json!({}))
+            .unwrap();
+        graph.rebuild_csr().unwrap();
+
+        let rows = run(
+            &graph,
+            "MATCH (x:Person)-[:KNOWS]->(y:Person)-[:KNOWS]->(z:Person) WHERE x.name = 'a' RETURN z.name AS z",
+        );
+        let mut names: Vec<String> = rows
+            .iter()
+            .map(|r| r[0].as_str().unwrap().to_string())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["c", "d"]);
+    }
+
     // --- SIP (Sideways Information Passing) correctness ---
 
     /// Two MATCH clauses sharing a variable: the SIP filter must restrict the
@@ -766,7 +1142,10 @@ mod tests {
         for i in 0..20i64 {
             let age = if i < 2 { 30 } else { i + 40 };
             graph
-                .add_node("Person", &serde_json::json!({"name": format!("p{i}"), "age": age}))
+                .add_node(
+                    "Person",
+                    &serde_json::json!({"name": format!("p{i}"), "age": age}),
+                )
                 .unwrap();
         }
 
@@ -776,7 +1155,12 @@ mod tests {
             &graph,
             "MATCH (a:Person) MATCH (a:Person) WHERE a.age = 30 RETURN a.name AS name",
         );
-        assert_eq!(rows.len(), 2, "expected exactly 2 rows with age=30, got {}", rows.len());
+        assert_eq!(
+            rows.len(),
+            2,
+            "expected exactly 2 rows with age=30, got {}",
+            rows.len()
+        );
         let mut names: Vec<String> = rows
             .iter()
             .map(|r| r[0].as_str().unwrap().to_string())
@@ -825,8 +1209,12 @@ mod tests {
         let q1 = graph
             .add_node("Person", &serde_json::json!({"name": "q1", "age": 2}))
             .unwrap();
-        graph.add_edge(p0, q0, "KNOWS", &serde_json::json!({})).unwrap();
-        graph.add_edge(p1, q1, "KNOWS", &serde_json::json!({})).unwrap();
+        graph
+            .add_edge(p0, q0, "KNOWS", &serde_json::json!({}))
+            .unwrap();
+        graph
+            .add_edge(p1, q1, "KNOWS", &serde_json::json!({}))
+            .unwrap();
         graph.rebuild_csr().unwrap();
 
         // First MATCH expands to KNOWS neighbors (probe, heavier).

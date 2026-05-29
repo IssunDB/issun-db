@@ -250,7 +250,8 @@ pub struct WriteTxn<'a> {
 impl Graph {
     pub fn open(path: &Path, map_size_gb: usize) -> Result<Self, Error> {
         let storage = Storage::open(path, map_size_gb)?;
-        let initial = CsrSnapshot::build(&storage)?;
+        let csr_file = path.join("csr_snapshot.bin");
+        let initial = CsrSnapshot::build_mapped(&storage, &csr_file)?;
         let storage = Arc::new(storage);
         let csr_cache = Arc::new(CsrCache::new(initial));
         let matrices = {
@@ -335,9 +336,16 @@ impl Graph {
     /// Synchronously rebuild the CSR snapshot from LMDB. Useful after bulk
     /// loads or when tests need a consistent read view before the threshold
     /// has been crossed.
+    ///
+    /// The snapshot is serialized to `<db_dir>/csr_snapshot.bin` and then
+    /// memory-mapped, enabling out-of-core traversal for graphs that exceed
+    /// available RAM.  Falls back to an in-RAM snapshot if the file cannot be
+    /// written.
     #[instrument(skip(self))]
     pub fn rebuild_csr(&self) -> Result<(), Error> {
-        let snap = CsrSnapshot::build(&self.storage)?;
+        // Derive the CSR file path from the LMDB env path.
+        let csr_file = self.storage.env.path().join("csr_snapshot.bin");
+        let snap = CsrSnapshot::build_mapped(&self.storage, &csr_file)?;
         let m = MatrixSet::materialize(&snap)?;
         *self.matrices.write() = Some(m);
         self.csr_cache.install(snap);

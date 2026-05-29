@@ -43,7 +43,7 @@ This document outlines the features implemented in IssunDB and the future goals 
 
 ### Advanced Retrieval and Vector Search
 
-- [x] Hierarchical Navigable Small World (HNSW) vector index integration using `usearch`
+- [x] Hierarchical Navigable Small World (HNSW) vector index integration
 - [x] Vector database APIs for dense embedding search and dynamic index rebuilds
 - [x] High-speed full-text indexing with ranked matches, BM25 scoring, and multi-language stemming
 - [x] Vector deletion API and persisted dimension/metric metadata
@@ -70,18 +70,24 @@ This document outlines the features implemented in IssunDB and the future goals 
 - [x] Inline relationship property map filter pushdown: e.g. `-[:KNOWS {since: 2026}]->`
 - [x] Worst-case optimal join (`MultiwayJoin`) for closing hops in cyclic patterns (triangles, cliques): optimizer detects already-bound `dst_var` and rewrites to O(1) hash-map lookup per row
 - [x] Factorized Filter-over-Expand execution: source-predicate filters are evaluated once per source node; destinations of rejected sources are skipped with zero PathMap clones
+- [ ] Full openCypher TCK conformance: as of 2026-05-29, about 75% of executed scenarios pass (roughly 2,480 of 3,300; a further 597 scenarios are skipped as intentional exclusions, such as negative-test tags and node or relationship display-literal representational mismatches). Notable remaining capability gaps:
+    - [ ] Temporal timezone resolution for named and historical zones, and duration-between computation
+    - [ ] `CALL` and procedure invocation
+    - [ ] Aggregation expressions inside `ORDER BY`
+    - [ ] Three-valued null comparison logic
 
 ---
 
 ### Ecosystem and Tooling
 
 - [x] An interactive REPL
-- [x] An HTTP REST API server (Axum) with node, edge, query, vector search, and full-text search routes
-- [x] A desktop GUI (egui) with a Cypher console and interactive graph visualization
+- [x] An HTTP REST API server with node, edge, query, vector search, and full-text search routes
+- [x] An MCP server over stdio or Streamable HTTP, exposing node and edge CRUD, query, explanation, full-text search, and vector search as tools
+- [x] A desktop GUI with a Cypher console and interactive graph visualization
 - [x] A benchmarking suite that measures throughput and load scaling
 - [x] Property-based and integration tests
 - [x] Shared test fixture library (`issundb-testing`) with graph builders and assertion helpers
-- [x] Language bindings for Python (using PyO3)
-- [x] Language bindings for Node.js (using NAPI-RS)
+- [x] Language bindings for Python
+- [x] Language bindings for Node.js
 - [x] Batch data import utilities for JSONL and CSV formats
 - [x] Online backup, restore, and snapshot tools

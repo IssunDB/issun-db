@@ -622,19 +622,32 @@ impl Graph {
         label: &str,
         property: &str,
         min_val: Option<PropValue>,
+        min_inclusive: bool,
         max_val: Option<PropValue>,
+        max_inclusive: bool,
     ) -> Result<Vec<NodeId>, Error> {
         let rtxn = self.storage.env.read_txn()?;
-        self.nodes_by_property_range_impl(&rtxn, label, property, min_val, max_val)
+        self.nodes_by_property_range_impl(
+            &rtxn,
+            label,
+            property,
+            min_val,
+            min_inclusive,
+            max_val,
+            max_inclusive,
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn nodes_by_property_range_impl(
         &self,
         rtxn: &heed::RoTxn,
         label: &str,
         property: &str,
         min_val: Option<PropValue>,
+        min_inclusive: bool,
         max_val: Option<PropValue>,
+        max_inclusive: bool,
     ) -> Result<Vec<NodeId>, Error> {
         let label_key = format!("label:{label}");
         let label_id = match self.storage.meta.get(rtxn, &label_key)? {
@@ -678,12 +691,20 @@ impl Graph {
                 let val_bytes = &key[prefix.len()..key.len() - 8];
 
                 if let Some(ref min_enc) = min_encoded {
-                    if val_bytes < min_enc.as_slice() {
+                    if min_inclusive {
+                        if val_bytes < min_enc.as_slice() {
+                            continue;
+                        }
+                    } else if val_bytes <= min_enc.as_slice() {
                         continue;
                     }
                 }
                 if let Some(ref max_enc) = max_encoded {
-                    if val_bytes > max_enc.as_slice() {
+                    if max_inclusive {
+                        if val_bytes > max_enc.as_slice() {
+                            continue;
+                        }
+                    } else if val_bytes >= max_enc.as_slice() {
                         continue;
                     }
                 }

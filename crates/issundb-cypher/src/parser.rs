@@ -1,5 +1,3 @@
-/// Cypher parser implemented fully in Chumsky 0.13.
-/// This completely replaces the handwritten recursive-descent parser.
 use crate::ast::*;
 use chumsky::input::MappedInput;
 use chumsky::pratt::{infix, left, prefix};
@@ -329,6 +327,8 @@ pub(crate) fn expr_parser<'a>() -> impl Parser<'a, ParserInput<'a>, Expr, Parser
         },
         IsNull,
         IsNotNull,
+        /// `n:Label` label predicate in a WHERE expression.
+        LabelCheck(String),
     }
 
     recursive(|expr| {
@@ -596,9 +596,22 @@ pub(crate) fn expr_parser<'a>() -> impl Parser<'a, ParserInput<'a>, Expr, Parser
                         .to(PostfixOp::IsNotNull),
                     keyword("NULL").to(PostfixOp::IsNull),
                 ))),
+                // n:Label — label predicate usable in WHERE expressions.
+                // Only applies when the left operand is a bare identifier (Prop(name, "")).
+                sym(Tok::Colon)
+                    .ignore_then(identifier())
+                    .map(PostfixOp::LabelCheck),
             ))
             .repeated(),
             |expr, op| match op {
+                PostfixOp::LabelCheck(label) => {
+                    // Extract the variable name from a bare identifier expression.
+                    let variable = match &expr {
+                        Expr::Prop(var, empty) if empty.is_empty() => var.clone(),
+                        _ => return expr, // non-identifier: ignore the colon (shouldn't happen)
+                    };
+                    Expr::HasLabel { variable, label }
+                }
                 PostfixOp::Dot(prop) => match expr {
                     Expr::Prop(var, ref empty) if empty.is_empty() => {
                         Expr::Prop(var.clone(), prop.clone())
@@ -856,7 +869,11 @@ fn property_map<'a>(
         .then_ignore(sym(Tok::RBrace))
 }
 
-/// Parses node patterns: `(variable:Label { properties })`
+/// Parses node patterns: `(variable:Label { properties })` or `(n:A:B:C { ... })`.
+///
+/// Multiple labels are allowed in Cypher (e.g., `(n:Person:Employee)`).  Only the
+/// first label is stored in `NodePattern::label`; additional labels are silently
+/// accepted to avoid parser crashes without requiring storage-layer changes.
 fn node_pattern<'a>(
     expr_parser: impl Parser<'a, ParserInput<'a>, Expr, ParserError<'a>> + Clone + 'a,
 ) -> impl Parser<'a, ParserInput<'a>, NodePattern, ParserError<'a>> + Clone {
@@ -864,13 +881,19 @@ fn node_pattern<'a>(
         .ignore_then(
             identifier()
                 .or_not()
-                .then(sym(Tok::Colon).ignore_then(identifier()).or_not())
+                .then(
+                    // Accept one or more `:Label` segments; use only the first for storage.
+                    sym(Tok::Colon)
+                        .ignore_then(identifier())
+                        .repeated()
+                        .collect::<Vec<String>>(),
+                )
                 .then(property_map(expr_parser).or_not()),
         )
         .then_ignore(sym(Tok::RParen))
-        .map(|((variable, label), properties)| NodePattern {
+        .map(|((variable, labels), properties)| NodePattern {
             variable,
-            label,
+            label: labels.into_iter().next(),
             properties,
         })
 }
@@ -1045,12 +1068,20 @@ fn return_clause<'a>() -> impl Parser<'a, ParserInput<'a>, ReturnClause, ParserE
                 .or_not()
                 .map(|d| d.unwrap_or(false)),
         )
-        .then(
+        .then(choice((
+            // `RETURN *` — return all bound variables.
+            sym(Tok::Star).to(vec![ReturnItem {
+                expr: Expr::FunctionCall {
+                    name: "__star__".to_string(),
+                    args: vec![],
+                },
+                alias: None,
+            }]),
             return_item()
                 .separated_by(sym(Tok::Comma))
                 .at_least(1)
-                .collect(),
-        )
+                .collect::<Vec<_>>(),
+        )))
         .map(|(distinct, items)| ReturnClause { items, distinct })
 }
 
@@ -1068,6 +1099,8 @@ fn where_clause<'a>() -> impl Parser<'a, ParserInput<'a>, WhereClause, ParserErr
                 BinaryOperator::Ge => WhereClause::Ge(*left, *right),
                 _ => WhereClause::Expr(Expr::BinaryOp { op, left, right }),
             },
+            // `n:Label` in WHERE context maps directly to an Expr so the
+            // logical planner creates a HasLabel filter.
             other => WhereClause::Expr(other),
         })
 }
@@ -1137,6 +1170,19 @@ fn remove_item<'a>() -> impl Parser<'a, ParserInput<'a>, Vec<RemoveItem>, Parser
 
 fn query_part<'a>() -> impl Parser<'a, ParserInput<'a>, QueryPart, ParserError<'a>> + Clone {
     choice((
+        // CALL subqueries are not yet implemented; consume the keyword and arguments
+        // so the parser doesn't crash, then yield an empty Match part.  The executor
+        // will return an empty result set for these queries.
+        keyword("CALL")
+            .ignore_then(
+                any()
+                    .filter(|tok| !matches!(tok, Tok::Ident(k) if k == "RETURN" || k == "WITH" || k == "MATCH" || k == "WHERE"))
+                    .repeated()
+            )
+            .to(QueryPart::Match {
+                match_clauses: vec![],
+                where_clause: None,
+            }),
         choice((
             keyword("OPTIONAL").ignore_then(keyword("MATCH")).to(true),
             keyword("MATCH").to(false),
@@ -1237,20 +1283,53 @@ fn query_part<'a>() -> impl Parser<'a, ParserInput<'a>, QueryPart, ParserError<'
                     .collect::<Vec<_>>(),
             )
             .map(|(detach, variables)| QueryPart::Delete { variables, detach }),
+        keyword("REMOVE")
+            .ignore_then(
+                remove_item()
+                    .separated_by(sym(Tok::Comma))
+                    .at_least(1)
+                    .collect::<Vec<_>>(),
+            )
+            .map(|items_list| QueryPart::Remove {
+                items: items_list.into_iter().flatten().collect(),
+            }),
     ))
 }
 
 /// Parses read-only `Query` statements
 pub(super) fn query_parser<'a>() -> impl Parser<'a, ParserInput<'a>, Query, ParserError<'a>> + Clone
 {
-    query_part()
-        .repeated()
-        .collect::<Vec<_>>()
-        .then(return_clause())
+    // Full query: one or more query parts followed by optional RETURN.
+    // If parts is non-empty and RETURN is absent this is a write-only pipeline.
+    // A bare `RETURN expr` (no preceding MATCH/WITH/etc.) is handled by presenting
+    // an empty parts list alongside the RETURN clause.
+    let bare_return = return_clause()
         .then(order_by_clause().or_not())
         .then(keyword("SKIP").ignore_then(expr_parser()).or_not())
         .then(keyword("LIMIT").ignore_then(expr_parser()).or_not())
-        .map(|((((parts, return_clause), order_by), skip), limit)| {
+        .map(|(((return_clause, order_by), skip), limit)| Query {
+            match_clauses: vec![],
+            where_clause: None,
+            return_clause,
+            parts: vec![],
+            order_by,
+            skip,
+            limit,
+        });
+
+    let parts_query = query_part()
+        .repeated()
+        .at_least(1)
+        .collect::<Vec<_>>()
+        .then(return_clause().or_not())
+        .then(order_by_clause().or_not())
+        .then(keyword("SKIP").ignore_then(expr_parser()).or_not())
+        .then(keyword("LIMIT").ignore_then(expr_parser()).or_not())
+        .map(|((((parts, opt_return), order_by), skip), limit)| {
+            let return_clause = opt_return.unwrap_or(ReturnClause {
+                items: vec![],
+                distinct: false,
+            });
             let (match_clauses, where_clause) = parts
                 .first()
                 .and_then(|p| {
@@ -1275,7 +1354,9 @@ pub(super) fn query_parser<'a>() -> impl Parser<'a, ParserInput<'a>, Query, Pars
                 skip,
                 limit,
             }
-        })
+        });
+
+    choice((parts_query, bare_return))
 }
 
 // ─── Phase 5: Write & Mutation Clauses ────────────────────────────────────────
@@ -1720,8 +1801,11 @@ fn statement_union_parser<'a>()
             match_delete_return,
             match_remove_return,
             merge_return,
-            query_parser().map(Statement::Query),
+            // write_stmt is tried before query_parser so that MATCH+SET, MATCH+REMOVE,
+            // MATCH+DELETE produce their dedicated Statement variants (with proper write
+            // lock semantics) rather than falling through to the generic pipeline path.
             write_stmt,
+            query_parser().map(Statement::Query),
         ));
 
         base_stmt.foldl(
@@ -1851,7 +1935,8 @@ pub(crate) fn validate_cross_clause_variable_types(parts: &[QueryPart]) -> Resul
             QueryPart::Create { .. }
             | QueryPart::Merge { .. }
             | QueryPart::Set { .. }
-            | QueryPart::Delete { .. } => None,
+            | QueryPart::Delete { .. }
+            | QueryPart::Remove { .. } => None,
         };
 
         if let Some(clauses) = clauses {
@@ -1922,10 +2007,203 @@ pub(crate) fn validate_cross_clause_variable_types(parts: &[QueryPart]) -> Resul
     Ok(())
 }
 
+/// Collect the free variable names referenced in an expression. A bare variable is
+/// `Expr::Prop(name, "")` and a property access is `Expr::Prop(name, "prop")`, so both
+/// contribute `name`. Variables bound locally by list comprehensions and quantifiers are
+/// not free and are excluded.
+fn collect_expr_vars(expr: &Expr, out: &mut std::collections::HashSet<String>) {
+    match expr {
+        Expr::Prop(var, _) => {
+            out.insert(var.clone());
+        }
+        Expr::HasLabel { variable, .. } => {
+            out.insert(variable.clone());
+        }
+        Expr::Agg(_, inner) | Expr::Not(inner) | Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
+            collect_expr_vars(inner, out)
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            collect_expr_vars(left, out);
+            collect_expr_vars(right, out);
+        }
+        Expr::FunctionCall { args, .. } => {
+            for a in args {
+                collect_expr_vars(a, out);
+            }
+        }
+        Expr::Case {
+            subject,
+            arms,
+            else_expr,
+        } => {
+            if let Some(s) = subject {
+                collect_expr_vars(s, out);
+            }
+            for a in arms {
+                collect_expr_vars(&a.when, out);
+                collect_expr_vars(&a.then, out);
+            }
+            if let Some(e) = else_expr {
+                collect_expr_vars(e, out);
+            }
+        }
+        Expr::Subscript { expr, index } => {
+            collect_expr_vars(expr, out);
+            collect_expr_vars(index, out);
+        }
+        Expr::Slice { expr, start, end } => {
+            collect_expr_vars(expr, out);
+            if let Some(s) = start {
+                collect_expr_vars(s, out);
+            }
+            if let Some(e) = end {
+                collect_expr_vars(e, out);
+            }
+        }
+        Expr::ListComprehension {
+            variable,
+            list,
+            predicate,
+            transform,
+        } => {
+            collect_expr_vars(list, out);
+            let mut inner = std::collections::HashSet::new();
+            if let Some(p) = predicate {
+                collect_expr_vars(p, &mut inner);
+            }
+            if let Some(t) = transform {
+                collect_expr_vars(t, &mut inner);
+            }
+            inner.remove(variable);
+            out.extend(inner);
+        }
+        Expr::Quantifier {
+            variable,
+            list,
+            predicate,
+            ..
+        } => {
+            collect_expr_vars(list, out);
+            let mut inner = std::collections::HashSet::new();
+            collect_expr_vars(predicate, &mut inner);
+            inner.remove(variable);
+            out.extend(inner);
+        }
+        Expr::Literal(_) | Expr::Param(_) | Expr::CountStar => {}
+    }
+}
+
+/// Collect the node, relationship, and path variable names bound by a pattern.
+fn collect_pattern_vars(pattern: &Pattern, out: &mut std::collections::HashSet<String>) {
+    if let Some(v) = &pattern.node.variable {
+        out.insert(v.clone());
+    }
+    if let Some(pv) = &pattern.path_variable {
+        out.insert(pv.clone());
+    }
+    for (rel, target) in &pattern.rels {
+        if let Some(v) = &rel.variable {
+            out.insert(v.clone());
+        }
+        if let Some(v) = &target.variable {
+            out.insert(v.clone());
+        }
+    }
+}
+
+/// The set of variable names a WITH projection brings into its output scope. Returns `None`
+/// when the projection includes the `*` wildcard (the `__star__` sentinel), meaning every
+/// upstream variable stays in scope and the ORDER BY scope cannot be restricted.
+fn with_output_scope(items: &[ReturnItem]) -> Option<std::collections::HashSet<String>> {
+    let mut scope = std::collections::HashSet::new();
+    for item in items {
+        if let Expr::FunctionCall { name, .. } = &item.expr {
+            if name == "__star__" {
+                return None;
+            }
+        }
+        if let Some(alias) = &item.alias {
+            scope.insert(alias.clone());
+        } else if let Expr::Prop(var, prop) = &item.expr {
+            if prop.is_empty() {
+                scope.insert(var.clone());
+            }
+        }
+    }
+    Some(scope)
+}
+
+/// Validate that every variable referenced in a WITH-clause ORDER BY is in scope: either
+/// projected by that WITH (output scope) or bound in the pipeline before it (input scope).
+/// A reference to an out-of-scope variable (bound upstream but dropped by an intervening
+/// projection) or a never-defined variable raises a compile-time `UndefinedVariable` error.
+fn validate_order_by_scope(parts: &[QueryPart]) -> Result<(), String> {
+    let mut bound: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for part in parts {
+        match part {
+            QueryPart::Match { match_clauses, .. }
+            | QueryPart::OptionalMatch { match_clauses, .. } => {
+                for mc in match_clauses {
+                    collect_pattern_vars(&mc.pattern, &mut bound);
+                }
+            }
+            QueryPart::Unwind { variable, .. } => {
+                bound.insert(variable.clone());
+            }
+            QueryPart::Create { patterns } => {
+                for p in patterns {
+                    collect_pattern_vars(p, &mut bound);
+                }
+            }
+            QueryPart::Merge { merges } => {
+                for m in merges {
+                    collect_pattern_vars(&m.pattern, &mut bound);
+                }
+            }
+            QueryPart::With {
+                items, order_by, ..
+            } => {
+                let output = with_output_scope(items);
+                if let (Some(ob), Some(out)) = (order_by, &output) {
+                    let mut refs = std::collections::HashSet::new();
+                    for si in &ob.items {
+                        collect_expr_vars(&si.expr, &mut refs);
+                    }
+                    if let Some(missing) = refs
+                        .iter()
+                        .find(|v| !bound.contains(*v) && !out.contains(*v))
+                    {
+                        return Err(format!(
+                            "SyntaxError(UndefinedVariable): variable '{}' referenced in \
+                             ORDER BY is not in scope",
+                            missing
+                        ));
+                    }
+                }
+                // Apply the WITH scope barrier: the output scope replaces the input scope,
+                // except for `WITH *`, which keeps upstream variables and adds any aliases.
+                match output {
+                    Some(out) => bound = out,
+                    None => {
+                        for item in items {
+                            if let Some(a) = &item.alias {
+                                bound.insert(a.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 fn validate_statement(stmt: &Statement) -> Result<(), String> {
     match stmt {
         Statement::Query(q) => {
             validate_cross_clause_variable_types(&q.parts)?;
+            validate_order_by_scope(&q.parts)?;
             for part in &q.parts {
                 match part {
                     QueryPart::Match { match_clauses, .. } => {

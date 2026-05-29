@@ -1,6 +1,6 @@
 <div align="center">
   <picture>
-    <img alt="IssunDB Logo" src="logo.svg" height="25%" width="25%">
+    <img alt="IssunDB Logo" src="docs/assets/logo.svg" height="25%" width="25%">
   </picture>
 <br>
 
@@ -10,7 +10,7 @@
 [![Code Coverage](https://img.shields.io/codecov/c/github/IssunDB/issun-db?label=coverage&style=flat&labelColor=282c34&logo=codecov)](https://codecov.io/gh/IssunDB/issun-db)
 [![Crates.io](https://img.shields.io/crates/v/issun-db.svg?label=crates.io&style=flat&labelColor=282c34&color=fc8d62&logo=rust)](https://crates.io/crates/issun-db)
 [![Docs.rs](https://img.shields.io/badge/docs-issun-db-66c2a5?style=flat&labelColor=282c34&logo=docs.rs)](https://docs.rs/issun-db)
-[![MSRV](https://img.shields.io/badge/msrv-1.85.0-informational?style=flat&labelColor=282c34&logo=rust)](https://www.rust-lang.org)
+[![Docs](https://img.shields.io/badge/docs-read-007ec6?label=docs&style=flat&labelColor=282c34&logo=readthedocs)](https://IssunDB.github.io/issun-db/)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-007ec6?style=flat&labelColor=282c34&logo=open-source-initiative)](https://github.com/IssunDB/issun-db)
 
 A fast embedded analytical graph database in Rust
@@ -19,16 +19,14 @@ A fast embedded analytical graph database in Rust
 
 ---
 
-IssunDB is a fast embedded OLAP graph database with property graph data model, Cypher support, vector and full-text search, written in Rust.
-
 ### Key Features
 
-* **Embedded Graph Storage**: Native Rust graph engine built on LMDB with transactional guarantees, monotonic ID allocation, and adjacency lists stored using `DUPSORT`.
-* **GraphBLAS Algorithms**: High-performance graph traversal and analytics operating on an in-memory Compressed Sparse Row (CSR) snapshot, supporting PageRank, Dijkstra, and betweenness centrality.
-* **Vector Search**: Integrated vector index using `usearch` for fast similarity searches and nearest-neighbor retrieval.
-* **Full-Text Search**: Inverted index storage with BM25 and TF-IDF ranking, custom tokenization, and multi-language support.
-* **Hybrid Retrieval**: Unified queries combining graph traversal, vector similarity, and text relevance scores.
-* **Cypher Query Language**: Planner and executor for an openCypher query subset supporting `MATCH`, `WHERE`, `RETURN`, `CREATE`, `SET`, and `DELETE`.
+* Rust graph engine built on LMDB with ACID, property graph model, and Cypher query language support
+* Fast graph traversal and analytics using GraphBLAS-based sparse matrix operations
+* Buit-in vector, text, and hybrid search and retrieval support
+* Fully cross-platform support for Linux, macOS, and Windows
+* Can be used via a wide range of APIs, including native Rust, CLI, GUI, HTTP, and MCP
+* Bindings for Python and JavaScript (other languages coming soon)
 
 ---
 

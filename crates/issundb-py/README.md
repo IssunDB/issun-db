@@ -1,15 +1,15 @@
-# issundb-py
+## issundb-py
 
-Python bindings for [IssunDB](../../README.md), an embedded graph database with vector and full-text search.
+Python bindings for [IssunDB](../../README.md).
 
-## Installation
+### Installation
 
 ```bash
 pip install maturin
 maturin develop --features extension-module
 ```
 
-## Quick Start
+### Quickstart
 
 ```python
 from issundb import IssunDB

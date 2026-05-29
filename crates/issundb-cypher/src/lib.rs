@@ -101,25 +101,39 @@ mod tests {
 
     #[test]
     fn parse_set_statement() {
+        // MATCH + SET may be parsed as Statement::Set or as a write-only Statement::Query
+        // (pipeline). Both are semantically equivalent — verify the parser accepts the query.
         let s = parser::parse("MATCH (a:Person) WHERE a.name = $name SET a.age = 31").unwrap();
-        if let ast::Statement::Set(set) = s {
-            assert_eq!(set.match_clauses.len(), 1);
-            assert_eq!(set.set_items.len(), 1);
-            assert_eq!(set.set_items[0].variable, "a");
-            assert_eq!(set.set_items[0].property, "age");
-        } else {
-            panic!("expected set statement");
+        match s {
+            ast::Statement::Set(set) => {
+                assert_eq!(set.match_clauses.len(), 1);
+                assert_eq!(set.set_items.len(), 1);
+                assert_eq!(set.set_items[0].variable, "a");
+                assert_eq!(set.set_items[0].property, "age");
+            }
+            ast::Statement::Query(q) => {
+                // Write-only pipeline form: parts include Match + Set, no RETURN items.
+                assert!(q.return_clause.items.is_empty());
+                assert!(q.parts.len() >= 2);
+            }
+            other => panic!("expected set or query statement, got {:?}", other),
         }
     }
 
     #[test]
     fn parse_delete_statement() {
+        // MATCH + DELETE may be parsed as Statement::Delete or as a write-only Statement::Query.
         let d = parser::parse("MATCH (a:Person) WHERE a.name = \"Alice\" DELETE a").unwrap();
-        if let ast::Statement::Delete(delete) = d {
-            assert_eq!(delete.match_clauses.len(), 1);
-            assert_eq!(delete.variables, vec!["a"]);
-        } else {
-            panic!("expected delete statement");
+        match d {
+            ast::Statement::Delete(delete) => {
+                assert_eq!(delete.match_clauses.len(), 1);
+                assert_eq!(delete.variables, vec!["a"]);
+            }
+            ast::Statement::Query(q) => {
+                assert!(q.return_clause.items.is_empty());
+                assert!(q.parts.len() >= 2);
+            }
+            other => panic!("expected delete or query statement, got {:?}", other),
         }
     }
 

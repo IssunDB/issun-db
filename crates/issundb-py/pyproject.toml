@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "issundb"
-description = "Python bindings for IssunDB — embedded graph database with vector and full-text search"
+description = "Python bindings for IssunDB"
 requires-python = ">=3.8"
 license = { text = "MIT" }
 classifiers = [

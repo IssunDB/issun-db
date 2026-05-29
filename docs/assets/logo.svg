@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!-- Uploaded to: SVG Repo, www.svgrepo.com, Generator: SVG Repo Mixer Tools -->
+
+<svg
+   width="800px"
+   height="800px"
+   viewBox="0 0 24 24"
+   version="1.1"
+   id="svg6"
+   xmlns="http://www.w3.org/2000/svg"
+   xmlns:svg="http://www.w3.org/2000/svg">
+  <path
+     fill="none"
+     d="M0 0h24v24H0z"
+     id="path4" />
+
+  <!-- Connection lines (Edges) -->
+  <g stroke="#241c1c" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round">
+    <!-- Pentagon perimeter -->
+    <line x1="11.5" y1="3.5" x2="20.5" y2="7.5" />
+    <line x1="20.5" y1="7.5" x2="17.5" y2="20.5" />
+    <line x1="17.5" y1="20.5" x2="5.5" y2="18.5" />
+    <line x1="5.5" y1="18.5" x2="3.5" y2="9.5" />
+    <line x1="3.5" y1="9.5" x2="11.5" y2="3.5" />
+
+    <!-- Pentagon spokes to center -->
+    <line x1="12.5" y1="11.5" x2="11.5" y2="3.5" />
+    <line x1="12.5" y1="11.5" x2="20.5" y2="7.5" />
+    <line x1="12.5" y1="11.5" x2="17.5" y2="20.5" />
+    <line x1="12.5" y1="11.5" x2="5.5" y2="18.5" />
+    <line x1="12.5" y1="11.5" x2="3.5" y2="9.5" />
+  </g>
+
+  <!-- Node Outer Rings (Charcoal background) -->
+  <g fill="#241c1c">
+    <circle cx="11.5" cy="3.5" r="2.5" />
+    <circle cx="20.5" cy="7.5" r="2.5" />
+    <circle cx="17.5" cy="20.5" r="2.5" />
+    <circle cx="5.5" cy="18.5" r="2.5" />
+    <circle cx="3.5" cy="9.5" r="2.5" />
+    <circle cx="12.5" cy="11.5" r="2.5" />
+  </g>
+
+  <!-- Node Inner Colors -->
+  <g>
+    <!-- Top Node (Green) -->
+    <circle cx="11.5" cy="3.5" r="1.5" fill="#668000" />
+    <!-- Top-Right Node (Blue) -->
+    <circle cx="20.5" cy="7.5" r="1.5" fill="#0044aa" />
+    <!-- Bottom-Right Node (Blue) -->
+    <circle cx="17.5" cy="20.5" r="1.5" fill="#0044aa" />
+    <!-- Bottom-Left Node (Blue) -->
+    <circle cx="5.5" cy="18.5" r="1.5" fill="#0044aa" />
+    <!-- Left Node (Green) -->
+    <circle cx="3.5" cy="9.5" r="1.5" fill="#668000" />
+    <!-- Center Node (Red) -->
+    <circle cx="12.5" cy="11.5" r="1.5" fill="#d40000" />
+  </g>
+</svg>

@@ -278,7 +278,8 @@ impl LogicalPlanner {
                             p = LogicalOperator::Distinct { input: Box::new(p) };
                         }
 
-                        // Apply optional ORDER BY attached to the WITH clause.
+                        // Apply optional ORDER BY attached to the WITH clause. ORDER BY scope
+                        // validation happens at parse time in `validate_statement`.
                         if let Some(ob) = order_by {
                             p = LogicalOperator::Sort {
                                 input: Box::new(p),
@@ -378,7 +379,8 @@ impl LogicalPlanner {
                     write_part @ (QueryPart::Create { .. }
                     | QueryPart::Merge { .. }
                     | QueryPart::Set { .. }
-                    | QueryPart::Delete { .. }) => {
+                    | QueryPart::Delete { .. }
+                    | QueryPart::Remove { .. }) => {
                         let p = current_plan.unwrap_or(LogicalOperator::SingleRow);
                         current_plan = Some(LogicalOperator::WritePart {
                             input: Box::new(p),

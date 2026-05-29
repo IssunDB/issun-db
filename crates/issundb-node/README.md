@@ -1,15 +1,15 @@
-# issundb (Node.js)
+## issundb (using Node.js)
 
-Node.js bindings for [IssunDB](../../README.md), an embedded graph database with vector and full-text search.
+Node.js bindings for [IssunDB](../../README.md).
 
-## Installation
+### Installation
 
 ```bash
 npm install @napi-rs/cli
 npm run build
 ```
 
-## Quick Start
+### Quickstart
 
 ```js
 const { IssunDB } = require('./index')

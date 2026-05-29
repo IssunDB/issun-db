@@ -6,8 +6,10 @@ everywhere and are not repeated here.
 
 ## Tokenization Pipeline
 
-Every string is processed through the following stages, applied in this exact
-order at both **index time** and **query time**:
+The tokenizer currently lives in `crates/issundb-core/src/storage/fts.rs` (the
+`tokenize` function), pending the target decoupling that moves it into this
+crate. Every string is processed through the following stages, applied in this
+exact order at both **index time** and **query time**:
 
 1. **`fold_ascii`**: normalize diacritics and accented characters to their
    ASCII base forms (e.g., `é → e`, `ü → u`). This ensures that queries
@@ -119,13 +121,14 @@ regress it by adding per-term doc-length lookups inside the cursor loop.
 
 ## Language Addition Checklist
 
-To add support for a new language:
+To add support for a new language (the tokenizer constants and selectors live
+in `crates/issundb-core/src/storage/fts.rs`):
 
-1. Add a stop-word list constant (e.g., `STOP_WORDS_DUTCH: &[&str]`) in the
-   tokenization module.
-2. Add an arm for the new language in `get_stop_words`.
-3. Add an arm for the new language in `map_algorithm` (the Snowball stemmer
-   language selector).
+1. Add a stop-word list constant (e.g., `STOP_WORDS_DUTCH: &[&str]`) in
+   `crates/issundb-core/src/storage/fts.rs`.
+2. Add an arm for the new language in `get_stop_words` (same file).
+3. Add an arm for the new language in `map_algorithm` (same file; the Snowball
+   stemmer language selector).
 4. Add the new variant to the `Language` enum in
    `crates/issundb-core/src/schema.rs`, keeping the `#[repr(u8)]`
    discriminant values contiguous.

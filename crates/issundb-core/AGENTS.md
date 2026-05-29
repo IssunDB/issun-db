@@ -33,7 +33,10 @@ These invariants must hold after every successful write transaction:
    its `(LabelId, NodeId)` entry, and every `delete_node` must remove it.
    Same rule applies to `type_idx` for edges.
 
-5. **Property column consistency.** Every `add_node` must write a `node_prop_idx` entry for each non-null scalar property in `props_json`. Every `update_node` must delete old entries and write new ones for all changed scalar properties. Every `delete_node` must remove all `node_prop_idx` entries for the deleted node. Failing to maintain this invariant causes `has_node_property_index` to return stale results and the Cypher optimizer to emit incorrect `NodeIndexScan` plans.
+5. **Property column consistency.** Every `add_node` must write a `node_prop_idx` entry for each non-null scalar property in `props_json`. Every
+   `update_node` must delete old entries and write new ones for all changed scalar properties. Every `delete_node` must remove all `node_prop_idx`
+   entries for the deleted node. Failing to maintain this invariant causes `has_node_property_index` to return stale results and the Cypher optimizer
+   to emit incorrect `NodeIndexScan` plans.
 
 ## LMDB Lifetime Rules
 
@@ -69,27 +72,34 @@ All mutations to the graph go through the `Graph` API. Inside `Graph`:
 
 ## OpenMP Thread Count
 
-`MatrixSet::materialize` (in `matrices.rs`) calls `GxB_Global_Option_set(GxB_NTHREADS, n)` immediately after creating the SuiteSparse:GraphBLAS context. The thread count is threshold-gated: graphs with more than 100 000 edges use `std::thread::available_parallelism()` cores; smaller graphs use 1 thread to avoid scheduling overhead on short operations. This setting is global to the SuiteSparse runtime for the lifetime of the process; do not call `GxB_Global_Option_set` from anywhere else.
+`MatrixSet::materialize` (in `matrices.rs`) calls `GxB_Global_Option_set(GxB_NTHREADS, n)` immediately after creating the SuiteSparse:GraphBLAS
+context. The thread count is threshold-gated: graphs with more than 100 000 edges use `std::thread::available_parallelism()` cores; smaller graphs use
+1 thread to avoid scheduling overhead on short operations. This setting is global to the SuiteSparse runtime for the lifetime of the process; do not
+call `GxB_Global_Option_set` from anywhere else.
 
 ## CSR Snapshot vs. LMDB Adjacency
 
-`CsrSnapshot` (in `csr.rs`) is a read-only in-memory Compressed Sparse Row view of outgoing edges, rebuilt in the background and swapped atomically via `arc_swap::ArcSwap`. `MatrixSet` (in `matrices.rs`) holds the GraphBLAS sparse matrices derived from the CSR snapshot.
+`CsrSnapshot` (in `csr.rs`) is a read-only in-memory Compressed Sparse Row view of outgoing edges, rebuilt in the background and swapped atomically
+via `arc_swap::ArcSwap`. `MatrixSet` (in `matrices.rs`) holds the GraphBLAS sparse matrices derived from the CSR snapshot.
 
 - **Always write to LMDB first.** The CSR snapshot is derived from LMDB, not the other way around.
-- Use LMDB adjacency databases (`out_adj`, `in_adj`) for correctness-critical reads: single-node neighbor lookups, existence checks, and anything inside a transaction.
-- Use the CSR snapshot as the hot read path for graph algorithms (BFS, DFS, PageRank, SCC). After a batch of writes, call `Graph::rebuild_csr` to refresh it.
-- `MatrixSet` is rebuilt from the CSR snapshot by `MatrixSet::materialize`. Rebuild both the CSR and the matrix set together; do not update one without the other.
+- Use LMDB adjacency databases (`out_adj`, `in_adj`) for correctness-critical reads: single-node neighbor lookups, existence checks, and anything
+  inside a transaction.
+- Use the CSR snapshot as the hot read path for graph algorithms (BFS, DFS, PageRank, SCC). After a batch of writes, call `Graph::rebuild_csr` to
+  refresh it.
+- `MatrixSet` is rebuilt from the CSR snapshot by `MatrixSet::materialize`. Rebuild both the CSR and the matrix set together; do not update one
+  without the other.
 
 ## GraphBLAS Semiring Choices
 
 Use the correct GraphBLAS semiring for each algorithm:
 
-| Algorithm | Semiring | Notes |
-|-----------|----------|-------|
-| BFS / reachability | Boolean (`any + land` / `lor + land`) | Frontier is a boolean vector; multiplication is logical AND. |
-| PageRank | FP32 / FP64 (`plus × times`) | Column-stochastic matrix `M` times rank vector; accumulate with addition. |
-| SSSP (Dijkstra / Bellman-Ford) | Min-plus tropical (`min + plus`) | Relax edge weights; `min` replaces addition and `plus` replaces multiplication. |
-| Typed pattern matching | Boolean element-wise | Per-type boolean matrix; element-wise `land` between type matrices. |
+| Algorithm                      | Semiring                              | Notes                                                                           |
+|--------------------------------|---------------------------------------|---------------------------------------------------------------------------------|
+| BFS / reachability             | Boolean (`any + land` / `lor + land`) | Frontier is a boolean vector; multiplication is logical AND.                    |
+| PageRank                       | FP32 / FP64 (`plus × times`)          | Column-stochastic matrix `M` times rank vector; accumulate with addition.       |
+| SSSP (Dijkstra / Bellman-Ford) | Min-plus tropical (`min + plus`)      | Relax edge weights; `min` replaces addition and `plus` replaces multiplication. |
+| Typed pattern matching         | Boolean element-wise                  | Per-type boolean matrix; element-wise `land` between type matrices.             |
 
 When adding a new graph algorithm, document the semiring choice in a comment above the operation.
 
@@ -97,29 +107,32 @@ When adding a new graph algorithm, document the semiring choice in a comment abo
 
 All sub-databases are opened once by `Storage::open` in `storage/lmdb.rs`:
 
-| Name | Key | Value | Notes |
-|------|-----|-------|-------|
-| `nodes` | `u64 BE` (NodeId) | msgpack `NodeRecord` | Primary node store. |
-| `edges` | `u64 BE` (EdgeId) | msgpack `EdgeRecord` | Primary edge store. |
-| `out_adj` | `u64 BE` (NodeId) | `AdjEntry` (20 B, DUPSORT + DUPFIXED) | Outgoing adjacency; one duplicate per edge. |
-| `in_adj` | `u64 BE` (NodeId) | `AdjEntry` (20 B, DUPSORT + DUPFIXED) | Incoming adjacency; mirror of `out_adj`. |
-| `label_idx` | `(u32 BE, u64 BE)` = 12 B composite | `Unit` | Secondary index: `(LabelId, NodeId)`. |
-| `type_idx` | `(u32 BE, u64 BE)` = 12 B composite | `Unit` | Secondary index: `(TypeId, EdgeId)`. |
-| `node_prop_idx` | `(LabelId, PropKeyId, encoded_val, NodeId)` variable | `Unit` | Property range index for nodes. Auto-populated for every scalar property on every `add_node` and `update_node` (semi-columnar auto-index); also used for user-created unique and required constraints. |
-| `edge_prop_idx` | `(TypeId, PropKeyId, encoded_val, EdgeId)` variable | `Unit` | Property range index for edges. |
-| `fts_postings` | `(LabelId, PropKeyId, term)` variable (DUPSORT + DUPFIXED) | 12 B `(NodeId BE, frequency BE)` | Inverted posting lists for full-text search. |
-| `fts_docs` | 16 B `(LabelId, PropKeyId, NodeId BE)` | 4 B `u32 BE` doc length | Per-document term count for BM25. |
-| `vectors` | `u64 BE` (NodeId) | raw `f32` bytes (little-endian) | Persistent vector embeddings. |
-| `meta` | `Str` key | `Bytes` value | Counters, label/type registries, FTS stats. |
+| Name            | Key                                                        | Value                                 | Notes                                                                                                                                                                                                  |
+|-----------------|------------------------------------------------------------|---------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `nodes`         | `u64 BE` (NodeId)                                          | msgpack `NodeRecord`                  | Primary node store.                                                                                                                                                                                    |
+| `edges`         | `u64 BE` (EdgeId)                                          | msgpack `EdgeRecord`                  | Primary edge store.                                                                                                                                                                                    |
+| `out_adj`       | `u64 BE` (NodeId)                                          | `AdjEntry` (20 B, DUPSORT + DUPFIXED) | Outgoing adjacency; one duplicate per edge.                                                                                                                                                            |
+| `in_adj`        | `u64 BE` (NodeId)                                          | `AdjEntry` (20 B, DUPSORT + DUPFIXED) | Incoming adjacency; mirror of `out_adj`.                                                                                                                                                               |
+| `label_idx`     | `(u32 BE, u64 BE)` = 12 B composite                        | `Unit`                                | Secondary index: `(LabelId, NodeId)`.                                                                                                                                                                  |
+| `type_idx`      | `(u32 BE, u64 BE)` = 12 B composite                        | `Unit`                                | Secondary index: `(TypeId, EdgeId)`.                                                                                                                                                                   |
+| `node_prop_idx` | `(LabelId, PropKeyId, encoded_val, NodeId)` variable       | `Unit`                                | Property range index for nodes. Auto-populated for every scalar property on every `add_node` and `update_node` (semi-columnar auto-index); also used for user-created unique and required constraints. |
+| `edge_prop_idx` | `(TypeId, PropKeyId, encoded_val, EdgeId)` variable        | `Unit`                                | Property range index for edges.                                                                                                                                                                        |
+| `fts_postings`  | `(LabelId, PropKeyId, term)` variable (DUPSORT + DUPFIXED) | 12 B `(NodeId BE, frequency BE)`      | Inverted posting lists for full-text search.                                                                                                                                                           |
+| `fts_docs`      | 16 B `(LabelId, PropKeyId, NodeId BE)`                     | 4 B `u32 BE` doc length               | Per-document term count for BM25.                                                                                                                                                                      |
+| `vectors`       | `u64 BE` (NodeId)                                          | raw `f32` bytes (little-endian)       | Persistent vector embeddings.                                                                                                                                                                          |
+| `meta`          | `Str` key                                                  | `Bytes` value                         | Counters, label/type registries, FTS stats.                                                                                                                                                            |
 
-`DUPSORT + DUPFIXED` databases require all duplicate values under a key to be the same byte length; `AdjEntry` is 20 bytes and FTS posting values are 12 bytes.
+`DUPSORT + DUPFIXED` databases require all duplicate values under a key to be the same byte length; `AdjEntry` is 20 bytes and FTS posting values are
+12 bytes.
 
 ## `deepsize::DeepSizeOf` Usage
 
 `deepsize` is used to track heap allocation of record types for memory instrumentation:
 
-- **Derive** `#[derive(DeepSizeOf)]` for types that own heap-allocated fields (`Vec<u8>`, `String`, nested structs with allocations). Examples: `NodeRecord`, `EdgeRecord`.
-- **Implement manually** for `#[repr(C, packed)]` or zero-copy structs that contain no heap allocations. Override `deep_size_of_children` to return `0`. Example: `AdjEntry`.
+- **Derive** `#[derive(DeepSizeOf)]` for types that own heap-allocated fields (`Vec<u8>`, `String`, nested structs with allocations). Examples:
+  `NodeRecord`, `EdgeRecord`.
+- **Implement manually** for `#[repr(C, packed)]` or zero-copy structs that contain no heap allocations. Override `deep_size_of_children` to return
+  `0`. Example: `AdjEntry`.
 - Do not derive `DeepSizeOf` for types that are never measured; implement it only where the size is actually read at runtime.
 
 ## Testing Rules

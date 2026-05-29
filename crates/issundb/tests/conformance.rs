@@ -581,6 +581,20 @@ fn build_scenario(
                     pending_query_kind = Some("setup");
                     idx += 1;
                 }
+            } else if let Some(graph_name) = trimmed
+                .strip_prefix("Given the ")
+                .and_then(|s| s.strip_suffix(" graph"))
+            {
+                // Named graph: load from the openCypher TCK graph fixtures.
+                // The fixture lives at external/openCypher/tck/graphs/<name>/<name>.cypher.
+                let cypher_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../external/openCypher/tck/graphs")
+                    .join(graph_name)
+                    .join(format!("{}.cypher", graph_name));
+                if let Ok(cypher) = std::fs::read_to_string(&cypher_path) {
+                    setup_queries.push(cypher);
+                }
+                idx += 1;
             } else {
                 // `Given an empty graph`, `Given any graph`, etc. — nothing to collect.
                 idx += 1;
@@ -812,11 +826,13 @@ fn parse_result_table(
 fn parse_table_cell(s: &str) -> (serde_json::Value, bool) {
     let t = s.trim();
 
-    // Node / relationship display literals like `(:Label)`, `(:L {p: v})`, `()-[:T]->()`, etc.
+    // Node / relationship display literals:
+    //   (:Label), (:L {p: v}), ()-[:T]->(), [:T], [:T {p: v}], etc.
     if (t.starts_with("(:") || t.starts_with("(") && t.contains(':'))
         || t.starts_with("()-[")
         || t.starts_with("()-[:")
         || t.starts_with("<-[")
+        || t.starts_with("[:")               // relationship literal [:TYPE] or [:TYPE {...}]
         || (t.starts_with('[') && t.contains("->"))
     {
         return (serde_json::Value::String(t.to_string()), true);

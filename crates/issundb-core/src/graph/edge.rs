@@ -113,6 +113,29 @@ impl Graph {
         Ok(edge_id)
     }
 
+    /// Update the properties of an existing edge, preserving src, dst, and type.
+    pub fn update_edge(&self, id: EdgeId, props: &impl serde::Serialize) -> Result<(), Error> {
+        let _guard = self._write_lock.lock();
+        let mut wtxn = self.storage.env.write_txn()?;
+        let existing = self
+            .storage
+            .edges
+            .get(&wtxn, &id)?
+            .ok_or(Error::EdgeNotFound(id))?;
+        let record: EdgeRecord = crate::storage::props::decode(existing)?;
+        let new_record = EdgeRecord {
+            src: record.src,
+            dst: record.dst,
+            edge_type: record.edge_type,
+            props: crate::storage::props::encode(props)?,
+        };
+        self.storage
+            .edges
+            .put(&mut wtxn, &id, &crate::storage::props::encode(&new_record)?)?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
     /// Fetch an edge record by id.
     pub fn get_edge(&self, id: EdgeId) -> Result<Option<EdgeRecord>, Error> {
         let rtxn = self.storage.env.read_txn()?;

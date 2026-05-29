@@ -262,6 +262,16 @@ pub(super) fn evaluate_expr(
                         Ok(serde_json::Value::Null)
                     }
                 }
+                // Indexing a non-list/non-map/non-string with an integer: TypeError.
+                (non_indexable, serde_json::Value::Number(_)) => Err(format!(
+                    "TypeError: cannot index into {} with an integer",
+                    match non_indexable {
+                        serde_json::Value::Bool(_) => "Boolean",
+                        serde_json::Value::Number(_) => "Number",
+                        serde_json::Value::String(_) => "String",
+                        _ => "value",
+                    }
+                )),
                 _ => Ok(serde_json::Value::Null),
             }
         }
@@ -519,16 +529,55 @@ pub(super) fn eval_binary_op(
                 return Ok(serde_json::Value::Null);
             }
             match op {
-                // Equality: NaN != NaN (IEEE 754).
+                // Equality: NaN != NaN (IEEE 754).  List equality propagates null when
+                // any element in either list is null (openCypher three-valued logic).
                 BinaryOperator::Eq => {
                     if is_nan(&lv) || is_nan(&rv) {
                         return Ok(serde_json::Value::Bool(false));
+                    }
+                    if let (serde_json::Value::Array(la), serde_json::Value::Array(ra)) = (&lv, &rv)
+                    {
+                        if la.len() != ra.len() {
+                            return Ok(serde_json::Value::Bool(false));
+                        }
+                        let mut has_null = false;
+                        for (a, b) in la.iter().zip(ra.iter()) {
+                            if *a == serde_json::Value::Null || *b == serde_json::Value::Null {
+                                has_null = true;
+                            } else if a != b {
+                                return Ok(serde_json::Value::Bool(false));
+                            }
+                        }
+                        return Ok(if has_null {
+                            serde_json::Value::Null
+                        } else {
+                            serde_json::Value::Bool(true)
+                        });
                     }
                     Ok(serde_json::Value::Bool(lv == rv))
                 }
                 BinaryOperator::Ne => {
                     if is_nan(&lv) || is_nan(&rv) {
                         return Ok(serde_json::Value::Bool(true));
+                    }
+                    if let (serde_json::Value::Array(la), serde_json::Value::Array(ra)) = (&lv, &rv)
+                    {
+                        if la.len() != ra.len() {
+                            return Ok(serde_json::Value::Bool(true));
+                        }
+                        let mut has_null = false;
+                        for (a, b) in la.iter().zip(ra.iter()) {
+                            if *a == serde_json::Value::Null || *b == serde_json::Value::Null {
+                                has_null = true;
+                            } else if a != b {
+                                return Ok(serde_json::Value::Bool(true));
+                            }
+                        }
+                        return Ok(if has_null {
+                            serde_json::Value::Null
+                        } else {
+                            serde_json::Value::Bool(false)
+                        });
                     }
                     Ok(serde_json::Value::Bool(lv != rv))
                 }
@@ -759,7 +808,6 @@ pub(super) fn eval_function_call(
             if args.len() != 1 {
                 return Err("type() requires exactly 1 argument".into());
             }
-            // Handle null argument.
             let val = evaluate_expr(graph, path, &args[0], params)?;
             if val == serde_json::Value::Null {
                 return Ok(serde_json::Value::Null);
@@ -777,15 +825,31 @@ pub(super) fn eval_function_call(
                                     .map(serde_json::Value::String)
                                     .unwrap_or(serde_json::Value::Null));
                             }
+                            return Ok(serde_json::Value::Null);
                         }
                         Some(GraphBinding::Scalar(serde_json::Value::Null)) => {
                             return Ok(serde_json::Value::Null);
+                        }
+                        Some(GraphBinding::Node(_)) => {
+                            return Err(
+                                "TypeError: type() requires a relationship, got a node".into()
+                            );
                         }
                         _ => {}
                     }
                 }
             }
-            Ok(serde_json::Value::Null)
+            // Non-variable argument that resolved to a non-null, non-edge value: TypeError.
+            match &val {
+                serde_json::Value::String(_)
+                | serde_json::Value::Number(_)
+                | serde_json::Value::Bool(_)
+                | serde_json::Value::Array(_)
+                | serde_json::Value::Object(_) => {
+                    Err("TypeError: type() requires a relationship argument".into())
+                }
+                _ => Ok(serde_json::Value::Null),
+            }
         }
         "id" => {
             if args.len() != 1 {
@@ -825,6 +889,12 @@ pub(super) fn eval_function_call(
                 serde_json::Value::Null => Ok(serde_json::Value::Null),
                 serde_json::Value::Bool(b) => Ok(serde_json::Value::String(b.to_string())),
                 serde_json::Value::Number(n) => Ok(serde_json::Value::String(n.to_string())),
+                // Temporal values are stored as objects carrying their canonical ISO string
+                // in `__str__`; toString() returns that representation.
+                serde_json::Value::Object(ref map) if map.contains_key("__str__") => map
+                    .get("__str__")
+                    .cloned()
+                    .ok_or_else(|| "toString() temporal value missing __str__".into()),
                 // Lists, maps, nodes, and edges cannot be converted to string.
                 serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
                     Err("TypeError: toString() cannot convert list or map to string".into())
@@ -1942,23 +2012,34 @@ fn apply_date_overrides(
 ) -> Result<NaiveDate, String> {
     let get_i64 = |k: &str| -> Option<i64> { map.get(k)?.as_i64() };
 
-    // If week override is specified, rebuild from ISO week.
+    // If week override is specified, rebuild from ISO week. The dayOfWeek is inherited from
+    // the base date (per openCypher selection semantics), not reset to Monday.
     if let Some(week) = get_i64("week") {
         let year = get_i64("year").unwrap_or(base.iso_week().year() as i64) as i32;
-        let dow_num = get_i64("dayOfWeek").unwrap_or(1);
+        let dow_num = get_i64("dayOfWeek").unwrap_or(base.weekday().number_from_monday() as i64);
         let wd = num_to_weekday(dow_num as u32)
             .ok_or_else(|| format!("invalid dayOfWeek: {}", dow_num))?;
         return NaiveDate::from_isoywd_opt(year, week as u32, wd)
             .ok_or_else(|| format!("invalid ISO week override: {}-W{}", year, week));
     }
 
-    // If quarter override is specified.
+    // If quarter override is specified. The dayOfQuarter is inherited from the base date
+    // (per openCypher selection semantics), not the base day-of-month.
     if let Some(quarter) = get_i64("quarter") {
         let year = get_i64("year").unwrap_or(base.year() as i64) as i32;
         let start_month = ((quarter - 1) * 3 + 1) as u32;
-        let day = get_i64("day").unwrap_or(base.day() as i64) as u32;
+        let day_of_quarter = match get_i64("dayOfQuarter") {
+            Some(d) => d,
+            None => {
+                let base_q_start_month = ((base.month() as i64 - 1) / 3) * 3 + 1;
+                let base_q_start =
+                    NaiveDate::from_ymd_opt(base.year(), base_q_start_month as u32, 1)
+                        .ok_or_else(|| "invalid base quarter start".to_string())?;
+                base.signed_duration_since(base_q_start).num_days() + 1
+            }
+        };
         return NaiveDate::from_ymd_opt(year, start_month, 1)
-            .map(|d| d + Duration::days(day as i64 - 1))
+            .map(|d| d + Duration::days(day_of_quarter - 1))
             .ok_or_else(|| format!("invalid quarter override: {}", quarter));
     }
 
@@ -2063,10 +2144,16 @@ fn time_to_obj(t: NaiveTime, tz: Option<&str>, type_name: &str) -> serde_json::V
             format!("{}.{}", t.format("%H:%M:%S"), trimmed)
         }
     };
+    let local_ns = t.hour() as i64 * 3_600_000_000_000
+        + t.minute() as i64 * 60_000_000_000
+        + t.second() as i64 * 1_000_000_000
+        + t.nanosecond() as i64;
     let sort_key = if let Some(z) = tz {
-        format!("{}{}", t.format("%H:%M:%S%.9f"), z)
+        let offset_ns = tz_offset_seconds(z) * 1_000_000_000;
+        let utc_ns = (local_ns - offset_ns).rem_euclid(86_400_000_000_000);
+        format!("{:020}", utc_ns)
     } else {
-        t.format("%H:%M:%S%.9f").to_string()
+        format!("{:020}", local_ns)
     };
     if let Some(z) = tz {
         m.insert(
@@ -2083,6 +2170,8 @@ fn time_to_obj(t: NaiveTime, tz: Option<&str>, type_name: &str) -> serde_json::V
 }
 
 fn tz_offset_seconds(tz: &str) -> i64 {
+    // Drop an optional bracketed zone-name suffix, e.g. "+02:00[Europe/Stockholm]".
+    let tz = tz.split('[').next().unwrap_or(tz);
     // Parse "+HH:MM" or "-HH:MM" or "Z"
     if tz == "Z" {
         return 0;
@@ -2153,23 +2242,41 @@ fn make_time(arg: serde_json::Value) -> Result<serde_json::Value, String> {
 /// Handles: Z, +HH:MM, -HH:MM, +HHMM, -HHMM, +HH, -HH
 /// Normalizes all to +HH:MM form, with +00:00 / -00:00 → "Z".
 fn split_tz(s: &str) -> (&str, Option<String>) {
+    // Strip an optional bracketed IANA zone-name suffix, e.g. "[Europe/Stockholm]". The zone
+    // name is preserved and appended to the resolved offset (e.g. "+02:00[Europe/Stockholm]").
+    let (s, zone) = match (s.rfind('['), s.strip_suffix(']')) {
+        (Some(open), Some(_)) => (&s[..open], Some(s[open + 1..s.len() - 1].to_string())),
+        _ => (s, None),
+    };
+
+    // Append the zone-name suffix (if any) to a resolved numeric offset.
+    let with_zone = |offset: String| -> String {
+        match &zone {
+            Some(z) => format!("{}[{}]", offset, z),
+            None => offset,
+        }
+    };
+
     if let Some(rest) = s.strip_suffix('Z') {
-        return (rest, Some("Z".to_string()));
+        return (rest, Some(with_zone("Z".to_string())));
     }
-    // Find last +/- that's after position 1 (avoid matching sign in time itself)
-    // We search from the right for +/-
+    // Find last +/- that's after position 1 (avoid matching sign in time itself).
+    // We search from the right for +/-.
     let bytes = s.as_bytes();
     for i in (1..s.len()).rev() {
         let c = bytes[i] as char;
         if c == '+' || c == '-' {
             let tz_raw = &s[i..];
             let time_part = &s[..i];
-            // Parse the timezone offset
-            let normalized = normalize_tz(tz_raw);
-            if let Some(tz) = normalized {
-                return (time_part, Some(tz));
+            // Parse the timezone offset.
+            if let Some(tz) = normalize_tz(tz_raw) {
+                return (time_part, Some(with_zone(tz)));
             }
         }
+    }
+    // No numeric offset present. If a zone name was given, resolve it to an offset.
+    if let Some(z) = zone {
+        return (s, Some(resolve_iana_tz(&z)));
     }
     (s, None)
 }
@@ -2323,7 +2430,21 @@ fn datetime_to_obj(dt: NaiveDateTime, tz: Option<&str>, type_name: &str) -> serd
     } else {
         format!("{}T{}", d.format("%Y-%m-%d"), time_repr)
     };
-    let sort_key = format!("{}T{}", d.format("%Y-%m-%d"), t.format("%H:%M:%S%.9f"));
+    // Sort key: for local datetimes use ISO string (already lexicographically correct);
+    // for timezone-aware datetimes shift to UTC so offsets compare correctly.
+    let sort_key = if let Some(z) = tz {
+        // Convert local datetime to UTC by subtracting the offset.
+        let offset_secs = tz_offset_seconds(z);
+        let utc_dt = dt - chrono::Duration::seconds(offset_secs);
+        format!(
+            "{}T{}",
+            utc_dt.format("%Y-%m-%d"),
+            utc_dt.format("%H:%M:%S%.9f")
+        )
+    } else {
+        // Local datetime: ISO string sorts correctly for all dates in any year.
+        format!("{}T{}", dt.format("%Y-%m-%d"), dt.format("%H:%M:%S%.9f"))
+    };
     temporal_obj(type_name, m, str_repr, sort_key)
 }
 
@@ -2336,25 +2457,33 @@ fn naive_datetime_from_map(
 }
 
 fn naive_datetime_from_str(s: &str) -> Result<(NaiveDateTime, Option<String>), String> {
-    let (main, tz) = if let Some(t_pos) = s.find('T') {
-        let (date_part, rest) = s.split_at(t_pos);
-        let rest = &rest[1..]; // skip 'T'
+    // Split date and time at the 'T' separator.
+    let (date_str, time_str, tz) = if let Some(t_pos) = s.find('T') {
+        let date_part = &s[..t_pos];
+        let rest = &s[t_pos + 1..];
         let (time_part, tz_part) = split_tz(rest);
-        (format!("{}T{}", date_part, time_part), tz_part)
+        (date_part, time_part, tz_part)
     } else {
-        (s.to_string(), None)
+        // No T separator: try date-only formats (defaulting time to midnight).
+        let d = naive_date_from_str(s).map_err(|_| format!("cannot parse datetime: '{}'", s))?;
+        return Ok((
+            d.and_hms_opt(0, 0, 0)
+                .ok_or_else(|| format!("failed to construct midnight for date: '{}'", s))?,
+            None,
+        ));
     };
 
-    if let Ok(dt) = NaiveDateTime::parse_from_str(&main, "%Y-%m-%dT%H:%M:%S%.f") {
-        return Ok((dt, tz));
-    }
-    if let Ok(dt) = NaiveDateTime::parse_from_str(&main, "%Y-%m-%dT%H:%M:%S") {
-        return Ok((dt, tz));
-    }
-    if let Ok(dt) = NaiveDateTime::parse_from_str(&main, "%Y-%m-%dT%H:%M") {
-        return Ok((dt, tz));
-    }
-    Err(format!("cannot parse datetime: '{}'", s))
+    // Parse date and time independently using the comprehensive parsers.
+    // This handles all ISO 8601 variants: extended, basic, week, ordinal, compact.
+    let date =
+        naive_date_from_str(date_str).map_err(|_| format!("cannot parse datetime: '{}'", s))?;
+    let time = if time_str.is_empty() {
+        NaiveTime::from_hms_opt(0, 0, 0)
+            .ok_or_else(|| "failed to construct midnight NaiveTime".to_string())?
+    } else {
+        parse_time_str(time_str).map_err(|_| format!("cannot parse datetime: '{}'", s))?
+    };
+    Ok((NaiveDateTime::new(date, time), tz))
 }
 
 fn make_localdatetime(arg: serde_json::Value) -> Result<serde_json::Value, String> {
@@ -2589,14 +2718,14 @@ fn parse_iso_duration(s: &str) -> Result<(i64, i64, i64, i64), String> {
         (&s[1..], None)
     };
 
-    let mut years = 0i64;
-    let mut months = 0i64;
-    let mut weeks = 0i64;
-    let mut days = 0i64;
-    let mut hours = 0i64;
-    let mut minutes = 0i64;
-    let mut secs = 0i64;
-    let mut nanos = 0i64;
+    // Accumulate into the three duration groups (months, days, seconds) as f64 so that a
+    // fractional component cascades into the next smaller unit, per openCypher duration
+    // semantics: e.g. P0.5D = PT12H, PT0.75M = PT45S, P1.5Y = P1Y6M. Cascades use exact
+    // ratios only (year=12 months, week=7 days, day=86400 s, hour=3600 s, minute=60 s); a
+    // fractional month has no exact day ratio and so is truncated.
+    let mut months_f = 0f64;
+    let mut days_f = 0f64;
+    let mut seconds_f = 0f64;
 
     let mut parse_component = |part: &str, is_time: bool| -> Result<(), String> {
         let mut buf = String::new();
@@ -2608,20 +2737,17 @@ fn parse_iso_duration(s: &str) -> Result<(i64, i64, i64, i64), String> {
                 buf.clear();
                 if is_time {
                     match c {
-                        'H' => hours = v as i64,
-                        'M' => minutes = v as i64,
-                        'S' => {
-                            secs = v as i64;
-                            nanos = ((v.fract()) * 1_000_000_000.0) as i64;
-                        }
+                        'H' => seconds_f += v * 3600.0,
+                        'M' => seconds_f += v * 60.0,
+                        'S' => seconds_f += v,
                         _ => {}
                     }
                 } else {
                     match c {
-                        'Y' => years = v as i64,
-                        'M' => months = v as i64,
-                        'W' => weeks = v as i64,
-                        'D' => days = v as i64,
+                        'Y' => months_f += v * 12.0,
+                        'M' => months_f += v,
+                        'W' => days_f += v * 7.0,
+                        'D' => days_f += v,
                         _ => {}
                     }
                 }
@@ -2635,9 +2761,13 @@ fn parse_iso_duration(s: &str) -> Result<(i64, i64, i64, i64), String> {
         parse_component(tp, true)?;
     }
 
-    let total_months = years * 12 + months;
-    let total_days = weeks * 7 + days;
-    let total_seconds = hours * 3600 + minutes * 60 + secs;
+    // Cascade the fractional day part down into seconds before splitting seconds and nanos.
+    seconds_f += days_f.fract() * 86_400.0;
+
+    let total_months = months_f.trunc() as i64;
+    let total_days = days_f.trunc() as i64;
+    let total_seconds = seconds_f.trunc() as i64;
+    let nanos = (seconds_f.fract() * 1_000_000_000.0).round() as i64;
     Ok((total_months, total_days, total_seconds, nanos))
 }
 

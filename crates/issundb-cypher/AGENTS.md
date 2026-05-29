@@ -67,75 +67,68 @@ than a global parser state.
 
 Follow this checklist in order:
 
-1. **AST variant**: add the new clause type to `src/ast.rs`. Derive `Clone`
-   and `PartialEq`.
-2. **Parser rule**: add a parsing function in `src/parser.rs`. Wire it into
-   the dispatch table at the top of `parse`.
-3. **Logical planner arm**: add a match arm in `LogicalPlanner::plan_statement`
-   or `plan_query` in `src/plan/logical.rs`.
-4. **Physical planner arm**: add a match arm in `PhysicalPlanner::plan` in
-   `src/plan/physical.rs`.
-5. **Optimizer arm** (if applicable): if the new clause benefits from
-   rewriting, add a rewrite rule in `src/plan/optimize.rs`. Skip this step if
-   no rewrite applies; do not add a pass-through arm unless the optimizer
+1. **AST variant**: add the new clause type to `src/ast.rs`. Derive `Clone` and `PartialEq`.
+2. **Parser rule**: add a parsing function in `src/parser.rs`. Wire it into the dispatch table at the top of `parse`.
+3. **Logical planner arm**: add a match arm in `LogicalPlanner::plan` in `src/plan/logical.rs`.
+4. **Physical planner arm**: add a match arm in `PhysicalPlanner::plan` in `src/plan/physical.rs`.
+5. **Optimizer arm** (if applicable): if the new clause benefits from rewriting, add a rewrite rule in `src/plan/optimize.rs`. Skip this step if no
+   rewrite applies; do not add a pass-through arm unless the optimizer
    explicitly needs to descend into the clause.
-6. **Executor arm**: add a match arm in the physical operator dispatch loop
-   in `src/exec.rs`.
-7. **Conformance test**: add at least one TCK scenario in
-   `crates/issundb/tests/conformance/` gated on `ISSUNDB_CONFORMANCE=1`.
+6. **Executor arm**: add a match arm in the physical operator dispatch loop in `execute_physical` (`src/exec/read.rs`).
+7. **Conformance test**: add at least one TCK scenario in `crates/issundb/tests/conformance/` gated on `ISSUNDB_CONFORMANCE=1`.
 
 All seven steps are required for the change to be considered complete.
 
 ## `FilterExpr` vs. `Expr`
 
-- `Expr` (defined in `src/ast.rs`) is the general expression type produced by
-  the parser. It covers literals, property accesses, function calls,
+- `Expr` (defined in `src/ast.rs`) is the general expression type produced by the parser. It covers literals, property accesses, function calls,
   arithmetic, comparisons, and boolean combinators.
-- `FilterExpr` (defined in `src/plan/logical.rs`) is the typed predicate
-  representation used inside `LogicalOperator::Filter` and
-  `PhysicalOperator::Filter`. It has explicit variants for common binary
-  comparisons (`Eq`, `Ne`, `Lt`, `Gt`, `Le`, `Ge`), a `HasLabel` variant for
-  label checks, and an `Expr` catch-all for predicates that do not fit a named
-  variant (IS NULL, quantifiers, compound boolean expressions).
-- Conversion from `Expr` to `FilterExpr` happens in `LogicalPlanner`. Do not
-  perform this conversion in the parser or executor.
+- `FilterExpr` (defined in `src/plan/logical.rs`) is the typed predicate representation used inside `LogicalOperator::Filter` and
+  `PhysicalOperator::Filter`. It has explicit variants for common binary comparisons (`Eq`, `Ne`, `Lt`, `Gt`, `Le`, `Ge`), a `HasLabel` variant for
+  label checks, and an `Expr` catch-all for predicates that do not fit a named variant (IS NULL, quantifiers, compound boolean expressions).
+- Conversion from `Expr` to `FilterExpr` happens in `LogicalPlanner`. Do not perform this conversion in the parser or executor.
 
 ## `WhereClause` Variants
 
-`WhereClause` (in `src/ast.rs`) covers the three forms that appear in Cypher
-WHERE positions:
+`WhereClause` (in `src/ast.rs`) covers the forms that appear in Cypher WHERE positions:
 
-- `Simple(FilterExpr)`: a single predicate, e.g. `WHERE n.age > 30`.
-- `And(Vec<FilterExpr>)` / `Or(Vec<FilterExpr>)`: compound predicates joined
-  with AND or OR.
-- `Expr(Expr)`: an arbitrary expression used for IS NULL checks, quantifier
-  expressions (`ANY`, `ALL`, `NONE`, `SINGLE`), and nested boolean
-  sub-expressions that do not reduce to a `FilterExpr` variant.
+- `Eq`, `Ne`, `Lt`, `Gt`, `Le`, `Ge`: a single binary comparison between two `Expr` operands, e.g. `WHERE n.age > 30`.
+- `Expr(Expr)`: an arbitrary boolean expression used for IS NULL checks, quantifier expressions (`ANY`, `ALL`, `NONE`, `SINGLE`), and compound boolean
+  sub-expressions (AND, OR, NOT) that do not reduce to a single comparison variant.
 
-When lowering a `WhereClause` to a plan node, prefer `FilterExpr` variants for
-simple comparisons so the optimizer can inspect and reorder them. Fall back to
-`FilterExpr::Expr` only when no named variant applies.
+`LogicalPlanner` lowers each `WhereClause` variant to the matching `FilterExpr` variant (`Eq` to `FilterExpr::Eq`, and so on, with `Expr` to
+`FilterExpr::Expr`).
+`FilterExpr` additionally has a `HasLabel` variant for label checks. Prefer the named comparison variants over `Expr` so the optimizer can inspect and
+reorder them; fall back to `Expr` only when no comparison variant applies.
 
 ## `MultiwayJoin` and Cyclic Pattern Execution
 
-`PhysicalOperator::MultiwayJoin` is emitted by the `rewrite_closing_expands` pass (in `optimize.rs`) when a single-hop directed `Expand` node's `dst_var` is already bound by an earlier operator in the same plan tree. This is the "closing hop" of a cyclic pattern (triangles, cliques, etc.).
+`PhysicalOperator::MultiwayJoin` is emitted by the `rewrite_closing_expands` pass (in `optimize.rs`) when a single-hop directed `Expand` node's
+`dst_var` is already bound by an earlier operator in the same plan tree. This is the "closing hop" of a cyclic pattern (triangles, cliques, etc.).
 
 The executor (`exec/read.rs`) handles `MultiwayJoin` by:
+
 1. Collecting unique `closing_src_var` node IDs from all input rows.
 2. Bulk-expanding from those nodes once via `expand_multi_type`.
 3. Building a `(src_node, dst_node) → EdgeId` hash map.
 4. For each input row, doing an O(1) lookup to check the closing edge and bind `closing_rel_var`.
 
-`MultiwayJoin` is optimizer-generated only: `PhysicalPlanner::plan` never emits it. Every match arm in `optimize.rs` that recurses into operator children must handle the `MultiwayJoin` variant.
+`MultiwayJoin` is optimizer-generated only: `PhysicalPlanner::plan` never emits it. Every match arm in `optimize.rs` that recurses into operator
+children must handle the `MultiwayJoin` variant.
 
 ## Factorized Execution
 
-`exec/factorize.rs` defines `FactorizedRecordGroup`: a shared `Arc<PathMap>` prefix (bindings from ancestor hops) plus a `Vec` of per-row extensions `(rel_var, rel_binding, dst_var, dst_binding)` for the current hop. Using `Arc` avoids O(shared_vars) HashMap clone cost for every destination; only the two new bindings are paid per output row.
+`exec/factorize.rs` defines `FactorizedRecordGroup`: a shared `Arc<PathMap>` prefix (bindings from ancestor hops) plus a `Vec` of per-row extensions
+`(rel_var, rel_binding, dst_var, dst_binding)` for the current hop. Using `Arc` avoids O(shared_vars) HashMap clone cost for every destination; only
+the two new bindings are paid per output row.
 
 `execute_filter_over_expand` (in `exec/read.rs`) handles the `Filter { input: Expand(single-hop, directed) }` pattern:
-- **Factorized fast path**: when the filter expression does not reference `rel_var` or `dst_var`, it is evaluated once per source path. Sources that fail skip all their destinations — zero PathMap clones for rejected sources.
+
+- **Factorized fast path**: when the filter expression does not reference `rel_var` or `dst_var`, it is evaluated once per source path. Sources that
+  fail skip all their destinations, costing zero PathMap clones for rejected sources.
 - **Per-row fallback**: when the filter touches the expansion variables, the full path is materialized before evaluation.
-- **`HasLabel` filters**: always route through the existing bulk-GraphBLAS path; `execute_filter_over_expand` is not called for `HasLabel` expressions.
+- **`HasLabel` filters**: always route through the existing bulk-GraphBLAS path; `execute_filter_over_expand` is not called for `HasLabel`
+  expressions.
 
 ## Executor Mutation Safety
 
@@ -146,7 +139,7 @@ CREATE, SET, DELETE, and MERGE all mutate the graph:
   same transaction.
 - All graph mutations go through `Graph` public methods (`add_node`,
   `add_edge`, `update_node`, `delete_node`, `delete_edge`). Do not call
-  `Storage` directly from `exec.rs`.
+  `Storage` directly from the `exec` module.
 - After a mutation, the caller is responsible for deciding whether to rebuild
   the CSR snapshot. The executor does not rebuild it automatically.
 

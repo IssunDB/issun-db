@@ -70,10 +70,19 @@ impl ReadTxn<'_> {
         label: &str,
         property: &str,
         min_val: Option<PropValue>,
+        min_inclusive: bool,
         max_val: Option<PropValue>,
+        max_inclusive: bool,
     ) -> Result<Vec<NodeId>, Error> {
-        self.graph
-            .nodes_by_property_range_impl(&self.rtxn, label, property, min_val, max_val)
+        self.graph.nodes_by_property_range_impl(
+            &self.rtxn,
+            label,
+            property,
+            min_val,
+            min_inclusive,
+            max_val,
+            max_inclusive,
+        )
     }
 
     pub fn edges_by_property(
@@ -206,10 +215,19 @@ impl WriteTxn<'_> {
         label: &str,
         property: &str,
         min_val: Option<PropValue>,
+        min_inclusive: bool,
         max_val: Option<PropValue>,
+        max_inclusive: bool,
     ) -> Result<Vec<NodeId>, Error> {
-        self.graph
-            .nodes_by_property_range_impl(&self.wtxn, label, property, min_val, max_val)
+        self.graph.nodes_by_property_range_impl(
+            &self.wtxn,
+            label,
+            property,
+            min_val,
+            min_inclusive,
+            max_val,
+            max_inclusive,
+        )
     }
 
     pub fn edges_by_property(
@@ -738,7 +756,9 @@ mod tests {
                 "Person",
                 "age",
                 Some(PropValue::Int(20)),
+                true,
                 Some(PropValue::Int(28)),
+                true,
             )
             .unwrap();
         assert_eq!(pr.len(), 1);

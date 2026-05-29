@@ -41,6 +41,7 @@ pyo3 = { version = "0.22", features = ["abi3-py38"] }
 walkdir = "2"
 roaring = "0.10"
 deepsize = { version = "0.2", features = ["derive"] }
+memmap2 = "0.9"
 
 [profile.release]
 strip = "debuginfo"

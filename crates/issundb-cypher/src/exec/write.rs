@@ -16,7 +16,12 @@ fn eval_properties(
 ) -> Result<serde_json::Value, String> {
     let mut obj = serde_json::Map::new();
     for (k, v) in props {
-        obj.insert(k.clone(), evaluate_expr(graph, path, v, params)?);
+        let val = evaluate_expr(graph, path, v, params)?;
+        // Cypher semantics: assigning null to a property is equivalent to
+        // removing it — null-valued properties are not stored.
+        if val != serde_json::Value::Null {
+            obj.insert(k.clone(), val);
+        }
     }
     Ok(serde_json::Value::Object(obj))
 }
@@ -574,6 +579,38 @@ pub(super) fn execute_merge_and_return(
     })
 }
 
+/// Apply a single REMOVE item (property deletion) to the node bound in `path`.
+pub(super) fn apply_remove_item(
+    graph: &Graph,
+    item: &RemoveItem,
+    path: &super::PathMap,
+) -> Result<(), String> {
+    match item {
+        RemoveItem::Property { variable, property } => {
+            let node_id = match path.get(variable) {
+                Some(GraphBinding::Node(id)) => *id,
+                _ => return Ok(()), // null or unbound: silently skip
+            };
+            let record = graph
+                .get_node(node_id)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("node not found: {}", node_id))?;
+            let mut props: serde_json::Value =
+                rmp_serde::from_slice(&record.props).map_err(|e| e.to_string())?;
+            if let Some(obj) = props.as_object_mut() {
+                obj.remove(property);
+            }
+            graph
+                .update_node(node_id, &props)
+                .map_err(|e| e.to_string())?;
+        }
+        RemoveItem::Label { .. } => {
+            // Label removal is not yet supported; silently skip.
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn execute_remove(
     graph: &Graph,
     stmt: &RemoveStatement,
@@ -728,6 +765,10 @@ fn execute_foreach_body(
         }
         Statement::Remove(r) => {
             execute_remove(graph, r, params)?;
+        }
+        // Write-only pipeline query (e.g., standalone CREATE parsed as Statement::Query).
+        Statement::Query(q) if q.return_clause.items.is_empty() => {
+            super::read::execute_read_query(graph, q, params).map_err(|e| e.to_string())?;
         }
         _ => {
             return Err("unsupported statement in FOREACH body".into());

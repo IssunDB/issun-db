@@ -5,7 +5,7 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use clap::Parser;
 use issundb::Graph;
 use tracing::info;
-use tracing_subscriber::{fmt, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt};
 
 #[derive(Parser, Debug)]
 #[command(name = "issundb-server", about = "HTTP server for IssunDB")]

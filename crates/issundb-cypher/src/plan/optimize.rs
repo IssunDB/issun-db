@@ -73,6 +73,26 @@ impl Optimizer {
                 },
                 Vec::new(),
             ),
+            PhysicalOperator::NodeRangeScan {
+                variable,
+                label,
+                property,
+                lo,
+                lo_inclusive,
+                hi,
+                hi_inclusive,
+            } => (
+                PhysicalOperator::NodeRangeScan {
+                    variable,
+                    label,
+                    property,
+                    lo,
+                    lo_inclusive,
+                    hi,
+                    hi_inclusive,
+                },
+                Vec::new(),
+            ),
             PhysicalOperator::Expand {
                 input,
                 src_var,
@@ -279,11 +299,12 @@ impl Optimizer {
                 min_hops,
                 max_hops,
             },
-            PhysicalOperator::Filter { .. } => {
-                unreachable!(
-                    "`extract_filters` must be called before `reorder_operators`; Filter nodes must not be present at this stage"
-                )
-            }
+            // Filter nodes inside opaque barrier-Project subtrees are not stripped by
+            // `extract_filters`.  Pass them through so that reordering does not panic.
+            PhysicalOperator::Filter { input, expression } => PhysicalOperator::Filter {
+                input: Box::new(Self::reorder_operators(*input, stats)),
+                expression,
+            },
             PhysicalOperator::Project {
                 input,
                 items,
@@ -318,6 +339,7 @@ impl Optimizer {
             },
             leaf @ PhysicalOperator::LabelScan { .. } => leaf,
             leaf @ PhysicalOperator::NodeIndexScan { .. } => leaf,
+            leaf @ PhysicalOperator::NodeRangeScan { .. } => leaf,
             // Aggregate, Sort, and Limit are placed above the plan by the logical planner
             // after the Join/Expand/Filter tree is built. Reordering does not descend into
             // them; they are transparent pass-throughs here.
@@ -376,6 +398,7 @@ impl Optimizer {
             PhysicalOperator::SingleRow => 1,
             PhysicalOperator::Unwind { input, .. } => 1 + Self::plan_weight(input, stats),
             PhysicalOperator::NodeIndexScan { .. } => 2,
+            PhysicalOperator::NodeRangeScan { .. } => 3,
             PhysicalOperator::LabelScan { label, .. } => {
                 if let Some(lbl) = label {
                     if let Some(s) = stats {
@@ -402,14 +425,10 @@ impl Optimizer {
                 };
                 input_weight.saturating_mul(rel_weight)
             }
-            // Filter nodes are stripped by `extract_filters` before `plan_weight` is ever
-            // called; reaching this arm means the optimization pipeline was bypassed.
-            PhysicalOperator::Filter { .. } => {
-                unreachable!(
-                    "`extract_filters` must run before `plan_weight`; \
-                     Filter nodes must not be present at this stage"
-                )
-            }
+            // Filter nodes inside barrier-Project subtrees are not stripped by
+            // `extract_filters` (barrier Projects are opaque).  When `plan_weight`
+            // recurses into such a subtree, treat the Filter as transparent.
+            PhysicalOperator::Filter { input, .. } => Self::plan_weight(input, stats),
             PhysicalOperator::Project { input, .. } => Self::plan_weight(input, stats),
             PhysicalOperator::HashJoin { left, right } => {
                 Self::plan_weight(left, stats).saturating_mul(Self::plan_weight(right, stats))
@@ -430,6 +449,40 @@ impl Optimizer {
     /// Push collected filters down the plan tree to the lowest possible nodes where they can be evaluated.
     fn push_down_filters(op: PhysicalOperator, pending: &mut Vec<FilterExpr>) -> PhysicalOperator {
         match op {
+            PhysicalOperator::NodeRangeScan {
+                variable,
+                label,
+                property,
+                lo,
+                lo_inclusive,
+                hi,
+                hi_inclusive,
+            } => {
+                let mut current_node = PhysicalOperator::NodeRangeScan {
+                    variable: variable.clone(),
+                    label,
+                    property,
+                    lo,
+                    lo_inclusive,
+                    hi,
+                    hi_inclusive,
+                };
+                let bound = Self::bound_vars(&current_node);
+                let mut i = 0;
+                while i < pending.len() {
+                    let ref_vars = Self::referenced_vars(&pending[i]);
+                    if ref_vars.is_subset(&bound) {
+                        let filter_expr = pending.remove(i);
+                        current_node = PhysicalOperator::Filter {
+                            input: Box::new(current_node),
+                            expression: filter_expr,
+                        };
+                    } else {
+                        i += 1;
+                    }
+                }
+                current_node
+            }
             PhysicalOperator::NodeIndexScan {
                 variable,
                 label,
@@ -867,6 +920,9 @@ impl Optimizer {
             PhysicalOperator::NodeIndexScan { variable, .. } => {
                 vars.insert(variable.clone());
             }
+            PhysicalOperator::NodeRangeScan { variable, .. } => {
+                vars.insert(variable.clone());
+            }
             PhysicalOperator::Expand {
                 input,
                 rel_var,
@@ -1062,16 +1118,84 @@ impl Optimizer {
             Expr::Prop(var, _) => {
                 vars.insert(var.clone());
             }
-            Expr::Literal(_) | Expr::Param(_) => {}
-            // Aggregate expressions and CountStar reference variables inside their
-            // inner expressions; delegate to recursive collection if needed.
-            Expr::CountStar => {}
+            Expr::Literal(_) | Expr::Param(_) | Expr::CountStar => {}
+            // Aggregate expressions delegate to recursive collection on their inner expression.
             Expr::Agg(_, inner) => Self::collect_expr_vars(inner, vars),
-            _ => {}
+            Expr::BinaryOp { left, right, .. } => {
+                Self::collect_expr_vars(left, vars);
+                Self::collect_expr_vars(right, vars);
+            }
+            Expr::IsNull(inner) | Expr::IsNotNull(inner) | Expr::Not(inner) => {
+                Self::collect_expr_vars(inner, vars);
+            }
+            Expr::FunctionCall { args, .. } => {
+                for arg in args {
+                    Self::collect_expr_vars(arg, vars);
+                }
+            }
+            Expr::Case {
+                subject,
+                arms,
+                else_expr,
+            } => {
+                if let Some(s) = subject {
+                    Self::collect_expr_vars(s, vars);
+                }
+                for arm in arms {
+                    Self::collect_expr_vars(&arm.when, vars);
+                    Self::collect_expr_vars(&arm.then, vars);
+                }
+                if let Some(e) = else_expr {
+                    Self::collect_expr_vars(e, vars);
+                }
+            }
+            Expr::Subscript { expr, index } => {
+                Self::collect_expr_vars(expr, vars);
+                Self::collect_expr_vars(index, vars);
+            }
+            Expr::Slice { expr, start, end } => {
+                Self::collect_expr_vars(expr, vars);
+                if let Some(s) = start {
+                    Self::collect_expr_vars(s, vars);
+                }
+                if let Some(e) = end {
+                    Self::collect_expr_vars(e, vars);
+                }
+            }
+            // variable is a local binding; do not insert it. Recurse into list and predicate.
+            Expr::Quantifier {
+                list, predicate, ..
+            } => {
+                Self::collect_expr_vars(list, vars);
+                Self::collect_expr_vars(predicate, vars);
+            }
+            // variable is a local binding; do not insert it. Recurse into list, predicate, and transform.
+            Expr::ListComprehension {
+                list,
+                predicate,
+                transform,
+                ..
+            } => {
+                Self::collect_expr_vars(list, vars);
+                if let Some(p) = predicate {
+                    Self::collect_expr_vars(p, vars);
+                }
+                if let Some(t) = transform {
+                    Self::collect_expr_vars(t, vars);
+                }
+            }
+            Expr::HasLabel { variable, .. } => {
+                vars.insert(variable.clone());
+            }
         }
     }
 
-    /// Recursively optimize LabelScan + Filter combinations into NodeIndexScan if an index is available.
+    /// Recursively optimize LabelScan + Filter combinations into NodeIndexScan or NodeRangeScan.
+    ///
+    /// - `Eq` filter → `NodeIndexScan` (point lookup)
+    /// - `Lt/Gt/Le/Ge` filter → `NodeRangeScan` (range scan)
+    /// - A second relational filter stacked on an existing `NodeRangeScan` for the same
+    ///   property narrows the bounds rather than adding a post-filter.
     fn optimize_index_scans(
         op: PhysicalOperator,
         stats: Option<&dyn StatsProvider>,
@@ -1079,44 +1203,288 @@ impl Optimizer {
         match op {
             PhysicalOperator::Filter { input, expression } => {
                 let optimized_input = Self::optimize_index_scans(*input, stats);
+
+                // Helper: extract (variable, property, value_expr) when a relational filter
+                // references a node property on one side and a literal/param on the other.
+                let try_prop_literal = |l: &Expr, r: &Expr, var: &str| -> Option<(String, Expr)> {
+                    if let Expr::Prop(v, prop) = l {
+                        if v == var && matches!(r, Expr::Literal(_) | Expr::Param(_)) {
+                            return Some((prop.clone(), r.clone()));
+                        }
+                    }
+                    if let Expr::Prop(v, prop) = r {
+                        if v == var && matches!(l, Expr::Literal(_) | Expr::Param(_)) {
+                            return Some((prop.clone(), l.clone()));
+                        }
+                    }
+                    None
+                };
+
+                // Check if the filter is a relational predicate on a LabelScan variable.
                 if let PhysicalOperator::LabelScan {
                     variable,
                     label: Some(lbl),
                 } = &optimized_input
                 {
                     if let Some(s) = stats {
-                        if let FilterExpr::Eq(l, r) = &expression {
-                            if let Expr::Prop(var, prop) = l {
-                                if var == variable {
-                                    if let Expr::Literal(_) | Expr::Param(_) = r {
-                                        if s.has_node_property_index(lbl, prop) {
-                                            return PhysicalOperator::NodeIndexScan {
-                                                variable: variable.clone(),
-                                                label: lbl.clone(),
-                                                property: prop.clone(),
-                                                value: r.clone(),
-                                            };
-                                        }
+                        match &expression {
+                            FilterExpr::Eq(l, r) => {
+                                if let Some((prop, val)) = try_prop_literal(l, r, variable) {
+                                    if s.has_node_property_index(lbl, &prop) {
+                                        return PhysicalOperator::NodeIndexScan {
+                                            variable: variable.clone(),
+                                            label: lbl.clone(),
+                                            property: prop,
+                                            value: val,
+                                        };
                                     }
                                 }
                             }
-                            if let Expr::Prop(var, prop) = r {
-                                if var == variable {
-                                    if let Expr::Literal(_) | Expr::Param(_) = l {
-                                        if s.has_node_property_index(lbl, prop) {
-                                            return PhysicalOperator::NodeIndexScan {
+                            FilterExpr::Lt(l, r) => {
+                                if let Some((prop, val)) = try_prop_literal(l, r, variable) {
+                                    // Determine direction: prop < val or val < prop
+                                    let prop_on_left =
+                                        matches!(l, Expr::Prop(v, _) if v == variable);
+                                    if s.has_node_property_index(lbl, &prop) {
+                                        return if prop_on_left {
+                                            PhysicalOperator::NodeRangeScan {
                                                 variable: variable.clone(),
                                                 label: lbl.clone(),
-                                                property: prop.clone(),
-                                                value: l.clone(),
-                                            };
-                                        }
+                                                property: prop,
+                                                lo: None,
+                                                lo_inclusive: true,
+                                                hi: Some(val),
+                                                hi_inclusive: false,
+                                            }
+                                        } else {
+                                            PhysicalOperator::NodeRangeScan {
+                                                variable: variable.clone(),
+                                                label: lbl.clone(),
+                                                property: prop,
+                                                lo: Some(val),
+                                                lo_inclusive: false,
+                                                hi: None,
+                                                hi_inclusive: true,
+                                            }
+                                        };
                                     }
                                 }
                             }
+                            FilterExpr::Le(l, r) => {
+                                if let Some((prop, val)) = try_prop_literal(l, r, variable) {
+                                    let prop_on_left =
+                                        matches!(l, Expr::Prop(v, _) if v == variable);
+                                    if s.has_node_property_index(lbl, &prop) {
+                                        return if prop_on_left {
+                                            PhysicalOperator::NodeRangeScan {
+                                                variable: variable.clone(),
+                                                label: lbl.clone(),
+                                                property: prop,
+                                                lo: None,
+                                                lo_inclusive: true,
+                                                hi: Some(val),
+                                                hi_inclusive: true,
+                                            }
+                                        } else {
+                                            PhysicalOperator::NodeRangeScan {
+                                                variable: variable.clone(),
+                                                label: lbl.clone(),
+                                                property: prop,
+                                                lo: Some(val),
+                                                lo_inclusive: true,
+                                                hi: None,
+                                                hi_inclusive: true,
+                                            }
+                                        };
+                                    }
+                                }
+                            }
+                            FilterExpr::Gt(l, r) => {
+                                if let Some((prop, val)) = try_prop_literal(l, r, variable) {
+                                    let prop_on_left =
+                                        matches!(l, Expr::Prop(v, _) if v == variable);
+                                    if s.has_node_property_index(lbl, &prop) {
+                                        return if prop_on_left {
+                                            PhysicalOperator::NodeRangeScan {
+                                                variable: variable.clone(),
+                                                label: lbl.clone(),
+                                                property: prop,
+                                                lo: Some(val),
+                                                lo_inclusive: false,
+                                                hi: None,
+                                                hi_inclusive: true,
+                                            }
+                                        } else {
+                                            PhysicalOperator::NodeRangeScan {
+                                                variable: variable.clone(),
+                                                label: lbl.clone(),
+                                                property: prop,
+                                                lo: None,
+                                                lo_inclusive: true,
+                                                hi: Some(val),
+                                                hi_inclusive: false,
+                                            }
+                                        };
+                                    }
+                                }
+                            }
+                            FilterExpr::Ge(l, r) => {
+                                if let Some((prop, val)) = try_prop_literal(l, r, variable) {
+                                    let prop_on_left =
+                                        matches!(l, Expr::Prop(v, _) if v == variable);
+                                    if s.has_node_property_index(lbl, &prop) {
+                                        return if prop_on_left {
+                                            PhysicalOperator::NodeRangeScan {
+                                                variable: variable.clone(),
+                                                label: lbl.clone(),
+                                                property: prop,
+                                                lo: Some(val),
+                                                lo_inclusive: true,
+                                                hi: None,
+                                                hi_inclusive: true,
+                                            }
+                                        } else {
+                                            PhysicalOperator::NodeRangeScan {
+                                                variable: variable.clone(),
+                                                label: lbl.clone(),
+                                                property: prop,
+                                                lo: None,
+                                                lo_inclusive: true,
+                                                hi: Some(val),
+                                                hi_inclusive: true,
+                                            }
+                                        };
+                                    }
+                                }
+                            }
+                            _ => {}
                         }
                     }
                 }
+
+                // If the input is already a NodeRangeScan on the same property, narrow its bounds
+                // rather than adding a post-filter.  This handles two-sided predicates like
+                // `WHERE n.age > 20 AND n.age < 50` which the push-down pass emits as
+                // `Filter(NodeRangeScan(lo=20), n.age<50)`.
+                if let PhysicalOperator::NodeRangeScan {
+                    variable,
+                    label,
+                    property,
+                    lo,
+                    lo_inclusive,
+                    hi,
+                    hi_inclusive,
+                } = optimized_input
+                {
+                    if let Some(s) = stats {
+                        if s.has_node_property_index(&label, &property) {
+                            let try_same_prop = |l: &Expr, r: &Expr| -> Option<(Expr, bool)> {
+                                if let Expr::Prop(v, p) = l {
+                                    if *v == variable
+                                        && *p == property
+                                        && matches!(r, Expr::Literal(_) | Expr::Param(_))
+                                    {
+                                        return Some((r.clone(), true));
+                                    }
+                                }
+                                if let Expr::Prop(v, p) = r {
+                                    if *v == variable
+                                        && *p == property
+                                        && matches!(l, Expr::Literal(_) | Expr::Param(_))
+                                    {
+                                        return Some((l.clone(), false));
+                                    }
+                                }
+                                None
+                            };
+                            match &expression {
+                                FilterExpr::Lt(l, r) => {
+                                    if let Some((val, prop_on_left)) = try_same_prop(l, r) {
+                                        return PhysicalOperator::NodeRangeScan {
+                                            variable,
+                                            label,
+                                            property,
+                                            lo,
+                                            lo_inclusive,
+                                            hi: if prop_on_left { Some(val) } else { hi },
+                                            hi_inclusive: if prop_on_left {
+                                                false
+                                            } else {
+                                                hi_inclusive
+                                            },
+                                        };
+                                    }
+                                }
+                                FilterExpr::Le(l, r) => {
+                                    if let Some((val, prop_on_left)) = try_same_prop(l, r) {
+                                        return PhysicalOperator::NodeRangeScan {
+                                            variable,
+                                            label,
+                                            property,
+                                            lo,
+                                            lo_inclusive,
+                                            hi: if prop_on_left { Some(val) } else { hi },
+                                            hi_inclusive: if prop_on_left {
+                                                true
+                                            } else {
+                                                hi_inclusive
+                                            },
+                                        };
+                                    }
+                                }
+                                FilterExpr::Gt(l, r) => {
+                                    if let Some((val, prop_on_left)) = try_same_prop(l, r) {
+                                        return PhysicalOperator::NodeRangeScan {
+                                            variable,
+                                            label,
+                                            property,
+                                            lo: if prop_on_left { Some(val) } else { lo },
+                                            lo_inclusive: if prop_on_left {
+                                                false
+                                            } else {
+                                                lo_inclusive
+                                            },
+                                            hi,
+                                            hi_inclusive,
+                                        };
+                                    }
+                                }
+                                FilterExpr::Ge(l, r) => {
+                                    if let Some((val, prop_on_left)) = try_same_prop(l, r) {
+                                        return PhysicalOperator::NodeRangeScan {
+                                            variable,
+                                            label,
+                                            property,
+                                            lo: if prop_on_left { Some(val) } else { lo },
+                                            lo_inclusive: if prop_on_left {
+                                                true
+                                            } else {
+                                                lo_inclusive
+                                            },
+                                            hi,
+                                            hi_inclusive,
+                                        };
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    // Bounds not merged — wrap back.
+                    return PhysicalOperator::Filter {
+                        input: Box::new(PhysicalOperator::NodeRangeScan {
+                            variable,
+                            label,
+                            property,
+                            lo,
+                            lo_inclusive,
+                            hi,
+                            hi_inclusive,
+                        }),
+                        expression,
+                    };
+                }
+
                 PhysicalOperator::Filter {
                     input: Box::new(optimized_input),
                     expression,

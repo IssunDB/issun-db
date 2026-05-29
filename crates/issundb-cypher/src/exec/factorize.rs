@@ -70,7 +70,73 @@ fn collect_expr_vars(expr: &Expr, vars: &mut HashSet<String>) {
         Expr::Prop(var, _) => {
             vars.insert(var.clone());
         }
+        Expr::Literal(_) | Expr::Param(_) | Expr::CountStar => {}
         Expr::Agg(_, inner) => collect_expr_vars(inner, vars),
-        _ => {}
+        Expr::BinaryOp { left, right, .. } => {
+            collect_expr_vars(left, vars);
+            collect_expr_vars(right, vars);
+        }
+        Expr::IsNull(inner) | Expr::IsNotNull(inner) | Expr::Not(inner) => {
+            collect_expr_vars(inner, vars);
+        }
+        Expr::FunctionCall { args, .. } => {
+            for arg in args {
+                collect_expr_vars(arg, vars);
+            }
+        }
+        Expr::Case {
+            subject,
+            arms,
+            else_expr,
+        } => {
+            if let Some(s) = subject {
+                collect_expr_vars(s, vars);
+            }
+            for arm in arms {
+                collect_expr_vars(&arm.when, vars);
+                collect_expr_vars(&arm.then, vars);
+            }
+            if let Some(e) = else_expr {
+                collect_expr_vars(e, vars);
+            }
+        }
+        Expr::Subscript { expr, index } => {
+            collect_expr_vars(expr, vars);
+            collect_expr_vars(index, vars);
+        }
+        Expr::Slice { expr, start, end } => {
+            collect_expr_vars(expr, vars);
+            if let Some(s) = start {
+                collect_expr_vars(s, vars);
+            }
+            if let Some(e) = end {
+                collect_expr_vars(e, vars);
+            }
+        }
+        // variable is a local binding; do not insert it. Recurse into list and predicate.
+        Expr::Quantifier {
+            list, predicate, ..
+        } => {
+            collect_expr_vars(list, vars);
+            collect_expr_vars(predicate, vars);
+        }
+        // variable is a local binding; do not insert it. Recurse into list, predicate, and transform.
+        Expr::ListComprehension {
+            list,
+            predicate,
+            transform,
+            ..
+        } => {
+            collect_expr_vars(list, vars);
+            if let Some(p) = predicate {
+                collect_expr_vars(p, vars);
+            }
+            if let Some(t) = transform {
+                collect_expr_vars(t, vars);
+            }
+        }
+        Expr::HasLabel { variable, .. } => {
+            vars.insert(variable.clone());
+        }
     }
 }

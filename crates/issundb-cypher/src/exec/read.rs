@@ -42,11 +42,58 @@ fn expand_multi_type(
     }
 }
 
+/// Validate a SKIP or LIMIT parameter value at runtime.
+///
+/// Cypher requires SKIP/LIMIT to be non-negative integers. When the value
+/// comes from a query parameter (`SKIP $n`), this validation must happen at
+/// execution time when the parameter is resolved.
+fn validate_skip_limit_param(
+    expr: &Expr,
+    keyword: &str,
+    params: &HashMap<String, serde_json::Value>,
+) -> Result<(), String> {
+    if let Expr::Param(name) = expr {
+        match params.get(name) {
+            None => return Err(format!("ParameterMissing: parameter ${name} is not set")),
+            Some(serde_json::Value::Number(n)) => {
+                if n.as_f64().is_some_and(|f| f != f.floor()) {
+                    return Err(format!(
+                        "SyntaxError: {keyword} requires an integer but got a float (${name})"
+                    ));
+                }
+                if let Some(i) = n.as_i64() {
+                    if i < 0 {
+                        return Err(format!(
+                            "SyntaxError: {keyword} value must not be negative (got {i})"
+                        ));
+                    }
+                } else if n.as_f64().is_some_and(|f| f < 0.0) {
+                    return Err(format!("SyntaxError: {keyword} value must not be negative"));
+                }
+            }
+            Some(v) => {
+                return Err(format!(
+                    "SyntaxError: {keyword} requires an integer, got {v}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn execute_read_query(
     graph: &Graph,
     query: &Query,
     params: &HashMap<String, serde_json::Value>,
 ) -> Result<QueryResult, String> {
+    // Validate parameter-based SKIP/LIMIT at runtime before planning.
+    if let Some(ref skip_expr) = query.skip {
+        validate_skip_limit_param(skip_expr, "SKIP", params)?;
+    }
+    if let Some(ref limit_expr) = query.limit {
+        validate_skip_limit_param(limit_expr, "LIMIT", params)?;
+    }
+
     // 1. Compile query AST into an optimized physical plan
     let logical = LogicalPlanner::plan(query)?;
     let physical = PhysicalPlanner::plan(&logical);
@@ -58,10 +105,26 @@ pub(super) fn execute_read_query(
     //    column-name keys. Reading by key here avoids a second evaluation of the
     //    same expressions (double-projection) against a PathMap that no longer
     //    contains the pre-projection variable names.
-    let resolved_paths = execute_physical(graph, &optimized, params)?;
+    // Write-only pipeline queries (no RETURN) must hold the graph write lock for
+    // the entire execution to prevent concurrent races (e.g., MERGE from two threads).
+    let has_write_parts = query.parts.iter().any(|p| {
+        matches!(
+            p,
+            QueryPart::Create { .. }
+                | QueryPart::Merge { .. }
+                | QueryPart::Set { .. }
+                | QueryPart::Delete { .. }
+                | QueryPart::Remove { .. }
+        )
+    });
 
-    // A query with an empty RETURN clause is a write-only pipeline query. Execute it
-    // for its side effects but return an empty QueryResult (no columns, no rows).
+    let resolved_paths = if has_write_parts && query.return_clause.items.is_empty() {
+        graph.with_write_lock(|| execute_physical(graph, &optimized, params))?
+    } else {
+        execute_physical(graph, &optimized, params)?
+    };
+
+    // A query with an empty RETURN clause is a write-only pipeline query.
     if query.return_clause.items.is_empty() {
         return Ok(QueryResult {
             columns: vec![],
@@ -559,17 +622,29 @@ fn expand_from_paths(
 
         if min_hops == 1 && max_hops == 1 {
             if let Some(dests) = transition_map.get(&src_node) {
-                for &(eid, dst_node) in dests {
-                    let mut new_path = path.clone();
-                    new_path.insert(rel_var.to_string(), GraphBinding::Edge(eid));
-                    if new_path
-                        .insert(dst_var.to_string(), GraphBinding::Node(dst_node))
-                        .is_some_and(|existing| existing != GraphBinding::Node(dst_node))
-                    {
-                        continue;
-                    }
-                    next_paths.push(new_path);
-                }
+                // Factorized single-hop expansion: create the Arc once per source path,
+                // then reference it for every destination.  This replaces N-1 redundant
+                // full PathMap clones (where N = degree of src_node) with a single
+                // Arc::new allocation.
+                let shared = std::sync::Arc::new(path);
+                let extensions: Vec<_> = dests
+                    .iter()
+                    .filter_map(|&(eid, dst_node)| {
+                        // Guard closing-hop mismatches (normally handled by MultiwayJoin).
+                        if let Some(existing) = shared.get(dst_var) {
+                            if *existing != GraphBinding::Node(dst_node) {
+                                return None;
+                            }
+                        }
+                        Some((
+                            rel_var.to_string(),
+                            GraphBinding::Edge(eid),
+                            dst_var.to_string(),
+                            GraphBinding::Node(dst_node),
+                        ))
+                    })
+                    .collect();
+                next_paths.extend(FactorizedRecordGroup { shared, extensions }.flatten());
             }
         } else {
             let mut queue = vec![(src_node, vec![src_node])];
@@ -731,6 +806,111 @@ fn execute_with_sip(
     }
 }
 
+/// Execute two consecutive single-hop directed Expand operators as one fused pass.
+///
+/// Instead of materializing the intermediate `Vec<PathMap>` between the two hops,
+/// this function builds transition maps for both hops up front and then produces
+/// the final PathMaps in a single nested loop.  For a pattern `(a)-[r1]->(b)-[r2]->(c)`
+/// with N source nodes and average degree D:
+///   - Without chaining: O(N*D) intermediate clones + O(N*D^2) output clones.
+///   - With chaining:                                  O(N*D^2) output clones only.
+#[allow(clippy::too_many_arguments)]
+fn execute_expand_chain_2(
+    graph: &Graph,
+    base_paths: Vec<PathMap>,
+    src_var1: &str,
+    rel_var1: &str,
+    dst_var1: &str,
+    rel_type1: Option<&str>,
+    is_incoming1: bool,
+    _src_var2: &str,
+    rel_var2: &str,
+    dst_var2: &str,
+    rel_type2: Option<&str>,
+    is_incoming2: bool,
+) -> Result<Vec<PathMap>, String> {
+    if base_paths.is_empty() {
+        return Ok(vec![]);
+    }
+
+    // Collect unique hop-1 source nodes.
+    let mut hop1_srcs: Vec<NodeId> = base_paths
+        .iter()
+        .filter_map(|p| match p.get(src_var1) {
+            Some(GraphBinding::Node(n)) => Some(*n),
+            _ => None,
+        })
+        .collect();
+    hop1_srcs.sort_unstable();
+    hop1_srcs.dedup();
+
+    // Bulk-expand hop 1.
+    let hop1_all = expand_multi_type(graph, &hop1_srcs, rel_type1, is_incoming1)?;
+    let mut hop1_map: HashMap<NodeId, Vec<(EdgeId, NodeId)>> = HashMap::new();
+    for (src, eid, dst) in hop1_all {
+        hop1_map.entry(src).or_default().push((eid, dst));
+    }
+
+    // Collect unique hop-2 source nodes (= hop-1 destinations).
+    let mut hop2_srcs: Vec<NodeId> = hop1_map
+        .values()
+        .flat_map(|v| v.iter().map(|(_, d)| *d))
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    hop2_srcs.sort_unstable();
+
+    // Bulk-expand hop 2.
+    let hop2_all = expand_multi_type(graph, &hop2_srcs, rel_type2, is_incoming2)?;
+    let mut hop2_map: HashMap<NodeId, Vec<(EdgeId, NodeId)>> = HashMap::new();
+    for (src, eid, dst) in hop2_all {
+        hop2_map.entry(src).or_default().push((eid, dst));
+    }
+
+    // Fused output loop: for each base path, expand hop1 then hop2 without
+    // materializing the intermediate (base + hop1) PathMap.
+    let mut next_paths = Vec::new();
+    for base_path in base_paths {
+        let src1 = match base_path.get(src_var1) {
+            Some(GraphBinding::Node(n)) => *n,
+            _ => continue,
+        };
+        let hop1_dests = match hop1_map.get(&src1) {
+            Some(v) => v,
+            None => continue,
+        };
+        for &(eid1, mid) in hop1_dests {
+            // Guard hop1 dst_var closing-hop mismatches.
+            if let Some(existing) = base_path.get(dst_var1) {
+                if *existing != GraphBinding::Node(mid) {
+                    continue;
+                }
+            }
+            let hop2_dests = match hop2_map.get(&mid) {
+                Some(v) => v,
+                None => continue,
+            };
+            for &(eid2, dst) in hop2_dests {
+                // Guard hop2 dst_var closing-hop mismatches.
+                if let Some(existing) = base_path.get(dst_var2) {
+                    if *existing != GraphBinding::Node(dst) {
+                        continue;
+                    }
+                }
+                // Single clone per output row: base_path + 4 new bindings.
+                let mut new_path = base_path.clone();
+                new_path.insert(rel_var1.to_string(), GraphBinding::Edge(eid1));
+                new_path.insert(dst_var1.to_string(), GraphBinding::Node(mid));
+                new_path.insert(rel_var2.to_string(), GraphBinding::Edge(eid2));
+                new_path.insert(dst_var2.to_string(), GraphBinding::Node(dst));
+                next_paths.push(new_path);
+            }
+        }
+    }
+
+    Ok(next_paths)
+}
+
 pub(super) fn execute_physical(
     graph: &Graph,
     op: &PhysicalOperator,
@@ -748,6 +928,46 @@ pub(super) fn execute_physical(
                 .ok_or_else(|| format!("unsupported property value type for index scan: {val}"))?;
             let candidates = graph
                 .nodes_by_property(label, property, prop_val)
+                .map_err(|e| e.to_string())?;
+
+            Ok(candidates
+                .into_iter()
+                .map(|cand| {
+                    let mut path = PathMap::new();
+                    path.insert(variable.clone(), GraphBinding::Node(cand));
+                    path
+                })
+                .collect())
+        }
+        PhysicalOperator::NodeRangeScan {
+            variable,
+            label,
+            property,
+            lo,
+            lo_inclusive,
+            hi,
+            hi_inclusive,
+        } => {
+            let lo_prop = lo
+                .as_ref()
+                .map(|e| evaluate_expr(graph, &PathMap::new(), e, params))
+                .transpose()?
+                .and_then(|v| json_to_prop_value(&v));
+            let hi_prop = hi
+                .as_ref()
+                .map(|e| evaluate_expr(graph, &PathMap::new(), e, params))
+                .transpose()?
+                .and_then(|v| json_to_prop_value(&v));
+
+            let candidates = graph
+                .nodes_by_property_range(
+                    label,
+                    property,
+                    lo_prop,
+                    *lo_inclusive,
+                    hi_prop,
+                    *hi_inclusive,
+                )
                 .map_err(|e| e.to_string())?;
 
             Ok(candidates
@@ -786,6 +1006,38 @@ pub(super) fn execute_physical(
             min_hops,
             max_hops,
         } => {
+            // Chained-expand fast path: when the input is also a single-hop directed
+            // Expand, run both hops together without materializing intermediate PathMaps.
+            // This avoids the O(n_sources * avg_degree) intermediate clone cost.
+            if *min_hops == 1 && *max_hops == 1 && !is_undirected {
+                if let PhysicalOperator::Expand {
+                    input: inner_input,
+                    src_var: inner_src_var,
+                    rel_var: inner_rel_var,
+                    dst_var: inner_dst_var,
+                    rel_type: inner_rel_type,
+                    is_incoming: inner_is_incoming,
+                    is_undirected: false,
+                    min_hops: 1,
+                    max_hops: 1,
+                } = input.as_ref()
+                {
+                    return execute_expand_chain_2(
+                        graph,
+                        execute_physical(graph, inner_input, params)?,
+                        inner_src_var,
+                        inner_rel_var,
+                        inner_dst_var,
+                        inner_rel_type.as_deref(),
+                        *inner_is_incoming,
+                        src_var,
+                        rel_var,
+                        dst_var,
+                        rel_type.as_deref(),
+                        *is_incoming,
+                    );
+                }
+            }
             let child_paths = execute_physical(graph, input, params)?;
             expand_from_paths(
                 graph,
@@ -881,88 +1133,132 @@ pub(super) fn execute_physical(
         }
         PhysicalOperator::HashJoin { left, right } => {
             // Determine common variables statically from plan trees before running either side.
-            // This is more reliable than sampling the first output row (which fails when the
-            // build side is empty) and is necessary so that the SIP filter can be built from
-            // the build side before the probe side executes.
-            let left_bound = Optimizer::bound_vars(left);
-            let right_bound = Optimizer::bound_vars(right);
-            let common_vars: Vec<String> =
-                left_bound.intersection(&right_bound).cloned().collect();
+            // Detect OptionalMatch on either side (the optimizer may place it on left or right
+            // depending on cardinality estimates).  Whichever side holds the OptionalMatch is
+            // the "optional" side; the other is the "required" side.  We always probe with the
+            // required side so that every required row is emitted even when the optional pattern
+            // finds no match for that row (left-outer-join semantics).
+            let (required_op, optional_inner, opt_null_vars): (
+                &PhysicalOperator,
+                &PhysicalOperator,
+                Option<&[String]>,
+            ) = if let PhysicalOperator::OptionalMatch { input, null_vars } = left.as_ref() {
+                // OptionalMatch ended up on the left — swap roles.
+                (right.as_ref(), input.as_ref(), Some(null_vars))
+            } else if let PhysicalOperator::OptionalMatch { input, null_vars } = right.as_ref() {
+                (left.as_ref(), input.as_ref(), Some(null_vars))
+            } else {
+                // No OptionalMatch: standard inner join.
+                (left.as_ref(), right.as_ref(), None)
+            };
+
+            // Compute common join variables from the actual plans (not the OptionalMatch
+            // wrapper, whose null_vars would inflate bound_vars).
+            let required_bound = Optimizer::bound_vars(required_op);
+            let optional_bound = Optimizer::bound_vars(optional_inner);
+            let common_vars: Vec<String> = required_bound
+                .intersection(&optional_bound)
+                .cloned()
+                .collect();
 
             let mut next_paths = Vec::new();
 
             if common_vars.is_empty() {
-                // Independent MATCH clauses with no shared variables: Cartesian product.
-                // SIP has nothing to filter, so run both sides normally.
-                let left_paths = execute_physical(graph, left, params)?;
-                let right_paths = execute_physical(graph, right, params)?;
-                for lp in &left_paths {
-                    for rp in &right_paths {
-                        let mut merged = lp.clone();
-                        merged.extend(rp.iter().map(|(k, v)| (k.clone(), v.clone())));
-                        next_paths.push(merged);
+                // No shared variables: Cartesian product, or outer-product for optional.
+                let required_paths = execute_physical(graph, required_op, params)?;
+                let opt_paths = execute_physical(graph, optional_inner, params)?;
+                if opt_paths.is_empty() {
+                    if let Some(null_vars) = opt_null_vars {
+                        for rp in required_paths {
+                            let mut merged = rp;
+                            for v in null_vars {
+                                if !merged.contains_key(v.as_str()) {
+                                    merged.insert(
+                                        v.clone(),
+                                        GraphBinding::Scalar(serde_json::Value::Null),
+                                    );
+                                }
+                            }
+                            next_paths.push(merged);
+                        }
+                    }
+                } else {
+                    for rp in &required_paths {
+                        for op in &opt_paths {
+                            let mut merged = rp.clone();
+                            merged.extend(op.iter().map(|(k, v)| (k.clone(), v.clone())));
+                            next_paths.push(merged);
+                        }
                     }
                 }
             } else {
                 // Equi-join on shared variables.
                 //
-                // SIP (Sideways Information Passing): run the build side (right, lighter by
-                // optimizer invariant) first.  Collect the NodeIds it produces for every
-                // common variable, then pass that set into the probe side (left, heavier)
-                // so that any LabelScan inside it skips nodes that cannot possibly produce a
-                // join match.  The probe side's LabelScan cost drops from O(|label|) to
-                // O(|build set|) when the build side is selective.
-                let right_paths = execute_physical(graph, right, params)?;
+                // Strategy: build hash table from the optional inner plan, probe with the
+                // required plan.  SIP can restrict the required-side LabelScans when the
+                // optional inner is selective.
+                let opt_paths = execute_physical(graph, optional_inner, params)?;
 
-                // Build the SIP filter: one HashSet<NodeId> per common variable, populated
-                // from the build-side rows.  Variables bound to non-Node values (scalars,
-                // edges) are excluded — they participate in the equi-join key but cannot be
-                // used to restrict a LabelScan.
                 let sip: HashMap<String, HashSet<NodeId>> = common_vars
                     .iter()
                     .filter_map(|var| {
-                        let ids: HashSet<NodeId> = right_paths
+                        let ids: HashSet<NodeId> = opt_paths
                             .iter()
                             .filter_map(|p| match p.get(var) {
                                 Some(GraphBinding::Node(n)) => Some(*n),
                                 _ => None,
                             })
                             .collect();
-                        if ids.is_empty() { None } else { Some((var.clone(), ids)) }
+                        if ids.is_empty() {
+                            None
+                        } else {
+                            Some((var.clone(), ids))
+                        }
                     })
                     .collect();
 
-                // Execute the probe side.  If there is a non-empty SIP filter, use the
-                // SIP-aware executor so that nested LabelScans are restricted before they
-                // read from LMDB.  If the build side produced no Node bindings for the
-                // common variables, fall back to normal execution.
-                let left_paths = if sip.is_empty() {
-                    execute_physical(graph, left, params)?
+                // SIP is only applied for inner joins; for outer joins it would suppress
+                // required rows that have no optional match, which is incorrect.
+                let required_paths = if sip.is_empty() || opt_null_vars.is_some() {
+                    execute_physical(graph, required_op, params)?
                 } else {
-                    execute_with_sip(graph, left, params, &sip)?
+                    execute_with_sip(graph, required_op, params, &sip)?
                 };
 
-                // Build hash table from the right side, probe with the (already SIP-filtered)
-                // left side.
+                // Build hash table from the optional inner side.
                 let mut hash_table: HashMap<Vec<GraphBinding>, Vec<PathMap>> = HashMap::new();
-                for rp in right_paths {
+                for op in opt_paths {
                     let key: Option<Vec<GraphBinding>> =
-                        common_vars.iter().map(|v| rp.get(v).cloned()).collect();
+                        common_vars.iter().map(|v| op.get(v).cloned()).collect();
                     if let Some(key) = key {
-                        hash_table.entry(key).or_default().push(rp);
+                        hash_table.entry(key).or_default().push(op);
                     }
                 }
 
-                for lp in left_paths {
+                // Probe with required rows.  Unmatched required rows get null-filled optional
+                // vars when this is an outer join.
+                for rp in required_paths {
                     let key: Option<Vec<GraphBinding>> =
-                        common_vars.iter().map(|v| lp.get(v).cloned()).collect();
+                        common_vars.iter().map(|v| rp.get(v).cloned()).collect();
                     if let Some(key) = key {
                         if let Some(matches) = hash_table.get(&key) {
-                            for rp in matches {
-                                let mut merged = lp.clone();
-                                merged.extend(rp.iter().map(|(k, v)| (k.clone(), v.clone())));
+                            for op in matches {
+                                let mut merged = rp.clone();
+                                merged.extend(op.iter().map(|(k, v)| (k.clone(), v.clone())));
                                 next_paths.push(merged);
                             }
+                        } else if let Some(null_vars) = opt_null_vars {
+                            // Outer join: no optional match for this required row → null-fill.
+                            let mut merged = rp;
+                            for v in null_vars {
+                                if !merged.contains_key(v.as_str()) {
+                                    merged.insert(
+                                        v.clone(),
+                                        GraphBinding::Scalar(serde_json::Value::Null),
+                                    );
+                                }
+                            }
+                            next_paths.push(merged);
                         }
                     }
                 }
@@ -1374,7 +1670,8 @@ pub(super) fn execute_physical(
 
             keyed.sort_by(|(ka, _), (kb, _)| {
                 for (i, si) in items.iter().enumerate() {
-                    let ord = json_cmp(&ka[i], &kb[i]).unwrap_or(std::cmp::Ordering::Equal);
+                    let ord =
+                        json_cmp(&ka[i], &kb[i]).unwrap_or_else(|| json_cmp_total(&ka[i], &kb[i]));
                     let ord = if si.ascending { ord } else { ord.reverse() };
                     if ord != std::cmp::Ordering::Equal {
                         return ord;
@@ -1440,21 +1737,40 @@ pub(super) fn execute_physical(
                         result_paths.push(new_path);
                     }
                     QueryPart::Set { items } => {
-                        // Apply SET for each row using existing set execution logic.
+                        // Apply SET for each row — supports both node and edge variables.
                         for item in items {
-                            if let Some(GraphBinding::Node(nid)) = path.get(&item.variable) {
-                                let new_val = evaluate_expr(graph, &path, &item.expr, params)?;
-                                let record = graph
-                                    .get_node(*nid)
-                                    .map_err(|e| e.to_string())?
-                                    .ok_or_else(|| format!("node not found: {}", nid))?;
-                                let mut props: serde_json::Value =
-                                    rmp_serde::from_slice(&record.props)
-                                        .map_err(|e| e.to_string())?;
-                                if let Some(obj) = props.as_object_mut() {
-                                    obj.insert(item.property.clone(), new_val);
+                            match path.get(&item.variable) {
+                                Some(GraphBinding::Node(nid)) => {
+                                    let new_val = evaluate_expr(graph, &path, &item.expr, params)?;
+                                    let record =
+                                        graph
+                                            .get_node(*nid)
+                                            .map_err(|e| e.to_string())?
+                                            .ok_or_else(|| format!("node not found: {}", nid))?;
+                                    let mut props: serde_json::Value =
+                                        rmp_serde::from_slice(&record.props)
+                                            .map_err(|e| e.to_string())?;
+                                    if let Some(obj) = props.as_object_mut() {
+                                        obj.insert(item.property.clone(), new_val);
+                                    }
+                                    graph.update_node(*nid, &props).map_err(|e| e.to_string())?;
                                 }
-                                graph.update_node(*nid, &props).map_err(|e| e.to_string())?;
+                                Some(GraphBinding::Edge(eid)) => {
+                                    let new_val = evaluate_expr(graph, &path, &item.expr, params)?;
+                                    let record =
+                                        graph
+                                            .get_edge(*eid)
+                                            .map_err(|e| e.to_string())?
+                                            .ok_or_else(|| format!("edge not found: {}", eid))?;
+                                    let mut props: serde_json::Value =
+                                        rmp_serde::from_slice(&record.props)
+                                            .map_err(|e| e.to_string())?;
+                                    if let Some(obj) = props.as_object_mut() {
+                                        obj.insert(item.property.clone(), new_val);
+                                    }
+                                    graph.update_edge(*eid, &props).map_err(|e| e.to_string())?;
+                                }
+                                _ => {}
                             }
                         }
                         result_paths.push(path);
@@ -1487,6 +1803,13 @@ pub(super) fn execute_physical(
                                 }
                                 _ => {}
                             }
+                        }
+                        result_paths.push(path);
+                    }
+                    QueryPart::Remove { items } => {
+                        use super::write::apply_remove_item;
+                        for item in items {
+                            apply_remove_item(graph, item, &path)?;
                         }
                         result_paths.push(path);
                     }

@@ -1,7 +1,7 @@
-site_name: RiceVM Documentation
-site_description: A Dis virtual machine and Limbo compiler in Rust
-repo_url: https://github.com/habedi/ricevm
-repo_name: habedi/ricevm
+site_name: IssunDB Documentation
+site_description: A fast embedded analytical graph database in Rust
+repo_url: https://github.com/IssunDB/issun-db
+repo_name: IssunDB/issun-db
 site_url: https://habedi.github.io/ricevm/
 
 theme:
@@ -37,7 +37,7 @@ theme:
 extra:
   social:
     - icon: fontawesome/brands/github
-      link: https://github.com/habedi/ricevm
+      link: https://github.com/IssunDB/issun-db
 
 plugins:
   - search

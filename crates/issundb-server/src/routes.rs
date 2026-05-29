@@ -1,17 +1,17 @@
 use std::sync::Arc;
 
 use axum::{
+    Json, Router,
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{delete, get, post, put},
-    Json, Router,
 };
 use issundb::{
     Graph, GraphQueryExt, TextGraphExt, TextSearchOptions, VectorGraphExt, VectorSearchOptions,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
@@ -328,7 +328,14 @@ pub async fn search_vector(
 // ---------------------------------------------------------------------------
 
 pub async fn health() -> impl IntoResponse {
-    (StatusCode::OK, Json(json!({ "status": "ok" })))
+    (
+        StatusCode::OK,
+        Json(json!({
+            "status": "ok",
+            "version": env!("CARGO_PKG_VERSION"),
+            "api": "v1",
+        })),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -336,8 +343,9 @@ pub async fn health() -> impl IntoResponse {
 // ---------------------------------------------------------------------------
 
 pub fn build_router(graph: Arc<Graph>) -> Router {
-    Router::new()
-        .route("/health", get(health))
+    // Versioned data and query routes. `/health` stays unversioned so
+    // infrastructure probes do not need to track the API version.
+    let v1 = Router::new()
         .route("/nodes", post(create_node))
         .route("/nodes/:id", get(get_node))
         .route("/nodes/:id", put(update_node))
@@ -349,5 +357,7 @@ pub fn build_router(graph: Arc<Graph>) -> Router {
         .route("/explain", post(explain_query))
         .route("/search/text", post(search_text))
         .route("/search/vector", post(search_vector))
-        .with_state(graph)
+        .with_state(graph);
+
+    Router::new().route("/health", get(health)).nest("/v1", v1)
 }

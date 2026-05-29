@@ -108,6 +108,10 @@ pub enum QueryPart {
         variables: Vec<String>,
         detach: bool,
     },
+    /// A REMOVE clause inside a pipeline query.
+    Remove {
+        items: Vec<RemoveItem>,
+    },
 }
 
 /// A MATCH clause containing a node and relationship pattern.

@@ -102,14 +102,24 @@ publish: ## Publish the package to crates.io (requires CARGO_REGISTRY_TOKEN to b
 	@cargo publish --token $(CARGO_REGISTRY_TOKEN)
 
 .PHONY: repl
-repl: ## Launch the interactive REPL (pass REPL_PATH=<dir> to set the database path; defaults to ./issundb-data)
+repl: ## Launch the REPL (pass REPL_PATH=<dir> to set the database path; defaults to ./issundb-data)
 	@echo "Starting IssunDB REPL (database: $(or $(REPL_PATH),./issundb-data))..."
 	@RUST_BACKTRACE=$(RUST_BACKTRACE) cargo run -p issundb-cli -- $(or $(REPL_PATH),./issundb-data)
 
 .PHONY: gui
-gui: ## Launch the graphical desktop user interface (pass GUI_PATH=<dir> to set the database path; defaults to ./issundb-data)
+gui: ## Launch the GUI (pass GUI_PATH=<dir> to set the database path; defaults to ./issundb-data)
 	@echo "Starting IssunDB GUI (database: $(or $(GUI_PATH),./issundb-data))..."
 	@RUST_BACKTRACE=$(RUST_BACKTRACE) cargo run -p issundb-gui -- $(or $(GUI_PATH),./issundb-data)
+
+.PHONY: mcp
+mcp: ## Launch the MCP server over stdio (pass MCP_PATH=<dir> to set the database path; defaults to ./issundb-data)
+	@echo "Starting IssunDB MCP server (database: $(or $(MCP_PATH),./issundb-data))..." >&2
+	@RUST_BACKTRACE=$(RUST_BACKTRACE) cargo run -q -p issundb-mcp -- --db-path $(or $(MCP_PATH),./issundb-data)
+
+.PHONY: mcp-http
+mcp-http: ## Launch the MCP server over Streamable HTTP (MCP_PATH=<dir> db path, MCP_BIND=<addr> bind address)
+	@echo "Starting IssunDB MCP server over HTTP at $(or $(MCP_BIND),127.0.0.1:8000) (database: $(or $(MCP_PATH),./issundb-data))..."
+	@RUST_BACKTRACE=$(RUST_BACKTRACE) cargo run -p issundb-mcp -- --db-path $(or $(MCP_PATH),./issundb-data) --transport http --bind $(or $(MCP_BIND),127.0.0.1:8000)
 
 .PHONY: bench
 bench: ## Run the benchmarks
