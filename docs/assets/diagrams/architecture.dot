@@ -1,9 +1,9 @@
-digraph RiceVMLimboWorkflow {
+digraph IssunDBArchitecture {
     fontname = "Helvetica,Arial,sans-serif"
     layout = dot
     rankdir = LR
-    ranksep = 0.9
-    nodesep = 0.7
+    ranksep = 1.1
+    nodesep = 0.5
     splines = true
     bgcolor = "white"
     compound = true
@@ -26,8 +26,11 @@ digraph RiceVMLimboWorkflow {
     penwidth = 1.2
     ]
 
-    subgraph cluster_limbo_compiler {
-    label = "Limbo Compiler"
+    // ---------------------------------------------------------------
+    // Storage engine: the foundation crate.
+    // ---------------------------------------------------------------
+    subgraph cluster_core {
+    label = "issundb-core (storage engine)"
     fontname = "Helvetica,Arial,sans-serif"
     fontsize = 14
     style = "rounded"
@@ -35,18 +38,21 @@ digraph RiceVMLimboWorkflow {
     penwidth = 1.4
     margin = 16
 
-    program_b [label = "program.b", fillcolor = "#E0F2FE", color = "#0284C7"]
-    sys_m [label = "sys.m", fillcolor = "#F8FAFC", color = "#64748B", style = "filled,dashed"]
-    draw_m [label = "draw.m", fillcolor = "#F8FAFC", color = "#64748B", style = "filled,dashed"]
-    compile_cmd [label = "ricevm-cli compile program.b", fillcolor = "#DBEAFE", color = "#2563EB"]
+    core_graph [label = "Graph\n(node/edge CRUD, adjacency, algos)", fillcolor = "#DBEAFE", color = "#2563EB"]
+    core_storage [label = "Storage\n(LMDB env, 12 sub-databases)", fillcolor = "#E0F2FE", color = "#0284C7"]
+    core_csr [label = "CSR snapshot\n(arc-swap hot read path)", fillcolor = "#F8FAFC", color = "#64748B"]
+    core_gblas [label = "GraphBLAS\n(traversal, analytics, paths, flow)", fillcolor = "#F8FAFC", color = "#64748B"]
 
-    program_b -> compile_cmd
-    sys_m -> compile_cmd [style = dashed]
-    draw_m -> compile_cmd [style = dashed]
+    core_graph -> core_storage [label = "owns"]
+    core_graph -> core_csr [label = "rebuilds"]
+    core_csr -> core_gblas [label = "materializes"]
     }
 
-    subgraph cluster_dis_vm {
-    label = "Dis VM"
+    // ---------------------------------------------------------------
+    // Extension crates: depend on core, never on each other upward.
+    // ---------------------------------------------------------------
+    subgraph cluster_ext {
+    label = "Extension Crates"
     fontname = "Helvetica,Arial,sans-serif"
     fontsize = 14
     style = "rounded"
@@ -54,14 +60,17 @@ digraph RiceVMLimboWorkflow {
     penwidth = 1.4
     margin = 16
 
-    program_dis [label = "program.dis", fillcolor = "#ECFCCB", color = "#65A30D"]
-    run_cmd [label = "ricevm-cli run program.dis", fillcolor = "#FCE7F3", color = "#DB2777"]
-
-    program_dis -> run_cmd
+    vector [label = "issundb-vector\nVectorGraphExt: upsert_vector, vector_search", fillcolor = "#ECFCCB", color = "#65A30D"]
+    text [label = "issundb-text\nTextGraphExt / TextIndexExt: text_search", fillcolor = "#ECFCCB", color = "#65A30D"]
+    retrieval [label = "issundb-retrieval\nretrieve, retrieve_with -> Subgraph", fillcolor = "#D9F99D", color = "#4D7C0F"]
+    cypher [label = "issundb-cypher\nparser, planner, optimizer, executor", fillcolor = "#D9F99D", color = "#4D7C0F"]
     }
 
-    subgraph cluster_utilities {
-    label = "Utilities"
+    // ---------------------------------------------------------------
+    // Public facade.
+    // ---------------------------------------------------------------
+    subgraph cluster_facade {
+    label = "Public Facade"
     fontname = "Helvetica,Arial,sans-serif"
     fontsize = 14
     style = "rounded"
@@ -69,12 +78,63 @@ digraph RiceVMLimboWorkflow {
     penwidth = 1.4
     margin = 16
 
-    dis_cmd [label = "ricevm-cli dis program.dis", fillcolor = "#FEF3C7", color = "#D97706"]
-    debug_cmd [label = "ricevm-cli debug program.dis", fillcolor = "#E9D5FF", color = "#7C3AED"]
-
-    program_dis -> dis_cmd [style = dashed]
-    program_dis -> debug_cmd [style = dashed]
+    facade [label = "issundb\nre-exports Graph, Error, Hit,\nretrieval + Cypher types, GraphQueryExt", fillcolor = "#FEF3C7", color = "#D97706"]
     }
 
-    compile_cmd -> program_dis
+    // ---------------------------------------------------------------
+    // Consumers: bindings, servers, tools. Facade-only.
+    // ---------------------------------------------------------------
+    subgraph cluster_consumers {
+    label = "Consumers (facade only)"
+    fontname = "Helvetica,Arial,sans-serif"
+    fontsize = 14
+    style = "rounded"
+    color = "#7C3AED"
+    penwidth = 1.4
+    margin = 16
+
+    cli [label = "issundb-cli\nREPL", fillcolor = "#E9D5FF", color = "#7C3AED"]
+    server [label = "issundb-server\nAxum REST /v1", fillcolor = "#E9D5FF", color = "#7C3AED"]
+    mcp [label = "issundb-mcp\nMCP (stdio / HTTP)", fillcolor = "#E9D5FF", color = "#7C3AED"]
+    gui [label = "issundb-gui\negui desktop", fillcolor = "#E9D5FF", color = "#7C3AED"]
+    node_bind [label = "issundb-node\nNAPI-RS", fillcolor = "#E9D5FF", color = "#7C3AED"]
+    py_bind [label = "issundb-py\nPyO3", fillcolor = "#E9D5FF", color = "#7C3AED"]
+    }
+
+    // ---------------------------------------------------------------
+    // Test fixtures: depend on core, never imported by production.
+    // ---------------------------------------------------------------
+    subgraph cluster_testing {
+    label = "Test Support"
+    fontname = "Helvetica,Arial,sans-serif"
+    fontsize = 14
+    style = "rounded"
+    color = "#DB2777"
+    penwidth = 1.4
+    margin = 16
+
+    testing [label = "issundb-testing\nopen_tmp, chain, clique, diamond", fillcolor = "#FCE7F3", color = "#DB2777"]
+    }
+
+    // ---------------------------------------------------------------
+    // Dependency edges (point from dependent to dependency).
+    // ---------------------------------------------------------------
+    vector -> core_graph [lhead = cluster_core]
+    text -> core_graph [lhead = cluster_core]
+    retrieval -> core_graph [lhead = cluster_core]
+    retrieval -> vector
+    retrieval -> text
+    cypher -> core_graph [lhead = cluster_core, label = "public API"]
+
+    facade -> core_graph [lhead = cluster_core]
+    facade -> vector [ltail = cluster_facade, lhead = cluster_ext]
+
+    cli -> facade [lhead = cluster_facade]
+    server -> facade [lhead = cluster_facade]
+    mcp -> facade [lhead = cluster_facade]
+    gui -> facade [lhead = cluster_facade]
+    node_bind -> facade [lhead = cluster_facade]
+    py_bind -> facade [lhead = cluster_facade]
+
+    testing -> core_graph [lhead = cluster_core, style = dashed, label = "fixtures"]
 }

@@ -28,6 +28,12 @@ A fast embedded analytical graph database in Rust
 * Can be used via a wide range of APIs, including native Rust, CLI, GUI, HTTP, and MCP
 * Bindings for Python and JavaScript (other languages coming soon)
 
+See [ROADMAP.md](ROADMAP.md) for the full list of implemented and planned features.
+
+> [!IMPORTANT]
+> This project is still in early development, so bugs and breaking changes are expected.
+> Please use the [issue page](https://github.com/IssunDB/issun-db/issues) to report bugs or request features.
+
 ---
 
 ### Quickstart
@@ -81,6 +87,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+---
+
+### Documentation
+
+The project documentation is available [here](https://IssunDB.github.io/issun-db/).
+
+#### Architecture
+
+![Architecture](docs/assets/diagrams/architecture.svg)
 
 ---
 
