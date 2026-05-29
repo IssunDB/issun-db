@@ -806,109 +806,122 @@ fn execute_with_sip(
     }
 }
 
-/// Execute two consecutive single-hop directed Expand operators as one fused pass.
-///
-/// Instead of materializing the intermediate `Vec<PathMap>` between the two hops,
-/// this function builds transition maps for both hops up front and then produces
-/// the final PathMaps in a single nested loop.  For a pattern `(a)-[r1]->(b)-[r2]->(c)`
-/// with N source nodes and average degree D:
-///   - Without chaining: O(N*D) intermediate clones + O(N*D^2) output clones.
-///   - With chaining:                                  O(N*D^2) output clones only.
-#[allow(clippy::too_many_arguments)]
-fn execute_expand_chain_2(
+/// One hop of a fused linear expand chain. `src_var` is the node the hop starts
+/// from (bound by the base or an earlier hop), and the hop binds `rel_var` to the
+/// traversed edge and `dst_var` to the reached node.
+struct ChainHop<'a> {
+    src_var: &'a str,
+    rel_var: &'a str,
+    dst_var: &'a str,
+    rel_type: Option<&'a str>,
+    is_incoming: bool,
+}
+
+/// Execute a maximal linear chain of single-hop directed Expands as one fused
+/// operation. Each hop level is bulk-expanded once (distinct sources only), then
+/// output rows are produced by threading every base path through all hops,
+/// cloning a base path exactly once per emitted row regardless of chain length.
+/// This generalizes the former two-hop fast path to N hops and preserves path
+/// multiplicity and all `(rel, dst)` bindings.
+fn execute_expand_chain_n(
     graph: &Graph,
     base_paths: Vec<PathMap>,
-    src_var1: &str,
-    rel_var1: &str,
-    dst_var1: &str,
-    rel_type1: Option<&str>,
-    is_incoming1: bool,
-    _src_var2: &str,
-    rel_var2: &str,
-    dst_var2: &str,
-    rel_type2: Option<&str>,
-    is_incoming2: bool,
+    hops: &[ChainHop<'_>],
 ) -> Result<Vec<PathMap>, String> {
-    if base_paths.is_empty() {
+    if base_paths.is_empty() || hops.is_empty() {
         return Ok(vec![]);
     }
 
-    // Collect unique hop-1 source nodes.
-    let mut hop1_srcs: Vec<NodeId> = base_paths
+    // Bulk-expand each hop level. The chain is linear, so level i's source set is
+    // the set of nodes reached at level i-1; level 0's sources come from the base.
+    let mut level_maps: Vec<HashMap<NodeId, Vec<(EdgeId, NodeId)>>> =
+        Vec::with_capacity(hops.len());
+    let mut frontier: Vec<NodeId> = base_paths
         .iter()
-        .filter_map(|p| match p.get(src_var1) {
+        .filter_map(|p| match p.get(hops[0].src_var) {
             Some(GraphBinding::Node(n)) => Some(*n),
             _ => None,
         })
         .collect();
-    hop1_srcs.sort_unstable();
-    hop1_srcs.dedup();
+    frontier.sort_unstable();
+    frontier.dedup();
 
-    // Bulk-expand hop 1.
-    let hop1_all = expand_multi_type(graph, &hop1_srcs, rel_type1, is_incoming1)?;
-    let mut hop1_map: HashMap<NodeId, Vec<(EdgeId, NodeId)>> = HashMap::new();
-    for (src, eid, dst) in hop1_all {
-        hop1_map.entry(src).or_default().push((eid, dst));
+    for hop in hops {
+        let expanded = expand_multi_type(graph, &frontier, hop.rel_type, hop.is_incoming)?;
+        let mut map: HashMap<NodeId, Vec<(EdgeId, NodeId)>> = HashMap::new();
+        for (src, eid, dst) in expanded {
+            map.entry(src).or_default().push((eid, dst));
+        }
+        // Next level's sources are this level's distinct destinations.
+        let mut next: Vec<NodeId> = map
+            .values()
+            .flat_map(|v| v.iter().map(|(_, d)| *d))
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        next.sort_unstable();
+        frontier = next;
+        level_maps.push(map);
     }
 
-    // Collect unique hop-2 source nodes (= hop-1 destinations).
-    let mut hop2_srcs: Vec<NodeId> = hop1_map
-        .values()
-        .flat_map(|v| v.iter().map(|(_, d)| *d))
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .collect();
-    hop2_srcs.sort_unstable();
-
-    // Bulk-expand hop 2.
-    let hop2_all = expand_multi_type(graph, &hop2_srcs, rel_type2, is_incoming2)?;
-    let mut hop2_map: HashMap<NodeId, Vec<(EdgeId, NodeId)>> = HashMap::new();
-    for (src, eid, dst) in hop2_all {
-        hop2_map.entry(src).or_default().push((eid, dst));
+    // Recursively thread each base path through all hops, cloning once per leaf.
+    let mut out = Vec::new();
+    let mut stack: Vec<(EdgeId, NodeId)> = Vec::with_capacity(hops.len());
+    for base_path in &base_paths {
+        let Some(GraphBinding::Node(start)) = base_path.get(hops[0].src_var) else {
+            continue;
+        };
+        thread_chain(
+            base_path,
+            *start,
+            hops,
+            &level_maps,
+            0,
+            &mut stack,
+            &mut out,
+        );
     }
+    Ok(out)
+}
 
-    // Fused output loop: for each base path, expand hop1 then hop2 without
-    // materializing the intermediate (base + hop1) PathMap.
-    let mut next_paths = Vec::new();
-    for base_path in base_paths {
-        let src1 = match base_path.get(src_var1) {
-            Some(GraphBinding::Node(n)) => *n,
-            _ => continue,
-        };
-        let hop1_dests = match hop1_map.get(&src1) {
-            Some(v) => v,
-            None => continue,
-        };
-        for &(eid1, mid) in hop1_dests {
-            // Guard hop1 dst_var closing-hop mismatches.
-            if let Some(existing) = base_path.get(dst_var1) {
-                if *existing != GraphBinding::Node(mid) {
-                    continue;
-                }
-            }
-            let hop2_dests = match hop2_map.get(&mid) {
-                Some(v) => v,
-                None => continue,
-            };
-            for &(eid2, dst) in hop2_dests {
-                // Guard hop2 dst_var closing-hop mismatches.
-                if let Some(existing) = base_path.get(dst_var2) {
-                    if *existing != GraphBinding::Node(dst) {
-                        continue;
-                    }
-                }
-                // Single clone per output row: base_path + 4 new bindings.
-                let mut new_path = base_path.clone();
-                new_path.insert(rel_var1.to_string(), GraphBinding::Edge(eid1));
-                new_path.insert(dst_var1.to_string(), GraphBinding::Node(mid));
-                new_path.insert(rel_var2.to_string(), GraphBinding::Edge(eid2));
-                new_path.insert(dst_var2.to_string(), GraphBinding::Node(dst));
-                next_paths.push(new_path);
+/// Depth-first expansion of one base path through the remaining hops. `src` is the
+/// node the current hop expands from. Edge and node bindings accumulate in `stack`
+/// and are materialized into a single cloned PathMap at the leaf.
+#[allow(clippy::too_many_arguments)]
+fn thread_chain(
+    base_path: &PathMap,
+    src: NodeId,
+    hops: &[ChainHop<'_>],
+    level_maps: &[HashMap<NodeId, Vec<(EdgeId, NodeId)>>],
+    hop_idx: usize,
+    stack: &mut Vec<(EdgeId, NodeId)>,
+    out: &mut Vec<PathMap>,
+) {
+    if hop_idx == hops.len() {
+        let mut new_path = base_path.clone();
+        for (i, &(eid, dst)) in stack.iter().enumerate() {
+            new_path.insert(hops[i].rel_var.to_string(), GraphBinding::Edge(eid));
+            new_path.insert(hops[i].dst_var.to_string(), GraphBinding::Node(dst));
+        }
+        out.push(new_path);
+        return;
+    }
+    let Some(dests) = level_maps[hop_idx].get(&src) else {
+        return;
+    };
+    let hop = &hops[hop_idx];
+    for &(eid, dst) in dests {
+        // Closing-hop guard: if dst_var is already pinned (by the base path or an
+        // earlier hop in this chain), only keep matching destinations.
+        if let Some(existing) = base_path.get(hop.dst_var) {
+            if *existing != GraphBinding::Node(dst) {
+                continue;
             }
         }
+        stack.push((eid, dst));
+        thread_chain(base_path, dst, hops, level_maps, hop_idx + 1, stack, out);
+        stack.pop();
     }
-
-    Ok(next_paths)
 }
 
 pub(super) fn execute_physical(
@@ -995,6 +1008,34 @@ pub(super) fn execute_physical(
                 })
                 .collect())
         }
+        PhysicalOperator::NodeByIdSeek {
+            variable,
+            label,
+            id_value,
+        } => {
+            // Resolve the constant id, then fetch the single node directly. A
+            // non-integer, negative, or missing id yields no rows.
+            let id_json = evaluate_expr(graph, &PathMap::new(), id_value, params)?;
+            let nid = match id_json.as_u64() {
+                Some(n) => n as NodeId,
+                None => return Ok(vec![]),
+            };
+            match graph.get_node(nid).map_err(|e| e.to_string())? {
+                Some(record) => {
+                    // Enforce the label predicate the seek replaced, if any.
+                    if let Some(lbl) = label {
+                        let name = graph.label_name(record.label).map_err(|e| e.to_string())?;
+                        if name.as_deref() != Some(lbl.as_str()) {
+                            return Ok(vec![]);
+                        }
+                    }
+                    let mut path = PathMap::new();
+                    path.insert(variable.clone(), GraphBinding::Node(nid));
+                    Ok(vec![path])
+                }
+                None => Ok(vec![]),
+            }
+        }
         PhysicalOperator::Expand {
             input,
             src_var,
@@ -1006,11 +1047,26 @@ pub(super) fn execute_physical(
             min_hops,
             max_hops,
         } => {
-            // Chained-expand fast path: when the input is also a single-hop directed
-            // Expand, run both hops together without materializing intermediate PathMaps.
-            // This avoids the O(n_sources * avg_degree) intermediate clone cost.
+            // Fused-chain fast path: collect a maximal linear chain of single-hop
+            // directed Expands and run all hops together, cloning the base path
+            // once per output row instead of materializing one PathMap per hop
+            // level. Falls through to the normal path for single hops, variable
+            // length, undirected, or non-contiguous chains (e.g. a Filter between
+            // hops, which the planner inserts for a labeled intermediate node).
             if *min_hops == 1 && *max_hops == 1 && !is_undirected {
-                if let PhysicalOperator::Expand {
+                let mut hops = vec![ChainHop {
+                    src_var,
+                    rel_var,
+                    dst_var,
+                    rel_type: rel_type.as_deref(),
+                    is_incoming: *is_incoming,
+                }];
+                // Source variable of the deepest hop collected so far; the next
+                // inner hop must reach it for the chain to stay linear.
+                let mut bottom_src = src_var.as_str();
+                let mut base = input.as_ref();
+                // Walk down through linearly connected single-hop directed Expands.
+                while let PhysicalOperator::Expand {
                     input: inner_input,
                     src_var: inner_src_var,
                     rel_var: inner_rel_var,
@@ -1020,22 +1076,27 @@ pub(super) fn execute_physical(
                     is_undirected: false,
                     min_hops: 1,
                     max_hops: 1,
-                } = input.as_ref()
+                } = base
                 {
-                    return execute_expand_chain_2(
-                        graph,
-                        execute_physical(graph, inner_input, params)?,
-                        inner_src_var,
-                        inner_rel_var,
-                        inner_dst_var,
-                        inner_rel_type.as_deref(),
-                        *inner_is_incoming,
-                        src_var,
-                        rel_var,
-                        dst_var,
-                        rel_type.as_deref(),
-                        *is_incoming,
-                    );
+                    // Linear only: this hop's source must be the inner hop's target.
+                    if bottom_src != inner_dst_var {
+                        break;
+                    }
+                    hops.push(ChainHop {
+                        src_var: inner_src_var,
+                        rel_var: inner_rel_var,
+                        dst_var: inner_dst_var,
+                        rel_type: inner_rel_type.as_deref(),
+                        is_incoming: *inner_is_incoming,
+                    });
+                    bottom_src = inner_src_var.as_str();
+                    base = inner_input.as_ref();
+                }
+                if hops.len() >= 2 {
+                    // hops were collected top-to-bottom; execute bottom-to-top.
+                    hops.reverse();
+                    let base_paths = execute_physical(graph, base, params)?;
+                    return execute_expand_chain_n(graph, base_paths, &hops);
                 }
             }
             let child_paths = execute_physical(graph, input, params)?;

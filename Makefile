@@ -4,7 +4,6 @@ PATH := /snap/bin:$(PATH)
 DEBUG_PROJ := 0
 RUST_BACKTRACE := 1
 ASSET_DIR := assets
-TEST_DATA_DIR := tests/testdata
 SHELL := /bin/bash
 MSRV := 1.85.0
 
@@ -195,9 +194,7 @@ check-module-deps: ## Verify crate boundary rules: lower-level crates must not i
 	fi
 
 .PHONY: testdata
-testdata: ## Download benchmark datasets and regenerate versioned LMDB snapshots
-	@echo "Downloading benchmark datasets..."
-	@$(SHELL) $(TEST_DATA_DIR)/download_datasets.sh $(TEST_DATA_DIR)
+testdata: ## Regenerate versioned LMDB snapshots
 	@echo "Regenerating versioned test snapshots..."
 	@VERSION=$$(cargo metadata --no-deps --format-version 1 | python3 -c "import sys,json; print(json.load(sys.stdin)['packages'][0]['version'])"); \
 	 SNAP_DIR="test_data/v$$VERSION/db"; \

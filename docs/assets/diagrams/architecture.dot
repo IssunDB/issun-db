@@ -1,7 +1,7 @@
 digraph IssunDBArchitecture {
     fontname = "Helvetica,Arial,sans-serif"
     layout = dot
-    rankdir = LR
+    rankdir = RL
     ranksep = 1.1
     nodesep = 0.5
     splines = true
@@ -30,7 +30,7 @@ digraph IssunDBArchitecture {
     // Storage engine: the foundation crate.
     // ---------------------------------------------------------------
     subgraph cluster_core {
-    label = "issundb-core (storage engine)"
+    label = "Storage Engine"
     fontname = "Helvetica,Arial,sans-serif"
     fontsize = 14
     style = "rounded"
@@ -38,14 +38,7 @@ digraph IssunDBArchitecture {
     penwidth = 1.4
     margin = 16
 
-    core_graph [label = "Graph\n(node/edge CRUD, adjacency, algos)", fillcolor = "#DBEAFE", color = "#2563EB"]
-    core_storage [label = "Storage\n(LMDB env, 12 sub-databases)", fillcolor = "#E0F2FE", color = "#0284C7"]
-    core_csr [label = "CSR snapshot\n(arc-swap hot read path)", fillcolor = "#F8FAFC", color = "#64748B"]
-    core_gblas [label = "GraphBLAS\n(traversal, analytics, paths, flow)", fillcolor = "#F8FAFC", color = "#64748B"]
-
-    core_graph -> core_storage [label = "owns"]
-    core_graph -> core_csr [label = "rebuilds"]
-    core_csr -> core_gblas [label = "materializes"]
+    core [label = "issundb-core", fillcolor = "#DBEAFE", color = "#2563EB"]
     }
 
     // ---------------------------------------------------------------
@@ -60,10 +53,10 @@ digraph IssunDBArchitecture {
     penwidth = 1.4
     margin = 16
 
-    vector [label = "issundb-vector\nVectorGraphExt: upsert_vector, vector_search", fillcolor = "#ECFCCB", color = "#65A30D"]
-    text [label = "issundb-text\nTextGraphExt / TextIndexExt: text_search", fillcolor = "#ECFCCB", color = "#65A30D"]
-    retrieval [label = "issundb-retrieval\nretrieve, retrieve_with -> Subgraph", fillcolor = "#D9F99D", color = "#4D7C0F"]
-    cypher [label = "issundb-cypher\nparser, planner, optimizer, executor", fillcolor = "#D9F99D", color = "#4D7C0F"]
+    vector [label = "issundb-vector", fillcolor = "#ECFCCB", color = "#65A30D"]
+    text [label = "issundb-text", fillcolor = "#ECFCCB", color = "#65A30D"]
+    retrieval [label = "issundb-retrieval", fillcolor = "#D9F99D", color = "#4D7C0F"]
+    cypher [label = "issundb-cypher", fillcolor = "#D9F99D", color = "#4D7C0F"]
     }
 
     // ---------------------------------------------------------------
@@ -78,14 +71,14 @@ digraph IssunDBArchitecture {
     penwidth = 1.4
     margin = 16
 
-    facade [label = "issundb\nre-exports Graph, Error, Hit,\nretrieval + Cypher types, GraphQueryExt", fillcolor = "#FEF3C7", color = "#D97706"]
+    facade [label = "issundb", fillcolor = "#FEF3C7", color = "#D97706"]
     }
 
     // ---------------------------------------------------------------
     // Consumers: bindings, servers, tools. Facade-only.
     // ---------------------------------------------------------------
     subgraph cluster_consumers {
-    label = "Consumers (facade only)"
+    label = "Consumers"
     fontname = "Helvetica,Arial,sans-serif"
     fontsize = 14
     style = "rounded"
@@ -93,12 +86,12 @@ digraph IssunDBArchitecture {
     penwidth = 1.4
     margin = 16
 
-    cli [label = "issundb-cli\nREPL", fillcolor = "#E9D5FF", color = "#7C3AED"]
-    server [label = "issundb-server\nAxum REST /v1", fillcolor = "#E9D5FF", color = "#7C3AED"]
-    mcp [label = "issundb-mcp\nMCP (stdio / HTTP)", fillcolor = "#E9D5FF", color = "#7C3AED"]
-    gui [label = "issundb-gui\negui desktop", fillcolor = "#E9D5FF", color = "#7C3AED"]
-    node_bind [label = "issundb-node\nNAPI-RS", fillcolor = "#E9D5FF", color = "#7C3AED"]
-    py_bind [label = "issundb-py\nPyO3", fillcolor = "#E9D5FF", color = "#7C3AED"]
+    cli [label = "issundb-cli", fillcolor = "#E9D5FF", color = "#7C3AED"]
+    server [label = "issundb-server", fillcolor = "#E9D5FF", color = "#7C3AED"]
+    mcp [label = "issundb-mcp", fillcolor = "#E9D5FF", color = "#7C3AED"]
+    gui [label = "issundb-gui", fillcolor = "#E9D5FF", color = "#7C3AED"]
+    node_bind [label = "issundb-node", fillcolor = "#E9D5FF", color = "#7C3AED"]
+    py_bind [label = "issundb-py", fillcolor = "#E9D5FF", color = "#7C3AED"]
     }
 
     // ---------------------------------------------------------------
@@ -113,28 +106,30 @@ digraph IssunDBArchitecture {
     penwidth = 1.4
     margin = 16
 
-    testing [label = "issundb-testing\nopen_tmp, chain, clique, diamond", fillcolor = "#FCE7F3", color = "#DB2777"]
+    testing [label = "issundb-testing", fillcolor = "#FCE7F3", color = "#DB2777"]
     }
 
     // ---------------------------------------------------------------
     // Dependency edges (point from dependent to dependency).
+    // lhead/ltail clip the edge at the cluster border (compound = true)
+    // so arrows attach to the enclosing cluster, not the inner box.
     // ---------------------------------------------------------------
-    vector -> core_graph [lhead = cluster_core]
-    text -> core_graph [lhead = cluster_core]
-    retrieval -> core_graph [lhead = cluster_core]
+    vector -> core [lhead = cluster_core]
+    text -> core [lhead = cluster_core]
+    retrieval -> core [lhead = cluster_core]
     retrieval -> vector
     retrieval -> text
-    cypher -> core_graph [lhead = cluster_core, label = "public API"]
+    cypher -> core [lhead = cluster_core]
 
-    facade -> core_graph [lhead = cluster_core]
+    facade -> core [ltail = cluster_facade, lhead = cluster_core]
     facade -> vector [ltail = cluster_facade, lhead = cluster_ext]
 
-    cli -> facade [lhead = cluster_facade]
-    server -> facade [lhead = cluster_facade]
-    mcp -> facade [lhead = cluster_facade]
-    gui -> facade [lhead = cluster_facade]
-    node_bind -> facade [lhead = cluster_facade]
-    py_bind -> facade [lhead = cluster_facade]
+    cli -> facade [ltail = cluster_consumers, lhead = cluster_facade]
+    server -> facade [ltail = cluster_consumers, lhead = cluster_facade]
+    mcp -> facade [ltail = cluster_consumers, lhead = cluster_facade]
+    gui -> facade [ltail = cluster_consumers, lhead = cluster_facade]
+    node_bind -> facade [ltail = cluster_consumers, lhead = cluster_facade]
+    py_bind -> facade [ltail = cluster_consumers, lhead = cluster_facade]
 
-    testing -> core_graph [lhead = cluster_core, style = dashed, label = "fixtures"]
+    testing -> core [ltail = cluster_testing, lhead = cluster_core, style = dashed]
 }

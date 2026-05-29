@@ -13,7 +13,7 @@
 [![Docs](https://img.shields.io/badge/docs-read-007ec6?label=docs&style=flat&labelColor=282c34&logo=readthedocs)](https://IssunDB.github.io/issun-db/)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-007ec6?style=flat&labelColor=282c34&logo=open-source-initiative)](https://github.com/IssunDB/issun-db)
 
-A fast embedded analytical graph database in Rust
+A fast embedded graph database for AI applications and graph analytics
 
 </div>
 
@@ -53,7 +53,7 @@ use std::path::Path;
 use issundb::{Graph, GraphQueryExt};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Open a graph database environment with a 1 GB map size limit
+    // Open a graph database with a 1 GB memory map size limit
     let graph = Graph::open(Path::new("./issundb-data"), 1)?;
 
     // Add nodes with properties
@@ -67,7 +67,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let edge_props = serde_json::json!({ "since": 2021 });
     graph.add_edge(alice_id, bob_id, "KNOWS", &edge_props)?;
 
-    // Rebuild the in-memory CSR snapshot for physical plan synchronization
+    // Rebuild the in-memory CSR snapshot
     graph.rebuild_csr()?;
 
     // Execute a Cypher query
@@ -93,10 +93,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ### Documentation
 
 The project documentation is available [here](https://IssunDB.github.io/issun-db/).
-
-#### Architecture
-
-![Architecture](docs/assets/diagrams/architecture.svg)
 
 ---
 

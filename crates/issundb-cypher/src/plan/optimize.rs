@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use crate::ast::Expr;
+use crate::ast::{AggFn, Expr, Literal};
 use crate::plan::logical::FilterExpr;
 use crate::plan::physical::PhysicalOperator;
 use crate::plan::stats::StatsProvider;
@@ -14,7 +14,12 @@ impl Optimizer {
     pub fn optimize(op: PhysicalOperator, stats: Option<&dyn StatsProvider>) -> PhysicalOperator {
         let (stripped_op, mut filters) = Self::extract_filters(op);
         let reordered_op = Self::reorder_operators(stripped_op, stats);
-        let mut result = Self::push_down_filters(reordered_op, &mut filters);
+        // Choose the lowest-cardinality endpoint as the traversal start, reversing a
+        // linear single-hop Expand chain when its far endpoint is cheaper to scan.
+        // Runs on the filter-free spine so the chain is contiguous; the HasLabel
+        // predicates needed to estimate endpoint cardinality live in `filters`.
+        let scan_selected = Self::select_scan_node(reordered_op, &mut filters, stats);
+        let mut result = Self::push_down_filters(scan_selected, &mut filters);
         // Any filter whose referenced variables are not bound by any operator in the
         // tree cannot be pushed down. Wrap them above the root so no predicate is
         // silently discarded.
@@ -28,6 +33,9 @@ impl Optimizer {
         // Rewrite closing Expand nodes into MultiwayJoin after index-scan optimization
         // so that both passes benefit each other.
         result = rewrite_closing_expands(result);
+        // Replace a count aggregation over a bare labeled scan with a constant read
+        // from graph metadata, avoiding a full scan.
+        result = Self::reduce_count(result, stats);
         result
     }
 
@@ -59,6 +67,18 @@ impl Optimizer {
             PhysicalOperator::LabelScan { variable, label } => {
                 (PhysicalOperator::LabelScan { variable, label }, Vec::new())
             }
+            PhysicalOperator::NodeByIdSeek {
+                variable,
+                label,
+                id_value,
+            } => (
+                PhysicalOperator::NodeByIdSeek {
+                    variable,
+                    label,
+                    id_value,
+                },
+                Vec::new(),
+            ),
             PhysicalOperator::NodeIndexScan {
                 variable,
                 label,
@@ -338,6 +358,7 @@ impl Optimizer {
                 variable,
             },
             leaf @ PhysicalOperator::LabelScan { .. } => leaf,
+            leaf @ PhysicalOperator::NodeByIdSeek { .. } => leaf,
             leaf @ PhysicalOperator::NodeIndexScan { .. } => leaf,
             leaf @ PhysicalOperator::NodeRangeScan { .. } => leaf,
             // Aggregate, Sort, and Limit are placed above the plan by the logical planner
@@ -397,6 +418,8 @@ impl Optimizer {
         match op {
             PhysicalOperator::SingleRow => 1,
             PhysicalOperator::Unwind { input, .. } => 1 + Self::plan_weight(input, stats),
+            // A primary-key seek touches at most one node: the cheapest scan.
+            PhysicalOperator::NodeByIdSeek { .. } => 1,
             PhysicalOperator::NodeIndexScan { .. } => 2,
             PhysicalOperator::NodeRangeScan { .. } => 3,
             PhysicalOperator::LabelScan { label, .. } => {
@@ -512,6 +535,32 @@ impl Optimizer {
                     }
                 }
 
+                current_node
+            }
+            PhysicalOperator::NodeByIdSeek {
+                variable,
+                label,
+                id_value,
+            } => {
+                let mut current_node = PhysicalOperator::NodeByIdSeek {
+                    variable: variable.clone(),
+                    label,
+                    id_value,
+                };
+                let bound = Self::bound_vars(&current_node);
+                let mut i = 0;
+                while i < pending.len() {
+                    let ref_vars = Self::referenced_vars(&pending[i]);
+                    if ref_vars.is_subset(&bound) {
+                        let filter_expr = pending.remove(i);
+                        current_node = PhysicalOperator::Filter {
+                            input: Box::new(current_node),
+                            expression: filter_expr,
+                        };
+                    } else {
+                        i += 1;
+                    }
+                }
                 current_node
             }
             PhysicalOperator::LabelScan { variable, label } => {
@@ -917,6 +966,9 @@ impl Optimizer {
             PhysicalOperator::LabelScan { variable, .. } => {
                 vars.insert(variable.clone());
             }
+            PhysicalOperator::NodeByIdSeek { variable, .. } => {
+                vars.insert(variable.clone());
+            }
             PhysicalOperator::NodeIndexScan { variable, .. } => {
                 vars.insert(variable.clone());
             }
@@ -1203,6 +1255,21 @@ impl Optimizer {
         match op {
             PhysicalOperator::Filter { input, expression } => {
                 let optimized_input = Self::optimize_index_scans(*input, stats);
+
+                // `WHERE id(n) = <const>` over a node scan becomes a primary-key seek.
+                // Applies to labeled and unlabeled scans; the label, when present, is
+                // re-checked by the seek executor.
+                if let PhysicalOperator::LabelScan { variable, label } = &optimized_input {
+                    if let FilterExpr::Eq(l, r) = &expression {
+                        if let Some(id_value) = Self::id_seek_value(l, r, variable) {
+                            return PhysicalOperator::NodeByIdSeek {
+                                variable: variable.clone(),
+                                label: label.clone(),
+                                id_value,
+                            };
+                        }
+                    }
+                }
 
                 // Helper: extract (variable, property, value_expr) when a relational filter
                 // references a node property on one side and a literal/param on the other.
@@ -1549,6 +1616,327 @@ impl Optimizer {
                 closing_is_incoming,
             },
             leaf => leaf,
+        }
+    }
+
+    /// Pick the cheapest endpoint of a linear single-hop `Expand` chain as the
+    /// traversal start, reversing the chain when its far endpoint is cheaper to
+    /// scan than the current start.
+    ///
+    /// The chain is reversed by swapping each hop's `src`/`dst` and flipping its
+    /// direction (a directed hop's `is_incoming` is inverted; an undirected hop is
+    /// symmetric and only swaps endpoints). Because `Expand` already honors
+    /// `is_incoming`, the reversed plan binds the same `(src, rel, dst)` triples
+    /// and needs no executor change. The far endpoint's `HasLabel` predicate
+    /// becomes the new scan label; the old start label is re-added to `filters` so
+    /// it is still enforced after push-down.
+    ///
+    /// Reversal is skipped for any non-linear, multi-hop, cyclic, or
+    /// label-unknown chain, and for `OptionalMatch` subtrees (whose `HasLabel`
+    /// predicates are not extracted and so still interrupt the spine).
+    fn select_scan_node(
+        op: PhysicalOperator,
+        filters: &mut Vec<FilterExpr>,
+        stats: Option<&dyn StatsProvider>,
+    ) -> PhysicalOperator {
+        match op {
+            PhysicalOperator::HashJoin { left, right } => PhysicalOperator::HashJoin {
+                left: Box::new(Self::select_scan_node(*left, filters, stats)),
+                right: Box::new(Self::select_scan_node(*right, filters, stats)),
+            },
+            PhysicalOperator::Project {
+                input,
+                items,
+                is_barrier,
+            } if !is_barrier => PhysicalOperator::Project {
+                input: Box::new(Self::select_scan_node(*input, filters, stats)),
+                items,
+                is_barrier,
+            },
+            PhysicalOperator::Aggregate {
+                input,
+                group_by,
+                aggregations,
+            } => PhysicalOperator::Aggregate {
+                input: Box::new(Self::select_scan_node(*input, filters, stats)),
+                group_by,
+                aggregations,
+            },
+            PhysicalOperator::Sort { input, items } => PhysicalOperator::Sort {
+                input: Box::new(Self::select_scan_node(*input, filters, stats)),
+                items,
+            },
+            PhysicalOperator::Limit { input, skip, count } => PhysicalOperator::Limit {
+                input: Box::new(Self::select_scan_node(*input, filters, stats)),
+                skip,
+                count,
+            },
+            PhysicalOperator::Distinct { input } => PhysicalOperator::Distinct {
+                input: Box::new(Self::select_scan_node(*input, filters, stats)),
+            },
+            op @ PhysicalOperator::Expand { .. } => Self::try_reverse_chain(op, filters, stats),
+            // Barrier projects, OptionalMatch, WritePart, Unwind, and leaf scans are
+            // left untouched: their spines either are not contiguous (filters remain
+            // inside) or contain no reversible chain.
+            other => other,
+        }
+    }
+
+    /// Attempt to reverse a linear single-hop `Expand` chain rooted at `op` so the
+    /// lower-cardinality (or index-backed) endpoint is scanned first. Returns the
+    /// original `op` unchanged when reversal does not apply or would not help.
+    fn try_reverse_chain(
+        op: PhysicalOperator,
+        filters: &mut Vec<FilterExpr>,
+        stats: Option<&dyn StatsProvider>,
+    ) -> PhysicalOperator {
+        struct Hop {
+            src: String,
+            rel_var: String,
+            dst: String,
+            rel_type: Option<String>,
+            is_incoming: bool,
+            is_undirected: bool,
+        }
+
+        // Walk the chain top-to-bottom by reference, validating shape without
+        // consuming `op`, so a bail-out can return it untouched.
+        let mut hops: Vec<Hop> = Vec::new();
+        let mut node = &op;
+        let (start_var, start_lbl) = loop {
+            match node {
+                PhysicalOperator::Expand {
+                    input,
+                    src_var,
+                    rel_var,
+                    dst_var,
+                    rel_type,
+                    is_incoming,
+                    is_undirected,
+                    min_hops,
+                    max_hops,
+                } => {
+                    if *min_hops != 1 || *max_hops != 1 {
+                        return op; // variable-length hops are not reversed here
+                    }
+                    hops.push(Hop {
+                        src: src_var.clone(),
+                        rel_var: rel_var.clone(),
+                        dst: dst_var.clone(),
+                        rel_type: rel_type.clone(),
+                        is_incoming: *is_incoming,
+                        is_undirected: *is_undirected,
+                    });
+                    node = input;
+                }
+                PhysicalOperator::LabelScan {
+                    variable,
+                    label: Some(lbl),
+                } => break (variable.clone(), lbl.clone()),
+                // Not a clean chain over a single labeled scan.
+                _ => return op,
+            }
+        };
+
+        // Validate linear connectivity (hops listed top-to-bottom) and acyclicity.
+        // hop[i].src must equal hop[i+1].dst, and the bottom hop's src is the scan.
+        let n = hops.len();
+        for i in 0..n.saturating_sub(1) {
+            if hops[i].src != hops[i + 1].dst {
+                return op;
+            }
+        }
+        if hops[n - 1].src != start_var {
+            return op;
+        }
+        // Distinct node variables (no repeated node = no cycle to close).
+        let mut node_vars: Vec<&str> = vec![start_var.as_str()];
+        for hop in hops.iter().rev() {
+            node_vars.push(hop.dst.as_str());
+        }
+        let distinct: HashSet<&str> = node_vars.iter().copied().collect();
+        if distinct.len() != node_vars.len() {
+            return op;
+        }
+
+        // The far endpoint is the top hop's destination.
+        let terminal_var = hops[0].dst.clone();
+        let term_lbl = match filters.iter().find_map(|f| match f {
+            FilterExpr::HasLabel(v, l) if *v == terminal_var => Some(l.clone()),
+            _ => None,
+        }) {
+            Some(l) => l,
+            None => return op, // cannot estimate the far endpoint
+        };
+
+        // Decide using index-backed equality first, then label cardinality.
+        let start_indexed = Self::has_indexed_eq(&start_var, &start_lbl, filters, stats);
+        let term_indexed = Self::has_indexed_eq(&terminal_var, &term_lbl, filters, stats);
+        let reverse = match (start_indexed, term_indexed) {
+            (false, true) => true,
+            (true, false) => false,
+            _ => {
+                let sc = stats.and_then(|s| s.node_count_by_label(&start_lbl));
+                let tc = stats.and_then(|s| s.node_count_by_label(&term_lbl));
+                match (sc, tc) {
+                    (Some(s), Some(t)) => t < s,
+                    _ => return op,
+                }
+            }
+        };
+        if !reverse {
+            return op;
+        }
+
+        // Build the reversed chain: scan the far endpoint, then apply hops from the
+        // top down, swapping endpoints and flipping direction for directed hops.
+        let mut tree = PhysicalOperator::LabelScan {
+            variable: terminal_var.clone(),
+            label: Some(term_lbl.clone()),
+        };
+        for hop in hops.iter() {
+            tree = PhysicalOperator::Expand {
+                input: Box::new(tree),
+                src_var: hop.dst.clone(),
+                rel_var: hop.rel_var.clone(),
+                dst_var: hop.src.clone(),
+                rel_type: hop.rel_type.clone(),
+                is_incoming: if hop.is_undirected {
+                    hop.is_incoming
+                } else {
+                    !hop.is_incoming
+                },
+                is_undirected: hop.is_undirected,
+                min_hops: 1,
+                max_hops: 1,
+            };
+        }
+
+        // The far endpoint's label is now carried by the scan; drop its HasLabel
+        // predicate and re-add the original start label so it is still enforced.
+        filters.retain(
+            |f| !matches!(f, FilterExpr::HasLabel(v, l) if *v == terminal_var && *l == term_lbl),
+        );
+        filters.push(FilterExpr::HasLabel(start_var, start_lbl));
+        tree
+    }
+
+    /// Return true when `filters` holds an equality predicate `var.prop = literal`
+    /// (or `literal = var.prop`) backed by an existing node property index.
+    fn has_indexed_eq(
+        var: &str,
+        label: &str,
+        filters: &[FilterExpr],
+        stats: Option<&dyn StatsProvider>,
+    ) -> bool {
+        let Some(s) = stats else { return false };
+        filters.iter().any(|f| {
+            let FilterExpr::Eq(l, r) = f else {
+                return false;
+            };
+            let prop = match (l, r) {
+                (Expr::Prop(v, p), Expr::Literal(_) | Expr::Param(_))
+                    if v == var && !p.is_empty() =>
+                {
+                    p
+                }
+                (Expr::Literal(_) | Expr::Param(_), Expr::Prop(v, p))
+                    if v == var && !p.is_empty() =>
+                {
+                    p
+                }
+                _ => return false,
+            };
+            s.has_node_property_index(label, prop)
+        })
+    }
+
+    /// When one side of an equality is `id(var)` and the other is a literal or
+    /// parameter, return the constant id expression; otherwise `None`. Used to
+    /// rewrite `WHERE id(n) = <const>` into a primary-key seek.
+    fn id_seek_value(l: &Expr, r: &Expr, var: &str) -> Option<Expr> {
+        let is_id_of_var = |e: &Expr| {
+            matches!(e, Expr::FunctionCall { name, args }
+                if name == "id"
+                    && args.len() == 1
+                    && matches!(&args[0], Expr::Prop(v, p) if v == var && p.is_empty()))
+        };
+        let is_const = |e: &Expr| matches!(e, Expr::Literal(_) | Expr::Param(_));
+        if is_id_of_var(l) && is_const(r) {
+            Some(r.clone())
+        } else if is_id_of_var(r) && is_const(l) {
+            Some(l.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Replace a `count(*)`/`count(n)` aggregation over a bare labeled node scan
+    /// with a constant read from graph metadata. Fires only when the aggregate has
+    /// no grouping keys and a single non-distinct count whose inner expression is
+    /// `count(*)` or a bare variable, its input is exactly a `LabelScan` with a
+    /// known label, and the label's node count is available and positive. A zero
+    /// count is left to normal execution so empty-result semantics are preserved.
+    fn reduce_count(op: PhysicalOperator, stats: Option<&dyn StatsProvider>) -> PhysicalOperator {
+        match op {
+            PhysicalOperator::Aggregate {
+                input,
+                group_by,
+                aggregations,
+            } => {
+                if group_by.is_empty() && aggregations.len() == 1 {
+                    let (agg_fn, inner, col) = &aggregations[0];
+                    let plain_count = matches!(agg_fn, AggFn::Count { distinct: false });
+                    let counts_rows = matches!(inner, Expr::CountStar)
+                        || matches!(inner, Expr::Prop(_, p) if p.is_empty());
+                    if plain_count && counts_rows {
+                        if let PhysicalOperator::LabelScan {
+                            label: Some(lbl), ..
+                        } = input.as_ref()
+                        {
+                            if let Some(n) = stats.and_then(|s| s.node_count_by_label(lbl)) {
+                                if n > 0 {
+                                    return PhysicalOperator::Project {
+                                        input: Box::new(PhysicalOperator::SingleRow),
+                                        items: vec![(
+                                            Expr::Literal(Literal::Int(n as i64)),
+                                            Some(col.clone()),
+                                        )],
+                                        is_barrier: false,
+                                    };
+                                }
+                            }
+                        }
+                    }
+                }
+                PhysicalOperator::Aggregate {
+                    input,
+                    group_by,
+                    aggregations,
+                }
+            }
+            PhysicalOperator::Project {
+                input,
+                items,
+                is_barrier,
+            } if !is_barrier => PhysicalOperator::Project {
+                input: Box::new(Self::reduce_count(*input, stats)),
+                items,
+                is_barrier,
+            },
+            PhysicalOperator::Sort { input, items } => PhysicalOperator::Sort {
+                input: Box::new(Self::reduce_count(*input, stats)),
+                items,
+            },
+            PhysicalOperator::Limit { input, skip, count } => PhysicalOperator::Limit {
+                input: Box::new(Self::reduce_count(*input, stats)),
+                skip,
+                count,
+            },
+            PhysicalOperator::Distinct { input } => PhysicalOperator::Distinct {
+                input: Box::new(Self::reduce_count(*input, stats)),
+            },
+            other => other,
         }
     }
 }
@@ -2040,6 +2428,267 @@ mod tests {
         assert!(
             matches!(rewritten, PhysicalOperator::Expand { dst_var, .. } if dst_var == "c"),
             "open chain must remain as Expand"
+        );
+    }
+
+    /// A `StatsProvider` with fixed label/type counts and an optional set of
+    /// node property indexes, for exercising cost-driven optimizer passes.
+    struct TestStats {
+        labels: std::collections::HashMap<String, u64>,
+        types: std::collections::HashMap<String, u64>,
+        indexes: HashSet<(String, String)>,
+    }
+
+    impl TestStats {
+        fn new(labels: &[(&str, u64)]) -> Self {
+            Self {
+                labels: labels.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
+                types: std::collections::HashMap::new(),
+                indexes: HashSet::new(),
+            }
+        }
+
+        fn with_index(mut self, label: &str, property: &str) -> Self {
+            self.indexes
+                .insert((label.to_string(), property.to_string()));
+            self
+        }
+    }
+
+    impl StatsProvider for TestStats {
+        fn node_count_by_label(&self, label: &str) -> Option<u64> {
+            self.labels.get(label).copied()
+        }
+        fn edge_count_by_type(&self, etype: &str) -> Option<u64> {
+            self.types.get(etype).copied()
+        }
+        fn has_node_property_index(&self, label: &str, property: &str) -> bool {
+            self.indexes
+                .contains(&(label.to_string(), property.to_string()))
+        }
+    }
+
+    fn optimize_query(cypher: &str, stats: &dyn StatsProvider) -> PhysicalOperator {
+        let stmt = parser::parse(cypher).unwrap();
+        let query = match stmt {
+            crate::ast::Statement::Query(q) => q,
+            _ => panic!("expected Query"),
+        };
+        let logical = LogicalPlanner::plan(&query).unwrap();
+        let physical = PhysicalPlanner::plan(&logical);
+        Optimizer::optimize(physical, Some(stats))
+    }
+
+    /// Return the variable and label of the deepest `LabelScan` in a plan.
+    fn bottom_scan(op: &PhysicalOperator) -> Option<(String, Option<String>)> {
+        match op {
+            PhysicalOperator::LabelScan { variable, label } => {
+                Some((variable.clone(), label.clone()))
+            }
+            PhysicalOperator::Expand { input, .. }
+            | PhysicalOperator::Filter { input, .. }
+            | PhysicalOperator::Project { input, .. }
+            | PhysicalOperator::Aggregate { input, .. }
+            | PhysicalOperator::Sort { input, .. }
+            | PhysicalOperator::Limit { input, .. }
+            | PhysicalOperator::Distinct { input }
+            | PhysicalOperator::MultiwayJoin { input, .. } => bottom_scan(input),
+            _ => None,
+        }
+    }
+
+    fn has_haslabel(op: &PhysicalOperator, var: &str, label: &str) -> bool {
+        match op {
+            PhysicalOperator::Filter { input, expression } => {
+                matches!(expression, FilterExpr::HasLabel(v, l) if v == var && l == label)
+                    || has_haslabel(input, var, label)
+            }
+            PhysicalOperator::Expand { input, .. }
+            | PhysicalOperator::Project { input, .. }
+            | PhysicalOperator::Aggregate { input, .. }
+            | PhysicalOperator::Sort { input, .. }
+            | PhysicalOperator::Limit { input, .. }
+            | PhysicalOperator::Distinct { input }
+            | PhysicalOperator::MultiwayJoin { input, .. } => has_haslabel(input, var, label),
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn select_scan_reverses_to_rarer_endpoint() {
+        // Person is common, City is rare: start the traversal from City and walk
+        // the KNOWS edge incoming back to Person.
+        let stats = TestStats::new(&[("Person", 1000), ("City", 10)]);
+        let plan = optimize_query("MATCH (a:Person)-[:KNOWS]->(b:City) RETURN a, b", &stats);
+
+        let (var, label) = bottom_scan(&plan).expect("a label scan");
+        assert_eq!(var, "b", "should scan the rarer City endpoint first");
+        assert_eq!(label.as_deref(), Some("City"));
+        // The original start label must still be enforced as a HasLabel predicate.
+        assert!(
+            has_haslabel(&plan, "a", "Person"),
+            "old start label must be re-added as a filter"
+        );
+    }
+
+    #[test]
+    fn select_scan_keeps_rarer_start_unchanged() {
+        // Start endpoint is already the rarer one: no reversal.
+        let stats = TestStats::new(&[("Person", 10), ("City", 1000)]);
+        let plan = optimize_query("MATCH (a:Person)-[:KNOWS]->(b:City) RETURN a, b", &stats);
+
+        let (var, label) = bottom_scan(&plan).expect("a label scan");
+        assert_eq!(var, "a", "rarer start endpoint must be kept");
+        assert_eq!(label.as_deref(), Some("Person"));
+    }
+
+    #[test]
+    fn select_scan_prefers_indexed_endpoint_over_cardinality() {
+        // City is rarer by count, but Person has an index-backed equality filter,
+        // so the start must stay on Person despite the larger label count.
+        let stats = TestStats::new(&[("Person", 1000), ("City", 10)]).with_index("Person", "name");
+        let plan = optimize_query(
+            "MATCH (a:Person)-[:KNOWS]->(b:City) WHERE a.name = 'Alice' RETURN a, b",
+            &stats,
+        );
+
+        // The start stays on Person, so the index-scan pass turns it into a
+        // NodeIndexScan on `a` rather than reversing toward City.
+        fn finds_index_scan_on(op: &PhysicalOperator, var: &str) -> bool {
+            match op {
+                PhysicalOperator::NodeIndexScan { variable, .. } => variable == var,
+                PhysicalOperator::Expand { input, .. }
+                | PhysicalOperator::Filter { input, .. }
+                | PhysicalOperator::Project { input, .. }
+                | PhysicalOperator::Aggregate { input, .. }
+                | PhysicalOperator::Sort { input, .. }
+                | PhysicalOperator::Limit { input, .. }
+                | PhysicalOperator::Distinct { input }
+                | PhysicalOperator::MultiwayJoin { input, .. } => finds_index_scan_on(input, var),
+                _ => false,
+            }
+        }
+        assert!(
+            finds_index_scan_on(&plan, "a"),
+            "index-backed endpoint must win over raw cardinality: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn select_scan_reverses_multi_hop_chain() {
+        // (a:Person)-->(b)-->(c:City): reverse the whole two-hop chain to start at c.
+        let stats = TestStats::new(&[("Person", 1000), ("City", 5)]);
+        let plan = optimize_query(
+            "MATCH (a:Person)-[:KNOWS]->(b)-[:LIVES_IN]->(c:City) RETURN a, c",
+            &stats,
+        );
+
+        let (var, label) = bottom_scan(&plan).expect("a label scan");
+        assert_eq!(var, "c");
+        assert_eq!(label.as_deref(), Some("City"));
+        assert!(has_haslabel(&plan, "a", "Person"));
+    }
+
+    #[test]
+    fn reduce_count_replaces_scan_with_constant() {
+        let stats = TestStats::new(&[("Person", 42)]);
+        let plan = optimize_query("MATCH (n:Person) RETURN count(*)", &stats);
+
+        // Expect Project[42 AS count(*)] over SingleRow, with no scan at all.
+        assert!(
+            bottom_scan(&plan).is_none(),
+            "count over a label scan must not scan: {plan:?}"
+        );
+        fn finds_literal_42(op: &PhysicalOperator) -> bool {
+            match op {
+                PhysicalOperator::Project { input, items, .. } => {
+                    items
+                        .iter()
+                        .any(|(e, _)| matches!(e, Expr::Literal(Literal::Int(42))))
+                        || finds_literal_42(input)
+                }
+                _ => false,
+            }
+        }
+        assert!(
+            finds_literal_42(&plan),
+            "count constant 42 must be projected"
+        );
+    }
+
+    #[test]
+    fn reduce_count_skips_grouped_and_property_counts() {
+        let stats = TestStats::new(&[("Person", 42)]);
+        // count(n.age) counts non-null properties, not rows: must not be reduced.
+        let plan = optimize_query("MATCH (n:Person) RETURN count(n.age)", &stats);
+        assert!(
+            bottom_scan(&plan).is_some(),
+            "property count must still scan"
+        );
+    }
+
+    fn finds_id_seek(op: &PhysicalOperator, var: &str) -> bool {
+        match op {
+            PhysicalOperator::NodeByIdSeek { variable, .. } => variable == var,
+            PhysicalOperator::Expand { input, .. }
+            | PhysicalOperator::Filter { input, .. }
+            | PhysicalOperator::Project { input, .. }
+            | PhysicalOperator::Aggregate { input, .. }
+            | PhysicalOperator::Sort { input, .. }
+            | PhysicalOperator::Limit { input, .. }
+            | PhysicalOperator::Distinct { input }
+            | PhysicalOperator::MultiwayJoin { input, .. } => finds_id_seek(input, var),
+            PhysicalOperator::HashJoin { left, right } => {
+                finds_id_seek(left, var) || finds_id_seek(right, var)
+            }
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn id_equality_becomes_node_seek() {
+        let stats = TestStats::new(&[("Person", 1000)]);
+        let plan = optimize_query("MATCH (n:Person) WHERE id(n) = 42 RETURN n", &stats);
+        assert!(finds_id_seek(&plan, "n"), "expected NodeByIdSeek: {plan:?}");
+        assert!(
+            bottom_scan(&plan).is_none(),
+            "id seek must not fall back to a label scan"
+        );
+    }
+
+    #[test]
+    fn id_equality_flipped_operands_becomes_node_seek() {
+        let stats = TestStats::new(&[("Person", 1000)]);
+        let plan = optimize_query("MATCH (n:Person) WHERE 42 = id(n) RETURN n", &stats);
+        assert!(finds_id_seek(&plan, "n"), "expected NodeByIdSeek: {plan:?}");
+    }
+
+    #[test]
+    fn id_seek_works_on_unlabeled_scan() {
+        let stats = TestStats::new(&[]);
+        let plan = optimize_query("MATCH (n) WHERE id(n) = 7 RETURN n", &stats);
+        assert!(finds_id_seek(&plan, "n"), "expected NodeByIdSeek: {plan:?}");
+    }
+
+    #[test]
+    fn non_id_equality_is_not_a_seek() {
+        let stats = TestStats::new(&[("Person", 1000)]);
+        let plan = optimize_query("MATCH (n:Person) WHERE n.age = 42 RETURN n", &stats);
+        assert!(
+            !finds_id_seek(&plan, "n"),
+            "property eq must not seek: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn reduce_count_skips_zero_count() {
+        // Unknown/empty label yields no metadata count, so the scan is preserved
+        // and empty-result semantics are unchanged.
+        let stats = TestStats::new(&[("Person", 0)]);
+        let plan = optimize_query("MATCH (n:Person) RETURN count(*)", &stats);
+        assert!(
+            bottom_scan(&plan).is_some(),
+            "zero count must fall through to normal execution"
         );
     }
 }

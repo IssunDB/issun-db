@@ -1,4 +1,4 @@
-use issundb::{Graph, NodeId};
+use issundb::{Graph, GraphQueryExt, NodeId};
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -274,4 +274,213 @@ fn test_facade_full_text_search_integration() {
     let hits_thief = g.text_search("thief", &opts).unwrap();
     assert_eq!(hits_thief.len(), 1);
     assert_eq!(hits_thief[0].node, m1);
+}
+
+// ---------------------------------------------------------------------------
+// Optimizer: scan-node selection and count reduction (end-to-end correctness)
+// ---------------------------------------------------------------------------
+
+/// Build a graph where Person is common and City is rare, so the optimizer
+/// reverses `(:Person)-[:KNOWS]->(:City)` to start from City and walk the edge
+/// incoming. The query results must be identical regardless of traversal order.
+fn knows_city_graph() -> (TempDir, Graph) {
+    let (dir, g) = open_tmp();
+    let alice = g.add_node("Person", &json!({ "name": "Alice" })).unwrap();
+    let bob = g.add_node("Person", &json!({ "name": "Bob" })).unwrap();
+    let carol = g.add_node("Person", &json!({ "name": "Carol" })).unwrap();
+    let paris = g.add_node("City", &json!({ "name": "Paris" })).unwrap();
+    let lyon = g.add_node("City", &json!({ "name": "Lyon" })).unwrap();
+    g.add_edge(alice, paris, "KNOWS", &json!({})).unwrap();
+    g.add_edge(bob, paris, "KNOWS", &json!({})).unwrap();
+    g.add_edge(carol, lyon, "KNOWS", &json!({})).unwrap();
+    g.rebuild_csr().unwrap();
+    (dir, g)
+}
+
+fn pairs(result: &issundb::QueryResult) -> Vec<(String, String)> {
+    let mut rows: Vec<(String, String)> = result
+        .records
+        .iter()
+        .map(|r| {
+            (
+                r.values[0].as_str().unwrap().to_string(),
+                r.values[1].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
+#[test]
+fn scan_selection_preserves_results_when_chain_reversed() {
+    let (_dir, g) = knows_city_graph();
+    let result = g
+        .query("MATCH (a:Person)-[:KNOWS]->(b:City) RETURN a.name AS person, b.name AS city")
+        .unwrap();
+    assert_eq!(
+        pairs(&result),
+        vec![
+            ("Alice".to_string(), "Paris".to_string()),
+            ("Bob".to_string(), "Paris".to_string()),
+            ("Carol".to_string(), "Lyon".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn scan_selection_multi_hop_preserves_results() {
+    let (_dir, g) = open_tmp();
+    let alice = g.add_node("Person", &json!({ "name": "Alice" })).unwrap();
+    let bob = g.add_node("Person", &json!({ "name": "Bob" })).unwrap();
+    let acme = g.add_node("Company", &json!({ "name": "Acme" })).unwrap();
+    let paris = g.add_node("City", &json!({ "name": "Paris" })).unwrap();
+    g.add_edge(alice, acme, "WORKS_AT", &json!({})).unwrap();
+    g.add_edge(bob, acme, "WORKS_AT", &json!({})).unwrap();
+    g.add_edge(acme, paris, "LOCATED_IN", &json!({})).unwrap();
+    g.rebuild_csr().unwrap();
+    let result = g
+        .query(
+            "MATCH (a:Person)-[:WORKS_AT]->(c:Company)-[:LOCATED_IN]->(city:City) \
+             RETURN a.name AS person, city.name AS city",
+        )
+        .unwrap();
+    assert_eq!(
+        pairs(&result),
+        vec![
+            ("Alice".to_string(), "Paris".to_string()),
+            ("Bob".to_string(), "Paris".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn reduce_count_returns_label_node_count() {
+    let (_dir, g) = knows_city_graph();
+    let result = g.query("MATCH (n:Person) RETURN count(*) AS c").unwrap();
+    assert_eq!(result.records.len(), 1);
+    assert_eq!(result.records[0].values[0].as_i64(), Some(3));
+}
+
+#[test]
+fn reduce_count_bare_variable_matches_row_count() {
+    let (_dir, g) = knows_city_graph();
+    let result = g.query("MATCH (n:City) RETURN count(n) AS c").unwrap();
+    assert_eq!(result.records.len(), 1);
+    assert_eq!(result.records[0].values[0].as_i64(), Some(2));
+}
+
+#[test]
+fn id_seek_returns_the_single_node() {
+    let (_dir, g) = knows_city_graph();
+    let alice = g
+        .nodes_by_label("Person")
+        .unwrap()
+        .into_iter()
+        .min()
+        .unwrap();
+    let q = format!("MATCH (n:Person) WHERE id(n) = {alice} RETURN n.name AS name");
+    let result = g.query(&q).unwrap();
+    assert_eq!(result.records.len(), 1);
+    assert_eq!(result.records[0].values[0].as_str(), Some("Alice"));
+}
+
+#[test]
+fn id_seek_with_wrong_label_returns_empty() {
+    let (_dir, g) = knows_city_graph();
+    // A Person id queried under the City label must yield no rows.
+    let alice = g
+        .nodes_by_label("Person")
+        .unwrap()
+        .into_iter()
+        .min()
+        .unwrap();
+    let q = format!("MATCH (n:City) WHERE id(n) = {alice} RETURN n");
+    let result = g.query(&q).unwrap();
+    assert_eq!(result.records.len(), 0);
+}
+
+#[test]
+fn id_seek_missing_id_returns_empty() {
+    let (_dir, g) = knows_city_graph();
+    let result = g
+        .query("MATCH (n:Person) WHERE id(n) = 999999 RETURN n")
+        .unwrap();
+    assert_eq!(result.records.len(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Fused multi-hop expand chains (execute_expand_chain_n)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn fused_three_hop_chain_preserves_results() {
+    let (_dir, g) = open_tmp();
+    let a = g.add_node("A", &json!({ "name": "a" })).unwrap();
+    let b = g.add_node("B", &json!({ "name": "b" })).unwrap();
+    let c = g.add_node("C", &json!({ "name": "c" })).unwrap();
+    let d = g.add_node("D", &json!({ "name": "d" })).unwrap();
+    g.add_edge(a, b, "R1", &json!({})).unwrap();
+    g.add_edge(b, c, "R2", &json!({})).unwrap();
+    g.add_edge(c, d, "R3", &json!({})).unwrap();
+    g.rebuild_csr().unwrap();
+    let result = g
+        .query(
+            "MATCH (a:A)-[:R1]->(x)-[:R2]->(y)-[:R3]->(z:D) \
+             RETURN a.name AS s, z.name AS e",
+        )
+        .unwrap();
+    assert_eq!(pairs(&result), vec![("a".to_string(), "d".to_string())]);
+}
+
+#[test]
+fn fused_four_hop_chain_with_branching_multiplicity() {
+    // a -> b -> {c1, c2} -> d -> e. Two distinct 4-hop paths must both appear.
+    let (_dir, g) = open_tmp();
+    let a = g.add_node("N", &json!({ "n": "a" })).unwrap();
+    let b = g.add_node("N", &json!({ "n": "b" })).unwrap();
+    let c1 = g.add_node("N", &json!({ "n": "c1" })).unwrap();
+    let c2 = g.add_node("N", &json!({ "n": "c2" })).unwrap();
+    let d = g.add_node("N", &json!({ "n": "d" })).unwrap();
+    let e = g.add_node("N", &json!({ "n": "e" })).unwrap();
+    g.add_edge(a, b, "R", &json!({})).unwrap();
+    g.add_edge(b, c1, "R", &json!({})).unwrap();
+    g.add_edge(b, c2, "R", &json!({})).unwrap();
+    g.add_edge(c1, d, "R", &json!({})).unwrap();
+    g.add_edge(c2, d, "R", &json!({})).unwrap();
+    g.add_edge(d, e, "R", &json!({})).unwrap();
+    g.rebuild_csr().unwrap();
+    let result = g
+        .query(
+            "MATCH (a)-[:R]->(w)-[:R]->(m)-[:R]->(x)-[:R]->(z) \
+             WHERE a.n = 'a' RETURN m.n AS mid",
+        )
+        .unwrap();
+    // Two paths a->b->c1->d->e and a->b->c2->d->e: distinct middles c1 and c2.
+    let mut mids: Vec<String> = result
+        .records
+        .iter()
+        .map(|r| r.values[0].as_str().unwrap().to_string())
+        .collect();
+    mids.sort();
+    assert_eq!(mids, vec!["c1".to_string(), "c2".to_string()]);
+}
+
+#[test]
+fn fused_chain_breaks_on_labeled_intermediate() {
+    // A label on the intermediate node forces a Filter between hops, so the chain
+    // does not fuse; results must still be correct.
+    let (_dir, g) = open_tmp();
+    let a = g.add_node("A", &json!({ "n": "a" })).unwrap();
+    let b = g.add_node("Stop", &json!({ "n": "b" })).unwrap();
+    let c = g.add_node("A", &json!({ "n": "c" })).unwrap();
+    let other = g.add_node("Other", &json!({ "n": "x" })).unwrap();
+    g.add_edge(a, b, "R", &json!({})).unwrap();
+    g.add_edge(b, c, "R", &json!({})).unwrap();
+    g.add_edge(a, other, "R", &json!({})).unwrap();
+    g.rebuild_csr().unwrap();
+    let result = g
+        .query("MATCH (a:A)-[:R]->(m:Stop)-[:R]->(z:A) RETURN a.n AS s, z.n AS e")
+        .unwrap();
+    assert_eq!(pairs(&result), vec![("a".to_string(), "c".to_string())]);
 }

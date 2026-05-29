@@ -17,6 +17,16 @@ pub enum PhysicalOperator {
         variable: String,
         label: Option<String>,
     },
+    /// Seek a single node by its internal id: binds `variable` to the node whose
+    /// id equals `id_value`, if it exists (and matches `label` when present).
+    ///
+    /// Emitted by the optimizer when a `WHERE id(n) = <const>` predicate sits over
+    /// a node scan, replacing a full label scan with an O(1) primary-key lookup.
+    NodeByIdSeek {
+        variable: String,
+        label: Option<String>,
+        id_value: Expr,
+    },
     /// Scan nodes using a property index: binds `variable` to nodes matching `label` and `property` value.
     NodeIndexScan {
         variable: String,
@@ -231,6 +241,20 @@ pub fn format_physical_plan(op: &PhysicalOperator, depth: usize) -> String {
         PhysicalOperator::LabelScan { variable, label } => {
             let lbl = label.as_deref().unwrap_or("*");
             buf.push_str(&format!("{}LabelScan {}:{}\n", pad, variable, lbl));
+        }
+        PhysicalOperator::NodeByIdSeek {
+            variable,
+            label,
+            id_value,
+        } => {
+            let lbl = label.as_deref().unwrap_or("*");
+            buf.push_str(&format!(
+                "{}NodeByIdSeek {}:{} id={}\n",
+                pad,
+                variable,
+                lbl,
+                fmt_expr(id_value)
+            ));
         }
         PhysicalOperator::NodeIndexScan {
             variable,

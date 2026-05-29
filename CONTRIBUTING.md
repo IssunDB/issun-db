@@ -30,7 +30,20 @@ would like to work on or if it has already been resolved.
 ### Development Workflow
 
 > [!IMPORTANT]
-> If you're using an AI-assisted coding tool like Claude Code or Codex, make sure the AI follows the instructions in the [AGENTS.md](AGENTS.md) file.
+> If you're using an AI-assisted coding tool like Claude Code or Codex, make sure the AI follows the instructions in]
+> the root [AGENTS.md](AGENTS.md) file.
+
+#### Architecture
+
+IssunDB components are organized into separate Rust crates for modularity and maintainability.
+It's very important that componets are decoupled and have well-defined boundaries and clean APIs between them.
+Diagram below shows the relationship between the main components and their responsibilities:
+
+<div align="center">
+  <picture>
+    <img alt="IssunDB Architecture" src="docs/assets/diagrams/architecture.svg" height="70%" width="70%">
+  </picture>
+</div>
 
 #### Code Style
 

@@ -70,6 +70,10 @@ This document outlines the features implemented in IssunDB and the future goals 
 - [x] Inline relationship property map filter pushdown: e.g. `-[:KNOWS {since: 2026}]->`
 - [x] Worst-case optimal join (`MultiwayJoin`) for closing hops in cyclic patterns (triangles, cliques): optimizer detects already-bound `dst_var` and rewrites to O(1) hash-map lookup per row
 - [x] Factorized Filter-over-Expand execution: source-predicate filters are evaluated once per source node; destinations of rejected sources are skipped with zero PathMap clones
+- [x] Scan-node selection: the optimizer reverses a linear single-hop Expand chain to start traversal from its lowest-cardinality or index-backed endpoint, flipping each hop's direction so no executor change is needed
+- [x] Count reduction: `count(*)` or `count(n)` over a bare labeled scan is replaced with a constant read from label metadata, avoiding a full scan
+- [x] Primary-key seek: `WHERE id(n) = <const>` over a node scan is rewritten to a `NodeByIdSeek` that fetches one node directly instead of scanning the label
+- [x] Fused linear expand chains: a contiguous run of single-hop directed expands is executed as one operation that bulk-expands each hop level and clones the base path once per output row, generalizing the former two-hop fast path to any length
 - [ ] Full openCypher TCK conformance: as of 2026-05-29, about 75% of executed scenarios pass (roughly 2,480 of 3,300; a further 597 scenarios are skipped as intentional exclusions, such as negative-test tags and node or relationship display-literal representational mismatches). Notable remaining capability gaps:
     - [ ] Temporal timezone resolution for named and historical zones, and duration-between computation
     - [ ] `CALL` and procedure invocation
