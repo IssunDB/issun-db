@@ -1,4 +1,5 @@
 use crate::ast::{AggFn, Expr, MatchClause, Query, SortItem, WhereClause};
+use crate::error::CypherError;
 use crate::exec::read::expr_display_name;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -100,7 +101,7 @@ pub enum LogicalOperator {
 pub struct LogicalPlanner;
 
 impl LogicalPlanner {
-    pub fn plan(query: &Query) -> Result<LogicalOperator, String> {
+    pub fn plan(query: &Query) -> Result<LogicalOperator, CypherError> {
         let mut plan = if query.parts.is_empty() {
             // Legacy single-MATCH planning flow.
             // When match_clauses is also empty this is a bare RETURN query (e.g. `RETURN 1 + 2`).
@@ -133,7 +134,9 @@ impl LogicalPlanner {
                 };
             }
 
-            let mut p = current_plan.ok_or_else(|| "failed to generate MATCH plan".to_string())?;
+            let mut p = current_plan.ok_or(CypherError::Plan(
+                "failed to generate MATCH plan".to_string(),
+            ))?;
 
             // Apply WHERE clause if present
             if let Some(ref where_clause) = query.where_clause {
@@ -164,7 +167,9 @@ impl LogicalPlanner {
                         where_clause,
                     } => {
                         if match_clauses.is_empty() {
-                            return Err("MATCH part must contain at least one MATCH clause".into());
+                            return Err(CypherError::Plan(
+                                "MATCH part must contain at least one MATCH clause".to_string(),
+                            ));
                         }
                         let mut part_match_plan: Option<LogicalOperator> = None;
                         for match_clause in match_clauses {
@@ -177,9 +182,9 @@ impl LogicalPlanner {
                                 None => Some(mp),
                             };
                         }
-                        let mut match_plan = part_match_plan.ok_or_else(|| {
-                            "MATCH part must contain at least one MATCH clause".to_string()
-                        })?;
+                        let mut match_plan = part_match_plan.ok_or(CypherError::Plan(
+                            "MATCH part must contain at least one MATCH clause".to_string(),
+                        ))?;
                         if let Some(wc) = where_clause {
                             let filter_expr = match wc {
                                 WhereClause::Eq(l, r) => FilterExpr::Eq(l.clone(), r.clone()),
@@ -355,14 +360,17 @@ impl LogicalPlanner {
                         where_clause,
                     } => {
                         if match_clauses.is_empty() {
-                            return Err(
-                                "OPTIONAL MATCH part must contain at least one clause".into()
-                            );
+                            return Err(CypherError::Plan(
+                                "OPTIONAL MATCH part must contain at least one clause".to_string(),
+                            ));
                         }
                         let mut part_match_plan: Option<LogicalOperator> = None;
                         // Collect all variables referenced in the pattern for null-filling.
                         let mut null_vars: Vec<String> = Vec::new();
                         for match_clause in match_clauses {
+                            if let Some(ref pv) = match_clause.pattern.path_variable {
+                                null_vars.push(pv.clone());
+                            }
                             if let Some(ref v) = match_clause.pattern.node.variable {
                                 null_vars.push(v.clone());
                             }
@@ -383,9 +391,9 @@ impl LogicalPlanner {
                                 None => Some(mp),
                             };
                         }
-                        let mut match_plan = part_match_plan.ok_or_else(|| {
-                            "OPTIONAL MATCH part must contain at least one clause".to_string()
-                        })?;
+                        let mut match_plan = part_match_plan.ok_or(CypherError::Plan(
+                            "OPTIONAL MATCH part must contain at least one clause".to_string(),
+                        ))?;
                         if let Some(wc) = where_clause {
                             let filter_expr = match wc {
                                 WhereClause::Eq(l, r) => FilterExpr::Eq(l.clone(), r.clone()),
@@ -550,8 +558,7 @@ impl LogicalPlanner {
 
         Ok(plan)
     }
-
-    fn plan_match(match_clause: &MatchClause) -> Result<LogicalOperator, String> {
+    fn plan_match(match_clause: &MatchClause) -> Result<LogicalOperator, CypherError> {
         let pattern = &match_clause.pattern;
         let seed_var = pattern
             .node
@@ -559,10 +566,18 @@ impl LogicalPlanner {
             .clone()
             .unwrap_or_else(|| "_seed".to_string());
 
+        // Scan by the first label; additional labels become HasLabel filters so
+        // a multi-label pattern such as (n:A:B) requires the node to carry all of them.
         let mut plan = LogicalOperator::LabelScan {
             variable: seed_var.clone(),
-            label: pattern.node.label.clone(),
+            label: pattern.node.labels.first().cloned(),
         };
+        for extra_label in pattern.node.labels.iter().skip(1) {
+            plan = LogicalOperator::Filter {
+                input: Box::new(plan),
+                expression: FilterExpr::HasLabel(seed_var.clone(), extra_label.clone()),
+            };
+        }
 
         // Apply inline properties filter on the seed node if specified.
         // Properties are now arbitrary expressions (not just literals), so
@@ -625,8 +640,8 @@ impl LogicalPlanner {
                 }
             }
 
-            // Filter target node label if specified
-            if let Some(ref label) = node_pat.label {
+            // Filter target node by each of its labels.
+            for label in &node_pat.labels {
                 plan = LogicalOperator::Filter {
                     input: Box::new(plan),
                     expression: FilterExpr::HasLabel(target_var.clone(), label.clone()),
@@ -650,34 +665,26 @@ impl LogicalPlanner {
         }
 
         if let Some(ref pv) = pattern.path_variable {
-            let mut path_vars = vec![seed_var.clone()];
-            for (seg_idx, (rel_pat, node_pat)) in pattern.rels.iter().enumerate() {
-                let rel_var = rel_pat
-                    .variable
-                    .clone()
-                    .unwrap_or_else(|| format!("_rel_{}", seg_idx));
-                let target_var = node_pat
-                    .variable
-                    .clone()
-                    .unwrap_or_else(|| format!("_target_{}", seg_idx));
-                path_vars.push(rel_var);
-                path_vars.push(target_var);
-            }
-
-            let path_expr_args: Vec<Expr> = path_vars
-                .into_iter()
-                .map(|v| Expr::Prop(v, "".to_string()))
-                .collect();
+            let expr = if pattern.rels.is_empty() {
+                Expr::FunctionCall {
+                    name: "__path__".to_string(),
+                    args: vec![Expr::Prop(seed_var.clone(), "".to_string())],
+                }
+            } else {
+                let last_target_var = if let Some((_, last_node_pat)) = pattern.rels.last() {
+                    last_node_pat
+                        .variable
+                        .clone()
+                        .unwrap_or_else(|| format!("_target_{}", pattern.rels.len() - 1))
+                } else {
+                    seed_var.clone()
+                };
+                Expr::Prop(format!("_path_{}", last_target_var), "".to_string())
+            };
 
             plan = LogicalOperator::Project {
                 input: Box::new(plan),
-                items: vec![(
-                    Expr::FunctionCall {
-                        name: "__list__".to_string(),
-                        args: path_expr_args,
-                    },
-                    Some(pv.clone()),
-                )],
+                items: vec![(expr, Some(pv.clone()))],
                 is_barrier: false,
             };
         }
@@ -765,6 +772,16 @@ fn expr_has_aggregation(expr: &Expr) -> bool {
                 || predicate.as_ref().is_some_and(|p| expr_has_aggregation(p))
                 || transform.as_ref().is_some_and(|t| expr_has_aggregation(t))
         }
+        Expr::Reduce {
+            initial,
+            list,
+            expression,
+            ..
+        } => {
+            expr_has_aggregation(initial)
+                || expr_has_aggregation(list)
+                || expr_has_aggregation(expression)
+        }
         Expr::Quantifier {
             list, predicate, ..
         } => expr_has_aggregation(list) || expr_has_aggregation(predicate),
@@ -815,30 +832,30 @@ fn literal_usize(expr: &Expr) -> usize {
 
 /// Validate a SKIP or LIMIT expression. Returns an error if the value is non-constant,
 /// negative, or a float.
-pub(crate) fn validate_skip_limit(expr: &Expr, keyword: &str) -> Result<(), String> {
+pub(crate) fn validate_skip_limit(expr: &Expr, keyword: &str) -> Result<(), CypherError> {
     match expr {
         Expr::Literal(crate::ast::Literal::Int(n)) => {
             if *n < 0 {
-                Err(format!(
+                Err(CypherError::Plan(format!(
                     "SyntaxError: {} value must not be negative, got {}",
                     keyword, n
-                ))
+                )))
             } else {
                 Ok(())
             }
         }
-        Expr::Literal(crate::ast::Literal::Float(_)) => Err(format!(
+        Expr::Literal(crate::ast::Literal::Float(_)) => Err(CypherError::Plan(format!(
             "SyntaxError: {} value must be an integer, not a float",
             keyword
-        )),
+        ))),
         Expr::Param(_) => {
             // Parameter-based SKIP/LIMIT is allowed in Cypher; validation happens at runtime.
             Ok(())
         }
-        _ => Err(format!(
+        _ => Err(CypherError::Plan(format!(
             "SyntaxError: {} value must be a constant integer expression",
             keyword
-        )),
+        ))),
     }
 }
 
@@ -942,6 +959,16 @@ fn extract_and_replace_aggs(
                 extract_and_replace_aggs(t, aggregations, count_index, prefix);
             }
         }
+        Expr::Reduce {
+            initial,
+            list,
+            expression,
+            ..
+        } => {
+            extract_and_replace_aggs(initial, aggregations, count_index, prefix);
+            extract_and_replace_aggs(list, aggregations, count_index, prefix);
+            extract_and_replace_aggs(expression, aggregations, count_index, prefix);
+        }
         Expr::Quantifier {
             list, predicate, ..
         } => {
@@ -1013,6 +1040,16 @@ fn collect_ord_aggs(expr: &Expr, set: &mut std::collections::HashSet<String>) {
             if let Some(t) = transform {
                 collect_ord_aggs(t, set);
             }
+        }
+        Expr::Reduce {
+            initial,
+            list,
+            expression,
+            ..
+        } => {
+            collect_ord_aggs(initial, set);
+            collect_ord_aggs(list, set);
+            collect_ord_aggs(expression, set);
         }
         Expr::Quantifier {
             list, predicate, ..
@@ -1226,6 +1263,16 @@ fn rewrite_expr_with_aliases(expr: &mut Expr, projections: &[(Expr, String)]) {
             if let Some(t) = transform {
                 rewrite_expr_with_aliases(t, projections);
             }
+        }
+        Expr::Reduce {
+            initial,
+            list,
+            expression,
+            ..
+        } => {
+            rewrite_expr_with_aliases(initial, projections);
+            rewrite_expr_with_aliases(list, projections);
+            rewrite_expr_with_aliases(expression, projections);
         }
         Expr::HasLabel { .. } => {}
     }

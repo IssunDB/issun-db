@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
+use crate::error::RetrievalError;
 use ahash::{AHashMap, AHashSet};
-use issundb_core::{EdgeId, Error, Graph, NodeId};
+use issundb_core::{EdgeId, Graph, NodeId};
 use issundb_text::{TextGraphExt, TextSearchOptions};
 use issundb_vector::{VectorGraphExt, VectorSearchOptions};
 
@@ -45,7 +46,7 @@ impl Default for RetrieveOptions {
 
 /// Convenience wrapper: vector search to k seeds, then `hops`-hop BFS expansion to
 /// subgraph materialization.
-pub fn retrieve(graph: &Graph, q: &[f32], k: usize, hops: u8) -> Result<Subgraph, Error> {
+pub fn retrieve(graph: &Graph, q: &[f32], k: usize, hops: u8) -> Result<Subgraph, RetrievalError> {
     retrieve_with(
         graph,
         q,
@@ -63,7 +64,11 @@ pub fn retrieve(graph: &Graph, q: &[f32], k: usize, hops: u8) -> Result<Subgraph
 ///
 /// Runs multi-source SpMV BFS from the filtered seed nodes up to `hops` hops.
 /// Stops early or caps the results if `max_nodes` is specified and exceeded.
-pub fn retrieve_with(graph: &Graph, q: &[f32], opts: &RetrieveOptions) -> Result<Subgraph, Error> {
+pub fn retrieve_with(
+    graph: &Graph,
+    q: &[f32],
+    opts: &RetrieveOptions,
+) -> Result<Subgraph, RetrievalError> {
     let hits = graph.vector_search(q, opts.k)?;
 
     let mut scores: AHashMap<NodeId, f32> = AHashMap::new();
@@ -176,7 +181,7 @@ pub fn retrieve_hybrid(
     q: &[f32],
     text_query: &str,
     opts: &HybridRetrieveOptions,
-) -> Result<Subgraph, Error> {
+) -> Result<Subgraph, RetrievalError> {
     // ---- collect vector hits -----------------------------------------------
     let mut vec_ranks: AHashMap<NodeId, usize> = AHashMap::new();
     let mut vec_scores: AHashMap<NodeId, f32> = AHashMap::new();
@@ -207,11 +212,7 @@ pub fn retrieve_hybrid(
             limit: opts.text_k,
             ..Default::default()
         };
-        let text_hits = graph
-            .text_search(text_query, &text_opts)
-            .map_err(|e| match e {
-                issundb_text::TextError::Core(inner) => inner,
-            })?;
+        let text_hits = graph.text_search(text_query, &text_opts)?;
         for (rank, hit) in text_hits.iter().enumerate() {
             text_ranks.insert(hit.node, rank);
         }

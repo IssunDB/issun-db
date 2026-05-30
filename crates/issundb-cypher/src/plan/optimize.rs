@@ -1240,6 +1240,16 @@ impl Optimizer {
                     Self::collect_expr_vars(t, vars);
                 }
             }
+            Expr::Reduce {
+                initial,
+                list,
+                expression,
+                ..
+            } => {
+                Self::collect_expr_vars(initial, vars);
+                Self::collect_expr_vars(list, vars);
+                Self::collect_expr_vars(expression, vars);
+            }
             Expr::HasLabel { variable, .. } => {
                 vars.insert(variable.clone());
             }

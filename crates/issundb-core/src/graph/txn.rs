@@ -252,13 +252,38 @@ impl WriteTxn<'_> {
     }
 
     pub fn add_node(&mut self, label: &str, props: &impl Serialize) -> Result<NodeId, Error> {
-        let node_id = self.graph.add_node_impl(&mut self.wtxn, label, props)?;
+        let node_id = self.graph.add_node_impl(&mut self.wtxn, &[label], props)?;
+        self.mutations_count += 1;
+        Ok(node_id)
+    }
+
+    /// Insert a node with zero or more labels inside this write transaction.
+    pub fn add_node_multi(
+        &mut self,
+        labels: &[&str],
+        props: &impl Serialize,
+    ) -> Result<NodeId, Error> {
+        let node_id = self.graph.add_node_impl(&mut self.wtxn, labels, props)?;
         self.mutations_count += 1;
         Ok(node_id)
     }
 
     pub fn update_node(&mut self, id: NodeId, props: &impl Serialize) -> Result<(), Error> {
         self.graph.update_node_impl(&mut self.wtxn, id, props)?;
+        self.mutations_count += 1;
+        Ok(())
+    }
+
+    /// Add a label to an existing node inside this write transaction.
+    pub fn add_label(&mut self, id: NodeId, label: &str) -> Result<(), Error> {
+        self.graph.add_label_impl(&mut self.wtxn, id, label)?;
+        self.mutations_count += 1;
+        Ok(())
+    }
+
+    /// Remove a label from an existing node inside this write transaction.
+    pub fn remove_label(&mut self, id: NodeId, label: &str) -> Result<(), Error> {
+        self.graph.remove_label_impl(&mut self.wtxn, id, label)?;
         self.mutations_count += 1;
         Ok(())
     }

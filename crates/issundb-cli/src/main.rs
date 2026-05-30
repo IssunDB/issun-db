@@ -431,10 +431,9 @@ fn dispatch(state: &mut State, cmd: &str, rest: &str) {
             Ok(id) => match g.get_node(NodeId::from(id)) {
                 Ok(Some(r)) => {
                     let label = g
-                        .label_name(r.label)
-                        .ok()
-                        .flatten()
-                        .unwrap_or_else(|| r.label.to_string());
+                        .node_labels(NodeId::from(id))
+                        .unwrap_or_default()
+                        .join(":");
                     println!("label={label} props={}", decode_props(&r.props));
                 }
                 Ok(None) => eprintln!("not found"),

@@ -68,6 +68,10 @@ via `arc_swap::ArcSwap`. `MatrixSet` (in `matrices.rs`) holds the GraphBLAS spar
 - **Always write to LMDB first.** The CSR snapshot is derived from LMDB, not the other way around.
 - Use LMDB adjacency databases (`out_adj`, `in_adj`) for correctness-critical reads: single-node neighbor lookups, existence checks, and anything
   inside a transaction.
+- Note that `out_neighbors` consults the CSR snapshot first and falls back to `out_adj` only when the snapshot has no entry for the node, so it can
+  return stale results until the background rebuild completes. `in_neighbors` reads `in_adj` directly. A write-time consistency check (such as the
+  DELETE connected-node guard) must read storage truth: use `node_has_relationships`, which reads both adjacency databases and never consults the
+  snapshot.
 - Use the CSR snapshot as the hot read path for graph algorithms (BFS, DFS, PageRank, SCC). After a batch of writes, call `Graph::rebuild_csr` to
   refresh it.
 - `MatrixSet` is rebuilt from the CSR snapshot by `MatrixSet::materialize`. Rebuild both the CSR and the matrix set together; do not update one

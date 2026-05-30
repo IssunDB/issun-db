@@ -11,6 +11,15 @@ use thiserror::Error;
 pub enum TextError {
     #[error("core storage error: {0}")]
     Core(#[from] issundb_core::Error),
+
+    #[error("tokenizer fault: {0}")]
+    TokenizerFault(String),
+
+    #[error("unsupported language: {0}")]
+    UnsupportedLanguage(String),
+
+    #[error("index not found for label {label} and property {property}")]
+    IndexNotFound { label: String, property: String },
 }
 
 /// A single ranked full-text search result.
@@ -416,6 +425,11 @@ impl TextGraphExt for Graph {
                 {
                     active_indices.push((label.clone(), property.clone(), *lang));
                 }
+            } else {
+                return Err(TextError::IndexNotFound {
+                    label: label.clone(),
+                    property: property.clone(),
+                });
             }
         } else {
             let all_active = self.active_text_indexes()?;
@@ -542,21 +556,22 @@ impl TextGraphExt for Graph {
 /// Implement text index creation, removal, and discovery through this trait
 /// rather than calling the corresponding storage methods on `Graph` directly.
 pub trait TextIndexExt {
-    fn create_text_index(&self, label: &str, property: &str) -> Result<(), issundb_core::Error>;
+    fn create_text_index(&self, label: &str, property: &str) -> Result<(), TextError>;
     fn create_text_index_with_language(
         &self,
         label: &str,
         property: &str,
         lang: Language,
-    ) -> Result<(), issundb_core::Error>;
-    fn drop_text_index(&self, label: &str, property: &str) -> Result<(), issundb_core::Error>;
-    fn has_text_index(&self, label: &str, property: &str) -> Result<bool, issundb_core::Error>;
-    fn list_text_indexes(&self) -> Result<Vec<(String, String, Language)>, issundb_core::Error>;
+    ) -> Result<(), TextError>;
+    fn drop_text_index(&self, label: &str, property: &str) -> Result<(), TextError>;
+    fn has_text_index(&self, label: &str, property: &str) -> Result<bool, TextError>;
+    fn list_text_indexes(&self) -> Result<Vec<(String, String, Language)>, TextError>;
 }
 
 impl TextIndexExt for Graph {
-    fn create_text_index(&self, label: &str, property: &str) -> Result<(), issundb_core::Error> {
+    fn create_text_index(&self, label: &str, property: &str) -> Result<(), TextError> {
         self.create_node_text_index(label, property)
+            .map_err(Into::into)
     }
 
     fn create_text_index_with_language(
@@ -564,20 +579,23 @@ impl TextIndexExt for Graph {
         label: &str,
         property: &str,
         lang: Language,
-    ) -> Result<(), issundb_core::Error> {
+    ) -> Result<(), TextError> {
         self.create_node_text_index_with_language(label, property, lang)
+            .map_err(Into::into)
     }
 
-    fn drop_text_index(&self, label: &str, property: &str) -> Result<(), issundb_core::Error> {
+    fn drop_text_index(&self, label: &str, property: &str) -> Result<(), TextError> {
         self.drop_node_text_index(label, property)
+            .map_err(Into::into)
     }
 
-    fn has_text_index(&self, label: &str, property: &str) -> Result<bool, issundb_core::Error> {
+    fn has_text_index(&self, label: &str, property: &str) -> Result<bool, TextError> {
         self.has_node_text_index(label, property)
+            .map_err(Into::into)
     }
 
-    fn list_text_indexes(&self) -> Result<Vec<(String, String, Language)>, issundb_core::Error> {
-        self.active_text_indexes()
+    fn list_text_indexes(&self) -> Result<Vec<(String, String, Language)>, TextError> {
+        self.active_text_indexes().map_err(Into::into)
     }
 }
 
@@ -609,17 +627,17 @@ mod tests {
             "description": "A tragic love story on a ship that hits an iceberg and sinks in the ocean"
         }))?;
 
-        // 2. Search should return nothing before index is created
+        // 2. Search should return IndexNotFound before index is created
         let opts = TextSearchOptions {
             label: Some("Movie".to_string()),
             property: Some("description".to_string()),
             limit: 5,
             ..Default::default()
         };
-        let hits = graph.text_search("space", &opts)?;
+        let err = graph.text_search("space", &opts).unwrap_err();
         assert!(
-            hits.is_empty(),
-            "Should return no hits when index is not created yet"
+            matches!(err, TextError::IndexNotFound { .. }),
+            "Expected IndexNotFound error when index is not created yet"
         );
 
         // 3. Create index and verify existence
@@ -677,10 +695,10 @@ mod tests {
         // 9. Drop index and verify cleanup.
         graph.drop_node_text_index("Movie", "description")?;
         assert!(!graph.has_node_text_index("Movie", "description")?);
-        let hits_after_drop = graph.text_search("spaceship", &opts)?;
+        let err_after_drop = graph.text_search("spaceship", &opts).unwrap_err();
         assert!(
-            hits_after_drop.is_empty(),
-            "Should not return hits after index drop"
+            matches!(err_after_drop, TextError::IndexNotFound { .. }),
+            "Should return IndexNotFound error after index drop"
         );
 
         Ok(())

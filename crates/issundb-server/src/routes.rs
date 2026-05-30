@@ -121,9 +121,8 @@ pub async fn create_node(
 pub async fn get_node(State(graph): State<AppState>, Path(id): Path<u64>) -> impl IntoResponse {
     match graph.get_node(id) {
         Ok(Some(record)) => {
-            let label = match graph.label_name(record.label) {
-                Ok(Some(l)) => l,
-                Ok(None) => String::new(),
+            let label = match graph.node_labels(id) {
+                Ok(labels) => labels.into_iter().next().unwrap_or_default(),
                 Err(e) => return internal(e).into_response(),
             };
             let props: Value = match rmp_serde::from_slice(&record.props) {

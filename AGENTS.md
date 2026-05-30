@@ -50,7 +50,8 @@ This layout describes the current structure and target decoupled crate boundarie
 Do not invent modules that do not yet exist when answering questions, but do place new modules according to this map.
 
 - `crates/issundb-core/`: storage engine. Public surface is `Graph` and the schema types.
-    - `src/schema.rs`: `NodeId`, `EdgeId`, `LabelId`, `TypeId`, `AdjEntry`, `NodeRecord`, and `EdgeRecord`.
+    - `src/schema.rs`: `NodeId`, `EdgeId`, `LabelId`, `TypeId`, `AdjEntry`, `NodeRecord`, and `EdgeRecord`. `NodeRecord` holds `labels: Vec<LabelId>`
+      (a node carries zero or more labels); use `primary_label` and `has_label` to inspect them.
     - `src/storage/lmdb.rs`: `Storage` struct; opens and owns all LMDB sub-databases.
     - `src/storage/ids.rs`: monotonic ID allocation and string-to-integer registries for labels and edge types, persisted in the `meta` sub-database.
     - `src/storage/props.rs`: msgpack encode and decode helpers via `rmp-serde`.
@@ -58,7 +59,7 @@ Do not invent modules that do not yet exist when answering questions, but do pla
     - `src/graph/mod.rs`: `Graph`, `ReadTxn`, `WriteTxn` struct definitions and lifecycle methods (`open`, `view`, `update`, `backup`, `restore`,
       `rebuild_csr`).
     - `src/graph/node.rs`: node CRUD (`add_node`, `get_node`, `update_node`, `delete_node`).
-    - `src/graph/edge.rs`: edge CRUD and adjacency (`add_edge`, `get_edge`, `delete_edge`, `out_neighbors`, `in_neighbors`).
+    - `src/graph/edge.rs`: edge CRUD and adjacency (`add_edge`, `get_edge`, `delete_edge`, `out_neighbors`, `in_neighbors`, `node_has_relationships`).
     - `src/graph/index.rs`: label and type indexes, property indexes, constraints, and property scan methods.
     - `src/graph/fts_mod.rs`: full-text search index lifecycle and FTS storage primitives.
     - `src/graph/vector.rs`: vector byte storage helpers.
@@ -70,8 +71,9 @@ Do not invent modules that do not yet exist when answering questions, but do pla
     - `src/metrics.rs`: lightweight runtime counters for storage operations.
     - `src/error.rs`: `Error` enum; all storage and serialization errors unify here.
 - `crates/issundb-cypher/`: Cypher parser, AST, logical planner, physical planner, optimizer, and executor.
-    - `src/parser.rs`: hand-written recursive-descent parser for MATCH (including inline relationship property maps), WHERE, RETURN, CREATE, SET, and
-      DELETE.
+    - `src/parser.rs`: hand-written recursive-descent parser for MATCH (including inline relationship property maps and multi-label node patterns
+      such as `(n:A:B)`), WHERE, RETURN, CREATE, SET (property and label assignment), REMOVE (label and property), and DELETE/DETACH DELETE over
+      arbitrary expression targets.
     - `src/ast.rs`: AST node types.
     - `src/plan/`: logical planner, physical planner, optimizer, and statistics helpers.
     - `src/exec/mod.rs`: public entry points (`execute`, `explain`), shared type definitions, and tests.
@@ -125,7 +127,8 @@ Do not invent modules that do not yet exist when answering questions, but do pla
 - Adjacency is stored as LMDB `DUPSORT + DUPFIXED`: each duplicate value under a node key is one raw `AdjEntry` (20 bytes). A single `db.put` appends
   one entry in O(log n); there is no read-modify-write of a blob.
 - Secondary indexes (`label_idx`, `type_idx`) use 12-byte composite keys `(u32 BE, u64 BE)` stored in plain LMDB databases with `Unit` values.
-  Prefix-range scans via `prefix_iter` enumerate all nodes or edges for a given label or type in ascending ID order.
+  Prefix-range scans via `prefix_iter` enumerate all nodes or edges for a given label or type in ascending ID order. A multi-label node has one
+  `label_idx` entry per label it carries, so it appears in every matching label scan.
 - The CSR snapshot is the hot read path for outgoing traversal. GraphBLAS operates on the CSR snapshot for all graph algorithms,
   pattern matching, and multi-source expansion.
 - `Storage::open` is the only entry point for LMDB. Do not call `heed::EnvOpenOptions` from outside `crates/issundb-core/src/storage/lmdb.rs`.
@@ -160,13 +163,18 @@ All graph operations go through `Graph`; do not call `Storage` directly from out
 
 - `Graph::open(path: &Path, map_size_gb: usize) -> Result<Self, Error>`
 - `add_node(label: &str, props: &impl Serialize) -> Result<NodeId, Error>`
+- `add_node_multi(labels: &[&str], props: &impl Serialize) -> Result<NodeId, Error>`
 - `get_node(id: NodeId) -> Result<Option<NodeRecord>, Error>`
 - `update_node(id: NodeId, props: &impl Serialize) -> Result<(), Error>`
 - `delete_node(id: NodeId) -> Result<(), Error>`
+- `add_label(id: NodeId, label: &str) -> Result<(), Error>`
+- `remove_label(id: NodeId, label: &str) -> Result<(), Error>`
+- `node_labels(id: NodeId) -> Result<Vec<String>, Error>`
 - `add_edge(src: NodeId, dst: NodeId, etype: &str, props: &impl Serialize) -> Result<EdgeId, Error>`
 - `get_edge(id: EdgeId) -> Result<Option<EdgeRecord>, Error>`
 - `out_neighbors(node: NodeId) -> Result<Vec<NeighborEntry>, Error>`
 - `in_neighbors(node: NodeId) -> Result<Vec<NeighborEntry>, Error>`
+- `node_has_relationships(node: NodeId) -> Result<bool, Error>`
 - `nodes_by_label(label: &str) -> Result<Vec<NodeId>, Error>`
 - `edges_by_type(etype: &str) -> Result<Vec<EdgeId>, Error>`
 - `rebuild_csr() -> Result<(), Error>`
@@ -202,8 +210,8 @@ All graph operations go through `Graph`; do not call `Storage` directly from out
 Vector search crate. Owns vector index abstractions, vector metadata, vector storage integration, and vector search APIs. It may depend on
 `issundb-core`; it must not depend on `issundb-text`, `issundb-retrieval`, `issundb-cypher`, bindings, or CLI crates.
 
-- `VectorGraphExt::upsert_vector(n: NodeId, v: &[f32]) -> Result<(), Error>`
-- `VectorGraphExt::vector_search(q: &[f32], k: usize) -> Result<Vec<Hit>, Error>`
+- `VectorGraphExt::upsert_vector(n: NodeId, v: &[f32]) -> Result<(), VectorError>`
+- `VectorGraphExt::vector_search(q: &[f32], k: usize) -> Result<Vec<Hit>, VectorError>`
 
 ### `issundb_text`
 
@@ -211,19 +219,19 @@ Full-text search crate. Owns tokenization, inverted index storage, ranking, and 
 depend on `issundb-vector`, `issundb-retrieval`, `issundb-cypher`, bindings, or CLI crates.
 
 - `TextGraphExt::text_search(query: &str, opts: &TextSearchOptions) -> Result<Vec<TextHit>, TextError>`
-- `TextIndexExt::create_text_index(label: &str, property: &str) -> Result<(), Error>`
-- `TextIndexExt::create_text_index_with_language(label: &str, property: &str, lang: Language) -> Result<(), Error>`
-- `TextIndexExt::drop_text_index(label: &str, property: &str) -> Result<(), Error>`
-- `TextIndexExt::has_text_index(label: &str, property: &str) -> Result<bool, Error>`
-- `TextIndexExt::list_text_indexes() -> Result<Vec<(String, String, Language)>, Error>`
+- `TextIndexExt::create_text_index(label: &str, property: &str) -> Result<(), TextError>`
+- `TextIndexExt::create_text_index_with_language(label: &str, property: &str, lang: Language) -> Result<(), TextError>`
+- `TextIndexExt::drop_text_index(label: &str, property: &str) -> Result<(), TextError>`
+- `TextIndexExt::has_text_index(label: &str, property: &str) -> Result<bool, TextError>`
+- `TextIndexExt::list_text_indexes() -> Result<Vec<(String, String, Language)>, TextError>`
 
 ### `issundb_retrieval`
 
 Hybrid retrieval crate. May depend on `issundb-core`, `issundb-vector`, and `issundb-text`; must not be imported by those lower-level crates. All
 retrieve functions are free functions, not methods on `Graph`, to preserve the crate boundary.
 
-- `retrieve(graph: &Graph, q: &[f32], k: usize, hops: u8) -> Result<Subgraph, Error>`
-- `retrieve_with(graph: &Graph, q: &[f32], opts: &RetrieveOptions) -> Result<Subgraph, Error>`
+- `retrieve(graph: &Graph, q: &[f32], k: usize, hops: u8) -> Result<Subgraph, RetrievalError>`
+- `retrieve_with(graph: &Graph, q: &[f32], opts: &RetrieveOptions) -> Result<Subgraph, RetrievalError>`
 - `Subgraph`: `nodes: Vec<NodeId>`, `edges: Vec<EdgeId>`, `scores: HashMap<NodeId, f32>`
 - `RetrieveOptions`: `k`, `hops`, `max_distance`, `max_nodes`
 
@@ -232,8 +240,8 @@ retrieve functions are free functions, not methods on `Graph`, to preserve the c
 Cypher query execution. Exposed through the `issundb` facade via the `GraphQueryExt` trait; do not call `issundb_cypher::execute` directly from
 outside `issundb`.
 
-- `query(cypher: &str) -> Result<QueryResult, String>` and
-  `query_with_params(cypher: &str, params: &HashMap<String, serde_json::Value>) -> Result<QueryResult, String>`
+- `query(cypher: &str) -> Result<QueryResult, CypherError>` and
+  `query_with_params(cypher: &str, params: &HashMap<String, serde_json::Value>) -> Result<QueryResult, CypherError>`
 - `QueryResult`: `columns: Vec<String>`, `records: Vec<Record>`
 - `Record`: `values: Vec<serde_json::Value>`
 

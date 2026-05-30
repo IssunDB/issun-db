@@ -296,16 +296,19 @@ pub(super) fn evaluate_expr(
                     }
                 }
                 (serde_json::Value::Object(map), serde_json::Value::String(key)) => {
-                    Ok(map.get(&key).cloned().unwrap_or(serde_json::Value::Null))
-                }
-
-                // Node/edge property access via subscript: n['propName']
-                (node_val, serde_json::Value::String(key)) => {
-                    if let serde_json::Value::Object(map) = node_val {
-                        Ok(map.get(&key).cloned().unwrap_or(serde_json::Value::Null))
-                    } else {
-                        Ok(serde_json::Value::Null)
-                    }
+                    // A node or relationship value carries its user properties under
+                    // "properties"; property access (`n.prop`, `n['prop']`, or
+                    // `expr.prop` where expr yields a node or edge) reads from there,
+                    // not from the wrapper's own fields (`id`, `__type__`).
+                    let looked = match map.get("__type__").and_then(|t| t.as_str()) {
+                        Some("__Node__") | Some("__Edge__") => map
+                            .get("properties")
+                            .and_then(|p| p.as_object())
+                            .and_then(|m| m.get(&key))
+                            .cloned(),
+                        _ => map.get(&key).cloned(),
+                    };
+                    Ok(looked.unwrap_or(serde_json::Value::Null))
                 }
                 // Indexing a non-list/non-map/non-string with an integer: TypeError.
                 (non_indexable, serde_json::Value::Number(_)) => Err(format!(
@@ -415,12 +418,34 @@ pub(super) fn evaluate_expr(
             }
             Ok(serde_json::Value::Array(result))
         }
+        Expr::Reduce {
+            accumulator,
+            initial,
+            variable,
+            list,
+            expression,
+        } => {
+            let list_val = evaluate_expr(graph, path, list, params)?;
+            let items = match list_val {
+                serde_json::Value::Array(arr) => arr,
+                serde_json::Value::Null => return Ok(serde_json::Value::Null),
+                _ => return Err("reduce() requires a list".into()),
+            };
+            let mut acc_val = evaluate_expr(graph, path, initial, params)?;
+            for item in items {
+                let mut inner_path = path.clone();
+                inner_path.insert(accumulator.clone(), GraphBinding::Scalar(acc_val.clone()));
+                inner_path.insert(variable.clone(), GraphBinding::Scalar(item.clone()));
+                acc_val = evaluate_expr(graph, &inner_path, expression, params)?;
+            }
+            Ok(acc_val)
+        }
         Expr::HasLabel { variable, label } => match path.get(variable.as_str()) {
             Some(GraphBinding::Node(id)) => {
-                if let Ok(Some(record)) = graph.get_node(*id) {
-                    if let Ok(Some(node_label)) = graph.label_name(record.label) {
-                        return Ok(serde_json::Value::Bool(node_label == *label));
-                    }
+                if let Ok(node_labels) = graph.node_labels(*id) {
+                    return Ok(serde_json::Value::Bool(
+                        node_labels.iter().any(|l| l == label),
+                    ));
                 }
                 Ok(serde_json::Value::Bool(false))
             }
@@ -430,9 +455,16 @@ pub(super) fn evaluate_expr(
             _ => Ok(serde_json::Value::Bool(false)),
         },
         Expr::Prop(var, prop) => {
-            let binding = path
-                .get(var)
-                .ok_or_else(|| format!("unbound variable: {}", var))?;
+            let binding = match path.get(var) {
+                Some(b) => b,
+                None => {
+                    if var.starts_with("_path_") {
+                        &GraphBinding::Scalar(serde_json::Value::Null)
+                    } else {
+                        return Err(format!("unbound variable: {}", var));
+                    }
+                }
+            };
             match binding {
                 GraphBinding::Node(node_id) => {
                     let record = graph
@@ -476,6 +508,14 @@ pub(super) fn evaluate_expr(
                         m.insert(
                             "id".to_string(),
                             serde_json::Value::Number((*edge_id as i64).into()),
+                        );
+                        m.insert(
+                            "startNode".to_string(),
+                            serde_json::Value::Number((record.src as i64).into()),
+                        );
+                        m.insert(
+                            "endNode".to_string(),
+                            serde_json::Value::Number((record.dst as i64).into()),
                         );
                         m.insert("properties".to_string(), actual_json);
                         Ok(serde_json::Value::Object(m))
@@ -542,6 +582,40 @@ pub(super) fn evaluate_expr(
     }
 }
 
+fn is_comparison_op(op: &BinaryOperator) -> bool {
+    matches!(
+        op,
+        BinaryOperator::Lt
+            | BinaryOperator::Gt
+            | BinaryOperator::Le
+            | BinaryOperator::Ge
+            | BinaryOperator::Eq
+            | BinaryOperator::Ne
+    )
+}
+
+fn eval_and(lv: &serde_json::Value, rv: &serde_json::Value) -> Result<serde_json::Value, String> {
+    if !matches!(lv, serde_json::Value::Bool(_) | serde_json::Value::Null) {
+        return Err(format!(
+            "TypeError: AND requires boolean operands, left operand is {}",
+            lv
+        ));
+    }
+    if !matches!(rv, serde_json::Value::Bool(_) | serde_json::Value::Null) {
+        return Err(format!(
+            "TypeError: AND requires boolean operands, right operand is {}",
+            rv
+        ));
+    }
+    if lv == &serde_json::Value::Bool(false) || rv == &serde_json::Value::Bool(false) {
+        return Ok(serde_json::Value::Bool(false));
+    }
+    if lv == &serde_json::Value::Null || rv == &serde_json::Value::Null {
+        return Ok(serde_json::Value::Null);
+    }
+    Ok(serde_json::Value::Bool(true))
+}
+
 /// Evaluate a binary operation with three-valued null propagation.
 pub(super) fn eval_binary_op(
     graph: &Graph,
@@ -551,6 +625,20 @@ pub(super) fn eval_binary_op(
     right: &Expr,
     params: &HashMap<String, serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
+    if is_comparison_op(op) {
+        if let Expr::BinaryOp {
+            op: op_left,
+            left: left_left,
+            right: right_left,
+        } = left
+        {
+            if is_comparison_op(op_left) {
+                let res_left = eval_binary_op(graph, path, op_left, left_left, right_left, params)?;
+                let res_right = eval_binary_op(graph, path, op, right_left, right, params)?;
+                return eval_and(&res_left, &res_right);
+            }
+        }
+    }
     match op {
         BinaryOperator::And => {
             let lv = evaluate_expr(graph, path, left, params)?;
@@ -708,6 +796,13 @@ pub(super) fn eval_arithmetic(
                 result.push(v.clone());
                 return Ok(serde_json::Value::Array(result));
             }
+            // scalar + list prepends the scalar: false + [4] => [false, 4].
+            (v, serde_json::Value::Array(b)) if *v != serde_json::Value::Null => {
+                let mut result = Vec::with_capacity(b.len() + 1);
+                result.push(v.clone());
+                result.extend(b.iter().cloned());
+                return Ok(serde_json::Value::Array(result));
+            }
             _ => {}
         }
     }
@@ -793,6 +888,40 @@ pub(super) fn eval_function_call(
             }
             Ok(serde_json::Value::Array(items))
         }
+        "__path__" => {
+            let mut items = Vec::new();
+            let mut is_null = true;
+            for arg in args {
+                let val = evaluate_expr(graph, path, arg, params)?;
+                if val != serde_json::Value::Null {
+                    is_null = false;
+                }
+                items.push(val);
+            }
+            if is_null {
+                return Ok(serde_json::Value::Null);
+            }
+            let mut nodes = Vec::new();
+            let mut relationships = Vec::new();
+            for (idx, item) in items.into_iter().enumerate() {
+                if idx % 2 == 0 {
+                    nodes.push(item);
+                } else {
+                    relationships.push(item);
+                }
+            }
+            let mut m = serde_json::Map::new();
+            m.insert(
+                "__type__".to_string(),
+                serde_json::Value::String("__Path__".to_string()),
+            );
+            m.insert("nodes".to_string(), serde_json::Value::Array(nodes));
+            m.insert(
+                "relationships".to_string(),
+                serde_json::Value::Array(relationships),
+            );
+            Ok(serde_json::Value::Object(m))
+        }
         "__map__" => {
             // Args are alternating key (Literal::Str) and value.
             let mut map = serde_json::Map::new();
@@ -874,47 +1003,30 @@ pub(super) fn eval_function_call(
             if args.len() != 1 {
                 return Err("type() requires exactly 1 argument".into());
             }
+            // Value-driven so that a relationship reached through an Any-typed
+            // expression (e.g. `type(list[0])`) works the same as a bare variable.
             let val = evaluate_expr(graph, path, &args[0], params)?;
-            if val == serde_json::Value::Null {
-                return Ok(serde_json::Value::Null);
-            }
-            if let Expr::Prop(var, prop) = &args[0] {
-                if prop.is_empty() {
-                    match path.get(var.as_str()) {
-                        Some(GraphBinding::Edge(eid)) => {
-                            let record = graph
-                                .get_edge(*eid)
-                                .map_err(|e| e.to_string())?
-                                .ok_or_else(|| format!("edge not found: {}", eid))?;
-                            if let Ok(name) = graph.type_name(record.edge_type) {
-                                return Ok(name
-                                    .map(serde_json::Value::String)
-                                    .unwrap_or(serde_json::Value::Null));
-                            }
-                            return Ok(serde_json::Value::Null);
-                        }
-                        Some(GraphBinding::Scalar(serde_json::Value::Null)) => {
-                            return Ok(serde_json::Value::Null);
-                        }
-                        Some(GraphBinding::Node(_)) => {
-                            return Err(
-                                "TypeError: type() requires a relationship, got a node".into()
-                            );
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            // Non-variable argument that resolved to a non-null, non-edge value: TypeError.
             match &val {
-                serde_json::Value::String(_)
-                | serde_json::Value::Number(_)
-                | serde_json::Value::Bool(_)
-                | serde_json::Value::Array(_)
-                | serde_json::Value::Object(_) => {
-                    Err("TypeError: type() requires a relationship argument".into())
+                serde_json::Value::Null => Ok(serde_json::Value::Null),
+                serde_json::Value::Object(m)
+                    if m.get("__type__").and_then(|t| t.as_str()) == Some("__Edge__") =>
+                {
+                    let eid = m
+                        .get("id")
+                        .and_then(|i| i.as_i64())
+                        .ok_or("type(): malformed relationship value")?
+                        as u64;
+                    let record = graph
+                        .get_edge(eid)
+                        .map_err(|e| e.to_string())?
+                        .ok_or_else(|| format!("edge not found: {}", eid))?;
+                    Ok(graph
+                        .type_name(record.edge_type)
+                        .map_err(|e| e.to_string())?
+                        .map(serde_json::Value::String)
+                        .unwrap_or(serde_json::Value::Null))
                 }
-                _ => Ok(serde_json::Value::Null),
+                _ => Err("TypeError: type() requires a relationship argument".into()),
             }
         }
         "id" => {
@@ -935,6 +1047,120 @@ pub(super) fn eval_function_call(
                 }
             }
             Ok(serde_json::Value::Null)
+        }
+        "exists" => {
+            if args.len() != 1 {
+                return Err("exists() requires exactly 1 argument".into());
+            }
+            let val = evaluate_expr(graph, path, &args[0], params)?;
+            Ok(serde_json::Value::Bool(val != serde_json::Value::Null))
+        }
+        "left" => {
+            if args.len() != 2 {
+                return Err("left() requires exactly 2 arguments".into());
+            }
+            let s_val = evaluate_expr(graph, path, &args[0], params)?;
+            let len_val = evaluate_expr(graph, path, &args[1], params)?;
+            if s_val == serde_json::Value::Null || len_val == serde_json::Value::Null {
+                return Ok(serde_json::Value::Null);
+            }
+            let s = s_val
+                .as_str()
+                .ok_or_else(|| "left() first argument must be a string".to_string())?;
+            let len = len_val
+                .as_i64()
+                .ok_or_else(|| "left() second argument must be an integer".to_string())?;
+            if len < 0 {
+                return Err("left() length argument must not be negative".into());
+            }
+            let chars: Vec<char> = s.chars().collect();
+            let end_idx = (len as usize).min(chars.len());
+            let result: String = chars[..end_idx].iter().collect();
+            Ok(serde_json::Value::String(result))
+        }
+        "right" => {
+            if args.len() != 2 {
+                return Err("right() requires exactly 2 arguments".into());
+            }
+            let s_val = evaluate_expr(graph, path, &args[0], params)?;
+            let len_val = evaluate_expr(graph, path, &args[1], params)?;
+            if s_val == serde_json::Value::Null || len_val == serde_json::Value::Null {
+                return Ok(serde_json::Value::Null);
+            }
+            let s = s_val
+                .as_str()
+                .ok_or_else(|| "right() first argument must be a string".to_string())?;
+            let len = len_val
+                .as_i64()
+                .ok_or_else(|| "right() second argument must be an integer".to_string())?;
+            if len < 0 {
+                return Err("right() length argument must not be negative".into());
+            }
+            let chars: Vec<char> = s.chars().collect();
+            let start_idx = chars.len().saturating_sub(len as usize);
+            let result: String = chars[start_idx..].iter().collect();
+            Ok(serde_json::Value::String(result))
+        }
+        "degrees" => {
+            if args.len() != 1 {
+                return Err("degrees() requires exactly 1 argument".into());
+            }
+            let val = evaluate_expr(graph, path, &args[0], params)?;
+            if val == serde_json::Value::Null {
+                return Ok(serde_json::Value::Null);
+            }
+            let rad = val
+                .as_f64()
+                .ok_or_else(|| "degrees() argument must be a number".to_string())?;
+            let deg = rad * 180.0 / std::f64::consts::PI;
+            Ok(serde_json::Value::Number(
+                serde_json::Number::from_f64(deg)
+                    .ok_or_else(|| "degrees() result overflow".to_string())?,
+            ))
+        }
+        "radians" => {
+            if args.len() != 1 {
+                return Err("radians() requires exactly 1 argument".into());
+            }
+            let val = evaluate_expr(graph, path, &args[0], params)?;
+            if val == serde_json::Value::Null {
+                return Ok(serde_json::Value::Null);
+            }
+            let deg = val
+                .as_f64()
+                .ok_or_else(|| "radians() argument must be a number".to_string())?;
+            let rad = deg * std::f64::consts::PI / 180.0;
+            Ok(serde_json::Value::Number(
+                serde_json::Number::from_f64(rad)
+                    .ok_or_else(|| "radians() result overflow".to_string())?,
+            ))
+        }
+        "haversin" => {
+            if args.len() != 1 {
+                return Err("haversin() requires exactly 1 argument".into());
+            }
+            let val = evaluate_expr(graph, path, &args[0], params)?;
+            if val == serde_json::Value::Null {
+                return Ok(serde_json::Value::Null);
+            }
+            let x = val
+                .as_f64()
+                .ok_or_else(|| "haversin() argument must be a number".to_string())?;
+            let res = (1.0 - x.cos()) / 2.0;
+            Ok(serde_json::Value::Number(
+                serde_json::Number::from_f64(res)
+                    .ok_or_else(|| "haversin() result overflow".to_string())?,
+            ))
+        }
+        "timestamp" => {
+            if !args.is_empty() {
+                return Err("timestamp() requires exactly 0 arguments".into());
+            }
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|e| e.to_string())?
+                .as_millis() as i64;
+            Ok(serde_json::Value::Number(now.into()))
         }
         "coalesce" => {
             for arg in args {
@@ -1188,7 +1414,8 @@ pub(super) fn eval_function_call(
                 (serde_json::Value::String(s), serde_json::Value::String(sub)) => {
                     Ok(serde_json::Value::Bool(s.contains(&*sub)))
                 }
-                _ => Ok(serde_json::Value::Bool(false)),
+                // Non-string, non-null operand: openCypher yields null, not false.
+                _ => Ok(serde_json::Value::Null),
             }
         }
         "__starts_with__" => {
@@ -1204,7 +1431,8 @@ pub(super) fn eval_function_call(
                 (serde_json::Value::String(s), serde_json::Value::String(prefix)) => {
                     Ok(serde_json::Value::Bool(s.starts_with(&*prefix)))
                 }
-                _ => Ok(serde_json::Value::Bool(false)),
+                // Non-string, non-null operand: openCypher yields null, not false.
+                _ => Ok(serde_json::Value::Null),
             }
         }
         "__ends_with__" => {
@@ -1220,7 +1448,8 @@ pub(super) fn eval_function_call(
                 (serde_json::Value::String(s), serde_json::Value::String(suffix)) => {
                     Ok(serde_json::Value::Bool(s.ends_with(&*suffix)))
                 }
-                _ => Ok(serde_json::Value::Bool(false)),
+                // Non-string, non-null operand: openCypher yields null, not false.
+                _ => Ok(serde_json::Value::Null),
             }
         }
         "__regex__" => {
@@ -1514,36 +1743,43 @@ pub(super) fn eval_function_call(
             if args.len() != 1 {
                 return Err("labels() requires exactly 1 argument".into());
             }
-            if let Expr::Prop(var, prop) = &args[0] {
-                if prop.is_empty() {
-                    if let Some(GraphBinding::Node(nid)) = path.get(var.as_str()) {
-                        if let Ok(Some(record)) = graph.get_node(*nid) {
-                            if let Ok(Some(label)) = graph.label_name(record.label) {
-                                return Ok(serde_json::Value::Array(vec![
-                                    serde_json::Value::String(label),
-                                ]));
-                            }
-                        }
-                    }
+            // Value-driven: a node reached through an Any-typed expression behaves
+            // like a bare variable; null yields null; a non-node argument is an error.
+            let val = evaluate_expr(graph, path, &args[0], params)?;
+            match &val {
+                serde_json::Value::Null => Ok(serde_json::Value::Null),
+                serde_json::Value::Object(m)
+                    if m.get("__type__").and_then(|t| t.as_str()) == Some("__Node__") =>
+                {
+                    let nid = m
+                        .get("id")
+                        .and_then(|i| i.as_i64())
+                        .ok_or("labels(): malformed node value")?
+                        as u64;
+                    let labels = graph.node_labels(nid).map_err(|e| e.to_string())?;
+                    Ok(serde_json::Value::Array(
+                        labels.into_iter().map(serde_json::Value::String).collect(),
+                    ))
                 }
+                _ => Err("TypeError: labels() requires a node argument".into()),
             }
-            Ok(serde_json::Value::Array(vec![]))
         }
         "length" => {
             if args.len() != 1 {
                 return Err("length() requires exactly 1 argument".into());
             }
             let val = evaluate_expr(graph, path, &args[0], params)?;
-            match val {
-                serde_json::Value::Array(arr) => {
-                    Ok(serde_json::Value::Number((arr.len() as i64).into()))
-                }
-                serde_json::Value::String(s) => {
-                    Ok(serde_json::Value::Number((s.chars().count() as i64).into()))
-                }
-                serde_json::Value::Null => Ok(serde_json::Value::Null),
-                _ => Ok(serde_json::Value::Null),
+            if val == serde_json::Value::Null {
+                return Ok(serde_json::Value::Null);
             }
+            if let serde_json::Value::Object(m) = &val {
+                if m.get("__type__").and_then(|t| t.as_str()) == Some("__Path__") {
+                    if let Some(serde_json::Value::Array(rels)) = m.get("relationships") {
+                        return Ok(serde_json::Value::Number((rels.len() as i64).into()));
+                    }
+                }
+            }
+            Err("TypeError: length() requires a path argument".into())
         }
         "substring" => {
             if args.len() < 2 || args.len() > 3 {
@@ -1658,12 +1894,38 @@ pub(super) fn eval_function_call(
             }
         }
         "nodes" => {
-            // Returns the nodes of a path; simplified: return empty list
-            Ok(serde_json::Value::Array(vec![]))
+            if args.len() != 1 {
+                return Err("nodes() requires exactly 1 argument".into());
+            }
+            let val = evaluate_expr(graph, path, &args[0], params)?;
+            if val == serde_json::Value::Null {
+                return Ok(serde_json::Value::Null);
+            }
+            if let serde_json::Value::Object(m) = &val {
+                if m.get("__type__").and_then(|t| t.as_str()) == Some("__Path__") {
+                    if let Some(nodes) = m.get("nodes") {
+                        return Ok(nodes.clone());
+                    }
+                }
+            }
+            Err("TypeError: nodes() requires a path argument".into())
         }
         "relationships" | "rels" => {
-            // Returns the relationships of a path; simplified: return empty list
-            Ok(serde_json::Value::Array(vec![]))
+            if args.len() != 1 {
+                return Err(format!("{}() requires exactly 1 argument", name));
+            }
+            let val = evaluate_expr(graph, path, &args[0], params)?;
+            if val == serde_json::Value::Null {
+                return Ok(serde_json::Value::Null);
+            }
+            if let serde_json::Value::Object(m) = &val {
+                if m.get("__type__").and_then(|t| t.as_str()) == Some("__Path__") {
+                    if let Some(rels) = m.get("relationships") {
+                        return Ok(rels.clone());
+                    }
+                }
+            }
+            Err(format!("TypeError: {}() requires a path argument", name))
         }
         "properties" => {
             if args.len() != 1 {
@@ -1690,15 +1952,64 @@ pub(super) fn eval_function_call(
                 }
             }
             let val = evaluate_expr(graph, path, &args[0], params)?;
-            match val {
-                serde_json::Value::Object(_) => Ok(val),
+            match &val {
                 serde_json::Value::Null => Ok(serde_json::Value::Null),
-                _ => Ok(serde_json::Value::Object(serde_json::Map::new())),
+                serde_json::Value::Object(m) => match m.get("__type__").and_then(|t| t.as_str()) {
+                    Some("__Node__") | Some("__Edge__") => Ok(m
+                        .get("properties")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()))),
+                    Some("__Path__") => {
+                        Err("TypeError: properties() requires a node, relationship, or map".into())
+                    }
+                    // A plain map's properties are the map itself.
+                    _ => Ok(val.clone()),
+                },
+                _ => Err("TypeError: properties() requires a node, relationship, or map".into()),
             }
         }
         "startnode" | "endnode" => {
-            // Stub for path functions
-            Ok(serde_json::Value::Null)
+            if args.len() != 1 {
+                return Err(format!("{}() requires exactly 1 argument", name));
+            }
+            let val = evaluate_expr(graph, path, &args[0], params)?;
+            if val == serde_json::Value::Null {
+                return Ok(serde_json::Value::Null);
+            }
+            if let serde_json::Value::Object(m) = &val {
+                if m.get("__type__").and_then(|t| t.as_str()) == Some("__Edge__") {
+                    if let Some(node_id_val) = m.get(if name == "startnode" {
+                        "startNode"
+                    } else {
+                        "endNode"
+                    }) {
+                        if let Some(id_i64) = node_id_val.as_i64() {
+                            let nid = id_i64 as u64;
+                            let record = graph
+                                .get_node(nid)
+                                .map_err(|e| e.to_string())?
+                                .ok_or_else(|| format!("node not found: {}", nid))?;
+                            let actual_json: serde_json::Value =
+                                rmp_serde::from_slice(&record.props).map_err(|e| e.to_string())?;
+                            let mut node_obj = serde_json::Map::new();
+                            node_obj.insert(
+                                "__type__".to_string(),
+                                serde_json::Value::String("__Node__".to_string()),
+                            );
+                            node_obj.insert(
+                                "id".to_string(),
+                                serde_json::Value::Number((nid as i64).into()),
+                            );
+                            node_obj.insert("properties".to_string(), actual_json);
+                            return Ok(serde_json::Value::Object(node_obj));
+                        }
+                    }
+                }
+            }
+            Err(format!(
+                "TypeError: {}() requires a relationship argument",
+                name
+            ))
         }
         "isnull" => {
             if args.len() != 1 {
@@ -4127,6 +4438,36 @@ pub(super) fn cypher_eq(lv: &serde_json::Value, rv: &serde_json::Value) -> serde
         } else {
             serde_json::Value::Bool(true)
         }
+    } else if let (serde_json::Value::Object(lm), serde_json::Value::Object(rm)) = (lv, rv) {
+        let is_temporal = lm.contains_key("__type__") || rm.contains_key("__type__");
+        if !is_temporal {
+            if lm.len() != rm.len() || lm.keys().any(|k| !rm.contains_key(k)) {
+                return serde_json::Value::Bool(false);
+            }
+            let mut has_null = false;
+            for (k, lv_item) in lm {
+                let rv_item = &rm[k];
+                let item_eq = cypher_eq(lv_item, rv_item);
+                if item_eq == serde_json::Value::Null {
+                    has_null = true;
+                } else if item_eq == serde_json::Value::Bool(false) {
+                    return serde_json::Value::Bool(false);
+                }
+            }
+            if has_null {
+                serde_json::Value::Null
+            } else {
+                serde_json::Value::Bool(true)
+            }
+        } else {
+            serde_json::Value::Bool(lv == rv)
+        }
+    } else if let (serde_json::Value::Number(n1), serde_json::Value::Number(n2)) = (lv, rv) {
+        if let (Some(i1), Some(i2)) = (n1.as_i64(), n2.as_i64()) {
+            serde_json::Value::Bool(i1 == i2)
+        } else {
+            serde_json::Value::Bool(n1.as_f64() == n2.as_f64())
+        }
     } else {
         serde_json::Value::Bool(lv == rv)
     }
@@ -4146,21 +4487,32 @@ pub(super) fn json_cmp(l: &serde_json::Value, r: &serde_json::Value) -> Option<s
         (serde_json::Value::String(s1), serde_json::Value::String(s2)) => Some(s1.cmp(s2)),
         // Booleans sort: false < true
         (serde_json::Value::Bool(b1), serde_json::Value::Bool(b2)) => Some(b1.cmp(b2)),
-        // Lists: lexicographic element-by-element comparison.
-        // A null element or incompatible element types make the comparison uncertain (None).
-        (serde_json::Value::Array(a), serde_json::Value::Array(b)) => {
-            let min_len = a.len().min(b.len());
-            for i in 0..min_len {
-                if a[i] == serde_json::Value::Null || b[i] == serde_json::Value::Null {
-                    return None;
-                }
-                match json_cmp(&a[i], &b[i]) {
-                    None => return None,
-                    Some(std::cmp::Ordering::Equal) => continue,
-                    other => return other,
+        (serde_json::Value::Array(a1), serde_json::Value::Array(a2)) => {
+            let mut i = 0;
+            loop {
+                match (a1.get(i), a2.get(i)) {
+                    (Some(v1), Some(v2)) => {
+                        let eq = cypher_eq(v1, v2);
+                        if eq == serde_json::Value::Bool(true) {
+                            i += 1;
+                            continue;
+                        }
+                        if eq == serde_json::Value::Null {
+                            return None;
+                        }
+                        return json_cmp(v1, v2);
+                    }
+                    (Some(_), None) => {
+                        return Some(std::cmp::Ordering::Greater);
+                    }
+                    (None, Some(_)) => {
+                        return Some(std::cmp::Ordering::Less);
+                    }
+                    (None, None) => {
+                        return Some(std::cmp::Ordering::Equal);
+                    }
                 }
             }
-            Some(a.len().cmp(&b.len()))
         }
         // Temporal objects: compare by __sort_key field (ISO string, lexicographically correct)
         (serde_json::Value::Object(m1), serde_json::Value::Object(m2)) => {

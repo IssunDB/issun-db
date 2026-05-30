@@ -95,7 +95,7 @@ pub(super) fn execute_read_query(
     }
 
     // 1. Compile query AST into an optimized physical plan
-    let logical = LogicalPlanner::plan(query)?;
+    let logical = LogicalPlanner::plan(query).map_err(|e| e.to_string())?;
     let physical = PhysicalPlanner::plan(&logical);
     let optimized = Optimizer::optimize(physical, Some(graph));
 
@@ -105,8 +105,13 @@ pub(super) fn execute_read_query(
     //    column-name keys. Reading by key here avoids a second evaluation of the
     //    same expressions (double-projection) against a PathMap that no longer
     //    contains the pre-projection variable names.
-    // Write-only pipeline queries (no RETURN) must hold the graph write lock for
-    // the entire execution to prevent concurrent races (e.g., MERGE from two threads).
+    // Any query containing write clauses must hold the graph write lock for the
+    // entire execution to prevent concurrent races (e.g., MERGE from two threads).
+    // This holds whether or not the query also projects a RETURN clause: a chained
+    // query such as `MATCH (a) SET a.x = 1 WITH a RETURN a` reaches this path with a
+    // non-empty RETURN, and the per-part write executors inside `execute_physical`
+    // assume the caller holds the lock (they call the `_internal` variants, which do
+    // not re-acquire it).
     let has_write_parts = query.parts.iter().any(|p| {
         matches!(
             p,
@@ -118,7 +123,7 @@ pub(super) fn execute_read_query(
         )
     });
 
-    let resolved_paths = if has_write_parts && query.return_clause.items.is_empty() {
+    let resolved_paths = if has_write_parts {
         graph.with_write_lock(|| execute_physical(graph, &optimized, params))?
     } else {
         execute_physical(graph, &optimized, params)?
@@ -272,7 +277,23 @@ pub(crate) fn expr_display_name(expr: &Expr) -> String {
             s.push(']');
             s
         }
-        Expr::HasLabel { variable, label } => format!("({}:{})", variable, label),
+        Expr::Reduce {
+            accumulator,
+            initial,
+            variable,
+            list,
+            expression,
+        } => {
+            format!(
+                "reduce({} = {}, {} IN {} | {})",
+                accumulator,
+                expr_display_name(initial),
+                variable,
+                expr_display_name(list),
+                expr_display_name(expression)
+            )
+        }
+        Expr::HasLabel { variable, label } => format!("{}:{}", variable, label),
         Expr::BinaryOp { op, left, right } => {
             let op_str = match op {
                 BinaryOperator::Eq => "=",
@@ -349,6 +370,66 @@ pub(crate) fn expr_display_name(expr: &Expr) -> String {
     }
 }
 
+fn format_cypher_value(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::Null => "null".to_string(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::String(s) => {
+            format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"))
+        }
+        serde_json::Value::Array(arr) => {
+            let items: Vec<String> = arr.iter().map(format_cypher_value).collect();
+            format!("[{}]", items.join(", "))
+        }
+        serde_json::Value::Object(map) => {
+            let mut items: Vec<String> = map
+                .iter()
+                .map(|(k, v)| format!("{}: {}", k, format_cypher_value(v)))
+                .collect();
+            items.sort();
+            format!("{{{}}}", items.join(", "))
+        }
+    }
+}
+
+fn format_node_literal(graph: &Graph, nid: NodeId) -> String {
+    let mut label_str = String::new();
+    if let Ok(Some(record)) = graph.get_node(nid) {
+        if let Ok(labels) = graph.node_labels(nid) {
+            for label in labels {
+                label_str.push(':');
+                label_str.push_str(&label);
+            }
+        }
+        if let Ok(props) = rmp_serde::from_slice::<serde_json::Value>(&record.props) {
+            if let Some(map) = props.as_object() {
+                if !map.is_empty() {
+                    return format!("({} {})", label_str, format_cypher_value(&props));
+                }
+            }
+        }
+    }
+    format!("({})", label_str)
+}
+
+fn format_edge_literal_string(graph: &Graph, eid: EdgeId) -> String {
+    let mut type_str = String::new();
+    if let Ok(Some(record)) = graph.get_edge(eid) {
+        if let Ok(Some(etype)) = graph.type_name(record.edge_type) {
+            type_str = format!(":{}", etype);
+        }
+        if let Ok(props) = rmp_serde::from_slice::<serde_json::Value>(&record.props) {
+            if let Some(map) = props.as_object() {
+                if !map.is_empty() {
+                    return format!("{} {}", type_str, format_cypher_value(&props));
+                }
+            }
+        }
+    }
+    type_str
+}
+
 pub(super) fn unpack_sentinels(graph: &Graph, val: serde_json::Value) -> serde_json::Value {
     match val {
         serde_json::Value::Object(map) => {
@@ -356,24 +437,16 @@ pub(super) fn unpack_sentinels(graph: &Graph, val: serde_json::Value) -> serde_j
                 if t == "__Node__" {
                     if let Some(id_val) = map.get("id").and_then(|i| i.as_i64()) {
                         let id = id_val as u64;
-                        if let Ok(Some(record)) = graph.get_node(id) {
-                            if let Ok(props) =
-                                rmp_serde::from_slice::<serde_json::Value>(&record.props)
-                            {
-                                return unpack_sentinels(graph, props);
-                            }
-                        }
+                        let formatted = format_node_literal(graph, id);
+                        return serde_json::Value::String(formatted);
                     }
                 } else if t == "__Edge__" {
                     if let Some(id_val) = map.get("id").and_then(|i| i.as_i64()) {
                         let id = id_val as u64;
-                        if let Ok(Some(record)) = graph.get_edge(id) {
-                            if let Ok(props) =
-                                rmp_serde::from_slice::<serde_json::Value>(&record.props)
-                            {
-                                return unpack_sentinels(graph, props);
-                            }
-                        }
+                        let formatted = format_edge_literal_string(graph, id);
+                        return serde_json::Value::Array(vec![serde_json::Value::String(
+                            formatted,
+                        )]);
                     }
                 }
             }
@@ -611,6 +684,94 @@ fn execute_filter_over_expand(
     Ok(next_paths)
 }
 
+fn get_node_representation(graph: &Graph, nid: NodeId) -> Result<serde_json::Value, String> {
+    let record = graph
+        .get_node(nid)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("node not found: {}", nid))?;
+    let actual_json: serde_json::Value =
+        rmp_serde::from_slice(&record.props).map_err(|e| e.to_string())?;
+    let mut node_obj = serde_json::Map::new();
+    node_obj.insert(
+        "__type__".to_string(),
+        serde_json::Value::String("__Node__".to_string()),
+    );
+    node_obj.insert(
+        "id".to_string(),
+        serde_json::Value::Number((nid as i64).into()),
+    );
+    node_obj.insert("properties".to_string(), actual_json);
+    Ok(serde_json::Value::Object(node_obj))
+}
+
+fn get_edge_representation(graph: &Graph, eid: EdgeId) -> Result<serde_json::Value, String> {
+    let record = graph
+        .get_edge(eid)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("edge not found: {}", eid))?;
+    let actual_json: serde_json::Value =
+        rmp_serde::from_slice(&record.props).map_err(|e| e.to_string())?;
+    let mut edge_obj = serde_json::Map::new();
+    edge_obj.insert(
+        "__type__".to_string(),
+        serde_json::Value::String("__Edge__".to_string()),
+    );
+    edge_obj.insert(
+        "id".to_string(),
+        serde_json::Value::Number((eid as i64).into()),
+    );
+    edge_obj.insert(
+        "startNode".to_string(),
+        serde_json::Value::Number((record.src as i64).into()),
+    );
+    edge_obj.insert(
+        "endNode".to_string(),
+        serde_json::Value::Number((record.dst as i64).into()),
+    );
+    edge_obj.insert("properties".to_string(), actual_json);
+    Ok(serde_json::Value::Object(edge_obj))
+}
+
+fn extend_or_create_path(
+    graph: &Graph,
+    existing_path: Option<&serde_json::Value>,
+    src_node: NodeId,
+    eid: EdgeId,
+    dst_node: NodeId,
+) -> Result<serde_json::Value, String> {
+    let mut nodes = Vec::new();
+    let mut relationships = Vec::new();
+
+    if let Some(serde_json::Value::Object(m)) = existing_path {
+        if m.get("__type__").and_then(|t| t.as_str()) == Some("__Path__") {
+            if let Some(serde_json::Value::Array(n)) = m.get("nodes") {
+                nodes.extend(n.clone());
+            }
+            if let Some(serde_json::Value::Array(r)) = m.get("relationships") {
+                relationships.extend(r.clone());
+            }
+        }
+    }
+
+    if nodes.is_empty() {
+        nodes.push(get_node_representation(graph, src_node)?);
+    }
+    relationships.push(get_edge_representation(graph, eid)?);
+    nodes.push(get_node_representation(graph, dst_node)?);
+
+    let mut m = serde_json::Map::new();
+    m.insert(
+        "__type__".to_string(),
+        serde_json::Value::String("__Path__".to_string()),
+    );
+    m.insert("nodes".to_string(), serde_json::Value::Array(nodes));
+    m.insert(
+        "relationships".to_string(),
+        serde_json::Value::Array(relationships),
+    );
+    Ok(serde_json::Value::Object(m))
+}
+
 /// Execute the body of an `Expand` operator given pre-computed child paths.
 ///
 /// Extracted from `execute_physical` so it can be reused by `execute_with_sip`
@@ -665,55 +826,64 @@ fn expand_from_paths(
 
         if min_hops == 1 && max_hops == 1 {
             if let Some(dests) = transition_map.get(&src_node) {
-                // Factorized single-hop expansion: create the Arc once per source path,
-                // then reference it for every destination.  This replaces N-1 redundant
-                // full PathMap clones (where N = degree of src_node) with a single
-                // Arc::new allocation.
                 let shared = std::sync::Arc::new(path);
-                let extensions: Vec<_> = dests
-                    .iter()
-                    .filter_map(|&(eid, dst_node)| {
-                        // Guard closing-hop mismatches (normally handled by MultiwayJoin).
-                        if let Some(existing) = shared.get(dst_var) {
-                            if *existing != GraphBinding::Node(dst_node) {
-                                return None;
-                            }
+                for &(eid, dst_node) in dests {
+                    if let Some(existing) = shared.get(dst_var) {
+                        if *existing != GraphBinding::Node(dst_node) {
+                            continue;
                         }
-                        Some((
-                            rel_var.to_string(),
-                            GraphBinding::Edge(eid),
-                            dst_var.to_string(),
-                            GraphBinding::Node(dst_node),
-                        ))
-                    })
-                    .collect();
-                next_paths.extend(FactorizedRecordGroup { shared, extensions }.flatten());
+                    }
+                    let mut new_path = (*shared).clone();
+                    new_path.insert(rel_var.to_string(), GraphBinding::Edge(eid));
+                    new_path.insert(dst_var.to_string(), GraphBinding::Node(dst_node));
+
+                    // Build and insert Path object
+                    let existing_path = match shared.get(&format!("_path_{}", src_var)) {
+                        Some(GraphBinding::Scalar(v)) => Some(v),
+                        _ => None,
+                    };
+                    if let Ok(path_obj) =
+                        extend_or_create_path(graph, existing_path, src_node, eid, dst_node)
+                    {
+                        new_path
+                            .insert(format!("_path_{}", dst_var), GraphBinding::Scalar(path_obj));
+                    }
+                    next_paths.push(new_path);
+                }
             }
         } else {
-            let mut queue = vec![(src_node, vec![src_node])];
-            let mut completed_targets: HashSet<NodeId> = HashSet::new();
+            let src_rep = get_node_representation(graph, src_node)?;
+            let mut visited = HashSet::new();
+            visited.insert(src_node);
+            let mut queue = vec![(src_node, vec![src_rep], visited)];
+            let mut completed_paths: Vec<(NodeId, Vec<serde_json::Value>)> = Vec::new();
+            let mut completed_targets = HashSet::new();
 
             if min_hops == 0 {
+                completed_paths.push((src_node, vec![get_node_representation(graph, src_node)?]));
                 completed_targets.insert(src_node);
             }
 
             for hop in 1..=max_hops {
                 let mut next_queue = Vec::new();
-                for (node, path_nodes) in queue {
+                for (node, traversed, visited_nodes) in queue {
                     for &dir in directions {
                         let neighbors = expand_multi_type(graph, &[node], rel_type, dir)?;
-                        for (_, _, neigh_node) in neighbors {
-                            if path_nodes.contains(&neigh_node) {
+                        for (_, eid, neigh_node) in neighbors {
+                            if visited_nodes.contains(&neigh_node) {
                                 continue;
                             }
-                            let mut next_path_nodes = path_nodes.clone();
-                            next_path_nodes.push(neigh_node);
-                            if hop >= min_hops {
-                                completed_targets.insert(neigh_node);
+                            let mut next_visited = visited_nodes.clone();
+                            next_visited.insert(neigh_node);
+
+                            let mut next_traversed = traversed.clone();
+                            next_traversed.push(get_edge_representation(graph, eid)?);
+                            next_traversed.push(get_node_representation(graph, neigh_node)?);
+
+                            if hop >= min_hops && completed_targets.insert(neigh_node) {
+                                completed_paths.push((neigh_node, next_traversed.clone()));
                             }
-                            if !next_queue.iter().any(|(n, _)| *n == neigh_node) {
-                                next_queue.push((neigh_node, next_path_nodes));
-                            }
+                            next_queue.push((neigh_node, next_traversed, next_visited));
                         }
                     }
                 }
@@ -723,7 +893,7 @@ fn expand_from_paths(
                 }
             }
 
-            for neigh_node in completed_targets {
+            for (neigh_node, path_elements) in completed_paths {
                 let mut new_path = path.clone();
                 if new_path
                     .insert(dst_var.to_string(), GraphBinding::Node(neigh_node))
@@ -731,6 +901,30 @@ fn expand_from_paths(
                 {
                     continue;
                 }
+
+                // Build Path object
+                let mut nodes = Vec::new();
+                let mut relationships = Vec::new();
+                for (idx, item) in path_elements.into_iter().enumerate() {
+                    if idx % 2 == 0 {
+                        nodes.push(item);
+                    } else {
+                        relationships.push(item);
+                    }
+                }
+                let mut m = serde_json::Map::new();
+                m.insert(
+                    "__type__".to_string(),
+                    serde_json::Value::String("__Path__".to_string()),
+                );
+                m.insert("nodes".to_string(), serde_json::Value::Array(nodes));
+                m.insert(
+                    "relationships".to_string(),
+                    serde_json::Value::Array(relationships),
+                );
+                let path_obj = serde_json::Value::Object(m);
+
+                new_path.insert(format!("_path_{}", dst_var), GraphBinding::Scalar(path_obj));
                 next_paths.push(new_path);
             }
         }
@@ -967,6 +1161,32 @@ fn thread_chain(
     }
 }
 
+fn json_vals_are_equal(v1: &serde_json::Value, v2: &serde_json::Value) -> bool {
+    match (v1, v2) {
+        (serde_json::Value::Number(n1), serde_json::Value::Number(n2)) => {
+            if let (Some(i1), Some(i2)) = (n1.as_i64(), n2.as_i64()) {
+                i1 == i2
+            } else {
+                n1.as_f64() == n2.as_f64()
+            }
+        }
+        _ => v1 == v2,
+    }
+}
+
+fn json_val_cmp(l: &serde_json::Value, r: &serde_json::Value) -> Option<std::cmp::Ordering> {
+    match (l, r) {
+        (serde_json::Value::Number(n1), serde_json::Value::Number(n2)) => {
+            if let (Some(i1), Some(i2)) = (n1.as_i64(), n2.as_i64()) {
+                Some(i1.cmp(&i2))
+            } else {
+                n1.as_f64().partial_cmp(&n2.as_f64())
+            }
+        }
+        _ => json_cmp(l, r),
+    }
+}
+
 pub(super) fn execute_physical(
     graph: &Graph,
     op: &PhysicalOperator,
@@ -986,14 +1206,21 @@ pub(super) fn execute_physical(
                 .nodes_by_property(label, property, prop_val)
                 .map_err(|e| e.to_string())?;
 
-            Ok(candidates
-                .into_iter()
-                .map(|cand| {
-                    let mut path = PathMap::new();
-                    path.insert(variable.clone(), GraphBinding::Node(cand));
-                    path
-                })
-                .collect())
+            let mut filtered = Vec::new();
+            for cand in candidates {
+                if let Ok(Some(record)) = graph.get_node(cand) {
+                    if let Ok(props) = rmp_serde::from_slice::<serde_json::Value>(&record.props) {
+                        if let Some(actual_val) = props.get(property) {
+                            if json_vals_are_equal(actual_val, &val) {
+                                let mut path = PathMap::new();
+                                path.insert(variable.clone(), GraphBinding::Node(cand));
+                                filtered.push(path);
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(filtered)
         }
         PhysicalOperator::NodeRangeScan {
             variable,
@@ -1004,16 +1231,17 @@ pub(super) fn execute_physical(
             hi,
             hi_inclusive,
         } => {
-            let lo_prop = lo
+            let lo_val = lo
                 .as_ref()
                 .map(|e| evaluate_expr(graph, &PathMap::new(), e, params))
-                .transpose()?
-                .and_then(|v| json_to_prop_value(&v));
-            let hi_prop = hi
+                .transpose()?;
+            let hi_val = hi
                 .as_ref()
                 .map(|e| evaluate_expr(graph, &PathMap::new(), e, params))
-                .transpose()?
-                .and_then(|v| json_to_prop_value(&v));
+                .transpose()?;
+
+            let lo_prop = lo_val.as_ref().and_then(json_to_prop_value);
+            let hi_prop = hi_val.as_ref().and_then(json_to_prop_value);
 
             let candidates = graph
                 .nodes_by_property_range(
@@ -1026,14 +1254,38 @@ pub(super) fn execute_physical(
                 )
                 .map_err(|e| e.to_string())?;
 
-            Ok(candidates
-                .into_iter()
-                .map(|cand| {
-                    let mut path = PathMap::new();
-                    path.insert(variable.clone(), GraphBinding::Node(cand));
-                    path
-                })
-                .collect())
+            let mut filtered = Vec::new();
+            for cand in candidates {
+                if let Ok(Some(record)) = graph.get_node(cand) {
+                    if let Ok(props) = rmp_serde::from_slice::<serde_json::Value>(&record.props) {
+                        if let Some(actual_val) = props.get(property) {
+                            let mut ok = true;
+                            if let Some(ref l_val) = lo_val {
+                                match json_val_cmp(actual_val, l_val) {
+                                    Some(std::cmp::Ordering::Greater) => {}
+                                    Some(std::cmp::Ordering::Equal) if *lo_inclusive => {}
+                                    _ => ok = false,
+                                }
+                            }
+                            if ok {
+                                if let Some(ref h_val) = hi_val {
+                                    match json_val_cmp(actual_val, h_val) {
+                                        Some(std::cmp::Ordering::Less) => {}
+                                        Some(std::cmp::Ordering::Equal) if *hi_inclusive => {}
+                                        _ => ok = false,
+                                    }
+                                }
+                            }
+                            if ok {
+                                let mut path = PathMap::new();
+                                path.insert(variable.clone(), GraphBinding::Node(cand));
+                                filtered.push(path);
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(filtered)
         }
         PhysicalOperator::LabelScan { variable, label } => {
             let candidates = if let Some(lbl) = label {
@@ -1072,7 +1324,15 @@ pub(super) fn execute_physical(
                     };
                     match label {
                         Some(lbl) => {
-                            Ok(txn.label_name(record.label)?.as_deref() == Some(lbl.as_str()))
+                            // A node matches the predicate if any of its labels is `lbl`.
+                            let mut found = false;
+                            for lid in &record.labels {
+                                if txn.label_name(*lid)?.as_deref() == Some(lbl.as_str()) {
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            Ok(found)
                         }
                         None => Ok(true),
                     }
@@ -1516,6 +1776,9 @@ pub(super) fn execute_physical(
             struct AggState {
                 count: i64,
                 sum: f64,
+                /// True once a non-integer value has been summed. `sum()` over only
+                /// integers returns an integer, matching openCypher numeric typing.
+                sum_is_float: bool,
                 min: Option<serde_json::Value>,
                 max: Option<serde_json::Value>,
                 collect: Vec<serde_json::Value>,
@@ -1528,6 +1791,7 @@ pub(super) fn execute_physical(
                     Self {
                         count: 0,
                         sum: 0.0,
+                        sum_is_float: false,
                         min: None,
                         max: None,
                         collect: Vec::new(),
@@ -1595,6 +1859,9 @@ pub(super) fn execute_physical(
                                 if *distinct && !state.distinct_seen.insert(val.to_string()) {
                                     // already seen, skip
                                 } else if let Some(n) = val.as_f64() {
+                                    if val.as_i64().is_none() {
+                                        state.sum_is_float = true;
+                                    }
                                     state.sum += n;
                                 }
                             }
@@ -1674,9 +1941,20 @@ pub(super) fn execute_physical(
                     let state = &states[i];
                     let agg_val = match agg_fn {
                         AggFn::Count { .. } => serde_json::Value::Number(state.count.into()),
-                        AggFn::Sum { .. } => serde_json::Number::from_f64(state.sum)
-                            .map(serde_json::Value::Number)
-                            .unwrap_or(serde_json::Value::Null),
+                        AggFn::Sum { .. } => {
+                            // Preserve integer typing: a sum over only integer inputs
+                            // is an integer, as in openCypher.
+                            if !state.sum_is_float
+                                && state.sum.fract() == 0.0
+                                && state.sum.abs() < i64::MAX as f64
+                            {
+                                serde_json::Value::Number((state.sum as i64).into())
+                            } else {
+                                serde_json::Number::from_f64(state.sum)
+                                    .map(serde_json::Value::Number)
+                                    .unwrap_or(serde_json::Value::Null)
+                            }
+                        }
                         AggFn::Avg { .. } => {
                             if state.count == 0 {
                                 serde_json::Value::Null
@@ -1725,6 +2003,13 @@ pub(super) fn execute_physical(
                             }
                         }
                         AggFn::PercentileDisc { percentile } => {
+                            let percentile =
+                                evaluate_expr(graph, &PathMap::new(), percentile, params)?
+                                    .as_f64()
+                                    .ok_or("percentileDisc(): percentile must be a number")?;
+                            if !(0.0..=1.0).contains(&percentile) {
+                                return Err("ArgumentError(NumberOutOfRange): percentile must be in [0.0, 1.0]".to_string());
+                            }
                             let mut sorted = state.values.clone();
                             sorted.sort_by(|a, b| {
                                 a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
@@ -1742,6 +2027,13 @@ pub(super) fn execute_physical(
                             }
                         }
                         AggFn::PercentileCont { percentile } => {
+                            let percentile =
+                                evaluate_expr(graph, &PathMap::new(), percentile, params)?
+                                    .as_f64()
+                                    .ok_or("percentileCont(): percentile must be a number")?;
+                            if !(0.0..=1.0).contains(&percentile) {
+                                return Err("ArgumentError(NumberOutOfRange): percentile must be in [0.0, 1.0]".to_string());
+                            }
                             let mut sorted = state.values.clone();
                             sorted.sort_by(|a, b| {
                                 a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
@@ -1827,6 +2119,17 @@ pub(super) fn execute_physical(
             use crate::ast::QueryPart;
 
             let child_paths = execute_physical(graph, input, params)?;
+
+            // DELETE is evaluated over the whole result at once: all listed
+            // relationships are removed before any node, so an undirected expand
+            // that binds the same edge in more than one row still succeeds. The
+            // rows pass through unchanged for a following RETURN.
+            if let QueryPart::Delete { targets, detach } = part {
+                use super::write::delete_over_paths;
+                delete_over_paths(graph, &child_paths, targets, *detach, params)?;
+                return Ok(child_paths);
+            }
+
             let mut result_paths = Vec::new();
 
             for path in child_paths {
@@ -1842,184 +2145,35 @@ pub(super) fn execute_physical(
                         result_paths.push(new_path);
                     }
                     QueryPart::Merge { merges } => {
-                        let mut new_path = path.clone();
+                        // Each MERGE in the clause extends every current row, and
+                        // may fan out to multiple rows when it matches more than one
+                        // existing pattern.
+                        let mut current = vec![path.clone()];
                         for merge_stmt in merges {
-                            let created = execute_merge_internal_with_context(
-                                graph, merge_stmt, &path, params,
-                            )?;
-                            new_path.extend(created);
+                            let mut next = Vec::new();
+                            for p in &current {
+                                let extensions = execute_merge_internal_with_context(
+                                    graph, merge_stmt, p, params,
+                                )?;
+                                for ext in extensions {
+                                    let mut row = p.clone();
+                                    row.extend(ext);
+                                    next.push(row);
+                                }
+                            }
+                            current = next;
                         }
-                        result_paths.push(new_path);
+                        result_paths.extend(current);
                     }
                     QueryPart::Set { items } => {
-                        // Apply SET for each row — supports both node and edge variables.
-                        for item in items {
-                            match path.get(&item.variable) {
-                                Some(GraphBinding::Node(nid)) => {
-                                    let new_val = evaluate_expr(graph, &path, &item.expr, params)?;
-                                    let record =
-                                        graph
-                                            .get_node(*nid)
-                                            .map_err(|e| e.to_string())?
-                                            .ok_or_else(|| format!("node not found: {}", nid))?;
-                                    let mut props: serde_json::Value =
-                                        rmp_serde::from_slice(&record.props)
-                                            .map_err(|e| e.to_string())?;
-                                    if let Some(obj) = props.as_object_mut() {
-                                        obj.insert(item.property.clone(), new_val);
-                                    }
-                                    graph.update_node(*nid, &props).map_err(|e| e.to_string())?;
-                                }
-                                Some(GraphBinding::Edge(eid)) => {
-                                    let new_val = evaluate_expr(graph, &path, &item.expr, params)?;
-                                    let record =
-                                        graph
-                                            .get_edge(*eid)
-                                            .map_err(|e| e.to_string())?
-                                            .ok_or_else(|| format!("edge not found: {}", eid))?;
-                                    let mut props: serde_json::Value =
-                                        rmp_serde::from_slice(&record.props)
-                                            .map_err(|e| e.to_string())?;
-                                    if let Some(obj) = props.as_object_mut() {
-                                        obj.insert(item.property.clone(), new_val);
-                                    }
-                                    graph.update_edge(*eid, &props).map_err(|e| e.to_string())?;
-                                }
-                                Some(GraphBinding::Scalar(val)) => {
-                                    if let Some(obj) = val.as_object() {
-                                        if obj.get("__type__").and_then(|t| t.as_str())
-                                            == Some("__Node__")
-                                        {
-                                            if let Some(id_val) =
-                                                obj.get("id").and_then(|i| i.as_i64())
-                                            {
-                                                let nid = id_val as u64;
-                                                let new_val = evaluate_expr(
-                                                    graph, &path, &item.expr, params,
-                                                )?;
-                                                let record = graph
-                                                    .get_node(nid)
-                                                    .map_err(|e| e.to_string())?
-                                                    .ok_or_else(|| {
-                                                        format!("node not found: {}", nid)
-                                                    })?;
-                                                let mut props: serde_json::Value =
-                                                    rmp_serde::from_slice(&record.props)
-                                                        .map_err(|e| e.to_string())?;
-                                                if let Some(o) = props.as_object_mut() {
-                                                    o.insert(item.property.clone(), new_val);
-                                                }
-                                                graph
-                                                    .update_node(nid, &props)
-                                                    .map_err(|e| e.to_string())?;
-                                            }
-                                        } else if obj.get("__type__").and_then(|t| t.as_str())
-                                            == Some("__Edge__")
-                                        {
-                                            if let Some(id_val) =
-                                                obj.get("id").and_then(|i| i.as_i64())
-                                            {
-                                                let eid = id_val as u64;
-                                                let new_val = evaluate_expr(
-                                                    graph, &path, &item.expr, params,
-                                                )?;
-                                                let record = graph
-                                                    .get_edge(eid)
-                                                    .map_err(|e| e.to_string())?
-                                                    .ok_or_else(|| {
-                                                        format!("edge not found: {}", eid)
-                                                    })?;
-                                                let mut props: serde_json::Value =
-                                                    rmp_serde::from_slice(&record.props)
-                                                        .map_err(|e| e.to_string())?;
-                                                if let Some(o) = props.as_object_mut() {
-                                                    o.insert(item.property.clone(), new_val);
-                                                }
-                                                graph
-                                                    .update_edge(eid, &props)
-                                                    .map_err(|e| e.to_string())?;
-                                            }
-                                        }
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
+                        // Apply SET for each row — supports node/edge properties and node labels.
+                        use super::write::apply_set_items;
+                        apply_set_items(graph, &path, items, params)?;
                         result_paths.push(path);
                     }
-                    QueryPart::Delete { variables, detach } => {
-                        for var in variables {
-                            match path.get(var.as_str()) {
-                                Some(GraphBinding::Node(nid)) => {
-                                    if *detach {
-                                        // Delete all edges first.
-                                        let out_neighbors =
-                                            graph.out_neighbors(*nid).map_err(|e| e.to_string())?;
-                                        for entry in out_neighbors {
-                                            graph
-                                                .delete_edge(entry.edge)
-                                                .map_err(|e| e.to_string())?;
-                                        }
-                                        let in_neighbors =
-                                            graph.in_neighbors(*nid).map_err(|e| e.to_string())?;
-                                        for entry in in_neighbors {
-                                            graph
-                                                .delete_edge(entry.edge)
-                                                .map_err(|e| e.to_string())?;
-                                        }
-                                    }
-                                    graph.delete_node(*nid).map_err(|e| e.to_string())?;
-                                }
-                                Some(GraphBinding::Edge(eid)) => {
-                                    graph.delete_edge(*eid).map_err(|e| e.to_string())?;
-                                }
-                                Some(GraphBinding::Scalar(val)) => {
-                                    if let Some(obj) = val.as_object() {
-                                        if obj.get("__type__").and_then(|t| t.as_str())
-                                            == Some("__Node__")
-                                        {
-                                            if let Some(id_val) =
-                                                obj.get("id").and_then(|i| i.as_i64())
-                                            {
-                                                let nid = id_val as u64;
-                                                if *detach {
-                                                    let out_neighbors = graph
-                                                        .out_neighbors(nid)
-                                                        .map_err(|e| e.to_string())?;
-                                                    for entry in out_neighbors {
-                                                        graph
-                                                            .delete_edge(entry.edge)
-                                                            .map_err(|e| e.to_string())?;
-                                                    }
-                                                    let in_neighbors = graph
-                                                        .in_neighbors(nid)
-                                                        .map_err(|e| e.to_string())?;
-                                                    for entry in in_neighbors {
-                                                        graph
-                                                            .delete_edge(entry.edge)
-                                                            .map_err(|e| e.to_string())?;
-                                                    }
-                                                }
-                                                graph
-                                                    .delete_node(nid)
-                                                    .map_err(|e| e.to_string())?;
-                                            }
-                                        } else if obj.get("__type__").and_then(|t| t.as_str())
-                                            == Some("__Edge__")
-                                        {
-                                            if let Some(id_val) =
-                                                obj.get("id").and_then(|i| i.as_i64())
-                                            {
-                                                graph
-                                                    .delete_edge(id_val as u64)
-                                                    .map_err(|e| e.to_string())?;
-                                            }
-                                        }
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
+                    QueryPart::Delete { targets, detach } => {
+                        use super::write::apply_delete_targets;
+                        apply_delete_targets(graph, &path, targets, *detach, params)?;
                         result_paths.push(path);
                     }
                     QueryPart::Remove { items } => {
@@ -2125,12 +2279,12 @@ pub(super) fn evaluate_where(
         WhereClause::Eq(l, r) => {
             let lv = evaluate_expr(graph, path, l, params)?;
             let rv = evaluate_expr(graph, path, r, params)?;
-            Ok(lv == rv)
+            Ok(cypher_eq(&lv, &rv) == serde_json::Value::Bool(true))
         }
         WhereClause::Ne(l, r) => {
             let lv = evaluate_expr(graph, path, l, params)?;
             let rv = evaluate_expr(graph, path, r, params)?;
-            Ok(lv != rv)
+            Ok(cypher_eq(&lv, &rv) == serde_json::Value::Bool(false))
         }
         WhereClause::Lt(l, r) => {
             let lv = evaluate_expr(graph, path, l, params)?;

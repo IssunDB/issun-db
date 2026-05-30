@@ -103,9 +103,10 @@ pub enum QueryPart {
     Set {
         items: Vec<SetItem>,
     },
-    /// A DELETE clause inside a pipeline query.
+    /// A DELETE clause inside a pipeline query. Each target is an expression that
+    /// must evaluate to a node, relationship, or path (or a list of them).
     Delete {
-        variables: Vec<String>,
+        targets: Vec<Expr>,
         detach: bool,
     },
     /// A REMOVE clause inside a pipeline query.
@@ -129,11 +130,15 @@ pub struct Pattern {
     pub path_variable: Option<String>,
 }
 
-/// A pattern matching a node with variable, label, and inline properties.
+/// A pattern matching a node with variable, labels, and inline properties.
+///
+/// `labels` holds every `:Label` segment in the pattern, in source order. An empty
+/// vector means the pattern places no label constraint (MATCH) or creates an
+/// unlabeled node (CREATE).
 #[derive(Debug, Clone, PartialEq)]
 pub struct NodePattern {
     pub variable: Option<String>,
-    pub label: Option<String>,
+    pub labels: Vec<String>,
     pub properties: Option<HashMap<String, Expr>>,
 }
 
@@ -200,13 +205,15 @@ pub enum AggFn {
     StDevP {
         distinct: bool,
     },
-    /// Discrete percentile (nearest rank). The percentile value is stored here.
+    /// Discrete percentile (nearest rank). The percentile is an expression so it
+    /// may be a literal or a parameter, evaluated once at aggregation time.
     PercentileDisc {
-        percentile: f64,
+        percentile: Box<Expr>,
     },
-    /// Continuous percentile (linear interpolation). The percentile value is stored here.
+    /// Continuous percentile (linear interpolation). The percentile is an
+    /// expression, evaluated once at aggregation time.
     PercentileCont {
-        percentile: f64,
+        percentile: Box<Expr>,
     },
 }
 
@@ -277,6 +284,14 @@ pub enum Expr {
         list: Box<Expr>,
         predicate: Option<Box<Expr>>,
         transform: Option<Box<Expr>>,
+    },
+    /// `reduce(accumulator = initial, variable IN list | expression)`
+    Reduce {
+        accumulator: String,
+        initial: Box<Expr>,
+        variable: String,
+        list: Box<Expr>,
+        expression: Box<Expr>,
     },
     /// `variable:Label` — boolean check whether the node has the given label.
     HasLabel {
@@ -382,10 +397,27 @@ pub struct SetStatement {
 
 /// An individual update in the SET statement.
 #[derive(Debug, Clone, PartialEq)]
-pub struct SetItem {
-    pub variable: String,
-    pub property: String,
-    pub expr: Expr,
+pub enum SetItem {
+    /// `SET n.prop = expr`
+    Property {
+        variable: String,
+        property: String,
+        expr: Expr,
+    },
+    /// `SET n:Label` or `SET n:Label1:Label2`
+    Labels {
+        variable: String,
+        labels: Vec<String>,
+    },
+}
+
+impl SetItem {
+    /// The variable this item updates.
+    pub fn variable(&self) -> &str {
+        match self {
+            SetItem::Property { variable, .. } | SetItem::Labels { variable, .. } => variable,
+        }
+    }
 }
 
 /// A DELETE statement for removing nodes or edges.
@@ -393,7 +425,8 @@ pub struct SetItem {
 pub struct DeleteStatement {
     pub match_clauses: Vec<MatchClause>,
     pub where_clause: Option<WhereClause>,
-    pub variables: Vec<String>,
+    /// Expressions that evaluate to nodes, relationships, or paths to delete.
+    pub targets: Vec<Expr>,
     /// When true, incident edges are deleted before deleting the node itself.
     pub detach: bool,
 }
@@ -511,7 +544,8 @@ pub struct RemoveAndReturnStatement {
 pub struct DeleteAndReturnStatement {
     pub match_clauses: Vec<MatchClause>,
     pub where_clause: Option<WhereClause>,
-    pub variables: Vec<String>,
+    /// Expressions that evaluate to nodes, relationships, or paths to delete.
+    pub targets: Vec<Expr>,
     pub detach: bool,
     pub return_clause: ReturnClause,
     pub order_by: Option<OrderBy>,

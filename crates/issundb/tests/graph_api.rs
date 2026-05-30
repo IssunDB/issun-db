@@ -32,11 +32,10 @@ fn node_label_is_stored() {
     let (_dir, g) = open_tmp();
     let id = g.add_node("Company", &json!({})).unwrap();
     let record = g.get_node(id).unwrap().unwrap();
-    // label is a u32 integer; verify it is non-zero (first label gets id 0).
-    // Two different labels must get different IDs.
+    // Each node carries one label here; different label names get different IDs.
     let id2 = g.add_node("Person", &json!({})).unwrap();
     let record2 = g.get_node(id2).unwrap().unwrap();
-    assert_ne!(record.label, record2.label);
+    assert_ne!(record.primary_label(), record2.primary_label());
 }
 
 // ---------------------------------------------------------------------------

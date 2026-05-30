@@ -1,4 +1,5 @@
 use crate::ast::*;
+use crate::error::CypherError;
 use chumsky::input::MappedInput;
 use chumsky::pratt::{infix, left, prefix};
 use chumsky::prelude::*;
@@ -496,13 +497,10 @@ pub(crate) fn expr_parser<'a>() -> impl Parser<'a, ParserInput<'a>, Expr, Parser
         .then_ignore(sym(Tok::LParen))
         .then(expr.clone())
         .then_ignore(sym(Tok::Comma))
-        .then(any().filter_map(|tok| match tok {
-            Tok::Float(f) => Some(f),
-            Tok::Integer(n) => Some(n as f64),
-            _ => None,
-        }))
+        .then(expr.clone())
         .then_ignore(sym(Tok::RParen))
         .map(|((is_disc, inner), percentile)| {
+            let percentile = Box::new(percentile);
             let fn_type = if is_disc {
                 AggFn::PercentileDisc { percentile }
             } else {
@@ -540,6 +538,61 @@ pub(crate) fn expr_parser<'a>() -> impl Parser<'a, ParserInput<'a>, Expr, Parser
                 args,
             });
 
+        // filter(var IN list WHERE predicate) -> list comprehension without transform
+        let filter_fn = keyword("FILTER")
+            .ignore_then(sym(Tok::LParen))
+            .ignore_then(identifier())
+            .then_ignore(keyword("IN"))
+            .then(expr.clone())
+            .then_ignore(keyword("WHERE"))
+            .then(expr.clone())
+            .then_ignore(sym(Tok::RParen))
+            .map(|((var, list), predicate)| Expr::ListComprehension {
+                variable: var,
+                list: Box::new(list),
+                predicate: Some(Box::new(predicate)),
+                transform: None,
+            });
+
+        // extract(var IN list WHERE predicate | transform)
+        let extract_fn = keyword("EXTRACT")
+            .ignore_then(sym(Tok::LParen))
+            .ignore_then(identifier())
+            .then_ignore(keyword("IN"))
+            .then(expr.clone())
+            .then(keyword("WHERE").ignore_then(expr.clone()).or_not())
+            .then(sym(Tok::Pipe).ignore_then(expr.clone()).or_not())
+            .then_ignore(sym(Tok::RParen))
+            .map(
+                |(((var, list), predicate), transform)| Expr::ListComprehension {
+                    variable: var,
+                    list: Box::new(list),
+                    predicate: predicate.map(Box::new),
+                    transform: transform.map(Box::new),
+                },
+            );
+
+        // reduce(acc = initial, var IN list | expression)
+        let reduce_fn = keyword("REDUCE")
+            .ignore_then(sym(Tok::LParen))
+            .ignore_then(identifier())
+            .then_ignore(sym(Tok::Eq))
+            .then(expr.clone())
+            .then_ignore(sym(Tok::Comma))
+            .then(identifier())
+            .then_ignore(keyword("IN"))
+            .then(expr.clone())
+            .then_ignore(sym(Tok::Pipe))
+            .then(expr.clone())
+            .then_ignore(sym(Tok::RParen))
+            .map(|((((acc, initial), var), list), expression)| Expr::Reduce {
+                accumulator: acc,
+                initial: Box::new(initial),
+                variable: var,
+                list: Box::new(list),
+                expression: Box::new(expression),
+            });
+
         let atom_choices = choice((
             count_star,
             quantifier_expr,
@@ -548,6 +601,9 @@ pub(crate) fn expr_parser<'a>() -> impl Parser<'a, ParserInput<'a>, Expr, Parser
             map_expr,
             normal_agg,
             percentile_agg,
+            filter_fn,
+            extract_fn,
+            reduce_fn,
             dotted_fn_call,
             standard_fn_call,
             lit_expr,
@@ -658,16 +714,18 @@ pub(crate) fn expr_parser<'a>() -> impl Parser<'a, ParserInput<'a>, Expr, Parser
         //  15: IN, CONTAINS, STARTS WITH, ENDS WITH  (tighter than =)
         //  16: +, -  (binary)
         //  17: *, /, %
-        //  18: unary -  (prefix — does NOT consume ^ 18 since same-level consumed)
         //  18: ^  (left-assoc)
+        //  19: unary -  (prefix — binds tighter than ^, so -3^2 = (-3)^2 = 9)
         let pratt = postfix.pratt((
-            // Unary minus at 18: ^ is also 18, so same-level rule keeps (-a)^b correct.
+            // Unary minus at 19, one above ^ (18): chumsky's prefix(P) lets infix(left(P))
+            // bind into its operand, so unary minus must sit ABOVE ^ for openCypher's
+            // "numeric unary negative takes precedence over exponentiation" (-3^2 = 9).
             // Fold negation into integer/float literals at parse time so that:
             //   -1 becomes Literal(Int(-1)) rather than BinaryOp(Sub, 0, 1)
             //   -1.5 becomes Literal(Float(-1.5))
             // This also fixes the column display ("abs(-1)" instead of "abs(0 - 1)")
             // and correctly handles i64::MIN (-9223372036854775808).
-            prefix(18, sym(Tok::Minus), |_, x, _| match x {
+            prefix(19, sym(Tok::Minus), |_, x, _| match x {
                 Expr::Literal(Literal::Int(n)) => Expr::Literal(Literal::Int(n.wrapping_neg())),
                 Expr::Literal(Literal::Float(f)) => Expr::Literal(Literal::Float(-f)),
                 other => Expr::BinaryOp {
@@ -872,8 +930,7 @@ fn property_map<'a>(
 /// Parses node patterns: `(variable:Label { properties })` or `(n:A:B:C { ... })`.
 ///
 /// Multiple labels are allowed in Cypher (e.g., `(n:Person:Employee)`).  Only the
-/// first label is stored in `NodePattern::label`; additional labels are silently
-/// accepted to avoid parser crashes without requiring storage-layer changes.
+/// every `:Label` segment is stored in `NodePattern::labels` in source order.
 fn node_pattern<'a>(
     expr_parser: impl Parser<'a, ParserInput<'a>, Expr, ParserError<'a>> + Clone + 'a,
 ) -> impl Parser<'a, ParserInput<'a>, NodePattern, ParserError<'a>> + Clone {
@@ -882,7 +939,7 @@ fn node_pattern<'a>(
             identifier()
                 .or_not()
                 .then(
-                    // Accept one or more `:Label` segments; use only the first for storage.
+                    // Accept one or more `:Label` segments; all are retained.
                     sym(Tok::Colon)
                         .ignore_then(identifier())
                         .repeated()
@@ -893,7 +950,7 @@ fn node_pattern<'a>(
         .then_ignore(sym(Tok::RParen))
         .map(|((variable, labels), properties)| NodePattern {
             variable,
-            label: labels.into_iter().next(),
+            labels,
             properties,
         })
 }
@@ -1090,15 +1147,36 @@ fn where_clause<'a>() -> impl Parser<'a, ParserInput<'a>, WhereClause, ParserErr
     keyword("WHERE")
         .ignore_then(expr_parser())
         .map(|expr| match expr {
-            Expr::BinaryOp { op, left, right } => match op {
-                BinaryOperator::Eq => WhereClause::Eq(*left, *right),
-                BinaryOperator::Ne => WhereClause::Ne(*left, *right),
-                BinaryOperator::Lt => WhereClause::Lt(*left, *right),
-                BinaryOperator::Gt => WhereClause::Gt(*left, *right),
-                BinaryOperator::Le => WhereClause::Le(*left, *right),
-                BinaryOperator::Ge => WhereClause::Ge(*left, *right),
-                _ => WhereClause::Expr(Expr::BinaryOp { op, left, right }),
-            },
+            Expr::BinaryOp { op, left, right } => {
+                let is_comp = |o: &BinaryOperator| {
+                    matches!(
+                        o,
+                        BinaryOperator::Eq
+                            | BinaryOperator::Ne
+                            | BinaryOperator::Lt
+                            | BinaryOperator::Gt
+                            | BinaryOperator::Le
+                            | BinaryOperator::Ge
+                    )
+                };
+                let left_is_comp = match &*left {
+                    Expr::BinaryOp { op: ol, .. } => is_comp(ol),
+                    _ => false,
+                };
+                if is_comp(&op) && left_is_comp {
+                    WhereClause::Expr(Expr::BinaryOp { op, left, right })
+                } else {
+                    match op {
+                        BinaryOperator::Eq => WhereClause::Eq(*left, *right),
+                        BinaryOperator::Ne => WhereClause::Ne(*left, *right),
+                        BinaryOperator::Lt => WhereClause::Lt(*left, *right),
+                        BinaryOperator::Gt => WhereClause::Gt(*left, *right),
+                        BinaryOperator::Le => WhereClause::Le(*left, *right),
+                        BinaryOperator::Ge => WhereClause::Ge(*left, *right),
+                        _ => WhereClause::Expr(Expr::BinaryOp { op, left, right }),
+                    }
+                }
+            }
             // `n:Label` in WHERE context maps directly to an Expr so the
             // logical planner creates a HasLabel filter.
             other => WhereClause::Expr(other),
@@ -1277,12 +1355,12 @@ fn query_part<'a>() -> impl Parser<'a, ParserInput<'a>, QueryPart, ParserError<'
             .map(|d| d.unwrap_or(false))
             .then_ignore(keyword("DELETE"))
             .then(
-                identifier()
+                expr_parser()
                     .separated_by(sym(Tok::Comma))
                     .at_least(1)
                     .collect::<Vec<_>>(),
             )
-            .map(|(detach, variables)| QueryPart::Delete { variables, detach }),
+            .map(|(detach, targets)| QueryPart::Delete { targets, detach }),
         keyword("REMOVE")
             .ignore_then(
                 remove_item()
@@ -1363,16 +1441,30 @@ pub(super) fn query_parser<'a>() -> impl Parser<'a, ParserInput<'a>, Query, Pars
 
 /// Parses individual items in a `SET` update: `n.prop = expr`
 fn set_item<'a>() -> impl Parser<'a, ParserInput<'a>, SetItem, ParserError<'a>> + Clone {
-    identifier()
+    // SET n.prop = expr
+    let property = identifier()
         .then_ignore(sym(Tok::Dot))
         .then(identifier())
         .then_ignore(sym(Tok::Eq))
         .then(expr_parser())
-        .map(|((variable, property), expr)| SetItem {
+        .map(|((variable, property), expr)| SetItem::Property {
             variable,
             property,
             expr,
-        })
+        });
+
+    // SET n:Label or SET n:Label1:Label2
+    let labels = identifier()
+        .then(
+            sym(Tok::Colon)
+                .ignore_then(identifier())
+                .repeated()
+                .at_least(1)
+                .collect::<Vec<String>>(),
+        )
+        .map(|(variable, labels)| SetItem::Labels { variable, labels });
+
+    choice((property, labels))
 }
 
 /// Parses a `CREATE INDEX` or `CREATE CONSTRAINT` or standard `CREATE` statement
@@ -1512,12 +1604,12 @@ fn delete_statement<'a>() -> impl Parser<'a, ParserInput<'a>, Statement, ParserE
         .then(detach)
         .then_ignore(keyword("DELETE"))
         .then(
-            identifier()
+            expr_parser()
                 .separated_by(sym(Tok::Comma))
                 .at_least(1)
                 .collect::<Vec<_>>(),
         )
-        .map(|(((match_clauses, where_clause), detach), variables)| {
+        .map(|(((match_clauses, where_clause), detach), targets)| {
             let mut clauses = Vec::new();
             for pat in match_clauses {
                 clauses.push(MatchClause { pattern: pat });
@@ -1525,7 +1617,7 @@ fn delete_statement<'a>() -> impl Parser<'a, ParserInput<'a>, Statement, ParserE
             Statement::Delete(DeleteStatement {
                 match_clauses: clauses,
                 where_clause,
-                variables,
+                targets,
                 detach,
             })
         })
@@ -1534,42 +1626,63 @@ fn delete_statement<'a>() -> impl Parser<'a, ParserInput<'a>, Statement, ParserE
 /// Parses a `MERGE` clause / statement
 fn merge_statement<'a>() -> impl Parser<'a, ParserInput<'a>, MergeStatement, ParserError<'a>> + Clone
 {
-    let on_create = keyword("ON")
-        .ignore_then(keyword("CREATE"))
-        .ignore_then(keyword("SET"))
-        .ignore_then(
-            set_item()
-                .separated_by(sym(Tok::Comma))
-                .at_least(1)
-                .collect(),
-        )
-        .or_not()
-        .map(|opt| opt.unwrap_or_default());
-
-    let on_match = keyword("ON")
-        .ignore_then(keyword("MATCH"))
-        .ignore_then(keyword("SET"))
-        .ignore_then(
-            set_item()
-                .separated_by(sym(Tok::Comma))
-                .at_least(1)
-                .collect(),
-        )
-        .or_not()
-        .map(|opt| opt.unwrap_or_default());
+    // An `ON CREATE SET ...` or `ON MATCH SET ...` action. Both may appear, in
+    // either order, so they are parsed as a repeated sequence and folded.
+    let set_items = || {
+        set_item()
+            .separated_by(sym(Tok::Comma))
+            .at_least(1)
+            .collect::<Vec<_>>()
+    };
+    let on_action = keyword("ON").ignore_then(choice((
+        keyword("CREATE")
+            .ignore_then(keyword("SET"))
+            .ignore_then(set_items())
+            .map(|items| (true, items)),
+        keyword("MATCH")
+            .ignore_then(keyword("SET"))
+            .ignore_then(set_items())
+            .map(|items| (false, items)),
+    )));
 
     keyword("MERGE")
         .ignore_then(pattern(expr_parser()))
-        .then(on_create)
-        .then(on_match)
-        .map(|((pattern, on_create_set), on_match_set)| MergeStatement {
-            pattern,
-            on_create_set,
-            on_match_set,
+        .then(on_action.repeated().collect::<Vec<(bool, Vec<_>)>>())
+        .map(|(pattern, actions)| {
+            let mut on_create_set = Vec::new();
+            let mut on_match_set = Vec::new();
+            for (is_create, items) in actions {
+                if is_create {
+                    on_create_set.extend(items);
+                } else {
+                    on_match_set.extend(items);
+                }
+            }
+            MergeStatement {
+                pattern,
+                on_create_set,
+                on_match_set,
+            }
         })
 }
 
 // ─── Phase 6: UNION Chaining & Pipelines ───────────────────────────────────────
+
+/// Zero-width parser that succeeds only at a statement boundary: end of input, a
+/// `;` pipeline separator, or a `UNION` keyword. It consumes nothing (the `;` and
+/// `UNION` checks rewind), so the caller's `foldl` / `separated_by` combinators
+/// still see the boundary token.
+///
+/// The specialized statement parsers (`CREATE ... RETURN`, `MATCH ... SET`, single
+/// `MERGE`, etc.) match a fixed clause shape. Without this guard they commit to a
+/// prefix of a longer multi-clause query such as `CREATE (a) CREATE (b)` or
+/// `MATCH (a) SET a.x = 1 WITH a RETURN a`, leaving trailing clauses that the
+/// top-level parser then rejects with "expected end of input". Requiring a boundary
+/// makes those parsers fail when more clauses follow, so the general `query_parser`
+/// clause-sequence path handles the full query instead.
+fn at_statement_boundary<'a>() -> impl Parser<'a, ParserInput<'a>, (), ParserError<'a>> + Clone {
+    choice((end(), sym(Tok::Semi).rewind(), keyword("UNION").rewind()))
+}
 
 /// Parses a top-level single statement (excluding pipeline chaining), supporting recursive `UNION` / `UNION ALL`
 fn statement_union_parser<'a>()
@@ -1642,7 +1755,7 @@ fn statement_union_parser<'a>()
             )
             .then_ignore(keyword("DELETE"))
             .then(
-                identifier()
+                expr_parser()
                     .separated_by(sym(Tok::Comma))
                     .at_least(1)
                     .collect(),
@@ -1655,7 +1768,7 @@ fn statement_union_parser<'a>()
                 |(
                     (
                         (
-                            ((((match_clauses, where_clause), detach), variables), return_clause),
+                            ((((match_clauses, where_clause), detach), targets), return_clause),
                             order_by,
                         ),
                         skip,
@@ -1665,7 +1778,7 @@ fn statement_union_parser<'a>()
                     Statement::DeleteAndReturn(DeleteAndReturnStatement {
                         match_clauses,
                         where_clause,
-                        variables,
+                        targets,
                         detach,
                         return_clause,
                         order_by,
@@ -1795,16 +1908,19 @@ fn statement_union_parser<'a>()
             drop_statement(),
         ));
 
+        // Each specialized parser is guarded by `at_statement_boundary` so it only wins
+        // when it consumes a complete statement. If more clauses follow (e.g.
+        // `CREATE (a) CREATE (b)` or `MATCH (a) SET a.x = 1 WITH a RETURN a`), the guard
+        // fails and the general `query_parser` clause-sequence path handles the full
+        // query. The dedicated variants still fire (with their proper write-lock
+        // semantics) for the single-statement shapes they were written for.
         let base_stmt = choice((
-            create_return,
-            match_set_return,
-            match_delete_return,
-            match_remove_return,
-            merge_return,
-            // write_stmt is tried before query_parser so that MATCH+SET, MATCH+REMOVE,
-            // MATCH+DELETE produce their dedicated Statement variants (with proper write
-            // lock semantics) rather than falling through to the generic pipeline path.
-            write_stmt,
+            create_return.then_ignore(at_statement_boundary()),
+            match_set_return.then_ignore(at_statement_boundary()),
+            match_delete_return.then_ignore(at_statement_boundary()),
+            match_remove_return.then_ignore(at_statement_boundary()),
+            merge_return.then_ignore(at_statement_boundary()),
+            write_stmt.then_ignore(at_statement_boundary()),
             query_parser().map(Statement::Query),
         ));
 
@@ -2077,6 +2193,21 @@ fn collect_expr_vars(expr: &Expr, out: &mut std::collections::HashSet<String>) {
             inner.remove(variable);
             out.extend(inner);
         }
+        Expr::Reduce {
+            accumulator,
+            initial,
+            variable,
+            list,
+            expression,
+        } => {
+            collect_expr_vars(initial, out);
+            collect_expr_vars(list, out);
+            let mut inner = std::collections::HashSet::new();
+            collect_expr_vars(expression, &mut inner);
+            inner.remove(accumulator);
+            inner.remove(variable);
+            out.extend(inner);
+        }
         Expr::Quantifier {
             variable,
             list,
@@ -2276,6 +2407,16 @@ fn expr_has_aggregation(expr: &Expr) -> bool {
                 || predicate.as_ref().is_some_and(|p| expr_has_aggregation(p))
                 || transform.as_ref().is_some_and(|t| expr_has_aggregation(t))
         }
+        Expr::Reduce {
+            initial,
+            list,
+            expression,
+            ..
+        } => {
+            expr_has_aggregation(initial)
+                || expr_has_aggregation(list)
+                || expr_has_aggregation(expression)
+        }
         Expr::Quantifier {
             list, predicate, ..
         } => expr_has_aggregation(list) || expr_has_aggregation(predicate),
@@ -2343,6 +2484,16 @@ fn collect_non_agg_props_in_expr(expr: &Expr, props: &mut Vec<(String, String)>)
             if let Some(t) = transform {
                 collect_non_agg_props_in_expr(t, props);
             }
+        }
+        Expr::Reduce {
+            initial,
+            list,
+            expression,
+            ..
+        } => {
+            collect_non_agg_props_in_expr(initial, props);
+            collect_non_agg_props_in_expr(list, props);
+            collect_non_agg_props_in_expr(expression, props);
         }
         Expr::Quantifier {
             list, predicate, ..
@@ -2508,6 +2659,118 @@ fn validate_query_order_by(query: &Query) -> Result<(), String> {
     Ok(())
 }
 
+fn collect_node_and_rel_vars_in_stmt(
+    stmt: &Statement,
+    node_vars: &mut std::collections::HashSet<String>,
+    rel_vars: &mut std::collections::HashSet<String>,
+) {
+    let mut collect_pattern = |pat: &Pattern| {
+        if let Some(ref v) = pat.node.variable {
+            node_vars.insert(v.clone());
+        }
+        for (rel, target) in &pat.rels {
+            if let Some(ref v) = rel.variable {
+                rel_vars.insert(v.clone());
+            }
+            if let Some(ref v) = target.variable {
+                node_vars.insert(v.clone());
+            }
+        }
+    };
+
+    match stmt {
+        Statement::Query(q) => {
+            for mc in &q.match_clauses {
+                collect_pattern(&mc.pattern);
+            }
+            for part in &q.parts {
+                match part {
+                    QueryPart::Match { match_clauses, .. }
+                    | QueryPart::OptionalMatch { match_clauses, .. } => {
+                        for mc in match_clauses {
+                            collect_pattern(&mc.pattern);
+                        }
+                    }
+                    QueryPart::Create { patterns } => {
+                        for pat in patterns {
+                            collect_pattern(pat);
+                        }
+                    }
+                    QueryPart::Merge { merges } => {
+                        for m in merges {
+                            collect_pattern(&m.pattern);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Statement::Create(c) => {
+            for pat in &c.patterns {
+                collect_pattern(pat);
+            }
+        }
+        Statement::CreateAndReturn(cr) => {
+            for pat in &cr.patterns {
+                collect_pattern(pat);
+            }
+        }
+        Statement::Set(s) => {
+            for mc in &s.match_clauses {
+                collect_pattern(&mc.pattern);
+            }
+        }
+        Statement::SetAndReturn(sr) => {
+            for mc in &sr.match_clauses {
+                collect_pattern(&mc.pattern);
+            }
+        }
+        Statement::Delete(d) => {
+            for mc in &d.match_clauses {
+                collect_pattern(&mc.pattern);
+            }
+        }
+        Statement::DeleteAndReturn(dr) => {
+            for mc in &dr.match_clauses {
+                collect_pattern(&mc.pattern);
+            }
+        }
+        Statement::Merge(m) => {
+            collect_pattern(&m.pattern);
+        }
+        Statement::MergeAndReturn(mr) => {
+            for m in &mr.merges {
+                collect_pattern(&m.pattern);
+            }
+        }
+        Statement::Remove(r) => {
+            for mc in &r.match_clauses {
+                collect_pattern(&mc.pattern);
+            }
+        }
+        Statement::RemoveAndReturn(rr) => {
+            for mc in &rr.match_clauses {
+                collect_pattern(&mc.pattern);
+            }
+        }
+        Statement::Foreach(f) => {
+            for s in &f.body {
+                collect_node_and_rel_vars_in_stmt(s, node_vars, rel_vars);
+            }
+        }
+        Statement::Union(u) => {
+            collect_node_and_rel_vars_in_stmt(&u.left, node_vars, rel_vars);
+            collect_node_and_rel_vars_in_stmt(&u.right, node_vars, rel_vars);
+        }
+        Statement::Pipeline(stmts) => {
+            for s in stmts {
+                collect_node_and_rel_vars_in_stmt(s, node_vars, rel_vars);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn collect_path_vars_in_stmt(stmt: &Statement, vars: &mut std::collections::HashSet<String>) {
     match stmt {
         Statement::Query(q) => {
@@ -2666,6 +2929,12 @@ fn has_aggregation(expr: &Expr) -> bool {
                 || predicate.as_ref().is_some_and(|p| has_aggregation(p))
                 || transform.as_ref().is_some_and(|t| has_aggregation(t))
         }
+        Expr::Reduce {
+            initial,
+            list,
+            expression,
+            ..
+        } => has_aggregation(initial) || has_aggregation(list) || has_aggregation(expression),
         _ => false,
     }
 }
@@ -2673,10 +2942,13 @@ fn has_aggregation(expr: &Expr) -> bool {
 fn check_expr_size_on_path(
     expr: &Expr,
     path_vars: &std::collections::HashSet<String>,
+    node_vars: &std::collections::HashSet<String>,
+    rel_vars: &std::collections::HashSet<String>,
 ) -> Result<(), String> {
     match expr {
         Expr::FunctionCall { name, args } => {
-            if name.to_lowercase() == "size" && args.len() == 1 {
+            let name_lc = name.to_lowercase();
+            if name_lc == "size" && args.len() == 1 {
                 if let Expr::Prop(var, prop) = &args[0] {
                     if prop.is_empty() && path_vars.contains(var) {
                         return Err(format!(
@@ -2685,17 +2957,44 @@ fn check_expr_size_on_path(
                         ));
                     }
                 }
+            } else if name_lc == "length" && args.len() == 1 {
+                if let Expr::Prop(var, prop) = &args[0] {
+                    if prop.is_empty() && (node_vars.contains(var) || rel_vars.contains(var)) {
+                        return Err(format!(
+                            "SyntaxError(InvalidArgumentType): length() cannot be applied to node or relationship variable '{}'",
+                            var
+                        ));
+                    }
+                }
+            } else if name_lc == "type" && args.len() == 1 {
+                if let Expr::Prop(var, prop) = &args[0] {
+                    if prop.is_empty() && (node_vars.contains(var) || path_vars.contains(var)) {
+                        return Err(format!(
+                            "SyntaxError(InvalidArgumentType): type() requires a relationship, but '{}' is not",
+                            var
+                        ));
+                    }
+                }
+            } else if name_lc == "labels" && args.len() == 1 {
+                if let Expr::Prop(var, prop) = &args[0] {
+                    if prop.is_empty() && (rel_vars.contains(var) || path_vars.contains(var)) {
+                        return Err(format!(
+                            "SyntaxError(InvalidArgumentType): labels() requires a node, but '{}' is not",
+                            var
+                        ));
+                    }
+                }
             }
             for a in args {
-                check_expr_size_on_path(a, path_vars)?;
+                check_expr_size_on_path(a, path_vars, node_vars, rel_vars)?;
             }
         }
         Expr::Agg(_, inner) | Expr::Not(inner) | Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
-            check_expr_size_on_path(inner, path_vars)?;
+            check_expr_size_on_path(inner, path_vars, node_vars, rel_vars)?;
         }
         Expr::BinaryOp { left, right, .. } => {
-            check_expr_size_on_path(left, path_vars)?;
-            check_expr_size_on_path(right, path_vars)?;
+            check_expr_size_on_path(left, path_vars, node_vars, rel_vars)?;
+            check_expr_size_on_path(right, path_vars, node_vars, rel_vars)?;
         }
         Expr::Case {
             subject,
@@ -2703,31 +3002,31 @@ fn check_expr_size_on_path(
             else_expr,
         } => {
             if let Some(s) = subject {
-                check_expr_size_on_path(s, path_vars)?;
+                check_expr_size_on_path(s, path_vars, node_vars, rel_vars)?;
             }
             for a in arms {
-                check_expr_size_on_path(&a.when, path_vars)?;
-                check_expr_size_on_path(&a.then, path_vars)?;
+                check_expr_size_on_path(&a.when, path_vars, node_vars, rel_vars)?;
+                check_expr_size_on_path(&a.then, path_vars, node_vars, rel_vars)?;
             }
             if let Some(e) = else_expr {
-                check_expr_size_on_path(e, path_vars)?;
+                check_expr_size_on_path(e, path_vars, node_vars, rel_vars)?;
             }
         }
         Expr::Subscript { expr: e, index } => {
-            check_expr_size_on_path(e, path_vars)?;
-            check_expr_size_on_path(index, path_vars)?;
+            check_expr_size_on_path(e, path_vars, node_vars, rel_vars)?;
+            check_expr_size_on_path(index, path_vars, node_vars, rel_vars)?;
         }
         Expr::Slice {
             expr: e,
             start,
             end,
         } => {
-            check_expr_size_on_path(e, path_vars)?;
+            check_expr_size_on_path(e, path_vars, node_vars, rel_vars)?;
             if let Some(s) = start {
-                check_expr_size_on_path(s, path_vars)?;
+                check_expr_size_on_path(s, path_vars, node_vars, rel_vars)?;
             }
             if let Some(ed) = end {
-                check_expr_size_on_path(ed, path_vars)?;
+                check_expr_size_on_path(ed, path_vars, node_vars, rel_vars)?;
             }
         }
         Expr::ListComprehension {
@@ -2744,13 +3043,26 @@ fn check_expr_size_on_path(
                         .to_string(),
                 );
             }
-            check_expr_size_on_path(list, path_vars)?;
+            check_expr_size_on_path(list, path_vars, node_vars, rel_vars)?;
             if let Some(p) = predicate {
-                check_expr_size_on_path(p, path_vars)?;
+                check_expr_size_on_path(p, path_vars, node_vars, rel_vars)?;
             }
             if let Some(t) = transform {
-                check_expr_size_on_path(t, path_vars)?;
+                check_expr_size_on_path(t, path_vars, node_vars, rel_vars)?;
             }
+        }
+        Expr::Reduce {
+            initial,
+            list,
+            expression,
+            ..
+        } => {
+            if has_aggregation(initial) || has_aggregation(list) || has_aggregation(expression) {
+                return Err("TypeError: reduce() cannot contain aggregation functions".to_string());
+            }
+            check_expr_size_on_path(initial, path_vars, node_vars, rel_vars)?;
+            check_expr_size_on_path(list, path_vars, node_vars, rel_vars)?;
+            check_expr_size_on_path(expression, path_vars, node_vars, rel_vars)?;
         }
         _ => {}
     }
@@ -2760,6 +3072,8 @@ fn check_expr_size_on_path(
 fn check_where_clause(
     wc: &WhereClause,
     path_vars: &std::collections::HashSet<String>,
+    node_vars: &std::collections::HashSet<String>,
+    rel_vars: &std::collections::HashSet<String>,
 ) -> Result<(), String> {
     match wc {
         WhereClause::Eq(l, r)
@@ -2768,11 +3082,11 @@ fn check_where_clause(
         | WhereClause::Gt(l, r)
         | WhereClause::Le(l, r)
         | WhereClause::Ge(l, r) => {
-            check_expr_size_on_path(l, path_vars)?;
-            check_expr_size_on_path(r, path_vars)?;
+            check_expr_size_on_path(l, path_vars, node_vars, rel_vars)?;
+            check_expr_size_on_path(r, path_vars, node_vars, rel_vars)?;
         }
         WhereClause::Expr(e) => {
-            check_expr_size_on_path(e, path_vars)?;
+            check_expr_size_on_path(e, path_vars, node_vars, rel_vars)?;
         }
     }
     Ok(())
@@ -2781,46 +3095,48 @@ fn check_where_clause(
 fn check_statement_exprs(
     stmt: &Statement,
     path_vars: &std::collections::HashSet<String>,
+    node_vars: &std::collections::HashSet<String>,
+    rel_vars: &std::collections::HashSet<String>,
 ) -> Result<(), String> {
     match stmt {
         Statement::Query(q) => {
             if let Some(wc) = &q.where_clause {
-                check_where_clause(wc, path_vars)?;
+                check_where_clause(wc, path_vars, node_vars, rel_vars)?;
             }
             for ri in &q.return_clause.items {
-                check_expr_size_on_path(&ri.expr, path_vars)?;
+                check_expr_size_on_path(&ri.expr, path_vars, node_vars, rel_vars)?;
             }
             if let Some(ob) = &q.order_by {
                 for si in &ob.items {
-                    check_expr_size_on_path(&si.expr, path_vars)?;
+                    check_expr_size_on_path(&si.expr, path_vars, node_vars, rel_vars)?;
                 }
             }
             if let Some(e) = &q.skip {
-                check_expr_size_on_path(e, path_vars)?;
+                check_expr_size_on_path(e, path_vars, node_vars, rel_vars)?;
             }
             if let Some(e) = &q.limit {
-                check_expr_size_on_path(e, path_vars)?;
+                check_expr_size_on_path(e, path_vars, node_vars, rel_vars)?;
             }
             for part in &q.parts {
-                check_query_part_exprs(part, path_vars)?;
+                check_query_part_exprs(part, path_vars, node_vars, rel_vars)?;
             }
         }
         Statement::Set(s) => {
             for part in &s.match_clauses {
                 if let Some(ref props) = part.pattern.node.properties {
                     for v in props.values() {
-                        check_expr_size_on_path(v, path_vars)?;
+                        check_expr_size_on_path(v, path_vars, node_vars, rel_vars)?;
                     }
                 }
                 for (rel, target) in &part.pattern.rels {
                     if let Some(ref props) = rel.properties {
                         for v in props.values() {
-                            check_expr_size_on_path(v, path_vars)?;
+                            check_expr_size_on_path(v, path_vars, node_vars, rel_vars)?;
                         }
                     }
                     if let Some(ref props) = target.properties {
                         for v in props.values() {
-                            check_expr_size_on_path(v, path_vars)?;
+                            check_expr_size_on_path(v, path_vars, node_vars, rel_vars)?;
                         }
                     }
                 }
@@ -2828,33 +3144,33 @@ fn check_statement_exprs(
         }
         Statement::Delete(_) | Statement::Remove(_) => {}
         Statement::Union(u) => {
-            check_statement_exprs(&u.left, path_vars)?;
-            check_statement_exprs(&u.right, path_vars)?;
+            check_statement_exprs(&u.left, path_vars, node_vars, rel_vars)?;
+            check_statement_exprs(&u.right, path_vars, node_vars, rel_vars)?;
         }
         Statement::SetAndReturn(sr) => {
             for ri in &sr.return_clause.items {
-                check_expr_size_on_path(&ri.expr, path_vars)?;
+                check_expr_size_on_path(&ri.expr, path_vars, node_vars, rel_vars)?;
             }
         }
         Statement::DeleteAndReturn(dr) => {
             for ri in &dr.return_clause.items {
-                check_expr_size_on_path(&ri.expr, path_vars)?;
+                check_expr_size_on_path(&ri.expr, path_vars, node_vars, rel_vars)?;
             }
         }
         Statement::RemoveAndReturn(rr) => {
             for ri in &rr.return_clause.items {
-                check_expr_size_on_path(&ri.expr, path_vars)?;
+                check_expr_size_on_path(&ri.expr, path_vars, node_vars, rel_vars)?;
             }
         }
         Statement::Foreach(f) => {
-            check_expr_size_on_path(&f.list, path_vars)?;
+            check_expr_size_on_path(&f.list, path_vars, node_vars, rel_vars)?;
             for s in &f.body {
-                check_statement_exprs(s, path_vars)?;
+                check_statement_exprs(s, path_vars, node_vars, rel_vars)?;
             }
         }
         Statement::Pipeline(stmts) => {
             for s in stmts {
-                check_statement_exprs(s, path_vars)?;
+                check_statement_exprs(s, path_vars, node_vars, rel_vars)?;
             }
         }
         _ => {}
@@ -2865,11 +3181,13 @@ fn check_statement_exprs(
 fn check_query_part_exprs(
     part: &QueryPart,
     path_vars: &std::collections::HashSet<String>,
+    node_vars: &std::collections::HashSet<String>,
+    rel_vars: &std::collections::HashSet<String>,
 ) -> Result<(), String> {
     match part {
         QueryPart::Match { where_clause, .. } | QueryPart::OptionalMatch { where_clause, .. } => {
             if let Some(wc) = where_clause {
-                check_where_clause(wc, path_vars)?;
+                check_where_clause(wc, path_vars, node_vars, rel_vars)?;
             }
         }
         QueryPart::With {
@@ -2881,29 +3199,31 @@ fn check_query_part_exprs(
             ..
         } => {
             for ri in items {
-                check_expr_size_on_path(&ri.expr, path_vars)?;
+                check_expr_size_on_path(&ri.expr, path_vars, node_vars, rel_vars)?;
             }
             if let Some(wc) = where_clause {
-                check_where_clause(wc, path_vars)?;
+                check_where_clause(wc, path_vars, node_vars, rel_vars)?;
             }
             if let Some(ob) = order_by {
                 for si in &ob.items {
-                    check_expr_size_on_path(&si.expr, path_vars)?;
+                    check_expr_size_on_path(&si.expr, path_vars, node_vars, rel_vars)?;
                 }
             }
             if let Some(e) = skip {
-                check_expr_size_on_path(e, path_vars)?;
+                check_expr_size_on_path(e, path_vars, node_vars, rel_vars)?;
             }
             if let Some(e) = limit {
-                check_expr_size_on_path(e, path_vars)?;
+                check_expr_size_on_path(e, path_vars, node_vars, rel_vars)?;
             }
         }
         QueryPart::Unwind { expr, .. } => {
-            check_expr_size_on_path(expr, path_vars)?;
+            check_expr_size_on_path(expr, path_vars, node_vars, rel_vars)?;
         }
         QueryPart::Set { items } => {
             for si in items {
-                check_expr_size_on_path(&si.expr, path_vars)?;
+                if let SetItem::Property { expr, .. } = si {
+                    check_expr_size_on_path(expr, path_vars, node_vars, rel_vars)?;
+                }
             }
         }
         _ => {}
@@ -2911,10 +3231,394 @@ fn check_query_part_exprs(
     Ok(())
 }
 
+fn collect_where_vars(w: &WhereClause, vars: &mut std::collections::HashSet<String>) {
+    match w {
+        WhereClause::Eq(l, r)
+        | WhereClause::Ne(l, r)
+        | WhereClause::Lt(l, r)
+        | WhereClause::Gt(l, r)
+        | WhereClause::Le(l, r)
+        | WhereClause::Ge(l, r) => {
+            collect_expr_vars(l, vars);
+            collect_expr_vars(r, vars);
+        }
+        WhereClause::Expr(e) => {
+            collect_expr_vars(e, vars);
+        }
+    }
+}
+
+fn collect_pattern_bound_vars(pattern: &Pattern, bound: &mut std::collections::HashSet<String>) {
+    if let Some(ref pv) = pattern.path_variable {
+        bound.insert(pv.clone());
+    }
+    if let Some(ref v) = pattern.node.variable {
+        bound.insert(v.clone());
+    }
+    for (rel, target) in &pattern.rels {
+        if let Some(ref v) = rel.variable {
+            bound.insert(v.clone());
+        }
+        if let Some(ref v) = target.variable {
+            bound.insert(v.clone());
+        }
+    }
+}
+
+fn validate_expr_vars(
+    expr: &Expr,
+    active: &std::collections::HashSet<String>,
+) -> Result<(), String> {
+    let mut vars = std::collections::HashSet::new();
+    collect_expr_vars(expr, &mut vars);
+    for v in vars {
+        if !active.contains(&v) {
+            return Err(format!(
+                "SyntaxError(UndefinedVariable): variable '{}' is not in scope",
+                v
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Validate that a SET item's target variable is in scope, and (for a property
+/// assignment) that its value expression references only in-scope variables.
+fn validate_set_item_vars(
+    item: &SetItem,
+    active: &std::collections::HashSet<String>,
+) -> Result<(), String> {
+    if !active.contains(item.variable()) {
+        return Err(format!(
+            "SyntaxError(UndefinedVariable): variable '{}' is not in scope",
+            item.variable()
+        ));
+    }
+    if let SetItem::Property { expr, .. } = item {
+        validate_expr_vars(expr, active)?;
+    }
+    Ok(())
+}
+
+fn validate_where_vars(
+    w: &WhereClause,
+    active: &std::collections::HashSet<String>,
+) -> Result<(), String> {
+    let mut vars = std::collections::HashSet::new();
+    collect_where_vars(w, &mut vars);
+    for v in vars {
+        if !active.contains(&v) {
+            return Err(format!(
+                "SyntaxError(UndefinedVariable): variable '{}' is not in scope",
+                v
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_pattern_exprs(
+    pattern: &Pattern,
+    active: &std::collections::HashSet<String>,
+) -> Result<(), String> {
+    if let Some(ref props) = pattern.node.properties {
+        for expr in props.values() {
+            validate_expr_vars(expr, active)?;
+        }
+    }
+    for (rel, target) in &pattern.rels {
+        if let Some(ref props) = rel.properties {
+            for expr in props.values() {
+                validate_expr_vars(expr, active)?;
+            }
+        }
+        if let Some(ref props) = target.properties {
+            for expr in props.values() {
+                validate_expr_vars(expr, active)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_statement_undefined_vars_impl(
+    stmt: &Statement,
+    active: &mut std::collections::HashSet<String>,
+) -> Result<(), String> {
+    match stmt {
+        Statement::Query(q) => {
+            // Match clauses at top-level
+            for mc in &q.match_clauses {
+                validate_pattern_exprs(&mc.pattern, active)?;
+                collect_pattern_bound_vars(&mc.pattern, active);
+            }
+            if let Some(wc) = &q.where_clause {
+                validate_where_vars(wc, active)?;
+            }
+            // Parts
+            for part in &q.parts {
+                match part {
+                    QueryPart::Match {
+                        match_clauses,
+                        where_clause,
+                    }
+                    | QueryPart::OptionalMatch {
+                        match_clauses,
+                        where_clause,
+                    } => {
+                        for mc in match_clauses {
+                            validate_pattern_exprs(&mc.pattern, active)?;
+                            collect_pattern_bound_vars(&mc.pattern, active);
+                        }
+                        if let Some(wc) = where_clause {
+                            validate_where_vars(wc, active)?;
+                        }
+                    }
+                    QueryPart::With {
+                        items,
+                        where_clause,
+                        order_by,
+                        skip,
+                        limit,
+                        ..
+                    } => {
+                        for item in items {
+                            validate_expr_vars(&item.expr, active)?;
+                        }
+                        let mut with_active = active.clone();
+                        for item in items {
+                            if let Some(ref alias) = item.alias {
+                                with_active.insert(alias.clone());
+                            } else if let Expr::Prop(ref v, ref p) = item.expr {
+                                if p.is_empty() {
+                                    with_active.insert(v.clone());
+                                }
+                            }
+                        }
+                        if let Some(wc) = where_clause {
+                            validate_where_vars(wc, &with_active)?;
+                        }
+                        if let Some(ob) = order_by {
+                            for si in &ob.items {
+                                validate_expr_vars(&si.expr, &with_active)?;
+                            }
+                        }
+                        if let Some(s) = skip {
+                            validate_expr_vars(s, active)?;
+                        }
+                        if let Some(l) = limit {
+                            validate_expr_vars(l, active)?;
+                        }
+                        if let Some(new_scope) = with_output_scope(items) {
+                            *active = new_scope;
+                        }
+                    }
+                    QueryPart::Unwind { expr, variable } => {
+                        validate_expr_vars(expr, active)?;
+                        active.insert(variable.clone());
+                    }
+                    QueryPart::Create { patterns } => {
+                        for p in patterns {
+                            validate_pattern_exprs(p, active)?;
+                            collect_pattern_bound_vars(p, active);
+                        }
+                    }
+                    QueryPart::Merge { merges } => {
+                        for m in merges {
+                            validate_pattern_exprs(&m.pattern, active)?;
+                            collect_pattern_bound_vars(&m.pattern, active);
+                            for item in &m.on_create_set {
+                                validate_set_item_vars(item, active)?;
+                            }
+                            for item in &m.on_match_set {
+                                validate_set_item_vars(item, active)?;
+                            }
+                        }
+                    }
+                    QueryPart::Set { items } => {
+                        for item in items {
+                            validate_set_item_vars(item, active)?;
+                        }
+                    }
+                    QueryPart::Delete { targets, .. } => {
+                        for t in targets {
+                            validate_expr_vars(t, active)?;
+                        }
+                    }
+                    QueryPart::Remove { items } => {
+                        for item in items {
+                            let v = match item {
+                                RemoveItem::Property { variable, .. } => variable,
+                                RemoveItem::Label { variable, .. } => variable,
+                            };
+                            if !active.contains(v) {
+                                return Err(format!(
+                                    "SyntaxError(UndefinedVariable): variable '{}' is not in scope",
+                                    v
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            // Return clause, order by, skip, limit
+            for item in &q.return_clause.items {
+                validate_expr_vars(&item.expr, active)?;
+            }
+            if let Some(ob) = &q.order_by {
+                for si in &ob.items {
+                    validate_expr_vars(&si.expr, active)?;
+                }
+            }
+            if let Some(s) = &q.skip {
+                validate_expr_vars(s, active)?;
+            }
+            if let Some(l) = &q.limit {
+                validate_expr_vars(l, active)?;
+            }
+        }
+        Statement::Create(c) => {
+            for p in &c.patterns {
+                validate_pattern_exprs(p, active)?;
+                collect_pattern_bound_vars(p, active);
+            }
+        }
+        Statement::Set(s) => {
+            for mc in &s.match_clauses {
+                validate_pattern_exprs(&mc.pattern, active)?;
+                collect_pattern_bound_vars(&mc.pattern, active);
+            }
+            if let Some(wc) = &s.where_clause {
+                validate_where_vars(wc, active)?;
+            }
+            for item in &s.set_items {
+                validate_set_item_vars(item, active)?;
+            }
+        }
+        Statement::Delete(d) => {
+            for mc in &d.match_clauses {
+                validate_pattern_exprs(&mc.pattern, active)?;
+                collect_pattern_bound_vars(&mc.pattern, active);
+            }
+            if let Some(wc) = &d.where_clause {
+                validate_where_vars(wc, active)?;
+            }
+            for t in &d.targets {
+                validate_expr_vars(t, active)?;
+            }
+        }
+        Statement::Remove(r) => {
+            for mc in &r.match_clauses {
+                validate_pattern_exprs(&mc.pattern, active)?;
+                collect_pattern_bound_vars(&mc.pattern, active);
+            }
+            if let Some(wc) = &r.where_clause {
+                validate_where_vars(wc, active)?;
+            }
+            for item in &r.items {
+                let v = match item {
+                    RemoveItem::Property { variable, .. } => variable,
+                    RemoveItem::Label { variable, .. } => variable,
+                };
+                if !active.contains(v) {
+                    return Err(format!(
+                        "SyntaxError(UndefinedVariable): variable '{}' is not in scope",
+                        v
+                    ));
+                }
+            }
+        }
+        Statement::Union(u) => {
+            let mut left_active = active.clone();
+            validate_statement_undefined_vars_impl(&u.left, &mut left_active)?;
+            let mut right_active = active.clone();
+            validate_statement_undefined_vars_impl(&u.right, &mut right_active)?;
+        }
+        Statement::SetAndReturn(sr) => {
+            for mc in &sr.match_clauses {
+                validate_pattern_exprs(&mc.pattern, active)?;
+                collect_pattern_bound_vars(&mc.pattern, active);
+            }
+            if let Some(wc) = &sr.where_clause {
+                validate_where_vars(wc, active)?;
+            }
+            for item in &sr.set_items {
+                validate_set_item_vars(item, active)?;
+            }
+            for item in &sr.return_clause.items {
+                validate_expr_vars(&item.expr, active)?;
+            }
+        }
+        Statement::DeleteAndReturn(dr) => {
+            for mc in &dr.match_clauses {
+                validate_pattern_exprs(&mc.pattern, active)?;
+                collect_pattern_bound_vars(&mc.pattern, active);
+            }
+            if let Some(wc) = &dr.where_clause {
+                validate_where_vars(wc, active)?;
+            }
+            for t in &dr.targets {
+                validate_expr_vars(t, active)?;
+            }
+            for item in &dr.return_clause.items {
+                validate_expr_vars(&item.expr, active)?;
+            }
+        }
+        Statement::RemoveAndReturn(rr) => {
+            for mc in &rr.match_clauses {
+                validate_pattern_exprs(&mc.pattern, active)?;
+                collect_pattern_bound_vars(&mc.pattern, active);
+            }
+            if let Some(wc) = &rr.where_clause {
+                validate_where_vars(wc, active)?;
+            }
+            for item in &rr.items {
+                let v = match item {
+                    RemoveItem::Property { variable, .. } => variable,
+                    RemoveItem::Label { variable, .. } => variable,
+                };
+                if !active.contains(v) {
+                    return Err(format!(
+                        "SyntaxError(UndefinedVariable): variable '{}' is not in scope",
+                        v
+                    ));
+                }
+            }
+            for item in &rr.return_clause.items {
+                validate_expr_vars(&item.expr, active)?;
+            }
+        }
+        Statement::Foreach(f) => {
+            validate_expr_vars(&f.list, active)?;
+            let mut body_active = active.clone();
+            body_active.insert(f.variable.clone());
+            for s in &f.body {
+                validate_statement_undefined_vars_impl(s, &mut body_active)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_statement_undefined_vars(stmt: &Statement) -> Result<(), String> {
+    let mut active = std::collections::HashSet::new();
+    validate_statement_undefined_vars_impl(stmt, &mut active)
+}
+
 fn validate_statement(stmt: &Statement) -> Result<(), String> {
+    validate_statement_undefined_vars(stmt)?;
+    validate_create_semantics(stmt)?;
+    validate_merge_semantics(stmt)?;
+    validate_delete_semantics(stmt)?;
+    validate_projection_semantics(stmt)?;
+    validate_value_var_conflicts(stmt)?;
     let mut path_vars = std::collections::HashSet::new();
     collect_path_vars_in_stmt(stmt, &mut path_vars);
-    check_statement_exprs(stmt, &path_vars)?;
+    let mut node_vars = std::collections::HashSet::new();
+    let mut rel_vars = std::collections::HashSet::new();
+    collect_node_and_rel_vars_in_stmt(stmt, &mut node_vars, &mut rel_vars);
+    check_statement_exprs(stmt, &path_vars, &node_vars, &rel_vars)?;
 
     match stmt {
         Statement::Query(q) => {
@@ -2970,15 +3674,776 @@ fn validate_statement(stmt: &Statement) -> Result<(), String> {
     Ok(())
 }
 
+// ─── CREATE clause semantics ────────────────────────────────────────────────
+
+/// Validate CREATE clauses against the openCypher structural rules: a created
+/// relationship must have exactly one type, must be directed, and must not be
+/// variable-length, and a CREATE pattern must not reuse an already-bound variable
+/// (a bound node may appear only as a bare relationship endpoint, never carrying
+/// labels or properties, and never standing alone).
+fn validate_create_semantics(stmt: &Statement) -> Result<(), String> {
+    match stmt {
+        Statement::Query(q) => {
+            let mut bound = std::collections::HashSet::new();
+            for mc in &q.match_clauses {
+                collect_pattern_bound_vars(&mc.pattern, &mut bound);
+            }
+            for part in &q.parts {
+                match part {
+                    QueryPart::Match { match_clauses, .. }
+                    | QueryPart::OptionalMatch { match_clauses, .. } => {
+                        for mc in match_clauses {
+                            collect_pattern_bound_vars(&mc.pattern, &mut bound);
+                        }
+                    }
+                    QueryPart::With { items, .. } => {
+                        // WITH is a scope barrier: only projected aliases survive.
+                        bound = with_output_scope(items).unwrap_or_default();
+                    }
+                    QueryPart::Unwind { variable, .. } => {
+                        bound.insert(variable.clone());
+                    }
+                    QueryPart::Create { patterns } => {
+                        validate_create_patterns(patterns, &mut bound)?;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Statement::Create(c) => {
+            let mut bound = std::collections::HashSet::new();
+            validate_create_patterns(&c.patterns, &mut bound)?;
+        }
+        Statement::CreateAndReturn(c) => {
+            let mut bound = std::collections::HashSet::new();
+            validate_create_patterns(&c.patterns, &mut bound)?;
+        }
+        Statement::Union(u) => {
+            validate_create_semantics(&u.left)?;
+            validate_create_semantics(&u.right)?;
+        }
+        Statement::Pipeline(stmts) => {
+            for s in stmts {
+                validate_create_semantics(s)?;
+            }
+        }
+        Statement::Foreach(f) => {
+            for s in &f.body {
+                validate_create_semantics(s)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Validate the patterns of one CREATE clause against the variables bound before
+/// it, then add the newly created variables to `bound`. All patterns in the clause
+/// are checked against the same pre-clause snapshot so that two standalone node
+/// patterns referring to the same fresh variable are not falsely rejected.
+fn validate_create_patterns(
+    patterns: &[Pattern],
+    bound: &mut std::collections::HashSet<String>,
+) -> Result<(), String> {
+    let snapshot = bound.clone();
+    for p in patterns {
+        let has_rels = !p.rels.is_empty();
+        check_create_node(&p.node, &snapshot, has_rels)?;
+        for (rel, target) in &p.rels {
+            check_create_rel(rel, &snapshot)?;
+            check_create_node(target, &snapshot, true)?;
+        }
+    }
+    for p in patterns {
+        collect_pattern_bound_vars(p, bound);
+    }
+    Ok(())
+}
+
+/// A created node may reuse an already-bound variable only as a bare relationship
+/// endpoint: it must carry no labels or properties, and the surrounding pattern
+/// must contain at least one relationship.
+fn check_create_node(
+    node: &NodePattern,
+    bound: &std::collections::HashSet<String>,
+    pattern_has_rels: bool,
+) -> Result<(), String> {
+    if let Some(ref v) = node.variable {
+        if bound.contains(v)
+            && (!node.labels.is_empty() || node.properties.is_some() || !pattern_has_rels)
+        {
+            return Err(format!(
+                "SyntaxError(VariableAlreadyBound): variable '{}' is already bound",
+                v
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A created relationship must have exactly one type, be directed, not be
+/// variable-length, and not reuse an already-bound variable.
+fn check_create_rel(
+    rel: &RelationshipPattern,
+    bound: &std::collections::HashSet<String>,
+) -> Result<(), String> {
+    match rel.rel_type {
+        None => {
+            return Err(
+                "SyntaxError(NoSingleRelationshipType): a created relationship must have a single type"
+                    .to_string(),
+            );
+        }
+        Some(ref t) if t.contains('|') => {
+            return Err(
+                "SyntaxError(NoSingleRelationshipType): a created relationship must have a single type"
+                    .to_string(),
+            );
+        }
+        _ => {}
+    }
+    if rel.is_undirected {
+        return Err(
+            "SyntaxError(RequiresDirectedRelationship): a created relationship must be directed"
+                .to_string(),
+        );
+    }
+    if rel.range.is_some() {
+        return Err(
+            "SyntaxError(CreatingVarLength): cannot create a variable-length relationship"
+                .to_string(),
+        );
+    }
+    if let Some(ref v) = rel.variable {
+        if bound.contains(v) {
+            return Err(format!(
+                "SyntaxError(VariableAlreadyBound): relationship variable '{}' is already bound",
+                v
+            ));
+        }
+    }
+    Ok(())
+}
+
+// ─── DELETE clause semantics ────────────────────────────────────────────────
+
+/// Validate DELETE targets: a target must be able to denote a node, relationship,
+/// or path. Expressions whose static form can never be a graph element (a literal,
+/// an arithmetic or boolean operation, a label check, an aggregation) are rejected
+/// at compile time.
+fn validate_delete_semantics(stmt: &Statement) -> Result<(), String> {
+    match stmt {
+        Statement::Query(q) => {
+            for part in &q.parts {
+                if let QueryPart::Delete { targets, .. } = part {
+                    for t in targets {
+                        check_delete_target(t)?;
+                    }
+                }
+            }
+        }
+        Statement::Delete(d) => {
+            for t in &d.targets {
+                check_delete_target(t)?;
+            }
+        }
+        Statement::DeleteAndReturn(d) => {
+            for t in &d.targets {
+                check_delete_target(t)?;
+            }
+        }
+        Statement::Union(u) => {
+            validate_delete_semantics(&u.left)?;
+            validate_delete_semantics(&u.right)?;
+        }
+        Statement::Pipeline(stmts) => {
+            for s in stmts {
+                validate_delete_semantics(s)?;
+            }
+        }
+        Statement::Foreach(f) => {
+            for s in &f.body {
+                validate_delete_semantics(s)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn check_delete_target(expr: &Expr) -> Result<(), String> {
+    match expr {
+        Expr::HasLabel { .. } => Err(
+            "SyntaxError(InvalidDelete): cannot delete a label; use REMOVE to remove labels"
+                .to_string(),
+        ),
+        Expr::Literal(_)
+        | Expr::BinaryOp { .. }
+        | Expr::IsNull(_)
+        | Expr::IsNotNull(_)
+        | Expr::Not(_)
+        | Expr::CountStar
+        | Expr::Agg(_, _)
+        | Expr::Quantifier { .. } => Err(
+            "SyntaxError(InvalidArgumentType): DELETE expects a node, relationship, or path"
+                .to_string(),
+        ),
+        _ => Ok(()),
+    }
+}
+
+// ─── MERGE clause semantics ─────────────────────────────────────────────────
+
+/// Validate MERGE clauses against the openCypher structural rules: a merged
+/// relationship must have exactly one type and must not be variable-length, a
+/// merged pattern must not reuse an already-bound variable except as a bare
+/// relationship endpoint, and a merged node or relationship must not carry a
+/// null inline property. Unlike CREATE, MERGE permits an undirected relationship
+/// (it is created with outgoing direction when unspecified).
+fn validate_merge_semantics(stmt: &Statement) -> Result<(), String> {
+    match stmt {
+        Statement::Query(q) => {
+            let mut bound = std::collections::HashSet::new();
+            for mc in &q.match_clauses {
+                collect_pattern_bound_vars(&mc.pattern, &mut bound);
+            }
+            for part in &q.parts {
+                match part {
+                    QueryPart::Match { match_clauses, .. }
+                    | QueryPart::OptionalMatch { match_clauses, .. } => {
+                        for mc in match_clauses {
+                            collect_pattern_bound_vars(&mc.pattern, &mut bound);
+                        }
+                    }
+                    QueryPart::With { items, .. } => {
+                        bound = with_output_scope(items).unwrap_or_default();
+                    }
+                    QueryPart::Unwind { variable, .. } => {
+                        bound.insert(variable.clone());
+                    }
+                    QueryPart::Create { patterns } => {
+                        for p in patterns {
+                            collect_pattern_bound_vars(p, &mut bound);
+                        }
+                    }
+                    QueryPart::Merge { merges } => {
+                        for m in merges {
+                            check_merge_pattern(&m.pattern, &mut bound)?;
+                            check_merge_on_clauses(m, &bound)?;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Statement::Merge(m) => {
+            let mut bound = std::collections::HashSet::new();
+            check_merge_pattern(&m.pattern, &mut bound)?;
+            check_merge_on_clauses(m, &bound)?;
+        }
+        Statement::MergeAndReturn(mr) => {
+            let mut bound = std::collections::HashSet::new();
+            for m in &mr.merges {
+                check_merge_pattern(&m.pattern, &mut bound)?;
+                check_merge_on_clauses(m, &bound)?;
+            }
+        }
+        Statement::Union(u) => {
+            validate_merge_semantics(&u.left)?;
+            validate_merge_semantics(&u.right)?;
+        }
+        Statement::Pipeline(stmts) => {
+            for s in stmts {
+                validate_merge_semantics(s)?;
+            }
+        }
+        Statement::Foreach(f) => {
+            for s in &f.body {
+                validate_merge_semantics(s)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn check_merge_pattern(
+    p: &Pattern,
+    bound: &mut std::collections::HashSet<String>,
+) -> Result<(), String> {
+    let snapshot = bound.clone();
+    let has_rels = !p.rels.is_empty();
+    // A bound node may appear only as a bare relationship endpoint; the rule is
+    // identical to CREATE.
+    check_create_node(&p.node, &snapshot, has_rels)?;
+    check_merge_null_props(&p.node.properties)?;
+    for (rel, target) in &p.rels {
+        check_merge_rel(rel, &snapshot)?;
+        check_merge_null_props(&rel.properties)?;
+        check_create_node(target, &snapshot, true)?;
+        check_merge_null_props(&target.properties)?;
+    }
+    collect_pattern_bound_vars(p, bound);
+    Ok(())
+}
+
+/// The target variable of every `ON CREATE SET` and `ON MATCH SET` action must be
+/// a variable bound by the surrounding query or by the MERGE pattern itself.
+fn check_merge_on_clauses(
+    m: &MergeStatement,
+    available: &std::collections::HashSet<String>,
+) -> Result<(), String> {
+    for item in m.on_create_set.iter().chain(m.on_match_set.iter()) {
+        let v = item.variable();
+        if !available.contains(v) {
+            return Err(format!(
+                "SyntaxError(UndefinedVariable): variable '{}' not defined",
+                v
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A merged relationship must have exactly one type, must not be variable-length,
+/// and must not reuse an already-bound variable. Undirected is allowed.
+fn check_merge_rel(
+    rel: &RelationshipPattern,
+    bound: &std::collections::HashSet<String>,
+) -> Result<(), String> {
+    match rel.rel_type {
+        None => {
+            return Err(
+                "SyntaxError(NoSingleRelationshipType): a merged relationship must have a single type"
+                    .to_string(),
+            );
+        }
+        Some(ref t) if t.contains('|') => {
+            return Err(
+                "SyntaxError(NoSingleRelationshipType): a merged relationship must have a single type"
+                    .to_string(),
+            );
+        }
+        _ => {}
+    }
+    if rel.range.is_some() {
+        return Err(
+            "SyntaxError(CreatingVarLength): cannot merge a variable-length relationship"
+                .to_string(),
+        );
+    }
+    if let Some(ref v) = rel.variable {
+        if bound.contains(v) {
+            return Err(format!(
+                "SyntaxError(VariableAlreadyBound): relationship variable '{}' is already bound",
+                v
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Reject a literal null among a merged element's inline properties. Merging on a
+/// null property value is a semantic error in openCypher.
+fn check_merge_null_props(
+    props: &Option<std::collections::HashMap<String, Expr>>,
+) -> Result<(), String> {
+    if let Some(map) = props {
+        for value in map.values() {
+            if matches!(value, Expr::Literal(Literal::Null)) {
+                return Err(
+                    "SyntaxError(InvalidArgumentValue): cannot merge on a null property value"
+                        .to_string(),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+// ─── RETURN and aggregation semantics ─────────────────────────────────────────
+
+/// Validate projection lists across the statement: no duplicate output column
+/// names, no aggregation nested inside another aggregation, and no
+/// non-deterministic function (`rand()`) inside an aggregation.
+fn validate_projection_semantics(stmt: &Statement) -> Result<(), String> {
+    for items in projection_lists(stmt) {
+        check_duplicate_columns(items)?;
+        for item in items {
+            check_aggregation_arg(&item.expr)?;
+        }
+    }
+    check_with_aliasing(stmt)?;
+    check_no_aggregate_in_where(stmt)?;
+    Ok(())
+}
+
+/// Every WITH item that is not a bare variable reference must be aliased. A
+/// projected expression without a name cannot be referenced downstream, so
+/// openCypher rejects it.
+fn check_with_aliasing(stmt: &Statement) -> Result<(), String> {
+    let check = |items: &[ReturnItem]| -> Result<(), String> {
+        for item in items {
+            let is_bare_var = matches!(&item.expr, Expr::Prop(_, p) if p.is_empty());
+            // `WITH *` is parsed as a `__star__` sentinel; it needs no alias.
+            let is_star =
+                matches!(&item.expr, Expr::FunctionCall { name, .. } if name == "__star__");
+            if item.alias.is_none() && !is_bare_var && !is_star {
+                return Err(
+                    "SyntaxError(NoExpressionAlias): expression in WITH must be aliased"
+                        .to_string(),
+                );
+            }
+        }
+        Ok(())
+    };
+    match stmt {
+        Statement::Query(q) => {
+            for part in &q.parts {
+                if let QueryPart::With { items, .. } = part {
+                    check(items)?;
+                }
+            }
+        }
+        Statement::Union(u) => {
+            check_with_aliasing(&u.left)?;
+            check_with_aliasing(&u.right)?;
+        }
+        Statement::Pipeline(stmts) => {
+            for s in stmts {
+                check_with_aliasing(s)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// An aggregating function may not appear in a WHERE predicate.
+fn check_no_aggregate_in_where(stmt: &Statement) -> Result<(), String> {
+    let check_where = |wc: &WhereClause| -> Result<(), String> {
+        let bad = match wc {
+            WhereClause::Eq(l, r)
+            | WhereClause::Ne(l, r)
+            | WhereClause::Lt(l, r)
+            | WhereClause::Gt(l, r)
+            | WhereClause::Le(l, r)
+            | WhereClause::Ge(l, r) => expr_contains_aggregate(l) || expr_contains_aggregate(r),
+            WhereClause::Expr(e) => expr_contains_aggregate(e),
+        };
+        if bad {
+            return Err(
+                "SyntaxError(InvalidAggregation): aggregation is not allowed in WHERE".to_string(),
+            );
+        }
+        Ok(())
+    };
+    match stmt {
+        Statement::Query(q) => {
+            if let Some(wc) = &q.where_clause {
+                check_where(wc)?;
+            }
+            for part in &q.parts {
+                match part {
+                    QueryPart::Match { where_clause, .. }
+                    | QueryPart::OptionalMatch { where_clause, .. }
+                    | QueryPart::With { where_clause, .. } => {
+                        if let Some(wc) = where_clause {
+                            check_where(wc)?;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Statement::Union(u) => {
+            check_no_aggregate_in_where(&u.left)?;
+            check_no_aggregate_in_where(&u.right)?;
+        }
+        Statement::Pipeline(stmts) => {
+            for s in stmts {
+                check_no_aggregate_in_where(s)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Collect every projection (RETURN or WITH) item list reachable from a statement.
+fn projection_lists(stmt: &Statement) -> Vec<&[ReturnItem]> {
+    let mut out: Vec<&[ReturnItem]> = Vec::new();
+    match stmt {
+        Statement::Query(q) => {
+            out.push(&q.return_clause.items);
+            for part in &q.parts {
+                if let QueryPart::With { items, .. } = part {
+                    out.push(items);
+                }
+            }
+        }
+        Statement::CreateAndReturn(c) => out.push(&c.return_clause.items),
+        Statement::SetAndReturn(s) => out.push(&s.return_clause.items),
+        Statement::DeleteAndReturn(d) => out.push(&d.return_clause.items),
+        Statement::RemoveAndReturn(r) => out.push(&r.return_clause.items),
+        Statement::MergeAndReturn(m) => out.push(&m.return_clause.items),
+        Statement::Union(u) => {
+            out.extend(projection_lists(&u.left));
+            out.extend(projection_lists(&u.right));
+        }
+        Statement::Pipeline(stmts) => {
+            for s in stmts {
+                out.extend(projection_lists(s));
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// Two projected columns may not share a name. A column's name is its explicit
+/// alias, or the bare variable name when the item is a plain variable reference.
+fn check_duplicate_columns(items: &[ReturnItem]) -> Result<(), String> {
+    let mut seen = std::collections::HashSet::new();
+    for item in items {
+        let name = match (&item.alias, &item.expr) {
+            (Some(a), _) => Some(a.clone()),
+            (None, Expr::Prop(v, p)) if p.is_empty() => Some(v.clone()),
+            _ => None,
+        };
+        if let Some(name) = name {
+            if !seen.insert(name.clone()) {
+                return Err(format!(
+                    "SyntaxError(ColumnNameConflict): multiple result columns with the name '{}'",
+                    name
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The argument of an aggregation must not itself contain an aggregation
+/// (`count(count(*))`) or a non-deterministic function (`count(rand())`).
+fn check_aggregation_arg(expr: &Expr) -> Result<(), String> {
+    match expr {
+        Expr::Agg(_, inner) => {
+            if expr_contains_aggregate(inner) {
+                return Err(
+                    "SyntaxError(NestedAggregation): an aggregate may not contain another aggregate"
+                        .to_string(),
+                );
+            }
+            if expr_contains_rand(inner) {
+                return Err(
+                    "SyntaxError(NonConstantExpression): an aggregate may not contain a non-deterministic function"
+                        .to_string(),
+                );
+            }
+            check_aggregation_arg(inner)
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            check_aggregation_arg(left)?;
+            check_aggregation_arg(right)
+        }
+        Expr::FunctionCall { args, .. } => {
+            for a in args {
+                check_aggregation_arg(a)?;
+            }
+            Ok(())
+        }
+        Expr::IsNull(e) | Expr::IsNotNull(e) | Expr::Not(e) => check_aggregation_arg(e),
+        Expr::Subscript { expr, index } => {
+            check_aggregation_arg(expr)?;
+            check_aggregation_arg(index)
+        }
+        Expr::Case {
+            subject,
+            arms,
+            else_expr,
+        } => {
+            if let Some(s) = subject {
+                check_aggregation_arg(s)?;
+            }
+            for arm in arms {
+                check_aggregation_arg(&arm.when)?;
+                check_aggregation_arg(&arm.then)?;
+            }
+            if let Some(e) = else_expr {
+                check_aggregation_arg(e)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// True if `expr` contains an aggregation function or `count(*)` anywhere.
+fn expr_contains_aggregate(expr: &Expr) -> bool {
+    match expr {
+        Expr::Agg(..) | Expr::CountStar => true,
+        Expr::BinaryOp { left, right, .. } => {
+            expr_contains_aggregate(left) || expr_contains_aggregate(right)
+        }
+        Expr::FunctionCall { args, .. } => args.iter().any(expr_contains_aggregate),
+        Expr::IsNull(e) | Expr::IsNotNull(e) | Expr::Not(e) => expr_contains_aggregate(e),
+        Expr::Subscript { expr, index } => {
+            expr_contains_aggregate(expr) || expr_contains_aggregate(index)
+        }
+        Expr::Case {
+            subject,
+            arms,
+            else_expr,
+        } => {
+            subject.as_ref().is_some_and(|s| expr_contains_aggregate(s))
+                || arms
+                    .iter()
+                    .any(|a| expr_contains_aggregate(&a.when) || expr_contains_aggregate(&a.then))
+                || else_expr
+                    .as_ref()
+                    .is_some_and(|e| expr_contains_aggregate(e))
+        }
+        _ => false,
+    }
+}
+
+/// True if `expr` calls `rand()` anywhere.
+fn expr_contains_rand(expr: &Expr) -> bool {
+    match expr {
+        Expr::FunctionCall { name, args } => {
+            name.eq_ignore_ascii_case("rand") || args.iter().any(expr_contains_rand)
+        }
+        Expr::Agg(_, inner) => expr_contains_rand(inner),
+        Expr::BinaryOp { left, right, .. } => expr_contains_rand(left) || expr_contains_rand(right),
+        Expr::IsNull(e) | Expr::IsNotNull(e) | Expr::Not(e) => expr_contains_rand(e),
+        Expr::Subscript { expr, index } => expr_contains_rand(expr) || expr_contains_rand(index),
+        Expr::Case {
+            subject,
+            arms,
+            else_expr,
+        } => {
+            subject.as_ref().is_some_and(|s| expr_contains_rand(s))
+                || arms
+                    .iter()
+                    .any(|a| expr_contains_rand(&a.when) || expr_contains_rand(&a.then))
+                || else_expr.as_ref().is_some_and(|e| expr_contains_rand(e))
+        }
+        _ => false,
+    }
+}
+
+// ─── Value-vs-element variable conflicts ──────────────────────────────────────
+
+/// Detect a variable that is bound to a value (a literal, a property access, an
+/// arithmetic result, and the like) and then used as a node, relationship, or
+/// path variable in a pattern. openCypher raises VariableTypeConflict for this.
+fn validate_value_var_conflicts(stmt: &Statement) -> Result<(), String> {
+    if let Statement::Query(q) = stmt {
+        let mut element_vars = std::collections::HashSet::new();
+        let mut value_vars = std::collections::HashSet::new();
+        for mc in &q.match_clauses {
+            check_pattern_value_conflict(&mc.pattern, &value_vars)?;
+            collect_pattern_bound_vars(&mc.pattern, &mut element_vars);
+        }
+        for part in &q.parts {
+            match part {
+                QueryPart::Match { match_clauses, .. }
+                | QueryPart::OptionalMatch { match_clauses, .. } => {
+                    for mc in match_clauses {
+                        check_pattern_value_conflict(&mc.pattern, &value_vars)?;
+                        collect_pattern_bound_vars(&mc.pattern, &mut element_vars);
+                    }
+                }
+                QueryPart::Create { patterns } => {
+                    for p in patterns {
+                        check_pattern_value_conflict(p, &value_vars)?;
+                        collect_pattern_bound_vars(p, &mut element_vars);
+                    }
+                }
+                QueryPart::With { items, .. } => {
+                    for item in items {
+                        if let Some(ref alias) = item.alias {
+                            if is_value_expr(&item.expr, &element_vars) {
+                                value_vars.insert(alias.clone());
+                            } else {
+                                element_vars.insert(alias.clone());
+                            }
+                        }
+                    }
+                }
+                QueryPart::Unwind { variable, .. } => {
+                    value_vars.insert(variable.clone());
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+/// True if `expr` denotes a value rather than a graph element. The only graph-element
+/// expression is a bare reference to a variable already bound as a node or relationship.
+fn is_value_expr(expr: &Expr, element_vars: &std::collections::HashSet<String>) -> bool {
+    match expr {
+        // Bare reference to a graph-element variable: passes the element through.
+        Expr::Prop(v, p) if p.is_empty() => !element_vars.contains(v),
+        // A null binding is type-compatible with any graph element, so reusing it as
+        // a node, relationship, or path variable is allowed (it matches nothing).
+        Expr::Literal(Literal::Null) => false,
+        // Functions that select among their arguments can return a node,
+        // relationship, or path (e.g. `coalesce(b, c)`, `head(list)`), so their
+        // result stays type-compatible with a graph-element variable.
+        Expr::FunctionCall { name, .. }
+            if matches!(name.to_lowercase().as_str(), "coalesce" | "head" | "last") =>
+        {
+            false
+        }
+        _ => true,
+    }
+}
+
+/// Reject a pattern that uses any variable in `value_vars` as a node, relationship,
+/// or path variable.
+fn check_pattern_value_conflict(
+    pattern: &Pattern,
+    value_vars: &std::collections::HashSet<String>,
+) -> Result<(), String> {
+    let conflict = |v: &Option<String>| -> Result<(), String> {
+        if let Some(v) = v {
+            if value_vars.contains(v) {
+                return Err(format!(
+                    "SyntaxError(VariableTypeConflict): variable '{}' is bound to a value and cannot be used as a graph element",
+                    v
+                ));
+            }
+        }
+        Ok(())
+    };
+    conflict(&pattern.path_variable)?;
+    conflict(&pattern.node.variable)?;
+    for (rel, target) in &pattern.rels {
+        // A variable-length relationship variable binds to a list, so reusing a
+        // list value there (e.g. `WITH [r1, r2] AS rs MATCH ()-[rs*]->()`) is a
+        // legal openCypher construct, not a type conflict.
+        if rel.range.is_none() {
+            conflict(&rel.variable)?;
+        }
+        conflict(&target.variable)?;
+    }
+    Ok(())
+}
+
 // ─── Public entry point ───────────────────────────────────────────────────────
 
 /// Parse a Cypher query string into a `Statement` AST.
-pub fn parse(cypher: &str) -> Result<Statement, String> {
+pub fn parse(cypher: &str) -> Result<Statement, CypherError> {
     let tokens = lexer().parse(cypher).into_result().map_err(|errs| {
-        errs.into_iter()
+        let msg = errs
+            .into_iter()
             .map(|e| e.to_string())
             .collect::<Vec<_>>()
-            .join("; ")
+            .join("; ");
+        CypherError::Parse(msg)
     })?;
 
     let eoi = SimpleSpan::from(cypher.len()..cypher.len());
@@ -2988,13 +4453,15 @@ pub fn parse(cypher: &str) -> Result<Statement, String> {
         .parse(stream)
         .into_result()
         .map_err(|errs| {
-            errs.into_iter()
+            let msg = errs
+                .into_iter()
                 .map(|e| format!("{:?}", e))
                 .collect::<Vec<_>>()
-                .join("; ")
+                .join("; ");
+            CypherError::Parse(msg)
         })?;
 
-    validate_statement(&statement)?;
+    validate_statement(&statement).map_err(CypherError::Parse)?;
 
     Ok(statement)
 }
@@ -3004,6 +4471,150 @@ pub fn parse(cypher: &str) -> Result<Statement, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- Multi-label patterns and SET/REMOVE labels ---
+
+    /// A node pattern retains every `:Label` segment in source order.
+    #[test]
+    fn parse_multi_label_node_pattern() {
+        let stmt = parse("MATCH (n:A:B:C) RETURN n").unwrap();
+        let Statement::Query(q) = stmt else {
+            panic!("expected query");
+        };
+        assert_eq!(q.match_clauses[0].pattern.node.labels, vec!["A", "B", "C"]);
+    }
+
+    /// `SET n:Label` parses to a `SetItem::Labels`, and `SET n.p = v` to a
+    /// `SetItem::Property`.
+    #[test]
+    fn parse_set_label_and_property() {
+        let stmt = parse("MATCH (n) SET n:Foo:Bar").unwrap();
+        let set_items = match stmt {
+            Statement::Set(s) => s.set_items,
+            Statement::Query(q) => match q.parts.into_iter().find_map(|p| match p {
+                QueryPart::Set { items } => Some(items),
+                _ => None,
+            }) {
+                Some(items) => items,
+                None => panic!("no SET part"),
+            },
+            other => panic!("unexpected statement: {other:?}"),
+        };
+        assert_eq!(set_items.len(), 1);
+        match &set_items[0] {
+            SetItem::Labels { variable, labels } => {
+                assert_eq!(variable, "n");
+                assert_eq!(labels, &vec!["Foo".to_string(), "Bar".to_string()]);
+            }
+            other => panic!("expected label set item, got {other:?}"),
+        }
+    }
+
+    /// DELETE accepts arbitrary expressions (subscripts, property access), not
+    /// just bare variables, so list/map/path deletion can be planned.
+    #[test]
+    fn parse_delete_expression_targets() {
+        let stmt = parse("MATCH (a) WITH collect(a) AS xs DELETE xs[0], xs[1]").unwrap();
+        let targets = match stmt {
+            Statement::Delete(d) => d.targets,
+            Statement::Query(q) => q
+                .parts
+                .into_iter()
+                .find_map(|p| match p {
+                    QueryPart::Delete { targets, .. } => Some(targets),
+                    _ => None,
+                })
+                .expect("no DELETE part"),
+            other => panic!("unexpected statement: {other:?}"),
+        };
+        assert_eq!(targets.len(), 2);
+        // Each target is a subscript expression, not a bare identifier.
+        assert!(matches!(&targets[0], Expr::Subscript { .. }));
+    }
+
+    /// `REMOVE n:Label` parses to a `RemoveItem::Label`.
+    #[test]
+    fn parse_remove_label() {
+        let stmt = parse("MATCH (n) REMOVE n:L1:L2").unwrap();
+        let items = match stmt {
+            Statement::Remove(r) => r.items,
+            Statement::Query(q) => q
+                .parts
+                .into_iter()
+                .find_map(|p| match p {
+                    QueryPart::Remove { items } => Some(items),
+                    _ => None,
+                })
+                .expect("no REMOVE part"),
+            other => panic!("unexpected statement: {other:?}"),
+        };
+        assert_eq!(items.len(), 2);
+        assert!(matches!(&items[0], RemoveItem::Label { label, .. } if label == "L1"));
+        assert!(matches!(&items[1], RemoveItem::Label { label, .. } if label == "L2"));
+    }
+
+    // --- Multi-clause chaining ---
+
+    /// Statements that chain clauses beyond the fixed shapes of the dedicated
+    /// statement parsers must parse as a single `Statement::Query` whose `parts`
+    /// hold the full clause sequence, rather than being rejected after a prefix.
+    #[test]
+    fn parse_multi_clause_chaining() {
+        let cases = [
+            "CREATE (a) CREATE (b)",
+            "MATCH (a) SET a.x = 1 CREATE (b)",
+            "MERGE (a) MERGE (b)",
+            "MATCH (a) SET a.x = 1 WITH a RETURN a",
+            "MATCH (a) SET a.x = 1 SET a.y = 2",
+            "MATCH (a) DELETE a CREATE (b)",
+            "CREATE (a) WITH a MATCH (b) RETURN b",
+            "MATCH (a) REMOVE a.x SET a.y = 1",
+            "MERGE (a) ON CREATE SET a.x = 1 MERGE (b)",
+        ];
+        for q in cases {
+            let stmt = parse(q).unwrap_or_else(|e| panic!("failed to parse {q:?}: {e}"));
+            assert!(
+                matches!(stmt, Statement::Query(ref query) if query.parts.len() >= 2),
+                "expected {q:?} to parse as a multi-part Statement::Query, got {stmt:?}"
+            );
+        }
+    }
+
+    /// The dedicated single-statement variants (with their write-lock semantics)
+    /// must be preserved when no further clauses follow.
+    #[test]
+    fn parse_single_statement_variants_preserved() {
+        assert!(matches!(parse("CREATE (a)").unwrap(), Statement::Create(_)));
+        assert!(matches!(
+            parse("CREATE (a) RETURN a").unwrap(),
+            Statement::CreateAndReturn(_)
+        ));
+        assert!(matches!(
+            parse("MATCH (a) SET a.x = 1").unwrap(),
+            Statement::Set(_)
+        ));
+        assert!(matches!(
+            parse("MATCH (a) SET a.x = 1 RETURN a").unwrap(),
+            Statement::SetAndReturn(_)
+        ));
+        assert!(matches!(
+            parse("MATCH (a) DELETE a").unwrap(),
+            Statement::Delete(_)
+        ));
+        assert!(matches!(parse("MERGE (a)").unwrap(), Statement::Merge(_)));
+        assert!(matches!(
+            parse("MERGE (a) RETURN a").unwrap(),
+            Statement::MergeAndReturn(_)
+        ));
+        assert!(matches!(
+            parse("MATCH (a) RETURN a UNION MATCH (b) RETURN b").unwrap(),
+            Statement::Union(_)
+        ));
+        assert!(matches!(
+            parse("CREATE (a); CREATE (b)").unwrap(),
+            Statement::Pipeline(_)
+        ));
+    }
 
     // --- Fix A: Undirected relationship syntax ---
 
@@ -3067,7 +4678,7 @@ mod tests {
             result.is_err(),
             "expected error for duplicate relationship variable 'r'"
         );
-        let msg = result.unwrap_err();
+        let msg = result.unwrap_err().to_string();
         assert!(msg.contains('r'), "error should mention variable name");
     }
 
@@ -3125,5 +4736,104 @@ mod tests {
                 assert!(limit.is_some(), "LIMIT should be present");
             }
         }
+    }
+
+    // --- Semantic validation: CREATE structure, aggregation, and value-type conflicts ---
+
+    fn err_kind(q: &str) -> String {
+        match parse(q) {
+            Ok(_) => "OK".to_string(),
+            Err(e) => {
+                let msg = match e {
+                    CypherError::Parse(msg) => msg,
+                    other => other.to_string(),
+                };
+                msg.split(|c| c == ':' || c == ')')
+                    .next()
+                    .unwrap_or("?")
+                    .trim_end_matches('(')
+                    .to_string()
+            }
+        }
+    }
+
+    #[test]
+    fn create_relationship_without_type_is_rejected() {
+        assert!(parse("CREATE ()-->()").is_err());
+    }
+
+    #[test]
+    fn create_relationship_with_multiple_types_is_rejected() {
+        assert!(parse("CREATE ()-[:A|:B]->()").is_err());
+    }
+
+    #[test]
+    fn create_undirected_relationship_is_rejected() {
+        assert!(parse("CREATE (a)-[:FOO]-(b)").is_err());
+    }
+
+    #[test]
+    fn create_variable_length_relationship_is_rejected() {
+        assert!(parse("CREATE ()-[:FOO*2]->()").is_err());
+    }
+
+    #[test]
+    fn create_already_bound_node_is_rejected() {
+        assert!(parse("MATCH (a) CREATE (a)").is_err());
+        assert!(parse("MATCH (a) CREATE (a {name: 'foo'}) RETURN a").is_err());
+        assert!(parse("CREATE (n:Foo) CREATE (n:Bar)-[:OWNS]->(:Dog)").is_err());
+    }
+
+    #[test]
+    fn create_already_bound_relationship_is_rejected() {
+        assert!(parse("MATCH ()-[r]->() CREATE ()-[r]->()").is_err());
+    }
+
+    #[test]
+    fn bound_node_as_bare_endpoint_is_allowed() {
+        // Reusing a bound node only to attach a new relationship is valid.
+        assert!(parse("MATCH (a) CREATE (a)-[:R]->(b) RETURN b").is_ok());
+        assert!(parse("MATCH (n) WITH n MATCH (n)-->(m) RETURN m").is_ok());
+    }
+
+    #[test]
+    fn duplicate_return_column_is_rejected() {
+        assert!(parse("RETURN 1 AS a, 2 AS a").is_err());
+        assert!(parse("RETURN 1 AS a, 2 AS b").is_ok());
+    }
+
+    #[test]
+    fn nested_aggregation_is_rejected() {
+        assert!(parse("RETURN count(count(*))").is_err());
+        assert_eq!(
+            err_kind("RETURN count(count(*))"),
+            "SyntaxError(NestedAggregation"
+        );
+    }
+
+    #[test]
+    fn rand_inside_aggregation_is_rejected() {
+        assert!(parse("RETURN count(rand())").is_err());
+    }
+
+    #[test]
+    fn value_bound_variable_used_as_pattern_element_is_rejected() {
+        assert!(parse("WITH 123 AS r MATCH ()-[r]-() RETURN r").is_err());
+        assert!(parse("WITH true AS n MATCH (n) RETURN n").is_err());
+        assert!(parse("WITH 123 AS p MATCH p = ()-[]-() RETURN p").is_err());
+    }
+
+    #[test]
+    fn passthrough_variable_reuse_is_allowed() {
+        // A bare passthrough of a node variable through WITH is not a value binding.
+        assert!(parse("MATCH (n) WITH n MATCH (n)-->(m) RETURN m").is_ok());
+        assert!(parse("WITH 1 AS x RETURN x").is_ok());
+    }
+
+    #[test]
+    fn null_bound_variable_used_as_pattern_element_is_allowed() {
+        // null is type-compatible with any graph element; reusing it matches nothing.
+        assert!(parse("WITH null AS a OPTIONAL MATCH p = (a)-[r]->() RETURN nodes(p)").is_ok());
+        assert!(parse("WITH null AS a MATCH (a) RETURN a").is_ok());
     }
 }

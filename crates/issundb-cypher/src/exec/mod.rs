@@ -1,3 +1,4 @@
+use crate::error::CypherError;
 use std::collections::{HashMap, HashSet};
 
 use issundb_core::{EdgeId, Graph, NodeId, PropValue};
@@ -78,7 +79,7 @@ pub fn execute(
     graph: &Graph,
     cypher: &str,
     params: &HashMap<String, serde_json::Value>,
-) -> Result<QueryResult, String> {
+) -> Result<QueryResult, CypherError> {
     let stmt = parser::parse(cypher)?;
     // Freeze a single wall-clock instant for the whole statement so that all current-time
     // functions (date(), datetime(), and the like) within this query observe the same time.
@@ -91,7 +92,7 @@ pub fn execute(
 ///
 /// Non-query statements (CREATE, SET, DELETE, MERGE) return a one-line summary
 /// because they do not go through the read-query planner.
-pub fn explain(graph: &Graph, cypher: &str) -> Result<String, String> {
+pub fn explain(graph: &Graph, cypher: &str) -> Result<String, CypherError> {
     use crate::plan::physical::format_physical_plan;
     use crate::plan::{LogicalPlanner, Optimizer, PhysicalPlanner};
 
@@ -150,8 +151,8 @@ fn execute_union(
         );
     }
 
-    let left_result = execute_statement(graph, &stmt.left, params)?;
-    let right_result = execute_statement(graph, &stmt.right, params)?;
+    let left_result = execute_statement(graph, &stmt.left, params).map_err(|e| e.to_string())?;
+    let right_result = execute_statement(graph, &stmt.right, params).map_err(|e| e.to_string())?;
 
     if left_result.columns != right_result.columns {
         return Err(format!(
@@ -175,13 +176,35 @@ fn execute_union(
     Ok(QueryResult { columns, records })
 }
 
+/// Classify query execution errors into structured CypherError variants.
+fn to_cypher_error(err: String) -> CypherError {
+    let lower = err.to_lowercase();
+    if lower.contains("type mismatch") || (lower.contains("expected") && lower.contains("got")) {
+        CypherError::TypeMismatch(err)
+    } else if lower.contains("not bound")
+        || lower.contains("undefined")
+        || lower.contains("not found")
+    {
+        CypherError::VariableNotBound(err)
+    } else if lower.contains("division by zero")
+        || lower.contains("math")
+        || lower.contains("overflow")
+    {
+        CypherError::Math(err)
+    } else if lower.contains("storage") || lower.contains("lmdb") || lower.contains("heed") {
+        CypherError::Storage(err)
+    } else {
+        CypherError::Execution(err)
+    }
+}
+
 /// Execute a pipeline of statements, threading node/edge bindings created by
 /// CREATE statements so that later statements can reference nodes created earlier.
 fn execute_pipeline(
     graph: &Graph,
     stmts: &[Statement],
     params: &HashMap<String, serde_json::Value>,
-) -> Result<QueryResult, String> {
+) -> Result<QueryResult, CypherError> {
     let mut shared_bindings: PathMap = PathMap::new();
     let mut last = QueryResult {
         columns: vec![],
@@ -198,10 +221,11 @@ fn execute_pipeline(
                             pattern,
                             &shared_bindings,
                             params,
-                        )?;
+                        )
+                        .map_err(to_cypher_error)?;
                         shared_bindings.extend(created);
                     }
-                    Ok::<(), String>(())
+                    Ok::<(), CypherError>(())
                 })?;
                 last = QueryResult {
                     columns: vec![],
@@ -221,36 +245,50 @@ fn execute_statement(
     graph: &Graph,
     stmt: &Statement,
     params: &HashMap<String, serde_json::Value>,
-) -> Result<QueryResult, String> {
+) -> Result<QueryResult, CypherError> {
     match stmt {
-        Statement::Query(q) => execute_read_query(graph, q, params),
-        Statement::Create(c) => graph.with_write_lock(|| execute_create(graph, c, params)),
-        Statement::CreateAndReturn(c) => {
-            graph.with_write_lock(|| execute_create_and_return(graph, c, params))
+        Statement::Query(q) => execute_read_query(graph, q, params).map_err(to_cypher_error),
+        Statement::Create(c) => graph
+            .with_write_lock(|| execute_create(graph, c, params))
+            .map_err(to_cypher_error),
+        Statement::CreateAndReturn(c) => graph
+            .with_write_lock(|| execute_create_and_return(graph, c, params))
+            .map_err(to_cypher_error),
+        Statement::Set(s) => graph
+            .with_write_lock(|| execute_set(graph, s, params))
+            .map_err(to_cypher_error),
+        Statement::SetAndReturn(s) => graph
+            .with_write_lock(|| execute_set_and_return(graph, s, params))
+            .map_err(to_cypher_error),
+        Statement::Delete(d) => graph
+            .with_write_lock(|| execute_delete(graph, d, params))
+            .map_err(to_cypher_error),
+        Statement::DeleteAndReturn(d) => {
+            execute_delete_and_return(graph, d, params).map_err(to_cypher_error)
         }
-        Statement::Set(s) => graph.with_write_lock(|| execute_set(graph, s, params)),
-        Statement::SetAndReturn(s) => {
-            graph.with_write_lock(|| execute_set_and_return(graph, s, params))
+        Statement::Merge(m) => execute_merge(graph, m, params).map_err(to_cypher_error),
+        Statement::MergeAndReturn(m) => {
+            execute_merge_and_return(graph, m, params).map_err(to_cypher_error)
         }
-        Statement::Delete(d) => graph.with_write_lock(|| execute_delete(graph, d, params)),
-        Statement::DeleteAndReturn(d) => execute_delete_and_return(graph, d, params),
-        Statement::Merge(m) => execute_merge(graph, m, params),
-        Statement::MergeAndReturn(m) => execute_merge_and_return(graph, m, params),
-        Statement::CreateIndex(ci) => execute_create_index(graph, ci),
-        Statement::DropIndex(di) => execute_drop_index(graph, di),
-        Statement::Remove(r) => graph.with_write_lock(|| execute_remove(graph, r, params)),
-        Statement::RemoveAndReturn(r) => execute_remove_and_return(graph, r, params),
-        Statement::Union(u) => execute_union(graph, u, params),
-        Statement::Foreach(f) => graph.with_write_lock(|| execute_foreach(graph, f, params)),
-        Statement::CreateConstraint(cc) => execute_create_constraint(graph, cc),
-        Statement::DropConstraint(dc) => execute_drop_constraint(graph, dc),
-        Statement::Pipeline(stmts) => {
-            // Execute each statement in order, returning the last result.
-            // A shared PathMap threads variable bindings created by CREATE
-            // statements so that later statements in the pipeline can reference
-            // nodes created earlier (e.g., `CREATE (a:A) CREATE (a)-[:R]->(b:B)`).
-            execute_pipeline(graph, stmts, params)
+        Statement::CreateIndex(ci) => execute_create_index(graph, ci).map_err(to_cypher_error),
+        Statement::DropIndex(di) => execute_drop_index(graph, di).map_err(to_cypher_error),
+        Statement::Remove(r) => graph
+            .with_write_lock(|| execute_remove(graph, r, params))
+            .map_err(to_cypher_error),
+        Statement::RemoveAndReturn(r) => {
+            execute_remove_and_return(graph, r, params).map_err(to_cypher_error)
         }
+        Statement::Union(u) => execute_union(graph, u, params).map_err(to_cypher_error),
+        Statement::Foreach(f) => graph
+            .with_write_lock(|| execute_foreach(graph, f, params))
+            .map_err(to_cypher_error),
+        Statement::CreateConstraint(cc) => {
+            execute_create_constraint(graph, cc).map_err(to_cypher_error)
+        }
+        Statement::DropConstraint(dc) => {
+            execute_drop_constraint(graph, dc).map_err(to_cypher_error)
+        }
+        Statement::Pipeline(stmts) => execute_pipeline(graph, stmts, params),
     }
 }
 
@@ -269,6 +307,282 @@ mod tests {
     fn insert_person(graph: &Graph, name: &str, age: i64, city: &str) -> issundb_core::NodeId {
         let props = serde_json::json!({"name": name, "age": age, "city": city});
         graph.add_node("Person", &props).unwrap()
+    }
+
+    /// Run `setup` then `query`, returning the single scalar value of the one expected row.
+    fn agg_scalar(setup: &[&str], query: &str) -> serde_json::Value {
+        let params = HashMap::new();
+        let dir = TempDir::new().unwrap();
+        let graph = Graph::open(dir.path(), 1).unwrap();
+        for s in setup {
+            execute(&graph, s, &params).unwrap();
+        }
+        let res = execute(&graph, query, &params).unwrap();
+        assert_eq!(res.records.len(), 1, "expected exactly one aggregated row");
+        res.records[0].values[0].clone()
+    }
+
+    /// `sum()` over integers preserves integer typing (openCypher numeric rules).
+    #[test]
+    fn sum_over_integers_is_integer() {
+        let v = agg_scalar(&[], "UNWIND [1, 2, 3, 4, 5] AS x RETURN sum(x) AS s");
+        assert_eq!(v, serde_json::json!(15));
+        assert!(
+            v.is_i64(),
+            "sum of integers must be an integer, got {:?}",
+            v
+        );
+    }
+
+    /// `percentileDisc` accepts the percentile as a parameter, evaluated at run time.
+    #[test]
+    fn percentile_disc_with_parameter() {
+        let mut params = HashMap::new();
+        params.insert("p".to_string(), serde_json::json!(0.5));
+        let (_dir, graph) = setup_graph();
+        for q in [
+            "CREATE ({price: 10.0})",
+            "CREATE ({price: 20.0})",
+            "CREATE ({price: 30.0})",
+        ] {
+            execute(&graph, q, &params).unwrap();
+        }
+        let res = execute(
+            &graph,
+            "MATCH (n) RETURN percentileDisc(n.price, $p) AS p",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(res.records[0].values[0], serde_json::json!(20.0));
+    }
+
+    /// An out-of-range percentile is an error.
+    #[test]
+    fn percentile_out_of_range_is_error() {
+        let mut params = HashMap::new();
+        params.insert("p".to_string(), serde_json::json!(1.1));
+        let (_dir, graph) = setup_graph();
+        execute(&graph, "CREATE ({price: 10.0})", &params).unwrap();
+        assert!(
+            execute(
+                &graph,
+                "MATCH (n) RETURN percentileDisc(n.price, $p) AS p",
+                &params,
+            )
+            .is_err()
+        );
+    }
+
+    /// An aggregation in WHERE is rejected.
+    #[test]
+    fn aggregation_in_where_is_rejected() {
+        assert!(parser::parse("MATCH (n) WHERE count(n) > 1 RETURN n").is_err());
+    }
+
+    /// A non-variable WITH expression must be aliased.
+    #[test]
+    fn unaliased_with_expression_is_rejected() {
+        assert!(parser::parse("MATCH (n) WITH n.name RETURN n").is_err());
+    }
+
+    /// DELETE over an undirected expand deletes the shared edge before the nodes.
+    #[test]
+    fn delete_undirected_expand_then_count() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+        execute(&graph, "CREATE ()-[:R]->()", &params).unwrap();
+        graph.rebuild_csr().unwrap();
+        let res = execute(
+            &graph,
+            "MATCH (a)-[r]-(b) DELETE r, a, b RETURN count(*) AS c",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(res.records[0].values[0], serde_json::json!(2));
+    }
+
+    /// Property access on a node reached through an expression reads user
+    /// properties, not the wrapper's internal id.
+    #[test]
+    fn property_access_on_expression_node() {
+        let v = agg_scalar(
+            &["CREATE (:Person {name: 'Alice', age: 30})"],
+            "MATCH (p:Person) WITH [p] AS list RETURN list[0].age AS a",
+        );
+        assert_eq!(v, serde_json::json!(30));
+    }
+
+    /// `type()` resolves a relationship reached through an Any-typed expression.
+    #[test]
+    fn type_of_relationship_via_any() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+        execute(&graph, "CREATE ()-[:KNOWS]->()", &params).unwrap();
+        graph.rebuild_csr().unwrap();
+        let res = execute(
+            &graph,
+            "MATCH ()-[r]->() WITH [r, 1] AS list RETURN type(list[0]) AS t",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(res.records[0].values[0], serde_json::json!("KNOWS"));
+    }
+
+    /// `labels()` on null returns null.
+    #[test]
+    fn labels_on_null_is_null() {
+        let v = agg_scalar(&[], "OPTIONAL MATCH (n:DoesNotExist) RETURN labels(n) AS l");
+        assert_eq!(v, serde_json::json!(null));
+    }
+
+    /// `properties()` on a non-graph scalar is an error.
+    #[test]
+    fn properties_on_scalar_is_error() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+        assert!(execute(&graph, "RETURN properties(1) AS p", &params).is_err());
+    }
+
+    /// `type()` on a node variable is rejected at compile time.
+    #[test]
+    fn type_on_node_variable_is_rejected() {
+        assert!(parser::parse("MATCH (r) RETURN type(r)").is_err());
+    }
+
+    /// Deleting a non-graph expression (arithmetic) is rejected at compile time.
+    #[test]
+    fn delete_integer_expression_is_rejected() {
+        assert!(parser::parse("MATCH () DELETE 1 + 1").is_err());
+    }
+
+    /// `DELETE n:Label` is rejected; labels are removed with REMOVE, not DELETE.
+    #[test]
+    fn delete_label_is_rejected() {
+        assert!(parser::parse("MATCH (n) DELETE n:Person").is_err());
+    }
+
+    /// MERGE binds the relationship variable so a following RETURN can reference it.
+    #[test]
+    fn merge_binds_relationship_variable() {
+        let v = agg_scalar(&[], "MERGE (a:A)-[r:KNOWS]->(b:B) RETURN type(r) AS t");
+        assert_eq!(v, serde_json::json!("KNOWS"));
+    }
+
+    /// MERGE on an existing pattern matches it rather than creating a duplicate.
+    #[test]
+    fn merge_matches_existing_without_duplicating() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+        execute(&graph, "CREATE (:A)-[:KNOWS]->(:B)", &params).unwrap();
+        let res = execute(
+            &graph,
+            "MERGE (a:A)-[r:KNOWS]->(b:B) RETURN type(r) AS t",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(res.records.len(), 1, "MERGE should match exactly one row");
+        // No second relationship was created. Rebuild the CSR snapshot first so the
+        // read-path MATCH sees the storage state.
+        graph.rebuild_csr().unwrap();
+        let count = execute(
+            &graph,
+            "MATCH (:A)-[r:KNOWS]->(:B) RETURN count(r) AS c",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(count.records[0].values[0], serde_json::json!(1));
+    }
+
+    /// ON MATCH SET runs when the pattern already exists; ON CREATE SET does not.
+    #[test]
+    fn merge_on_match_runs_for_existing() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+        execute(&graph, "CREATE (:A {tag: 'old'})", &params).unwrap();
+        let res = execute(
+            &graph,
+            "MERGE (a:A) ON CREATE SET a.tag = 'created' ON MATCH SET a.tag = 'matched' RETURN a.tag AS tag",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(res.records[0].values[0], serde_json::json!("matched"));
+    }
+
+    /// MERGE can reference a bound node's property to constrain the merged pattern.
+    #[test]
+    fn merge_uses_bound_node_property() {
+        let v = agg_scalar(
+            &["CREATE (:Person {name: 'A'})"],
+            "MATCH (p:Person) MERGE (c:City {name: p.name}) RETURN c.name AS n",
+        );
+        assert_eq!(v, serde_json::json!("A"));
+    }
+
+    /// A merged relationship without a type is rejected at compile time.
+    #[test]
+    fn merge_relationship_without_type_is_rejected() {
+        assert!(parser::parse("MERGE (a)-[r]->(b)").is_err());
+    }
+
+    /// Merging a node that is already bound is rejected.
+    #[test]
+    fn merge_already_bound_node_is_rejected() {
+        assert!(parser::parse("MATCH (a) MERGE (a)").is_err());
+    }
+
+    /// An undefined variable in an ON MATCH SET action is rejected.
+    #[test]
+    fn merge_undefined_variable_in_on_clause_is_rejected() {
+        assert!(parser::parse("MERGE (n) ON MATCH SET x.num = 1").is_err());
+    }
+
+    /// Aggregating in RETURN after CREATE reflects the created rows.
+    #[test]
+    fn aggregate_after_create() {
+        let v = agg_scalar(
+            &[],
+            "UNWIND [1, 2, 3, 4, 5] AS x CREATE (n:N {num: x}) RETURN sum(n.num) AS sum",
+        );
+        assert_eq!(v, serde_json::json!(15));
+    }
+
+    /// Aggregating in RETURN after SET reflects the post-mutation property values.
+    #[test]
+    fn aggregate_after_set_property() {
+        let setup = [
+            "CREATE (:N {num:1})",
+            "CREATE (:N {num:2})",
+            "CREATE (:N {num:3})",
+            "CREATE (:N {num:4})",
+            "CREATE (:N {num:5})",
+        ];
+        let v = agg_scalar(
+            &setup,
+            "MATCH (n:N) SET n.num = n.num + 1 RETURN sum(n.num) AS sum",
+        );
+        assert_eq!(v, serde_json::json!(20));
+    }
+
+    /// Adding a label via SET does not change the matched-row cardinality.
+    #[test]
+    fn aggregate_after_set_label() {
+        let setup = [
+            "CREATE (:N {num:1})",
+            "CREATE (:N {num:2})",
+            "CREATE (:N {num:3})",
+            "CREATE (:N {num:4})",
+            "CREATE (:N {num:5})",
+        ];
+        let v = agg_scalar(&setup, "MATCH (n:N) SET n:Foo RETURN sum(n.num) AS sum");
+        assert_eq!(v, serde_json::json!(15));
+    }
+
+    /// Removing the matched label does not drop rows from the aggregation.
+    #[test]
+    fn aggregate_after_remove_label() {
+        let setup = ["CREATE (:N)", "CREATE (:N)", "CREATE (:N)"];
+        let v = agg_scalar(&setup, "MATCH (n:N) REMOVE n:N RETURN count(*) AS c");
+        assert_eq!(v, serde_json::json!(3));
     }
 
     // Helper: run a simple Cypher and return all records.

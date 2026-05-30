@@ -1,8 +1,10 @@
 pub mod ast;
+pub mod error;
 pub mod exec;
 pub mod parser;
 pub mod plan;
 
+pub use error::CypherError;
 pub use exec::{QueryResult, Record, execute, explain};
 
 #[cfg(test)]
@@ -32,8 +34,8 @@ mod tests {
                 Some("a")
             );
             assert_eq!(
-                query.match_clauses[0].pattern.node.label.as_deref(),
-                Some("Person")
+                query.match_clauses[0].pattern.node.labels,
+                vec!["Person".to_string()]
             );
             assert_eq!(query.match_clauses[0].pattern.rels.len(), 1);
             assert_eq!(
@@ -91,7 +93,7 @@ mod tests {
             _ => panic!("expected create statement or query"),
         };
         assert_eq!(pattern.node.variable.as_deref(), Some("a"));
-        assert_eq!(pattern.node.label.as_deref(), Some("Person"));
+        assert_eq!(pattern.node.labels, vec!["Person".to_string()]);
         let props = pattern.node.properties.as_ref().unwrap();
         assert_eq!(
             props.get("name").unwrap(),
@@ -108,8 +110,15 @@ mod tests {
             ast::Statement::Set(set) => {
                 assert_eq!(set.match_clauses.len(), 1);
                 assert_eq!(set.set_items.len(), 1);
-                assert_eq!(set.set_items[0].variable, "a");
-                assert_eq!(set.set_items[0].property, "age");
+                match &set.set_items[0] {
+                    ast::SetItem::Property {
+                        variable, property, ..
+                    } => {
+                        assert_eq!(variable, "a");
+                        assert_eq!(property, "age");
+                    }
+                    other => panic!("expected property set item, got {:?}", other),
+                }
             }
             ast::Statement::Query(q) => {
                 // Write-only pipeline form: parts include Match + Set, no RETURN items.
@@ -127,7 +136,10 @@ mod tests {
         match d {
             ast::Statement::Delete(delete) => {
                 assert_eq!(delete.match_clauses.len(), 1);
-                assert_eq!(delete.variables, vec!["a"]);
+                assert_eq!(
+                    delete.targets,
+                    vec![ast::Expr::Prop("a".to_string(), String::new())]
+                );
             }
             ast::Statement::Query(q) => {
                 assert!(q.return_clause.items.is_empty());

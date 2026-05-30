@@ -33,7 +33,7 @@ would like to work on or if it has already been resolved.
 > If you're using an AI-assisted coding tool like Claude Code or Codex, make sure the AI follows the instructions in
 > the root [AGENTS.md](AGENTS.md) file.
 
-#### Architecture
+#### Architectual Considerations
 
 IssunDB components are organized into separate Rust crates for modularity and maintainability.
 It's very important that componets are decoupled and have well-defined boundaries and clean APIs between them.

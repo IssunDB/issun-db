@@ -135,6 +135,16 @@ fn collect_expr_vars(expr: &Expr, vars: &mut HashSet<String>) {
                 collect_expr_vars(t, vars);
             }
         }
+        Expr::Reduce {
+            initial,
+            list,
+            expression,
+            ..
+        } => {
+            collect_expr_vars(initial, vars);
+            collect_expr_vars(list, vars);
+            collect_expr_vars(expression, vars);
+        }
         Expr::HasLabel { variable, .. } => {
             vars.insert(variable.clone());
         }

@@ -121,9 +121,35 @@ mcp-http: ## Launch the MCP server over Streamable HTTP (MCP_PATH=<dir> db path,
 	@RUST_BACKTRACE=$(RUST_BACKTRACE) cargo run -p issundb-mcp -- --db-path $(or $(MCP_PATH),./issundb-data) --transport http --bind $(or $(MCP_BIND),127.0.0.1:8000)
 
 .PHONY: bench
-bench: ## Run the benchmarks
-	@echo "Running benchmarks..."
+bench: ## Run all workspace benchmarks
+	@echo "Running all benchmarks..."
 	@DEBUG_PROJ=$(DEBUG_PROJ) cargo bench
+
+.PHONY: bench-storage
+bench-storage: ## Run core storage engine and analytics benchmarks
+	@echo "Running core storage benchmarks..."
+	@DEBUG_PROJ=$(DEBUG_PROJ) cargo bench -p issundb-core
+
+.PHONY: bench-vector
+bench-vector: ## Run vector search benchmarks
+	@echo "Running vector search benchmarks..."
+	@DEBUG_PROJ=$(DEBUG_PROJ) cargo bench -p issundb-vector
+
+.PHONY: bench-text
+bench-text: ## Run full-text search benchmarks
+	@echo "Running full-text search benchmarks..."
+	@DEBUG_PROJ=$(DEBUG_PROJ) cargo bench -p issundb-text
+
+.PHONY: bench-retrieval
+bench-retrieval: ## Run hybrid retrieval benchmarks
+	@echo "Running hybrid retrieval benchmarks..."
+	@DEBUG_PROJ=$(DEBUG_PROJ) cargo bench -p issundb-retrieval
+
+.PHONY: bench-cypher
+bench-cypher: ## Run Cypher parser and query optimizer benchmarks
+	@echo "Running Cypher and query optimizer benchmarks..."
+	@DEBUG_PROJ=$(DEBUG_PROJ) cargo bench -p issundb-cypher
+	@DEBUG_PROJ=$(DEBUG_PROJ) cargo bench -p issundb --bench query_optimizer
 
 .PHONY: audit
 audit: ## Run security audit on Rust dependencies

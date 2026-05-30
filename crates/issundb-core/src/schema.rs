@@ -65,10 +65,27 @@ impl DeepSizeOf for AdjEntry {
 }
 
 /// Stored in the `nodes` LMDB sub-database as msgpack bytes.
+///
+/// A node carries a set of labels. The set may be empty (an unlabeled node) and
+/// labels are stored in insertion order. Use [`NodeRecord::primary_label`] when a
+/// single representative label is needed for display.
 #[derive(Debug, Clone, Serialize, Deserialize, DeepSizeOf)]
 pub struct NodeRecord {
-    pub label: LabelId,
+    pub labels: Vec<LabelId>,
     pub props: Vec<u8>, // msgpack-encoded user properties
+}
+
+impl NodeRecord {
+    /// The first label assigned to the node, if any. Used where a single
+    /// representative label is needed (display, REST/MCP responses, vector hits).
+    pub fn primary_label(&self) -> Option<LabelId> {
+        self.labels.first().copied()
+    }
+
+    /// Returns true if the node carries the given label id.
+    pub fn has_label(&self, id: LabelId) -> bool {
+        self.labels.contains(&id)
+    }
 }
 
 /// Stored in the `edges` LMDB sub-database as msgpack bytes.

@@ -1370,7 +1370,12 @@ mod tests {
         let (_dir, g) = open_tmp();
         let id = g.add_node("Person", &json!({})).unwrap();
         let rec = g.get_node(id).unwrap().unwrap();
-        assert_eq!(g.label_name(rec.label).unwrap().as_deref(), Some("Person"));
+        assert_eq!(
+            g.label_name(rec.primary_label().unwrap())
+                .unwrap()
+                .as_deref(),
+            Some("Person")
+        );
     }
 
     #[test]

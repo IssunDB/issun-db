@@ -18,6 +18,8 @@ This document outlines the features implemented in IssunDB and the future goals 
 - [x] Multi-step database transactions with atomic commits and rollbacks
 - [x] Native full-text index database storage for terms, postings, and tokenizer configurations
 - [x] Semi-columnar auto-indexing
+- [x] Strongly-typed, structured error handling enums across all sub-crates (core, cypher, vector, text, and retrieval) to prevent leaky abstractions
+  and eliminate untyped string-based errors
 
 ---
 
@@ -62,8 +64,13 @@ This document outlines the features implemented in IssunDB and the future goals 
 - [x] Unconditional (GraphBLAS-accelerated) Cypher pattern matching using vector-matrix multiplication
 - [x] Variable-length path patterns, collection unwinding, and projection barriers
 - [x] Result shaping with order, skip, limit, and aggregation functions
-- [x] Idempotent writes using the `MERGE` clause
+- [x] Idempotent writes using the `MERGE` clause, including relationship and bound-node binding carried into following clauses, `ON CREATE`
+  and `ON MATCH` actions in either order, and fan-out to one row per matched pattern
 - [x] `OPTIONAL MATCH` for outer-join pattern matching
+- [x] Multi-label nodes: `CREATE`, `MATCH`, and `SET` over patterns such as `(n:A:B)`, with one label-index entry per label
+- [x] `SET` and `REMOVE` for node labels in addition to node and relationship properties
+- [x] `DELETE` and `DETACH DELETE` over arbitrary expression targets, not just bare variables, evaluated over the whole result so relationships
+  are removed before nodes (with a storage-truth connected-node guard) and compile-time rejection of non-graph delete targets
 - [x] Cypher DDL for administrative index and constraint creation
 - [x] Query plan visualization for logical, physical, and optimized query paths
 - [x] OpenCypher TCK submodule integration and `make test-conformance` target
@@ -78,13 +85,18 @@ This document outlines the features implemented in IssunDB and the future goals 
   clones the base path once per output row, generalizing the former two-hop fast path to any length
 - [x] Static filter elimination: provably-true predicates (`WHERE true`, equality or inequality of identical-form literals) are dropped before
   pushdown so they are never evaluated per row
-- [ ] Full openCypher TCK conformance: as of 2026-05-30, 3,028 of 3,300 executed scenarios pass (91.76%; a further 598 scenarios are
+- [ ] Full openCypher TCK conformance: as of 2026-05-31, 3,333 of 3,490 executed scenarios pass (95.50%; a further 407 scenarios are
   skipped as intentional exclusions, such as negative-test tags and node or relationship display-literal representational mismatches). Notable
   remaining capability gaps:
     - [x] Temporal expression conformance: timezone resolution for named and historical zones (DST and local-mean-time offsets via the IANA
       database), storage of temporal values as node properties, duration parsing from ISO strings (including the extended date format),
       `datetime.fromepoch` construction, duration component accessors, statement-clock current-time functions, and extreme-year (±999999999)
       date arithmetic via civil day counting
+    - [x] Standard list functions: `filter()`, `extract()`, and `reduce()` list functions
+    - [x] Path and graph introspection: `nodes()`, `relationships()`, `length()`, `startNode()`, and `endNode()` introspection functions, including
+      compile-time type validation of `length()`
+    - [x] Standard math and string scalar functions: `exists()`, `left()`, `right()`, `degrees()`, `radians()`, `haversin()`, and `timestamp()` scalar
+      functions
     - [ ] `CALL` and procedure invocation
     - [ ] Pattern comprehension and list comprehension subqueries
     - [x] Aggregation expressions inside `ORDER BY`

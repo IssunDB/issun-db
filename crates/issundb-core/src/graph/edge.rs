@@ -252,4 +252,17 @@ impl Graph {
     ) -> Result<Vec<NeighborEntry>, Error> {
         self.adj_entries_impl(rtxn, node, false)
     }
+
+    /// Returns whether the node has any incident relationship, reading the
+    /// adjacency stores directly. Unlike [`Self::out_neighbors`], this never
+    /// consults the CSR snapshot, which lags writes until the background rebuild
+    /// completes. Write-time consistency checks (such as the DELETE connected-node
+    /// guard) must see just-applied edge deletions, so they rely on this method.
+    pub fn node_has_relationships(&self, node: NodeId) -> Result<bool, Error> {
+        let rtxn = self.storage.env.read_txn()?;
+        if !self.adj_entries_impl(&rtxn, node, true)?.is_empty() {
+            return Ok(true);
+        }
+        Ok(!self.adj_entries_impl(&rtxn, node, false)?.is_empty())
+    }
 }

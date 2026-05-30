@@ -1,14 +1,12 @@
 # Design Note: Execution Engine Performance
 
-Status: proposal, not yet implemented. This is a scoping pass for the larger
-performance work that the incremental optimizer rules do not address.
+Status: proposal, not yet implemented. This is a scoping pass for the larger performance work that the incremental optimizer rules do not address.
 
 ## Motivation
 
-The optimizer-rule work (scan selection, count reduction, id seek, chain fusion)
-removes asymptotic waste: queries that would scan a whole label now seek or read
-metadata. The `query_optimizer` benchmarks confirm those wins (see
-[Query Optimizer](../query-optimizer.md)).
+The optimizer-rule work (scan selection, count reduction, id seek, chain fusion) removes asymptotic waste:
+queries that would scan a whole label now seek or read metadata.
+The `query_optimizer` benchmarks confirm those wins (see [Query Optimizer](../query-optimizer.md)).
 
 The same benchmarks expose a different, structural cost. A trivial query such as
 `MATCH (n:Person) RETURN count(*)` resolves to a constant after `reduce_count`,

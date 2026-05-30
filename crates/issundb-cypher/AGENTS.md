@@ -135,6 +135,17 @@ CREATE, SET, DELETE, and MERGE all mutate the graph:
   directly from the `exec` module.
 - After a mutation, the caller is responsible for deciding whether to rebuild the CSR snapshot. The executor does not rebuild it automatically.
 
+## Statement Clock
+
+The current-time functions (`date()`, `localtime()`, `time()`, `localdatetime()`, `datetime()`, and their `.transaction`, `.statement`, and
+`.realtime` variants) read a single wall-clock instant captured once per query, so two calls within one statement observe the same time and their
+difference is exactly zero. The instant lives in a thread-local `Cell` (`STATEMENT_NOW` in `src/exec/expr.rs`), installed by a `StatementClock` guard
+at the top of `execute` and restored when the guard drops, so a nested execution keeps its own instant.
+
+This thread-local is a deliberate, scoped exception to the root rule against module-level runtime globals, and to the AST immutability rule against
+`Cell`: it is not engine state (it never touches `Graph` or `Storage`), it is set and cleared within one `execute` call, and the `Cell` is a free
+function's clock, not interior mutability on an AST or plan node. Do not widen its use beyond the statement clock.
+
 ## Conformance Test Gating
 
 Cypher conformance tests live in `crates/issundb/tests/conformance/` and are gated on the `ISSUNDB_CONFORMANCE=1` environment variable:

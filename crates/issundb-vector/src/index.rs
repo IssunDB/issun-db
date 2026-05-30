@@ -4,7 +4,8 @@ use parking_lot::Mutex;
 use tracing::instrument;
 use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
 
-use issundb_core::{Error, Graph, NodeId};
+use crate::error::VectorError;
+use issundb_core::{Graph, NodeId};
 
 /// A single result from vector search.
 pub struct Hit {
@@ -41,47 +42,23 @@ pub enum VectorMetric {
     Hamming,
 }
 
-/// Scalar quantization level for HNSW storage.
-///
-/// Lower precision reduces memory by 2–32× at the cost of recall accuracy.
+/// Quantization format for in-memory vector storage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum VectorQuantization {
-    /// 32-bit float (default, lossless).
+    /// Float32 quantization (default, full accuracy).
     #[default]
-    F32,
-    /// 16-bit float (2× memory reduction).
-    F16,
-    /// 8-bit integer (4× memory reduction).
-    I8,
-    /// 1-bit (32× memory reduction, binary vectors only).
-    B1,
+    Float32,
+    /// Float16 quantization (half memory footprint).
+    Float16,
+    /// Int8 quantization (quarter memory footprint).
+    Int8,
 }
 
-/// Construction options for a [`VectorIndex`].
-#[derive(Debug, Clone, Default)]
+/// Construction options for `VectorIndex`.
+#[derive(Debug, Clone, Copy, Default)]
 pub struct VectorIndexOptions {
-    /// Distance metric used for ANN search.
     pub metric: VectorMetric,
-    /// Scalar quantization level.
     pub quantization: VectorQuantization,
-}
-
-fn metric_to_usearch(m: VectorMetric) -> MetricKind {
-    match m {
-        VectorMetric::Cosine => MetricKind::Cos,
-        VectorMetric::L2 => MetricKind::L2sq,
-        VectorMetric::Dot => MetricKind::IP,
-        VectorMetric::Hamming => MetricKind::Hamming,
-    }
-}
-
-fn quantization_to_usearch(q: VectorQuantization) -> ScalarKind {
-    match q {
-        VectorQuantization::F32 => ScalarKind::F32,
-        VectorQuantization::F16 => ScalarKind::F16,
-        VectorQuantization::I8 => ScalarKind::I8,
-        VectorQuantization::B1 => ScalarKind::B1,
-    }
 }
 
 enum Inner {
@@ -89,15 +66,10 @@ enum Inner {
     Ready { index: Index, dims: usize },
 }
 
-/// In-memory HNSW vector index backed by usearch.
-///
-/// Dimensions are inferred from the first call to `upsert`. All subsequent
-/// calls must supply the same number of dimensions or an error is returned.
-/// Thread safety is provided by an internal `Mutex`; the graph write lock
-/// serializes upserts, while searches may run concurrently.
+/// An in-memory HNSW vector index using the `usearch` library.
 pub struct VectorIndex {
-    inner: Mutex<Inner>,
     opts: VectorIndexOptions,
+    inner: Mutex<Inner>,
 }
 
 impl Default for VectorIndex {
@@ -107,15 +79,16 @@ impl Default for VectorIndex {
 }
 
 impl VectorIndex {
+    /// Construct a new empty vector index with default Cosine and Float32 options.
     pub fn new() -> Self {
-        Self::new_with_options(&VectorIndexOptions::default())
+        Self::new_with_options(VectorIndexOptions::default())
     }
 
-    /// Create a new `VectorIndex` with explicit metric and quantization options.
-    pub fn new_with_options(opts: &VectorIndexOptions) -> Self {
+    /// Construct a new empty vector index with custom metric and quantization.
+    pub fn new_with_options(opts: VectorIndexOptions) -> Self {
         Self {
+            opts,
             inner: Mutex::new(Inner::Empty),
-            opts: opts.clone(),
         }
     }
 
@@ -123,11 +96,13 @@ impl VectorIndex {
     ///
     /// On the first call, the index is initialised with `v.len()` dimensions
     /// using the metric and quantization from the construction options. Subsequent
-    /// calls with a different dimension count return `Error::Vector`.
-    pub fn upsert(&self, node: NodeId, v: &[f32]) -> Result<(), Error> {
+    /// calls with a different dimension count return `VectorError::DimensionMismatch`.
+    pub fn upsert(&self, node: NodeId, v: &[f32]) -> Result<(), VectorError> {
         let dims = v.len();
         if dims == 0 {
-            return Err(Error::Vector("embedding must not be empty".into()));
+            return Err(VectorError::IndexFault(
+                "embedding must not be empty".into(),
+            ));
         }
         let mut guard = self.inner.lock();
         match &mut *guard {
@@ -138,48 +113,50 @@ impl VectorIndex {
                     quantization: quantization_to_usearch(self.opts.quantization),
                     ..Default::default()
                 };
-                let index = Index::new(&opts).map_err(|e| Error::Vector(e.to_string()))?;
+                let index =
+                    Index::new(&opts).map_err(|e| VectorError::IndexFault(e.to_string()))?;
                 index
                     .reserve(64)
-                    .map_err(|e| Error::Vector(e.to_string()))?;
+                    .map_err(|e| VectorError::IndexFault(e.to_string()))?;
                 index
                     .add(node, v)
-                    .map_err(|e| Error::Vector(e.to_string()))?;
+                    .map_err(|e| VectorError::IndexFault(e.to_string()))?;
                 *guard = Inner::Ready { index, dims };
             }
             Inner::Ready { index, dims: d } => {
                 if dims != *d {
-                    return Err(Error::Vector(format!(
-                        "expected {d}-dimensional embedding, got {dims}"
-                    )));
+                    return Err(VectorError::DimensionMismatch {
+                        expected: *d,
+                        got: dims,
+                    });
                 }
                 if index.contains(node) {
                     index
                         .remove(node)
-                        .map_err(|e| Error::Vector(e.to_string()))?;
+                        .map_err(|e| VectorError::IndexFault(e.to_string()))?;
                 }
                 if index.size() >= index.capacity() {
                     let new_cap = (index.capacity() * 2).max(64);
                     index
                         .reserve(new_cap)
-                        .map_err(|e| Error::Vector(e.to_string()))?;
+                        .map_err(|e| VectorError::IndexFault(e.to_string()))?;
                 }
                 index
                     .add(node, v)
-                    .map_err(|e| Error::Vector(e.to_string()))?;
+                    .map_err(|e| VectorError::IndexFault(e.to_string()))?;
             }
         }
         Ok(())
     }
 
     /// Remove the embedding for `node` from the index.
-    pub fn remove(&self, node: NodeId) -> Result<(), Error> {
+    pub fn remove(&self, node: NodeId) -> Result<(), VectorError> {
         let mut guard = self.inner.lock();
         if let Inner::Ready { index, .. } = &mut *guard {
             if index.contains(node) {
                 index
                     .remove(node)
-                    .map_err(|e| Error::Vector(e.to_string()))?;
+                    .map_err(|e| VectorError::IndexFault(e.to_string()))?;
             }
         }
         Ok(())
@@ -189,16 +166,16 @@ impl VectorIndex {
     ///
     /// Returns an empty slice when the index has no vectors or `k == 0`.
     /// `k` is silently clamped to the number of indexed vectors.
-    pub fn search(&self, q: &[f32], k: usize) -> Result<Vec<Hit>, Error> {
+    pub fn search(&self, q: &[f32], k: usize) -> Result<Vec<Hit>, VectorError> {
         let guard = self.inner.lock();
         match &*guard {
             Inner::Empty => Ok(vec![]),
             Inner::Ready { index, dims } => {
                 if q.len() != *dims {
-                    return Err(Error::Vector(format!(
-                        "expected {dims}-dimensional query, got {}",
-                        q.len()
-                    )));
+                    return Err(VectorError::DimensionMismatch {
+                        expected: *dims,
+                        got: q.len(),
+                    });
                 }
                 if k == 0 || index.size() == 0 {
                     return Ok(vec![]);
@@ -206,7 +183,7 @@ impl VectorIndex {
                 let actual_k = k.min(index.size());
                 let matches = index
                     .search::<f32>(q, actual_k)
-                    .map_err(|e| Error::Vector(e.to_string()))?;
+                    .map_err(|e| VectorError::IndexFault(e.to_string()))?;
                 Ok(matches
                     .keys
                     .iter()
@@ -218,16 +195,18 @@ impl VectorIndex {
     }
 }
 
-fn encode_vector(v: &[f32]) -> Result<Vec<u8>, Error> {
+fn encode_vector(v: &[f32]) -> Result<Vec<u8>, VectorError> {
     if v.is_empty() {
-        return Err(Error::Vector("embedding must not be empty".into()));
+        return Err(VectorError::IndexFault(
+            "embedding must not be empty".into(),
+        ));
     }
     Ok(v.iter().flat_map(|f| f.to_le_bytes()).collect())
 }
 
-fn decode_vector(bytes: &[u8]) -> Result<Vec<f32>, Error> {
+fn decode_vector(bytes: &[u8]) -> Result<Vec<f32>, VectorError> {
     if bytes.len() % 4 != 0 {
-        return Err(Error::Vector(format!(
+        return Err(VectorError::IndexFault(format!(
             "stored embedding byte length must be divisible by 4, got {}",
             bytes.len()
         )));
@@ -242,13 +221,13 @@ fn decode_vector(bytes: &[u8]) -> Result<Vec<f32>, Error> {
 /// Vector search operations for `Graph`.
 pub trait VectorGraphExt {
     /// Persist `v` under `n`.
-    fn upsert_vector(&self, n: NodeId, v: &[f32]) -> Result<(), Error>;
+    fn upsert_vector(&self, n: NodeId, v: &[f32]) -> Result<(), VectorError>;
 
     /// Remove the embedding for `n` from the index and from persistent storage.
-    fn remove_vector(&self, n: NodeId) -> Result<(), Error>;
+    fn remove_vector(&self, n: NodeId) -> Result<(), VectorError>;
 
     /// Return the `k` approximate nearest neighbors to `q` by cosine distance.
-    fn vector_search(&self, q: &[f32], k: usize) -> Result<Vec<Hit>, Error>;
+    fn vector_search(&self, q: &[f32], k: usize) -> Result<Vec<Hit>, VectorError>;
 
     /// Return the `k` approximate nearest neighbors whose label matches `opts.label`.
     ///
@@ -257,7 +236,11 @@ pub trait VectorGraphExt {
     /// and candidates whose stored label does not match are discarded. The first `opts.k`
     /// survivors are returned; fewer may be returned when the index contains fewer matching
     /// nodes.
-    fn vector_search_with(&self, q: &[f32], opts: &VectorSearchOptions) -> Result<Vec<Hit>, Error>;
+    fn vector_search_with(
+        &self,
+        q: &[f32],
+        opts: &VectorSearchOptions,
+    ) -> Result<Vec<Hit>, VectorError>;
 }
 
 /// Key type used to store the persistent HNSW cache in `Graph::extensions`.
@@ -265,7 +248,7 @@ struct VectorIndexCache(Mutex<VectorIndex>);
 
 impl VectorGraphExt for Graph {
     #[instrument(skip(self, v), fields(node = %n, dims = v.len()))]
-    fn upsert_vector(&self, n: NodeId, v: &[f32]) -> Result<(), Error> {
+    fn upsert_vector(&self, n: NodeId, v: &[f32]) -> Result<(), VectorError> {
         let bytes = encode_vector(v)?;
         self.put_vector_bytes(n, &bytes)?;
         // Update (or cold-start) the cached HNSW index.
@@ -274,7 +257,7 @@ impl VectorGraphExt for Graph {
         result
     }
 
-    fn remove_vector(&self, n: NodeId) -> Result<(), Error> {
+    fn remove_vector(&self, n: NodeId) -> Result<(), VectorError> {
         self.delete_vector_bytes(n)?;
         // Remove from in-memory HNSW index if the cache has been built.
         if let Some(arc) = self.get_extension::<VectorIndexCache>() {
@@ -284,14 +267,18 @@ impl VectorGraphExt for Graph {
     }
 
     #[instrument(skip(self, q), fields(k = %k, dims = q.len()))]
-    fn vector_search(&self, q: &[f32], k: usize) -> Result<Vec<Hit>, Error> {
+    fn vector_search(&self, q: &[f32], k: usize) -> Result<Vec<Hit>, VectorError> {
         let arc = get_or_init_cache(self)?;
         let result = arc.0.lock().search(q, k);
         result
     }
 
     #[instrument(skip(self, q), fields(k = %opts.k, label = ?opts.label, dims = q.len()))]
-    fn vector_search_with(&self, q: &[f32], opts: &VectorSearchOptions) -> Result<Vec<Hit>, Error> {
+    fn vector_search_with(
+        &self,
+        q: &[f32],
+        opts: &VectorSearchOptions,
+    ) -> Result<Vec<Hit>, VectorError> {
         let label_filter = match &opts.label {
             None => return self.vector_search(q, opts.k),
             Some(l) => l.clone(),
@@ -306,12 +293,10 @@ impl VectorGraphExt for Graph {
             if out.len() >= opts.k {
                 break;
             }
-            // Check the node's label.
-            if let Ok(Some(record)) = self.get_node(hit.node) {
-                if let Ok(Some(name)) = self.label_name(record.label) {
-                    if name == label_filter {
-                        out.push(hit);
-                    }
+            // Keep the hit if any of the node's labels matches the filter.
+            if let Ok(labels) = self.node_labels(hit.node) {
+                if labels.iter().any(|l| *l == label_filter) {
+                    out.push(hit);
                 }
             }
         }
@@ -321,7 +306,7 @@ impl VectorGraphExt for Graph {
 
 /// Return the cached `VectorIndexCache` for this Graph, building it from LMDB
 /// if it has not been initialised yet.
-fn get_or_init_cache(graph: &Graph) -> Result<Arc<VectorIndexCache>, Error> {
+fn get_or_init_cache(graph: &Graph) -> Result<Arc<VectorIndexCache>, VectorError> {
     if let Some(existing) = graph.get_extension::<VectorIndexCache>() {
         return Ok(existing);
     }
@@ -347,6 +332,23 @@ fn get_or_init_cache(graph: &Graph) -> Result<Arc<VectorIndexCache>, Error> {
     }
     ext.insert(TypeId::of::<VectorIndexCache>(), Box::new(arc.clone()));
     Ok(arc)
+}
+
+fn metric_to_usearch(m: VectorMetric) -> MetricKind {
+    match m {
+        VectorMetric::Cosine => MetricKind::Cos,
+        VectorMetric::L2 => MetricKind::L2sq,
+        VectorMetric::Dot => MetricKind::IP,
+        VectorMetric::Hamming => MetricKind::Hamming,
+    }
+}
+
+fn quantization_to_usearch(q: VectorQuantization) -> ScalarKind {
+    match q {
+        VectorQuantization::Float32 => ScalarKind::F32,
+        VectorQuantization::Float16 => ScalarKind::F16,
+        VectorQuantization::Int8 => ScalarKind::I8,
+    }
 }
 
 #[cfg(test)]

@@ -174,8 +174,10 @@ impl IssunMcp {
             Some(record) => {
                 let label = self
                     .graph
-                    .label_name(record.label)
+                    .node_labels(args.id)
                     .map_err(internal)?
+                    .into_iter()
+                    .next()
                     .unwrap_or_default();
                 let props: Value = rmp_serde::from_slice(&record.props).map_err(internal)?;
                 ok_json(json!({ "id": args.id, "label": label, "props": props }))
