@@ -80,6 +80,9 @@ pub fn execute(
     params: &HashMap<String, serde_json::Value>,
 ) -> Result<QueryResult, String> {
     let stmt = parser::parse(cypher)?;
+    // Freeze a single wall-clock instant for the whole statement so that all current-time
+    // functions (date(), datetime(), and the like) within this query observe the same time.
+    let _clock = expr::StatementClock::install();
     execute_statement(graph, &stmt, params)
 }
 
@@ -287,6 +290,136 @@ mod tests {
         rows.into_iter().next().unwrap().into_iter().next().unwrap()
     }
 
+    #[test]
+    fn duration_between_extreme_years_calendar() {
+        let (_dir, graph) = setup_graph();
+        assert_eq!(
+            scalar(
+                &graph,
+                "toString(duration.between(date('-999999999-01-01'), date('+999999999-12-31')))"
+            ),
+            serde_json::Value::String("P1999999998Y11M30D".to_string())
+        );
+    }
+
+    #[test]
+    fn duration_inseconds_extreme_years() {
+        let (_dir, graph) = setup_graph();
+        assert_eq!(
+            scalar(
+                &graph,
+                "toString(duration.inSeconds(localdatetime('-999999999-01-01'), localdatetime('+999999999-12-31T23:59:59')))"
+            ),
+            serde_json::Value::String("PT17531639991215H59M59S".to_string())
+        );
+    }
+
+    #[test]
+    fn duration_parse_fractional_month_cascades_into_days() {
+        let (_dir, graph) = setup_graph();
+        assert_eq!(
+            scalar(&graph, "toString(duration('P0.75M'))"),
+            serde_json::Value::String("P22DT19H51M49.5S".to_string())
+        );
+    }
+
+    #[test]
+    fn duration_parse_extended_iso_format() {
+        let (_dir, graph) = setup_graph();
+        assert_eq!(
+            scalar(&graph, "toString(duration('P2012-02-02T14:37:21.545'))"),
+            serde_json::Value::String("P2012Y2M2DT14H37M21.545S".to_string())
+        );
+    }
+
+    #[test]
+    fn datetime_fromepoch_builds_utc_datetime() {
+        let (_dir, graph) = setup_graph();
+        assert_eq!(
+            scalar(&graph, "toString(datetime.fromepoch(416779, 999999999))"),
+            serde_json::Value::String("1970-01-05T19:46:19.999999999Z".to_string())
+        );
+    }
+
+    #[test]
+    fn datetime_fromepochmillis_builds_utc_datetime() {
+        let (_dir, graph) = setup_graph();
+        assert_eq!(
+            scalar(&graph, "toString(datetime.fromepochmillis(237821673987))"),
+            serde_json::Value::String("1977-07-15T13:34:33.987Z".to_string())
+        );
+    }
+
+    #[test]
+    fn duration_cumulative_and_of_second_accessors() {
+        let (_dir, graph) = setup_graph();
+        let expr = "duration({years: 1, months: 4, days: 10, hours: 1, minutes: 1, seconds: 1, nanoseconds: 111111111})";
+        let cols = "d.years, d.quarters, d.months, d.weeks, d.days, d.hours, d.minutes, d.seconds, d.milliseconds, d.microseconds, d.nanoseconds, d.quartersOfYear, d.monthsOfQuarter, d.monthsOfYear, d.daysOfWeek, d.minutesOfHour, d.secondsOfMinute, d.millisecondsOfSecond, d.microsecondsOfSecond, d.nanosecondsOfSecond";
+        let rows = run(&graph, &format!("WITH {expr} AS d RETURN {cols}"));
+        let got: Vec<i64> = rows[0].iter().map(|v| v.as_i64().unwrap()).collect();
+        assert_eq!(
+            got,
+            vec![
+                1,
+                5,
+                16,
+                1,
+                10,
+                1,
+                61,
+                3661,
+                3661111,
+                3661111111,
+                3661111111111,
+                1,
+                1,
+                4,
+                3,
+                1,
+                1,
+                111,
+                111111,
+                111111111
+            ]
+        );
+    }
+
+    #[test]
+    fn duration_between_negative_subsecond_normalizes_to_nonnegative_nanos() {
+        let (_dir, graph) = setup_graph();
+        let rows = run(
+            &graph,
+            "WITH duration.between(localdatetime('2018-01-02T10:00:00.1'), localdatetime('2018-01-01T10:00:00.2')) AS dur \
+             RETURN toString(dur), dur.seconds, dur.nanosecondsOfSecond",
+        );
+        assert_eq!(
+            rows[0][0],
+            serde_json::Value::String("PT-23H-59M-59.9S".to_string())
+        );
+        assert_eq!(rows[0][1].as_i64(), Some(-86400));
+        assert_eq!(rows[0][2].as_i64(), Some(100000000));
+    }
+
+    #[test]
+    fn current_time_functions_share_one_statement_instant() {
+        let (_dir, graph) = setup_graph();
+        // Two current-time calls in one statement observe the same instant, so the difference
+        // between them is exactly zero.
+        for f in [
+            "localtime()",
+            "time()",
+            "date()",
+            "localdatetime()",
+            "datetime()",
+        ] {
+            assert_eq!(
+                scalar(&graph, &format!("toString(duration.inSeconds({f}, {f}))")),
+                serde_json::Value::String("PT0S".to_string()),
+                "expected zero duration for {f}"
+            );
+        }
+    }
+
     // Cluster 1: toString() must serialize temporal values via their canonical ISO string,
     // not reject them as "list or map".
     #[test]
@@ -421,6 +554,638 @@ mod tests {
             serde_json::Value::String(
                 "2015-07-21T21:40:32.142-04:00[America/New_York]".to_string()
             )
+        );
+    }
+
+    // A timezone-aware datetime constructed without an explicit zone defaults to UTC, which
+    // serializes with the `Z` designator. A local datetime stays zoneless.
+    #[test]
+    fn datetime_default_zone_serializes_with_z() {
+        let (_dir, graph) = setup_graph();
+        assert_eq!(
+            scalar(
+                &graph,
+                "toString(datetime({year:1984, month:10, day:11, hour:12, minute:31, second:14, nanosecond:123456789}))"
+            ),
+            serde_json::Value::String("1984-10-11T12:31:14.123456789Z".to_string())
+        );
+    }
+
+    #[test]
+    fn datetime_week_construction_defaults_to_utc() {
+        let (_dir, graph) = setup_graph();
+        assert_eq!(
+            scalar(&graph, "toString(datetime({year:1816, week:1}))"),
+            serde_json::Value::String("1816-01-01T00:00Z".to_string())
+        );
+    }
+
+    #[test]
+    fn localdatetime_stays_zoneless() {
+        let (_dir, graph) = setup_graph();
+        assert_eq!(
+            scalar(
+                &graph,
+                "toString(localdatetime({year:1984, month:10, day:11, hour:12, minute:31, second:14}))"
+            ),
+            serde_json::Value::String("1984-10-11T12:31:14".to_string())
+        );
+    }
+
+    // truncate: the output type follows the function name, not the input type, and time-field
+    // overrides from the map (e.g. {nanosecond: 2}) must apply to the result.
+    #[test]
+    fn datetime_truncate_day_applies_nanosecond_override() {
+        let (_dir, graph) = setup_graph();
+        assert_eq!(
+            scalar(
+                &graph,
+                "toString(datetime.truncate('day', datetime({year:1984, month:10, day:11, hour:12, minute:31, second:14, nanosecond:645876123, timezone:'+01:00'}), {nanosecond:2}))"
+            ),
+            serde_json::Value::String("1984-10-11T00:00:00.000000002+01:00".to_string())
+        );
+    }
+
+    #[test]
+    fn localtime_truncate_over_datetime_yields_zoneless_time() {
+        let (_dir, graph) = setup_graph();
+        assert_eq!(
+            scalar(
+                &graph,
+                "toString(localtime.truncate('day', datetime({year:1984, month:10, day:11, hour:12, minute:31, second:14, nanosecond:645876123, timezone:'+01:00'}), {nanosecond:2}))"
+            ),
+            serde_json::Value::String("00:00:00.000000002".to_string())
+        );
+    }
+
+    #[test]
+    fn time_truncate_over_datetime_keeps_offset() {
+        let (_dir, graph) = setup_graph();
+        assert_eq!(
+            scalar(
+                &graph,
+                "toString(time.truncate('hour', datetime({year:1984, month:10, day:11, hour:12, minute:31, second:14, nanosecond:645876123, timezone:'+01:00'}), {nanosecond:2}))"
+            ),
+            serde_json::Value::String("12:00:00.000000002+01:00".to_string())
+        );
+    }
+
+    #[test]
+    fn localdatetime_truncate_microsecond_floors_subsecond() {
+        let (_dir, graph) = setup_graph();
+        assert_eq!(
+            scalar(
+                &graph,
+                "toString(localdatetime.truncate('microsecond', localdatetime({year:1984, month:10, day:11, hour:12, minute:31, second:14, nanosecond:645876123})))"
+            ),
+            serde_json::Value::String("1984-10-11T12:31:14.645876".to_string())
+        );
+    }
+
+    // Selection into localdatetime: a `{date: .., time: ..}` map must combine the selected
+    // date and time. Previously localdatetime() lacked the selection branch and rejected these
+    // maps with "must include at least 'year'".
+    #[test]
+    fn localdatetime_selects_date_and_time() {
+        let (_dir, graph) = setup_graph();
+        assert_eq!(
+            scalar(
+                &graph,
+                "toString(localdatetime({date: date({year:1984, month:10, day:11}), time: localtime({hour:12, minute:31, second:14, nanosecond:645876123})}))"
+            ),
+            serde_json::Value::String("1984-10-11T12:31:14.645876123".to_string())
+        );
+    }
+
+    #[test]
+    fn localdatetime_selects_date_with_time_components() {
+        let (_dir, graph) = setup_graph();
+        assert_eq!(
+            scalar(
+                &graph,
+                "toString(localdatetime({date: date({year:1984, month:10, day:11}), hour:10, minute:10, second:10}))"
+            ),
+            serde_json::Value::String("1984-10-11T10:10:10".to_string())
+        );
+    }
+
+    // Field overrides combined with a time selector must replace only the named field and keep
+    // the selected value's sub-second precision: overriding `second` keeps `.645876123`.
+    #[test]
+    fn localdatetime_time_override_keeps_subsecond() {
+        let (_dir, graph) = setup_graph();
+        assert_eq!(
+            scalar(
+                &graph,
+                "toString(localdatetime({year:1984, month:10, day:11, time: localtime({hour:12, minute:31, second:14, nanosecond:645876123}), second:42}))"
+            ),
+            serde_json::Value::String("1984-10-11T12:31:42.645876123".to_string())
+        );
+    }
+
+    // A `{datetime: ..}` selector with overrides applies the date override and keeps the
+    // selected sub-second precision.
+    #[test]
+    fn localdatetime_selects_datetime_with_overrides() {
+        let (_dir, graph) = setup_graph();
+        assert_eq!(
+            scalar(
+                &graph,
+                "toString(localdatetime({datetime: localdatetime({year:1984, month:10, day:11, hour:12, minute:31, second:14, millisecond:645}), day:28, second:42}))"
+            ),
+            serde_json::Value::String("1984-10-28T12:31:42.645".to_string())
+        );
+    }
+
+    // The same selection path for datetime() must default the zone to Z and keep sub-second
+    // precision through a `second` override.
+    #[test]
+    fn datetime_time_override_keeps_subsecond_and_defaults_z() {
+        let (_dir, graph) = setup_graph();
+        assert_eq!(
+            scalar(
+                &graph,
+                "toString(datetime({year:1984, month:10, day:11, time: localtime({hour:12, minute:31, second:14, nanosecond:645876123}), second:42}))"
+            ),
+            serde_json::Value::String("1984-10-11T12:31:42.645876123Z".to_string())
+        );
+    }
+
+    // A zoned time() with no explicit zone defaults to UTC and serializes with `Z`.
+    #[test]
+    fn time_construct_defaults_to_z() {
+        let (_dir, graph) = setup_graph();
+        assert_eq!(
+            scalar(
+                &graph,
+                "toString(time({hour:12, minute:31, second:14, nanosecond:645876123}))"
+            ),
+            serde_json::Value::String("12:31:14.645876123Z".to_string())
+        );
+    }
+
+    // Selecting a time and overriding a field keeps the source sub-second precision; a local
+    // source attaches the default `Z`.
+    #[test]
+    fn time_selects_localtime_override_defaults_z() {
+        let (_dir, graph) = setup_graph();
+        assert_eq!(
+            scalar(
+                &graph,
+                "toString(time({time: localtime({hour:12, minute:31, second:14, nanosecond:645876123}), second:42}))"
+            ),
+            serde_json::Value::String("12:31:42.645876123Z".to_string())
+        );
+    }
+
+    // A timezone override on a zoned source preserves the instant: the wall-clock time shifts by
+    // the offset difference.
+    #[test]
+    fn time_selects_zoned_with_timezone_override_shifts_walltime() {
+        let (_dir, graph) = setup_graph();
+        assert_eq!(
+            scalar(
+                &graph,
+                "toString(time({time: time({hour:12, minute:31, second:14, microsecond:645876, timezone:'+01:00'}), timezone:'+05:00'}))"
+            ),
+            serde_json::Value::String("16:31:14.645876+05:00".to_string())
+        );
+    }
+
+    // A timezone override on a local source attaches the zone without shifting the wall clock.
+    #[test]
+    fn time_selects_local_with_timezone_override_attaches_no_shift() {
+        let (_dir, graph) = setup_graph();
+        assert_eq!(
+            scalar(
+                &graph,
+                "toString(time({time: localtime({hour:12, minute:31, second:14, nanosecond:645876123}), timezone:'+05:00'}))"
+            ),
+            serde_json::Value::String("12:31:14.645876123+05:00".to_string())
+        );
+    }
+
+    // localtime() selection drops the source zone and keeps the wall-clock time.
+    #[test]
+    fn localtime_selects_time_drops_zone() {
+        let (_dir, graph) = setup_graph();
+        assert_eq!(
+            scalar(
+                &graph,
+                "toString(localtime({time: time({hour:12, minute:31, second:14, microsecond:645876, timezone:'+01:00'}), second:42}))"
+            ),
+            serde_json::Value::String("12:31:42.645876".to_string())
+        );
+    }
+
+    // duration.inDays returns only whole days; the sub-day remainder is discarded.
+    #[test]
+    fn duration_in_days_discards_subday_remainder() {
+        let (_dir, graph) = setup_graph();
+        assert_eq!(
+            scalar(
+                &graph,
+                "toString(duration.inDays(date('1984-10-11'), localdatetime('2016-07-21T21:45:22.142')))"
+            ),
+            serde_json::Value::String("P11606D".to_string())
+        );
+    }
+
+    // When either operand is a pure time, duration.between compares only the time of day; the
+    // date is dropped and months/days are zero.
+    #[test]
+    fn duration_between_time_and_datetime_compares_time_of_day() {
+        let (_dir, graph) = setup_graph();
+        assert_eq!(
+            scalar(
+                &graph,
+                "toString(duration.between(localtime('14:30'), localdatetime('2016-07-21T21:45:22.142')))"
+            ),
+            serde_json::Value::String("PT7H15M22.142S".to_string())
+        );
+    }
+
+    // Two zoned operands are compared as instants: their offsets shift the wall clock before the
+    // time-of-day difference.
+    #[test]
+    fn duration_in_seconds_zoned_time_and_datetime_adjusts_offset() {
+        let (_dir, graph) = setup_graph();
+        assert_eq!(
+            scalar(
+                &graph,
+                "toString(duration.inSeconds(time('14:30'), datetime('2015-07-21T21:40:32.142+0100')))"
+            ),
+            serde_json::Value::String("PT6H10M32.142S".to_string())
+        );
+    }
+
+    // The whole-month count accounts for the time of day: going back to a later time of day on the
+    // same day-of-month leaves the final month incomplete.
+    #[test]
+    fn duration_in_months_accounts_for_time_of_day() {
+        let (_dir, graph) = setup_graph();
+        assert_eq!(
+            scalar(
+                &graph,
+                "toString(duration.inMonths(date('2018-07-21'), datetime('2016-07-21T21:40:32.142+0100')))"
+            ),
+            serde_json::Value::String("P-1Y-11M".to_string())
+        );
+    }
+
+    // A negative time-of-day difference borrows a day so the components share one sign.
+    #[test]
+    fn duration_between_borrows_day_for_negative_time() {
+        let (_dir, graph) = setup_graph();
+        assert_eq!(
+            scalar(
+                &graph,
+                "toString(duration.between(datetime('2014-07-21T21:40:36.143+0200'), date('2015-06-24')))"
+            ),
+            serde_json::Value::String("P11M2DT2H19M23.857S".to_string())
+        );
+    }
+
+    // Two zoned datetimes are reconciled to a common zone before the calendar difference.
+    #[test]
+    fn duration_between_two_zoned_datetimes_adjusts_offset() {
+        let (_dir, graph) = setup_graph();
+        assert_eq!(
+            scalar(
+                &graph,
+                "toString(duration.between(datetime('2014-07-21T21:40:36.143+0200'), datetime('2015-07-21T21:40:32.142+0100')))"
+            ),
+            serde_json::Value::String("P1YT59M55.999S".to_string())
+        );
+    }
+
+    // A sub-second-only negative duration keeps its sign even though the seconds field is zero.
+    #[test]
+    fn duration_negative_subsecond_keeps_sign() {
+        let (_dir, graph) = setup_graph();
+        assert_eq!(
+            scalar(
+                &graph,
+                "toString(duration.inSeconds(localdatetime('2014-07-21T21:40:36.143'), localdatetime('2014-07-21T21:40:36.142')))"
+            ),
+            serde_json::Value::String("PT-0.001S".to_string())
+        );
+    }
+
+    // Date plus or minus a duration ignores the duration's time component entirely.
+    #[test]
+    fn date_plus_duration_ignores_time_component() {
+        let (_dir, graph) = setup_graph();
+        assert_eq!(
+            scalar(
+                &graph,
+                "toString(date({year:1984, month:10, day:11}) - duration({years:12, months:5, days:14, hours:16, minutes:12, seconds:70, nanoseconds:2}))"
+            ),
+            serde_json::Value::String("1972-04-27".to_string())
+        );
+    }
+
+    // LocalTime plus a duration uses only the time component and wraps modulo 24 hours, keeping
+    // nanosecond precision.
+    #[test]
+    fn localtime_plus_duration_wraps_modulo_day() {
+        let (_dir, graph) = setup_graph();
+        assert_eq!(
+            scalar(
+                &graph,
+                "toString(localtime({hour:12, minute:31, second:14, nanosecond:1}) + duration({years:12, months:5, days:14, hours:16, minutes:12, seconds:70, nanoseconds:2}))"
+            ),
+            serde_json::Value::String("04:44:24.000000003".to_string())
+        );
+    }
+
+    // Time arithmetic keeps the zone offset.
+    #[test]
+    fn time_minus_duration_keeps_offset() {
+        let (_dir, graph) = setup_graph();
+        assert_eq!(
+            scalar(
+                &graph,
+                "toString(time({hour:12, minute:31, second:14, nanosecond:1, timezone:'+01:00'}) - duration({years:12, months:5, days:14, hours:16, minutes:12, seconds:70, nanoseconds:2}))"
+            ),
+            serde_json::Value::String("20:18:03.999999999+01:00".to_string())
+        );
+    }
+
+    // LocalDateTime arithmetic shifts the date by months and days, then adds the time component
+    // (which can roll the date over), keeping nanosecond precision.
+    #[test]
+    fn localdatetime_plus_duration_rolls_over_date() {
+        let (_dir, graph) = setup_graph();
+        assert_eq!(
+            scalar(
+                &graph,
+                "toString(localdatetime({year:1984, month:10, day:11, hour:12, minute:31, second:14, nanosecond:1}) + duration({years:12, months:5, days:14, hours:16, minutes:12, seconds:70, nanoseconds:2}))"
+            ),
+            serde_json::Value::String("1997-03-26T04:44:24.000000003".to_string())
+        );
+    }
+
+    // Multiplying a duration by an integer scales every component.
+    #[test]
+    fn duration_times_integer_scales_components() {
+        let (_dir, graph) = setup_graph();
+        assert_eq!(
+            scalar(
+                &graph,
+                "toString(duration({years:12, months:5, days:14, hours:16, minutes:12, seconds:70, nanoseconds:1}) * 2)"
+            ),
+            serde_json::Value::String("P24Y10M28DT32H26M20.000000002S".to_string())
+        );
+    }
+
+    // Dividing a duration cascades the fractional month into days (at 30.436875 days per month)
+    // and the fractional day into seconds.
+    #[test]
+    fn duration_divided_cascades_fractional_month() {
+        let (_dir, graph) = setup_graph();
+        assert_eq!(
+            scalar(
+                &graph,
+                "toString(duration({years:12, months:5, days:14, hours:16, minutes:12, seconds:70, nanoseconds:1}) / 2)"
+            ),
+            serde_json::Value::String("P6Y2M22DT13H21M8S".to_string())
+        );
+    }
+
+    // A fractional month in duration construction cascades into days (at 30.436875 days per
+    // month) and the fractional day into seconds.
+    #[test]
+    fn duration_construct_fractional_month_cascades() {
+        let (_dir, graph) = setup_graph();
+        assert_eq!(
+            scalar(&graph, "toString(duration({months: 0.75}))"),
+            serde_json::Value::String("P22DT19H51M49.5S".to_string())
+        );
+    }
+
+    // A fractional day cascades into the time component.
+    #[test]
+    fn duration_construct_fractional_day_cascades() {
+        let (_dir, graph) = setup_graph();
+        assert_eq!(
+            scalar(&graph, "toString(duration({months: 5, days: 1.5}))"),
+            serde_json::Value::String("P5M1DT12H".to_string())
+        );
+    }
+
+    // A fractional minute cascades into seconds.
+    #[test]
+    fn duration_construct_fractional_minute_cascades() {
+        let (_dir, graph) = setup_graph();
+        assert_eq!(
+            scalar(&graph, "toString(duration({minutes: 1.5, seconds: 1}))"),
+            serde_json::Value::String("PT1M31S".to_string())
+        );
+    }
+
+    // A fractional-component duration added to a date rolls whole days out of the seconds and
+    // drops the sub-day remainder.
+    #[test]
+    fn date_plus_fractional_duration_rolls_whole_days() {
+        let (_dir, graph) = setup_graph();
+        assert_eq!(
+            scalar(
+                &graph,
+                "toString(date({year:1984, month:10, day:11}) + duration({years:12.5, months:5.5, days:14.5, hours:16.5, minutes:12.5, seconds:70.5, nanoseconds:3}))"
+            ),
+            serde_json::Value::String("1997-10-11".to_string())
+        );
+    }
+
+    // A named IANA zone resolves to its summer (DST) offset at a summer instant.
+    #[test]
+    fn datetime_named_zone_resolves_summer_offset() {
+        let (_dir, graph) = setup_graph();
+        assert_eq!(
+            scalar(
+                &graph,
+                "toString(datetime({year: 2017, month: 8, day: 8, hour: 12, minute: 31, second: 14, nanosecond: 645876123, timezone: 'Europe/Stockholm'}))"
+            ),
+            serde_json::Value::String(
+                "2017-08-08T12:31:14.645876123+02:00[Europe/Stockholm]".to_string()
+            )
+        );
+    }
+
+    // The same zone resolves to its winter (standard) offset at a winter instant.
+    #[test]
+    fn datetime_named_zone_resolves_winter_offset() {
+        let (_dir, graph) = setup_graph();
+        assert_eq!(
+            scalar(
+                &graph,
+                "toString(datetime({year: 1984, month: 10, day: 11, hour: 12, minute: 31, timezone: 'Europe/Stockholm'}))"
+            ),
+            serde_json::Value::String("1984-10-11T12:31+01:00[Europe/Stockholm]".to_string())
+        );
+    }
+
+    // A historical instant before standardized zones resolves to the sub-minute local-mean-time
+    // offset, formatted with seconds.
+    #[test]
+    fn datetime_named_zone_historical_lmt_offset() {
+        let (_dir, graph) = setup_graph();
+        assert_eq!(
+            scalar(
+                &graph,
+                "toString(datetime('1818-07-21T21:40:32.142[Europe/Stockholm]'))"
+            ),
+            serde_json::Value::String(
+                "1818-07-21T21:40:32.142+00:53:28[Europe/Stockholm]".to_string()
+            )
+        );
+    }
+
+    // A zone name on a parsed string with no explicit offset resolves at the instant.
+    #[test]
+    fn datetime_parse_named_zone_resolves_offset() {
+        let (_dir, graph) = setup_graph();
+        assert_eq!(
+            scalar(
+                &graph,
+                "toString(datetime('2015-07-21T21:40:32.142[Europe/London]'))"
+            ),
+            serde_json::Value::String("2015-07-21T21:40:32.142+01:00[Europe/London]".to_string())
+        );
+    }
+
+    // Accessors report the IANA name in `timezone`, the resolved numeric `offset`, and the UTC
+    // instant in `epochSeconds`.
+    #[test]
+    fn datetime_named_zone_accessors() {
+        let (_dir, graph) = setup_graph();
+        let q = "datetime({year: 1984, month: 11, day: 11, hour: 12, minute: 31, second: 14, nanosecond: 645876123, timezone: 'Europe/Stockholm'})";
+        assert_eq!(
+            scalar(&graph, &format!("({}).timezone", q)),
+            serde_json::Value::String("Europe/Stockholm".to_string())
+        );
+        assert_eq!(
+            scalar(&graph, &format!("({}).offset", q)),
+            serde_json::Value::String("+01:00".to_string())
+        );
+        assert_eq!(
+            scalar(&graph, &format!("({}).offsetMinutes", q)),
+            serde_json::json!(60)
+        );
+        assert_eq!(
+            scalar(&graph, &format!("({}).offsetSeconds", q)),
+            serde_json::json!(3600)
+        );
+        assert_eq!(
+            scalar(&graph, &format!("({}).epochSeconds", q)),
+            serde_json::json!(469020674)
+        );
+    }
+
+    // duration.between two zoned datetimes on opposite sides of a DST transition counts the real
+    // elapsed seconds, accounting for the differing offsets.
+    #[test]
+    fn duration_between_zoned_across_dst_counts_real_seconds() {
+        let (_dir, graph) = setup_graph();
+        assert_eq!(
+            scalar(
+                &graph,
+                "toString(duration.between(datetime('2017-10-28T23:00+02:00[Europe/Stockholm]'), datetime('2017-10-29T04:00+01:00[Europe/Stockholm]')))"
+            ),
+            serde_json::Value::String("PT6H".to_string())
+        );
+    }
+
+    // duration.inSeconds between a zoned datetime and a local one on a DST-transition day counts
+    // real elapsed seconds: the local operand adopts the zoned operand's zone, so the fall-back
+    // hour makes 00:00 to 04:00 span five hours, not four.
+    #[test]
+    fn duration_in_seconds_mixed_zone_local_across_dst_counts_real_hours() {
+        let (_dir, graph) = setup_graph();
+        assert_eq!(
+            scalar(
+                &graph,
+                "toString(duration.inSeconds(datetime({year: 2017, month: 10, day: 29, hour: 0, timezone: 'Europe/Stockholm'}), localdatetime({year: 2017, month: 10, day: 29, hour: 4})))"
+            ),
+            serde_json::Value::String("PT5H".to_string())
+        );
+    }
+
+    // The same holds when the local operand is a pure time that borrows the zoned operand's date.
+    #[test]
+    fn duration_in_seconds_zoned_datetime_vs_local_time_across_dst() {
+        let (_dir, graph) = setup_graph();
+        assert_eq!(
+            scalar(
+                &graph,
+                "toString(duration.inSeconds(datetime({year: 2017, month: 10, day: 29, hour: 0, timezone: 'Europe/Stockholm'}), localtime({hour: 4})))"
+            ),
+            serde_json::Value::String("PT5H".to_string())
+        );
+    }
+
+    // Truncating to a unit then setting a finer field keeps the truncated value of the coarser
+    // sub-second components: truncate to the millisecond keeps 645ms, then nanosecond: 2 sets only
+    // the nanosecond component.
+    #[test]
+    fn truncate_to_millisecond_with_nanosecond_override_keeps_millisecond() {
+        let (_dir, graph) = setup_graph();
+        assert_eq!(
+            scalar(
+                &graph,
+                "toString(localtime.truncate('millisecond', localtime({hour:12, minute:31, second:14, nanosecond: 645876123}), {nanosecond: 2}))"
+            ),
+            serde_json::Value::String("12:31:14.645000002".to_string())
+        );
+    }
+
+    // Sub-second accessors report cumulative totals: microsecond is the whole microseconds and
+    // nanosecond the full sub-second in nanoseconds.
+    #[test]
+    fn time_accessors_report_cumulative_subsecond_totals() {
+        let (_dir, graph) = setup_graph();
+        let q = "localtime({hour: 12, minute: 31, second: 14, nanosecond: 645876123})";
+        assert_eq!(
+            scalar(&graph, &format!("({}).millisecond", q)),
+            serde_json::json!(645)
+        );
+        assert_eq!(
+            scalar(&graph, &format!("({}).microsecond", q)),
+            serde_json::json!(645876)
+        );
+        assert_eq!(
+            scalar(&graph, &format!("({}).nanosecond", q)),
+            serde_json::json!(645876123)
+        );
+    }
+
+    // A date exposes `weekDay` (the ISO day of week) and `dayOfQuarter` accessors.
+    #[test]
+    fn date_exposes_week_day_and_day_of_quarter() {
+        let (_dir, graph) = setup_graph();
+        let q = "date({year: 1984, month: 10, day: 11})";
+        assert_eq!(
+            scalar(&graph, &format!("({}).weekDay", q)),
+            serde_json::json!(4)
+        );
+        assert_eq!(
+            scalar(&graph, &format!("({}).dayOfQuarter", q)),
+            serde_json::json!(11)
+        );
+    }
+
+    // Reinterpreting a stored zoned datetime as a Time inherits its resolved numeric offset, not
+    // the IANA zone name, and preserves the full sub-second.
+    #[test]
+    fn time_from_zoned_datetime_inherits_numeric_offset() {
+        let (_dir, graph) = setup_graph();
+        assert_eq!(
+            scalar(
+                &graph,
+                "toString(time(datetime({year: 1984, month: 10, day: 11, hour: 12, minute: 31, second: 14, microsecond: 645876, timezone: 'Europe/Stockholm'})))"
+            ),
+            serde_json::Value::String("12:31:14.645876+01:00".to_string())
         );
     }
 

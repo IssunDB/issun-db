@@ -1,37 +1,26 @@
 # issundb-core Agent Guide
 
-This file covers crate-specific guidance for contributors working inside
-`crates/issundb-core`. Read the root `AGENTS.md` first; the rules there apply
-everywhere and are not repeated here.
+This file covers crate-specific guidance for contributors working inside `crates/issundb-core`.
+Read the root `AGENTS.md` first; the rules there apply everywhere and are not repeated here.
 
 ## Storage Invariants
 
 These invariants must hold after every successful write transaction:
 
-1. **Adjacency consistency.** For every edge `(src → dst)` stored in `out_adj`
-   under key `src`, a matching `AdjEntry` must exist in `in_adj` under key
-   `dst`, and vice versa. Both entries encode the same `EdgeId`, `TypeId`, and
-   the other node. Never write one side without writing the other in the same
-   `RwTxn`.
+1. **Adjacency consistency.** For every edge `(src → dst)` stored in `out_adj` under key `src`, a matching `AdjEntry` must exist in `in_adj` under key
+   `dst`, and vice versa. Both entries encode the same `EdgeId`, `TypeId`, and the other node. Never write one side without writing the other in the
+   same`RwTxn`.
 
-2. **ID monotonicity.** `NodeId` and `EdgeId` are allocated by
-   `alloc_node_id` and `alloc_edge_id` in `storage/ids.rs`, which increment
-   a `u64` counter stored in the `meta` sub-database. These counters must only
-   ever increase. Never reset, reuse, or manually write a counter key outside
+2. **ID monotonicity.** `NodeId` and `EdgeId` are allocated by `alloc_node_id` and `alloc_edge_id` in `storage/ids.rs`, which increment a `u64`
+   counter stored in the `meta` sub-database. These counters must only ever increase. Never reset, reuse, or manually write a counter key outside
    `ids.rs`.
 
-3. **Label and type registry persistence.** String-to-integer mappings for
-   labels (`LabelId`) and edge types (`TypeId`) are stored as
-   `"label:<name>"` and `"type:<name>"` keys in `meta`. Every node or edge
-   write must call `get_or_create_label` or `get_or_create_type` inside the
-   same `RwTxn` that writes the record. Do not cache integer IDs in memory
-   between transactions and then use them in a later transaction without
-   verifying they exist.
+3. **Label and type registry persistence.** String-to-integer mappings for labels (`LabelId`) and edge types (`TypeId`) are stored as `"label:<name>"`
+   and `"type:<name>"` keys in `meta`. Every node or edge write must call `get_or_create_label` or `get_or_create_type` inside the same `RwTxn` that
+   writes the record. Do not cache integer IDs in memory between transactions and then use them in a later transaction without verifying they exist.
 
-4. **Secondary index consistency.** `label_idx` and `type_idx` use composite
-   keys `(u32 BE, u64 BE)` with `Unit` values. Every `add_node` must insert
-   its `(LabelId, NodeId)` entry, and every `delete_node` must remove it.
-   Same rule applies to `type_idx` for edges.
+4. **Secondary index consistency.** `label_idx` and `type_idx` use composite keys `(u32 BE, u64 BE)` with `Unit` values. Every `add_node` must insert
+   its `(LabelId, NodeId)` entry, and every `delete_node` must remove it. Same rule applies to `type_idx` for edges.
 
 5. **Property column consistency.** Every `add_node` must write a `node_prop_idx` entry for each non-null scalar property in `props_json`. Every
    `update_node` must delete old entries and write new ones for all changed scalar properties. Every `delete_node` must remove all `node_prop_idx`
@@ -40,18 +29,12 @@ These invariants must hold after every successful write transaction:
 
 ## LMDB Lifetime Rules
 
-- Transactions must not escape the function that opened them. Open a
-  `RoTxn` or `RwTxn`, use it, then commit (write) or drop (read) before
-  returning.
-- `RoTxn` is cheap to create; open one per read call rather than storing it
-  across calls.
-- `RwTxn` must be committed with `txn.commit()?` for changes to persist. A
-  dropped `RwTxn` silently aborts; this is safe, but do not rely on implicit
+- Transactions must not escape the function that opened them. Open a `RoTxn` or `RwTxn`, use it, then commit (write) or drop (read) before returning.
+- `RoTxn` is cheap to create; open one per read call rather than storing it across calls.
+- `RwTxn` must be committed with `txn.commit()?` for changes to persist. A dropped `RwTxn` silently aborts; this is safe, but do not rely on implicit
   abort as a rollback strategy. Explicit abort is `drop(txn)`.
-- Do not hold a `RwTxn` open while calling any method that might open another
-  `RwTxn`; LMDB on Linux does not support nested write transactions.
-- Do not store transactions, cursors, or database handles with lifetimes tied
-  to the transaction in `struct` fields or `Arc`.
+- Do not hold a `RwTxn` open while calling any method that might open another `RwTxn`; LMDB on Linux does not support nested write transactions.
+- Do not store transactions, cursors, or database handles with lifetimes tied to the transaction in `struct` fields or `Arc`.
 
 ## Write-Lock Contract
 

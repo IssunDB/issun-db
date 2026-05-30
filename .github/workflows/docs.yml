@@ -1,0 +1,54 @@
+name: Publish Docs (MkDocs)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  deploy-docs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+          version: "latest"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Dependencies
+        run: uv sync --extra dev
+
+      - name: Build Graphina Docs
+        run: uv run mkdocs build
+
+      - name: Build PyGraphina Docs
+        run: uv run mkdocs build --config-file pygraphina/mkdocs.yml
+
+      - name: Merge Documentation Sites
+        run: |
+             mkdir -p site/python
+             cp -r pygraphina/site/* site/python/
+
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./site
+          publish_branch: gh-pages
+          user_name: ${{ github.actor }}
+          user_email: ${{ github.actor }}@users.noreply.github.com
+          commit_message: "Deploy documentation from ${{ github.sha }} by ${{ github.actor }}"

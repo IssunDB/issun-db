@@ -639,6 +639,22 @@ fn build_scenario(
             continue;
         }
 
+        // When executing control query: a second query whose result is asserted. The
+        // preceding query (typically a CREATE) becomes setup, and this control query
+        // becomes the asserted query.
+        if trimmed.starts_with("When executing control query:") {
+            if !query.trim().is_empty() {
+                setup_queries.push(std::mem::take(&mut query));
+            }
+            if let Some(q) = consume_docstring(body, &mut idx) {
+                query = q;
+            } else {
+                pending_query_kind = Some("when");
+                idx += 1;
+            }
+            continue;
+        }
+
         // When executing query:
         if trimmed.starts_with("When executing query:")
             || trimmed.starts_with("When running query:")

@@ -2,23 +2,16 @@ name: Run Linter Checks
 
 on:
   workflow_dispatch:
-  schedule: # Run every day at midnight (UTC)
-    - cron: '0 0 * * *'
-  push:
-    branches:
-      - main
-      - develop
-    tags:
-      - 'v*'
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
   pull_request:
     branches:
       - main
     paths-ignore:
       - '**.md'
       - 'docs/**'
+      - 'pygraphina/**'
+  push:
+    tags:
+      - 'v*'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -28,31 +21,24 @@ permissions:
   contents: read
 
 jobs:
-  lints:
+  lint:
     runs-on: ubuntu-latest
 
-    strategy:
-      matrix:
-        # Define the Rust versions for linting against
-        rust-version: [ "1.92.0", "stable" ]
-
     steps:
-      - name: Checkout code
+      - name: Checkout Code
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          submodules: recursive
 
-      - name: Set up Rust ${{ matrix.rust-version }}
+      - name: Set Up Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          toolchain: ${{ matrix.rust-version }}
+          toolchain: '1.86.0' # Pinned to project's MSRV
+          cache: true
 
-      - name: Install dependencies
+      - name: Install Dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y clang curl pkg-config libssl-dev make
           make install-deps
 
-      - name: Run linters
+      - name: Run Linters
         run: make lint

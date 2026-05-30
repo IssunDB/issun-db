@@ -30,7 +30,7 @@ would like to work on or if it has already been resolved.
 ### Development Workflow
 
 > [!IMPORTANT]
-> If you're using an AI-assisted coding tool like Claude Code or Codex, make sure the AI follows the instructions in]
+> If you're using an AI-assisted coding tool like Claude Code or Codex, make sure the AI follows the instructions in
 > the root [AGENTS.md](AGENTS.md) file.
 
 #### Architecture

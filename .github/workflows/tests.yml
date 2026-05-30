@@ -5,31 +5,25 @@ on:
   schedule: # Run every day at midnight (UTC)
     - cron: '0 0 * * *'
   workflow_call:
-  push:
-    branches:
-      - main
-      - develop
-    tags:
-      - 'v*'
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
   pull_request:
     branches:
       - main
     paths-ignore:
       - '**.md'
       - 'docs/**'
+  push:
+    tags:
+      - 'v*'
 
-#concurrency:
-#  group: ${{ github.workflow }}-${{ github.ref }}
-#  cancel-in-progress: true
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
 
 jobs:
-  tests:
+  test:
     runs-on: ubuntu-latest
 
     strategy:
@@ -38,28 +32,36 @@ jobs:
         rust-version: [ "1.85.0", "stable" ]
 
     steps:
-      - name: Checkout repository
+      - name: Checkout Repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
-          submodules: recursive
+          lfs: true
 
-      - name: Set up Rust ${{ matrix.rust-version }}
+      - name: Set Up Rust ${{ matrix.rust-version }}
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: ${{ matrix.rust-version }}
+          cache: true
 
-      - name: Install dependencies
+      - name: Install Dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y make
           make install-deps
 
-      - name: Run tests and generate coverage report
+      - name: Download Test Datasets (for Integration and E2E tests)
+        run: |
+          pip install uv
+          uv sync --extra dev
+          source .venv/bin/activate
+          make testdata
+        continue-on-error: true
+
+      - name: Run Tests and Generate Coverage Report
         run: make coverage
 
-      - name: Upload coverage reports to Codecov
+      - name: Upload Coverage Reports to Codecov
         uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
-        continue-on-error: false
+        continue-on-error: true
