@@ -17,7 +17,8 @@ This document outlines the features implemented in IssunDB and the future goals 
 - [x] Unique and required property constraints on labels or types
 - [x] Multi-step database transactions with atomic commits and rollbacks
 - [x] Native full-text index database storage for terms, postings, and tokenizer configurations
-- [x] Semi-columnar auto-indexing: all scalar node properties are automatically written to `node_prop_idx` on every insert and update, enabling `NodeIndexScan` for any equality predicate without a prior `CREATE INDEX`
+- [x] Semi-columnar auto-indexing: all scalar node properties are automatically written to `node_prop_idx` on every insert and update, enabling
+  `NodeIndexScan` for any equality predicate without a prior `CREATE INDEX`
 
 ---
 
@@ -25,7 +26,8 @@ This document outlines the features implemented in IssunDB and the future goals 
 
 - [x] Thread-safe in-memory Compressed Sparse Row (CSR) snapshot cache
 - [x] Dynamic, zero-overhead GraphBLAS matrix materialization triggered by database writes
-- [x] Threshold-gated OpenMP multi-threading: graphs with more than 100k edges use all available CPU cores for SpMV; smaller graphs run single-threaded to avoid scheduling overhead
+- [x] Threshold-gated OpenMP multi-threading: graphs with more than 100k edges use all available CPU cores for SpMV; smaller graphs run
+  single-threaded to avoid scheduling overhead
 - [x] SuiteSparse:GraphBLAS algorithm suite executing via sparse matrix-vector multiplication (SpMV) kernels:
     - [x] Breadth-first search (BFS) and multi-source BFS
     - [x] Directed PageRank power iterations
@@ -68,17 +70,28 @@ This document outlines the features implemented in IssunDB and the future goals 
 - [x] Query plan visualization for logical, physical, and optimized query paths
 - [x] openCypher TCK submodule integration and `make test-conformance` target
 - [x] Inline relationship property map filter pushdown: e.g. `-[:KNOWS {since: 2026}]->`
-- [x] Worst-case optimal join (`MultiwayJoin`) for closing hops in cyclic patterns (triangles, cliques): optimizer detects already-bound `dst_var` and rewrites to O(1) hash-map lookup per row
-- [x] Factorized Filter-over-Expand execution: source-predicate filters are evaluated once per source node; destinations of rejected sources are skipped with zero PathMap clones
-- [x] Scan-node selection: the optimizer reverses a linear single-hop Expand chain to start traversal from its lowest-cardinality or index-backed endpoint, flipping each hop's direction so no executor change is needed
+- [x] Worst-case optimal join (`MultiwayJoin`) for closing hops in cyclic patterns (triangles, cliques): optimizer detects already-bound `dst_var` and
+  rewrites to O(1) hash-map lookup per row
+- [x] Factorized Filter-over-Expand execution: source-predicate filters are evaluated once per source node; destinations of rejected sources are
+  skipped with zero PathMap clones
+- [x] Scan-node selection: the optimizer reverses a linear single-hop Expand chain to start traversal from its lowest-cardinality or index-backed
+  endpoint, flipping each hop's direction so no executor change is needed
 - [x] Count reduction: `count(*)` or `count(n)` over a bare labeled scan is replaced with a constant read from label metadata, avoiding a full scan
-- [x] Primary-key seek: `WHERE id(n) = <const>` over a node scan is rewritten to a `NodeByIdSeek` that fetches one node directly instead of scanning the label
-- [x] Fused linear expand chains: a contiguous run of single-hop directed expands is executed as one operation that bulk-expands each hop level and clones the base path once per output row, generalizing the former two-hop fast path to any length
-- [ ] Full openCypher TCK conformance: as of 2026-05-29, about 75% of executed scenarios pass (roughly 2,480 of 3,300; a further 597 scenarios are skipped as intentional exclusions, such as negative-test tags and node or relationship display-literal representational mismatches). Notable remaining capability gaps:
+- [x] Primary-key seek: `WHERE id(n) = <const>` over a node scan is rewritten to a `NodeByIdSeek` that fetches one node directly instead of scanning
+  the label
+- [x] Fused linear expand chains: a contiguous run of single-hop directed expands is executed as one operation that bulk-expands each hop level and
+  clones the base path once per output row, generalizing the former two-hop fast path to any length
+- [x] Static filter elimination: provably-true predicates (`WHERE true`, equality or inequality of identical-form literals) are dropped before
+  pushdown so they are never evaluated per row
+- [ ] Full openCypher TCK conformance: as of 2026-05-30, 2,542 of 3,300 executed scenarios pass (77.03%; a further 597 scenarios are
+  skipped as intentional exclusions, such as negative-test tags and node or relationship display-literal representational mismatches). Notable
+  remaining capability gaps:
     - [ ] Temporal timezone resolution for named and historical zones, and duration-between computation
     - [ ] `CALL` and procedure invocation
-    - [ ] Aggregation expressions inside `ORDER BY`
-    - [ ] Three-valued null comparison logic
+    - [ ] Pattern comprehension and list comprehension subqueries
+    - [x] Aggregation expressions inside `ORDER BY`
+    - [x] Three-valued null comparison logic
+    - [x] Intermediate orderings and path variable bindings in `WITH` / `ORDER BY`
 
 ---
 

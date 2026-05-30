@@ -18,10 +18,12 @@ source file:
    `LogicalOperator` into a `PhysicalOperator`, choosing access paths (label
    scan, index seek, adjacency expansion).
 4. **Optimize** (`src/plan/optimize.rs`): `Optimizer` rewrites the physical
-   tree. Passes run in this order: extract filters, reorder operators,
-   push-down filters, optimize index scans, then `rewrite_closing_expands`.
-   The optimizer takes ownership of the physical tree and returns a new tree;
-   it never mutates in place.
+   tree. Passes run in this order: extract filters, eliminate statically-true
+   filters, reorder operators, select the cheapest scan node (reversing linear
+   expand chains), push-down filters, optimize index scans and id seeks, rewrite
+   closing expands into `MultiwayJoin`, then reduce counts over a bare labeled
+   scan to a constant. The optimizer takes ownership of the physical tree and
+   returns a new tree; it never mutates in place.
 5. **Execute** (`src/exec/read.rs`): `execute_physical` drives the physical
    tree against a `Graph` reference, producing a `Vec<PathMap>`. The
    `Filter { input: Expand }` pattern uses a factorized fast path implemented
@@ -62,6 +64,20 @@ than a global parser state.
   Produce new nodes from rewrite rules and replace subtrees by constructing
   new parent nodes.
 - Do not add `Cell`, `RefCell`, or interior mutability to any AST or plan type.
+
+## Optimizer Correctness Invariants
+
+- Preserve row multiplicity. IssunDB is a multigraph: the LMDB `DUPSORT`
+  adjacency stores one entry per edge, so two parallel edges between the same
+  pair produce two distinct expansion results and two result rows. A rewrite
+  that collapses one-row-per-edge into one-row-per-(src, dst), or that uses a
+  boolean reachability product in place of per-edge traversal, will silently
+  drop rows for parallel edges. Such rewrites (for example a `reduce_expand_into`
+  that drops edge emission, or matrix-product chain fusion) are only valid when
+  multiplicity is provably irrelevant; default to rejecting them.
+- A rewrite must produce the same result set as the unoptimized plan for every
+  graph, not just the common single-edge case. When in doubt, add an end-to-end
+  test with parallel edges through the `issundb` facade.
 
 ## Adding a New Cypher Clause
 

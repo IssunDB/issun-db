@@ -273,11 +273,29 @@ pub(super) fn execute_set(
                         set_item.variable
                     ));
                 }
-                Some(GraphBinding::Scalar(_)) => {
-                    return Err(format!(
-                        "SET on scalar variable '{}' is not supported",
-                        set_item.variable
-                    ));
+                Some(GraphBinding::Scalar(val)) => {
+                    if let Some(obj) = val.as_object() {
+                        if obj.get("__type__").and_then(|t| t.as_str()) == Some("__Node__") {
+                            if let Some(id_val) = obj.get("id").and_then(|i| i.as_i64()) {
+                                id_val as u64
+                            } else {
+                                return Err(format!(
+                                    "SET on scalar variable '{}' is not supported",
+                                    set_item.variable
+                                ));
+                            }
+                        } else {
+                            return Err(format!(
+                                "SET on scalar variable '{}' is not supported",
+                                set_item.variable
+                            ));
+                        }
+                    } else {
+                        return Err(format!(
+                            "SET on scalar variable '{}' is not supported",
+                            set_item.variable
+                        ));
+                    }
                 }
                 None => return Err(format!("unbound variable: {}", set_item.variable)),
             };
@@ -355,11 +373,53 @@ pub(super) fn execute_delete(
                 Some(GraphBinding::Edge(id)) => {
                     graph.delete_edge(*id).map_err(|e| e.to_string())?;
                 }
-                Some(GraphBinding::Scalar(_)) => {
-                    return Err(format!(
-                        "DELETE on scalar variable '{}' is not supported",
-                        var
-                    ));
+                Some(GraphBinding::Scalar(val)) => {
+                    if let Some(obj) = val.as_object() {
+                        if obj.get("__type__").and_then(|t| t.as_str()) == Some("__Node__") {
+                            if let Some(id_val) = obj.get("id").and_then(|i| i.as_i64()) {
+                                let id = id_val as u64;
+                                if delete.detach {
+                                    let out_edges =
+                                        graph.out_neighbors(id).map_err(|e| e.to_string())?;
+                                    for ne in out_edges {
+                                        graph.delete_edge(ne.edge).map_err(|e| e.to_string())?;
+                                    }
+                                    let in_edges =
+                                        graph.in_neighbors(id).map_err(|e| e.to_string())?;
+                                    for ne in in_edges {
+                                        graph.delete_edge(ne.edge).map_err(|e| e.to_string())?;
+                                    }
+                                }
+                                graph.delete_node(id).map_err(|e| e.to_string())?;
+                            } else {
+                                return Err(format!(
+                                    "DELETE on scalar variable '{}' is not supported",
+                                    var
+                                ));
+                            }
+                        } else if obj.get("__type__").and_then(|t| t.as_str()) == Some("__Edge__") {
+                            if let Some(id_val) = obj.get("id").and_then(|i| i.as_i64()) {
+                                graph
+                                    .delete_edge(id_val as u64)
+                                    .map_err(|e| e.to_string())?;
+                            } else {
+                                return Err(format!(
+                                    "DELETE on scalar variable '{}' is not supported",
+                                    var
+                                ));
+                            }
+                        } else {
+                            return Err(format!(
+                                "DELETE on scalar variable '{}' is not supported",
+                                var
+                            ));
+                        }
+                    } else {
+                        return Err(format!(
+                            "DELETE on scalar variable '{}' is not supported",
+                            var
+                        ));
+                    }
                 }
                 None => return Err(format!("unbound variable: {}", var)),
             }
@@ -792,11 +852,29 @@ pub(super) fn apply_set_items(
                     item.variable
                 ));
             }
-            Some(GraphBinding::Scalar(_)) => {
-                return Err(format!(
-                    "SET on scalar variable '{}' is not supported",
-                    item.variable
-                ));
+            Some(GraphBinding::Scalar(val)) => {
+                if let Some(obj) = val.as_object() {
+                    if obj.get("__type__").and_then(|t| t.as_str()) == Some("__Node__") {
+                        if let Some(id_val) = obj.get("id").and_then(|i| i.as_i64()) {
+                            id_val as u64
+                        } else {
+                            return Err(format!(
+                                "SET on scalar variable '{}' is not supported",
+                                item.variable
+                            ));
+                        }
+                    } else {
+                        return Err(format!(
+                            "SET on scalar variable '{}' is not supported",
+                            item.variable
+                        ));
+                    }
+                } else {
+                    return Err(format!(
+                        "SET on scalar variable '{}' is not supported",
+                        item.variable
+                    ));
+                }
             }
             None => return Err(format!("unbound variable: {}", item.variable)),
         };

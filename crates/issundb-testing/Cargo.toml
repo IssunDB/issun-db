@@ -16,6 +16,10 @@ tempfile.workspace = true
 serde_json.workspace = true
 rand.workspace = true
 
+[lib]
+doc = false
+
 [[bin]]
 name = "gen_testdata"
 path = "src/bin/gen_testdata.rs"
+doc = false

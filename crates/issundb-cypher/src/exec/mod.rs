@@ -10,7 +10,7 @@ use crate::plan::{FilterExpr, LogicalPlanner, Optimizer, PhysicalOperator, Physi
 mod ddl;
 mod expr;
 mod factorize;
-mod read;
+pub(crate) mod read;
 mod write;
 
 use ddl::{

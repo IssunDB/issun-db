@@ -15,7 +15,7 @@ pub enum Statement {
     DropIndex(DropIndexStatement),
     /// REMOVE n.property or REMOVE n:Label
     Remove(RemoveStatement),
-    /// MATCH ... RETURN ... UNION [ALL] MATCH ... RETURN ...
+    /// `MATCH ... RETURN ... UNION [ALL] MATCH ... RETURN ...`
     Union(UnionStatement),
     /// CREATE ... RETURN ...
     CreateAndReturn(CreateAndReturnStatement),
@@ -253,7 +253,7 @@ pub enum Expr {
     IsNotNull(Box<Expr>),
     /// Unary negation: `NOT expr`.
     Not(Box<Expr>),
-    /// CASE [subject] WHEN ... THEN ... [ELSE ...] END
+    /// `CASE [subject] WHEN ... THEN ... [ELSE ...] END`
     Case {
         /// None for searched CASE; Some(expr) for simple CASE.
         subject: Option<Box<Expr>>,

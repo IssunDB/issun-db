@@ -1,4 +1,5 @@
 use crate::ast::{AggFn, Expr, MatchClause, Query, SortItem, WhereClause};
+use crate::exec::read::expr_display_name;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum FilterExpr {
@@ -216,21 +217,70 @@ impl LogicalPlanner {
                         // behavior of the Unwind arm above.
                         let mut p = current_plan.unwrap_or(LogicalOperator::SingleRow);
 
-                        let project_items: Vec<(Expr, Option<String>)> = items
+                        // Split WITH items and extract aggregations from ORDER BY.
+                        let (with_group_by, with_aggs, rewritten_with_items) =
+                            split_with_items(items);
+                        let mut with_aggs = with_aggs;
+
+                        let mut order_by_items = order_by.as_ref().map(|ob| ob.items.clone());
+
+                        let projections: Vec<(Expr, String)> = items
                             .iter()
-                            .map(|item| (item.expr.clone(), item.alias.clone()))
+                            .map(|item| {
+                                let target_var = if let Some(ref a) = item.alias {
+                                    a.clone()
+                                } else {
+                                    expr_display_name(&item.expr)
+                                };
+                                (item.expr.clone(), target_var)
+                            })
                             .collect();
 
-                        // Detect aggregations in the WITH items and insert an Aggregate
-                        // operator when any item contains an aggregation function (collect,
-                        // count, sum, avg, min, max, stDev, stDevP, percentile).
-                        let (with_group_by, with_aggs) = split_with_items(items);
+                        if let Some(ref mut items) = order_by_items {
+                            for si in items.iter_mut() {
+                                rewrite_expr_with_aliases(&mut si.expr, &projections);
+                            }
+                        }
+
+                        if let Some(ref mut items) = order_by_items {
+                            let mut count_index = 0;
+                            for si in items.iter_mut() {
+                                if expr_has_aggregation(&si.expr) {
+                                    extract_and_replace_aggs(
+                                        &mut si.expr,
+                                        &mut with_aggs,
+                                        &mut count_index,
+                                        "_ord_agg_",
+                                    );
+                                }
+                            }
+                        }
+
                         if !with_aggs.is_empty() {
                             p = LogicalOperator::Aggregate {
                                 input: Box::new(p),
                                 group_by: with_group_by,
                                 aggregations: with_aggs,
                             };
+                        }
+
+                        let mut project_items: Vec<(Expr, Option<String>)> = rewritten_with_items
+                            .iter()
+                            .map(|item| (item.expr.clone(), item.alias.clone()))
+                            .collect();
+
+                        // Add pre-computed ORDER BY aggregations to WITH project items so they survive the projection barrier.
+                        if let Some(ref items) = order_by_items {
+                            let mut ord_aggs = std::collections::HashSet::new();
+                            for si in items.iter() {
+                                collect_ord_aggs(&si.expr, &mut ord_aggs);
+                            }
+                            for col in ord_aggs {
+                                project_items.push((
+                                    Expr::Prop(col.clone(), "".to_string()),
+                                    Some(col.clone()),
+                                ));
+                            }
                         }
 
                         if let Some(wc) = where_clause {
@@ -280,10 +330,10 @@ impl LogicalPlanner {
 
                         // Apply optional ORDER BY attached to the WITH clause. ORDER BY scope
                         // validation happens at parse time in `validate_statement`.
-                        if let Some(ob) = order_by {
+                        if let Some(ref items) = order_by_items {
                             p = LogicalOperator::Sort {
                                 input: Box::new(p),
-                                items: ob.items.clone(),
+                                items: items.clone(),
                             };
                         }
 
@@ -396,7 +446,44 @@ impl LogicalPlanner {
         };
 
         // Split RETURN items into group-by keys and aggregations.
-        let (group_by_items, agg_items) = split_return_items(query);
+        let (group_by_items, agg_items, rewritten_return_items) = split_return_items(query);
+        let mut agg_items = agg_items;
+
+        let mut order_by_items = query.order_by.as_ref().map(|ob| ob.items.clone());
+
+        let projections: Vec<(Expr, String)> = query
+            .return_clause
+            .items
+            .iter()
+            .map(|item| {
+                let target_var = if let Some(ref a) = item.alias {
+                    a.clone()
+                } else {
+                    expr_display_name(&item.expr)
+                };
+                (item.expr.clone(), target_var)
+            })
+            .collect();
+
+        if let Some(ref mut items) = order_by_items {
+            for si in items.iter_mut() {
+                rewrite_expr_with_aliases(&mut si.expr, &projections);
+            }
+        }
+
+        if let Some(ref mut items) = order_by_items {
+            let mut count_index = 0;
+            for si in items.iter_mut() {
+                if expr_has_aggregation(&si.expr) {
+                    extract_and_replace_aggs(
+                        &mut si.expr,
+                        &mut agg_items,
+                        &mut count_index,
+                        "_ord_agg_",
+                    );
+                }
+            }
+        }
 
         // Insert Aggregate operator when at least one aggregation is present.
         if !agg_items.is_empty() {
@@ -409,12 +496,21 @@ impl LogicalPlanner {
 
         // Apply final RETURN projection (only over non-aggregate expressions when
         // aggregation is present; Aggregate already emits aggregate column names).
-        let project_items: Vec<(Expr, Option<String>)> = query
-            .return_clause
-            .items
+        let mut project_items: Vec<(Expr, Option<String>)> = rewritten_return_items
             .iter()
             .map(|item| (item.expr.clone(), item.alias.clone()))
             .collect();
+
+        // Add pre-computed ORDER BY aggregations to Project items so they survive the projection barrier.
+        if let Some(ref items) = order_by_items {
+            let mut ord_aggs = std::collections::HashSet::new();
+            for si in items.iter() {
+                collect_ord_aggs(&si.expr, &mut ord_aggs);
+            }
+            for col in ord_aggs {
+                project_items.push((Expr::Prop(col.clone(), "".to_string()), Some(col.clone())));
+            }
+        }
 
         plan = LogicalOperator::Project {
             input: Box::new(plan),
@@ -423,10 +519,10 @@ impl LogicalPlanner {
         };
 
         // INSERT ORDER BY above Project.
-        if let Some(ref ob) = query.order_by {
+        if let Some(ref items) = order_by_items {
             plan = LogicalOperator::Sort {
                 input: Box::new(plan),
-                items: ob.items.clone(),
+                items: items.clone(),
             };
         }
 
@@ -480,7 +576,7 @@ impl LogicalPlanner {
             }
         }
 
-        let mut prev_node_var = seed_var;
+        let mut prev_node_var = seed_var.clone();
 
         for (seg_idx, (rel_pat, node_pat)) in pattern.rels.iter().enumerate() {
             // Use segment-indexed fallback names so auto-generated variables do not
@@ -553,6 +649,39 @@ impl LogicalPlanner {
             prev_node_var = target_var;
         }
 
+        if let Some(ref pv) = pattern.path_variable {
+            let mut path_vars = vec![seed_var.clone()];
+            for (seg_idx, (rel_pat, node_pat)) in pattern.rels.iter().enumerate() {
+                let rel_var = rel_pat
+                    .variable
+                    .clone()
+                    .unwrap_or_else(|| format!("_rel_{}", seg_idx));
+                let target_var = node_pat
+                    .variable
+                    .clone()
+                    .unwrap_or_else(|| format!("_target_{}", seg_idx));
+                path_vars.push(rel_var);
+                path_vars.push(target_var);
+            }
+
+            let path_expr_args: Vec<Expr> = path_vars
+                .into_iter()
+                .map(|v| Expr::Prop(v, "".to_string()))
+                .collect();
+
+            plan = LogicalOperator::Project {
+                input: Box::new(plan),
+                items: vec![(
+                    Expr::FunctionCall {
+                        name: "__list__".to_string(),
+                        args: path_expr_args,
+                    },
+                    Some(pv.clone()),
+                )],
+                is_barrier: false,
+            };
+        }
+
         Ok(plan)
     }
 }
@@ -562,68 +691,36 @@ type GroupByItem = (Expr, Option<String>);
 /// Aggregation spec: `(function, inner expression, output column name)`.
 type AggItem = (AggFn, Expr, String);
 
-/// Compute a display name for an aggregation expression (used as the default column name).
-fn agg_display_name(fn_: &AggFn, inner: &Expr) -> String {
-    let inner_name = inner_expr_name(inner);
-    match fn_ {
-        AggFn::Count { distinct: true } => format!("count(DISTINCT {})", inner_name),
-        AggFn::Count { distinct: false } => format!("count({})", inner_name),
-        AggFn::Sum { .. } => format!("sum({})", inner_name),
-        AggFn::Avg { .. } => format!("avg({})", inner_name),
-        AggFn::Min { .. } => format!("min({})", inner_name),
-        AggFn::Max { .. } => format!("max({})", inner_name),
-        AggFn::Collect { .. } => format!("collect({})", inner_name),
-        AggFn::StDev { .. } => format!("stDev({})", inner_name),
-        AggFn::StDevP { .. } => format!("stDevP({})", inner_name),
-        AggFn::PercentileDisc { .. } => format!("percentileDisc({})", inner_name),
-        AggFn::PercentileCont { .. } => format!("percentileCont({})", inner_name),
-    }
-}
-
-fn inner_expr_name(expr: &Expr) -> String {
-    match expr {
-        Expr::CountStar => "*".to_string(),
-        Expr::Prop(var, prop) => {
-            if prop.is_empty() {
-                var.clone()
-            } else {
-                format!("{}.{}", var, prop)
-            }
-        }
-        Expr::Literal(lit) => lit.to_string(),
-        _ => "expr".to_string(),
-    }
-}
-
 /// Classify RETURN items into group-by keys (non-aggregate) and aggregation specs.
 ///
 /// Returns `(group_by, aggregations)` where:
 /// - `group_by` contains `(expr, alias)` pairs for non-aggregate items.
 /// - `aggregations` contains `(agg_fn, inner_expr, output_name)` triples for aggregate items.
-fn split_return_items(query: &Query) -> (Vec<GroupByItem>, Vec<AggItem>) {
+fn split_return_items(
+    query: &Query,
+) -> (Vec<GroupByItem>, Vec<AggItem>, Vec<crate::ast::ReturnItem>) {
     let mut group_by = Vec::new();
     let mut aggregations = Vec::new();
+    let mut count_index = 0;
 
-    for item in &query.return_clause.items {
-        match &item.expr {
-            Expr::CountStar => {
-                let col = item.alias.clone().unwrap_or_else(|| "count(*)".to_string());
-                aggregations.push((AggFn::Count { distinct: false }, Expr::CountStar, col));
+    let mut rewritten_items = query.return_clause.items.clone();
+    for item in &mut rewritten_items {
+        if expr_has_aggregation(&item.expr) {
+            if item.alias.is_none() {
+                item.alias = Some(expr_display_name(&item.expr));
             }
-            Expr::Agg(fn_, inner) => {
-                let col = item
-                    .alias
-                    .clone()
-                    .unwrap_or_else(|| agg_display_name(fn_, inner));
-                aggregations.push((fn_.clone(), *inner.clone(), col));
-            }
-            other => {
-                group_by.push((other.clone(), item.alias.clone()));
-            }
+            extract_and_replace_aggs(
+                &mut item.expr,
+                &mut aggregations,
+                &mut count_index,
+                "_ret_agg_",
+            );
+        } else {
+            group_by.push((item.expr.clone(), item.alias.clone()));
         }
     }
 
-    (group_by, aggregations)
+    (group_by, aggregations, rewritten_items)
 }
 
 /// Return true when an expression contains any aggregation function (CountStar
@@ -680,30 +777,31 @@ fn expr_has_aggregation(expr: &Expr) -> bool {
 /// Mirrors `split_return_items` but operates on a slice of `ReturnItem` rather than a `Query`.
 /// When a WITH item contains a nested aggregation expression (e.g., `$age + avg(n.age) AS agg`),
 /// the whole expression is treated as an aggregation so that the Aggregate operator is inserted.
-fn split_with_items(items: &[crate::ast::ReturnItem]) -> (Vec<GroupByItem>, Vec<AggItem>) {
+fn split_with_items(
+    items: &[crate::ast::ReturnItem],
+) -> (Vec<GroupByItem>, Vec<AggItem>, Vec<crate::ast::ReturnItem>) {
     let mut group_by = Vec::new();
     let mut aggregations = Vec::new();
+    let mut count_index = 0;
 
-    for item in items {
-        match &item.expr {
-            Expr::CountStar => {
-                let col = item.alias.clone().unwrap_or_else(|| "count(*)".to_string());
-                aggregations.push((AggFn::Count { distinct: false }, Expr::CountStar, col));
+    let mut rewritten_items = items.to_vec();
+    for item in &mut rewritten_items {
+        if expr_has_aggregation(&item.expr) {
+            if item.alias.is_none() {
+                item.alias = Some(expr_display_name(&item.expr));
             }
-            Expr::Agg(fn_, inner) => {
-                let col = item
-                    .alias
-                    .clone()
-                    .unwrap_or_else(|| agg_display_name(fn_, inner));
-                aggregations.push((fn_.clone(), *inner.clone(), col));
-            }
-            other => {
-                group_by.push((other.clone(), item.alias.clone()));
-            }
+            extract_and_replace_aggs(
+                &mut item.expr,
+                &mut aggregations,
+                &mut count_index,
+                "_ret_agg_",
+            );
+        } else {
+            group_by.push((item.expr.clone(), item.alias.clone()));
         }
     }
 
-    (group_by, aggregations)
+    (group_by, aggregations, rewritten_items)
 }
 
 /// Extract a `usize` value from a literal `Expr::Literal(Int(...))`.
@@ -741,6 +839,188 @@ pub(crate) fn validate_skip_limit(expr: &Expr, keyword: &str) -> Result<(), Stri
             "SyntaxError: {} value must be a constant integer expression",
             keyword
         )),
+    }
+}
+
+fn extract_and_replace_aggs(
+    expr: &mut Expr,
+    aggregations: &mut Vec<AggItem>,
+    count_index: &mut usize,
+    prefix: &str,
+) {
+    match expr {
+        Expr::CountStar => {
+            let mut found_col = None;
+            for (fn_, inner, col) in aggregations.iter() {
+                if matches!(fn_, AggFn::Count { distinct: false })
+                    && matches!(inner, Expr::CountStar)
+                {
+                    found_col = Some(col.clone());
+                    break;
+                }
+            }
+            let col = found_col.unwrap_or_else(|| {
+                let name = format!("{}{}", prefix, *count_index);
+                *count_index += 1;
+                aggregations.push((
+                    AggFn::Count { distinct: false },
+                    Expr::CountStar,
+                    name.clone(),
+                ));
+                name
+            });
+            *expr = Expr::Prop(col, "".to_string());
+        }
+        Expr::Agg(fn_, inner) => {
+            let mut found_col = None;
+            for (f, i, col) in aggregations.iter() {
+                if f == fn_ && i == inner.as_ref() {
+                    found_col = Some(col.clone());
+                    break;
+                }
+            }
+            let col = found_col.unwrap_or_else(|| {
+                let name = format!("{}{}", prefix, *count_index);
+                *count_index += 1;
+                aggregations.push((fn_.clone(), *inner.clone(), name.clone()));
+                name
+            });
+            *expr = Expr::Prop(col, "".to_string());
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            extract_and_replace_aggs(left, aggregations, count_index, prefix);
+            extract_and_replace_aggs(right, aggregations, count_index, prefix);
+        }
+        Expr::Not(inner) | Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
+            extract_and_replace_aggs(inner, aggregations, count_index, prefix);
+        }
+        Expr::FunctionCall { args, .. } => {
+            for arg in args {
+                extract_and_replace_aggs(arg, aggregations, count_index, prefix);
+            }
+        }
+        Expr::Case {
+            subject,
+            arms,
+            else_expr,
+        } => {
+            if let Some(s) = subject {
+                extract_and_replace_aggs(s, aggregations, count_index, prefix);
+            }
+            for arm in arms {
+                extract_and_replace_aggs(&mut arm.when, aggregations, count_index, prefix);
+                extract_and_replace_aggs(&mut arm.then, aggregations, count_index, prefix);
+            }
+            if let Some(e) = else_expr {
+                extract_and_replace_aggs(e, aggregations, count_index, prefix);
+            }
+        }
+        Expr::Subscript { expr, index } => {
+            extract_and_replace_aggs(expr, aggregations, count_index, prefix);
+            extract_and_replace_aggs(index, aggregations, count_index, prefix);
+        }
+        Expr::Slice { expr, start, end } => {
+            extract_and_replace_aggs(expr, aggregations, count_index, prefix);
+            if let Some(s) = start {
+                extract_and_replace_aggs(s, aggregations, count_index, prefix);
+            }
+            if let Some(e) = end {
+                extract_and_replace_aggs(e, aggregations, count_index, prefix);
+            }
+        }
+        Expr::ListComprehension {
+            list,
+            predicate,
+            transform,
+            ..
+        } => {
+            extract_and_replace_aggs(list, aggregations, count_index, prefix);
+            if let Some(p) = predicate {
+                extract_and_replace_aggs(p, aggregations, count_index, prefix);
+            }
+            if let Some(t) = transform {
+                extract_and_replace_aggs(t, aggregations, count_index, prefix);
+            }
+        }
+        Expr::Quantifier {
+            list, predicate, ..
+        } => {
+            extract_and_replace_aggs(list, aggregations, count_index, prefix);
+            extract_and_replace_aggs(predicate, aggregations, count_index, prefix);
+        }
+        _ => {}
+    }
+}
+
+fn collect_ord_aggs(expr: &Expr, set: &mut std::collections::HashSet<String>) {
+    match expr {
+        Expr::Prop(col, prop) => {
+            if (col.starts_with("_ord_agg_") || col.starts_with("_ret_agg_")) && prop.is_empty() {
+                set.insert(col.clone());
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            collect_ord_aggs(left, set);
+            collect_ord_aggs(right, set);
+        }
+        Expr::Not(inner) | Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
+            collect_ord_aggs(inner, set);
+        }
+        Expr::FunctionCall { args, .. } => {
+            for arg in args {
+                collect_ord_aggs(arg, set);
+            }
+        }
+        Expr::Case {
+            subject,
+            arms,
+            else_expr,
+        } => {
+            if let Some(s) = subject {
+                collect_ord_aggs(s, set);
+            }
+            for arm in arms {
+                collect_ord_aggs(&arm.when, set);
+                collect_ord_aggs(&arm.then, set);
+            }
+            if let Some(e) = else_expr {
+                collect_ord_aggs(e, set);
+            }
+        }
+        Expr::Subscript { expr, index } => {
+            collect_ord_aggs(expr, set);
+            collect_ord_aggs(index, set);
+        }
+        Expr::Slice { expr, start, end } => {
+            collect_ord_aggs(expr, set);
+            if let Some(s) = start {
+                collect_ord_aggs(s, set);
+            }
+            if let Some(e) = end {
+                collect_ord_aggs(e, set);
+            }
+        }
+        Expr::ListComprehension {
+            list,
+            predicate,
+            transform,
+            ..
+        } => {
+            collect_ord_aggs(list, set);
+            if let Some(p) = predicate {
+                collect_ord_aggs(p, set);
+            }
+            if let Some(t) = transform {
+                collect_ord_aggs(t, set);
+            }
+        }
+        Expr::Quantifier {
+            list, predicate, ..
+        } => {
+            collect_ord_aggs(list, set);
+            collect_ord_aggs(predicate, set);
+        }
+        _ => {}
     }
 }
 
@@ -867,5 +1147,86 @@ mod tests {
             } => (min_hops, max_hops),
             other => panic!("unexpected operator: {:?}", other),
         }
+    }
+}
+
+fn rewrite_expr_with_aliases(expr: &mut Expr, projections: &[(Expr, String)]) {
+    // Check if the current expression matches any projected source expression exactly.
+    for (source_expr, target_var) in projections {
+        if expr == source_expr {
+            *expr = Expr::Prop(target_var.clone(), "".to_string());
+            return;
+        }
+    }
+
+    // Otherwise, recursively rewrite child expressions.
+    match expr {
+        Expr::Prop(_, _) | Expr::Literal(_) | Expr::Param(_) | Expr::CountStar => {}
+        Expr::Agg(_, inner) | Expr::IsNull(inner) | Expr::IsNotNull(inner) | Expr::Not(inner) => {
+            rewrite_expr_with_aliases(inner, projections);
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            rewrite_expr_with_aliases(left, projections);
+            rewrite_expr_with_aliases(right, projections);
+        }
+        Expr::FunctionCall { args, .. } => {
+            for arg in args {
+                rewrite_expr_with_aliases(arg, projections);
+            }
+        }
+        Expr::Quantifier {
+            list, predicate, ..
+        } => {
+            rewrite_expr_with_aliases(list, projections);
+            rewrite_expr_with_aliases(predicate, projections);
+        }
+        Expr::Case {
+            subject,
+            arms,
+            else_expr,
+        } => {
+            if let Some(s) = subject {
+                rewrite_expr_with_aliases(s, projections);
+            }
+            for arm in arms {
+                rewrite_expr_with_aliases(&mut arm.when, projections);
+                rewrite_expr_with_aliases(&mut arm.then, projections);
+            }
+            if let Some(e) = else_expr {
+                rewrite_expr_with_aliases(e, projections);
+            }
+        }
+        Expr::Subscript { expr: inner, index } => {
+            rewrite_expr_with_aliases(inner, projections);
+            rewrite_expr_with_aliases(index, projections);
+        }
+        Expr::Slice {
+            expr: inner,
+            start,
+            end,
+        } => {
+            rewrite_expr_with_aliases(inner, projections);
+            if let Some(s) = start {
+                rewrite_expr_with_aliases(s, projections);
+            }
+            if let Some(e) = end {
+                rewrite_expr_with_aliases(e, projections);
+            }
+        }
+        Expr::ListComprehension {
+            list,
+            predicate,
+            transform,
+            ..
+        } => {
+            rewrite_expr_with_aliases(list, projections);
+            if let Some(p) = predicate {
+                rewrite_expr_with_aliases(p, projections);
+            }
+            if let Some(t) = transform {
+                rewrite_expr_with_aliases(t, projections);
+            }
+        }
+        Expr::HasLabel { .. } => {}
     }
 }

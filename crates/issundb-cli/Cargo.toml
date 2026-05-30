@@ -13,6 +13,7 @@ publish = false
 [[bin]]
 name = "issundb"
 path = "src/main.rs"
+doc = false
 
 [dependencies]
 issundb = { path = "../issundb" }

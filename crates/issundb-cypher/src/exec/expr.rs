@@ -243,17 +243,7 @@ pub(super) fn evaluate_expr(
                 (serde_json::Value::Object(map), serde_json::Value::String(key)) => {
                     Ok(map.get(&key).cloned().unwrap_or(serde_json::Value::Null))
                 }
-                (serde_json::Value::String(s), serde_json::Value::Number(n)) => {
-                    let i = n.as_i64().unwrap_or(0);
-                    let chars: Vec<char> = s.chars().collect();
-                    let len = chars.len() as i64;
-                    let pos = if i < 0 { len + i } else { i };
-                    if pos < 0 || pos >= len {
-                        Ok(serde_json::Value::Null)
-                    } else {
-                        Ok(serde_json::Value::String(chars[pos as usize].to_string()))
-                    }
-                }
+
                 // Node/edge property access via subscript: n['propName']
                 (node_val, serde_json::Value::String(key)) => {
                     if let serde_json::Value::Object(map) = node_val {
@@ -397,7 +387,17 @@ pub(super) fn evaluate_expr(
                     let actual_json: serde_json::Value =
                         rmp_serde::from_slice(&record.props).map_err(|e| e.to_string())?;
                     if prop.is_empty() {
-                        Ok(actual_json)
+                        let mut m = serde_json::Map::new();
+                        m.insert(
+                            "__type__".to_string(),
+                            serde_json::Value::String("__Node__".to_string()),
+                        );
+                        m.insert(
+                            "id".to_string(),
+                            serde_json::Value::Number((*node_id as i64).into()),
+                        );
+                        m.insert("properties".to_string(), actual_json);
+                        Ok(serde_json::Value::Object(m))
                     } else {
                         Ok(actual_json
                             .get(prop)
@@ -413,7 +413,17 @@ pub(super) fn evaluate_expr(
                     let actual_json: serde_json::Value =
                         rmp_serde::from_slice(&record.props).map_err(|e| e.to_string())?;
                     if prop.is_empty() {
-                        Ok(actual_json)
+                        let mut m = serde_json::Map::new();
+                        m.insert(
+                            "__type__".to_string(),
+                            serde_json::Value::String("__Edge__".to_string()),
+                        );
+                        m.insert(
+                            "id".to_string(),
+                            serde_json::Value::Number((*edge_id as i64).into()),
+                        );
+                        m.insert("properties".to_string(), actual_json);
+                        Ok(serde_json::Value::Object(m))
                     } else {
                         Ok(actual_json
                             .get(prop)
@@ -425,7 +435,43 @@ pub(super) fn evaluate_expr(
                     if prop.is_empty() {
                         Ok(val.clone())
                     } else if let Some(obj) = val.as_object() {
-                        Ok(obj.get(prop).cloned().unwrap_or(serde_json::Value::Null))
+                        if obj.get("__type__").and_then(|t| t.as_str()) == Some("__Node__") {
+                            if let Some(id_val) = obj.get("id").and_then(|i| i.as_i64()) {
+                                let node_id = id_val as u64;
+                                let record = graph
+                                    .get_node(node_id)
+                                    .map_err(|e| e.to_string())?
+                                    .ok_or_else(|| format!("node not found: {}", node_id))?;
+                                let actual_json: serde_json::Value =
+                                    rmp_serde::from_slice(&record.props)
+                                        .map_err(|e| e.to_string())?;
+                                Ok(actual_json
+                                    .get(prop)
+                                    .cloned()
+                                    .unwrap_or(serde_json::Value::Null))
+                            } else {
+                                Ok(serde_json::Value::Null)
+                            }
+                        } else if obj.get("__type__").and_then(|t| t.as_str()) == Some("__Edge__") {
+                            if let Some(id_val) = obj.get("id").and_then(|i| i.as_i64()) {
+                                let edge_id = id_val as u64;
+                                let record = graph
+                                    .get_edge(edge_id)
+                                    .map_err(|e| e.to_string())?
+                                    .ok_or_else(|| format!("edge not found: {}", edge_id))?;
+                                let actual_json: serde_json::Value =
+                                    rmp_serde::from_slice(&record.props)
+                                        .map_err(|e| e.to_string())?;
+                                Ok(actual_json
+                                    .get(prop)
+                                    .cloned()
+                                    .unwrap_or(serde_json::Value::Null))
+                            } else {
+                                Ok(serde_json::Value::Null)
+                            }
+                        } else {
+                            Ok(obj.get(prop).cloned().unwrap_or(serde_json::Value::Null))
+                        }
                     } else if *val == serde_json::Value::Null {
                         Ok(serde_json::Value::Null)
                     } else {
@@ -531,55 +577,14 @@ pub(super) fn eval_binary_op(
             match op {
                 // Equality: NaN != NaN (IEEE 754).  List equality propagates null when
                 // any element in either list is null (openCypher three-valued logic).
-                BinaryOperator::Eq => {
-                    if is_nan(&lv) || is_nan(&rv) {
-                        return Ok(serde_json::Value::Bool(false));
-                    }
-                    if let (serde_json::Value::Array(la), serde_json::Value::Array(ra)) = (&lv, &rv)
-                    {
-                        if la.len() != ra.len() {
-                            return Ok(serde_json::Value::Bool(false));
-                        }
-                        let mut has_null = false;
-                        for (a, b) in la.iter().zip(ra.iter()) {
-                            if *a == serde_json::Value::Null || *b == serde_json::Value::Null {
-                                has_null = true;
-                            } else if a != b {
-                                return Ok(serde_json::Value::Bool(false));
-                            }
-                        }
-                        return Ok(if has_null {
-                            serde_json::Value::Null
-                        } else {
-                            serde_json::Value::Bool(true)
-                        });
-                    }
-                    Ok(serde_json::Value::Bool(lv == rv))
-                }
+                BinaryOperator::Eq => Ok(cypher_eq(&lv, &rv)),
                 BinaryOperator::Ne => {
-                    if is_nan(&lv) || is_nan(&rv) {
-                        return Ok(serde_json::Value::Bool(true));
+                    let eq = cypher_eq(&lv, &rv);
+                    match eq {
+                        serde_json::Value::Bool(b) => Ok(serde_json::Value::Bool(!b)),
+                        serde_json::Value::Null => Ok(serde_json::Value::Null),
+                        _ => unreachable!(),
                     }
-                    if let (serde_json::Value::Array(la), serde_json::Value::Array(ra)) = (&lv, &rv)
-                    {
-                        if la.len() != ra.len() {
-                            return Ok(serde_json::Value::Bool(true));
-                        }
-                        let mut has_null = false;
-                        for (a, b) in la.iter().zip(ra.iter()) {
-                            if *a == serde_json::Value::Null || *b == serde_json::Value::Null {
-                                has_null = true;
-                            } else if a != b {
-                                return Ok(serde_json::Value::Bool(true));
-                            }
-                        }
-                        return Ok(if has_null {
-                            serde_json::Value::Null
-                        } else {
-                            serde_json::Value::Bool(false)
-                        });
-                    }
-                    Ok(serde_json::Value::Bool(lv != rv))
                 }
                 // Ordered comparisons: return null for incompatible types; for NaN vs
                 // number return false; for NaN vs non-number return null (openCypher spec).
@@ -753,6 +758,9 @@ pub(super) fn eval_function_call(
             }
             let start_val = evaluate_expr(graph, path, &args[0], params)?;
             let end_val = evaluate_expr(graph, path, &args[1], params)?;
+            if start_val == serde_json::Value::Null || end_val == serde_json::Value::Null {
+                return Ok(serde_json::Value::Null);
+            }
             let start = start_val
                 .as_i64()
                 .ok_or_else(|| "range() start must be an integer".to_string())?;
@@ -761,6 +769,9 @@ pub(super) fn eval_function_call(
                 .ok_or_else(|| "range() end must be an integer".to_string())?;
             let step = if args.len() == 3 {
                 let sv = evaluate_expr(graph, path, &args[2], params)?;
+                if sv == serde_json::Value::Null {
+                    return Ok(serde_json::Value::Null);
+                }
                 let s = sv
                     .as_i64()
                     .ok_or_else(|| "range() step must be an integer".to_string())?;
@@ -1089,10 +1100,11 @@ pub(super) fn eval_function_call(
                     }
                     let mut found_null = false;
                     for item in &arr {
-                        if *item == needle {
+                        let eq = cypher_eq(&needle, item);
+                        if eq == serde_json::Value::Bool(true) {
                             return Ok(serde_json::Value::Bool(true));
                         }
-                        if *item == serde_json::Value::Null || needle == serde_json::Value::Null {
+                        if eq == serde_json::Value::Null {
                             found_null = true;
                         }
                     }
@@ -2283,9 +2295,9 @@ fn split_tz(s: &str) -> (&str, Option<String>) {
 
 /// Normalize a timezone string (+0100, +01:00, +01, -00:00, etc.) to canonical form.
 /// Returns None if not a valid timezone.
-/// Resolve an IANA timezone name to a "+HH:MM[Name]" representation.
+/// Resolve an IANA timezone name to a `"+HH:MM[Name]"` representation.
 /// For numeric offsets, normalize to "+HH:MM" or "Z".
-/// For named timezones, use a hardcoded offset and append "[Name]".
+/// For named timezones, use a hardcoded offset and append `"[Name]"`.
 fn resolve_iana_tz(tz: &str) -> String {
     // If it already looks like a numeric offset (+HH:MM etc.), normalize it.
     if tz == "Z" || tz.starts_with('+') || tz.starts_with('-') {
@@ -3412,6 +3424,36 @@ pub(super) fn is_nan(v: &serde_json::Value) -> bool {
         .and_then(|m| m.get("__type__"))
         .and_then(|t| t.as_str())
         .is_some_and(|s| s == "__NaN__")
+}
+
+pub(super) fn cypher_eq(lv: &serde_json::Value, rv: &serde_json::Value) -> serde_json::Value {
+    if lv == &serde_json::Value::Null || rv == &serde_json::Value::Null {
+        return serde_json::Value::Null;
+    }
+    if is_nan(lv) || is_nan(rv) {
+        return serde_json::Value::Bool(false);
+    }
+    if let (serde_json::Value::Array(la), serde_json::Value::Array(ra)) = (lv, rv) {
+        if la.len() != ra.len() {
+            return serde_json::Value::Bool(false);
+        }
+        let mut has_null = false;
+        for (a, b) in la.iter().zip(ra.iter()) {
+            let item_eq = cypher_eq(a, b);
+            if item_eq == serde_json::Value::Null {
+                has_null = true;
+            } else if item_eq == serde_json::Value::Bool(false) {
+                return serde_json::Value::Bool(false);
+            }
+        }
+        if has_null {
+            serde_json::Value::Null
+        } else {
+            serde_json::Value::Bool(true)
+        }
+    } else {
+        serde_json::Value::Bool(lv == rv)
+    }
 }
 
 pub(super) fn json_cmp(l: &serde_json::Value, r: &serde_json::Value) -> Option<std::cmp::Ordering> {

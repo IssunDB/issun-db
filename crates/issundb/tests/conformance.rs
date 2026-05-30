@@ -62,12 +62,21 @@ fn conformance_body() -> Result<(), String> {
 
     println!("TCK root: {:?}", features_root);
 
+    let filter = std::env::var("ISSUNDB_CONFORMANCE_FILTER").ok();
+
     // Collect all .feature files recursively.
     let feature_files: Vec<PathBuf> = WalkDir::new(&features_root)
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| e.path().extension().is_some_and(|ext| ext == "feature"))
         .map(|e| e.path().to_path_buf())
+        .filter(|p| {
+            if let Some(ref f) = filter {
+                p.to_string_lossy().contains(f)
+            } else {
+                true
+            }
+        })
         .collect();
 
     if feature_files.is_empty() {
@@ -1127,6 +1136,11 @@ fn run_scenario(scenario: &Scenario) -> Result<(), String> {
 /// against the quoted string literals that appear in the TCK result tables.
 fn normalize_value(v: serde_json::Value) -> serde_json::Value {
     match v {
+        serde_json::Value::Object(ref map)
+            if map.get("__type__").and_then(|t| t.as_str()) == Some("__NaN__") =>
+        {
+            serde_json::Value::Null
+        }
         serde_json::Value::Object(ref map) if map.contains_key("__str__") => {
             map.get("__str__").cloned().unwrap_or(v)
         }

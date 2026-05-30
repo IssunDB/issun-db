@@ -19,3 +19,8 @@ petgraph = "0.8"
 serde = { workspace = true }
 serde_json = { workspace = true }
 rfd = "=0.14.1"
+
+[[bin]]
+name = "issundb-gui"
+path = "src/main.rs"
+doc = false

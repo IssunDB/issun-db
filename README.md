@@ -19,13 +19,17 @@ A fast embedded graph database for AI applications and graph analytics
 
 ---
 
-### Key Features
+IssunDB is a fast, embedded graph database writen in Rust.
+It can be embedded in Rust applications without the need for a server, cand can be used for wide range of applications like building building
+GraphRAG pipleines and querying knowledge graphs.
 
-* Rust graph engine built on LMDB with ACID, property graph model, and Cypher query language support
-* Fast graph traversal and analytics using GraphBLAS-based sparse matrix operations
+### Features
+
+* Rust graph engine built on [LMDB](https://www.symas.com/mdb) with ACID, property graph model, and Cypher query language support
+* Fast graph traversal and analytics using [GraphBLAS](https://graphblas.org)-based sparse matrix operations
 * Buit-in vector, text, and hybrid search and retrieval support
-* Fully cross-platform support for Linux, macOS, and Windows
 * Can be used via a wide range of APIs, including native Rust, CLI, GUI, HTTP, and MCP
+* Fully cross-platform; supports Linux, macOS, and Windows
 * Bindings for Python and JavaScript (other languages coming soon)
 
 See [ROADMAP.md](ROADMAP.md) for the full list of implemented and planned features.

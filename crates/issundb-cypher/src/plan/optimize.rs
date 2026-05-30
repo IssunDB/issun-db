@@ -13,6 +13,10 @@ impl Optimizer {
     /// extracting filter predicates, and pushing them down to the lowest possible nodes.
     pub fn optimize(op: PhysicalOperator, stats: Option<&dyn StatsProvider>) -> PhysicalOperator {
         let (stripped_op, mut filters) = Self::extract_filters(op);
+        // Drop statically-true predicates so they are neither pushed down nor
+        // evaluated per row. Only provably-true forms are removed; false or
+        // unknown predicates are preserved for normal evaluation.
+        filters.retain(|f| !Self::is_trivially_true(f));
         let reordered_op = Self::reorder_operators(stripped_op, stats);
         // Choose the lowest-cardinality endpoint as the traversal start, reversing a
         // linear single-hop Expand chain when its far endpoint is cheaper to scan.
@@ -1851,6 +1855,19 @@ impl Optimizer {
         })
     }
 
+    /// Return true when a predicate is statically, unconditionally true and can be
+    /// dropped. Conservative: only literal-`true` and equality or inequality of two
+    /// identical-form literals are recognized; false or unknown predicates are not
+    /// touched (folding a false predicate to "drop" would change results).
+    fn is_trivially_true(f: &FilterExpr) -> bool {
+        match f {
+            FilterExpr::Expr(Expr::Literal(Literal::Bool(true))) => true,
+            FilterExpr::Eq(Expr::Literal(a), Expr::Literal(b)) => a == b,
+            FilterExpr::Ne(Expr::Literal(a), Expr::Literal(b)) => a != b,
+            _ => false,
+        }
+    }
+
     /// When one side of an equality is `id(var)` and the other is a literal or
     /// parameter, return the constant id expression; otherwise `None`. Used to
     /// rewrite `WHERE id(n) = <const>` into a primary-key seek.
@@ -2678,6 +2695,55 @@ mod tests {
             !finds_id_seek(&plan, "n"),
             "property eq must not seek: {plan:?}"
         );
+    }
+
+    /// Count the `Filter` operators remaining in a plan.
+    fn count_filters(op: &PhysicalOperator) -> usize {
+        match op {
+            PhysicalOperator::Filter { input, .. } => 1 + count_filters(input),
+            PhysicalOperator::Expand { input, .. }
+            | PhysicalOperator::Project { input, .. }
+            | PhysicalOperator::Aggregate { input, .. }
+            | PhysicalOperator::Sort { input, .. }
+            | PhysicalOperator::Limit { input, .. }
+            | PhysicalOperator::Distinct { input }
+            | PhysicalOperator::Unwind { input, .. }
+            | PhysicalOperator::OptionalMatch { input, .. }
+            | PhysicalOperator::MultiwayJoin { input, .. } => count_filters(input),
+            PhysicalOperator::HashJoin { left, right } => {
+                count_filters(left) + count_filters(right)
+            }
+            _ => 0,
+        }
+    }
+
+    #[test]
+    fn eliminate_true_filter_drops_literal_true() {
+        let stats = TestStats::new(&[("Person", 5)]);
+        let plan = optimize_query("MATCH (n:Person) WHERE true RETURN n", &stats);
+        assert_eq!(
+            count_filters(&plan),
+            0,
+            "WHERE true must be dropped: {plan:?}"
+        );
+        // The scan and projection survive.
+        assert!(bottom_scan(&plan).is_some());
+    }
+
+    #[test]
+    fn eliminate_true_filter_keeps_real_predicate() {
+        let stats = TestStats::new(&[("Person", 5)]);
+        let plan = optimize_query("MATCH (n:Person) WHERE n.age > 18 RETURN n", &stats);
+        assert_eq!(count_filters(&plan), 1, "a real predicate must be kept");
+    }
+
+    #[test]
+    fn eliminate_true_filter_does_not_drop_false() {
+        let stats = TestStats::new(&[("Person", 5)]);
+        // `1 = 2` is statically false and must be preserved (dropping it would
+        // wrongly turn an empty result into all rows).
+        let plan = optimize_query("MATCH (n:Person) WHERE 1 = 2 RETURN n", &stats);
+        assert_eq!(count_filters(&plan), 1, "a false predicate must be kept");
     }
 
     #[test]

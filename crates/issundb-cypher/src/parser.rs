@@ -2180,6 +2180,44 @@ fn validate_order_by_scope(parts: &[QueryPart]) -> Result<(), String> {
                         ));
                     }
                 }
+
+                let with_has_agg = items.iter().any(|item| expr_has_aggregation(&item.expr));
+                let order_by_has_agg = order_by
+                    .as_ref()
+                    .is_some_and(|ob| ob.items.iter().any(|si| expr_has_aggregation(&si.expr)));
+                if order_by_has_agg && !with_has_agg {
+                    return Err("SyntaxError: aggregation in ORDER BY is not allowed when WITH has no aggregation".to_string());
+                }
+
+                let has_with_agg = with_has_agg || order_by_has_agg;
+                if has_with_agg {
+                    if let Some(ob) = order_by {
+                        let grouping_keys = get_grouping_keys(items);
+                        let aliases: std::collections::HashSet<String> =
+                            items.iter().filter_map(|item| item.alias.clone()).collect();
+                        for si in &ob.items {
+                            let mut non_agg_props = Vec::new();
+                            collect_non_agg_props_in_expr(&si.expr, &mut non_agg_props);
+                            for (var, prop) in non_agg_props {
+                                let is_valid = if prop.is_empty() {
+                                    grouping_keys.contains(&var) || aliases.contains(&var)
+                                } else {
+                                    grouping_keys.contains(&format!("{}.{}", var, prop))
+                                        || grouping_keys.contains(&var)
+                                        || aliases.contains(&var)
+                                };
+                                if !is_valid {
+                                    return Err(format!(
+                                        "SyntaxError: variable '{}' referenced in aggregating ORDER BY \
+                                         is not a grouping key in WITH",
+                                        var
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // Apply the WITH scope barrier: the output scope replaces the input scope,
                 // except for `WITH *`, which keeps upstream variables and adds any aliases.
                 match output {
@@ -2199,11 +2237,690 @@ fn validate_order_by_scope(parts: &[QueryPart]) -> Result<(), String> {
     Ok(())
 }
 
+fn expr_has_aggregation(expr: &Expr) -> bool {
+    match expr {
+        Expr::CountStar | Expr::Agg(_, _) => true,
+        Expr::BinaryOp { left, right, .. } => {
+            expr_has_aggregation(left) || expr_has_aggregation(right)
+        }
+        Expr::Not(inner) | Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
+            expr_has_aggregation(inner)
+        }
+        Expr::FunctionCall { args, .. } => args.iter().any(expr_has_aggregation),
+        Expr::Case {
+            subject,
+            arms,
+            else_expr,
+        } => {
+            subject.as_ref().is_some_and(|s| expr_has_aggregation(s))
+                || arms
+                    .iter()
+                    .any(|a| expr_has_aggregation(&a.when) || expr_has_aggregation(&a.then))
+                || else_expr.as_ref().is_some_and(|e| expr_has_aggregation(e))
+        }
+        Expr::Subscript { expr, index } => {
+            expr_has_aggregation(expr) || expr_has_aggregation(index)
+        }
+        Expr::Slice { expr, start, end } => {
+            expr_has_aggregation(expr)
+                || start.as_ref().is_some_and(|s| expr_has_aggregation(s))
+                || end.as_ref().is_some_and(|e| expr_has_aggregation(e))
+        }
+        Expr::ListComprehension {
+            list,
+            predicate,
+            transform,
+            ..
+        } => {
+            expr_has_aggregation(list)
+                || predicate.as_ref().is_some_and(|p| expr_has_aggregation(p))
+                || transform.as_ref().is_some_and(|t| expr_has_aggregation(t))
+        }
+        Expr::Quantifier {
+            list, predicate, ..
+        } => expr_has_aggregation(list) || expr_has_aggregation(predicate),
+        _ => false,
+    }
+}
+
+fn collect_non_agg_props_in_expr(expr: &Expr, props: &mut Vec<(String, String)>) {
+    match expr {
+        Expr::CountStar | Expr::Agg(_, _) => {}
+        Expr::Prop(var, prop) => {
+            props.push((var.clone(), prop.clone()));
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            collect_non_agg_props_in_expr(left, props);
+            collect_non_agg_props_in_expr(right, props);
+        }
+        Expr::Not(inner) | Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
+            collect_non_agg_props_in_expr(inner, props);
+        }
+        Expr::FunctionCall { args, .. } => {
+            for arg in args {
+                collect_non_agg_props_in_expr(arg, props);
+            }
+        }
+        Expr::Case {
+            subject,
+            arms,
+            else_expr,
+        } => {
+            if let Some(s) = subject {
+                collect_non_agg_props_in_expr(s, props);
+            }
+            for arm in arms {
+                collect_non_agg_props_in_expr(&arm.when, props);
+                collect_non_agg_props_in_expr(&arm.then, props);
+            }
+            if let Some(e) = else_expr {
+                collect_non_agg_props_in_expr(e, props);
+            }
+        }
+        Expr::Subscript { expr, index } => {
+            collect_non_agg_props_in_expr(expr, props);
+            collect_non_agg_props_in_expr(index, props);
+        }
+        Expr::Slice { expr, start, end } => {
+            collect_non_agg_props_in_expr(expr, props);
+            if let Some(s) = start {
+                collect_non_agg_props_in_expr(s, props);
+            }
+            if let Some(e) = end {
+                collect_non_agg_props_in_expr(e, props);
+            }
+        }
+        Expr::ListComprehension {
+            list,
+            predicate,
+            transform,
+            ..
+        } => {
+            collect_non_agg_props_in_expr(list, props);
+            if let Some(p) = predicate {
+                collect_non_agg_props_in_expr(p, props);
+            }
+            if let Some(t) = transform {
+                collect_non_agg_props_in_expr(t, props);
+            }
+        }
+        Expr::Quantifier {
+            list, predicate, ..
+        } => {
+            collect_non_agg_props_in_expr(list, props);
+            collect_non_agg_props_in_expr(predicate, props);
+        }
+        Expr::HasLabel { variable, .. } => {
+            props.push((variable.clone(), "".to_string()));
+        }
+        Expr::Literal(_) | Expr::Param(_) => {}
+    }
+}
+
+fn get_grouping_keys(items: &[crate::ast::ReturnItem]) -> std::collections::HashSet<String> {
+    let mut keys = std::collections::HashSet::new();
+    for item in items {
+        if !expr_has_aggregation(&item.expr) {
+            if let Some(alias) = &item.alias {
+                keys.insert(alias.clone());
+            }
+            if let Expr::Prop(var, prop) = &item.expr {
+                if prop.is_empty() {
+                    keys.insert(var.clone());
+                } else {
+                    keys.insert(format!("{}.{}", var, prop));
+                }
+            }
+        }
+    }
+    keys
+}
+
+fn validate_query_order_by(query: &Query) -> Result<(), String> {
+    let mut bound = std::collections::HashSet::new();
+    for part in &query.parts {
+        match part {
+            QueryPart::Match { match_clauses, .. }
+            | QueryPart::OptionalMatch { match_clauses, .. } => {
+                for mc in match_clauses {
+                    collect_pattern_vars(&mc.pattern, &mut bound);
+                }
+            }
+            QueryPart::Unwind { variable, .. } => {
+                bound.insert(variable.clone());
+            }
+            QueryPart::Create { patterns } => {
+                for p in patterns {
+                    collect_pattern_vars(p, &mut bound);
+                }
+            }
+            QueryPart::Merge { merges } => {
+                for m in merges {
+                    collect_pattern_vars(&m.pattern, &mut bound);
+                }
+            }
+            QueryPart::With { items, .. } => {
+                let output = with_output_scope(items);
+                match output {
+                    Some(out) => bound = out,
+                    None => {
+                        for item in items {
+                            if let Some(a) = &item.alias {
+                                bound.insert(a.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(ref ob) = query.order_by {
+        let mut out = std::collections::HashSet::new();
+        for item in &query.return_clause.items {
+            if let Some(a) = &item.alias {
+                out.insert(a.clone());
+            } else if let Expr::Prop(var, prop) = &item.expr {
+                if prop.is_empty() {
+                    out.insert(var.clone());
+                } else {
+                    out.insert(format!("{}.{}", var, prop));
+                }
+            }
+        }
+
+        let mut refs = std::collections::HashSet::new();
+        for si in &ob.items {
+            collect_expr_vars(&si.expr, &mut refs);
+        }
+        if let Some(missing) = refs
+            .iter()
+            .find(|v| !bound.contains(*v) && !out.contains(*v))
+        {
+            return Err(format!(
+                "SyntaxError(UndefinedVariable): variable '{}' referenced in ORDER BY is not in scope",
+                missing
+            ));
+        }
+
+        if query.return_clause.distinct {
+            for si in &ob.items {
+                let mut props = Vec::new();
+                collect_non_agg_props_in_expr(&si.expr, &mut props);
+                for (var, prop) in props {
+                    let is_valid = if prop.is_empty() {
+                        out.contains(&var)
+                    } else {
+                        out.contains(&format!("{}.{}", var, prop)) || out.contains(&var)
+                    };
+                    if !is_valid {
+                        return Err(format!(
+                            "SyntaxError(UndefinedVariable): variable '{}' referenced in ORDER BY is not in DISTINCT scope",
+                            var
+                        ));
+                    }
+                }
+            }
+        }
+
+        let return_has_agg = query
+            .return_clause
+            .items
+            .iter()
+            .any(|item| expr_has_aggregation(&item.expr));
+        let order_by_has_agg = ob.items.iter().any(|si| expr_has_aggregation(&si.expr));
+        if order_by_has_agg && !return_has_agg {
+            return Err("SyntaxError: aggregation in ORDER BY is not allowed when RETURN has no aggregation".to_string());
+        }
+
+        let has_agg = return_has_agg || order_by_has_agg;
+        if has_agg {
+            let grouping_keys = get_grouping_keys(&query.return_clause.items);
+            let aliases: std::collections::HashSet<String> = query
+                .return_clause
+                .items
+                .iter()
+                .filter_map(|item| item.alias.clone())
+                .collect();
+            for si in &ob.items {
+                let mut non_agg_props = Vec::new();
+                collect_non_agg_props_in_expr(&si.expr, &mut non_agg_props);
+                for (var, prop) in non_agg_props {
+                    let is_valid = if prop.is_empty() {
+                        grouping_keys.contains(&var) || aliases.contains(&var)
+                    } else {
+                        grouping_keys.contains(&format!("{}.{}", var, prop))
+                            || grouping_keys.contains(&var)
+                            || aliases.contains(&var)
+                    };
+                    if !is_valid {
+                        return Err(format!(
+                            "SyntaxError: variable '{}' referenced in aggregating ORDER BY \
+                             is not a grouping key in RETURN",
+                            var
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn collect_path_vars_in_stmt(stmt: &Statement, vars: &mut std::collections::HashSet<String>) {
+    match stmt {
+        Statement::Query(q) => {
+            for mc in &q.match_clauses {
+                if let Some(ref pv) = mc.pattern.path_variable {
+                    vars.insert(pv.clone());
+                }
+            }
+            for part in &q.parts {
+                match part {
+                    QueryPart::Match { match_clauses, .. }
+                    | QueryPart::OptionalMatch { match_clauses, .. } => {
+                        for mc in match_clauses {
+                            if let Some(ref pv) = mc.pattern.path_variable {
+                                vars.insert(pv.clone());
+                            }
+                        }
+                    }
+                    QueryPart::Create { patterns } => {
+                        for pat in patterns {
+                            if let Some(ref pv) = pat.path_variable {
+                                vars.insert(pv.clone());
+                            }
+                        }
+                    }
+                    QueryPart::Merge { merges } => {
+                        for m in merges {
+                            if let Some(ref pv) = m.pattern.path_variable {
+                                vars.insert(pv.clone());
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Statement::Create(c) => {
+            for pat in &c.patterns {
+                if let Some(ref pv) = pat.path_variable {
+                    vars.insert(pv.clone());
+                }
+            }
+        }
+        Statement::Set(s) => {
+            for mc in &s.match_clauses {
+                if let Some(ref pv) = mc.pattern.path_variable {
+                    vars.insert(pv.clone());
+                }
+            }
+        }
+        Statement::Delete(d) => {
+            for mc in &d.match_clauses {
+                if let Some(ref pv) = mc.pattern.path_variable {
+                    vars.insert(pv.clone());
+                }
+            }
+        }
+        Statement::Merge(m) => {
+            if let Some(ref pv) = m.pattern.path_variable {
+                vars.insert(pv.clone());
+            }
+        }
+        Statement::Remove(r) => {
+            for mc in &r.match_clauses {
+                if let Some(ref pv) = mc.pattern.path_variable {
+                    vars.insert(pv.clone());
+                }
+            }
+        }
+        Statement::Union(u) => {
+            collect_path_vars_in_stmt(&u.left, vars);
+            collect_path_vars_in_stmt(&u.right, vars);
+        }
+        Statement::CreateAndReturn(cr) => {
+            for pat in &cr.patterns {
+                if let Some(ref pv) = pat.path_variable {
+                    vars.insert(pv.clone());
+                }
+            }
+        }
+        Statement::SetAndReturn(sr) => {
+            for mc in &sr.match_clauses {
+                if let Some(ref pv) = mc.pattern.path_variable {
+                    vars.insert(pv.clone());
+                }
+            }
+        }
+        Statement::MergeAndReturn(mr) => {
+            for m in &mr.merges {
+                if let Some(ref pv) = m.pattern.path_variable {
+                    vars.insert(pv.clone());
+                }
+            }
+        }
+        Statement::DeleteAndReturn(dr) => {
+            for mc in &dr.match_clauses {
+                if let Some(ref pv) = mc.pattern.path_variable {
+                    vars.insert(pv.clone());
+                }
+            }
+        }
+        Statement::RemoveAndReturn(rr) => {
+            for mc in &rr.match_clauses {
+                if let Some(ref pv) = mc.pattern.path_variable {
+                    vars.insert(pv.clone());
+                }
+            }
+        }
+        Statement::Foreach(f) => {
+            for s in &f.body {
+                collect_path_vars_in_stmt(s, vars);
+            }
+        }
+        Statement::Pipeline(stmts) => {
+            for s in stmts {
+                collect_path_vars_in_stmt(s, vars);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn has_aggregation(expr: &Expr) -> bool {
+    match expr {
+        Expr::CountStar | Expr::Agg(_, _) => true,
+        Expr::Quantifier {
+            list, predicate, ..
+        } => has_aggregation(list) || has_aggregation(predicate),
+        Expr::FunctionCall { args, .. } => args.iter().any(has_aggregation),
+        Expr::BinaryOp { left, right, .. } => has_aggregation(left) || has_aggregation(right),
+        Expr::IsNull(inner) | Expr::IsNotNull(inner) | Expr::Not(inner) => has_aggregation(inner),
+        Expr::Case {
+            subject,
+            arms,
+            else_expr,
+        } => {
+            subject.as_ref().is_some_and(|s| has_aggregation(s))
+                || arms
+                    .iter()
+                    .any(|a| has_aggregation(&a.when) || has_aggregation(&a.then))
+                || else_expr.as_ref().is_some_and(|e| has_aggregation(e))
+        }
+        Expr::Subscript { expr, index } => has_aggregation(expr) || has_aggregation(index),
+        Expr::Slice { expr, start, end } => {
+            has_aggregation(expr)
+                || start.as_ref().is_some_and(|s| has_aggregation(s))
+                || end.as_ref().is_some_and(|e| has_aggregation(e))
+        }
+        Expr::ListComprehension {
+            list,
+            predicate,
+            transform,
+            ..
+        } => {
+            has_aggregation(list)
+                || predicate.as_ref().is_some_and(|p| has_aggregation(p))
+                || transform.as_ref().is_some_and(|t| has_aggregation(t))
+        }
+        _ => false,
+    }
+}
+
+fn check_expr_size_on_path(
+    expr: &Expr,
+    path_vars: &std::collections::HashSet<String>,
+) -> Result<(), String> {
+    match expr {
+        Expr::FunctionCall { name, args } => {
+            if name.to_lowercase() == "size" && args.len() == 1 {
+                if let Expr::Prop(var, prop) = &args[0] {
+                    if prop.is_empty() && path_vars.contains(var) {
+                        return Err(format!(
+                            "TypeError: size() cannot be applied to path variable '{}'",
+                            var
+                        ));
+                    }
+                }
+            }
+            for a in args {
+                check_expr_size_on_path(a, path_vars)?;
+            }
+        }
+        Expr::Agg(_, inner) | Expr::Not(inner) | Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
+            check_expr_size_on_path(inner, path_vars)?;
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            check_expr_size_on_path(left, path_vars)?;
+            check_expr_size_on_path(right, path_vars)?;
+        }
+        Expr::Case {
+            subject,
+            arms,
+            else_expr,
+        } => {
+            if let Some(s) = subject {
+                check_expr_size_on_path(s, path_vars)?;
+            }
+            for a in arms {
+                check_expr_size_on_path(&a.when, path_vars)?;
+                check_expr_size_on_path(&a.then, path_vars)?;
+            }
+            if let Some(e) = else_expr {
+                check_expr_size_on_path(e, path_vars)?;
+            }
+        }
+        Expr::Subscript { expr: e, index } => {
+            check_expr_size_on_path(e, path_vars)?;
+            check_expr_size_on_path(index, path_vars)?;
+        }
+        Expr::Slice {
+            expr: e,
+            start,
+            end,
+        } => {
+            check_expr_size_on_path(e, path_vars)?;
+            if let Some(s) = start {
+                check_expr_size_on_path(s, path_vars)?;
+            }
+            if let Some(ed) = end {
+                check_expr_size_on_path(ed, path_vars)?;
+            }
+        }
+        Expr::ListComprehension {
+            list,
+            predicate,
+            transform,
+            ..
+        } => {
+            if predicate.as_ref().is_some_and(|p| has_aggregation(p))
+                || transform.as_ref().is_some_and(|t| has_aggregation(t))
+            {
+                return Err(
+                    "TypeError: list comprehension cannot contain aggregation functions"
+                        .to_string(),
+                );
+            }
+            check_expr_size_on_path(list, path_vars)?;
+            if let Some(p) = predicate {
+                check_expr_size_on_path(p, path_vars)?;
+            }
+            if let Some(t) = transform {
+                check_expr_size_on_path(t, path_vars)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn check_where_clause(
+    wc: &WhereClause,
+    path_vars: &std::collections::HashSet<String>,
+) -> Result<(), String> {
+    match wc {
+        WhereClause::Eq(l, r)
+        | WhereClause::Ne(l, r)
+        | WhereClause::Lt(l, r)
+        | WhereClause::Gt(l, r)
+        | WhereClause::Le(l, r)
+        | WhereClause::Ge(l, r) => {
+            check_expr_size_on_path(l, path_vars)?;
+            check_expr_size_on_path(r, path_vars)?;
+        }
+        WhereClause::Expr(e) => {
+            check_expr_size_on_path(e, path_vars)?;
+        }
+    }
+    Ok(())
+}
+
+fn check_statement_exprs(
+    stmt: &Statement,
+    path_vars: &std::collections::HashSet<String>,
+) -> Result<(), String> {
+    match stmt {
+        Statement::Query(q) => {
+            if let Some(wc) = &q.where_clause {
+                check_where_clause(wc, path_vars)?;
+            }
+            for ri in &q.return_clause.items {
+                check_expr_size_on_path(&ri.expr, path_vars)?;
+            }
+            if let Some(ob) = &q.order_by {
+                for si in &ob.items {
+                    check_expr_size_on_path(&si.expr, path_vars)?;
+                }
+            }
+            if let Some(e) = &q.skip {
+                check_expr_size_on_path(e, path_vars)?;
+            }
+            if let Some(e) = &q.limit {
+                check_expr_size_on_path(e, path_vars)?;
+            }
+            for part in &q.parts {
+                check_query_part_exprs(part, path_vars)?;
+            }
+        }
+        Statement::Set(s) => {
+            for part in &s.match_clauses {
+                if let Some(ref props) = part.pattern.node.properties {
+                    for v in props.values() {
+                        check_expr_size_on_path(v, path_vars)?;
+                    }
+                }
+                for (rel, target) in &part.pattern.rels {
+                    if let Some(ref props) = rel.properties {
+                        for v in props.values() {
+                            check_expr_size_on_path(v, path_vars)?;
+                        }
+                    }
+                    if let Some(ref props) = target.properties {
+                        for v in props.values() {
+                            check_expr_size_on_path(v, path_vars)?;
+                        }
+                    }
+                }
+            }
+        }
+        Statement::Delete(_) | Statement::Remove(_) => {}
+        Statement::Union(u) => {
+            check_statement_exprs(&u.left, path_vars)?;
+            check_statement_exprs(&u.right, path_vars)?;
+        }
+        Statement::SetAndReturn(sr) => {
+            for ri in &sr.return_clause.items {
+                check_expr_size_on_path(&ri.expr, path_vars)?;
+            }
+        }
+        Statement::DeleteAndReturn(dr) => {
+            for ri in &dr.return_clause.items {
+                check_expr_size_on_path(&ri.expr, path_vars)?;
+            }
+        }
+        Statement::RemoveAndReturn(rr) => {
+            for ri in &rr.return_clause.items {
+                check_expr_size_on_path(&ri.expr, path_vars)?;
+            }
+        }
+        Statement::Foreach(f) => {
+            check_expr_size_on_path(&f.list, path_vars)?;
+            for s in &f.body {
+                check_statement_exprs(s, path_vars)?;
+            }
+        }
+        Statement::Pipeline(stmts) => {
+            for s in stmts {
+                check_statement_exprs(s, path_vars)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn check_query_part_exprs(
+    part: &QueryPart,
+    path_vars: &std::collections::HashSet<String>,
+) -> Result<(), String> {
+    match part {
+        QueryPart::Match { where_clause, .. } | QueryPart::OptionalMatch { where_clause, .. } => {
+            if let Some(wc) = where_clause {
+                check_where_clause(wc, path_vars)?;
+            }
+        }
+        QueryPart::With {
+            items,
+            where_clause,
+            order_by,
+            skip,
+            limit,
+            ..
+        } => {
+            for ri in items {
+                check_expr_size_on_path(&ri.expr, path_vars)?;
+            }
+            if let Some(wc) = where_clause {
+                check_where_clause(wc, path_vars)?;
+            }
+            if let Some(ob) = order_by {
+                for si in &ob.items {
+                    check_expr_size_on_path(&si.expr, path_vars)?;
+                }
+            }
+            if let Some(e) = skip {
+                check_expr_size_on_path(e, path_vars)?;
+            }
+            if let Some(e) = limit {
+                check_expr_size_on_path(e, path_vars)?;
+            }
+        }
+        QueryPart::Unwind { expr, .. } => {
+            check_expr_size_on_path(expr, path_vars)?;
+        }
+        QueryPart::Set { items } => {
+            for si in items {
+                check_expr_size_on_path(&si.expr, path_vars)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 fn validate_statement(stmt: &Statement) -> Result<(), String> {
+    let mut path_vars = std::collections::HashSet::new();
+    collect_path_vars_in_stmt(stmt, &mut path_vars);
+    check_statement_exprs(stmt, &path_vars)?;
+
     match stmt {
         Statement::Query(q) => {
             validate_cross_clause_variable_types(&q.parts)?;
             validate_order_by_scope(&q.parts)?;
+            validate_query_order_by(q)?;
             for part in &q.parts {
                 match part {
                     QueryPart::Match { match_clauses, .. } => {

@@ -47,7 +47,10 @@ nav:
   - Getting Started: getting-started.md
   - Examples: examples.md
   - API Reference: api-reference.md
+  - Query Optimizer: query-optimizer.md
   - Current Limitations: limitations.md
+  - Design Notes:
+      - Execution Engine: design/execution-engine.md
 
 markdown_extensions:
   - pymdownx.highlight:

@@ -55,7 +55,8 @@ Do not invent modules that do not yet exist when answering questions, but do pla
     - `src/storage/ids.rs`: monotonic ID allocation and string-to-integer registries for labels and edge types, persisted in the `meta` sub-database.
     - `src/storage/props.rs`: msgpack encode and decode helpers via `rmp-serde`.
     - `src/storage/fts.rs`: full-text index storage primitives (postings and document tables) inside the LMDB environment.
-    - `src/graph/mod.rs`: `Graph`, `ReadTxn`, `WriteTxn` struct definitions and lifecycle methods (`open`, `view`, `update`, `backup`, `restore`, `rebuild_csr`).
+    - `src/graph/mod.rs`: `Graph`, `ReadTxn`, `WriteTxn` struct definitions and lifecycle methods (`open`, `view`, `update`, `backup`, `restore`,
+      `rebuild_csr`).
     - `src/graph/node.rs`: node CRUD (`add_node`, `get_node`, `update_node`, `delete_node`).
     - `src/graph/edge.rs`: edge CRUD and adjacency (`add_edge`, `get_edge`, `delete_edge`, `out_neighbors`, `in_neighbors`).
     - `src/graph/index.rs`: label and type indexes, property indexes, constraints, and property scan methods.
@@ -74,7 +75,8 @@ Do not invent modules that do not yet exist when answering questions, but do pla
     - `src/ast.rs`: AST node types.
     - `src/plan/`: logical planner, physical planner, optimizer, and statistics helpers.
     - `src/exec/mod.rs`: public entry points (`execute`, `explain`), shared type definitions, and tests.
-    - `src/exec/read.rs`: `execute_physical` and read-path helpers (`evaluate_where`, `evaluate_sort_key`, `json_to_prop_value`, `execute_filter_over_expand`).
+    - `src/exec/read.rs`: `execute_physical` and read-path helpers (`evaluate_where`, `evaluate_sort_key`, `json_to_prop_value`,
+      `execute_filter_over_expand`).
     - `src/exec/factorize.rs`: `FactorizedRecordGroup` (shared `Arc<PathMap>` prefix plus per-row extensions) and `filter_refs_in_expr`.
     - `src/exec/expr.rs`: expression evaluation (`evaluate_expr`, `eval_binary_op`, `eval_arithmetic`, `eval_function_call`).
     - `src/exec/write.rs`: mutation execution (`execute_create`, `execute_set`, `execute_delete`, `execute_merge`).
@@ -244,7 +246,8 @@ HTTP REST API server built on Axum and Tokio.
 Depends only on `issundb`; must not import lower-level crates directly. All handlers share a single `Arc<Graph>` instance.
 
 Data and query routes are versioned under a `/v1` prefix.
-`GET /health` stays unversioned so infrastructure probes do not track the API version; its body reports the crate `version` and the current `api` version.
+`GET /health` stays unversioned so infrastructure probes do not track the API version; its body reports the crate `version` and the current `api`
+version.
 
 Routes:
 

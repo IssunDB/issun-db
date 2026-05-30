@@ -142,8 +142,10 @@ careful: ## Run tests under cargo-careful (detects undefined behavior and unsafe
 
 .PHONY: docs
 docs: format ## Generate the documentation
-	@echo "Generating documentation..."
+	@echo "Generating Rust API documentation..."
 	@cargo doc --no-deps --document-private-items
+	@echo "Generating MkDocs documentation..."
+	@uv run python -c "import yaml.nodes; import yaml; yaml.Node = yaml.nodes.Node; from mkdocs.__main__ import cli; cli()" build
 
 .PHONE: figs
 figs: ## Generate the figures in the assets directory

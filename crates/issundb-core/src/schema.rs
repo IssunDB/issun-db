@@ -81,7 +81,7 @@ pub struct EdgeRecord {
 }
 
 /// The result of a single adjacency lookup entry returned by
-/// [`Graph::out_neighbors`] and [`Graph::in_neighbors`].
+/// [`crate::Graph::out_neighbors`] and [`crate::Graph::in_neighbors`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct NeighborEntry {
     pub node: NodeId,
@@ -89,7 +89,7 @@ pub struct NeighborEntry {
     pub edge_type: TypeId,
 }
 
-/// A neighbor entry with a direction flag, returned by [`Graph::all_neighbors`].
+/// A neighbor entry with a direction flag, returned by [`crate::Graph::all_neighbors`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct DirectedNeighborEntry {
     pub node: NodeId,

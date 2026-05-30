@@ -201,7 +201,7 @@ pub(super) fn projected_key(expr: &Expr, alias: &Option<String>) -> String {
 
 /// Return a human-readable name for an expression, used as the default column name
 /// when no alias is specified in a RETURN or WITH clause.
-pub(super) fn expr_display_name(expr: &Expr) -> String {
+pub(crate) fn expr_display_name(expr: &Expr) -> String {
     match expr {
         Expr::Prop(var, prop) => {
             if prop.is_empty() {
@@ -349,6 +349,49 @@ pub(super) fn expr_display_name(expr: &Expr) -> String {
     }
 }
 
+pub(super) fn unpack_sentinels(graph: &Graph, val: serde_json::Value) -> serde_json::Value {
+    match val {
+        serde_json::Value::Object(map) => {
+            if let Some(serde_json::Value::String(t)) = map.get("__type__") {
+                if t == "__Node__" {
+                    if let Some(id_val) = map.get("id").and_then(|i| i.as_i64()) {
+                        let id = id_val as u64;
+                        if let Ok(Some(record)) = graph.get_node(id) {
+                            if let Ok(props) =
+                                rmp_serde::from_slice::<serde_json::Value>(&record.props)
+                            {
+                                return unpack_sentinels(graph, props);
+                            }
+                        }
+                    }
+                } else if t == "__Edge__" {
+                    if let Some(id_val) = map.get("id").and_then(|i| i.as_i64()) {
+                        let id = id_val as u64;
+                        if let Ok(Some(record)) = graph.get_edge(id) {
+                            if let Ok(props) =
+                                rmp_serde::from_slice::<serde_json::Value>(&record.props)
+                            {
+                                return unpack_sentinels(graph, props);
+                            }
+                        }
+                    }
+                }
+            }
+            serde_json::Value::Object(
+                map.into_iter()
+                    .map(|(k, v)| (k, unpack_sentinels(graph, v)))
+                    .collect(),
+            )
+        }
+        serde_json::Value::Array(arr) => serde_json::Value::Array(
+            arr.into_iter()
+                .map(|v| unpack_sentinels(graph, v))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
 /// Convert a `GraphBinding` entry from a projected `PathMap` into a JSON value.
 ///
 /// `Node` and `Edge` bindings that survive projection (e.g., `WITH n RETURN n`) are
@@ -359,7 +402,7 @@ pub(super) fn binding_to_value(
 ) -> Result<serde_json::Value, String> {
     match binding {
         None => Ok(serde_json::Value::Null),
-        Some(GraphBinding::Scalar(v)) => Ok(v.clone()),
+        Some(GraphBinding::Scalar(v)) => Ok(unpack_sentinels(graph, v.clone())),
         Some(GraphBinding::Node(id)) => {
             let record = graph
                 .get_node(*id)
@@ -1020,20 +1063,27 @@ pub(super) fn execute_physical(
                 Some(n) => n as NodeId,
                 None => return Ok(vec![]),
             };
-            match graph.get_node(nid).map_err(|e| e.to_string())? {
-                Some(record) => {
-                    // Enforce the label predicate the seek replaced, if any.
-                    if let Some(lbl) = label {
-                        let name = graph.label_name(record.label).map_err(|e| e.to_string())?;
-                        if name.as_deref() != Some(lbl.as_str()) {
-                            return Ok(vec![]);
+            // Fetch the node and resolve its label in a single read transaction,
+            // enforcing the label predicate the seek replaced.
+            let matched = graph
+                .view(|txn| {
+                    let Some(record) = txn.get_node(nid)? else {
+                        return Ok(false);
+                    };
+                    match label {
+                        Some(lbl) => {
+                            Ok(txn.label_name(record.label)?.as_deref() == Some(lbl.as_str()))
                         }
+                        None => Ok(true),
                     }
-                    let mut path = PathMap::new();
-                    path.insert(variable.clone(), GraphBinding::Node(nid));
-                    Ok(vec![path])
-                }
-                None => Ok(vec![]),
+                })
+                .map_err(|e| e.to_string())?;
+            if matched {
+                let mut path = PathMap::new();
+                path.insert(variable.clone(), GraphBinding::Node(nid));
+                Ok(vec![path])
+            } else {
+                Ok(vec![])
             }
         }
         PhysicalOperator::Expand {
@@ -1489,6 +1539,10 @@ pub(super) fn execute_physical(
 
             // group_key -> (group-by PathMap, per-aggregation state Vec)
             let mut groups: BTreeMap<String, (PathMap, Vec<AggState>)> = BTreeMap::new();
+            if group_by.is_empty() {
+                let states = aggregations.iter().map(|_| AggState::new()).collect();
+                groups.insert("".to_string(), (PathMap::new(), states));
+            }
 
             for path in child_paths {
                 let mut key_parts = Vec::new();
@@ -1831,6 +1885,63 @@ pub(super) fn execute_physical(
                                     }
                                     graph.update_edge(*eid, &props).map_err(|e| e.to_string())?;
                                 }
+                                Some(GraphBinding::Scalar(val)) => {
+                                    if let Some(obj) = val.as_object() {
+                                        if obj.get("__type__").and_then(|t| t.as_str())
+                                            == Some("__Node__")
+                                        {
+                                            if let Some(id_val) =
+                                                obj.get("id").and_then(|i| i.as_i64())
+                                            {
+                                                let nid = id_val as u64;
+                                                let new_val = evaluate_expr(
+                                                    graph, &path, &item.expr, params,
+                                                )?;
+                                                let record = graph
+                                                    .get_node(nid)
+                                                    .map_err(|e| e.to_string())?
+                                                    .ok_or_else(|| {
+                                                        format!("node not found: {}", nid)
+                                                    })?;
+                                                let mut props: serde_json::Value =
+                                                    rmp_serde::from_slice(&record.props)
+                                                        .map_err(|e| e.to_string())?;
+                                                if let Some(o) = props.as_object_mut() {
+                                                    o.insert(item.property.clone(), new_val);
+                                                }
+                                                graph
+                                                    .update_node(nid, &props)
+                                                    .map_err(|e| e.to_string())?;
+                                            }
+                                        } else if obj.get("__type__").and_then(|t| t.as_str())
+                                            == Some("__Edge__")
+                                        {
+                                            if let Some(id_val) =
+                                                obj.get("id").and_then(|i| i.as_i64())
+                                            {
+                                                let eid = id_val as u64;
+                                                let new_val = evaluate_expr(
+                                                    graph, &path, &item.expr, params,
+                                                )?;
+                                                let record = graph
+                                                    .get_edge(eid)
+                                                    .map_err(|e| e.to_string())?
+                                                    .ok_or_else(|| {
+                                                        format!("edge not found: {}", eid)
+                                                    })?;
+                                                let mut props: serde_json::Value =
+                                                    rmp_serde::from_slice(&record.props)
+                                                        .map_err(|e| e.to_string())?;
+                                                if let Some(o) = props.as_object_mut() {
+                                                    o.insert(item.property.clone(), new_val);
+                                                }
+                                                graph
+                                                    .update_edge(eid, &props)
+                                                    .map_err(|e| e.to_string())?;
+                                            }
+                                        }
+                                    }
+                                }
                                 _ => {}
                             }
                         }
@@ -1861,6 +1972,50 @@ pub(super) fn execute_physical(
                                 }
                                 Some(GraphBinding::Edge(eid)) => {
                                     graph.delete_edge(*eid).map_err(|e| e.to_string())?;
+                                }
+                                Some(GraphBinding::Scalar(val)) => {
+                                    if let Some(obj) = val.as_object() {
+                                        if obj.get("__type__").and_then(|t| t.as_str())
+                                            == Some("__Node__")
+                                        {
+                                            if let Some(id_val) =
+                                                obj.get("id").and_then(|i| i.as_i64())
+                                            {
+                                                let nid = id_val as u64;
+                                                if *detach {
+                                                    let out_neighbors = graph
+                                                        .out_neighbors(nid)
+                                                        .map_err(|e| e.to_string())?;
+                                                    for entry in out_neighbors {
+                                                        graph
+                                                            .delete_edge(entry.edge)
+                                                            .map_err(|e| e.to_string())?;
+                                                    }
+                                                    let in_neighbors = graph
+                                                        .in_neighbors(nid)
+                                                        .map_err(|e| e.to_string())?;
+                                                    for entry in in_neighbors {
+                                                        graph
+                                                            .delete_edge(entry.edge)
+                                                            .map_err(|e| e.to_string())?;
+                                                    }
+                                                }
+                                                graph
+                                                    .delete_node(nid)
+                                                    .map_err(|e| e.to_string())?;
+                                            }
+                                        } else if obj.get("__type__").and_then(|t| t.as_str())
+                                            == Some("__Edge__")
+                                        {
+                                            if let Some(id_val) =
+                                                obj.get("id").and_then(|i| i.as_i64())
+                                            {
+                                                graph
+                                                    .delete_edge(id_val as u64)
+                                                    .map_err(|e| e.to_string())?;
+                                            }
+                                        }
+                                    }
                                 }
                                 _ => {}
                             }
@@ -2072,18 +2227,37 @@ pub(super) fn canonical_function_name(name: &str) -> &str {
 
 /// Total ordering for JSON values used by min/max aggregation.
 /// Numbers compare numerically; strings compare lexicographically.
-/// Cross-type order: null < bool < number < string < array < object.
+/// Cross-type order according to openCypher: Map < List < String < Boolean < Number < Null.
 pub(super) fn json_cmp_total(l: &serde_json::Value, r: &serde_json::Value) -> std::cmp::Ordering {
     use serde_json::Value;
     fn type_rank(v: &Value) -> u8 {
-        match v {
-            Value::Null => 0,
-            Value::Bool(_) => 1,
-            Value::Number(_) => 2,
-            Value::String(_) => 3,
-            Value::Array(_) => 4,
-            Value::Object(_) => 5,
+        if crate::exec::expr::is_nan(v) {
+            return 4;
         }
+        match v {
+            Value::Object(_) => 0,
+            Value::Array(_) => 1,
+            Value::String(_) => 2,
+            Value::Bool(_) => 3,
+            Value::Number(_) => 4,
+            Value::Null => 5,
+        }
+    }
+    let is_l_nan = crate::exec::expr::is_nan(l);
+    let is_r_nan = crate::exec::expr::is_nan(r);
+    match (is_l_nan, is_r_nan) {
+        (true, true) => return std::cmp::Ordering::Equal,
+        (true, false) => {
+            if type_rank(r) == 4 {
+                return std::cmp::Ordering::Greater;
+            }
+        }
+        (false, true) => {
+            if type_rank(l) == 4 {
+                return std::cmp::Ordering::Less;
+            }
+        }
+        (false, false) => {}
     }
     let lr = type_rank(l);
     let rr = type_rank(r);
@@ -2103,6 +2277,16 @@ pub(super) fn json_cmp_total(l: &serde_json::Value, r: &serde_json::Value) -> st
             }
         }
         (Value::String(a), Value::String(b)) => a.cmp(b),
+        (Value::Array(a), Value::Array(b)) => {
+            let min_len = a.len().min(b.len());
+            for i in 0..min_len {
+                let cmp = json_cmp_total(&a[i], &b[i]);
+                if cmp != std::cmp::Ordering::Equal {
+                    return cmp;
+                }
+            }
+            a.len().cmp(&b.len())
+        }
         _ => json_cmp(l, r).unwrap_or(std::cmp::Ordering::Equal),
     }
 }
