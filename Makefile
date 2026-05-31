@@ -18,7 +18,7 @@ CAREFUL_VERSION := 0.4.8
 
 .PHONY: help
 help: ## Show help messages for all available targets
-	@grep -E '^[a-zA-Z_-]+:.*## .*$$' Makefile | \
+	@grep -E '^[a-zA-Z0-9_-]+:.*## .*$$' Makefile | \
 	awk 'BEGIN {FS = ":.*## "}; {printf "\033[36m%-30s\033[0m %s\n", $$1, $$2}'
 
 .PHONY: format
@@ -50,6 +50,21 @@ coverage: format ## Generate test coverage report
 build: format ## Build the binary for the current platform
 	@echo "Building the project..."
 	@DEBUG_PROJ=$(DEBUG_PROJ) cargo build --release
+
+.PHONY: build-zig
+build-zig: format ## Build the release binary using `cargo-zigbuild`
+	@echo "Building the project with cargo-zigbuild..."
+	@DEBUG_PROJ=$(DEBUG_PROJ) cargo zigbuild --release
+
+.PHONY: build-zig-x64
+build-zig-x64: format ## Cross-compile the release binary for x86_64 Linux using `cargo-zigbuild`
+	@echo "Cross-compiling for x86_64-unknown-linux-gnu..."
+	@DEBUG_PROJ=$(DEBUG_PROJ) cargo zigbuild --release --target x86_64-unknown-linux-gnu
+
+.PHONY: build-zig-arm64
+build-zig-arm64: format ## Cross-compile the release binary for AArch64 Linux using `cargo-zigbuild`
+	@echo "Cross-compiling for aarch64-unknown-linux-gnu..."
+	@DEBUG_PROJ=$(DEBUG_PROJ) cargo zigbuild --release --target aarch64-unknown-linux-gnu
 
 .PHONY: run
 run: build ## Build and run the binary

@@ -73,6 +73,8 @@
               pkgs.llvmPackages.libclang
               pkgs.clang
               pkgs.pre-commit
+              pkgs.zig
+              pkgs.cargo-zigbuild
 
               # Dev tools used in Makefile
               pkgs.cargo-tarpaulin
