@@ -1,9 +1,8 @@
 pub(crate) mod csr;
-pub mod error;
-pub mod graph;
-pub mod matrices;
-pub mod metrics;
-pub mod schema;
+mod error;
+mod graph;
+pub(crate) mod matrices;
+mod schema;
 pub(crate) mod storage;
 
 pub use error::Error;

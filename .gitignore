@@ -89,3 +89,5 @@ data/
 test_data/*/db/lock.mdb
 *.mdb
 site/
+node_modules/
+package-lock.json

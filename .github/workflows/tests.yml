@@ -12,6 +12,11 @@ on:
       - '**.md'
       - 'docs/**'
   push:
+    branches:
+      - main
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
     tags:
       - 'v*'
 

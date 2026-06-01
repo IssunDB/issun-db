@@ -213,8 +213,13 @@ impl Graph {
 
     /// Returns neighbor entries for all outgoing edges of `node`.
     ///
-    /// Uses the in-memory CSR snapshot when the node is present in it; falls
-    /// back to an LMDB cursor for nodes added since the last rebuild.
+    /// Reads the `out_adj` store directly through the supplied transaction so
+    /// the result always reflects committed (and, inside a [`WriteTxn`],
+    /// uncommitted) writes. The CSR snapshot is deliberately not consulted here:
+    /// it lags writes until the background rebuild runs, so serving point
+    /// lookups from it would return deleted edges, hide newly added ones, and
+    /// disagree with [`Self::in_neighbors`]. The snapshot remains the basis for
+    /// the GraphBLAS matrix algorithms, which have explicit snapshot semantics.
     pub fn out_neighbors(&self, node: NodeId) -> Result<Vec<NeighborEntry>, Error> {
         let rtxn = self.storage.env.read_txn()?;
         self.out_neighbors_impl(&rtxn, node)
@@ -225,17 +230,6 @@ impl Graph {
         rtxn: &heed::RoTxn,
         node: NodeId,
     ) -> Result<Vec<NeighborEntry>, Error> {
-        let snap = self.csr_cache.snapshot.load();
-        if let Some(neighbors) = snap.out_neighbors(node) {
-            return Ok(neighbors
-                .into_iter()
-                .map(|(node, edge, edge_type)| NeighborEntry {
-                    node,
-                    edge,
-                    edge_type,
-                })
-                .collect());
-        }
         self.adj_entries_impl(rtxn, node, true)
     }
 
@@ -264,5 +258,101 @@ impl Graph {
             return Ok(true);
         }
         Ok(!self.adj_entries_impl(&rtxn, node, false)?.is_empty())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::TempDir;
+
+    use super::*;
+
+    fn open_tmp() -> (TempDir, Graph) {
+        let dir = TempDir::new().unwrap();
+        let g = Graph::open(dir.path(), 1).unwrap();
+        (dir, g)
+    }
+
+    /// After a CSR rebuild captures a node into the snapshot, adding an edge to
+    /// that node must be visible through `out_neighbors`. The snapshot lags
+    /// writes, so consulting it for point lookups would hide the new edge.
+    #[test]
+    fn out_neighbors_reflects_edge_added_after_snapshot() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("N", &()).unwrap();
+        let b = g.add_node("N", &()).unwrap();
+
+        // Force a snapshot that includes `a` with zero outgoing edges.
+        g.rebuild_csr().unwrap();
+        assert!(g.out_neighbors(a).unwrap().is_empty());
+
+        let eid = g.add_edge(a, b, "E", &()).unwrap();
+
+        let out = g.out_neighbors(a).unwrap();
+        assert_eq!(out.len(), 1, "new edge must be visible despite stale CSR");
+        assert_eq!(out[0].edge, eid);
+        assert_eq!(out[0].node, b);
+    }
+
+    /// After a CSR rebuild captures an edge into the snapshot, deleting that
+    /// edge must remove it from `out_neighbors`. Serving from the stale snapshot
+    /// would return the deleted edge.
+    #[test]
+    fn out_neighbors_reflects_edge_deleted_after_snapshot() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("N", &()).unwrap();
+        let b = g.add_node("N", &()).unwrap();
+        let eid = g.add_edge(a, b, "E", &()).unwrap();
+
+        g.rebuild_csr().unwrap();
+        assert_eq!(g.out_neighbors(a).unwrap().len(), 1);
+
+        g.delete_edge(eid).unwrap();
+
+        assert!(
+            g.out_neighbors(a).unwrap().is_empty(),
+            "deleted edge must not appear, even though CSR still holds it"
+        );
+    }
+
+    /// `out_neighbors` and `in_neighbors` must agree on the same edge after a
+    /// mutation that postdates the snapshot. This is the asymmetry the snapshot
+    /// fast path introduced: `in_neighbors` always read LMDB while
+    /// `out_neighbors` trusted the snapshot.
+    #[test]
+    fn out_and_in_neighbors_agree_after_snapshot() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("N", &()).unwrap();
+        let b = g.add_node("N", &()).unwrap();
+        g.rebuild_csr().unwrap();
+
+        let eid = g.add_edge(a, b, "E", &()).unwrap();
+
+        let out = g.out_neighbors(a).unwrap();
+        let inc = g.in_neighbors(b).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(inc.len(), 1);
+        assert_eq!(out[0].edge, eid);
+        assert_eq!(inc[0].edge, eid);
+    }
+
+    /// Inside a write transaction, `out_neighbors` must observe the edge created
+    /// earlier in the same uncommitted transaction (read-your-writes).
+    #[test]
+    fn write_txn_out_neighbors_sees_uncommitted_edge() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("N", &()).unwrap();
+        let b = g.add_node("N", &()).unwrap();
+        // Snapshot `a` with no outgoing edges so the stale path would return [].
+        g.rebuild_csr().unwrap();
+
+        g.update(|txn| {
+            let eid = txn.add_edge(a, b, "E", &())?;
+            let out = txn.out_neighbors(a)?;
+            assert_eq!(out.len(), 1, "uncommitted edge must be visible in-txn");
+            assert_eq!(out[0].edge, eid);
+            Ok(())
+        })
+        .unwrap();
     }
 }

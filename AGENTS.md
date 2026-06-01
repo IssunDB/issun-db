@@ -68,7 +68,6 @@ Do not invent modules that do not yet exist when answering questions, but do pla
     - `src/graph/txn.rs`: `ReadTxn` and `WriteTxn` delegation impls and transaction tests.
     - `src/csr.rs`: in-memory CSR snapshot, rebuilt in the background and swapped via `arc-swap`.
     - `src/matrices.rs`: GraphBLAS matrix materialization from the CSR snapshot.
-    - `src/metrics.rs`: lightweight runtime counters for storage operations.
     - `src/error.rs`: `Error` enum; all storage and serialization errors unify here.
 - `crates/issundb-cypher/`: Cypher parser, AST, logical planner, physical planner, optimizer, and executor.
     - `src/parser.rs`: hand-written recursive-descent parser for MATCH (including inline relationship property maps and multi-label node patterns
@@ -129,8 +128,10 @@ Do not invent modules that do not yet exist when answering questions, but do pla
 - Secondary indexes (`label_idx`, `type_idx`) use 12-byte composite keys `(u32 BE, u64 BE)` stored in plain LMDB databases with `Unit` values.
   Prefix-range scans via `prefix_iter` enumerate all nodes or edges for a given label or type in ascending ID order. A multi-label node has one
   `label_idx` entry per label it carries, so it appears in every matching label scan.
-- The CSR snapshot is the hot read path for outgoing traversal. GraphBLAS operates on the CSR snapshot for all graph algorithms,
-  pattern matching, and multi-source expansion.
+- The CSR snapshot is the basis for the GraphBLAS algorithms: GraphBLAS operates on it for all graph algorithms, pattern matching, and
+  multi-source expansion. The snapshot lags writes until the background rebuild runs, so it has eventual-consistency semantics; callers needing a
+  fresh view call `rebuild_csr`. Point adjacency lookups (`out_neighbors`, `in_neighbors`, `all_neighbors`) read the `out_adj` and `in_adj` stores
+  directly through the transaction, never the snapshot, so they always reflect committed and in-transaction writes.
 - `Storage::open` is the only entry point for LMDB. Do not call `heed::EnvOpenOptions` from outside `crates/issundb-core/src/storage/lmdb.rs`.
 - Heavy dependencies are tracked in the workspace `Cargo.toml`. `usearch`, `chumsky`, and GraphBLAS (`graphblas-sparse-linear-algebra`) are active,
   non-optional dependencies.
@@ -210,6 +211,12 @@ All graph operations go through `Graph`; do not call `Storage` directly from out
 Vector search crate. Owns vector index abstractions, vector metadata, vector storage integration, and vector search APIs. It may depend on
 `issundb-core`; it must not depend on `issundb-text`, `issundb-retrieval`, `issundb-cypher`, bindings, or CLI crates.
 
+- `VectorGraphExt::configure_vector_index(opts: VectorIndexOptions) -> Result<(), VectorError>`: sets the per-graph metric and
+  quantization. The choice persists in the `meta` sub-database, so reopen rebuilds with the same configuration. Call it before the first
+  upsert; changing the metric or quantization once vectors exist returns `VectorError::AlreadyConfigured`. Defaults to Cosine and Float32.
+- `VectorGraphExt::reindex_vector_index(opts: VectorIndexOptions) -> Result<(), VectorError>`: changes the metric or quantization on a
+  populated graph and rebuilds the index from the persisted embeddings under the new configuration. The stored vectors are raw, metric-agnostic
+  f32, so they re-index under any metric; this is O(n) in the stored vector count and is an administrative operation, not a concurrent one.
 - `VectorGraphExt::upsert_vector(n: NodeId, v: &[f32]) -> Result<(), VectorError>`
 - `VectorGraphExt::vector_search(q: &[f32], k: usize) -> Result<Vec<Hit>, VectorError>`
 
@@ -272,7 +279,10 @@ Model Context Protocol server built on the `rmcp` SDK. Depends only on `issundb`
 the server as a subprocess) or `http` (MCP's Streamable HTTP transport, mounted on an Axum router at `--http-path`, default `/mcp`, bound to
 `--bind`, default `127.0.0.1:8000`). Diagnostics always go to `stderr` because the stdio transport owns `stdout`. This is distinct from
 `issundb-server`, which is a plain REST API; the HTTP transport here still speaks MCP JSON-RPC. The `rmcp` dependency is pinned to `0.11` because
-`0.12` and later require `darling` `0.23`, which exceeds the workspace MSRV (`1.85`).
+`0.12` and later require `darling` `0.23`, which exceeds the workspace MSRV (`1.85`). Because the `rmcp` `0.11` Streamable HTTP transport does not
+validate the `Host` header (DNS rebinding, GHSA-89vp-x53w-74fx, fixed upstream only in `rmcp` `1.4.0`), the HTTP arm wraps the router in a `Host`
+header allowlist middleware. The allowlist defaults to the loopback names (`localhost`, `127.0.0.1`, `::1`) plus the `--bind` host; repeat
+`--allowed-host` to add the public hostnames a reverse proxy forwards under. Requests with a missing or non-allowlisted `Host` header get HTTP 403.
 
 Tools: `add_node`, `get_node`, `update_node`, `delete_node`, `add_edge`, `get_edge`, `delete_edge`, `cypher_query`, `explain`, `text_search`, and
 `vector_search`.

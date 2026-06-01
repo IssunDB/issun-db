@@ -334,14 +334,27 @@ impl Graph {
             let cache = Arc::clone(&self.csr_cache);
             let storage = Arc::clone(&self.storage);
             let matrices = Arc::clone(&self.matrices);
-            std::thread::spawn(move || match CsrSnapshot::build(&storage) {
-                Ok(snap) => {
-                    if let Ok(m) = MatrixSet::materialize(&snap) {
-                        *matrices.write() = Some(m);
+            std::thread::spawn(move || {
+                // Rebuild until the dirty count drops below the threshold: writes
+                // that commit while a rebuild runs keep the count above zero, and
+                // `install` retains the claim and asks for another pass so the
+                // snapshot does not silently lag behind LMDB.
+                loop {
+                    match CsrSnapshot::build(&storage) {
+                        Ok(snap) => {
+                            if let Ok(m) = MatrixSet::materialize(&snap) {
+                                *matrices.write() = Some(m);
+                            }
+                            if !cache.install(snap) {
+                                break;
+                            }
+                        }
+                        Err(_) => {
+                            cache.cancel_rebuild();
+                            break;
+                        }
                     }
-                    cache.install(snap);
                 }
-                Err(_) => cache.cancel_rebuild(),
             });
         }
     }

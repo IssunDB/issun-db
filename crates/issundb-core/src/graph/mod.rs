@@ -60,23 +60,57 @@ pub(super) fn composite_key(prefix: u32, id: u64) -> [u8; 12] {
     key
 }
 
+/// Type tag for a null value in the sortable property encoding.
+pub(super) const ENCODED_NULL: u8 = 0x00;
+
+/// Sign bit mask used to make IEEE-754 `f64` bit patterns and two's-complement
+/// `i64` values sort in ascending numeric order as big-endian bytes.
+const SORT_SIGN_BIT: u64 = 0x8000_0000_0000_0000;
+
 /// Encodes a JSON property value into a sortable byte representation for the index.
+///
+/// Numbers use a fixed 17-byte encoding: a `0x03` tag, then 8 bytes of the
+/// order-preserving `f64` bit pattern (the primary numeric sort key), then 8
+/// bytes of an integer disambiguator. The disambiguator makes the encoding
+/// lossless for `i64` values: two integers that round to the same `f64` (any
+/// pair beyond 2^53) still produce distinct keys, while an integer and a float
+/// of the same real value (e.g. `30` and `30.0`) produce identical keys so they
+/// continue to compare equal. Keeping every numeric encoding the same length is
+/// required because property lookups match by key prefix; a variable-length
+/// encoding where one value is a prefix of another would yield false matches.
 pub(super) fn encode_property_value(val: &serde_json::Value) -> Option<Vec<u8>> {
     match val {
-        serde_json::Value::Null => Some(vec![0x00]),
+        serde_json::Value::Null => Some(vec![ENCODED_NULL]),
         serde_json::Value::Bool(false) => Some(vec![0x01]),
         serde_json::Value::Bool(true) => Some(vec![0x02]),
         serde_json::Value::Number(num) => {
             let float_val = num.as_f64()?;
             let bits = float_val.to_bits();
-            let masked = if (bits & 0x8000_0000_0000_0000) != 0 {
+            let masked = if (bits & SORT_SIGN_BIT) != 0 {
                 !bits
             } else {
-                bits ^ 0x8000_0000_0000_0000
+                bits ^ SORT_SIGN_BIT
             };
-            let mut buf = Vec::with_capacity(9);
+            // Integer disambiguator: for any number whose exact real value is an
+            // integer in `i64` range, store that integer in sign-flipped
+            // big-endian order so distinct large integers never collide. All
+            // other numbers (non-integers, out-of-range) get a fixed sentinel;
+            // they already have a unique `f64` bit pattern in the primary key,
+            // so the sentinel value cannot affect ordering or equality.
+            let int_disambig: u64 = if let Some(i) = num.as_i64() {
+                (i as u64) ^ SORT_SIGN_BIT
+            } else if float_val.fract() == 0.0
+                && float_val >= i64::MIN as f64
+                && float_val <= i64::MAX as f64
+            {
+                ((float_val as i64) as u64) ^ SORT_SIGN_BIT
+            } else {
+                0
+            };
+            let mut buf = Vec::with_capacity(17);
             buf.push(0x03);
             buf.extend_from_slice(&masked.to_be_bytes());
+            buf.extend_from_slice(&int_disambig.to_be_bytes());
             Some(buf)
         }
         serde_json::Value::String(s) => {
@@ -101,19 +135,35 @@ pub(super) fn decode_property_value(bytes: &[u8]) -> Option<serde_json::Value> {
         0x01 => Some(serde_json::Value::Bool(false)),
         0x02 => Some(serde_json::Value::Bool(true)),
         0x03 => {
-            if bytes.len() < 9 {
+            // Numbers are `tag + 8-byte f64 sort key + 8-byte int disambiguator`.
+            if bytes.len() < 17 {
                 return None;
             }
+            // Prefer the lossless integer disambiguator when it round-trips,
+            // so large integers decode exactly rather than through `f64`.
+            let mut int_arr = [0u8; 8];
+            int_arr.copy_from_slice(&bytes[9..17]);
+            let int_val = (u64::from_be_bytes(int_arr) ^ SORT_SIGN_BIT) as i64;
+
             let mut arr = [0u8; 8];
             arr.copy_from_slice(&bytes[1..9]);
             let masked = u64::from_be_bytes(arr);
-            let bits = if (masked & 0x8000_0000_0000_0000) == 0 {
+            let bits = if (masked & SORT_SIGN_BIT) == 0 {
                 !masked
             } else {
-                masked ^ 0x8000_0000_0000_0000
+                masked ^ SORT_SIGN_BIT
             };
             let float_val = f64::from_bits(bits);
-            serde_json::Number::from_f64(float_val).map(serde_json::Value::Number)
+
+            // If the disambiguator's integer equals the float key, the value was
+            // an integer (or integer-valued float): return it losslessly as an
+            // integer. Non-integers store a sentinel whose sign-flipped form is
+            // `i64::MIN`, which never matches a non-integer float key.
+            if (int_val as f64) == float_val {
+                Some(serde_json::Value::Number(int_val.into()))
+            } else {
+                serde_json::Number::from_f64(float_val).map(serde_json::Value::Number)
+            }
         }
         0x04 => {
             let str_bytes = if bytes.ends_with(&[0x00]) {
@@ -228,10 +278,12 @@ pub struct Graph {
     pub(super) _write_lock: Arc<ReentrantMutex<()>>,
     pub(super) csr_cache: Arc<CsrCache>,
     pub(super) matrices: Arc<parking_lot::RwLock<Option<MatrixSet>>>,
-    /// Type-erased extension cache. Higher-level crates use this to attach
-    /// caches (e.g. HNSW vector index) to a Graph without creating a circular
-    /// dependency. Keys are `std::any::TypeId`; values are `Arc<dyn Any + Send + Sync>`.
-    pub extensions: Arc<parking_lot::Mutex<AHashMap<StdTypeId, Box<dyn Any + Send + Sync>>>>,
+    /// Type-erased extension cache. Higher-level crates attach caches (e.g. the
+    /// HNSW vector index) to a Graph without creating a circular dependency,
+    /// through the `get_extension`, `set_extension`, and
+    /// `get_or_init_extension_with` methods. Keys are `std::any::TypeId`; values
+    /// are `Arc<dyn Any + Send + Sync>`.
+    pub(crate) extensions: Arc<parking_lot::Mutex<AHashMap<StdTypeId, Box<dyn Any + Send + Sync>>>>,
 }
 
 /// A read-only transaction on the graph.
@@ -283,6 +335,36 @@ impl Graph {
             .get(&StdTypeId::of::<T>())
             .and_then(|b| b.downcast_ref::<Arc<T>>())
             .cloned()
+    }
+
+    /// Return the extension of type `T`, initializing it with `init` if absent.
+    ///
+    /// `init` runs without the extensions lock held, so it may call back into
+    /// the graph (for example, to read from storage) without risking a lock
+    /// ordering problem. If two threads initialize concurrently, both may run
+    /// `init`, but only the first stored value is kept and every caller observes
+    /// that same `Arc`. `init` is fallible; on error nothing is stored and the
+    /// error is propagated.
+    pub fn get_or_init_extension_with<T, E, F>(&self, init: F) -> Result<Arc<T>, E>
+    where
+        T: Any + Send + Sync,
+        F: FnOnce() -> Result<Arc<T>, E>,
+    {
+        if let Some(existing) = self.get_extension::<T>() {
+            return Ok(existing);
+        }
+        let value = init()?;
+        let mut ext = self.extensions.lock();
+        // Another thread may have initialized while we built ours; prefer the
+        // already-stored value so all callers share one instance.
+        if let Some(existing) = ext
+            .get(&StdTypeId::of::<T>())
+            .and_then(|b| b.downcast_ref::<Arc<T>>())
+        {
+            return Ok(existing.clone());
+        }
+        ext.insert(StdTypeId::of::<T>(), Box::new(value.clone()));
+        Ok(value)
     }
 
     /// Execute a read-only transaction inside a closure.
@@ -348,7 +430,7 @@ impl Graph {
         let snap = CsrSnapshot::build_mapped(&self.storage, &csr_file)?;
         let m = MatrixSet::materialize(&snap)?;
         *self.matrices.write() = Some(m);
-        self.csr_cache.install(snap);
+        self.csr_cache.install_full(snap);
         Ok(())
     }
 
@@ -391,5 +473,91 @@ impl Graph {
         let dst_file = dst_dir.join("data.mdb");
         std::fs::copy(snapshot_file, &dst_file)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod encode_tests {
+    use serde_json::json;
+
+    use super::{decode_property_value, encode_property_value};
+
+    /// Distinct integers beyond 2^53 must encode to distinct keys. Encoding
+    /// purely through `f64` (the previous behavior) collapsed them, causing
+    /// index collisions and wrong `nodes_by_property` matches.
+    #[test]
+    fn large_integers_do_not_collide() {
+        let a = encode_property_value(&json!(9_007_199_254_740_992_i64)).unwrap(); // 2^53
+        let b = encode_property_value(&json!(9_007_199_254_740_993_i64)).unwrap(); // 2^53 + 1
+        assert_ne!(a, b, "distinct large integers must encode distinctly");
+    }
+
+    /// An integer and the float of the same real value must encode identically
+    /// so they keep comparing equal in the index (Cypher treats `30 = 30.0`).
+    #[test]
+    fn integer_and_equal_float_unify() {
+        assert_eq!(
+            encode_property_value(&json!(30)).unwrap(),
+            encode_property_value(&json!(30.0)).unwrap(),
+        );
+        assert_eq!(
+            encode_property_value(&json!(0)).unwrap(),
+            encode_property_value(&json!(0.0)).unwrap(),
+        );
+    }
+
+    /// Every numeric encoding must be the same length: property lookups match by
+    /// key prefix, so a value whose encoding prefixes another's would alias.
+    #[test]
+    fn numeric_encoding_is_fixed_length() {
+        for v in [
+            json!(1),
+            json!(-1),
+            json!(0),
+            json!(i64::MAX),
+            json!(i64::MIN),
+            json!(3.5),
+            json!(-2.5e10),
+        ] {
+            assert_eq!(encode_property_value(&v).unwrap().len(), 17, "value {v}");
+        }
+    }
+
+    /// Byte-lexicographic order of encodings must match numeric order, including
+    /// across the 2^53 boundary where the disambiguator orders the tie.
+    #[test]
+    fn numeric_ordering_preserved() {
+        let ascending: Vec<i64> = vec![
+            i64::MIN,
+            -1_000,
+            -1,
+            0,
+            1,
+            1_000,
+            1 << 53,
+            (1 << 53) + 1,
+            i64::MAX,
+        ];
+        let encoded: Vec<Vec<u8>> = ascending
+            .iter()
+            .map(|v| encode_property_value(&json!(v)).unwrap())
+            .collect();
+        let mut sorted = encoded.clone();
+        sorted.sort();
+        assert_eq!(encoded, sorted, "encodings must sort in numeric order");
+    }
+
+    /// Large integers must decode back to the exact integer, not a rounded float.
+    #[test]
+    fn decode_round_trips_large_integer() {
+        for v in [
+            json!(0),
+            json!(-1),
+            json!(9_007_199_254_740_993_i64),
+            json!(i64::MAX),
+        ] {
+            let enc = encode_property_value(&v).unwrap();
+            assert_eq!(decode_property_value(&enc), Some(v.clone()), "value {v}");
+        }
     }
 }

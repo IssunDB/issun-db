@@ -1,4 +1,3 @@
-pub use issundb_core::metrics::{MetricsCollector, NoOpMetrics};
 pub use issundb_core::{
     DegreeDirection, DirectedNeighborEntry, EdgeId, EdgeRecord, Error, Graph, LabelId, Language,
     NeighborEntry, NodeId, NodeRecord, PropValue, ReadTxn, TypeId, WeightedPath, WriteTxn,
@@ -15,8 +14,8 @@ pub use issundb_text::{
     TextSearchOptions, TfIdfScorer,
 };
 pub use issundb_vector::{
-    Hit, VectorError, VectorGraphExt, VectorIndex, VectorIndexOptions, VectorMetric,
-    VectorQuantization, VectorSearchOptions,
+    Hit, VectorError, VectorGraphExt, VectorIndexOptions, VectorMetric, VectorQuantization,
+    VectorSearchOptions,
 };
 
 /// Extension trait to execute Cypher queries on the `Graph` handle.

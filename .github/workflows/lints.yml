@@ -10,8 +10,12 @@ on:
     paths-ignore:
       - '**.md'
       - 'docs/**'
-      - 'crates/issundb-py/**'
   push:
+    branches:
+      - main
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
     tags:
       - 'v*'
 

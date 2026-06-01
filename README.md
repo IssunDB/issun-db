@@ -8,8 +8,8 @@
 
 [![Tests](https://img.shields.io/github/actions/workflow/status/IssunDB/issun-db/tests.yml?label=tests&style=flat&labelColor=282c34&logo=github)](https://github.com/IssunDB/issun-db/actions/workflows/tests.yml)
 [![Code Coverage](https://img.shields.io/codecov/c/github/IssunDB/issun-db?label=coverage&style=flat&labelColor=282c34&logo=codecov)](https://codecov.io/gh/IssunDB/issun-db)
-[![Crates.io](https://img.shields.io/crates/v/issun-db.svg?label=crates.io&style=flat&labelColor=282c34&color=fc8d62&logo=rust)](https://crates.io/crates/issun-db)
-[![Docs.rs](https://img.shields.io/badge/docs-issun-db-66c2a5?style=flat&labelColor=282c34&logo=docs.rs)](https://docs.rs/issun-db)
+[![Crates.io](https://img.shields.io/crates/v/issundb.svg?label=crates.io&style=flat&labelColor=282c34&color=fc8d62&logo=rust)](https://crates.io/crates/issundb)
+[![Docs.rs](https://img.shields.io/badge/docs-issundb-66c2a5?style=flat&labelColor=282c34&logo=docs.rs)](https://docs.rs/issundb)
 [![Docs](https://img.shields.io/badge/docs-read-007ec6?label=docs&style=flat&labelColor=282c34&logo=readthedocs)](https://IssunDB.github.io/issun-db/)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-007ec6?style=flat&labelColor=282c34&logo=open-source-initiative)](https://github.com/IssunDB/issun-db)
 
@@ -19,15 +19,15 @@ A fast embedded graph database for AI applications and graph analytics
 
 ---
 
-IssunDB is a fast, embedded graph database writen in Rust.
-It can be embedded in Rust applications without the need for a server, cand can be used for wide range of applications like building building
-GraphRAG pipleines and querying knowledge graphs.
+IssunDB is a fast, embedded graph database written in Rust.
+It can be embedded in Rust applications without the need for a server, and can be used for a wide range of applications such as building
+GraphRAG pipelines and querying knowledge graphs.
 
 ### Features
 
 * Rust graph engine built on [LMDB](https://www.symas.com/mdb) with ACID, property graph model, and Cypher query language support
 * Fast graph traversal and analytics using [GraphBLAS](https://graphblas.org)-based sparse matrix operations
-* Buit-in vector, text, and hybrid search and retrieval support
+* Built-in vector, text, and hybrid search and retrieval support
 * Can be used via a wide range of APIs, including native Rust, CLI, GUI, HTTP, and MCP
 * Fully cross-platform; supports Linux, macOS, and Windows
 * Bindings for Python and JavaScript (other languages coming soon)

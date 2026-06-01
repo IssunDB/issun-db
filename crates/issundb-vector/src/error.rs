@@ -6,8 +6,10 @@ pub enum VectorError {
     #[error("dimension mismatch: index expects {expected}, got {got}")]
     DimensionMismatch { expected: usize, got: usize },
 
-    #[error("vector index not initialized for label {0}")]
-    IndexNotInitialized(String),
+    #[error(
+        "vector index already configured ({existing}); cannot change to {requested} while vectors exist, use reindex_vector_index to rebuild under the new configuration"
+    )]
+    AlreadyConfigured { existing: String, requested: String },
 
     #[error("usearch library fault: {0}")]
     IndexFault(String),

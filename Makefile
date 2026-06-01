@@ -18,7 +18,7 @@ WHEEL_FILE := $(shell ls $(PY_DIR)/$(WHEEL_DIR)/issundb-*.whl 2>/dev/null | head
 
 # Pinned versions for development tools
 TARPAULIN_VERSION := 0.32.8
-NEXTEST_VERSION := 0.9.101
+NEXTEST_VERSION := 0.9.100
 AUDIT_VERSION := 0.21.2
 CAREFUL_VERSION := 0.4.8
 

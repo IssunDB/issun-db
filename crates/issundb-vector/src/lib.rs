@@ -1,8 +1,7 @@
-pub mod error;
-pub mod index;
+mod error;
+mod index;
 
 pub use error::VectorError;
 pub use index::{
-    Hit, VectorGraphExt, VectorIndex, VectorIndexOptions, VectorMetric, VectorQuantization,
-    VectorSearchOptions,
+    Hit, VectorGraphExt, VectorIndexOptions, VectorMetric, VectorQuantization, VectorSearchOptions,
 };

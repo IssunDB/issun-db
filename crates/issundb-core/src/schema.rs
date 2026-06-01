@@ -1,6 +1,5 @@
 use deepsize::DeepSizeOf;
 use serde::{Deserialize, Serialize};
-use serde_json;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 pub type NodeId = u64;

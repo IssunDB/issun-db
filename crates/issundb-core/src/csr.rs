@@ -54,6 +54,7 @@ unsafe impl Send for CsrSnapshot {}
 unsafe impl Sync for CsrSnapshot {}
 
 impl CsrSnapshot {
+    #[cfg(test)]
     pub fn empty() -> Self {
         Self {
             row_ptr: vec![0],
@@ -313,25 +314,6 @@ impl CsrSnapshot {
             _mmap: Some(mmap),
         })
     }
-
-    /// Returns `(other_node_id, edge_id, type_id)` for each outgoing edge of
-    /// `node`, or `None` if `node` has no entry in this snapshot.
-    pub fn out_neighbors(&self, node: NodeId) -> Option<Vec<(NodeId, EdgeId, TypeId)>> {
-        let &dense = self.id_to_dense.get(&node)?;
-        let start = self.row_ptr[dense as usize];
-        let end = self.row_ptr[dense as usize + 1];
-        Some(
-            (start..end)
-                .map(|i| {
-                    (
-                        self.dense_to_id[self.col_idx[i] as usize],
-                        self.edge_id[i],
-                        self.edge_type[i],
-                    )
-                })
-                .collect(),
-        )
-    }
 }
 
 /// Thread-safe handle around a `CsrSnapshot` that supports atomic swaps and
@@ -340,6 +322,10 @@ pub struct CsrCache {
     pub snapshot: ArcSwap<CsrSnapshot>,
     dirty: AtomicU64,
     rebuilding: AtomicBool,
+    /// The dirty count captured when the in-flight rebuild was claimed. On
+    /// install this much is subtracted from `dirty` rather than zeroing it, so
+    /// writes that committed while the rebuild ran are not lost.
+    claimed: AtomicU64,
 }
 
 impl CsrCache {
@@ -348,6 +334,7 @@ impl CsrCache {
             snapshot: ArcSwap::from_pointee(initial),
             dirty: AtomicU64::new(0),
             rebuilding: AtomicBool::new(false),
+            claimed: AtomicU64::new(0),
         }
     }
 
@@ -356,19 +343,98 @@ impl CsrCache {
     /// then perform the rebuild.
     pub fn mark_dirty_n(&self, count: u64) -> bool {
         let prev = self.dirty.fetch_add(count, Ordering::Relaxed);
-        prev + count >= REBUILD_THRESHOLD && !self.rebuilding.swap(true, Ordering::AcqRel)
+        let total = prev + count;
+        if total >= REBUILD_THRESHOLD && !self.rebuilding.swap(true, Ordering::AcqRel) {
+            self.claimed.store(total, Ordering::Release);
+            true
+        } else {
+            false
+        }
     }
 
-    /// Install a freshly-built snapshot and reset the dirty counter and flag.
-    pub fn install(&self, snap: CsrSnapshot) {
+    /// Install a snapshot produced by a claimed background rebuild. Subtracts the
+    /// claimed dirty count instead of zeroing it, so writes that landed during
+    /// the rebuild remain counted. Returns `true` if the residual dirty count
+    /// still meets the threshold, in which case the rebuild claim is retained
+    /// and the caller must build again; otherwise the claim is released.
+    #[must_use]
+    pub fn install(&self, snap: CsrSnapshot) -> bool {
+        self.snapshot.store(Arc::new(snap));
+        let claimed = self.claimed.swap(0, Ordering::AcqRel);
+        let prev = self.dirty.fetch_sub(claimed, Ordering::AcqRel);
+        let remaining = prev.saturating_sub(claimed);
+        if remaining >= REBUILD_THRESHOLD {
+            self.claimed.store(remaining, Ordering::Release);
+            true
+        } else {
+            self.rebuilding.store(false, Ordering::Release);
+            false
+        }
+    }
+
+    /// Install a snapshot from a full synchronous rebuild that captured all
+    /// committed state. Clears the dirty counter and any outstanding rebuild
+    /// claim, since the new snapshot already reflects every prior write.
+    pub fn install_full(&self, snap: CsrSnapshot) {
         self.snapshot.store(Arc::new(snap));
         self.dirty.store(0, Ordering::Release);
+        self.claimed.store(0, Ordering::Release);
         self.rebuilding.store(false, Ordering::Release);
     }
 
     /// Release the rebuild claim without installing a snapshot; used when the
     /// build step fails so a future write can retry.
     pub fn cancel_rebuild(&self) {
+        self.claimed.store(0, Ordering::Release);
         self.rebuilding.store(false, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    /// Writes that arrive while a rebuild is in flight must not be discarded by
+    /// the install that follows; only the claimed count is subtracted.
+    #[test]
+    fn install_retains_writes_during_rebuild() {
+        let cache = CsrCache::new(CsrSnapshot::empty());
+        assert!(
+            cache.mark_dirty_n(REBUILD_THRESHOLD),
+            "crossing claims a rebuild"
+        );
+        // Five more writes land while the rebuild runs; the claim is already held.
+        assert!(!cache.mark_dirty_n(5));
+        // Install subtracts only the claimed THRESHOLD, leaving 5 dirty. That is
+        // below the threshold, so no follow-up rebuild is requested.
+        assert!(!cache.install(CsrSnapshot::empty()));
+        // The residual 5 is retained: THRESHOLD - 5 more writes re-trigger.
+        assert!(cache.mark_dirty_n(REBUILD_THRESHOLD - 5));
+    }
+
+    /// When a full threshold of writes lands during a rebuild, install must keep
+    /// the claim and ask for another pass so the snapshot catches up.
+    #[test]
+    fn install_requests_followup_when_still_dirty() {
+        let cache = CsrCache::new(CsrSnapshot::empty());
+        assert!(cache.mark_dirty_n(REBUILD_THRESHOLD));
+        assert!(!cache.mark_dirty_n(REBUILD_THRESHOLD));
+        assert!(
+            cache.install(CsrSnapshot::empty()),
+            "still dirty: rebuild again"
+        );
+        assert!(!cache.install(CsrSnapshot::empty()), "now caught up");
+    }
+
+    /// A full synchronous rebuild clears the counter and any outstanding claim.
+    #[test]
+    fn install_full_clears_dirty_and_claim() {
+        let cache = CsrCache::new(CsrSnapshot::empty());
+        assert!(cache.mark_dirty_n(REBUILD_THRESHOLD));
+        cache.install_full(CsrSnapshot::empty());
+        assert!(
+            !cache.mark_dirty_n(1),
+            "counter was reset by the full rebuild"
+        );
     }
 }

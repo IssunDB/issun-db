@@ -387,6 +387,13 @@ impl Graph {
             if !existing_val.is_empty() && existing_val[0] == flags {
                 self.storage.meta.delete(wtxn, &meta_key)?;
 
+                // `node_prop_idx` doubles as the always-on auto-index for scalar
+                // properties (see `index_node_for_label`). Dropping an explicit
+                // index or constraint must not remove those baseline entries, or
+                // `nodes_by_property` and the Cypher NodeIndexScan would return
+                // wrong (empty) results for still-present nodes. Remove only the
+                // entries the auto-index never maintains: null-valued entries
+                // written by `create_node_index_impl`.
                 let mut prefix = Vec::with_capacity(8);
                 prefix.extend_from_slice(&label_id.to_be_bytes());
                 prefix.extend_from_slice(&prop_key_id.to_be_bytes());
@@ -394,7 +401,12 @@ impl Graph {
                 let mut to_delete = Vec::new();
                 for entry in self.storage.node_prop_idx.prefix_iter(wtxn, &prefix)? {
                     let (key, _) = entry?;
-                    to_delete.push(key.to_vec());
+                    if key.len() >= prefix.len() + 8 {
+                        let encoded_val = &key[prefix.len()..key.len() - 8];
+                        if encoded_val == [crate::graph::ENCODED_NULL].as_slice() {
+                            to_delete.push(key.to_vec());
+                        }
+                    }
                 }
 
                 for key in to_delete {
@@ -899,5 +911,102 @@ impl Graph {
             }
         }
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    use super::*;
+
+    fn open_tmp() -> (TempDir, Graph) {
+        let dir = TempDir::new().unwrap();
+        let g = Graph::open(dir.path(), 1).unwrap();
+        (dir, g)
+    }
+
+    /// Dropping an explicit property index must leave the always-on auto-index
+    /// intact so `nodes_by_property` still finds existing nodes.
+    #[test]
+    fn drop_index_preserves_auto_index() {
+        let (_dir, g) = open_tmp();
+        let id = g.add_node("Person", &json!({"age": 30})).unwrap();
+
+        g.create_node_property_index("Person", "age").unwrap();
+        g.drop_node_property_index("Person", "age").unwrap();
+
+        assert_eq!(
+            g.nodes_by_property("Person", "age", PropValue::Int(30))
+                .unwrap(),
+            vec![id],
+            "auto-index entries must survive dropping the explicit index"
+        );
+    }
+
+    /// Dropping a unique constraint must keep property lookups working and stop
+    /// enforcing uniqueness.
+    #[test]
+    fn drop_unique_constraint_preserves_lookups() {
+        let (_dir, g) = open_tmp();
+        let id = g.add_node("User", &json!({"email": "a@b.c"})).unwrap();
+
+        g.create_node_unique_constraint("User", "email").unwrap();
+        g.drop_node_unique_constraint("User", "email").unwrap();
+
+        assert_eq!(
+            g.nodes_by_property("User", "email", PropValue::Str("a@b.c".into()))
+                .unwrap(),
+            vec![id]
+        );
+
+        // Uniqueness is no longer enforced; a duplicate value is accepted and
+        // both nodes are findable.
+        let id2 = g.add_node("User", &json!({"email": "a@b.c"})).unwrap();
+        let mut hits = g
+            .nodes_by_property("User", "email", PropValue::Str("a@b.c".into()))
+            .unwrap();
+        hits.sort();
+        let mut expected = vec![id, id2];
+        expected.sort();
+        assert_eq!(hits, expected);
+    }
+
+    /// Two nodes with integer properties beyond 2^53 must be distinguishable by
+    /// `nodes_by_property`; the values previously collapsed through `f64`.
+    #[test]
+    fn large_integer_property_no_false_match() {
+        let (_dir, g) = open_tmp();
+        let a = g
+            .add_node("Item", &json!({"sid": 9_007_199_254_740_992_i64}))
+            .unwrap();
+        let b = g
+            .add_node("Item", &json!({"sid": 9_007_199_254_740_993_i64}))
+            .unwrap();
+
+        assert_eq!(
+            g.nodes_by_property("Item", "sid", PropValue::Int(9_007_199_254_740_992))
+                .unwrap(),
+            vec![a]
+        );
+        assert_eq!(
+            g.nodes_by_property("Item", "sid", PropValue::Int(9_007_199_254_740_993))
+                .unwrap(),
+            vec![b]
+        );
+    }
+
+    /// An integer-valued property must still be findable when queried with the
+    /// equal float, matching Cypher's `30 = 30.0` semantics.
+    #[test]
+    fn integer_property_matches_float_query() {
+        let (_dir, g) = open_tmp();
+        let id = g.add_node("Person", &json!({"age": 30})).unwrap();
+        assert_eq!(
+            g.nodes_by_property("Person", "age", PropValue::Float(30.0))
+                .unwrap(),
+            vec![id]
+        );
     }
 }

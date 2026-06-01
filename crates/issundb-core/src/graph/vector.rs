@@ -1,9 +1,39 @@
 use super::*;
 
+/// Meta key under which the vector search crate persists its per-graph index
+/// configuration (metric and quantization). `issundb-core` owns the durable
+/// `meta` record; the vector crate owns its byte encoding and semantics.
+const VECTOR_CONFIG_KEY: &str = "vector_config";
+
 impl Graph {
     // ------------------------------------------------------------------
     // Vector storage
     // ------------------------------------------------------------------
+
+    /// Persist the vector index configuration bytes for this graph.
+    ///
+    /// The byte encoding is owned by the vector search crate; `issundb-core`
+    /// only stores the opaque record under a fixed `meta` key.
+    #[doc(hidden)]
+    pub fn put_vector_config(&self, bytes: &[u8]) -> Result<(), Error> {
+        let _guard = self._write_lock.lock();
+        let mut wtxn = self.storage.env.write_txn()?;
+        self.storage.meta.put(&mut wtxn, VECTOR_CONFIG_KEY, bytes)?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    /// Return the persisted vector index configuration bytes, or `None` if the
+    /// graph has never been configured.
+    #[doc(hidden)]
+    pub fn get_vector_config(&self) -> Result<Option<Vec<u8>>, Error> {
+        let rtxn = self.storage.env.read_txn()?;
+        Ok(self
+            .storage
+            .meta
+            .get(&rtxn, VECTOR_CONFIG_KEY)?
+            .map(|b| b.to_vec()))
+    }
 
     /// Persist raw vector bytes for `n`.
     ///

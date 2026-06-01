@@ -55,7 +55,7 @@ pub enum VectorQuantization {
 }
 
 /// Construction options for `VectorIndex`.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct VectorIndexOptions {
     pub metric: VectorMetric,
     pub quantization: VectorQuantization,
@@ -67,7 +67,11 @@ enum Inner {
 }
 
 /// An in-memory HNSW vector index using the `usearch` library.
-pub struct VectorIndex {
+///
+/// Internal building block for the `VectorGraphExt` implementation on `Graph`.
+/// It holds no persistence of its own, so it is not part of the public surface;
+/// callers use the graph-backed `VectorGraphExt` methods instead.
+pub(crate) struct VectorIndex {
     opts: VectorIndexOptions,
     inner: Mutex<Inner>,
 }
@@ -220,6 +224,31 @@ fn decode_vector(bytes: &[u8]) -> Result<Vec<f32>, VectorError> {
 
 /// Vector search operations for `Graph`.
 pub trait VectorGraphExt {
+    /// Set the metric and quantization for this graph's vector index.
+    ///
+    /// The choice is persisted, so reopening the graph rebuilds the index with
+    /// the same configuration. Call this before upserting the first vector. The
+    /// HNSW graph is built per-metric, so the configuration cannot change once
+    /// vectors exist: a call that would change the persisted metric or
+    /// quantization while embeddings are present returns
+    /// `VectorError::AlreadyConfigured`. Re-applying the identical configuration
+    /// is a no-op. When no graph configuration is set, the index defaults to
+    /// `Cosine` and `Float32`.
+    fn configure_vector_index(&self, opts: VectorIndexOptions) -> Result<(), VectorError>;
+
+    /// Change the metric and quantization and rebuild the index from the
+    /// persisted embeddings under the new configuration.
+    ///
+    /// Unlike `configure_vector_index`, this accepts a change after vectors
+    /// exist. The raw f32 embeddings are stored in LMDB independently of the
+    /// metric, so they are re-indexed under `opts`; switching back to `Float32`
+    /// recovers full precision from storage. This rebuilds the entire in-memory
+    /// HNSW index, so it is O(n) in the number of stored vectors and is intended
+    /// as an administrative operation, not a concurrent one: running it while
+    /// other threads upsert may drop an in-flight write from the snapshot, which
+    /// the next `Graph::open` rebuild reconciles.
+    fn reindex_vector_index(&self, opts: VectorIndexOptions) -> Result<(), VectorError>;
+
     /// Persist `v` under `n`.
     fn upsert_vector(&self, n: NodeId, v: &[f32]) -> Result<(), VectorError>;
 
@@ -247,14 +276,54 @@ pub trait VectorGraphExt {
 struct VectorIndexCache(Mutex<VectorIndex>);
 
 impl VectorGraphExt for Graph {
+    fn configure_vector_index(&self, opts: VectorIndexOptions) -> Result<(), VectorError> {
+        let current = load_config(self)?;
+        if current == Some(opts) {
+            return Ok(());
+        }
+        // The HNSW graph is built per-metric. Changing the metric or
+        // quantization once embeddings exist would silently reinterpret them on
+        // the next cold-start rebuild, so refuse it while vectors are present.
+        if !self.vector_bytes()?.is_empty() {
+            return Err(VectorError::AlreadyConfigured {
+                existing: format!("{:?}", current.unwrap_or_default()),
+                requested: format!("{opts:?}"),
+            });
+        }
+        self.put_vector_config(&encode_config(opts))?;
+        // Replace any lazily built default cache so later upserts use the new
+        // configuration. Safe because no vectors exist yet.
+        self.set_extension(Arc::new(VectorIndexCache(Mutex::new(
+            VectorIndex::new_with_options(opts),
+        ))));
+        Ok(())
+    }
+
+    fn reindex_vector_index(&self, opts: VectorIndexOptions) -> Result<(), VectorError> {
+        // Persist the new configuration, rebuild the index from the stored raw
+        // embeddings, then swap the cache atomically. The build runs before the
+        // swap so a mid-rebuild failure leaves the previous cache in place.
+        self.put_vector_config(&encode_config(opts))?;
+        let rebuilt = build_index(self, opts)?;
+        self.set_extension(Arc::new(VectorIndexCache(Mutex::new(rebuilt))));
+        Ok(())
+    }
+
     #[instrument(skip(self, v), fields(node = %n, dims = v.len()))]
     fn upsert_vector(&self, n: NodeId, v: &[f32]) -> Result<(), VectorError> {
         let bytes = encode_vector(v)?;
-        self.put_vector_bytes(n, &bytes)?;
-        // Update (or cold-start) the cached HNSW index.
+        // Validate against (and update) the in-memory index BEFORE persisting to
+        // LMDB. `upsert` rejects empty or dimension-mismatched embeddings, so
+        // doing it first guarantees a rejected vector never reaches durable
+        // storage. If it did, the cold-start rebuild on the next `Graph::open`
+        // would hit the mismatch and fail to build the index, bricking every
+        // subsequent search. The reverse failure (index updated, LMDB write
+        // fails) only drops an in-memory entry that the next reopen rebuilds
+        // consistently, so it is the safe ordering.
         let arc = get_or_init_cache(self)?;
-        let result = arc.0.lock().upsert(n, v);
-        result
+        arc.0.lock().upsert(n, v)?;
+        self.put_vector_bytes(n, &bytes)?;
+        Ok(())
     }
 
     fn remove_vector(&self, n: NodeId) -> Result<(), VectorError> {
@@ -284,20 +353,27 @@ impl VectorGraphExt for Graph {
             Some(l) => l.clone(),
         };
 
-        // Over-fetch to increase the chance of finding opts.k label-matching results.
-        let fetch_k = (opts.k * 4).max(opts.k + 64);
+        // Over-fetch to increase the chance of finding opts.k label-matching
+        // results. Saturating arithmetic keeps a very large `opts.k` from
+        // overflowing; `vector_search` clamps the request to the index size.
+        let fetch_k = opts.k.saturating_mul(4).max(opts.k.saturating_add(64));
         let candidates = self.vector_search(q, fetch_k)?;
 
-        let mut out = Vec::with_capacity(opts.k);
+        // Bound the pre-allocation by the number of candidates actually
+        // returned, not by the caller-supplied `opts.k`. The result holds at
+        // most `min(opts.k, candidates.len())` hits, so this avoids reserving
+        // an unbounded amount of memory for a large `k`.
+        let mut out = Vec::with_capacity(opts.k.min(candidates.len()));
         for hit in candidates {
             if out.len() >= opts.k {
                 break;
             }
-            // Keep the hit if any of the node's labels matches the filter.
-            if let Ok(labels) = self.node_labels(hit.node) {
-                if labels.iter().any(|l| *l == label_filter) {
-                    out.push(hit);
-                }
+            // Keep the hit if any of the node's labels matches the filter. A
+            // storage error here is surfaced rather than silently dropping the
+            // candidate, which would under-report results without explanation.
+            let labels = self.node_labels(hit.node)?;
+            if labels.iter().any(|l| *l == label_filter) {
+                out.push(hit);
             }
         }
         Ok(out)
@@ -307,31 +383,88 @@ impl VectorGraphExt for Graph {
 /// Return the cached `VectorIndexCache` for this Graph, building it from LMDB
 /// if it has not been initialised yet.
 fn get_or_init_cache(graph: &Graph) -> Result<Arc<VectorIndexCache>, VectorError> {
-    if let Some(existing) = graph.get_extension::<VectorIndexCache>() {
-        return Ok(existing);
-    }
-    // Cold start: load all vectors from LMDB into a fresh HNSW index.
-    // Call vector_bytes() BEFORE acquiring the extensions lock to avoid
-    // holding two locks simultaneously.
-    let all_bytes = graph.vector_bytes()?;
-    let idx = VectorIndex::new();
-    for (node_id, bytes) in all_bytes {
+    // Cold start: load all vectors from LMDB into a fresh HNSW index, built with
+    // the graph's persisted metric and quantization (default Cosine and Float32
+    // when never configured). The initializer runs without the extensions lock
+    // held, so reading from storage here cannot deadlock against it.
+    graph.get_or_init_extension_with(|| {
+        let opts = load_config(graph)?.unwrap_or_default();
+        Ok(Arc::new(VectorIndexCache(Mutex::new(build_index(
+            graph, opts,
+        )?))))
+    })
+}
+
+/// Build a fresh in-memory HNSW index from every embedding persisted in LMDB,
+/// using `opts` for the metric and quantization. The stored vectors are raw
+/// f32 and metric-agnostic, so this re-indexes them correctly under any metric.
+fn build_index(graph: &Graph, opts: VectorIndexOptions) -> Result<VectorIndex, VectorError> {
+    let idx = VectorIndex::new_with_options(opts);
+    for (node_id, bytes) in graph.vector_bytes()? {
         let v = decode_vector(&bytes)?;
         idx.upsert(node_id, &v)?;
     }
-    let arc = Arc::new(VectorIndexCache(Mutex::new(idx)));
+    Ok(idx)
+}
 
-    // Double check under lock before inserting to prevent overwriting a concurrently initialized index.
-    let mut ext = graph.extensions.lock();
-    use std::any::TypeId;
-    if let Some(existing) = ext
-        .get(&TypeId::of::<VectorIndexCache>())
-        .and_then(|b| b.downcast_ref::<Arc<VectorIndexCache>>())
-    {
-        return Ok(existing.clone());
+/// Load and decode this graph's persisted vector index configuration, or
+/// `None` when the graph has never been configured.
+fn load_config(graph: &Graph) -> Result<Option<VectorIndexOptions>, VectorError> {
+    match graph.get_vector_config()? {
+        Some(bytes) => Ok(Some(decode_config(&bytes)?)),
+        None => Ok(None),
     }
-    ext.insert(TypeId::of::<VectorIndexCache>(), Box::new(arc.clone()));
-    Ok(arc)
+}
+
+/// Encode the index configuration as two stable tag bytes: `[metric, quantization]`.
+fn encode_config(opts: VectorIndexOptions) -> [u8; 2] {
+    let metric = match opts.metric {
+        VectorMetric::Cosine => 0,
+        VectorMetric::L2 => 1,
+        VectorMetric::Dot => 2,
+        VectorMetric::Hamming => 3,
+    };
+    let quant = match opts.quantization {
+        VectorQuantization::Float32 => 0,
+        VectorQuantization::Float16 => 1,
+        VectorQuantization::Int8 => 2,
+    };
+    [metric, quant]
+}
+
+/// Decode the two-byte index configuration written by `encode_config`.
+fn decode_config(bytes: &[u8]) -> Result<VectorIndexOptions, VectorError> {
+    let [metric, quant] = bytes.try_into().map_err(|_| {
+        VectorError::IndexFault(format!(
+            "vector config must be 2 bytes, got {}",
+            bytes.len()
+        ))
+    })?;
+    let metric = match metric {
+        0 => VectorMetric::Cosine,
+        1 => VectorMetric::L2,
+        2 => VectorMetric::Dot,
+        3 => VectorMetric::Hamming,
+        other => {
+            return Err(VectorError::IndexFault(format!(
+                "unknown vector metric tag {other}"
+            )));
+        }
+    };
+    let quantization = match quant {
+        0 => VectorQuantization::Float32,
+        1 => VectorQuantization::Float16,
+        2 => VectorQuantization::Int8,
+        other => {
+            return Err(VectorError::IndexFault(format!(
+                "unknown vector quantization tag {other}"
+            )));
+        }
+    };
+    Ok(VectorIndexOptions {
+        metric,
+        quantization,
+    })
 }
 
 fn metric_to_usearch(m: VectorMetric) -> MetricKind {
@@ -474,6 +607,132 @@ mod tests {
         );
         assert!(hits.len() <= 2);
         assert!(hits.iter().any(|h| h.node == a));
+    }
+
+    #[test]
+    fn rejected_upsert_does_not_persist_and_brick_reopen() {
+        // A dimension-mismatched upsert must not leave bytes in LMDB. If it did,
+        // the cold-start rebuild on the next `Graph::open` would fail to decode
+        // a consistent index and brick every subsequent search.
+        let dir = TempDir::new().unwrap();
+        let a = {
+            let graph = Graph::open(dir.path(), 1).unwrap();
+            let a = graph.add_node("N", &json!({})).unwrap();
+            let b = graph.add_node("N", &json!({})).unwrap();
+            graph.upsert_vector(a, &[1.0f32, 0.0, 0.0]).unwrap();
+            // Wrong dimension count: must be rejected and must not persist.
+            let bad = graph.upsert_vector(b, &[1.0f32, 0.0]);
+            assert!(matches!(bad, Err(VectorError::DimensionMismatch { .. })));
+            a
+        };
+
+        // Reopen: the rebuild must succeed and search must still work.
+        let graph = Graph::open(dir.path(), 1).unwrap();
+        let hits = graph.vector_search(&[1.0f32, 0.0, 0.0], 1).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].node, a);
+    }
+
+    #[test]
+    fn configure_vector_index_persists_metric_across_reopen() {
+        let dir = TempDir::new().unwrap();
+        let a = {
+            let graph = Graph::open(dir.path(), 1).unwrap();
+            graph
+                .configure_vector_index(VectorIndexOptions {
+                    metric: VectorMetric::L2,
+                    quantization: VectorQuantization::Float32,
+                })
+                .unwrap();
+            let a = graph.add_node("N", &json!({})).unwrap();
+            let b = graph.add_node("N", &json!({})).unwrap();
+            graph.upsert_vector(a, &[0.0f32, 0.0]).unwrap();
+            graph.upsert_vector(b, &[5.0f32, 5.0]).unwrap();
+            a
+        };
+
+        // Reopen: the persisted L2 metric must be used by the cold-start rebuild.
+        let graph = Graph::open(dir.path(), 1).unwrap();
+        let hits = graph.vector_search(&[0.1f32, 0.1], 1).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].node, a,
+            "nearest under L2 must be the origin vector"
+        );
+    }
+
+    #[test]
+    fn configure_vector_index_idempotent_with_same_options() {
+        let (_dir, graph) = open_tmp();
+        let opts = VectorIndexOptions {
+            metric: VectorMetric::Dot,
+            quantization: VectorQuantization::Float16,
+        };
+        graph.configure_vector_index(opts).unwrap();
+        let a = graph.add_node("N", &json!({})).unwrap();
+        graph.upsert_vector(a, &[1.0f32, 0.0]).unwrap();
+        // Re-applying the identical configuration after vectors exist is a no-op.
+        graph.configure_vector_index(opts).unwrap();
+    }
+
+    #[test]
+    fn configure_vector_index_rejects_change_after_vectors_exist() {
+        let (_dir, graph) = open_tmp();
+        graph
+            .configure_vector_index(VectorIndexOptions {
+                metric: VectorMetric::Cosine,
+                quantization: VectorQuantization::Float32,
+            })
+            .unwrap();
+        let a = graph.add_node("N", &json!({})).unwrap();
+        graph.upsert_vector(a, &[1.0f32, 0.0]).unwrap();
+
+        let changed = graph.configure_vector_index(VectorIndexOptions {
+            metric: VectorMetric::L2,
+            quantization: VectorQuantization::Float32,
+        });
+        assert!(matches!(
+            changed,
+            Err(VectorError::AlreadyConfigured { .. })
+        ));
+    }
+
+    #[test]
+    fn reindex_vector_index_switches_metric_on_populated_graph() {
+        let dir = TempDir::new().unwrap();
+        let (a, b) = {
+            let graph = Graph::open(dir.path(), 1).unwrap();
+            // Default Cosine configuration.
+            let a = graph.add_node("N", &json!({})).unwrap();
+            let b = graph.add_node("N", &json!({})).unwrap();
+            graph.upsert_vector(a, &[0.0f32, 0.0]).unwrap();
+            graph.upsert_vector(b, &[5.0f32, 5.0]).unwrap();
+
+            // configure must refuse the change while vectors exist.
+            let refused = graph.configure_vector_index(VectorIndexOptions {
+                metric: VectorMetric::L2,
+                quantization: VectorQuantization::Float32,
+            });
+            assert!(matches!(
+                refused,
+                Err(VectorError::AlreadyConfigured { .. })
+            ));
+
+            // reindex accepts it and rebuilds from the stored embeddings.
+            graph
+                .reindex_vector_index(VectorIndexOptions {
+                    metric: VectorMetric::L2,
+                    quantization: VectorQuantization::Float32,
+                })
+                .unwrap();
+            (a, b)
+        };
+
+        // The new metric persists, and search reflects L2 geometry after reopen.
+        let graph = Graph::open(dir.path(), 1).unwrap();
+        let hits = graph.vector_search(&[0.1f32, 0.1], 2).unwrap();
+        assert_eq!(hits[0].node, a, "origin is nearest under L2");
+        assert!(hits.iter().any(|h| h.node == b));
     }
 
     #[test]
