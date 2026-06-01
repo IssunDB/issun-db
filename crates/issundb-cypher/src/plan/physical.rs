@@ -106,6 +106,13 @@ pub enum PhysicalOperator {
         input: Box<PhysicalOperator>,
         part: crate::ast::QueryPart,
     },
+    /// A resolved `CALL`: emit one output row per entry in `rows` for each input
+    /// row, binding `output_vars` to the corresponding cells.
+    ProcedureCall {
+        input: Box<PhysicalOperator>,
+        output_vars: Vec<String>,
+        rows: Vec<Vec<serde_json::Value>>,
+    },
     /// Worst-case optimal join (WCOJ) for closing a cyclic pattern.
     ///
     /// Emitted by the optimizer when an `Expand` node's `dst_var` is already
@@ -221,6 +228,15 @@ impl PhysicalPlanner {
             LogicalOperator::WritePart { input, part } => PhysicalOperator::WritePart {
                 input: Box::new(Self::plan(input)),
                 part: part.clone(),
+            },
+            LogicalOperator::ProcedureCall {
+                input,
+                output_vars,
+                rows,
+            } => PhysicalOperator::ProcedureCall {
+                input: Box::new(Self::plan(input)),
+                output_vars: output_vars.clone(),
+                rows: rows.clone(),
             },
         }
     }
@@ -434,6 +450,16 @@ pub fn format_physical_plan(op: &PhysicalOperator, depth: usize) -> String {
                 _ => "WritePart",
             };
             buf.push_str(&format!("{}WritePart({})\n", pad, part_name));
+            buf.push_str(&format_physical_plan(input, depth + 1));
+        }
+        PhysicalOperator::ProcedureCall {
+            input, output_vars, ..
+        } => {
+            buf.push_str(&format!(
+                "{}ProcedureCall({})\n",
+                pad,
+                output_vars.join(", ")
+            ));
             buf.push_str(&format_physical_plan(input, depth + 1));
         }
         PhysicalOperator::MultiwayJoin {

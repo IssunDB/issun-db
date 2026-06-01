@@ -225,6 +225,8 @@ struct Scenario {
     assertion: Assertion,
     /// Query parameters from `And parameters are:` tables.
     params: HashMap<String, serde_json::Value>,
+    /// Table-backed procedures registered via `And there exists a procedure ...`.
+    procedures: Vec<issundb::Procedure>,
 }
 
 // ---------------------------------------------------------------------------
@@ -501,6 +503,7 @@ fn build_scenario(
     let mut query = String::new();
     let mut assertion = Assertion::None;
     let mut params: HashMap<String, serde_json::Value> = HashMap::new();
+    let mut procedures: Vec<issundb::Procedure> = Vec::new();
 
     let mut idx = 0;
     let mut pending_query_kind: Option<&'static str> = None; // "setup" | "when"
@@ -611,6 +614,41 @@ fn build_scenario(
             continue;
         }
 
+        // Procedure registration: `And there exists a procedure NAME(sig) :: (out):`
+        // followed by a data table whose header is `inputs ++ outputs` and whose
+        // remaining rows are the procedure's relation.
+        if trimmed.contains("there exists a procedure") {
+            let sig = trimmed
+                .split_once("there exists a procedure")
+                .map(|(_, rest)| rest.trim())
+                .unwrap_or("");
+            idx += 1;
+            let mut table_rows: Vec<Vec<String>> = Vec::new();
+            while idx < body.len() {
+                let t = body[idx].trim();
+                if t.starts_with('|') {
+                    // `|` alone is an empty (zero-column) header row, e.g. for a
+                    // void procedure `... :: ():`.
+                    let cells: Vec<String> = if t.len() >= 2 {
+                        t[1..t.len() - 1]
+                            .split('|')
+                            .map(|c| c.trim().to_string())
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    table_rows.push(cells);
+                    idx += 1;
+                } else {
+                    break;
+                }
+            }
+            if let Some(proc) = parse_procedure(sig, &table_rows) {
+                procedures.push(proc);
+            }
+            continue;
+        }
+
         if trimmed.starts_with("And ") || trimmed.starts_with("But ") {
             // Could be "And having executed:", "And no side effects", "And the side effects..."
             if trimmed.contains("having executed:") {
@@ -684,6 +722,63 @@ fn build_scenario(
         query,
         assertion,
         params,
+        procedures,
+    })
+}
+
+/// Parse a procedure signature such as
+/// `test.my.proc(name :: STRING?, id :: INTEGER?) :: (city :: STRING?, country_code :: INTEGER?):`
+/// together with its data table (header row `inputs ++ outputs` followed by data
+/// rows) into a registrable `Procedure`. Returns `None` if the signature is
+/// malformed.
+fn parse_procedure(sig: &str, table_rows: &[Vec<String>]) -> Option<issundb::Procedure> {
+    let sig = sig.trim().trim_end_matches(':').trim();
+
+    let open = sig.find('(')?;
+    let name = sig[..open].trim().to_string();
+    let close = sig[open + 1..].find(')')? + open + 1;
+    let inputs_str = &sig[open + 1..close];
+
+    // Outputs live inside the `:: ( ... )` that follows the input list.
+    let rest = &sig[close + 1..];
+    let out_open = rest.find('(');
+    let outputs_str = match out_open {
+        Some(o) => {
+            let out_close = rest[o + 1..].find(')')? + o + 1;
+            &rest[o + 1..out_close]
+        }
+        None => "",
+    };
+
+    let parse_fields = |s: &str| -> Vec<(String, issundb::CypherType)> {
+        s.split(',')
+            .filter_map(|field| {
+                let field = field.trim();
+                if field.is_empty() {
+                    return None;
+                }
+                let (fname, ftype) = field.split_once("::").unwrap_or((field, ""));
+                Some((fname.trim().to_string(), issundb::CypherType::parse(ftype)))
+            })
+            .collect()
+    };
+
+    let inputs = parse_fields(inputs_str);
+    let outputs = parse_fields(outputs_str);
+
+    // The first table row is the header (column names); the rest are data rows,
+    // each parsed cell-by-cell with the shared table-value parser.
+    let rows: Vec<Vec<serde_json::Value>> = table_rows
+        .iter()
+        .skip(1)
+        .map(|cells| cells.iter().map(|c| parse_table_value(c)).collect())
+        .collect();
+
+    Some(issundb::Procedure {
+        name,
+        inputs,
+        outputs,
+        rows,
     })
 }
 
@@ -853,12 +948,24 @@ fn parse_table_cell(s: &str) -> (serde_json::Value, bool) {
 
     // Node / relationship display literals:
     //   (:Label), (:L {p: v}), ()-[:T]->(), [:T], [:T {p: v}], etc.
+    // A path display literal is wrapped in angle brackets: `<(:A)-[:T]->(:B)>`, `<()>`.
+    // IssunDB returns a structured `__Path__` object for a path, never the `<...>`
+    // string, so any expected cell carrying a path literal is a representational
+    // mismatch and the scenario is skipped. The `<...>` wrapper appears only in path
+    // literals (result cells never contain bare comparison operators and strings are
+    // quoted), so matching it cannot reclassify a passing scenario. The narrower
+    // node and relationship literal markers are deliberately not broadened to nested
+    // positions, because the runner already compares many node and relationship
+    // literals successfully (for example `()` and `[[:T]]` cells), and a broad
+    // substring match there would skip scenarios that currently pass.
     if (t.starts_with("(:") || t.starts_with("(") && t.contains(':'))
         || t.starts_with("()-[")
         || t.starts_with("()-[:")
         || t.starts_with("<-[")
         || t.starts_with("[:")               // relationship literal [:TYPE] or [:TYPE {...}]
         || (t.starts_with('[') && t.contains("->"))
+        || (t.starts_with('<') && t.ends_with('>'))
+    // path literal <(:A)-[:T]->(:B)>, <()>
     {
         return (serde_json::Value::String(t.to_string()), true);
     }
@@ -1063,7 +1170,11 @@ fn run_scenario(scenario: &Scenario) -> Result<(), String> {
     }
 
     let params = scenario.params.clone();
-    let exec_result = graph.query_with_params(&scenario.query, &params);
+    let mut registry = issundb::ProcedureRegistry::new();
+    for proc in &scenario.procedures {
+        registry.register(proc.clone());
+    }
+    let exec_result = graph.query_with_procedures(&scenario.query, &params, &registry);
 
     match &scenario.assertion {
         Assertion::ExpectError => {

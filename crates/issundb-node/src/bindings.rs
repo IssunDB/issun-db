@@ -5,17 +5,32 @@ use std::path::Path;
 use issundb::{
     Graph, GraphQueryExt, TextGraphExt, TextIndexExt, TextSearchOptions, VectorGraphExt,
 };
+use napi::bindgen_prelude::BigInt;
 use napi_derive::napi;
 
 /// Node.js handle for an IssunDB graph database.
 ///
-/// Node IDs and edge IDs are represented as `u32` here. The core uses `u64`
-/// internally; the cast is safe for typical data sets, but will silently
-/// truncate IDs above 2^32 - 1. Applications storing more than ~4 billion
-/// nodes or edges should use the Rust API directly.
+/// Node IDs and edge IDs are the core `u64` values, exposed to JavaScript as
+/// `BigInt`. Methods return IDs as `BigInt` and accept them as `BigInt`, so the
+/// full identifier range round-trips without truncation.
 #[napi]
 pub struct IssunDB {
     graph: Graph,
+}
+
+/// Convert a JavaScript `BigInt` node or edge ID into the core `u64` value.
+///
+/// The conversion is rejected when the value is negative or does not fit in a
+/// `u64`, so an out-of-range ID surfaces as a JavaScript error rather than a
+/// silently truncated lookup.
+fn id_from_bigint(value: BigInt) -> napi::Result<u64> {
+    let (_, id, lossless) = value.get_u64();
+    if !lossless {
+        return Err(napi::Error::from_reason(
+            "node and edge IDs must be non-negative integers that fit in u64",
+        ));
+    }
+    Ok(id)
 }
 
 #[napi]
@@ -40,7 +55,8 @@ impl IssunDB {
 
     /// Return the JSON-encoded properties of node `id`, or `null` if the node does not exist.
     #[napi]
-    pub fn get_node(&self, id: u64) -> napi::Result<Option<String>> {
+    pub fn get_node(&self, id: BigInt) -> napi::Result<Option<String>> {
+        let id = id_from_bigint(id)?;
         let record = self
             .graph
             .get_node(id)
@@ -59,7 +75,8 @@ impl IssunDB {
 
     /// Replace the properties of node `id` with JSON-encoded `props`.
     #[napi]
-    pub fn update_node(&self, id: u64, props_json: String) -> napi::Result<()> {
+    pub fn update_node(&self, id: BigInt, props_json: String) -> napi::Result<()> {
+        let id = id_from_bigint(id)?;
         let value: serde_json::Value = serde_json::from_str(&props_json)
             .map_err(|e| napi::Error::from_reason(e.to_string()))?;
         self.graph
@@ -69,7 +86,8 @@ impl IssunDB {
 
     /// Delete node `id` and all of its incident edges.
     #[napi]
-    pub fn delete_node(&self, id: u64) -> napi::Result<()> {
+    pub fn delete_node(&self, id: BigInt) -> napi::Result<()> {
+        let id = id_from_bigint(id)?;
         self.graph
             .delete_node(id)
             .map_err(|e| napi::Error::from_reason(e.to_string()))
@@ -80,11 +98,13 @@ impl IssunDB {
     #[napi]
     pub fn add_edge(
         &self,
-        src: u64,
-        dst: u64,
+        src: BigInt,
+        dst: BigInt,
         etype: String,
         props_json: String,
     ) -> napi::Result<u64> {
+        let src = id_from_bigint(src)?;
+        let dst = id_from_bigint(dst)?;
         let value: serde_json::Value = serde_json::from_str(&props_json)
             .map_err(|e| napi::Error::from_reason(e.to_string()))?;
         self.graph
@@ -100,7 +120,7 @@ impl IssunDB {
         let result = self
             .graph
             .query(&cypher)
-            .map_err(napi::Error::from_reason)?;
+            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
         // QueryResult does not derive Serialize, so we construct the JSON manually.
         let records: Vec<serde_json::Value> = result
             .records
@@ -119,7 +139,7 @@ impl IssunDB {
     pub fn explain(&self, cypher: String) -> napi::Result<String> {
         self.graph
             .explain(&cypher)
-            .map_err(napi::Error::from_reason)
+            .map_err(|e| napi::Error::from_reason(e.to_string()))
     }
 
     /// Index or update the float32 embedding for node `id`.
@@ -128,7 +148,8 @@ impl IssunDB {
     /// converted to `f32` internally. Values outside the `f32` range are
     /// clamped silently by the cast.
     #[napi]
-    pub fn upsert_vector(&self, id: u64, vec: Vec<f64>) -> napi::Result<()> {
+    pub fn upsert_vector(&self, id: BigInt, vec: Vec<f64>) -> napi::Result<()> {
+        let id = id_from_bigint(id)?;
         let floats: Vec<f32> = vec.iter().map(|&v| v as f32).collect();
         self.graph
             .upsert_vector(id, &floats)

@@ -226,18 +226,19 @@ impl Optimizer {
                     filters,
                 )
             }
-            // OptionalMatch must not have filters extracted out of it; doing so would break
-            // the null-row semantics. Pass through transparently.
-            PhysicalOperator::OptionalMatch { input, null_vars } => {
-                let (inner, inner_filters) = Self::extract_filters(*input);
-                (
-                    PhysicalOperator::OptionalMatch {
-                        input: Box::new(inner),
-                        null_vars,
-                    },
-                    inner_filters,
-                )
-            }
+            // Filters inside an OptionalMatch belong to the optional pattern and must be
+            // evaluated before null-row preservation: a predicate such as `m:NonExistent`
+            // (an inline label) or a `WHERE` attached to the OPTIONAL MATCH restricts which
+            // optional matches exist, and when none survive the left row is preserved with
+            // the optional variables set to null. Extracting those filters out of the
+            // OptionalMatch hoists them above the join, where they would instead drop the
+            // preserved null rows. Leave the input subtree intact and report no filters to
+            // the caller. `push_down_filters` never recurses into an OptionalMatch, so the
+            // inner filters stay contained; `reorder_operators` handles them in place.
+            PhysicalOperator::OptionalMatch { input, null_vars } => (
+                PhysicalOperator::OptionalMatch { input, null_vars },
+                Vec::new(),
+            ),
             PhysicalOperator::Distinct { input } => {
                 let (inner, inner_filters) = Self::extract_filters(*input);
                 (
@@ -251,6 +252,20 @@ impl Optimizer {
             PhysicalOperator::WritePart { input, part } => {
                 (PhysicalOperator::WritePart { input, part }, Vec::new())
             }
+            // ProcedureCall is opaque: it produces rows from a resolved table and
+            // has no filters to extract.
+            PhysicalOperator::ProcedureCall {
+                input,
+                output_vars,
+                rows,
+            } => (
+                PhysicalOperator::ProcedureCall {
+                    input,
+                    output_vars,
+                    rows,
+                },
+                Vec::new(),
+            ),
             PhysicalOperator::MultiwayJoin {
                 input,
                 closing_src_var,
@@ -399,6 +414,16 @@ impl Optimizer {
             PhysicalOperator::WritePart { input, part } => {
                 PhysicalOperator::WritePart { input, part }
             }
+            // ProcedureCall is opaque: do not descend into it for reordering.
+            PhysicalOperator::ProcedureCall {
+                input,
+                output_vars,
+                rows,
+            } => PhysicalOperator::ProcedureCall {
+                input,
+                output_vars,
+                rows,
+            },
             PhysicalOperator::MultiwayJoin {
                 input,
                 closing_src_var,
@@ -466,7 +491,8 @@ impl Optimizer {
             | PhysicalOperator::Limit { input, .. }
             | PhysicalOperator::OptionalMatch { input, .. }
             | PhysicalOperator::Distinct { input, .. }
-            | PhysicalOperator::WritePart { input, .. } => Self::plan_weight(input, stats),
+            | PhysicalOperator::WritePart { input, .. }
+            | PhysicalOperator::ProcedureCall { input, .. } => Self::plan_weight(input, stats),
             // MultiwayJoin is cheaper than a regular Expand because the closing check is O(1)
             // per row after a single bulk expansion. Weight as the input cost.
             PhysicalOperator::MultiwayJoin { input, .. } => Self::plan_weight(input, stats),
@@ -895,6 +921,16 @@ impl Optimizer {
             PhysicalOperator::WritePart { input, part } => {
                 PhysicalOperator::WritePart { input, part }
             }
+            // ProcedureCall is opaque: do not push filters through it.
+            PhysicalOperator::ProcedureCall {
+                input,
+                output_vars,
+                rows,
+            } => PhysicalOperator::ProcedureCall {
+                input,
+                output_vars,
+                rows,
+            },
             PhysicalOperator::MultiwayJoin {
                 input,
                 closing_src_var,
@@ -1142,6 +1178,15 @@ impl Optimizer {
                 // the only new binding introduced here is the closing edge variable.
                 vars.insert(closing_rel_var.clone());
             }
+            // A CALL binds its YIELD output variables on top of its input bindings.
+            PhysicalOperator::ProcedureCall {
+                input, output_vars, ..
+            } => {
+                Self::collect_bound_vars(input, vars);
+                for v in output_vars {
+                    vars.insert(v.clone());
+                }
+            }
         }
     }
 
@@ -1249,6 +1294,39 @@ impl Optimizer {
                 Self::collect_expr_vars(initial, vars);
                 Self::collect_expr_vars(list, vars);
                 Self::collect_expr_vars(expression, vars);
+            }
+            // The anchor node is an outer reference; the relationship, target-node, and
+            // path variables are local bindings, so they are excluded.
+            Expr::PatternComprehension {
+                pattern,
+                predicate,
+                transform,
+            } => {
+                let mut local = HashSet::new();
+                if let Some(pv) = &pattern.path_variable {
+                    local.insert(pv.clone());
+                }
+                for (rel, node) in &pattern.rels {
+                    if let Some(v) = &rel.variable {
+                        local.insert(v.clone());
+                    }
+                    if let Some(v) = &node.variable {
+                        local.insert(v.clone());
+                    }
+                }
+                let mut inner = HashSet::new();
+                if let Some(p) = predicate {
+                    Self::collect_expr_vars(p, &mut inner);
+                }
+                Self::collect_expr_vars(transform, &mut inner);
+                for v in inner {
+                    if !local.contains(&v) {
+                        vars.insert(v);
+                    }
+                }
+                if let Some(anchor) = &pattern.node.variable {
+                    vars.insert(anchor.clone());
+                }
             }
             Expr::HasLabel { variable, .. } => {
                 vars.insert(variable.clone());

@@ -80,11 +80,30 @@ pub fn execute(
     cypher: &str,
     params: &HashMap<String, serde_json::Value>,
 ) -> Result<QueryResult, CypherError> {
+    execute_with_procedures(
+        graph,
+        cypher,
+        params,
+        &crate::procedure::ProcedureRegistry::new(),
+    )
+}
+
+/// Execute a Cypher query, resolving any `CALL` clauses against `registry`.
+///
+/// IssunDB ships no built-in procedures, so the default `execute` passes an empty
+/// registry; callers that register table-backed procedures use this entry point.
+#[instrument(skip(graph, params, registry), fields(cypher = %cypher))]
+pub fn execute_with_procedures(
+    graph: &Graph,
+    cypher: &str,
+    params: &HashMap<String, serde_json::Value>,
+    registry: &crate::procedure::ProcedureRegistry,
+) -> Result<QueryResult, CypherError> {
     let stmt = parser::parse(cypher)?;
     // Freeze a single wall-clock instant for the whole statement so that all current-time
     // functions (date(), datetime(), and the like) within this query observe the same time.
     let _clock = expr::StatementClock::install();
-    execute_statement(graph, &stmt, params)
+    execute_statement(graph, &stmt, params, registry)
 }
 
 /// Parse `cypher`, compile it into an optimized physical plan, and return the
@@ -144,6 +163,7 @@ fn execute_union(
     graph: &Graph,
     stmt: &UnionStatement,
     params: &HashMap<String, serde_json::Value>,
+    registry: &crate::procedure::ProcedureRegistry,
 ) -> Result<QueryResult, String> {
     if union_has_mixed_all(stmt) {
         return Err(
@@ -151,8 +171,10 @@ fn execute_union(
         );
     }
 
-    let left_result = execute_statement(graph, &stmt.left, params).map_err(|e| e.to_string())?;
-    let right_result = execute_statement(graph, &stmt.right, params).map_err(|e| e.to_string())?;
+    let left_result =
+        execute_statement(graph, &stmt.left, params, registry).map_err(|e| e.to_string())?;
+    let right_result =
+        execute_statement(graph, &stmt.right, params, registry).map_err(|e| e.to_string())?;
 
     if left_result.columns != right_result.columns {
         return Err(format!(
@@ -204,6 +226,7 @@ fn execute_pipeline(
     graph: &Graph,
     stmts: &[Statement],
     params: &HashMap<String, serde_json::Value>,
+    registry: &crate::procedure::ProcedureRegistry,
 ) -> Result<QueryResult, CypherError> {
     let mut shared_bindings: PathMap = PathMap::new();
     let mut last = QueryResult {
@@ -233,7 +256,7 @@ fn execute_pipeline(
                 };
             }
             other => {
-                last = execute_statement(graph, other, params)?;
+                last = execute_statement(graph, other, params, registry)?;
             }
         }
     }
@@ -245,9 +268,21 @@ fn execute_statement(
     graph: &Graph,
     stmt: &Statement,
     params: &HashMap<String, serde_json::Value>,
+    registry: &crate::procedure::ProcedureRegistry,
 ) -> Result<QueryResult, CypherError> {
     match stmt {
-        Statement::Query(q) => execute_read_query(graph, q, params).map_err(to_cypher_error),
+        Statement::Query(q) => {
+            // Resolve CALL clauses against the registry before planning. Cloning is
+            // cheap relative to execution and keeps the parsed AST immutable.
+            if q.parts.iter().any(|p| matches!(p, QueryPart::Call { .. })) {
+                let mut resolved = q.clone();
+                read::resolve_call_parts(graph, &mut resolved, registry, params)
+                    .map_err(to_cypher_error)?;
+                execute_read_query(graph, &resolved, params).map_err(to_cypher_error)
+            } else {
+                execute_read_query(graph, q, params).map_err(to_cypher_error)
+            }
+        }
         Statement::Create(c) => graph
             .with_write_lock(|| execute_create(graph, c, params))
             .map_err(to_cypher_error),
@@ -278,7 +313,7 @@ fn execute_statement(
         Statement::RemoveAndReturn(r) => {
             execute_remove_and_return(graph, r, params).map_err(to_cypher_error)
         }
-        Statement::Union(u) => execute_union(graph, u, params).map_err(to_cypher_error),
+        Statement::Union(u) => execute_union(graph, u, params, registry).map_err(to_cypher_error),
         Statement::Foreach(f) => graph
             .with_write_lock(|| execute_foreach(graph, f, params))
             .map_err(to_cypher_error),
@@ -288,7 +323,7 @@ fn execute_statement(
         Statement::DropConstraint(dc) => {
             execute_drop_constraint(graph, dc).map_err(to_cypher_error)
         }
-        Statement::Pipeline(stmts) => execute_pipeline(graph, stmts, params),
+        Statement::Pipeline(stmts) => execute_pipeline(graph, stmts, params, registry),
     }
 }
 
@@ -596,12 +631,292 @@ mod tests {
             .collect()
     }
 
+    /// Without an `AS` alias, a projected column takes the verbatim source text of
+    /// the expression (preserving case and whitespace); an explicit alias overrides it.
+    #[test]
+    fn verbatim_column_names_preserve_source_text() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+        graph.add_node("N", &serde_json::json!({})).unwrap();
+        graph.rebuild_csr().unwrap();
+
+        let res = execute(&graph, "MATCH (n) RETURN cOuNt( * )", &params).unwrap();
+        assert_eq!(res.columns, vec!["cOuNt( * )".to_string()]);
+
+        let res = execute(&graph, "RETURN 1 +  2", &params).unwrap();
+        assert_eq!(res.columns, vec!["1 +  2".to_string()]);
+
+        let res = execute(&graph, "RETURN 1 + 2 AS total", &params).unwrap();
+        assert_eq!(res.columns, vec!["total".to_string()]);
+    }
+
+    #[test]
+    fn call_procedure_standalone_and_in_query() {
+        use crate::procedure::{CypherType, Procedure, ProcedureRegistry};
+        let (_dir, graph) = setup_graph();
+        let mut registry = ProcedureRegistry::new();
+        registry.register(Procedure {
+            name: "test.labels".to_string(),
+            inputs: vec![],
+            outputs: vec![("label".to_string(), CypherType::String)],
+            rows: vec![vec![serde_json::json!("A")], vec![serde_json::json!("B")]],
+        });
+        let params = HashMap::new();
+
+        // Standalone: a non-void call auto-projects its output field as a column.
+        let res =
+            execute_with_procedures(&graph, "CALL test.labels()", &params, &registry).unwrap();
+        assert_eq!(res.columns, vec!["label".to_string()]);
+        assert_eq!(res.records.len(), 2);
+
+        // In-query: YIELD binds the output for a following RETURN.
+        let res = execute_with_procedures(
+            &graph,
+            "CALL test.labels() YIELD label RETURN label",
+            &params,
+            &registry,
+        )
+        .unwrap();
+        assert_eq!(res.columns, vec!["label".to_string()]);
+        assert_eq!(res.records.len(), 2);
+    }
+
+    #[test]
+    fn call_procedure_filters_by_argument_and_checks_type() {
+        use crate::procedure::{CypherType, Procedure, ProcedureRegistry};
+        let (_dir, graph) = setup_graph();
+        let mut registry = ProcedureRegistry::new();
+        registry.register(Procedure {
+            name: "test.my.proc".to_string(),
+            inputs: vec![("in".to_string(), CypherType::Integer)],
+            outputs: vec![("out".to_string(), CypherType::String)],
+            rows: vec![
+                vec![serde_json::json!(1), serde_json::json!("one")],
+                vec![serde_json::json!(2), serde_json::json!("two")],
+            ],
+        });
+        let params = HashMap::new();
+
+        let res = execute_with_procedures(
+            &graph,
+            "CALL test.my.proc(2) YIELD out RETURN out",
+            &params,
+            &registry,
+        )
+        .unwrap();
+        assert_eq!(res.records.len(), 1);
+        assert_eq!(res.records[0].values[0], serde_json::json!("two"));
+
+        // A wrong argument type is a compile-time error.
+        assert!(
+            execute_with_procedures(&graph, "CALL test.my.proc(true)", &params, &registry).is_err()
+        );
+    }
+
+    /// A pattern comprehension introduces a new target-node variable usable in the
+    /// transform, yields one element per match, and yields an empty list for an anchor
+    /// with no matching outgoing relationship (TCK Pattern2 [4]).
+    #[test]
+    fn pattern_comprehension_introduces_target_variable() {
+        let (_dir, graph) = setup_graph();
+        let params = HashMap::new();
+        execute(
+            &graph,
+            "CREATE (a)-[:T]->(b {name: 'val'})-[:T]->(c)",
+            &params,
+        )
+        .unwrap();
+        graph.rebuild_csr().unwrap();
+        let mut rows = run(&graph, "MATCH (n) RETURN [(n)-[:T]->(b) | b.name] AS list");
+        rows.sort_by_key(|r| serde_json::to_string(&r[0]).unwrap());
+        let mut expected = vec![
+            vec![serde_json::json!([])],
+            vec![serde_json::json!([null])],
+            vec![serde_json::json!(["val"])],
+        ];
+        expected.sort_by_key(|r| serde_json::to_string(&r[0]).unwrap());
+        assert_eq!(rows, expected);
+    }
+
+    /// A pattern comprehension introduces a relationship variable usable in the transform
+    /// (TCK Pattern2 [5]).
+    #[test]
+    fn pattern_comprehension_introduces_relationship_variable() {
+        let (_dir, graph) = setup_graph();
+        let params = HashMap::new();
+        execute(
+            &graph,
+            "CREATE (a), (b), (c) CREATE (a)-[:T {name: 'val'}]->(b), (b)-[:T]->(c)",
+            &params,
+        )
+        .unwrap();
+        graph.rebuild_csr().unwrap();
+        let mut rows = run(&graph, "MATCH (n) RETURN [(n)-[r:T]->() | r.name] AS list");
+        rows.sort_by_key(|r| serde_json::to_string(&r[0]).unwrap());
+        let mut expected = vec![
+            vec![serde_json::json!([])],
+            vec![serde_json::json!([null])],
+            vec![serde_json::json!(["val"])],
+        ];
+        expected.sort_by_key(|r| serde_json::to_string(&r[0]).unwrap());
+        assert_eq!(rows, expected);
+    }
+
+    /// A pattern comprehension may be the argument of an aggregation: `count(...)` over a
+    /// comprehension counts one per anchor row, including empty matches (TCK Pattern2 [6]).
+    #[test]
+    fn pattern_comprehension_under_aggregation() {
+        let (_dir, graph) = setup_graph();
+        let params = HashMap::new();
+        execute(
+            &graph,
+            "CREATE (a:A), (:A), (:A) CREATE (a)-[:HAS]->()",
+            &params,
+        )
+        .unwrap();
+        graph.rebuild_csr().unwrap();
+        let rows = run(
+            &graph,
+            "MATCH (n:A) RETURN count([p = (n)-[:HAS]->() | p]) AS c",
+        );
+        assert_eq!(rows, vec![vec![serde_json::json!(3)]]);
+    }
+
+    /// A pattern comprehension nested inside a list comprehension resolves its anchor from
+    /// a `__Node__` scalar (an element of `nodes(p)`) (TCK Pattern2 [7]).
+    #[test]
+    fn pattern_comprehension_nested_in_list_comprehension() {
+        let (_dir, graph) = setup_graph();
+        let params = HashMap::new();
+        execute(
+            &graph,
+            "CREATE (n1:X {n: 1}), (m1:Y), (i1:Y), (i2:Y) \
+             CREATE (n1)-[:T]->(m1), (m1)-[:T]->(i1), (m1)-[:T]->(i2) \
+             CREATE (n2:X {n: 2}), (m2), (i3:L), (i4:Y) \
+             CREATE (n2)-[:T]->(m2), (m2)-[:T]->(i3), (m2)-[:T]->(i4)",
+            &params,
+        )
+        .unwrap();
+        graph.rebuild_csr().unwrap();
+        let mut rows = run(
+            &graph,
+            "MATCH p = (n:X)-->() RETURN n.n AS n, [x IN nodes(p) | size([(x)-->(:Y) | 1])] AS list",
+        );
+        rows.sort_by_key(|r| r[0].as_i64().unwrap());
+        assert_eq!(rows[0][1], serde_json::json!([1, 2]));
+        assert_eq!(rows[1][1], serde_json::json!([0, 1]));
+    }
+
+    /// An inline label predicate on an OPTIONAL MATCH target node belongs to the optional
+    /// pattern: when it eliminates every match, the bound left row is preserved with the
+    /// optional variables null, not dropped (TCK Match7 [28]).
+    fn optional_match_label_fixture() -> (TempDir, Graph) {
+        let (dir, graph) = setup_graph();
+        let params = HashMap::new();
+        execute(
+            &graph,
+            "CREATE (s:Single), (a:A {num: 42}), (b:B {num: 46}), (c:C) \
+             CREATE (s)-[:REL]->(a), (s)-[:REL]->(b), (a)-[:REL]->(c), (b)-[:LOOP]->(b)",
+            &params,
+        )
+        .unwrap();
+        graph.rebuild_csr().unwrap();
+        (dir, graph)
+    }
+
+    #[test]
+    fn optional_match_inline_label_preserves_null_row() {
+        let (_dir, graph) = optional_match_label_fixture();
+        let rows = run(
+            &graph,
+            "MATCH (n:Single) OPTIONAL MATCH (n)-[r]-(m:NonExistent) RETURN r",
+        );
+        assert_eq!(rows, vec![vec![serde_json::Value::Null]]);
+    }
+
+    /// A WHERE attached to an OPTIONAL MATCH is part of the optional pattern: filtering out
+    /// every optional match still preserves the left row with null optional vars (TCK
+    /// MatchWhere6 [2]).
+    #[test]
+    fn optional_match_where_label_preserves_null_row() {
+        let (_dir, graph) = optional_match_label_fixture();
+        let rows = run(
+            &graph,
+            "MATCH (n:Single) OPTIONAL MATCH (n)-[r]-(m) WHERE m:NonExistent RETURN r",
+        );
+        assert_eq!(rows, vec![vec![serde_json::Value::Null]]);
+    }
+
+    /// A WHERE on an OPTIONAL MATCH that some rows satisfy keeps the satisfying matches and
+    /// does not drop the anchoring left row (TCK MatchWhere6 [1]).
+    #[test]
+    fn optional_match_where_keeps_satisfying_match() {
+        let (_dir, graph) = setup_graph();
+        let params = HashMap::new();
+        execute(
+            &graph,
+            "CREATE (a {name: 'A'}), (b:B {name: 'B'}), (c:C {name: 'C'}), (d:D {name: 'C'}) \
+             CREATE (a)-[:T]->(b), (a)-[:T]->(c), (a)-[:T]->(d)",
+            &params,
+        )
+        .unwrap();
+        graph.rebuild_csr().unwrap();
+        let rows = run(
+            &graph,
+            "MATCH (a)-->(b) WHERE b:B OPTIONAL MATCH (a)-->(c) WHERE c:C RETURN a.name",
+        );
+        assert_eq!(rows, vec![vec![serde_json::json!("A")]]);
+    }
+
+    /// A property predicate in a WHERE on an OPTIONAL MATCH that matches nothing preserves
+    /// the left row (TCK MatchWhere6 [4]).
+    #[test]
+    fn optional_match_where_property_predicate_preserves_left_row() {
+        let (_dir, graph) = setup_graph();
+        let params = HashMap::new();
+        execute(
+            &graph,
+            "CREATE (a), (b {name: 'Mark'}) CREATE (a)-[:T]->(b)",
+            &params,
+        )
+        .unwrap();
+        graph.rebuild_csr().unwrap();
+        let rows = run(
+            &graph,
+            "MATCH (n)-->(x0) OPTIONAL MATCH (x0)-->(x1) WHERE x1.name = 'bar' RETURN x0.name",
+        );
+        assert_eq!(rows, vec![vec![serde_json::json!("Mark")]]);
+    }
+
     // Helper: run a bare `RETURN <expr> AS v` and return the single scalar value.
     fn scalar(graph: &Graph, expr: &str) -> serde_json::Value {
         let cypher = format!("RETURN {} AS v", expr);
         let rows = run(graph, &cypher);
         assert_eq!(rows.len(), 1, "expected exactly one row for `{}`", expr);
         rows.into_iter().next().unwrap().into_iter().next().unwrap()
+    }
+
+    /// A parenthesized comparison is a complete boolean expression, not a link in a
+    /// chained comparison. `(a = b) = c` must evaluate the left comparison and compare
+    /// its boolean result to `c`, not desugar into the chain `a = b AND b = c`.
+    #[test]
+    fn parenthesized_comparison_is_not_chained() {
+        let (_dir, graph) = setup_graph();
+        // (1 = 1) = (1 = 1) is true = true = true. Chaining would give 1=1 AND 1=true = false.
+        assert_eq!(scalar(&graph, "(1 = 1) = (1 = 1)"), serde_json::json!(true));
+        assert_eq!(scalar(&graph, "(1 = 2) = (3 = 4)"), serde_json::json!(true));
+        assert_eq!(
+            scalar(&graph, "(1 = 1) = (1 = 2)"),
+            serde_json::json!(false)
+        );
+        // IS NULL binds tighter than comparison, and the grouped form must agree.
+        assert_eq!(
+            scalar(&graph, "(false = true IS NULL) = (false = (true IS NULL))"),
+            serde_json::json!(true)
+        );
+        // A genuine chained comparison (no parentheses) must still desugar correctly.
+        assert_eq!(scalar(&graph, "1 < 2 < 3"), serde_json::json!(true));
+        assert_eq!(scalar(&graph, "1 < 2 < 1"), serde_json::json!(false));
     }
 
     #[test]

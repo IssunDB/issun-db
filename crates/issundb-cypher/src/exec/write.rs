@@ -1,5 +1,7 @@
 use super::expr::evaluate_expr;
-use super::read::{binding_to_value, execute_physical, execute_read_query, projected_key};
+use super::read::{
+    binding_to_value, column_name, execute_physical, execute_read_query, projected_key,
+};
 use super::*;
 use crate::ast::{
     CreateAndReturnStatement, DeleteAndReturnStatement, ForeachStatement, MergeAndReturnStatement,
@@ -63,12 +65,7 @@ pub(super) fn execute_create_and_return(
     }
 
     // Project the RETURN clause over the created bindings.
-    let columns: Vec<String> = stmt
-        .return_clause
-        .items
-        .iter()
-        .map(|item| projected_key(&item.expr, &item.alias))
-        .collect();
+    let columns: Vec<String> = stmt.return_clause.items.iter().map(column_name).collect();
 
     let mut values = Vec::new();
     for item in &stmt.return_clause.items {

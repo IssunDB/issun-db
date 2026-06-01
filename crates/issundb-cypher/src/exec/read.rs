@@ -154,12 +154,7 @@ pub(super) fn execute_read_query(
         keys.sort();
         keys
     } else {
-        query
-            .return_clause
-            .items
-            .iter()
-            .map(|item| projected_key(&item.expr, &item.alias))
-            .collect()
+        query.return_clause.items.iter().map(column_name).collect()
     };
 
     // 4. Read each projected value directly from the PathMap by its canonical key.
@@ -191,6 +186,144 @@ pub(super) fn execute_read_query(
     Ok(QueryResult { columns, records })
 }
 
+/// Collect the variable names a path pattern binds (node, relationship, and path
+/// variables) into `vars`.
+fn collect_pattern_vars(
+    pattern: &crate::ast::Pattern,
+    vars: &mut std::collections::HashSet<String>,
+) {
+    if let Some(v) = &pattern.node.variable {
+        vars.insert(v.clone());
+    }
+    if let Some(v) = &pattern.path_variable {
+        vars.insert(v.clone());
+    }
+    for (rel, node) in &pattern.rels {
+        if let Some(v) = &rel.variable {
+            vars.insert(v.clone());
+        }
+        if let Some(v) = &node.variable {
+            vars.insert(v.clone());
+        }
+    }
+}
+
+/// Resolve every `CALL` part in `query` against the procedure `registry`,
+/// embedding the concrete output rows into each `QueryPart::Call` so the planner
+/// can lower it without registry access.
+///
+/// A `CALL` is standalone when it is the query's sole part and there is no
+/// explicit RETURN; otherwise it is treated as in-query, which forbids implicit
+/// arguments to a procedure with inputs and `YIELD *`. For a standalone, non-void
+/// call this also synthesizes a RETURN of the output variables so they surface as
+/// result columns (a void standalone call keeps its empty RETURN and yields no
+/// rows). Errors carry an openCypher error name and are surfaced as compile-time
+/// `SyntaxError`s.
+pub(super) fn resolve_call_parts(
+    graph: &Graph,
+    query: &mut crate::ast::Query,
+    registry: &crate::procedure::ProcedureRegistry,
+    params: &HashMap<String, serde_json::Value>,
+) -> Result<(), String> {
+    use crate::ast::{Expr, QueryPart, ReturnItem};
+
+    if !query
+        .parts
+        .iter()
+        .any(|p| matches!(p, QueryPart::Call { .. }))
+    {
+        return Ok(());
+    }
+
+    let standalone = query.parts.len() == 1
+        && matches!(query.parts[0], QueryPart::Call { .. })
+        && query.return_clause.items.is_empty();
+
+    let mut standalone_output_vars: Option<Vec<String>> = None;
+    // Track the variables in scope before each part so a CALL can reject a YIELD
+    // that shadows an already-bound variable. WITH resets the scope to its outputs.
+    let mut scope: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for part in query.parts.iter_mut() {
+        match part {
+            QueryPart::Match { match_clauses, .. }
+            | QueryPart::OptionalMatch { match_clauses, .. } => {
+                for mc in match_clauses {
+                    collect_pattern_vars(&mc.pattern, &mut scope);
+                }
+            }
+            QueryPart::Unwind { variable, .. } => {
+                scope.insert(variable.clone());
+            }
+            QueryPart::With { items, .. } => {
+                let mut next: std::collections::HashSet<String> = std::collections::HashSet::new();
+                for item in items {
+                    if let Some(alias) = &item.alias {
+                        next.insert(alias.clone());
+                    } else if let crate::ast::Expr::FunctionCall { name, .. } = &item.expr {
+                        if name == "__star__" {
+                            next.extend(scope.iter().cloned());
+                        }
+                    } else if let crate::ast::Expr::Prop(v, p) = &item.expr {
+                        if p.is_empty() {
+                            next.insert(v.clone());
+                        }
+                    }
+                }
+                scope = next;
+            }
+            QueryPart::Call {
+                name,
+                args,
+                implicit_args,
+                yields,
+                yield_star,
+                resolved,
+            } => {
+                let mut arg_values = Vec::with_capacity(args.len());
+                for arg in args.iter() {
+                    arg_values.push(evaluate_expr(graph, &PathMap::new(), arg, params)?);
+                }
+                let rc = registry.resolve(
+                    name,
+                    &arg_values,
+                    *implicit_args,
+                    !standalone,
+                    yields,
+                    *yield_star,
+                    &scope,
+                    params,
+                )?;
+                for v in &rc.output_vars {
+                    scope.insert(v.clone());
+                }
+                if standalone {
+                    standalone_output_vars = Some(rc.output_vars.clone());
+                }
+                *resolved = Some(rc);
+            }
+            _ => {}
+        }
+    }
+
+    if standalone {
+        if let Some(vars) = standalone_output_vars {
+            if !vars.is_empty() {
+                query.return_clause.items = vars
+                    .into_iter()
+                    .map(|v| ReturnItem {
+                        expr: Expr::Prop(v.clone(), String::new()),
+                        alias: Some(v),
+                        source_text: None,
+                    })
+                    .collect();
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Compute the key under which a RETURN/WITH item is stored in the projected PathMap.
 ///
 /// Must exactly match the key-naming logic in the `PhysicalOperator::Project` arm of
@@ -204,8 +337,69 @@ pub(super) fn projected_key(expr: &Expr, alias: &Option<String>) -> String {
     }
 }
 
+/// Compute the output column name for a RETURN/WITH item. An explicit alias wins;
+/// otherwise openCypher uses the verbatim source text of the expression (preserving
+/// case and whitespace), falling back to a reconstructed display name when the raw
+/// source was not captured. This is distinct from `projected_key`, which is the
+/// internal storage key and stays stable on the reconstructed display name.
+pub(super) fn column_name(item: &crate::ast::ReturnItem) -> String {
+    if let Some(a) = &item.alias {
+        a.clone()
+    } else if let Some(text) = &item.source_text {
+        text.clone()
+    } else {
+        expr_display_name(&item.expr)
+    }
+}
+
 /// Return a human-readable name for an expression, used as the default column name
 /// when no alias is specified in a RETURN or WITH clause.
+/// Render a path pattern as Cypher source for use as a default column name, for example
+/// `(n)-[:T]->(b)`. Only the structural shape needed by pattern comprehension display is
+/// reproduced (variable, labels, direction, and relationship type).
+fn pattern_display_name(pattern: &crate::ast::Pattern) -> String {
+    fn node(n: &crate::ast::NodePattern) -> String {
+        let mut s = String::from("(");
+        if let Some(v) = &n.variable {
+            s.push_str(v);
+        }
+        for label in &n.labels {
+            s.push(':');
+            s.push_str(label);
+        }
+        s.push(')');
+        s
+    }
+    let mut s = node(&pattern.node);
+    for (rel, target) in &pattern.rels {
+        let mut inner = String::new();
+        if let Some(v) = &rel.variable {
+            inner.push_str(v);
+        }
+        if let Some(t) = &rel.rel_type {
+            inner.push(':');
+            inner.push_str(t);
+        }
+        if rel.range.is_some() {
+            inner.push('*');
+        }
+        let body = if inner.is_empty() {
+            String::new()
+        } else {
+            format!("[{}]", inner)
+        };
+        if rel.is_undirected {
+            s.push_str(&format!("-{}-", body));
+        } else if rel.is_incoming {
+            s.push_str(&format!("<-{}-", body));
+        } else {
+            s.push_str(&format!("-{}->", body));
+        }
+        s.push_str(&node(target));
+    }
+    s
+}
+
 pub(crate) fn expr_display_name(expr: &Expr) -> String {
     match expr {
         Expr::Prop(var, prop) => {
@@ -277,6 +471,23 @@ pub(crate) fn expr_display_name(expr: &Expr) -> String {
             s.push(']');
             s
         }
+        Expr::PatternComprehension {
+            pattern,
+            predicate,
+            transform,
+        } => {
+            let mut s = String::from("[");
+            if let Some(pv) = &pattern.path_variable {
+                s.push_str(pv);
+                s.push_str(" = ");
+            }
+            s.push_str(&pattern_display_name(pattern));
+            if let Some(p) = predicate {
+                s.push_str(&format!(" WHERE {}", expr_display_name(p)));
+            }
+            s.push_str(&format!(" | {}]", expr_display_name(transform)));
+            s
+        }
         Expr::Reduce {
             accumulator,
             initial,
@@ -321,6 +532,14 @@ pub(crate) fn expr_display_name(expr: &Expr) -> String {
         }
         Expr::FunctionCall { name, args } => {
             // Special internal functions get display names matching source syntax.
+            // `__grouped__` is a transparent parenthesized-comparison marker; display
+            // its single inner expression (redundant parentheses are dropped, matching
+            // the reference column-name behavior).
+            if name == "__grouped__" {
+                if let Some(inner) = args.first() {
+                    return expr_display_name(inner);
+                }
+            }
             if name == "__list__" {
                 let args_str: Vec<String> = args.iter().map(expr_display_name).collect();
                 return format!("[{}]", args_str.join(", "));
@@ -931,6 +1150,163 @@ fn expand_from_paths(
     }
 
     Ok(next_paths)
+}
+
+/// Evaluate a pattern comprehension (`[ p = (n)-->(b) WHERE pred | transform ]`).
+///
+/// The pattern is matched starting from the anchor node, which must already be bound
+/// in `outer` (either as a node binding or as a `__Node__` scalar produced by, for
+/// example, `nodes(p)`). Each match yields one element: the `transform` expression is
+/// evaluated with the relationship and target-node variables introduced by the pattern
+/// bound, plus the optional path variable bound to the matched path. Matches that fail
+/// the optional `WHERE` predicate are dropped. An anchor that is not bound to a node
+/// yields an empty list rather than an error.
+pub(super) fn eval_pattern_comprehension(
+    graph: &Graph,
+    outer: &PathMap,
+    pattern: &crate::ast::Pattern,
+    predicate: Option<&Expr>,
+    transform: &Expr,
+    params: &HashMap<String, serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let anchor_var = match &pattern.node.variable {
+        Some(v) => v.clone(),
+        None => return Ok(serde_json::Value::Array(Vec::new())),
+    };
+
+    // Seed the expansion with the surrounding bindings, normalizing a `__Node__`
+    // scalar anchor (e.g. an element of `nodes(p)`) to a node binding so the
+    // expansion machinery can traverse from it. A non-node anchor yields no matches.
+    let mut seed = outer.clone();
+    match seed.get(&anchor_var) {
+        Some(GraphBinding::Node(_)) => {}
+        Some(GraphBinding::Scalar(v)) => {
+            let id = v
+                .as_object()
+                .filter(|o| o.get("__type__").and_then(|t| t.as_str()) == Some("__Node__"))
+                .and_then(|o| o.get("id"))
+                .and_then(|i| i.as_i64());
+            match id {
+                Some(id) => {
+                    seed.insert(anchor_var.clone(), GraphBinding::Node(id as u64));
+                }
+                None => return Ok(serde_json::Value::Array(Vec::new())),
+            }
+        }
+        _ => return Ok(serde_json::Value::Array(Vec::new())),
+    }
+
+    let mut current_paths = vec![seed];
+    let mut src_var = anchor_var.clone();
+    let mut last_dst_var = anchor_var;
+    let mut anon = 0usize;
+
+    for (rel, node) in &pattern.rels {
+        let rel_var = rel.variable.clone().unwrap_or_else(|| {
+            anon += 1;
+            format!("__pc_rel_{}", anon)
+        });
+        let dst_var = node.variable.clone().unwrap_or_else(|| {
+            anon += 1;
+            format!("__pc_node_{}", anon)
+        });
+        let min_hops = rel.range.as_ref().and_then(|r| r.min).unwrap_or(1) as usize;
+        let max_hops = match rel.range.as_ref() {
+            None => 1,
+            Some(r) => r.max.map(|v| v as usize).unwrap_or(usize::MAX),
+        };
+
+        current_paths = expand_from_paths(
+            graph,
+            current_paths,
+            &src_var,
+            &rel_var,
+            &dst_var,
+            rel.rel_type.as_deref(),
+            rel.is_incoming,
+            rel.is_undirected,
+            min_hops,
+            max_hops,
+        )?;
+        current_paths = filter_paths_by_node(
+            graph,
+            current_paths,
+            &dst_var,
+            &node.labels,
+            &node.properties,
+            params,
+        )?;
+
+        src_var = dst_var.clone();
+        last_dst_var = dst_var;
+    }
+
+    let mut result = Vec::new();
+    for mut path in current_paths {
+        if let Some(pv) = &pattern.path_variable {
+            if let Some(GraphBinding::Scalar(obj)) = path.get(&format!("_path_{}", last_dst_var)) {
+                let obj = obj.clone();
+                path.insert(pv.clone(), GraphBinding::Scalar(obj));
+            }
+        }
+        if let Some(pred) = predicate {
+            if evaluate_expr(graph, &path, pred, params)? != serde_json::Value::Bool(true) {
+                continue;
+            }
+        }
+        result.push(evaluate_expr(graph, &path, transform, params)?);
+    }
+    Ok(serde_json::Value::Array(result))
+}
+
+/// Retain only the paths whose `dst_var` node carries every required label and matches
+/// every inline property in `properties`.
+fn filter_paths_by_node(
+    graph: &Graph,
+    paths: Vec<PathMap>,
+    dst_var: &str,
+    labels: &[String],
+    properties: &Option<HashMap<String, Expr>>,
+    params: &HashMap<String, serde_json::Value>,
+) -> Result<Vec<PathMap>, String> {
+    if labels.is_empty() && properties.is_none() {
+        return Ok(paths);
+    }
+    let mut out = Vec::new();
+    for path in paths {
+        let nid = match path.get(dst_var) {
+            Some(GraphBinding::Node(n)) => *n,
+            _ => continue,
+        };
+        if !labels.is_empty() {
+            let node_labels = graph.node_labels(nid).map_err(|e| e.to_string())?;
+            if !labels.iter().all(|l| node_labels.iter().any(|x| x == l)) {
+                continue;
+            }
+        }
+        if let Some(props) = properties {
+            let record = graph
+                .get_node(nid)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("node not found: {}", nid))?;
+            let actual: serde_json::Value =
+                rmp_serde::from_slice(&record.props).map_err(|e| e.to_string())?;
+            let mut keep = true;
+            for (key, expr) in props {
+                let want = evaluate_expr(graph, &path, expr, params)?;
+                let got = actual.get(key).cloned().unwrap_or(serde_json::Value::Null);
+                if got != want {
+                    keep = false;
+                    break;
+                }
+            }
+            if !keep {
+                continue;
+            }
+        }
+        out.push(path);
+    }
+    Ok(out)
 }
 
 /// Execute a physical operator tree with a Sideways Information Passing (SIP) filter.
@@ -1659,6 +2035,29 @@ pub(super) fn execute_physical(
                 } else if list_val != serde_json::Value::Null {
                     let mut new_path = path.clone();
                     new_path.insert(variable.clone(), GraphBinding::Scalar(list_val));
+                    next_paths.push(new_path);
+                }
+            }
+
+            Ok(next_paths)
+        }
+        PhysicalOperator::ProcedureCall {
+            input,
+            output_vars,
+            rows,
+        } => {
+            let child_paths = execute_physical(graph, input, params)?;
+            let mut next_paths = Vec::new();
+
+            // For each input row, emit one output row per resolved procedure row,
+            // binding the YIELD output variables. A void procedure has empty
+            // `output_vars` and a single empty row, so this passes rows through.
+            for path in child_paths {
+                for row in rows {
+                    let mut new_path = path.clone();
+                    for (var, value) in output_vars.iter().zip(row.iter()) {
+                        new_path.insert(var.clone(), GraphBinding::Scalar(value.clone()));
+                    }
                     next_paths.push(new_path);
                 }
             }

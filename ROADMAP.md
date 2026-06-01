@@ -66,7 +66,8 @@ This document outlines the features implemented in IssunDB and the future goals 
 - [x] Result shaping with order, skip, limit, and aggregation functions
 - [x] Idempotent writes using the `MERGE` clause, including relationship and bound-node binding carried into following clauses, `ON CREATE`
   and `ON MATCH` actions in either order, and fan-out to one row per matched pattern
-- [x] `OPTIONAL MATCH` for outer-join pattern matching
+- [x] `OPTIONAL MATCH` for outer-join pattern matching, with an inline label predicate or a `WHERE` attached to the `OPTIONAL MATCH` scoped to
+  the optional pattern, so eliminating every optional match preserves the bound left row with null optional variables rather than dropping it
 - [x] Multi-label nodes: `CREATE`, `MATCH`, and `SET` over patterns such as `(n:A:B)`, with one label-index entry per label
 - [x] `SET` and `REMOVE` for node labels in addition to node and relationship properties
 - [x] `DELETE` and `DETACH DELETE` over arbitrary expression targets, not just bare variables, evaluated over the whole result so relationships
@@ -85,9 +86,9 @@ This document outlines the features implemented in IssunDB and the future goals 
   clones the base path once per output row, generalizing the former two-hop fast path to any length
 - [x] Static filter elimination: provably-true predicates (`WHERE true`, equality or inequality of identical-form literals) are dropped before
   pushdown so they are never evaluated per row
-- [ ] Full openCypher TCK conformance: as of 2026-05-31, 3,333 of 3,490 executed scenarios pass (95.50%; a further 407 scenarios are
-  skipped as intentional exclusions, such as negative-test tags and node or relationship display-literal representational mismatches). Notable
-  remaining capability gaps:
+- [ ] Full openCypher TCK conformance: as of 2026-06-01, 3,412 of 3,490 executed scenarios pass (97.77%; a further 428 scenarios are
+  skipped as intentional exclusions, such as negative-test tags and node, relationship, or path display-literal representational mismatches).
+  Notable remaining capability gaps:
     - [x] Temporal expression conformance: timezone resolution for named and historical zones (DST and local-mean-time offsets via the IANA
       database), storage of temporal values as node properties, duration parsing from ISO strings (including the extended date format),
       `datetime.fromepoch` construction, duration component accessors, statement-clock current-time functions, and extreme-year (±999999999)
@@ -97,11 +98,21 @@ This document outlines the features implemented in IssunDB and the future goals 
       compile-time type validation of `length()`
     - [x] Standard math and string scalar functions: `exists()`, `left()`, `right()`, `degrees()`, `radians()`, `haversin()`, and `timestamp()` scalar
       functions
-    - [ ] `CALL` and procedure invocation
-    - [ ] Pattern comprehension and list comprehension subqueries
+    - [x] `CALL` and procedure invocation: standalone and in-query calls, explicit and implicit (parameter) arguments, `YIELD` with output
+      renaming and `YIELD *`, table-backed procedures registered through a `ProcedureRegistry` resolved at execution time, and compile-time
+      validation (unknown procedure, wrong argument count or type, missing implicit parameter, `YIELD *` in an in-query call, and `YIELD`
+      shadowing a bound variable)
+    - [x] Pattern comprehension: `[ p = (n)-[:T]->(b) WHERE pred | transform ]`, matched from the bound anchor node, introducing
+      relationship and target-node variables (and an optional path variable) scoped to the comprehension, with label and inline-property
+      filters on target nodes, variable-length relationships, nesting inside list comprehensions (anchored on a node scalar), and use under
+      aggregation; list comprehension subqueries were already supported
     - [x] Aggregation expressions inside `ORDER BY`
     - [x] Three-valued null comparison logic
     - [x] Intermediate orderings and path variable bindings in `WITH` / `ORDER BY`
+    - [x] Compile-time numeric literal validation: integer overflow (decimal, hexadecimal, and octal, including the negated `i64::MIN`
+      boundary), floating-point overflow, and malformed unicode escape literals are rejected during parsing
+    - [x] Verbatim default column names: an unaliased projection takes the raw source text of its expression (preserving case and whitespace)
+      as the output column name, matching openCypher, while the internal storage key stays on the reconstructed display name
 
 ---
 

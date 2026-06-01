@@ -145,6 +145,40 @@ fn collect_expr_vars(expr: &Expr, vars: &mut HashSet<String>) {
             collect_expr_vars(list, vars);
             collect_expr_vars(expression, vars);
         }
+        // The anchor node is an outer reference; the relationship, target-node, and path
+        // variables are local bindings. Insert the anchor, then collect from the predicate
+        // and transform with the local bindings removed.
+        Expr::PatternComprehension {
+            pattern,
+            predicate,
+            transform,
+        } => {
+            let mut local = std::collections::HashSet::new();
+            if let Some(pv) = &pattern.path_variable {
+                local.insert(pv.clone());
+            }
+            for (rel, node) in &pattern.rels {
+                if let Some(v) = &rel.variable {
+                    local.insert(v.clone());
+                }
+                if let Some(v) = &node.variable {
+                    local.insert(v.clone());
+                }
+            }
+            let mut inner = HashSet::new();
+            if let Some(p) = predicate {
+                collect_expr_vars(p, &mut inner);
+            }
+            collect_expr_vars(transform, &mut inner);
+            for v in inner {
+                if !local.contains(&v) {
+                    vars.insert(v);
+                }
+            }
+            if let Some(anchor) = &pattern.node.variable {
+                vars.insert(anchor.clone());
+            }
+        }
         Expr::HasLabel { variable, .. } => {
             vars.insert(variable.clone());
         }

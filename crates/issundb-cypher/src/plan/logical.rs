@@ -96,6 +96,15 @@ pub enum LogicalOperator {
         input: Box<LogicalOperator>,
         part: crate::ast::QueryPart,
     },
+    /// A resolved `CALL` clause. For each input row the operator emits one output
+    /// row per entry in `rows`, binding `output_vars` to the corresponding cells.
+    /// A void procedure has empty `output_vars` and a single empty row, making the
+    /// call an identity over the input.
+    ProcedureCall {
+        input: Box<LogicalOperator>,
+        output_vars: Vec<String>,
+        rows: Vec<Vec<serde_json::Value>>,
+    },
 }
 
 pub struct LogicalPlanner;
@@ -429,6 +438,21 @@ impl LogicalPlanner {
                             input: Box::new(p),
                             expr: expr.clone(),
                             variable: variable.clone(),
+                        });
+                    }
+                    QueryPart::Call { resolved, .. } => {
+                        let p = current_plan.unwrap_or(LogicalOperator::SingleRow);
+                        // `resolved` is populated by the execution-time resolution
+                        // pass; an unresolved call (e.g. from plan inspection) is an
+                        // identity over the input.
+                        let (output_vars, rows) = match resolved {
+                            Some(rc) => (rc.output_vars.clone(), rc.rows.clone()),
+                            None => (vec![], vec![vec![]]),
+                        };
+                        current_plan = Some(LogicalOperator::ProcedureCall {
+                            input: Box::new(p),
+                            output_vars,
+                            rows,
                         });
                     }
                     // Write clause variants are passed through as-is for the physical planner
@@ -1273,6 +1297,16 @@ fn rewrite_expr_with_aliases(expr: &mut Expr, projections: &[(Expr, String)]) {
             rewrite_expr_with_aliases(initial, projections);
             rewrite_expr_with_aliases(list, projections);
             rewrite_expr_with_aliases(expression, projections);
+        }
+        Expr::PatternComprehension {
+            predicate,
+            transform,
+            ..
+        } => {
+            if let Some(p) = predicate {
+                rewrite_expr_with_aliases(p, projections);
+            }
+            rewrite_expr_with_aliases(transform, projections);
         }
         Expr::HasLabel { .. } => {}
     }

@@ -50,6 +50,19 @@ pub(crate) enum Tok {
 type ParserInput<'a> = MappedInput<'a, Tok, SimpleSpan, &'a [(Tok, SimpleSpan)]>;
 type ParserError<'a> = extra::Err<Rich<'a, Tok>>;
 
+/// Build an integer token from an unsigned magnitude string in the given radix.
+/// Magnitudes up to `i64::MAX` map directly. A magnitude of exactly `2^63` maps
+/// to `i64::MIN`, which is only valid when immediately negated (the unary-minus
+/// folder accepts it; a standalone occurrence is rejected later in validation).
+/// Anything larger overflows and yields `None` so the lexer can raise an error.
+fn int_token(digits: &str, radix: u32) -> Option<Tok> {
+    match u128::from_str_radix(digits, radix) {
+        Ok(v) if v <= i64::MAX as u128 => Some(Tok::Integer(v as i64)),
+        Ok(v) if v == i64::MAX as u128 + 1 => Some(Tok::Integer(i64::MIN)),
+        _ => None,
+    }
+}
+
 // ─── Phase 1: Spanned Lexer ───────────────────────────────────────────────────
 
 /// Build a spanned chumsky lexer that converts a Cypher source string into a
@@ -60,18 +73,38 @@ pub(crate) fn lexer<'src>()
     let hex_int = just("0x")
         .or(just("0X"))
         .ignore_then(text::digits(16).to_slice())
-        .map(|s: &str| Tok::Integer(u64::from_str_radix(s, 16).map(|v| v as i64).unwrap_or(0)));
+        .validate(|s: &str, e, emitter| {
+            int_token(s, 16).unwrap_or_else(|| {
+                emitter.emit(Rich::custom(
+                    e.span(),
+                    "SyntaxError(IntegerOverflow): hexadecimal integer literal out of range",
+                ));
+                Tok::Integer(0)
+            })
+        });
 
     // Octal integer: 0o77 or 0O77
     let oct_int = just("0o")
         .or(just("0O"))
         .ignore_then(text::digits(8).to_slice())
-        .map(|s: &str| Tok::Integer(u64::from_str_radix(s, 8).map(|v| v as i64).unwrap_or(0)));
+        .validate(|s: &str, e, emitter| {
+            int_token(s, 8).unwrap_or_else(|| {
+                emitter.emit(Rich::custom(
+                    e.span(),
+                    "SyntaxError(IntegerOverflow): octal integer literal out of range",
+                ));
+                Tok::Integer(0)
+            })
+        });
 
     // Exponent for floats
     let exponent = choice((just('e'), just('E')))
         .then(just('-').or(just('+')).or_not())
         .then(text::digits(10));
+
+    // A float literal that parses to infinity is out of range; raise an error.
+    // (Inlined at both branches below because the `validate` closure's argument
+    // types are inferred from the call site.)
 
     // Floating-point literals
     let float_num = choice((
@@ -86,62 +119,95 @@ pub(crate) fn lexer<'src>()
                 exponent.to_slice().map(Some),
             )))
             .to_slice()
-            .map(|s: &str| Tok::Float(s.parse().unwrap_or(0.0))),
+            .validate(|s: &str, e, emitter| {
+                let v: f64 = s.parse().unwrap_or(0.0);
+                if v.is_infinite() {
+                    emitter.emit(Rich::custom(
+                        e.span(),
+                        "SyntaxError(FloatingPointOverflow): floating point literal out of range",
+                    ));
+                }
+                Tok::Float(v)
+            }),
         // .5 / .5e-3
         just('.')
             .then(text::digits(10))
             .then(exponent.or_not())
             .to_slice()
-            .map(|s: &str| Tok::Float(s.parse().unwrap_or(0.0))),
+            .validate(|s: &str, e, emitter| {
+                let v: f64 = s.parse().unwrap_or(0.0);
+                if v.is_infinite() {
+                    emitter.emit(Rich::custom(
+                        e.span(),
+                        "SyntaxError(FloatingPointOverflow): floating point literal out of range",
+                    ));
+                }
+                Tok::Float(v)
+            }),
     ));
 
     // Plain integer literals
-    let int_num = text::int(10)
-        .to_slice()
-        .map(|s: &str| Tok::Integer(s.parse::<u64>().map(|v| v as i64).unwrap_or(0)));
+    let int_num = text::int(10).to_slice().validate(|s: &str, e, emitter| {
+        int_token(s, 10).unwrap_or_else(|| {
+            emitter.emit(Rich::custom(
+                e.span(),
+                "SyntaxError(IntegerOverflow): integer literal out of range",
+            ));
+            Tok::Integer(0)
+        })
+    });
+
+    // A `\u` unicode escape requires exactly four hexadecimal digits. Consume up
+    // to four hex digits after `u` and raise an error if fewer than four are
+    // present, rather than silently falling back to a literal `u`.
+    let unicode_escape = just('u')
+        .ignore_then(
+            any()
+                .filter(|c: &char| c.is_ascii_hexdigit())
+                .repeated()
+                .at_most(4)
+                .collect::<String>(),
+        )
+        .validate(|s: String, e, emitter| {
+            if s.len() != 4 {
+                emitter.emit(Rich::custom(
+                    e.span(),
+                    "SyntaxError(InvalidUnicodeLiteral): \\u requires four hexadecimal digits",
+                ));
+                return '\u{FFFD}';
+            }
+            u32::from_str_radix(&s, 16)
+                .ok()
+                .and_then(char::from_u32)
+                .unwrap_or('\u{FFFD}')
+        });
 
     // escape handler for strings
-    let escape_sq =
-        just('\\').ignore_then(choice((
-            just('\'').to('\''),
-            just('"').to('"'),
-            just('\\').to('\\'),
-            just('n').to('\n'),
-            just('t').to('\t'),
-            just('r').to('\r'),
-            just('b').to('\x08'),
-            just('f').to('\x0C'),
-            just('u').ignore_then(text::digits(16).at_least(4).at_most(4).to_slice().map(
-                |s: &str| {
-                    u32::from_str_radix(s, 16)
-                        .ok()
-                        .and_then(char::from_u32)
-                        .unwrap_or('\u{FFFD}')
-                },
-            )),
-            any().map(|c| c),
-        )));
+    let escape_sq = just('\\').ignore_then(choice((
+        just('\'').to('\''),
+        just('"').to('"'),
+        just('\\').to('\\'),
+        just('n').to('\n'),
+        just('t').to('\t'),
+        just('r').to('\r'),
+        just('b').to('\x08'),
+        just('f').to('\x0C'),
+        unicode_escape,
+        any().map(|c| c),
+    )));
 
-    let escape_dq =
-        just('\\').ignore_then(choice((
-            just('\'').to('\''),
-            just('"').to('"'),
-            just('\\').to('\\'),
-            just('n').to('\n'),
-            just('t').to('\t'),
-            just('r').to('\r'),
-            just('b').to('\x08'),
-            just('f').to('\x0C'),
-            just('u').ignore_then(text::digits(16).at_least(4).at_most(4).to_slice().map(
-                |s: &str| {
-                    u32::from_str_radix(s, 16)
-                        .ok()
-                        .and_then(char::from_u32)
-                        .unwrap_or('\u{FFFD}')
-                },
-            )),
-            any().map(|c| c),
-        )));
+    let escape_dq = just('\\').ignore_then(choice((
+        just('\'').to('\''),
+        just('"').to('"'),
+        just('\\').to('\\'),
+        just('n').to('\n'),
+        just('t').to('\t'),
+        just('r').to('\r'),
+        just('b').to('\x08'),
+        just('f').to('\x0C'),
+        unicode_escape,
+        any().map(|c| c),
+    )));
 
     // Single-quoted string literal
     let sq_str = just('\'')
@@ -334,7 +400,17 @@ pub(crate) fn expr_parser<'a>() -> impl Parser<'a, ParserInput<'a>, Expr, Parser
 
     recursive(|expr| {
         // --- Core Atomic Elements ---
-        let lit_expr = literal().map(Expr::Literal);
+        // A magnitude of exactly 2^63 lexes to `i64::MIN`. It is only valid when
+        // immediately negated (yielding `i64::MIN`); the unary-minus folder
+        // rewrites this marker back to the literal. A surviving marker is a
+        // standalone out-of-range positive literal, rejected during validation.
+        let lit_expr = literal().map(|lit| match lit {
+            Literal::Int(n) if n == i64::MIN => Expr::FunctionCall {
+                name: "__neg_min_int__".to_string(),
+                args: vec![],
+            },
+            other => Expr::Literal(other),
+        });
 
         let param_expr = any().filter_map(|tok| match tok {
             Tok::Param(p) => Some(Expr::Param(p.clone())),
@@ -344,9 +420,23 @@ pub(crate) fn expr_parser<'a>() -> impl Parser<'a, ParserInput<'a>, Expr, Parser
         // Bare identifier is initially mapped to Prop(name, "") as per legacy parser design
         let var_expr = identifier().map(|name| Expr::Prop(name, "".to_string()));
 
+        // Parentheses make the enclosed expression a complete, self-contained operand.
+        // When that operand is a comparison, mark it with the internal `__grouped__`
+        // wrapper so the executor's chained-comparison desugaring (which fires on the
+        // bare `Cmp(Cmp(..), ..)` shape) does not flatten it: `(a = b) = c` must compare
+        // the boolean result of `a = b` to `c`, not become `a = b AND b = c`. The wrapper
+        // is transparent to every other consumer because they all recurse into
+        // `FunctionCall` arguments.
         let paren_expr = sym(Tok::LParen)
             .ignore_then(expr.clone())
-            .then_ignore(sym(Tok::RParen));
+            .then_ignore(sym(Tok::RParen))
+            .map(|inner| match &inner {
+                Expr::BinaryOp { op, .. } if is_comparison_operator(op) => Expr::FunctionCall {
+                    name: "__grouped__".to_string(),
+                    args: vec![inner],
+                },
+                _ => inner,
+            });
 
         // count(*) special case
         let count_star = keyword("COUNT")
@@ -380,6 +470,21 @@ pub(crate) fn expr_parser<'a>() -> impl Parser<'a, ParserInput<'a>, Expr, Parser
 
         // List literal or List comprehension: [ ... ]
         let list_expr = sym(Tok::LBrack).ignore_then(choice((
+            // Pattern comprehension: [pathvar = (a)-[r]->(b) WHERE predicate | transform].
+            // The pattern always contains at least one relationship, so its leading
+            // `(` (or `pathvar =`) distinguishes it from a list comprehension (which
+            // begins with `identifier IN`) or a plain list literal. The transform after
+            // `|` is mandatory.
+            pattern(expr.clone())
+                .then(keyword("WHERE").ignore_then(expr.clone()).or_not())
+                .then_ignore(sym(Tok::Pipe))
+                .then(expr.clone())
+                .then_ignore(sym(Tok::RBrack))
+                .map(|((pat, predicate), transform)| Expr::PatternComprehension {
+                    pattern: Box::new(pat),
+                    predicate: predicate.map(Box::new),
+                    transform: Box::new(transform),
+                }),
             // List comprehension: [x IN list WHERE predicate | transform]
             identifier()
                 .then_ignore(keyword("IN"))
@@ -726,6 +831,10 @@ pub(crate) fn expr_parser<'a>() -> impl Parser<'a, ParserInput<'a>, Expr, Parser
             // This also fixes the column display ("abs(-1)" instead of "abs(0 - 1)")
             // and correctly handles i64::MIN (-9223372036854775808).
             prefix(19, sym(Tok::Minus), |_, x, _| match x {
+                // Negating the 2^63 marker yields i64::MIN, the smallest integer.
+                Expr::FunctionCall { name, .. } if name == "__neg_min_int__" => {
+                    Expr::Literal(Literal::Int(i64::MIN))
+                }
                 Expr::Literal(Literal::Int(n)) => Expr::Literal(Literal::Int(n.wrapping_neg())),
                 Expr::Literal(Literal::Float(f)) => Expr::Literal(Literal::Float(-f)),
                 other => Expr::BinaryOp {
@@ -1113,11 +1222,18 @@ fn pattern<'a>(
 fn return_item<'a>() -> impl Parser<'a, ParserInput<'a>, ReturnItem, ParserError<'a>> + Clone {
     expr_parser()
         .then(keyword("AS").ignore_then(identifier()).or_not())
-        .map(|(expr, alias)| ReturnItem { expr, alias })
+        .map(|(expr, alias)| ReturnItem {
+            expr,
+            alias,
+            source_text: None,
+        })
 }
 
-/// Parses the complete `RETURN` clause
-fn return_clause<'a>() -> impl Parser<'a, ParserInput<'a>, ReturnClause, ParserError<'a>> + Clone {
+/// Parses the complete `RETURN` clause. `src` is the original query text, used to
+/// capture each unaliased item's verbatim source as its default column name.
+fn return_clause(
+    src: &str,
+) -> impl Parser<'_, ParserInput<'_>, ReturnClause, ParserError<'_>> + Clone {
     keyword("RETURN")
         .ignore_then(
             keyword("DISTINCT")
@@ -1133,8 +1249,20 @@ fn return_clause<'a>() -> impl Parser<'a, ParserInput<'a>, ReturnClause, ParserE
                     args: vec![],
                 },
                 alias: None,
+                source_text: None,
             }]),
             return_item()
+                .map_with(move |mut item, e| {
+                    // The default column name is the verbatim source of the
+                    // expression; only relevant when the item has no `AS` alias.
+                    if item.alias.is_none() {
+                        let sp = e.span();
+                        if let Some(text) = src.get(sp.start()..sp.end()) {
+                            item.source_text = Some(text.trim().to_string());
+                        }
+                    }
+                    item
+                })
                 .separated_by(sym(Tok::Comma))
                 .at_least(1)
                 .collect::<Vec<_>>(),
@@ -1248,19 +1376,71 @@ fn remove_item<'a>() -> impl Parser<'a, ParserInput<'a>, Vec<RemoveItem>, Parser
 
 fn query_part<'a>() -> impl Parser<'a, ParserInput<'a>, QueryPart, ParserError<'a>> + Clone {
     choice((
-        // CALL subqueries are not yet implemented; consume the keyword and arguments
-        // so the parser doesn't crash, then yield an empty Match part.  The executor
-        // will return an empty result set for these queries.
-        keyword("CALL")
-            .ignore_then(
-                any()
-                    .filter(|tok| !matches!(tok, Tok::Ident(k) if k == "RETURN" || k == "WITH" || k == "MATCH" || k == "WHERE"))
-                    .repeated()
-            )
-            .to(QueryPart::Match {
-                match_clauses: vec![],
-                where_clause: None,
-            }),
+        // CALL procedure(args) [YIELD ...]. The procedure name is a dotted
+        // identifier (e.g. `test.my.proc`). Arguments are optional: the
+        // no-parentheses form `CALL proc` reads its arguments from query
+        // parameters. YIELD selects and optionally renames output fields, or
+        // `YIELD *` projects all of them.
+        {
+            let proc_name = identifier()
+                .then(
+                    sym(Tok::Dot)
+                        .ignore_then(identifier())
+                        .repeated()
+                        .collect::<Vec<_>>(),
+                )
+                .map(|(first, rest)| {
+                    let mut name = first;
+                    for segment in rest {
+                        name.push('.');
+                        name.push_str(&segment);
+                    }
+                    name
+                });
+
+            let call_args = sym(Tok::LParen)
+                .ignore_then(
+                    expr_parser()
+                        .separated_by(sym(Tok::Comma))
+                        .allow_trailing()
+                        .collect::<Vec<Expr>>(),
+                )
+                .then_ignore(sym(Tok::RParen));
+
+            let yield_item = identifier().then(keyword("AS").ignore_then(identifier()).or_not());
+
+            let yield_clause = keyword("YIELD").ignore_then(choice((
+                sym(Tok::Star).to((None, true)),
+                yield_item
+                    .separated_by(sym(Tok::Comma))
+                    .at_least(1)
+                    .collect::<Vec<(String, Option<String>)>>()
+                    .map(|items| (Some(items), false)),
+            )));
+
+            keyword("CALL")
+                .ignore_then(proc_name)
+                .then(call_args.or_not())
+                .then(yield_clause.or_not())
+                .map(|((name, opt_args), opt_yield)| {
+                    let (args, implicit_args) = match opt_args {
+                        Some(a) => (a, false),
+                        None => (vec![], true),
+                    };
+                    let (yields, yield_star) = match opt_yield {
+                        Some((y, star)) => (y, star),
+                        None => (None, false),
+                    };
+                    QueryPart::Call {
+                        name,
+                        args,
+                        implicit_args,
+                        yields,
+                        yield_star,
+                        resolved: None,
+                    }
+                })
+        },
         choice((
             keyword("OPTIONAL").ignore_then(keyword("MATCH")).to(true),
             keyword("MATCH").to(false),
@@ -1303,6 +1483,7 @@ fn query_part<'a>() -> impl Parser<'a, ParserInput<'a>, QueryPart, ParserError<'
                         args: vec![],
                     },
                     alias: None,
+                    source_text: None,
                 }]),
                 return_item()
                     .separated_by(sym(Tok::Comma))
@@ -1374,14 +1555,16 @@ fn query_part<'a>() -> impl Parser<'a, ParserInput<'a>, QueryPart, ParserError<'
     ))
 }
 
-/// Parses read-only `Query` statements
-pub(super) fn query_parser<'a>() -> impl Parser<'a, ParserInput<'a>, Query, ParserError<'a>> + Clone
-{
+/// Parses read-only `Query` statements. `src` is the original query text, threaded
+/// to `return_clause` so unaliased projections capture their verbatim column names.
+pub(super) fn query_parser(
+    src: &str,
+) -> impl Parser<'_, ParserInput<'_>, Query, ParserError<'_>> + Clone {
     // Full query: one or more query parts followed by optional RETURN.
     // If parts is non-empty and RETURN is absent this is a write-only pipeline.
     // A bare `RETURN expr` (no preceding MATCH/WITH/etc.) is handled by presenting
     // an empty parts list alongside the RETURN clause.
-    let bare_return = return_clause()
+    let bare_return = return_clause(src)
         .then(order_by_clause().or_not())
         .then(keyword("SKIP").ignore_then(expr_parser()).or_not())
         .then(keyword("LIMIT").ignore_then(expr_parser()).or_not())
@@ -1399,7 +1582,7 @@ pub(super) fn query_parser<'a>() -> impl Parser<'a, ParserInput<'a>, Query, Pars
         .repeated()
         .at_least(1)
         .collect::<Vec<_>>()
-        .then(return_clause().or_not())
+        .then(return_clause(src).or_not())
         .then(order_by_clause().or_not())
         .then(keyword("SKIP").ignore_then(expr_parser()).or_not())
         .then(keyword("LIMIT").ignore_then(expr_parser()).or_not())
@@ -1684,9 +1867,11 @@ fn at_statement_boundary<'a>() -> impl Parser<'a, ParserInput<'a>, (), ParserErr
     choice((end(), sym(Tok::Semi).rewind(), keyword("UNION").rewind()))
 }
 
-/// Parses a top-level single statement (excluding pipeline chaining), supporting recursive `UNION` / `UNION ALL`
-fn statement_union_parser<'a>()
--> impl Parser<'a, ParserInput<'a>, Statement, ParserError<'a>> + Clone {
+/// Parses a top-level single statement (excluding pipeline chaining), supporting recursive `UNION` / `UNION ALL`.
+/// `src` is the original query text, threaded to `return_clause` for verbatim column naming.
+fn statement_union_parser(
+    src: &str,
+) -> impl Parser<'_, ParserInput<'_>, Statement, ParserError<'_>> + Clone {
     recursive(|statement| {
         let create_return = keyword("CREATE")
             .ignore_then(
@@ -1695,7 +1880,7 @@ fn statement_union_parser<'a>()
                     .at_least(1)
                     .collect(),
             )
-            .then(return_clause())
+            .then(return_clause(src))
             .then(order_by_clause().or_not())
             .then(keyword("SKIP").ignore_then(expr_parser()).or_not())
             .then(keyword("LIMIT").ignore_then(expr_parser()).or_not())
@@ -1721,7 +1906,7 @@ fn statement_union_parser<'a>()
                     .at_least(1)
                     .collect(),
             )
-            .then(return_clause())
+            .then(return_clause(src))
             .then(order_by_clause().or_not())
             .then(keyword("SKIP").ignore_then(expr_parser()).or_not())
             .then(keyword("LIMIT").ignore_then(expr_parser()).or_not())
@@ -1760,7 +1945,7 @@ fn statement_union_parser<'a>()
                     .at_least(1)
                     .collect(),
             )
-            .then(return_clause())
+            .then(return_clause(src))
             .then(order_by_clause().or_not())
             .then(keyword("SKIP").ignore_then(expr_parser()).or_not())
             .then(keyword("LIMIT").ignore_then(expr_parser()).or_not())
@@ -1800,7 +1985,7 @@ fn statement_union_parser<'a>()
                     .at_least(1)
                     .collect::<Vec<_>>(),
             )
-            .then(return_clause())
+            .then(return_clause(src))
             .then(order_by_clause().or_not())
             .then(keyword("SKIP").ignore_then(expr_parser()).or_not())
             .then(keyword("LIMIT").ignore_then(expr_parser()).or_not())
@@ -1828,7 +2013,7 @@ fn statement_union_parser<'a>()
             );
 
         let merge_return = merge_statement()
-            .then(return_clause())
+            .then(return_clause(src))
             .then(order_by_clause().or_not())
             .then(keyword("SKIP").ignore_then(expr_parser()).or_not())
             .then(keyword("LIMIT").ignore_then(expr_parser()).or_not())
@@ -1921,7 +2106,7 @@ fn statement_union_parser<'a>()
             match_remove_return.then_ignore(at_statement_boundary()),
             merge_return.then_ignore(at_statement_boundary()),
             write_stmt.then_ignore(at_statement_boundary()),
-            query_parser().map(Statement::Query),
+            query_parser(src).map(Statement::Query),
         ));
 
         base_stmt.foldl(
@@ -1940,10 +2125,12 @@ fn statement_union_parser<'a>()
     })
 }
 
-/// Parses one or more semicolon-separated statements (Cypher execution pipelines)
-pub(crate) fn pipeline_parser<'a>()
--> impl Parser<'a, ParserInput<'a>, Statement, ParserError<'a>> + Clone {
-    statement_union_parser()
+/// Parses one or more semicolon-separated statements (Cypher execution pipelines).
+/// `src` is the original query text, threaded for verbatim column naming.
+pub(crate) fn pipeline_parser(
+    src: &str,
+) -> impl Parser<'_, ParserInput<'_>, Statement, ParserError<'_>> + Clone {
+    statement_union_parser(src)
         .separated_by(sym(Tok::Semi).repeated().at_least(1))
         .allow_trailing()
         .collect::<Vec<Statement>>()
@@ -2052,7 +2239,8 @@ pub(crate) fn validate_cross_clause_variable_types(parts: &[QueryPart]) -> Resul
             | QueryPart::Merge { .. }
             | QueryPart::Set { .. }
             | QueryPart::Delete { .. }
-            | QueryPart::Remove { .. } => None,
+            | QueryPart::Remove { .. }
+            | QueryPart::Call { .. } => None,
         };
 
         if let Some(clauses) = clauses {
@@ -2218,6 +2406,57 @@ fn collect_expr_vars(expr: &Expr, out: &mut std::collections::HashSet<String>) {
             let mut inner = std::collections::HashSet::new();
             collect_expr_vars(predicate, &mut inner);
             inner.remove(variable);
+            out.extend(inner);
+        }
+        // The anchor node references an outer variable and is collected as free. The
+        // relationship, target-node, and path variables are bound locally, so they are
+        // removed from whatever the predicate, transform, and inline property expressions
+        // reference.
+        Expr::PatternComprehension {
+            pattern,
+            predicate,
+            transform,
+        } => {
+            if let Some(anchor) = &pattern.node.variable {
+                out.insert(anchor.clone());
+            }
+            let mut local = std::collections::HashSet::new();
+            if let Some(pv) = &pattern.path_variable {
+                local.insert(pv.clone());
+            }
+            for (rel, node) in &pattern.rels {
+                if let Some(v) = &rel.variable {
+                    local.insert(v.clone());
+                }
+                if let Some(v) = &node.variable {
+                    local.insert(v.clone());
+                }
+            }
+            let mut inner = std::collections::HashSet::new();
+            if let Some(p) = predicate {
+                collect_expr_vars(p, &mut inner);
+            }
+            collect_expr_vars(transform, &mut inner);
+            if let Some(props) = &pattern.node.properties {
+                for e in props.values() {
+                    collect_expr_vars(e, &mut inner);
+                }
+            }
+            for (rel, node) in &pattern.rels {
+                if let Some(props) = &rel.properties {
+                    for e in props.values() {
+                        collect_expr_vars(e, &mut inner);
+                    }
+                }
+                if let Some(props) = &node.properties {
+                    for e in props.values() {
+                        collect_expr_vars(e, &mut inner);
+                    }
+                }
+            }
+            for v in &local {
+                inner.remove(v);
+            }
             out.extend(inner);
         }
         Expr::Literal(_) | Expr::Param(_) | Expr::CountStar => {}
@@ -2500,6 +2739,55 @@ fn collect_non_agg_props_in_expr(expr: &Expr, props: &mut Vec<(String, String)>)
         } => {
             collect_non_agg_props_in_expr(list, props);
             collect_non_agg_props_in_expr(predicate, props);
+        }
+        // A pattern comprehension depends only on its anchor (an outer variable) and
+        // on whatever its predicate, transform, and inline properties reference from
+        // the outer scope; its own relationship, target-node, and path variables are
+        // local bindings and never group keys.
+        Expr::PatternComprehension {
+            pattern,
+            predicate,
+            transform,
+        } => {
+            let mut local = std::collections::HashSet::new();
+            if let Some(pv) = &pattern.path_variable {
+                local.insert(pv.clone());
+            }
+            for (rel, node) in &pattern.rels {
+                if let Some(v) = &rel.variable {
+                    local.insert(v.clone());
+                }
+                if let Some(v) = &node.variable {
+                    local.insert(v.clone());
+                }
+            }
+            let mut inner = Vec::new();
+            if let Some(p) = predicate {
+                collect_non_agg_props_in_expr(p, &mut inner);
+            }
+            collect_non_agg_props_in_expr(transform, &mut inner);
+            if let Some(ps) = &pattern.node.properties {
+                for e in ps.values() {
+                    collect_non_agg_props_in_expr(e, &mut inner);
+                }
+            }
+            for (rel, node) in &pattern.rels {
+                if let Some(ps) = &rel.properties {
+                    for e in ps.values() {
+                        collect_non_agg_props_in_expr(e, &mut inner);
+                    }
+                }
+                if let Some(ps) = &node.properties {
+                    for e in ps.values() {
+                        collect_non_agg_props_in_expr(e, &mut inner);
+                    }
+                }
+            }
+            inner.retain(|(v, _)| !local.contains(v));
+            props.extend(inner);
+            if let Some(anchor) = &pattern.node.variable {
+                props.push((anchor.clone(), String::new()));
+            }
         }
         Expr::HasLabel { variable, .. } => {
             props.push((variable.clone(), "".to_string()));
@@ -2893,6 +3181,21 @@ fn collect_path_vars_in_stmt(stmt: &Statement, vars: &mut std::collections::Hash
     }
 }
 
+/// True for the six binary comparison operators (`=`, `<>`, `<`, `>`, `<=`, `>=`).
+/// Used to decide whether a parenthesized expression needs the `__grouped__` wrapper
+/// that blocks chained-comparison desugaring.
+fn is_comparison_operator(op: &BinaryOperator) -> bool {
+    matches!(
+        op,
+        BinaryOperator::Eq
+            | BinaryOperator::Ne
+            | BinaryOperator::Lt
+            | BinaryOperator::Gt
+            | BinaryOperator::Le
+            | BinaryOperator::Ge
+    )
+}
+
 fn has_aggregation(expr: &Expr) -> bool {
     match expr {
         Expr::CountStar | Expr::Agg(_, _) => true,
@@ -2947,6 +3250,13 @@ fn check_expr_size_on_path(
 ) -> Result<(), String> {
     match expr {
         Expr::FunctionCall { name, args } => {
+            // A surviving 2^63 marker is a standalone positive literal out of the
+            // i64 range (it is only valid when negated, which rewrites the marker).
+            if name == "__neg_min_int__" {
+                return Err(
+                    "SyntaxError(IntegerOverflow): integer literal out of range".to_string()
+                );
+            }
             let name_lc = name.to_lowercase();
             if name_lc == "size" && args.len() == 1 {
                 if let Expr::Prop(var, prop) = &args[0] {
@@ -3456,6 +3766,18 @@ fn validate_statement_undefined_vars_impl(
                                     "SyntaxError(UndefinedVariable): variable '{}' is not in scope",
                                     v
                                 ));
+                            }
+                        }
+                    }
+                    QueryPart::Call { args, yields, .. } => {
+                        for arg in args {
+                            validate_expr_vars(arg, active)?;
+                        }
+                        // YIELD introduces the (optionally renamed) output fields
+                        // into scope for following clauses.
+                        if let Some(items) = yields {
+                            for (field, alias) in items {
+                                active.insert(alias.clone().unwrap_or_else(|| field.clone()));
                             }
                         }
                     }
@@ -4449,7 +4771,7 @@ pub fn parse(cypher: &str) -> Result<Statement, CypherError> {
     let eoi = SimpleSpan::from(cypher.len()..cypher.len());
     let stream = tokens.as_slice().split_token_span(eoi);
 
-    let statement = pipeline_parser()
+    let statement = pipeline_parser(cypher)
         .parse(stream)
         .into_result()
         .map_err(|errs| {
@@ -4471,6 +4793,49 @@ pub fn parse(cypher: &str) -> Result<Statement, CypherError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- Numeric literal range and escape validation ---
+
+    /// Out-of-range numeric literals are rejected at parse time, while the
+    /// boundary values (`i64::MAX`, and `i64::MIN` written as a negated 2^63
+    /// literal) are accepted. Malformed `\u` escapes are also rejected.
+    #[test]
+    fn numeric_literal_range_and_escape_validation() {
+        // Boundary values that must parse.
+        assert!(parse("RETURN 9223372036854775807 AS x").is_ok());
+        assert!(parse("RETURN -9223372036854775808 AS x").is_ok());
+        assert!(parse("RETURN 0x7FFFFFFFFFFFFFFF AS x").is_ok());
+        assert!(parse("RETURN -0x8000000000000000 AS x").is_ok());
+        assert!(parse("RETURN -0o1000000000000000000000 AS x").is_ok());
+
+        // Standalone 2^63 (one past i64::MAX) is out of range.
+        assert!(parse("RETURN 9223372036854775808 AS x").is_err());
+        assert!(parse("RETURN 0x8000000000000000 AS x").is_err());
+        assert!(parse("RETURN 0o1000000000000000000000 AS x").is_err());
+
+        // Magnitudes beyond 2^63 are always out of range, signed either way.
+        assert!(parse("RETURN -9223372036854775809 AS x").is_err());
+        assert!(parse("RETURN -0x8000000000000001 AS x").is_err());
+        assert!(parse("RETURN -0o1000000000000000000001 AS x").is_err());
+
+        // Floating point overflow and malformed unicode escapes.
+        assert!(parse("RETURN 1.34E999").is_err());
+        assert!(parse("RETURN '\\uH'").is_err());
+        assert!(parse("RETURN '\\u00e9'").is_ok());
+    }
+
+    /// A negated 2^63 literal folds to `i64::MIN`, not a `0 - x` subtraction.
+    #[test]
+    fn negated_min_integer_folds_to_literal() {
+        let stmt = parse("RETURN -9223372036854775808 AS x").unwrap();
+        let Statement::Query(q) = stmt else {
+            panic!("expected query");
+        };
+        assert_eq!(
+            q.return_clause.items[0].expr,
+            Expr::Literal(Literal::Int(i64::MIN))
+        );
+    }
 
     // --- Multi-label patterns and SET/REMOVE labels ---
 

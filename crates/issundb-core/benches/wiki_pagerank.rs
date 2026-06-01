@@ -31,10 +31,6 @@ use issundb_core::Graph;
 use rand::Rng;
 use tempfile::TempDir;
 
-// Synthetic-graph parameters.
-const SYNTH_NODES: usize = 500_000;
-const SYNTH_EDGES: usize = 2_000_000;
-
 // ---------------------------------------------------------------------------
 // Benchmark state
 // Fields are declared in drop order: graph first, dir last.
@@ -54,12 +50,18 @@ fn load_synthetic() -> BenchState {
     let g = Graph::open(dir.path(), 8).unwrap();
     let mut rng = rand::thread_rng();
 
-    let mut ids = Vec::with_capacity(SYNTH_NODES);
-    for i in 0..SYNTH_NODES {
+    let (n_nodes, n_edges) = if std::env::var("ISSUNDB_LARGE_BENCH").is_ok() {
+        (500_000, 2_000_000)
+    } else {
+        (10_000, 40_000)
+    };
+
+    let mut ids = Vec::with_capacity(n_nodes);
+    for i in 0..n_nodes {
         ids.push(g.add_node("Article", &i).unwrap());
     }
     let n = ids.len();
-    for i in 0..SYNTH_EDGES {
+    for i in 0..n_edges {
         let src = ids[i % n];
         let dst = ids[(i
             .wrapping_mul(6_364_136_223_846_793_005_usize)
@@ -125,9 +127,14 @@ fn setup() -> BenchState {
             load_snap(&dir)
         }
         Err(_) => {
+            let (n_nodes, n_edges) = if std::env::var("ISSUNDB_LARGE_BENCH").is_ok() {
+                (500_000, 2_000_000)
+            } else {
+                (10_000, 40_000)
+            };
             eprintln!(
                 "[wiki_pagerank] generating synthetic graph \
-                 ({SYNTH_NODES} nodes, {SYNTH_EDGES} edges)"
+                 ({n_nodes} nodes, {n_edges} edges)"
             );
             load_synthetic()
         }

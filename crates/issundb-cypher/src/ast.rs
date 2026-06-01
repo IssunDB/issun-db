@@ -113,6 +113,22 @@ pub enum QueryPart {
     Remove {
         items: Vec<RemoveItem>,
     },
+    /// A `CALL procedure(args) [YIELD ...]` clause. `resolved` is filled in
+    /// during execution-time resolution against the procedure registry; it is
+    /// `None` until then (for example when only the query plan is inspected).
+    Call {
+        name: String,
+        args: Vec<Expr>,
+        /// True for the no-parentheses form `CALL proc`, whose arguments come
+        /// from query parameters rather than an explicit argument list.
+        implicit_args: bool,
+        /// `YIELD field [AS alias]` items; `None` when there is no `YIELD`.
+        yields: Option<Vec<(String, Option<String>)>>,
+        /// True for `YIELD *`.
+        yield_star: bool,
+        /// Concrete rows and output variables produced by resolving this call.
+        resolved: Option<crate::procedure::ResolvedCall>,
+    },
 }
 
 /// A MATCH clause containing a node and relationship pattern.
@@ -285,6 +301,18 @@ pub enum Expr {
         predicate: Option<Box<Expr>>,
         transform: Option<Box<Expr>>,
     },
+    /// `[ pathvar = (a)-[r]->(b) WHERE predicate | transform ]` — pattern comprehension.
+    ///
+    /// The pattern is matched against the graph starting from the already-bound anchor
+    /// node, producing one list element per match. The optional path variable is carried
+    /// inside `pattern.path_variable`; relationship and target-node variables introduced
+    /// in the pattern are local to the comprehension and visible only in `predicate` and
+    /// `transform`.
+    PatternComprehension {
+        pattern: Box<Pattern>,
+        predicate: Option<Box<Expr>>,
+        transform: Box<Expr>,
+    },
     /// `reduce(accumulator = initial, variable IN list | expression)`
     Reduce {
         accumulator: String,
@@ -368,6 +396,11 @@ pub struct ReturnClause {
 pub struct ReturnItem {
     pub expr: Expr,
     pub alias: Option<String>,
+    /// Verbatim source text of the projected expression, captured when the item
+    /// has no explicit `AS` alias. openCypher uses the raw query text (preserving
+    /// case and whitespace) as the default output column name. `None` for aliased
+    /// items, `RETURN *`, and items not produced directly from query source.
+    pub source_text: Option<String>,
 }
 
 /// A CREATE statement pattern for inserting new nodes and edges.

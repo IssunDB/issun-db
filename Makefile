@@ -7,6 +7,15 @@ ASSET_DIR := assets
 SHELL := /bin/bash
 MSRV := 1.85.0
 
+# Binding crates and Python dependency manager
+PY_DIR := crates/issundb-py
+NODE_DIR := crates/issundb-node
+WHEEL_DIR := dist
+PY_MNGR := uv
+
+# Latest built issundb wheel, used by the publish target
+WHEEL_FILE := $(shell ls $(PY_DIR)/$(WHEEL_DIR)/issundb-*.whl 2>/dev/null | head -n 1)
+
 # Pinned versions for development tools
 TARPAULIN_VERSION := 0.32.8
 NEXTEST_VERSION := 0.9.101
@@ -75,6 +84,9 @@ run: build ## Build and run the binary
 clean: ## Remove generated and temporary files
 	@echo "Cleaning up..."
 	@cargo clean
+	@rm -rf $(PY_DIR)/$(WHEEL_DIR)
+	@rm -f $(PY_DIR)/python/issundb/*.so
+	@rm -f $(NODE_DIR)/*.node
 	@rm -f $(ASSET_DIR)/*.svg && echo "Removed SVG files; might want to run 'make figs' to regenerate them."
 
 .PHONY: install-snap
@@ -115,6 +127,51 @@ publish: ## Publish the package to crates.io (requires CARGO_REGISTRY_TOKEN to b
 	@echo "Publishing the package to Cargo registry..."
 	@cargo publish --token $(CARGO_REGISTRY_TOKEN)
 
+########################################################################################
+## Python and Node.js binding targets
+########################################################################################
+
+.PHONY: develop-py
+develop-py: ## Build issundb-py and install it into the active Python environment
+	@echo "Building and installing issundb-py..."
+	@# Maturin fails when CONDA_PREFIX and VIRTUAL_ENV are both set; clear the former.
+	@(cd $(PY_DIR) && unset CONDA_PREFIX && maturin develop)
+
+.PHONY: wheel-py
+wheel-py: ## Build the issundb-py wheel for the current platform
+	@echo "Building the issundb-py wheel..."
+	@(cd $(PY_DIR) && maturin build --release --out $(WHEEL_DIR) --auditwheel check)
+
+.PHONY: wheel-py-manylinux
+wheel-py-manylinux: ## Build the manylinux issundb-py wheel using Zig
+	@echo "Building the manylinux issundb-py wheel..."
+	@(cd $(PY_DIR) && maturin build --release --out $(WHEEL_DIR) --auditwheel check --zig)
+
+.PHONY: test-py
+test-py: develop-py ## Build issundb-py and run the Python binding tests
+	@echo "Running Python binding tests..."
+	@(cd $(PY_DIR) && $(PY_MNGR) run pytest)
+
+.PHONY: publish-py
+publish-py: wheel-py-manylinux ## Publish the issundb-py wheel to PyPI (requires PYPI_TOKEN to be set)
+	@echo "Publishing issundb-py to PyPI..."
+	@if [ -z "$(WHEEL_FILE)" ]; then \
+	   echo "Error: no wheel file found in $(PY_DIR)/$(WHEEL_DIR). Run 'make wheel-py-manylinux' first."; \
+	   exit 1; \
+	fi
+	@echo "Found wheel file: $(WHEEL_FILE)"
+	@twine upload -u __token__ -p $(PYPI_TOKEN) $(WHEEL_FILE)
+
+.PHONY: build-node
+build-node: ## Build the issundb-node native addon for the current platform
+	@echo "Building the issundb-node native addon..."
+	@(cd $(NODE_DIR) && npm install && npm run build)
+
+.PHONY: test-node
+test-node: build-node ## Build issundb-node and run the Node.js binding tests
+	@echo "Running Node.js binding tests..."
+	@(cd $(NODE_DIR) && npm test)
+
 .PHONY: repl
 repl: ## Launch the REPL (pass REPL_PATH=<dir> to set the database path; defaults to ./issundb-data)
 	@echo "Starting IssunDB REPL (database: $(or $(REPL_PATH),./issundb-data))..."
@@ -139,6 +196,11 @@ mcp-http: ## Launch the MCP server over Streamable HTTP (MCP_PATH=<dir> db path,
 bench: ## Run all workspace benchmarks
 	@echo "Running all benchmarks..."
 	@DEBUG_PROJ=$(DEBUG_PROJ) cargo bench
+
+.PHONY: bench-large
+bench-large: ## Run all benchmarks including large storage and load tests
+	@echo "Running all benchmarks including large storage and load tests..."
+	@DEBUG_PROJ=$(DEBUG_PROJ) ISSUNDB_LARGE_BENCH=1 ISSUNDB_LOAD_TEST=1 cargo bench
 
 .PHONY: bench-storage
 bench-storage: ## Run core storage engine and analytics benchmarks

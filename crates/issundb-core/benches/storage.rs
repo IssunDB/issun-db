@@ -18,8 +18,15 @@ fn open_tmp() -> (TempDir, Graph) {
 
 fn bench_node_insert(c: &mut Criterion) {
     let mut group = c.benchmark_group("node_insert");
+    group.sample_size(10);
 
-    for count in [1_000u64, 10_000, 100_000] {
+    let mut counts = vec![1_000u64];
+    if std::env::var("ISSUNDB_LARGE_BENCH").is_ok() {
+        counts.push(10_000);
+        counts.push(100_000);
+    }
+
+    for count in counts {
         group.throughput(Throughput::Elements(count));
         group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, &n| {
             b.iter_batched(
@@ -43,8 +50,15 @@ fn bench_node_insert(c: &mut Criterion) {
 
 fn bench_edge_insert(c: &mut Criterion) {
     let mut group = c.benchmark_group("edge_insert");
+    group.sample_size(10);
 
-    for count in [1_000u64, 10_000, 100_000] {
+    let mut counts = vec![1_000u64];
+    if std::env::var("ISSUNDB_LARGE_BENCH").is_ok() {
+        counts.push(10_000);
+        counts.push(100_000);
+    }
+
+    for count in counts {
         group.throughput(Throughput::Elements(count));
         group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, &n| {
             b.iter_batched(

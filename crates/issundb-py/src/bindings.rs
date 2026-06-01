@@ -83,7 +83,7 @@ impl PyGraph {
         let result = self
             .graph
             .query(cypher)
-            .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
         serde_json::to_string(&result)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
@@ -92,7 +92,7 @@ impl PyGraph {
     fn explain(&self, cypher: &str) -> PyResult<String> {
         self.graph
             .explain(cypher)
-            .map_err(pyo3::exceptions::PyRuntimeError::new_err)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
 
     /// Index or update the float32 embedding for node `id`.

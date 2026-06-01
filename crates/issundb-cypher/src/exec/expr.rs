@@ -418,6 +418,18 @@ pub(super) fn evaluate_expr(
             }
             Ok(serde_json::Value::Array(result))
         }
+        Expr::PatternComprehension {
+            pattern,
+            predicate,
+            transform,
+        } => super::read::eval_pattern_comprehension(
+            graph,
+            path,
+            pattern,
+            predicate.as_deref(),
+            transform,
+            params,
+        ),
         Expr::Reduce {
             accumulator,
             initial,
@@ -881,6 +893,14 @@ pub(super) fn eval_function_call(
     let name_lc = name.to_ascii_lowercase();
     let name = name_lc.as_str();
     match name {
+        // A parenthesized comparison: transparently evaluate the single inner expression.
+        // The wrapper exists only to stop chained-comparison desugaring from flattening it.
+        "__grouped__" => {
+            if args.len() != 1 {
+                return Err("__grouped__ requires exactly 1 argument".into());
+            }
+            evaluate_expr(graph, path, &args[0], params)
+        }
         "__list__" => {
             let mut items = Vec::new();
             for arg in args {

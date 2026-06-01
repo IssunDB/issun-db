@@ -3,9 +3,11 @@ pub mod error;
 pub mod exec;
 pub mod parser;
 pub mod plan;
+pub mod procedure;
 
 pub use error::CypherError;
-pub use exec::{QueryResult, Record, execute, explain};
+pub use exec::{QueryResult, Record, execute, execute_with_procedures, explain};
+pub use procedure::{CypherType, Procedure, ProcedureRegistry};
 
 #[cfg(test)]
 mod tests {
