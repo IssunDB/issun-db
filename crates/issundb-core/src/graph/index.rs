@@ -157,6 +157,15 @@ impl Graph {
         self.node_count_by_label_impl(&rtxn, label)
     }
 
+    /// Upper-bound estimate of the node count: the node-id high-water mark. This
+    /// does not decrease when a node is deleted, so it is not an exact live
+    /// count; it exists for query-planner cardinality estimates (for example,
+    /// average relationship fan-out). O(1).
+    pub fn node_count_hint(&self) -> Result<u64, Error> {
+        let rtxn = self.storage.env.read_txn()?;
+        crate::storage::ids::node_high_water(&self.storage, &rtxn)
+    }
+
     pub(super) fn node_count_by_label_impl(
         &self,
         rtxn: &heed::RoTxn,

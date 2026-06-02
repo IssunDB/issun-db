@@ -19,6 +19,8 @@ petgraph = "0.8"
 serde = { workspace = true }
 serde_json = { workspace = true }
 rfd = "=0.14.1"
+egui_extras = { version = "=0.32" }
+rand = { workspace = true }
 
 [[bin]]
 name = "issundb-gui"

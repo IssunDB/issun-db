@@ -273,6 +273,7 @@ impl Optimizer {
                 closing_rel_type,
                 closing_rel_var,
                 closing_is_incoming,
+                closing_is_undirected,
             } => {
                 let (inner_op, inner_filters) = Self::extract_filters(*input);
                 (
@@ -283,6 +284,7 @@ impl Optimizer {
                         closing_rel_type,
                         closing_rel_var,
                         closing_is_incoming,
+                        closing_is_undirected,
                     },
                     inner_filters,
                 )
@@ -431,6 +433,7 @@ impl Optimizer {
                 closing_rel_type,
                 closing_rel_var,
                 closing_is_incoming,
+                closing_is_undirected,
             } => PhysicalOperator::MultiwayJoin {
                 input: Box::new(Self::reorder_operators(*input, stats)),
                 closing_src_var,
@@ -438,6 +441,7 @@ impl Optimizer {
                 closing_rel_type,
                 closing_rel_var,
                 closing_is_incoming,
+                closing_is_undirected,
             },
         }
     }
@@ -466,13 +470,30 @@ impl Optimizer {
                 input, rel_type, ..
             } => {
                 let input_weight = Self::plan_weight(input, stats);
+                // `rel_weight` is the average fan-out per input row: the number of
+                // edges of this type divided by the node count. The previous model
+                // used the total typed edge count as the multiplier, which treated
+                // every input row as expanding to *every* edge of the type. That
+                // inflated chained multi-hop expands (input * edges * edges * ...)
+                // until they saturated `usize`, collapsing the cost space so plan
+                // ordering became arbitrary. Average fan-out keeps the estimate in
+                // a realistic range so ordering stays meaningful across hops.
                 let rel_weight = if let Some(rtype) = rel_type {
-                    if let Some(s) = stats {
-                        s.edge_count_by_type(rtype).unwrap_or(10).max(1) as usize
-                    } else {
-                        10
+                    match stats {
+                        Some(s) => {
+                            let edges = s.edge_count_by_type(rtype).unwrap_or(0);
+                            match s.total_node_count() {
+                                Some(nodes) if nodes > 0 => {
+                                    ((edges as f64 / nodes as f64).ceil() as usize).max(1)
+                                }
+                                // No node-count estimate: keep the prior typed default.
+                                _ => 10,
+                            }
+                        }
+                        None => 10,
                     }
                 } else {
+                    // Untyped expand: the type is unknown, so assume a higher fan-out.
                     100
                 };
                 input_weight.saturating_mul(rel_weight)
@@ -938,6 +959,7 @@ impl Optimizer {
                 closing_rel_type,
                 closing_rel_var,
                 closing_is_incoming,
+                closing_is_undirected,
             } => {
                 let child_bound = Self::bound_vars(&input);
 
@@ -963,6 +985,7 @@ impl Optimizer {
                     closing_rel_type,
                     closing_rel_var,
                     closing_is_incoming,
+                    closing_is_undirected,
                 };
 
                 let bound = Self::bound_vars(&current_node);
@@ -1699,6 +1722,7 @@ impl Optimizer {
                 closing_rel_type,
                 closing_rel_var,
                 closing_is_incoming,
+                closing_is_undirected,
             } => PhysicalOperator::MultiwayJoin {
                 input: Box::new(Self::optimize_index_scans(*input, stats)),
                 closing_src_var,
@@ -1706,6 +1730,7 @@ impl Optimizer {
                 closing_rel_type,
                 closing_rel_var,
                 closing_is_incoming,
+                closing_is_undirected,
             },
             leaf => leaf,
         }
@@ -2047,9 +2072,10 @@ impl Optimizer {
 }
 
 /// Rewrite `Expand` nodes whose `dst_var` is already bound by an ancestor
-/// operator into `MultiwayJoin` nodes. Only applies to single-hop, directed
-/// patterns where the closing check would otherwise iterate all neighbors and
-/// filter by value.
+/// operator into `MultiwayJoin` nodes. Applies to single-hop patterns, directed
+/// or undirected, where the closing check would otherwise iterate all neighbors
+/// and filter by value. Undirected closing hops set `closing_is_undirected` so
+/// the executor checks both edge directions.
 fn rewrite_closing_expands(op: PhysicalOperator) -> PhysicalOperator {
     match op {
         PhysicalOperator::Expand {
@@ -2065,7 +2091,7 @@ fn rewrite_closing_expands(op: PhysicalOperator) -> PhysicalOperator {
         } => {
             let new_input = rewrite_closing_expands(*input);
             let input_bound = Optimizer::bound_vars(&new_input);
-            if min_hops == 1 && max_hops == 1 && !is_undirected && input_bound.contains(&dst_var) {
+            if min_hops == 1 && max_hops == 1 && input_bound.contains(&dst_var) {
                 PhysicalOperator::MultiwayJoin {
                     input: Box::new(new_input),
                     closing_src_var: src_var,
@@ -2073,6 +2099,7 @@ fn rewrite_closing_expands(op: PhysicalOperator) -> PhysicalOperator {
                     closing_rel_type: rel_type,
                     closing_rel_var: rel_var,
                     closing_is_incoming: is_incoming,
+                    closing_is_undirected: is_undirected,
                 }
             } else {
                 PhysicalOperator::Expand {
@@ -2151,6 +2178,7 @@ fn rewrite_closing_expands(op: PhysicalOperator) -> PhysicalOperator {
             closing_rel_type,
             closing_rel_var,
             closing_is_incoming,
+            closing_is_undirected,
         } => PhysicalOperator::MultiwayJoin {
             input: Box::new(rewrite_closing_expands(*input)),
             closing_src_var,
@@ -2158,6 +2186,7 @@ fn rewrite_closing_expands(op: PhysicalOperator) -> PhysicalOperator {
             closing_rel_type,
             closing_rel_var,
             closing_is_incoming,
+            closing_is_undirected,
         },
         leaf => leaf,
     }
@@ -2372,6 +2401,53 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_expand_weight_uses_average_fanout() {
+        // With a node-count estimate available, the Expand weight scales with the
+        // average fan-out (edges / nodes), not the total edge count, so chained
+        // multi-hop expands stay in a realistic range instead of saturating.
+        struct DegreeStats;
+        impl StatsProvider for DegreeStats {
+            fn node_count_by_label(&self, label: &str) -> Option<u64> {
+                (label == "Person").then_some(1000)
+            }
+            fn edge_count_by_type(&self, etype: &str) -> Option<u64> {
+                (etype == "KNOWS").then_some(5000)
+            }
+            fn total_node_count(&self) -> Option<u64> {
+                Some(1000)
+            }
+        }
+        let stats = DegreeStats;
+
+        let scan = PhysicalOperator::LabelScan {
+            variable: "a".to_string(),
+            label: Some("Person".to_string()),
+        };
+        let expand = |input: PhysicalOperator| PhysicalOperator::Expand {
+            input: Box::new(input),
+            src_var: "a".to_string(),
+            rel_var: "r".to_string(),
+            dst_var: "b".to_string(),
+            rel_type: Some("KNOWS".to_string()),
+            is_incoming: false,
+            is_undirected: false,
+            min_hops: 1,
+            max_hops: 1,
+        };
+
+        // Average fan-out = ceil(5000 / 1000) = 5; input weight (Person) = 1000.
+        let one_hop = expand(scan.clone());
+        assert_eq!(Optimizer::plan_weight(&one_hop, Some(&stats)), 1000 * 5);
+
+        // A three-hop chain stays at 1000 * 5^3 = 125_000. The old total-edge
+        // multiplier would have been 1000 * 5000^3, which saturates `usize`.
+        let three_hop = expand(expand(expand(scan)));
+        let w = Optimizer::plan_weight(&three_hop, Some(&stats));
+        assert_eq!(w, 1000 * 5 * 5 * 5);
+        assert!(w < usize::MAX, "multi-hop estimate must not saturate");
+    }
+
     struct MockStats {
         node_counts: std::collections::HashMap<String, u64>,
         edge_counts: std::collections::HashMap<String, u64>,
@@ -2534,6 +2610,58 @@ mod tests {
             matches!(rewritten, PhysicalOperator::Expand { dst_var, .. } if dst_var == "c"),
             "open chain must remain as Expand"
         );
+    }
+
+    #[test]
+    fn test_rewrite_closing_expands_undirected() {
+        // An undirected single-hop into an already-bound destination is also a
+        // closing hop: MATCH (a)-[:KNOWS]->(b), (a)-[r]-(b) closes on `b`. It
+        // should rewrite to a MultiwayJoin that knows it is undirected, so the
+        // executor checks both edge directions instead of expanding all
+        // neighbors and filtering.
+        let plan = PhysicalOperator::Expand {
+            input: Box::new(PhysicalOperator::Expand {
+                input: Box::new(PhysicalOperator::LabelScan {
+                    variable: "a".to_string(),
+                    label: Some("Person".to_string()),
+                }),
+                src_var: "a".to_string(),
+                rel_var: "r1".to_string(),
+                dst_var: "b".to_string(),
+                rel_type: Some("KNOWS".to_string()),
+                is_incoming: false,
+                is_undirected: false,
+                min_hops: 1,
+                max_hops: 1,
+            }),
+            src_var: "a".to_string(),
+            rel_var: "r".to_string(),
+            dst_var: "b".to_string(), // already bound — undirected closing hop
+            rel_type: Some("KNOWS".to_string()),
+            is_incoming: false,
+            is_undirected: true,
+            min_hops: 1,
+            max_hops: 1,
+        };
+
+        let rewritten = rewrite_closing_expands(plan);
+
+        match rewritten {
+            PhysicalOperator::MultiwayJoin {
+                closing_src_var,
+                closing_dst_var,
+                closing_is_undirected,
+                ..
+            } => {
+                assert_eq!(closing_src_var, "a");
+                assert_eq!(closing_dst_var, "b");
+                assert!(
+                    closing_is_undirected,
+                    "undirected closing hop must set closing_is_undirected"
+                );
+            }
+            other => panic!("expected MultiwayJoin, got {other:?}"),
+        }
     }
 
     /// A `StatsProvider` with fixed label/type counts and an optional set of

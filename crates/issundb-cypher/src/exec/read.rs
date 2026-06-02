@@ -123,6 +123,13 @@ pub(super) fn execute_read_query(
         )
     });
 
+    // Read-only queries install a statement-scoped property cache so repeated
+    // property access on the same node or edge decodes once. Queries with write
+    // parts mutate records mid-execution, so they leave the cache uninstalled to
+    // avoid serving a stale decode; the guard drops at the end of this function,
+    // covering both expansion and the projection below.
+    let _prop_cache = (!has_write_parts).then(expr::PropCache::install);
+
     let resolved_paths = if has_write_parts {
         graph.with_write_lock(|| execute_physical(graph, &optimized, params))?
     } else {
@@ -1563,6 +1570,475 @@ fn json_val_cmp(l: &serde_json::Value, r: &serde_json::Value) -> Option<std::cmp
     }
 }
 
+/// Apply a `Project` operator's RETURN/WITH items to each input row. Extracted
+/// from the `Project` execution arm so the bounded-scan path can reuse it.
+fn project_rows(
+    graph: &Graph,
+    child_paths: Vec<PathMap>,
+    items: &[(Expr, Option<String>)],
+    is_barrier: bool,
+    params: &HashMap<String, serde_json::Value>,
+) -> Result<Vec<PathMap>, String> {
+    let mut next_paths = Vec::new();
+
+    for path in child_paths {
+        // RETURN * / WITH * passes all current bindings through unchanged.
+        let is_star = items.len() == 1
+            && matches!(
+                &items[0].0,
+                Expr::FunctionCall { name, .. } if name == "__star__"
+            );
+        if is_star {
+            next_paths.push(path);
+            continue;
+        }
+
+        // For non-barrier projects (intermediate projections in WITH-WHERE
+        // pipelines), start with all existing bindings so that the filter
+        // after this project can still see pre-projection variables.
+        // Barrier projects (WITH clause boundaries) always start fresh.
+        let mut projected_path: PathMap = if is_barrier {
+            PathMap::new()
+        } else {
+            path.clone()
+        };
+
+        for (expr, alias) in items {
+            let target_var = if let Some(alias_name) = alias {
+                alias_name.clone()
+            } else {
+                expr_display_name(expr)
+            };
+
+            match expr {
+                // For CountStar / Agg, the Aggregate operator has already placed
+                // the computed value in the PathMap under `target_var`. Pull it
+                // directly rather than trying to re-evaluate the expression.
+                Expr::CountStar | Expr::Agg(_, _) => {
+                    if let Some(binding) = path.get(&target_var) {
+                        projected_path.insert(target_var, binding.clone());
+                    } else {
+                        projected_path
+                            .insert(target_var, GraphBinding::Scalar(serde_json::Value::Null));
+                    }
+                }
+                Expr::Prop(var, prop) if prop.is_empty() => {
+                    // Whole-variable reference: first try the node binding,
+                    // then fall back to a scalar already in the PathMap
+                    // (e.g., a group-by column emitted by Aggregate).
+                    if let Some(binding) = path.get(var) {
+                        projected_path.insert(target_var, binding.clone());
+                    } else if let Some(binding) = path.get(&target_var) {
+                        projected_path.insert(target_var, binding.clone());
+                    }
+                }
+                _ => {
+                    // For property expressions (n.age), first check whether the
+                    // Aggregate already emitted a scalar under the target column
+                    // name (e.g., the group-by key alias). If so, reuse it.
+                    // Exception: if the existing binding is a Node/Edge (not a Scalar),
+                    // and there's an alias, always evaluate the expression to avoid
+                    // shadowing issues like `a.id AS a` where a = Node(...).
+                    if let Some(binding) = path.get(&target_var) {
+                        match binding {
+                            GraphBinding::Scalar(_) => {
+                                // Pre-computed scalar (from Aggregate) → reuse.
+                                projected_path.insert(target_var, binding.clone());
+                            }
+                            GraphBinding::Node(_) | GraphBinding::Edge(_) => {
+                                // Node/Edge with a matching key: only reuse if there's
+                                // no alias (variable pass-through).
+                                if alias.is_none() {
+                                    projected_path.insert(target_var, binding.clone());
+                                } else {
+                                    let val = evaluate_expr(graph, &path, expr, params)?;
+                                    projected_path.insert(target_var, GraphBinding::Scalar(val));
+                                }
+                            }
+                        }
+                    } else {
+                        let val = evaluate_expr(graph, &path, expr, params)?;
+                        projected_path.insert(target_var, GraphBinding::Scalar(val));
+                    }
+                }
+            }
+        }
+
+        next_paths.push(projected_path);
+    }
+
+    Ok(next_paths)
+}
+
+/// Apply a `Filter` operator's predicate to an already-materialized batch of
+/// rows. `FilterExpr::HasLabel` routes through the bulk GraphBLAS label filter
+/// (one set-membership pass over the distinct bound nodes); every other
+/// predicate is evaluated row by row. This is the shared body of the
+/// `PhysicalOperator::Filter` default path and the streaming `Filter` node, so
+/// both produce identical rows in identical order.
+pub(super) fn apply_filter(
+    graph: &Graph,
+    child_paths: Vec<PathMap>,
+    expression: &FilterExpr,
+    params: &HashMap<String, serde_json::Value>,
+) -> Result<Vec<PathMap>, String> {
+    let mut next_paths = Vec::new();
+
+    if let FilterExpr::HasLabel(variable, label) = expression {
+        // Collect the distinct node IDs bound to this variable for bulk label filtering.
+        let mut active_nodes: Vec<NodeId> = child_paths
+            .iter()
+            .filter_map(|p| match p.get(variable) {
+                Some(GraphBinding::Node(n)) => Some(*n),
+                _ => None,
+            })
+            .collect();
+        active_nodes.sort_unstable();
+        active_nodes.dedup();
+
+        let filtered_nodes = graph
+            .label_filter_and_graphblas(&active_nodes, label)
+            .map_err(|e| e.to_string())?;
+        let filtered_set: HashSet<NodeId> = filtered_nodes.into_iter().collect();
+
+        for path in child_paths {
+            if let Some(GraphBinding::Node(node)) = path.get(variable) {
+                if filtered_set.contains(node) {
+                    next_paths.push(path);
+                }
+            }
+        }
+    } else {
+        let where_clause = filter_expr_to_where_clause(expression);
+        for path in child_paths {
+            if evaluate_where(graph, &path, &where_clause, params)? {
+                next_paths.push(path);
+            }
+        }
+    }
+
+    Ok(next_paths)
+}
+
+/// Execute `op` producing at most `cap` rows, but only when the plan shape lets
+/// the leaf scan be bounded safely: a `LabelScan`, optionally under pass-through
+/// `Project`s. Returns `None` for any other shape (a `Sort`, `Filter`,
+/// `Distinct`, `Expand`, and so on between the `Limit` and the scan), signaling
+/// the caller to fall back to normal, unbounded execution. Because `LIMIT`
+/// without `ORDER BY` is order-independent in openCypher, taking the first `cap`
+/// matching nodes is a valid result.
+fn execute_bounded(
+    graph: &Graph,
+    op: &PhysicalOperator,
+    params: &HashMap<String, serde_json::Value>,
+    cap: usize,
+) -> Result<Option<Vec<PathMap>>, String> {
+    match op {
+        PhysicalOperator::LabelScan { variable, label } => {
+            let candidates = if let Some(lbl) = label {
+                graph.nodes_by_label(lbl).map_err(|e| e.to_string())?
+            } else {
+                graph.all_nodes().map_err(|e| e.to_string())?
+            };
+            let rows = candidates
+                .into_iter()
+                .take(cap)
+                .map(|cand| {
+                    let mut path = PathMap::new();
+                    path.insert(variable.clone(), GraphBinding::Node(cand));
+                    path
+                })
+                .collect();
+            Ok(Some(rows))
+        }
+        PhysicalOperator::Project {
+            input,
+            items,
+            is_barrier,
+        } => match execute_bounded(graph, input, params, cap)? {
+            // Project is a 1:1, order-preserving row transform, so capping its
+            // input also caps its output.
+            Some(child) => Ok(Some(project_rows(
+                graph,
+                child,
+                items,
+                *is_barrier,
+                params,
+            )?)),
+            None => Ok(None),
+        },
+        _ => Ok(None),
+    }
+}
+
+/// Number of rows a streaming operator yields per `next_batch` pull. Large
+/// enough to amortize per-pull overhead, small enough that a `LIMIT` stops the
+/// upstream scan and expansion after only a few batches.
+const STREAM_BATCH: usize = 256;
+
+/// A pull-based, batch-at-a-time row producer used to short-circuit `LIMIT`
+/// through `Expand`. Each `next_batch` returns up to `STREAM_BATCH` rows; an
+/// empty return signals exhaustion. The variants mirror the streamable subset
+/// of `PhysicalOperator` (see `is_streamable`); the bits each node needs are
+/// cloned from the plan at build time so the stream does not borrow the
+/// operator tree.
+///
+/// Every node delegates its row transform to the same helper the materializing
+/// executor uses (`expand_from_paths`, `apply_filter`, `project_rows`), so a
+/// streamed chain yields exactly the rows the materialized chain would, in the
+/// same nested-loop order. Because the engine runs only under a `LIMIT` (which
+/// is order-independent without `ORDER BY`), bypassing the fused-chain and
+/// factorized-filter fast paths costs nothing the limit does not already cap.
+enum RowStream {
+    /// Lazy label scan: candidate ids are fetched once on the first pull, then
+    /// emitted `STREAM_BATCH` at a time so an upstream `LIMIT` never forces the
+    /// whole label into rows.
+    LabelScan {
+        variable: String,
+        label: Option<String>,
+        ids: Option<std::vec::IntoIter<NodeId>>,
+    },
+    /// A streamable leaf other than `LabelScan` (id seek, index scan, range
+    /// scan, or the single bootstrap row). These are already bounded or small,
+    /// so they materialize once via `execute_physical` and drain in batches.
+    Materialized {
+        op: Box<PhysicalOperator>,
+        rows: Option<std::vec::IntoIter<PathMap>>,
+    },
+    Project {
+        input: Box<RowStream>,
+        items: Vec<(Expr, Option<String>)>,
+        is_barrier: bool,
+    },
+    Filter {
+        input: Box<RowStream>,
+        expression: FilterExpr,
+    },
+    Expand {
+        input: Box<RowStream>,
+        src_var: String,
+        rel_var: String,
+        dst_var: String,
+        rel_type: Option<String>,
+        is_incoming: bool,
+        is_undirected: bool,
+        min_hops: usize,
+        max_hops: usize,
+        /// Holds expansion output beyond `STREAM_BATCH`: one input row can fan
+        /// out to many neighbors, so the overflow is buffered and served on
+        /// later pulls before the next input batch is fetched.
+        buf: std::collections::VecDeque<PathMap>,
+    },
+}
+
+/// Return true when `op` and every descendant is one of the operators the
+/// streaming engine knows how to drive lazily, down to a leaf scan. Only a
+/// fully streamable input lets `LIMIT` short-circuit; any other shape (Sort,
+/// Aggregate, Distinct, HashJoin, OptionalMatch, MultiwayJoin, Unwind, a write,
+/// or a nested Limit) falls back to the materializing executor.
+fn is_streamable(op: &PhysicalOperator) -> bool {
+    match op {
+        PhysicalOperator::LabelScan { .. }
+        | PhysicalOperator::NodeByIdSeek { .. }
+        | PhysicalOperator::NodeIndexScan { .. }
+        | PhysicalOperator::NodeRangeScan { .. }
+        | PhysicalOperator::SingleRow => true,
+        PhysicalOperator::Project { input, .. }
+        | PhysicalOperator::Filter { input, .. }
+        | PhysicalOperator::Expand { input, .. } => is_streamable(input),
+        _ => false,
+    }
+}
+
+/// Build a `RowStream` mirroring a streamable `op` (callers must check
+/// `is_streamable` first). Streamable leaves other than `LabelScan` become a
+/// `Materialized` node wrapping the original operator.
+fn build_stream(op: &PhysicalOperator) -> RowStream {
+    match op {
+        PhysicalOperator::LabelScan { variable, label } => RowStream::LabelScan {
+            variable: variable.clone(),
+            label: label.clone(),
+            ids: None,
+        },
+        PhysicalOperator::Project {
+            input,
+            items,
+            is_barrier,
+        } => RowStream::Project {
+            input: Box::new(build_stream(input)),
+            items: items.clone(),
+            is_barrier: *is_barrier,
+        },
+        PhysicalOperator::Filter { input, expression } => RowStream::Filter {
+            input: Box::new(build_stream(input)),
+            expression: expression.clone(),
+        },
+        PhysicalOperator::Expand {
+            input,
+            src_var,
+            rel_var,
+            dst_var,
+            rel_type,
+            is_incoming,
+            is_undirected,
+            min_hops,
+            max_hops,
+        } => RowStream::Expand {
+            input: Box::new(build_stream(input)),
+            src_var: src_var.clone(),
+            rel_var: rel_var.clone(),
+            dst_var: dst_var.clone(),
+            rel_type: rel_type.clone(),
+            is_incoming: *is_incoming,
+            is_undirected: *is_undirected,
+            min_hops: *min_hops,
+            max_hops: *max_hops,
+            buf: std::collections::VecDeque::new(),
+        },
+        // A streamable leaf that is not a LabelScan (id seek, index/range scan,
+        // SingleRow): execute it eagerly on first pull and drain in batches.
+        other => RowStream::Materialized {
+            op: Box::new(other.clone()),
+            rows: None,
+        },
+    }
+}
+
+impl RowStream {
+    /// Produce the next batch of up to `STREAM_BATCH` rows. An empty `Vec`
+    /// means the stream is exhausted. Size-reducing nodes (Filter) and the
+    /// Expand buffer-refill loop pull repeatedly so an empty intermediate batch
+    /// is never mistaken for end-of-stream.
+    fn next_batch(
+        &mut self,
+        graph: &Graph,
+        params: &HashMap<String, serde_json::Value>,
+    ) -> Result<Vec<PathMap>, String> {
+        match self {
+            RowStream::LabelScan {
+                variable,
+                label,
+                ids,
+            } => {
+                let iter = match ids {
+                    Some(it) => it,
+                    None => {
+                        let candidates = if let Some(lbl) = label {
+                            graph.nodes_by_label(lbl).map_err(|e| e.to_string())?
+                        } else {
+                            graph.all_nodes().map_err(|e| e.to_string())?
+                        };
+                        ids.insert(candidates.into_iter())
+                    }
+                };
+                let out: Vec<PathMap> = iter
+                    .by_ref()
+                    .take(STREAM_BATCH)
+                    .map(|nid| {
+                        let mut path = PathMap::new();
+                        path.insert(variable.clone(), GraphBinding::Node(nid));
+                        path
+                    })
+                    .collect();
+                Ok(out)
+            }
+            RowStream::Materialized { op, rows } => {
+                let iter = match rows {
+                    Some(it) => it,
+                    None => rows.insert(execute_physical(graph, op, params)?.into_iter()),
+                };
+                Ok(iter.by_ref().take(STREAM_BATCH).collect())
+            }
+            RowStream::Project {
+                input,
+                items,
+                is_barrier,
+            } => {
+                // Project is a 1:1 transform, so a non-empty input batch yields a
+                // non-empty output batch; loop only to pass through end-of-stream.
+                let batch = input.next_batch(graph, params)?;
+                if batch.is_empty() {
+                    return Ok(vec![]);
+                }
+                project_rows(graph, batch, items, *is_barrier, params)
+            }
+            RowStream::Filter { input, expression } => {
+                // A filter can empty a batch without exhausting the input, so
+                // keep pulling until a batch survives or the input runs out.
+                loop {
+                    let batch = input.next_batch(graph, params)?;
+                    if batch.is_empty() {
+                        return Ok(vec![]);
+                    }
+                    let kept = apply_filter(graph, batch, expression, params)?;
+                    if !kept.is_empty() {
+                        return Ok(kept);
+                    }
+                }
+            }
+            RowStream::Expand {
+                input,
+                src_var,
+                rel_var,
+                dst_var,
+                rel_type,
+                is_incoming,
+                is_undirected,
+                min_hops,
+                max_hops,
+                buf,
+            } => loop {
+                if !buf.is_empty() {
+                    let take = buf.len().min(STREAM_BATCH);
+                    return Ok(buf.drain(..take).collect());
+                }
+                let batch = input.next_batch(graph, params)?;
+                if batch.is_empty() {
+                    return Ok(vec![]);
+                }
+                let expanded = expand_from_paths(
+                    graph,
+                    batch,
+                    src_var,
+                    rel_var,
+                    dst_var,
+                    rel_type.as_deref(),
+                    *is_incoming,
+                    *is_undirected,
+                    *min_hops,
+                    *max_hops,
+                )?;
+                buf.extend(expanded);
+            },
+        }
+    }
+}
+
+/// Drive a streamable `input` chain just far enough to satisfy `skip + count`
+/// rows, then apply the skip and limit. Because the chain pulls lazily, the
+/// leaf `LabelScan` and any `Expand` stop as soon as enough rows exist, so a
+/// `LIMIT` no longer forces a full scan and expansion. Caller must ensure
+/// `is_streamable(input)`.
+fn execute_streaming_limit(
+    graph: &Graph,
+    input: &PhysicalOperator,
+    params: &HashMap<String, serde_json::Value>,
+    skip: usize,
+    count: usize,
+) -> Result<Vec<PathMap>, String> {
+    let target = skip.saturating_add(count);
+    let mut stream = build_stream(input);
+    let mut collected: Vec<PathMap> = Vec::new();
+    while collected.len() < target {
+        let batch = stream.next_batch(graph, params)?;
+        if batch.is_empty() {
+            break;
+        }
+        collected.extend(batch);
+    }
+    Ok(collected.into_iter().skip(skip).take(count).collect())
+}
+
 pub(super) fn execute_physical(
     graph: &Graph,
     op: &PhysicalOperator,
@@ -1841,42 +2317,7 @@ pub(super) fn execute_physical(
 
             // Default path: materialize child, then filter row by row.
             let child_paths = execute_physical(graph, input, params)?;
-            let mut next_paths = Vec::new();
-
-            if let FilterExpr::HasLabel(variable, label) = expression {
-                // Collect the distinct node IDs bound to this variable for bulk label filtering.
-                let mut active_nodes: Vec<NodeId> = child_paths
-                    .iter()
-                    .filter_map(|p| match p.get(variable) {
-                        Some(GraphBinding::Node(n)) => Some(*n),
-                        _ => None,
-                    })
-                    .collect();
-                active_nodes.sort_unstable();
-                active_nodes.dedup();
-
-                let filtered_nodes = graph
-                    .label_filter_and_graphblas(&active_nodes, label)
-                    .map_err(|e| e.to_string())?;
-                let filtered_set: HashSet<NodeId> = filtered_nodes.into_iter().collect();
-
-                for path in child_paths {
-                    if let Some(GraphBinding::Node(node)) = path.get(variable) {
-                        if filtered_set.contains(node) {
-                            next_paths.push(path);
-                        }
-                    }
-                }
-            } else {
-                let where_clause = filter_expr_to_where_clause(expression);
-                for path in child_paths {
-                    if evaluate_where(graph, &path, &where_clause, params)? {
-                        next_paths.push(path);
-                    }
-                }
-            }
-
-            Ok(next_paths)
+            apply_filter(graph, child_paths, expression, params)
         }
         PhysicalOperator::HashJoin { left, right } => {
             // Determine common variables statically from plan trees before running either side.
@@ -2070,98 +2511,7 @@ pub(super) fn execute_physical(
             is_barrier,
         } => {
             let child_paths = execute_physical(graph, input, params)?;
-            let mut next_paths = Vec::new();
-
-            for path in child_paths {
-                // RETURN * / WITH * passes all current bindings through unchanged.
-                let is_star = items.len() == 1
-                    && matches!(
-                        &items[0].0,
-                        Expr::FunctionCall { name, .. } if name == "__star__"
-                    );
-                if is_star {
-                    next_paths.push(path);
-                    continue;
-                }
-
-                // For non-barrier projects (intermediate projections in WITH-WHERE
-                // pipelines), start with all existing bindings so that the filter
-                // after this project can still see pre-projection variables.
-                // Barrier projects (WITH clause boundaries) always start fresh.
-                let mut projected_path: PathMap = if *is_barrier {
-                    PathMap::new()
-                } else {
-                    path.clone()
-                };
-
-                for (expr, alias) in items {
-                    let target_var = if let Some(alias_name) = alias {
-                        alias_name.clone()
-                    } else {
-                        expr_display_name(expr)
-                    };
-
-                    match expr {
-                        // For CountStar / Agg, the Aggregate operator has already placed
-                        // the computed value in the PathMap under `target_var`. Pull it
-                        // directly rather than trying to re-evaluate the expression.
-                        Expr::CountStar | Expr::Agg(_, _) => {
-                            if let Some(binding) = path.get(&target_var) {
-                                projected_path.insert(target_var, binding.clone());
-                            } else {
-                                projected_path.insert(
-                                    target_var,
-                                    GraphBinding::Scalar(serde_json::Value::Null),
-                                );
-                            }
-                        }
-                        Expr::Prop(var, prop) if prop.is_empty() => {
-                            // Whole-variable reference: first try the node binding,
-                            // then fall back to a scalar already in the PathMap
-                            // (e.g., a group-by column emitted by Aggregate).
-                            if let Some(binding) = path.get(var) {
-                                projected_path.insert(target_var, binding.clone());
-                            } else if let Some(binding) = path.get(&target_var) {
-                                projected_path.insert(target_var, binding.clone());
-                            }
-                        }
-                        _ => {
-                            // For property expressions (n.age), first check whether the
-                            // Aggregate already emitted a scalar under the target column
-                            // name (e.g., the group-by key alias). If so, reuse it.
-                            // Exception: if the existing binding is a Node/Edge (not a Scalar),
-                            // and there's an alias, always evaluate the expression to avoid
-                            // shadowing issues like `a.id AS a` where a = Node(...).
-                            if let Some(binding) = path.get(&target_var) {
-                                match binding {
-                                    GraphBinding::Scalar(_) => {
-                                        // Pre-computed scalar (from Aggregate) → reuse.
-                                        projected_path.insert(target_var, binding.clone());
-                                    }
-                                    GraphBinding::Node(_) | GraphBinding::Edge(_) => {
-                                        // Node/Edge with a matching key: only reuse if there's
-                                        // no alias (variable pass-through).
-                                        if alias.is_none() {
-                                            projected_path.insert(target_var, binding.clone());
-                                        } else {
-                                            let val = evaluate_expr(graph, &path, expr, params)?;
-                                            projected_path
-                                                .insert(target_var, GraphBinding::Scalar(val));
-                                        }
-                                    }
-                                }
-                            } else {
-                                let val = evaluate_expr(graph, &path, expr, params)?;
-                                projected_path.insert(target_var, GraphBinding::Scalar(val));
-                            }
-                        }
-                    }
-                }
-
-                next_paths.push(projected_path);
-            }
-
-            Ok(next_paths)
+            project_rows(graph, child_paths, items, *is_barrier, params)
         }
         PhysicalOperator::Aggregate {
             input,
@@ -2169,8 +2519,6 @@ pub(super) fn execute_physical(
             aggregations,
         } => {
             use std::collections::BTreeMap;
-
-            let child_paths = execute_physical(graph, input, params)?;
 
             struct AggState {
                 count: i64,
@@ -2207,7 +2555,13 @@ pub(super) fn execute_physical(
                 groups.insert("".to_string(), (PathMap::new(), states));
             }
 
-            for path in child_paths {
+            // Fold one input row into the group table. The fold is associative
+            // and order-independent, so rows can arrive in any batching: streamed
+            // a batch at a time or from a fully materialized child, the resulting
+            // groups are identical.
+            let fold_path = |groups: &mut BTreeMap<String, (PathMap, Vec<AggState>)>,
+                             path: PathMap|
+             -> Result<(), String> {
                 let mut key_parts = Vec::new();
                 let mut gb_path = PathMap::new();
                 for (expr, alias) in group_by {
@@ -2331,6 +2685,27 @@ pub(super) fn execute_physical(
                             }
                         }
                     }
+                }
+                Ok(())
+            };
+
+            // Drive the fold. A streamable child is pulled a batch at a time so
+            // peak memory is one batch plus the group table; any other child
+            // (for example an Aggregate over a HashJoin) is materialized once.
+            if is_streamable(input) {
+                let mut stream = build_stream(input);
+                loop {
+                    let batch = stream.next_batch(graph, params)?;
+                    if batch.is_empty() {
+                        break;
+                    }
+                    for path in batch {
+                        fold_path(&mut groups, path)?;
+                    }
+                }
+            } else {
+                for path in execute_physical(graph, input, params)? {
+                    fold_path(&mut groups, path)?;
                 }
             }
 
@@ -2493,7 +2868,24 @@ pub(super) fn execute_physical(
             if *skip > 1_000_000_000 {
                 return Err(format!("SKIP value too large: {}", skip));
             }
-            let child_paths = execute_physical(graph, input, params)?;
+            // When the whole input chain streams (Project/Filter/Expand down to
+            // a leaf scan), drive it lazily so the leaf scan and any Expand stop
+            // as soon as `skip + count` rows exist: this short-circuits LIMIT
+            // through Expand, not just over a bare scan. `LIMIT` without
+            // `ORDER BY` is order-independent, so taking the first matching rows
+            // is valid.
+            if is_streamable(input) {
+                return execute_streaming_limit(graph, input, params, *skip, *count);
+            }
+            // Non-streamable shapes (Sort, Aggregate, Distinct, HashJoin, ...)
+            // execute normally; `execute_bounded` still bounds the legacy
+            // projected-scan shape, and otherwise we fall through to full
+            // execution. Correctness never depends on the bound.
+            let cap = skip.saturating_add(*count);
+            let child_paths = match execute_bounded(graph, input, params, cap)? {
+                Some(rows) => rows,
+                None => execute_physical(graph, input, params)?,
+            };
             Ok(child_paths.into_iter().skip(*skip).take(*count).collect())
         }
         PhysicalOperator::Distinct { input } => {
@@ -2611,6 +3003,7 @@ pub(super) fn execute_physical(
             closing_rel_type,
             closing_rel_var,
             closing_is_incoming,
+            closing_is_undirected,
         } => {
             let child_paths = execute_physical(graph, input, params)?;
             if child_paths.is_empty() {
@@ -2630,35 +3023,80 @@ pub(super) fn execute_physical(
             src_nodes.sort_unstable();
             src_nodes.dedup();
 
-            let transitions = expand_multi_type(
-                graph,
-                &src_nodes,
-                closing_rel_type.as_deref(),
-                *closing_is_incoming,
-            )?;
-
-            // Index the transitions as (closing_src, closing_dst) → EdgeId for O(1) lookup.
-            let mut join_map: HashMap<NodeId, HashMap<NodeId, EdgeId>> = HashMap::new();
-            for (src, eid, dst) in transitions {
-                join_map.entry(src).or_default().insert(dst, eid);
-            }
-
             let mut next_paths = Vec::new();
-            for path in child_paths {
-                let closing_src = match path.get(closing_src_var) {
-                    Some(GraphBinding::Node(n)) => *n,
-                    _ => continue,
-                };
-                let closing_dst = match path.get(closing_dst_var) {
-                    Some(GraphBinding::Node(n)) => *n,
-                    _ => continue,
-                };
 
-                if let Some(dst_map) = join_map.get(&closing_src) {
-                    if let Some(&eid) = dst_map.get(&closing_dst) {
-                        let mut new_path = path.clone();
-                        new_path.insert(closing_rel_var.clone(), GraphBinding::Edge(eid));
-                        next_paths.push(new_path);
+            if *closing_is_undirected {
+                // Undirected closing hop: the edge may run either way between the
+                // two bound nodes, so check both adjacency directions. Index every
+                // distinct edge (deduplicated by `(src, eid, dst)` to match the
+                // undirected Expand path: one row per edge, self-loops counted
+                // once) keyed by `closing_src → (closing_dst → [EdgeId])`.
+                let mut join_map: HashMap<NodeId, HashMap<NodeId, Vec<EdgeId>>> = HashMap::new();
+                let mut seen: HashSet<(NodeId, EdgeId, NodeId)> = HashSet::new();
+                for dir in [false, true] {
+                    let transitions =
+                        expand_multi_type(graph, &src_nodes, closing_rel_type.as_deref(), dir)?;
+                    for (src, eid, dst) in transitions {
+                        if seen.insert((src, eid, dst)) {
+                            join_map
+                                .entry(src)
+                                .or_default()
+                                .entry(dst)
+                                .or_default()
+                                .push(eid);
+                        }
+                    }
+                }
+
+                for path in child_paths {
+                    let closing_src = match path.get(closing_src_var) {
+                        Some(GraphBinding::Node(n)) => *n,
+                        _ => continue,
+                    };
+                    let closing_dst = match path.get(closing_dst_var) {
+                        Some(GraphBinding::Node(n)) => *n,
+                        _ => continue,
+                    };
+
+                    if let Some(eids) = join_map.get(&closing_src).and_then(|m| m.get(&closing_dst))
+                    {
+                        for &eid in eids {
+                            let mut new_path = path.clone();
+                            new_path.insert(closing_rel_var.clone(), GraphBinding::Edge(eid));
+                            next_paths.push(new_path);
+                        }
+                    }
+                }
+            } else {
+                let transitions = expand_multi_type(
+                    graph,
+                    &src_nodes,
+                    closing_rel_type.as_deref(),
+                    *closing_is_incoming,
+                )?;
+
+                // Index the transitions as (closing_src, closing_dst) → EdgeId for O(1) lookup.
+                let mut join_map: HashMap<NodeId, HashMap<NodeId, EdgeId>> = HashMap::new();
+                for (src, eid, dst) in transitions {
+                    join_map.entry(src).or_default().insert(dst, eid);
+                }
+
+                for path in child_paths {
+                    let closing_src = match path.get(closing_src_var) {
+                        Some(GraphBinding::Node(n)) => *n,
+                        _ => continue,
+                    };
+                    let closing_dst = match path.get(closing_dst_var) {
+                        Some(GraphBinding::Node(n)) => *n,
+                        _ => continue,
+                    };
+
+                    if let Some(dst_map) = join_map.get(&closing_src) {
+                        if let Some(&eid) = dst_map.get(&closing_dst) {
+                            let mut new_path = path.clone();
+                            new_path.insert(closing_rel_var.clone(), GraphBinding::Edge(eid));
+                            next_paths.push(new_path);
+                        }
                     }
                 }
             }

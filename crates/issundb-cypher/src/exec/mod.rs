@@ -834,6 +834,193 @@ mod tests {
         assert_eq!(rows, vec![vec![serde_json::Value::Null]]);
     }
 
+    /// An undirected single hop between two already-bound nodes is a closing hop:
+    /// the optimizer rewrites it to a `MultiwayJoin` with `closing_is_undirected`.
+    /// The executor must then check both edge directions, matching every
+    /// undirected edge between the pair rather than only the outgoing ones.
+    #[test]
+    fn undirected_closing_hop_matches_both_directions() {
+        let (_dir, graph) = setup_graph();
+        let params = HashMap::new();
+        execute(
+            &graph,
+            "CREATE (a:Person {name: 'A'}), (b:Person {name: 'B'}) \
+             CREATE (a)-[:KNOWS]->(b), (a)-[:LIKES]->(b), (b)-[:LIKES]->(a)",
+            &params,
+        )
+        .unwrap();
+        graph.rebuild_csr().unwrap();
+
+        // The first MATCH binds both `a` and `b` via the single KNOWS edge; the
+        // second is an undirected closing hop on LIKES, which exists in both
+        // directions between the pair, so it must match exactly twice.
+        let rows = run(
+            &graph,
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) \
+             MATCH (a)-[r:LIKES]-(b) RETURN a.name, b.name",
+        );
+        assert_eq!(
+            rows.len(),
+            2,
+            "undirected closing hop must match LIKES in both directions"
+        );
+        for row in &rows {
+            assert_eq!(row[0], serde_json::json!("A"));
+            assert_eq!(row[1], serde_json::json!("B"));
+        }
+    }
+
+    /// A directed closing hop must remain directional: the same fixture matched
+    /// with `->` sees only the single forward LIKES edge, confirming the
+    /// undirected branch is not over-matching.
+    #[test]
+    fn directed_closing_hop_matches_one_direction() {
+        let (_dir, graph) = setup_graph();
+        let params = HashMap::new();
+        execute(
+            &graph,
+            "CREATE (a:Person {name: 'A'}), (b:Person {name: 'B'}) \
+             CREATE (a)-[:KNOWS]->(b), (a)-[:LIKES]->(b), (b)-[:LIKES]->(a)",
+            &params,
+        )
+        .unwrap();
+        graph.rebuild_csr().unwrap();
+
+        let rows = run(
+            &graph,
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) \
+             MATCH (a)-[r:LIKES]->(b) RETURN a.name, b.name",
+        );
+        assert_eq!(
+            rows.len(),
+            1,
+            "directed closing hop must match only the forward LIKES edge"
+        );
+    }
+
+    /// `LIMIT` behind an `Expand` streams: the result is a prefix of the
+    /// unbounded result, and asking for fewer rows than exist returns exactly
+    /// that many. This exercises the lazy scan-then-expand short-circuit path.
+    #[test]
+    fn limit_behind_expand_returns_prefix() {
+        let (_dir, graph) = setup_graph();
+        let params = HashMap::new();
+        // A small star: one hub KNOWS several leaves, so a single source node
+        // fans out to many Expand output rows.
+        execute(
+            &graph,
+            "CREATE (h:Person {name: 'hub'}), \
+             (a:Person {name: 'a'}), (b:Person {name: 'b'}), \
+             (c:Person {name: 'c'}), (d:Person {name: 'd'}) \
+             CREATE (h)-[:KNOWS]->(a), (h)-[:KNOWS]->(b), \
+             (h)-[:KNOWS]->(c), (h)-[:KNOWS]->(d)",
+            &params,
+        )
+        .unwrap();
+        graph.rebuild_csr().unwrap();
+
+        let full = run(
+            &graph,
+            "MATCH (p:Person)-[:KNOWS]->(q:Person) RETURN q.name",
+        );
+        assert_eq!(full.len(), 4, "fixture must expose four KNOWS edges");
+
+        // LIMIT below the full count returns exactly that many rows, each one a
+        // row the unbounded query also produced (LIMIT without ORDER BY may
+        // return any subset, so we assert membership, not position).
+        let limited = run(
+            &graph,
+            "MATCH (p:Person)-[:KNOWS]->(q:Person) RETURN q.name LIMIT 2",
+        );
+        assert_eq!(limited.len(), 2, "LIMIT 2 must cap the streamed expansion");
+        for row in &limited {
+            assert!(full.contains(row), "limited row {row:?} not in full result");
+        }
+
+        // A LIMIT at or above the full count returns the whole result.
+        let limited_all = run(
+            &graph,
+            "MATCH (p:Person)-[:KNOWS]->(q:Person) RETURN q.name LIMIT 100",
+        );
+        assert_eq!(limited_all.len(), 4);
+    }
+
+    /// `SKIP ... LIMIT` behind an `Expand` is consistent with the unbounded
+    /// result: skip + limit selects a contiguous window of the streamed rows.
+    #[test]
+    fn skip_limit_behind_expand_is_consistent() {
+        let (_dir, graph) = setup_graph();
+        let params = HashMap::new();
+        execute(
+            &graph,
+            "CREATE (h:Person {name: 'hub'}), \
+             (a:Person {name: 'a'}), (b:Person {name: 'b'}), (c:Person {name: 'c'}) \
+             CREATE (h)-[:KNOWS]->(a), (h)-[:KNOWS]->(b), (h)-[:KNOWS]->(c)",
+            &params,
+        )
+        .unwrap();
+        graph.rebuild_csr().unwrap();
+
+        let full = run(
+            &graph,
+            "MATCH (p:Person)-[:KNOWS]->(q:Person) RETURN q.name",
+        );
+        let windowed = run(
+            &graph,
+            "MATCH (p:Person)-[:KNOWS]->(q:Person) RETURN q.name SKIP 1 LIMIT 1",
+        );
+        assert_eq!(windowed.len(), 1, "SKIP 1 LIMIT 1 yields one row");
+        assert!(full.contains(&windowed[0]));
+    }
+
+    /// A grouped aggregation over a streamable child folds rows a batch at a
+    /// time. The fixture has more expansion rows than `STREAM_BATCH`, so the
+    /// per-group counters must accumulate correctly across batch boundaries and
+    /// match the materialized result.
+    #[test]
+    fn streaming_aggregation_groups_across_batches() {
+        let (_dir, graph) = setup_graph();
+        // Two sink nodes; many sources, each pointing at one sink. The expansion
+        // produces 600 rows (more than one 256-row batch), split into two groups.
+        let even = graph
+            .add_node("Person", &serde_json::json!({"name": "even"}))
+            .unwrap();
+        let odd = graph
+            .add_node("Person", &serde_json::json!({"name": "odd"}))
+            .unwrap();
+        let (mut n_even, mut n_odd) = (0i64, 0i64);
+        for i in 0..600 {
+            let src = graph
+                .add_node("Person", &serde_json::json!({"name": format!("s{i}")}))
+                .unwrap();
+            if i % 2 == 0 {
+                graph
+                    .add_edge(src, even, "KNOWS", &serde_json::json!({}))
+                    .unwrap();
+                n_even += 1;
+            } else {
+                graph
+                    .add_edge(src, odd, "KNOWS", &serde_json::json!({}))
+                    .unwrap();
+                n_odd += 1;
+            }
+        }
+        graph.rebuild_csr().unwrap();
+
+        let rows = run(
+            &graph,
+            "MATCH (p:Person)-[:KNOWS]->(q:Person) RETURN q.name AS name, count(*) AS c",
+        );
+        let mut counts: HashMap<String, i64> = HashMap::new();
+        for row in rows {
+            let name = row[0].as_str().expect("group key is a string").to_string();
+            let c = row[1].as_i64().expect("count is an integer");
+            counts.insert(name, c);
+        }
+        assert_eq!(counts.get("even").copied(), Some(n_even));
+        assert_eq!(counts.get("odd").copied(), Some(n_odd));
+    }
+
     /// A WHERE attached to an OPTIONAL MATCH is part of the optional pattern: filtering out
     /// every optional match still preserves the left row with null optional vars (TCK
     /// MatchWhere6 [2]).
@@ -1912,6 +2099,22 @@ mod tests {
                 .unwrap();
         }
         let rows = run(&graph, "MATCH (n:Item) RETURN n.i AS i LIMIT 3");
+        assert_eq!(rows.len(), 3);
+    }
+
+    #[test]
+    fn skip_and_limit_without_order_returns_correct_count() {
+        // SKIP 2 LIMIT 3 over a bare scan exercises the bounded-scan fast path,
+        // which caps the scan at skip + count. Without ORDER BY the rows are
+        // arbitrary, but the count must be exactly 3 (not fewer because the cap
+        // dropped rows needed for the skip).
+        let (_dir, graph) = setup_graph();
+        for i in 0..10i64 {
+            graph
+                .add_node("Item", &serde_json::json!({"i": i}))
+                .unwrap();
+        }
+        let rows = run(&graph, "MATCH (n:Item) RETURN n.i AS i SKIP 2 LIMIT 3");
         assert_eq!(rows.len(), 3);
     }
 

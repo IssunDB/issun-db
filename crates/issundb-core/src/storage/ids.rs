@@ -28,6 +28,22 @@ pub fn alloc_node_id(storage: &Storage, txn: &mut heed::RwTxn) -> Result<NodeId,
     bump_counter(storage, txn, KEY_NEXT_NODE)
 }
 
+/// Reads the node-id high-water mark: the number of node IDs ever allocated.
+/// This is an upper bound on the live node count, because it does not decrease
+/// when a node is deleted, so it is intended for planning estimates rather than
+/// exact counts. O(1): a single `meta` lookup.
+pub fn node_high_water(storage: &Storage, txn: &heed::RoTxn) -> Result<u64, Error> {
+    match storage.meta.get(txn, KEY_NEXT_NODE)? {
+        Some(b) => {
+            let arr: [u8; 8] = b
+                .try_into()
+                .map_err(|_| Error::Corrupt("counter must be 8 bytes"))?;
+            Ok(u64::from_be_bytes(arr))
+        }
+        None => Ok(0),
+    }
+}
+
 pub fn alloc_edge_id(storage: &Storage, txn: &mut heed::RwTxn) -> Result<EdgeId, Error> {
     bump_counter(storage, txn, KEY_NEXT_EDGE)
 }

@@ -135,7 +135,11 @@ pub enum PhysicalOperator {
         /// Variable to bind the closing edge's `EdgeId`.
         closing_rel_var: String,
         /// Direction of the closing edge: `true` = incoming to `closing_src_var`.
+        /// Ignored when `closing_is_undirected` is true.
         closing_is_incoming: bool,
+        /// When true, the closing edge matches in either direction; the executor
+        /// checks both the outgoing and incoming adjacency of `closing_src_var`.
+        closing_is_undirected: bool,
     },
 }
 
@@ -469,8 +473,15 @@ pub fn format_physical_plan(op: &PhysicalOperator, depth: usize) -> String {
             closing_rel_type,
             closing_rel_var,
             closing_is_incoming,
+            closing_is_undirected,
         } => {
-            let dir = if *closing_is_incoming { "<-" } else { "->" };
+            let dir = if *closing_is_undirected {
+                "-"
+            } else if *closing_is_incoming {
+                "<-"
+            } else {
+                "->"
+            };
             let rel = closing_rel_type.as_deref().unwrap_or("*");
             buf.push_str(&format!(
                 "{}MultiwayJoin ({}{dir}[{closing_rel_var}:{rel}]{dir}{closing_dst_var})\n",

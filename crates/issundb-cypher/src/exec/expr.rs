@@ -3,7 +3,8 @@ use chrono::{
     Datelike, Duration, NaiveDate, NaiveDateTime, NaiveTime, Offset, TimeZone, Timelike, Weekday,
 };
 use chrono_tz::Tz;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 
 thread_local! {
     // The statement clock: the wall-clock instant captured when the current query began
@@ -39,6 +40,94 @@ fn statement_now() -> chrono::DateTime<chrono::Utc> {
     STATEMENT_NOW
         .with(|c| c.get())
         .unwrap_or_else(chrono::Utc::now)
+}
+
+thread_local! {
+    // Per-statement decoded-property cache: a node or edge id mapped to its decoded
+    // property JSON. Repeated property access on the same record within one read
+    // query then decodes the msgpack blob (and reads LMDB) once instead of once per
+    // touch. Installed by `PropCache` for read-only queries and restored on drop,
+    // the same install-guard pattern as `STATEMENT_NOW`. Write queries leave it
+    // uninstalled, so a record mutated mid-statement is never served stale.
+    static PROP_CACHE: RefCell<Option<PropCacheState>> = const { RefCell::new(None) };
+}
+
+#[derive(Default)]
+struct PropCacheState {
+    nodes: HashMap<NodeId, Rc<serde_json::Value>>,
+    edges: HashMap<EdgeId, Rc<serde_json::Value>>,
+}
+
+/// Guard that installs an empty property cache for one read-query execution and
+/// restores the previous cache on drop, so a nested subquery does not clear the
+/// outer statement's cache.
+pub(crate) struct PropCache {
+    previous: Option<PropCacheState>,
+}
+
+impl PropCache {
+    pub(crate) fn install() -> Self {
+        let previous = PROP_CACHE.with(|c| c.borrow_mut().replace(PropCacheState::default()));
+        PropCache { previous }
+    }
+}
+
+impl Drop for PropCache {
+    fn drop(&mut self) {
+        PROP_CACHE.with(|c| *c.borrow_mut() = self.previous.take());
+    }
+}
+
+/// Decode a node's properties as JSON, serving from the statement cache when one
+/// is installed. Returns `None` if the node does not exist. The returned `Rc`
+/// shares storage with the cache, so clone the inner value before mutating it.
+pub(crate) fn node_props(
+    graph: &Graph,
+    id: NodeId,
+) -> Result<Option<Rc<serde_json::Value>>, String> {
+    if let Some(hit) =
+        PROP_CACHE.with(|c| c.borrow().as_ref().and_then(|s| s.nodes.get(&id).cloned()))
+    {
+        return Ok(Some(hit));
+    }
+    let record = match graph.get_node(id).map_err(|e| e.to_string())? {
+        Some(r) => r,
+        None => return Ok(None),
+    };
+    let json: serde_json::Value =
+        rmp_serde::from_slice(&record.props).map_err(|e| e.to_string())?;
+    let rc = Rc::new(json);
+    PROP_CACHE.with(|c| {
+        if let Some(s) = c.borrow_mut().as_mut() {
+            s.nodes.insert(id, Rc::clone(&rc));
+        }
+    });
+    Ok(Some(rc))
+}
+
+/// Edge counterpart to [`node_props`].
+pub(crate) fn edge_props(
+    graph: &Graph,
+    id: EdgeId,
+) -> Result<Option<Rc<serde_json::Value>>, String> {
+    if let Some(hit) =
+        PROP_CACHE.with(|c| c.borrow().as_ref().and_then(|s| s.edges.get(&id).cloned()))
+    {
+        return Ok(Some(hit));
+    }
+    let record = match graph.get_edge(id).map_err(|e| e.to_string())? {
+        Some(r) => r,
+        None => return Ok(None),
+    };
+    let json: serde_json::Value =
+        rmp_serde::from_slice(&record.props).map_err(|e| e.to_string())?;
+    let rc = Rc::new(json);
+    PROP_CACHE.with(|c| {
+        if let Some(s) = c.borrow_mut().as_mut() {
+            s.edges.insert(id, Rc::clone(&rc));
+        }
+    });
+    Ok(Some(rc))
 }
 
 /// Build the current value of a temporal type from the statement clock. `name` is the function
@@ -479,12 +568,8 @@ pub(super) fn evaluate_expr(
             };
             match binding {
                 GraphBinding::Node(node_id) => {
-                    let record = graph
-                        .get_node(*node_id)
-                        .map_err(|e| e.to_string())?
+                    let actual_json = node_props(graph, *node_id)?
                         .ok_or_else(|| format!("node not found: {}", node_id))?;
-                    let actual_json: serde_json::Value =
-                        rmp_serde::from_slice(&record.props).map_err(|e| e.to_string())?;
                     if prop.is_empty() {
                         let mut m = serde_json::Map::new();
                         m.insert(
@@ -495,7 +580,7 @@ pub(super) fn evaluate_expr(
                             "id".to_string(),
                             serde_json::Value::Number((*node_id as i64).into()),
                         );
-                        m.insert("properties".to_string(), actual_json);
+                        m.insert("properties".to_string(), (*actual_json).clone());
                         Ok(serde_json::Value::Object(m))
                     } else {
                         Ok(actual_json
@@ -505,13 +590,16 @@ pub(super) fn evaluate_expr(
                     }
                 }
                 GraphBinding::Edge(edge_id) => {
-                    let record = graph
-                        .get_edge(*edge_id)
-                        .map_err(|e| e.to_string())?
-                        .ok_or_else(|| format!("edge not found: {}", edge_id))?;
-                    let actual_json: serde_json::Value =
-                        rmp_serde::from_slice(&record.props).map_err(|e| e.to_string())?;
+                    // The whole-edge form needs `src`/`dst` from the record, which the
+                    // property cache does not hold, so it reads the record directly;
+                    // the hot single-property form goes through the cache.
                     if prop.is_empty() {
+                        let record = graph
+                            .get_edge(*edge_id)
+                            .map_err(|e| e.to_string())?
+                            .ok_or_else(|| format!("edge not found: {}", edge_id))?;
+                        let actual_json: serde_json::Value =
+                            rmp_serde::from_slice(&record.props).map_err(|e| e.to_string())?;
                         let mut m = serde_json::Map::new();
                         m.insert(
                             "__type__".to_string(),
@@ -532,6 +620,8 @@ pub(super) fn evaluate_expr(
                         m.insert("properties".to_string(), actual_json);
                         Ok(serde_json::Value::Object(m))
                     } else {
+                        let actual_json = edge_props(graph, *edge_id)?
+                            .ok_or_else(|| format!("edge not found: {}", edge_id))?;
                         Ok(actual_json
                             .get(prop)
                             .cloned()
@@ -545,13 +635,8 @@ pub(super) fn evaluate_expr(
                         if obj.get("__type__").and_then(|t| t.as_str()) == Some("__Node__") {
                             if let Some(id_val) = obj.get("id").and_then(|i| i.as_i64()) {
                                 let node_id = id_val as u64;
-                                let record = graph
-                                    .get_node(node_id)
-                                    .map_err(|e| e.to_string())?
+                                let actual_json = node_props(graph, node_id)?
                                     .ok_or_else(|| format!("node not found: {}", node_id))?;
-                                let actual_json: serde_json::Value =
-                                    rmp_serde::from_slice(&record.props)
-                                        .map_err(|e| e.to_string())?;
                                 Ok(actual_json
                                     .get(prop)
                                     .cloned()
@@ -562,13 +647,8 @@ pub(super) fn evaluate_expr(
                         } else if obj.get("__type__").and_then(|t| t.as_str()) == Some("__Edge__") {
                             if let Some(id_val) = obj.get("id").and_then(|i| i.as_i64()) {
                                 let edge_id = id_val as u64;
-                                let record = graph
-                                    .get_edge(edge_id)
-                                    .map_err(|e| e.to_string())?
+                                let actual_json = edge_props(graph, edge_id)?
                                     .ok_or_else(|| format!("edge not found: {}", edge_id))?;
-                                let actual_json: serde_json::Value =
-                                    rmp_serde::from_slice(&record.props)
-                                        .map_err(|e| e.to_string())?;
                                 Ok(actual_json
                                     .get(prop)
                                     .cloned()
