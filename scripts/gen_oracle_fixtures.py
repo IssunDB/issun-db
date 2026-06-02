@@ -223,7 +223,7 @@ def main():
 
     corpus = {
         "meta": {
-            "generator": "tools/gen_oracle_fixtures.py",
+            "generator": "scripts/gen_oracle_fixtures.py",
             "networkx_version": nx.__version__,
             "seed": SEED,
             "num_graphs": NUM_GRAPHS,

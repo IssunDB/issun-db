@@ -76,7 +76,7 @@ def main():
 
     corpus = {
         "meta": {
-            "generator": "tools/gen_pagerank_fixtures.py",
+            "generator": "scripts/gen_pagerank_fixtures.py",
             "networkx_version": nx.__version__,
             "seed": SEED,
             "num_graphs": NUM_GRAPHS,

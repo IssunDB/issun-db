@@ -18,7 +18,7 @@ Priorities, in order:
 - Prefer small, focused changes over broad rewrites.
 - Keep the workspace modular: `issundb-core` owns graph storage, `issundb-vector` owns vector search, `issundb-text` owns full-text search,
   `issundb-retrieval` owns hybrid retrieval, `issundb-cypher` owns the query layer, `issundb` is the public facade, `issundb-cli` uses only
-  the public facade, and the binding crates (`issundb-rest`, `issundb-mcp`, `issundb-gui`, `issundb-node`, `issundb-py`) consume only the
+  the public facade, and the binding crates (`issundb-rest`, `issundb-mcp`, `issundb-node`, `issundb-py`) consume only the
   `issundb` facade and its extension crates. Do not import across those boundaries in the wrong direction.
 - Keep all mutable state inside `Graph` and `Storage`; do not introduce module-level `static mut` or `lazy_static` globals for runtime state.
 - Writes are serialized via the `parking_lot::Mutex<()>` write lock on `Graph`; LMDB enforces the same constraint at the storage level. Do not bypass
@@ -44,8 +44,8 @@ Quick examples:
 
 ## Repository Layout
 
-The current tree includes storage, CSR snapshots, vector search, hybrid retrieval primitives, Cypher planning, the CLI, an HTTP server, a desktop
-GUI, language bindings, and shared test utilities.
+The current tree includes storage, CSR snapshots, vector search, hybrid retrieval primitives, Cypher, the CLI, an REST API, language bindings,
+and shared test utilities.
 This layout describes the current structure and target decoupled crate boundaries.
 Do not invent modules that do not yet exist when answering questions, but do place new modules according to this map.
 
@@ -94,8 +94,6 @@ Do not invent modules that do not yet exist when answering questions, but do pla
 - `crates/issundb-mcp/`: Model Context Protocol server built on the `rmcp` SDK, serving over either stdio or MCP's Streamable HTTP transport.
   Exposes node and edge CRUD, Cypher query execution, query plan explanation, full-text search, and vector search as MCP tools. Uses `tokio` as
   its async runtime; depends only on `issundb`.
-- `crates/issundb-gui/`: egui desktop application for interactive graph exploration. Provides a Cypher query console, a graph visualization canvas
-  via `egui_graphs`, and a node or edge inspector. Depends only on `issundb`.
 - `crates/issundb-node/`: Node.js bindings via NAPI-RS. Exposes the `IssunDB` class with node, edge, query, vector search, text search, and
   backup methods. Depends only on `issundb`.
 - `crates/issundb-py/`: Python bindings via PyO3. Exposes the `IssunDB` class with the same surface as the Node.js bindings. Depends only on
@@ -141,14 +139,14 @@ Do not invent modules that do not yet exist when answering questions, but do pla
 
 Target dependency direction:
 
-1. `issundb-core` has no dependencies on vector, text, retrieval, Cypher, bindings, server, GUI, or CLI crates.
-2. `issundb-vector` may depend on `issundb-core`, but not on text, retrieval, Cypher, bindings, server, GUI, or CLI crates.
-3. `issundb-text` may depend on `issundb-core`, but not on vector, retrieval, Cypher, bindings, server, GUI, or CLI crates.
+1. `issundb-core` has no dependencies on vector, text, retrieval, Cypher, bindings, server, or CLI crates.
+2. `issundb-vector` may depend on `issundb-core`, but not on text, retrieval, Cypher, bindings, server, or CLI crates.
+3. `issundb-text` may depend on `issundb-core`, but not on vector, retrieval, Cypher, bindings, server, or CLI crates.
 4. `issundb-retrieval` may depend on `issundb-core`, `issundb-vector`, and `issundb-text`.
 5. `issundb-cypher` may depend on public APIs from core, vector, text, and retrieval crates, but not storage internals.
 6. `issundb` composes and re-exports the stable public API.
 7. `issundb-cli` uses only the `issundb` facade.
-8. `issundb-rest`, `issundb-mcp`, `issundb-gui`, `issundb-node`, and `issundb-py` must depend only on `issundb`; they must not import
+8. `issundb-rest`, `issundb-mcp`, `issundb-node`, and `issundb-py` must depend only on `issundb`; they must not import
    `issundb-core`, `issundb-vector`, `issundb-text`, `issundb-retrieval`, or `issundb-cypher` directly.
 
 Lower-level crates must not know about higher-level crates.
@@ -208,8 +206,8 @@ All graph operations go through `Graph`; do not call `Storage` directly from out
 
 ### `issundb_vector`
 
-Vector search crate. Owns vector index abstractions, vector metadata, vector storage integration, and vector search APIs. It may depend on
-`issundb-core`; it must not depend on `issundb-text`, `issundb-retrieval`, `issundb-cypher`, bindings, or CLI crates.
+Vector search crate. Owns vector index abstractions, vector metadata, vector storage integration, and vector search APIs.
+It may depend on `issundb-core`; it must not depend on `issundb-text`, `issundb-retrieval`, `issundb-cypher`, bindings, or CLI crates.
 
 - `VectorGraphExt::configure_vector_index(opts: VectorIndexOptions) -> Result<(), VectorError>`: sets the per-graph metric and
   quantization. The choice persists in the `meta` sub-database, so reopen rebuilds with the same configuration. Call it before the first
@@ -222,8 +220,8 @@ Vector search crate. Owns vector index abstractions, vector metadata, vector sto
 
 ### `issundb_text`
 
-Full-text search crate. Owns tokenization, inverted index storage, ranking, and text search APIs. It may depend on `issundb-core`; it must not
-depend on `issundb-vector`, `issundb-retrieval`, `issundb-cypher`, bindings, or CLI crates.
+Full-text search crate. Owns tokenization, inverted index storage, ranking, and text search APIs.
+It may depend on `issundb-core`; it must not depend on `issundb-vector`, `issundb-retrieval`, `issundb-cypher`, bindings, or CLI crates.
 
 - `TextGraphExt::text_search(query: &str, opts: &TextSearchOptions) -> Result<Vec<TextHit>, TextError>`
 - `TextIndexExt::create_text_index(label: &str, property: &str) -> Result<(), TextError>`
@@ -299,12 +297,6 @@ Methods: `add_node`, `get_node`, `update_node`, `delete_node`, `add_edge`, `quer
 
 Python bindings via PyO3. Exposes a single `IssunDB` class with the same method surface as `issundb_node`. The `extension-module` feature must
 be enabled for the Python extension to compile. Depends only on `issundb`.
-
-### `issundb_gui`
-
-Desktop application built with `eframe` and `egui`. Depends only on `issundb`.
-Provides a Cypher query console, an interactive graph visualization canvas via `egui_graphs`, and a node or edge inspector panel.
-Not part of the library surface; changes here do not affect the public API.
 
 ### `issundb_core::Storage`
 

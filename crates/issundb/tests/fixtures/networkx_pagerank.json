@@ -6219,7 +6219,7 @@
   ],
   "meta": {
     "alpha": 0.85,
-    "generator": "tools/gen_pagerank_fixtures.py",
+    "generator": "scripts/gen_pagerank_fixtures.py",
     "networkx_version": "2.8.8",
     "num_graphs": 60,
     "seed": 2590923281

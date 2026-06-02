@@ -10,14 +10,14 @@
 //!   - `two_hop`           multi-hop expansion
 //!   - `var_length`        variable-length path expansion
 //!   - `limit_behind_expand` small LIMIT over a single-hop expand (streaming short-circuit)
+//!   - `aggregation`        grouped count whose streamable child is folded a batch at a time
 //!
-//! The last two are Phase-3 gate baselines: query shapes whose plans are not
-//! yet streamable, so they still fully materialize. They quantify the cost the
-//! deferred streaming work (through joins, and streaming aggregation) would
-//! target, so a future change can be measured against them rather than asserted:
+//! `limit_behind_join` is a Phase-3 gate baseline: a query shape whose plan is
+//! not yet streamable, so it still fully materializes. It quantifies the cost
+//! the deferred streaming-through-join work would target, so a future change can
+//! be measured against it rather than asserted:
 //!
 //!   - `limit_behind_join` small LIMIT over a HashJoin (no short-circuit today)
-//!   - `aggregation`        grouped count over a full single-hop expansion
 //!
 //! The graph is deterministic (no RNG), so run-to-run comparisons are stable.
 
@@ -100,11 +100,11 @@ fn bench_execution(c: &mut Criterion) {
         "MATCH (a:Person)-[:KNOWS]->(b:Person) \
          MATCH (c:Person)-[:KNOWS]->(b) RETURN a, c LIMIT 5",
     );
-    // Phase-3 gate: a grouped aggregation over the full single-hop expansion.
-    // The Aggregate operator drains its child into a `Vec` before grouping, so
-    // every expansion row is materialized. Streaming aggregation would consume
-    // batches without holding all rows; this records the materialize-then-group
-    // baseline.
+    // A grouped aggregation over the full single-hop expansion. The Aggregate
+    // operator's child chain is streamable, so it folds rows a batch at a time
+    // instead of materializing the whole expansion before grouping. Aggregation
+    // is still full-consumption (every row is visited), so the win is bounded
+    // peak memory, not a short-circuit.
     run(
         "exec_aggregation",
         "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN b.name, count(*) AS c",

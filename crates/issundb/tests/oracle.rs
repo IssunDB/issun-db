@@ -1,7 +1,7 @@
 //! Differential tests against a NetworkX oracle corpus.
 //!
 //! The corpus in `tests/fixtures/networkx_oracle.json` is generated offline by
-//! `tools/gen_oracle_fixtures.py` (run via `make oracle-fixtures`) and committed
+//! `scripts/gen_oracle_fixtures.py` (run via `make oracle-fixtures`) and committed
 //! to the repository. Each case is a simple directed graph plus the reference
 //! output NetworkX computes for a fixed set of algorithms. This test replays
 //! each graph through the `issundb` facade and asserts that IssunDB agrees with
@@ -17,7 +17,7 @@
 //! (`networkx_pagerank.json`) restricted to graphs with no dangling nodes. On
 //! that subclass IssunDB's fixed-iteration power method (which does not
 //! redistribute dangling-node mass) converges to the same stationary
-//! distribution NetworkX computes; see `tools/gen_pagerank_fixtures.py` for the
+//! distribution NetworkX computes; see `scripts/gen_pagerank_fixtures.py` for the
 //! convention analysis. The centralities (betweenness, harmonic) remain out of
 //! scope pending a verified normalization and directedness match.
 
@@ -440,7 +440,7 @@ struct CentralityCase {
     /// Directed Brandes betweenness, unnormalized, no endpoints, indexed by node.
     betweenness: Vec<f64>,
     /// Out-distance harmonic centrality (sum of 1/d(u, v) over v reachable from
-    /// u), indexed by node. See `tools/gen_centrality_fixtures.py` for why the
+    /// u), indexed by node. See `scripts/gen_centrality_fixtures.py` for why the
     /// generator reverses the graph before calling NetworkX.
     harmonic: Vec<f64>,
 }

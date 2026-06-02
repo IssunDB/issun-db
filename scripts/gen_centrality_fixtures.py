@@ -71,7 +71,7 @@ def main():
 
     corpus = {
         "meta": {
-            "generator": "tools/gen_centrality_fixtures.py",
+            "generator": "scripts/gen_centrality_fixtures.py",
             "networkx_version": nx.__version__,
             "seed": SEED,
             "num_graphs": NUM_GRAPHS,

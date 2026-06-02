@@ -4,6 +4,7 @@ PATH := /snap/bin:$(PATH)
 DEBUG_PROJ := 0
 RUST_BACKTRACE := 1
 ASSET_DIR := docs/assets
+SCRIPTS_DIR := scripts
 SHELL := /bin/bash
 MSRV := 1.85.0
 
@@ -53,7 +54,7 @@ test-conformance: format ## Run the openCypher TCK conformance integration tests
 .PHONY: coverage
 coverage: format ## Generate test coverage report
 	@echo "Generating test coverage report..."
-	@DEBUG_PROJ=$(DEBUG_PROJ) cargo tarpaulin --workspace --exclude issundb-gui --exclude issundb-cli --exclude issundb-node --exclude issundb-py --out Xml --out Html
+	@DEBUG_PROJ=$(DEBUG_PROJ) cargo tarpaulin --workspace --exclude issundb-cli --exclude issundb-node --exclude issundb-py --out Xml --out Html
 
 .PHONY: build
 build: format ## Build the binary for the current platform
@@ -177,10 +178,6 @@ repl: ## Launch the REPL (pass REPL_PATH=<dir> to set the database path; default
 	@echo "Starting IssunDB REPL (database: $(or $(REPL_PATH),./issundb-data))..."
 	@RUST_BACKTRACE=$(RUST_BACKTRACE) cargo run -p issundb-cli -- $(or $(REPL_PATH),./issundb-data)
 
-.PHONY: gui
-gui: ## Launch the GUI (pass GUI_PATH=<dir> to set the database path; defaults to ./issundb-data)
-	@echo "Starting IssunDB GUI (database: $(or $(GUI_PATH),./issundb-data))..."
-	@RUST_BACKTRACE=$(RUST_BACKTRACE) cargo run -p issundb-gui -- $(or $(GUI_PATH),./issundb-data)
 
 .PHONY: mcp
 mcp: ## Launch the MCP server over stdio (pass MCP_PATH=<dir> to set the database path; defaults to ./issundb-data)
@@ -310,10 +307,10 @@ testdata: ## Regenerate versioned LMDB snapshots
 .PHONY: oracle-fixtures
 oracle-fixtures: ## Regenerate the NetworkX oracle corpora (needs Python3 and NetworkX)
 	@echo "Regenerating NetworkX oracle corpora..."
-	@python3 tools/gen_oracle_fixtures.py crates/issundb/tests/fixtures/networkx_oracle.json
-	@python3 tools/gen_pagerank_fixtures.py crates/issundb/tests/fixtures/networkx_pagerank.json
-	@python3 tools/gen_centrality_fixtures.py crates/issundb/tests/fixtures/networkx_centrality.json
-	@python3 tools/gen_paths_fixtures.py crates/issundb/tests/fixtures/networkx_paths.json
+	@python3 $SCRIPTS_DIR/gen_oracle_fixtures.py crates/issundb/tests/fixtures/networkx_oracle.json
+	@python3 $SCRIPTS_DIR/gen_pagerank_fixtures.py crates/issundb/tests/fixtures/networkx_pagerank.json
+	@python3 $SCRIPTS_DIR/gen_centrality_fixtures.py crates/issundb/tests/fixtures/networkx_centrality.json
+	@python3 $SCRIPTS_DIR/gen_paths_fixtures.py crates/issundb/tests/fixtures/networkx_paths.json
 	@echo "Corpora written. Commit crates/issundb/tests/fixtures/ to record the oracle."
 
 .PHONY: nextest

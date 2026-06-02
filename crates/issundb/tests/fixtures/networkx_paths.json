@@ -16247,7 +16247,7 @@
     }
   ],
   "meta": {
-    "generator": "tools/gen_paths_fixtures.py",
+    "generator": "scripts/gen_paths_fixtures.py",
     "networkx_version": "2.8.8",
     "num_graphs": 60,
     "seed": 2592037393

@@ -121,7 +121,6 @@ This document outlines the features implemented in IssunDB and the future goals 
 - [x] An interactive REPL
 - [x] An HTTP REST API server with node, edge, query, vector search, and full-text search routes
 - [x] An MCP server over stdio or Streamable HTTP, exposing node and edge CRUD, query, explanation, full-text search, and vector search as tools
-- [x] A desktop GUI with a Cypher console and interactive graph visualization
 - [x] A benchmarking suite that measures throughput and load scaling
 - [x] Property-based and integration tests
 - [x] Language bindings for Python
