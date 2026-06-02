@@ -92,6 +92,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+```
+# Output:
+Match: "Alice" knows "Bob" since 2021
+```
+
 ---
 
 ### Documentation

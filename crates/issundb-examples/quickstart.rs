@@ -1,0 +1,46 @@
+use issundb::{Graph, GraphQueryExt};
+use std::path::Path;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Clean up any existing data directory from a previous run to ensure a clean slate
+    let db_path = Path::new("./issundb-data-quickstart");
+    if db_path.exists() {
+        let _ = std::fs::remove_dir_all(db_path);
+    }
+
+    // Open a graph database with a 1 GB memory map size limit
+    let graph = Graph::open(db_path, 1)?;
+
+    // Add nodes with properties
+    let alice_props = serde_json::json!({ "name": "Alice", "age": 30 });
+    let alice_id = graph.add_node("Person", &alice_props)?;
+
+    // Add another node
+    let bob_props = serde_json::json!({ "name": "Bob", "age": 28 });
+    let bob_id = graph.add_node("Person", &bob_props)?;
+
+    // Create an edge connecting the nodes
+    let edge_props = serde_json::json!({ "since": 2021 });
+    graph.add_edge(alice_id, bob_id, "KNOWS", &edge_props)?;
+
+    // Rebuild the in-memory CSR snapshot
+    graph.rebuild_csr()?;
+
+    // Execute a Cypher query
+    let result =
+        graph.query("MATCH (a:Person)-[r:KNOWS]->(b:Person) RETURN a.name, b.name, r.since")?;
+
+    for record in result.records {
+        println!(
+            "Match: {} knows {} since {}",
+            record.values[0], record.values[1], record.values[2]
+        );
+    }
+
+    // Clean up the created database directory
+    if db_path.exists() {
+        let _ = std::fs::remove_dir_all(db_path);
+    }
+
+    Ok(())
+}

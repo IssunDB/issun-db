@@ -1,5 +1,5 @@
-pub mod error;
-pub mod retrieve;
+mod error;
+mod retrieve;
 
 pub use error::RetrievalError;
 pub use retrieve::{

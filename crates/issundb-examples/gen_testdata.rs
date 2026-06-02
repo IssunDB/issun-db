@@ -1,6 +1,9 @@
+//! Regenerate the versioned LMDB snapshot used by storage-format compatibility
+//! tests. Run via `make testdata`, which writes into `test_data/v<version>/db`.
+
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use issundb_testing::open_at;
+use issundb::Graph;
 use serde_json::json;
 
 fn main() {
@@ -10,7 +13,7 @@ fn main() {
     let path = std::path::Path::new(&path_str);
     std::fs::create_dir_all(path).expect("create output dir");
 
-    let g = open_at(path);
+    let g = Graph::open(path, 1).expect("open graph");
 
     // Five Person nodes with deterministic properties.
     let people = [

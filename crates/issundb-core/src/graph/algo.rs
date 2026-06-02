@@ -84,11 +84,16 @@ impl Graph {
     }
 
     /// Computes the weighted shortest path between `src` and `dst` using Dijkstra's algorithm.
+    ///
+    /// Edge weights come from the materialized CSR snapshot, which reads the
+    /// first present of the `weight`, `cost`, `capacity`, or `cap` edge
+    /// properties, defaulting to `1.0`. The weight source is fixed: unlike
+    /// `shortest_path_top_k` and `spanning_forest`, this method does not take a
+    /// weight-property argument.
     pub fn shortest_path_dijkstra(
         &self,
         src: NodeId,
         dst: NodeId,
-        _weight_property: &str,
     ) -> Result<Option<WeightedPath>, Error> {
         self.ensure_matrices()?;
         let guard = self.matrices.read();

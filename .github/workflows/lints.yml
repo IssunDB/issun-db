@@ -33,18 +33,20 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Set up Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: '1.85.0' # Pinned to project's MSRV
+          components: rustfmt, clippy
           cache: true
 
-      - name: Install dependencies
+      - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang curl pkg-config libssl-dev make
-          make install-deps
+          sudo apt-get install -y clang pkg-config libssl-dev
 
       - name: Run linters
         run: make lint

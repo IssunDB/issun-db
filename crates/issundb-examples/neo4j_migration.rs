@@ -195,6 +195,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  Imported edge {:?}: {:?} -> {:?}", edge_id, src, dst);
     }
 
+    // Rebuild the CSR snapshot so the Cypher verification query sees the imported edges.
+    // Pattern-match expansion runs over the snapshot, which lags writes until a rebuild.
+    graph.rebuild_csr()?;
+
     // ---- 4. Verify the import by running a Cypher query --------------------------
     println!(
         "\n--- Cypher verification: MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a.name, b.name ---"

@@ -1,3 +1,31 @@
+//! IssunDB is an embedded graph database with vector search, full-text search,
+//! and hybrid retrieval.
+//!
+//! This crate is the public facade. It re-exports the deliberate public surface
+//! of the storage engine, vector index, text index, hybrid retrieval layer, and
+//! Cypher query engine. Application code, bindings, and tools depend on this
+//! crate only; the internal crates (`issundb-core`, `issundb-vector`,
+//! `issundb-text`, `issundb-retrieval`, and `issundb-cypher`) are not part of
+//! the stable API.
+//!
+//! # Entry Points
+//!
+//! - [`Graph`] is the central handle. Open it with [`Graph::open`], then use its
+//!   methods for node and edge CRUD, adjacency, and graph algorithms.
+//! - [`GraphQueryExt`] adds Cypher execution ([`query`](GraphQueryExt::query),
+//!   [`query_with_params`](GraphQueryExt::query_with_params), and
+//!   [`explain`](GraphQueryExt::explain)) to [`Graph`].
+//! - [`VectorGraphExt`] adds vector indexing and search to [`Graph`].
+//! - [`TextGraphExt`] and [`TextIndexExt`] add full-text indexing and search.
+//! - [`retrieve`], [`retrieve_with`], and [`retrieve_hybrid`] run hybrid
+//!   retrieval over vector hits, text hits, and graph expansion.
+//!
+//! # Working with Query Results
+//!
+//! Query parameters and [`Record`] values use `serde_json::Value`. The
+//! `serde_json` crate is re-exported as [`issundb::serde_json`](serde_json) so
+//! callers do not need to track a separate, version-compatible dependency.
+
 pub use issundb_core::{
     DegreeDirection, DirectedNeighborEntry, EdgeId, EdgeRecord, Error, Graph, LabelId, Language,
     NeighborEntry, NodeId, NodeRecord, PropValue, ReadTxn, TypeId, WeightedPath, WriteTxn,
@@ -17,6 +45,11 @@ pub use issundb_vector::{
     Hit, VectorError, VectorGraphExt, VectorIndexOptions, VectorMetric, VectorQuantization,
     VectorSearchOptions,
 };
+
+/// Re-export of the `serde_json` crate. Query parameters and [`Record`] values
+/// are `serde_json::Value`, so callers construct and inspect them through this
+/// re-export without depending on a separate `serde_json` version.
+pub use serde_json;
 
 /// Extension trait to execute Cypher queries on the `Graph` handle.
 pub trait GraphQueryExt {

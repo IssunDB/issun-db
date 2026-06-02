@@ -124,7 +124,6 @@ This document outlines the features implemented in IssunDB and the future goals 
 - [x] A desktop GUI with a Cypher console and interactive graph visualization
 - [x] A benchmarking suite that measures throughput and load scaling
 - [x] Property-based and integration tests
-- [x] Shared test fixture library (`issundb-testing`) with graph builders and assertion helpers
 - [x] Language bindings for Python
 - [x] Language bindings for JavaScript (Node.js)
 - [x] Batch data import utilities for JSONL and CSV formats

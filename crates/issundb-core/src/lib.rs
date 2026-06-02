@@ -490,7 +490,7 @@ mod tests {
     fn dijkstra_shortest_path_same_node() {
         let (_dir, g) = open_tmp();
         let a = g.add_node("N", &json!({})).unwrap();
-        let wp = g.shortest_path_dijkstra(a, a, "weight").unwrap().unwrap();
+        let wp = g.shortest_path_dijkstra(a, a).unwrap().unwrap();
         assert_eq!(wp.nodes, vec![a]);
         assert_eq!(wp.total_weight, 0.0);
     }
@@ -512,7 +512,7 @@ mod tests {
         g.rebuild_csr().unwrap();
 
         // Dijkstra must select the longer hop path (a → b → c) because its total cost (3.5) is smaller than 10.0
-        let wp = g.shortest_path_dijkstra(a, c, "cost").unwrap().unwrap();
+        let wp = g.shortest_path_dijkstra(a, c).unwrap().unwrap();
         assert_eq!(wp.nodes, vec![a, b, c]);
         assert_eq!(wp.total_weight, 3.5);
     }
@@ -532,7 +532,7 @@ mod tests {
 
         g.rebuild_csr().unwrap();
 
-        let wp = g.shortest_path_dijkstra(a, c, "cost").unwrap().unwrap();
+        let wp = g.shortest_path_dijkstra(a, c).unwrap().unwrap();
         assert_eq!(wp.nodes, vec![a, b, c]);
         assert_eq!(wp.total_weight, 2.0);
     }
@@ -542,7 +542,7 @@ mod tests {
         let (_dir, g) = open_tmp();
         let a = g.add_node("N", &json!({})).unwrap();
         let b = g.add_node("N", &json!({})).unwrap();
-        assert!(g.shortest_path_dijkstra(a, b, "cost").unwrap().is_none());
+        assert!(g.shortest_path_dijkstra(a, b).unwrap().is_none());
     }
 
     // ------------------------------------------------------------------
@@ -1349,6 +1349,48 @@ mod tests {
     }
 
     #[test]
+    fn connected_components_graphblas_path_node_zero_connected() {
+        // Regression: after rebuild_csr the GraphBLAS path runs. Node index 0
+        // must join its component rather than being stranded as a singleton by a
+        // label value colliding with the semiring's implicit zero.
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("N", &json!({})).unwrap();
+        let b = g.add_node("N", &json!({})).unwrap();
+        let c = g.add_node("N", &json!({})).unwrap();
+        g.add_edge(a, b, "E", &json!({})).unwrap();
+        g.add_edge(b, c, "E", &json!({})).unwrap();
+        g.rebuild_csr().unwrap();
+
+        let cc = g.connected_components().unwrap();
+        let distinct: std::collections::HashSet<u64> = cc.values().copied().collect();
+        assert_eq!(distinct.len(), 1, "all three nodes form one component");
+        assert_eq!(cc[&a], cc[&b]);
+        assert_eq!(cc[&b], cc[&c]);
+    }
+
+    #[test]
+    fn connected_components_graphblas_path_keeps_components_separate() {
+        // Regression: the GraphBLAS WCC propagation must reduce over neighbor
+        // labels, not the adjacency matrix value. Two disjoint edges A->B and
+        // C->D form two components; a MinFirst semiring collapses every
+        // edge-touching node into one component, so this guards MinSecond.
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("N", &json!({})).unwrap();
+        let b = g.add_node("N", &json!({})).unwrap();
+        let c = g.add_node("N", &json!({})).unwrap();
+        let d = g.add_node("N", &json!({})).unwrap();
+        g.add_edge(a, b, "E", &json!({})).unwrap();
+        g.add_edge(c, d, "E", &json!({})).unwrap();
+        g.rebuild_csr().unwrap();
+
+        let cc = g.connected_components().unwrap();
+        assert_eq!(cc.len(), 4);
+        assert_eq!(cc[&a], cc[&b]);
+        assert_eq!(cc[&c], cc[&d]);
+        assert_ne!(cc[&a], cc[&c], "disjoint edges must be separate components");
+    }
+
+    #[test]
     fn connected_components_weakly_connected_via_reverse_edge() {
         let (_dir, g) = open_tmp();
         // a → b and b → c: all three are weakly connected.
@@ -1580,5 +1622,84 @@ mod prop_tests {
             prop_assert_eq!(after.len(), before + 1);
             prop_assert!(after.contains(&eid));
         });
+    }
+}
+
+#[cfg(test)]
+mod differential_tests {
+    use std::collections::HashMap;
+
+    use proptest::prelude::*;
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    use super::*;
+
+    fn open_tmp() -> (TempDir, Graph) {
+        let dir = TempDir::new().unwrap();
+        let g = Graph::open(dir.path(), 1).unwrap();
+        (dir, g)
+    }
+
+    /// Union-find reference for weakly connected components: treat every edge
+    /// as undirected and union its endpoints. This is the textbook definition
+    /// the GraphBLAS min-label propagation in `connected_components` computes.
+    fn reference_wcc(n: usize, edges: &[(usize, usize)]) -> Vec<usize> {
+        fn find(parent: &mut [usize], mut x: usize) -> usize {
+            while parent[x] != x {
+                parent[x] = parent[parent[x]];
+                x = parent[x];
+            }
+            x
+        }
+        let mut parent: Vec<usize> = (0..n).collect();
+        for &(a, b) in edges {
+            let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
+            if ra != rb {
+                parent[ra] = rb;
+            }
+        }
+        (0..n).map(|i| find(&mut parent, i)).collect()
+    }
+
+    /// Two component labelings agree iff they induce the same partition: nodes
+    /// share a label under one exactly when they share a label under the other.
+    /// This is convention-independent, so it does not depend on which integer
+    /// each side picked as a component representative.
+    fn same_partition<A: Eq, B: Eq>(xs: &[A], ys: &[B]) -> bool {
+        let n = xs.len();
+        (0..n).all(|i| (0..n).all(|j| (xs[i] == xs[j]) == (ys[i] == ys[j])))
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 64, ..ProptestConfig::default() })]
+
+        #[test]
+        fn connected_components_matches_union_find(
+            n in 1usize..12,
+            edges in prop::collection::vec((0usize..12, 0usize..12), 0..24),
+        ) {
+            // A fresh graph per case: whole-graph algorithms cannot share state.
+            let edges: Vec<(usize, usize)> =
+                edges.into_iter().filter(|&(a, b)| a < n && b < n).collect();
+            let (_dir, g) = open_tmp();
+            let ids: Vec<NodeId> = (0..n)
+                .map(|_| g.add_node("N", &json!({})).unwrap())
+                .collect();
+            for &(a, b) in &edges {
+                g.add_edge(ids[a], ids[b], "E", &json!({})).unwrap();
+            }
+            g.rebuild_csr().unwrap();
+
+            let got: HashMap<NodeId, u64> = g.connected_components().unwrap();
+            let impl_labels: Vec<u64> = ids.iter().map(|id| got[id]).collect();
+            let ref_labels = reference_wcc(n, &edges);
+
+            prop_assert!(
+                same_partition(&impl_labels, &ref_labels),
+                "WCC partition mismatch: impl={:?} ref={:?} edges={:?}",
+                impl_labels, ref_labels, edges
+            );
+        }
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "issundb-examples"
-description = "Runnable examples for IssunDB"
+description = "A collection of examples for IssunDB"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -17,6 +17,10 @@ tempfile.workspace = true
 rmp-serde.workspace = true
 
 [[example]]
+name = "quickstart"
+path = "quickstart.rs"
+
+[[example]]
 name = "hybrid_retrieval_quickstart"
 path = "hybrid_retrieval_quickstart.rs"
 
@@ -27,3 +31,7 @@ path = "load_ldbc.rs"
 [[example]]
 name = "neo4j_migration"
 path = "neo4j_migration.rs"
+
+[[bin]]
+name = "gen_testdata"
+path = "gen_testdata.rs"

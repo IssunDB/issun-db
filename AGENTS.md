@@ -18,7 +18,7 @@ Priorities, in order:
 - Prefer small, focused changes over broad rewrites.
 - Keep the workspace modular: `issundb-core` owns graph storage, `issundb-vector` owns vector search, `issundb-text` owns full-text search,
   `issundb-retrieval` owns hybrid retrieval, `issundb-cypher` owns the query layer, `issundb` is the public facade, `issundb-cli` uses only
-  the public facade, and the binding crates (`issundb-server`, `issundb-mcp`, `issundb-gui`, `issundb-node`, `issundb-py`) consume only the
+  the public facade, and the binding crates (`issundb-rest`, `issundb-mcp`, `issundb-gui`, `issundb-node`, `issundb-py`) consume only the
   `issundb` facade and its extension crates. Do not import across those boundaries in the wrong direction.
 - Keep all mutable state inside `Graph` and `Storage`; do not introduce module-level `static mut` or `lazy_static` globals for runtime state.
 - Writes are serialized via the `parking_lot::Mutex<()>` write lock on `Graph`; LMDB enforces the same constraint at the storage level. Do not bypass
@@ -89,7 +89,7 @@ Do not invent modules that do not yet exist when answering questions, but do pla
 - `crates/issundb/`: public facade. Re-exports the deliberate public surface from `issundb-core`, `issundb-vector`, `issundb-text`,
   `issundb-retrieval`, and `issundb-cypher`. Do not re-export internal storage types like `Storage`.
 - `crates/issundb-cli/`: interactive REPL binary. Uses only the `issundb` public facade for manual exploration and demos.
-- `crates/issundb-server/`: Axum-based HTTP REST API server. Exposes node and edge CRUD, Cypher query execution, query plan explanation, vector
+- `crates/issundb-rest/`: Axum-based HTTP REST API server. Exposes node and edge CRUD, Cypher query execution, query plan explanation, vector
   search, and full-text search over HTTP. Uses `tokio` as its async runtime; depends only on `issundb`.
 - `crates/issundb-mcp/`: Model Context Protocol server built on the `rmcp` SDK, serving over either stdio or MCP's Streamable HTTP transport.
   Exposes node and edge CRUD, Cypher query execution, query plan explanation, full-text search, and vector search as MCP tools. Uses `tokio` as
@@ -100,9 +100,8 @@ Do not invent modules that do not yet exist when answering questions, but do pla
   backup methods. Depends only on `issundb`.
 - `crates/issundb-py/`: Python bindings via PyO3. Exposes the `IssunDB` class with the same surface as the Node.js bindings. Depends only on
   `issundb`.
-- `crates/issundb-testing/`: shared test fixtures and graph builders (`open_tmp`, `chain`, `clique`, `diamond`, `two_triangles`) used across
-  unit and integration tests. Depends on `issundb-core`; must not be imported by production crates.
-- `crates/issundb-examples/`: standalone example programs (`hybrid_retrieval_quickstart.rs`, `neo4j_migration.rs`, `load_ldbc.rs`).
+- `crates/issundb-examples/`: standalone example programs (`hybrid_retrieval_quickstart.rs`, `neo4j_migration.rs`, `load_ldbc.rs`) and the
+  `gen_testdata` binary that regenerates the versioned LMDB storage-format snapshot (driven by `make testdata`). Depends only on `issundb`.
 - `crates/issundb-core/benches/`: Criterion storage benchmarks.
 - `crates/issundb/tests/conformance/`: openCypher TCK subset integration tests.
 - `Cargo.toml`: workspace root with shared `[workspace.dependencies]`. All version pins live here.
@@ -149,9 +148,8 @@ Target dependency direction:
 5. `issundb-cypher` may depend on public APIs from core, vector, text, and retrieval crates, but not storage internals.
 6. `issundb` composes and re-exports the stable public API.
 7. `issundb-cli` uses only the `issundb` facade.
-8. `issundb-server`, `issundb-mcp`, `issundb-gui`, `issundb-node`, and `issundb-py` must depend only on `issundb`; they must not import
+8. `issundb-rest`, `issundb-mcp`, `issundb-gui`, `issundb-node`, and `issundb-py` must depend only on `issundb`; they must not import
    `issundb-core`, `issundb-vector`, `issundb-text`, `issundb-retrieval`, or `issundb-cypher` directly.
-9. `issundb-testing` may depend on `issundb-core` for fixture setup; it must not be imported by any production crate.
 
 Lower-level crates must not know about higher-level crates.
 
@@ -189,7 +187,9 @@ All graph operations go through `Graph`; do not call `Storage` directly from out
 - `bfs(start: NodeId, hops: u8) -> Result<Vec<NodeId>, Error>`
 - `dfs(start: NodeId, hops: u8) -> Result<Vec<NodeId>, Error>`
 - `shortest_path(src: NodeId, dst: NodeId) -> Result<Option<Vec<NodeId>>, Error>`
-- `shortest_path_dijkstra(src: NodeId, dst: NodeId, weight_property: &str) -> Result<Option<WeightedPath>, Error>`
+- `shortest_path_dijkstra(src: NodeId, dst: NodeId) -> Result<Option<WeightedPath>, Error>` (edge weight is the first present of the `weight`, `cost`,
+  `capacity`, or `cap` property, default `1.0`; the source is fixed, so unlike `shortest_path_top_k` and `spanning_forest` this method takes no
+  weight-property argument)
 - `all_paths(src: NodeId, dst: NodeId) -> Result<Vec<Vec<NodeId>>, Error>`
 - `all_shortest_paths(src: NodeId, dst: NodeId) -> Result<Vec<Vec<NodeId>>, Error>`
 - `longest_path(src: NodeId, dst: NodeId) -> Result<Option<Vec<NodeId>>, Error>`
@@ -255,7 +255,7 @@ outside `issundb`.
 The executor resolves patterns through the physical plan.
 Expansion and label filtering use GraphBLAS SpMV and element-wise matrix operators unconditionally.
 
-### `issundb_server`
+### `issundb_rest`
 
 HTTP REST API server built on Axum and Tokio.
 Depends only on `issundb`; must not import lower-level crates directly. All handlers share a single `Arc<Graph>` instance.
@@ -278,7 +278,7 @@ Model Context Protocol server built on the `rmcp` SDK. Depends only on `issundb`
 `Arc<Graph>` and serves the same tool surface over one of two transports, selected with `--transport`: `stdio` (default; for clients that launch
 the server as a subprocess) or `http` (MCP's Streamable HTTP transport, mounted on an Axum router at `--http-path`, default `/mcp`, bound to
 `--bind`, default `127.0.0.1:8000`). Diagnostics always go to `stderr` because the stdio transport owns `stdout`. This is distinct from
-`issundb-server`, which is a plain REST API; the HTTP transport here still speaks MCP JSON-RPC. The `rmcp` dependency is pinned to `0.11` because
+`issundb-rest`, which is a plain REST API; the HTTP transport here still speaks MCP JSON-RPC. The `rmcp` dependency is pinned to `0.11` because
 `0.12` and later require `darling` `0.23`, which exceeds the workspace MSRV (`1.85`). Because the `rmcp` `0.11` Streamable HTTP transport does not
 validate the `Host` header (DNS rebinding, GHSA-89vp-x53w-74fx, fixed upstream only in `rmcp` `1.4.0`), the HTTP arm wraps the router in a `Host`
 header allowlist middleware. The allowlist defaults to the loopback names (`localhost`, `127.0.0.1`, `::1`) plus the `--bind` host; repeat
@@ -305,15 +305,6 @@ be enabled for the Python extension to compile. Depends only on `issundb`.
 Desktop application built with `eframe` and `egui`. Depends only on `issundb`.
 Provides a Cypher query console, an interactive graph visualization canvas via `egui_graphs`, and a node or edge inspector panel.
 Not part of the library surface; changes here do not affect the public API.
-
-### `issundb_testing`
-
-Shared test fixtures for unit and integration tests. Depends on `issundb-core`. Must not be imported by production crates.
-
-- `open_tmp() -> (Graph, TempDir)`: opens a fresh LMDB environment in a temporary directory.
-- `open_at(dir: &Path) -> Graph`: opens an environment at a known path.
-- `chain(graph, n)`, `clique(graph, n)`, `diamond(graph)`, `two_triangles(graph)`: graph fixture builders.
-- `assert_nodes_eq(...)`, `assert_valid_path(...)`: targeted assertion helpers.
 
 ### `issundb_core::Storage`
 

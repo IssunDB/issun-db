@@ -1,9 +1,15 @@
+// `ast` and `parser` are internal implementation details, not part of the stable public API.
+// They are kept `pub` (and hidden from rustdoc) only so the crate-local parse benchmark can drive
+// the parser directly. The deliberate public surface is the set of re-exports below, which is all
+// the `issundb` facade consumes.
+#[doc(hidden)]
 pub mod ast;
-pub mod error;
-pub mod exec;
+mod error;
+mod exec;
+#[doc(hidden)]
 pub mod parser;
-pub mod plan;
-pub mod procedure;
+mod plan;
+mod procedure;
 
 pub use error::CypherError;
 pub use exec::{QueryResult, Record, execute, execute_with_procedures, explain};

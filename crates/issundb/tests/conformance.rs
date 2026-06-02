@@ -234,253 +234,216 @@ struct Scenario {
 // ---------------------------------------------------------------------------
 
 fn parse_feature_file(path: &Path) -> Result<Vec<Scenario>, String> {
-    let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-    let lines: Vec<&str> = content.lines().collect();
+    let feature = load_feature(path)?;
 
-    // First pass: collect background setup queries (they apply to every scenario).
-    let background_queries = collect_background(&lines);
-
-    // Second pass: split the file into scenario blocks and parse each one.
-    let blocks = split_scenario_blocks(&lines);
+    // Background steps apply to every scenario in the file.
+    let background = feature
+        .background
+        .as_ref()
+        .map(|b| collect_setup_steps(&b.steps))
+        .unwrap_or_default();
 
     let mut scenarios = Vec::new();
-    for block in blocks {
-        let parsed = parse_scenario_block(&block, &background_queries)?;
-        scenarios.extend(parsed);
+    for scenario in &feature.scenarios {
+        scenarios.extend(expand_scenario(scenario, &background));
+    }
+    // Scenarios nested under `Rule:` sections inherit the feature background
+    // followed by the rule background. The openCypher TCK does not currently use
+    // rules, but handle them so a future TCK bump does not silently drop coverage.
+    for rule in &feature.rules {
+        let mut rule_background = background.clone();
+        if let Some(b) = &rule.background {
+            rule_background.extend(collect_setup_steps(&b.steps));
+        }
+        for scenario in &rule.scenarios {
+            scenarios.extend(expand_scenario(scenario, &rule_background));
+        }
     }
 
     Ok(scenarios)
 }
 
-/// Collect the setup queries from the `Background:` section (if any).
-fn collect_background(lines: &[&str]) -> Vec<String> {
-    let mut in_background = false;
-    let mut queries = Vec::new();
-    let mut idx = 0;
+/// Parse a feature file into a `gherkin::Feature`, with a fallback for the
+/// non-strict dialect used by parts of the openCypher TCK. Some TCK scenarios
+/// open with an `And`/`But` step that continues the `Background`; strict Gherkin
+/// rejects a leading continuation step. On parse failure, promote any leading
+/// continuation step to `Given` and retry once.
+fn load_feature(path: &Path) -> Result<gherkin::Feature, String> {
+    match gherkin::Feature::parse_path(path, gherkin::GherkinEnv::default()) {
+        Ok(feature) => Ok(feature),
+        Err(_) => {
+            let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+            let normalized = normalize_leading_continuations(&content);
+            gherkin::Feature::parse(normalized, gherkin::GherkinEnv::default())
+                .map_err(|e| e.to_string())
+        }
+    }
+}
 
-    while idx < lines.len() {
-        let trimmed = lines[idx].trim();
+/// Rewrite the first step of each `Scenario`, `Scenario Outline`, or
+/// `Background` from a leading `And`/`But`/`*` continuation to `Given`,
+/// preserving indentation. Later continuation steps are left untouched. This is
+/// applied only as a fallback when strict parsing fails.
+fn normalize_leading_continuations(content: &str) -> String {
+    let mut out: Vec<String> = Vec::with_capacity(content.lines().count());
+    let mut expect_first_step = false;
+    // Tracks the delimiter (`"""` or ```` ``` ````) of an open docstring, if any.
+    // Lines inside a docstring are copied verbatim and never reinterpreted as
+    // headers or steps. The delimiter kind is remembered so the other delimiter
+    // appearing as docstring content does not close the block.
+    let mut docstring_delim: Option<&str> = None;
 
-        if trimmed.starts_with("Background:") {
-            in_background = true;
-            idx += 1;
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+
+        let delim = if trimmed.starts_with("\"\"\"") {
+            Some("\"\"\"")
+        } else if trimmed.starts_with("```") {
+            Some("```")
+        } else {
+            None
+        };
+        if let Some(d) = delim {
+            match docstring_delim {
+                None => docstring_delim = Some(d),
+                Some(open) if open == d => docstring_delim = None,
+                Some(_) => {} // the other delimiter as content; stays open
+            }
+            out.push(line.to_string());
+            continue;
+        }
+        if docstring_delim.is_some() {
+            out.push(line.to_string());
             continue;
         }
 
-        // A new Feature/Scenario ends the background.
-        if in_background
-            && (trimmed.starts_with("Scenario:")
-                || trimmed.starts_with("Scenario Outline:")
-                || trimmed.starts_with("Feature:"))
+        if trimmed.starts_with("Scenario:")
+            || trimmed.starts_with("Scenario Outline:")
+            || trimmed.starts_with("Background:")
         {
-            break;
+            expect_first_step = true;
+            out.push(line.to_string());
+            continue;
         }
 
-        if in_background
-            && (trimmed.starts_with("Given ")
-                || trimmed.starts_with("And ")
-                || trimmed.starts_with("* "))
-        {
-            // Consume an optional docstring block.
-            if let Some(query) = consume_docstring(lines, &mut idx) {
-                queries.push(query);
+        if expect_first_step {
+            // Tags, comments, and blank lines may precede the first step.
+            if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('@') {
+                out.push(line.to_string());
+                continue;
+            }
+
+            expect_first_step = false;
+            let indent = &line[..line.len() - trimmed.len()];
+            let promoted = trimmed
+                .strip_prefix("And ")
+                .or_else(|| trimmed.strip_prefix("But "))
+                .or_else(|| trimmed.strip_prefix("* "));
+            if let Some(rest) = promoted {
+                out.push(format!("{}Given {}", indent, rest));
                 continue;
             }
         }
 
-        idx += 1;
+        out.push(line.to_string());
     }
 
-    queries
+    out.join("\n")
 }
 
-/// A raw block of lines belonging to a single Scenario / Scenario Outline.
-struct Block {
-    tags: Vec<String>,
-    lines: Vec<String>,
-}
-
-/// Split the file's lines into one `Block` per scenario heading.
-fn split_scenario_blocks(lines: &[&str]) -> Vec<Block> {
-    let mut blocks: Vec<Block> = Vec::new();
-    let mut pending_tags: Vec<String> = Vec::new();
-    let mut current_block: Option<Vec<String>> = None;
-    let mut current_tags: Vec<String> = Vec::new();
-
-    for &line in lines {
-        let trimmed = line.trim();
-
-        // Tag lines begin with `@`.
-        if trimmed.starts_with('@') {
-            let tags: Vec<String> = trimmed
-                .split_whitespace()
-                .filter(|t| t.starts_with('@'))
-                .map(|t| t[1..].to_string())
-                .collect();
-            if current_block.is_none() {
-                pending_tags.extend(tags);
-            } else {
-                // Tags between scenarios belong to the upcoming one; flush current.
-                if let Some(b) = current_block.take() {
-                    blocks.push(Block {
-                        tags: current_tags.clone(),
-                        lines: b,
-                    });
-                }
-                current_tags = tags;
-                current_block = None;
-                pending_tags.clear();
-            }
-            continue;
-        }
-
-        if trimmed.starts_with("Scenario:") || trimmed.starts_with("Scenario Outline:") {
-            if let Some(b) = current_block.take() {
-                blocks.push(Block {
-                    tags: current_tags.clone(),
-                    lines: b,
-                });
-            }
-            current_tags = std::mem::take(&mut pending_tags);
-            current_block = Some(vec![line.to_string()]);
-            continue;
-        }
-
-        if let Some(ref mut block) = current_block {
-            block.push(line.to_string());
-        }
-    }
-
-    if let Some(b) = current_block {
-        blocks.push(Block {
-            tags: current_tags,
-            lines: b,
-        });
-    }
-
-    blocks
-}
-
-/// Parse a single block, expanding `Scenario Outline` + `Examples` into concrete scenarios.
-fn parse_scenario_block(block: &Block, background: &[String]) -> Result<Vec<Scenario>, String> {
-    let lines: Vec<&str> = block.lines.iter().map(|s| s.as_str()).collect();
-    if lines.is_empty() {
-        return Ok(vec![]);
-    }
-
-    let header = lines[0].trim();
-    let is_outline = header.starts_with("Scenario Outline:");
-
-    let base_name = if is_outline {
-        header
-            .strip_prefix("Scenario Outline:")
-            .unwrap_or("")
-            .trim()
-            .to_string()
-    } else {
-        header
-            .strip_prefix("Scenario:")
-            .unwrap_or(header)
-            .trim()
-            .to_string()
-    };
-
-    let skip = block
+/// Expand one parsed scenario into concrete `Scenario` values, materializing a
+/// `Scenario Outline` into one entry per `Examples` data row.
+fn expand_scenario(scenario: &gherkin::Scenario, background: &[String]) -> Vec<Scenario> {
+    let skip = scenario
         .tags
         .iter()
         .any(|t| t == "skip" || t == "NegativeTests");
 
-    if !is_outline {
-        let scenario = build_scenario(&base_name, &lines[1..], background, skip, &[])?;
-        return Ok(vec![scenario]);
-    }
-
-    // Parse an outline: collect Examples tables.
-    let examples_tables = collect_examples_tables(&lines[1..]);
-
-    if examples_tables.is_empty() {
-        // No Examples; treat as a regular skip.
-        let scenario = build_scenario(&base_name, &lines[1..], background, true, &[])?;
-        return Ok(vec![scenario]);
+    if scenario.examples.is_empty() {
+        // An outline with no Examples table cannot be instantiated; skip it.
+        let is_outline = scenario.keyword.contains("Outline");
+        return vec![build_scenario(
+            scenario.name.clone(),
+            &scenario.steps,
+            background,
+            skip || is_outline,
+        )];
     }
 
     let mut expanded = Vec::new();
-    for table in &examples_tables {
-        if table.is_empty() {
+    for examples in &scenario.examples {
+        let Some(table) = &examples.table else {
             continue;
-        }
-        let header_row = &table[0];
-        for data_row in &table[1..] {
-            // Build a substitution map.
-            let subs: Vec<(String, String)> = header_row
+        };
+        let Some((header, data_rows)) = table.rows.split_first() else {
+            continue;
+        };
+        for data_row in data_rows {
+            let subs: Vec<(String, String)> = header
                 .iter()
                 .zip(data_row.iter())
                 .map(|(k, v)| (format!("<{}>", k.trim()), v.trim().to_string()))
                 .collect();
-
-            let concrete_name = apply_subs(&base_name, &subs);
-            let concrete_lines: Vec<String> = lines[1..]
+            let name = apply_subs(&scenario.name, &subs);
+            let steps: Vec<gherkin::Step> = scenario
+                .steps
                 .iter()
-                .map(|l| apply_subs(l.trim(), &subs))
+                .map(|s| subst_step(s, &subs))
                 .collect();
-            let concrete_refs: Vec<&str> = concrete_lines.iter().map(|s| s.as_str()).collect();
-            let scenario = build_scenario(&concrete_name, &concrete_refs, background, skip, &subs)?;
-            expanded.push(scenario);
+            expanded.push(build_scenario(name, &steps, background, skip));
         }
     }
-
-    Ok(expanded)
+    expanded
 }
 
-/// Collect `Examples:` tables from the body of a Scenario Outline.
-fn collect_examples_tables(lines: &[&str]) -> Vec<Vec<Vec<String>>> {
-    let mut tables = Vec::new();
-    let mut current_table: Option<Vec<Vec<String>>> = None;
-    let mut in_examples = false;
+/// Collect the setup queries carried by a list of `Given` steps (used for
+/// `Background:` sections and any rule background).
+fn collect_setup_steps(steps: &[gherkin::Step]) -> Vec<String> {
+    steps.iter().filter_map(setup_query_from_step).collect()
+}
 
-    for &line in lines {
-        let trimmed = line.trim();
+/// Extract a setup query from a single step, if it carries one. Handles
+/// `... having executed: """<query>"""` and `Given the <name> graph` fixtures.
+fn setup_query_from_step(step: &gherkin::Step) -> Option<String> {
+    let value = step.value.trim();
+    if value.contains("having executed:") {
+        return step.docstring.clone();
+    }
+    if let Some(name) = value
+        .strip_prefix("the ")
+        .and_then(|s| s.strip_suffix(" graph"))
+    {
+        return load_named_graph(name);
+    }
+    None
+}
 
-        if trimmed.starts_with("Examples:") || trimmed == "Examples:" {
-            if let Some(t) = current_table.take() {
-                tables.push(t);
-            }
-            current_table = Some(Vec::new());
-            in_examples = true;
-            continue;
-        }
+/// Load a named openCypher TCK graph fixture from
+/// `external/openCypher/tck/graphs/<name>/<name>.cypher`.
+fn load_named_graph(name: &str) -> Option<String> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../external/openCypher/tck/graphs")
+        .join(name)
+        .join(format!("{}.cypher", name));
+    std::fs::read_to_string(&path).ok()
+}
 
-        // A new section ends the current table.
-        if in_examples
-            && (trimmed.starts_with("Scenario")
-                || trimmed.starts_with("Background")
-                || trimmed.starts_with("Feature"))
-        {
-            if let Some(t) = current_table.take() {
-                tables.push(t);
-            }
-            in_examples = false;
-            continue;
-        }
-
-        if in_examples {
-            if let Some(ref mut t) = current_table {
-                if trimmed.starts_with('|') && trimmed.ends_with('|') {
-                    let cells: Vec<String> = trimmed[1..trimmed.len() - 1]
-                        .split('|')
-                        .map(|c| c.trim().to_string())
-                        .collect();
-                    t.push(cells);
-                }
+/// Apply one step's `Scenario Outline` placeholder substitutions to its text,
+/// docstring, and any data table cells, returning a concrete step.
+fn subst_step(step: &gherkin::Step, subs: &[(String, String)]) -> gherkin::Step {
+    let mut step = step.clone();
+    step.value = apply_subs(&step.value, subs);
+    if let Some(doc) = &step.docstring {
+        step.docstring = Some(apply_subs(doc, subs));
+    }
+    if let Some(table) = &mut step.table {
+        for row in &mut table.rows {
+            for cell in row.iter_mut() {
+                *cell = apply_subs(cell, subs);
             }
         }
     }
-
-    if let Some(t) = current_table {
-        tables.push(t);
-    }
-
-    tables
+    step
 }
 
 fn apply_subs(s: &str, subs: &[(String, String)]) -> String {
@@ -491,239 +454,154 @@ fn apply_subs(s: &str, subs: &[(String, String)]) -> String {
     result
 }
 
-/// Build a concrete `Scenario` from its body lines.
+/// Build a concrete `Scenario` from its parsed steps.
 fn build_scenario(
-    name: &str,
-    body: &[&str],
+    name: String,
+    steps: &[gherkin::Step],
     background: &[String],
     skip: bool,
-    _subs: &[(String, String)],
-) -> Result<Scenario, String> {
+) -> Scenario {
     let mut setup_queries: Vec<String> = background.to_vec();
     let mut query = String::new();
     let mut assertion = Assertion::None;
     let mut params: HashMap<String, serde_json::Value> = HashMap::new();
     let mut procedures: Vec<issundb::Procedure> = Vec::new();
 
-    let mut idx = 0;
-    let mut pending_query_kind: Option<&'static str> = None; // "setup" | "when"
+    for step in steps {
+        let value = step.value.trim();
 
-    while idx < body.len() {
-        let trimmed = body[idx].trim();
-
-        // Skip blank lines and comments.
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            idx += 1;
-            continue;
-        }
-
-        // Skip Examples: sections (already used during outline expansion).
-        if trimmed.starts_with("Examples:") {
-            // Skip the whole table.
-            idx += 1;
-            while idx < body.len() {
-                let t = body[idx].trim();
-                if t.starts_with('|') {
-                    idx += 1;
-                } else {
-                    break;
-                }
-            }
-            continue;
-        }
-
-        // Docstring blocks.
-        if trimmed == "\"\"\"" {
-            if let Some(kind) = pending_query_kind.take() {
-                let (collected, advance) = collect_docstring(body, idx + 1);
-                idx = advance;
-                if kind == "setup" {
-                    setup_queries.push(collected);
-                } else {
-                    query = collected;
-                }
-                continue;
-            }
-            idx += 1;
-            continue;
-        }
-
-        // Parameters table: `And parameters are:` followed by | key | value | rows.
-        if trimmed == "And parameters are:"
-            || trimmed == "* parameters are:"
-            || trimmed.ends_with("parameters are:")
-        {
-            idx += 1;
-            // ALL rows are data rows (key, value) - no header.
-            while idx < body.len() {
-                let t = body[idx].trim();
-                if t.starts_with('|') && t.ends_with('|') {
-                    let cells: Vec<&str> = t[1..t.len() - 1].split('|').collect();
-                    if cells.len() == 2 {
-                        let key = cells[0].trim().to_string();
-                        let raw_val = cells[1].trim();
-                        // Skip substitution placeholders like <elt> that weren't expanded.
-                        if raw_val.starts_with('<') && raw_val.ends_with('>') {
-                            idx += 1;
-                            continue;
-                        }
-                        let val = parse_table_value(raw_val);
-                        if !key.is_empty() {
-                            params.insert(key, val);
-                        }
+        // Parameters table: `parameters are:` followed by | key | value | rows.
+        if value.ends_with("parameters are:") {
+            if let Some(table) = &step.table {
+                for row in &table.rows {
+                    if row.len() != 2 {
+                        continue;
                     }
-                    idx += 1;
-                } else {
-                    break;
+                    let key = row[0].trim();
+                    let raw_val = row[1].trim();
+                    // Skip unexpanded substitution placeholders like <elt>.
+                    if key.is_empty() || (raw_val.starts_with('<') && raw_val.ends_with('>')) {
+                        continue;
+                    }
+                    params.insert(key.to_string(), parse_table_value(raw_val));
                 }
             }
             continue;
         }
 
-        // Given/And/But (setup steps).
-        if trimmed.starts_with("Given ")
-            || trimmed.starts_with("And having executed:")
-            || trimmed.starts_with("* having executed:")
-        {
-            if trimmed.ends_with("\"\"\"") || trimmed.contains("having executed:") {
-                // The docstring may start on the next line.
-                if let Some(q) = consume_docstring(body, &mut idx) {
-                    setup_queries.push(q);
-                } else {
-                    pending_query_kind = Some("setup");
-                    idx += 1;
-                }
-            } else if let Some(graph_name) = trimmed
-                .strip_prefix("Given the ")
-                .and_then(|s| s.strip_suffix(" graph"))
-            {
-                // Named graph: load from the openCypher TCK graph fixtures.
-                // The fixture lives at external/openCypher/tck/graphs/<name>/<name>.cypher.
-                let cypher_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("../../external/openCypher/tck/graphs")
-                    .join(graph_name)
-                    .join(format!("{}.cypher", graph_name));
-                if let Ok(cypher) = std::fs::read_to_string(&cypher_path) {
-                    setup_queries.push(cypher);
-                }
-                idx += 1;
-            } else {
-                // `Given an empty graph`, `Given any graph`, etc. — nothing to collect.
-                idx += 1;
-            }
-            continue;
-        }
-
-        // Procedure registration: `And there exists a procedure NAME(sig) :: (out):`
-        // followed by a data table whose header is `inputs ++ outputs` and whose
-        // remaining rows are the procedure's relation.
-        if trimmed.contains("there exists a procedure") {
-            let sig = trimmed
+        // Procedure registration: `there exists a procedure NAME(sig) :: (out):`
+        // with a data table whose header is `inputs ++ outputs`.
+        if value.contains("there exists a procedure") {
+            let sig = value
                 .split_once("there exists a procedure")
                 .map(|(_, rest)| rest.trim())
                 .unwrap_or("");
-            idx += 1;
-            let mut table_rows: Vec<Vec<String>> = Vec::new();
-            while idx < body.len() {
-                let t = body[idx].trim();
-                if t.starts_with('|') {
-                    // `|` alone is an empty (zero-column) header row, e.g. for a
-                    // void procedure `... :: ():`.
-                    let cells: Vec<String> = if t.len() >= 2 {
-                        t[1..t.len() - 1]
-                            .split('|')
-                            .map(|c| c.trim().to_string())
-                            .collect()
-                    } else {
-                        Vec::new()
-                    };
-                    table_rows.push(cells);
-                    idx += 1;
-                } else {
-                    break;
-                }
-            }
-            if let Some(proc) = parse_procedure(sig, &table_rows) {
+            let rows = step
+                .table
+                .as_ref()
+                .map(|t| t.rows.clone())
+                .unwrap_or_default();
+            if let Some(proc) = parse_procedure(sig, &rows) {
                 procedures.push(proc);
             }
             continue;
         }
 
-        if trimmed.starts_with("And ") || trimmed.starts_with("But ") {
-            // Could be "And having executed:", "And no side effects", "And the side effects..."
-            if trimmed.contains("having executed:") {
-                if let Some(q) = consume_docstring(body, &mut idx) {
-                    setup_queries.push(q);
-                } else {
-                    pending_query_kind = Some("setup");
-                    idx += 1;
-                }
-            } else if trimmed.contains("the side effects should be:")
-                || trimmed.contains("no side effects")
-            {
-                // Consume an optional table.
-                idx += 1;
-                while idx < body.len() {
-                    let t = body[idx].trim();
-                    if t.starts_with('|') {
-                        idx += 1;
-                    } else {
-                        break;
-                    }
-                }
-            } else {
-                idx += 1;
-            }
-            continue;
-        }
-
-        // When executing control query: a second query whose result is asserted. The
-        // preceding query (typically a CREATE) becomes setup, and this control query
-        // becomes the asserted query.
-        if trimmed.starts_with("When executing control query:") {
+        // Control query: the preceding query becomes setup and this one is asserted.
+        if value.starts_with("executing control query:") {
             if !query.trim().is_empty() {
                 setup_queries.push(std::mem::take(&mut query));
             }
-            if let Some(q) = consume_docstring(body, &mut idx) {
-                query = q;
-            } else {
-                pending_query_kind = Some("when");
-                idx += 1;
+            if let Some(doc) = &step.docstring {
+                query = doc.clone();
             }
             continue;
         }
 
-        // When executing query:
-        if trimmed.starts_with("When executing query:")
-            || trimmed.starts_with("When running query:")
-        {
-            if let Some(q) = consume_docstring(body, &mut idx) {
-                query = q;
-            } else {
-                pending_query_kind = Some("when");
-                idx += 1;
+        // Main query.
+        if value.starts_with("executing query:") || value.starts_with("running query:") {
+            if let Some(doc) = &step.docstring {
+                query = doc.clone();
             }
             continue;
         }
 
-        // Then assertions.
-        if trimmed.starts_with("Then ") {
-            assertion = parse_then(body, &mut idx);
+        // Setup steps: `... having executed:` docstrings and named-graph fixtures.
+        if let Some(q) = setup_query_from_step(step) {
+            setup_queries.push(q);
             continue;
         }
 
-        idx += 1;
+        // A genuine `Then` step (raw keyword `Then`, not an `And`/`But`
+        // continuation) sets the assertion for the most recently selected query.
+        // A later `Then` overwrites it, which is what the control-query pattern
+        // needs: the first `Then` asserts the setup query, the second asserts the
+        // control query. `And`/`But` side-effect steps share `ty == Then` but keep
+        // their raw keyword, so they are skipped here.
+        if step.keyword.trim() == "Then" {
+            assertion = assertion_from_step(value, step.table.as_ref());
+            continue;
+        }
     }
 
-    Ok(Scenario {
-        name: name.to_string(),
+    Scenario {
+        name,
         skip,
         setup_queries,
         query,
         assertion,
         params,
         procedures,
-    })
+    }
+}
+
+/// Map a `Then ...` step (and its optional table) to an `Assertion`.
+fn assertion_from_step(value: &str, table: Option<&gherkin::Table>) -> Assertion {
+    if value.contains("result should be empty") {
+        return Assertion::Empty;
+    }
+    if value.contains("result should be") {
+        let ordered = value.contains("in order") && !value.contains("any order");
+        let (columns, rows, has_node_literals) = parse_gherkin_result_table(table);
+        return Assertion::Rows {
+            ordered,
+            columns,
+            rows,
+            has_node_literals,
+        };
+    }
+    if value.contains("should be raised") {
+        return Assertion::ExpectError;
+    }
+    Assertion::None
+}
+
+/// Parse a `gherkin::Table` into columns, rows, and a node literal flag.
+fn parse_gherkin_result_table(
+    table: Option<&gherkin::Table>,
+) -> (Vec<String>, Vec<Vec<serde_json::Value>>, bool) {
+    let mut columns: Vec<String> = Vec::new();
+    let mut rows: Vec<Vec<serde_json::Value>> = Vec::new();
+    let mut has_node_literals = false;
+
+    if let Some(t) = table {
+        if let Some(first_row) = t.rows.first() {
+            columns = first_row.iter().map(|c| c.trim().to_string()).collect();
+            for row_cells in t.rows.iter().skip(1) {
+                let mut parsed_row = Vec::new();
+                for cell in row_cells {
+                    let (val, is_node) = parse_table_cell(cell);
+                    if is_node {
+                        has_node_literals = true;
+                    }
+                    parsed_row.push(val);
+                }
+                rows.push(parsed_row);
+            }
+        }
+    }
+
+    (columns, rows, has_node_literals)
 }
 
 /// Parse a procedure signature such as
@@ -780,161 +658,6 @@ fn parse_procedure(sig: &str, table_rows: &[Vec<String>]) -> Option<issundb::Pro
         outputs,
         rows,
     })
-}
-
-/// Advance past a `"""..."""` docstring starting at `idx` (which points to the `"""` opener or the
-/// line before it, depending on how the caller found it). Returns the collected text and the new
-/// `idx` (pointing just past the closing `"""`).
-fn collect_docstring(lines: &[&str], start: usize) -> (String, usize) {
-    let mut idx = start;
-    let mut collected = Vec::new();
-    while idx < lines.len() {
-        let trimmed = lines[idx].trim();
-        if trimmed == "\"\"\"" {
-            return (collected.join("\n"), idx + 1);
-        }
-        collected.push(lines[idx].to_string());
-        idx += 1;
-    }
-    (collected.join("\n"), idx)
-}
-
-/// Try to find and consume a docstring that starts on the current line or the next line.
-/// Advances `idx` past the closing `"""` and returns the collected text, or returns `None` if
-/// no docstring is found.
-fn consume_docstring(lines: &[&str], idx: &mut usize) -> Option<String> {
-    // Check if the opening `"""` is on the same line (e.g., `Given having executed: """`).
-    let current = lines[*idx].trim();
-    if current.ends_with("\"\"\"") && current.len() > 3 {
-        // The docstring opens and possibly closes on the next line(s).
-        *idx += 1;
-        let (text, new_idx) = collect_docstring(lines, *idx);
-        *idx = new_idx;
-        return Some(text);
-    }
-
-    // Check if the very next line is `"""`.
-    let next_idx = *idx + 1;
-    if next_idx < lines.len() && lines[next_idx].trim() == "\"\"\"" {
-        *idx = next_idx + 1;
-        let (text, new_idx) = collect_docstring(lines, *idx);
-        *idx = new_idx;
-        return Some(text);
-    }
-
-    None
-}
-
-/// Parse a `Then ...` line (and any following table) into an `Assertion`.
-/// Advances `idx` past the assertion block.
-fn parse_then(lines: &[&str], idx: &mut usize) -> Assertion {
-    let trimmed = lines[*idx].trim();
-    *idx += 1;
-
-    if trimmed.contains("result should be empty") {
-        // Consume optional `And ...` lines (side effects).
-        consume_and_clauses(lines, idx);
-        return Assertion::Empty;
-    }
-
-    if trimmed.contains("result should be") {
-        let ordered = trimmed.contains("in order") && !trimmed.contains("any order");
-        let (columns, rows, has_node_literals) = parse_result_table(lines, idx);
-        // Consume optional `And ...` lines (side effects).
-        consume_and_clauses(lines, idx);
-        return Assertion::Rows {
-            ordered,
-            columns,
-            rows,
-            has_node_literals,
-        };
-    }
-
-    if trimmed.contains("SyntaxError should be raised")
-        || trimmed.contains("error should be raised")
-        || trimmed.contains("TypeError should be raised")
-        || trimmed.contains("EntityNotFound should be raised")
-        || trimmed.contains("ArgumentError should be raised")
-        || trimmed.contains("ParameterMissing should be raised")
-        || trimmed.contains("ProcedureError should be raised")
-        || trimmed.contains("SemanticError should be raised")
-        || trimmed.contains("ConstraintVerificationFailed should be raised")
-        || trimmed.contains("ConstraintValidationFailed should be raised")
-        || trimmed.contains("should be raised")
-    {
-        consume_and_clauses(lines, idx);
-        return Assertion::ExpectError;
-    }
-
-    // Unknown Then clause; consume any table and move on.
-    while *idx < lines.len() {
-        let t = lines[*idx].trim();
-        if t.starts_with('|') {
-            *idx += 1;
-        } else {
-            break;
-        }
-    }
-    consume_and_clauses(lines, idx);
-    Assertion::None
-}
-
-/// Consume `And ...` / `But ...` follow-up lines (side-effects assertions, etc.).
-fn consume_and_clauses(lines: &[&str], idx: &mut usize) {
-    while *idx < lines.len() {
-        let t = lines[*idx].trim();
-        if t.starts_with("And ") || t.starts_with("But ") {
-            *idx += 1;
-            // Consume an optional table attached to this clause.
-            while *idx < lines.len() {
-                let inner = lines[*idx].trim();
-                if inner.starts_with('|') {
-                    *idx += 1;
-                } else {
-                    break;
-                }
-            }
-        } else {
-            break;
-        }
-    }
-}
-
-/// Parse the `| col | col |` header and rows that follow a `Then the result should be...` step.
-/// Returns `(columns, rows, has_node_literals)`.
-fn parse_result_table(
-    lines: &[&str],
-    idx: &mut usize,
-) -> (Vec<String>, Vec<Vec<serde_json::Value>>, bool) {
-    let mut columns: Vec<String> = Vec::new();
-    let mut rows: Vec<Vec<serde_json::Value>> = Vec::new();
-    let mut has_node_literals = false;
-
-    while *idx < lines.len() {
-        let trimmed = lines[*idx].trim();
-        if !(trimmed.starts_with('|') && trimmed.ends_with('|')) {
-            break;
-        }
-        let cells: Vec<&str> = trimmed[1..trimmed.len() - 1].split('|').collect();
-        if columns.is_empty() {
-            columns = cells.iter().map(|c| c.trim().to_string()).collect();
-        } else {
-            let row: Vec<serde_json::Value> = cells
-                .iter()
-                .map(|c| {
-                    let (v, is_node) = parse_table_cell(c);
-                    if is_node {
-                        has_node_literals = true;
-                    }
-                    v
-                })
-                .collect();
-            rows.push(row);
-        }
-        *idx += 1;
-    }
-
-    (columns, rows, has_node_literals)
 }
 
 // ---------------------------------------------------------------------------

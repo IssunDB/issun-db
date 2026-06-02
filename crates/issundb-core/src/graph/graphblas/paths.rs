@@ -350,19 +350,29 @@ impl Graph {
         start: NodeId,
         hops: u8,
     ) -> Result<Vec<NodeId>, Error> {
-        let mut visited: AHashSet<NodeId> = AHashSet::new();
-        let mut path: Vec<NodeId> = Vec::new();
+        // Track the shallowest depth at which each node has been reached. A
+        // plain visited set would under-report: a node first discovered via a
+        // longer branch gets pruned, so nodes that are within `hops` along a
+        // shorter path (and their deeper neighbors) would be missed. Re-expand
+        // whenever a node is reached at a strictly shallower depth so the result
+        // is every node within `hops`, in DFS discovery order.
+        let mut best_depth: AHashMap<NodeId, u8> = AHashMap::new();
+        let mut order: Vec<NodeId> = Vec::new();
 
         fn dfs_recurse(
             snap: &CsrSnapshot,
             node: NodeId,
             depth: u8,
             max_depth: u8,
-            visited: &mut AHashSet<NodeId>,
-            path: &mut Vec<NodeId>,
+            best_depth: &mut AHashMap<NodeId, u8>,
+            order: &mut Vec<NodeId>,
         ) {
-            visited.insert(node);
-            path.push(node);
+            match best_depth.get(&node) {
+                Some(&d) if d <= depth => return,
+                Some(_) => {}
+                None => order.push(node),
+            }
+            best_depth.insert(node, depth);
 
             if depth < max_depth {
                 if let Some(dense) = snap.id_to_dense.get(&node) {
@@ -370,16 +380,14 @@ impl Graph {
                     let end_idx = snap.row_ptr[*dense as usize + 1];
                     for k in start_idx..end_idx {
                         let neighbor = snap.dense_to_id[snap.col_idx[k] as usize];
-                        if !visited.contains(&neighbor) {
-                            dfs_recurse(snap, neighbor, depth + 1, max_depth, visited, path);
-                        }
+                        dfs_recurse(snap, neighbor, depth + 1, max_depth, best_depth, order);
                     }
                 }
             }
         }
 
-        dfs_recurse(snap, start, 0, hops, &mut visited, &mut path);
-        Ok(path)
+        dfs_recurse(snap, start, 0, hops, &mut best_depth, &mut order);
+        Ok(order)
     }
 
     /// Directed Cycle Detection using 3-color DFS over contiguous CSR snapshot arrays.

@@ -784,13 +784,13 @@ fn dispatch(state: &mut State, cmd: &str, rest: &str) {
         }
         "wpath" => {
             let tokens: Vec<&str> = rest.split_whitespace().collect();
-            if tokens.len() < 3 {
-                eprintln!("usage: wpath <src> <dst> <weight_property>");
+            if tokens.len() < 2 {
+                eprintln!("usage: wpath <src> <dst>");
                 return;
             }
             match (tokens[0].parse::<u64>(), tokens[1].parse::<u64>()) {
                 (Ok(s), Ok(d)) => {
-                    match g.shortest_path_dijkstra(NodeId::from(s), NodeId::from(d), tokens[2]) {
+                    match g.shortest_path_dijkstra(NodeId::from(s), NodeId::from(d)) {
                         Ok(Some(wp)) => println!(
                             "cost={:.6} path={}",
                             wp.total_weight,

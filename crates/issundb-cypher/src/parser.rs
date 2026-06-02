@@ -5113,7 +5113,7 @@ mod tests {
                     CypherError::Parse(msg) => msg,
                     other => other.to_string(),
                 };
-                msg.split(|c| c == ':' || c == ')')
+                msg.split([':', ')'])
                     .next()
                     .unwrap_or("?")
                     .trim_end_matches('(')

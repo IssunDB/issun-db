@@ -8,7 +8,7 @@ use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt};
 
 #[derive(Parser, Debug)]
-#[command(name = "issundb-server", about = "HTTP server for IssunDB")]
+#[command(name = "issundb-rest", about = "HTTP REST API server for IssunDB")]
 struct Args {
     /// Path to the LMDB database directory.
     #[arg(long)]

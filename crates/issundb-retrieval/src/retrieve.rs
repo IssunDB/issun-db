@@ -6,11 +6,14 @@ use issundb_core::{EdgeId, Graph, NodeId};
 use issundb_text::{TextGraphExt, TextSearchOptions};
 use issundb_vector::{VectorGraphExt, VectorSearchOptions};
 
-/// A subgraph extracted by a hybrid retrieval call.
+/// A subgraph extracted by a retrieval call.
 ///
-/// `nodes` and `edges` are deduplicated but unordered. `scores` maps each
-/// seed node (a direct vector-search hit) to its cosine distance from the
-/// query; expansion-only nodes are absent from the map.
+/// `nodes` and `edges` are deduplicated but unordered. `scores` maps each seed
+/// node to its relevance value; expansion-only nodes are absent from the map.
+/// For [`retrieve`] and [`retrieve_with`] the value is the seed's cosine
+/// distance from the query (lower is closer). For [`retrieve_hybrid`] it is the
+/// fused score produced by the configured [`FusionStrategy`] over the vector
+/// and text seeds (higher is more relevant).
 pub struct Subgraph {
     pub nodes: Vec<NodeId>,
     pub edges: Vec<EdgeId>,

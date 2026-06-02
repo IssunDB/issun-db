@@ -1085,6 +1085,107 @@ fn collect_ord_aggs(expr: &Expr, set: &mut std::collections::HashSet<String>) {
     }
 }
 
+fn rewrite_expr_with_aliases(expr: &mut Expr, projections: &[(Expr, String)]) {
+    // Check if the current expression matches any projected source expression exactly.
+    for (source_expr, target_var) in projections {
+        if expr == source_expr {
+            *expr = Expr::Prop(target_var.clone(), "".to_string());
+            return;
+        }
+    }
+
+    // Otherwise, recursively rewrite child expressions.
+    match expr {
+        Expr::Prop(_, _) | Expr::Literal(_) | Expr::Param(_) | Expr::CountStar => {}
+        Expr::Agg(_, inner) | Expr::IsNull(inner) | Expr::IsNotNull(inner) | Expr::Not(inner) => {
+            rewrite_expr_with_aliases(inner, projections);
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            rewrite_expr_with_aliases(left, projections);
+            rewrite_expr_with_aliases(right, projections);
+        }
+        Expr::FunctionCall { args, .. } => {
+            for arg in args {
+                rewrite_expr_with_aliases(arg, projections);
+            }
+        }
+        Expr::Quantifier {
+            list, predicate, ..
+        } => {
+            rewrite_expr_with_aliases(list, projections);
+            rewrite_expr_with_aliases(predicate, projections);
+        }
+        Expr::Case {
+            subject,
+            arms,
+            else_expr,
+        } => {
+            if let Some(s) = subject {
+                rewrite_expr_with_aliases(s, projections);
+            }
+            for arm in arms {
+                rewrite_expr_with_aliases(&mut arm.when, projections);
+                rewrite_expr_with_aliases(&mut arm.then, projections);
+            }
+            if let Some(e) = else_expr {
+                rewrite_expr_with_aliases(e, projections);
+            }
+        }
+        Expr::Subscript { expr: inner, index } => {
+            rewrite_expr_with_aliases(inner, projections);
+            rewrite_expr_with_aliases(index, projections);
+        }
+        Expr::Slice {
+            expr: inner,
+            start,
+            end,
+        } => {
+            rewrite_expr_with_aliases(inner, projections);
+            if let Some(s) = start {
+                rewrite_expr_with_aliases(s, projections);
+            }
+            if let Some(e) = end {
+                rewrite_expr_with_aliases(e, projections);
+            }
+        }
+        Expr::ListComprehension {
+            list,
+            predicate,
+            transform,
+            ..
+        } => {
+            rewrite_expr_with_aliases(list, projections);
+            if let Some(p) = predicate {
+                rewrite_expr_with_aliases(p, projections);
+            }
+            if let Some(t) = transform {
+                rewrite_expr_with_aliases(t, projections);
+            }
+        }
+        Expr::Reduce {
+            initial,
+            list,
+            expression,
+            ..
+        } => {
+            rewrite_expr_with_aliases(initial, projections);
+            rewrite_expr_with_aliases(list, projections);
+            rewrite_expr_with_aliases(expression, projections);
+        }
+        Expr::PatternComprehension {
+            predicate,
+            transform,
+            ..
+        } => {
+            if let Some(p) = predicate {
+                rewrite_expr_with_aliases(p, projections);
+            }
+            rewrite_expr_with_aliases(transform, projections);
+        }
+        Expr::HasLabel { .. } => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1208,106 +1309,5 @@ mod tests {
             } => (min_hops, max_hops),
             other => panic!("unexpected operator: {:?}", other),
         }
-    }
-}
-
-fn rewrite_expr_with_aliases(expr: &mut Expr, projections: &[(Expr, String)]) {
-    // Check if the current expression matches any projected source expression exactly.
-    for (source_expr, target_var) in projections {
-        if expr == source_expr {
-            *expr = Expr::Prop(target_var.clone(), "".to_string());
-            return;
-        }
-    }
-
-    // Otherwise, recursively rewrite child expressions.
-    match expr {
-        Expr::Prop(_, _) | Expr::Literal(_) | Expr::Param(_) | Expr::CountStar => {}
-        Expr::Agg(_, inner) | Expr::IsNull(inner) | Expr::IsNotNull(inner) | Expr::Not(inner) => {
-            rewrite_expr_with_aliases(inner, projections);
-        }
-        Expr::BinaryOp { left, right, .. } => {
-            rewrite_expr_with_aliases(left, projections);
-            rewrite_expr_with_aliases(right, projections);
-        }
-        Expr::FunctionCall { args, .. } => {
-            for arg in args {
-                rewrite_expr_with_aliases(arg, projections);
-            }
-        }
-        Expr::Quantifier {
-            list, predicate, ..
-        } => {
-            rewrite_expr_with_aliases(list, projections);
-            rewrite_expr_with_aliases(predicate, projections);
-        }
-        Expr::Case {
-            subject,
-            arms,
-            else_expr,
-        } => {
-            if let Some(s) = subject {
-                rewrite_expr_with_aliases(s, projections);
-            }
-            for arm in arms {
-                rewrite_expr_with_aliases(&mut arm.when, projections);
-                rewrite_expr_with_aliases(&mut arm.then, projections);
-            }
-            if let Some(e) = else_expr {
-                rewrite_expr_with_aliases(e, projections);
-            }
-        }
-        Expr::Subscript { expr: inner, index } => {
-            rewrite_expr_with_aliases(inner, projections);
-            rewrite_expr_with_aliases(index, projections);
-        }
-        Expr::Slice {
-            expr: inner,
-            start,
-            end,
-        } => {
-            rewrite_expr_with_aliases(inner, projections);
-            if let Some(s) = start {
-                rewrite_expr_with_aliases(s, projections);
-            }
-            if let Some(e) = end {
-                rewrite_expr_with_aliases(e, projections);
-            }
-        }
-        Expr::ListComprehension {
-            list,
-            predicate,
-            transform,
-            ..
-        } => {
-            rewrite_expr_with_aliases(list, projections);
-            if let Some(p) = predicate {
-                rewrite_expr_with_aliases(p, projections);
-            }
-            if let Some(t) = transform {
-                rewrite_expr_with_aliases(t, projections);
-            }
-        }
-        Expr::Reduce {
-            initial,
-            list,
-            expression,
-            ..
-        } => {
-            rewrite_expr_with_aliases(initial, projections);
-            rewrite_expr_with_aliases(list, projections);
-            rewrite_expr_with_aliases(expression, projections);
-        }
-        Expr::PatternComprehension {
-            predicate,
-            transform,
-            ..
-        } => {
-            if let Some(p) = predicate {
-                rewrite_expr_with_aliases(p, projections);
-            }
-            rewrite_expr_with_aliases(transform, projections);
-        }
-        Expr::HasLabel { .. } => {}
     }
 }

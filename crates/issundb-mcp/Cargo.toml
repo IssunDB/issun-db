@@ -1,6 +1,6 @@
 [package]
 name = "issundb-mcp"
-description = "Model Context Protocol server for IssunDB"
+description = "A Model Context Protocol server for IssunDB"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

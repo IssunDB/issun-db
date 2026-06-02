@@ -12,12 +12,6 @@ pub enum TextError {
     #[error("core storage error: {0}")]
     Core(#[from] issundb_core::Error),
 
-    #[error("tokenizer fault: {0}")]
-    TokenizerFault(String),
-
-    #[error("unsupported language: {0}")]
-    UnsupportedLanguage(String),
-
     #[error("index not found for label {label} and property {property}")]
     IndexNotFound { label: String, property: String },
 }

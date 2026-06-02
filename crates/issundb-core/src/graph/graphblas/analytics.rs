@@ -119,7 +119,7 @@ impl Graph {
                 monoid::Min,
                 multiplication::{MatrixVectorMultiplicationOperator, MultiplyMatrixByVector},
                 options::{OperatorOptions, OptionsForOperatorWithMatrixAsFirstArgument},
-                semiring::MinFirst,
+                semiring::MinSecond,
             },
         };
 
@@ -128,8 +128,16 @@ impl Graph {
             return Ok(HashMap::new());
         }
 
+        // Labels are 1-based: node at dense index `i` starts with label `i + 1`.
+        // The semiring is MinSecond so the SpMV propagates each neighbor's label
+        // (the vector entry), not the adjacency matrix value: fwd[i] is the
+        // minimum label over i's neighbors. A 0-based label would give index 0
+        // the value 0, which the sparse Min monoid treats as an implicit zero,
+        // so index 0's label would be dropped from storage and would never
+        // propagate and the node would be stranded in its own component. Readout
+        // subtracts 1 to recover the 0-based representative index.
         let init_list = VectorElementList::<i32>::from_element_vector(
-            (0..n).map(|i| (i, i as i32).into()).collect(),
+            (0..n).map(|i| (i, (i + 1) as i32).into()).collect(),
         );
         let mut label = SparseVector::<i32>::from_element_list(
             m.context.clone(),
@@ -150,7 +158,7 @@ impl Graph {
                 .map_err(|e| Error::GraphBLAS(e.to_string()))?;
             mxv.apply(
                 &m.adjacency,
-                &MinFirst::<i32>::new(),
+                &MinSecond::<i32>::new(),
                 &label,
                 &Assignment::new(),
                 &mut fwd,
@@ -163,7 +171,7 @@ impl Graph {
                 .map_err(|e| Error::GraphBLAS(e.to_string()))?;
             mxv.apply(
                 &m.adjacency_t,
-                &MinFirst::<i32>::new(),
+                &MinSecond::<i32>::new(),
                 &label,
                 &Assignment::new(),
                 &mut rev,
@@ -233,9 +241,11 @@ impl Graph {
             .map_err(|e| Error::GraphBLAS(e.to_string()))?;
         let mut result = HashMap::with_capacity(n);
         for idx in indices {
-            let comp = label
+            // Undo the 1-based offset applied at initialization.
+            let comp = (label
                 .element_value_or_default(idx)
-                .map_err(|e| Error::GraphBLAS(e.to_string()))? as u64;
+                .map_err(|e| Error::GraphBLAS(e.to_string()))?
+                - 1) as u64;
             if let Some(&node_id) = snap.dense_to_id.get(idx) {
                 result.insert(node_id, comp);
             }
@@ -718,5 +728,104 @@ impl Graph {
         }
 
         Ok(labels)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{HashMap, HashSet};
+
+    use tempfile::TempDir;
+
+    use super::*;
+
+    fn open_tmp() -> (TempDir, Graph) {
+        let dir = TempDir::new().unwrap();
+        let g = Graph::open(dir.path(), 1).unwrap();
+        (dir, g)
+    }
+
+    /// Connect every unordered pair among `nodes` with a single directed edge.
+    /// `all_neighbors` is direction-agnostic, so one edge per pair yields a
+    /// symmetric neighbor relation, i.e. an undirected clique.
+    fn add_clique(g: &Graph, nodes: &[NodeId]) {
+        for i in 0..nodes.len() {
+            for j in (i + 1)..nodes.len() {
+                g.add_edge(nodes[i], nodes[j], "E", &()).unwrap();
+            }
+        }
+    }
+
+    /// Canonicalize a label map into sorted groups of node IDs. Only the induced
+    /// partition is significant, not the label values.
+    fn partition(labels: &HashMap<NodeId, u64>) -> Vec<Vec<NodeId>> {
+        let mut groups: HashMap<u64, Vec<NodeId>> = HashMap::new();
+        for (&id, &label) in labels {
+            groups.entry(label).or_default().push(id);
+        }
+        let mut parts: Vec<Vec<NodeId>> = groups
+            .into_values()
+            .map(|mut part| {
+                part.sort_unstable();
+                part
+            })
+            .collect();
+        parts.sort();
+        parts
+    }
+
+    /// LPA cannot be compared against NetworkX, whose label propagation is
+    /// randomized and yields no canonical partition. Instead these tests pin the
+    /// invariants the deterministic implementation must satisfy.
+    ///
+    /// Three disjoint triangles must collapse to exactly three communities, one
+    /// per triangle, matching the weakly connected components. A clique of size
+    /// three or more contains an odd cycle, so the synchronous update converges;
+    /// a two-clique is bipartite and would oscillate, so triangles are the
+    /// smallest safe building block.
+    #[test]
+    fn label_propagation_resolves_disjoint_cliques_to_components() {
+        let (_dir, g) = open_tmp();
+        let mut triangles = Vec::new();
+        for _ in 0..3 {
+            let nodes: Vec<NodeId> = (0..3).map(|_| g.add_node("N", &()).unwrap()).collect();
+            add_clique(&g, &nodes);
+            triangles.push(nodes);
+        }
+        g.rebuild_csr().unwrap();
+
+        let labels = g.label_propagation(100).unwrap();
+        assert_eq!(
+            partition(&labels),
+            partition(&g.connected_components().unwrap()),
+            "community partition must match the connected components"
+        );
+
+        let distinct: HashSet<u64> = labels.values().copied().collect();
+        assert_eq!(distinct.len(), 3, "expected one community per triangle");
+        for tri in &triangles {
+            let label = labels[&tri[0]];
+            assert!(
+                tri.iter().all(|n| labels[n] == label),
+                "a triangle was split across communities"
+            );
+        }
+    }
+
+    /// The implementation iterates a `HashMap` of neighbor label counts, whose
+    /// order is randomized per process, but breaks ties toward the smallest
+    /// label. The result must therefore be identical run to run.
+    #[test]
+    fn label_propagation_is_deterministic() {
+        let (_dir, g) = open_tmp();
+        let nodes: Vec<NodeId> = (0..6).map(|_| g.add_node("N", &()).unwrap()).collect();
+        add_clique(&g, &nodes[0..3]);
+        add_clique(&g, &nodes[3..6]);
+        g.add_edge(nodes[2], nodes[3], "E", &()).unwrap();
+        g.rebuild_csr().unwrap();
+
+        let first = g.label_propagation(100).unwrap();
+        let second = g.label_propagation(100).unwrap();
+        assert_eq!(first, second, "label propagation must be run-to-run stable");
     }
 }

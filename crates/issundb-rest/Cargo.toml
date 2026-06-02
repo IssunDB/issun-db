@@ -1,6 +1,6 @@
 [package]
-name = "issundb-server"
-description = "HTTP server for IssunDB"
+name = "issundb-rest"
+description = "An HTTP REST API server for IssunDB"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -11,7 +11,7 @@ rust-version.workspace = true
 publish = false
 
 [[bin]]
-name = "issundb-server"
+name = "issundb-rest"
 path = "src/main.rs"
 doc = false
 

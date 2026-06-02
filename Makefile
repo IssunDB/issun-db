@@ -3,7 +3,7 @@ BINARY := target/release/issun-db
 PATH := /snap/bin:$(PATH)
 DEBUG_PROJ := 0
 RUST_BACKTRACE := 1
-ASSET_DIR := assets
+ASSET_DIR := docs/assets
 SHELL := /bin/bash
 MSRV := 1.85.0
 
@@ -53,7 +53,7 @@ test-conformance: format ## Run the openCypher TCK conformance integration tests
 .PHONY: coverage
 coverage: format ## Generate test coverage report
 	@echo "Generating test coverage report..."
-	@DEBUG_PROJ=$(DEBUG_PROJ) cargo tarpaulin --out Xml --out Html
+	@DEBUG_PROJ=$(DEBUG_PROJ) cargo tarpaulin --workspace --exclude issundb-gui --exclude issundb-cli --exclude issundb-node --exclude issundb-py --out Xml --out Html
 
 .PHONY: build
 build: format ## Build the binary for the current platform
@@ -253,7 +253,7 @@ docs: format ## Generate the documentation
 .PHONE: figs
 figs: ## Generate the figures in the assets directory
 	@echo "Generating figures..."
-	@$(SHELL) $(ASSET_DIR)/make_figures.sh $(ASSET_DIR)
+	@$(SHELL) $(ASSET_DIR)/diagrams/make_figures.sh $(ASSET_DIR)/diagrams
 
 .PHONY: fix-lint
 fix-lint: ## Fix the linter warnings
@@ -304,8 +304,17 @@ testdata: ## Regenerate versioned LMDB snapshots
 	@VERSION=$$(cargo metadata --no-deps --format-version 1 | python3 -c "import sys,json; print(json.load(sys.stdin)['packages'][0]['version'])"); \
 	 SNAP_DIR="test_data/v$$VERSION/db"; \
 	 mkdir -p "$$SNAP_DIR"; \
-	 cargo run -p issundb-testing --bin gen_testdata -- "$$SNAP_DIR"
+	 cargo run -p issundb-examples --bin gen_testdata -- "$$SNAP_DIR"
 	@echo "Snapshot written. Commit test_data/ to record the current storage format."
+
+.PHONY: oracle-fixtures
+oracle-fixtures: ## Regenerate the NetworkX oracle corpora (needs Python3 and NetworkX)
+	@echo "Regenerating NetworkX oracle corpora..."
+	@python3 tools/gen_oracle_fixtures.py crates/issundb/tests/fixtures/networkx_oracle.json
+	@python3 tools/gen_pagerank_fixtures.py crates/issundb/tests/fixtures/networkx_pagerank.json
+	@python3 tools/gen_centrality_fixtures.py crates/issundb/tests/fixtures/networkx_centrality.json
+	@python3 tools/gen_paths_fixtures.py crates/issundb/tests/fixtures/networkx_paths.json
+	@echo "Corpora written. Commit crates/issundb/tests/fixtures/ to record the oracle."
 
 .PHONY: nextest
 nextest: ## Run tests using nextest
