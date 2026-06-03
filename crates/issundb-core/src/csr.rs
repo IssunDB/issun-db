@@ -296,7 +296,7 @@ impl CsrSnapshot {
             dense_to_id.push(val);
         }
 
-        // Rebuild id_to_dense from dense_to_id (kept in RAM — it is a HashMap).
+        // Rebuild id_to_dense from dense_to_id (kept in RAM; it is a HashMap).
         let id_to_dense: AHashMap<NodeId, u32> = dense_to_id
             .iter()
             .enumerate()

@@ -1652,7 +1652,8 @@ impl Optimizer {
                             }
                         }
                     }
-                    // Bounds not merged — wrap back.
+                    // Bounds not merged; wrap back.
+
                     return PhysicalOperator::Filter {
                         input: Box::new(PhysicalOperator::NodeRangeScan {
                             variable,
@@ -2548,7 +2549,8 @@ mod tests {
             }),
             src_var: "c".to_string(),
             rel_var: "r3".to_string(),
-            dst_var: "a".to_string(), // already bound — this is the closing hop
+            dst_var: "a".to_string(), // already bound; this is the closing hop
+
             rel_type: Some("KNOWS".to_string()),
             is_incoming: false,
             is_undirected: false,
@@ -2636,7 +2638,8 @@ mod tests {
             }),
             src_var: "a".to_string(),
             rel_var: "r".to_string(),
-            dst_var: "b".to_string(), // already bound — undirected closing hop
+            dst_var: "b".to_string(), // already bound; undirected closing hop
+
             rel_type: Some("KNOWS".to_string()),
             is_incoming: false,
             is_undirected: true,

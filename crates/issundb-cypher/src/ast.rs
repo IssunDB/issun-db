@@ -283,25 +283,25 @@ pub enum Expr {
         arms: Vec<CaseArm>,
         else_expr: Option<Box<Expr>>,
     },
-    /// `expr[index]` — list element or map key lookup.
+    /// `expr[index]`: list element or map key lookup.
     Subscript {
         expr: Box<Expr>,
         index: Box<Expr>,
     },
-    /// `expr[start..end]` — list slice (start and end are optional).
+    /// `expr[start..end]`: list slice (start and end are optional).
     Slice {
         expr: Box<Expr>,
         start: Option<Box<Expr>>,
         end: Option<Box<Expr>>,
     },
-    /// `[variable IN list WHERE predicate | transform]` — list comprehension.
+    /// `[variable IN list WHERE predicate | transform]`: list comprehension.
     ListComprehension {
         variable: String,
         list: Box<Expr>,
         predicate: Option<Box<Expr>>,
         transform: Option<Box<Expr>>,
     },
-    /// `[ pathvar = (a)-[r]->(b) WHERE predicate | transform ]` — pattern comprehension.
+    /// `[ pathvar = (a)-[r]->(b) WHERE predicate | transform ]`: pattern comprehension.
     ///
     /// The pattern is matched against the graph starting from the already-bound anchor
     /// node, producing one list element per match. The optional path variable is carried
@@ -321,7 +321,7 @@ pub enum Expr {
         list: Box<Expr>,
         expression: Box<Expr>,
     },
-    /// `variable:Label` — boolean check whether the node has the given label.
+    /// `variable:Label`: boolean check whether the node has the given label.
     HasLabel {
         variable: String,
         label: String,

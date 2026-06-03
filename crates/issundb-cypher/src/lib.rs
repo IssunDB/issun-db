@@ -112,7 +112,7 @@ mod tests {
     #[test]
     fn parse_set_statement() {
         // MATCH + SET may be parsed as Statement::Set or as a write-only Statement::Query
-        // (pipeline). Both are semantically equivalent — verify the parser accepts the query.
+        // (pipeline). Both are semantically equivalent; verify the parser accepts the query.
         let s = parser::parse("MATCH (a:Person) WHERE a.name = $name SET a.age = 31").unwrap();
         match s {
             ast::Statement::Set(set) => {

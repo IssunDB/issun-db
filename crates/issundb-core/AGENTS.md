@@ -1,4 +1,5 @@
-# issundb-core Agent Guide
+# `issundb-core` Agent Guide
+
 
 This file covers crate-specific guidance for contributors working inside `crates/issundb-core`.
 Read the root `AGENTS.md` first; the rules there apply everywhere and are not repeated here.
@@ -60,7 +61,8 @@ context. The thread count is threshold-gated: graphs with more than 100 000 edge
 1 thread to avoid scheduling overhead on short operations. This setting is global to the SuiteSparse runtime for the lifetime of the process; do not
 call `GxB_Global_Option_set` from anywhere else.
 
-## CSR Snapshot vs. LMDB Adjacency
+## CSR Snapshot Vs. LMDB Adjacency
+
 
 `CsrSnapshot` (in `csr.rs`) is a read-only in-memory Compressed Sparse Row view of outgoing edges, rebuilt in the background and swapped atomically
 via `arc_swap::ArcSwap`. `MatrixSet` (in `matrices.rs`) holds the GraphBLAS sparse matrices derived from the CSR snapshot.

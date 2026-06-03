@@ -27,7 +27,8 @@ independent and can be pursued separately.
 
 ## Lever A: Per-Row Execution Cost
 
-### Current state
+### Current State
+
 
 - Row shape: `HashMap<String, GraphBinding>`. Variable lookup hashes a string;
   row clone copies the map and all string keys.
@@ -47,7 +48,8 @@ reference):
    `Arc`-wrapped for O(1) clone, with temporals stored as flat integers.
    Conversion to `serde_json::Value` happens once, at the result boundary.
 
-### Why it is large
+### Why It Is Large
+
 
 `PathMap` and `GraphBinding` are threaded through `exec/read.rs`,
 `exec/write.rs`, `exec/expr.rs`, and `exec/factorize.rs` (several thousand
@@ -66,7 +68,8 @@ rather than an incremental patch.
   `Vec<Binding>`. This is the disruptive phase; gate it behind a full pass of
   the conformance suite (`make test-conformance`).
 
-### Test strategy
+### Test Strategy
+
 
 Every phase must keep `make test` and `make test-conformance` green. The
 `query_optimizer` benchmarks plus the Pokec and Wikipedia benchmarks in
@@ -76,7 +79,8 @@ current optimizer benchmarks are deliberately small-result.
 
 ## Lever B: Per-Query Compilation Cost
 
-### Current state
+### Current State
+
 
 `query()` parses, plans, and optimizes on every call. For repeated queries
 (parameterized or not) this work is redundant.

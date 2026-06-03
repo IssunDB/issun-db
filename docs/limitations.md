@@ -19,4 +19,4 @@ Writes to the database are fully serialized. While read transactions execute con
 The underlying database uses LMDB memory mapping:
 
 - **Database Size Boundaries**: The maximum database size is constrained by the virtual memory limits of the host operating system and the `map_size_gb` parameter configured during initialization.
-- **Adjacency Entries**: Routine edge additions are maintained incrementally, so they do not trigger a full snapshot rebuild. Operations that do force a complete CSR (Compressed Sparse Row) snapshot rebuild, such as node deletion or periodic compaction, may experience increased memory footprints on extremely dense nodes with millions of outgoing or incoming relationships.
+- **Adjacency Entries**: Routine edge additions are maintained incrementally, so they do not trigger a full snapshot rebuild. Operations that do force a complete CSR (Compressed Sparse Row) snapshot rebuild, such as node deletion or periodic compaction, may experience increased memory footprints on dense nodes with millions of outgoing or incoming relationships.

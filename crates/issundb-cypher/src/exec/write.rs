@@ -20,7 +20,7 @@ fn eval_properties(
     for (k, v) in props {
         let val = evaluate_expr(graph, path, v, params)?;
         // Cypher semantics: assigning null to a property is equivalent to
-        // removing it — null-valued properties are not stored.
+        // removing it; null-valued properties are not stored.
         if val != serde_json::Value::Null {
             obj.insert(k.clone(), val);
         }

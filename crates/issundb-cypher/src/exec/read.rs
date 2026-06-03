@@ -833,7 +833,7 @@ fn filter_over_expand_batch(
         let where_clause = filter_expr_to_where_clause(expression);
         for path in &child_paths {
             if !evaluate_where(graph, path, &where_clause, params)? {
-                continue; // source fails — skip every destination for free
+                continue; // source fails; skip every destination for free
             }
             let src_node = match path.get(src_var) {
                 Some(GraphBinding::Node(n)) => *n,
