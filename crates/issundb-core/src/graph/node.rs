@@ -12,6 +12,7 @@ impl Graph {
         let mut wtxn = self.storage.env.write_txn()?;
         let id = self.add_node_impl(&mut wtxn, &[label], props)?;
         wtxn.commit()?;
+        self.csr_cache.record_added_node(id);
         self.maybe_spawn_rebuild();
         Ok(id)
     }
@@ -23,6 +24,7 @@ impl Graph {
         let mut wtxn = self.storage.env.write_txn()?;
         let id = self.add_node_impl(&mut wtxn, labels, props)?;
         wtxn.commit()?;
+        self.csr_cache.record_added_node(id);
         self.maybe_spawn_rebuild();
         Ok(id)
     }
@@ -376,6 +378,9 @@ impl Graph {
         let mut wtxn = self.storage.env.write_txn()?;
         self.delete_node_impl(&mut wtxn, id)?;
         wtxn.commit()?;
+        // A node deletion reshuffles the sorted dense-index mapping, so the next
+        // matrix refresh must rebuild fully rather than patch incrementally.
+        self.csr_cache.mark_force_full();
         self.maybe_spawn_rebuild();
         Ok(())
     }

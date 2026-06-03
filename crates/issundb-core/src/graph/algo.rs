@@ -7,7 +7,7 @@ impl Graph {
 
     /// Depth-first search outward from `start` up to `hops` levels deep.
     pub fn dfs(&self, start: NodeId, hops: u8) -> Result<Vec<NodeId>, Error> {
-        self.ensure_matrices()?;
+        self.ensure_csr_fresh()?;
         let guard = self.matrices.read();
         let m = guard
             .as_ref()
@@ -18,7 +18,7 @@ impl Graph {
 
     /// Detects if there is at least one directed cycle in the graph.
     pub fn detect_cycle(&self) -> Result<bool, Error> {
-        self.ensure_matrices()?;
+        self.ensure_csr_fresh()?;
         let guard = self.matrices.read();
         let m = guard
             .as_ref()
@@ -52,7 +52,7 @@ impl Graph {
 
     /// Returns all simple paths (no repeated nodes) between `src` and `dst`.
     pub fn all_paths(&self, src: NodeId, dst: NodeId) -> Result<Vec<Vec<NodeId>>, Error> {
-        self.ensure_matrices()?;
+        self.ensure_csr_fresh()?;
         let guard = self.matrices.read();
         let m = guard
             .as_ref()
@@ -63,7 +63,7 @@ impl Graph {
 
     /// Returns all unweighted shortest paths between `src` and `dst`.
     pub fn all_shortest_paths(&self, src: NodeId, dst: NodeId) -> Result<Vec<Vec<NodeId>>, Error> {
-        self.ensure_matrices()?;
+        self.ensure_csr_fresh()?;
         let guard = self.matrices.read();
         let m = guard
             .as_ref()
@@ -74,7 +74,7 @@ impl Graph {
 
     /// Returns the longest simple path (no repeated nodes) between `src` and `dst`.
     pub fn longest_path(&self, src: NodeId, dst: NodeId) -> Result<Option<Vec<NodeId>>, Error> {
-        self.ensure_matrices()?;
+        self.ensure_csr_fresh()?;
         let guard = self.matrices.read();
         let m = guard
             .as_ref()
@@ -95,7 +95,7 @@ impl Graph {
         src: NodeId,
         dst: NodeId,
     ) -> Result<Option<WeightedPath>, Error> {
-        self.ensure_matrices()?;
+        self.ensure_csr_fresh()?;
         let guard = self.matrices.read();
         let m = guard
             .as_ref()
@@ -110,7 +110,7 @@ impl Graph {
         weight_property: &str,
         maximum: bool,
     ) -> Result<Vec<EdgeId>, Error> {
-        self.ensure_matrices()?;
+        self.ensure_csr_fresh()?;
         let guard = self.matrices.read();
         let m = guard
             .as_ref()
@@ -121,7 +121,7 @@ impl Graph {
 
     /// Computes community detection on the graph using the Label Propagation Algorithm (LPA / CDLP).
     pub fn label_propagation(&self, max_iterations: usize) -> Result<HashMap<NodeId, u64>, Error> {
-        self.ensure_matrices()?;
+        self.ensure_csr_fresh()?;
         let guard = self.matrices.read();
         let m = guard
             .as_ref()
@@ -132,7 +132,7 @@ impl Graph {
 
     /// Computes the harmonic closeness centrality for all nodes in the graph.
     pub fn harmonic_centrality(&self) -> Result<HashMap<NodeId, f64>, Error> {
-        self.ensure_matrices()?;
+        self.ensure_csr_fresh()?;
         let guard = self.matrices.read();
         let m = guard
             .as_ref()
@@ -143,7 +143,7 @@ impl Graph {
 
     /// Computes the betweenness centrality for all nodes in the graph.
     pub fn betweenness_centrality(&self) -> Result<HashMap<NodeId, f64>, Error> {
-        self.ensure_matrices()?;
+        self.ensure_csr_fresh()?;
         let guard = self.matrices.read();
         let m = guard
             .as_ref()
@@ -154,7 +154,7 @@ impl Graph {
 
     /// Computes the strongly connected components (SCC) of the graph using Tarjan's algorithm.
     pub fn strongly_connected_components(&self) -> Result<HashMap<NodeId, u64>, Error> {
-        self.ensure_matrices()?;
+        self.ensure_csr_fresh()?;
         let guard = self.matrices.read();
         let m = guard
             .as_ref()
@@ -168,13 +168,12 @@ impl Graph {
         &self,
         direction: DegreeDirection,
     ) -> Result<HashMap<NodeId, u64>, Error> {
-        self.ensure_matrices()?;
+        self.ensure_matrix_view()?;
         let guard = self.matrices.read();
         let m = guard
             .as_ref()
             .ok_or(Error::Corrupt("matrices not initialized"))?;
-        let snap = self.csr_cache.snapshot.load();
-        self.degree_centrality_graphblas(m, &snap, direction)
+        self.degree_centrality_graphblas(m, direction)
     }
 
     /// Computes the maximum flow from a source node to a sink node.
@@ -184,7 +183,7 @@ impl Graph {
         sink: NodeId,
         capacity_property: &str,
     ) -> Result<f64, Error> {
-        self.ensure_matrices()?;
+        self.ensure_csr_fresh()?;
         let guard = self.matrices.read();
         let m = guard
             .as_ref()
@@ -201,7 +200,7 @@ impl Graph {
         k: usize,
         weight_property: &str,
     ) -> Result<Vec<WeightedPath>, Error> {
-        self.ensure_matrices()?;
+        self.ensure_csr_fresh()?;
         let guard = self.matrices.read();
         let m = guard
             .as_ref()
@@ -219,37 +218,88 @@ impl Graph {
 
     /// Breadth-first search outward from `start` up to `hops` levels deep.
     pub fn bfs(&self, start: NodeId, hops: u8) -> Result<Vec<NodeId>, Error> {
-        self.ensure_matrices()?;
+        self.ensure_matrix_view()?;
         self.bfs_graphblas(start, hops)
     }
 
     /// Unweighted shortest path from `src` to `dst` by BFS.
     pub fn shortest_path(&self, src: NodeId, dst: NodeId) -> Result<Option<Vec<NodeId>>, Error> {
-        self.ensure_matrices()?;
+        self.ensure_csr_fresh()?;
         self.shortest_path_graphblas(src, dst)
     }
 
     /// Iterative PageRank over the current CSR snapshot.
     pub fn page_rank(&self, iterations: u32, damping: f32) -> Result<HashMap<NodeId, f32>, Error> {
-        self.ensure_matrices()?;
+        self.ensure_csr_fresh()?;
         self.page_rank_graphblas(iterations, damping)
     }
 
-    /// Dynamic matrices materialization guard to rebuild snapshot and matrices unconditionally.
-    pub(crate) fn ensure_matrices(&self) -> Result<(), Error> {
-        let needs_rebuild = {
-            let guard = self.matrices.read();
-            match guard.as_ref() {
-                Some(m) => {
-                    let rtxn = self.storage.env.read_txn()?;
-                    let db_len = self.storage.nodes.len(&rtxn)?;
-                    m.n_nodes != db_len as usize
-                }
-                None => true,
-            }
-        };
-        if needs_rebuild {
+    /// Freshness gate for consumers that read the CSR snapshot: the native-CSR
+    /// algorithms (`dfs`, `strongly_connected_components`, `maximum_flow`,
+    /// `spanning_forest`, `shortest_path_top_k`, `all_paths`, `longest_path`,
+    /// `detect_cycle`) and the hybrid SpMV-plus-path-reconstruction algorithms
+    /// (`shortest_path_dijkstra`, `betweenness_centrality`, `harmonic_centrality`,
+    /// `all_shortest_paths`, `page_rank`). A full rebuild refreshes both the
+    /// snapshot and all matrices. Gated by the write generation, so it catches
+    /// edge-only drift, not just node-count changes.
+    pub(crate) fn ensure_csr_fresh(&self) -> Result<(), Error> {
+        if self.matrices.read().is_none() || self.csr_cache.snapshot_is_stale() {
             self.rebuild_csr()?;
+        }
+        Ok(())
+    }
+
+    /// Freshness gate for the pure-adjacency consumers (`bfs`,
+    /// `bfs_multi_source`, untyped `expand`, `degree_centrality`,
+    /// `connected_components`), which read only `adjacency`/`adjacency_t` and the
+    /// dense mapping carried on `MatrixSet`. Applies the pending structural delta
+    /// to the cached matrices in place (resize plus per-element set/drop) in
+    /// O(delta), falling back to a full rebuild when a node was deleted (the
+    /// dense-index mapping is reshuffled) or the matrices are not yet
+    /// materialized. The take-and-apply runs under the matrices write lock, so a
+    /// reader's subsequent `matrices.read()` never observes a partial apply.
+    pub(crate) fn ensure_matrix_view(&self) -> Result<(), Error> {
+        // A node deletion or an unmaterialized matrix set needs a full rebuild,
+        // which refreshes the snapshot and all matrices from LMDB.
+        if self.matrices.read().is_none() || self.csr_cache.pending_force_full() {
+            return self.rebuild_csr();
+        }
+        // Cheap pre-check: skip the exclusive lock when nothing is pending.
+        if !self.csr_cache.has_pending() {
+            return Ok(());
+        }
+
+        let mut guard = self.matrices.write();
+        let delta = self.csr_cache.take_delta();
+        if delta.force_full {
+            // A node deletion raced in after the peek above. Drop the guard
+            // (rebuild_csr re-acquires the write lock) and rebuild from LMDB; the
+            // taken delta is superseded.
+            drop(guard);
+            return self.rebuild_csr();
+        }
+        if delta.is_empty() {
+            return Ok(());
+        }
+
+        // A removed edge clears the boolean adjacency bit only when no parallel
+        // edge between the same endpoints remains. LMDB is the fresh truth.
+        let mut clear_edges = Vec::new();
+        {
+            let rtxn = self.storage.env.read_txn()?;
+            for &(src, dst) in &delta.removed_edges {
+                let still_connected = self
+                    .out_neighbors_impl(&rtxn, src)?
+                    .into_iter()
+                    .any(|ne| ne.node == dst);
+                if !still_connected {
+                    clear_edges.push((src, dst));
+                }
+            }
+        }
+
+        if let Some(m) = guard.as_mut() {
+            m.apply_delta(&delta.added_nodes, &delta.added_edges, &clear_edges)?;
         }
         Ok(())
     }
@@ -277,12 +327,12 @@ impl Graph {
     /// assigned in ascending order of first discovery and have no guaranteed
     /// relationship to node IDs.
     pub fn connected_components(&self) -> Result<HashMap<NodeId, u64>, Error> {
+        self.ensure_matrix_view()?;
         {
             let guard = self.matrices.read();
             if let Some(m) = guard.as_ref() {
                 if m.n_nodes > 0 {
-                    let snap = self.csr_cache.snapshot.load();
-                    return self.connected_components_graphblas(m, &snap);
+                    return self.connected_components_graphblas(m);
                 }
             }
         }
@@ -345,12 +395,19 @@ impl Graph {
                 // `install` retains the claim and asks for another pass so the
                 // snapshot does not silently lag behind LMDB.
                 loop {
+                    // Capture the generation before reading LMDB; writes that
+                    // commit during the build leave the snapshot stale until the
+                    // next pass, which the dirty-count loop already drives.
+                    let built_gen = cache.current_gen();
+                    // Clear before reading LMDB so writes during the build are
+                    // retained in the emptied delta for a later incremental apply.
+                    cache.clear_delta();
                     match CsrSnapshot::build(&storage) {
                         Ok(snap) => {
                             if let Ok(m) = MatrixSet::materialize(&snap) {
                                 *matrices.write() = Some(m);
                             }
-                            if !cache.install(snap) {
+                            if !cache.install(snap, built_gen) {
                                 break;
                             }
                         }
@@ -428,5 +485,324 @@ impl Graph {
             });
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod incremental_matrix_tests {
+    use graphblas_sparse_linear_algebra::collections::sparse_matrix::SparseMatrix;
+    use graphblas_sparse_linear_algebra::collections::sparse_matrix::operations::GetSparseMatrixElementList;
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    use std::collections::{BTreeMap, HashMap};
+
+    use crate::Graph;
+    use crate::graph::DegreeDirection;
+    use crate::schema::NodeId;
+
+    /// Adjacency coordinates, transpose coordinates, and the dense-index mapping:
+    /// the matrix-view state the incremental path maintains.
+    type MatrixView = (Vec<(usize, usize)>, Vec<(usize, usize)>, Vec<NodeId>);
+
+    /// Canonicalize a component map to its underlying partition (each node mapped
+    /// to the smallest node id in its component), so two results compare equal
+    /// regardless of the arbitrary component-id numbering.
+    fn canonical_partition(cc: &HashMap<NodeId, u64>) -> BTreeMap<NodeId, NodeId> {
+        let mut groups: HashMap<u64, Vec<NodeId>> = HashMap::new();
+        for (&node, &comp) in cc {
+            groups.entry(comp).or_default().push(node);
+        }
+        let mut out = BTreeMap::new();
+        for members in groups.into_values() {
+            let rep = *members.iter().min().unwrap();
+            for n in members {
+                out.insert(n, rep);
+            }
+        }
+        out
+    }
+
+    /// Sorted, deduplicated `(row, col)` coordinates of a boolean adjacency
+    /// matrix, for set comparison independent of internal storage order.
+    fn matrix_coords(m: &SparseMatrix<i32>) -> Vec<(usize, usize)> {
+        let list = m.element_list().expect("element_list");
+        let rows = list.row_indices_ref();
+        let cols = list.column_indices_ref();
+        let mut out: Vec<(usize, usize)> = rows
+            .iter()
+            .zip(cols.iter())
+            .map(|(&r, &c)| (r, c))
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// Snapshot the matrix-view state that the incremental path maintains:
+    /// adjacency coordinates, transpose coordinates, and the dense-index mapping.
+    fn extract(graph: &Graph) -> MatrixView {
+        let guard = graph.matrices.read();
+        let m = guard.as_ref().expect("matrices materialized");
+        (
+            matrix_coords(&m.adjacency),
+            matrix_coords(&m.adjacency_t),
+            m.dense_to_id.clone(),
+        )
+    }
+
+    /// The incrementally-maintained matrices must be byte-identical (as element
+    /// sets and dense mapping) to a full rebuild over the same final LMDB state.
+    /// Because the incremental matrices equal the freshly-built ones, any
+    /// consumer reading them sees every committed mutation: this is the freshness
+    /// proof as well as the correctness proof.
+    #[test]
+    fn incremental_matrices_match_full_rebuild() {
+        let dir = TempDir::new().unwrap();
+        let g = Graph::open(dir.path(), 1).unwrap();
+
+        // Base graph: a 20-node ring.
+        let ids: Vec<NodeId> = (0..20)
+            .map(|i| g.add_node("N", &json!({ "v": i })).unwrap())
+            .collect();
+        let mut base_edges = Vec::new();
+        for i in 0..20 {
+            base_edges.push(
+                g.add_edge(ids[i], ids[(i + 1) % 20], "R", &json!({}))
+                    .unwrap(),
+            );
+        }
+        // Establish the base matrices and clear the pending delta.
+        g.rebuild_csr().unwrap();
+
+        // Mutations recorded into the delta:
+        // 1. New edges among existing nodes.
+        g.add_edge(ids[0], ids[5], "R", &json!({})).unwrap();
+        g.add_edge(ids[3], ids[10], "R", &json!({})).unwrap();
+        // 2. Parallel edges, then remove one: the adjacency bit must stay set.
+        let par_a = g.add_edge(ids[2], ids[4], "R", &json!({})).unwrap();
+        let _par_b = g.add_edge(ids[2], ids[4], "R", &json!({})).unwrap();
+        // 3. New nodes with edges (matrix must grow).
+        let n20 = g.add_node("N", &json!({ "v": 20 })).unwrap();
+        let n21 = g.add_node("N", &json!({ "v": 21 })).unwrap();
+        g.add_edge(n20, n21, "R", &json!({})).unwrap();
+        g.add_edge(ids[1], n20, "R", &json!({})).unwrap();
+        // 4. Remove an edge with no parallel: the adjacency bit must clear.
+        g.delete_edge(base_edges[7]).unwrap();
+        // 5. Remove one of the parallel pair (the other still connects the pair).
+        g.delete_edge(par_a).unwrap();
+
+        // Incremental refresh, then snapshot.
+        g.ensure_matrix_view().unwrap();
+        let incremental = extract(&g);
+
+        // Full rebuild over the same LMDB state, then snapshot.
+        g.rebuild_csr().unwrap();
+        let full = extract(&g);
+
+        assert_eq!(incremental.0, full.0, "adjacency element sets differ");
+        assert_eq!(incremental.1, full.1, "adjacency_t element sets differ");
+        assert_eq!(incremental.2, full.2, "dense-index mapping differs");
+    }
+
+    /// A node deletion reshuffles dense indices, so the refresh must fall back to
+    /// a full rebuild and still match.
+    #[test]
+    fn node_deletion_forces_full_rebuild_and_matches() {
+        let dir = TempDir::new().unwrap();
+        let g = Graph::open(dir.path(), 1).unwrap();
+        let ids: Vec<NodeId> = (0..10)
+            .map(|i| g.add_node("N", &json!({ "v": i })).unwrap())
+            .collect();
+        for i in 0..10 {
+            g.add_edge(ids[i], ids[(i + 1) % 10], "R", &json!({}))
+                .unwrap();
+        }
+        g.rebuild_csr().unwrap();
+
+        // Delete a node (cascades its edges) and add a fresh edge.
+        g.delete_node(ids[3]).unwrap();
+        g.add_edge(ids[5], ids[7], "R", &json!({})).unwrap();
+
+        g.ensure_matrix_view().unwrap();
+        let incremental = extract(&g);
+        g.rebuild_csr().unwrap();
+        let full = extract(&g);
+
+        assert_eq!(incremental.0, full.0, "adjacency element sets differ");
+        assert_eq!(incremental.1, full.1, "adjacency_t element sets differ");
+        assert_eq!(incremental.2, full.2, "dense-index mapping differs");
+    }
+
+    /// Go/no-go measurement (ignored by default; the build dominates runtime).
+    /// Run with:
+    /// `cargo test -p issundb-core --release incremental_apply_cost -- --ignored --nocapture`
+    #[test]
+    #[ignore = "measurement: prints incremental-apply vs full-rebuild timings"]
+    fn incremental_apply_cost() {
+        use std::time::Instant;
+
+        fn measure(n_nodes: usize, out_degree: usize, k_added: usize) {
+            let dir = TempDir::new().unwrap();
+            let g = Graph::open(dir.path(), 4).unwrap();
+            // Build the base graph in one batched transaction: individual commits
+            // would dominate the runtime and swamp the measurement.
+            let ids: Vec<NodeId> = g
+                .update(|txn| {
+                    let ids: Vec<NodeId> = (0..n_nodes)
+                        .map(|i| txn.add_node("N", &json!({ "v": i })).unwrap())
+                        .collect();
+                    for i in 0..n_nodes {
+                        for k in 0..out_degree {
+                            let off = 1 + k * 7;
+                            txn.add_edge(ids[i], ids[(i + off) % n_nodes], "R", &json!({}))
+                                .unwrap();
+                        }
+                    }
+                    Ok(ids)
+                })
+                .unwrap();
+            g.rebuild_csr().unwrap();
+
+            // Stage `k_added` new edges among existing nodes, then time the
+            // incremental apply of exactly that delta.
+            for j in 0..k_added {
+                let a = (j * 31) % n_nodes;
+                let b = (j * 97 + 5) % n_nodes;
+                g.add_edge(ids[a], ids[b], "R", &json!({})).unwrap();
+            }
+            let t = Instant::now();
+            g.ensure_matrix_view().unwrap();
+            let incr = t.elapsed();
+
+            // Full rebuild is independent of the delta size: it is the cost the
+            // incremental path replaces.
+            let mut best_full = std::time::Duration::from_secs(3600);
+            for _ in 0..3 {
+                let t = Instant::now();
+                g.rebuild_csr().unwrap();
+                let e = t.elapsed();
+                if e < best_full {
+                    best_full = e;
+                }
+            }
+            let n_edges = n_nodes * out_degree + k_added;
+            println!(
+                "{:>7} nodes, {:>9} edges: incremental apply of {} edges = {:>8.3} ms; full rebuild = {:>8.2} ms",
+                n_nodes,
+                n_edges,
+                k_added,
+                incr.as_secs_f64() * 1e3,
+                best_full.as_secs_f64() * 1e3,
+            );
+        }
+
+        measure(10_000, 5, 1_000);
+        measure(50_000, 5, 1_000);
+        measure(100_000, 5, 1_000);
+    }
+
+    /// End-to-end differential check: the migrated matrix-view consumers (`bfs`,
+    /// `degree_centrality`, `connected_components`) must return identical results
+    /// whether refreshed incrementally or via a forced full rebuild, over a
+    /// mutation battery including a new node reached through a new edge.
+    #[test]
+    fn incremental_consumers_match_full_rebuild() {
+        let dir = TempDir::new().unwrap();
+        let g = Graph::open(dir.path(), 1).unwrap();
+        let ids: Vec<NodeId> = (0..15)
+            .map(|i| g.add_node("N", &json!({ "v": i })).unwrap())
+            .collect();
+        for i in 0..15 {
+            g.add_edge(ids[i], ids[(i + 1) % 15], "R", &json!({}))
+                .unwrap();
+        }
+        g.rebuild_csr().unwrap();
+
+        // Mutations recorded into the delta, with no rebuild in between.
+        g.add_edge(ids[0], ids[7], "R", &json!({})).unwrap();
+        let n15 = g.add_node("N", &json!({ "v": 15 })).unwrap();
+        g.add_edge(ids[2], n15, "R", &json!({})).unwrap();
+        g.add_edge(n15, ids[5], "R", &json!({})).unwrap();
+
+        // Results via the incremental matrix-view path.
+        let bfs_incr = {
+            let mut v = g.bfs(ids[0], 3).unwrap();
+            v.sort_unstable();
+            v
+        };
+        let deg_incr = g.degree_centrality(DegreeDirection::Both).unwrap();
+        let cc_incr = canonical_partition(&g.connected_components().unwrap());
+
+        // Results via a forced full rebuild over the same LMDB state.
+        g.rebuild_csr().unwrap();
+        let bfs_full = {
+            let mut v = g.bfs(ids[0], 3).unwrap();
+            v.sort_unstable();
+            v
+        };
+        let deg_full = g.degree_centrality(DegreeDirection::Both).unwrap();
+        let cc_full = canonical_partition(&g.connected_components().unwrap());
+
+        assert_eq!(bfs_incr, bfs_full, "bfs: incremental vs full rebuild");
+        assert_eq!(deg_incr, deg_full, "degree: incremental vs full rebuild");
+        assert_eq!(cc_incr, cc_full, "components: incremental vs full rebuild");
+    }
+
+    /// Freshness: a matrix-view consumer reflects an edge, and a brand-new node
+    /// reached through a new edge, with no explicit `rebuild_csr` between the
+    /// write and the read. This is the edge-drift bug the migration closes.
+    #[test]
+    fn matrix_view_consumers_reflect_writes_without_rebuild() {
+        let dir = TempDir::new().unwrap();
+        let g = Graph::open(dir.path(), 1).unwrap();
+        let a = g.add_node("N", &json!({})).unwrap();
+        let b = g.add_node("N", &json!({})).unwrap();
+        g.rebuild_csr().unwrap();
+        assert!(
+            !g.bfs(a, 5).unwrap().contains(&b),
+            "b is unreachable before the edge exists"
+        );
+
+        // Edge between existing nodes, no rebuild: the incremental view sees it.
+        g.add_edge(a, b, "R", &json!({})).unwrap();
+        assert!(
+            g.bfs(a, 1).unwrap().contains(&b),
+            "b reachable from a after the edge, without a rebuild"
+        );
+
+        // A brand-new node reached through a new edge, still no rebuild: this
+        // exercises the matrix resize plus dense-mapping extension end to end.
+        let c = g.add_node("N", &json!({})).unwrap();
+        g.add_edge(b, c, "R", &json!({})).unwrap();
+        assert!(
+            g.bfs(a, 2).unwrap().contains(&c),
+            "new node c reachable two hops from a, without a rebuild"
+        );
+    }
+
+    /// Freshness for the CSR-snapshot consumers: a generation-gated rebuild makes
+    /// a native-CSR algorithm (`all_paths`) reflect an edge added with no explicit
+    /// `rebuild_csr`.
+    #[test]
+    fn csr_consumers_reflect_writes_without_rebuild() {
+        let dir = TempDir::new().unwrap();
+        let g = Graph::open(dir.path(), 1).unwrap();
+        let a = g.add_node("N", &json!({})).unwrap();
+        let b = g.add_node("N", &json!({})).unwrap();
+        let c = g.add_node("N", &json!({})).unwrap();
+        g.add_edge(a, b, "R", &json!({})).unwrap();
+        g.rebuild_csr().unwrap();
+        assert!(
+            g.all_paths(a, c).unwrap().is_empty(),
+            "no path a..c before the edge exists"
+        );
+
+        // Edge b->c, no rebuild: the write-generation gate forces a refresh.
+        g.add_edge(b, c, "R", &json!({})).unwrap();
+        assert!(
+            !g.all_paths(a, c).unwrap().is_empty(),
+            "path a->b->c reflected without an explicit rebuild"
+        );
     }
 }

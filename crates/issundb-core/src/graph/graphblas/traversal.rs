@@ -35,12 +35,11 @@ impl Graph {
             Some(m) => m,
             None => return self.bfs(start, hops),
         };
-        let snap = self.csr_cache.snapshot.load();
         let n = m.n_nodes;
         if n == 0 {
             return Ok(vec![]);
         }
-        let start_dense = match snap.id_to_dense.get(&start) {
+        let start_dense = match m.id_to_dense.get(&start) {
             Some(&d) => d as usize,
             None => return self.bfs(start, hops),
         };
@@ -103,7 +102,7 @@ impl Graph {
             .map_err(|e| Error::GraphBLAS(e.to_string()))?;
         Ok(dense_indices
             .into_iter()
-            .filter_map(|d| snap.dense_to_id.get(d).copied())
+            .filter_map(|d| m.dense_to_id.get(d).copied())
             .collect())
     }
 
@@ -140,14 +139,13 @@ impl Graph {
             },
         };
 
-        self.ensure_matrices()?;
+        self.ensure_matrix_view()?;
 
         let guard = self.matrices.read();
         let m = match guard.as_ref() {
             Some(m) => m,
             None => return Ok(vec![]),
         };
-        let snap = self.csr_cache.snapshot.load();
         let n = m.n_nodes;
         if seeds.is_empty() || n == 0 {
             return Ok(vec![]);
@@ -163,7 +161,7 @@ impl Graph {
             if max_nodes.is_some_and(|max| seeds_added >= max) {
                 break;
             }
-            if let Some(&d) = snap.id_to_dense.get(&start) {
+            if let Some(&d) = m.id_to_dense.get(&start) {
                 level
                     .set_value(d as usize, 0)
                     .map_err(|e| Error::GraphBLAS(e.to_string()))?;
@@ -250,7 +248,7 @@ impl Graph {
             .map_err(|e| Error::GraphBLAS(e.to_string()))?;
         Ok(dense_indices
             .into_iter()
-            .filter_map(|d| snap.dense_to_id.get(d).copied())
+            .filter_map(|d| m.dense_to_id.get(d).copied())
             .collect())
     }
 
@@ -279,6 +277,13 @@ impl Graph {
         };
         use std::collections::HashMap as StdHashMap;
 
+        // The untyped path reaches reachability through the adjacency matrix, so
+        // it needs the incremental matrix view fresh. The typed path below reads
+        // LMDB directly and is always fresh, so it does not pay for a refresh.
+        if rel_type.is_none() {
+            self.ensure_matrix_view()?;
+        }
+
         let guard = self.matrices.read();
         let m = match guard.as_ref() {
             Some(m) => m,
@@ -305,7 +310,6 @@ impl Graph {
             }
         };
 
-        let snap = self.csr_cache.snapshot.load();
         let n = m.n_nodes;
         if src_nodes.is_empty() || n == 0 {
             return Ok(vec![]);
@@ -353,7 +357,7 @@ impl Graph {
         let mut results = Vec::new();
 
         for &src in src_nodes {
-            let src_dense = match snap.id_to_dense.get(&src) {
+            let src_dense = match m.id_to_dense.get(&src) {
                 Some(&d) => d as usize,
                 None => continue,
             };
@@ -365,20 +369,12 @@ impl Graph {
             let edge_lookup: StdHashMap<usize, EdgeId> = if is_incoming {
                 self.in_neighbors(src)?
                     .into_iter()
-                    .filter_map(|ne| {
-                        snap.id_to_dense
-                            .get(&ne.node)
-                            .map(|&d| (d as usize, ne.edge))
-                    })
+                    .filter_map(|ne| m.id_to_dense.get(&ne.node).map(|&d| (d as usize, ne.edge)))
                     .collect()
             } else {
                 self.out_neighbors(src)?
                     .into_iter()
-                    .filter_map(|ne| {
-                        snap.id_to_dense
-                            .get(&ne.node)
-                            .map(|&d| (d as usize, ne.edge))
-                    })
+                    .filter_map(|ne| m.id_to_dense.get(&ne.node).map(|&d| (d as usize, ne.edge)))
                     .collect()
             };
 
@@ -410,7 +406,7 @@ impl Graph {
                 .map_err(|e| Error::GraphBLAS(e.to_string()))?;
 
             for idx in target_indices {
-                if let Some(&dst) = snap.dense_to_id.get(idx) {
+                if let Some(&dst) = m.dense_to_id.get(idx) {
                     // Skip entries whose EdgeId is not in the LMDB-backed lookup; this
                     // can only happen if the edge was deleted between the LMDB query and
                     // the SpMV pass, which is not possible in a single-writer model.
@@ -446,6 +442,8 @@ impl Graph {
             },
         };
 
+        self.ensure_matrix_view()?;
+
         let guard = self.matrices.read();
         let m = match guard.as_ref() {
             Some(m) => m,
@@ -460,7 +458,6 @@ impl Graph {
             }
         };
 
-        let snap = self.csr_cache.snapshot.load();
         let n = m.n_nodes;
         if nodes.is_empty() || n == 0 {
             return Ok(vec![]);
@@ -471,7 +468,7 @@ impl Graph {
             .map_err(|e| Error::GraphBLAS(e.to_string()))?;
         let mut any_v = false;
         for &node in nodes {
-            if let Some(&d) = snap.id_to_dense.get(&node) {
+            if let Some(&d) = m.id_to_dense.get(&node) {
                 v.set_value(d as usize, 1)
                     .map_err(|e| Error::GraphBLAS(e.to_string()))?;
                 any_v = true;
@@ -487,7 +484,7 @@ impl Graph {
             .map_err(|e| Error::GraphBLAS(e.to_string()))?;
         let mut any_u = false;
         for node in label_nodes {
-            if let Some(&d) = snap.id_to_dense.get(&node) {
+            if let Some(&d) = m.id_to_dense.get(&node) {
                 u.set_value(d as usize, 1)
                     .map_err(|e| Error::GraphBLAS(e.to_string()))?;
                 any_u = true;
@@ -521,7 +518,7 @@ impl Graph {
 
         Ok(filtered_indices
             .into_iter()
-            .filter_map(|d| snap.dense_to_id.get(d).copied())
+            .filter_map(|d| m.dense_to_id.get(d).copied())
             .collect())
     }
 }

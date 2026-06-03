@@ -99,7 +99,6 @@ impl Graph {
     pub(in crate::graph) fn connected_components_graphblas(
         &self,
         m: &MatrixSet,
-        snap: &CsrSnapshot,
     ) -> Result<HashMap<NodeId, u64>, Error> {
         use graphblas_sparse_linear_algebra::{
             collections::sparse_vector::{
@@ -246,7 +245,7 @@ impl Graph {
                 .element_value_or_default(idx)
                 .map_err(|e| Error::GraphBLAS(e.to_string()))?
                 - 1) as u64;
-            if let Some(&node_id) = snap.dense_to_id.get(idx) {
+            if let Some(&node_id) = m.dense_to_id.get(idx) {
                 result.insert(node_id, comp);
             }
         }
@@ -583,7 +582,6 @@ impl Graph {
     pub(in crate::graph) fn degree_centrality_graphblas(
         &self,
         m: &MatrixSet,
-        snap: &CsrSnapshot,
         direction: DegreeDirection,
     ) -> Result<HashMap<NodeId, u64>, Error> {
         use graphblas_sparse_linear_algebra::{
@@ -665,7 +663,7 @@ impl Graph {
         };
 
         let mut result = HashMap::with_capacity(n);
-        for (dense, &node_id) in snap.dense_to_id.iter().enumerate() {
+        for (dense, &node_id) in m.dense_to_id.iter().enumerate() {
             let count = match direction {
                 DegreeDirection::Out => out_degrees[dense],
                 DegreeDirection::In => in_degrees[dense],

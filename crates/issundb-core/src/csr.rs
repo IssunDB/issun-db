@@ -316,6 +316,35 @@ impl CsrSnapshot {
     }
 }
 
+/// Mutations accumulated since the matrices were last refreshed, sufficient to
+/// update the GraphBLAS matrices incrementally instead of rebuilding them from a
+/// full LMDB scan. Recorded post-commit on the write path (so an aborted
+/// transaction never pollutes it) and drained by the matrix-refresh path.
+///
+/// `added_edges` and `removed_edges` carry the source and destination node ids;
+/// the combined adjacency matrices are a boolean union, so the matrix-refresh
+/// path resolves parallel edges against LMDB before deciding to clear a bit.
+/// Node deletion reshuffles the sorted dense-index mapping, so it sets
+/// `force_full` to fall back to a full rebuild rather than an incremental patch.
+#[derive(Default)]
+pub struct GraphDelta {
+    pub added_nodes: Vec<NodeId>,
+    pub added_edges: Vec<(NodeId, NodeId)>,
+    pub removed_edges: Vec<(NodeId, NodeId)>,
+    pub force_full: bool,
+}
+
+impl GraphDelta {
+    /// True when there is nothing to apply: no structural change and no forced
+    /// full rebuild pending.
+    pub fn is_empty(&self) -> bool {
+        !self.force_full
+            && self.added_nodes.is_empty()
+            && self.added_edges.is_empty()
+            && self.removed_edges.is_empty()
+    }
+}
+
 /// Thread-safe handle around a `CsrSnapshot` that supports atomic swaps and
 /// background rebuilds triggered by a dirty-write threshold.
 pub struct CsrCache {
@@ -326,6 +355,17 @@ pub struct CsrCache {
     /// install this much is subtracted from `dirty` rather than zeroing it, so
     /// writes that committed while the rebuild ran are not lost.
     claimed: AtomicU64,
+    /// Structural mutations accumulated since the last matrix refresh. Writers
+    /// serialize on the `Graph` write lock, so contention here is only between a
+    /// writer recording a mutation and the refresh path draining it.
+    pending: parking_lot::Mutex<GraphDelta>,
+    /// Monotonic count of committed structural writes. Bumped on every write,
+    /// independent of the `pending` delta (which the incremental matrix-refresh
+    /// path drains). The CSR snapshot records the value it was built at in
+    /// `snapshot_gen`; a mismatch means the snapshot lags committed writes.
+    write_gen: AtomicU64,
+    /// The `write_gen` value the currently installed snapshot reflects.
+    snapshot_gen: AtomicU64,
 }
 
 impl CsrCache {
@@ -335,13 +375,93 @@ impl CsrCache {
             dirty: AtomicU64::new(0),
             rebuilding: AtomicBool::new(false),
             claimed: AtomicU64::new(0),
+            pending: parking_lot::Mutex::new(GraphDelta::default()),
+            write_gen: AtomicU64::new(0),
+            snapshot_gen: AtomicU64::new(0),
         }
+    }
+
+    /// Current committed-write generation. Capture this before building a
+    /// snapshot and pass it to `install`/`install_full`; writes that land during
+    /// the build leave the snapshot conservatively stale.
+    pub fn current_gen(&self) -> u64 {
+        self.write_gen.load(Ordering::Acquire)
+    }
+
+    /// True when the installed snapshot lags committed writes, so a CSR-array or
+    /// hybrid consumer must rebuild before reading it.
+    pub fn snapshot_is_stale(&self) -> bool {
+        self.write_gen.load(Ordering::Acquire) != self.snapshot_gen.load(Ordering::Acquire)
+    }
+
+    /// Record a newly inserted node. Called post-commit under the write lock.
+    pub fn record_added_node(&self, node: NodeId) {
+        self.pending.lock().added_nodes.push(node);
+    }
+
+    /// Record a newly inserted edge by its endpoints. Called post-commit under
+    /// the write lock.
+    pub fn record_added_edge(&self, src: NodeId, dst: NodeId) {
+        self.pending.lock().added_edges.push((src, dst));
+    }
+
+    /// Record a removed edge by its endpoints. Called post-commit under the
+    /// write lock.
+    pub fn record_removed_edge(&self, src: NodeId, dst: NodeId) {
+        self.pending.lock().removed_edges.push((src, dst));
+    }
+
+    /// Mark that the next refresh must do a full rebuild (a node was deleted, so
+    /// the sorted dense-index mapping is reshuffled).
+    pub fn mark_force_full(&self) {
+        self.pending.lock().force_full = true;
+    }
+
+    /// True when a structural mutation is pending. A cheap pre-check so the
+    /// incremental refresh avoids the exclusive matrices lock when idle.
+    pub fn has_pending(&self) -> bool {
+        !self.pending.lock().is_empty()
+    }
+
+    /// True when a node deletion is pending, requiring a full rebuild.
+    pub fn pending_force_full(&self) -> bool {
+        self.pending.lock().force_full
+    }
+
+    /// Merge a batch of mutations recorded during a multi-write transaction.
+    /// Called once, post-commit, so an aborted transaction contributes nothing.
+    pub fn record_batch(&self, batch: GraphDelta) {
+        if batch.is_empty() {
+            return;
+        }
+        let mut pending = self.pending.lock();
+        pending.force_full |= batch.force_full;
+        pending.added_nodes.extend(batch.added_nodes);
+        pending.added_edges.extend(batch.added_edges);
+        pending.removed_edges.extend(batch.removed_edges);
+    }
+
+    /// Take the accumulated delta, leaving the buffer empty.
+    pub fn take_delta(&self) -> GraphDelta {
+        std::mem::take(&mut *self.pending.lock())
+    }
+
+    /// Clear the accumulated delta. A full rebuild calls this *before* reading
+    /// LMDB (after capturing the generation), so writes that commit during the
+    /// build land in the freshly-emptied delta and are re-applied incrementally
+    /// later rather than lost.
+    pub fn clear_delta(&self) {
+        *self.pending.lock() = GraphDelta::default();
     }
 
     /// Increment the dirty counter by `count`. Returns `true` if this call crosses
     /// the rebuild threshold and no rebuild is already running; the caller must
     /// then perform the rebuild.
     pub fn mark_dirty_n(&self, count: u64) -> bool {
+        // Every committed write advances the generation, so a CSR consumer can
+        // tell its snapshot lags even when the matrix-refresh path has drained
+        // the structural delta.
+        self.write_gen.fetch_add(count, Ordering::AcqRel);
         let prev = self.dirty.fetch_add(count, Ordering::Relaxed);
         let total = prev + count;
         if total >= REBUILD_THRESHOLD && !self.rebuilding.swap(true, Ordering::AcqRel) {
@@ -358,8 +478,13 @@ impl CsrCache {
     /// still meets the threshold, in which case the rebuild claim is retained
     /// and the caller must build again; otherwise the claim is released.
     #[must_use]
-    pub fn install(&self, snap: CsrSnapshot) -> bool {
+    pub fn install(&self, snap: CsrSnapshot, built_gen: u64) -> bool {
         self.snapshot.store(Arc::new(snap));
+        // `built_gen` was captured before the build, so the snapshot reflects at
+        // least that generation. Writes that landed during the build keep
+        // `write_gen` ahead, leaving the snapshot correctly stale until the next
+        // pass.
+        self.snapshot_gen.store(built_gen, Ordering::Release);
         let claimed = self.claimed.swap(0, Ordering::AcqRel);
         let prev = self.dirty.fetch_sub(claimed, Ordering::AcqRel);
         let remaining = prev.saturating_sub(claimed);
@@ -375,11 +500,15 @@ impl CsrCache {
     /// Install a snapshot from a full synchronous rebuild that captured all
     /// committed state. Clears the dirty counter and any outstanding rebuild
     /// claim, since the new snapshot already reflects every prior write.
-    pub fn install_full(&self, snap: CsrSnapshot) {
+    pub fn install_full(&self, snap: CsrSnapshot, built_gen: u64) {
         self.snapshot.store(Arc::new(snap));
+        self.snapshot_gen.store(built_gen, Ordering::Release);
         self.dirty.store(0, Ordering::Release);
         self.claimed.store(0, Ordering::Release);
         self.rebuilding.store(false, Ordering::Release);
+        // Note: the delta is cleared by `clear_delta` *before* the build, not
+        // here, so writes that committed during the build are retained in the
+        // freshly-emptied delta for a later incremental apply.
     }
 
     /// Release the rebuild claim without installing a snapshot; used when the
@@ -407,7 +536,7 @@ mod cache_tests {
         assert!(!cache.mark_dirty_n(5));
         // Install subtracts only the claimed THRESHOLD, leaving 5 dirty. That is
         // below the threshold, so no follow-up rebuild is requested.
-        assert!(!cache.install(CsrSnapshot::empty()));
+        assert!(!cache.install(CsrSnapshot::empty(), 0));
         // The residual 5 is retained: THRESHOLD - 5 more writes re-trigger.
         assert!(cache.mark_dirty_n(REBUILD_THRESHOLD - 5));
     }
@@ -420,10 +549,10 @@ mod cache_tests {
         assert!(cache.mark_dirty_n(REBUILD_THRESHOLD));
         assert!(!cache.mark_dirty_n(REBUILD_THRESHOLD));
         assert!(
-            cache.install(CsrSnapshot::empty()),
+            cache.install(CsrSnapshot::empty(), 0),
             "still dirty: rebuild again"
         );
-        assert!(!cache.install(CsrSnapshot::empty()), "now caught up");
+        assert!(!cache.install(CsrSnapshot::empty(), 0), "now caught up");
     }
 
     /// A full synchronous rebuild clears the counter and any outstanding claim.
@@ -431,7 +560,7 @@ mod cache_tests {
     fn install_full_clears_dirty_and_claim() {
         let cache = CsrCache::new(CsrSnapshot::empty());
         assert!(cache.mark_dirty_n(REBUILD_THRESHOLD));
-        cache.install_full(CsrSnapshot::empty());
+        cache.install_full(CsrSnapshot::empty(), 0);
         assert!(
             !cache.mark_dirty_n(1),
             "counter was reset by the full rebuild"

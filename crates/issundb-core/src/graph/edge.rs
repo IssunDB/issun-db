@@ -18,6 +18,7 @@ impl Graph {
         let mut wtxn = self.storage.env.write_txn()?;
         let edge_id = self.add_edge_impl(&mut wtxn, src, dst, etype, props)?;
         wtxn.commit()?;
+        self.csr_cache.record_added_edge(src, dst);
         self.maybe_spawn_rebuild();
         Ok(edge_id)
     }
@@ -158,16 +159,26 @@ impl Graph {
     pub fn delete_edge(&self, id: EdgeId) -> Result<(), Error> {
         let _guard = self._write_lock.lock();
         let mut wtxn = self.storage.env.write_txn()?;
-        self.delete_edge_impl(&mut wtxn, id)?;
+        let endpoints = self.delete_edge_impl(&mut wtxn, id)?;
         wtxn.commit()?;
+        if let Some((src, dst)) = endpoints {
+            self.csr_cache.record_removed_edge(src, dst);
+        }
         self.maybe_spawn_rebuild();
         Ok(())
     }
 
-    pub(crate) fn delete_edge_impl(&self, wtxn: &mut heed::RwTxn, id: EdgeId) -> Result<(), Error> {
+    /// Delete an edge inside an open write transaction. Returns the deleted
+    /// edge's `(src, dst)` endpoints so the caller can record the adjacency
+    /// removal, or `None` if no such edge existed.
+    pub(crate) fn delete_edge_impl(
+        &self,
+        wtxn: &mut heed::RwTxn,
+        id: EdgeId,
+    ) -> Result<Option<(NodeId, NodeId)>, Error> {
         let record: EdgeRecord = match self.get_edge_impl(wtxn, id)? {
             Some(rec) => rec,
-            None => return Ok(()),
+            None => return Ok(None),
         };
 
         // 1. Delete from edge property index
@@ -204,7 +215,7 @@ impl Graph {
             .in_adj
             .delete_one_duplicate(wtxn, &record.dst, in_entry.as_bytes())?;
 
-        Ok(())
+        Ok(Some((record.src, record.dst)))
     }
 
     // ------------------------------------------------------------------

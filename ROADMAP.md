@@ -27,6 +27,11 @@ This document outlines the features implemented in IssunDB and the future goals 
 
 - [x] Thread-safe in-memory CSR snapshot cache
 - [x] Dynamic, zero-overhead GraphBLAS matrix materialization triggered by database writes
+- [x] Incremental (delta) maintenance of the adjacency matrices: a structural delta captured on the write path is applied in place
+  (resize plus per-element set and drop) in time proportional to the change rather than the full graph, so the pure-adjacency consumers
+  (BFS, multi-source BFS, untyped expansion, degree centrality, and connected components) stay fresh without a full O(V+E) rebuild. Consumers
+  that read the CSR snapshot arrays rebuild on demand, gated by a committed-write generation counter that also closes the prior edge-only
+  staleness gap
 - [x] Threshold-gated OpenMP multi-threading (graphs with more than 100k edges use all available CPU cores)
 - [x] SuiteSparse:GraphBLAS algorithm suite executing via sparse matrix-vector multiplication kernels:
     - [x] Single and multi-source BFS

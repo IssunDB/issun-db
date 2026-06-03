@@ -12,7 +12,9 @@ use graphblas_sparse_linear_algebra::context::Context;
 use graphblas_sparse_linear_algebra::operators::binary_operator::{First, Plus};
 use suitesparse_graphblas_sys::{GxB_Global_Option_set, GxB_NTHREADS};
 
-use crate::{csr::CsrSnapshot, error::Error};
+use ahash::AHashMap;
+
+use crate::{csr::CsrSnapshot, error::Error, schema::NodeId};
 
 /// Set of materialized adjacency matrices for all edge types.
 ///
@@ -31,6 +33,12 @@ pub struct MatrixSet {
     /// Weighted adjacency: `W[i][j] = weight` for each edge i→j.
     pub weight_matrix: SparseMatrix<f64>,
     pub n_nodes: usize,
+    /// Dense-index → node id, mirroring the CSR snapshot the matrices were built
+    /// from. Owned here so the matrix view is self-contained and can be extended
+    /// incrementally (see `apply_delta`) without rebuilding the CSR arrays.
+    pub dense_to_id: Vec<NodeId>,
+    /// Node id → dense index, the inverse of `dense_to_id`.
+    pub id_to_dense: AHashMap<NodeId, u32>,
 }
 
 impl MatrixSet {
@@ -155,6 +163,84 @@ impl MatrixSet {
             page_rank_matrix,
             weight_matrix,
             n_nodes,
+            dense_to_id: csr.dense_to_id.clone(),
+            id_to_dense: csr.id_to_dense.clone(),
         })
+    }
+
+    /// Apply a structural delta to the cached matrices in place, instead of
+    /// rebuilding them from a full LMDB scan.
+    ///
+    /// `added_nodes` extend the dense-index mapping: node ids are monotonic, so
+    /// they append to the sorted order without shifting existing indices, and the
+    /// matrices are resized to fit. `set_edges` set the adjacency bit for each
+    /// `(src, dst)`; `clear_edges` drop it. Because the combined adjacency is a
+    /// boolean union, the caller resolves parallel edges against LMDB so a bit is
+    /// cleared only when no edge between the pair remains. Indexing is by node id;
+    /// endpoints absent from the mapping are skipped.
+    ///
+    /// Spike scope: only `adjacency` and `adjacency_t` carry edge updates;
+    /// `weight_matrix` and `page_rank_matrix` are resized for dimensional
+    /// consistency but their incremental edge maintenance is deferred.
+    pub fn apply_delta(
+        &mut self,
+        added_nodes: &[NodeId],
+        set_edges: &[(NodeId, NodeId)],
+        clear_edges: &[(NodeId, NodeId)],
+    ) -> Result<(), Error> {
+        use graphblas_sparse_linear_algebra::collections::sparse_matrix::{
+            Size,
+            operations::{DropSparseMatrixElement, ResizeSparseMatrix, SetSparseMatrixElement},
+        };
+
+        let gb = |e: graphblas_sparse_linear_algebra::error::SparseLinearAlgebraError| {
+            Error::GraphBLAS(e.to_string())
+        };
+
+        // Extend the dense-index mapping with the new nodes. Monotonic ids append
+        // in sorted order, so existing dense indices stay valid.
+        for &node in added_nodes {
+            if self.id_to_dense.contains_key(&node) {
+                continue;
+            }
+            let idx = self.dense_to_id.len() as u32;
+            self.dense_to_id.push(node);
+            self.id_to_dense.insert(node, idx);
+        }
+        let new_n = self.dense_to_id.len();
+        if new_n > self.n_nodes {
+            let size = Size::from((new_n, new_n));
+            self.adjacency.resize(size).map_err(gb)?;
+            self.adjacency_t.resize(size).map_err(gb)?;
+            self.page_rank_matrix.resize(size).map_err(gb)?;
+            self.weight_matrix.resize(size).map_err(gb)?;
+            self.n_nodes = new_n;
+        }
+
+        for &(src, dst) in set_edges {
+            let (Some(&s), Some(&d)) = (self.id_to_dense.get(&src), self.id_to_dense.get(&dst))
+            else {
+                continue;
+            };
+            self.adjacency
+                .set_value(s as usize, d as usize, 1)
+                .map_err(gb)?;
+            self.adjacency_t
+                .set_value(d as usize, s as usize, 1)
+                .map_err(gb)?;
+        }
+        for &(src, dst) in clear_edges {
+            let (Some(&s), Some(&d)) = (self.id_to_dense.get(&src), self.id_to_dense.get(&dst))
+            else {
+                continue;
+            };
+            self.adjacency
+                .drop_element(s as usize, d as usize)
+                .map_err(gb)?;
+            self.adjacency_t
+                .drop_element(d as usize, s as usize)
+                .map_err(gb)?;
+        }
+        Ok(())
     }
 }

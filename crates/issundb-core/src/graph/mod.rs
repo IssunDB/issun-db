@@ -297,6 +297,9 @@ pub struct WriteTxn<'a> {
     pub(super) graph: &'a Graph,
     pub(super) wtxn: heed::RwTxn<'a>,
     pub(super) mutations_count: usize,
+    /// Structural mutations staged during this transaction, flushed to the
+    /// `CsrCache` only on commit so an aborted transaction records nothing.
+    pub(super) delta: crate::csr::GraphDelta,
 }
 
 impl Graph {
@@ -388,12 +391,16 @@ impl Graph {
             graph: self,
             wtxn,
             mutations_count: 0,
+            delta: crate::csr::GraphDelta::default(),
         };
         match f(&mut txn) {
             Ok(val) => {
+                let mutations_count = txn.mutations_count;
+                let delta = std::mem::take(&mut txn.delta);
                 txn.wtxn.commit()?;
-                if txn.mutations_count > 0 {
-                    self.maybe_spawn_rebuild_n(txn.mutations_count);
+                self.csr_cache.record_batch(delta);
+                if mutations_count > 0 {
+                    self.maybe_spawn_rebuild_n(mutations_count);
                 }
                 Ok(val)
             }
@@ -427,10 +434,17 @@ impl Graph {
     pub fn rebuild_csr(&self) -> Result<(), Error> {
         // Derive the CSR file path from the LMDB env path.
         let csr_file = self.storage.env.path().join("csr_snapshot.bin");
+        // Capture the generation before reading LMDB so writes that land during
+        // the build leave the snapshot conservatively stale.
+        let built_gen = self.csr_cache.current_gen();
+        // Clear the delta before reading LMDB: writes that commit during the
+        // build land in the emptied delta and are re-applied incrementally later
+        // (idempotently) rather than lost.
+        self.csr_cache.clear_delta();
         let snap = CsrSnapshot::build_mapped(&self.storage, &csr_file)?;
         let m = MatrixSet::materialize(&snap)?;
         *self.matrices.write() = Some(m);
-        self.csr_cache.install_full(snap);
+        self.csr_cache.install_full(snap, built_gen);
         Ok(())
     }
 

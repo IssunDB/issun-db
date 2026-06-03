@@ -254,6 +254,7 @@ impl WriteTxn<'_> {
     pub fn add_node(&mut self, label: &str, props: &impl Serialize) -> Result<NodeId, Error> {
         let node_id = self.graph.add_node_impl(&mut self.wtxn, &[label], props)?;
         self.mutations_count += 1;
+        self.delta.added_nodes.push(node_id);
         Ok(node_id)
     }
 
@@ -265,6 +266,7 @@ impl WriteTxn<'_> {
     ) -> Result<NodeId, Error> {
         let node_id = self.graph.add_node_impl(&mut self.wtxn, labels, props)?;
         self.mutations_count += 1;
+        self.delta.added_nodes.push(node_id);
         Ok(node_id)
     }
 
@@ -291,11 +293,16 @@ impl WriteTxn<'_> {
     pub fn delete_node(&mut self, id: NodeId) -> Result<(), Error> {
         self.graph.delete_node_impl(&mut self.wtxn, id)?;
         self.mutations_count += 1;
+        // A node deletion reshuffles the sorted dense-index mapping, so the next
+        // refresh must rebuild fully rather than patch incrementally.
+        self.delta.force_full = true;
         Ok(())
     }
 
     pub fn delete_edge(&mut self, id: EdgeId) -> Result<(), Error> {
-        self.graph.delete_edge_impl(&mut self.wtxn, id)?;
+        if let Some((src, dst)) = self.graph.delete_edge_impl(&mut self.wtxn, id)? {
+            self.delta.removed_edges.push((src, dst));
+        }
         self.mutations_count += 1;
         Ok(())
     }
@@ -311,6 +318,7 @@ impl WriteTxn<'_> {
             .graph
             .add_edge_impl(&mut self.wtxn, src, dst, etype, props)?;
         self.mutations_count += 1;
+        self.delta.added_edges.push((src, dst));
         Ok(edge_id)
     }
 
