@@ -10,16 +10,19 @@
 //!   - `two_hop`           multi-hop expansion
 //!   - `var_length`        variable-length path expansion
 //!   - `limit_behind_expand` small LIMIT over a single-hop expand (streaming short-circuit)
+//!   - `limit_behind_join`  small LIMIT over a HashJoin (probe-side streaming short-circuit)
+//!   - `limit_behind_multiway` small LIMIT over a MultiwayJoin closing hop (streaming short-circuit)
 //!   - `aggregation`        grouped count whose streamable child is folded a batch at a time
+//!   - `order_by_limit`     ORDER BY ... LIMIT (bounded top-N heap)
+//!   - `distinct_limit`     small LIMIT over a streaming DISTINCT (short-circuit)
 //!
-//! `limit_behind_join` is a Phase-3 gate baseline: a query shape whose plan is
-//! not yet streamable, so it still fully materializes. It quantifies the cost
-//! the deferred streaming-through-join work would target, so a future change can
-//! be measured against it rather than asserted:
+//! `limit_behind_join` streams the probe side of the hash join, so a small
+//! `LIMIT` stops the probe scan/expansion early; the build (hash) side is still
+//! materialized, which is the floor on the win. `limit_behind_multiway` streams
+//! the input of a closing-hop join. It runs over a separate triangle graph
+//! because the main graph's forward-only edges form no short cycles.
 //!
-//!   - `limit_behind_join` small LIMIT over a HashJoin (no short-circuit today)
-//!
-//! The graph is deterministic (no RNG), so run-to-run comparisons are stable.
+//! The graphs are deterministic (no RNG), so run-to-run comparisons are stable.
 
 use std::collections::HashMap;
 
@@ -52,6 +55,29 @@ fn build_graph() -> (TempDir, Graph) {
             g.add_edge(ids[i], ids[(i + off) % NUM_NODES], "KNOWS", &json!({}))
                 .unwrap();
         }
+    }
+    g.rebuild_csr().unwrap();
+    (dir, g)
+}
+
+/// Build a graph of disjoint directed triangles `(x)->(y)->(z)->(x)`, so a
+/// closing-hop pattern (`MultiwayJoin`) has matches. `num_triangles * 3` nodes.
+fn build_triangle_graph(num_triangles: usize) -> (TempDir, Graph) {
+    let dir = TempDir::new().unwrap();
+    let g = Graph::open(dir.path(), 1).unwrap();
+    for t in 0..num_triangles {
+        let a = g
+            .add_node("N", &json!({ "name": format!("a{t}") }))
+            .unwrap();
+        let b = g
+            .add_node("N", &json!({ "name": format!("b{t}") }))
+            .unwrap();
+        let c = g
+            .add_node("N", &json!({ "name": format!("c{t}") }))
+            .unwrap();
+        g.add_edge(a, b, "R", &json!({})).unwrap();
+        g.add_edge(b, c, "R", &json!({})).unwrap();
+        g.add_edge(c, a, "R", &json!({})).unwrap();
     }
     g.rebuild_csr().unwrap();
     (dir, g)
@@ -91,10 +117,10 @@ fn bench_execution(c: &mut Criterion) {
         "exec_limit_behind_expand",
         "MATCH (a:Person)-[:KNOWS]->(b) RETURN b LIMIT 5",
     );
-    // Phase-3 gate: a small LIMIT over a HashJoin (two patterns sharing `b`).
-    // The plan is `Limit -> Project -> HashJoin`, which `is_streamable` rejects,
-    // so both join inputs materialize in full before the limit applies. Streaming
-    // through the join would let this stop early; this records today's cost.
+    // A small LIMIT over a HashJoin (two patterns sharing `b`). The plan is
+    // `Limit -> Project -> HashJoin`; the probe side streams, so the limit stops
+    // the probe scan/expansion after a few rows. The build (hash) side is still
+    // materialized, which is the floor on the saving.
     run(
         "exec_limit_behind_join",
         "MATCH (a:Person)-[:KNOWS]->(b:Person) \
@@ -109,6 +135,36 @@ fn bench_execution(c: &mut Criterion) {
         "exec_aggregation",
         "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN b.name, count(*) AS c",
     );
+    // ORDER BY ... LIMIT over the full scan: the plan is `Limit -> Sort`, so the
+    // sort keeps only `skip + count` rows in a bounded heap instead of sorting
+    // and materializing all NUM_NODES. Sort is blocking, so the scan still reads
+    // every node; the saving is the sort cost and the full sorted output.
+    run(
+        "exec_order_by_limit",
+        "MATCH (n:Person) RETURN n.age AS age ORDER BY n.age ASC LIMIT 5",
+    );
+    // A small LIMIT over a streaming DISTINCT: the plan is `Limit -> Project ->
+    // Distinct -> ...`, so the limit stops the scan/expansion once enough distinct
+    // rows are emitted instead of deduplicating the whole expansion.
+    run(
+        "exec_distinct_limit",
+        "MATCH (a:Person)-[:KNOWS]->(b:Person) WITH DISTINCT b RETURN b LIMIT 5",
+    );
+
+    // A small LIMIT over a MultiwayJoin closing hop, on the triangle graph (the
+    // main graph's forward-only edges form no short cycles). The plan is
+    // `Limit -> Project -> MultiwayJoin`; the input streams, so the limit stops
+    // the scan/expansion after a few matches.
+    let (_tdir, tg) = build_triangle_graph(666);
+    let triangle_query = "MATCH (a:N)-[:R]->(b)-[:R]->(c)-[:R]->(a) RETURN a LIMIT 5";
+    execute(&tg, triangle_query, &params).unwrap();
+    c.bench_function("exec_limit_behind_multiway", |b| {
+        b.iter(|| {
+            criterion::black_box(
+                execute(&tg, criterion::black_box(triangle_query), &params).unwrap(),
+            )
+        });
+    });
 }
 
 criterion_group!(benches, bench_execution);

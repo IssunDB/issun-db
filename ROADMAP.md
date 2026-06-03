@@ -84,6 +84,10 @@ This document outlines the features implemented in IssunDB and the future goals 
   the label
 - [x] Fused linear expand chains: a contiguous run of single-hop directed expands is executed as one operation that bulk-expands each hop level and
   clones the base path once per output row, generalizing the former two-hop fast path to any length
+- [x] Single pull-based (Volcano) execution path: every physical operator is a streaming iterator drained by one sink, so a `LIMIT` short-circuits
+  through scans, expands, joins, `DISTINCT`, `UNWIND`, and `OPTIONAL MATCH`. Blocking operators (`Sort`, grouped or ungrouped `Aggregate`, and writes)
+  consume their input before emitting, and a `Sort` directly under a `LIMIT` selects a bounded top-N. The fused expand-chain and factorized
+  filter-over-expand fast paths run inside the stream, so a bounded multi-hop query expands only what the limit needs
 - [x] Static filter elimination: provably-true predicates (`WHERE true`, equality or inequality of identical-form literals) are dropped before
   pushdown so they are never evaluated per row
 - [ ] Full openCypher TCK conformance: as of 2026-06-01, 3,412 of 3,490 executed scenarios pass (97.77%; a further 428 scenarios are

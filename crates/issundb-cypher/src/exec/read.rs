@@ -735,44 +735,28 @@ fn filter_expr_to_where_clause(expression: &FilterExpr) -> WhereClause {
     }
 }
 
-/// Parameters extracted from a single-hop `Expand` operator for the factorized filter executor.
-struct ExpandParams<'a> {
-    input: &'a PhysicalOperator,
-    src_var: &'a str,
-    rel_var: &'a str,
-    dst_var: &'a str,
-    rel_type: Option<&'a str>,
-    is_incoming: bool,
-}
-
-/// Optimized execution for `Filter { input: Expand(single-hop, directed), expression }`.
-///
-/// Evaluates the filter predicate once per source path when the predicate only
-/// references variables that are bound BEFORE the expansion (the shared prefix).
-/// Sources that fail are skipped with zero PathMap clones, avoiding the
-/// O(avg_degree) clone cost that the default path incurs per rejected source.
-///
-/// When the predicate references `rel_var` or `dst_var` (the new expansion
-/// bindings), falls back to per-row evaluation.
-fn execute_filter_over_expand(
+/// Bulk-expand a batch of pre-expansion rows and apply a `Filter` predicate that
+/// sits directly over a single-hop directed `Expand`. The predicate is evaluated
+/// once per source row when it touches only pre-expansion variables (factorized),
+/// or per `(src, dst)` row otherwise. Driven by the `RowStream::FilterOverExpand`
+/// node; each source row is processed independently and in order, so streaming a
+/// batch at a time yields the same rows in the same order as one whole-input call.
+#[allow(clippy::too_many_arguments)]
+fn filter_over_expand_batch(
     graph: &Graph,
-    expand: ExpandParams<'_>,
+    child_paths: Vec<PathMap>,
+    src_var: &str,
+    rel_var: &str,
+    dst_var: &str,
+    rel_type: Option<&str>,
+    is_incoming: bool,
     expression: &FilterExpr,
     params: &HashMap<String, serde_json::Value>,
 ) -> Result<Vec<PathMap>, String> {
-    let ExpandParams {
-        input: expand_input,
-        src_var,
-        rel_var,
-        dst_var,
-        rel_type,
-        is_incoming,
-    } = expand;
     // Determine whether the filter references the new hop-local bindings.
     let refs = filter_refs_in_expr(expression);
     let filter_touches_expansion = refs.contains(rel_var) || refs.contains(dst_var);
 
-    let child_paths = execute_physical(graph, expand_input, params)?;
     if child_paths.is_empty() {
         return Ok(vec![]);
     }
@@ -1000,8 +984,8 @@ fn extend_or_create_path(
 
 /// Execute the body of an `Expand` operator given pre-computed child paths.
 ///
-/// Extracted from `execute_physical` so it can be reused by `execute_with_sip`
-/// without duplicating the BFS and single-hop expansion logic.
+/// Shared by the `RowStream::Expand` node (per batch) without duplicating the
+/// BFS and single-hop expansion logic.
 #[allow(clippy::too_many_arguments)]
 fn expand_from_paths(
     graph: &Graph,
@@ -1316,114 +1300,271 @@ fn filter_paths_by_node(
     Ok(out)
 }
 
-/// Execute a physical operator tree with a Sideways Information Passing (SIP) filter.
+/// Decide which side of a `HashJoin` is the probe (required) side, which is the
+/// build (hash) side, and the outer-join null-fill vars (`Some` for a left-outer
+/// join). Used by `build_stream`'s `HashJoin` arm to assign the probe and build
+/// streams consistently.
 ///
-/// `sip` maps variable names to the set of `NodeId`s that the build side of a
-/// `HashJoin` produced for that variable.  Any `LabelScan` whose variable appears
-/// in `sip` is restricted to the intersection of the label's nodes and the allowed
-/// set, avoiding a full-table scan when the build side is selective.
-///
-/// The filter threads down through `Expand` and `Filter` operators (the two
-/// structural wrappers that appear between a `HashJoin` and its inner `LabelScan`)
-/// and delegates all other operators to `execute_physical` unchanged.
-fn execute_with_sip(
-    graph: &Graph,
-    op: &PhysicalOperator,
-    params: &HashMap<String, serde_json::Value>,
-    sip: &HashMap<String, HashSet<NodeId>>,
-) -> Result<Vec<PathMap>, String> {
-    match op {
-        PhysicalOperator::LabelScan { variable, label } => {
-            if let Some(allowed) = sip.get(variable) {
-                // Intersect the label scan with the SIP-allowed node IDs.
-                let candidates: Vec<NodeId> = if let Some(lbl) = label {
-                    let all = graph.nodes_by_label(lbl).map_err(|e| e.to_string())?;
-                    all.into_iter().filter(|id| allowed.contains(id)).collect()
-                } else {
-                    let mut ids: Vec<NodeId> = allowed.iter().copied().collect();
-                    ids.sort_unstable();
-                    ids
-                };
-                Ok(candidates
-                    .into_iter()
-                    .map(|id| {
-                        let mut path = PathMap::new();
-                        path.insert(variable.clone(), GraphBinding::Node(id));
-                        path
-                    })
-                    .collect())
-            } else {
-                execute_physical(graph, op, params)
-            }
-        }
-        PhysicalOperator::Expand {
-            input,
-            src_var,
-            rel_var,
-            dst_var,
-            rel_type,
-            is_incoming,
-            is_undirected,
-            min_hops,
-            max_hops,
-        } => {
-            // Thread SIP into the input so the inner LabelScan is restricted.
-            let child_paths = execute_with_sip(graph, input, params, sip)?;
-            expand_from_paths(
-                graph,
-                child_paths,
-                src_var,
-                rel_var,
-                dst_var,
-                rel_type.as_deref(),
-                *is_incoming,
-                *is_undirected,
-                *min_hops,
-                *max_hops,
-            )
-        }
-        PhysicalOperator::Filter { input, expression } => {
-            // Thread SIP into the input, then apply the predicate to the
-            // reduced result set.  Skip the factorized fast-path used by the
-            // normal executor — SIP has already shrunk the input, so the
-            // per-row cost is low.
-            let child_paths = execute_with_sip(graph, input, params, sip)?;
-            let mut next_paths = Vec::new();
-            if let FilterExpr::HasLabel(variable, label) = expression {
-                let mut active_nodes: Vec<NodeId> = child_paths
-                    .iter()
-                    .filter_map(|p| match p.get(variable) {
-                        Some(GraphBinding::Node(n)) => Some(*n),
-                        _ => None,
-                    })
-                    .collect();
-                active_nodes.sort_unstable();
-                active_nodes.dedup();
-                let filtered_nodes = graph
-                    .label_filter_and_graphblas(&active_nodes, label)
-                    .map_err(|e| e.to_string())?;
-                let filtered_set: HashSet<NodeId> = filtered_nodes.into_iter().collect();
-                for path in child_paths {
-                    if let Some(GraphBinding::Node(node)) = path.get(variable) {
-                        if filtered_set.contains(node) {
-                            next_paths.push(path);
-                        }
-                    }
-                }
-            } else {
-                let where_clause = filter_expr_to_where_clause(expression);
-                for path in child_paths {
-                    if evaluate_where(graph, &path, &where_clause, params)? {
-                        next_paths.push(path);
-                    }
-                }
-            }
-            Ok(next_paths)
-        }
-        // For all other operators (NodeIndexScan, MultiwayJoin, etc.) SIP cannot be
-        // applied structurally; delegate to the standard executor unchanged.
-        _ => execute_physical(graph, op, params),
+/// Whichever side carries the `OptionalMatch` is the build/optional side; the
+/// other is the probe/required side, so every required row is emitted even when
+/// the optional pattern finds no match (left-outer semantics). For an inner join
+/// the probe is `left` (the optimizer standardizes the heavier branch onto the
+/// left) and the build is `right`, so the smaller side becomes the hash table
+/// and the larger side is the streamed probe.
+fn join_roles<'a>(
+    left: &'a PhysicalOperator,
+    right: &'a PhysicalOperator,
+) -> (
+    &'a PhysicalOperator,
+    &'a PhysicalOperator,
+    Option<&'a [String]>,
+) {
+    if let PhysicalOperator::OptionalMatch { input, null_vars } = left {
+        (right, input.as_ref(), Some(null_vars))
+    } else if let PhysicalOperator::OptionalMatch { input, null_vars } = right {
+        (left, input.as_ref(), Some(null_vars))
+    } else {
+        (left, right, None)
     }
+}
+
+/// Variables bound by both join sides: the equi-join keys. Computed from the
+/// plans (not the `OptionalMatch` wrapper, whose `null_vars` would inflate the
+/// set), so the streaming and materializing paths derive identical keys.
+fn join_common_vars(probe_op: &PhysicalOperator, build_op: &PhysicalOperator) -> Vec<String> {
+    let probe_bound = Optimizer::bound_vars(probe_op);
+    let build_bound = Optimizer::bound_vars(build_op);
+    probe_bound.intersection(&build_bound).cloned().collect()
+}
+
+/// Build the SIP node-id sets (one per common var that is bound to nodes on the
+/// build side) used to restrict the probe-side scans. Only meaningful for inner
+/// joins; an empty result means SIP cannot prune.
+fn build_sip(common_vars: &[String], build_rows: &[PathMap]) -> HashMap<String, HashSet<NodeId>> {
+    common_vars
+        .iter()
+        .filter_map(|var| {
+            let ids: HashSet<NodeId> = build_rows
+                .iter()
+                .filter_map(|p| match p.get(var) {
+                    Some(GraphBinding::Node(n)) => Some(*n),
+                    _ => None,
+                })
+                .collect();
+            if ids.is_empty() {
+                None
+            } else {
+                Some((var.clone(), ids))
+            }
+        })
+        .collect()
+}
+
+/// Build the equi-join hash table from the fully materialized build side,
+/// keyed by the common-variable bindings. Rows missing a common var are dropped
+/// (they cannot match), matching the materializing executor.
+fn build_hash_table(
+    common_vars: &[String],
+    build_rows: Vec<PathMap>,
+) -> HashMap<Vec<GraphBinding>, Vec<PathMap>> {
+    let mut hash_table: HashMap<Vec<GraphBinding>, Vec<PathMap>> = HashMap::new();
+    for op in build_rows {
+        let key: Option<Vec<GraphBinding>> =
+            common_vars.iter().map(|v| op.get(v).cloned()).collect();
+        if let Some(key) = key {
+            hash_table.entry(key).or_default().push(op);
+        }
+    }
+    hash_table
+}
+
+/// Fill any `null_vars` not already present in `path` with `null`. Used for the
+/// left-outer case when a required row has no optional match.
+fn null_fill(path: &mut PathMap, null_vars: &[String]) {
+    for v in null_vars {
+        if !path.contains_key(v.as_str()) {
+            path.insert(v.clone(), GraphBinding::Scalar(serde_json::Value::Null));
+        }
+    }
+}
+
+/// The fully prepared build side of a `HashJoin`, ready to probe row by row.
+/// `Cartesian` is used when the two sides share no variables (cross product);
+/// `Equi` is the hashed equi-join.
+enum JoinProbeData {
+    Equi {
+        common_vars: Vec<String>,
+        hash_table: HashMap<Vec<GraphBinding>, Vec<PathMap>>,
+    },
+    Cartesian {
+        build_rows: Vec<PathMap>,
+    },
+}
+
+/// Join one batch of probe rows against an already-built `JoinProbeData`,
+/// applying left-outer null-fill when `null_vars` is `Some`. This is the inner
+/// loop of the `HashJoin` executor arm, factored out so the materializing path
+/// and the streaming `RowStream::HashJoin` share one implementation; processing
+/// rows in batches versus all at once changes neither the output rows nor their
+/// order, because the build side is fully materialized before any probe row is
+/// joined.
+fn hash_join_rows(
+    probe_batch: Vec<PathMap>,
+    data: &JoinProbeData,
+    null_vars: Option<&[String]>,
+) -> Vec<PathMap> {
+    let mut out = Vec::new();
+    for rp in probe_batch {
+        match data {
+            JoinProbeData::Equi {
+                common_vars,
+                hash_table,
+            } => {
+                let key: Option<Vec<GraphBinding>> =
+                    common_vars.iter().map(|v| rp.get(v).cloned()).collect();
+                // A row missing a common var cannot join; drop it.
+                if let Some(key) = key {
+                    if let Some(matches) = hash_table.get(&key) {
+                        for op in matches {
+                            let mut merged = rp.clone();
+                            merged.extend(op.iter().map(|(k, v)| (k.clone(), v.clone())));
+                            out.push(merged);
+                        }
+                    } else if let Some(null_vars) = null_vars {
+                        let mut merged = rp;
+                        null_fill(&mut merged, null_vars);
+                        out.push(merged);
+                    }
+                }
+            }
+            JoinProbeData::Cartesian { build_rows } => {
+                if build_rows.is_empty() {
+                    if let Some(null_vars) = null_vars {
+                        let mut merged = rp;
+                        null_fill(&mut merged, null_vars);
+                        out.push(merged);
+                    }
+                } else {
+                    for op in build_rows {
+                        let mut merged = rp.clone();
+                        merged.extend(op.iter().map(|(k, v)| (k.clone(), v.clone())));
+                        out.push(merged);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Close a `MultiwayJoin` over one batch of child rows: bulk-expand the distinct
+/// `closing_src_var` nodes once, index the transitions, then emit a row per
+/// matching `(closing_src, closing_dst)` pair. Factored out of the executor arm
+/// so the materializing path and the streaming `RowStream::MultiwayJoin` share
+/// one implementation. When streaming, the bulk expansion runs once per batch
+/// rather than once over all rows; for typed relationships that is a cheap
+/// per-source adjacency loop, and a `LIMIT` bounds the number of batches.
+#[allow(clippy::too_many_arguments)]
+fn multiway_join_rows(
+    graph: &Graph,
+    child_paths: Vec<PathMap>,
+    closing_src_var: &str,
+    closing_dst_var: &str,
+    closing_rel_type: Option<&str>,
+    closing_rel_var: &str,
+    closing_is_incoming: bool,
+    closing_is_undirected: bool,
+) -> Result<Vec<PathMap>, String> {
+    if child_paths.is_empty() {
+        return Ok(vec![]);
+    }
+
+    // Collect unique closing-src node IDs for a single bulk expansion. Paying
+    // O(sum of degrees of unique sources) once is far cheaper than iterating all
+    // neighbors for every input row.
+    let mut src_nodes: Vec<NodeId> = child_paths
+        .iter()
+        .filter_map(|p| match p.get(closing_src_var) {
+            Some(GraphBinding::Node(n)) => Some(*n),
+            _ => None,
+        })
+        .collect();
+    src_nodes.sort_unstable();
+    src_nodes.dedup();
+
+    let mut next_paths = Vec::new();
+
+    if closing_is_undirected {
+        // Undirected closing hop: the edge may run either way between the two
+        // bound nodes, so check both adjacency directions. Index every distinct
+        // edge (deduplicated by `(src, eid, dst)` to match the undirected Expand
+        // path: one row per edge, self-loops counted once) keyed by
+        // `closing_src → (closing_dst → [EdgeId])`.
+        let mut join_map: HashMap<NodeId, HashMap<NodeId, Vec<EdgeId>>> = HashMap::new();
+        let mut seen: HashSet<(NodeId, EdgeId, NodeId)> = HashSet::new();
+        for dir in [false, true] {
+            let transitions = expand_multi_type(graph, &src_nodes, closing_rel_type, dir)?;
+            for (src, eid, dst) in transitions {
+                if seen.insert((src, eid, dst)) {
+                    join_map
+                        .entry(src)
+                        .or_default()
+                        .entry(dst)
+                        .or_default()
+                        .push(eid);
+                }
+            }
+        }
+
+        for path in child_paths {
+            let closing_src = match path.get(closing_src_var) {
+                Some(GraphBinding::Node(n)) => *n,
+                _ => continue,
+            };
+            let closing_dst = match path.get(closing_dst_var) {
+                Some(GraphBinding::Node(n)) => *n,
+                _ => continue,
+            };
+
+            if let Some(eids) = join_map.get(&closing_src).and_then(|m| m.get(&closing_dst)) {
+                for &eid in eids {
+                    let mut new_path = path.clone();
+                    new_path.insert(closing_rel_var.to_string(), GraphBinding::Edge(eid));
+                    next_paths.push(new_path);
+                }
+            }
+        }
+    } else {
+        let transitions =
+            expand_multi_type(graph, &src_nodes, closing_rel_type, closing_is_incoming)?;
+
+        // Index the transitions as (closing_src, closing_dst) → EdgeId for O(1) lookup.
+        let mut join_map: HashMap<NodeId, HashMap<NodeId, EdgeId>> = HashMap::new();
+        for (src, eid, dst) in transitions {
+            join_map.entry(src).or_default().insert(dst, eid);
+        }
+
+        for path in child_paths {
+            let closing_src = match path.get(closing_src_var) {
+                Some(GraphBinding::Node(n)) => *n,
+                _ => continue,
+            };
+            let closing_dst = match path.get(closing_dst_var) {
+                Some(GraphBinding::Node(n)) => *n,
+                _ => continue,
+            };
+
+            if let Some(dst_map) = join_map.get(&closing_src) {
+                if let Some(&eid) = dst_map.get(&closing_dst) {
+                    let mut new_path = path.clone();
+                    new_path.insert(closing_rel_var.to_string(), GraphBinding::Edge(eid));
+                    next_paths.push(new_path);
+                }
+            }
+        }
+    }
+
+    Ok(next_paths)
 }
 
 /// One hop of a fused linear expand chain. `src_var` is the node the hop starts
@@ -1720,75 +1861,26 @@ pub(super) fn apply_filter(
     Ok(next_paths)
 }
 
-/// Execute `op` producing at most `cap` rows, but only when the plan shape lets
-/// the leaf scan be bounded safely: a `LabelScan`, optionally under pass-through
-/// `Project`s. Returns `None` for any other shape (a `Sort`, `Filter`,
-/// `Distinct`, `Expand`, and so on between the `Limit` and the scan), signaling
-/// the caller to fall back to normal, unbounded execution. Because `LIMIT`
-/// without `ORDER BY` is order-independent in openCypher, taking the first `cap`
-/// matching nodes is a valid result.
-fn execute_bounded(
-    graph: &Graph,
-    op: &PhysicalOperator,
-    params: &HashMap<String, serde_json::Value>,
-    cap: usize,
-) -> Result<Option<Vec<PathMap>>, String> {
-    match op {
-        PhysicalOperator::LabelScan { variable, label } => {
-            let candidates = if let Some(lbl) = label {
-                graph.nodes_by_label(lbl).map_err(|e| e.to_string())?
-            } else {
-                graph.all_nodes().map_err(|e| e.to_string())?
-            };
-            let rows = candidates
-                .into_iter()
-                .take(cap)
-                .map(|cand| {
-                    let mut path = PathMap::new();
-                    path.insert(variable.clone(), GraphBinding::Node(cand));
-                    path
-                })
-                .collect();
-            Ok(Some(rows))
-        }
-        PhysicalOperator::Project {
-            input,
-            items,
-            is_barrier,
-        } => match execute_bounded(graph, input, params, cap)? {
-            // Project is a 1:1, order-preserving row transform, so capping its
-            // input also caps its output.
-            Some(child) => Ok(Some(project_rows(
-                graph,
-                child,
-                items,
-                *is_barrier,
-                params,
-            )?)),
-            None => Ok(None),
-        },
-        _ => Ok(None),
-    }
-}
-
 /// Number of rows a streaming operator yields per `next_batch` pull. Large
 /// enough to amortize per-pull overhead, small enough that a `LIMIT` stops the
 /// upstream scan and expansion after only a few batches.
 const STREAM_BATCH: usize = 256;
 
-/// A pull-based, batch-at-a-time row producer used to short-circuit `LIMIT`
-/// through `Expand`. Each `next_batch` returns up to `STREAM_BATCH` rows; an
-/// empty return signals exhaustion. The variants mirror the streamable subset
-/// of `PhysicalOperator` (see `is_streamable`); the bits each node needs are
-/// cloned from the plan at build time so the stream does not borrow the
+/// A pull-based, batch-at-a-time row producer. This is the engine's only
+/// execution path: there is one `RowStream` variant per `PhysicalOperator`, and
+/// `execute_physical` builds a stream and drains it. Each `next_batch` returns up
+/// to `STREAM_BATCH` rows; an empty return signals exhaustion. The bits each node
+/// needs are cloned from the plan at build time so the stream does not borrow the
 /// operator tree.
 ///
-/// Every node delegates its row transform to the same helper the materializing
-/// executor uses (`expand_from_paths`, `apply_filter`, `project_rows`), so a
-/// streamed chain yields exactly the rows the materialized chain would, in the
-/// same nested-loop order. Because the engine runs only under a `LIMIT` (which
-/// is order-independent without `ORDER BY`), bypassing the fused-chain and
-/// factorized-filter fast paths costs nothing the limit does not already cap.
+/// Pipelined nodes (`Project`, `Filter`, `Expand`, `Unwind`, the streaming join
+/// probe, and so on) delegate their row transform to a shared helper
+/// (`expand_from_paths`, `apply_filter`, `project_rows`, `hash_join_rows`, ...),
+/// so the result rows and their order are exactly what a single whole-input pass
+/// would produce. Blocking nodes (`Sort`, `Aggregate`, `WritePart`, and a hash
+/// join's build side) consume their full input before emitting; a `Limit` then
+/// short-circuits any pipelined input, and a `Sort` directly under a `Limit`
+/// keeps only the top rows.
 enum RowStream {
     /// Lazy label scan: candidate ids are fetched once on the first pull, then
     /// emitted `STREAM_BATCH` at a time so an upstream `LIMIT` never forces the
@@ -1796,6 +1888,10 @@ enum RowStream {
     LabelScan {
         variable: String,
         label: Option<String>,
+        /// SIP restriction: when `Some`, only these node ids are emitted (the
+        /// scan is intersected with the build side of an enclosing streaming
+        /// hash join).
+        allowed: Option<HashSet<NodeId>>,
         ids: Option<std::vec::IntoIter<NodeId>>,
     },
     /// A streamable leaf other than `LabelScan` (id seek, index scan, range
@@ -1829,35 +1925,165 @@ enum RowStream {
         /// later pulls before the next input batch is fetched.
         buf: std::collections::VecDeque<PathMap>,
     },
+    /// A hash join whose probe side streams. The build side is materialized once
+    /// and hashed on the first pull (`state`); thereafter the probe side is
+    /// pulled a batch at a time and joined against the hash table, so an upstream
+    /// `LIMIT` stops the probe scan/expansion early. The build side cannot be
+    /// short-circuited (the hash table must be complete before any probe row is
+    /// joined), so it is the floor on the work this saves.
+    HashJoin {
+        build_op: Box<PhysicalOperator>,
+        probe_op: Box<PhysicalOperator>,
+        /// `Some` for a left-outer join: probe rows with no match are null-filled.
+        null_vars: Option<Vec<String>>,
+        /// Built lazily on the first pull (build side materialized + hashed,
+        /// probe stream constructed with SIP applied).
+        state: Option<Box<HashJoinState>>,
+        /// Overflow when one probe batch joins to more than `STREAM_BATCH` rows.
+        buf: std::collections::VecDeque<PathMap>,
+    },
+    /// A closing-hop (multiway) join whose input streams. Each input batch is
+    /// closed against the bound target via `multiway_join_rows`, so an upstream
+    /// `LIMIT` stops the input scan/expansion early.
+    MultiwayJoin {
+        input: Box<RowStream>,
+        closing_src_var: String,
+        closing_dst_var: String,
+        closing_rel_type: Option<String>,
+        closing_rel_var: String,
+        closing_is_incoming: bool,
+        closing_is_undirected: bool,
+        buf: std::collections::VecDeque<PathMap>,
+    },
+    /// Fused linear chain of single-hop directed Expands: the streaming form of
+    /// the `execute_expand_chain_n` fast path. Each input batch is threaded
+    /// through all hops at once; overflow beyond `STREAM_BATCH` is buffered.
+    ExpandChain {
+        base: Box<RowStream>,
+        hops: Vec<OwnedChainHop>,
+        buf: std::collections::VecDeque<PathMap>,
+    },
+    /// A `Filter` directly over a single-hop directed `Expand`: the streaming form
+    /// of the `filter_over_expand_batch` factorization fast path. The predicate is
+    /// applied once per source row (or per `(src, dst)` row when it references the
+    /// expansion bindings); overflow is buffered.
+    FilterOverExpand {
+        base: Box<RowStream>,
+        src_var: String,
+        rel_var: String,
+        dst_var: String,
+        rel_type: Option<String>,
+        is_incoming: bool,
+        expression: FilterExpr,
+        buf: std::collections::VecDeque<PathMap>,
+    },
+    /// Blocking sort: drains `input` fully on the first pull, sorts it (or keeps
+    /// the top `bound` rows), then emits the result in batches. A `Sort` directly
+    /// under a `Limit` gets `bound = Some(skip + count)` for a top-N selection.
+    Sort {
+        input: Box<RowStream>,
+        items: Vec<crate::ast::SortItem>,
+        bound: Option<usize>,
+        out: Option<std::vec::IntoIter<PathMap>>,
+    },
+    /// Streaming DISTINCT: a stateful pass-through emitting each row whose dedup
+    /// key has not been seen, so an upstream `LIMIT` can short-circuit.
+    Distinct {
+        input: Box<RowStream>,
+        seen: HashSet<String>,
+    },
+    /// Blocking aggregate: drains and folds `input` on the first pull, then emits
+    /// the grouped rows in batches.
+    Aggregate {
+        input: Box<RowStream>,
+        group_by: Vec<(Expr, Option<String>)>,
+        aggregations: Vec<(AggFn, Expr, String)>,
+        out: Option<std::vec::IntoIter<PathMap>>,
+    },
+    /// OPTIONAL MATCH: forwards `input` rows; if the entire input is empty, emits
+    /// exactly one null-filled row for the pattern variables.
+    OptionalMatch {
+        input: Box<RowStream>,
+        null_vars: Vec<String>,
+        any: bool,
+        done: bool,
+    },
+    /// UNWIND: 1:N expansion of a list expression with an overflow buffer.
+    Unwind {
+        input: Box<RowStream>,
+        expr: Expr,
+        variable: String,
+        buf: std::collections::VecDeque<PathMap>,
+    },
+    /// A resolved `CALL`: the N:M cross of each input row with the procedure's
+    /// output rows, with an overflow buffer.
+    ProcedureCall {
+        input: Box<RowStream>,
+        output_vars: Vec<String>,
+        rows: Vec<Vec<serde_json::Value>>,
+        buf: std::collections::VecDeque<PathMap>,
+    },
+    /// SKIP/LIMIT: drops the first `skip` rows then emits up to `count`, returning
+    /// empty (stopping upstream pulls) once `count` rows are emitted.
+    Limit {
+        input: Box<RowStream>,
+        skip: usize,
+        count: usize,
+        skipped: usize,
+        emitted: usize,
+        validated: bool,
+    },
+    /// A write clause executed over the input. Blocking: the input is drained
+    /// fully and the writes applied before any row is emitted, so `DELETE` sees
+    /// the whole result and a trailing `LIMIT` cannot skip writes.
+    WritePart {
+        input: Box<RowStream>,
+        part: crate::ast::QueryPart,
+        out: Option<std::vec::IntoIter<PathMap>>,
+    },
 }
 
-/// Return true when `op` and every descendant is one of the operators the
-/// streaming engine knows how to drive lazily, down to a leaf scan. Only a
-/// fully streamable input lets `LIMIT` short-circuit; any other shape (Sort,
-/// Aggregate, Distinct, HashJoin, OptionalMatch, MultiwayJoin, Unwind, a write,
-/// or a nested Limit) falls back to the materializing executor.
-fn is_streamable(op: &PhysicalOperator) -> bool {
-    match op {
-        PhysicalOperator::LabelScan { .. }
-        | PhysicalOperator::NodeByIdSeek { .. }
-        | PhysicalOperator::NodeIndexScan { .. }
-        | PhysicalOperator::NodeRangeScan { .. }
-        | PhysicalOperator::SingleRow => true,
-        PhysicalOperator::Project { input, .. }
-        | PhysicalOperator::Filter { input, .. }
-        | PhysicalOperator::Expand { input, .. } => is_streamable(input),
-        _ => false,
-    }
+/// Owned form of `ChainHop` for a streaming `ExpandChain` node. The borrowed
+/// `ChainHop` slice is rebuilt from this at call time so `execute_expand_chain_n`
+/// is reused unchanged.
+struct OwnedChainHop {
+    src_var: String,
+    rel_var: String,
+    dst_var: String,
+    rel_type: Option<String>,
+    is_incoming: bool,
 }
 
-/// Build a `RowStream` mirroring a streamable `op` (callers must check
-/// `is_streamable` first). Streamable leaves other than `LabelScan` become a
-/// `Materialized` node wrapping the original operator.
+/// The prepared build side of a streaming `HashJoin`, constructed on the first
+/// pull: the build side materialized and hashed (`data`), plus the probe-side
+/// `RowStream` (built with SIP applied for inner joins).
+struct HashJoinState {
+    data: JoinProbeData,
+    probe: Box<RowStream>,
+}
+
+/// Build the `RowStream` for `op`. Total over `PhysicalOperator`: every operator
+/// maps to a variant. Leaves other than `LabelScan` become a `Materialized` node
+/// that calls `eval_leaf` once on the first pull.
 fn build_stream(op: &PhysicalOperator) -> RowStream {
+    build_stream_with_sip(op, &HashMap::new())
+}
+
+/// Like `build_stream`, but threads a SIP node-id map down to the `LabelScan`
+/// leaves: a scan whose variable is in `sip` is restricted to those ids, so a
+/// streaming join's probe side prunes exactly as the build side allows. SIP is a
+/// performance restriction only (it never changes results), so it is propagated
+/// through the pipelined operators and dropped at the `Materialized` and nested
+/// `HashJoin` boundaries (a nested join derives its own SIP from its build side).
+fn build_stream_with_sip(
+    op: &PhysicalOperator,
+    sip: &HashMap<String, HashSet<NodeId>>,
+) -> RowStream {
     match op {
         PhysicalOperator::LabelScan { variable, label } => RowStream::LabelScan {
             variable: variable.clone(),
             label: label.clone(),
+            allowed: sip.get(variable).cloned(),
             ids: None,
         },
         PhysicalOperator::Project {
@@ -1865,14 +2091,44 @@ fn build_stream(op: &PhysicalOperator) -> RowStream {
             items,
             is_barrier,
         } => RowStream::Project {
-            input: Box::new(build_stream(input)),
+            input: Box::new(build_stream_with_sip(input, sip)),
             items: items.clone(),
             is_barrier: *is_barrier,
         },
-        PhysicalOperator::Filter { input, expression } => RowStream::Filter {
-            input: Box::new(build_stream(input)),
-            expression: expression.clone(),
-        },
+        PhysicalOperator::Filter { input, expression } => {
+            // Factorization fast path: a non-HasLabel predicate directly over a
+            // single-hop directed Expand applies once per source row. Mirrors the
+            // precedence of the materializing `Filter` arm.
+            if let PhysicalOperator::Expand {
+                input: expand_input,
+                src_var,
+                rel_var,
+                dst_var,
+                rel_type,
+                is_incoming,
+                is_undirected: false,
+                min_hops: 1,
+                max_hops: 1,
+            } = input.as_ref()
+            {
+                if !matches!(expression, FilterExpr::HasLabel(..)) {
+                    return RowStream::FilterOverExpand {
+                        base: Box::new(build_stream_with_sip(expand_input, sip)),
+                        src_var: src_var.clone(),
+                        rel_var: rel_var.clone(),
+                        dst_var: dst_var.clone(),
+                        rel_type: rel_type.clone(),
+                        is_incoming: *is_incoming,
+                        expression: expression.clone(),
+                        buf: std::collections::VecDeque::new(),
+                    };
+                }
+            }
+            RowStream::Filter {
+                input: Box::new(build_stream_with_sip(input, sip)),
+                expression: expression.clone(),
+            }
+        }
         PhysicalOperator::Expand {
             input,
             src_var,
@@ -1883,20 +2139,179 @@ fn build_stream(op: &PhysicalOperator) -> RowStream {
             is_undirected,
             min_hops,
             max_hops,
-        } => RowStream::Expand {
-            input: Box::new(build_stream(input)),
-            src_var: src_var.clone(),
-            rel_var: rel_var.clone(),
-            dst_var: dst_var.clone(),
-            rel_type: rel_type.clone(),
-            is_incoming: *is_incoming,
-            is_undirected: *is_undirected,
-            min_hops: *min_hops,
-            max_hops: *max_hops,
+        } => {
+            // Fused-chain fast path: collapse a maximal linear chain of single-hop
+            // directed Expands, mirroring the materializing `Expand` arm.
+            if *min_hops == 1 && *max_hops == 1 && !*is_undirected {
+                let mut hops = vec![OwnedChainHop {
+                    src_var: src_var.clone(),
+                    rel_var: rel_var.clone(),
+                    dst_var: dst_var.clone(),
+                    rel_type: rel_type.clone(),
+                    is_incoming: *is_incoming,
+                }];
+                let mut bottom_src = src_var.as_str();
+                let mut base = input.as_ref();
+                while let PhysicalOperator::Expand {
+                    input: inner_input,
+                    src_var: inner_src_var,
+                    rel_var: inner_rel_var,
+                    dst_var: inner_dst_var,
+                    rel_type: inner_rel_type,
+                    is_incoming: inner_is_incoming,
+                    is_undirected: false,
+                    min_hops: 1,
+                    max_hops: 1,
+                } = base
+                {
+                    if bottom_src != inner_dst_var {
+                        break;
+                    }
+                    hops.push(OwnedChainHop {
+                        src_var: inner_src_var.clone(),
+                        rel_var: inner_rel_var.clone(),
+                        dst_var: inner_dst_var.clone(),
+                        rel_type: inner_rel_type.clone(),
+                        is_incoming: *inner_is_incoming,
+                    });
+                    bottom_src = inner_src_var.as_str();
+                    base = inner_input.as_ref();
+                }
+                if hops.len() >= 2 {
+                    // Collected top-to-bottom; execute bottom-to-top.
+                    hops.reverse();
+                    return RowStream::ExpandChain {
+                        base: Box::new(build_stream_with_sip(base, sip)),
+                        hops,
+                        buf: std::collections::VecDeque::new(),
+                    };
+                }
+            }
+            RowStream::Expand {
+                input: Box::new(build_stream_with_sip(input, sip)),
+                src_var: src_var.clone(),
+                rel_var: rel_var.clone(),
+                dst_var: dst_var.clone(),
+                rel_type: rel_type.clone(),
+                is_incoming: *is_incoming,
+                is_undirected: *is_undirected,
+                min_hops: *min_hops,
+                max_hops: *max_hops,
+                buf: std::collections::VecDeque::new(),
+            }
+        }
+        PhysicalOperator::MultiwayJoin {
+            input,
+            closing_src_var,
+            closing_dst_var,
+            closing_rel_type,
+            closing_rel_var,
+            closing_is_incoming,
+            closing_is_undirected,
+        } => RowStream::MultiwayJoin {
+            input: Box::new(build_stream_with_sip(input, sip)),
+            closing_src_var: closing_src_var.clone(),
+            closing_dst_var: closing_dst_var.clone(),
+            closing_rel_type: closing_rel_type.clone(),
+            closing_rel_var: closing_rel_var.clone(),
+            closing_is_incoming: *closing_is_incoming,
+            closing_is_undirected: *closing_is_undirected,
             buf: std::collections::VecDeque::new(),
         },
-        // A streamable leaf that is not a LabelScan (id seek, index/range scan,
-        // SingleRow): execute it eagerly on first pull and drain in batches.
+        PhysicalOperator::Limit { input, skip, count } => {
+            // Top-N: a `Sort` directly under the `Limit` keeps only `skip + count`
+            // rows, so the sort never materializes its full output.
+            let inner = if let PhysicalOperator::Sort {
+                input: sort_input,
+                items,
+            } = input.as_ref()
+            {
+                RowStream::Sort {
+                    input: Box::new(build_stream_with_sip(sort_input, sip)),
+                    items: items.clone(),
+                    bound: Some(skip.saturating_add(*count)),
+                    out: None,
+                }
+            } else {
+                build_stream_with_sip(input, sip)
+            };
+            RowStream::Limit {
+                input: Box::new(inner),
+                skip: *skip,
+                count: *count,
+                skipped: 0,
+                emitted: 0,
+                validated: false,
+            }
+        }
+        PhysicalOperator::Sort { input, items } => RowStream::Sort {
+            input: Box::new(build_stream_with_sip(input, sip)),
+            items: items.clone(),
+            bound: None,
+            out: None,
+        },
+        PhysicalOperator::Distinct { input } => RowStream::Distinct {
+            input: Box::new(build_stream_with_sip(input, sip)),
+            seen: HashSet::new(),
+        },
+        PhysicalOperator::Aggregate {
+            input,
+            group_by,
+            aggregations,
+        } => RowStream::Aggregate {
+            input: Box::new(build_stream_with_sip(input, sip)),
+            group_by: group_by.clone(),
+            aggregations: aggregations.clone(),
+            out: None,
+        },
+        PhysicalOperator::OptionalMatch { input, null_vars } => RowStream::OptionalMatch {
+            input: Box::new(build_stream_with_sip(input, sip)),
+            null_vars: null_vars.clone(),
+            any: false,
+            done: false,
+        },
+        PhysicalOperator::Unwind {
+            input,
+            expr,
+            variable,
+        } => RowStream::Unwind {
+            input: Box::new(build_stream_with_sip(input, sip)),
+            expr: expr.clone(),
+            variable: variable.clone(),
+            buf: std::collections::VecDeque::new(),
+        },
+        PhysicalOperator::ProcedureCall {
+            input,
+            output_vars,
+            rows,
+        } => RowStream::ProcedureCall {
+            input: Box::new(build_stream_with_sip(input, sip)),
+            output_vars: output_vars.clone(),
+            rows: rows.clone(),
+            buf: std::collections::VecDeque::new(),
+        },
+        PhysicalOperator::WritePart { input, part } => RowStream::WritePart {
+            input: Box::new(build_stream_with_sip(input, sip)),
+            part: part.clone(),
+            out: None,
+        },
+        PhysicalOperator::HashJoin { left, right } => {
+            // The probe side's own SIP is derived from this join's build side at
+            // run time (it needs the materialized build rows), so it is built
+            // lazily in `next_batch`; the outer `sip` does not propagate into a
+            // nested join, matching the former `execute_with_sip`.
+            let (probe_op, build_op, null_vars) = join_roles(left, right);
+            RowStream::HashJoin {
+                build_op: Box::new(build_op.clone()),
+                probe_op: Box::new(probe_op.clone()),
+                null_vars: null_vars.map(|v| v.to_vec()),
+                state: None,
+                buf: std::collections::VecDeque::new(),
+            }
+        }
+        // The remaining streamable leaves (`NodeByIdSeek`, `NodeIndexScan`,
+        // `NodeRangeScan`, `SingleRow`): evaluate eagerly on the first pull via
+        // `eval_leaf` and drain in batches. SIP is not applied here.
         other => RowStream::Materialized {
             op: Box::new(other.clone()),
             rows: None,
@@ -1918,15 +2333,30 @@ impl RowStream {
             RowStream::LabelScan {
                 variable,
                 label,
+                allowed,
                 ids,
             } => {
                 let iter = match ids {
                     Some(it) => it,
                     None => {
-                        let candidates = if let Some(lbl) = label {
-                            graph.nodes_by_label(lbl).map_err(|e| e.to_string())?
-                        } else {
-                            graph.all_nodes().map_err(|e| e.to_string())?
+                        // Candidate set: the label's nodes (or all nodes),
+                        // intersected with the SIP-allowed ids when present.
+                        let candidates: Vec<NodeId> = match (label.as_deref(), allowed.as_ref()) {
+                            (Some(lbl), Some(set)) => graph
+                                .nodes_by_label(lbl)
+                                .map_err(|e| e.to_string())?
+                                .into_iter()
+                                .filter(|id| set.contains(id))
+                                .collect(),
+                            (None, Some(set)) => {
+                                let mut v: Vec<NodeId> = set.iter().copied().collect();
+                                v.sort_unstable();
+                                v
+                            }
+                            (Some(lbl), None) => {
+                                graph.nodes_by_label(lbl).map_err(|e| e.to_string())?
+                            }
+                            (None, None) => graph.all_nodes().map_err(|e| e.to_string())?,
                         };
                         ids.insert(candidates.into_iter())
                     }
@@ -1945,7 +2375,7 @@ impl RowStream {
             RowStream::Materialized { op, rows } => {
                 let iter = match rows {
                     Some(it) => it,
-                    None => rows.insert(execute_physical(graph, op, params)?.into_iter()),
+                    None => rows.insert(eval_leaf(graph, op, params)?.into_iter()),
                 };
                 Ok(iter.by_ref().take(STREAM_BATCH).collect())
             }
@@ -2010,36 +2440,812 @@ impl RowStream {
                 )?;
                 buf.extend(expanded);
             },
+            RowStream::HashJoin {
+                build_op,
+                probe_op,
+                null_vars,
+                state,
+                buf,
+            } => loop {
+                if !buf.is_empty() {
+                    let take = buf.len().min(STREAM_BATCH);
+                    return Ok(buf.drain(..take).collect());
+                }
+                // First pull: materialize and hash the build side, then build the
+                // probe stream (with SIP for inner joins). The hash table is
+                // complete before any probe row is joined, so the streamed join
+                // yields exactly the rows the materializing join would.
+                let st = match state {
+                    Some(s) => s,
+                    None => {
+                        let build_rows = execute_physical(graph, build_op, params)?;
+                        let common_vars = join_common_vars(probe_op, build_op);
+                        let (data, probe) = if common_vars.is_empty() {
+                            (
+                                JoinProbeData::Cartesian { build_rows },
+                                Box::new(build_stream(probe_op)),
+                            )
+                        } else {
+                            let sip = build_sip(&common_vars, &build_rows);
+                            let probe = if sip.is_empty() || null_vars.is_some() {
+                                Box::new(build_stream(probe_op))
+                            } else {
+                                Box::new(build_stream_with_sip(probe_op, &sip))
+                            };
+                            let hash_table = build_hash_table(&common_vars, build_rows);
+                            (
+                                JoinProbeData::Equi {
+                                    common_vars,
+                                    hash_table,
+                                },
+                                probe,
+                            )
+                        };
+                        state.insert(Box::new(HashJoinState { data, probe }))
+                    }
+                };
+                let probe_batch = st.probe.next_batch(graph, params)?;
+                if probe_batch.is_empty() {
+                    return Ok(vec![]);
+                }
+                let rows = hash_join_rows(probe_batch, &st.data, null_vars.as_deref());
+                buf.extend(rows);
+            },
+            RowStream::MultiwayJoin {
+                input,
+                closing_src_var,
+                closing_dst_var,
+                closing_rel_type,
+                closing_rel_var,
+                closing_is_incoming,
+                closing_is_undirected,
+                buf,
+            } => loop {
+                if !buf.is_empty() {
+                    let take = buf.len().min(STREAM_BATCH);
+                    return Ok(buf.drain(..take).collect());
+                }
+                let batch = input.next_batch(graph, params)?;
+                if batch.is_empty() {
+                    return Ok(vec![]);
+                }
+                let rows = multiway_join_rows(
+                    graph,
+                    batch,
+                    closing_src_var,
+                    closing_dst_var,
+                    closing_rel_type.as_deref(),
+                    closing_rel_var,
+                    *closing_is_incoming,
+                    *closing_is_undirected,
+                )?;
+                buf.extend(rows);
+            },
+            RowStream::ExpandChain { base, hops, buf } => loop {
+                if !buf.is_empty() {
+                    let take = buf.len().min(STREAM_BATCH);
+                    return Ok(buf.drain(..take).collect());
+                }
+                let batch = base.next_batch(graph, params)?;
+                if batch.is_empty() {
+                    return Ok(vec![]);
+                }
+                // Rebuild the borrowed hop slice the fused-chain helper expects.
+                let borrowed: Vec<ChainHop<'_>> = hops
+                    .iter()
+                    .map(|h| ChainHop {
+                        src_var: &h.src_var,
+                        rel_var: &h.rel_var,
+                        dst_var: &h.dst_var,
+                        rel_type: h.rel_type.as_deref(),
+                        is_incoming: h.is_incoming,
+                    })
+                    .collect();
+                let expanded = execute_expand_chain_n(graph, batch, &borrowed)?;
+                buf.extend(expanded);
+            },
+            RowStream::FilterOverExpand {
+                base,
+                src_var,
+                rel_var,
+                dst_var,
+                rel_type,
+                is_incoming,
+                expression,
+                buf,
+            } => loop {
+                if !buf.is_empty() {
+                    let take = buf.len().min(STREAM_BATCH);
+                    return Ok(buf.drain(..take).collect());
+                }
+                let batch = base.next_batch(graph, params)?;
+                if batch.is_empty() {
+                    return Ok(vec![]);
+                }
+                // The factorized filter may drop a whole batch; the outer loop
+                // refills until rows survive or the base is exhausted.
+                let rows = filter_over_expand_batch(
+                    graph,
+                    batch,
+                    src_var,
+                    rel_var,
+                    dst_var,
+                    rel_type.as_deref(),
+                    *is_incoming,
+                    expression,
+                    params,
+                )?;
+                buf.extend(rows);
+            },
+            RowStream::Sort {
+                input,
+                items,
+                bound,
+                out,
+            } => {
+                let iter = match out {
+                    Some(it) => it,
+                    None => {
+                        let mut rows = Vec::new();
+                        loop {
+                            let batch = input.next_batch(graph, params)?;
+                            if batch.is_empty() {
+                                break;
+                            }
+                            rows.extend(batch);
+                        }
+                        let sorted = sort_all(graph, rows, items, *bound, params);
+                        out.insert(sorted.into_iter())
+                    }
+                };
+                Ok(iter.by_ref().take(STREAM_BATCH).collect())
+            }
+            RowStream::Distinct { input, seen } => loop {
+                let batch = input.next_batch(graph, params)?;
+                if batch.is_empty() {
+                    return Ok(vec![]);
+                }
+                let kept: Vec<PathMap> = batch
+                    .into_iter()
+                    .filter(|path| {
+                        let key = path
+                            .iter()
+                            .map(|(k, v)| format!("{}={:?}", k, v))
+                            .collect::<Vec<_>>()
+                            .join("|");
+                        seen.insert(key)
+                    })
+                    .collect();
+                if !kept.is_empty() {
+                    return Ok(kept);
+                }
+            },
+            RowStream::Aggregate {
+                input,
+                group_by,
+                aggregations,
+                out,
+            } => {
+                let iter = match out {
+                    Some(it) => it,
+                    None => {
+                        let rows = aggregate_all(graph, input, group_by, aggregations, params)?;
+                        out.insert(rows.into_iter())
+                    }
+                };
+                Ok(iter.by_ref().take(STREAM_BATCH).collect())
+            }
+            RowStream::OptionalMatch {
+                input,
+                null_vars,
+                any,
+                done,
+            } => {
+                let batch = input.next_batch(graph, params)?;
+                if !batch.is_empty() {
+                    *any = true;
+                    return Ok(batch);
+                }
+                // Input exhausted: emit one null-filled row only if the entire
+                // input was empty, and only once.
+                if !*any && !*done {
+                    *done = true;
+                    let mut null_row: PathMap = HashMap::new();
+                    for var in null_vars.iter() {
+                        null_row.insert(var.clone(), GraphBinding::Scalar(serde_json::Value::Null));
+                    }
+                    return Ok(vec![null_row]);
+                }
+                Ok(vec![])
+            }
+            RowStream::Unwind {
+                input,
+                expr,
+                variable,
+                buf,
+            } => loop {
+                if !buf.is_empty() {
+                    let take = buf.len().min(STREAM_BATCH);
+                    return Ok(buf.drain(..take).collect());
+                }
+                let batch = input.next_batch(graph, params)?;
+                if batch.is_empty() {
+                    return Ok(vec![]);
+                }
+                for path in batch {
+                    let list_val = evaluate_expr(graph, &path, expr, params)?;
+                    if let serde_json::Value::Array(elems) = list_val {
+                        for item in elems {
+                            let mut new_path = path.clone();
+                            new_path.insert(variable.clone(), GraphBinding::Scalar(item));
+                            buf.push_back(new_path);
+                        }
+                    } else if list_val != serde_json::Value::Null {
+                        let mut new_path = path.clone();
+                        new_path.insert(variable.clone(), GraphBinding::Scalar(list_val));
+                        buf.push_back(new_path);
+                    }
+                }
+            },
+            RowStream::ProcedureCall {
+                input,
+                output_vars,
+                rows,
+                buf,
+            } => loop {
+                if !buf.is_empty() {
+                    let take = buf.len().min(STREAM_BATCH);
+                    return Ok(buf.drain(..take).collect());
+                }
+                let batch = input.next_batch(graph, params)?;
+                if batch.is_empty() {
+                    return Ok(vec![]);
+                }
+                for path in batch {
+                    for row in rows.iter() {
+                        let mut new_path = path.clone();
+                        for (var, value) in output_vars.iter().zip(row.iter()) {
+                            new_path.insert(var.clone(), GraphBinding::Scalar(value.clone()));
+                        }
+                        buf.push_back(new_path);
+                    }
+                }
+            },
+            RowStream::Limit {
+                input,
+                skip,
+                count,
+                skipped,
+                emitted,
+                validated,
+            } => {
+                if !*validated {
+                    if *skip > 1_000_000_000 {
+                        return Err(format!("SKIP value too large: {}", skip));
+                    }
+                    *validated = true;
+                }
+                loop {
+                    if *emitted >= *count {
+                        return Ok(vec![]);
+                    }
+                    let batch = input.next_batch(graph, params)?;
+                    if batch.is_empty() {
+                        return Ok(vec![]);
+                    }
+                    let mut out = Vec::new();
+                    for path in batch {
+                        if *skipped < *skip {
+                            *skipped += 1;
+                            continue;
+                        }
+                        if *emitted >= *count {
+                            break;
+                        }
+                        out.push(path);
+                        *emitted += 1;
+                    }
+                    if !out.is_empty() {
+                        return Ok(out);
+                    }
+                    // The whole batch was skipped; pull more.
+                }
+            }
+            RowStream::WritePart { input, part, out } => {
+                let iter = match out {
+                    Some(it) => it,
+                    None => {
+                        let mut rows = Vec::new();
+                        loop {
+                            let batch = input.next_batch(graph, params)?;
+                            if batch.is_empty() {
+                                break;
+                            }
+                            rows.extend(batch);
+                        }
+                        let result = write_part_rows(graph, rows, part, params)?;
+                        out.insert(result.into_iter())
+                    }
+                };
+                Ok(iter.by_ref().take(STREAM_BATCH).collect())
+            }
         }
     }
 }
 
-/// Drive a streamable `input` chain just far enough to satisfy `skip + count`
-/// rows, then apply the skip and limit. Because the chain pulls lazily, the
-/// leaf `LabelScan` and any `Expand` stop as soon as enough rows exist, so a
-/// `LIMIT` no longer forces a full scan and expansion. Caller must ensure
-/// `is_streamable(input)`.
-fn execute_streaming_limit(
+/// Group and aggregate every row drained from `input`, returning one row per
+/// group with the aggregate columns bound. The fold is associative and
+/// order-independent, so a streamed (batch-at-a-time) input and a fully
+/// materialized one produce identical groups; output rows are emitted in
+/// `BTreeMap` key order. Shared by the materializing `Aggregate` arm and the
+/// streaming `RowStream::Aggregate` node.
+fn aggregate_all(
     graph: &Graph,
-    input: &PhysicalOperator,
+    input: &mut RowStream,
+    group_by: &[(Expr, Option<String>)],
+    aggregations: &[(AggFn, Expr, String)],
     params: &HashMap<String, serde_json::Value>,
-    skip: usize,
-    count: usize,
 ) -> Result<Vec<PathMap>, String> {
-    let target = skip.saturating_add(count);
-    let mut stream = build_stream(input);
-    let mut collected: Vec<PathMap> = Vec::new();
-    while collected.len() < target {
-        let batch = stream.next_batch(graph, params)?;
+    use std::collections::BTreeMap;
+
+    struct AggState {
+        count: i64,
+        sum: f64,
+        /// True once a non-integer value has been summed. `sum()` over only
+        /// integers returns an integer, matching openCypher numeric typing.
+        sum_is_float: bool,
+        min: Option<serde_json::Value>,
+        max: Option<serde_json::Value>,
+        collect: Vec<serde_json::Value>,
+        distinct_seen: std::collections::HashSet<String>,
+        /// Accumulated numeric values for stDev, stDevP, percentile functions.
+        values: Vec<f64>,
+    }
+    impl AggState {
+        fn new() -> Self {
+            Self {
+                count: 0,
+                sum: 0.0,
+                sum_is_float: false,
+                min: None,
+                max: None,
+                collect: Vec::new(),
+                distinct_seen: std::collections::HashSet::new(),
+                values: Vec::new(),
+            }
+        }
+    }
+
+    // group_key -> (group-by PathMap, per-aggregation state Vec)
+    let mut groups: BTreeMap<String, (PathMap, Vec<AggState>)> = BTreeMap::new();
+    if group_by.is_empty() {
+        let states = aggregations.iter().map(|_| AggState::new()).collect();
+        groups.insert("".to_string(), (PathMap::new(), states));
+    }
+
+    // Fold one input row into the group table.
+    let fold_path = |groups: &mut BTreeMap<String, (PathMap, Vec<AggState>)>,
+                     path: PathMap|
+     -> Result<(), String> {
+        let mut key_parts = Vec::new();
+        let mut gb_path = PathMap::new();
+        for (expr, alias) in group_by {
+            let val = evaluate_expr(graph, &path, expr, params)?;
+            let col = if let Some(a) = alias {
+                a.clone()
+            } else {
+                match expr {
+                    Expr::Prop(var, prop) if prop.is_empty() => var.clone(),
+                    Expr::Prop(var, prop) => format!("{}.{}", var, prop),
+                    Expr::Literal(lit) => lit.to_string(),
+                    Expr::Param(p) => format!("${}", p),
+                    other => expr_display_name(other),
+                }
+            };
+            key_parts.push(val.to_string());
+            gb_path.insert(col, GraphBinding::Scalar(val));
+        }
+        let group_key = key_parts.join("\x00");
+
+        let entry = groups.entry(group_key).or_insert_with(|| {
+            let states = aggregations.iter().map(|_| AggState::new()).collect();
+            (gb_path, states)
+        });
+
+        for (i, (agg_fn, inner_expr, _col)) in aggregations.iter().enumerate() {
+            let state = &mut entry.1[i];
+            match agg_fn {
+                AggFn::Count { distinct } => {
+                    if matches!(inner_expr, Expr::CountStar) {
+                        state.count += 1;
+                    } else {
+                        let val = evaluate_expr(graph, &path, inner_expr, params)?;
+                        if val != serde_json::Value::Null {
+                            if *distinct {
+                                if state.distinct_seen.insert(val.to_string()) {
+                                    state.count += 1;
+                                }
+                            } else {
+                                state.count += 1;
+                            }
+                        }
+                    }
+                }
+                AggFn::Sum { distinct } => {
+                    let val = evaluate_expr(graph, &path, inner_expr, params)?;
+                    if val != serde_json::Value::Null {
+                        if *distinct && !state.distinct_seen.insert(val.to_string()) {
+                            // already seen, skip
+                        } else if let Some(n) = val.as_f64() {
+                            if val.as_i64().is_none() {
+                                state.sum_is_float = true;
+                            }
+                            state.sum += n;
+                        }
+                    }
+                }
+                AggFn::Avg { distinct } => {
+                    let val = evaluate_expr(graph, &path, inner_expr, params)?;
+                    if val != serde_json::Value::Null {
+                        if *distinct && !state.distinct_seen.insert(val.to_string()) {
+                            // already seen, skip
+                        } else if let Some(n) = val.as_f64() {
+                            state.sum += n;
+                            state.count += 1;
+                        }
+                    }
+                }
+                AggFn::Min { .. } => {
+                    let val = evaluate_expr(graph, &path, inner_expr, params)?;
+                    if val != serde_json::Value::Null {
+                        state.min = Some(match state.min.take() {
+                            None => val,
+                            Some(prev) => {
+                                if json_cmp_total(&val, &prev) == std::cmp::Ordering::Less {
+                                    val
+                                } else {
+                                    prev
+                                }
+                            }
+                        });
+                    }
+                }
+                AggFn::Max { .. } => {
+                    let val = evaluate_expr(graph, &path, inner_expr, params)?;
+                    if val != serde_json::Value::Null {
+                        state.max = Some(match state.max.take() {
+                            None => val,
+                            Some(prev) => {
+                                if json_cmp_total(&val, &prev) == std::cmp::Ordering::Greater {
+                                    val
+                                } else {
+                                    prev
+                                }
+                            }
+                        });
+                    }
+                }
+                AggFn::Collect { distinct } => {
+                    let val = evaluate_expr(graph, &path, inner_expr, params)?;
+                    if val != serde_json::Value::Null {
+                        if *distinct && !state.distinct_seen.insert(val.to_string()) {
+                            // already seen, skip
+                        } else {
+                            state.collect.push(val);
+                        }
+                    }
+                }
+                AggFn::StDev { .. } | AggFn::StDevP { .. } => {
+                    let val = evaluate_expr(graph, &path, inner_expr, params)?;
+                    if let Some(n) = val.as_f64() {
+                        state.values.push(n);
+                    }
+                }
+                AggFn::PercentileDisc { .. } | AggFn::PercentileCont { .. } => {
+                    let val = evaluate_expr(graph, &path, inner_expr, params)?;
+                    if let Some(n) = val.as_f64() {
+                        state.values.push(n);
+                    }
+                }
+            }
+        }
+        Ok(())
+    };
+
+    // Drain the input stream a batch at a time so peak memory is one batch plus
+    // the group table.
+    loop {
+        let batch = input.next_batch(graph, params)?;
         if batch.is_empty() {
             break;
         }
-        collected.extend(batch);
+        for path in batch {
+            fold_path(&mut groups, path)?;
+        }
     }
-    Ok(collected.into_iter().skip(skip).take(count).collect())
+
+    let mut result = Vec::new();
+    for (_key, (mut gb_path, states)) in groups {
+        for (i, (agg_fn, _inner, col)) in aggregations.iter().enumerate() {
+            let state = &states[i];
+            let agg_val = match agg_fn {
+                AggFn::Count { .. } => serde_json::Value::Number(state.count.into()),
+                AggFn::Sum { .. } => {
+                    // Preserve integer typing: a sum over only integer inputs
+                    // is an integer, as in openCypher.
+                    if !state.sum_is_float
+                        && state.sum.fract() == 0.0
+                        && state.sum.abs() < i64::MAX as f64
+                    {
+                        serde_json::Value::Number((state.sum as i64).into())
+                    } else {
+                        serde_json::Number::from_f64(state.sum)
+                            .map(serde_json::Value::Number)
+                            .unwrap_or(serde_json::Value::Null)
+                    }
+                }
+                AggFn::Avg { .. } => {
+                    if state.count == 0 {
+                        serde_json::Value::Null
+                    } else {
+                        let avg = state.sum / state.count as f64;
+                        serde_json::Number::from_f64(avg)
+                            .map(serde_json::Value::Number)
+                            .unwrap_or(serde_json::Value::Null)
+                    }
+                }
+                AggFn::Min { .. } => state.min.clone().unwrap_or(serde_json::Value::Null),
+                AggFn::Max { .. } => state.max.clone().unwrap_or(serde_json::Value::Null),
+                AggFn::Collect { .. } => serde_json::Value::Array(state.collect.clone()),
+                AggFn::StDev { .. } => {
+                    let n = state.values.len();
+                    if n < 2 {
+                        serde_json::Value::Number(
+                            serde_json::Number::from_f64(0.0)
+                                .unwrap_or_else(|| serde_json::Number::from(0)),
+                        )
+                    } else {
+                        let mean = state.values.iter().sum::<f64>() / n as f64;
+                        let variance = state.values.iter().map(|x| (x - mean).powi(2)).sum::<f64>()
+                            / (n - 1) as f64;
+                        serde_json::Number::from_f64(variance.sqrt())
+                            .map(serde_json::Value::Number)
+                            .unwrap_or(serde_json::Value::Null)
+                    }
+                }
+                AggFn::StDevP { .. } => {
+                    let n = state.values.len();
+                    if n == 0 {
+                        serde_json::Value::Number(
+                            serde_json::Number::from_f64(0.0)
+                                .unwrap_or_else(|| serde_json::Number::from(0)),
+                        )
+                    } else {
+                        let mean = state.values.iter().sum::<f64>() / n as f64;
+                        let variance =
+                            state.values.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n as f64;
+                        serde_json::Number::from_f64(variance.sqrt())
+                            .map(serde_json::Value::Number)
+                            .unwrap_or(serde_json::Value::Null)
+                    }
+                }
+                AggFn::PercentileDisc { percentile } => {
+                    let percentile = evaluate_expr(graph, &PathMap::new(), percentile, params)?
+                        .as_f64()
+                        .ok_or("percentileDisc(): percentile must be a number")?;
+                    if !(0.0..=1.0).contains(&percentile) {
+                        return Err(
+                            "ArgumentError(NumberOutOfRange): percentile must be in [0.0, 1.0]"
+                                .to_string(),
+                        );
+                    }
+                    let mut sorted = state.values.clone();
+                    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                    let n = sorted.len();
+                    if n == 0 {
+                        serde_json::Value::Null
+                    } else {
+                        let idx = ((percentile * n as f64).ceil() as usize)
+                            .saturating_sub(1)
+                            .min(n - 1);
+                        serde_json::Number::from_f64(sorted[idx])
+                            .map(serde_json::Value::Number)
+                            .unwrap_or(serde_json::Value::Null)
+                    }
+                }
+                AggFn::PercentileCont { percentile } => {
+                    let percentile = evaluate_expr(graph, &PathMap::new(), percentile, params)?
+                        .as_f64()
+                        .ok_or("percentileCont(): percentile must be a number")?;
+                    if !(0.0..=1.0).contains(&percentile) {
+                        return Err(
+                            "ArgumentError(NumberOutOfRange): percentile must be in [0.0, 1.0]"
+                                .to_string(),
+                        );
+                    }
+                    let mut sorted = state.values.clone();
+                    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                    let n = sorted.len();
+                    if n == 0 {
+                        serde_json::Value::Null
+                    } else {
+                        let rank = percentile * (n - 1) as f64;
+                        let lower = rank.floor() as usize;
+                        let upper = rank.ceil() as usize;
+                        let frac = rank - lower as f64;
+                        let val = sorted[lower] + frac * (sorted[upper.min(n - 1)] - sorted[lower]);
+                        serde_json::Number::from_f64(val)
+                            .map(serde_json::Value::Number)
+                            .unwrap_or(serde_json::Value::Null)
+                    }
+                }
+            };
+            gb_path.insert(col.clone(), GraphBinding::Scalar(agg_val));
+        }
+        result.push(gb_path);
+    }
+
+    Ok(result)
 }
 
-pub(super) fn execute_physical(
+/// Sort `child_paths` by `items`. With `bound = None` this is a full stable sort
+/// (matching the materializing `Sort` arm). With `bound = Some(k)` it keeps only
+/// the first `k` rows a stable sort would yield, trimming a bounded buffer as it
+/// fills (the `Sort -> Limit` top-N optimization): the input-index tiebreak makes
+/// the trimmed set byte-identical to sort-then-truncate while bounding memory.
+fn sort_all(
+    graph: &Graph,
+    child_paths: Vec<PathMap>,
+    items: &[crate::ast::SortItem],
+    bound: Option<usize>,
+    params: &HashMap<String, serde_json::Value>,
+) -> Vec<PathMap> {
+    // Primary comparison by the sort keys, honoring per-key ASC/DESC.
+    let cmp = |ka: &[serde_json::Value], kb: &[serde_json::Value]| -> std::cmp::Ordering {
+        for (i, si) in items.iter().enumerate() {
+            let ord = json_cmp(&ka[i], &kb[i]).unwrap_or_else(|| json_cmp_total(&ka[i], &kb[i]));
+            let ord = if si.ascending { ord } else { ord.reverse() };
+            if ord != std::cmp::Ordering::Equal {
+                return ord;
+            }
+        }
+        std::cmp::Ordering::Equal
+    };
+    let keys_of = |path: &PathMap| -> Vec<serde_json::Value> {
+        items
+            .iter()
+            .map(|si| evaluate_sort_key(graph, path, &si.expr, params))
+            .collect()
+    };
+
+    match bound {
+        None => {
+            let mut keyed: Vec<(Vec<serde_json::Value>, PathMap)> = child_paths
+                .into_iter()
+                .map(|path| {
+                    let keys = keys_of(&path);
+                    (keys, path)
+                })
+                .collect();
+            keyed.sort_by(|(ka, _), (kb, _)| cmp(ka, kb));
+            keyed.into_iter().map(|(_, path)| path).collect()
+        }
+        Some(0) => Vec::new(),
+        Some(k) => {
+            // Total order with the input index as a final tiebreak, so trimming
+            // keeps exactly the rows a stable sort would put first.
+            let order = |a: &(Vec<serde_json::Value>, usize, PathMap),
+                         b: &(Vec<serde_json::Value>, usize, PathMap)| {
+                cmp(&a.0, &b.0).then(a.1.cmp(&b.1))
+            };
+            let mut buf: Vec<(Vec<serde_json::Value>, usize, PathMap)> = Vec::new();
+            for (idx, path) in child_paths.into_iter().enumerate() {
+                let keys = keys_of(&path);
+                buf.push((keys, idx, path));
+                if buf.len() >= 2 * k {
+                    buf.sort_by(&order);
+                    buf.truncate(k);
+                }
+            }
+            buf.sort_by(&order);
+            buf.truncate(k);
+            buf.into_iter().map(|(_, _, path)| path).collect()
+        }
+    }
+}
+
+/// Apply a write clause (`CREATE`, `MERGE`, `SET`, `DELETE`, `REMOVE`) over a
+/// fully materialized batch of input rows, returning the downstream rows. This is
+/// blocking by design: `DELETE` operates over the whole result at once, and a
+/// trailing `LIMIT` must not skip writes, so the caller drains the input fully
+/// before running this (matching the former materializing `WritePart` arm). The
+/// graph write lock is held for the whole statement by `execute_read_query`.
+fn write_part_rows(
+    graph: &Graph,
+    child_paths: Vec<PathMap>,
+    part: &crate::ast::QueryPart,
+    params: &HashMap<String, serde_json::Value>,
+) -> Result<Vec<PathMap>, String> {
+    use super::write::execute_create_internal_with_context;
+    use super::write::execute_merge_internal_with_context;
+    use crate::ast::QueryPart;
+
+    // DELETE is evaluated over the whole result at once: all listed
+    // relationships are removed before any node, so an undirected expand that
+    // binds the same edge in more than one row still succeeds. The rows pass
+    // through unchanged for a following RETURN.
+    if let QueryPart::Delete { targets, detach } = part {
+        use super::write::delete_over_paths;
+        delete_over_paths(graph, &child_paths, targets, *detach, params)?;
+        return Ok(child_paths);
+    }
+
+    let mut result_paths = Vec::new();
+
+    for path in child_paths {
+        match part {
+            QueryPart::Create { patterns } => {
+                let mut new_path = path.clone();
+                for pattern in patterns {
+                    let created =
+                        execute_create_internal_with_context(graph, pattern, &path, params)?;
+                    new_path.extend(created);
+                }
+                result_paths.push(new_path);
+            }
+            QueryPart::Merge { merges } => {
+                // Each MERGE in the clause extends every current row, and may fan
+                // out to multiple rows when it matches more than one existing
+                // pattern.
+                let mut current = vec![path.clone()];
+                for merge_stmt in merges {
+                    let mut next = Vec::new();
+                    for p in &current {
+                        let extensions =
+                            execute_merge_internal_with_context(graph, merge_stmt, p, params)?;
+                        for ext in extensions {
+                            let mut row = p.clone();
+                            row.extend(ext);
+                            next.push(row);
+                        }
+                    }
+                    current = next;
+                }
+                result_paths.extend(current);
+            }
+            QueryPart::Set { items } => {
+                use super::write::apply_set_items;
+                apply_set_items(graph, &path, items, params)?;
+                result_paths.push(path);
+            }
+            QueryPart::Delete { targets, detach } => {
+                use super::write::apply_delete_targets;
+                apply_delete_targets(graph, &path, targets, *detach, params)?;
+                result_paths.push(path);
+            }
+            QueryPart::Remove { items } => {
+                use super::write::apply_remove_item;
+                for item in items {
+                    apply_remove_item(graph, item, &path)?;
+                }
+                result_paths.push(path);
+            }
+            _ => {
+                // Other QueryPart variants are not write clauses; pass through.
+                result_paths.push(path);
+            }
+        }
+    }
+
+    Ok(result_paths)
+}
+
+/// Directly evaluate a streamable leaf operator that is not a `LabelScan`
+/// (`NodeByIdSeek`, `NodeIndexScan`, `NodeRangeScan`, or `SingleRow`). These are
+/// O(1) or index-bounded, so `RowStream::Materialized` evaluates them once on
+/// the first pull and drains the result. Kept separate from the `execute_physical`
+/// sink so the sink/leaf relationship cannot recurse.
+fn eval_leaf(
     graph: &Graph,
     op: &PhysicalOperator,
     params: &HashMap<String, serde_json::Value>,
@@ -2139,22 +3345,6 @@ pub(super) fn execute_physical(
             }
             Ok(filtered)
         }
-        PhysicalOperator::LabelScan { variable, label } => {
-            let candidates = if let Some(lbl) = label {
-                graph.nodes_by_label(lbl).map_err(|e| e.to_string())?
-            } else {
-                graph.all_nodes().map_err(|e| e.to_string())?
-            };
-
-            Ok(candidates
-                .into_iter()
-                .map(|cand| {
-                    let mut path = PathMap::new();
-                    path.insert(variable.clone(), GraphBinding::Node(cand));
-                    path
-                })
-                .collect())
-        }
         PhysicalOperator::NodeByIdSeek {
             variable,
             label,
@@ -2198,912 +3388,33 @@ pub(super) fn execute_physical(
                 Ok(vec![])
             }
         }
-        PhysicalOperator::Expand {
-            input,
-            src_var,
-            rel_var,
-            dst_var,
-            rel_type,
-            is_incoming,
-            is_undirected,
-            min_hops,
-            max_hops,
-        } => {
-            // Fused-chain fast path: collect a maximal linear chain of single-hop
-            // directed Expands and run all hops together, cloning the base path
-            // once per output row instead of materializing one PathMap per hop
-            // level. Falls through to the normal path for single hops, variable
-            // length, undirected, or non-contiguous chains (e.g. a Filter between
-            // hops, which the planner inserts for a labeled intermediate node).
-            if *min_hops == 1 && *max_hops == 1 && !is_undirected {
-                let mut hops = vec![ChainHop {
-                    src_var,
-                    rel_var,
-                    dst_var,
-                    rel_type: rel_type.as_deref(),
-                    is_incoming: *is_incoming,
-                }];
-                // Source variable of the deepest hop collected so far; the next
-                // inner hop must reach it for the chain to stay linear.
-                let mut bottom_src = src_var.as_str();
-                let mut base = input.as_ref();
-                // Walk down through linearly connected single-hop directed Expands.
-                while let PhysicalOperator::Expand {
-                    input: inner_input,
-                    src_var: inner_src_var,
-                    rel_var: inner_rel_var,
-                    dst_var: inner_dst_var,
-                    rel_type: inner_rel_type,
-                    is_incoming: inner_is_incoming,
-                    is_undirected: false,
-                    min_hops: 1,
-                    max_hops: 1,
-                } = base
-                {
-                    // Linear only: this hop's source must be the inner hop's target.
-                    if bottom_src != inner_dst_var {
-                        break;
-                    }
-                    hops.push(ChainHop {
-                        src_var: inner_src_var,
-                        rel_var: inner_rel_var,
-                        dst_var: inner_dst_var,
-                        rel_type: inner_rel_type.as_deref(),
-                        is_incoming: *inner_is_incoming,
-                    });
-                    bottom_src = inner_src_var.as_str();
-                    base = inner_input.as_ref();
-                }
-                if hops.len() >= 2 {
-                    // hops were collected top-to-bottom; execute bottom-to-top.
-                    hops.reverse();
-                    let base_paths = execute_physical(graph, base, params)?;
-                    return execute_expand_chain_n(graph, base_paths, &hops);
-                }
-            }
-            let child_paths = execute_physical(graph, input, params)?;
-            expand_from_paths(
-                graph,
-                child_paths,
-                src_var,
-                rel_var,
-                dst_var,
-                rel_type.as_deref(),
-                *is_incoming,
-                *is_undirected,
-                *min_hops,
-                *max_hops,
-            )
-        }
-        PhysicalOperator::Filter { input, expression } => {
-            // Factorization fast-path: when the child is a single-hop directed Expand
-            // and the filter touches only pre-expansion (shared-prefix) variables, apply
-            // the predicate once per source path rather than once per (src, dst) row.
-            // Sources that fail the predicate skip all their destinations with zero clones.
-            if let PhysicalOperator::Expand {
-                input: expand_input,
-                src_var,
-                rel_var,
-                dst_var,
-                rel_type,
-                is_incoming,
-                is_undirected,
-                min_hops,
-                max_hops,
-            } = input.as_ref()
-            {
-                // HasLabel is handled by the bulk GraphBLAS path below; only route
-                // non-HasLabel predicates through the factorized executor.
-                if *min_hops == 1
-                    && *max_hops == 1
-                    && !is_undirected
-                    && !matches!(expression, FilterExpr::HasLabel(..))
-                {
-                    return execute_filter_over_expand(
-                        graph,
-                        ExpandParams {
-                            input: expand_input,
-                            src_var,
-                            rel_var,
-                            dst_var,
-                            rel_type: rel_type.as_deref(),
-                            is_incoming: *is_incoming,
-                        },
-                        expression,
-                        params,
-                    );
-                }
-            }
-
-            // Default path: materialize child, then filter row by row.
-            let child_paths = execute_physical(graph, input, params)?;
-            apply_filter(graph, child_paths, expression, params)
-        }
-        PhysicalOperator::HashJoin { left, right } => {
-            // Determine common variables statically from plan trees before running either side.
-            // Detect OptionalMatch on either side (the optimizer may place it on left or right
-            // depending on cardinality estimates).  Whichever side holds the OptionalMatch is
-            // the "optional" side; the other is the "required" side.  We always probe with the
-            // required side so that every required row is emitted even when the optional pattern
-            // finds no match for that row (left-outer-join semantics).
-            let (required_op, optional_inner, opt_null_vars): (
-                &PhysicalOperator,
-                &PhysicalOperator,
-                Option<&[String]>,
-            ) = if let PhysicalOperator::OptionalMatch { input, null_vars } = left.as_ref() {
-                // OptionalMatch ended up on the left — swap roles.
-                (right.as_ref(), input.as_ref(), Some(null_vars))
-            } else if let PhysicalOperator::OptionalMatch { input, null_vars } = right.as_ref() {
-                (left.as_ref(), input.as_ref(), Some(null_vars))
-            } else {
-                // No OptionalMatch: standard inner join.
-                (left.as_ref(), right.as_ref(), None)
-            };
-
-            // Compute common join variables from the actual plans (not the OptionalMatch
-            // wrapper, whose null_vars would inflate bound_vars).
-            let required_bound = Optimizer::bound_vars(required_op);
-            let optional_bound = Optimizer::bound_vars(optional_inner);
-            let common_vars: Vec<String> = required_bound
-                .intersection(&optional_bound)
-                .cloned()
-                .collect();
-
-            let mut next_paths = Vec::new();
-
-            if common_vars.is_empty() {
-                // No shared variables: Cartesian product, or outer-product for optional.
-                let required_paths = execute_physical(graph, required_op, params)?;
-                let opt_paths = execute_physical(graph, optional_inner, params)?;
-                if opt_paths.is_empty() {
-                    if let Some(null_vars) = opt_null_vars {
-                        for rp in required_paths {
-                            let mut merged = rp;
-                            for v in null_vars {
-                                if !merged.contains_key(v.as_str()) {
-                                    merged.insert(
-                                        v.clone(),
-                                        GraphBinding::Scalar(serde_json::Value::Null),
-                                    );
-                                }
-                            }
-                            next_paths.push(merged);
-                        }
-                    }
-                } else {
-                    for rp in &required_paths {
-                        for op in &opt_paths {
-                            let mut merged = rp.clone();
-                            merged.extend(op.iter().map(|(k, v)| (k.clone(), v.clone())));
-                            next_paths.push(merged);
-                        }
-                    }
-                }
-            } else {
-                // Equi-join on shared variables.
-                //
-                // Strategy: build hash table from the optional inner plan, probe with the
-                // required plan.  SIP can restrict the required-side LabelScans when the
-                // optional inner is selective.
-                let opt_paths = execute_physical(graph, optional_inner, params)?;
-
-                let sip: HashMap<String, HashSet<NodeId>> = common_vars
-                    .iter()
-                    .filter_map(|var| {
-                        let ids: HashSet<NodeId> = opt_paths
-                            .iter()
-                            .filter_map(|p| match p.get(var) {
-                                Some(GraphBinding::Node(n)) => Some(*n),
-                                _ => None,
-                            })
-                            .collect();
-                        if ids.is_empty() {
-                            None
-                        } else {
-                            Some((var.clone(), ids))
-                        }
-                    })
-                    .collect();
-
-                // SIP is only applied for inner joins; for outer joins it would suppress
-                // required rows that have no optional match, which is incorrect.
-                let required_paths = if sip.is_empty() || opt_null_vars.is_some() {
-                    execute_physical(graph, required_op, params)?
-                } else {
-                    execute_with_sip(graph, required_op, params, &sip)?
-                };
-
-                // Build hash table from the optional inner side.
-                let mut hash_table: HashMap<Vec<GraphBinding>, Vec<PathMap>> = HashMap::new();
-                for op in opt_paths {
-                    let key: Option<Vec<GraphBinding>> =
-                        common_vars.iter().map(|v| op.get(v).cloned()).collect();
-                    if let Some(key) = key {
-                        hash_table.entry(key).or_default().push(op);
-                    }
-                }
-
-                // Probe with required rows.  Unmatched required rows get null-filled optional
-                // vars when this is an outer join.
-                for rp in required_paths {
-                    let key: Option<Vec<GraphBinding>> =
-                        common_vars.iter().map(|v| rp.get(v).cloned()).collect();
-                    if let Some(key) = key {
-                        if let Some(matches) = hash_table.get(&key) {
-                            for op in matches {
-                                let mut merged = rp.clone();
-                                merged.extend(op.iter().map(|(k, v)| (k.clone(), v.clone())));
-                                next_paths.push(merged);
-                            }
-                        } else if let Some(null_vars) = opt_null_vars {
-                            // Outer join: no optional match for this required row → null-fill.
-                            let mut merged = rp;
-                            for v in null_vars {
-                                if !merged.contains_key(v.as_str()) {
-                                    merged.insert(
-                                        v.clone(),
-                                        GraphBinding::Scalar(serde_json::Value::Null),
-                                    );
-                                }
-                            }
-                            next_paths.push(merged);
-                        }
-                    }
-                }
-            }
-
-            Ok(next_paths)
-        }
         PhysicalOperator::SingleRow => Ok(vec![PathMap::new()]),
-        PhysicalOperator::Unwind {
-            input,
-            expr,
-            variable,
-        } => {
-            let child_paths = execute_physical(graph, input, params)?;
-            let mut next_paths = Vec::new();
-
-            for path in child_paths {
-                let list_val = evaluate_expr(graph, &path, expr, params)?;
-                if let serde_json::Value::Array(items) = list_val {
-                    for item in items {
-                        let mut new_path = path.clone();
-                        // Always bind as a Scalar: the integer values in a list literal
-                        // (e.g., [1, 2, 3]) are plain data, not NodeId references.
-                        new_path.insert(variable.clone(), GraphBinding::Scalar(item));
-                        next_paths.push(new_path);
-                    }
-                } else if list_val != serde_json::Value::Null {
-                    let mut new_path = path.clone();
-                    new_path.insert(variable.clone(), GraphBinding::Scalar(list_val));
-                    next_paths.push(new_path);
-                }
-            }
-
-            Ok(next_paths)
-        }
-        PhysicalOperator::ProcedureCall {
-            input,
-            output_vars,
-            rows,
-        } => {
-            let child_paths = execute_physical(graph, input, params)?;
-            let mut next_paths = Vec::new();
-
-            // For each input row, emit one output row per resolved procedure row,
-            // binding the YIELD output variables. A void procedure has empty
-            // `output_vars` and a single empty row, so this passes rows through.
-            for path in child_paths {
-                for row in rows {
-                    let mut new_path = path.clone();
-                    for (var, value) in output_vars.iter().zip(row.iter()) {
-                        new_path.insert(var.clone(), GraphBinding::Scalar(value.clone()));
-                    }
-                    next_paths.push(new_path);
-                }
-            }
-
-            Ok(next_paths)
-        }
-        PhysicalOperator::Project {
-            input,
-            items,
-            is_barrier,
-        } => {
-            let child_paths = execute_physical(graph, input, params)?;
-            project_rows(graph, child_paths, items, *is_barrier, params)
-        }
-        PhysicalOperator::Aggregate {
-            input,
-            group_by,
-            aggregations,
-        } => {
-            use std::collections::BTreeMap;
-
-            struct AggState {
-                count: i64,
-                sum: f64,
-                /// True once a non-integer value has been summed. `sum()` over only
-                /// integers returns an integer, matching openCypher numeric typing.
-                sum_is_float: bool,
-                min: Option<serde_json::Value>,
-                max: Option<serde_json::Value>,
-                collect: Vec<serde_json::Value>,
-                distinct_seen: std::collections::HashSet<String>,
-                /// Accumulated numeric values for stDev, stDevP, percentile functions.
-                values: Vec<f64>,
-            }
-            impl AggState {
-                fn new() -> Self {
-                    Self {
-                        count: 0,
-                        sum: 0.0,
-                        sum_is_float: false,
-                        min: None,
-                        max: None,
-                        collect: Vec::new(),
-                        distinct_seen: std::collections::HashSet::new(),
-                        values: Vec::new(),
-                    }
-                }
-            }
-
-            // group_key -> (group-by PathMap, per-aggregation state Vec)
-            let mut groups: BTreeMap<String, (PathMap, Vec<AggState>)> = BTreeMap::new();
-            if group_by.is_empty() {
-                let states = aggregations.iter().map(|_| AggState::new()).collect();
-                groups.insert("".to_string(), (PathMap::new(), states));
-            }
-
-            // Fold one input row into the group table. The fold is associative
-            // and order-independent, so rows can arrive in any batching: streamed
-            // a batch at a time or from a fully materialized child, the resulting
-            // groups are identical.
-            let fold_path = |groups: &mut BTreeMap<String, (PathMap, Vec<AggState>)>,
-                             path: PathMap|
-             -> Result<(), String> {
-                let mut key_parts = Vec::new();
-                let mut gb_path = PathMap::new();
-                for (expr, alias) in group_by {
-                    let val = evaluate_expr(graph, &path, expr, params)?;
-                    let col = if let Some(a) = alias {
-                        a.clone()
-                    } else {
-                        match expr {
-                            Expr::Prop(var, prop) if prop.is_empty() => var.clone(),
-                            Expr::Prop(var, prop) => format!("{}.{}", var, prop),
-                            Expr::Literal(lit) => lit.to_string(),
-                            Expr::Param(p) => format!("${}", p),
-                            other => expr_display_name(other),
-                        }
-                    };
-                    key_parts.push(val.to_string());
-                    gb_path.insert(col, GraphBinding::Scalar(val));
-                }
-                let group_key = key_parts.join("\x00");
-
-                let entry = groups.entry(group_key).or_insert_with(|| {
-                    let states = aggregations.iter().map(|_| AggState::new()).collect();
-                    (gb_path, states)
-                });
-
-                for (i, (agg_fn, inner_expr, _col)) in aggregations.iter().enumerate() {
-                    let state = &mut entry.1[i];
-                    match agg_fn {
-                        AggFn::Count { distinct } => {
-                            if matches!(inner_expr, Expr::CountStar) {
-                                state.count += 1;
-                            } else {
-                                let val = evaluate_expr(graph, &path, inner_expr, params)?;
-                                if val != serde_json::Value::Null {
-                                    if *distinct {
-                                        if state.distinct_seen.insert(val.to_string()) {
-                                            state.count += 1;
-                                        }
-                                    } else {
-                                        state.count += 1;
-                                    }
-                                }
-                            }
-                        }
-                        AggFn::Sum { distinct } => {
-                            let val = evaluate_expr(graph, &path, inner_expr, params)?;
-                            if val != serde_json::Value::Null {
-                                if *distinct && !state.distinct_seen.insert(val.to_string()) {
-                                    // already seen, skip
-                                } else if let Some(n) = val.as_f64() {
-                                    if val.as_i64().is_none() {
-                                        state.sum_is_float = true;
-                                    }
-                                    state.sum += n;
-                                }
-                            }
-                        }
-                        AggFn::Avg { distinct } => {
-                            let val = evaluate_expr(graph, &path, inner_expr, params)?;
-                            if val != serde_json::Value::Null {
-                                if *distinct && !state.distinct_seen.insert(val.to_string()) {
-                                    // already seen, skip
-                                } else if let Some(n) = val.as_f64() {
-                                    state.sum += n;
-                                    state.count += 1;
-                                }
-                            }
-                        }
-                        AggFn::Min { .. } => {
-                            let val = evaluate_expr(graph, &path, inner_expr, params)?;
-                            if val != serde_json::Value::Null {
-                                state.min = Some(match state.min.take() {
-                                    None => val,
-                                    Some(prev) => {
-                                        if json_cmp_total(&val, &prev) == std::cmp::Ordering::Less {
-                                            val
-                                        } else {
-                                            prev
-                                        }
-                                    }
-                                });
-                            }
-                        }
-                        AggFn::Max { .. } => {
-                            let val = evaluate_expr(graph, &path, inner_expr, params)?;
-                            if val != serde_json::Value::Null {
-                                state.max = Some(match state.max.take() {
-                                    None => val,
-                                    Some(prev) => {
-                                        if json_cmp_total(&val, &prev)
-                                            == std::cmp::Ordering::Greater
-                                        {
-                                            val
-                                        } else {
-                                            prev
-                                        }
-                                    }
-                                });
-                            }
-                        }
-                        AggFn::Collect { distinct } => {
-                            let val = evaluate_expr(graph, &path, inner_expr, params)?;
-                            if val != serde_json::Value::Null {
-                                if *distinct && !state.distinct_seen.insert(val.to_string()) {
-                                    // already seen, skip
-                                } else {
-                                    state.collect.push(val);
-                                }
-                            }
-                        }
-                        AggFn::StDev { .. } | AggFn::StDevP { .. } => {
-                            let val = evaluate_expr(graph, &path, inner_expr, params)?;
-                            if let Some(n) = val.as_f64() {
-                                state.values.push(n);
-                            }
-                        }
-                        AggFn::PercentileDisc { .. } | AggFn::PercentileCont { .. } => {
-                            let val = evaluate_expr(graph, &path, inner_expr, params)?;
-                            if let Some(n) = val.as_f64() {
-                                state.values.push(n);
-                            }
-                        }
-                    }
-                }
-                Ok(())
-            };
-
-            // Drive the fold. A streamable child is pulled a batch at a time so
-            // peak memory is one batch plus the group table; any other child
-            // (for example an Aggregate over a HashJoin) is materialized once.
-            if is_streamable(input) {
-                let mut stream = build_stream(input);
-                loop {
-                    let batch = stream.next_batch(graph, params)?;
-                    if batch.is_empty() {
-                        break;
-                    }
-                    for path in batch {
-                        fold_path(&mut groups, path)?;
-                    }
-                }
-            } else {
-                for path in execute_physical(graph, input, params)? {
-                    fold_path(&mut groups, path)?;
-                }
-            }
-
-            let mut result = Vec::new();
-            for (_key, (mut gb_path, states)) in groups {
-                for (i, (agg_fn, _inner, col)) in aggregations.iter().enumerate() {
-                    let state = &states[i];
-                    let agg_val = match agg_fn {
-                        AggFn::Count { .. } => serde_json::Value::Number(state.count.into()),
-                        AggFn::Sum { .. } => {
-                            // Preserve integer typing: a sum over only integer inputs
-                            // is an integer, as in openCypher.
-                            if !state.sum_is_float
-                                && state.sum.fract() == 0.0
-                                && state.sum.abs() < i64::MAX as f64
-                            {
-                                serde_json::Value::Number((state.sum as i64).into())
-                            } else {
-                                serde_json::Number::from_f64(state.sum)
-                                    .map(serde_json::Value::Number)
-                                    .unwrap_or(serde_json::Value::Null)
-                            }
-                        }
-                        AggFn::Avg { .. } => {
-                            if state.count == 0 {
-                                serde_json::Value::Null
-                            } else {
-                                let avg = state.sum / state.count as f64;
-                                serde_json::Number::from_f64(avg)
-                                    .map(serde_json::Value::Number)
-                                    .unwrap_or(serde_json::Value::Null)
-                            }
-                        }
-                        AggFn::Min { .. } => state.min.clone().unwrap_or(serde_json::Value::Null),
-                        AggFn::Max { .. } => state.max.clone().unwrap_or(serde_json::Value::Null),
-                        AggFn::Collect { .. } => serde_json::Value::Array(state.collect.clone()),
-                        AggFn::StDev { .. } => {
-                            let n = state.values.len();
-                            if n < 2 {
-                                serde_json::Value::Number(
-                                    serde_json::Number::from_f64(0.0)
-                                        .unwrap_or_else(|| serde_json::Number::from(0)),
-                                )
-                            } else {
-                                let mean = state.values.iter().sum::<f64>() / n as f64;
-                                let variance =
-                                    state.values.iter().map(|x| (x - mean).powi(2)).sum::<f64>()
-                                        / (n - 1) as f64;
-                                serde_json::Number::from_f64(variance.sqrt())
-                                    .map(serde_json::Value::Number)
-                                    .unwrap_or(serde_json::Value::Null)
-                            }
-                        }
-                        AggFn::StDevP { .. } => {
-                            let n = state.values.len();
-                            if n == 0 {
-                                serde_json::Value::Number(
-                                    serde_json::Number::from_f64(0.0)
-                                        .unwrap_or_else(|| serde_json::Number::from(0)),
-                                )
-                            } else {
-                                let mean = state.values.iter().sum::<f64>() / n as f64;
-                                let variance =
-                                    state.values.iter().map(|x| (x - mean).powi(2)).sum::<f64>()
-                                        / n as f64;
-                                serde_json::Number::from_f64(variance.sqrt())
-                                    .map(serde_json::Value::Number)
-                                    .unwrap_or(serde_json::Value::Null)
-                            }
-                        }
-                        AggFn::PercentileDisc { percentile } => {
-                            let percentile =
-                                evaluate_expr(graph, &PathMap::new(), percentile, params)?
-                                    .as_f64()
-                                    .ok_or("percentileDisc(): percentile must be a number")?;
-                            if !(0.0..=1.0).contains(&percentile) {
-                                return Err("ArgumentError(NumberOutOfRange): percentile must be in [0.0, 1.0]".to_string());
-                            }
-                            let mut sorted = state.values.clone();
-                            sorted.sort_by(|a, b| {
-                                a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-                            });
-                            let n = sorted.len();
-                            if n == 0 {
-                                serde_json::Value::Null
-                            } else {
-                                let idx = ((percentile * n as f64).ceil() as usize)
-                                    .saturating_sub(1)
-                                    .min(n - 1);
-                                serde_json::Number::from_f64(sorted[idx])
-                                    .map(serde_json::Value::Number)
-                                    .unwrap_or(serde_json::Value::Null)
-                            }
-                        }
-                        AggFn::PercentileCont { percentile } => {
-                            let percentile =
-                                evaluate_expr(graph, &PathMap::new(), percentile, params)?
-                                    .as_f64()
-                                    .ok_or("percentileCont(): percentile must be a number")?;
-                            if !(0.0..=1.0).contains(&percentile) {
-                                return Err("ArgumentError(NumberOutOfRange): percentile must be in [0.0, 1.0]".to_string());
-                            }
-                            let mut sorted = state.values.clone();
-                            sorted.sort_by(|a, b| {
-                                a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-                            });
-                            let n = sorted.len();
-                            if n == 0 {
-                                serde_json::Value::Null
-                            } else {
-                                let rank = percentile * (n - 1) as f64;
-                                let lower = rank.floor() as usize;
-                                let upper = rank.ceil() as usize;
-                                let frac = rank - lower as f64;
-                                let val = sorted[lower]
-                                    + frac * (sorted[upper.min(n - 1)] - sorted[lower]);
-                                serde_json::Number::from_f64(val)
-                                    .map(serde_json::Value::Number)
-                                    .unwrap_or(serde_json::Value::Null)
-                            }
-                        }
-                    };
-                    gb_path.insert(col.clone(), GraphBinding::Scalar(agg_val));
-                }
-                result.push(gb_path);
-            }
-
-            Ok(result)
-        }
-        PhysicalOperator::Sort { input, items } => {
-            let mut child_paths = execute_physical(graph, input, params)?;
-
-            let mut keyed: Vec<(Vec<serde_json::Value>, PathMap)> = child_paths
-                .drain(..)
-                .map(|path| {
-                    let keys: Vec<serde_json::Value> = items
-                        .iter()
-                        .map(|si| evaluate_sort_key(graph, &path, &si.expr, params))
-                        .collect();
-                    (keys, path)
-                })
-                .collect();
-
-            keyed.sort_by(|(ka, _), (kb, _)| {
-                for (i, si) in items.iter().enumerate() {
-                    let ord =
-                        json_cmp(&ka[i], &kb[i]).unwrap_or_else(|| json_cmp_total(&ka[i], &kb[i]));
-                    let ord = if si.ascending { ord } else { ord.reverse() };
-                    if ord != std::cmp::Ordering::Equal {
-                        return ord;
-                    }
-                }
-                std::cmp::Ordering::Equal
-            });
-
-            Ok(keyed.into_iter().map(|(_, path)| path).collect())
-        }
-        PhysicalOperator::Limit { input, skip, count } => {
-            // Validate skip and count.
-            if *skip > 1_000_000_000 {
-                return Err(format!("SKIP value too large: {}", skip));
-            }
-            // When the whole input chain streams (Project/Filter/Expand down to
-            // a leaf scan), drive it lazily so the leaf scan and any Expand stop
-            // as soon as `skip + count` rows exist: this short-circuits LIMIT
-            // through Expand, not just over a bare scan. `LIMIT` without
-            // `ORDER BY` is order-independent, so taking the first matching rows
-            // is valid.
-            if is_streamable(input) {
-                return execute_streaming_limit(graph, input, params, *skip, *count);
-            }
-            // Non-streamable shapes (Sort, Aggregate, Distinct, HashJoin, ...)
-            // execute normally; `execute_bounded` still bounds the legacy
-            // projected-scan shape, and otherwise we fall through to full
-            // execution. Correctness never depends on the bound.
-            let cap = skip.saturating_add(*count);
-            let child_paths = match execute_bounded(graph, input, params, cap)? {
-                Some(rows) => rows,
-                None => execute_physical(graph, input, params)?,
-            };
-            Ok(child_paths.into_iter().skip(*skip).take(*count).collect())
-        }
-        PhysicalOperator::Distinct { input } => {
-            let child_paths = execute_physical(graph, input, params)?;
-            let mut seen = std::collections::HashSet::new();
-            let deduped: Vec<PathMap> = child_paths
-                .into_iter()
-                .filter(|path| {
-                    let key = path
-                        .iter()
-                        .map(|(k, v)| format!("{}={:?}", k, v))
-                        .collect::<Vec<_>>()
-                        .join("|");
-                    seen.insert(key)
-                })
-                .collect();
-            Ok(deduped)
-        }
-        PhysicalOperator::WritePart { input, part } => {
-            use super::write::execute_create_internal_with_context;
-            use super::write::execute_merge_internal_with_context;
-            use crate::ast::QueryPart;
-
-            let child_paths = execute_physical(graph, input, params)?;
-
-            // DELETE is evaluated over the whole result at once: all listed
-            // relationships are removed before any node, so an undirected expand
-            // that binds the same edge in more than one row still succeeds. The
-            // rows pass through unchanged for a following RETURN.
-            if let QueryPart::Delete { targets, detach } = part {
-                use super::write::delete_over_paths;
-                delete_over_paths(graph, &child_paths, targets, *detach, params)?;
-                return Ok(child_paths);
-            }
-
-            let mut result_paths = Vec::new();
-
-            for path in child_paths {
-                match part {
-                    QueryPart::Create { patterns } => {
-                        let mut new_path = path.clone();
-                        for pattern in patterns {
-                            let created = execute_create_internal_with_context(
-                                graph, pattern, &path, params,
-                            )?;
-                            new_path.extend(created);
-                        }
-                        result_paths.push(new_path);
-                    }
-                    QueryPart::Merge { merges } => {
-                        // Each MERGE in the clause extends every current row, and
-                        // may fan out to multiple rows when it matches more than one
-                        // existing pattern.
-                        let mut current = vec![path.clone()];
-                        for merge_stmt in merges {
-                            let mut next = Vec::new();
-                            for p in &current {
-                                let extensions = execute_merge_internal_with_context(
-                                    graph, merge_stmt, p, params,
-                                )?;
-                                for ext in extensions {
-                                    let mut row = p.clone();
-                                    row.extend(ext);
-                                    next.push(row);
-                                }
-                            }
-                            current = next;
-                        }
-                        result_paths.extend(current);
-                    }
-                    QueryPart::Set { items } => {
-                        // Apply SET for each row — supports node/edge properties and node labels.
-                        use super::write::apply_set_items;
-                        apply_set_items(graph, &path, items, params)?;
-                        result_paths.push(path);
-                    }
-                    QueryPart::Delete { targets, detach } => {
-                        use super::write::apply_delete_targets;
-                        apply_delete_targets(graph, &path, targets, *detach, params)?;
-                        result_paths.push(path);
-                    }
-                    QueryPart::Remove { items } => {
-                        use super::write::apply_remove_item;
-                        for item in items {
-                            apply_remove_item(graph, item, &path)?;
-                        }
-                        result_paths.push(path);
-                    }
-                    _ => {
-                        // Other QueryPart variants are not write clauses; pass through.
-                        result_paths.push(path);
-                    }
-                }
-            }
-
-            Ok(result_paths)
-        }
-        PhysicalOperator::OptionalMatch { input, null_vars } => {
-            let child_paths = execute_physical(graph, input, params)?;
-            if child_paths.is_empty() {
-                // Produce one null-filled row for the pattern variables.
-                let mut null_row: PathMap = HashMap::new();
-                for var in null_vars {
-                    null_row.insert(var.clone(), GraphBinding::Scalar(serde_json::Value::Null));
-                }
-                Ok(vec![null_row])
-            } else {
-                Ok(child_paths)
-            }
-        }
-        PhysicalOperator::MultiwayJoin {
-            input,
-            closing_src_var,
-            closing_dst_var,
-            closing_rel_type,
-            closing_rel_var,
-            closing_is_incoming,
-            closing_is_undirected,
-        } => {
-            let child_paths = execute_physical(graph, input, params)?;
-            if child_paths.is_empty() {
-                return Ok(vec![]);
-            }
-
-            // Collect unique closing-src node IDs for a single bulk expansion.
-            // Paying O(sum of degrees of unique sources) once is far cheaper than
-            // iterating all neighbors for every input row.
-            let mut src_nodes: Vec<NodeId> = child_paths
-                .iter()
-                .filter_map(|p| match p.get(closing_src_var) {
-                    Some(GraphBinding::Node(n)) => Some(*n),
-                    _ => None,
-                })
-                .collect();
-            src_nodes.sort_unstable();
-            src_nodes.dedup();
-
-            let mut next_paths = Vec::new();
-
-            if *closing_is_undirected {
-                // Undirected closing hop: the edge may run either way between the
-                // two bound nodes, so check both adjacency directions. Index every
-                // distinct edge (deduplicated by `(src, eid, dst)` to match the
-                // undirected Expand path: one row per edge, self-loops counted
-                // once) keyed by `closing_src → (closing_dst → [EdgeId])`.
-                let mut join_map: HashMap<NodeId, HashMap<NodeId, Vec<EdgeId>>> = HashMap::new();
-                let mut seen: HashSet<(NodeId, EdgeId, NodeId)> = HashSet::new();
-                for dir in [false, true] {
-                    let transitions =
-                        expand_multi_type(graph, &src_nodes, closing_rel_type.as_deref(), dir)?;
-                    for (src, eid, dst) in transitions {
-                        if seen.insert((src, eid, dst)) {
-                            join_map
-                                .entry(src)
-                                .or_default()
-                                .entry(dst)
-                                .or_default()
-                                .push(eid);
-                        }
-                    }
-                }
-
-                for path in child_paths {
-                    let closing_src = match path.get(closing_src_var) {
-                        Some(GraphBinding::Node(n)) => *n,
-                        _ => continue,
-                    };
-                    let closing_dst = match path.get(closing_dst_var) {
-                        Some(GraphBinding::Node(n)) => *n,
-                        _ => continue,
-                    };
-
-                    if let Some(eids) = join_map.get(&closing_src).and_then(|m| m.get(&closing_dst))
-                    {
-                        for &eid in eids {
-                            let mut new_path = path.clone();
-                            new_path.insert(closing_rel_var.clone(), GraphBinding::Edge(eid));
-                            next_paths.push(new_path);
-                        }
-                    }
-                }
-            } else {
-                let transitions = expand_multi_type(
-                    graph,
-                    &src_nodes,
-                    closing_rel_type.as_deref(),
-                    *closing_is_incoming,
-                )?;
-
-                // Index the transitions as (closing_src, closing_dst) → EdgeId for O(1) lookup.
-                let mut join_map: HashMap<NodeId, HashMap<NodeId, EdgeId>> = HashMap::new();
-                for (src, eid, dst) in transitions {
-                    join_map.entry(src).or_default().insert(dst, eid);
-                }
-
-                for path in child_paths {
-                    let closing_src = match path.get(closing_src_var) {
-                        Some(GraphBinding::Node(n)) => *n,
-                        _ => continue,
-                    };
-                    let closing_dst = match path.get(closing_dst_var) {
-                        Some(GraphBinding::Node(n)) => *n,
-                        _ => continue,
-                    };
-
-                    if let Some(dst_map) = join_map.get(&closing_src) {
-                        if let Some(&eid) = dst_map.get(&closing_dst) {
-                            let mut new_path = path.clone();
-                            new_path.insert(closing_rel_var.clone(), GraphBinding::Edge(eid));
-                            next_paths.push(new_path);
-                        }
-                    }
-                }
-            }
-
-            Ok(next_paths)
-        }
+        other => Err(format!("eval_leaf called on non-leaf operator: {other:?}")),
     }
+}
+
+/// Execute a physical operator tree, fully materializing the result rows.
+///
+/// This is the single execution path: it builds the pull-based `RowStream` for
+/// `op` and drains it into a `Vec`. Every operator is a `RowStream` variant, so
+/// there is no separate materializing executor; callers that need the whole
+/// result (the top-level projection, the write binding plans) drain here, while
+/// a `Limit` inside the tree still short-circuits its streamable input.
+pub(super) fn execute_physical(
+    graph: &Graph,
+    op: &PhysicalOperator,
+    params: &HashMap<String, serde_json::Value>,
+) -> Result<Vec<PathMap>, String> {
+    let mut stream = build_stream(op);
+    let mut out = Vec::new();
+    loop {
+        let batch = stream.next_batch(graph, params)?;
+        if batch.is_empty() {
+            break;
+        }
+        out.extend(batch);
+    }
+    Ok(out)
 }
 
 pub(super) fn evaluate_where(
@@ -3296,5 +3607,379 @@ pub(super) fn json_to_prop_value(v: &serde_json::Value) -> Option<PropValue> {
         }
         serde_json::Value::String(s) => Some(PropValue::Str(s.clone())),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod stream_join_tests {
+    //! Correctness guards for streaming `LIMIT` through `HashJoin` and
+    //! `MultiwayJoin`. Each test asserts the plan is actually streamable and
+    //! carries the expected join operator, then proves the streamed result
+    //! equals the materializing result: streaming the whole plan reproduces the
+    //! full result as a multiset, and a small `LIMIT` returns exactly that many
+    //! valid result rows. These exercise the new `RowStream::HashJoin` and
+    //! `RowStream::MultiwayJoin` arms directly, not just the public `execute`.
+    use super::*;
+    use crate::ast::Statement;
+    use crate::parser;
+    use crate::plan::physical::format_physical_plan;
+    use crate::plan::{LogicalPlanner, Optimizer, PhysicalPlanner};
+    use issundb_core::Graph;
+    use tempfile::TempDir;
+
+    fn setup() -> (TempDir, Graph) {
+        let dir = TempDir::new().unwrap();
+        let graph = Graph::open(dir.path(), 1).unwrap();
+        (dir, graph)
+    }
+
+    fn exec(graph: &Graph, cypher: &str) {
+        super::execute(graph, cypher, &HashMap::new()).unwrap();
+    }
+
+    fn optimized_plan(graph: &Graph, cypher: &str) -> PhysicalOperator {
+        let stmt = parser::parse(cypher).unwrap();
+        let q = match stmt {
+            Statement::Query(q) => q,
+            _ => panic!("not a read query: {cypher}"),
+        };
+        let logical = LogicalPlanner::plan(&q).unwrap();
+        let physical = PhysicalPlanner::plan(&logical);
+        Optimizer::optimize(physical, Some(graph))
+    }
+
+    type Row = Vec<serde_json::Value>;
+
+    fn run_rows(graph: &Graph, cypher: &str) -> Vec<Row> {
+        super::execute(graph, cypher, &HashMap::new())
+            .unwrap()
+            .records
+            .into_iter()
+            .map(|r| r.values)
+            .collect()
+    }
+
+    fn sorted_rows(rows: &[Row]) -> Vec<String> {
+        let mut v: Vec<String> = rows
+            .iter()
+            .map(|r| serde_json::to_string(r).unwrap())
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// Every row in `sub` is a row of `full`, counting multiplicity.
+    fn assert_subset(sub: &[Row], full: &[Row]) {
+        let mut counts: HashMap<String, i32> = HashMap::new();
+        for r in full {
+            *counts.entry(serde_json::to_string(r).unwrap()).or_default() += 1;
+        }
+        for r in sub {
+            let k = serde_json::to_string(r).unwrap();
+            let c = counts
+                .get_mut(&k)
+                .unwrap_or_else(|| panic!("streamed row not in full result: {k}"));
+            assert!(*c > 0, "streamed row appears too often vs full result: {k}");
+            *c -= 1;
+        }
+    }
+
+    /// The shared assertion. First proves the expected operator is in the plan
+    /// (`must_contain`). Then compares user-visible results: with one execution
+    /// path, a small `LIMIT` rides the short-circuit, so streaming the whole
+    /// result (`LIMIT 1000000`) must reproduce the unbounded result as a multiset,
+    /// and a small `LIMIT` must return exactly that many valid rows.
+    fn assert_streaming_matches(graph: &Graph, cypher: &str, must_contain: &str) {
+        let limit_query = format!("{cypher} LIMIT 1000000");
+        let plan = optimized_plan(graph, &limit_query);
+        let input = match &plan {
+            PhysicalOperator::Limit { input, .. } => input.as_ref(),
+            other => other,
+        };
+        let rendered = format_physical_plan(input, 0);
+        assert!(
+            rendered.contains(must_contain),
+            "plan for `{cypher}` does not contain {must_contain}:\n{rendered}"
+        );
+
+        let full = run_rows(graph, cypher);
+        assert!(!full.is_empty(), "fixture for `{cypher}` produced no rows");
+
+        // Streaming the whole result reproduces the materialized result.
+        let all = run_rows(graph, &limit_query);
+        assert_eq!(
+            sorted_rows(&all),
+            sorted_rows(&full),
+            "streamed-all != materialized for `{cypher}`"
+        );
+
+        // A small LIMIT returns exactly that many valid rows; a SKIP/LIMIT
+        // window is a valid single row. Both ride the short-circuit path.
+        if full.len() >= 2 {
+            let limited = run_rows(graph, &format!("{cypher} LIMIT 2"));
+            assert_eq!(limited.len(), 2, "LIMIT 2 count for `{cypher}`");
+            assert_subset(&limited, &full);
+
+            let windowed = run_rows(graph, &format!("{cypher} SKIP 1 LIMIT 1"));
+            assert_eq!(windowed.len(), 1, "SKIP 1 LIMIT 1 count for `{cypher}`");
+            assert_subset(&windowed, &full);
+        }
+    }
+
+    #[test]
+    fn streaming_inner_join_matches_materialized() {
+        let (_dir, graph) = setup();
+        // a1, a2, c1 all KNOW the shared target b: the two patterns join on b.
+        exec(
+            &graph,
+            "CREATE (b:Person {name: 'b'}), (a1:Person {name: 'a1'}), \
+             (a2:Person {name: 'a2'}), (c1:Person {name: 'c1'}) \
+             CREATE (a1)-[:KNOWS]->(b), (a2)-[:KNOWS]->(b), (c1)-[:KNOWS]->(b)",
+        );
+        graph.rebuild_csr().unwrap();
+        assert_streaming_matches(
+            &graph,
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) \
+             MATCH (c:Person)-[:KNOWS]->(b) RETURN a.name AS a, c.name AS c",
+            "HashJoin",
+        );
+    }
+
+    #[test]
+    fn streaming_outer_join_preserves_null_rows() {
+        let (_dir, graph) = setup();
+        // a1 knows b; a2 knows nobody, so the OPTIONAL side null-fills for a2.
+        exec(
+            &graph,
+            "CREATE (b:Person {name: 'b'}), (a1:Person {name: 'a1'}), (a2:Person {name: 'a2'}) \
+             CREATE (a1)-[:KNOWS]->(b)",
+        );
+        graph.rebuild_csr().unwrap();
+        assert_streaming_matches(
+            &graph,
+            "MATCH (a:Person) OPTIONAL MATCH (a)-[:KNOWS]->(b:Person) \
+             RETURN a.name AS a, b.name AS b",
+            "HashJoin",
+        );
+    }
+
+    #[test]
+    fn streaming_cartesian_join_matches_materialized() {
+        let (_dir, graph) = setup();
+        // Two patterns with no shared variable: a cross product.
+        exec(
+            &graph,
+            "CREATE (:Person {name: 'p1'}), (:Person {name: 'p2'}), \
+             (:City {name: 'c1'}), (:City {name: 'c2'})",
+        );
+        graph.rebuild_csr().unwrap();
+        assert_streaming_matches(
+            &graph,
+            "MATCH (p:Person) MATCH (c:City) RETURN p.name AS p, c.name AS c",
+            "HashJoin",
+        );
+    }
+
+    /// A directed triangle: the planner linearizes the cycle into a chain of
+    /// expands whose final hop closes onto the already-bound start node, which
+    /// the optimizer rewrites to a `MultiwayJoin`.
+    fn triangle_graph() -> (TempDir, Graph) {
+        let (dir, graph) = setup();
+        exec(
+            &graph,
+            "CREATE (x:N {name: 'x'}), (y:N {name: 'y'}), (z:N {name: 'z'}) \
+             CREATE (x)-[:R]->(y), (y)-[:R]->(z), (z)-[:R]->(x)",
+        );
+        graph.rebuild_csr().unwrap();
+        (dir, graph)
+    }
+
+    #[test]
+    fn streaming_directed_multiway_join_matches_materialized() {
+        let (_dir, graph) = triangle_graph();
+        assert_streaming_matches(
+            &graph,
+            "MATCH (a:N)-[:R]->(b)-[:R]->(c)-[:R]->(a) \
+             RETURN a.name AS a, b.name AS b, c.name AS c",
+            "MultiwayJoin",
+        );
+    }
+
+    #[test]
+    fn streaming_undirected_multiway_join_matches_materialized() {
+        let (_dir, graph) = triangle_graph();
+        // The closing hop is undirected, so the MultiwayJoin checks both edge
+        // directions between the bound pair.
+        assert_streaming_matches(
+            &graph,
+            "MATCH (a:N)-[:R]->(b)-[:R]->(c)-[r:R]-(a) \
+             RETURN a.name AS a, b.name AS b, c.name AS c",
+            "MultiwayJoin",
+        );
+    }
+
+    /// One probe batch fanning out to more than `STREAM_BATCH` joined rows must
+    /// exercise the overflow buffer without losing or duplicating rows.
+    #[test]
+    fn streaming_inner_join_crosses_stream_batch() {
+        let (_dir, graph) = setup();
+        let b = graph
+            .add_node("Person", &serde_json::json!({"name": "b"}))
+            .unwrap();
+        // 60 sources on the `a` side, 5 on the `c` side, all KNOWS b: the join
+        // emits 60 * 5 = 300 rows (> STREAM_BATCH = 256) from one probe batch.
+        for i in 0..60 {
+            let a = graph
+                .add_node("Person", &serde_json::json!({"name": format!("a{i}")}))
+                .unwrap();
+            graph
+                .add_edge(a, b, "KNOWS", &serde_json::json!({}))
+                .unwrap();
+        }
+        for i in 0..5 {
+            let c = graph
+                .add_node("Person", &serde_json::json!({"name": format!("c{i}")}))
+                .unwrap();
+            graph
+                .add_edge(c, b, "KNOWS", &serde_json::json!({}))
+                .unwrap();
+        }
+        graph.rebuild_csr().unwrap();
+        assert_streaming_matches(
+            &graph,
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) \
+             MATCH (c:Person)-[:KNOWS]->(b) RETURN a.name AS a, c.name AS c",
+            "HashJoin",
+        );
+    }
+
+    /// `WITH DISTINCT` lowers to a `Distinct` operator: streaming it lets a
+    /// downstream `LIMIT` short-circuit, and streamed-all must reproduce the
+    /// deduplicated result.
+    #[test]
+    fn streaming_distinct_matches_materialized() {
+        let (_dir, graph) = setup();
+        // a1, a2 both know b1; a3 knows b2: DISTINCT b collapses to two targets.
+        exec(
+            &graph,
+            "CREATE (b1:Person {name: 'b1'}), (b2:Person {name: 'b2'}), \
+             (a1:Person {name: 'a1'}), (a2:Person {name: 'a2'}), (a3:Person {name: 'a3'}) \
+             CREATE (a1)-[:KNOWS]->(b1), (a2)-[:KNOWS]->(b1), (a3)-[:KNOWS]->(b2)",
+        );
+        graph.rebuild_csr().unwrap();
+        assert_streaming_matches(
+            &graph,
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) WITH DISTINCT b RETURN b.name AS b",
+            "Distinct",
+        );
+    }
+
+    /// UNWIND streams 1:N, so a small `LIMIT` stops after a few elements.
+    #[test]
+    fn streaming_unwind_matches_materialized() {
+        let (_dir, graph) = setup();
+        assert_streaming_matches(
+            &graph,
+            "UNWIND [1, 2, 3, 4, 5, 6, 7] AS x RETURN x AS x",
+            "Unwind",
+        );
+    }
+
+    /// A leading OPTIONAL MATCH forwards its rows when the pattern matches, and
+    /// emits exactly one null-filled row when it does not. A `LIMIT` short-circuits
+    /// the pass-through.
+    #[test]
+    fn streaming_optional_match_passes_through_and_null_fills() {
+        let (_dir, graph) = setup();
+        exec(
+            &graph,
+            "CREATE (:Person {name: 'p1'}), (:Person {name: 'p2'})",
+        );
+        graph.rebuild_csr().unwrap();
+
+        let mut rows = run_rows(&graph, "OPTIONAL MATCH (p:Person) RETURN p.name AS p");
+        rows.sort_by_key(|r| r[0].to_string());
+        assert_eq!(
+            rows,
+            vec![vec![serde_json::json!("p1")], vec![serde_json::json!("p2")],]
+        );
+
+        // No match: a single null-filled row.
+        let none = run_rows(&graph, "OPTIONAL MATCH (x:Nonexistent) RETURN x.name AS x");
+        assert_eq!(none, vec![vec![serde_json::Value::Null]]);
+
+        // LIMIT short-circuits the forwarded rows.
+        let limited = run_rows(
+            &graph,
+            "OPTIONAL MATCH (p:Person) RETURN p.name AS p LIMIT 1",
+        );
+        assert_eq!(limited.len(), 1);
+    }
+
+    /// `ORDER BY ... LIMIT k` selects a bounded top-N via the heap path; the result
+    /// must equal a full sort truncated to the window, for ASC, DESC, and a
+    /// SKIP/LIMIT window.
+    #[test]
+    fn sort_limit_topn_matches_full_sort() {
+        let (_dir, graph) = setup();
+        for i in 0..50 {
+            exec(&graph, &format!("CREATE (:P {{name: 'n{i}', age: {i}}})"));
+        }
+        graph.rebuild_csr().unwrap();
+
+        // The top-N path engages only when the Limit's input is a Sort.
+        let plan = optimized_plan(
+            &graph,
+            "MATCH (n:P) RETURN n.age AS age ORDER BY n.age ASC LIMIT 5",
+        );
+        assert!(
+            matches!(
+                &plan,
+                PhysicalOperator::Limit { input, .. } if matches!(input.as_ref(), PhysicalOperator::Sort { .. })
+            ),
+            "expected Limit over Sort, got:\n{}",
+            format_physical_plan(&plan, 0)
+        );
+
+        let full = run_rows(&graph, "MATCH (n:P) RETURN n.age AS age ORDER BY n.age ASC");
+        let top = run_rows(
+            &graph,
+            "MATCH (n:P) RETURN n.age AS age ORDER BY n.age ASC LIMIT 5",
+        );
+        assert_eq!(top, full[..5].to_vec(), "ASC top-5");
+
+        let full_desc = run_rows(
+            &graph,
+            "MATCH (n:P) RETURN n.age AS age ORDER BY n.age DESC",
+        );
+        let top_desc = run_rows(
+            &graph,
+            "MATCH (n:P) RETURN n.age AS age ORDER BY n.age DESC LIMIT 5",
+        );
+        assert_eq!(top_desc, full_desc[..5].to_vec(), "DESC top-5");
+
+        let window = run_rows(
+            &graph,
+            "MATCH (n:P) RETURN n.age AS age ORDER BY n.age ASC SKIP 3 LIMIT 4",
+        );
+        assert_eq!(window, full[3..7].to_vec(), "ASC SKIP 3 LIMIT 4 window");
+    }
+
+    /// Top-N over more than `STREAM_BATCH` input rows must still match a full sort,
+    /// exercising the bounded buffer's trim-on-fill across batches.
+    #[test]
+    fn sort_limit_topn_crosses_stream_batch() {
+        let (_dir, graph) = setup();
+        // 600 rows (> STREAM_BATCH = 256), ages chosen so order is unambiguous.
+        for i in 0..600 {
+            exec(&graph, &format!("CREATE (:Q {{age: {i}}})"));
+        }
+        graph.rebuild_csr().unwrap();
+        let full = run_rows(&graph, "MATCH (n:Q) RETURN n.age AS age ORDER BY n.age ASC");
+        let top = run_rows(
+            &graph,
+            "MATCH (n:Q) RETURN n.age AS age ORDER BY n.age ASC LIMIT 10",
+        );
+        assert_eq!(top, full[..10].to_vec());
     }
 }
