@@ -757,7 +757,8 @@ pub(crate) fn expr_parser<'a>() -> impl Parser<'a, ParserInput<'a>, Expr, Parser
                         .to(PostfixOp::IsNotNull),
                     keyword("NULL").to(PostfixOp::IsNull),
                 ))),
-                // n:Label — label predicate usable in WHERE expressions.
+                // n:Label: label predicate usable in WHERE expressions.
+
                 // Only applies when the left operand is a bare identifier (Prop(name, "")).
                 sym(Tok::Colon)
                     .ignore_then(identifier())
@@ -811,16 +812,19 @@ pub(crate) fn expr_parser<'a>() -> impl Parser<'a, ParserInput<'a>, Expr, Parser
         // IS consumed (13 > 12 true), giving the correct NOT > AND but NOT < comparisons.
         // openCypher Pratt precedence table (all levels; higher = tighter binding).
         // Empirically chumsky's prefix(P) consumes infix(left(P)) (same level), so
-        // NOT must be at prefix(13) — one above AND(12) — to give (NOT a) AND b.
+        // NOT must be at prefix(13); one above AND(12); to give (NOT a) AND b.
+
         //
         //  10: OR         11: XOR       12: AND
-        //  13: NOT (prefix — grabs comparisons 14 but not AND 12)
+        //  13: NOT (prefix; grabs comparisons 14 but not AND 12)
+
         //  14: =,<>,<,>,<=,>=,=~
         //  15: IN, CONTAINS, STARTS WITH, ENDS WITH  (tighter than =)
         //  16: +, -  (binary)
         //  17: *, /, %
         //  18: ^  (left-assoc)
-        //  19: unary -  (prefix — binds tighter than ^, so -3^2 = (-3)^2 = 9)
+        //  19: unary -  (prefix; binds tighter than ^, so -3^2 = (-3)^2 = 9)
+
         let pratt = postfix.pratt((
             // Unary minus at 19, one above ^ (18): chumsky's prefix(P) lets infix(left(P))
             // bind into its operand, so unary minus must sit ABOVE ^ for openCypher's
@@ -1242,7 +1246,7 @@ fn return_clause(
                 .map(|d| d.unwrap_or(false)),
         )
         .then(choice((
-            // `RETURN *` — return all bound variables.
+            // `RETURN *`: return all bound variables.
             sym(Tok::Star).to(vec![ReturnItem {
                 expr: Expr::FunctionCall {
                     name: "__star__".to_string(),
@@ -5049,7 +5053,8 @@ mod tests {
 
     #[test]
     fn rel_var_used_as_node_errors() {
-        // ()-[r]-(r) — 'r' as both relationship and node
+        // ()-[r]-(r): 'r' as both relationship and node
+
         let result = parse("MATCH ()-[r]-(r) RETURN r");
         assert!(
             result.is_err(),
@@ -5059,7 +5064,8 @@ mod tests {
 
     #[test]
     fn cross_match_node_then_rel_var_errors() {
-        // MATCH (r) MATCH ()-[r]-() — 'r' as node then relationship
+        // MATCH (r) MATCH ()-[r]-(): 'r' as node then relationship
+
         let result = parse("MATCH (r) MATCH ()-[r]-() RETURN r");
         assert!(
             result.is_err(),

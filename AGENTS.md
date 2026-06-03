@@ -66,8 +66,10 @@ Do not invent modules that do not yet exist when answering questions, but do pla
     - `src/graph/algo.rs`: public algorithm dispatch methods and internal traversal helpers.
     - `src/graph/graphblas/`: GraphBLAS algorithm implementations split by family: `traversal.rs`, `analytics.rs`, `paths.rs`, and `flow.rs`.
     - `src/graph/txn.rs`: `ReadTxn` and `WriteTxn` delegation impls and transaction tests.
-    - `src/csr.rs`: in-memory CSR snapshot, rebuilt in the background and swapped via `arc-swap`.
-    - `src/matrices.rs`: GraphBLAS matrix materialization from the CSR snapshot.
+    - `src/csr.rs`: in-memory CSR snapshot, rebuilt in the background and swapped via `arc-swap`. Also owns the `GraphDelta` buffer captured on the
+      write path and the `write_gen`/`snapshot_gen` generation counters that drive incremental matrix maintenance and on-demand CSR refresh.
+    - `src/matrices.rs`: GraphBLAS matrix materialization from the CSR snapshot, plus `MatrixSet::apply_delta` for incremental in-place maintenance
+      (resize plus per-element set and drop) and the self-contained `dense_to_id`/`id_to_dense` mapping the matrix-view consumers read.
     - `src/error.rs`: `Error` enum; all storage and serialization errors unify here.
 - `crates/issundb-cypher/`: Cypher parser, AST, logical planner, physical planner, optimizer, and executor.
     - `src/parser.rs`: hand-written recursive-descent parser for MATCH (including inline relationship property maps and multi-label node patterns
@@ -125,10 +127,17 @@ Do not invent modules that do not yet exist when answering questions, but do pla
 - Secondary indexes (`label_idx`, `type_idx`) use 12-byte composite keys `(u32 BE, u64 BE)` stored in plain LMDB databases with `Unit` values.
   Prefix-range scans via `prefix_iter` enumerate all nodes or edges for a given label or type in ascending ID order. A multi-label node has one
   `label_idx` entry per label it carries, so it appears in every matching label scan.
-- The CSR snapshot is the basis for the GraphBLAS algorithms: GraphBLAS operates on it for all graph algorithms, pattern matching, and
-  multi-source expansion. The snapshot lags writes until the background rebuild runs, so it has eventual-consistency semantics; callers needing a
-  fresh view call `rebuild_csr`. Point adjacency lookups (`out_neighbors`, `in_neighbors`, `all_neighbors`) read the `out_adj` and `in_adj` stores
-  directly through the transaction, never the snapshot, so they always reflect committed and in-transaction writes.
+- The GraphBLAS matrices (`MatrixSet`) and the CSR snapshot are the basis for the GraphBLAS algorithms, pattern matching, and multi-source
+  expansion. They are kept fresh through two gates rather than a single periodic rebuild. The write path records a structural delta (added nodes,
+  added edges, and removed edges, plus a `force_full` flag set on any node deletion). The pure-adjacency consumers (`bfs`, `bfs_multi_source`,
+  untyped expansion, `degree_centrality`, and `connected_components`) call `ensure_matrix_view`, which applies the delta in place in time
+  proportional to the change (resize plus per-element set and drop on `adjacency` and `adjacency_t`), falling back to a full `rebuild_csr` only when
+  a node was deleted. The CSR-array and hybrid consumers (everything else, including `dfs`, the path searches, the weighted and flow algorithms,
+  `page_rank`, and the remaining centralities) call `ensure_csr_fresh`, which rebuilds on demand gated by a committed-write generation counter
+  (`write_gen` versus `snapshot_gen`). The background rebuild after `REBUILD_THRESHOLD` writes is a compaction safety net, not the freshness path.
+  Callers needing a guaranteed fresh CSR view still call `rebuild_csr`. Point adjacency lookups (`out_neighbors`, `in_neighbors`, `all_neighbors`)
+  read the `out_adj` and `in_adj` stores directly through the transaction, never the snapshot, so they always reflect committed and in-transaction
+  writes.
 - `Storage::open` is the only entry point for LMDB. Do not call `heed::EnvOpenOptions` from outside `crates/issundb-core/src/storage/lmdb.rs`.
 - Heavy dependencies are tracked in the workspace `Cargo.toml`. `usearch`, `chumsky`, and GraphBLAS (`graphblas-sparse-linear-algebra`) are active,
   non-optional dependencies.

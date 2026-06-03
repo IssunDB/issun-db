@@ -588,7 +588,7 @@ mod tests {
     #[test]
     fn graphblas_multi_source_deduplicates_shared_neighbors() {
         let (_dir, g) = open_tmp();
-        // a → c; b → c — c must appear once.
+        // a → c; b → c; c must appear once.
         let a = g.add_node("N", &json!({})).unwrap();
         let b = g.add_node("N", &json!({})).unwrap();
         let c = g.add_node("N", &json!({})).unwrap();

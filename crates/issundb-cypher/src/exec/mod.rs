@@ -2463,7 +2463,8 @@ mod tests {
     fn foreach_creates_nodes_from_list() {
         let (_dir, graph) = setup_graph();
         // FOREACH iterates over a literal list; each iteration executes CREATE (:Person).
-        // The body CREATE uses no properties — we simply verify that one node is created
+        // The body CREATE uses no properties; we simply verify that one node is created
+
         // per list element (two elements → two nodes).
         execute(
             &graph,
@@ -2777,7 +2778,8 @@ mod tests {
                 .unwrap();
         }
 
-        // No Person has age = 30, so the build side is empty — result must be empty.
+        // No Person has age = 30, so the build side is empty; result must be empty.
+
         let rows = run(
             &graph,
             "MATCH (a:Person) MATCH (a:Person) WHERE a.age = 30 RETURN a",

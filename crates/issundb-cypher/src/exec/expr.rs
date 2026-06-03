@@ -2426,7 +2426,8 @@ fn naive_date_from_str(s: &str) -> Result<NaiveDate, String> {
     if let Ok(d) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
         return Ok(d);
     }
-    // "YYYY-Www-D" (10) — ISO week with dash separator and weekday
+    // "YYYY-Www-D" (10): ISO week with dash separator and weekday
+
     if let Ok(d) = NaiveDate::parse_from_str(s, "%G-W%V-%u") {
         return Ok(d);
     }
@@ -2440,7 +2441,8 @@ fn naive_date_from_str(s: &str) -> Result<NaiveDate, String> {
                 .ok_or_else(|| format!("cannot parse date: '{}'", s));
         }
     }
-    // "YYYY-Www" (9 chars: "YYYY-W30") — dash + W + 2 digit week
+    // "YYYY-Www" (9 chars: "YYYY-W30"): dash + W + 2 digit week
+
     if s.len() == 9 && s.starts_with(|c: char| c.is_ascii_digit()) {
         if let Some(w_pos) = s.find('W').or_else(|| s.find('w')) {
             let year_str = &s[..w_pos - 1]; // before dash
@@ -2451,7 +2453,8 @@ fn naive_date_from_str(s: &str) -> Result<NaiveDate, String> {
             }
         }
     }
-    // "YYYYDDD" (7) → ordinal (no dash) — after other 7-char checks fail
+    // "YYYYDDD" (7) → ordinal (no dash): after other 7-char checks fail
+
     if s.len() == 7 && !s.contains('-') && !s.contains('W') && !s.contains('w') {
         if let Ok(d) = NaiveDate::parse_from_str(s, "%Y%j") {
             return Ok(d);
