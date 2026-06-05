@@ -23,11 +23,18 @@ Knobs, all environment variables:
 - `LADYBUG_COMPARE_EDGES`: KNOWS edge count (default 50000)
 - `LADYBUG_COMPARE_REPS`: timed repetitions per query, median reported (default 10)
 - `LADYBUG_COMPARE_WARMUPS`: untimed warmup runs per query (default 3)
+- `LADYBUG_COMPARE_SKEW`: `uniform` (default) or `zipf` for a power-law degree distribution with hub nodes; the skewed graph contains far more
+  two-paths and triangles, so join-heavy queries get much slower on both engines
+- `LADYBUG_COMPARE_SWEEP`: set to `1` to run the workload at base/5, base, and base*5 sizes and print per-query scaling ratios between consecutive
+  sizes; ratios above the 5x dataset growth indicate superlinear behavior
+- `LADYBUG_COMPARE_BUDGET_SECS`: time budget per query per engine configuration (default 30); repetitions stop early once the budget is spent, and
+  a trailing `*` in the table marks a median taken from fewer than the requested reps
 
 ### Workload
 
 The synthetic graph is a deterministic LCG-generated social network (Person nodes with id, name, age, and city; distinct KNOWS edges, no self-loops),
-so runs are reproducible and both engines always see the same data.
+so runs are reproducible and both engines always see the same data. Edge endpoints are sampled uniformly by default or from a Zipf distribution
+(exponent 0.8) with `LADYBUG_COMPARE_SKEW=zipf`, which produces hub nodes as in real social graphs and stresses skewed joins.
 
 Current queries, each sent verbatim to both engines:
 
