@@ -29,7 +29,6 @@ independent and can be pursued separately.
 
 ### Current State
 
-
 - Row shape: `HashMap<String, GraphBinding>`. Variable lookup hashes a string;
   row clone copies the map and all string keys.
 - Scalars: `serde_json::Value`, which deep-clones strings and arrays per row.
@@ -50,7 +49,6 @@ reference):
 
 ### Why It Is Large
 
-
 `PathMap` and `GraphBinding` are threaded through `exec/read.rs`,
 `exec/write.rs`, `exec/expr.rs`, and `exec/factorize.rs` (several thousand
 lines). The change touches every operator and every expression evaluator. It is
@@ -70,7 +68,6 @@ rather than an incremental patch.
 
 ### Test Strategy
 
-
 Every phase must keep `make test` and `make test-conformance` green. The
 `query_optimizer` benchmarks plus the Pokec and Wikipedia benchmarks in
 `crates/issundb-core/benches` provide the before-and-after signal. Add a row-heavy
@@ -80,7 +77,6 @@ current optimizer benchmarks are deliberately small-result.
 ## Lever B: Per-Query Compilation Cost
 
 ### Current State
-
 
 `query()` parses, plans, and optimizes on every call. For repeated queries
 (parameterized or not) this work is redundant.

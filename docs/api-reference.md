@@ -74,14 +74,17 @@ Import the `GraphQueryExt` trait to run declarative graph queries.
 
 ## Cypher DDL Reference
 
-Schema statements run through the same `query` entry point as data statements. A DDL statement targets either nodes of a label, written `(n:Label)`, or relationships of a type, written `()-[r:TYPE]-()`.
+Schema statements run through the same `query` entry point as data statements. A DDL statement targets either nodes of a label, written `(n:Label)`,
+or relationships of a type, written `()-[r:TYPE]-()`.
 
 ### Index Statements
 
 - `CREATE INDEX FOR (n:Label) ON (n.property)`  
-  Creates a full-text search index on a node property. Node property equality and range lookups need no DDL because every node property is indexed automatically.
+  Creates a full-text search index on a node property. Node property equality and range lookups need no DDL because every node property is indexed
+  automatically.
 - `CREATE INDEX FOR ()-[r:TYPE]-() ON (r.property)`  
-  Creates a relationship property index and backfills it from existing relationships. Relationship properties are indexed only while such an index exists; subsequent relationship creation and property updates keep it current.
+  Creates a relationship property index and backfills it from existing relationships. Relationship properties are indexed only while such an index
+  exists; subsequent relationship creation and property updates keep it current.
 - `DROP INDEX FOR (n:Label) ON (n.property)`  
   Removes the full-text search index on a node property.
 - `DROP INDEX FOR ()-[r:TYPE]-() ON (r.property)`  
@@ -98,4 +101,6 @@ Schema statements run through the same `query` entry point as data statements. A
 - `CREATE CONSTRAINT ON ()-[r:TYPE]-() ASSERT EXISTS(r.property)`  
   Requires the property to be present and non-null on every relationship of the type.
 
-Each `CREATE CONSTRAINT` form has a matching `DROP CONSTRAINT` form with the same target and assertion. Creating a constraint validates the existing data first and fails if any element already violates it. Once in place, a constraint is checked when an element is created and when its properties are updated; a violating write fails and leaves the database unchanged.
+Each `CREATE CONSTRAINT` form has a matching `DROP CONSTRAINT` form with the same target and assertion. Creating a constraint validates the existing
+data first and fails if any element already violates it. Once in place, a constraint is checked when an element is created and when its properties are
+updated; a violating write fails and leaves the database unchanged.
