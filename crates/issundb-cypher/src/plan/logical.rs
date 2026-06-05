@@ -50,6 +50,11 @@ pub enum LogicalOperator {
         /// relationship already bound to one of these variables. Uniqueness is
         /// scoped to a single pattern, so separate MATCH clauses may reuse a relationship.
         unique_rels: Vec<String>,
+        /// True only when the pattern binds a path variable (`MATCH p = ...`), so
+        /// the executor must materialize a `_path_*` object per emitted row.
+        /// Building those objects costs three record decodes per row, so plain
+        /// patterns skip them entirely.
+        needs_path: bool,
     },
     /// Filter records based on expressions/WHERE predicates.
     Filter {
@@ -656,6 +661,7 @@ impl LogicalPlanner {
                 min_hops,
                 max_hops,
                 unique_rels: prior_rel_vars.clone(),
+                needs_path: pattern.path_variable.is_some(),
             };
             prior_rel_vars.push(rel_var.clone());
 

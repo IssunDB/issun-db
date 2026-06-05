@@ -807,6 +807,28 @@ mod tests {
         assert_eq!(rows[1][1], serde_json::json!([0, 1]));
     }
 
+    /// A named path over a fusable linear chain (two directed single-hop expands with
+    /// no filter between them) must still bind the path variable; the fused
+    /// `ExpandChain` fast path skips `_path_` construction entirely, so fusion must
+    /// not apply when the pattern binds a path.
+    #[test]
+    fn named_path_survives_fused_expand_chain() {
+        let (_dir, graph) = setup_graph();
+        let params = HashMap::new();
+        execute(
+            &graph,
+            "CREATE (a:X {n: 1}), (b), (c) CREATE (a)-[:T]->(b), (b)-[:T]->(c)",
+            &params,
+        )
+        .unwrap();
+        graph.rebuild_csr().unwrap();
+        let rows = run(
+            &graph,
+            "MATCH p = (a:X)-[:T]->()-[:T]->() RETURN length(p) AS len, size(nodes(p)) AS n",
+        );
+        assert_eq!(rows, vec![vec![serde_json::json!(2), serde_json::json!(3)]]);
+    }
+
     /// An inline label predicate on an OPTIONAL MATCH target node belongs to the optional
     /// pattern: when it eliminates every match, the bound left row is preserved with the
     /// optional variables null, not dropped (TCK Match7 [28]).

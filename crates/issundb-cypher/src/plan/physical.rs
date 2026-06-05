@@ -63,6 +63,11 @@ pub enum PhysicalOperator {
         /// this hop must bind a different relationship (openCypher
         /// relationship uniqueness, scoped to one pattern).
         unique_rels: Vec<String>,
+        /// True only when the pattern binds a path variable (`MATCH p = ...`);
+        /// the executor then materializes a `_path_*` object per emitted row,
+        /// and the fused-chain fast path (which skips path objects) must not
+        /// apply.
+        needs_path: bool,
     },
     /// Filter records based on expressions/WHERE predicates.
     Filter {
@@ -183,6 +188,7 @@ impl PhysicalPlanner {
                 min_hops,
                 max_hops,
                 unique_rels,
+                needs_path,
             } => PhysicalOperator::Expand {
                 input: Box::new(Self::plan(input)),
                 src_var: src_var.clone(),
@@ -194,6 +200,7 @@ impl PhysicalPlanner {
                 min_hops: *min_hops,
                 max_hops: *max_hops,
                 unique_rels: unique_rels.clone(),
+                needs_path: *needs_path,
             },
             LogicalOperator::Filter { input, expression } => PhysicalOperator::Filter {
                 input: Box::new(Self::plan(input)),

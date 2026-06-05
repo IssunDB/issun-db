@@ -1019,6 +1019,7 @@ fn expand_from_paths(
     min_hops: usize,
     max_hops: usize,
     unique_rels: &[String],
+    needs_path: bool,
 ) -> Result<Vec<PathMap>, String> {
     let mut next_paths = Vec::new();
 
@@ -1071,30 +1072,41 @@ fn expand_from_paths(
                     new_path.insert(rel_var.to_string(), GraphBinding::Edge(eid));
                     new_path.insert(dst_var.to_string(), GraphBinding::Node(dst_node));
 
-                    // Build and insert Path object
-                    let existing_path = match shared.get(&format!("_path_{}", src_var)) {
-                        Some(GraphBinding::Scalar(v)) => Some(v),
-                        _ => None,
-                    };
-                    if let Ok(path_obj) =
-                        extend_or_create_path(graph, existing_path, src_node, eid, dst_node)
-                    {
-                        new_path
-                            .insert(format!("_path_{}", dst_var), GraphBinding::Scalar(path_obj));
+                    // Build and insert the Path object only when the pattern binds a
+                    // path variable: it costs three record decodes per emitted row.
+                    if needs_path {
+                        let existing_path = match shared.get(&format!("_path_{}", src_var)) {
+                            Some(GraphBinding::Scalar(v)) => Some(v),
+                            _ => None,
+                        };
+                        if let Ok(path_obj) =
+                            extend_or_create_path(graph, existing_path, src_node, eid, dst_node)
+                        {
+                            new_path.insert(
+                                format!("_path_{}", dst_var),
+                                GraphBinding::Scalar(path_obj),
+                            );
+                        }
                     }
                     next_paths.push(new_path);
                 }
             }
         } else {
-            let src_rep = get_node_representation(graph, src_node)?;
+            // The traversed element list feeds only the Path object, so it stays
+            // empty (no per-step record decodes) unless the pattern binds a path.
+            let initial_traversed = if needs_path {
+                vec![get_node_representation(graph, src_node)?]
+            } else {
+                Vec::new()
+            };
             let mut visited = HashSet::new();
             visited.insert(src_node);
-            let mut queue = vec![(src_node, vec![src_rep], visited)];
+            let mut queue = vec![(src_node, initial_traversed.clone(), visited)];
             let mut completed_paths: Vec<(NodeId, Vec<serde_json::Value>)> = Vec::new();
             let mut completed_targets = HashSet::new();
 
             if min_hops == 0 {
-                completed_paths.push((src_node, vec![get_node_representation(graph, src_node)?]));
+                completed_paths.push((src_node, initial_traversed));
                 completed_targets.insert(src_node);
             }
 
@@ -1114,8 +1126,10 @@ fn expand_from_paths(
                             next_visited.insert(neigh_node);
 
                             let mut next_traversed = traversed.clone();
-                            next_traversed.push(get_edge_representation(graph, eid)?);
-                            next_traversed.push(get_node_representation(graph, neigh_node)?);
+                            if needs_path {
+                                next_traversed.push(get_edge_representation(graph, eid)?);
+                                next_traversed.push(get_node_representation(graph, neigh_node)?);
+                            }
 
                             if hop >= min_hops && completed_targets.insert(neigh_node) {
                                 completed_paths.push((neigh_node, next_traversed.clone()));
@@ -1139,29 +1153,31 @@ fn expand_from_paths(
                     continue;
                 }
 
-                // Build Path object
-                let mut nodes = Vec::new();
-                let mut relationships = Vec::new();
-                for (idx, item) in path_elements.into_iter().enumerate() {
-                    if idx % 2 == 0 {
-                        nodes.push(item);
-                    } else {
-                        relationships.push(item);
+                // Build the Path object only when the pattern binds a path variable.
+                if needs_path {
+                    let mut nodes = Vec::new();
+                    let mut relationships = Vec::new();
+                    for (idx, item) in path_elements.into_iter().enumerate() {
+                        if idx % 2 == 0 {
+                            nodes.push(item);
+                        } else {
+                            relationships.push(item);
+                        }
                     }
-                }
-                let mut m = serde_json::Map::new();
-                m.insert(
-                    "__type__".to_string(),
-                    serde_json::Value::String("__Path__".to_string()),
-                );
-                m.insert("nodes".to_string(), serde_json::Value::Array(nodes));
-                m.insert(
-                    "relationships".to_string(),
-                    serde_json::Value::Array(relationships),
-                );
-                let path_obj = serde_json::Value::Object(m);
+                    let mut m = serde_json::Map::new();
+                    m.insert(
+                        "__type__".to_string(),
+                        serde_json::Value::String("__Path__".to_string()),
+                    );
+                    m.insert("nodes".to_string(), serde_json::Value::Array(nodes));
+                    m.insert(
+                        "relationships".to_string(),
+                        serde_json::Value::Array(relationships),
+                    );
+                    let path_obj = serde_json::Value::Object(m);
 
-                new_path.insert(format!("_path_{}", dst_var), GraphBinding::Scalar(path_obj));
+                    new_path.insert(format!("_path_{}", dst_var), GraphBinding::Scalar(path_obj));
+                }
                 next_paths.push(new_path);
             }
         }
@@ -1248,6 +1264,7 @@ pub(super) fn eval_pattern_comprehension(
             min_hops,
             max_hops,
             &prior_rel_vars,
+            pattern.path_variable.is_some(),
         )?;
         prior_rel_vars.push(rel_var.clone());
         current_paths = filter_paths_by_node(
@@ -1980,6 +1997,9 @@ enum RowStream {
         min_hops: usize,
         max_hops: usize,
         unique_rels: Vec<String>,
+        /// True only when the pattern binds a path variable; the expansion then
+        /// materializes a `_path_*` object per emitted row.
+        needs_path: bool,
         /// Holds expansion output beyond `STREAM_BATCH`: one input row can fan
         /// out to many neighbors, so the overflow is buffered and served on
         /// later pulls before the next input batch is fetched.
@@ -2173,6 +2193,8 @@ fn build_stream_with_sip(
                 min_hops: 1,
                 max_hops: 1,
                 unique_rels,
+                // The factorized path never builds `_path_*` objects.
+                needs_path: false,
             } = input.as_ref()
             {
                 if !matches!(expression, FilterExpr::HasLabel(..)) {
@@ -2205,10 +2227,13 @@ fn build_stream_with_sip(
             min_hops,
             max_hops,
             unique_rels,
+            needs_path,
         } => {
             // Fused-chain fast path: collapse a maximal linear chain of single-hop
-            // directed Expands, mirroring the materializing `Expand` arm.
-            if *min_hops == 1 && *max_hops == 1 && !*is_undirected {
+            // directed Expands, mirroring the materializing `Expand` arm. The fused
+            // chain never builds `_path_*` objects, so hops of a named-path pattern
+            // are excluded.
+            if *min_hops == 1 && *max_hops == 1 && !*is_undirected && !*needs_path {
                 let mut hops = vec![OwnedChainHop {
                     src_var: src_var.clone(),
                     rel_var: rel_var.clone(),
@@ -2230,6 +2255,7 @@ fn build_stream_with_sip(
                     min_hops: 1,
                     max_hops: 1,
                     unique_rels: inner_unique_rels,
+                    needs_path: false,
                 } = base
                 {
                     if bottom_src != inner_dst_var {
@@ -2267,6 +2293,7 @@ fn build_stream_with_sip(
                 min_hops: *min_hops,
                 max_hops: *max_hops,
                 unique_rels: unique_rels.clone(),
+                needs_path: *needs_path,
                 buf: std::collections::VecDeque::new(),
             }
         }
@@ -2489,6 +2516,7 @@ impl RowStream {
                 min_hops,
                 max_hops,
                 unique_rels,
+                needs_path,
                 buf,
             } => loop {
                 if !buf.is_empty() {
@@ -2511,6 +2539,7 @@ impl RowStream {
                     *min_hops,
                     *max_hops,
                     unique_rels,
+                    *needs_path,
                 )?;
                 buf.extend(expanded);
             },

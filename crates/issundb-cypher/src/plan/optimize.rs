@@ -128,6 +128,7 @@ impl Optimizer {
                 min_hops,
                 max_hops,
                 unique_rels,
+                needs_path,
             } => {
                 let (inner_op, inner_filters) = Self::extract_filters(*input);
                 (
@@ -142,6 +143,7 @@ impl Optimizer {
                         min_hops,
                         max_hops,
                         unique_rels,
+                        needs_path,
                     },
                     inner_filters,
                 )
@@ -334,6 +336,7 @@ impl Optimizer {
                 min_hops,
                 max_hops,
                 unique_rels,
+                needs_path,
             } => PhysicalOperator::Expand {
                 input: Box::new(Self::reorder_operators(*input, stats)),
                 src_var,
@@ -345,6 +348,7 @@ impl Optimizer {
                 min_hops,
                 max_hops,
                 unique_rels,
+                needs_path,
             },
             // Filter nodes inside opaque barrier-Project subtrees are not stripped by
             // `extract_filters`.  Pass them through so that reordering does not panic.
@@ -658,6 +662,7 @@ impl Optimizer {
                 min_hops,
                 max_hops,
                 unique_rels,
+                needs_path,
             } => {
                 let child_bound = Self::bound_vars(&input);
 
@@ -687,6 +692,7 @@ impl Optimizer {
                     min_hops,
                     max_hops,
                     unique_rels,
+                    needs_path,
                 };
 
                 let bound = Self::bound_vars(&current_node);
@@ -1705,6 +1711,7 @@ impl Optimizer {
                 min_hops,
                 max_hops,
                 unique_rels,
+                needs_path,
             } => PhysicalOperator::Expand {
                 input: Box::new(Self::optimize_index_scans(*input, stats)),
                 src_var,
@@ -1716,6 +1723,7 @@ impl Optimizer {
                 min_hops,
                 max_hops,
                 unique_rels,
+                needs_path,
             },
             PhysicalOperator::Project {
                 input,
@@ -1831,6 +1839,7 @@ impl Optimizer {
             rel_type: Option<String>,
             is_incoming: bool,
             is_undirected: bool,
+            needs_path: bool,
         }
 
         // Walk the chain top-to-bottom by reference, validating shape without
@@ -1849,6 +1858,7 @@ impl Optimizer {
                     is_undirected,
                     min_hops,
                     max_hops,
+                    needs_path,
                     ..
                 } => {
                     if *min_hops != 1 || *max_hops != 1 {
@@ -1861,6 +1871,7 @@ impl Optimizer {
                         rel_type: rel_type.clone(),
                         is_incoming: *is_incoming,
                         is_undirected: *is_undirected,
+                        needs_path: *needs_path,
                     });
                     node = input;
                 }
@@ -1872,6 +1883,12 @@ impl Optimizer {
                 _ => return op,
             }
         };
+
+        // A named path accumulates `_path_*` objects hop by hop in pattern order;
+        // executing the chain reversed would build them backwards, so bail out.
+        if hops.iter().any(|h| h.needs_path) {
+            return op;
+        }
 
         // Validate linear connectivity (hops listed top-to-bottom) and acyclicity.
         // hop[i].src must equal hop[i+1].dst, and the bottom hop's src is the scan.
@@ -1948,6 +1965,7 @@ impl Optimizer {
                 min_hops: 1,
                 max_hops: 1,
                 unique_rels: prior_rels.clone(),
+                needs_path: hop.needs_path,
             };
             prior_rels.push(hop.rel_var.clone());
         }
@@ -2112,10 +2130,13 @@ fn rewrite_closing_expands(op: PhysicalOperator) -> PhysicalOperator {
             min_hops,
             max_hops,
             unique_rels,
+            needs_path,
         } => {
             let new_input = rewrite_closing_expands(*input);
             let input_bound = Optimizer::bound_vars(&new_input);
-            if min_hops == 1 && max_hops == 1 && input_bound.contains(&dst_var) {
+            // A closing join never extends `_path_*` objects, so a pattern that
+            // binds a path variable keeps its plain Expand.
+            if min_hops == 1 && max_hops == 1 && !needs_path && input_bound.contains(&dst_var) {
                 PhysicalOperator::MultiwayJoin {
                     input: Box::new(new_input),
                     closing_src_var: src_var,
@@ -2138,6 +2159,7 @@ fn rewrite_closing_expands(op: PhysicalOperator) -> PhysicalOperator {
                     min_hops,
                     max_hops,
                     unique_rels,
+                    needs_path,
                 }
             }
         }
@@ -2412,6 +2434,7 @@ mod tests {
             min_hops: 1,
             max_hops: 1,
             unique_rels: vec![],
+            needs_path: false,
         };
 
         let join_plan = PhysicalOperator::HashJoin {
@@ -2464,6 +2487,7 @@ mod tests {
             min_hops: 1,
             max_hops: 1,
             unique_rels: vec![],
+            needs_path: false,
         };
 
         // Average fan-out = ceil(5000 / 1000) = 5; input weight (Person) = 1000.
@@ -2567,6 +2591,7 @@ mod tests {
                     min_hops: 1,
                     max_hops: 1,
                     unique_rels: vec![],
+                    needs_path: false,
                 }),
                 src_var: "b".to_string(),
                 rel_var: "r2".to_string(),
@@ -2577,6 +2602,7 @@ mod tests {
                 min_hops: 1,
                 max_hops: 1,
                 unique_rels: vec![],
+                needs_path: false,
             }),
             src_var: "c".to_string(),
             rel_var: "r3".to_string(),
@@ -2588,6 +2614,7 @@ mod tests {
             min_hops: 1,
             max_hops: 1,
             unique_rels: vec![],
+            needs_path: false,
         };
 
         let rewritten = rewrite_closing_expands(plan);
@@ -2628,6 +2655,7 @@ mod tests {
                 min_hops: 1,
                 max_hops: 1,
                 unique_rels: vec![],
+                needs_path: false,
             }),
             src_var: "b".to_string(),
             rel_var: "r2".to_string(),
@@ -2638,6 +2666,7 @@ mod tests {
             min_hops: 1,
             max_hops: 1,
             unique_rels: vec![],
+            needs_path: false,
         };
 
         let rewritten = rewrite_closing_expands(plan);
@@ -2670,6 +2699,7 @@ mod tests {
                 min_hops: 1,
                 max_hops: 1,
                 unique_rels: vec![],
+                needs_path: false,
             }),
             src_var: "a".to_string(),
             rel_var: "r".to_string(),
@@ -2681,6 +2711,7 @@ mod tests {
             min_hops: 1,
             max_hops: 1,
             unique_rels: vec![],
+            needs_path: false,
         };
 
         let rewritten = rewrite_closing_expands(plan);
@@ -2812,6 +2843,79 @@ mod tests {
         let (var, label) = bottom_scan(&plan).expect("a label scan");
         assert_eq!(var, "a", "rarer start endpoint must be kept");
         assert_eq!(label.as_deref(), Some("Person"));
+    }
+
+    /// Collect the `needs_path` flag of every `Expand` in a plan, top-down.
+    fn expand_path_flags(op: &PhysicalOperator, out: &mut Vec<bool>) {
+        match op {
+            PhysicalOperator::Expand {
+                input, needs_path, ..
+            } => {
+                out.push(*needs_path);
+                expand_path_flags(input, out);
+            }
+            PhysicalOperator::Filter { input, .. }
+            | PhysicalOperator::Project { input, .. }
+            | PhysicalOperator::Aggregate { input, .. }
+            | PhysicalOperator::Sort { input, .. }
+            | PhysicalOperator::Limit { input, .. }
+            | PhysicalOperator::Distinct { input }
+            | PhysicalOperator::MultiwayJoin { input, .. } => expand_path_flags(input, out),
+            _ => {}
+        }
+    }
+
+    /// `needs_path` is set per pattern: plain patterns plan every hop with
+    /// `false` (no per-row `_path_*` materialization), and a pattern that binds
+    /// a path variable plans every hop with `true`.
+    #[test]
+    fn needs_path_flag_follows_path_variable() {
+        let stats = TestStats::new(&[("Person", 100)]);
+
+        let plain = optimize_query(
+            "MATCH (a:Person)-[:KNOWS]->()-[:KNOWS]->(c) RETURN c",
+            &stats,
+        );
+        let mut flags = Vec::new();
+        expand_path_flags(&plain, &mut flags);
+        assert_eq!(flags, vec![false, false]);
+
+        let named = optimize_query(
+            "MATCH p = (a:Person)-[:KNOWS]->()-[:KNOWS]->(c) RETURN p",
+            &stats,
+        );
+        let mut flags = Vec::new();
+        expand_path_flags(&named, &mut flags);
+        assert_eq!(flags, vec![true, true]);
+    }
+
+    /// A cyclic named-path pattern keeps its closing hop as a plain `Expand`:
+    /// the `MultiwayJoin` rewrite never extends `_path_*` objects, so applying
+    /// it would drop the path binding.
+    #[test]
+    fn closing_hop_stays_expand_for_named_path() {
+        fn has_multiway(op: &PhysicalOperator) -> bool {
+            match op {
+                PhysicalOperator::MultiwayJoin { .. } => true,
+                PhysicalOperator::Expand { input, .. }
+                | PhysicalOperator::Filter { input, .. }
+                | PhysicalOperator::Project { input, .. }
+                | PhysicalOperator::Aggregate { input, .. }
+                | PhysicalOperator::Sort { input, .. }
+                | PhysicalOperator::Limit { input, .. }
+                | PhysicalOperator::Distinct { input } => has_multiway(input),
+                _ => false,
+            }
+        }
+        let stats = TestStats::new(&[("Person", 100)]);
+        let plan = optimize_query(
+            "MATCH p = (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(a) RETURN p",
+            &stats,
+        );
+        assert!(
+            !has_multiway(&plan),
+            "closing hop of a named path must stay a plain Expand"
+        );
     }
 
     #[test]
