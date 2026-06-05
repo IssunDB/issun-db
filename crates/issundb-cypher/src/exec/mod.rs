@@ -2272,6 +2272,106 @@ mod tests {
         assert!(!graph.has_node_text_index("Movie", "title").unwrap());
     }
 
+    /// `CREATE INDEX FOR ()-[r:TYPE]-() ON (r.prop)` must create an edge
+    /// property index that `add_edge` populates, and `DROP INDEX` must remove its entries.
+    #[test]
+    fn edge_index_ddl_roundtrip() {
+        let (_dir, graph) = setup_graph();
+        let params = HashMap::new();
+
+        execute(
+            &graph,
+            "CREATE INDEX FOR ()-[r:ROAD]-() ON (r.cost)",
+            &params,
+        )
+        .unwrap();
+        execute(
+            &graph,
+            "CREATE (a:City)-[r:ROAD {cost: 5}]->(b:City)",
+            &params,
+        )
+        .unwrap();
+
+        let hits = graph
+            .edges_by_property("ROAD", "cost", issundb_core::PropValue::Int(5))
+            .unwrap();
+        assert_eq!(hits.len(), 1, "edge must be findable through the index");
+
+        execute(&graph, "DROP INDEX FOR ()-[r:ROAD]-() ON (r.cost)", &params).unwrap();
+        let hits = graph
+            .edges_by_property("ROAD", "cost", issundb_core::PropValue::Int(5))
+            .unwrap();
+        assert!(hits.is_empty(), "dropped index must lose its entries");
+    }
+
+    /// A relationship unique constraint created via Cypher must reject a
+    /// duplicate value on edge creation and stop doing so once dropped.
+    #[test]
+    fn edge_unique_constraint_ddl() {
+        let (_dir, graph) = setup_graph();
+        let params = HashMap::new();
+
+        execute(
+            &graph,
+            "CREATE CONSTRAINT ON ()-[r:ROAD]-() ASSERT r.toll_id IS UNIQUE",
+            &params,
+        )
+        .unwrap();
+        execute(
+            &graph,
+            "CREATE (a:City)-[r:ROAD {toll_id: 1}]->(b:City)",
+            &params,
+        )
+        .unwrap();
+        let err = execute(
+            &graph,
+            "CREATE (a:City)-[r:ROAD {toll_id: 1}]->(b:City)",
+            &params,
+        );
+        assert!(
+            err.is_err(),
+            "duplicate toll_id must violate the constraint"
+        );
+
+        execute(
+            &graph,
+            "DROP CONSTRAINT ON ()-[r:ROAD]-() ASSERT r.toll_id IS UNIQUE",
+            &params,
+        )
+        .unwrap();
+        execute(
+            &graph,
+            "CREATE (a:City)-[r:ROAD {toll_id: 1}]->(b:City)",
+            &params,
+        )
+        .unwrap();
+    }
+
+    /// A relationship existence constraint created via Cypher must reject an
+    /// edge that lacks the property.
+    #[test]
+    fn edge_exists_constraint_ddl() {
+        let (_dir, graph) = setup_graph();
+        let params = HashMap::new();
+
+        execute(
+            &graph,
+            "CREATE CONSTRAINT ON ()-[r:ROAD]-() ASSERT EXISTS(r.cost)",
+            &params,
+        )
+        .unwrap();
+        let err = execute(&graph, "CREATE (a:City)-[r:ROAD]->(b:City)", &params);
+        assert!(err.is_err(), "missing cost must violate the constraint");
+
+        execute(
+            &graph,
+            "DROP CONSTRAINT ON ()-[r:ROAD]-() ASSERT EXISTS(r.cost)",
+            &params,
+        )
+        .unwrap();
+        execute(&graph, "CREATE (a:City)-[r:ROAD]->(b:City)", &params).unwrap();
+    }
+
     #[test]
     fn merge_concurrent_safety() {
         let (_dir, graph) = setup_graph();
