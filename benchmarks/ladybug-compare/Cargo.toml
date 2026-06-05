@@ -1,0 +1,24 @@
+[package]
+name = "ladybug-compare"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+issundb = { path = "../../crates/issundb" }
+lbug = "0.17"
+serde_json = "1"
+tempfile = "3"
+anyhow = "1"
+
+# Detached from the root workspace on purpose: `lbug` links the LadybugDB C++
+# library (downloaded as a precompiled static archive, or built from source via
+# CMake as a fallback), and that must never become part of `make build` or `make test`.
+[workspace]
+
+# This mirror the root release profile so the issundb side is measured with the same flags as `make bench`.
+[profile.release]
+strip = "debuginfo"
+panic = "unwind"
+codegen-units = 1
+lto = true
