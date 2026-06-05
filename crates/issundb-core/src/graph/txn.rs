@@ -923,4 +923,36 @@ mod tests {
         let props: serde_json::Value = rmp_serde::from_slice(&rec.props).unwrap();
         assert_eq!(props["x"], serde_json::json!(42));
     }
+
+    #[test]
+    fn backup_compact_and_restore_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        let backup_file = dir.path().join("compact.mdb");
+        let restore_dir = dir.path().join("restored");
+
+        // Write data, delete some of it, then take a compacted snapshot.
+        let kept;
+        {
+            let g = Graph::open(&dir.path().join("primary"), 1).unwrap();
+            let doomed = g
+                .add_node("BackupTest", &serde_json::json!({"x": 1}))
+                .unwrap();
+            kept = g
+                .add_node("BackupTest", &serde_json::json!({"x": 42}))
+                .unwrap();
+            g.delete_node(doomed).unwrap();
+            g.backup_compact(&backup_file).unwrap();
+        }
+
+        // Restore and verify the surviving data round-trips.
+        Graph::restore(&backup_file, &restore_dir).unwrap();
+        let g2 = Graph::open(&restore_dir, 1).unwrap();
+        let rec = g2
+            .get_node(kept)
+            .unwrap()
+            .expect("node must exist in restored graph");
+        let props: serde_json::Value = rmp_serde::from_slice(&rec.props).unwrap();
+        assert_eq!(props["x"], serde_json::json!(42));
+        assert_eq!(g2.nodes_by_label("BackupTest").unwrap(), vec![kept]);
+    }
 }

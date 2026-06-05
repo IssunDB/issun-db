@@ -123,6 +123,79 @@ impl Graph {
         self.meta_reverse_lookup_impl(rtxn, "prop_key:", id)
     }
 
+    /// Validate the active edge constraints for `etype` against the edge's
+    /// encoded properties and write one `edge_prop_idx` entry per indexed
+    /// property. Shared by `add_edge` and `update_edge`; `update_edge` must
+    /// drop the edge's old entries first so the unique check never conflicts
+    /// with the edge itself.
+    pub(super) fn write_edge_index_entries(
+        &self,
+        wtxn: &mut heed::RwTxn,
+        edge_id: EdgeId,
+        type_id: TypeId,
+        etype: &str,
+        encoded_props: &[u8],
+    ) -> Result<(), Error> {
+        let active_indexes = self.get_active_edge_indexes(wtxn, type_id)?;
+        if active_indexes.is_empty() {
+            return Ok(());
+        }
+        let props_json: serde_json::Value = props::decode(encoded_props)?;
+        for (prop_key_id, flags) in active_indexes {
+            if let Some(prop_name) = self.prop_key_name_impl(wtxn, prop_key_id)? {
+                let prop_val = props_json.get(&prop_name);
+
+                // 1. Required constraint check
+                if flags == 0x02
+                    && (prop_val.is_none() || prop_val == Some(&serde_json::Value::Null))
+                {
+                    return Err(Error::RequiredConstraintViolation(
+                        etype.to_string(),
+                        prop_name.to_string(),
+                    ));
+                }
+
+                if let Some(val) = prop_val {
+                    if val != &serde_json::Value::Null {
+                        if let Some(encoded) = encode_property_value(val) {
+                            // 2. Unique constraint check
+                            if flags == 0x01 {
+                                let mut prefix = Vec::with_capacity(4 + 4 + encoded.len());
+                                prefix.extend_from_slice(&type_id.to_be_bytes());
+                                prefix.extend_from_slice(&prop_key_id.to_be_bytes());
+                                prefix.extend_from_slice(&encoded);
+
+                                for entry in
+                                    self.storage.edge_prop_idx.prefix_iter(wtxn, &prefix)?
+                                {
+                                    let (key, _) = entry?;
+                                    if key.len() >= 8 {
+                                        let mut edge_id_bytes = [0u8; 8];
+                                        edge_id_bytes.copy_from_slice(&key[key.len() - 8..]);
+                                        let found_edge_id = u64::from_be_bytes(edge_id_bytes);
+                                        if found_edge_id != edge_id {
+                                            return Err(Error::UniqueConstraintViolation(
+                                                etype.to_string(),
+                                                prop_name.to_string(),
+                                                val.to_string(),
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+
+                            // 3. Write index entry
+                            let idx_key =
+                                edge_prop_index_key(type_id, prop_key_id, &encoded, edge_id);
+                            self.storage.edge_prop_idx.put(wtxn, &idx_key, &())?;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn delete_edge_index_entries(
         &self,
         wtxn: &mut heed::RwTxn,
@@ -1017,5 +1090,173 @@ mod tests {
                 .unwrap(),
             vec![id]
         );
+    }
+
+    /// `node_count_hint` is the node-id high-water mark: it tracks allocations
+    /// and must not decrease when a node is deleted.
+    #[test]
+    fn node_count_hint_is_high_water_mark() {
+        let (_dir, g) = open_tmp();
+        assert_eq!(g.node_count_hint().unwrap(), 0);
+
+        let a = g.add_node("N", &()).unwrap();
+        g.add_node("N", &()).unwrap();
+        assert_eq!(g.node_count_hint().unwrap(), 2);
+
+        g.delete_node(a).unwrap();
+        assert_eq!(g.node_count_hint().unwrap(), 2);
+    }
+
+    /// An edge property index created before any edges exist must be populated
+    /// by `add_edge`, and one created afterwards must backfill existing edges.
+    #[test]
+    fn edge_property_index_lookup() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("N", &()).unwrap();
+        let b = g.add_node("N", &()).unwrap();
+
+        // Backfill path: the edge exists before the index.
+        let e1 = g.add_edge(a, b, "ROAD", &json!({"cost": 5})).unwrap();
+        g.create_edge_property_index("ROAD", "cost").unwrap();
+
+        // Insert path: the edge arrives after the index.
+        let e2 = g.add_edge(b, a, "ROAD", &json!({"cost": 7})).unwrap();
+
+        assert_eq!(
+            g.edges_by_property("ROAD", "cost", PropValue::Int(5))
+                .unwrap(),
+            vec![e1]
+        );
+        assert_eq!(
+            g.edges_by_property("ROAD", "cost", PropValue::Int(7))
+                .unwrap(),
+            vec![e2]
+        );
+        assert_eq!(
+            g.edges_by_property_range(
+                "ROAD",
+                "cost",
+                Some(PropValue::Int(5)),
+                Some(PropValue::Int(7)),
+            )
+            .unwrap(),
+            vec![e1, e2]
+        );
+    }
+
+    #[test]
+    fn drop_edge_property_index_removes_entries() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("N", &()).unwrap();
+        let b = g.add_node("N", &()).unwrap();
+        g.create_edge_property_index("ROAD", "cost").unwrap();
+        g.add_edge(a, b, "ROAD", &json!({"cost": 5})).unwrap();
+
+        g.drop_edge_property_index("ROAD", "cost").unwrap();
+        assert_eq!(
+            g.edges_by_property("ROAD", "cost", PropValue::Int(5))
+                .unwrap(),
+            Vec::<EdgeId>::new()
+        );
+    }
+
+    #[test]
+    fn edge_unique_constraint_rejects_duplicate_insert() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("N", &()).unwrap();
+        let b = g.add_node("N", &()).unwrap();
+        g.create_edge_unique_constraint("ROAD", "toll_id").unwrap();
+
+        g.add_edge(a, b, "ROAD", &json!({"toll_id": 1})).unwrap();
+        let err = g
+            .add_edge(b, a, "ROAD", &json!({"toll_id": 1}))
+            .unwrap_err();
+        assert!(matches!(err, Error::UniqueConstraintViolation(..)));
+    }
+
+    #[test]
+    fn edge_unique_constraint_rejects_existing_duplicates() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("N", &()).unwrap();
+        let b = g.add_node("N", &()).unwrap();
+        g.add_edge(a, b, "ROAD", &json!({"toll_id": 1})).unwrap();
+        g.add_edge(b, a, "ROAD", &json!({"toll_id": 1})).unwrap();
+
+        let err = g
+            .create_edge_unique_constraint("ROAD", "toll_id")
+            .unwrap_err();
+        assert!(matches!(err, Error::UniqueConstraintViolation(..)));
+    }
+
+    #[test]
+    fn edge_required_constraint_rejects_missing_property() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("N", &()).unwrap();
+        let b = g.add_node("N", &()).unwrap();
+        g.create_edge_required_constraint("ROAD", "cost").unwrap();
+
+        let err = g.add_edge(a, b, "ROAD", &json!({})).unwrap_err();
+        assert!(matches!(err, Error::RequiredConstraintViolation(..)));
+
+        // Creating the constraint must also reject pre-existing violations.
+        g.add_edge(a, b, "RAIL", &json!({})).unwrap();
+        let err = g
+            .create_edge_required_constraint("RAIL", "cost")
+            .unwrap_err();
+        assert!(matches!(err, Error::RequiredConstraintViolation(..)));
+    }
+
+    /// `update_edge` must re-index the edge under its new property values:
+    /// the old index entry disappears and the new one is findable.
+    #[test]
+    fn update_edge_reindexes_edge_properties() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("N", &()).unwrap();
+        let b = g.add_node("N", &()).unwrap();
+        g.create_edge_property_index("ROAD", "cost").unwrap();
+        let eid = g.add_edge(a, b, "ROAD", &json!({"cost": 5})).unwrap();
+
+        g.update_edge(eid, &json!({"cost": 7})).unwrap();
+
+        assert_eq!(
+            g.edges_by_property("ROAD", "cost", PropValue::Int(5))
+                .unwrap(),
+            Vec::<EdgeId>::new(),
+            "stale index entry must be removed"
+        );
+        assert_eq!(
+            g.edges_by_property("ROAD", "cost", PropValue::Int(7))
+                .unwrap(),
+            vec![eid],
+            "new value must be indexed"
+        );
+    }
+
+    #[test]
+    fn update_edge_enforces_unique_constraint() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("N", &()).unwrap();
+        let b = g.add_node("N", &()).unwrap();
+        g.create_edge_unique_constraint("ROAD", "toll_id").unwrap();
+        g.add_edge(a, b, "ROAD", &json!({"toll_id": 1})).unwrap();
+        let e2 = g.add_edge(b, a, "ROAD", &json!({"toll_id": 2})).unwrap();
+
+        let err = g.update_edge(e2, &json!({"toll_id": 1})).unwrap_err();
+        assert!(matches!(err, Error::UniqueConstraintViolation(..)));
+
+        // Updating an edge to keep its own value must not self-conflict.
+        g.update_edge(e2, &json!({"toll_id": 2})).unwrap();
+    }
+
+    #[test]
+    fn update_edge_enforces_required_constraint() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("N", &()).unwrap();
+        let b = g.add_node("N", &()).unwrap();
+        g.create_edge_required_constraint("ROAD", "cost").unwrap();
+        let eid = g.add_edge(a, b, "ROAD", &json!({"cost": 5})).unwrap();
+
+        let err = g.update_edge(eid, &json!({})).unwrap_err();
+        assert!(matches!(err, Error::RequiredConstraintViolation(..)));
     }
 }

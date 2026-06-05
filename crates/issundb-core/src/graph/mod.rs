@@ -491,6 +491,72 @@ impl Graph {
 }
 
 #[cfg(test)]
+mod extension_tests {
+    use std::sync::Arc;
+
+    use tempfile::TempDir;
+
+    use super::Graph;
+
+    fn open_tmp() -> (TempDir, Graph) {
+        let dir = TempDir::new().unwrap();
+        let g = Graph::open(dir.path(), 1).unwrap();
+        (dir, g)
+    }
+
+    /// Extensions are keyed by concrete type: a stored value round-trips, an
+    /// absent type returns `None`, and a second `set_extension` replaces the
+    /// previous value of the same type.
+    #[test]
+    fn extension_roundtrip_by_type() {
+        let (_dir, g) = open_tmp();
+        assert!(g.get_extension::<String>().is_none());
+
+        g.set_extension(Arc::new(String::from("cache")));
+        let got = g.get_extension::<String>().expect("extension must exist");
+        assert_eq!(*got, "cache");
+        assert!(g.get_extension::<u64>().is_none(), "distinct type slot");
+
+        g.set_extension(Arc::new(String::from("replaced")));
+        assert_eq!(*g.get_extension::<String>().unwrap(), "replaced");
+    }
+
+    /// `get_or_init_extension_with` runs `init` only when the slot is empty;
+    /// later callers observe the first stored value.
+    #[test]
+    fn get_or_init_extension_initializes_once() {
+        let (_dir, g) = open_tmp();
+
+        let v1 = g
+            .get_or_init_extension_with::<u64, std::convert::Infallible, _>(|| Ok(Arc::new(7)))
+            .unwrap();
+        assert_eq!(*v1, 7);
+
+        let v2 = g
+            .get_or_init_extension_with::<u64, std::convert::Infallible, _>(|| Ok(Arc::new(9)))
+            .unwrap();
+        assert_eq!(*v2, 7, "second init must not replace the stored value");
+    }
+
+    /// An `init` failure stores nothing, so a later successful `init` runs.
+    #[test]
+    fn get_or_init_extension_propagates_init_error() {
+        let (_dir, g) = open_tmp();
+
+        let err = g
+            .get_or_init_extension_with::<u64, &str, _>(|| Err("init failed"))
+            .unwrap_err();
+        assert_eq!(err, "init failed");
+        assert!(g.get_extension::<u64>().is_none());
+
+        let v = g
+            .get_or_init_extension_with::<u64, &str, _>(|| Ok(Arc::new(7)))
+            .unwrap();
+        assert_eq!(*v, 7);
+    }
+}
+
+#[cfg(test)]
 mod encode_tests {
     use serde_json::json;
 
