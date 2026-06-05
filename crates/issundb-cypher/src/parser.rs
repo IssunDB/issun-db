@@ -3818,8 +3818,16 @@ fn validate_statement_undefined_vars_impl(
                 validate_expr_vars(&item.expr, active)?;
             }
             if let Some(ob) = &q.order_by {
+                // ORDER BY sees the RETURN projection scope in addition to the
+                // match-bound variables, so an alias introduced by RETURN is a valid sort key.
+                let mut return_active = active.clone();
+                for item in &q.return_clause.items {
+                    if let Some(ref alias) = item.alias {
+                        return_active.insert(alias.clone());
+                    }
+                }
                 for si in &ob.items {
-                    validate_expr_vars(&si.expr, active)?;
+                    validate_expr_vars(&si.expr, &return_active)?;
                 }
             }
             if let Some(s) = &q.skip {

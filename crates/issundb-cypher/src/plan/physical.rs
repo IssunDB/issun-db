@@ -59,6 +59,10 @@ pub enum PhysicalOperator {
         is_undirected: bool,
         min_hops: usize,
         max_hops: usize,
+        /// Relationship variables bound by earlier hops of the same pattern;
+        /// this hop must bind a different relationship (openCypher
+        /// relationship uniqueness, scoped to one pattern).
+        unique_rels: Vec<String>,
     },
     /// Filter records based on expressions/WHERE predicates.
     Filter {
@@ -140,6 +144,10 @@ pub enum PhysicalOperator {
         /// When true, the closing edge matches in either direction; the executor
         /// checks both the outgoing and incoming adjacency of `closing_src_var`.
         closing_is_undirected: bool,
+        /// Relationship variables bound by earlier hops of the same pattern;
+        /// the closing edge must differ from all of them (openCypher
+        /// relationship uniqueness).
+        closing_unique_rels: Vec<String>,
     },
 }
 
@@ -174,6 +182,7 @@ impl PhysicalPlanner {
                 is_undirected,
                 min_hops,
                 max_hops,
+                unique_rels,
             } => PhysicalOperator::Expand {
                 input: Box::new(Self::plan(input)),
                 src_var: src_var.clone(),
@@ -184,6 +193,7 @@ impl PhysicalPlanner {
                 is_undirected: *is_undirected,
                 min_hops: *min_hops,
                 max_hops: *max_hops,
+                unique_rels: unique_rels.clone(),
             },
             LogicalOperator::Filter { input, expression } => PhysicalOperator::Filter {
                 input: Box::new(Self::plan(input)),
@@ -474,6 +484,7 @@ pub fn format_physical_plan(op: &PhysicalOperator, depth: usize) -> String {
             closing_rel_var,
             closing_is_incoming,
             closing_is_undirected,
+            ..
         } => {
             let dir = if *closing_is_undirected {
                 "-"

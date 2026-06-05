@@ -127,6 +127,7 @@ impl Optimizer {
                 is_undirected,
                 min_hops,
                 max_hops,
+                unique_rels,
             } => {
                 let (inner_op, inner_filters) = Self::extract_filters(*input);
                 (
@@ -140,6 +141,7 @@ impl Optimizer {
                         is_undirected,
                         min_hops,
                         max_hops,
+                        unique_rels,
                     },
                     inner_filters,
                 )
@@ -274,6 +276,7 @@ impl Optimizer {
                 closing_rel_var,
                 closing_is_incoming,
                 closing_is_undirected,
+                closing_unique_rels,
             } => {
                 let (inner_op, inner_filters) = Self::extract_filters(*input);
                 (
@@ -285,6 +288,7 @@ impl Optimizer {
                         closing_rel_var,
                         closing_is_incoming,
                         closing_is_undirected,
+                        closing_unique_rels,
                     },
                     inner_filters,
                 )
@@ -329,6 +333,7 @@ impl Optimizer {
                 is_undirected,
                 min_hops,
                 max_hops,
+                unique_rels,
             } => PhysicalOperator::Expand {
                 input: Box::new(Self::reorder_operators(*input, stats)),
                 src_var,
@@ -339,6 +344,7 @@ impl Optimizer {
                 is_undirected,
                 min_hops,
                 max_hops,
+                unique_rels,
             },
             // Filter nodes inside opaque barrier-Project subtrees are not stripped by
             // `extract_filters`.  Pass them through so that reordering does not panic.
@@ -434,6 +440,7 @@ impl Optimizer {
                 closing_rel_var,
                 closing_is_incoming,
                 closing_is_undirected,
+                closing_unique_rels,
             } => PhysicalOperator::MultiwayJoin {
                 input: Box::new(Self::reorder_operators(*input, stats)),
                 closing_src_var,
@@ -442,6 +449,7 @@ impl Optimizer {
                 closing_rel_var,
                 closing_is_incoming,
                 closing_is_undirected,
+                closing_unique_rels,
             },
         }
     }
@@ -649,6 +657,7 @@ impl Optimizer {
                 is_undirected,
                 min_hops,
                 max_hops,
+                unique_rels,
             } => {
                 let child_bound = Self::bound_vars(&input);
 
@@ -677,6 +686,7 @@ impl Optimizer {
                     is_undirected,
                     min_hops,
                     max_hops,
+                    unique_rels,
                 };
 
                 let bound = Self::bound_vars(&current_node);
@@ -960,6 +970,7 @@ impl Optimizer {
                 closing_rel_var,
                 closing_is_incoming,
                 closing_is_undirected,
+                closing_unique_rels,
             } => {
                 let child_bound = Self::bound_vars(&input);
 
@@ -986,6 +997,7 @@ impl Optimizer {
                     closing_rel_var,
                     closing_is_incoming,
                     closing_is_undirected,
+                    closing_unique_rels,
                 };
 
                 let bound = Self::bound_vars(&current_node);
@@ -1692,6 +1704,7 @@ impl Optimizer {
                 is_undirected,
                 min_hops,
                 max_hops,
+                unique_rels,
             } => PhysicalOperator::Expand {
                 input: Box::new(Self::optimize_index_scans(*input, stats)),
                 src_var,
@@ -1702,6 +1715,7 @@ impl Optimizer {
                 is_undirected,
                 min_hops,
                 max_hops,
+                unique_rels,
             },
             PhysicalOperator::Project {
                 input,
@@ -1724,6 +1738,7 @@ impl Optimizer {
                 closing_rel_var,
                 closing_is_incoming,
                 closing_is_undirected,
+                closing_unique_rels,
             } => PhysicalOperator::MultiwayJoin {
                 input: Box::new(Self::optimize_index_scans(*input, stats)),
                 closing_src_var,
@@ -1732,6 +1747,7 @@ impl Optimizer {
                 closing_rel_var,
                 closing_is_incoming,
                 closing_is_undirected,
+                closing_unique_rels,
             },
             leaf => leaf,
         }
@@ -1833,6 +1849,7 @@ impl Optimizer {
                     is_undirected,
                     min_hops,
                     max_hops,
+                    ..
                 } => {
                     if *min_hops != 1 || *max_hops != 1 {
                         return op; // variable-length hops are not reversed here
@@ -1912,6 +1929,9 @@ impl Optimizer {
             variable: terminal_var.clone(),
             label: Some(term_lbl.clone()),
         };
+        // Relationship uniqueness is pairwise within the pattern, so the
+        // reversed chain re-derives each hop's predecessors from the new order.
+        let mut prior_rels: Vec<String> = Vec::new();
         for hop in hops.iter() {
             tree = PhysicalOperator::Expand {
                 input: Box::new(tree),
@@ -1927,7 +1947,9 @@ impl Optimizer {
                 is_undirected: hop.is_undirected,
                 min_hops: 1,
                 max_hops: 1,
+                unique_rels: prior_rels.clone(),
             };
+            prior_rels.push(hop.rel_var.clone());
         }
 
         // The far endpoint's label is now carried by the scan; drop its HasLabel
@@ -2089,6 +2111,7 @@ fn rewrite_closing_expands(op: PhysicalOperator) -> PhysicalOperator {
             is_undirected,
             min_hops,
             max_hops,
+            unique_rels,
         } => {
             let new_input = rewrite_closing_expands(*input);
             let input_bound = Optimizer::bound_vars(&new_input);
@@ -2101,6 +2124,7 @@ fn rewrite_closing_expands(op: PhysicalOperator) -> PhysicalOperator {
                     closing_rel_var: rel_var,
                     closing_is_incoming: is_incoming,
                     closing_is_undirected: is_undirected,
+                    closing_unique_rels: unique_rels,
                 }
             } else {
                 PhysicalOperator::Expand {
@@ -2113,6 +2137,7 @@ fn rewrite_closing_expands(op: PhysicalOperator) -> PhysicalOperator {
                     is_undirected,
                     min_hops,
                     max_hops,
+                    unique_rels,
                 }
             }
         }
@@ -2180,6 +2205,7 @@ fn rewrite_closing_expands(op: PhysicalOperator) -> PhysicalOperator {
             closing_rel_var,
             closing_is_incoming,
             closing_is_undirected,
+            closing_unique_rels,
         } => PhysicalOperator::MultiwayJoin {
             input: Box::new(rewrite_closing_expands(*input)),
             closing_src_var,
@@ -2188,6 +2214,7 @@ fn rewrite_closing_expands(op: PhysicalOperator) -> PhysicalOperator {
             closing_rel_var,
             closing_is_incoming,
             closing_is_undirected,
+            closing_unique_rels,
         },
         leaf => leaf,
     }
@@ -2384,6 +2411,7 @@ mod tests {
             is_undirected: false,
             min_hops: 1,
             max_hops: 1,
+            unique_rels: vec![],
         };
 
         let join_plan = PhysicalOperator::HashJoin {
@@ -2435,6 +2463,7 @@ mod tests {
             is_undirected: false,
             min_hops: 1,
             max_hops: 1,
+            unique_rels: vec![],
         };
 
         // Average fan-out = ceil(5000 / 1000) = 5; input weight (Person) = 1000.
@@ -2537,6 +2566,7 @@ mod tests {
                     is_undirected: false,
                     min_hops: 1,
                     max_hops: 1,
+                    unique_rels: vec![],
                 }),
                 src_var: "b".to_string(),
                 rel_var: "r2".to_string(),
@@ -2546,6 +2576,7 @@ mod tests {
                 is_undirected: false,
                 min_hops: 1,
                 max_hops: 1,
+                unique_rels: vec![],
             }),
             src_var: "c".to_string(),
             rel_var: "r3".to_string(),
@@ -2556,6 +2587,7 @@ mod tests {
             is_undirected: false,
             min_hops: 1,
             max_hops: 1,
+            unique_rels: vec![],
         };
 
         let rewritten = rewrite_closing_expands(plan);
@@ -2595,6 +2627,7 @@ mod tests {
                 is_undirected: false,
                 min_hops: 1,
                 max_hops: 1,
+                unique_rels: vec![],
             }),
             src_var: "b".to_string(),
             rel_var: "r2".to_string(),
@@ -2604,6 +2637,7 @@ mod tests {
             is_undirected: false,
             min_hops: 1,
             max_hops: 1,
+            unique_rels: vec![],
         };
 
         let rewritten = rewrite_closing_expands(plan);
@@ -2635,6 +2669,7 @@ mod tests {
                 is_undirected: false,
                 min_hops: 1,
                 max_hops: 1,
+                unique_rels: vec![],
             }),
             src_var: "a".to_string(),
             rel_var: "r".to_string(),
@@ -2645,6 +2680,7 @@ mod tests {
             is_undirected: true,
             min_hops: 1,
             max_hops: 1,
+            unique_rels: vec![],
         };
 
         let rewritten = rewrite_closing_expands(plan);

@@ -735,6 +735,16 @@ fn filter_expr_to_where_clause(expression: &FilterExpr) -> WhereClause {
     }
 }
 
+/// True when `eid` is already bound to one of `unique_rels` in `path`.
+/// Implements openCypher relationship uniqueness: the hops of one pattern must
+/// bind pairwise-distinct relationships, while separate MATCH clauses may
+/// reuse a relationship (so the check covers sibling hops only, never the whole row).
+fn edge_bound_to_sibling_rel(path: &PathMap, unique_rels: &[String], eid: EdgeId) -> bool {
+    unique_rels
+        .iter()
+        .any(|v| matches!(path.get(v.as_str()), Some(GraphBinding::Edge(e)) if *e == eid))
+}
+
 /// Bulk-expand a batch of pre-expansion rows and apply a `Filter` predicate that
 /// sits directly over a single-hop directed `Expand`. The predicate is evaluated
 /// once per source row when it touches only pre-expansion variables (factorized),
@@ -750,6 +760,7 @@ fn filter_over_expand_batch(
     dst_var: &str,
     rel_type: Option<&str>,
     is_incoming: bool,
+    unique_rels: &[String],
     expression: &FilterExpr,
     params: &HashMap<String, serde_json::Value>,
 ) -> Result<Vec<PathMap>, String> {
@@ -809,6 +820,9 @@ fn filter_over_expand_batch(
                 };
                 if let Some(dests) = transition_map.get(&src_node) {
                     for &(eid, dst_node) in dests {
+                        if edge_bound_to_sibling_rel(path, unique_rels, eid) {
+                            continue;
+                        }
                         let mut new_path = path.clone();
                         new_path.insert(rel_var.to_string(), GraphBinding::Edge(eid));
                         if new_path
@@ -847,6 +861,9 @@ fn filter_over_expand_batch(
                     extensions: dests
                         .iter()
                         .filter_map(|&(eid, dst_node)| {
+                            if edge_bound_to_sibling_rel(path, unique_rels, eid) {
+                                return None;
+                            }
                             // Guard closing-hop mismatches (normally handled by MultiwayJoin).
                             if let Some(existing) = path.get(dst_var) {
                                 if *existing != GraphBinding::Node(dst_node) {
@@ -875,6 +892,9 @@ fn filter_over_expand_batch(
             };
             if let Some(dests) = transition_map.get(&src_node) {
                 for &(eid, dst_node) in dests {
+                    if edge_bound_to_sibling_rel(path, unique_rels, eid) {
+                        continue;
+                    }
                     let mut new_path = path.clone();
                     new_path.insert(rel_var.to_string(), GraphBinding::Edge(eid));
                     if new_path
@@ -998,6 +1018,7 @@ fn expand_from_paths(
     is_undirected: bool,
     min_hops: usize,
     max_hops: usize,
+    unique_rels: &[String],
 ) -> Result<Vec<PathMap>, String> {
     let mut next_paths = Vec::new();
 
@@ -1038,6 +1059,9 @@ fn expand_from_paths(
             if let Some(dests) = transition_map.get(&src_node) {
                 let shared = std::sync::Arc::new(path);
                 for &(eid, dst_node) in dests {
+                    if edge_bound_to_sibling_rel(&shared, unique_rels, eid) {
+                        continue;
+                    }
                     if let Some(existing) = shared.get(dst_var) {
                         if *existing != GraphBinding::Node(dst_node) {
                             continue;
@@ -1081,6 +1105,9 @@ fn expand_from_paths(
                         let neighbors = expand_multi_type(graph, &[node], rel_type, dir)?;
                         for (_, eid, neigh_node) in neighbors {
                             if visited_nodes.contains(&neigh_node) {
+                                continue;
+                            }
+                            if edge_bound_to_sibling_rel(&path, unique_rels, eid) {
                                 continue;
                             }
                             let mut next_visited = visited_nodes.clone();
@@ -1191,6 +1218,8 @@ pub(super) fn eval_pattern_comprehension(
     let mut src_var = anchor_var.clone();
     let mut last_dst_var = anchor_var;
     let mut anon = 0usize;
+    // Relationship uniqueness within the comprehension's pattern.
+    let mut prior_rel_vars: Vec<String> = Vec::new();
 
     for (rel, node) in &pattern.rels {
         let rel_var = rel.variable.clone().unwrap_or_else(|| {
@@ -1218,7 +1247,9 @@ pub(super) fn eval_pattern_comprehension(
             rel.is_undirected,
             min_hops,
             max_hops,
+            &prior_rel_vars,
         )?;
+        prior_rel_vars.push(rel_var.clone());
         current_paths = filter_paths_by_node(
             graph,
             current_paths,
@@ -1474,6 +1505,7 @@ fn multiway_join_rows(
     closing_rel_var: &str,
     closing_is_incoming: bool,
     closing_is_undirected: bool,
+    closing_unique_rels: &[String],
 ) -> Result<Vec<PathMap>, String> {
     if child_paths.is_empty() {
         return Ok(vec![]);
@@ -1528,6 +1560,9 @@ fn multiway_join_rows(
 
             if let Some(eids) = join_map.get(&closing_src).and_then(|m| m.get(&closing_dst)) {
                 for &eid in eids {
+                    if edge_bound_to_sibling_rel(&path, closing_unique_rels, eid) {
+                        continue;
+                    }
                     let mut new_path = path.clone();
                     new_path.insert(closing_rel_var.to_string(), GraphBinding::Edge(eid));
                     next_paths.push(new_path);
@@ -1556,6 +1591,9 @@ fn multiway_join_rows(
 
             if let Some(dst_map) = join_map.get(&closing_src) {
                 if let Some(&eid) = dst_map.get(&closing_dst) {
+                    if edge_bound_to_sibling_rel(&path, closing_unique_rels, eid) {
+                        continue;
+                    }
                     let mut new_path = path.clone();
                     new_path.insert(closing_rel_var.to_string(), GraphBinding::Edge(eid));
                     next_paths.push(new_path);
@@ -1576,6 +1614,9 @@ struct ChainHop<'a> {
     dst_var: &'a str,
     rel_type: Option<&'a str>,
     is_incoming: bool,
+    /// Sibling relationship variables of the same pattern this hop's edge must
+    /// differ from (openCypher relationship uniqueness).
+    unique_rels: &'a [String],
 }
 
 /// Execute a maximal linear chain of single-hop directed Expands as one fused
@@ -1678,6 +1719,16 @@ fn thread_chain(
             if *existing != GraphBinding::Node(dst) {
                 continue;
             }
+        }
+        // Relationship uniqueness: the edge must differ from every sibling
+        // hop's edge, whether that sibling was bound by the base path (a
+        // partially fused pattern) or by an earlier hop of this chain.
+        if edge_bound_to_sibling_rel(base_path, hop.unique_rels, eid)
+            || stack.iter().enumerate().any(|(i, &(prev_eid, _))| {
+                prev_eid == eid && hop.unique_rels.iter().any(|v| v == hops[i].rel_var)
+            })
+        {
+            continue;
         }
         stack.push((eid, dst));
         thread_chain(base_path, dst, hops, level_maps, hop_idx + 1, stack, out);
@@ -1920,6 +1971,7 @@ enum RowStream {
         is_undirected: bool,
         min_hops: usize,
         max_hops: usize,
+        unique_rels: Vec<String>,
         /// Holds expansion output beyond `STREAM_BATCH`: one input row can fan
         /// out to many neighbors, so the overflow is buffered and served on
         /// later pulls before the next input batch is fetched.
@@ -1953,6 +2005,7 @@ enum RowStream {
         closing_rel_var: String,
         closing_is_incoming: bool,
         closing_is_undirected: bool,
+        closing_unique_rels: Vec<String>,
         buf: std::collections::VecDeque<PathMap>,
     },
     /// Fused linear chain of single-hop directed Expands: the streaming form of
@@ -1974,6 +2027,7 @@ enum RowStream {
         dst_var: String,
         rel_type: Option<String>,
         is_incoming: bool,
+        unique_rels: Vec<String>,
         expression: FilterExpr,
         buf: std::collections::VecDeque<PathMap>,
     },
@@ -2052,6 +2106,7 @@ struct OwnedChainHop {
     dst_var: String,
     rel_type: Option<String>,
     is_incoming: bool,
+    unique_rels: Vec<String>,
 }
 
 /// The prepared build side of a streaming `HashJoin`, constructed on the first
@@ -2109,6 +2164,7 @@ fn build_stream_with_sip(
                 is_undirected: false,
                 min_hops: 1,
                 max_hops: 1,
+                unique_rels,
             } = input.as_ref()
             {
                 if !matches!(expression, FilterExpr::HasLabel(..)) {
@@ -2119,6 +2175,7 @@ fn build_stream_with_sip(
                         dst_var: dst_var.clone(),
                         rel_type: rel_type.clone(),
                         is_incoming: *is_incoming,
+                        unique_rels: unique_rels.clone(),
                         expression: expression.clone(),
                         buf: std::collections::VecDeque::new(),
                     };
@@ -2139,6 +2196,7 @@ fn build_stream_with_sip(
             is_undirected,
             min_hops,
             max_hops,
+            unique_rels,
         } => {
             // Fused-chain fast path: collapse a maximal linear chain of single-hop
             // directed Expands, mirroring the materializing `Expand` arm.
@@ -2149,6 +2207,7 @@ fn build_stream_with_sip(
                     dst_var: dst_var.clone(),
                     rel_type: rel_type.clone(),
                     is_incoming: *is_incoming,
+                    unique_rels: unique_rels.clone(),
                 }];
                 let mut bottom_src = src_var.as_str();
                 let mut base = input.as_ref();
@@ -2162,6 +2221,7 @@ fn build_stream_with_sip(
                     is_undirected: false,
                     min_hops: 1,
                     max_hops: 1,
+                    unique_rels: inner_unique_rels,
                 } = base
                 {
                     if bottom_src != inner_dst_var {
@@ -2173,6 +2233,7 @@ fn build_stream_with_sip(
                         dst_var: inner_dst_var.clone(),
                         rel_type: inner_rel_type.clone(),
                         is_incoming: *inner_is_incoming,
+                        unique_rels: inner_unique_rels.clone(),
                     });
                     bottom_src = inner_src_var.as_str();
                     base = inner_input.as_ref();
@@ -2197,6 +2258,7 @@ fn build_stream_with_sip(
                 is_undirected: *is_undirected,
                 min_hops: *min_hops,
                 max_hops: *max_hops,
+                unique_rels: unique_rels.clone(),
                 buf: std::collections::VecDeque::new(),
             }
         }
@@ -2208,6 +2270,7 @@ fn build_stream_with_sip(
             closing_rel_var,
             closing_is_incoming,
             closing_is_undirected,
+            closing_unique_rels,
         } => RowStream::MultiwayJoin {
             input: Box::new(build_stream_with_sip(input, sip)),
             closing_src_var: closing_src_var.clone(),
@@ -2216,6 +2279,7 @@ fn build_stream_with_sip(
             closing_rel_var: closing_rel_var.clone(),
             closing_is_incoming: *closing_is_incoming,
             closing_is_undirected: *closing_is_undirected,
+            closing_unique_rels: closing_unique_rels.clone(),
             buf: std::collections::VecDeque::new(),
         },
         PhysicalOperator::Limit { input, skip, count } => {
@@ -2416,6 +2480,7 @@ impl RowStream {
                 is_undirected,
                 min_hops,
                 max_hops,
+                unique_rels,
                 buf,
             } => loop {
                 if !buf.is_empty() {
@@ -2437,6 +2502,7 @@ impl RowStream {
                     *is_undirected,
                     *min_hops,
                     *max_hops,
+                    unique_rels,
                 )?;
                 buf.extend(expanded);
             },
@@ -2499,6 +2565,7 @@ impl RowStream {
                 closing_rel_var,
                 closing_is_incoming,
                 closing_is_undirected,
+                closing_unique_rels,
                 buf,
             } => loop {
                 if !buf.is_empty() {
@@ -2518,6 +2585,7 @@ impl RowStream {
                     closing_rel_var,
                     *closing_is_incoming,
                     *closing_is_undirected,
+                    closing_unique_rels,
                 )?;
                 buf.extend(rows);
             },
@@ -2539,6 +2607,7 @@ impl RowStream {
                         dst_var: &h.dst_var,
                         rel_type: h.rel_type.as_deref(),
                         is_incoming: h.is_incoming,
+                        unique_rels: &h.unique_rels,
                     })
                     .collect();
                 let expanded = execute_expand_chain_n(graph, batch, &borrowed)?;
@@ -2551,6 +2620,7 @@ impl RowStream {
                 dst_var,
                 rel_type,
                 is_incoming,
+                unique_rels,
                 expression,
                 buf,
             } => loop {
@@ -2572,6 +2642,7 @@ impl RowStream {
                     dst_var,
                     rel_type.as_deref(),
                     *is_incoming,
+                    unique_rels,
                     expression,
                     params,
                 )?;

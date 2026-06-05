@@ -45,6 +45,11 @@ pub enum LogicalOperator {
         is_undirected: bool,
         min_hops: usize,
         max_hops: usize,
+        /// Relationship variables bound by earlier hops of the same pattern.
+        /// openCypher relationship uniqueness: this hop must not bind a
+        /// relationship already bound to one of these variables. Uniqueness is
+        /// scoped to a single pattern, so separate MATCH clauses may reuse a relationship.
+        unique_rels: Vec<String>,
     },
     /// Filter records based on expressions/WHERE predicates.
     Filter {
@@ -616,6 +621,7 @@ impl LogicalPlanner {
         }
 
         let mut prev_node_var = seed_var.clone();
+        let mut prior_rel_vars: Vec<String> = Vec::new();
 
         for (seg_idx, (rel_pat, node_pat)) in pattern.rels.iter().enumerate() {
             // Use segment-indexed fallback names so auto-generated variables do not
@@ -649,7 +655,9 @@ impl LogicalPlanner {
                 is_undirected: rel_pat.is_undirected,
                 min_hops,
                 max_hops,
+                unique_rels: prior_rel_vars.clone(),
             };
+            prior_rel_vars.push(rel_var.clone());
 
             // Apply inline properties filter on relationship if specified.
             if let Some(ref props) = rel_pat.properties {

@@ -2258,6 +2258,80 @@ mod tests {
     }
 
     #[test]
+    fn relationship_uniqueness_within_pattern() {
+        // The canonical co-developer query: a relationship matched by one hop
+        // of a pattern must not be reused by another hop of the same pattern,
+        // so marko is not his own co-developer through the single marko-CREATED->lop relationship.
+        let (_dir, graph) = setup_graph();
+        let marko = graph
+            .add_node("Person", &serde_json::json!({"name": "marko"}))
+            .unwrap();
+        let josh = graph
+            .add_node("Person", &serde_json::json!({"name": "josh"}))
+            .unwrap();
+        let lop = graph
+            .add_node("Software", &serde_json::json!({"name": "lop"}))
+            .unwrap();
+        graph.add_edge(marko, lop, "CREATED", &()).unwrap();
+        graph.add_edge(josh, lop, "CREATED", &()).unwrap();
+
+        let rows = run(
+            &graph,
+            "MATCH (m:Person {name: 'marko'})-[:CREATED]->(s)<-[:CREATED]-(c) \
+             RETURN c.name AS name",
+        );
+        let names: Vec<&str> = rows.iter().map(|r| r[0].as_str().unwrap()).collect();
+        assert_eq!(names, ["josh"]);
+    }
+
+    #[test]
+    fn relationship_uniqueness_blocks_undirected_backtrack() {
+        // With a single KNOWS relationship, an undirected two-hop pattern has
+        // no valid assignment: the second hop may not traverse the first
+        // hop's relationship back to the start.
+        let (_dir, graph) = setup_graph();
+        let a = graph
+            .add_node("Person", &serde_json::json!({"name": "a"}))
+            .unwrap();
+        let b = graph
+            .add_node("Person", &serde_json::json!({"name": "b"}))
+            .unwrap();
+        graph.add_edge(a, b, "KNOWS", &()).unwrap();
+
+        let rows = run(
+            &graph,
+            "MATCH (x:Person {name: 'a'})-[:KNOWS]-(y)-[:KNOWS]-(z) RETURN z.name AS name",
+        );
+        assert!(
+            rows.is_empty(),
+            "backtracking over the same relationship must be rejected"
+        );
+    }
+
+    #[test]
+    fn relationship_reuse_across_match_clauses_is_allowed() {
+        // Uniqueness is scoped to a single pattern: two separate MATCH
+        // clauses may bind the same relationship.
+        let (_dir, graph) = setup_graph();
+        let a = graph
+            .add_node("Person", &serde_json::json!({"name": "a"}))
+            .unwrap();
+        let b = graph
+            .add_node("Person", &serde_json::json!({"name": "b"}))
+            .unwrap();
+        graph.add_edge(a, b, "KNOWS", &()).unwrap();
+
+        let rows = run(
+            &graph,
+            "MATCH (x:Person {name: 'a'})-[r1:KNOWS]->(y) \
+             MATCH (x)-[r2:KNOWS]->(y) \
+             RETURN y.name AS name",
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0].as_str().unwrap(), "b");
+    }
+
+    #[test]
     fn create_index_and_drop_index_execute_without_error() {
         let (_dir, graph) = setup_graph();
         graph
