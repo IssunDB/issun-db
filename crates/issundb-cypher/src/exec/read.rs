@@ -1573,10 +1573,18 @@ fn multiway_join_rows(
         let transitions =
             expand_multi_type(graph, &src_nodes, closing_rel_type, closing_is_incoming)?;
 
-        // Index the transitions as (closing_src, closing_dst) → EdgeId for O(1) lookup.
-        let mut join_map: HashMap<NodeId, HashMap<NodeId, EdgeId>> = HashMap::new();
+        // Index the transitions as (closing_src, closing_dst) → [EdgeId] for O(1)
+        // lookup. The value is a list, not a single EdgeId, because parallel
+        // edges between the same pair are distinct matches and each must emit
+        // its own row.
+        let mut join_map: HashMap<NodeId, HashMap<NodeId, Vec<EdgeId>>> = HashMap::new();
         for (src, eid, dst) in transitions {
-            join_map.entry(src).or_default().insert(dst, eid);
+            join_map
+                .entry(src)
+                .or_default()
+                .entry(dst)
+                .or_default()
+                .push(eid);
         }
 
         for path in child_paths {
@@ -1589,8 +1597,8 @@ fn multiway_join_rows(
                 _ => continue,
             };
 
-            if let Some(dst_map) = join_map.get(&closing_src) {
-                if let Some(&eid) = dst_map.get(&closing_dst) {
+            if let Some(eids) = join_map.get(&closing_src).and_then(|m| m.get(&closing_dst)) {
+                for &eid in eids {
                     if edge_bound_to_sibling_rel(&path, closing_unique_rels, eid) {
                         continue;
                     }

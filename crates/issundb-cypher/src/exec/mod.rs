@@ -898,6 +898,38 @@ mod tests {
         );
     }
 
+    /// A directed closing hop must preserve parallel-edge multiplicity: two
+    /// distinct LIKES edges between the same bound pair are two matches, one
+    /// per edge, exactly like a plain `Expand` would produce.
+    #[test]
+    fn directed_closing_hop_matches_parallel_edges() {
+        let (_dir, graph) = setup_graph();
+        let params = HashMap::new();
+        execute(
+            &graph,
+            "CREATE (a:Person {name: 'A'}), (b:Person {name: 'B'}) \
+             CREATE (a)-[:KNOWS]->(b), (a)-[:LIKES {n: 1}]->(b), (a)-[:LIKES {n: 2}]->(b)",
+            &params,
+        )
+        .unwrap();
+        graph.rebuild_csr().unwrap();
+
+        // The cyclic single pattern makes the LIKES hop a closing hop (both
+        // endpoints already bound), which the optimizer rewrites to a
+        // `MultiwayJoin`; a separate MATCH clause would plan as a `HashJoin`
+        // and never exercise this path.
+        let mut rows = run(
+            &graph,
+            "MATCH (a:Person)-[:KNOWS]->(b:Person)<-[r:LIKES]-(a) RETURN r.n",
+        );
+        rows.sort_by_key(|r| r[0].as_i64().unwrap());
+        assert_eq!(
+            rows,
+            vec![vec![serde_json::json!(1)], vec![serde_json::json!(2)],],
+            "directed closing hop must emit one row per parallel edge"
+        );
+    }
+
     /// `LIMIT` behind an `Expand` streams: the result is a prefix of the
     /// unbounded result, and asking for fewer rows than exist returns exactly
     /// that many. This exercises the lazy scan-then-expand short-circuit path.
