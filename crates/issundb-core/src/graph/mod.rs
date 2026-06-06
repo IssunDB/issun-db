@@ -25,7 +25,7 @@ use crate::{
         ids::{
             adjust_label_count, adjust_type_count, alloc_edge_id, alloc_node_id, get_label,
             get_or_create_label, get_or_create_prop_key, get_or_create_type, get_prop_key,
-            get_prop_key_name,
+            get_prop_key_name, get_type,
         },
         lmdb::Storage,
         props,
@@ -50,6 +50,18 @@ pub enum DegreeDirection {
     Out,
     /// Count both incoming and outgoing edges.
     Both,
+}
+
+/// Pattern description for [`Graph::count_triangle_cycles`]: the directed
+/// cycle `(a)-[t1]->(b)-[t2]->(c)-[t3]->(a)` with an optional relationship
+/// type per hop and an optional label per node variable. `None` means
+/// unconstrained.
+#[derive(Debug, Clone, Default)]
+pub struct TriangleCountSpec<'a> {
+    /// Relationship types for the hops `a -> b`, `b -> c`, and `c -> a`.
+    pub rel_types: [Option<&'a str>; 3],
+    /// Labels required on `a`, `b`, and `c`.
+    pub labels: [Option<&'a str>; 3],
 }
 
 /// Builds a 12-byte composite key `(prefix u32 BE, id u64 BE)` for secondary index lookups.

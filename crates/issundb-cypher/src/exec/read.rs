@@ -3546,6 +3546,32 @@ fn eval_leaf(
             }
         }
         PhysicalOperator::SingleRow => Ok(vec![SlotRow::empty(schema.clone())]),
+        PhysicalOperator::TriangleCount {
+            rel_types,
+            labels,
+            output,
+        } => {
+            // One kernel call over the CSR snapshot replaces the whole
+            // expand-and-close pipeline; the count comes back as one row.
+            let spec = issundb_core::TriangleCountSpec {
+                rel_types: [
+                    rel_types[0].as_deref(),
+                    rel_types[1].as_deref(),
+                    rel_types[2].as_deref(),
+                ],
+                labels: [
+                    labels[0].as_deref(),
+                    labels[1].as_deref(),
+                    labels[2].as_deref(),
+                ],
+            };
+            let count = graph
+                .count_triangle_cycles(&spec)
+                .map_err(|e| e.to_string())?;
+            let mut path = SlotRow::empty(schema.clone());
+            path.bind_local(output, GraphBinding::Scalar(serde_json::Value::from(count)));
+            Ok(vec![path])
+        }
         other => Err(format!("eval_leaf called on non-leaf operator: {other:?}")),
     }
 }
@@ -4173,5 +4199,191 @@ mod stream_join_tests {
             "MATCH (n:R) RETURN n.age AS age ORDER BY n.age ASC SKIP 2",
         );
         assert_eq!(skipped, full[2..].to_vec());
+    }
+}
+
+#[cfg(test)]
+mod triangle_count_exec_tests {
+    //! Plan-shape and parity tests for the `TriangleCount` kernel rewrite.
+    //! The forced row path appends an always-true `IS NULL` predicate: its
+    //! pushed-down `Filter` breaks the rewrite's exact shape match without
+    //! changing the result set, so the same query runs through the
+    //! `MultiwayJoin` row pipeline as a semantic oracle.
+    use super::*;
+    use crate::ast::Statement;
+    use crate::parser;
+    use crate::plan::physical::format_physical_plan;
+    use crate::plan::{LogicalPlanner, Optimizer, PhysicalPlanner};
+    use issundb_core::Graph;
+    use tempfile::TempDir;
+
+    const KERNEL_Q: &str = "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person)\
+         -[:KNOWS]->(a) RETURN count(a) AS n";
+    const ROW_Q: &str = "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person)\
+         -[:KNOWS]->(a) WHERE a.__force_row_path IS NULL RETURN count(a) AS n";
+
+    fn setup() -> (TempDir, Graph) {
+        let dir = TempDir::new().unwrap();
+        let graph = Graph::open(dir.path(), 1).unwrap();
+        (dir, graph)
+    }
+
+    fn plan_text(graph: &Graph, cypher: &str) -> String {
+        let stmt = parser::parse(cypher).unwrap();
+        let q = match stmt {
+            Statement::Query(q) => q,
+            _ => panic!("not a read query: {cypher}"),
+        };
+        let logical = LogicalPlanner::plan(&q).unwrap();
+        let physical = PhysicalPlanner::plan(&logical);
+        format_physical_plan(&Optimizer::optimize(physical, Some(graph)), 0)
+    }
+
+    fn count_result(graph: &Graph, cypher: &str) -> u64 {
+        let result = super::execute(graph, cypher, &HashMap::new()).unwrap();
+        assert_eq!(result.records.len(), 1, "count query must yield one row");
+        result.records[0].values[0].as_u64().unwrap()
+    }
+
+    fn triangle_fixture() -> (TempDir, Graph) {
+        let (dir, graph) = setup();
+        super::execute(
+            &graph,
+            "CREATE (x:Person), (y:Person), (z:Person) \
+             CREATE (x)-[:KNOWS]->(y), (y)-[:KNOWS]->(z), (z)-[:KNOWS]->(x)",
+            &HashMap::new(),
+        )
+        .unwrap();
+        graph.rebuild_csr().unwrap();
+        (dir, graph)
+    }
+
+    /// The harness triangle query plans to the kernel leaf and returns one
+    /// row per rotation of the single cycle.
+    #[test]
+    fn kernel_plan_shape_and_result() {
+        let (_dir, graph) = triangle_fixture();
+        let plan = plan_text(&graph, KERNEL_Q);
+        assert!(
+            plan.contains("TriangleCount"),
+            "expected the kernel leaf:\n{plan}"
+        );
+        assert_eq!(count_result(&graph, KERNEL_Q), 3);
+
+        // The forced row path keeps the MultiwayJoin pipeline and agrees.
+        let row_plan = plan_text(&graph, ROW_Q);
+        assert!(
+            !row_plan.contains("TriangleCount") && row_plan.contains("MultiwayJoin"),
+            "forcing predicate failed to disable the rewrite:\n{row_plan}"
+        );
+        assert_eq!(count_result(&graph, ROW_Q), 3);
+    }
+
+    /// `count(*)` and counts over the other pattern variables take the kernel
+    /// path too; every variable is bound in every match, so the counts agree.
+    #[test]
+    fn kernel_accepts_count_star_and_other_variables() {
+        let (_dir, graph) = triangle_fixture();
+        for ret in ["count(*)", "count(b)", "count(c)", "count(r1)"] {
+            let q = format!(
+                "MATCH (a:Person)-[r1:KNOWS]->(b:Person)-[:KNOWS]->(c:Person)-[:KNOWS]->(a) \
+                 RETURN {ret} AS n"
+            );
+            let plan = plan_text(&graph, &q);
+            assert!(
+                plan.contains("TriangleCount"),
+                "expected the kernel leaf for {ret}:\n{plan}"
+            );
+            assert_eq!(count_result(&graph, &q), 3, "count mismatch for {ret}");
+        }
+    }
+
+    /// Shapes outside the kernel contract must stay on the row pipeline:
+    /// extra predicates, grouping, DISTINCT, undirected or reversed or
+    /// var-length hops, and a missing closing join.
+    #[test]
+    fn unsupported_shapes_keep_the_row_path() {
+        let (_dir, graph) = triangle_fixture();
+        let bail_queries = [
+            // Property predicate on a pattern variable.
+            "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person)-[:KNOWS]->(a) \
+             WHERE b.age > 1 RETURN count(a) AS n",
+            // Grouped aggregation.
+            "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person)-[:KNOWS]->(a) \
+             RETURN b.city AS city, count(a) AS n",
+            // DISTINCT count.
+            "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person)-[:KNOWS]->(a) \
+             RETURN count(DISTINCT a) AS n",
+            // Undirected middle hop.
+            "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]-(c:Person)-[:KNOWS]->(a) \
+             RETURN count(a) AS n",
+            // Reversed closing hop: not a directed cycle.
+            "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person)<-[:KNOWS]-(a) \
+             RETURN count(a) AS n",
+            // Var-length hop.
+            "MATCH (a:Person)-[:KNOWS*1..2]->(b:Person)-[:KNOWS]->(c:Person)-[:KNOWS]->(a) \
+             RETURN count(a) AS n",
+            // Open chain: no closing join at all.
+            "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person) \
+             RETURN count(a) AS n",
+        ];
+        for q in bail_queries {
+            let plan = plan_text(&graph, q);
+            assert!(
+                !plan.contains("TriangleCount"),
+                "rewrite must not fire for `{q}`:\n{plan}"
+            );
+            // The query still executes on the row path.
+            super::execute(&graph, q, &HashMap::new()).unwrap();
+        }
+    }
+
+    /// Differential parity on random multigraphs: the kernel path and the
+    /// forced row path must agree on every graph, including self-loops and
+    /// parallel edges.
+    #[test]
+    fn kernel_matches_row_path_on_random_multigraphs() {
+        use proptest::prelude::*;
+
+        let mut runner = proptest::test_runner::TestRunner::new(ProptestConfig {
+            cases: 24,
+            ..ProptestConfig::default()
+        });
+        let strategy = (
+            1usize..=6,
+            proptest::collection::vec((0usize..6, 0usize..6), 0..24),
+        );
+        runner
+            .run(&strategy, |(n_nodes, edges)| {
+                let (_dir, graph) = setup();
+                let mut create = String::from("CREATE ");
+                for i in 0..n_nodes {
+                    if i > 0 {
+                        create.push_str(", ");
+                    }
+                    create.push_str(&format!("(p{i}:Person)"));
+                }
+                super::execute(&graph, &create, &HashMap::new()).unwrap();
+                let mut ids = Vec::new();
+                for i in 0..n_nodes {
+                    ids.push(i as u64);
+                }
+                for (s, d) in &edges {
+                    let (s, d) = (s % n_nodes, d % n_nodes);
+                    let q = format!(
+                        "MATCH (a:Person), (b:Person) WHERE id(a) = {} AND id(b) = {} \
+                         CREATE (a)-[:KNOWS]->(b)",
+                        ids[s], ids[d]
+                    );
+                    super::execute(&graph, &q, &HashMap::new()).unwrap();
+                }
+                graph.rebuild_csr().unwrap();
+
+                let kernel = count_result(&graph, KERNEL_Q);
+                let row = count_result(&graph, ROW_Q);
+                prop_assert_eq!(kernel, row, "kernel vs row path on {} nodes", n_nodes);
+                Ok(())
+            })
+            .unwrap();
     }
 }

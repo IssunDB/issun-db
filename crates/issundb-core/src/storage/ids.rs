@@ -207,6 +207,18 @@ pub fn get_label(
     Ok(None)
 }
 
+/// Returns the existing `TypeId` for `name` if it exists.
+pub fn get_type(storage: &Storage, txn: &heed::RoTxn, name: &str) -> Result<Option<TypeId>, Error> {
+    let meta_key = format!("type:{name}");
+    if let Some(b) = storage.meta.get(txn, &meta_key)? {
+        let arr: [u8; 4] = b
+            .try_into()
+            .map_err(|_| Error::Corrupt("type id must be 4 bytes"))?;
+        return Ok(Some(u32::from_be_bytes(arr)));
+    }
+    Ok(None)
+}
+
 /// Returns the existing `PropKeyId` for `name` if it exists.
 pub fn get_prop_key(
     storage: &Storage,

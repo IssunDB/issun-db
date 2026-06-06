@@ -1479,6 +1479,7 @@ dependencies = [
  "chumsky",
  "criterion",
  "issundb-core",
+ "proptest",
  "regex",
  "rmp-serde",
  "serde",

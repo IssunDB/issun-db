@@ -24,6 +24,7 @@ chrono-tz.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 criterion.workspace = true
+proptest.workspace = true
 
 [[bench]]
 name = "parse"

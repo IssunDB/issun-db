@@ -40,6 +40,9 @@ impl Optimizer {
         // Replace a count aggregation over a bare labeled scan with a constant read
         // from graph metadata, avoiding a full scan.
         result = Self::reduce_count(result, stats);
+        // Replace a grouping-free count over a MultiwayJoin-closed directed
+        // triangle chain with the core sorted-intersect kernel.
+        result = rewrite_triangle_count(result);
         result
     }
 
@@ -295,6 +298,8 @@ impl Optimizer {
                     inner_filters,
                 )
             }
+            // A leaf produced after this pass; nothing to extract.
+            t @ PhysicalOperator::TriangleCount { .. } => (t, Vec::new()),
         }
     }
 
@@ -455,6 +460,7 @@ impl Optimizer {
                 closing_is_undirected,
                 closing_unique_rels,
             },
+            t @ PhysicalOperator::TriangleCount { .. } => t,
         }
     }
 
@@ -526,6 +532,8 @@ impl Optimizer {
             | PhysicalOperator::Distinct { input, .. }
             | PhysicalOperator::WritePart { input, .. }
             | PhysicalOperator::ProcedureCall { input, .. } => Self::plan_weight(input, stats),
+            // A single kernel call producing one row.
+            PhysicalOperator::TriangleCount { .. } => 1,
             // MultiwayJoin is cheaper than a regular Expand because the closing check is O(1)
             // per row after a single bulk expansion. Weight as the input cost.
             PhysicalOperator::MultiwayJoin { input, .. } => Self::plan_weight(input, stats),
@@ -1024,6 +1032,8 @@ impl Optimizer {
                 *pending = remaining_pending;
                 current_node
             }
+            // A leaf produced after this pass; no children to push into.
+            t @ PhysicalOperator::TriangleCount { .. } => t,
         }
     }
 
@@ -1227,6 +1237,9 @@ impl Optimizer {
                 for v in output_vars {
                     vars.insert(v.clone());
                 }
+            }
+            PhysicalOperator::TriangleCount { output, .. } => {
+                vars.insert(output.clone());
             }
         }
     }
@@ -2264,6 +2277,202 @@ fn rewrite_closing_expands(op: PhysicalOperator) -> PhysicalOperator {
         },
         leaf => leaf,
     }
+}
+
+/// Replace a grouping-free, non-distinct `count` aggregate sitting directly on
+/// a `MultiwayJoin`-closed directed triangle chain with the leaf
+/// `TriangleCount` operator, which the executor answers via one core kernel
+/// call instead of materializing every row of the pattern.
+///
+/// Recursion is limited to the operators that can sit between the query root
+/// and a RETURN-level aggregate (`Project`, `Limit`, `Sort`, `Distinct`, and
+/// `Filter`); anywhere else the plan is left untouched, which only forfeits
+/// the fast path, never correctness.
+fn rewrite_triangle_count(op: PhysicalOperator) -> PhysicalOperator {
+    if let Some(t) = try_triangle_count(&op) {
+        return t;
+    }
+    match op {
+        PhysicalOperator::Project {
+            input,
+            items,
+            is_barrier,
+        } => PhysicalOperator::Project {
+            input: Box::new(rewrite_triangle_count(*input)),
+            items,
+            is_barrier,
+        },
+        PhysicalOperator::Limit { input, skip, count } => PhysicalOperator::Limit {
+            input: Box::new(rewrite_triangle_count(*input)),
+            skip,
+            count,
+        },
+        PhysicalOperator::Sort { input, items } => PhysicalOperator::Sort {
+            input: Box::new(rewrite_triangle_count(*input)),
+            items,
+        },
+        PhysicalOperator::Distinct { input } => PhysicalOperator::Distinct {
+            input: Box::new(rewrite_triangle_count(*input)),
+        },
+        PhysicalOperator::Filter { input, expression } => PhysicalOperator::Filter {
+            input: Box::new(rewrite_triangle_count(*input)),
+            expression,
+        },
+        other => other,
+    }
+}
+
+/// Strip one `HasLabel` filter, returning the label predicate and the inner
+/// operator. Any other filter shape stays in place and fails the pattern
+/// match in `try_triangle_count`.
+fn peel_one_haslabel(op: &PhysicalOperator) -> (Option<(&str, &str)>, &PhysicalOperator) {
+    if let PhysicalOperator::Filter {
+        input,
+        expression: FilterExpr::HasLabel(var, label),
+    } = op
+    {
+        (Some((var.as_str(), label.as_str())), input.as_ref())
+    } else {
+        (None, op)
+    }
+}
+
+/// Match the exact triangle-count plan shape and build its replacement.
+///
+/// Required shape, bottom-up: `LabelScan a`, `Expand a->b` (single-hop,
+/// directed, no path), optional `HasLabel` on `b`, `Expand b->c` (same
+/// restrictions, unique against hop 1), optional `HasLabel` on `c`,
+/// `MultiwayJoin` closing `c->a` (directed, unique against both hops), and an
+/// `Aggregate` with no grouping whose only aggregation is a non-distinct
+/// `count(*)` or `count(var)` over a pattern variable. The `unique_rels`
+/// wiring is checked exactly so the chain is one MATCH pattern; relationship
+/// uniqueness across separate patterns does not apply and must not be folded
+/// into the kernel.
+fn try_triangle_count(op: &PhysicalOperator) -> Option<PhysicalOperator> {
+    let PhysicalOperator::Aggregate {
+        input,
+        group_by,
+        aggregations,
+    } = op
+    else {
+        return None;
+    };
+    if !group_by.is_empty() || aggregations.len() != 1 {
+        return None;
+    }
+    let (agg_fn, count_expr, out_name) = &aggregations[0];
+    if !matches!(agg_fn, AggFn::Count { distinct: false }) {
+        return None;
+    }
+
+    let PhysicalOperator::MultiwayJoin {
+        input: mj_input,
+        closing_src_var,
+        closing_dst_var,
+        closing_rel_type,
+        closing_rel_var,
+        closing_is_incoming: false,
+        closing_is_undirected: false,
+        closing_unique_rels,
+    } = input.as_ref()
+    else {
+        return None;
+    };
+
+    let (c_label, exp2_op) = peel_one_haslabel(mj_input);
+    let PhysicalOperator::Expand {
+        input: e2_input,
+        src_var: src2,
+        rel_var: rel2,
+        dst_var: dst2,
+        rel_type: t2,
+        is_incoming: false,
+        is_undirected: false,
+        min_hops: 1,
+        max_hops: 1,
+        unique_rels: unique2,
+        needs_path: false,
+    } = exp2_op
+    else {
+        return None;
+    };
+
+    let (b_label, exp1_op) = peel_one_haslabel(e2_input);
+    let PhysicalOperator::Expand {
+        input: e1_input,
+        src_var: src1,
+        rel_var: rel1,
+        dst_var: dst1,
+        rel_type: t1,
+        is_incoming: false,
+        is_undirected: false,
+        min_hops: 1,
+        max_hops: 1,
+        unique_rels: unique1,
+        needs_path: false,
+    } = exp1_op
+    else {
+        return None;
+    };
+
+    let PhysicalOperator::LabelScan {
+        variable: a_var,
+        label: a_label,
+    } = e1_input.as_ref()
+    else {
+        return None;
+    };
+
+    // Cycle wiring: a -> b -> c -> a over three distinct node variables.
+    let (b_var, c_var) = (dst1, dst2);
+    if src1 != a_var || src2 != b_var || closing_src_var != c_var || closing_dst_var != a_var {
+        return None;
+    }
+    if a_var == b_var || b_var == c_var || a_var == c_var {
+        return None;
+    }
+    // Peeled label filters must apply to the variable they sit above.
+    if let Some((v, _)) = c_label {
+        if v != c_var {
+            return None;
+        }
+    }
+    if let Some((v, _)) = b_label {
+        if v != b_var {
+            return None;
+        }
+    }
+    // One-pattern relationship uniqueness, exactly as the kernel encodes it.
+    if !unique1.is_empty()
+        || unique2.as_slice() != [rel1.clone()]
+        || closing_unique_rels.as_slice() != [rel1.clone(), rel2.clone()]
+    {
+        return None;
+    }
+    // The counted expression must be `*` or a bare pattern variable, all of
+    // which are non-null in every match.
+    match count_expr {
+        Expr::CountStar => {}
+        Expr::Prop(v, p)
+            if p.is_empty()
+                && (v == a_var
+                    || v == b_var
+                    || v == c_var
+                    || v == rel1
+                    || v == rel2
+                    || v == closing_rel_var) => {}
+        _ => return None,
+    }
+
+    Some(PhysicalOperator::TriangleCount {
+        rel_types: [t1.clone(), t2.clone(), closing_rel_type.clone()],
+        labels: [
+            a_label.clone(),
+            b_label.map(|(_, l)| l.to_string()),
+            c_label.map(|(_, l)| l.to_string()),
+        ],
+        output: out_name.clone(),
+    })
 }
 
 #[cfg(test)]

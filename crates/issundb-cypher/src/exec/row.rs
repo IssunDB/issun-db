@@ -199,6 +199,9 @@ impl SlotSchema {
                 self.collect(input);
                 self.bind(closing_rel_var);
             }
+            TriangleCount { output, .. } => {
+                self.bind(output);
+            }
         }
     }
 
