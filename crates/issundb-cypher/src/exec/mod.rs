@@ -12,6 +12,7 @@ mod ddl;
 mod expr;
 mod factorize;
 pub(crate) mod read;
+mod row;
 mod write;
 
 use ddl::{

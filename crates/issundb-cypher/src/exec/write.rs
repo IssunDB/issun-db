@@ -1,6 +1,6 @@
 use super::expr::evaluate_expr;
 use super::read::{
-    binding_to_value, column_name, execute_physical, execute_read_query, projected_key,
+    binding_to_value, column_name, execute_physical_pathmaps, execute_read_query, projected_key,
 };
 use super::*;
 use crate::ast::{
@@ -170,7 +170,7 @@ pub(super) fn execute_set(
         PhysicalOperator::Project { input, items, .. } if items.is_empty() => *input,
         other => other,
     };
-    let bound_paths = execute_physical(graph, &binding_plan, params)?;
+    let bound_paths = execute_physical_pathmaps(graph, &binding_plan, params)?;
 
     for path in bound_paths {
         apply_set_items(graph, &path, &set.set_items, params)?;
@@ -210,7 +210,7 @@ pub(super) fn execute_delete(
         PhysicalOperator::Project { input, items, .. } if items.is_empty() => *input,
         other => other,
     };
-    let bound_paths = execute_physical(graph, &binding_plan, params)?;
+    let bound_paths = execute_physical_pathmaps(graph, &binding_plan, params)?;
 
     delete_over_paths(graph, &bound_paths, &delete.targets, delete.detach, params)?;
 
@@ -409,7 +409,7 @@ pub(super) fn execute_delete_and_return(
             PhysicalOperator::Project { input, items, .. } if items.is_empty() => *input,
             other => other,
         };
-        let bound_paths = execute_physical(graph, &binding_plan, params)?;
+        let bound_paths = execute_physical_pathmaps(graph, &binding_plan, params)?;
 
         delete_over_paths(graph, &bound_paths, &stmt.targets, stmt.detach, params)?;
 
@@ -535,7 +535,7 @@ pub(super) fn execute_remove(
         PhysicalOperator::Project { input, items, .. } if items.is_empty() => *input,
         other => other,
     };
-    let bound_paths = execute_physical(graph, &binding_plan, params)?;
+    let bound_paths = execute_physical_pathmaps(graph, &binding_plan, params)?;
 
     for path in bound_paths {
         for item in &stmt.items {
