@@ -5,7 +5,10 @@
 //! the workload runs on both. The harness reports median wall time per engine
 //! and asserts row-set equality, so it doubles as a differential correctness check.
 //! The differential check runs before timing: medians for a query the engines
-//! disagree on are meaningless, so a mismatched query is reported and not timed.
+//! disagree on are meaningless, so a divergent query is reported and not timed.
+//! Trail-sensitive queries carry an openCypher trail reference computed from
+//! the dataset (see `Oracle`), so a known LadybugDB walk-semantics overcount
+//! is attributed and reported without failing the run.
 //!
 //! Probe-anchored queries use deterministic degree-percentile probes (cold,
 //! median, and hub) computed from the generated graph rather than fixed ids,
@@ -238,14 +241,20 @@ struct Probes {
     expand_target: u64,
 }
 
-fn pick_probes(data: &Dataset) -> Probes {
-    let nodes = data.persons.len() as u64;
-    let mut out_degree = vec![0u64; nodes as usize];
-    let mut adjacency: Vec<Vec<u64>> = vec![Vec::new(); nodes as usize];
+/// Out-adjacency lists in generation order, shared by probe selection and the
+/// trail oracle.
+fn out_adjacency(data: &Dataset) -> Vec<Vec<u64>> {
+    let mut adjacency: Vec<Vec<u64>> = vec![Vec::new(); data.persons.len()];
     for &(src, dst, _) in &data.knows {
-        out_degree[src as usize] += 1;
         adjacency[src as usize].push(dst);
     }
+    adjacency
+}
+
+fn pick_probes(data: &Dataset) -> Probes {
+    let nodes = data.persons.len() as u64;
+    let adjacency = out_adjacency(data);
+    let out_degree: Vec<u64> = adjacency.iter().map(|n| n.len() as u64).collect();
     let mut by_degree: Vec<u64> = (0..nodes).collect();
     by_degree.sort_by_key(|&id| (out_degree[id as usize], id));
     let cold = by_degree[0];
@@ -402,19 +411,102 @@ enum Scope {
     ProbeLocal,
 }
 
+/// How a row-set divergence between the engines is adjudicated.
+///
+/// openCypher requires pairwise-distinct relationships within a MATCH pattern
+/// (trail semantics). LadybugDB matches walks instead: fixed-length chains
+/// never enforce cross-hop relationship uniqueness, and the
+/// `recursive_pattern_semantic` session setting is accepted but inert in the
+/// pinned `lbug` build (see `tests/lbug_trail_semantics.rs`). For the queries
+/// where walks and trails can differ, a trail count computed directly from
+/// the dataset attributes the divergence instead of failing the run blindly.
+/// Two-hop patterns are exempt because a two-edge walk cannot repeat an edge
+/// without a self-loop, and the generator emits none.
+enum Oracle {
+    /// Row sets must match exactly; any divergence fails the run.
+    Exact,
+    /// Trail count from the median probe with hop counts in `min..=max`.
+    TrailCount(u8, u8),
+    /// Distinct trail endpoints at exactly `hops` hops from the median probe.
+    TrailEndpoints(u8),
+}
+
+/// Count trails (edge-distinct paths) from `start` with `min..=max` hops.
+fn count_trails(adjacency: &[Vec<u64>], start: u64, min: u8, max: u8) -> u64 {
+    fn rec(
+        adjacency: &[Vec<u64>],
+        node: u64,
+        used: &mut Vec<(u64, u64)>,
+        depth: u8,
+        min: u8,
+        max: u8,
+        total: &mut u64,
+    ) {
+        if depth >= min {
+            *total += 1;
+        }
+        if depth == max {
+            return;
+        }
+        for &next in &adjacency[node as usize] {
+            let edge = (node, next);
+            if used.contains(&edge) {
+                continue;
+            }
+            used.push(edge);
+            rec(adjacency, next, used, depth + 1, min, max, total);
+            used.pop();
+        }
+    }
+    let mut total = 0;
+    rec(adjacency, start, &mut Vec::new(), 0, min, max, &mut total);
+    total
+}
+
+/// Count distinct endpoints of trails at exactly `hops` hops from `start`.
+fn count_trail_endpoints(adjacency: &[Vec<u64>], start: u64, hops: u8) -> u64 {
+    fn rec(
+        adjacency: &[Vec<u64>],
+        node: u64,
+        used: &mut Vec<(u64, u64)>,
+        depth: u8,
+        hops: u8,
+        endpoints: &mut HashSet<u64>,
+    ) {
+        if depth == hops {
+            endpoints.insert(node);
+            return;
+        }
+        for &next in &adjacency[node as usize] {
+            let edge = (node, next);
+            if used.contains(&edge) {
+                continue;
+            }
+            used.push(edge);
+            rec(adjacency, next, used, depth + 1, hops, endpoints);
+            used.pop();
+        }
+    }
+    let mut endpoints = HashSet::new();
+    rec(adjacency, start, &mut Vec::new(), 0, hops, &mut endpoints);
+    endpoints.len() as u64
+}
+
 /// One benchmark query; the Cypher is sent verbatim to both engines.
 struct Query {
     name: &'static str,
     cypher: String,
     scope: Scope,
+    oracle: Oracle,
 }
 
-/// Median timings for one query at one dataset size.
+/// Median timings for one query at one dataset size. `None` marks a query
+/// that was not timed at this size (a reported semantic divergence).
 struct QueryTiming {
     name: &'static str,
     scope: Scope,
-    issundb: Duration,
-    ladybug_1t: Duration,
+    issundb: Option<Duration>,
+    ladybug_1t: Option<Duration>,
 }
 
 /// The benchmark queries, anchored at the degree-percentile probes.
@@ -427,6 +519,13 @@ fn workload(probes: &Probes) -> Vec<Query> {
         name,
         cypher,
         scope,
+        oracle: Oracle::Exact,
+    };
+    let qo = |name, scope, cypher, oracle| Query {
+        name,
+        cypher,
+        scope,
+        oracle,
     };
     vec![
         q(
@@ -479,18 +578,19 @@ fn workload(probes: &Probes) -> Vec<Query> {
                  WHERE a.id = {median} RETURN count(c) AS n"
             ),
         ),
-        q(
+        qo(
             "three_hop_count",
             Scope::ProbeLocal,
             format!(
                 "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person) \
                  -[:KNOWS]->(d:Person) WHERE a.id = {median} RETURN count(d) AS n"
             ),
+            Oracle::TrailCount(3, 3),
         ),
         // Unlike the path-counting hops above, this counts distinct endpoints
         // (count(DISTINCT e)) to bound the four-hop combinatorial blowup; the
         // name records the different semantics.
-        q(
+        qo(
             "four_hop_distinct",
             Scope::ProbeLocal,
             format!(
@@ -498,6 +598,7 @@ fn workload(probes: &Probes) -> Vec<Query> {
                  -[:KNOWS]->(d:Person)-[:KNOWS]->(e:Person) \
                  WHERE a.id = {median} RETURN count(DISTINCT e) AS n"
             ),
+            Oracle::TrailEndpoints(4),
         ),
         q(
             "one_or_two_hop",
@@ -537,13 +638,14 @@ fn workload(probes: &Probes) -> Vec<Query> {
                  WHERE a.id = {median} AND c.id = {target} RETURN count(b) AS n"
             ),
         ),
-        q(
+        qo(
             "var_length_count",
             Scope::ProbeLocal,
             format!(
                 "MATCH (a:Person)-[:KNOWS*2..3]->(c:Person) \
                  WHERE a.id = {median} RETURN count(c) AS n"
             ),
+            Oracle::TrailCount(2, 3),
         ),
         q(
             "order_limit",
@@ -610,9 +712,12 @@ fn run_at(cfg: &Config, nodes: u64, edges: u64) -> anyhow::Result<Vec<QueryTimin
     let lb_dir = tempfile::tempdir()?;
     let db = Database::new(lb_dir.path().join("db"), SystemConfig::default())?;
     let mut conn = Connection::new(&db)?;
-    // LadybugDB defaults to WALK semantics for variable-length patterns, where
-    // a relationship may repeat within a path; openCypher (and IssunDB) use
-    // TRAIL semantics. Pin TRAIL so both engines match the same paths.
+    // LadybugDB defaults to WALK semantics, where a relationship may repeat
+    // within a path; openCypher (and IssunDB) require pairwise-distinct
+    // relationships. Pin TRAIL for the day the pinned `lbug` build honors it;
+    // today the setting registers but is inert (see
+    // `tests/lbug_trail_semantics.rs`), so the trail-sensitive queries carry
+    // an `Oracle` that adjudicates row-set divergences instead.
     conn.query("CALL recursive_pattern_semantic = 'TRAIL';")?;
     let default_threads = conn.get_max_num_threads_for_exec();
     let start = Instant::now();
@@ -644,31 +749,72 @@ fn run_at(cfg: &Config, nodes: u64, edges: u64) -> anyhow::Result<Vec<QueryTimin
     let mut timings = Vec::new();
     let mut truncated = false;
     let mut mismatches = 0;
+    let mut divergences = 0;
     for query in &workload(&probes) {
         let (name, cypher) = (query.name, &query.cypher);
 
         // Differential check before timing: medians for a query the engines
         // disagree on are meaningless (an engine doing the wrong amount of
-        // work can look faster), so a mismatch is reported and the query is
-        // not timed. Sorted row sets must match exactly.
+        // work can look faster), so a divergent query is reported and not
+        // timed. Sorted row sets must match exactly; for the trail-sensitive
+        // queries, the dataset-computed trail reference adjudicates which
+        // engine diverged from openCypher.
         let mut is_rows = issundb_rows(&graph.query(cypher)?);
         let mut lb_rows = ladybug_rows(conn.query(cypher)?);
         is_rows.sort();
         lb_rows.sort();
         if is_rows != lb_rows {
-            mismatches += 1;
-            println!(
-                "{name:<20} {:>12} {:>12} {:>14} {:>10}  MISMATCH \
-                 (issundb {} rows: {:?}..., ladybug {} rows: {:?}...)",
-                "-",
-                "-",
-                "-",
-                "-",
-                is_rows.len(),
-                is_rows.first(),
-                lb_rows.len(),
-                lb_rows.first()
-            );
+            let reference = match query.oracle {
+                Oracle::Exact => None,
+                Oracle::TrailCount(min, max) => {
+                    Some(count_trails(&out_adjacency(&data), probes.median, min, max))
+                }
+                Oracle::TrailEndpoints(hops) => Some(count_trail_endpoints(
+                    &out_adjacency(&data),
+                    probes.median,
+                    hops,
+                )),
+            };
+            let issundb_matches_reference =
+                reference.is_some_and(|n| is_rows == vec![vec![n.to_string()]]);
+            timings.push(QueryTiming {
+                name,
+                scope: query.scope,
+                issundb: None,
+                ladybug_1t: None,
+            });
+            if issundb_matches_reference {
+                // A known LadybugDB walk-semantics overcount, reported but
+                // not a harness failure; the run stays usable.
+                divergences += 1;
+                println!(
+                    "{name:<20} {:>12} {:>12} {:>14} {:>10}  DIVERGENT \
+                     (ladybug walk semantics: ladybug {}, openCypher trails {})",
+                    "-",
+                    "-",
+                    "-",
+                    "-",
+                    lb_rows
+                        .first()
+                        .map(|row| row.join(","))
+                        .unwrap_or_else(|| "no rows".to_string()),
+                    reference.unwrap()
+                );
+            } else {
+                mismatches += 1;
+                println!(
+                    "{name:<20} {:>12} {:>12} {:>14} {:>10}  MISMATCH \
+                     (issundb {} rows: {:?}..., ladybug {} rows: {:?}...)",
+                    "-",
+                    "-",
+                    "-",
+                    "-",
+                    is_rows.len(),
+                    is_rows.first(),
+                    lb_rows.len(),
+                    lb_rows.first()
+                );
+            }
             continue;
         }
 
@@ -705,8 +851,8 @@ fn run_at(cfg: &Config, nodes: u64, edges: u64) -> anyhow::Result<Vec<QueryTimin
         timings.push(QueryTiming {
             name,
             scope: query.scope,
-            issundb: is_time,
-            ladybug_1t: lb_time_1t,
+            issundb: Some(is_time),
+            ladybug_1t: Some(lb_time_1t),
         });
     }
     if truncated {
@@ -717,6 +863,12 @@ fn run_at(cfg: &Config, nodes: u64, edges: u64) -> anyhow::Result<Vec<QueryTimin
         );
     }
 
+    if divergences > 0 {
+        println!(
+            "{divergences} known walk-semantics divergence(s); \
+             the affected queries are reported, not timed"
+        );
+    }
     if mismatches > 0 {
         anyhow::bail!("{mismatches} differential mismatch(es)");
     }
@@ -771,12 +923,19 @@ fn main() -> anyhow::Result<()> {
                 if reports[0][qi].scope != scope {
                     continue;
                 }
-                let ratios = |get: fn(&QueryTiming) -> Duration| -> String {
+                let ratios = |get: fn(&QueryTiming) -> Option<Duration>| -> String {
                     (1..reports.len())
                         .map(|i| {
-                            let prev = get(&reports[i - 1][qi]).as_secs_f64();
-                            let next = get(&reports[i][qi]).as_secs_f64();
-                            format!("{:>6.1}x", next / prev.max(f64::EPSILON))
+                            match (get(&reports[i - 1][qi]), get(&reports[i][qi])) {
+                                (Some(prev), Some(next)) => {
+                                    let ratio =
+                                        next.as_secs_f64() / prev.as_secs_f64().max(f64::EPSILON);
+                                    format!("{ratio:>6.1}x")
+                                }
+                                // Untimed at one of the sizes (a reported
+                                // semantic divergence): no ratio.
+                                _ => format!("{:>7}", "-"),
+                            }
                         })
                         .collect::<Vec<_>>()
                         .join(" ")
@@ -924,6 +1083,34 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The trail oracle against an independently computed reference (a
+    /// brute-force Python reimplementation of the seeded generator and a
+    /// trail DFS produced these values for the 200-node, 1000-edge uniform
+    /// dataset from its median probe).
+    #[test]
+    fn trail_oracle_matches_independent_reference() {
+        let data = generate(200, 1_000, Skew::Uniform);
+        let probes = pick_probes(&data);
+        let adjacency = out_adjacency(&data);
+        assert_eq!(probes.median, 93);
+        assert_eq!(count_trails(&adjacency, probes.median, 3, 3), 133);
+        assert_eq!(count_trails(&adjacency, probes.median, 2, 3), 158);
+        // Walk counts differ here (134 three-hop walks, 159 walks at 2..3),
+        // so this dataset is exactly the shape that distinguishes the
+        // semantics.
+    }
+
+    /// A two-node cycle separates trail endpoints from walk endpoints at
+    /// even hop counts: the only four-hop walk 0->1->0->1->0 reuses edges,
+    /// so no four-hop trail exists.
+    #[test]
+    fn trail_endpoints_exclude_edge_reusing_walks() {
+        let adjacency = vec![vec![1], vec![0]];
+        assert_eq!(count_trail_endpoints(&adjacency, 0, 2), 1); // 0->1->0
+        assert_eq!(count_trail_endpoints(&adjacency, 0, 4), 0);
+        assert_eq!(count_trails(&adjacency, 0, 2, 3), 1);
     }
 
     #[test]
