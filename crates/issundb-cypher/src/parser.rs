@@ -1654,32 +1654,58 @@ fn set_item<'a>() -> impl Parser<'a, ParserInput<'a>, SetItem, ParserError<'a>> 
     choice((property, labels))
 }
 
+/// Parses the target of a schema DDL statement: either a node pattern
+/// `(n:Label)` or a relationship pattern `()-[r:TYPE]-()`. Yields the label
+/// or type name together with which kind of element it names.
+fn schema_target<'a>()
+-> impl Parser<'a, ParserInput<'a>, (String, SchemaTarget), ParserError<'a>> + Clone {
+    let node = sym(Tok::LParen)
+        .ignore_then(identifier()) // var
+        .ignore_then(sym(Tok::Colon))
+        .ignore_then(identifier()) // label
+        .then_ignore(sym(Tok::RParen))
+        .map(|label| (label, SchemaTarget::Node));
+
+    let relationship = sym(Tok::LParen)
+        .ignore_then(sym(Tok::RParen))
+        .ignore_then(sym(Tok::Minus))
+        .ignore_then(sym(Tok::LBrack))
+        .ignore_then(identifier()) // var
+        .ignore_then(sym(Tok::Colon))
+        .ignore_then(identifier()) // type
+        .then_ignore(sym(Tok::RBrack))
+        .then_ignore(sym(Tok::Minus))
+        .then_ignore(sym(Tok::LParen))
+        .then_ignore(sym(Tok::RParen))
+        .map(|etype| (etype, SchemaTarget::Relationship));
+
+    choice((node, relationship))
+}
+
 /// Parses a `CREATE INDEX` or `CREATE CONSTRAINT` or standard `CREATE` statement
 fn create_statement<'a>() -> impl Parser<'a, ParserInput<'a>, Statement, ParserError<'a>> + Clone {
     let index_ddl = keyword("CREATE")
         .ignore_then(keyword("INDEX"))
         .ignore_then(keyword("FOR"))
-        .ignore_then(sym(Tok::LParen))
-        .ignore_then(identifier()) // var
-        .ignore_then(sym(Tok::Colon))
-        .ignore_then(identifier()) // label
-        .then_ignore(sym(Tok::RParen))
+        .ignore_then(schema_target())
         .then_ignore(keyword("ON"))
         .then_ignore(sym(Tok::LParen))
         .then_ignore(identifier()) // var
         .then_ignore(sym(Tok::Dot))
         .then(identifier()) // property
         .then_ignore(sym(Tok::RParen))
-        .map(|(label, property)| Statement::CreateIndex(CreateIndexStatement { label, property }));
+        .map(|((label, target), property)| {
+            Statement::CreateIndex(CreateIndexStatement {
+                label,
+                property,
+                target,
+            })
+        });
 
     let constraint_ddl = keyword("CREATE")
         .ignore_then(keyword("CONSTRAINT"))
         .ignore_then(keyword("ON"))
-        .ignore_then(sym(Tok::LParen))
-        .ignore_then(identifier()) // var
-        .ignore_then(sym(Tok::Colon))
-        .ignore_then(identifier()) // label
-        .then_ignore(sym(Tok::RParen))
+        .ignore_then(schema_target())
         .then_ignore(keyword("ASSERT"))
         .then(choice((
             // EXISTS(n.prop)
@@ -1698,11 +1724,12 @@ fn create_statement<'a>() -> impl Parser<'a, ParserInput<'a>, Statement, ParserE
                 .then_ignore(keyword("UNIQUE"))
                 .map(|prop| (prop, ConstraintKind::Unique)),
         )))
-        .map(|(label, (property, kind))| {
+        .map(|((label, target), (property, kind))| {
             Statement::CreateConstraint(CreateConstraintStatement {
                 label,
                 property,
                 kind,
+                target,
             })
         });
 
@@ -1723,27 +1750,25 @@ fn drop_statement<'a>() -> impl Parser<'a, ParserInput<'a>, Statement, ParserErr
     let index_ddl = keyword("DROP")
         .ignore_then(keyword("INDEX"))
         .ignore_then(keyword("FOR"))
-        .ignore_then(sym(Tok::LParen))
-        .ignore_then(identifier()) // var
-        .ignore_then(sym(Tok::Colon))
-        .ignore_then(identifier()) // label
-        .then_ignore(sym(Tok::RParen))
+        .ignore_then(schema_target())
         .then_ignore(keyword("ON"))
         .then_ignore(sym(Tok::LParen))
         .then_ignore(identifier()) // var
         .then_ignore(sym(Tok::Dot))
         .then(identifier()) // property
         .then_ignore(sym(Tok::RParen))
-        .map(|(label, property)| Statement::DropIndex(DropIndexStatement { label, property }));
+        .map(|((label, target), property)| {
+            Statement::DropIndex(DropIndexStatement {
+                label,
+                property,
+                target,
+            })
+        });
 
     let constraint_ddl = keyword("DROP")
         .ignore_then(keyword("CONSTRAINT"))
         .ignore_then(keyword("ON"))
-        .ignore_then(sym(Tok::LParen))
-        .ignore_then(identifier()) // var
-        .ignore_then(sym(Tok::Colon))
-        .ignore_then(identifier()) // label
-        .then_ignore(sym(Tok::RParen))
+        .ignore_then(schema_target())
         .then_ignore(keyword("ASSERT"))
         .then(choice((
             // EXISTS(n.prop)
@@ -1762,11 +1787,12 @@ fn drop_statement<'a>() -> impl Parser<'a, ParserInput<'a>, Statement, ParserErr
                 .then_ignore(keyword("UNIQUE"))
                 .map(|prop| (prop, ConstraintKind::Unique)),
         )))
-        .map(|(label, (property, kind))| {
+        .map(|((label, target), (property, kind))| {
             Statement::DropConstraint(DropConstraintStatement {
                 label,
                 property,
                 kind,
+                target,
             })
         });
 
@@ -3792,8 +3818,16 @@ fn validate_statement_undefined_vars_impl(
                 validate_expr_vars(&item.expr, active)?;
             }
             if let Some(ob) = &q.order_by {
+                // ORDER BY sees the RETURN projection scope in addition to the
+                // match-bound variables, so an alias introduced by RETURN is a valid sort key.
+                let mut return_active = active.clone();
+                for item in &q.return_clause.items {
+                    if let Some(ref alias) = item.alias {
+                        return_active.insert(alias.clone());
+                    }
+                }
                 for si in &ob.items {
-                    validate_expr_vars(&si.expr, active)?;
+                    validate_expr_vars(&si.expr, &return_active)?;
                 }
             }
             if let Some(s) = &q.skip {

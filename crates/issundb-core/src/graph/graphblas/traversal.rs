@@ -277,46 +277,12 @@ impl Graph {
         };
         use std::collections::HashMap as StdHashMap;
 
-        // The untyped path reaches reachability through the adjacency matrix, so
-        // it needs the incremental matrix view fresh. The typed path below reads
-        // LMDB directly and is always fresh, so it does not pay for a refresh.
-        if rel_type.is_none() {
-            self.ensure_matrix_view()?;
-        }
-
-        let guard = self.matrices.read();
-        let m = match guard.as_ref() {
-            Some(m) => m,
-            None => {
-                // Fall back to LMDB if matrices are not yet materialized.
-                let mut results = Vec::new();
-                for &src in src_nodes {
-                    let neighbors = if is_incoming {
-                        self.in_neighbors(src)?
-                    } else {
-                        self.out_neighbors(src)?
-                    };
-                    for ne in neighbors {
-                        if let Some(t) = rel_type {
-                            let actual_name = self.type_name(ne.edge_type)?;
-                            if actual_name.as_deref() != Some(t) {
-                                continue;
-                            }
-                        }
-                        results.push((src, ne.edge, ne.node));
-                    }
-                }
-                return Ok(results);
-            }
-        };
-
-        let n = m.n_nodes;
-        if src_nodes.is_empty() || n == 0 {
-            return Ok(vec![]);
-        }
-
-        // If a rel_type is specified, fetch typed neighbors via direct LMDB lookups to
-        // avoid GraphBLAS boolean-semiring limitations. EdgeId is available directly.
+        // The typed path fetches neighbors via direct LMDB lookups to avoid
+        // GraphBLAS boolean-semiring limitations; EdgeId is available directly.
+        // It must run before any matrices access: point adjacency reads are
+        // always fresh, while the cached matrix dimension can be stale (an
+        // empty matrix set on a freshly opened graph would otherwise
+        // short-circuit the expansion to an empty result).
         if let Some(t) = rel_type {
             let type_id = {
                 let rtxn = self.storage.env.read_txn()?;
@@ -346,6 +312,35 @@ impl Graph {
                 }
             }
             return Ok(results);
+        }
+
+        // The untyped path reaches reachability through the adjacency matrix,
+        // so it needs the incremental matrix view fresh.
+        self.ensure_matrix_view()?;
+
+        let guard = self.matrices.read();
+        let m = match guard.as_ref() {
+            Some(m) => m,
+            None => {
+                // Fall back to LMDB if matrices are not yet materialized.
+                let mut results = Vec::new();
+                for &src in src_nodes {
+                    let neighbors = if is_incoming {
+                        self.in_neighbors(src)?
+                    } else {
+                        self.out_neighbors(src)?
+                    };
+                    for ne in neighbors {
+                        results.push((src, ne.edge, ne.node));
+                    }
+                }
+                return Ok(results);
+            }
+        };
+
+        let n = m.n_nodes;
+        if src_nodes.is_empty() || n == 0 {
+            return Ok(vec![]);
         }
 
         let mxv = MatrixVectorMultiplicationOperator::new();
@@ -520,5 +515,46 @@ impl Graph {
             .into_iter()
             .filter_map(|d| m.dense_to_id.get(d).copied())
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::TempDir;
+
+    use crate::Graph;
+
+    fn open_tmp() -> (TempDir, Graph) {
+        let dir = TempDir::new().unwrap();
+        let g = Graph::open(dir.path(), 1).unwrap();
+        (dir, g)
+    }
+
+    #[test]
+    fn typed_expand_sees_writes_without_matrix_refresh() {
+        // Regression: the typed branch reads LMDB directly, so it must not be
+        // short-circuited by a stale (here: empty) matrix dimension before any
+        // matrix view refresh has run.
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("person", &()).unwrap();
+        let b = g.add_node("person", &()).unwrap();
+        let e = g.add_edge(a, b, "knows", &()).unwrap();
+
+        let out = g.expand_spmv_graphblas(&[a], Some("knows"), false).unwrap();
+        assert_eq!(out, vec![(a, e, b)]);
+
+        let incoming = g.expand_spmv_graphblas(&[b], Some("knows"), true).unwrap();
+        assert_eq!(incoming, vec![(b, e, a)]);
+    }
+
+    #[test]
+    fn typed_expand_unknown_type_is_empty() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("person", &()).unwrap();
+        let b = g.add_node("person", &()).unwrap();
+        g.add_edge(a, b, "knows", &()).unwrap();
+
+        let out = g.expand_spmv_graphblas(&[a], Some("likes"), false).unwrap();
+        assert!(out.is_empty());
     }
 }

@@ -4,7 +4,8 @@ This guide provides instructions to help you get started with building, configur
 
 ## Build from Source
 
-Ensure you have Rust 1.85.0 or later installed on your system. You can build the entire workspace, including the core storage library, query layer, and interactive CLI:
+Ensure you have Rust 1.85.0 or later installed on your system. You can build the entire workspace, including the core storage library, query layer,
+and interactive CLI:
 
 ```bash
 # Clone the repository and initialize submodules

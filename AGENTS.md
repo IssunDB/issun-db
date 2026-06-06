@@ -100,10 +100,16 @@ Do not invent modules that do not yet exist when answering questions, but do pla
   backup methods. Depends only on `issundb`.
 - `crates/issundb-py/`: Python bindings via PyO3. Exposes the `IssunDB` class with the same surface as the Node.js bindings. Depends only on
   `issundb`.
-- `crates/issundb-examples/`: standalone example programs (`hybrid_retrieval_quickstart.rs`, `neo4j_migration.rs`, `load_ldbc.rs`) and the
-  `gen_testdata` binary that regenerates the versioned LMDB storage-format snapshot (driven by `make testdata`). Depends only on `issundb`.
+- `crates/issundb-examples/`: standalone example programs (`quickstart.rs`, `hybrid_retrieval_quickstart.rs`, `neo4j_migration.rs`, and
+  `load_ldbc.rs`), the `gen_testdata` binary that regenerates the versioned LMDB storage-format snapshot (driven by `make testdata`), and the
+  `profile_triangle` binary, a profiling driver that loads a persistent Zipf-skewed graph once and reruns the cyclic triangle-count query so a
+  profiler observes query execution without load noise. Depends only on `issundb`.
 - `crates/issundb-core/benches/`: Criterion storage benchmarks.
 - `crates/issundb/tests/conformance/`: openCypher TCK subset integration tests.
+- `benchmarks/ladybug-compare/`: differential comparison harness against LadybugDB. Deliberately excluded from the workspace (own `[workspace]`
+  stanza, root `exclude`, and own `rust-toolchain.toml`) because the `lbug` crate links the LadybugDB C++ library and needs a newer Rust than the
+  workspace MSRV; it must never become part of `make build` or `make test`. Run via `make bench-ladybug`, which `cd`s into the directory so the
+  local toolchain pin applies. Cross-engine harnesses belong here, not in crate-local `benches/`, which is reserved for Criterion targets.
 - `Cargo.toml`: workspace root with shared `[workspace.dependencies]`. All version pins live here.
 - `Makefile`: developer workflow entry points.
 
@@ -345,6 +351,7 @@ Additional validation when relevant:
 
 - `make bench` for performance-sensitive storage changes.
 - `make test-conformance` for Cypher conformance coverage.
+- `make bench-ladybug` for cross-engine performance comparison and differential correctness checks on the Cypher execution path.
 
 ## Testing Expectations
 

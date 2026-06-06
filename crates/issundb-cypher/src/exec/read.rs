@@ -1,5 +1,6 @@
 use super::expr::*;
 use super::factorize::{FactorizedRecordGroup, filter_refs_in_expr};
+use super::row::{Bindings, SlotRow, SlotSchema};
 use super::*;
 
 /// Expand from a set of source nodes, handling pipe-separated OR relationship types.
@@ -99,11 +100,15 @@ pub(super) fn execute_read_query(
     let physical = PhysicalPlanner::plan(&logical);
     let optimized = Optimizer::optimize(physical, Some(graph));
 
+    // One slot schema per query, walked from the optimized plan: every row of
+    // this execution (join build sides included) binds against these slots.
+    let schema = std::sync::Arc::new(SlotSchema::from_plan(&optimized));
+
     // 2. Execute the optimized physical operator tree recursively.
     //    The top-level `PhysicalOperator::Project` in the plan has already
-    //    materialized all projected values into the PathMap under their canonical
+    //    materialized all projected values into the row under their canonical
     //    column-name keys. Reading by key here avoids a second evaluation of the
-    //    same expressions (double-projection) against a PathMap that no longer
+    //    same expressions (double-projection) against a row that no longer
     //    contains the pre-projection variable names.
     // Any query containing write clauses must hold the graph write lock for the
     // entire execution to prevent concurrent races (e.g., MERGE from two threads).
@@ -131,9 +136,9 @@ pub(super) fn execute_read_query(
     let _prop_cache = (!has_write_parts).then(expr::PropCache::install);
 
     let resolved_paths = if has_write_parts {
-        graph.with_write_lock(|| execute_physical(graph, &optimized, params))?
+        graph.with_write_lock(|| execute_physical(graph, &optimized, params, &schema))?
     } else {
-        execute_physical(graph, &optimized, params)?
+        execute_physical(graph, &optimized, params, &schema)?
     };
 
     // A query with an empty RETURN clause is a write-only pipeline query.
@@ -156,7 +161,7 @@ pub(super) fn execute_read_query(
         // Collect and sort keys from the first path for deterministic column ordering.
         let mut keys: Vec<String> = resolved_paths
             .first()
-            .map(|p| p.keys().cloned().collect())
+            .map(|p| p.bound_entries().map(|(k, _)| k.to_string()).collect())
             .unwrap_or_default();
         keys.sort();
         keys
@@ -164,18 +169,18 @@ pub(super) fn execute_read_query(
         query.return_clause.items.iter().map(column_name).collect()
     };
 
-    // 4. Read each projected value directly from the PathMap by its canonical key.
+    // 4. Read each projected value directly from the row by its canonical key.
     let mut records = Vec::new();
     for path in resolved_paths {
         let mut values = Vec::new();
         if is_return_star {
             for key in &columns {
-                values.push(binding_to_value(graph, path.get(key))?);
+                values.push(binding_to_value(graph, path.get_binding(key))?);
             }
         } else {
             for item in &query.return_clause.items {
                 let key = projected_key(&item.expr, &item.alias);
-                values.push(binding_to_value(graph, path.get(&key))?);
+                values.push(binding_to_value(graph, path.get_binding(&key))?);
             }
         }
         records.push(Record { values });
@@ -331,7 +336,7 @@ pub(super) fn resolve_call_parts(
     Ok(())
 }
 
-/// Compute the key under which a RETURN/WITH item is stored in the projected PathMap.
+/// Compute the key under which a RETURN/WITH item is stored in the projected row.
 ///
 /// Must exactly match the key-naming logic in the `PhysicalOperator::Project` arm of
 /// `execute_physical` so that `execute_read_query` can look up pre-materialized values
@@ -691,7 +696,7 @@ pub(super) fn unpack_sentinels(graph: &Graph, val: serde_json::Value) -> serde_j
     }
 }
 
-/// Convert a `GraphBinding` entry from a projected `PathMap` into a JSON value.
+/// Convert a `GraphBinding` entry from a projected row into a JSON value.
 ///
 /// `Node` and `Edge` bindings that survive projection (e.g., `WITH n RETURN n`) are
 /// resolved by fetching the stored property blob from the graph.
@@ -735,6 +740,16 @@ fn filter_expr_to_where_clause(expression: &FilterExpr) -> WhereClause {
     }
 }
 
+/// True when `eid` is already bound to one of `unique_rels` in `path`.
+/// Implements openCypher relationship uniqueness: the hops of one pattern must
+/// bind pairwise-distinct relationships, while separate MATCH clauses may
+/// reuse a relationship (so the check covers sibling hops only, never the whole row).
+fn edge_bound_to_sibling_rel(path: &SlotRow, unique_rels: &[String], eid: EdgeId) -> bool {
+    unique_rels
+        .iter()
+        .any(|v| matches!(path.get_binding(v.as_str()), Some(GraphBinding::Edge(e)) if *e == eid))
+}
+
 /// Bulk-expand a batch of pre-expansion rows and apply a `Filter` predicate that
 /// sits directly over a single-hop directed `Expand`. The predicate is evaluated
 /// once per source row when it touches only pre-expansion variables (factorized),
@@ -744,15 +759,16 @@ fn filter_expr_to_where_clause(expression: &FilterExpr) -> WhereClause {
 #[allow(clippy::too_many_arguments)]
 fn filter_over_expand_batch(
     graph: &Graph,
-    child_paths: Vec<PathMap>,
+    child_paths: Vec<SlotRow>,
     src_var: &str,
     rel_var: &str,
     dst_var: &str,
     rel_type: Option<&str>,
     is_incoming: bool,
+    unique_rels: &[String],
     expression: &FilterExpr,
     params: &HashMap<String, serde_json::Value>,
-) -> Result<Vec<PathMap>, String> {
+) -> Result<Vec<SlotRow>, String> {
     // Determine whether the filter references the new hop-local bindings.
     let refs = filter_refs_in_expr(expression);
     let filter_touches_expansion = refs.contains(rel_var) || refs.contains(dst_var);
@@ -764,7 +780,7 @@ fn filter_over_expand_batch(
     // Bulk-expand from all unique source nodes.
     let mut src_nodes: Vec<NodeId> = child_paths
         .iter()
-        .filter_map(|p| match p.get(src_var) {
+        .filter_map(|p| match p.get_binding(src_var) {
             Some(GraphBinding::Node(n)) => Some(*n),
             _ => None,
         })
@@ -785,7 +801,7 @@ fn filter_over_expand_batch(
         if variable != rel_var && variable != dst_var {
             let mut active: Vec<NodeId> = child_paths
                 .iter()
-                .filter_map(|p| match p.get(variable.as_str()) {
+                .filter_map(|p| match p.get_binding(variable.as_str()) {
                     Some(GraphBinding::Node(n)) => Some(*n),
                     _ => None,
                 })
@@ -798,25 +814,30 @@ fn filter_over_expand_batch(
             let pass_set: HashSet<NodeId> = filtered.into_iter().collect();
 
             for path in &child_paths {
-                if let Some(GraphBinding::Node(n)) = path.get(variable.as_str()) {
+                if let Some(GraphBinding::Node(n)) = path.get_binding(variable.as_str()) {
                     if !pass_set.contains(n) {
                         continue;
                     }
                 }
-                let src_node = match path.get(src_var) {
+                let src_node = match path.get_binding(src_var) {
                     Some(GraphBinding::Node(n)) => *n,
                     _ => continue,
                 };
                 if let Some(dests) = transition_map.get(&src_node) {
                     for &(eid, dst_node) in dests {
-                        let mut new_path = path.clone();
-                        new_path.insert(rel_var.to_string(), GraphBinding::Edge(eid));
-                        if new_path
-                            .insert(dst_var.to_string(), GraphBinding::Node(dst_node))
-                            .is_some_and(|e| e != GraphBinding::Node(dst_node))
+                        if edge_bound_to_sibling_rel(path, unique_rels, eid) {
+                            continue;
+                        }
+                        // Closing-hop guard: a pre-bound dst must match.
+                        if path
+                            .get_binding(dst_var)
+                            .is_some_and(|e| *e != GraphBinding::Node(dst_node))
                         {
                             continue;
                         }
+                        let mut new_path = path.clone();
+                        new_path.bind_local(rel_var, GraphBinding::Edge(eid));
+                        new_path.bind_local(dst_var, GraphBinding::Node(dst_node));
                         next_paths.push(new_path);
                     }
                 }
@@ -829,26 +850,29 @@ fn filter_over_expand_batch(
     if !filter_touches_expansion {
         // Factorization fast path: predicate is on shared variables only.
         // Evaluate once per source path; skip all destinations if the source fails.
-        // This avoids O(avg_degree) PathMap clones per rejected source.
+        // This avoids O(avg_degree) row clones per rejected source.
         let where_clause = filter_expr_to_where_clause(expression);
         for path in &child_paths {
             if !evaluate_where(graph, path, &where_clause, params)? {
                 continue; // source fails; skip every destination for free
             }
-            let src_node = match path.get(src_var) {
+            let src_node = match path.get_binding(src_var) {
                 Some(GraphBinding::Node(n)) => *n,
                 _ => continue,
             };
             if let Some(dests) = transition_map.get(&src_node) {
                 // Build factorized groups: `Arc` around the shared prefix so the
-                // PathMap bytes are owned once per source, not copied per destination.
+                // prefix row is owned once per source, not copied per destination.
                 let group = FactorizedRecordGroup {
                     shared: std::sync::Arc::new(path.clone()),
                     extensions: dests
                         .iter()
                         .filter_map(|&(eid, dst_node)| {
+                            if edge_bound_to_sibling_rel(path, unique_rels, eid) {
+                                return None;
+                            }
                             // Guard closing-hop mismatches (normally handled by MultiwayJoin).
-                            if let Some(existing) = path.get(dst_var) {
+                            if let Some(existing) = path.get_binding(dst_var) {
                                 if *existing != GraphBinding::Node(dst_node) {
                                     return None;
                                 }
@@ -869,20 +893,25 @@ fn filter_over_expand_batch(
         // Per-row path: filter references expansion variables; evaluate after each expand.
         let where_clause = filter_expr_to_where_clause(expression);
         for path in &child_paths {
-            let src_node = match path.get(src_var) {
+            let src_node = match path.get_binding(src_var) {
                 Some(GraphBinding::Node(n)) => *n,
                 _ => continue,
             };
             if let Some(dests) = transition_map.get(&src_node) {
                 for &(eid, dst_node) in dests {
-                    let mut new_path = path.clone();
-                    new_path.insert(rel_var.to_string(), GraphBinding::Edge(eid));
-                    if new_path
-                        .insert(dst_var.to_string(), GraphBinding::Node(dst_node))
-                        .is_some_and(|e| e != GraphBinding::Node(dst_node))
+                    if edge_bound_to_sibling_rel(path, unique_rels, eid) {
+                        continue;
+                    }
+                    // Closing-hop guard: a pre-bound dst must match.
+                    if path
+                        .get_binding(dst_var)
+                        .is_some_and(|e| *e != GraphBinding::Node(dst_node))
                     {
                         continue;
                     }
+                    let mut new_path = path.clone();
+                    new_path.bind_local(rel_var, GraphBinding::Edge(eid));
+                    new_path.bind_local(dst_var, GraphBinding::Node(dst_node));
                     if evaluate_where(graph, &new_path, &where_clause, params)? {
                         next_paths.push(new_path);
                     }
@@ -989,7 +1018,7 @@ fn extend_or_create_path(
 #[allow(clippy::too_many_arguments)]
 fn expand_from_paths(
     graph: &Graph,
-    child_paths: Vec<PathMap>,
+    child_paths: Vec<SlotRow>,
     src_var: &str,
     rel_var: &str,
     dst_var: &str,
@@ -998,12 +1027,14 @@ fn expand_from_paths(
     is_undirected: bool,
     min_hops: usize,
     max_hops: usize,
-) -> Result<Vec<PathMap>, String> {
+    unique_rels: &[String],
+    needs_path: bool,
+) -> Result<Vec<SlotRow>, String> {
     let mut next_paths = Vec::new();
 
     let mut src_nodes: Vec<NodeId> = child_paths
         .iter()
-        .filter_map(|p| match p.get(src_var) {
+        .filter_map(|p| match p.get_binding(src_var) {
             Some(GraphBinding::Node(n)) => Some(*n),
             _ => None,
         })
@@ -1029,7 +1060,7 @@ fn expand_from_paths(
     }
 
     for path in child_paths {
-        let src_node = match path.get(src_var) {
+        let src_node = match path.get_binding(src_var) {
             Some(GraphBinding::Node(n)) => *n,
             _ => continue,
         };
@@ -1038,62 +1069,83 @@ fn expand_from_paths(
             if let Some(dests) = transition_map.get(&src_node) {
                 let shared = std::sync::Arc::new(path);
                 for &(eid, dst_node) in dests {
-                    if let Some(existing) = shared.get(dst_var) {
+                    if edge_bound_to_sibling_rel(&shared, unique_rels, eid) {
+                        continue;
+                    }
+                    if let Some(existing) = shared.get_binding(dst_var) {
                         if *existing != GraphBinding::Node(dst_node) {
                             continue;
                         }
                     }
                     let mut new_path = (*shared).clone();
-                    new_path.insert(rel_var.to_string(), GraphBinding::Edge(eid));
-                    new_path.insert(dst_var.to_string(), GraphBinding::Node(dst_node));
+                    new_path.bind_local(rel_var, GraphBinding::Edge(eid));
+                    new_path.bind_local(dst_var, GraphBinding::Node(dst_node));
 
-                    // Build and insert Path object
-                    let existing_path = match shared.get(&format!("_path_{}", src_var)) {
-                        Some(GraphBinding::Scalar(v)) => Some(v),
-                        _ => None,
-                    };
-                    if let Ok(path_obj) =
-                        extend_or_create_path(graph, existing_path, src_node, eid, dst_node)
-                    {
-                        new_path
-                            .insert(format!("_path_{}", dst_var), GraphBinding::Scalar(path_obj));
+                    // Build and insert the Path object only when the pattern binds a
+                    // path variable: it costs three record decodes per emitted row.
+                    if needs_path {
+                        let existing_path = match shared.get_binding(&format!("_path_{}", src_var))
+                        {
+                            Some(GraphBinding::Scalar(v)) => Some(v),
+                            _ => None,
+                        };
+                        if let Ok(path_obj) =
+                            extend_or_create_path(graph, existing_path, src_node, eid, dst_node)
+                        {
+                            new_path.bind_local(
+                                &format!("_path_{}", dst_var),
+                                GraphBinding::Scalar(path_obj),
+                            );
+                        }
                     }
                     next_paths.push(new_path);
                 }
             }
         } else {
-            let src_rep = get_node_representation(graph, src_node)?;
-            let mut visited = HashSet::new();
-            visited.insert(src_node);
-            let mut queue = vec![(src_node, vec![src_rep], visited)];
+            // The traversed element list feeds only the Path object, so it stays
+            // empty (no per-step record decodes) unless the pattern binds a path.
+            let initial_traversed = if needs_path {
+                vec![get_node_representation(graph, src_node)?]
+            } else {
+                Vec::new()
+            };
+            // openCypher trail semantics: a relationship may appear at most once
+            // per path, nodes may repeat, and every distinct trail is one result
+            // row. The per-path edge list is a Vec with a linear membership
+            // check because trails are short; termination on unbounded ranges
+            // follows from the finite edge set emptying the queue.
+            let mut queue = vec![(src_node, initial_traversed.clone(), Vec::<EdgeId>::new())];
             let mut completed_paths: Vec<(NodeId, Vec<serde_json::Value>)> = Vec::new();
-            let mut completed_targets = HashSet::new();
 
             if min_hops == 0 {
-                completed_paths.push((src_node, vec![get_node_representation(graph, src_node)?]));
-                completed_targets.insert(src_node);
+                completed_paths.push((src_node, initial_traversed));
             }
 
             for hop in 1..=max_hops {
                 let mut next_queue = Vec::new();
-                for (node, traversed, visited_nodes) in queue {
+                for (node, traversed, used_edges) in queue {
                     for &dir in directions {
                         let neighbors = expand_multi_type(graph, &[node], rel_type, dir)?;
                         for (_, eid, neigh_node) in neighbors {
-                            if visited_nodes.contains(&neigh_node) {
+                            if used_edges.contains(&eid) {
                                 continue;
                             }
-                            let mut next_visited = visited_nodes.clone();
-                            next_visited.insert(neigh_node);
+                            if edge_bound_to_sibling_rel(&path, unique_rels, eid) {
+                                continue;
+                            }
+                            let mut next_used = used_edges.clone();
+                            next_used.push(eid);
 
                             let mut next_traversed = traversed.clone();
-                            next_traversed.push(get_edge_representation(graph, eid)?);
-                            next_traversed.push(get_node_representation(graph, neigh_node)?);
+                            if needs_path {
+                                next_traversed.push(get_edge_representation(graph, eid)?);
+                                next_traversed.push(get_node_representation(graph, neigh_node)?);
+                            }
 
-                            if hop >= min_hops && completed_targets.insert(neigh_node) {
+                            if hop >= min_hops {
                                 completed_paths.push((neigh_node, next_traversed.clone()));
                             }
-                            next_queue.push((neigh_node, next_traversed, next_visited));
+                            next_queue.push((neigh_node, next_traversed, next_used));
                         }
                     }
                 }
@@ -1104,37 +1156,44 @@ fn expand_from_paths(
             }
 
             for (neigh_node, path_elements) in completed_paths {
-                let mut new_path = path.clone();
-                if new_path
-                    .insert(dst_var.to_string(), GraphBinding::Node(neigh_node))
-                    .is_some_and(|existing| existing != GraphBinding::Node(neigh_node))
+                // Closing-hop guard: a pre-bound dst must match.
+                if path
+                    .get_binding(dst_var)
+                    .is_some_and(|existing| *existing != GraphBinding::Node(neigh_node))
                 {
                     continue;
                 }
+                let mut new_path = path.clone();
+                new_path.bind_local(dst_var, GraphBinding::Node(neigh_node));
 
-                // Build Path object
-                let mut nodes = Vec::new();
-                let mut relationships = Vec::new();
-                for (idx, item) in path_elements.into_iter().enumerate() {
-                    if idx % 2 == 0 {
-                        nodes.push(item);
-                    } else {
-                        relationships.push(item);
+                // Build the Path object only when the pattern binds a path variable.
+                if needs_path {
+                    let mut nodes = Vec::new();
+                    let mut relationships = Vec::new();
+                    for (idx, item) in path_elements.into_iter().enumerate() {
+                        if idx % 2 == 0 {
+                            nodes.push(item);
+                        } else {
+                            relationships.push(item);
+                        }
                     }
-                }
-                let mut m = serde_json::Map::new();
-                m.insert(
-                    "__type__".to_string(),
-                    serde_json::Value::String("__Path__".to_string()),
-                );
-                m.insert("nodes".to_string(), serde_json::Value::Array(nodes));
-                m.insert(
-                    "relationships".to_string(),
-                    serde_json::Value::Array(relationships),
-                );
-                let path_obj = serde_json::Value::Object(m);
+                    let mut m = serde_json::Map::new();
+                    m.insert(
+                        "__type__".to_string(),
+                        serde_json::Value::String("__Path__".to_string()),
+                    );
+                    m.insert("nodes".to_string(), serde_json::Value::Array(nodes));
+                    m.insert(
+                        "relationships".to_string(),
+                        serde_json::Value::Array(relationships),
+                    );
+                    let path_obj = serde_json::Value::Object(m);
 
-                new_path.insert(format!("_path_{}", dst_var), GraphBinding::Scalar(path_obj));
+                    new_path.bind_local(
+                        &format!("_path_{}", dst_var),
+                        GraphBinding::Scalar(path_obj),
+                    );
+                }
                 next_paths.push(new_path);
             }
         }
@@ -1167,9 +1226,11 @@ pub(super) fn eval_pattern_comprehension(
 
     // Seed the expansion with the surrounding bindings, normalizing a `__Node__`
     // scalar anchor (e.g. an element of `nodes(p)`) to a node binding so the
-    // expansion machinery can traverse from it. A non-node anchor yields no matches.
-    let mut seed = outer.clone();
-    match seed.get(&anchor_var) {
+    // expansion machinery can traverse from it. A non-node anchor yields no
+    // matches. The comprehension has no plan to derive a slot schema from, so
+    // the seed row runs entirely on the locals overflow.
+    let mut seed = SlotRow::from_path_map(std::sync::Arc::new(SlotSchema::empty()), outer);
+    match seed.get_binding(&anchor_var) {
         Some(GraphBinding::Node(_)) => {}
         Some(GraphBinding::Scalar(v)) => {
             let id = v
@@ -1179,7 +1240,7 @@ pub(super) fn eval_pattern_comprehension(
                 .and_then(|i| i.as_i64());
             match id {
                 Some(id) => {
-                    seed.insert(anchor_var.clone(), GraphBinding::Node(id as u64));
+                    seed.bind_local(&anchor_var, GraphBinding::Node(id as u64));
                 }
                 None => return Ok(serde_json::Value::Array(Vec::new())),
             }
@@ -1191,6 +1252,8 @@ pub(super) fn eval_pattern_comprehension(
     let mut src_var = anchor_var.clone();
     let mut last_dst_var = anchor_var;
     let mut anon = 0usize;
+    // Relationship uniqueness within the comprehension's pattern.
+    let mut prior_rel_vars: Vec<String> = Vec::new();
 
     for (rel, node) in &pattern.rels {
         let rel_var = rel.variable.clone().unwrap_or_else(|| {
@@ -1218,7 +1281,10 @@ pub(super) fn eval_pattern_comprehension(
             rel.is_undirected,
             min_hops,
             max_hops,
+            &prior_rel_vars,
+            pattern.path_variable.is_some(),
         )?;
+        prior_rel_vars.push(rel_var.clone());
         current_paths = filter_paths_by_node(
             graph,
             current_paths,
@@ -1235,9 +1301,11 @@ pub(super) fn eval_pattern_comprehension(
     let mut result = Vec::new();
     for mut path in current_paths {
         if let Some(pv) = &pattern.path_variable {
-            if let Some(GraphBinding::Scalar(obj)) = path.get(&format!("_path_{}", last_dst_var)) {
+            if let Some(GraphBinding::Scalar(obj)) =
+                path.get_binding(&format!("_path_{}", last_dst_var))
+            {
                 let obj = obj.clone();
-                path.insert(pv.clone(), GraphBinding::Scalar(obj));
+                path.bind_local(pv, GraphBinding::Scalar(obj));
             }
         }
         if let Some(pred) = predicate {
@@ -1254,18 +1322,18 @@ pub(super) fn eval_pattern_comprehension(
 /// every inline property in `properties`.
 fn filter_paths_by_node(
     graph: &Graph,
-    paths: Vec<PathMap>,
+    paths: Vec<SlotRow>,
     dst_var: &str,
     labels: &[String],
     properties: &Option<HashMap<String, Expr>>,
     params: &HashMap<String, serde_json::Value>,
-) -> Result<Vec<PathMap>, String> {
+) -> Result<Vec<SlotRow>, String> {
     if labels.is_empty() && properties.is_none() {
         return Ok(paths);
     }
     let mut out = Vec::new();
     for path in paths {
-        let nid = match path.get(dst_var) {
+        let nid = match path.get_binding(dst_var) {
             Some(GraphBinding::Node(n)) => *n,
             _ => continue,
         };
@@ -1340,13 +1408,13 @@ fn join_common_vars(probe_op: &PhysicalOperator, build_op: &PhysicalOperator) ->
 /// Build the SIP node-id sets (one per common var that is bound to nodes on the
 /// build side) used to restrict the probe-side scans. Only meaningful for inner
 /// joins; an empty result means SIP cannot prune.
-fn build_sip(common_vars: &[String], build_rows: &[PathMap]) -> HashMap<String, HashSet<NodeId>> {
+fn build_sip(common_vars: &[String], build_rows: &[SlotRow]) -> HashMap<String, HashSet<NodeId>> {
     common_vars
         .iter()
         .filter_map(|var| {
             let ids: HashSet<NodeId> = build_rows
                 .iter()
-                .filter_map(|p| match p.get(var) {
+                .filter_map(|p| match p.get_binding(var) {
                     Some(GraphBinding::Node(n)) => Some(*n),
                     _ => None,
                 })
@@ -1365,12 +1433,14 @@ fn build_sip(common_vars: &[String], build_rows: &[PathMap]) -> HashMap<String, 
 /// (they cannot match), matching the materializing executor.
 fn build_hash_table(
     common_vars: &[String],
-    build_rows: Vec<PathMap>,
-) -> HashMap<Vec<GraphBinding>, Vec<PathMap>> {
-    let mut hash_table: HashMap<Vec<GraphBinding>, Vec<PathMap>> = HashMap::new();
+    build_rows: Vec<SlotRow>,
+) -> HashMap<Vec<GraphBinding>, Vec<SlotRow>> {
+    let mut hash_table: HashMap<Vec<GraphBinding>, Vec<SlotRow>> = HashMap::new();
     for op in build_rows {
-        let key: Option<Vec<GraphBinding>> =
-            common_vars.iter().map(|v| op.get(v).cloned()).collect();
+        let key: Option<Vec<GraphBinding>> = common_vars
+            .iter()
+            .map(|v| op.get_binding(v).cloned())
+            .collect();
         if let Some(key) = key {
             hash_table.entry(key).or_default().push(op);
         }
@@ -1380,10 +1450,10 @@ fn build_hash_table(
 
 /// Fill any `null_vars` not already present in `path` with `null`. Used for the
 /// left-outer case when a required row has no optional match.
-fn null_fill(path: &mut PathMap, null_vars: &[String]) {
+fn null_fill(path: &mut SlotRow, null_vars: &[String]) {
     for v in null_vars {
-        if !path.contains_key(v.as_str()) {
-            path.insert(v.clone(), GraphBinding::Scalar(serde_json::Value::Null));
+        if path.get_binding(v.as_str()).is_none() {
+            path.bind_local(v, GraphBinding::Scalar(serde_json::Value::Null));
         }
     }
 }
@@ -1394,10 +1464,10 @@ fn null_fill(path: &mut PathMap, null_vars: &[String]) {
 enum JoinProbeData {
     Equi {
         common_vars: Vec<String>,
-        hash_table: HashMap<Vec<GraphBinding>, Vec<PathMap>>,
+        hash_table: HashMap<Vec<GraphBinding>, Vec<SlotRow>>,
     },
     Cartesian {
-        build_rows: Vec<PathMap>,
+        build_rows: Vec<SlotRow>,
     },
 }
 
@@ -1409,10 +1479,10 @@ enum JoinProbeData {
 /// order, because the build side is fully materialized before any probe row is
 /// joined.
 fn hash_join_rows(
-    probe_batch: Vec<PathMap>,
+    probe_batch: Vec<SlotRow>,
     data: &JoinProbeData,
     null_vars: Option<&[String]>,
-) -> Vec<PathMap> {
+) -> Vec<SlotRow> {
     let mut out = Vec::new();
     for rp in probe_batch {
         match data {
@@ -1420,14 +1490,16 @@ fn hash_join_rows(
                 common_vars,
                 hash_table,
             } => {
-                let key: Option<Vec<GraphBinding>> =
-                    common_vars.iter().map(|v| rp.get(v).cloned()).collect();
+                let key: Option<Vec<GraphBinding>> = common_vars
+                    .iter()
+                    .map(|v| rp.get_binding(v).cloned())
+                    .collect();
                 // A row missing a common var cannot join; drop it.
                 if let Some(key) = key {
                     if let Some(matches) = hash_table.get(&key) {
                         for op in matches {
                             let mut merged = rp.clone();
-                            merged.extend(op.iter().map(|(k, v)| (k.clone(), v.clone())));
+                            merged.merge_from(op);
                             out.push(merged);
                         }
                     } else if let Some(null_vars) = null_vars {
@@ -1447,7 +1519,7 @@ fn hash_join_rows(
                 } else {
                     for op in build_rows {
                         let mut merged = rp.clone();
-                        merged.extend(op.iter().map(|(k, v)| (k.clone(), v.clone())));
+                        merged.merge_from(op);
                         out.push(merged);
                     }
                 }
@@ -1467,14 +1539,15 @@ fn hash_join_rows(
 #[allow(clippy::too_many_arguments)]
 fn multiway_join_rows(
     graph: &Graph,
-    child_paths: Vec<PathMap>,
+    child_paths: Vec<SlotRow>,
     closing_src_var: &str,
     closing_dst_var: &str,
     closing_rel_type: Option<&str>,
     closing_rel_var: &str,
     closing_is_incoming: bool,
     closing_is_undirected: bool,
-) -> Result<Vec<PathMap>, String> {
+    closing_unique_rels: &[String],
+) -> Result<Vec<SlotRow>, String> {
     if child_paths.is_empty() {
         return Ok(vec![]);
     }
@@ -1484,7 +1557,7 @@ fn multiway_join_rows(
     // neighbors for every input row.
     let mut src_nodes: Vec<NodeId> = child_paths
         .iter()
-        .filter_map(|p| match p.get(closing_src_var) {
+        .filter_map(|p| match p.get_binding(closing_src_var) {
             Some(GraphBinding::Node(n)) => Some(*n),
             _ => None,
         })
@@ -1517,19 +1590,22 @@ fn multiway_join_rows(
         }
 
         for path in child_paths {
-            let closing_src = match path.get(closing_src_var) {
+            let closing_src = match path.get_binding(closing_src_var) {
                 Some(GraphBinding::Node(n)) => *n,
                 _ => continue,
             };
-            let closing_dst = match path.get(closing_dst_var) {
+            let closing_dst = match path.get_binding(closing_dst_var) {
                 Some(GraphBinding::Node(n)) => *n,
                 _ => continue,
             };
 
             if let Some(eids) = join_map.get(&closing_src).and_then(|m| m.get(&closing_dst)) {
                 for &eid in eids {
+                    if edge_bound_to_sibling_rel(&path, closing_unique_rels, eid) {
+                        continue;
+                    }
                     let mut new_path = path.clone();
-                    new_path.insert(closing_rel_var.to_string(), GraphBinding::Edge(eid));
+                    new_path.bind_local(closing_rel_var, GraphBinding::Edge(eid));
                     next_paths.push(new_path);
                 }
             }
@@ -1538,26 +1614,37 @@ fn multiway_join_rows(
         let transitions =
             expand_multi_type(graph, &src_nodes, closing_rel_type, closing_is_incoming)?;
 
-        // Index the transitions as (closing_src, closing_dst) → EdgeId for O(1) lookup.
-        let mut join_map: HashMap<NodeId, HashMap<NodeId, EdgeId>> = HashMap::new();
+        // Index the transitions as (closing_src, closing_dst) → [EdgeId] for O(1)
+        // lookup. The value is a list, not a single EdgeId, because parallel
+        // edges between the same pair are distinct matches and each must emit
+        // its own row.
+        let mut join_map: HashMap<NodeId, HashMap<NodeId, Vec<EdgeId>>> = HashMap::new();
         for (src, eid, dst) in transitions {
-            join_map.entry(src).or_default().insert(dst, eid);
+            join_map
+                .entry(src)
+                .or_default()
+                .entry(dst)
+                .or_default()
+                .push(eid);
         }
 
         for path in child_paths {
-            let closing_src = match path.get(closing_src_var) {
+            let closing_src = match path.get_binding(closing_src_var) {
                 Some(GraphBinding::Node(n)) => *n,
                 _ => continue,
             };
-            let closing_dst = match path.get(closing_dst_var) {
+            let closing_dst = match path.get_binding(closing_dst_var) {
                 Some(GraphBinding::Node(n)) => *n,
                 _ => continue,
             };
 
-            if let Some(dst_map) = join_map.get(&closing_src) {
-                if let Some(&eid) = dst_map.get(&closing_dst) {
+            if let Some(eids) = join_map.get(&closing_src).and_then(|m| m.get(&closing_dst)) {
+                for &eid in eids {
+                    if edge_bound_to_sibling_rel(&path, closing_unique_rels, eid) {
+                        continue;
+                    }
                     let mut new_path = path.clone();
-                    new_path.insert(closing_rel_var.to_string(), GraphBinding::Edge(eid));
+                    new_path.bind_local(closing_rel_var, GraphBinding::Edge(eid));
                     next_paths.push(new_path);
                 }
             }
@@ -1576,6 +1663,9 @@ struct ChainHop<'a> {
     dst_var: &'a str,
     rel_type: Option<&'a str>,
     is_incoming: bool,
+    /// Sibling relationship variables of the same pattern this hop's edge must
+    /// differ from (openCypher relationship uniqueness).
+    unique_rels: &'a [String],
 }
 
 /// Execute a maximal linear chain of single-hop directed Expands as one fused
@@ -1586,9 +1676,9 @@ struct ChainHop<'a> {
 /// multiplicity and all `(rel, dst)` bindings.
 fn execute_expand_chain_n(
     graph: &Graph,
-    base_paths: Vec<PathMap>,
+    base_paths: Vec<SlotRow>,
     hops: &[ChainHop<'_>],
-) -> Result<Vec<PathMap>, String> {
+) -> Result<Vec<SlotRow>, String> {
     if base_paths.is_empty() || hops.is_empty() {
         return Ok(vec![]);
     }
@@ -1599,7 +1689,7 @@ fn execute_expand_chain_n(
         Vec::with_capacity(hops.len());
     let mut frontier: Vec<NodeId> = base_paths
         .iter()
-        .filter_map(|p| match p.get(hops[0].src_var) {
+        .filter_map(|p| match p.get_binding(hops[0].src_var) {
             Some(GraphBinding::Node(n)) => Some(*n),
             _ => None,
         })
@@ -1629,7 +1719,7 @@ fn execute_expand_chain_n(
     let mut out = Vec::new();
     let mut stack: Vec<(EdgeId, NodeId)> = Vec::with_capacity(hops.len());
     for base_path in &base_paths {
-        let Some(GraphBinding::Node(start)) = base_path.get(hops[0].src_var) else {
+        let Some(GraphBinding::Node(start)) = base_path.get_binding(hops[0].src_var) else {
             continue;
         };
         thread_chain(
@@ -1647,22 +1737,22 @@ fn execute_expand_chain_n(
 
 /// Depth-first expansion of one base path through the remaining hops. `src` is the
 /// node the current hop expands from. Edge and node bindings accumulate in `stack`
-/// and are materialized into a single cloned PathMap at the leaf.
+/// and are materialized into a single cloned row at the leaf.
 #[allow(clippy::too_many_arguments)]
 fn thread_chain(
-    base_path: &PathMap,
+    base_path: &SlotRow,
     src: NodeId,
     hops: &[ChainHop<'_>],
     level_maps: &[HashMap<NodeId, Vec<(EdgeId, NodeId)>>],
     hop_idx: usize,
     stack: &mut Vec<(EdgeId, NodeId)>,
-    out: &mut Vec<PathMap>,
+    out: &mut Vec<SlotRow>,
 ) {
     if hop_idx == hops.len() {
         let mut new_path = base_path.clone();
         for (i, &(eid, dst)) in stack.iter().enumerate() {
-            new_path.insert(hops[i].rel_var.to_string(), GraphBinding::Edge(eid));
-            new_path.insert(hops[i].dst_var.to_string(), GraphBinding::Node(dst));
+            new_path.bind_local(hops[i].rel_var, GraphBinding::Edge(eid));
+            new_path.bind_local(hops[i].dst_var, GraphBinding::Node(dst));
         }
         out.push(new_path);
         return;
@@ -1674,10 +1764,20 @@ fn thread_chain(
     for &(eid, dst) in dests {
         // Closing-hop guard: if dst_var is already pinned (by the base path or an
         // earlier hop in this chain), only keep matching destinations.
-        if let Some(existing) = base_path.get(hop.dst_var) {
+        if let Some(existing) = base_path.get_binding(hop.dst_var) {
             if *existing != GraphBinding::Node(dst) {
                 continue;
             }
+        }
+        // Relationship uniqueness: the edge must differ from every sibling
+        // hop's edge, whether that sibling was bound by the base path (a
+        // partially fused pattern) or by an earlier hop of this chain.
+        if edge_bound_to_sibling_rel(base_path, hop.unique_rels, eid)
+            || stack.iter().enumerate().any(|(i, &(prev_eid, _))| {
+                prev_eid == eid && hop.unique_rels.iter().any(|v| v == hops[i].rel_var)
+            })
+        {
+            continue;
         }
         stack.push((eid, dst));
         thread_chain(base_path, dst, hops, level_maps, hop_idx + 1, stack, out);
@@ -1715,11 +1815,11 @@ fn json_val_cmp(l: &serde_json::Value, r: &serde_json::Value) -> Option<std::cmp
 /// from the `Project` execution arm so the bounded-scan path can reuse it.
 fn project_rows(
     graph: &Graph,
-    child_paths: Vec<PathMap>,
+    child_paths: Vec<SlotRow>,
     items: &[(Expr, Option<String>)],
     is_barrier: bool,
     params: &HashMap<String, serde_json::Value>,
-) -> Result<Vec<PathMap>, String> {
+) -> Result<Vec<SlotRow>, String> {
     let mut next_paths = Vec::new();
 
     for path in child_paths {
@@ -1738,8 +1838,8 @@ fn project_rows(
         // pipelines), start with all existing bindings so that the filter
         // after this project can still see pre-projection variables.
         // Barrier projects (WITH clause boundaries) always start fresh.
-        let mut projected_path: PathMap = if is_barrier {
-            PathMap::new()
+        let mut projected_path: SlotRow = if is_barrier {
+            SlotRow::empty(path.schema_arc())
         } else {
             path.clone()
         };
@@ -1753,24 +1853,24 @@ fn project_rows(
 
             match expr {
                 // For CountStar / Agg, the Aggregate operator has already placed
-                // the computed value in the PathMap under `target_var`. Pull it
+                // the computed value in the row under `target_var`. Pull it
                 // directly rather than trying to re-evaluate the expression.
                 Expr::CountStar | Expr::Agg(_, _) => {
-                    if let Some(binding) = path.get(&target_var) {
-                        projected_path.insert(target_var, binding.clone());
+                    if let Some(binding) = path.get_binding(&target_var) {
+                        projected_path.bind_local(&target_var, binding.clone());
                     } else {
                         projected_path
-                            .insert(target_var, GraphBinding::Scalar(serde_json::Value::Null));
+                            .bind_local(&target_var, GraphBinding::Scalar(serde_json::Value::Null));
                     }
                 }
                 Expr::Prop(var, prop) if prop.is_empty() => {
                     // Whole-variable reference: first try the node binding,
                     // then fall back to a scalar already in the PathMap
                     // (e.g., a group-by column emitted by Aggregate).
-                    if let Some(binding) = path.get(var) {
-                        projected_path.insert(target_var, binding.clone());
-                    } else if let Some(binding) = path.get(&target_var) {
-                        projected_path.insert(target_var, binding.clone());
+                    if let Some(binding) = path.get_binding(var) {
+                        projected_path.bind_local(&target_var, binding.clone());
+                    } else if let Some(binding) = path.get_binding(&target_var) {
+                        projected_path.bind_local(&target_var, binding.clone());
                     }
                 }
                 _ => {
@@ -1780,26 +1880,27 @@ fn project_rows(
                     // Exception: if the existing binding is a Node/Edge (not a Scalar),
                     // and there's an alias, always evaluate the expression to avoid
                     // shadowing issues like `a.id AS a` where a = Node(...).
-                    if let Some(binding) = path.get(&target_var) {
+                    if let Some(binding) = path.get_binding(&target_var) {
                         match binding {
                             GraphBinding::Scalar(_) => {
                                 // Pre-computed scalar (from Aggregate) → reuse.
-                                projected_path.insert(target_var, binding.clone());
+                                projected_path.bind_local(&target_var, binding.clone());
                             }
                             GraphBinding::Node(_) | GraphBinding::Edge(_) => {
                                 // Node/Edge with a matching key: only reuse if there's
                                 // no alias (variable pass-through).
                                 if alias.is_none() {
-                                    projected_path.insert(target_var, binding.clone());
+                                    projected_path.bind_local(&target_var, binding.clone());
                                 } else {
                                     let val = evaluate_expr(graph, &path, expr, params)?;
-                                    projected_path.insert(target_var, GraphBinding::Scalar(val));
+                                    projected_path
+                                        .bind_local(&target_var, GraphBinding::Scalar(val));
                                 }
                             }
                         }
                     } else {
                         let val = evaluate_expr(graph, &path, expr, params)?;
-                        projected_path.insert(target_var, GraphBinding::Scalar(val));
+                        projected_path.bind_local(&target_var, GraphBinding::Scalar(val));
                     }
                 }
             }
@@ -1819,17 +1920,17 @@ fn project_rows(
 /// both produce identical rows in identical order.
 pub(super) fn apply_filter(
     graph: &Graph,
-    child_paths: Vec<PathMap>,
+    child_paths: Vec<SlotRow>,
     expression: &FilterExpr,
     params: &HashMap<String, serde_json::Value>,
-) -> Result<Vec<PathMap>, String> {
+) -> Result<Vec<SlotRow>, String> {
     let mut next_paths = Vec::new();
 
     if let FilterExpr::HasLabel(variable, label) = expression {
         // Collect the distinct node IDs bound to this variable for bulk label filtering.
         let mut active_nodes: Vec<NodeId> = child_paths
             .iter()
-            .filter_map(|p| match p.get(variable) {
+            .filter_map(|p| match p.get_binding(variable) {
                 Some(GraphBinding::Node(n)) => Some(*n),
                 _ => None,
             })
@@ -1843,7 +1944,7 @@ pub(super) fn apply_filter(
         let filtered_set: HashSet<NodeId> = filtered_nodes.into_iter().collect();
 
         for path in child_paths {
-            if let Some(GraphBinding::Node(node)) = path.get(variable) {
+            if let Some(GraphBinding::Node(node)) = path.get_binding(variable) {
                 if filtered_set.contains(node) {
                     next_paths.push(path);
                 }
@@ -1899,7 +2000,7 @@ enum RowStream {
     /// so they materialize once via `execute_physical` and drain in batches.
     Materialized {
         op: Box<PhysicalOperator>,
-        rows: Option<std::vec::IntoIter<PathMap>>,
+        rows: Option<std::vec::IntoIter<SlotRow>>,
     },
     Project {
         input: Box<RowStream>,
@@ -1920,10 +2021,14 @@ enum RowStream {
         is_undirected: bool,
         min_hops: usize,
         max_hops: usize,
+        unique_rels: Vec<String>,
+        /// True only when the pattern binds a path variable; the expansion then
+        /// materializes a `_path_*` object per emitted row.
+        needs_path: bool,
         /// Holds expansion output beyond `STREAM_BATCH`: one input row can fan
         /// out to many neighbors, so the overflow is buffered and served on
         /// later pulls before the next input batch is fetched.
-        buf: std::collections::VecDeque<PathMap>,
+        buf: std::collections::VecDeque<SlotRow>,
     },
     /// A hash join whose probe side streams. The build side is materialized once
     /// and hashed on the first pull (`state`); thereafter the probe side is
@@ -1940,7 +2045,7 @@ enum RowStream {
         /// probe stream constructed with SIP applied).
         state: Option<Box<HashJoinState>>,
         /// Overflow when one probe batch joins to more than `STREAM_BATCH` rows.
-        buf: std::collections::VecDeque<PathMap>,
+        buf: std::collections::VecDeque<SlotRow>,
     },
     /// A closing-hop (multiway) join whose input streams. Each input batch is
     /// closed against the bound target via `multiway_join_rows`, so an upstream
@@ -1953,7 +2058,8 @@ enum RowStream {
         closing_rel_var: String,
         closing_is_incoming: bool,
         closing_is_undirected: bool,
-        buf: std::collections::VecDeque<PathMap>,
+        closing_unique_rels: Vec<String>,
+        buf: std::collections::VecDeque<SlotRow>,
     },
     /// Fused linear chain of single-hop directed Expands: the streaming form of
     /// the `execute_expand_chain_n` fast path. Each input batch is threaded
@@ -1961,7 +2067,7 @@ enum RowStream {
     ExpandChain {
         base: Box<RowStream>,
         hops: Vec<OwnedChainHop>,
-        buf: std::collections::VecDeque<PathMap>,
+        buf: std::collections::VecDeque<SlotRow>,
     },
     /// A `Filter` directly over a single-hop directed `Expand`: the streaming form
     /// of the `filter_over_expand_batch` factorization fast path. The predicate is
@@ -1974,8 +2080,9 @@ enum RowStream {
         dst_var: String,
         rel_type: Option<String>,
         is_incoming: bool,
+        unique_rels: Vec<String>,
         expression: FilterExpr,
-        buf: std::collections::VecDeque<PathMap>,
+        buf: std::collections::VecDeque<SlotRow>,
     },
     /// Blocking sort: drains `input` fully on the first pull, sorts it (or keeps
     /// the top `bound` rows), then emits the result in batches. A `Sort` directly
@@ -1984,7 +2091,7 @@ enum RowStream {
         input: Box<RowStream>,
         items: Vec<crate::ast::SortItem>,
         bound: Option<usize>,
-        out: Option<std::vec::IntoIter<PathMap>>,
+        out: Option<std::vec::IntoIter<SlotRow>>,
     },
     /// Streaming DISTINCT: a stateful pass-through emitting each row whose dedup
     /// key has not been seen, so an upstream `LIMIT` can short-circuit.
@@ -1998,7 +2105,7 @@ enum RowStream {
         input: Box<RowStream>,
         group_by: Vec<(Expr, Option<String>)>,
         aggregations: Vec<(AggFn, Expr, String)>,
-        out: Option<std::vec::IntoIter<PathMap>>,
+        out: Option<std::vec::IntoIter<SlotRow>>,
     },
     /// OPTIONAL MATCH: forwards `input` rows; if the entire input is empty, emits
     /// exactly one null-filled row for the pattern variables.
@@ -2013,7 +2120,7 @@ enum RowStream {
         input: Box<RowStream>,
         expr: Expr,
         variable: String,
-        buf: std::collections::VecDeque<PathMap>,
+        buf: std::collections::VecDeque<SlotRow>,
     },
     /// A resolved `CALL`: the N:M cross of each input row with the procedure's
     /// output rows, with an overflow buffer.
@@ -2021,7 +2128,7 @@ enum RowStream {
         input: Box<RowStream>,
         output_vars: Vec<String>,
         rows: Vec<Vec<serde_json::Value>>,
-        buf: std::collections::VecDeque<PathMap>,
+        buf: std::collections::VecDeque<SlotRow>,
     },
     /// SKIP/LIMIT: drops the first `skip` rows then emits up to `count`, returning
     /// empty (stopping upstream pulls) once `count` rows are emitted.
@@ -2039,7 +2146,7 @@ enum RowStream {
     WritePart {
         input: Box<RowStream>,
         part: crate::ast::QueryPart,
-        out: Option<std::vec::IntoIter<PathMap>>,
+        out: Option<std::vec::IntoIter<SlotRow>>,
     },
 }
 
@@ -2052,6 +2159,7 @@ struct OwnedChainHop {
     dst_var: String,
     rel_type: Option<String>,
     is_incoming: bool,
+    unique_rels: Vec<String>,
 }
 
 /// The prepared build side of a streaming `HashJoin`, constructed on the first
@@ -2109,6 +2217,9 @@ fn build_stream_with_sip(
                 is_undirected: false,
                 min_hops: 1,
                 max_hops: 1,
+                unique_rels,
+                // The factorized path never builds `_path_*` objects.
+                needs_path: false,
             } = input.as_ref()
             {
                 if !matches!(expression, FilterExpr::HasLabel(..)) {
@@ -2119,6 +2230,7 @@ fn build_stream_with_sip(
                         dst_var: dst_var.clone(),
                         rel_type: rel_type.clone(),
                         is_incoming: *is_incoming,
+                        unique_rels: unique_rels.clone(),
                         expression: expression.clone(),
                         buf: std::collections::VecDeque::new(),
                     };
@@ -2139,16 +2251,21 @@ fn build_stream_with_sip(
             is_undirected,
             min_hops,
             max_hops,
+            unique_rels,
+            needs_path,
         } => {
             // Fused-chain fast path: collapse a maximal linear chain of single-hop
-            // directed Expands, mirroring the materializing `Expand` arm.
-            if *min_hops == 1 && *max_hops == 1 && !*is_undirected {
+            // directed Expands, mirroring the materializing `Expand` arm. The fused
+            // chain never builds `_path_*` objects, so hops of a named-path pattern
+            // are excluded.
+            if *min_hops == 1 && *max_hops == 1 && !*is_undirected && !*needs_path {
                 let mut hops = vec![OwnedChainHop {
                     src_var: src_var.clone(),
                     rel_var: rel_var.clone(),
                     dst_var: dst_var.clone(),
                     rel_type: rel_type.clone(),
                     is_incoming: *is_incoming,
+                    unique_rels: unique_rels.clone(),
                 }];
                 let mut bottom_src = src_var.as_str();
                 let mut base = input.as_ref();
@@ -2162,6 +2279,8 @@ fn build_stream_with_sip(
                     is_undirected: false,
                     min_hops: 1,
                     max_hops: 1,
+                    unique_rels: inner_unique_rels,
+                    needs_path: false,
                 } = base
                 {
                     if bottom_src != inner_dst_var {
@@ -2173,6 +2292,7 @@ fn build_stream_with_sip(
                         dst_var: inner_dst_var.clone(),
                         rel_type: inner_rel_type.clone(),
                         is_incoming: *inner_is_incoming,
+                        unique_rels: inner_unique_rels.clone(),
                     });
                     bottom_src = inner_src_var.as_str();
                     base = inner_input.as_ref();
@@ -2197,6 +2317,8 @@ fn build_stream_with_sip(
                 is_undirected: *is_undirected,
                 min_hops: *min_hops,
                 max_hops: *max_hops,
+                unique_rels: unique_rels.clone(),
+                needs_path: *needs_path,
                 buf: std::collections::VecDeque::new(),
             }
         }
@@ -2208,6 +2330,7 @@ fn build_stream_with_sip(
             closing_rel_var,
             closing_is_incoming,
             closing_is_undirected,
+            closing_unique_rels,
         } => RowStream::MultiwayJoin {
             input: Box::new(build_stream_with_sip(input, sip)),
             closing_src_var: closing_src_var.clone(),
@@ -2216,6 +2339,7 @@ fn build_stream_with_sip(
             closing_rel_var: closing_rel_var.clone(),
             closing_is_incoming: *closing_is_incoming,
             closing_is_undirected: *closing_is_undirected,
+            closing_unique_rels: closing_unique_rels.clone(),
             buf: std::collections::VecDeque::new(),
         },
         PhysicalOperator::Limit { input, skip, count } => {
@@ -2328,7 +2452,8 @@ impl RowStream {
         &mut self,
         graph: &Graph,
         params: &HashMap<String, serde_json::Value>,
-    ) -> Result<Vec<PathMap>, String> {
+        schema: &std::sync::Arc<SlotSchema>,
+    ) -> Result<Vec<SlotRow>, String> {
         match self {
             RowStream::LabelScan {
                 variable,
@@ -2361,12 +2486,12 @@ impl RowStream {
                         ids.insert(candidates.into_iter())
                     }
                 };
-                let out: Vec<PathMap> = iter
+                let out: Vec<SlotRow> = iter
                     .by_ref()
                     .take(STREAM_BATCH)
                     .map(|nid| {
-                        let mut path = PathMap::new();
-                        path.insert(variable.clone(), GraphBinding::Node(nid));
+                        let mut path = SlotRow::empty(schema.clone());
+                        path.bind_local(variable, GraphBinding::Node(nid));
                         path
                     })
                     .collect();
@@ -2375,7 +2500,7 @@ impl RowStream {
             RowStream::Materialized { op, rows } => {
                 let iter = match rows {
                     Some(it) => it,
-                    None => rows.insert(eval_leaf(graph, op, params)?.into_iter()),
+                    None => rows.insert(eval_leaf(graph, op, params, schema)?.into_iter()),
                 };
                 Ok(iter.by_ref().take(STREAM_BATCH).collect())
             }
@@ -2386,7 +2511,7 @@ impl RowStream {
             } => {
                 // Project is a 1:1 transform, so a non-empty input batch yields a
                 // non-empty output batch; loop only to pass through end-of-stream.
-                let batch = input.next_batch(graph, params)?;
+                let batch = input.next_batch(graph, params, schema)?;
                 if batch.is_empty() {
                     return Ok(vec![]);
                 }
@@ -2396,7 +2521,7 @@ impl RowStream {
                 // A filter can empty a batch without exhausting the input, so
                 // keep pulling until a batch survives or the input runs out.
                 loop {
-                    let batch = input.next_batch(graph, params)?;
+                    let batch = input.next_batch(graph, params, schema)?;
                     if batch.is_empty() {
                         return Ok(vec![]);
                     }
@@ -2416,13 +2541,15 @@ impl RowStream {
                 is_undirected,
                 min_hops,
                 max_hops,
+                unique_rels,
+                needs_path,
                 buf,
             } => loop {
                 if !buf.is_empty() {
                     let take = buf.len().min(STREAM_BATCH);
                     return Ok(buf.drain(..take).collect());
                 }
-                let batch = input.next_batch(graph, params)?;
+                let batch = input.next_batch(graph, params, schema)?;
                 if batch.is_empty() {
                     return Ok(vec![]);
                 }
@@ -2437,6 +2564,8 @@ impl RowStream {
                     *is_undirected,
                     *min_hops,
                     *max_hops,
+                    unique_rels,
+                    *needs_path,
                 )?;
                 buf.extend(expanded);
             },
@@ -2458,7 +2587,7 @@ impl RowStream {
                 let st = match state {
                     Some(s) => s,
                     None => {
-                        let build_rows = execute_physical(graph, build_op, params)?;
+                        let build_rows = execute_physical(graph, build_op, params, schema)?;
                         let common_vars = join_common_vars(probe_op, build_op);
                         let (data, probe) = if common_vars.is_empty() {
                             (
@@ -2484,7 +2613,7 @@ impl RowStream {
                         state.insert(Box::new(HashJoinState { data, probe }))
                     }
                 };
-                let probe_batch = st.probe.next_batch(graph, params)?;
+                let probe_batch = st.probe.next_batch(graph, params, schema)?;
                 if probe_batch.is_empty() {
                     return Ok(vec![]);
                 }
@@ -2499,13 +2628,14 @@ impl RowStream {
                 closing_rel_var,
                 closing_is_incoming,
                 closing_is_undirected,
+                closing_unique_rels,
                 buf,
             } => loop {
                 if !buf.is_empty() {
                     let take = buf.len().min(STREAM_BATCH);
                     return Ok(buf.drain(..take).collect());
                 }
-                let batch = input.next_batch(graph, params)?;
+                let batch = input.next_batch(graph, params, schema)?;
                 if batch.is_empty() {
                     return Ok(vec![]);
                 }
@@ -2518,6 +2648,7 @@ impl RowStream {
                     closing_rel_var,
                     *closing_is_incoming,
                     *closing_is_undirected,
+                    closing_unique_rels,
                 )?;
                 buf.extend(rows);
             },
@@ -2526,7 +2657,7 @@ impl RowStream {
                     let take = buf.len().min(STREAM_BATCH);
                     return Ok(buf.drain(..take).collect());
                 }
-                let batch = base.next_batch(graph, params)?;
+                let batch = base.next_batch(graph, params, schema)?;
                 if batch.is_empty() {
                     return Ok(vec![]);
                 }
@@ -2539,6 +2670,7 @@ impl RowStream {
                         dst_var: &h.dst_var,
                         rel_type: h.rel_type.as_deref(),
                         is_incoming: h.is_incoming,
+                        unique_rels: &h.unique_rels,
                     })
                     .collect();
                 let expanded = execute_expand_chain_n(graph, batch, &borrowed)?;
@@ -2551,6 +2683,7 @@ impl RowStream {
                 dst_var,
                 rel_type,
                 is_incoming,
+                unique_rels,
                 expression,
                 buf,
             } => loop {
@@ -2558,7 +2691,7 @@ impl RowStream {
                     let take = buf.len().min(STREAM_BATCH);
                     return Ok(buf.drain(..take).collect());
                 }
-                let batch = base.next_batch(graph, params)?;
+                let batch = base.next_batch(graph, params, schema)?;
                 if batch.is_empty() {
                     return Ok(vec![]);
                 }
@@ -2572,6 +2705,7 @@ impl RowStream {
                     dst_var,
                     rel_type.as_deref(),
                     *is_incoming,
+                    unique_rels,
                     expression,
                     params,
                 )?;
@@ -2588,7 +2722,7 @@ impl RowStream {
                     None => {
                         let mut rows = Vec::new();
                         loop {
-                            let batch = input.next_batch(graph, params)?;
+                            let batch = input.next_batch(graph, params, schema)?;
                             if batch.is_empty() {
                                 break;
                             }
@@ -2601,15 +2735,17 @@ impl RowStream {
                 Ok(iter.by_ref().take(STREAM_BATCH).collect())
             }
             RowStream::Distinct { input, seen } => loop {
-                let batch = input.next_batch(graph, params)?;
+                let batch = input.next_batch(graph, params, schema)?;
                 if batch.is_empty() {
                     return Ok(vec![]);
                 }
-                let kept: Vec<PathMap> = batch
+                let kept: Vec<SlotRow> = batch
                     .into_iter()
                     .filter(|path| {
+                        // `bound_entries` iterates slots in schema order then
+                        // locals, so the dedup key is deterministic.
                         let key = path
-                            .iter()
+                            .bound_entries()
                             .map(|(k, v)| format!("{}={:?}", k, v))
                             .collect::<Vec<_>>()
                             .join("|");
@@ -2629,7 +2765,8 @@ impl RowStream {
                 let iter = match out {
                     Some(it) => it,
                     None => {
-                        let rows = aggregate_all(graph, input, group_by, aggregations, params)?;
+                        let rows =
+                            aggregate_all(graph, input, group_by, aggregations, params, schema)?;
                         out.insert(rows.into_iter())
                     }
                 };
@@ -2641,7 +2778,7 @@ impl RowStream {
                 any,
                 done,
             } => {
-                let batch = input.next_batch(graph, params)?;
+                let batch = input.next_batch(graph, params, schema)?;
                 if !batch.is_empty() {
                     *any = true;
                     return Ok(batch);
@@ -2650,9 +2787,9 @@ impl RowStream {
                 // input was empty, and only once.
                 if !*any && !*done {
                     *done = true;
-                    let mut null_row: PathMap = HashMap::new();
+                    let mut null_row = SlotRow::empty(schema.clone());
                     for var in null_vars.iter() {
-                        null_row.insert(var.clone(), GraphBinding::Scalar(serde_json::Value::Null));
+                        null_row.bind_local(var, GraphBinding::Scalar(serde_json::Value::Null));
                     }
                     return Ok(vec![null_row]);
                 }
@@ -2668,7 +2805,7 @@ impl RowStream {
                     let take = buf.len().min(STREAM_BATCH);
                     return Ok(buf.drain(..take).collect());
                 }
-                let batch = input.next_batch(graph, params)?;
+                let batch = input.next_batch(graph, params, schema)?;
                 if batch.is_empty() {
                     return Ok(vec![]);
                 }
@@ -2677,12 +2814,12 @@ impl RowStream {
                     if let serde_json::Value::Array(elems) = list_val {
                         for item in elems {
                             let mut new_path = path.clone();
-                            new_path.insert(variable.clone(), GraphBinding::Scalar(item));
+                            new_path.bind_local(variable, GraphBinding::Scalar(item));
                             buf.push_back(new_path);
                         }
                     } else if list_val != serde_json::Value::Null {
                         let mut new_path = path.clone();
-                        new_path.insert(variable.clone(), GraphBinding::Scalar(list_val));
+                        new_path.bind_local(variable, GraphBinding::Scalar(list_val));
                         buf.push_back(new_path);
                     }
                 }
@@ -2697,7 +2834,7 @@ impl RowStream {
                     let take = buf.len().min(STREAM_BATCH);
                     return Ok(buf.drain(..take).collect());
                 }
-                let batch = input.next_batch(graph, params)?;
+                let batch = input.next_batch(graph, params, schema)?;
                 if batch.is_empty() {
                     return Ok(vec![]);
                 }
@@ -2705,7 +2842,7 @@ impl RowStream {
                     for row in rows.iter() {
                         let mut new_path = path.clone();
                         for (var, value) in output_vars.iter().zip(row.iter()) {
-                            new_path.insert(var.clone(), GraphBinding::Scalar(value.clone()));
+                            new_path.bind_local(var, GraphBinding::Scalar(value.clone()));
                         }
                         buf.push_back(new_path);
                     }
@@ -2729,7 +2866,7 @@ impl RowStream {
                     if *emitted >= *count {
                         return Ok(vec![]);
                     }
-                    let batch = input.next_batch(graph, params)?;
+                    let batch = input.next_batch(graph, params, schema)?;
                     if batch.is_empty() {
                         return Ok(vec![]);
                     }
@@ -2757,7 +2894,7 @@ impl RowStream {
                     None => {
                         let mut rows = Vec::new();
                         loop {
-                            let batch = input.next_batch(graph, params)?;
+                            let batch = input.next_batch(graph, params, schema)?;
                             if batch.is_empty() {
                                 break;
                             }
@@ -2785,7 +2922,8 @@ fn aggregate_all(
     group_by: &[(Expr, Option<String>)],
     aggregations: &[(AggFn, Expr, String)],
     params: &HashMap<String, serde_json::Value>,
-) -> Result<Vec<PathMap>, String> {
+    schema: &std::sync::Arc<SlotSchema>,
+) -> Result<Vec<SlotRow>, String> {
     use std::collections::BTreeMap;
 
     struct AggState {
@@ -2816,19 +2954,19 @@ fn aggregate_all(
         }
     }
 
-    // group_key -> (group-by PathMap, per-aggregation state Vec)
-    let mut groups: BTreeMap<String, (PathMap, Vec<AggState>)> = BTreeMap::new();
+    // group_key -> (group-by row, per-aggregation state Vec)
+    let mut groups: BTreeMap<String, (SlotRow, Vec<AggState>)> = BTreeMap::new();
     if group_by.is_empty() {
         let states = aggregations.iter().map(|_| AggState::new()).collect();
-        groups.insert("".to_string(), (PathMap::new(), states));
+        groups.insert("".to_string(), (SlotRow::empty(schema.clone()), states));
     }
 
     // Fold one input row into the group table.
-    let fold_path = |groups: &mut BTreeMap<String, (PathMap, Vec<AggState>)>,
-                     path: PathMap|
+    let fold_path = |groups: &mut BTreeMap<String, (SlotRow, Vec<AggState>)>,
+                     path: SlotRow|
      -> Result<(), String> {
         let mut key_parts = Vec::new();
-        let mut gb_path = PathMap::new();
+        let mut gb_path = SlotRow::empty(path.schema_arc());
         for (expr, alias) in group_by {
             let val = evaluate_expr(graph, &path, expr, params)?;
             let col = if let Some(a) = alias {
@@ -2843,7 +2981,7 @@ fn aggregate_all(
                 }
             };
             key_parts.push(val.to_string());
-            gb_path.insert(col, GraphBinding::Scalar(val));
+            gb_path.bind_local(&col, GraphBinding::Scalar(val));
         }
         let group_key = key_parts.join("\x00");
 
@@ -2955,7 +3093,7 @@ fn aggregate_all(
     // Drain the input stream a batch at a time so peak memory is one batch plus
     // the group table.
     loop {
-        let batch = input.next_batch(graph, params)?;
+        let batch = input.next_batch(graph, params, schema)?;
         if batch.is_empty() {
             break;
         }
@@ -3080,7 +3218,7 @@ fn aggregate_all(
                     }
                 }
             };
-            gb_path.insert(col.clone(), GraphBinding::Scalar(agg_val));
+            gb_path.bind_local(col, GraphBinding::Scalar(agg_val));
         }
         result.push(gb_path);
     }
@@ -3095,11 +3233,11 @@ fn aggregate_all(
 /// the trimmed set byte-identical to sort-then-truncate while bounding memory.
 fn sort_all(
     graph: &Graph,
-    child_paths: Vec<PathMap>,
+    child_paths: Vec<SlotRow>,
     items: &[crate::ast::SortItem],
     bound: Option<usize>,
     params: &HashMap<String, serde_json::Value>,
-) -> Vec<PathMap> {
+) -> Vec<SlotRow> {
     // Primary comparison by the sort keys, honoring per-key ASC/DESC.
     let cmp = |ka: &[serde_json::Value], kb: &[serde_json::Value]| -> std::cmp::Ordering {
         for (i, si) in items.iter().enumerate() {
@@ -3111,7 +3249,7 @@ fn sort_all(
         }
         std::cmp::Ordering::Equal
     };
-    let keys_of = |path: &PathMap| -> Vec<serde_json::Value> {
+    let keys_of = |path: &SlotRow| -> Vec<serde_json::Value> {
         items
             .iter()
             .map(|si| evaluate_sort_key(graph, path, &si.expr, params))
@@ -3120,7 +3258,7 @@ fn sort_all(
 
     match bound {
         None => {
-            let mut keyed: Vec<(Vec<serde_json::Value>, PathMap)> = child_paths
+            let mut keyed: Vec<(Vec<serde_json::Value>, SlotRow)> = child_paths
                 .into_iter()
                 .map(|path| {
                     let keys = keys_of(&path);
@@ -3134,15 +3272,17 @@ fn sort_all(
         Some(k) => {
             // Total order with the input index as a final tiebreak, so trimming
             // keeps exactly the rows a stable sort would put first.
-            let order = |a: &(Vec<serde_json::Value>, usize, PathMap),
-                         b: &(Vec<serde_json::Value>, usize, PathMap)| {
+            let order = |a: &(Vec<serde_json::Value>, usize, SlotRow),
+                         b: &(Vec<serde_json::Value>, usize, SlotRow)| {
                 cmp(&a.0, &b.0).then(a.1.cmp(&b.1))
             };
-            let mut buf: Vec<(Vec<serde_json::Value>, usize, PathMap)> = Vec::new();
+            let mut buf: Vec<(Vec<serde_json::Value>, usize, SlotRow)> = Vec::new();
             for (idx, path) in child_paths.into_iter().enumerate() {
                 let keys = keys_of(&path);
                 buf.push((keys, idx, path));
-                if buf.len() >= 2 * k {
+                // Saturating: a SKIP without a LIMIT saturates `k` to
+                // `usize::MAX`, and `2 * k` would overflow in debug builds.
+                if buf.len() >= k.saturating_mul(2) {
                     buf.sort_by(&order);
                     buf.truncate(k);
                 }
@@ -3162,13 +3302,18 @@ fn sort_all(
 /// graph write lock is held for the whole statement by `execute_read_query`.
 fn write_part_rows(
     graph: &Graph,
-    child_paths: Vec<PathMap>,
+    child_paths: Vec<SlotRow>,
     part: &crate::ast::QueryPart,
     params: &HashMap<String, serde_json::Value>,
-) -> Result<Vec<PathMap>, String> {
+) -> Result<Vec<SlotRow>, String> {
     use super::write::execute_create_internal_with_context;
     use super::write::execute_merge_internal_with_context;
     use crate::ast::QueryPart;
+
+    // The write executors in write.rs are still keyed by name; rows bridge
+    // through `to_path_map` at this boundary, and the names a CREATE or MERGE
+    // binds come back through `bind_local` (pattern variables have slots from
+    // the plan walk, so they re-enter positionally).
 
     // DELETE is evaluated over the whole result at once: all listed
     // relationships are removed before any node, so an undirected expand that
@@ -3176,7 +3321,8 @@ fn write_part_rows(
     // through unchanged for a following RETURN.
     if let QueryPart::Delete { targets, detach } = part {
         use super::write::delete_over_paths;
-        delete_over_paths(graph, &child_paths, targets, *detach, params)?;
+        let maps: Vec<PathMap> = child_paths.iter().map(|p| p.to_path_map()).collect();
+        delete_over_paths(graph, &maps, targets, *detach, params)?;
         return Ok(child_paths);
     }
 
@@ -3185,11 +3331,14 @@ fn write_part_rows(
     for path in child_paths {
         match part {
             QueryPart::Create { patterns } => {
+                let path_map = path.to_path_map();
                 let mut new_path = path.clone();
                 for pattern in patterns {
                     let created =
-                        execute_create_internal_with_context(graph, pattern, &path, params)?;
-                    new_path.extend(created);
+                        execute_create_internal_with_context(graph, pattern, &path_map, params)?;
+                    for (name, binding) in created {
+                        new_path.bind_local(&name, binding);
+                    }
                 }
                 result_paths.push(new_path);
             }
@@ -3201,11 +3350,17 @@ fn write_part_rows(
                 for merge_stmt in merges {
                     let mut next = Vec::new();
                     for p in &current {
-                        let extensions =
-                            execute_merge_internal_with_context(graph, merge_stmt, p, params)?;
+                        let extensions = execute_merge_internal_with_context(
+                            graph,
+                            merge_stmt,
+                            &p.to_path_map(),
+                            params,
+                        )?;
                         for ext in extensions {
                             let mut row = p.clone();
-                            row.extend(ext);
+                            for (name, binding) in ext {
+                                row.bind_local(&name, binding);
+                            }
                             next.push(row);
                         }
                     }
@@ -3215,18 +3370,19 @@ fn write_part_rows(
             }
             QueryPart::Set { items } => {
                 use super::write::apply_set_items;
-                apply_set_items(graph, &path, items, params)?;
+                apply_set_items(graph, &path.to_path_map(), items, params)?;
                 result_paths.push(path);
             }
             QueryPart::Delete { targets, detach } => {
                 use super::write::apply_delete_targets;
-                apply_delete_targets(graph, &path, targets, *detach, params)?;
+                apply_delete_targets(graph, &path.to_path_map(), targets, *detach, params)?;
                 result_paths.push(path);
             }
             QueryPart::Remove { items } => {
                 use super::write::apply_remove_item;
+                let path_map = path.to_path_map();
                 for item in items {
-                    apply_remove_item(graph, item, &path)?;
+                    apply_remove_item(graph, item, &path_map)?;
                 }
                 result_paths.push(path);
             }
@@ -3249,7 +3405,8 @@ fn eval_leaf(
     graph: &Graph,
     op: &PhysicalOperator,
     params: &HashMap<String, serde_json::Value>,
-) -> Result<Vec<PathMap>, String> {
+    schema: &std::sync::Arc<SlotSchema>,
+) -> Result<Vec<SlotRow>, String> {
     match op {
         PhysicalOperator::NodeIndexScan {
             variable,
@@ -3270,8 +3427,8 @@ fn eval_leaf(
                     if let Ok(props) = rmp_serde::from_slice::<serde_json::Value>(&record.props) {
                         if let Some(actual_val) = props.get(property) {
                             if json_vals_are_equal(actual_val, &val) {
-                                let mut path = PathMap::new();
-                                path.insert(variable.clone(), GraphBinding::Node(cand));
+                                let mut path = SlotRow::empty(schema.clone());
+                                path.bind_local(variable, GraphBinding::Node(cand));
                                 filtered.push(path);
                             }
                         }
@@ -3335,8 +3492,8 @@ fn eval_leaf(
                                 }
                             }
                             if ok {
-                                let mut path = PathMap::new();
-                                path.insert(variable.clone(), GraphBinding::Node(cand));
+                                let mut path = SlotRow::empty(schema.clone());
+                                path.bind_local(variable, GraphBinding::Node(cand));
                                 filtered.push(path);
                             }
                         }
@@ -3381,14 +3538,14 @@ fn eval_leaf(
                 })
                 .map_err(|e| e.to_string())?;
             if matched {
-                let mut path = PathMap::new();
-                path.insert(variable.clone(), GraphBinding::Node(nid));
+                let mut path = SlotRow::empty(schema.clone());
+                path.bind_local(variable, GraphBinding::Node(nid));
                 Ok(vec![path])
             } else {
                 Ok(vec![])
             }
         }
-        PhysicalOperator::SingleRow => Ok(vec![PathMap::new()]),
+        PhysicalOperator::SingleRow => Ok(vec![SlotRow::empty(schema.clone())]),
         other => Err(format!("eval_leaf called on non-leaf operator: {other:?}")),
     }
 }
@@ -3404,11 +3561,12 @@ pub(super) fn execute_physical(
     graph: &Graph,
     op: &PhysicalOperator,
     params: &HashMap<String, serde_json::Value>,
-) -> Result<Vec<PathMap>, String> {
+    schema: &std::sync::Arc<SlotSchema>,
+) -> Result<Vec<SlotRow>, String> {
     let mut stream = build_stream(op);
     let mut out = Vec::new();
     loop {
-        let batch = stream.next_batch(graph, params)?;
+        let batch = stream.next_batch(graph, params, schema)?;
         if batch.is_empty() {
             break;
         }
@@ -3417,9 +3575,24 @@ pub(super) fn execute_physical(
     Ok(out)
 }
 
-pub(super) fn evaluate_where(
+/// `execute_physical` for callers that still consume name-keyed rows (the
+/// write-path binding plans in write.rs). Builds the slot schema for `op`,
+/// executes, and bridges each row back to a `PathMap`.
+pub(super) fn execute_physical_pathmaps(
     graph: &Graph,
-    path: &PathMap,
+    op: &PhysicalOperator,
+    params: &HashMap<String, serde_json::Value>,
+) -> Result<Vec<PathMap>, String> {
+    let schema = std::sync::Arc::new(SlotSchema::from_plan(op));
+    Ok(execute_physical(graph, op, params, &schema)?
+        .iter()
+        .map(|r| r.to_path_map())
+        .collect())
+}
+
+pub(super) fn evaluate_where<B: Bindings>(
+    graph: &Graph,
+    path: &B,
     where_clause: &WhereClause,
     params: &HashMap<String, serde_json::Value>,
 ) -> Result<bool, String> {
@@ -3469,9 +3642,9 @@ pub(super) fn evaluate_where(
 /// Evaluate a sort-key expression. First tries a normal evaluate_expr; if the variable is
 /// unbound (because Project has already stripped node bindings), falls back to looking up
 /// the expression's natural projected column name as a pre-computed scalar in the PathMap.
-pub(super) fn evaluate_sort_key(
+pub(super) fn evaluate_sort_key<B: Bindings>(
     graph: &Graph,
-    path: &PathMap,
+    path: &B,
     expr: &Expr,
     params: &HashMap<String, serde_json::Value>,
 ) -> serde_json::Value {
@@ -3496,13 +3669,13 @@ pub(super) fn evaluate_sort_key(
     };
 
     // Try the full `var.prop` column name, then just `prop` alone (alias forms).
-    if let Some(GraphBinding::Scalar(v)) = path.get(&col_name) {
+    if let Some(GraphBinding::Scalar(v)) = path.get_binding(&col_name) {
         return v.clone();
     }
     // Try just the property name as a fallback alias (e.g., `n.age` stored as `"age"`).
     if let Expr::Prop(_, prop) = expr {
         if !prop.is_empty() {
-            if let Some(GraphBinding::Scalar(v)) = path.get(prop) {
+            if let Some(GraphBinding::Scalar(v)) = path.get_binding(prop) {
                 return v.clone();
             }
         }
@@ -3981,5 +4154,24 @@ mod stream_join_tests {
             "MATCH (n:Q) RETURN n.age AS age ORDER BY n.age ASC LIMIT 10",
         );
         assert_eq!(top, full[..10].to_vec());
+    }
+
+    /// `ORDER BY ... SKIP` without a `LIMIT` plans a `Limit` whose count is
+    /// `usize::MAX`, so the top-N bound saturates to `usize::MAX`. The bounded
+    /// sort buffer must not overflow on its `2 * k` trim threshold (a debug-build
+    /// panic caught by the TCK skip scenarios).
+    #[test]
+    fn sort_skip_without_limit_does_not_overflow() {
+        let (_dir, graph) = setup();
+        for i in 0..5 {
+            exec(&graph, &format!("CREATE (:R {{age: {i}}})"));
+        }
+        graph.rebuild_csr().unwrap();
+        let full = run_rows(&graph, "MATCH (n:R) RETURN n.age AS age ORDER BY n.age ASC");
+        let skipped = run_rows(
+            &graph,
+            "MATCH (n:R) RETURN n.age AS age ORDER BY n.age ASC SKIP 2",
+        );
+        assert_eq!(skipped, full[2..].to_vec());
     }
 }

@@ -36,62 +36,7 @@ impl Graph {
         let encoded_props = props::encode(props)?;
 
         // Validate constraints and populate indexes
-        let active_indexes = self.get_active_edge_indexes(wtxn, type_id)?;
-        if !active_indexes.is_empty() {
-            let props_json: serde_json::Value = props::decode(&encoded_props)?;
-            for (prop_key_id, flags) in active_indexes {
-                if let Some(prop_name) = self.prop_key_name_impl(wtxn, prop_key_id)? {
-                    let prop_val = props_json.get(&prop_name);
-
-                    // 1. Required constraint check
-                    if flags == 0x02
-                        && (prop_val.is_none() || prop_val == Some(&serde_json::Value::Null))
-                    {
-                        return Err(Error::RequiredConstraintViolation(
-                            etype.to_string(),
-                            prop_name.to_string(),
-                        ));
-                    }
-
-                    if let Some(val) = prop_val {
-                        if val != &serde_json::Value::Null {
-                            if let Some(encoded) = encode_property_value(val) {
-                                // 2. Unique constraint check
-                                if flags == 0x01 {
-                                    let mut prefix = Vec::with_capacity(4 + 4 + encoded.len());
-                                    prefix.extend_from_slice(&type_id.to_be_bytes());
-                                    prefix.extend_from_slice(&prop_key_id.to_be_bytes());
-                                    prefix.extend_from_slice(&encoded);
-
-                                    for entry in
-                                        self.storage.edge_prop_idx.prefix_iter(wtxn, &prefix)?
-                                    {
-                                        let (key, _) = entry?;
-                                        if key.len() >= 8 {
-                                            let mut edge_id_bytes = [0u8; 8];
-                                            edge_id_bytes.copy_from_slice(&key[key.len() - 8..]);
-                                            let found_edge_id = u64::from_be_bytes(edge_id_bytes);
-                                            if found_edge_id != edge_id {
-                                                return Err(Error::UniqueConstraintViolation(
-                                                    etype.to_string(),
-                                                    prop_name.to_string(),
-                                                    val.to_string(),
-                                                ));
-                                            }
-                                        }
-                                    }
-                                }
-
-                                // 3. Write index entry
-                                let idx_key =
-                                    edge_prop_index_key(type_id, prop_key_id, &encoded, edge_id);
-                                self.storage.edge_prop_idx.put(wtxn, &idx_key, &())?;
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        self.write_edge_index_entries(wtxn, edge_id, type_id, etype, &encoded_props)?;
 
         let record = EdgeRecord {
             src,
@@ -124,11 +69,23 @@ impl Graph {
             .get(&wtxn, &id)?
             .ok_or(Error::EdgeNotFound(id))?;
         let record: EdgeRecord = crate::storage::props::decode(existing)?;
+        let etype = self
+            .type_name_impl(&wtxn, record.edge_type)?
+            .ok_or(Error::Corrupt("edge type name missing"))?;
+
+        // Re-index under the new properties: drop the old entries first so the
+        // unique check never conflicts with the edge against itself. A
+        // constraint violation aborts the uncommitted transaction, so the old
+        // entries survive.
+        self.delete_edge_index_entries(&mut wtxn, id, &record)?;
+        let encoded_props = crate::storage::props::encode(props)?;
+        self.write_edge_index_entries(&mut wtxn, id, record.edge_type, &etype, &encoded_props)?;
+
         let new_record = EdgeRecord {
             src: record.src,
             dst: record.dst,
             edge_type: record.edge_type,
-            props: crate::storage::props::encode(props)?,
+            props: encoded_props,
         };
         self.storage
             .edges
@@ -365,5 +322,51 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    /// `update_edge` must replace the stored properties and leave the
+    /// endpoints and type untouched.
+    #[test]
+    fn update_edge_replaces_props() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("N", &()).unwrap();
+        let b = g.add_node("N", &()).unwrap();
+        let eid = g.add_edge(a, b, "E", &serde_json::json!({"w": 1})).unwrap();
+
+        g.update_edge(eid, &serde_json::json!({"w": 2})).unwrap();
+
+        let rec = g.get_edge(eid).unwrap().expect("edge must still exist");
+        assert_eq!(rec.src, a);
+        assert_eq!(rec.dst, b);
+        let props: serde_json::Value = rmp_serde::from_slice(&rec.props).unwrap();
+        assert_eq!(props["w"], serde_json::json!(2));
+    }
+
+    #[test]
+    fn update_edge_missing_edge_errors() {
+        let (_dir, g) = open_tmp();
+        let err = g
+            .update_edge(999, &serde_json::json!({"w": 1}))
+            .unwrap_err();
+        assert!(matches!(err, Error::EdgeNotFound(999)));
+    }
+
+    /// `node_has_relationships` must reflect both adjacency directions and
+    /// must go back to `false` once the last edge is deleted.
+    #[test]
+    fn node_has_relationships_reflects_adjacency() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("N", &()).unwrap();
+        let b = g.add_node("N", &()).unwrap();
+        assert!(!g.node_has_relationships(a).unwrap());
+        assert!(!g.node_has_relationships(b).unwrap());
+
+        let eid = g.add_edge(a, b, "E", &()).unwrap();
+        assert!(g.node_has_relationships(a).unwrap(), "out edge counts");
+        assert!(g.node_has_relationships(b).unwrap(), "in edge counts");
+
+        g.delete_edge(eid).unwrap();
+        assert!(!g.node_has_relationships(a).unwrap());
+        assert!(!g.node_has_relationships(b).unwrap());
     }
 }

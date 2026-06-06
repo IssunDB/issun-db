@@ -127,6 +127,8 @@ impl Optimizer {
                 is_undirected,
                 min_hops,
                 max_hops,
+                unique_rels,
+                needs_path,
             } => {
                 let (inner_op, inner_filters) = Self::extract_filters(*input);
                 (
@@ -140,6 +142,8 @@ impl Optimizer {
                         is_undirected,
                         min_hops,
                         max_hops,
+                        unique_rels,
+                        needs_path,
                     },
                     inner_filters,
                 )
@@ -274,6 +278,7 @@ impl Optimizer {
                 closing_rel_var,
                 closing_is_incoming,
                 closing_is_undirected,
+                closing_unique_rels,
             } => {
                 let (inner_op, inner_filters) = Self::extract_filters(*input);
                 (
@@ -285,6 +290,7 @@ impl Optimizer {
                         closing_rel_var,
                         closing_is_incoming,
                         closing_is_undirected,
+                        closing_unique_rels,
                     },
                     inner_filters,
                 )
@@ -329,6 +335,8 @@ impl Optimizer {
                 is_undirected,
                 min_hops,
                 max_hops,
+                unique_rels,
+                needs_path,
             } => PhysicalOperator::Expand {
                 input: Box::new(Self::reorder_operators(*input, stats)),
                 src_var,
@@ -339,6 +347,8 @@ impl Optimizer {
                 is_undirected,
                 min_hops,
                 max_hops,
+                unique_rels,
+                needs_path,
             },
             // Filter nodes inside opaque barrier-Project subtrees are not stripped by
             // `extract_filters`.  Pass them through so that reordering does not panic.
@@ -434,6 +444,7 @@ impl Optimizer {
                 closing_rel_var,
                 closing_is_incoming,
                 closing_is_undirected,
+                closing_unique_rels,
             } => PhysicalOperator::MultiwayJoin {
                 input: Box::new(Self::reorder_operators(*input, stats)),
                 closing_src_var,
@@ -442,6 +453,7 @@ impl Optimizer {
                 closing_rel_var,
                 closing_is_incoming,
                 closing_is_undirected,
+                closing_unique_rels,
             },
         }
     }
@@ -649,6 +661,8 @@ impl Optimizer {
                 is_undirected,
                 min_hops,
                 max_hops,
+                unique_rels,
+                needs_path,
             } => {
                 let child_bound = Self::bound_vars(&input);
 
@@ -677,6 +691,8 @@ impl Optimizer {
                     is_undirected,
                     min_hops,
                     max_hops,
+                    unique_rels,
+                    needs_path,
                 };
 
                 let bound = Self::bound_vars(&current_node);
@@ -960,6 +976,7 @@ impl Optimizer {
                 closing_rel_var,
                 closing_is_incoming,
                 closing_is_undirected,
+                closing_unique_rels,
             } => {
                 let child_bound = Self::bound_vars(&input);
 
@@ -986,6 +1003,7 @@ impl Optimizer {
                     closing_rel_var,
                     closing_is_incoming,
                     closing_is_undirected,
+                    closing_unique_rels,
                 };
 
                 let bound = Self::bound_vars(&current_node);
@@ -1692,6 +1710,8 @@ impl Optimizer {
                 is_undirected,
                 min_hops,
                 max_hops,
+                unique_rels,
+                needs_path,
             } => PhysicalOperator::Expand {
                 input: Box::new(Self::optimize_index_scans(*input, stats)),
                 src_var,
@@ -1702,6 +1722,8 @@ impl Optimizer {
                 is_undirected,
                 min_hops,
                 max_hops,
+                unique_rels,
+                needs_path,
             },
             PhysicalOperator::Project {
                 input,
@@ -1724,6 +1746,7 @@ impl Optimizer {
                 closing_rel_var,
                 closing_is_incoming,
                 closing_is_undirected,
+                closing_unique_rels,
             } => PhysicalOperator::MultiwayJoin {
                 input: Box::new(Self::optimize_index_scans(*input, stats)),
                 closing_src_var,
@@ -1732,6 +1755,7 @@ impl Optimizer {
                 closing_rel_var,
                 closing_is_incoming,
                 closing_is_undirected,
+                closing_unique_rels,
             },
             leaf => leaf,
         }
@@ -1815,6 +1839,7 @@ impl Optimizer {
             rel_type: Option<String>,
             is_incoming: bool,
             is_undirected: bool,
+            needs_path: bool,
         }
 
         // Walk the chain top-to-bottom by reference, validating shape without
@@ -1833,6 +1858,8 @@ impl Optimizer {
                     is_undirected,
                     min_hops,
                     max_hops,
+                    needs_path,
+                    ..
                 } => {
                     if *min_hops != 1 || *max_hops != 1 {
                         return op; // variable-length hops are not reversed here
@@ -1844,6 +1871,7 @@ impl Optimizer {
                         rel_type: rel_type.clone(),
                         is_incoming: *is_incoming,
                         is_undirected: *is_undirected,
+                        needs_path: *needs_path,
                     });
                     node = input;
                 }
@@ -1855,6 +1883,12 @@ impl Optimizer {
                 _ => return op,
             }
         };
+
+        // A named path accumulates `_path_*` objects hop by hop in pattern order;
+        // executing the chain reversed would build them backwards, so bail out.
+        if hops.iter().any(|h| h.needs_path) {
+            return op;
+        }
 
         // Validate linear connectivity (hops listed top-to-bottom) and acyclicity.
         // hop[i].src must equal hop[i+1].dst, and the bottom hop's src is the scan.
@@ -1912,6 +1946,9 @@ impl Optimizer {
             variable: terminal_var.clone(),
             label: Some(term_lbl.clone()),
         };
+        // Relationship uniqueness is pairwise within the pattern, so the
+        // reversed chain re-derives each hop's predecessors from the new order.
+        let mut prior_rels: Vec<String> = Vec::new();
         for hop in hops.iter() {
             tree = PhysicalOperator::Expand {
                 input: Box::new(tree),
@@ -1927,7 +1964,10 @@ impl Optimizer {
                 is_undirected: hop.is_undirected,
                 min_hops: 1,
                 max_hops: 1,
+                unique_rels: prior_rels.clone(),
+                needs_path: hop.needs_path,
             };
+            prior_rels.push(hop.rel_var.clone());
         }
 
         // The far endpoint's label is now carried by the scan; drop its HasLabel
@@ -2002,12 +2042,21 @@ impl Optimizer {
         }
     }
 
-    /// Replace a `count(*)`/`count(n)` aggregation over a bare labeled node scan
-    /// with a constant read from graph metadata. Fires only when the aggregate has
-    /// no grouping keys and a single non-distinct count whose inner expression is
-    /// `count(*)` or a bare variable, its input is exactly a `LabelScan` with a
-    /// known label, and the label's node count is available and positive. A zero
-    /// count is left to normal execution so empty-result semantics are preserved.
+    /// Replace a `count(*)`/`count(n)` aggregation over a bare labeled node scan,
+    /// or over a bare typed single-hop directed expand, with a constant read from
+    /// graph metadata. Fires only when the aggregate has no grouping keys and a
+    /// single non-distinct count whose inner expression is `count(*)` or a bare
+    /// variable, and its input is exactly one of:
+    ///
+    /// - a `LabelScan` with a known label whose node count is available, or
+    /// - an `Expand` of exactly one hop, directed, with a known relationship
+    ///   type, over an unlabeled full-node `LabelScan`, whose type count is
+    ///   available. Undirected expands are excluded because each edge matches in
+    ///   both directions, and labeled or filtered endpoints are excluded because
+    ///   type metadata ignores them.
+    ///
+    /// A zero count is left to normal execution so empty-result semantics are
+    /// preserved.
     fn reduce_count(op: PhysicalOperator, stats: Option<&dyn StatsProvider>) -> PhysicalOperator {
         match op {
             PhysicalOperator::Aggregate {
@@ -2021,21 +2070,36 @@ impl Optimizer {
                     let counts_rows = matches!(inner, Expr::CountStar)
                         || matches!(inner, Expr::Prop(_, p) if p.is_empty());
                     if plain_count && counts_rows {
-                        if let PhysicalOperator::LabelScan {
-                            label: Some(lbl), ..
-                        } = input.as_ref()
-                        {
-                            if let Some(n) = stats.and_then(|s| s.node_count_by_label(lbl)) {
-                                if n > 0 {
-                                    return PhysicalOperator::Project {
-                                        input: Box::new(PhysicalOperator::SingleRow),
-                                        items: vec![(
-                                            Expr::Literal(Literal::Int(n as i64)),
-                                            Some(col.clone()),
-                                        )],
-                                        is_barrier: false,
-                                    };
-                                }
+                        let metadata_count = match input.as_ref() {
+                            PhysicalOperator::LabelScan {
+                                label: Some(lbl), ..
+                            } => stats.and_then(|s| s.node_count_by_label(lbl)),
+                            PhysicalOperator::Expand {
+                                input: scan,
+                                rel_type: Some(rtype),
+                                is_undirected: false,
+                                min_hops: 1,
+                                max_hops: 1,
+                                ..
+                            } if matches!(
+                                scan.as_ref(),
+                                PhysicalOperator::LabelScan { label: None, .. }
+                            ) =>
+                            {
+                                stats.and_then(|s| s.edge_count_by_type(rtype))
+                            }
+                            _ => None,
+                        };
+                        if let Some(n) = metadata_count {
+                            if n > 0 {
+                                return PhysicalOperator::Project {
+                                    input: Box::new(PhysicalOperator::SingleRow),
+                                    items: vec![(
+                                        Expr::Literal(Literal::Int(n as i64)),
+                                        Some(col.clone()),
+                                    )],
+                                    is_barrier: false,
+                                };
                             }
                         }
                     }
@@ -2089,10 +2153,14 @@ fn rewrite_closing_expands(op: PhysicalOperator) -> PhysicalOperator {
             is_undirected,
             min_hops,
             max_hops,
+            unique_rels,
+            needs_path,
         } => {
             let new_input = rewrite_closing_expands(*input);
             let input_bound = Optimizer::bound_vars(&new_input);
-            if min_hops == 1 && max_hops == 1 && input_bound.contains(&dst_var) {
+            // A closing join never extends `_path_*` objects, so a pattern that
+            // binds a path variable keeps its plain Expand.
+            if min_hops == 1 && max_hops == 1 && !needs_path && input_bound.contains(&dst_var) {
                 PhysicalOperator::MultiwayJoin {
                     input: Box::new(new_input),
                     closing_src_var: src_var,
@@ -2101,6 +2169,7 @@ fn rewrite_closing_expands(op: PhysicalOperator) -> PhysicalOperator {
                     closing_rel_var: rel_var,
                     closing_is_incoming: is_incoming,
                     closing_is_undirected: is_undirected,
+                    closing_unique_rels: unique_rels,
                 }
             } else {
                 PhysicalOperator::Expand {
@@ -2113,6 +2182,8 @@ fn rewrite_closing_expands(op: PhysicalOperator) -> PhysicalOperator {
                     is_undirected,
                     min_hops,
                     max_hops,
+                    unique_rels,
+                    needs_path,
                 }
             }
         }
@@ -2180,6 +2251,7 @@ fn rewrite_closing_expands(op: PhysicalOperator) -> PhysicalOperator {
             closing_rel_var,
             closing_is_incoming,
             closing_is_undirected,
+            closing_unique_rels,
         } => PhysicalOperator::MultiwayJoin {
             input: Box::new(rewrite_closing_expands(*input)),
             closing_src_var,
@@ -2188,6 +2260,7 @@ fn rewrite_closing_expands(op: PhysicalOperator) -> PhysicalOperator {
             closing_rel_var,
             closing_is_incoming,
             closing_is_undirected,
+            closing_unique_rels,
         },
         leaf => leaf,
     }
@@ -2384,6 +2457,8 @@ mod tests {
             is_undirected: false,
             min_hops: 1,
             max_hops: 1,
+            unique_rels: vec![],
+            needs_path: false,
         };
 
         let join_plan = PhysicalOperator::HashJoin {
@@ -2435,6 +2510,8 @@ mod tests {
             is_undirected: false,
             min_hops: 1,
             max_hops: 1,
+            unique_rels: vec![],
+            needs_path: false,
         };
 
         // Average fan-out = ceil(5000 / 1000) = 5; input weight (Person) = 1000.
@@ -2537,6 +2614,8 @@ mod tests {
                     is_undirected: false,
                     min_hops: 1,
                     max_hops: 1,
+                    unique_rels: vec![],
+                    needs_path: false,
                 }),
                 src_var: "b".to_string(),
                 rel_var: "r2".to_string(),
@@ -2546,6 +2625,8 @@ mod tests {
                 is_undirected: false,
                 min_hops: 1,
                 max_hops: 1,
+                unique_rels: vec![],
+                needs_path: false,
             }),
             src_var: "c".to_string(),
             rel_var: "r3".to_string(),
@@ -2556,6 +2637,8 @@ mod tests {
             is_undirected: false,
             min_hops: 1,
             max_hops: 1,
+            unique_rels: vec![],
+            needs_path: false,
         };
 
         let rewritten = rewrite_closing_expands(plan);
@@ -2595,6 +2678,8 @@ mod tests {
                 is_undirected: false,
                 min_hops: 1,
                 max_hops: 1,
+                unique_rels: vec![],
+                needs_path: false,
             }),
             src_var: "b".to_string(),
             rel_var: "r2".to_string(),
@@ -2604,6 +2689,8 @@ mod tests {
             is_undirected: false,
             min_hops: 1,
             max_hops: 1,
+            unique_rels: vec![],
+            needs_path: false,
         };
 
         let rewritten = rewrite_closing_expands(plan);
@@ -2635,6 +2722,8 @@ mod tests {
                 is_undirected: false,
                 min_hops: 1,
                 max_hops: 1,
+                unique_rels: vec![],
+                needs_path: false,
             }),
             src_var: "a".to_string(),
             rel_var: "r".to_string(),
@@ -2645,6 +2734,8 @@ mod tests {
             is_undirected: true,
             min_hops: 1,
             max_hops: 1,
+            unique_rels: vec![],
+            needs_path: false,
         };
 
         let rewritten = rewrite_closing_expands(plan);
@@ -2687,6 +2778,11 @@ mod tests {
         fn with_index(mut self, label: &str, property: &str) -> Self {
             self.indexes
                 .insert((label.to_string(), property.to_string()));
+            self
+        }
+
+        fn with_type(mut self, etype: &str, count: u64) -> Self {
+            self.types.insert(etype.to_string(), count);
             self
         }
     }
@@ -2776,6 +2872,79 @@ mod tests {
         let (var, label) = bottom_scan(&plan).expect("a label scan");
         assert_eq!(var, "a", "rarer start endpoint must be kept");
         assert_eq!(label.as_deref(), Some("Person"));
+    }
+
+    /// Collect the `needs_path` flag of every `Expand` in a plan, top-down.
+    fn expand_path_flags(op: &PhysicalOperator, out: &mut Vec<bool>) {
+        match op {
+            PhysicalOperator::Expand {
+                input, needs_path, ..
+            } => {
+                out.push(*needs_path);
+                expand_path_flags(input, out);
+            }
+            PhysicalOperator::Filter { input, .. }
+            | PhysicalOperator::Project { input, .. }
+            | PhysicalOperator::Aggregate { input, .. }
+            | PhysicalOperator::Sort { input, .. }
+            | PhysicalOperator::Limit { input, .. }
+            | PhysicalOperator::Distinct { input }
+            | PhysicalOperator::MultiwayJoin { input, .. } => expand_path_flags(input, out),
+            _ => {}
+        }
+    }
+
+    /// `needs_path` is set per pattern: plain patterns plan every hop with
+    /// `false` (no per-row `_path_*` materialization), and a pattern that binds
+    /// a path variable plans every hop with `true`.
+    #[test]
+    fn needs_path_flag_follows_path_variable() {
+        let stats = TestStats::new(&[("Person", 100)]);
+
+        let plain = optimize_query(
+            "MATCH (a:Person)-[:KNOWS]->()-[:KNOWS]->(c) RETURN c",
+            &stats,
+        );
+        let mut flags = Vec::new();
+        expand_path_flags(&plain, &mut flags);
+        assert_eq!(flags, vec![false, false]);
+
+        let named = optimize_query(
+            "MATCH p = (a:Person)-[:KNOWS]->()-[:KNOWS]->(c) RETURN p",
+            &stats,
+        );
+        let mut flags = Vec::new();
+        expand_path_flags(&named, &mut flags);
+        assert_eq!(flags, vec![true, true]);
+    }
+
+    /// A cyclic named-path pattern keeps its closing hop as a plain `Expand`:
+    /// the `MultiwayJoin` rewrite never extends `_path_*` objects, so applying
+    /// it would drop the path binding.
+    #[test]
+    fn closing_hop_stays_expand_for_named_path() {
+        fn has_multiway(op: &PhysicalOperator) -> bool {
+            match op {
+                PhysicalOperator::MultiwayJoin { .. } => true,
+                PhysicalOperator::Expand { input, .. }
+                | PhysicalOperator::Filter { input, .. }
+                | PhysicalOperator::Project { input, .. }
+                | PhysicalOperator::Aggregate { input, .. }
+                | PhysicalOperator::Sort { input, .. }
+                | PhysicalOperator::Limit { input, .. }
+                | PhysicalOperator::Distinct { input } => has_multiway(input),
+                _ => false,
+            }
+        }
+        let stats = TestStats::new(&[("Person", 100)]);
+        let plan = optimize_query(
+            "MATCH p = (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(a) RETURN p",
+            &stats,
+        );
+        assert!(
+            !has_multiway(&plan),
+            "closing hop of a named path must stay a plain Expand"
+        );
     }
 
     #[test]
@@ -2963,6 +3132,64 @@ mod tests {
         // wrongly turn an empty result into all rows).
         let plan = optimize_query("MATCH (n:Person) WHERE 1 = 2 RETURN n", &stats);
         assert_eq!(count_filters(&plan), 1, "a false predicate must be kept");
+    }
+
+    /// True when the plan projects the given integer literal somewhere on its
+    /// Project spine, the shape `reduce_count` leaves behind.
+    fn finds_int_literal(op: &PhysicalOperator, n: i64) -> bool {
+        match op {
+            PhysicalOperator::Project { input, items, .. } => {
+                items
+                    .iter()
+                    .any(|(e, _)| matches!(e, Expr::Literal(Literal::Int(v)) if *v == n))
+                    || finds_int_literal(input, n)
+            }
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn reduce_count_replaces_typed_edge_expand_with_constant() {
+        let stats = TestStats::new(&[]).with_type("KNOWS", 7);
+        for q in [
+            "MATCH ()-[r:KNOWS]->() RETURN count(r)",
+            "MATCH ()-[:KNOWS]->() RETURN count(*)",
+            "MATCH ()<-[r:KNOWS]-() RETURN count(r)",
+        ] {
+            let plan = optimize_query(q, &stats);
+            assert!(
+                bottom_scan(&plan).is_none(),
+                "edge count must not scan for {q}: {plan:?}"
+            );
+            assert!(
+                finds_int_literal(&plan, 7),
+                "edge count constant 7 must be projected for {q}: {plan:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reduce_count_skips_non_reducible_edge_counts() {
+        let stats = TestStats::new(&[("Person", 42)]).with_type("KNOWS", 7);
+        for q in [
+            // Undirected: each edge matches in both directions, so the type
+            // metadata would undercount by half.
+            "MATCH ()-[r:KNOWS]-() RETURN count(r)",
+            // A labeled endpoint constrains the rows; type metadata ignores labels.
+            "MATCH (a:Person)-[r:KNOWS]->() RETURN count(r)",
+            // An untyped relationship has no metadata count.
+            "MATCH ()-[r]->() RETURN count(r)",
+            // Variable-length: row count is path count, not edge count.
+            "MATCH ()-[:KNOWS*1..2]->() RETURN count(*)",
+            // A residual predicate must be evaluated per row.
+            "MATCH (a)-[r:KNOWS]->() WHERE a.age > 18 RETURN count(r)",
+        ] {
+            let plan = optimize_query(q, &stats);
+            assert!(
+                bottom_scan(&plan).is_some(),
+                "edge count must still scan for {q}: {plan:?}"
+            );
+        }
     }
 
     #[test]

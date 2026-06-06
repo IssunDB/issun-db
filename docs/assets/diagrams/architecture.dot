@@ -27,8 +27,8 @@ digraph IssunDBArchitecture {
     ]
 
     // ---------------------------------------------------------------
-    // Storage engine: the foundation crate.
-    // ---------------------------------------------------------------
+ // Storage engine: the foundation crate.
+ // ---------------------------------------------------------------
     subgraph cluster_core {
     label = "Storage Engine"
     fontname = "Helvetica,Arial,sans-serif"
@@ -42,8 +42,8 @@ digraph IssunDBArchitecture {
     }
 
     // ---------------------------------------------------------------
-    // Extension crates: depend on core, never on each other upward.
-    // ---------------------------------------------------------------
+ // Extension crates: depend on core, never on each other upward.
+ // ---------------------------------------------------------------
     subgraph cluster_ext {
     label = "Extension Crates"
     fontname = "Helvetica,Arial,sans-serif"
@@ -60,8 +60,8 @@ digraph IssunDBArchitecture {
     }
 
     // ---------------------------------------------------------------
-    // Public facade.
-    // ---------------------------------------------------------------
+ // Public facade.
+ // ---------------------------------------------------------------
     subgraph cluster_facade {
     label = "Public Facade"
     fontname = "Helvetica,Arial,sans-serif"
@@ -75,8 +75,8 @@ digraph IssunDBArchitecture {
     }
 
     // ---------------------------------------------------------------
-    // Consumers: bindings, servers, tools. Facade-only.
-    // ---------------------------------------------------------------
+ // Consumers: bindings, servers, tools. Facade-only.
+ // ---------------------------------------------------------------
     subgraph cluster_consumers {
     label = "Consumers"
     fontname = "Helvetica,Arial,sans-serif"
@@ -94,10 +94,10 @@ digraph IssunDBArchitecture {
     }
 
     // ---------------------------------------------------------------
-    // Dependency edges (point from dependent to dependency).
-    // lhead/ltail clip the edge at the cluster border (compound = true)
-    // so arrows attach to the enclosing cluster, not the inner box.
-    // ---------------------------------------------------------------
+ // Dependency edges (point from dependent to dependency).
+ // lhead/ltail clip the edge at the cluster border (compound = true)
+ // so arrows attach to the enclosing cluster, not the inner box.
+ // ---------------------------------------------------------------
     vector -> core [lhead = cluster_core]
     text -> core [lhead = cluster_core]
     retrieval -> core [lhead = cluster_core]

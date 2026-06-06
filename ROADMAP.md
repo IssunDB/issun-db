@@ -95,7 +95,10 @@ This document outlines the features implemented in IssunDB and the future goals 
   filter-over-expand fast paths run inside the stream, so a bounded multi-hop query expands only what the limit needs
 - [x] Static filter elimination: provably-true predicates (`WHERE true`, equality or inequality of identical-form literals) are dropped before
   pushdown so they are never evaluated per row
-- [ ] Full openCypher TCK conformance: as of 2026-06-01, 3,412 of 3,490 executed scenarios pass (97.77%; a further 428 scenarios are
+- [x] Lazy named-path materialization: per-row path objects are built only when the pattern binds a path variable (`MATCH p = ...`), removing
+  three record decodes and a JSON tree per expanded row from plain patterns (a 3-4x speedup on cyclic and aggregation traversals), while the
+  fused-chain, closing-join, and chain-reversal rewrites are disabled for named-path patterns so the path binding survives them
+- [ ] Full openCypher TCK conformance: as of 2026-06-06, 3,424 of 3,473 executed scenarios pass (98.6%; a further 424 scenarios are
   skipped as intentional exclusions, such as negative-test tags and node, relationship, or path display-literal representational mismatches).
   Notable remaining capability gaps:
     - [x] Temporal expression conformance: timezone resolution for named and historical zones (DST and local-mean-time offsets via the IANA
@@ -131,6 +134,9 @@ This document outlines the features implemented in IssunDB and the future goals 
 - [x] An HTTP REST API server with node, edge, query, vector search, and full-text search routes
 - [x] An MCP server over stdio or Streamable HTTP, exposing node and edge CRUD, query, explanation, full-text search, and vector search as tools
 - [x] A benchmarking suite that measures throughput and load scaling
+- [x] A differential comparison harness against LadybugDB (`benchmarks/ladybug-compare`): an identical Cypher workload runs on both engines with
+  median timings and sorted row-set equality checks, with uniform or Zipf-skewed synthetic graphs, a scale-sweep mode reporting per-query scaling
+  ratios, and a per-query time budget
 - [x] Property-based and integration tests
 - [x] Language bindings for Python
 - [x] Language bindings for JavaScript (Node.js)

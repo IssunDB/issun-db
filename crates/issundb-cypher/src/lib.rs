@@ -414,9 +414,9 @@ mod tests {
     }
 
     #[test]
-    fn variable_length_diamond_no_duplicate_rows() {
-        // Regression for: completed_targets was a Vec, so nodes reachable via
-        // multiple paths (diamond topology) produced duplicate result rows.
+    fn variable_length_diamond_emits_one_row_per_path() {
+        // openCypher emits one row per matched path, not per distinct endpoint:
+        // in a diamond, d is reachable via two paths and must appear twice.
         let (_dir, g) = open_tmp();
         let a = g.add_node("N", &json!({ "name": "a" })).unwrap();
         let b = g.add_node("N", &json!({ "name": "b" })).unwrap();
@@ -443,11 +443,62 @@ mod tests {
             .map(|r| r.values[0].as_str().unwrap().to_string())
             .collect();
         names.sort_unstable();
-        // b, c, and d must each appear exactly once.
+        // Paths: a→b, a→c, a→b→d, and a→c→d.
         assert_eq!(
             names,
-            vec!["b".to_string(), "c".to_string(), "d".to_string()]
+            vec![
+                "b".to_string(),
+                "c".to_string(),
+                "d".to_string(),
+                "d".to_string()
+            ]
         );
+    }
+
+    #[test]
+    fn variable_length_follows_trail_semantics() {
+        // openCypher relationship uniqueness applies per path: a node may be
+        // revisited as long as no relationship repeats, and a path that would
+        // reuse a relationship is not a match.
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("N", &json!({ "name": "a" })).unwrap();
+        let b = g.add_node("N", &json!({ "name": "b" })).unwrap();
+        let c = g.add_node("N", &json!({ "name": "c" })).unwrap();
+        // Reciprocal pair plus a spur: a⇄b, a→c.
+        g.add_edge(a, b, "E", &json!({})).unwrap();
+        g.add_edge(b, a, "E", &json!({})).unwrap();
+        g.add_edge(a, c, "E", &json!({})).unwrap();
+        g.rebuild_csr().unwrap();
+
+        let params = HashMap::new();
+        let two_hop = execute(
+            &g,
+            "MATCH (x:N)-[:E*2]->(y:N) WHERE x.name = \"a\" RETURN y.name AS name",
+            &params,
+        )
+        .unwrap();
+        let names: Vec<&str> = two_hop
+            .records
+            .iter()
+            .map(|r| r.values[0].as_str().unwrap())
+            .collect();
+        // a→b→a revisits node a over two distinct relationships: a valid trail.
+        assert_eq!(names, vec!["a"]);
+
+        let three_hop = execute(
+            &g,
+            "MATCH (x:N)-[:E*3]->(y:N) WHERE x.name = \"a\" RETURN y.name AS name",
+            &params,
+        )
+        .unwrap();
+        let names: Vec<&str> = three_hop
+            .records
+            .iter()
+            .map(|r| r.values[0].as_str().unwrap())
+            .collect();
+        // a→b→a→c continues past the revisited node; a→b→a→b would repeat the
+        // a→b relationship and must not match.
+        assert_eq!(names, vec!["c"]);
     }
 
     #[test]

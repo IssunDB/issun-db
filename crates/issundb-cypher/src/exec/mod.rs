@@ -12,6 +12,7 @@ mod ddl;
 mod expr;
 mod factorize;
 pub(crate) mod read;
+mod row;
 mod write;
 
 use ddl::{
@@ -807,6 +808,28 @@ mod tests {
         assert_eq!(rows[1][1], serde_json::json!([0, 1]));
     }
 
+    /// A named path over a fusable linear chain (two directed single-hop expands with
+    /// no filter between them) must still bind the path variable; the fused
+    /// `ExpandChain` fast path skips `_path_` construction entirely, so fusion must
+    /// not apply when the pattern binds a path.
+    #[test]
+    fn named_path_survives_fused_expand_chain() {
+        let (_dir, graph) = setup_graph();
+        let params = HashMap::new();
+        execute(
+            &graph,
+            "CREATE (a:X {n: 1}), (b), (c) CREATE (a)-[:T]->(b), (b)-[:T]->(c)",
+            &params,
+        )
+        .unwrap();
+        graph.rebuild_csr().unwrap();
+        let rows = run(
+            &graph,
+            "MATCH p = (a:X)-[:T]->()-[:T]->() RETURN length(p) AS len, size(nodes(p)) AS n",
+        );
+        assert_eq!(rows, vec![vec![serde_json::json!(2), serde_json::json!(3)]]);
+    }
+
     /// An inline label predicate on an OPTIONAL MATCH target node belongs to the optional
     /// pattern: when it eliminates every match, the bound left row is preserved with the
     /// optional variables null, not dropped (TCK Match7 [28]).
@@ -895,6 +918,38 @@ mod tests {
             rows.len(),
             1,
             "directed closing hop must match only the forward LIKES edge"
+        );
+    }
+
+    /// A directed closing hop must preserve parallel-edge multiplicity: two
+    /// distinct LIKES edges between the same bound pair are two matches, one
+    /// per edge, exactly like a plain `Expand` would produce.
+    #[test]
+    fn directed_closing_hop_matches_parallel_edges() {
+        let (_dir, graph) = setup_graph();
+        let params = HashMap::new();
+        execute(
+            &graph,
+            "CREATE (a:Person {name: 'A'}), (b:Person {name: 'B'}) \
+             CREATE (a)-[:KNOWS]->(b), (a)-[:LIKES {n: 1}]->(b), (a)-[:LIKES {n: 2}]->(b)",
+            &params,
+        )
+        .unwrap();
+        graph.rebuild_csr().unwrap();
+
+        // The cyclic single pattern makes the LIKES hop a closing hop (both
+        // endpoints already bound), which the optimizer rewrites to a
+        // `MultiwayJoin`; a separate MATCH clause would plan as a `HashJoin`
+        // and never exercise this path.
+        let mut rows = run(
+            &graph,
+            "MATCH (a:Person)-[:KNOWS]->(b:Person)<-[r:LIKES]-(a) RETURN r.n",
+        );
+        rows.sort_by_key(|r| r[0].as_i64().unwrap());
+        assert_eq!(
+            rows,
+            vec![vec![serde_json::json!(1)], vec![serde_json::json!(2)],],
+            "directed closing hop must emit one row per parallel edge"
         );
     }
 
@@ -2258,6 +2313,80 @@ mod tests {
     }
 
     #[test]
+    fn relationship_uniqueness_within_pattern() {
+        // The canonical co-developer query: a relationship matched by one hop
+        // of a pattern must not be reused by another hop of the same pattern,
+        // so marko is not his own co-developer through the single marko-CREATED->lop relationship.
+        let (_dir, graph) = setup_graph();
+        let marko = graph
+            .add_node("Person", &serde_json::json!({"name": "marko"}))
+            .unwrap();
+        let josh = graph
+            .add_node("Person", &serde_json::json!({"name": "josh"}))
+            .unwrap();
+        let lop = graph
+            .add_node("Software", &serde_json::json!({"name": "lop"}))
+            .unwrap();
+        graph.add_edge(marko, lop, "CREATED", &()).unwrap();
+        graph.add_edge(josh, lop, "CREATED", &()).unwrap();
+
+        let rows = run(
+            &graph,
+            "MATCH (m:Person {name: 'marko'})-[:CREATED]->(s)<-[:CREATED]-(c) \
+             RETURN c.name AS name",
+        );
+        let names: Vec<&str> = rows.iter().map(|r| r[0].as_str().unwrap()).collect();
+        assert_eq!(names, ["josh"]);
+    }
+
+    #[test]
+    fn relationship_uniqueness_blocks_undirected_backtrack() {
+        // With a single KNOWS relationship, an undirected two-hop pattern has
+        // no valid assignment: the second hop may not traverse the first
+        // hop's relationship back to the start.
+        let (_dir, graph) = setup_graph();
+        let a = graph
+            .add_node("Person", &serde_json::json!({"name": "a"}))
+            .unwrap();
+        let b = graph
+            .add_node("Person", &serde_json::json!({"name": "b"}))
+            .unwrap();
+        graph.add_edge(a, b, "KNOWS", &()).unwrap();
+
+        let rows = run(
+            &graph,
+            "MATCH (x:Person {name: 'a'})-[:KNOWS]-(y)-[:KNOWS]-(z) RETURN z.name AS name",
+        );
+        assert!(
+            rows.is_empty(),
+            "backtracking over the same relationship must be rejected"
+        );
+    }
+
+    #[test]
+    fn relationship_reuse_across_match_clauses_is_allowed() {
+        // Uniqueness is scoped to a single pattern: two separate MATCH
+        // clauses may bind the same relationship.
+        let (_dir, graph) = setup_graph();
+        let a = graph
+            .add_node("Person", &serde_json::json!({"name": "a"}))
+            .unwrap();
+        let b = graph
+            .add_node("Person", &serde_json::json!({"name": "b"}))
+            .unwrap();
+        graph.add_edge(a, b, "KNOWS", &()).unwrap();
+
+        let rows = run(
+            &graph,
+            "MATCH (x:Person {name: 'a'})-[r1:KNOWS]->(y) \
+             MATCH (x)-[r2:KNOWS]->(y) \
+             RETURN y.name AS name",
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0].as_str().unwrap(), "b");
+    }
+
+    #[test]
     fn create_index_and_drop_index_execute_without_error() {
         let (_dir, graph) = setup_graph();
         graph
@@ -2270,6 +2399,106 @@ mod tests {
 
         execute(&graph, "DROP INDEX FOR (n:Movie) ON (n.title)", &params).unwrap();
         assert!(!graph.has_node_text_index("Movie", "title").unwrap());
+    }
+
+    /// `CREATE INDEX FOR ()-[r:TYPE]-() ON (r.prop)` must create an edge
+    /// property index that `add_edge` populates, and `DROP INDEX` must remove its entries.
+    #[test]
+    fn edge_index_ddl_roundtrip() {
+        let (_dir, graph) = setup_graph();
+        let params = HashMap::new();
+
+        execute(
+            &graph,
+            "CREATE INDEX FOR ()-[r:ROAD]-() ON (r.cost)",
+            &params,
+        )
+        .unwrap();
+        execute(
+            &graph,
+            "CREATE (a:City)-[r:ROAD {cost: 5}]->(b:City)",
+            &params,
+        )
+        .unwrap();
+
+        let hits = graph
+            .edges_by_property("ROAD", "cost", issundb_core::PropValue::Int(5))
+            .unwrap();
+        assert_eq!(hits.len(), 1, "edge must be findable through the index");
+
+        execute(&graph, "DROP INDEX FOR ()-[r:ROAD]-() ON (r.cost)", &params).unwrap();
+        let hits = graph
+            .edges_by_property("ROAD", "cost", issundb_core::PropValue::Int(5))
+            .unwrap();
+        assert!(hits.is_empty(), "dropped index must lose its entries");
+    }
+
+    /// A relationship unique constraint created via Cypher must reject a
+    /// duplicate value on edge creation and stop doing so once dropped.
+    #[test]
+    fn edge_unique_constraint_ddl() {
+        let (_dir, graph) = setup_graph();
+        let params = HashMap::new();
+
+        execute(
+            &graph,
+            "CREATE CONSTRAINT ON ()-[r:ROAD]-() ASSERT r.toll_id IS UNIQUE",
+            &params,
+        )
+        .unwrap();
+        execute(
+            &graph,
+            "CREATE (a:City)-[r:ROAD {toll_id: 1}]->(b:City)",
+            &params,
+        )
+        .unwrap();
+        let err = execute(
+            &graph,
+            "CREATE (a:City)-[r:ROAD {toll_id: 1}]->(b:City)",
+            &params,
+        );
+        assert!(
+            err.is_err(),
+            "duplicate toll_id must violate the constraint"
+        );
+
+        execute(
+            &graph,
+            "DROP CONSTRAINT ON ()-[r:ROAD]-() ASSERT r.toll_id IS UNIQUE",
+            &params,
+        )
+        .unwrap();
+        execute(
+            &graph,
+            "CREATE (a:City)-[r:ROAD {toll_id: 1}]->(b:City)",
+            &params,
+        )
+        .unwrap();
+    }
+
+    /// A relationship existence constraint created via Cypher must reject an
+    /// edge that lacks the property.
+    #[test]
+    fn edge_exists_constraint_ddl() {
+        let (_dir, graph) = setup_graph();
+        let params = HashMap::new();
+
+        execute(
+            &graph,
+            "CREATE CONSTRAINT ON ()-[r:ROAD]-() ASSERT EXISTS(r.cost)",
+            &params,
+        )
+        .unwrap();
+        let err = execute(&graph, "CREATE (a:City)-[r:ROAD]->(b:City)", &params);
+        assert!(err.is_err(), "missing cost must violate the constraint");
+
+        execute(
+            &graph,
+            "DROP CONSTRAINT ON ()-[r:ROAD]-() ASSERT EXISTS(r.cost)",
+            &params,
+        )
+        .unwrap();
+        execute(&graph, "CREATE (a:City)-[r:ROAD]->(b:City)", &params).unwrap();
     }
 
     #[test]

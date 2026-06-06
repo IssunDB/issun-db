@@ -472,18 +472,30 @@ pub struct MergeStatement {
     pub on_match_set: Vec<SetItem>,
 }
 
-/// A CREATE INDEX statement targeting a single label and property.
+/// Whether a schema DDL statement targets nodes of a label, written
+/// `(n:Label)`, or relationships of a type, written `()-[r:TYPE]-()`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SchemaTarget {
+    Node,
+    Relationship,
+}
+
+/// A CREATE INDEX statement targeting a single label or relationship type
+/// (held in `label`) and property.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreateIndexStatement {
     pub label: String,
     pub property: String,
+    pub target: SchemaTarget,
 }
 
-/// A DROP INDEX statement targeting a single label and property.
+/// A DROP INDEX statement targeting a single label or relationship type
+/// (held in `label`) and property.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DropIndexStatement {
     pub label: String,
     pub property: String,
+    pub target: SchemaTarget,
 }
 
 /// Items that can appear in a REMOVE clause.
@@ -544,20 +556,24 @@ pub enum ConstraintKind {
     Exists,
 }
 
-/// A CREATE CONSTRAINT statement.
+/// A CREATE CONSTRAINT statement. `label` holds the node label or
+/// relationship type, depending on `target`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreateConstraintStatement {
     pub label: String,
     pub property: String,
     pub kind: ConstraintKind,
+    pub target: SchemaTarget,
 }
 
-/// A DROP CONSTRAINT statement.
+/// A DROP CONSTRAINT statement. `label` holds the node label or relationship
+/// type, depending on `target`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DropConstraintStatement {
     pub label: String,
     pub property: String,
     pub kind: ConstraintKind,
+    pub target: SchemaTarget,
 }
 
 /// A REMOVE statement followed by a RETURN clause.

@@ -69,3 +69,38 @@ Import the `GraphQueryExt` trait to run declarative graph queries.
   Executes a raw Cypher query string against the database.
 - `query_with_params(cypher: &str, params: &HashMap<String, serde_json::Value>) -> Result<QueryResult, String>`  
   Executes a parameterized Cypher query against the database.
+
+---
+
+## Cypher DDL Reference
+
+Schema statements run through the same `query` entry point as data statements. A DDL statement targets either nodes of a label, written `(n:Label)`,
+or relationships of a type, written `()-[r:TYPE]-()`.
+
+### Index Statements
+
+- `CREATE INDEX FOR (n:Label) ON (n.property)`  
+  Creates a full-text search index on a node property. Node property equality and range lookups need no DDL because every node property is indexed
+  automatically.
+- `CREATE INDEX FOR ()-[r:TYPE]-() ON (r.property)`  
+  Creates a relationship property index and backfills it from existing relationships. Relationship properties are indexed only while such an index
+  exists; subsequent relationship creation and property updates keep it current.
+- `DROP INDEX FOR (n:Label) ON (n.property)`  
+  Removes the full-text search index on a node property.
+- `DROP INDEX FOR ()-[r:TYPE]-() ON (r.property)`  
+  Removes a relationship property index and its entries.
+
+### Constraint Statements
+
+- `CREATE CONSTRAINT ON (n:Label) ASSERT n.property IS UNIQUE`  
+  Requires the property value to be unique across all nodes with the label.
+- `CREATE CONSTRAINT ON (n:Label) ASSERT EXISTS(n.property)`  
+  Requires the property to be present and non-null on every node with the label.
+- `CREATE CONSTRAINT ON ()-[r:TYPE]-() ASSERT r.property IS UNIQUE`  
+  Requires the property value to be unique across all relationships of the type.
+- `CREATE CONSTRAINT ON ()-[r:TYPE]-() ASSERT EXISTS(r.property)`  
+  Requires the property to be present and non-null on every relationship of the type.
+
+Each `CREATE CONSTRAINT` form has a matching `DROP CONSTRAINT` form with the same target and assertion. Creating a constraint validates the existing
+data first and fails if any element already violates it. Once in place, a constraint is checked when an element is created and when its properties are
+updated; a violating write fails and leaves the database unchanged.

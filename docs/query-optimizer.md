@@ -50,12 +50,12 @@ Indicative results on a development machine (50,000 Person nodes for the
 scan-comparison groups, 5,000 for the expansion groups). Treat the ratios, not
 the absolute times, as the regression signal:
 
-| Group | Optimized | Baseline | Ratio |
-| --- | --- | --- | --- |
-| `reduce_count` | ~34 µs (`count(*)`) | ~32 ms (count over a property scan) | ~940x |
-| `id_seek` | ~113 µs (`WHERE id(n) = k`) | ~27.6 ms (full unindexable scan) | ~245x |
-| `scan_selection` | ~7.1 ms (reversed chain) | regression guard | n/a |
-| `chain_fusion` | ~10.8 ms (three-hop fused) | regression guard | n/a |
+| Group            | Optimized                   | Baseline                            | Ratio |
+|------------------|-----------------------------|-------------------------------------|-------|
+| `reduce_count`   | ~34 µs (`count(*)`)         | ~32 ms (count over a property scan) | ~940x |
+| `id_seek`        | ~113 µs (`WHERE id(n) = k`) | ~27.6 ms (full unindexable scan)    | ~245x |
+| `scan_selection` | ~7.1 ms (reversed chain)    | regression guard                    | n/a   |
+| `chain_fusion`   | ~10.8 ms (three-hop fused)  | regression guard                    | n/a   |
 
 ### Notes on Interpretation
 

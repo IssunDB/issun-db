@@ -1,3 +1,4 @@
+use super::row::Bindings;
 use super::*;
 use chrono::{
     Datelike, Duration, NaiveDate, NaiveDateTime, NaiveTime, Offset, TimeZone, Timelike, Weekday,
@@ -145,9 +146,9 @@ fn current_temporal(name: &str) -> serde_json::Value {
     }
 }
 
-pub(super) fn evaluate_expr(
+pub(super) fn evaluate_expr<B: Bindings>(
     graph: &Graph,
-    path: &PathMap,
+    path: &B,
     expr: &Expr,
     params: &HashMap<String, serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
@@ -203,7 +204,7 @@ pub(super) fn evaluate_expr(
                     let mut all_true = true;
                     for item in &items {
                         let mut inner_path = path.clone();
-                        inner_path.insert(variable.clone(), GraphBinding::Scalar(item.clone()));
+                        inner_path.bind_local(variable, GraphBinding::Scalar(item.clone()));
                         let pred_val = evaluate_expr(graph, &inner_path, predicate, params)?;
                         match pred_val {
                             serde_json::Value::Bool(true) => {}
@@ -235,7 +236,7 @@ pub(super) fn evaluate_expr(
                     let mut any_true = false;
                     for item in &items {
                         let mut inner_path = path.clone();
-                        inner_path.insert(variable.clone(), GraphBinding::Scalar(item.clone()));
+                        inner_path.bind_local(variable, GraphBinding::Scalar(item.clone()));
                         let pred_val = evaluate_expr(graph, &inner_path, predicate, params)?;
                         match pred_val {
                             serde_json::Value::Bool(true) => {
@@ -262,7 +263,7 @@ pub(super) fn evaluate_expr(
                     let mut any_true = false;
                     for item in &items {
                         let mut inner_path = path.clone();
-                        inner_path.insert(variable.clone(), GraphBinding::Scalar(item.clone()));
+                        inner_path.bind_local(variable, GraphBinding::Scalar(item.clone()));
                         let pred_val = evaluate_expr(graph, &inner_path, predicate, params)?;
                         match pred_val {
                             serde_json::Value::Bool(true) => {
@@ -290,7 +291,7 @@ pub(super) fn evaluate_expr(
                     let mut has_null = false;
                     for item in &items {
                         let mut inner_path = path.clone();
-                        inner_path.insert(variable.clone(), GraphBinding::Scalar(item.clone()));
+                        inner_path.bind_local(variable, GraphBinding::Scalar(item.clone()));
                         let pred_val = evaluate_expr(graph, &inner_path, predicate, params)?;
                         match pred_val {
                             serde_json::Value::Bool(true) => {
@@ -489,7 +490,7 @@ pub(super) fn evaluate_expr(
             let mut result = Vec::new();
             for item in items {
                 let mut inner_path = path.clone();
-                inner_path.insert(variable.clone(), GraphBinding::Scalar(item.clone()));
+                inner_path.bind_local(variable, GraphBinding::Scalar(item.clone()));
                 let keep = match predicate {
                     Some(pred) => {
                         evaluate_expr(graph, &inner_path, pred, params)?
@@ -513,7 +514,9 @@ pub(super) fn evaluate_expr(
             transform,
         } => super::read::eval_pattern_comprehension(
             graph,
-            path,
+            // Pattern comprehension runs its own pattern expansion, which is
+            // still keyed by name; bridge through a materialized PathMap.
+            &path.to_path_map(),
             pattern,
             predicate.as_deref(),
             transform,
@@ -535,13 +538,13 @@ pub(super) fn evaluate_expr(
             let mut acc_val = evaluate_expr(graph, path, initial, params)?;
             for item in items {
                 let mut inner_path = path.clone();
-                inner_path.insert(accumulator.clone(), GraphBinding::Scalar(acc_val.clone()));
-                inner_path.insert(variable.clone(), GraphBinding::Scalar(item.clone()));
+                inner_path.bind_local(accumulator, GraphBinding::Scalar(acc_val.clone()));
+                inner_path.bind_local(variable, GraphBinding::Scalar(item.clone()));
                 acc_val = evaluate_expr(graph, &inner_path, expression, params)?;
             }
             Ok(acc_val)
         }
-        Expr::HasLabel { variable, label } => match path.get(variable.as_str()) {
+        Expr::HasLabel { variable, label } => match path.get_binding(variable.as_str()) {
             Some(GraphBinding::Node(id)) => {
                 if let Ok(node_labels) = graph.node_labels(*id) {
                     return Ok(serde_json::Value::Bool(
@@ -556,7 +559,7 @@ pub(super) fn evaluate_expr(
             _ => Ok(serde_json::Value::Bool(false)),
         },
         Expr::Prop(var, prop) => {
-            let binding = match path.get(var) {
+            let binding = match path.get_binding(var) {
                 Some(b) => b,
                 None => {
                     if var.starts_with("_path_") {
@@ -709,9 +712,9 @@ fn eval_and(lv: &serde_json::Value, rv: &serde_json::Value) -> Result<serde_json
 }
 
 /// Evaluate a binary operation with three-valued null propagation.
-pub(super) fn eval_binary_op(
+pub(super) fn eval_binary_op<B: Bindings>(
     graph: &Graph,
-    path: &PathMap,
+    path: &B,
     op: &BinaryOperator,
     left: &Expr,
     right: &Expr,
@@ -963,9 +966,9 @@ pub(super) fn eval_arithmetic(
 }
 
 /// Evaluate a built-in function call.
-pub(super) fn eval_function_call(
+pub(super) fn eval_function_call<B: Bindings>(
     graph: &Graph,
-    path: &PathMap,
+    path: &B,
     name: &str,
     args: &[Expr],
     params: &HashMap<String, serde_json::Value>,
@@ -1135,7 +1138,7 @@ pub(super) fn eval_function_call(
             }
             if let Expr::Prop(var, prop) = &args[0] {
                 if prop.is_empty() {
-                    match path.get(var.as_str()) {
+                    match path.get_binding(var.as_str()) {
                         Some(GraphBinding::Node(nid)) => {
                             return Ok(serde_json::Value::Number((*nid).into()));
                         }
@@ -1383,7 +1386,7 @@ pub(super) fn eval_function_call(
             // Check if the arg is a node/edge binding directly.
             let node_props = if let Expr::Prop(var, prop) = &args[0] {
                 if prop.is_empty() {
-                    match path.get(var.as_str()) {
+                    match path.get_binding(var.as_str()) {
                         Some(GraphBinding::Node(nid)) => {
                             if let Ok(Some(record)) = graph.get_node(*nid) {
                                 rmp_serde::from_slice::<serde_json::Value>(&record.props).ok()
@@ -2034,7 +2037,7 @@ pub(super) fn eval_function_call(
             // Handle node/edge bindings directly.
             if let Expr::Prop(var, prop) = &args[0] {
                 if prop.is_empty() {
-                    match path.get(var.as_str()) {
+                    match path.get_binding(var.as_str()) {
                         Some(GraphBinding::Node(nid)) => {
                             if let Ok(Some(record)) = graph.get_node(*nid) {
                                 return rmp_serde::from_slice::<serde_json::Value>(&record.props)
