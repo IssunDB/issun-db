@@ -306,7 +306,7 @@ impl Graph {
     ) -> Result<Vec<(PropKeyId, u8)>, Error> {
         let prefix = format!("idx_meta:node:l:{label_id}:p:");
         let mut active = Vec::new();
-        for entry in self.storage.meta.iter(rtxn)? {
+        for entry in self.storage.meta.prefix_iter(rtxn, &prefix)? {
             let (key, val) = entry?;
             if let Some(prop_str) = key.strip_prefix(&prefix) {
                 let prop_key_id: PropKeyId = prop_str
@@ -326,7 +326,7 @@ impl Graph {
     ) -> Result<Vec<(PropKeyId, u8)>, Error> {
         let prefix = format!("idx_meta:edge:t:{type_id}:p:");
         let mut active = Vec::new();
-        for entry in self.storage.meta.iter(rtxn)? {
+        for entry in self.storage.meta.prefix_iter(rtxn, &prefix)? {
             let (key, val) = entry?;
             if let Some(prop_str) = key.strip_prefix(&prefix) {
                 let prop_key_id: PropKeyId = prop_str

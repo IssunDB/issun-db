@@ -228,23 +228,28 @@ fn load_ladybug(conn: &Connection, csv_dir: &std::path::Path) -> anyhow::Result<
 }
 
 fn load_issundb(graph: &Graph, data: &Dataset) -> anyhow::Result<()> {
-    // Node ids are dense (0..n), so insertion order doubles as the id map.
-    let mut node_ids = Vec::with_capacity(data.persons.len());
-    for (id, name, age, city) in &data.persons {
-        let nid = graph.add_node(
-            "Person",
-            &serde_json::json!({ "id": id, "name": name, "age": age, "city": city }),
-        )?;
-        node_ids.push(nid);
-    }
-    for (src, dst, weight) in &data.knows {
-        graph.add_edge(
-            node_ids[*src as usize],
-            node_ids[*dst as usize],
-            "KNOWS",
-            &serde_json::json!({ "weight": weight }),
-        )?;
-    }
+    // Single write transaction: one commit for the whole dataset, matching
+    // LadybugDB's COPY FROM ingestion model instead of per-record commits.
+    graph.update(|txn| {
+        // Node ids are dense (0..n), so insertion order doubles as the id map.
+        let mut node_ids = Vec::with_capacity(data.persons.len());
+        for (id, name, age, city) in &data.persons {
+            let nid = txn.add_node(
+                "Person",
+                &serde_json::json!({ "id": id, "name": name, "age": age, "city": city }),
+            )?;
+            node_ids.push(nid);
+        }
+        for (src, dst, weight) in &data.knows {
+            txn.add_edge(
+                node_ids[*src as usize],
+                node_ids[*dst as usize],
+                "KNOWS",
+                &serde_json::json!({ "weight": weight }),
+            )?;
+        }
+        Ok(())
+    })?;
     // Index-backed point lookups, matching LadybugDB's PRIMARY KEY hash index.
     graph.query("CREATE INDEX FOR (p:Person) ON (p.id)")?;
     graph.rebuild_csr()?;
@@ -402,7 +407,7 @@ fn run_at(cfg: &Config, nodes: u64, edges: u64) -> anyhow::Result<Vec<QueryTimin
     load_issundb(&graph, &data)?;
     let is_load = start.elapsed();
 
-    println!("load: issundb {is_load:?} (per-record inserts), ladybug {lb_load:?} (COPY FROM)\n");
+    println!("load: issundb {is_load:?} (single write txn), ladybug {lb_load:?} (COPY FROM)\n");
 
     println!(
         "{:<20} {:>12} {:>12} {:>14} {:>7}  {}",

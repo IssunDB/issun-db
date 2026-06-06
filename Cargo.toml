@@ -48,7 +48,6 @@ walkdir = "2"
 gherkin = "0.14"
 roaring = "0.10"
 deepsize = { version = "0.2", features = ["derive"] }
-memmap2 = "0.9"
 
 [profile.release]
 strip = "debuginfo"

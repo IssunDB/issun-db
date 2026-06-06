@@ -42,16 +42,7 @@ pub struct CsrSnapshot {
     pub edge_weight: Vec<f64>,
     pub dense_to_id: Vec<NodeId>,
     pub id_to_dense: AHashMap<NodeId, u32>,
-    /// When `Some`, this mmap keeps the backing file alive and the raw slices
-    /// above refer into it.  The Vec fields are then zero-capacity placeholders.
-    _mmap: Option<memmap2::Mmap>,
 }
-
-// SAFETY: raw pointer slices from an mmap are valid as long as the Mmap object
-// is alive (held by `_mmap`).  CsrSnapshot owns the Mmap, so the lifetime is
-// guaranteed.  No mutable access to the mmap data ever occurs.
-unsafe impl Send for CsrSnapshot {}
-unsafe impl Sync for CsrSnapshot {}
 
 impl CsrSnapshot {
     #[cfg(test)]
@@ -64,7 +55,6 @@ impl CsrSnapshot {
             edge_weight: vec![],
             dense_to_id: vec![],
             id_to_dense: AHashMap::new(),
-            _mmap: None,
         }
     }
 
@@ -134,185 +124,63 @@ impl CsrSnapshot {
             edge_weight: edge_weight_arr,
             dense_to_id,
             id_to_dense,
-            _mmap: None,
         })
     }
 
-    /// Build a snapshot and persist it to `path`, then memory-map the file for
-    /// reads.  When the graph exceeds available RAM the OS will page arrays in
-    /// and out on demand, enabling out-of-core traversal.
-    ///
-    /// Falls back to `Self::build` (in-RAM) if the file cannot be created.
-    pub fn build_mapped(storage: &Storage, path: &Path) -> Result<Self, Error> {
-        // Always build the in-RAM snapshot first; we need it to serialize.
+    /// Build a snapshot and serialize it to `path` in the binary layout
+    /// documented above, so external tooling can inspect a snapshot without
+    /// opening LMDB. The returned snapshot always owns its arrays in RAM; a
+    /// failed write is ignored and the snapshot is returned unchanged.
+    pub fn build_persisted(storage: &Storage, path: &Path) -> Result<Self, Error> {
         let snap = Self::build(storage)?;
-
-        // Try to serialize and mmap.  If anything fails, return the in-RAM version.
-        match Self::try_persist_and_map(&snap, path) {
-            Ok(mapped) => Ok(mapped),
-            Err(_) => Ok(snap),
-        }
+        let _ = snap.persist(path);
+        Ok(snap)
     }
 
-    fn try_persist_and_map(snap: &Self, path: &Path) -> Result<Self, Error> {
+    /// Serialize the snapshot arrays to `path` through a buffered writer.
+    fn persist(&self, path: &Path) -> Result<(), Error> {
         use std::io::Write;
 
-        let n = snap.dense_to_id.len();
-        let n_edges = snap.col_idx.len();
+        let n = self.dense_to_id.len();
+        let n_edges = self.col_idx.len();
 
-        // Write binary file.
-        let mut file = std::fs::File::create(path).map_err(Error::from)?;
+        let file = std::fs::File::create(path).map_err(Error::from)?;
+        let mut out = std::io::BufWriter::new(file);
 
         // Header.
-        file.write_all(&MAGIC.to_le_bytes()).map_err(Error::from)?;
-        file.write_all(&(n as u64).to_le_bytes())
+        out.write_all(&MAGIC.to_le_bytes()).map_err(Error::from)?;
+        out.write_all(&(n as u64).to_le_bytes())
             .map_err(Error::from)?;
-        file.write_all(&(n_edges as u64).to_le_bytes())
+        out.write_all(&(n_edges as u64).to_le_bytes())
             .map_err(Error::from)?;
 
         // row_ptr: (n+1) u64 values.
-        for &v in &snap.row_ptr {
-            file.write_all(&(v as u64).to_le_bytes())
+        for &v in &self.row_ptr {
+            out.write_all(&(v as u64).to_le_bytes())
                 .map_err(Error::from)?;
         }
         // col_idx: n_edges u32.
-        for &v in &snap.col_idx {
-            file.write_all(&v.to_le_bytes()).map_err(Error::from)?;
+        for &v in &self.col_idx {
+            out.write_all(&v.to_le_bytes()).map_err(Error::from)?;
         }
         // edge_type: n_edges u32.
-        for &v in &snap.edge_type {
-            file.write_all(&v.to_le_bytes()).map_err(Error::from)?;
+        for &v in &self.edge_type {
+            out.write_all(&v.to_le_bytes()).map_err(Error::from)?;
         }
         // edge_id: n_edges u64.
-        for &v in &snap.edge_id {
-            file.write_all(&v.to_le_bytes()).map_err(Error::from)?;
+        for &v in &self.edge_id {
+            out.write_all(&v.to_le_bytes()).map_err(Error::from)?;
         }
         // edge_weight: n_edges f64.
-        for &v in &snap.edge_weight {
-            file.write_all(&v.to_le_bytes()).map_err(Error::from)?;
+        for &v in &self.edge_weight {
+            out.write_all(&v.to_le_bytes()).map_err(Error::from)?;
         }
         // dense_to_id: n u64.
-        for &v in &snap.dense_to_id {
-            file.write_all(&v.to_le_bytes()).map_err(Error::from)?;
+        for &v in &self.dense_to_id {
+            out.write_all(&v.to_le_bytes()).map_err(Error::from)?;
         }
-        file.flush().map_err(Error::from)?;
-        drop(file);
-
-        // Mmap the written file.
-        let file = std::fs::File::open(path).map_err(Error::from)?;
-        // SAFETY: we just wrote this file and no other process is modifying it.
-        let mmap = unsafe { memmap2::Mmap::map(&file) }.map_err(Error::from)?;
-
-        // Validate magic.
-        if mmap.len() < 24 {
-            return Err(Error::Corrupt("CSR mmap file too small"));
-        }
-        let magic = u64::from_le_bytes(
-            mmap[0..8]
-                .try_into()
-                .map_err(|_| Error::Corrupt("Failed to parse magic number"))?,
-        );
-        if magic != MAGIC {
-            return Err(Error::Corrupt("CSR mmap file has wrong magic"));
-        }
-
-        // Parse the typed slices from the mmap bytes.
-        let mut off = 24usize; // skip header (magic + n + n_edges)
-
-        // row_ptr: (n+1) u64 → usize.
-        let mut row_ptr = Vec::with_capacity(n + 1);
-        for i in 0..=n {
-            let start = off + i * 8;
-            let val = u64::from_le_bytes(
-                mmap[start..start + 8]
-                    .try_into()
-                    .map_err(|_| Error::Corrupt("Failed to parse row_ptr slice"))?,
-            ) as usize;
-            row_ptr.push(val);
-        }
-        off += (n + 1) * 8;
-
-        // col_idx: n_edges u32.
-        let mut col_idx = Vec::with_capacity(n_edges);
-        for i in 0..n_edges {
-            let start = off + i * 4;
-            let val = u32::from_le_bytes(
-                mmap[start..start + 4]
-                    .try_into()
-                    .map_err(|_| Error::Corrupt("Failed to parse col_idx slice"))?,
-            );
-            col_idx.push(val);
-        }
-        off += n_edges * 4;
-
-        // edge_type: n_edges u32.
-        let mut edge_type = Vec::with_capacity(n_edges);
-        for i in 0..n_edges {
-            let start = off + i * 4;
-            let val = u32::from_le_bytes(
-                mmap[start..start + 4]
-                    .try_into()
-                    .map_err(|_| Error::Corrupt("Failed to parse edge_type slice"))?,
-            );
-            edge_type.push(val);
-        }
-        off += n_edges * 4;
-
-        // edge_id: n_edges u64.
-        let mut edge_id = Vec::with_capacity(n_edges);
-        for i in 0..n_edges {
-            let start = off + i * 8;
-            let val = u64::from_le_bytes(
-                mmap[start..start + 8]
-                    .try_into()
-                    .map_err(|_| Error::Corrupt("Failed to parse edge_id slice"))?,
-            );
-            edge_id.push(val);
-        }
-        off += n_edges * 8;
-
-        // edge_weight: n_edges f64.
-        let mut edge_weight = Vec::with_capacity(n_edges);
-        for i in 0..n_edges {
-            let start = off + i * 8;
-            let val = f64::from_le_bytes(
-                mmap[start..start + 8]
-                    .try_into()
-                    .map_err(|_| Error::Corrupt("Failed to parse edge_weight slice"))?,
-            );
-            edge_weight.push(val);
-        }
-        off += n_edges * 8;
-
-        // dense_to_id: n u64.
-        let mut dense_to_id = Vec::with_capacity(n);
-        for i in 0..n {
-            let start = off + i * 8;
-            let val = u64::from_le_bytes(
-                mmap[start..start + 8]
-                    .try_into()
-                    .map_err(|_| Error::Corrupt("Failed to parse dense_to_id slice"))?,
-            );
-            dense_to_id.push(val);
-        }
-
-        // Rebuild id_to_dense from dense_to_id (kept in RAM; it is a HashMap).
-        let id_to_dense: AHashMap<NodeId, u32> = dense_to_id
-            .iter()
-            .enumerate()
-            .map(|(i, &id)| (id, i as u32))
-            .collect();
-
-        Ok(Self {
-            row_ptr,
-            col_idx,
-            edge_type,
-            edge_id,
-            edge_weight,
-            dense_to_id,
-            id_to_dense,
-            _mmap: Some(mmap),
-        })
+        out.flush().map_err(Error::from)?;
+        Ok(())
     }
 }
 
