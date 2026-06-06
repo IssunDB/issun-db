@@ -323,16 +323,47 @@ struct QueryTiming {
 /// The benchmark queries; each string is sent verbatim to both engines.
 fn workload(nodes: u64) -> Vec<(&'static str, String)> {
     let probe = nodes / 2;
+    let target = if nodes > 1 {
+        (probe + 1) % nodes
+    } else {
+        probe
+    };
     vec![
+        (
+            "node_count",
+            "MATCH (p:Person) RETURN count(p) AS n".to_string(),
+        ),
+        (
+            "edge_count",
+            "MATCH ()-[r:KNOWS]->() RETURN count(r) AS n".to_string(),
+        ),
         (
             "point_lookup",
             format!("MATCH (p:Person) WHERE p.id = {probe} RETURN p.name AS name"),
+        ),
+        (
+            "range_filter",
+            "MATCH (p:Person) WHERE p.age >= 30 AND p.age < 40 RETURN count(p) AS n".to_string(),
+        ),
+        (
+            "one_hop_count",
+            format!(
+                "MATCH (a:Person)-[:KNOWS]->(b:Person) \
+                 WHERE a.id = {probe} RETURN count(b) AS n"
+            ),
         ),
         (
             "two_hop_count",
             format!(
                 "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person) \
                  WHERE a.id = {probe} RETURN count(c) AS n"
+            ),
+        ),
+        (
+            "three_hop_count",
+            format!(
+                "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person) \
+                 -[:KNOWS]->(d:Person) WHERE a.id = {probe} RETURN count(d) AS n"
             ),
         ),
         // Node 0 is the hottest node under Zipf skew, so this measures two-hop
@@ -344,10 +375,39 @@ fn workload(nodes: u64) -> Vec<(&'static str, String)> {
                 .to_string(),
         ),
         (
+            "filter_after_expand",
+            format!(
+                "MATCH (a:Person)-[:KNOWS]->(b:Person) \
+                 WHERE a.id = {probe} AND b.age >= 30 AND b.age < 40 RETURN count(b) AS n"
+            ),
+        ),
+        // Both endpoints are fixed, so this exercises an expand-into-shaped
+        // two-hop join rather than fan-out from only the source.
+        (
+            "expand_into",
+            format!(
+                "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person) \
+                 WHERE a.id = {probe} AND c.id = {target} RETURN count(b) AS n"
+            ),
+        ),
+        (
             "var_length_count",
             format!(
                 "MATCH (a:Person)-[:KNOWS*2..3]->(c:Person) \
                  WHERE a.id = {probe} RETURN count(c) AS n"
+            ),
+        ),
+        (
+            "order_limit",
+            "MATCH (p:Person) RETURN p.name AS name, p.age AS age \
+             ORDER BY age DESC, name ASC LIMIT 10"
+                .to_string(),
+        ),
+        (
+            "distinct_limit",
+            format!(
+                "MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE a.id = {probe} \
+                 RETURN DISTINCT b.city AS city ORDER BY city LIMIT 5"
             ),
         ),
         // Full-scan projection of three properties per row, so per-row property
@@ -410,8 +470,8 @@ fn run_at(cfg: &Config, nodes: u64, edges: u64) -> anyhow::Result<Vec<QueryTimin
     println!("load: issundb {is_load:?} (single write txn), ladybug {lb_load:?} (COPY FROM)\n");
 
     println!(
-        "{:<20} {:>12} {:>12} {:>14} {:>7}  {}",
-        "query", "issundb", "ladybug", "ladybug(1t)", "rows", "diff"
+        "{:<20} {:>12} {:>12} {:>14} {:>7}  diff",
+        "query", "issundb", "ladybug", "ladybug(1t)", "rows"
     );
     // A trailing `*` marks a median taken from fewer than the requested reps
     // because the per-query budget ran out.
@@ -586,5 +646,32 @@ mod tests {
             max >= 50,
             "max in-degree {max} is too small for a skewed graph"
         );
+    }
+
+    #[test]
+    fn workload_covers_core_read_scenarios() {
+        let names: HashSet<_> = workload(1_000).into_iter().map(|(name, _)| name).collect();
+        for expected in [
+            "node_count",
+            "edge_count",
+            "point_lookup",
+            "range_filter",
+            "one_hop_count",
+            "two_hop_count",
+            "three_hop_count",
+            "filter_after_expand",
+            "expand_into",
+            "var_length_count",
+            "order_limit",
+            "distinct_limit",
+            "prop_projection",
+            "triangle_count",
+            "agg_over_traversal",
+        ] {
+            assert!(
+                names.contains(expected),
+                "missing workload scenario {expected}"
+            );
+        }
     }
 }

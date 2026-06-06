@@ -38,13 +38,23 @@ so runs are reproducible and both engines always see the same data. Edge endpoin
 
 Current queries, each sent verbatim to both engines:
 
+- Node and relationship counts
 - Point lookup by indexed property (IssunDB property index versus LadybugDB primary key)
-- Two-hop typed expansion from a fixed seed with an aggregate
-- Two-hop typed expansion from node 0, the hottest node under Zipf skew, so hub fan-out is measured rather than only a cold probe
-- Variable-length expansion (`*2..3`) from the fixed seed with an aggregate
-- Full-scan projection of three node properties per row, so per-row property decode cost is visible instead of hidden behind `count(...)`
+- Property range filtering
+- One-, two-, and three-hop typed expansion from a fixed seed
+- Two-hop typed expansion from node 0, the hottest node under Zipf skew
+- Selective property filtering after a one-hop expansion
+- Two-hop expansion with both source and destination fixed
+- Variable-length expansion (`*2..3`) from a fixed seed
+- `ORDER BY ... LIMIT` over node properties
+- `DISTINCT ... LIMIT` over duplicate-heavy traversal results
+- Full-scan projection of three node properties per row
 - Cyclic triangle count (exercises the IssunDB MultiwayJoin closing hop)
 - Aggregation over a one-hop traversal grouped by city
+
+Mutation throughput, concurrent clients, and direct graph-algorithm APIs are deliberately excluded.
+They need separate setup and transaction semantics, and IssunDB does not expose shortest-path operators through the shared Cypher surface used by
+this harness.
 
 LadybugDB is measured twice per query: at its default thread count and pinned to one thread, since IssunDB executes a query single-threaded.
 
