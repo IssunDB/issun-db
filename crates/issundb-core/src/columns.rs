@@ -258,6 +258,174 @@ impl PropColumns {
         })
     }
 
+    /// Gather `props` for each id in `ids`, row-major: `out[i][j]` is the
+    /// value of `props[j]` on `ids[i]`. Each id resolves to its dense index
+    /// once, so the per-cell cost is one typed column read. A missing property
+    /// (or a property name with no column) reads as `Value::Null`; a missing
+    /// node is an error, matching the per-row executor path.
+    pub(crate) fn props_table(
+        &self,
+        ids: &[NodeId],
+        props: &[&str],
+    ) -> Result<Vec<Vec<Value>>, Error> {
+        let cols: Vec<Option<&PropColumn>> = props.iter().map(|p| self.cols.get(*p)).collect();
+        let mut out = Vec::with_capacity(ids.len());
+        for &id in ids {
+            let dense = *self
+                .id_to_dense
+                .get(&id)
+                .ok_or_else(|| Error::NodeNotFound(id))? as usize;
+            out.push(
+                cols.iter()
+                    .map(|c| c.and_then(|c| c.get_json_opt(dense)).unwrap_or(Value::Null))
+                    .collect(),
+            );
+        }
+        Ok(out)
+    }
+
+    /// Assign one dense group code per id under exact value identity of
+    /// `prop`, plus one representative value per code (the first occurrence).
+    /// Null and missing values share one code whose representative is
+    /// `Value::Null`. Two ids get the same code exactly when decoding their
+    /// records yields equal property values, which for scalar JSON values is
+    /// also serialization equality, so grouping by code matches grouping by
+    /// the serialized value. A missing node is an error.
+    ///
+    /// On a typed column the per-row cost is one dense-index read plus one
+    /// native-keyed intern (for the dictionary-encoded string column, a plain
+    /// array index); no `Value` is built per row.
+    pub(crate) fn group_codes(
+        &self,
+        ids: &[NodeId],
+        prop: &str,
+    ) -> Result<(Vec<u32>, Vec<Value>), Error> {
+        let mut codes = Vec::with_capacity(ids.len());
+        let mut reps: Vec<Value> = Vec::new();
+
+        let Some(col) = self.cols.get(prop) else {
+            // No such column: every (existing) id is one null group.
+            for &id in ids {
+                if !self.id_to_dense.contains_key(&id) {
+                    return Err(Error::NodeNotFound(id));
+                }
+            }
+            if !ids.is_empty() {
+                reps.push(Value::Null);
+                codes.resize(ids.len(), 0);
+            }
+            return Ok((codes, reps));
+        };
+
+        // Null gets its code lazily so an all-present column never spends one.
+        let mut null_code: Option<u32> = None;
+        let mut intern_null = |reps: &mut Vec<Value>| -> u32 {
+            *null_code.get_or_insert_with(|| {
+                reps.push(Value::Null);
+                (reps.len() - 1) as u32
+            })
+        };
+
+        match col {
+            PropColumn::Int(v) => {
+                let mut seen: AHashMap<i64, u32> = AHashMap::new();
+                for &id in ids {
+                    let dense = *self
+                        .id_to_dense
+                        .get(&id)
+                        .ok_or_else(|| Error::NodeNotFound(id))?
+                        as usize;
+                    codes.push(match v[dense] {
+                        None => intern_null(&mut reps),
+                        Some(n) => *seen.entry(n).or_insert_with(|| {
+                            reps.push(Value::from(n));
+                            (reps.len() - 1) as u32
+                        }),
+                    });
+                }
+            }
+            PropColumn::Float(v) => {
+                // Keyed by bit pattern: JSON numbers cannot be NaN, and the
+                // shortest-roundtrip formatting is injective on f64, so bit
+                // identity is serialization identity.
+                let mut seen: AHashMap<u64, u32> = AHashMap::new();
+                for &id in ids {
+                    let dense = *self
+                        .id_to_dense
+                        .get(&id)
+                        .ok_or_else(|| Error::NodeNotFound(id))?
+                        as usize;
+                    codes.push(match v[dense] {
+                        None => intern_null(&mut reps),
+                        Some(f) => *seen.entry(f.to_bits()).or_insert_with(|| {
+                            reps.push(Value::from(f));
+                            (reps.len() - 1) as u32
+                        }),
+                    });
+                }
+            }
+            PropColumn::Bool(v) => {
+                let mut seen: [Option<u32>; 2] = [None, None];
+                for &id in ids {
+                    let dense = *self
+                        .id_to_dense
+                        .get(&id)
+                        .ok_or_else(|| Error::NodeNotFound(id))?
+                        as usize;
+                    codes.push(match v[dense] {
+                        None => intern_null(&mut reps),
+                        Some(b) => *seen[b as usize].get_or_insert_with(|| {
+                            reps.push(Value::from(b));
+                            (reps.len() - 1) as u32
+                        }),
+                    });
+                }
+            }
+            PropColumn::Str { dict, idx, .. } => {
+                // The dictionary index is already a dense value identity; the
+                // per-row work is two array reads.
+                let mut dict_code: Vec<u32> = vec![u32::MAX; dict.len()];
+                for &id in ids {
+                    let dense = *self
+                        .id_to_dense
+                        .get(&id)
+                        .ok_or_else(|| Error::NodeNotFound(id))?
+                        as usize;
+                    codes.push(match idx[dense] {
+                        STR_NULL => intern_null(&mut reps),
+                        i => {
+                            if dict_code[i as usize] == u32::MAX {
+                                reps.push(Value::String(dict[i as usize].clone()));
+                                dict_code[i as usize] = (reps.len() - 1) as u32;
+                            }
+                            dict_code[i as usize]
+                        }
+                    });
+                }
+            }
+            PropColumn::Json(v) => {
+                // Mixed kinds: key by the serialized value, the exact group
+                // identity the executor's string-keyed fold uses.
+                let mut seen: AHashMap<String, u32> = AHashMap::new();
+                for &id in ids {
+                    let dense = *self
+                        .id_to_dense
+                        .get(&id)
+                        .ok_or_else(|| Error::NodeNotFound(id))?
+                        as usize;
+                    codes.push(match &v[dense] {
+                        None => intern_null(&mut reps),
+                        Some(val) => *seen.entry(val.to_string()).or_insert_with(|| {
+                            reps.push(val.clone());
+                            (reps.len() - 1) as u32
+                        }),
+                    });
+                }
+            }
+        }
+        Ok((codes, reps))
+    }
+
     /// Re-read `touched` node records and patch their slots in place. New
     /// nodes extend the dense mapping; new property names start a new column.
     fn patch(&mut self, storage: &Storage, touched: &[NodeId]) -> Result<(), Error> {
@@ -463,6 +631,119 @@ mod tests {
         g.delete_node(a).unwrap();
         assert_eq!(g.node_prop_json(a, "x").unwrap(), None);
         assert_eq!(g.node_prop_json(b, "x").unwrap(), Some(json!(2)));
+    }
+
+    #[test]
+    fn props_table_gathers_rows_in_input_order() {
+        let (_dir, g) = open_tmp();
+        let a = g
+            .add_node("N", &json!({ "name": "ada", "age": 36, "city": "london" }))
+            .unwrap();
+        let b = g
+            .add_node("N", &json!({ "name": "bob", "age": 4 }))
+            .unwrap();
+
+        // Duplicate ids are allowed and each occurrence gets its own row.
+        let table = g
+            .node_props_json_table(&[b, a, b], &["name", "age", "city"])
+            .unwrap();
+        assert_eq!(
+            table,
+            vec![
+                vec![json!("bob"), json!(4), serde_json::Value::Null],
+                vec![json!("ada"), json!(36), json!("london")],
+                vec![json!("bob"), json!(4), serde_json::Value::Null],
+            ]
+        );
+
+        // An unknown property name yields a null column, not an error.
+        let table = g.node_props_json_table(&[a], &["nope"]).unwrap();
+        assert_eq!(table, vec![vec![serde_json::Value::Null]]);
+
+        // Empty inputs are fine.
+        assert!(g.node_props_json_table(&[], &["name"]).unwrap().is_empty());
+        assert_eq!(
+            g.node_props_json_table(&[a], &[]).unwrap(),
+            vec![Vec::<serde_json::Value>::new()]
+        );
+    }
+
+    #[test]
+    fn group_codes_match_value_identity() {
+        let (_dir, g) = open_tmp();
+        // One mixed-kind property (a Json column): 1, "1", 1.0, true, and a
+        // missing value must each get their own group; equal values share.
+        let vals = [
+            json!({ "v": 1 }),
+            json!({ "v": "1" }),
+            json!({ "v": 1.0 }),
+            json!({ "v": true }),
+            json!({}),
+            json!({ "v": 1 }),
+            json!({ "v": "1" }),
+        ];
+        let ids: Vec<_> = vals.iter().map(|p| g.add_node("N", p).unwrap()).collect();
+
+        let (codes, reps) = g.node_prop_group_codes(&ids, "v").unwrap();
+        assert_eq!(codes.len(), ids.len());
+        // Equal values share a code; the representative is the value itself.
+        assert_eq!(codes[0], codes[5]);
+        assert_eq!(codes[1], codes[6]);
+        let distinct: std::collections::HashSet<u32> = codes.iter().copied().collect();
+        assert_eq!(distinct.len(), 5);
+        for (i, &c) in codes.iter().enumerate() {
+            let expected = vals[i].get("v").cloned().unwrap_or(serde_json::Value::Null);
+            assert_eq!(reps[c as usize], expected, "representative for row {i}");
+        }
+    }
+
+    #[test]
+    fn group_codes_cover_typed_columns_and_unknown_props() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("N", &json!({ "s": "x", "i": 7 })).unwrap();
+        let b = g.add_node("N", &json!({ "s": "y", "i": 7 })).unwrap();
+        let c = g.add_node("N", &json!({ "s": "x" })).unwrap();
+
+        // Dictionary-encoded string column: same string, same code.
+        let (codes, reps) = g.node_prop_group_codes(&[a, b, c, a], "s").unwrap();
+        assert_eq!(codes[0], codes[2]);
+        assert_eq!(codes[0], codes[3]);
+        assert_ne!(codes[0], codes[1]);
+        assert_eq!(reps[codes[0] as usize], json!("x"));
+
+        // Int column with a null slot.
+        let (codes, reps) = g.node_prop_group_codes(&[a, b, c], "i").unwrap();
+        assert_eq!(codes[0], codes[1]);
+        assert_ne!(codes[0], codes[2]);
+        assert_eq!(reps[codes[2] as usize], serde_json::Value::Null);
+
+        // Unknown property: every row is one null group.
+        let (codes, reps) = g.node_prop_group_codes(&[a, b], "nope").unwrap();
+        assert_eq!(codes, vec![0, 0]);
+        assert_eq!(reps, vec![serde_json::Value::Null]);
+
+        // Missing node is an error, like the table gather.
+        assert!(g.node_prop_group_codes(&[a + 999], "s").is_err());
+    }
+
+    #[test]
+    fn props_table_errors_on_missing_node() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("N", &json!({ "x": 1 })).unwrap();
+        let err = g.node_props_json_table(&[a, a + 999], &["x"]).unwrap_err();
+        assert!(matches!(err, crate::error::Error::NodeNotFound(id) if id == a + 999));
+    }
+
+    #[test]
+    fn props_table_sees_committed_writes_immediately() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("N", &json!({ "x": 1 })).unwrap();
+        let table = g.node_props_json_table(&[a], &["x"]).unwrap();
+        assert_eq!(table, vec![vec![json!(1)]]);
+
+        g.update_node(a, &json!({ "x": 2 })).unwrap();
+        let table = g.node_props_json_table(&[a], &["x"]).unwrap();
+        assert_eq!(table, vec![vec![json!(2)]]);
     }
 
     #[test]

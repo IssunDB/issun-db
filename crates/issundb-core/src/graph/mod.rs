@@ -359,6 +359,35 @@ impl Graph {
         })
     }
 
+    /// Bulk form of [`Graph::node_prop_json`]: gather `props` for each id in
+    /// `ids` through the in-memory property columns, row-major (`out[i][j]` is
+    /// `props[j]` on `ids[i]`). One columns refresh covers the whole gather,
+    /// and each id resolves to its dense index once. A missing property reads
+    /// as `Value::Null`; a nonexistent node is [`Error::NodeNotFound`].
+    pub fn node_props_json_table(
+        &self,
+        ids: &[NodeId],
+        props: &[&str],
+    ) -> Result<Vec<Vec<serde_json::Value>>, Error> {
+        self.prop_columns
+            .with_fresh(&self.storage, |cols| cols.props_table(ids, props))?
+    }
+
+    /// Group `ids` by the exact value of `prop` through the in-memory
+    /// property columns: one dense group code per id, plus one representative
+    /// value per code (the first occurrence). Null and missing property
+    /// values share one code represented by `Value::Null`; a nonexistent node
+    /// is [`Error::NodeNotFound`]. Codes are assigned under value identity,
+    /// which for the typed columns needs no per-row value materialization.
+    pub fn node_prop_group_codes(
+        &self,
+        ids: &[NodeId],
+        prop: &str,
+    ) -> Result<(Vec<u32>, Vec<serde_json::Value>), Error> {
+        self.prop_columns
+            .with_fresh(&self.storage, |cols| cols.group_codes(ids, prop))?
+    }
+
     /// Store an extension value (as `Arc`) keyed by its concrete type.
     /// Replaces any existing value of the same type.
     pub fn set_extension<T: Any + Send + Sync>(&self, val: Arc<T>) {

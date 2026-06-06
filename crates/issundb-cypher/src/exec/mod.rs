@@ -13,6 +13,7 @@ mod expr;
 mod factorize;
 pub(crate) mod read;
 mod row;
+mod vectorized;
 mod write;
 
 use ddl::{

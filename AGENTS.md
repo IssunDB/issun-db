@@ -84,6 +84,11 @@ Do not invent modules that do not yet exist when answering questions, but do pla
     - `src/exec/mod.rs`: public entry points (`execute`, `explain`), shared type definitions, and tests.
     - `src/exec/read.rs`: `execute_physical` and read-path helpers (`evaluate_where`, `evaluate_sort_key`, `json_to_prop_value`,
       `execute_filter_over_expand`).
+    - `src/exec/vectorized.rs`: columnar fast path for the final projection or aggregation over a single-hop expansion. A structural
+      recognizer matches `[Sort]? Project [Aggregate]? Filter(HasLabel)* Expand(one directed hop) LabelScan` with single-property
+      expressions, then executes column-at-a-time (bulk expansion, bulk label membership, bulk property gather via
+      `Graph::node_props_json_table`, and group-by-code aggregation via `Graph::node_prop_group_codes`), building the result records
+      directly. Any unrecognized shape falls back to the row pipeline, so correctness never depends on the recognizer.
     - `src/exec/factorize.rs`: `FactorizedRecordGroup` (shared `Arc<PathMap>` prefix plus per-row extensions) and `filter_refs_in_expr`.
     - `src/exec/expr.rs`: expression evaluation (`evaluate_expr`, `eval_binary_op`, `eval_arithmetic`, `eval_function_call`).
     - `src/exec/write.rs`: mutation execution (`execute_create`, `execute_set`, `execute_delete`, `execute_merge`).
@@ -184,6 +189,12 @@ All graph operations go through `Graph`; do not call `Storage` directly from out
 - `get_node(id: NodeId) -> Result<Option<NodeRecord>, Error>`
 - `node_prop_json(id: NodeId, prop: &str) -> Result<Option<serde_json::Value>, Error>` (single-property read through the in-memory property
   columns; `None` for a nonexistent node, `Some(Value::Null)` for a missing property)
+- `node_props_json_table(ids: &[NodeId], props: &[&str]) -> Result<Vec<Vec<serde_json::Value>>, Error>` (bulk row-major property gather
+  through the property columns; one columns refresh and one dense-index resolution per id, `Value::Null` for a missing property, and
+  `Error::NodeNotFound` for a nonexistent node)
+- `node_prop_group_codes(ids: &[NodeId], prop: &str) -> Result<(Vec<u32>, Vec<serde_json::Value>), Error>` (dense group codes under exact
+  value identity of one property, plus one representative value per code; null and missing values share one `Value::Null` code; on a typed
+  column no per-row value is materialized)
 - `update_node(id: NodeId, props: &impl Serialize) -> Result<(), Error>`
 - `delete_node(id: NodeId) -> Result<(), Error>`
 - `add_label(id: NodeId, label: &str) -> Result<(), Error>`
@@ -281,6 +292,8 @@ outside `issundb`.
 The executor resolves patterns through the physical plan.
 Untyped expansion uses GraphBLAS SpMV; typed expansion reads adjacency through the transaction. Bulk label filtering uses `label_idx` point
 lookups (`Graph::label_filter`), and single-property node reads go through the in-memory property columns (`Graph::node_prop_json`).
+A final projection or aggregation over a single-hop expansion executes column-at-a-time through `exec/vectorized.rs`
+(`Graph::node_props_json_table` and `Graph::node_prop_group_codes`); every other shape runs the row pipeline.
 
 ### `issundb_rest`
 
