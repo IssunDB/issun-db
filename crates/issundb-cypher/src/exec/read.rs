@@ -789,7 +789,7 @@ fn filter_over_expand_batch(
     src_nodes.dedup();
 
     let transitions = expand_multi_type(graph, &src_nodes, rel_type, is_incoming)?;
-    let mut transition_map: HashMap<NodeId, Vec<(EdgeId, NodeId)>> = HashMap::new();
+    let mut transition_map: ahash::AHashMap<NodeId, Vec<(EdgeId, NodeId)>> = ahash::AHashMap::new();
     for (src, eid, dst) in transitions {
         transition_map.entry(src).or_default().push((eid, dst));
     }
@@ -811,7 +811,7 @@ fn filter_over_expand_batch(
             let filtered = graph
                 .label_filter(&active, label)
                 .map_err(|e| e.to_string())?;
-            let pass_set: HashSet<NodeId> = filtered.into_iter().collect();
+            let pass_set: ahash::AHashSet<NodeId> = filtered.into_iter().collect();
 
             for path in &child_paths {
                 if let Some(GraphBinding::Node(n)) = path.get_binding(variable.as_str()) {
@@ -1048,7 +1048,7 @@ fn expand_from_paths(
         std::slice::from_ref(&is_incoming)
     };
 
-    let mut transition_map: HashMap<NodeId, Vec<(EdgeId, NodeId)>> = HashMap::new();
+    let mut transition_map: ahash::AHashMap<NodeId, Vec<(EdgeId, NodeId)>> = ahash::AHashMap::new();
     for &dir in directions {
         let transitions = expand_multi_type(graph, &src_nodes, rel_type, dir)?;
         for (src, eid, dst) in transitions {
@@ -1685,7 +1685,7 @@ fn execute_expand_chain_n(
 
     // Bulk-expand each hop level. The chain is linear, so level i's source set is
     // the set of nodes reached at level i-1; level 0's sources come from the base.
-    let mut level_maps: Vec<HashMap<NodeId, Vec<(EdgeId, NodeId)>>> =
+    let mut level_maps: Vec<ahash::AHashMap<NodeId, Vec<(EdgeId, NodeId)>>> =
         Vec::with_capacity(hops.len());
     let mut frontier: Vec<NodeId> = base_paths
         .iter()
@@ -1699,7 +1699,7 @@ fn execute_expand_chain_n(
 
     for hop in hops {
         let expanded = expand_multi_type(graph, &frontier, hop.rel_type, hop.is_incoming)?;
-        let mut map: HashMap<NodeId, Vec<(EdgeId, NodeId)>> = HashMap::new();
+        let mut map: ahash::AHashMap<NodeId, Vec<(EdgeId, NodeId)>> = ahash::AHashMap::new();
         for (src, eid, dst) in expanded {
             map.entry(src).or_default().push((eid, dst));
         }
@@ -1743,7 +1743,7 @@ fn thread_chain(
     base_path: &SlotRow,
     src: NodeId,
     hops: &[ChainHop<'_>],
-    level_maps: &[HashMap<NodeId, Vec<(EdgeId, NodeId)>>],
+    level_maps: &[ahash::AHashMap<NodeId, Vec<(EdgeId, NodeId)>>],
     hop_idx: usize,
     stack: &mut Vec<(EdgeId, NodeId)>,
     out: &mut Vec<SlotRow>,
@@ -1941,7 +1941,7 @@ pub(super) fn apply_filter(
         let filtered_nodes = graph
             .label_filter(&active_nodes, label)
             .map_err(|e| e.to_string())?;
-        let filtered_set: HashSet<NodeId> = filtered_nodes.into_iter().collect();
+        let filtered_set: ahash::AHashSet<NodeId> = filtered_nodes.into_iter().collect();
 
         for path in child_paths {
             if let Some(GraphBinding::Node(node)) = path.get_binding(variable) {

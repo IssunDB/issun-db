@@ -115,7 +115,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for rep in 0..reps {
         let start = Instant::now();
         let result = graph.query(&query)?;
-        eprintln!("rep {rep}: {:?} ({} rows)", start.elapsed(), result.records.len());
+        eprintln!(
+            "rep {rep}: {:?} ({} rows)",
+            start.elapsed(),
+            result.records.len()
+        );
     }
     Ok(())
 }

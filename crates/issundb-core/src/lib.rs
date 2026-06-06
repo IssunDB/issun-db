@@ -1,3 +1,4 @@
+pub(crate) mod columns;
 pub(crate) mod csr;
 mod error;
 mod graph;

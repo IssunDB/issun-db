@@ -290,6 +290,7 @@ pub struct Graph {
     pub(super) _write_lock: Arc<ReentrantMutex<()>>,
     pub(super) csr_cache: Arc<CsrCache>,
     pub(super) matrices: Arc<parking_lot::RwLock<Option<MatrixSet>>>,
+    pub(super) prop_columns: Arc<crate::columns::ColumnsCache>,
     /// Type-erased extension cache. Higher-level crates attach caches (e.g. the
     /// HNSW vector index) to a Graph without creating a circular dependency,
     /// through the `get_extension`, `set_extension`, and
@@ -333,7 +334,28 @@ impl Graph {
             _write_lock: Arc::new(ReentrantMutex::new(())),
             csr_cache,
             matrices,
+            prop_columns: Arc::new(crate::columns::ColumnsCache::default()),
             extensions: Arc::new(parking_lot::Mutex::new(AHashMap::new())),
+        })
+    }
+
+    /// Read one property of a node through the in-memory property columns,
+    /// as the `serde_json::Value` that decoding the stored record would give.
+    /// Returns `None` for a nonexistent node and `Some(Value::Null)` for a
+    /// missing property. Builds or refreshes the columns on first use after a
+    /// write, so the result always reflects committed state.
+    pub fn node_prop_json(
+        &self,
+        id: NodeId,
+        prop: &str,
+    ) -> Result<Option<serde_json::Value>, Error> {
+        self.prop_columns.with_fresh(&self.storage, |cols| {
+            cols.id_to_dense.get(&id).map(|&d| {
+                cols.cols
+                    .get(prop)
+                    .and_then(|c| c.get_json_opt(d as usize))
+                    .unwrap_or(serde_json::Value::Null)
+            })
         })
     }
 
@@ -412,6 +434,12 @@ impl Graph {
                 let mutations_count = txn.mutations_count;
                 let delta = std::mem::take(&mut txn.delta);
                 txn.wtxn.commit()?;
+                if delta.force_full {
+                    self.prop_columns.record_force_full();
+                } else {
+                    self.prop_columns.record_touched_many(&delta.added_nodes);
+                    self.prop_columns.record_touched_many(&delta.updated_nodes);
+                }
                 self.csr_cache.record_batch(delta);
                 if mutations_count > 0 {
                     self.maybe_spawn_rebuild_n(mutations_count);

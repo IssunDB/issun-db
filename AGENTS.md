@@ -68,6 +68,10 @@ Do not invent modules that do not yet exist when answering questions, but do pla
     - `src/graph/txn.rs`: `ReadTxn` and `WriteTxn` delegation impls and transaction tests.
     - `src/csr.rs`: in-memory CSR snapshot, rebuilt in the background and swapped via `arc-swap`. Also owns the `GraphDelta` buffer captured on the
       write path and the `write_gen`/`snapshot_gen` generation counters that drive incremental matrix maintenance and on-demand CSR refresh.
+    - `src/columns.rs`: in-memory property columns for the read path. One typed column (`Int`, `Float`, `Bool`, dictionary-encoded `Str`, or the
+      exact-semantics `Json` fallback) per node property name over a self-contained dense node mapping, built lazily from one full node scan and
+      kept fresh by a post-commit delta (added and updated nodes are re-read individually; node deletion forces a rebuild). Read through
+      `Graph::node_prop_json`.
     - `src/matrices.rs`: GraphBLAS matrix materialization from the CSR snapshot, plus `MatrixSet::apply_delta` for incremental in-place maintenance
       (resize plus per-element set and drop) and the self-contained `dense_to_id`/`id_to_dense` mapping the matrix-view consumers read.
     - `src/error.rs`: `Error` enum; all storage and serialization errors unify here.
@@ -101,9 +105,10 @@ Do not invent modules that do not yet exist when answering questions, but do pla
 - `crates/issundb-py/`: Python bindings via PyO3. Exposes the `IssunDB` class with the same surface as the Node.js bindings. Depends only on
   `issundb`.
 - `crates/issundb-examples/`: standalone example programs (`quickstart.rs`, `hybrid_retrieval_quickstart.rs`, `neo4j_migration.rs`, and
-  `load_ldbc.rs`), the `gen_testdata` binary that regenerates the versioned LMDB storage-format snapshot (driven by `make testdata`), and the
-  `profile_triangle` binary, a profiling driver that loads a persistent Zipf-skewed graph once and reruns the cyclic triangle-count query so a
-  profiler observes query execution without load noise. Depends only on `issundb`.
+  `load_ldbc.rs`), the `gen_testdata` binary that regenerates the versioned LMDB storage-format snapshot (driven by `make testdata`), and two
+  profiling drivers that load a persistent graph once and rerun a query so a profiler observes query execution without load noise:
+  `profile_triangle` (Zipf-skewed graph, cyclic triangle-count query) and `profile_query` (uniform graph with the comparison harness's
+  Person/KNOWS schema, arbitrary query via `PROFILE_QUERY`). Depends only on `issundb`.
 - `crates/issundb-core/benches/`: Criterion storage benchmarks.
 - `crates/issundb/tests/conformance/`: openCypher TCK subset integration tests.
 - `benchmarks/ladybug-compare/`: differential comparison harness against LadybugDB. Deliberately excluded from the workspace (own `[workspace]`
@@ -177,6 +182,8 @@ All graph operations go through `Graph`; do not call `Storage` directly from out
 - `add_node(label: &str, props: &impl Serialize) -> Result<NodeId, Error>`
 - `add_node_multi(labels: &[&str], props: &impl Serialize) -> Result<NodeId, Error>`
 - `get_node(id: NodeId) -> Result<Option<NodeRecord>, Error>`
+- `node_prop_json(id: NodeId, prop: &str) -> Result<Option<serde_json::Value>, Error>` (single-property read through the in-memory property
+  columns; `None` for a nonexistent node, `Some(Value::Null)` for a missing property)
 - `update_node(id: NodeId, props: &impl Serialize) -> Result<(), Error>`
 - `delete_node(id: NodeId) -> Result<(), Error>`
 - `add_label(id: NodeId, label: &str) -> Result<(), Error>`
@@ -188,6 +195,8 @@ All graph operations go through `Graph`; do not call `Storage` directly from out
 - `in_neighbors(node: NodeId) -> Result<Vec<NeighborEntry>, Error>`
 - `node_has_relationships(node: NodeId) -> Result<bool, Error>`
 - `nodes_by_label(label: &str) -> Result<Vec<NodeId>, Error>`
+- `label_filter(nodes: &[NodeId], label: &str) -> Result<Vec<NodeId>, Error>` (subset of `nodes` carrying `label`, via one `label_idx` point
+  lookup per candidate)
 - `edges_by_type(etype: &str) -> Result<Vec<EdgeId>, Error>`
 - `rebuild_csr() -> Result<(), Error>`
 - `all_nodes() -> Result<Vec<NodeId>, Error>`
@@ -270,7 +279,8 @@ outside `issundb`.
 - `Record`: `values: Vec<serde_json::Value>`
 
 The executor resolves patterns through the physical plan.
-Expansion and label filtering use GraphBLAS SpMV and element-wise matrix operators unconditionally.
+Untyped expansion uses GraphBLAS SpMV; typed expansion reads adjacency through the transaction. Bulk label filtering uses `label_idx` point
+lookups (`Graph::label_filter`), and single-property node reads go through the in-memory property columns (`Graph::node_prop_json`).
 
 ### `issundb_rest`
 

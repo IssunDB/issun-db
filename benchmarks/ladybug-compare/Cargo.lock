@@ -793,6 +793,7 @@ dependencies = [
 name = "issundb-cypher"
 version = "0.1.0-alpha.1"
 dependencies = [
+ "ahash",
  "chrono",
  "chrono-tz",
  "chumsky",

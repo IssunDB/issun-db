@@ -414,7 +414,6 @@ impl Graph {
 
         Ok(results)
     }
-
 }
 
 #[cfg(test)]
