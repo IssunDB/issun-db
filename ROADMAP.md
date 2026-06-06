@@ -135,8 +135,10 @@ This document outlines the features implemented in IssunDB and the future goals 
 - [x] An MCP server over stdio or Streamable HTTP, exposing node and edge CRUD, query, explanation, full-text search, and vector search as tools
 - [x] A benchmarking suite that measures throughput and load scaling
 - [x] A differential comparison harness against LadybugDB (`benchmarks/ladybug-compare`): an identical Cypher workload runs on both engines with
-  median timings and sorted row-set equality checks, with uniform or Zipf-skewed synthetic graphs, a scale-sweep mode reporting per-query scaling
-  ratios, and a per-query time budget
+  median timings and sorted row-set equality checks (run before timing, so a divergent query is reported rather than timed), with uniform or
+  Zipf-skewed synthetic graphs, deterministic degree-percentile traversal probes (cold, median, and hub), an openCypher trail reference that
+  attributes LadybugDB walk-semantics divergences on the trail-sensitive queries, a scale-sweep mode reporting per-query scaling ratios split by
+  query scope, and a per-query time budget
 - [x] Property-based and integration tests
 - [x] Language bindings for Python
 - [x] Language bindings for JavaScript (Node.js)

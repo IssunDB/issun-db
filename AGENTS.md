@@ -86,10 +86,11 @@ Do not invent modules that do not yet exist when answering questions, but do pla
     - `src/exec/read.rs`: `execute_physical` and read-path helpers (`evaluate_where`, `evaluate_sort_key`, `json_to_prop_value`,
       `execute_filter_over_expand`).
     - `src/exec/vectorized.rs`: columnar fast path for the final projection or aggregation over a single-hop expansion. A structural
-      recognizer matches `[Sort]? Project [Aggregate]? Filter(HasLabel)* Expand(one directed hop) LabelScan` with single-property
+      recognizer matches `[Sort]? [Distinct]? Project [Aggregate]? Filter(HasLabel)* Expand(one directed hop) LabelScan` with single-property
       expressions, then executes column-at-a-time (bulk expansion, bulk label membership, bulk property gather via
       `Graph::node_props_json_table`, and group-by-code aggregation via `Graph::node_prop_group_codes`), building the result records
-      directly. Any unrecognized shape falls back to the row pipeline, so correctness never depends on the recognizer.
+      directly. The recognizer sees through a `Distinct` operator because the caller deduplicates the built records. Any unrecognized
+      shape falls back to the row pipeline, so correctness never depends on the recognizer.
     - `src/exec/factorize.rs`: `FactorizedRecordGroup` (shared `Arc<PathMap>` prefix plus per-row extensions) and `filter_refs_in_expr`.
     - `src/exec/expr.rs`: expression evaluation (`evaluate_expr`, `eval_binary_op`, `eval_arithmetic`, `eval_function_call`).
     - `src/exec/write.rs`: mutation execution (`execute_create`, `execute_set`, `execute_delete`, `execute_merge`).
@@ -121,6 +122,11 @@ Do not invent modules that do not yet exist when answering questions, but do pla
   stanza, root `exclude`, and own `rust-toolchain.toml`) because the `lbug` crate links the LadybugDB C++ library and needs a newer Rust than the
   workspace MSRV; it must never become part of `make build` or `make test`. Run via `make bench-ladybug`, which `cd`s into the directory so the
   local toolchain pin applies. Cross-engine harnesses belong here, not in crate-local `benches/`, which is reserved for Criterion targets.
+  The differential row-set check runs before timing, and a divergent query is reported without being timed. Traversal queries anchor at
+  deterministic degree-percentile probes (cold, median, and hub) derived from the generated graph. The trail-sensitive queries carry an
+  openCypher trail reference computed from the dataset, because LadybugDB matches walks (its `recursive_pattern_semantic` setting registers
+  but is inert in the pinned `lbug` build, and fixed-length chains never enforce relationship uniqueness; `tests/lbug_trail_semantics.rs`
+  pins this). A `DIVERGENT` verdict is an attributed LadybugDB walk-semantics overcount and does not fail the run; a `MISMATCH` does.
 - `Cargo.toml`: workspace root with shared `[workspace.dependencies]`. All version pins live here.
 - `Makefile`: developer workflow entry points.
 
@@ -301,6 +307,9 @@ each conjunct pushes down to its own lowest binder. Bulk label filtering uses `l
 lookups (`Graph::label_filter`), and single-property node reads go through the in-memory property columns (`Graph::node_prop_json`).
 A final projection or aggregation over a single-hop expansion executes column-at-a-time through `exec/vectorized.rs`
 (`Graph::node_props_json_table` and `Graph::node_prop_group_codes`); every other shape runs the row pipeline.
+`RETURN DISTINCT` plans a `Distinct` operator between the final `Project` and `Sort`, keyed on the projected columns, so deduplication
+happens before `ORDER BY` and `SKIP`/`LIMIT`; `WITH DISTINCT` keeps full-row deduplication behind its barrier project, and only
+`RETURN DISTINCT *` deduplicates records after projection in the executor.
 
 ### `issundb_rest`
 
