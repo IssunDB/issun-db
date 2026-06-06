@@ -211,6 +211,10 @@ All graph operations go through `Graph`; do not call `Storage` directly from out
 - `connected_components() -> Result<HashMap<NodeId, u64>, Error>`
 - `strongly_connected_components() -> Result<HashMap<NodeId, u64>, Error>`
 - `detect_cycle() -> Result<bool, Error>`
+- `count_triangle_cycles(spec: &TriangleCountSpec) -> Result<u64, Error>` (assignment count of the directed triangle pattern
+  `(a)-[t1]->(b)-[t2]->(c)-[t3]->(a)` with optional per-hop relationship types and per-variable labels, following Cypher MATCH row
+  semantics including relationship uniqueness; the Cypher optimizer lowers grouping-free `count` aggregates over that pattern to this
+  kernel via the `TriangleCount` physical operator)
 - `label_propagation(max_iterations: usize) -> Result<HashMap<NodeId, u64>, Error>`
 - `degree_centrality(direction: DegreeDirection) -> Result<HashMap<NodeId, u64>, Error>`
 - `betweenness_centrality() -> Result<HashMap<NodeId, f64>, Error>`

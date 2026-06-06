@@ -109,44 +109,44 @@ impl Graph {
                 while j < out2_row.len() && k < in3_row.len() {
                     let c2 = out2_row[j].0;
                     let c3 = in3_row[k].0;
-                    if c2 < c3 {
-                        j += 1;
-                    } else if c2 > c3 {
-                        k += 1;
-                    } else {
-                        let c = c2 as usize;
-                        let j0 = j;
-                        while j < out2_row.len() && out2_row[j].0 as usize == c {
-                            j += 1;
-                        }
-                        let k0 = k;
-                        while k < in3_row.len() && in3_row[k].0 as usize == c {
-                            k += 1;
-                        }
-                        if !label_ok(&masks[2], c) {
-                            continue;
-                        }
-                        if a == b && c == a {
-                            // Every hop is a self-loop at `a`, the one shape
-                            // where two hops can bind the same relationship.
-                            // Enumerate ordered triples of pairwise-distinct
-                            // edge IDs explicitly; this term replaces the
-                            // multiplicity product for this cell, so it is
-                            // not scaled by `m1`.
-                            for &(_, e1) in &out1_row[run1_start..run1_start + m1 as usize] {
-                                for &(_, e2) in &out2_row[j0..j] {
-                                    if e2 == e1 {
-                                        continue;
-                                    }
-                                    for &(_, e3) in &in3_row[k0..k] {
-                                        if e3 != e1 && e3 != e2 {
-                                            total += 1;
+                    match c2.cmp(&c3) {
+                        std::cmp::Ordering::Less => j += 1,
+                        std::cmp::Ordering::Greater => k += 1,
+                        std::cmp::Ordering::Equal => {
+                            let c = c2 as usize;
+                            let j0 = j;
+                            while j < out2_row.len() && out2_row[j].0 as usize == c {
+                                j += 1;
+                            }
+                            let k0 = k;
+                            while k < in3_row.len() && in3_row[k].0 as usize == c {
+                                k += 1;
+                            }
+                            if !label_ok(&masks[2], c) {
+                                continue;
+                            }
+                            if a == b && c == a {
+                                // Every hop is a self-loop at `a`, the one shape
+                                // where two hops can bind the same relationship.
+                                // Enumerate ordered triples of pairwise-distinct
+                                // edge IDs explicitly; this term replaces the
+                                // multiplicity product for this cell, so it is
+                                // not scaled by `m1`.
+                                for &(_, e1) in &out1_row[run1_start..run1_start + m1 as usize] {
+                                    for &(_, e2) in &out2_row[j0..j] {
+                                        if e2 == e1 {
+                                            continue;
+                                        }
+                                        for &(_, e3) in &in3_row[k0..k] {
+                                            if e3 != e1 && e3 != e2 {
+                                                total += 1;
+                                            }
                                         }
                                     }
                                 }
+                            } else {
+                                pair_count += ((j - j0) * (k - k0)) as u64;
                             }
-                        } else {
-                            pair_count += ((j - j0) * (k - k0)) as u64;
                         }
                     }
                 }

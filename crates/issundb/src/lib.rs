@@ -28,7 +28,8 @@
 
 pub use issundb_core::{
     DegreeDirection, DirectedNeighborEntry, EdgeId, EdgeRecord, Error, Graph, LabelId, Language,
-    NeighborEntry, NodeId, NodeRecord, PropValue, ReadTxn, TypeId, WeightedPath, WriteTxn,
+    NeighborEntry, NodeId, NodeRecord, PropValue, ReadTxn, TriangleCountSpec, TypeId, WeightedPath,
+    WriteTxn,
 };
 pub use issundb_cypher::{
     CypherError, CypherType, Procedure, ProcedureRegistry, QueryResult, Record,
