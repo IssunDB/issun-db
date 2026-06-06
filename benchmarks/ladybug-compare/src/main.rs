@@ -366,6 +366,21 @@ fn workload(nodes: u64) -> Vec<(&'static str, String)> {
                  -[:KNOWS]->(d:Person) WHERE a.id = {probe} RETURN count(d) AS n"
             ),
         ),
+        (
+            "four_hop_count",
+            format!(
+                "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person) \
+                 -[:KNOWS]->(d:Person)-[:KNOWS]->(e:Person) \
+                 WHERE a.id = {probe} RETURN count(DISTINCT e) AS n"
+            ),
+        ),
+        (
+            "one_or_two_hop",
+            format!(
+                "MATCH (a:Person)-[:KNOWS*1..2]->(b:Person) \
+                 WHERE a.id = {probe} RETURN count(DISTINCT b) AS n"
+            ),
+        ),
         // Node 0 is the hottest node under Zipf skew, so this measures two-hop
         // fan-out from a hub; under uniform skew it is just another probe.
         (
@@ -659,6 +674,8 @@ mod tests {
             "one_hop_count",
             "two_hop_count",
             "three_hop_count",
+            "four_hop_count",
+            "one_or_two_hop",
             "filter_after_expand",
             "expand_into",
             "var_length_count",
