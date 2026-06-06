@@ -2042,12 +2042,21 @@ impl Optimizer {
         }
     }
 
-    /// Replace a `count(*)`/`count(n)` aggregation over a bare labeled node scan
-    /// with a constant read from graph metadata. Fires only when the aggregate has
-    /// no grouping keys and a single non-distinct count whose inner expression is
-    /// `count(*)` or a bare variable, its input is exactly a `LabelScan` with a
-    /// known label, and the label's node count is available and positive. A zero
-    /// count is left to normal execution so empty-result semantics are preserved.
+    /// Replace a `count(*)`/`count(n)` aggregation over a bare labeled node scan,
+    /// or over a bare typed single-hop directed expand, with a constant read from
+    /// graph metadata. Fires only when the aggregate has no grouping keys and a
+    /// single non-distinct count whose inner expression is `count(*)` or a bare
+    /// variable, and its input is exactly one of:
+    ///
+    /// - a `LabelScan` with a known label whose node count is available, or
+    /// - an `Expand` of exactly one hop, directed, with a known relationship
+    ///   type, over an unlabeled full-node `LabelScan`, whose type count is
+    ///   available. Undirected expands are excluded because each edge matches in
+    ///   both directions, and labeled or filtered endpoints are excluded because
+    ///   type metadata ignores them.
+    ///
+    /// A zero count is left to normal execution so empty-result semantics are
+    /// preserved.
     fn reduce_count(op: PhysicalOperator, stats: Option<&dyn StatsProvider>) -> PhysicalOperator {
         match op {
             PhysicalOperator::Aggregate {
@@ -2061,21 +2070,36 @@ impl Optimizer {
                     let counts_rows = matches!(inner, Expr::CountStar)
                         || matches!(inner, Expr::Prop(_, p) if p.is_empty());
                     if plain_count && counts_rows {
-                        if let PhysicalOperator::LabelScan {
-                            label: Some(lbl), ..
-                        } = input.as_ref()
-                        {
-                            if let Some(n) = stats.and_then(|s| s.node_count_by_label(lbl)) {
-                                if n > 0 {
-                                    return PhysicalOperator::Project {
-                                        input: Box::new(PhysicalOperator::SingleRow),
-                                        items: vec![(
-                                            Expr::Literal(Literal::Int(n as i64)),
-                                            Some(col.clone()),
-                                        )],
-                                        is_barrier: false,
-                                    };
-                                }
+                        let metadata_count = match input.as_ref() {
+                            PhysicalOperator::LabelScan {
+                                label: Some(lbl), ..
+                            } => stats.and_then(|s| s.node_count_by_label(lbl)),
+                            PhysicalOperator::Expand {
+                                input: scan,
+                                rel_type: Some(rtype),
+                                is_undirected: false,
+                                min_hops: 1,
+                                max_hops: 1,
+                                ..
+                            } if matches!(
+                                scan.as_ref(),
+                                PhysicalOperator::LabelScan { label: None, .. }
+                            ) =>
+                            {
+                                stats.and_then(|s| s.edge_count_by_type(rtype))
+                            }
+                            _ => None,
+                        };
+                        if let Some(n) = metadata_count {
+                            if n > 0 {
+                                return PhysicalOperator::Project {
+                                    input: Box::new(PhysicalOperator::SingleRow),
+                                    items: vec![(
+                                        Expr::Literal(Literal::Int(n as i64)),
+                                        Some(col.clone()),
+                                    )],
+                                    is_barrier: false,
+                                };
                             }
                         }
                     }
@@ -2756,6 +2780,11 @@ mod tests {
                 .insert((label.to_string(), property.to_string()));
             self
         }
+
+        fn with_type(mut self, etype: &str, count: u64) -> Self {
+            self.types.insert(etype.to_string(), count);
+            self
+        }
     }
 
     impl StatsProvider for TestStats {
@@ -3103,6 +3132,64 @@ mod tests {
         // wrongly turn an empty result into all rows).
         let plan = optimize_query("MATCH (n:Person) WHERE 1 = 2 RETURN n", &stats);
         assert_eq!(count_filters(&plan), 1, "a false predicate must be kept");
+    }
+
+    /// True when the plan projects the given integer literal somewhere on its
+    /// Project spine, the shape `reduce_count` leaves behind.
+    fn finds_int_literal(op: &PhysicalOperator, n: i64) -> bool {
+        match op {
+            PhysicalOperator::Project { input, items, .. } => {
+                items
+                    .iter()
+                    .any(|(e, _)| matches!(e, Expr::Literal(Literal::Int(v)) if *v == n))
+                    || finds_int_literal(input, n)
+            }
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn reduce_count_replaces_typed_edge_expand_with_constant() {
+        let stats = TestStats::new(&[]).with_type("KNOWS", 7);
+        for q in [
+            "MATCH ()-[r:KNOWS]->() RETURN count(r)",
+            "MATCH ()-[:KNOWS]->() RETURN count(*)",
+            "MATCH ()<-[r:KNOWS]-() RETURN count(r)",
+        ] {
+            let plan = optimize_query(q, &stats);
+            assert!(
+                bottom_scan(&plan).is_none(),
+                "edge count must not scan for {q}: {plan:?}"
+            );
+            assert!(
+                finds_int_literal(&plan, 7),
+                "edge count constant 7 must be projected for {q}: {plan:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reduce_count_skips_non_reducible_edge_counts() {
+        let stats = TestStats::new(&[("Person", 42)]).with_type("KNOWS", 7);
+        for q in [
+            // Undirected: each edge matches in both directions, so the type
+            // metadata would undercount by half.
+            "MATCH ()-[r:KNOWS]-() RETURN count(r)",
+            // A labeled endpoint constrains the rows; type metadata ignores labels.
+            "MATCH (a:Person)-[r:KNOWS]->() RETURN count(r)",
+            // An untyped relationship has no metadata count.
+            "MATCH ()-[r]->() RETURN count(r)",
+            // Variable-length: row count is path count, not edge count.
+            "MATCH ()-[:KNOWS*1..2]->() RETURN count(*)",
+            // A residual predicate must be evaluated per row.
+            "MATCH (a)-[r:KNOWS]->() WHERE a.age > 18 RETURN count(r)",
+        ] {
+            let plan = optimize_query(q, &stats);
+            assert!(
+                bottom_scan(&plan).is_some(),
+                "edge count must still scan for {q}: {plan:?}"
+            );
+        }
     }
 
     #[test]
