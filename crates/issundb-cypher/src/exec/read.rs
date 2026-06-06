@@ -3250,7 +3250,9 @@ fn sort_all(
             for (idx, path) in child_paths.into_iter().enumerate() {
                 let keys = keys_of(&path);
                 buf.push((keys, idx, path));
-                if buf.len() >= 2 * k {
+                // Saturating: a SKIP without a LIMIT saturates `k` to
+                // `usize::MAX`, and `2 * k` would overflow in debug builds.
+                if buf.len() >= k.saturating_mul(2) {
                     buf.sort_by(&order);
                     buf.truncate(k);
                 }
@@ -4089,5 +4091,24 @@ mod stream_join_tests {
             "MATCH (n:Q) RETURN n.age AS age ORDER BY n.age ASC LIMIT 10",
         );
         assert_eq!(top, full[..10].to_vec());
+    }
+
+    /// `ORDER BY ... SKIP` without a `LIMIT` plans a `Limit` whose count is
+    /// `usize::MAX`, so the top-N bound saturates to `usize::MAX`. The bounded
+    /// sort buffer must not overflow on its `2 * k` trim threshold (a debug-build
+    /// panic caught by the TCK skip scenarios).
+    #[test]
+    fn sort_skip_without_limit_does_not_overflow() {
+        let (_dir, graph) = setup();
+        for i in 0..5 {
+            exec(&graph, &format!("CREATE (:R {{age: {i}}})"));
+        }
+        graph.rebuild_csr().unwrap();
+        let full = run_rows(&graph, "MATCH (n:R) RETURN n.age AS age ORDER BY n.age ASC");
+        let skipped = run_rows(
+            &graph,
+            "MATCH (n:R) RETURN n.age AS age ORDER BY n.age ASC SKIP 2",
+        );
+        assert_eq!(skipped, full[2..].to_vec());
     }
 }
