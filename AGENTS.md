@@ -66,8 +66,13 @@ Do not invent modules that do not yet exist when answering questions, but do pla
     - `src/graph/algo.rs`: public algorithm dispatch methods and internal traversal helpers.
     - `src/graph/graphblas/`: GraphBLAS algorithm implementations split by family: `traversal.rs`, `analytics.rs`, `paths.rs`, and `flow.rs`.
     - `src/graph/txn.rs`: `ReadTxn` and `WriteTxn` delegation impls and transaction tests.
-    - `src/csr.rs`: in-memory CSR snapshot, rebuilt in the background and swapped via `arc-swap`. Also owns the `GraphDelta` buffer captured on the
-      write path and the `write_gen`/`snapshot_gen` generation counters that drive incremental matrix maintenance and on-demand CSR refresh.
+    - `src/csr.rs`: in-memory CSR snapshot (outgoing arrays plus a transposed incoming view with per-edge type and edge ids), rebuilt in the
+      background and swapped via `arc-swap`. Also owns the `GraphDelta` buffer captured on the write path and the `write_gen`/`snapshot_gen`
+      generation counters that drive incremental matrix maintenance and on-demand CSR refresh.
+    - `src/columns.rs`: in-memory property columns for the read path. One typed column (`Int`, `Float`, `Bool`, dictionary-encoded `Str`, or the
+      exact-semantics `Json` fallback) per node property name over a self-contained dense node mapping, built lazily from one full node scan and
+      kept fresh by a post-commit delta (added and updated nodes are re-read individually; node deletion forces a rebuild). Read through
+      `Graph::node_prop_json`.
     - `src/matrices.rs`: GraphBLAS matrix materialization from the CSR snapshot, plus `MatrixSet::apply_delta` for incremental in-place maintenance
       (resize plus per-element set and drop) and the self-contained `dense_to_id`/`id_to_dense` mapping the matrix-view consumers read.
     - `src/error.rs`: `Error` enum; all storage and serialization errors unify here.
@@ -80,6 +85,11 @@ Do not invent modules that do not yet exist when answering questions, but do pla
     - `src/exec/mod.rs`: public entry points (`execute`, `explain`), shared type definitions, and tests.
     - `src/exec/read.rs`: `execute_physical` and read-path helpers (`evaluate_where`, `evaluate_sort_key`, `json_to_prop_value`,
       `execute_filter_over_expand`).
+    - `src/exec/vectorized.rs`: columnar fast path for the final projection or aggregation over a single-hop expansion. A structural
+      recognizer matches `[Sort]? Project [Aggregate]? Filter(HasLabel)* Expand(one directed hop) LabelScan` with single-property
+      expressions, then executes column-at-a-time (bulk expansion, bulk label membership, bulk property gather via
+      `Graph::node_props_json_table`, and group-by-code aggregation via `Graph::node_prop_group_codes`), building the result records
+      directly. Any unrecognized shape falls back to the row pipeline, so correctness never depends on the recognizer.
     - `src/exec/factorize.rs`: `FactorizedRecordGroup` (shared `Arc<PathMap>` prefix plus per-row extensions) and `filter_refs_in_expr`.
     - `src/exec/expr.rs`: expression evaluation (`evaluate_expr`, `eval_binary_op`, `eval_arithmetic`, `eval_function_call`).
     - `src/exec/write.rs`: mutation execution (`execute_create`, `execute_set`, `execute_delete`, `execute_merge`).
@@ -101,9 +111,10 @@ Do not invent modules that do not yet exist when answering questions, but do pla
 - `crates/issundb-py/`: Python bindings via PyO3. Exposes the `IssunDB` class with the same surface as the Node.js bindings. Depends only on
   `issundb`.
 - `crates/issundb-examples/`: standalone example programs (`quickstart.rs`, `hybrid_retrieval_quickstart.rs`, `neo4j_migration.rs`, and
-  `load_ldbc.rs`), the `gen_testdata` binary that regenerates the versioned LMDB storage-format snapshot (driven by `make testdata`), and the
-  `profile_triangle` binary, a profiling driver that loads a persistent Zipf-skewed graph once and reruns the cyclic triangle-count query so a
-  profiler observes query execution without load noise. Depends only on `issundb`.
+  `load_ldbc.rs`), the `gen_testdata` binary that regenerates the versioned LMDB storage-format snapshot (driven by `make testdata`), and two
+  profiling drivers that load a persistent graph once and rerun a query so a profiler observes query execution without load noise:
+  `profile_triangle` (Zipf-skewed graph, cyclic triangle-count query) and `profile_query` (uniform graph with the comparison harness's
+  Person/KNOWS schema, arbitrary query via `PROFILE_QUERY`). Depends only on `issundb`.
 - `crates/issundb-core/benches/`: Criterion storage benchmarks.
 - `crates/issundb/tests/conformance/`: openCypher TCK subset integration tests.
 - `benchmarks/ladybug-compare/`: differential comparison harness against LadybugDB. Deliberately excluded from the workspace (own `[workspace]`
@@ -134,13 +145,16 @@ Do not invent modules that do not yet exist when answering questions, but do pla
   Prefix-range scans via `prefix_iter` enumerate all nodes or edges for a given label or type in ascending ID order. A multi-label node has one
   `label_idx` entry per label it carries, so it appears in every matching label scan.
 - The GraphBLAS matrices (`MatrixSet`) and the CSR snapshot are the basis for the GraphBLAS algorithms, pattern matching, and multi-source
-  expansion. They are kept fresh through two gates rather than a single periodic rebuild. The write path records a structural delta (added nodes,
+  expansion. They are kept fresh through three gates rather than a single periodic rebuild. The write path records a structural delta (added nodes,
   added edges, and removed edges, plus a `force_full` flag set on any node deletion). The pure-adjacency consumers (`bfs`, `bfs_multi_source`,
   untyped expansion, `degree_centrality`, and `connected_components`) call `ensure_matrix_view`, which applies the delta in place in time
   proportional to the change (resize plus per-element set and drop on `adjacency` and `adjacency_t`), falling back to a full `rebuild_csr` only when
   a node was deleted. The CSR-array and hybrid consumers (everything else, including `dfs`, the path searches, the weighted and flow algorithms,
   `page_rank`, and the remaining centralities) call `ensure_csr_fresh`, which rebuilds on demand gated by a committed-write generation counter
-  (`write_gen` versus `snapshot_gen`). The background rebuild after `REBUILD_THRESHOLD` writes is a compaction safety net, not the freshness path.
+  (`write_gen` versus `snapshot_gen`); when the snapshot is already fresh it still drains the pending delta into the matrices, because a
+  snapshot-only refresh leaves them lagging. Typed bulk expansion calls `ensure_snapshot_fresh`, which rebuilds only the snapshot (no GraphBLAS
+  materialization) and leaves the delta for the matrix path; for a small source set over a stale snapshot it skips the gate entirely and reads
+  per-source LMDB adjacency. The background rebuild after `REBUILD_THRESHOLD` writes is a compaction safety net, not the freshness path.
   Callers needing a guaranteed fresh CSR view still call `rebuild_csr`. Point adjacency lookups (`out_neighbors`, `in_neighbors`, `all_neighbors`)
   read the `out_adj` and `in_adj` stores directly through the transaction, never the snapshot, so they always reflect committed and in-transaction
   writes.
@@ -177,6 +191,14 @@ All graph operations go through `Graph`; do not call `Storage` directly from out
 - `add_node(label: &str, props: &impl Serialize) -> Result<NodeId, Error>`
 - `add_node_multi(labels: &[&str], props: &impl Serialize) -> Result<NodeId, Error>`
 - `get_node(id: NodeId) -> Result<Option<NodeRecord>, Error>`
+- `node_prop_json(id: NodeId, prop: &str) -> Result<Option<serde_json::Value>, Error>` (single-property read through the in-memory property
+  columns; `None` for a nonexistent node, `Some(Value::Null)` for a missing property)
+- `node_props_json_table(ids: &[NodeId], props: &[&str]) -> Result<Vec<Vec<serde_json::Value>>, Error>` (bulk row-major property gather
+  through the property columns; one columns refresh and one dense-index resolution per id, `Value::Null` for a missing property, and
+  `Error::NodeNotFound` for a nonexistent node)
+- `node_prop_group_codes(ids: &[NodeId], prop: &str) -> Result<(Vec<u32>, Vec<serde_json::Value>), Error>` (dense group codes under exact
+  value identity of one property, plus one representative value per code; null and missing values share one `Value::Null` code; on a typed
+  column no per-row value is materialized)
 - `update_node(id: NodeId, props: &impl Serialize) -> Result<(), Error>`
 - `delete_node(id: NodeId) -> Result<(), Error>`
 - `add_label(id: NodeId, label: &str) -> Result<(), Error>`
@@ -188,6 +210,8 @@ All graph operations go through `Graph`; do not call `Storage` directly from out
 - `in_neighbors(node: NodeId) -> Result<Vec<NeighborEntry>, Error>`
 - `node_has_relationships(node: NodeId) -> Result<bool, Error>`
 - `nodes_by_label(label: &str) -> Result<Vec<NodeId>, Error>`
+- `label_filter(nodes: &[NodeId], label: &str) -> Result<Vec<NodeId>, Error>` (subset of `nodes` carrying `label`, via one `label_idx` point
+  lookup per candidate)
 - `edges_by_type(etype: &str) -> Result<Vec<EdgeId>, Error>`
 - `rebuild_csr() -> Result<(), Error>`
 - `all_nodes() -> Result<Vec<NodeId>, Error>`
@@ -211,6 +235,10 @@ All graph operations go through `Graph`; do not call `Storage` directly from out
 - `connected_components() -> Result<HashMap<NodeId, u64>, Error>`
 - `strongly_connected_components() -> Result<HashMap<NodeId, u64>, Error>`
 - `detect_cycle() -> Result<bool, Error>`
+- `count_triangle_cycles(spec: &TriangleCountSpec) -> Result<u64, Error>` (assignment count of the directed triangle pattern
+  `(a)-[t1]->(b)-[t2]->(c)-[t3]->(a)` with optional per-hop relationship types and per-variable labels, following Cypher MATCH row
+  semantics including relationship uniqueness; the Cypher optimizer lowers grouping-free `count` aggregates over that pattern to this
+  kernel via the `TriangleCount` physical operator)
 - `label_propagation(max_iterations: usize) -> Result<HashMap<NodeId, u64>, Error>`
 - `degree_centrality(direction: DegreeDirection) -> Result<HashMap<NodeId, u64>, Error>`
 - `betweenness_centrality() -> Result<HashMap<NodeId, f64>, Error>`
@@ -266,7 +294,13 @@ outside `issundb`.
 - `Record`: `values: Vec<serde_json::Value>`
 
 The executor resolves patterns through the physical plan.
-Expansion and label filtering use GraphBLAS SpMV and element-wise matrix operators unconditionally.
+Untyped expansion uses GraphBLAS SpMV; typed expansion reads the CSR snapshot in bulk behind a snapshot-only freshness gate
+(`ensure_snapshot_fresh`, which skips GraphBLAS matrix materialization), falling back to per-source LMDB point reads when the snapshot is stale
+and the source set is small so a write-then-expand workload never pays a rebuild. The optimizer splits top-level `AND` conjunctions in WHERE so
+each conjunct pushes down to its own lowest binder. Bulk label filtering uses `label_idx` point
+lookups (`Graph::label_filter`), and single-property node reads go through the in-memory property columns (`Graph::node_prop_json`).
+A final projection or aggregation over a single-hop expansion executes column-at-a-time through `exec/vectorized.rs`
+(`Graph::node_props_json_table` and `Graph::node_prop_group_codes`); every other shape runs the row pipeline.
 
 ### `issundb_rest`
 

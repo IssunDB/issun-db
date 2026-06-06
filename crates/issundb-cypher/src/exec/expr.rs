@@ -571,9 +571,9 @@ pub(super) fn evaluate_expr<B: Bindings>(
             };
             match binding {
                 GraphBinding::Node(node_id) => {
-                    let actual_json = node_props(graph, *node_id)?
-                        .ok_or_else(|| format!("node not found: {}", node_id))?;
                     if prop.is_empty() {
+                        let actual_json = node_props(graph, *node_id)?
+                            .ok_or_else(|| format!("node not found: {}", node_id))?;
                         let mut m = serde_json::Map::new();
                         m.insert(
                             "__type__".to_string(),
@@ -586,10 +586,13 @@ pub(super) fn evaluate_expr<B: Bindings>(
                         m.insert("properties".to_string(), (*actual_json).clone());
                         Ok(serde_json::Value::Object(m))
                     } else {
-                        Ok(actual_json
-                            .get(prop)
-                            .cloned()
-                            .unwrap_or(serde_json::Value::Null))
+                        // The hot single-property form reads the in-memory
+                        // property columns: a dense-index lookup instead of a
+                        // point read plus a full record decode.
+                        graph
+                            .node_prop_json(*node_id, prop)
+                            .map_err(|e| e.to_string())?
+                            .ok_or_else(|| format!("node not found: {}", node_id))
                     }
                 }
                 GraphBinding::Edge(edge_id) => {

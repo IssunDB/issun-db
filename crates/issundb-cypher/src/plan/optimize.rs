@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use crate::ast::{AggFn, Expr, Literal};
+use crate::ast::{AggFn, BinaryOperator, Expr, Literal};
 use crate::plan::logical::FilterExpr;
 use crate::plan::physical::PhysicalOperator;
 use crate::plan::stats::StatsProvider;
@@ -12,7 +12,15 @@ impl Optimizer {
     /// Optimize a `PhysicalOperator` plan by standardizing operator sequences,
     /// extracting filter predicates, and pushing them down to the lowest possible nodes.
     pub fn optimize(op: PhysicalOperator, stats: Option<&dyn StatsProvider>) -> PhysicalOperator {
-        let (stripped_op, mut filters) = Self::extract_filters(op);
+        let (stripped_op, raw_filters) = Self::extract_filters(op);
+        // Split top-level AND conjunctions so each conjunct pushes down to its
+        // own lowest binder: `a.id = 1 AND b.age > 30` as a whole references
+        // both endpoints and would stay above the Expand, while its conjuncts
+        // reach the scan and the expansion respectively.
+        let mut filters = Vec::with_capacity(raw_filters.len());
+        for filter in raw_filters {
+            Self::split_conjuncts(filter, &mut filters);
+        }
         // Drop statically-true predicates so they are neither pushed down nor
         // evaluated per row. Only provably-true forms are removed; false or
         // unknown predicates are preserved for normal evaluation.
@@ -40,7 +48,30 @@ impl Optimizer {
         // Replace a count aggregation over a bare labeled scan with a constant read
         // from graph metadata, avoiding a full scan.
         result = Self::reduce_count(result, stats);
+        // Replace a grouping-free count over a MultiwayJoin-closed directed
+        // triangle chain with the core sorted-intersect kernel.
+        result = rewrite_triangle_count(result);
         result
+    }
+
+    /// Append `filter` to `out`, recursively splitting top-level `AND`
+    /// conjunctions into their conjuncts. Each conjunct keeps its original
+    /// `Expr` form, so per-conjunct evaluation stays on the same code path;
+    /// only the placement changes. The split preserves three-valued logic: a
+    /// conjunction passes a row exactly when every conjunct evaluates to TRUE,
+    /// which is what sequential Filter nodes compute.
+    fn split_conjuncts(filter: FilterExpr, out: &mut Vec<FilterExpr>) {
+        if let FilterExpr::Expr(Expr::BinaryOp {
+            op: BinaryOperator::And,
+            left,
+            right,
+        }) = filter
+        {
+            Self::split_conjuncts(FilterExpr::Expr(*left), out);
+            Self::split_conjuncts(FilterExpr::Expr(*right), out);
+        } else {
+            out.push(filter);
+        }
     }
 
     /// Extract all filter operators from the physical plan, return a stripped tree,
@@ -243,11 +274,12 @@ impl Optimizer {
                 PhysicalOperator::OptionalMatch { input, null_vars },
                 Vec::new(),
             ),
-            PhysicalOperator::Distinct { input } => {
+            PhysicalOperator::Distinct { input, keys } => {
                 let (inner, inner_filters) = Self::extract_filters(*input);
                 (
                     PhysicalOperator::Distinct {
                         input: Box::new(inner),
+                        keys,
                     },
                     inner_filters,
                 )
@@ -295,6 +327,8 @@ impl Optimizer {
                     inner_filters,
                 )
             }
+            // A leaf produced after this pass; nothing to extract.
+            t @ PhysicalOperator::TriangleCount { .. } => (t, Vec::new()),
         }
     }
 
@@ -419,7 +453,8 @@ impl Optimizer {
                     null_vars,
                 }
             }
-            PhysicalOperator::Distinct { input } => PhysicalOperator::Distinct {
+            PhysicalOperator::Distinct { input, keys } => PhysicalOperator::Distinct {
+                keys,
                 input: Box::new(Self::reorder_operators(*input, stats)),
             },
             // WritePart is opaque: do not descend into it for reordering.
@@ -455,6 +490,7 @@ impl Optimizer {
                 closing_is_undirected,
                 closing_unique_rels,
             },
+            t @ PhysicalOperator::TriangleCount { .. } => t,
         }
     }
 
@@ -526,6 +562,8 @@ impl Optimizer {
             | PhysicalOperator::Distinct { input, .. }
             | PhysicalOperator::WritePart { input, .. }
             | PhysicalOperator::ProcedureCall { input, .. } => Self::plan_weight(input, stats),
+            // A single kernel call producing one row.
+            PhysicalOperator::TriangleCount { .. } => 1,
             // MultiwayJoin is cheaper than a regular Expand because the closing check is O(1)
             // per row after a single bulk expansion. Weight as the input cost.
             PhysicalOperator::MultiwayJoin { input, .. } => Self::plan_weight(input, stats),
@@ -948,10 +986,11 @@ impl Optimizer {
                     null_vars,
                 }
             }
-            PhysicalOperator::Distinct { input } => {
+            PhysicalOperator::Distinct { input, keys } => {
                 let optimized = Self::push_down_filters(*input, pending);
                 PhysicalOperator::Distinct {
                     input: Box::new(optimized),
+                    keys,
                 }
             }
             // WritePart is opaque: do not push filters through a write boundary.
@@ -1024,6 +1063,8 @@ impl Optimizer {
                 *pending = remaining_pending;
                 current_node
             }
+            // A leaf produced after this pass; no children to push into.
+            t @ PhysicalOperator::TriangleCount { .. } => t,
         }
     }
 
@@ -1167,7 +1208,7 @@ impl Optimizer {
                     vars.insert(var.clone());
                 }
             }
-            PhysicalOperator::Distinct { input } => {
+            PhysicalOperator::Distinct { input, .. } => {
                 Self::collect_bound_vars(input, vars);
             }
             // WritePart binds variables from its input plus newly created node/edge variables.
@@ -1227,6 +1268,9 @@ impl Optimizer {
                 for v in output_vars {
                     vars.insert(v.clone());
                 }
+            }
+            PhysicalOperator::TriangleCount { output, .. } => {
+                vars.insert(output.clone());
             }
         }
     }
@@ -1813,7 +1857,8 @@ impl Optimizer {
                 skip,
                 count,
             },
-            PhysicalOperator::Distinct { input } => PhysicalOperator::Distinct {
+            PhysicalOperator::Distinct { input, keys } => PhysicalOperator::Distinct {
+                keys,
                 input: Box::new(Self::select_scan_node(*input, filters, stats)),
             },
             op @ PhysicalOperator::Expand { .. } => Self::try_reverse_chain(op, filters, stats),
@@ -2128,7 +2173,8 @@ impl Optimizer {
                 skip,
                 count,
             },
-            PhysicalOperator::Distinct { input } => PhysicalOperator::Distinct {
+            PhysicalOperator::Distinct { input, keys } => PhysicalOperator::Distinct {
+                keys,
                 input: Box::new(Self::reduce_count(*input, stats)),
             },
             other => other,
@@ -2235,7 +2281,8 @@ fn rewrite_closing_expands(op: PhysicalOperator) -> PhysicalOperator {
             input: Box::new(rewrite_closing_expands(*input)),
             null_vars,
         },
-        PhysicalOperator::Distinct { input } => PhysicalOperator::Distinct {
+        PhysicalOperator::Distinct { input, keys } => PhysicalOperator::Distinct {
+            keys,
             input: Box::new(rewrite_closing_expands(*input)),
         },
         PhysicalOperator::WritePart { input, part } => PhysicalOperator::WritePart {
@@ -2264,6 +2311,203 @@ fn rewrite_closing_expands(op: PhysicalOperator) -> PhysicalOperator {
         },
         leaf => leaf,
     }
+}
+
+/// Replace a grouping-free, non-distinct `count` aggregate sitting directly on
+/// a `MultiwayJoin`-closed directed triangle chain with the leaf
+/// `TriangleCount` operator, which the executor answers via one core kernel
+/// call instead of materializing every row of the pattern.
+///
+/// Recursion is limited to the operators that can sit between the query root
+/// and a RETURN-level aggregate (`Project`, `Limit`, `Sort`, `Distinct`, and
+/// `Filter`); anywhere else the plan is left untouched, which only forfeits
+/// the fast path, never correctness.
+fn rewrite_triangle_count(op: PhysicalOperator) -> PhysicalOperator {
+    if let Some(t) = try_triangle_count(&op) {
+        return t;
+    }
+    match op {
+        PhysicalOperator::Project {
+            input,
+            items,
+            is_barrier,
+        } => PhysicalOperator::Project {
+            input: Box::new(rewrite_triangle_count(*input)),
+            items,
+            is_barrier,
+        },
+        PhysicalOperator::Limit { input, skip, count } => PhysicalOperator::Limit {
+            input: Box::new(rewrite_triangle_count(*input)),
+            skip,
+            count,
+        },
+        PhysicalOperator::Sort { input, items } => PhysicalOperator::Sort {
+            input: Box::new(rewrite_triangle_count(*input)),
+            items,
+        },
+        PhysicalOperator::Distinct { input, keys } => PhysicalOperator::Distinct {
+            keys,
+            input: Box::new(rewrite_triangle_count(*input)),
+        },
+        PhysicalOperator::Filter { input, expression } => PhysicalOperator::Filter {
+            input: Box::new(rewrite_triangle_count(*input)),
+            expression,
+        },
+        other => other,
+    }
+}
+
+/// Strip one `HasLabel` filter, returning the label predicate and the inner
+/// operator. Any other filter shape stays in place and fails the pattern
+/// match in `try_triangle_count`.
+fn peel_one_haslabel(op: &PhysicalOperator) -> (Option<(&str, &str)>, &PhysicalOperator) {
+    if let PhysicalOperator::Filter {
+        input,
+        expression: FilterExpr::HasLabel(var, label),
+    } = op
+    {
+        (Some((var.as_str(), label.as_str())), input.as_ref())
+    } else {
+        (None, op)
+    }
+}
+
+/// Match the exact triangle-count plan shape and build its replacement.
+///
+/// Required shape, bottom-up: `LabelScan a`, `Expand a->b` (single-hop,
+/// directed, no path), optional `HasLabel` on `b`, `Expand b->c` (same
+/// restrictions, unique against hop 1), optional `HasLabel` on `c`,
+/// `MultiwayJoin` closing `c->a` (directed, unique against both hops), and an
+/// `Aggregate` with no grouping whose only aggregation is a non-distinct
+/// `count(*)` or `count(var)` over a pattern variable. The `unique_rels`
+/// wiring is checked exactly so the chain is one MATCH pattern; relationship
+/// uniqueness across separate patterns does not apply and must not be folded
+/// into the kernel.
+fn try_triangle_count(op: &PhysicalOperator) -> Option<PhysicalOperator> {
+    let PhysicalOperator::Aggregate {
+        input,
+        group_by,
+        aggregations,
+    } = op
+    else {
+        return None;
+    };
+    if !group_by.is_empty() || aggregations.len() != 1 {
+        return None;
+    }
+    let (agg_fn, count_expr, out_name) = &aggregations[0];
+    if !matches!(agg_fn, AggFn::Count { distinct: false }) {
+        return None;
+    }
+
+    let PhysicalOperator::MultiwayJoin {
+        input: mj_input,
+        closing_src_var,
+        closing_dst_var,
+        closing_rel_type,
+        closing_rel_var,
+        closing_is_incoming: false,
+        closing_is_undirected: false,
+        closing_unique_rels,
+    } = input.as_ref()
+    else {
+        return None;
+    };
+
+    let (c_label, exp2_op) = peel_one_haslabel(mj_input);
+    let PhysicalOperator::Expand {
+        input: e2_input,
+        src_var: src2,
+        rel_var: rel2,
+        dst_var: dst2,
+        rel_type: t2,
+        is_incoming: false,
+        is_undirected: false,
+        min_hops: 1,
+        max_hops: 1,
+        unique_rels: unique2,
+        needs_path: false,
+    } = exp2_op
+    else {
+        return None;
+    };
+
+    let (b_label, exp1_op) = peel_one_haslabel(e2_input);
+    let PhysicalOperator::Expand {
+        input: e1_input,
+        src_var: src1,
+        rel_var: rel1,
+        dst_var: dst1,
+        rel_type: t1,
+        is_incoming: false,
+        is_undirected: false,
+        min_hops: 1,
+        max_hops: 1,
+        unique_rels: unique1,
+        needs_path: false,
+    } = exp1_op
+    else {
+        return None;
+    };
+
+    let PhysicalOperator::LabelScan {
+        variable: a_var,
+        label: a_label,
+    } = e1_input.as_ref()
+    else {
+        return None;
+    };
+
+    // Cycle wiring: a -> b -> c -> a over three distinct node variables.
+    let (b_var, c_var) = (dst1, dst2);
+    if src1 != a_var || src2 != b_var || closing_src_var != c_var || closing_dst_var != a_var {
+        return None;
+    }
+    if a_var == b_var || b_var == c_var || a_var == c_var {
+        return None;
+    }
+    // Peeled label filters must apply to the variable they sit above.
+    if let Some((v, _)) = c_label {
+        if v != c_var {
+            return None;
+        }
+    }
+    if let Some((v, _)) = b_label {
+        if v != b_var {
+            return None;
+        }
+    }
+    // One-pattern relationship uniqueness, exactly as the kernel encodes it.
+    if !unique1.is_empty()
+        || unique2.as_slice() != [rel1.clone()]
+        || closing_unique_rels.as_slice() != [rel1.clone(), rel2.clone()]
+    {
+        return None;
+    }
+    // The counted expression must be `*` or a bare pattern variable, all of
+    // which are non-null in every match.
+    match count_expr {
+        Expr::CountStar => {}
+        Expr::Prop(v, p)
+            if p.is_empty()
+                && (v == a_var
+                    || v == b_var
+                    || v == c_var
+                    || v == rel1
+                    || v == rel2
+                    || v == closing_rel_var) => {}
+        _ => return None,
+    }
+
+    Some(PhysicalOperator::TriangleCount {
+        rel_types: [t1.clone(), t2.clone(), closing_rel_type.clone()],
+        labels: [
+            a_label.clone(),
+            b_label.map(|(_, l)| l.to_string()),
+            c_label.map(|(_, l)| l.to_string()),
+        ],
+        output: out_name.clone(),
+    })
 }
 
 #[cfg(test)]
@@ -2341,6 +2585,69 @@ mod tests {
         } else {
             panic!("expected Project operator");
         }
+    }
+
+    /// Peel consecutive `Filter` nodes off `op`, returning the collected
+    /// predicates and the first non-Filter operator.
+    fn peel_filters(mut op: PhysicalOperator) -> (Vec<FilterExpr>, PhysicalOperator) {
+        let mut filters = Vec::new();
+        while let PhysicalOperator::Filter { input, expression } = op {
+            filters.push(expression);
+            op = *input;
+        }
+        (filters, op)
+    }
+
+    #[test]
+    fn test_and_conjuncts_split_and_push_independently() {
+        // The conjunction as a whole references both `a` and `b`, but each
+        // conjunct references one variable, so the split must let `a.age = 30`
+        // reach the scan below the Expand while `b.age = 40` stays above it.
+        let stmt = parser::parse(
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) \
+             WHERE a.age = 30 AND b.age = 40 RETURN b.name AS name",
+        )
+        .unwrap();
+        let query = match stmt {
+            crate::ast::Statement::Query(q) => q,
+            _ => panic!("expected Query"),
+        };
+
+        let logical_plan = LogicalPlanner::plan(&query).unwrap();
+        let physical_plan = PhysicalPlanner::plan(&logical_plan);
+        let optimized = Optimizer::optimize(physical_plan, None);
+
+        let PhysicalOperator::Project { input, .. } = optimized else {
+            panic!("expected Project at the root");
+        };
+        let (above, expand) = peel_filters(*input);
+        let PhysicalOperator::Expand { input, .. } = expand else {
+            panic!("expected Expand below the b-side filters, got {expand:?}");
+        };
+        let (below, scan) = peel_filters(*input);
+        assert!(matches!(
+            scan,
+            PhysicalOperator::LabelScan { ref variable, .. } if variable == "a"
+        ));
+
+        let refs_only = |f: &FilterExpr, var: &str| {
+            let vars = Optimizer::referenced_vars(f);
+            vars.len() == 1 && vars.contains(var)
+        };
+        assert!(
+            above.iter().all(|f| refs_only(f, "b")),
+            "only b-conjuncts may stay above the Expand, got {above:?}"
+        );
+        assert!(
+            above.iter().any(|f| !matches!(f, FilterExpr::HasLabel(..))),
+            "the b.age conjunct must survive the split, got {above:?}"
+        );
+        assert_eq!(
+            below.len(),
+            1,
+            "exactly the a.age conjunct belongs below the Expand, got {below:?}"
+        );
+        assert!(refs_only(&below[0], "a"));
     }
 
     #[test]
@@ -2823,7 +3130,7 @@ mod tests {
             | PhysicalOperator::Aggregate { input, .. }
             | PhysicalOperator::Sort { input, .. }
             | PhysicalOperator::Limit { input, .. }
-            | PhysicalOperator::Distinct { input }
+            | PhysicalOperator::Distinct { input, .. }
             | PhysicalOperator::MultiwayJoin { input, .. } => bottom_scan(input),
             _ => None,
         }
@@ -2840,7 +3147,7 @@ mod tests {
             | PhysicalOperator::Aggregate { input, .. }
             | PhysicalOperator::Sort { input, .. }
             | PhysicalOperator::Limit { input, .. }
-            | PhysicalOperator::Distinct { input }
+            | PhysicalOperator::Distinct { input, .. }
             | PhysicalOperator::MultiwayJoin { input, .. } => has_haslabel(input, var, label),
             _ => false,
         }
@@ -2888,7 +3195,7 @@ mod tests {
             | PhysicalOperator::Aggregate { input, .. }
             | PhysicalOperator::Sort { input, .. }
             | PhysicalOperator::Limit { input, .. }
-            | PhysicalOperator::Distinct { input }
+            | PhysicalOperator::Distinct { input, .. }
             | PhysicalOperator::MultiwayJoin { input, .. } => expand_path_flags(input, out),
             _ => {}
         }
@@ -2932,7 +3239,7 @@ mod tests {
                 | PhysicalOperator::Aggregate { input, .. }
                 | PhysicalOperator::Sort { input, .. }
                 | PhysicalOperator::Limit { input, .. }
-                | PhysicalOperator::Distinct { input } => has_multiway(input),
+                | PhysicalOperator::Distinct { input, .. } => has_multiway(input),
                 _ => false,
             }
         }
@@ -2968,7 +3275,7 @@ mod tests {
                 | PhysicalOperator::Aggregate { input, .. }
                 | PhysicalOperator::Sort { input, .. }
                 | PhysicalOperator::Limit { input, .. }
-                | PhysicalOperator::Distinct { input }
+                | PhysicalOperator::Distinct { input, .. }
                 | PhysicalOperator::MultiwayJoin { input, .. } => finds_index_scan_on(input, var),
                 _ => false,
             }
@@ -3041,7 +3348,7 @@ mod tests {
             | PhysicalOperator::Aggregate { input, .. }
             | PhysicalOperator::Sort { input, .. }
             | PhysicalOperator::Limit { input, .. }
-            | PhysicalOperator::Distinct { input }
+            | PhysicalOperator::Distinct { input, .. }
             | PhysicalOperator::MultiwayJoin { input, .. } => finds_id_seek(input, var),
             PhysicalOperator::HashJoin { left, right } => {
                 finds_id_seek(left, var) || finds_id_seek(right, var)
@@ -3094,7 +3401,7 @@ mod tests {
             | PhysicalOperator::Aggregate { input, .. }
             | PhysicalOperator::Sort { input, .. }
             | PhysicalOperator::Limit { input, .. }
-            | PhysicalOperator::Distinct { input }
+            | PhysicalOperator::Distinct { input, .. }
             | PhysicalOperator::Unwind { input, .. }
             | PhysicalOperator::OptionalMatch { input, .. }
             | PhysicalOperator::MultiwayJoin { input, .. } => count_filters(input),

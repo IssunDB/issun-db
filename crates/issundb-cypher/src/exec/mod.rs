@@ -13,6 +13,7 @@ mod expr;
 mod factorize;
 pub(crate) mod read;
 mod row;
+mod vectorized;
 mod write;
 
 use ddl::{
@@ -1026,6 +1027,63 @@ mod tests {
         );
         assert_eq!(windowed.len(), 1, "SKIP 1 LIMIT 1 yields one row");
         assert!(full.contains(&windowed[0]));
+    }
+
+    /// `RETURN DISTINCT ... LIMIT n` deduplicates before the limit applies: the
+    /// limit caps the distinct rows, not the raw expansion rows.
+    #[test]
+    fn distinct_applies_before_skip_and_limit() {
+        let (_dir, graph) = setup_graph();
+        let params = HashMap::new();
+        // One hub fanning out to eight leaves over five distinct cities, with
+        // the duplicated cities first in insertion order so a limit applied
+        // before deduplication surfaces fewer than five cities.
+        execute(
+            &graph,
+            "CREATE (h:Person {name: 'hub', city: 'hub'}), \
+             (a:Person {name: 'a', city: 'ams'}), (b:Person {name: 'b', city: 'ams'}), \
+             (c:Person {name: 'c', city: 'ams'}), (d:Person {name: 'd', city: 'ber'}), \
+             (e:Person {name: 'e', city: 'ber'}), (f:Person {name: 'f', city: 'kyoto'}), \
+             (g:Person {name: 'g', city: 'oslo'}), (i:Person {name: 'i', city: 'rio'}) \
+             CREATE (h)-[:KNOWS]->(a), (h)-[:KNOWS]->(b), (h)-[:KNOWS]->(c), \
+             (h)-[:KNOWS]->(d), (h)-[:KNOWS]->(e), (h)-[:KNOWS]->(f), \
+             (h)-[:KNOWS]->(g), (h)-[:KNOWS]->(i)",
+            &params,
+        )
+        .unwrap();
+        graph.rebuild_csr().unwrap();
+
+        let rows = run(
+            &graph,
+            "MATCH (h:Person)-[:KNOWS]->(b:Person) WHERE h.name = 'hub' \
+             RETURN DISTINCT b.city AS city ORDER BY city LIMIT 5",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec![serde_json::json!("ams")],
+                vec![serde_json::json!("ber")],
+                vec![serde_json::json!("kyoto")],
+                vec![serde_json::json!("oslo")],
+                vec![serde_json::json!("rio")],
+            ],
+            "DISTINCT must deduplicate before LIMIT caps the rows"
+        );
+
+        // SKIP windows over the deduplicated, sorted rows as well.
+        let windowed = run(
+            &graph,
+            "MATCH (h:Person)-[:KNOWS]->(b:Person) WHERE h.name = 'hub' \
+             RETURN DISTINCT b.city AS city ORDER BY city SKIP 1 LIMIT 2",
+        );
+        assert_eq!(
+            windowed,
+            vec![
+                vec![serde_json::json!("ber")],
+                vec![serde_json::json!("kyoto")],
+            ],
+            "SKIP and LIMIT must window the distinct rows"
+        );
     }
 
     /// A grouped aggregation over a streamable child folds rows a batch at a

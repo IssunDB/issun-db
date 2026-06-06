@@ -16,6 +16,146 @@ impl Graph {
         self.dfs_graphblas(m, &snap, start, hops)
     }
 
+    /// Counts variable assignments of the directed triangle pattern
+    /// `(a)-[t1]->(b)-[t2]->(c)-[t3]->(a)` under `spec`'s per-hop relationship
+    /// types and per-variable labels.
+    ///
+    /// The count follows Cypher MATCH semantics: each distinct assignment of
+    /// `(a, b, c, e1, e2, e3)` is one match, so a single 3-cycle of distinct
+    /// nodes counts once per rotation of `a` (three when all hops share one
+    /// type), parallel edges multiply, and the three relationships must be
+    /// pairwise distinct (relationship uniqueness), which only constrains
+    /// self-loop assignments where `a == b == c`.
+    pub fn count_triangle_cycles(&self, spec: &TriangleCountSpec) -> Result<u64, Error> {
+        self.ensure_csr_fresh()?;
+        let snap = self.csr_cache.snapshot.load();
+        let n = snap.dense_to_id.len();
+        if n == 0 {
+            return Ok(0);
+        }
+
+        // A named but unregistered relationship type matches nothing.
+        let mut type_ids: [Option<TypeId>; 3] = [None; 3];
+        {
+            let rtxn = self.storage.env.read_txn()?;
+            for (i, name) in spec.rel_types.iter().enumerate() {
+                if let Some(name) = name {
+                    match get_type(&self.storage, &rtxn, name)? {
+                        Some(tid) => type_ids[i] = Some(tid),
+                        None => return Ok(0),
+                    }
+                }
+            }
+        }
+
+        // Dense-index masks for the per-variable labels; `None` means
+        // unconstrained. An unknown label yields an all-false mask, which
+        // counts zero without a special case.
+        let mut masks: [Option<Vec<bool>>; 3] = [None, None, None];
+        for (i, label) in spec.labels.iter().enumerate() {
+            if let Some(name) = label {
+                let mut mask = vec![false; n];
+                for id in self.nodes_by_label(name)? {
+                    if let Some(&d) = snap.id_to_dense.get(&id) {
+                        mask[d as usize] = true;
+                    }
+                }
+                masks[i] = Some(mask);
+            }
+        }
+        let label_ok = |mask: &Option<Vec<bool>>, d: usize| mask.as_ref().is_none_or(|m| m[d]);
+
+        // Sorted typed adjacency for each hop: hop 1 and hop 2 read forward
+        // rows, hop 3 reads the transpose (edges into `a`). Hop 2 reuses the
+        // hop-1 view when the types coincide.
+        let out1 = typed_out_sorted(&snap, type_ids[0]);
+        let out2_built = if type_ids[1] == type_ids[0] {
+            None
+        } else {
+            Some(typed_out_sorted(&snap, type_ids[1]))
+        };
+        let out2 = out2_built.as_ref().unwrap_or(&out1);
+        let in3 = typed_in_sorted(&snap, type_ids[2]);
+
+        let mut total: u64 = 0;
+        for a in 0..n {
+            if !label_ok(&masks[0], a) {
+                continue;
+            }
+            let in3_row = in3.row(a);
+            if in3_row.is_empty() {
+                continue;
+            }
+            let out1_row = out1.row(a);
+
+            let mut i = 0;
+            while i < out1_row.len() {
+                let b = out1_row[i].0 as usize;
+                let run1_start = i;
+                while i < out1_row.len() && out1_row[i].0 as usize == b {
+                    i += 1;
+                }
+                if !label_ok(&masks[1], b) {
+                    continue;
+                }
+                let m1 = (i - run1_start) as u64;
+                let out2_row = out2.row(b);
+
+                // Sorted merge of the hop-2 candidates from `b` against the
+                // hop-3 sources into `a`; equal runs give parallel-edge
+                // multiplicities.
+                let (mut j, mut k) = (0, 0);
+                let mut pair_count: u64 = 0;
+                while j < out2_row.len() && k < in3_row.len() {
+                    let c2 = out2_row[j].0;
+                    let c3 = in3_row[k].0;
+                    match c2.cmp(&c3) {
+                        std::cmp::Ordering::Less => j += 1,
+                        std::cmp::Ordering::Greater => k += 1,
+                        std::cmp::Ordering::Equal => {
+                            let c = c2 as usize;
+                            let j0 = j;
+                            while j < out2_row.len() && out2_row[j].0 as usize == c {
+                                j += 1;
+                            }
+                            let k0 = k;
+                            while k < in3_row.len() && in3_row[k].0 as usize == c {
+                                k += 1;
+                            }
+                            if !label_ok(&masks[2], c) {
+                                continue;
+                            }
+                            if a == b && c == a {
+                                // Every hop is a self-loop at `a`, the one shape
+                                // where two hops can bind the same relationship.
+                                // Enumerate ordered triples of pairwise-distinct
+                                // edge IDs explicitly; this term replaces the
+                                // multiplicity product for this cell, so it is
+                                // not scaled by `m1`.
+                                for &(_, e1) in &out1_row[run1_start..run1_start + m1 as usize] {
+                                    for &(_, e2) in &out2_row[j0..j] {
+                                        if e2 == e1 {
+                                            continue;
+                                        }
+                                        for &(_, e3) in &in3_row[k0..k] {
+                                            if e3 != e1 && e3 != e2 {
+                                                total += 1;
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                pair_count += ((j - j0) * (k - k0)) as u64;
+                            }
+                        }
+                    }
+                }
+                total += m1 * pair_count;
+            }
+        }
+        Ok(total)
+    }
+
     /// Detects if there is at least one directed cycle in the graph.
     pub fn detect_cycle(&self) -> Result<bool, Error> {
         self.ensure_csr_fresh()?;
@@ -245,6 +385,24 @@ impl Graph {
     pub(crate) fn ensure_csr_fresh(&self) -> Result<(), Error> {
         if self.matrices.read().is_none() || self.csr_cache.snapshot_is_stale() {
             self.rebuild_csr()?;
+        } else {
+            // A snapshot-only refresh (`ensure_snapshot_fresh`) leaves the
+            // structural delta pending, so a fresh snapshot generation does
+            // not imply fresh matrices; drain the delta into them.
+            self.ensure_matrix_view()?;
+        }
+        Ok(())
+    }
+
+    /// Freshness gate for consumers that read only the CSR snapshot (typed
+    /// expansion). Rebuilds the snapshot alone when it lags committed writes,
+    /// skipping GraphBLAS matrix materialization; the pending structural delta
+    /// stays in place for `ensure_matrix_view` to drain later.
+    pub(crate) fn ensure_snapshot_fresh(&self) -> Result<(), Error> {
+        if self.csr_cache.snapshot_is_stale() {
+            let built_gen = self.csr_cache.current_gen();
+            let snap = CsrSnapshot::build(&self.storage)?;
+            self.csr_cache.install_snapshot(snap, built_gen);
         }
         Ok(())
     }
@@ -486,6 +644,84 @@ impl Graph {
         }
         Ok(out)
     }
+}
+
+/// Per-row adjacency restricted to one relationship type, with each row
+/// sorted by `(neighbor, edge id)` so intersections run as sorted merges and
+/// parallel edges form contiguous runs.
+struct TypedSortedAdj {
+    ptr: Vec<usize>,
+    adj: Vec<(u32, EdgeId)>,
+}
+
+impl TypedSortedAdj {
+    fn row(&self, d: usize) -> &[(u32, EdgeId)] {
+        &self.adj[self.ptr[d]..self.ptr[d + 1]]
+    }
+}
+
+/// Forward adjacency from the CSR snapshot filtered to `type_id` (`None`
+/// keeps every edge), rows sorted by `(dst, edge id)`.
+fn typed_out_sorted(snap: &CsrSnapshot, type_id: Option<TypeId>) -> TypedSortedAdj {
+    let n = snap.dense_to_id.len();
+    let keep = |idx: usize| type_id.is_none_or(|t| snap.edge_type[idx] == t);
+
+    let mut ptr = vec![0usize; n + 1];
+    for row in 0..n {
+        let mut count = 0;
+        for idx in snap.row_ptr[row]..snap.row_ptr[row + 1] {
+            if keep(idx) {
+                count += 1;
+            }
+        }
+        ptr[row + 1] = ptr[row] + count;
+    }
+
+    let mut adj = vec![(0u32, 0u64); ptr[n]];
+    for row in 0..n {
+        let mut at = ptr[row];
+        for idx in snap.row_ptr[row]..snap.row_ptr[row + 1] {
+            if keep(idx) {
+                adj[at] = (snap.col_idx[idx], snap.edge_id[idx]);
+                at += 1;
+            }
+        }
+        adj[ptr[row]..at].sort_unstable();
+    }
+    TypedSortedAdj { ptr, adj }
+}
+
+/// Transposed adjacency (edges grouped by destination) filtered to
+/// `type_id`, rows sorted by `(src, edge id)`.
+fn typed_in_sorted(snap: &CsrSnapshot, type_id: Option<TypeId>) -> TypedSortedAdj {
+    let n = snap.dense_to_id.len();
+    let keep = |idx: usize| type_id.is_none_or(|t| snap.edge_type[idx] == t);
+
+    let mut ptr = vec![0usize; n + 1];
+    for idx in 0..snap.col_idx.len() {
+        if keep(idx) {
+            ptr[snap.col_idx[idx] as usize + 1] += 1;
+        }
+    }
+    for d in 0..n {
+        ptr[d + 1] += ptr[d];
+    }
+
+    let mut at = ptr.clone();
+    let mut adj = vec![(0u32, 0u64); ptr[n]];
+    for row in 0..n {
+        for idx in snap.row_ptr[row]..snap.row_ptr[row + 1] {
+            if keep(idx) {
+                let dst = snap.col_idx[idx] as usize;
+                adj[at[dst]] = (row as u32, snap.edge_id[idx]);
+                at[dst] += 1;
+            }
+        }
+    }
+    for d in 0..n {
+        adj[ptr[d]..ptr[d + 1]].sort_unstable();
+    }
+    TypedSortedAdj { ptr, adj }
 }
 
 #[cfg(test)]
@@ -803,6 +1039,258 @@ mod incremental_matrix_tests {
         assert!(
             !g.all_paths(a, c).unwrap().is_empty(),
             "path a->b->c reflected without an explicit rebuild"
+        );
+    }
+}
+
+#[cfg(test)]
+mod triangle_cycle_count_tests {
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    use crate::{Graph, TriangleCountSpec};
+
+    fn open_tmp() -> (TempDir, Graph) {
+        let dir = TempDir::new().unwrap();
+        let g = Graph::open(dir.path(), 1).unwrap();
+        (dir, g)
+    }
+
+    fn spec_all<'a>(rel: &'a str, label: &'a str) -> TriangleCountSpec<'a> {
+        TriangleCountSpec {
+            rel_types: [Some(rel); 3],
+            labels: [Some(label); 3],
+        }
+    }
+
+    /// One directed 3-cycle of distinct nodes matches once per rotation of
+    /// `a`: three assignments, exactly what MATCH row semantics produce.
+    #[test]
+    fn single_cycle_counts_one_per_rotation() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("Person", &json!({})).unwrap();
+        let b = g.add_node("Person", &json!({})).unwrap();
+        let c = g.add_node("Person", &json!({})).unwrap();
+        g.add_edge(a, b, "KNOWS", &json!({})).unwrap();
+        g.add_edge(b, c, "KNOWS", &json!({})).unwrap();
+        g.add_edge(c, a, "KNOWS", &json!({})).unwrap();
+
+        let n = g
+            .count_triangle_cycles(&spec_all("KNOWS", "Person"))
+            .unwrap();
+        assert_eq!(n, 3);
+    }
+
+    /// A non-cycle triangle orientation (two edges out of one node) is not a
+    /// directed cycle and must not count.
+    #[test]
+    fn non_cyclic_orientation_does_not_count() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("Person", &json!({})).unwrap();
+        let b = g.add_node("Person", &json!({})).unwrap();
+        let c = g.add_node("Person", &json!({})).unwrap();
+        g.add_edge(a, b, "KNOWS", &json!({})).unwrap();
+        g.add_edge(b, c, "KNOWS", &json!({})).unwrap();
+        g.add_edge(a, c, "KNOWS", &json!({})).unwrap();
+
+        let n = g
+            .count_triangle_cycles(&spec_all("KNOWS", "Person"))
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    /// Parallel edges are distinct relationships; doubling one hop doubles
+    /// every assignment that uses it.
+    #[test]
+    fn parallel_edges_multiply() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("Person", &json!({})).unwrap();
+        let b = g.add_node("Person", &json!({})).unwrap();
+        let c = g.add_node("Person", &json!({})).unwrap();
+        g.add_edge(a, b, "KNOWS", &json!({})).unwrap();
+        g.add_edge(a, b, "KNOWS", &json!({})).unwrap();
+        g.add_edge(b, c, "KNOWS", &json!({})).unwrap();
+        g.add_edge(c, a, "KNOWS", &json!({})).unwrap();
+
+        let n = g
+            .count_triangle_cycles(&spec_all("KNOWS", "Person"))
+            .unwrap();
+        assert_eq!(n, 6);
+    }
+
+    /// Per-hop types are positional: a cycle whose third edge has a different
+    /// type matches only the rotation whose hop order lines up with the spec.
+    #[test]
+    fn per_hop_types_are_positional() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("Person", &json!({})).unwrap();
+        let b = g.add_node("Person", &json!({})).unwrap();
+        let c = g.add_node("Person", &json!({})).unwrap();
+        g.add_edge(a, b, "KNOWS", &json!({})).unwrap();
+        g.add_edge(b, c, "KNOWS", &json!({})).unwrap();
+        g.add_edge(c, a, "LIKES", &json!({})).unwrap();
+
+        let homogeneous = g
+            .count_triangle_cycles(&spec_all("KNOWS", "Person"))
+            .unwrap();
+        assert_eq!(homogeneous, 0);
+
+        let mixed = g
+            .count_triangle_cycles(&TriangleCountSpec {
+                rel_types: [Some("KNOWS"), Some("KNOWS"), Some("LIKES")],
+                labels: [Some("Person"); 3],
+            })
+            .unwrap();
+        assert_eq!(mixed, 1);
+    }
+
+    /// Untyped hops match any relationship type.
+    #[test]
+    fn untyped_hops_match_any_type() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("Person", &json!({})).unwrap();
+        let b = g.add_node("Person", &json!({})).unwrap();
+        let c = g.add_node("Person", &json!({})).unwrap();
+        g.add_edge(a, b, "KNOWS", &json!({})).unwrap();
+        g.add_edge(b, c, "LIKES", &json!({})).unwrap();
+        g.add_edge(c, a, "FOLLOWS", &json!({})).unwrap();
+
+        let n = g
+            .count_triangle_cycles(&TriangleCountSpec {
+                rel_types: [None; 3],
+                labels: [Some("Person"); 3],
+            })
+            .unwrap();
+        assert_eq!(n, 3);
+    }
+
+    /// A node missing the required label excludes every assignment that
+    /// binds it; a multi-label node still qualifies.
+    #[test]
+    fn label_filter_applies_per_variable() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("Person", &json!({})).unwrap();
+        let b = g.add_node("Person", &json!({})).unwrap();
+        let c = g.add_node("Robot", &json!({})).unwrap();
+        g.add_edge(a, b, "KNOWS", &json!({})).unwrap();
+        g.add_edge(b, c, "KNOWS", &json!({})).unwrap();
+        g.add_edge(c, a, "KNOWS", &json!({})).unwrap();
+
+        let strict = g
+            .count_triangle_cycles(&spec_all("KNOWS", "Person"))
+            .unwrap();
+        assert_eq!(strict, 0);
+
+        // With the label added, the node carries both labels and qualifies.
+        g.add_label(c, "Person").unwrap();
+        let after = g
+            .count_triangle_cycles(&spec_all("KNOWS", "Person"))
+            .unwrap();
+        assert_eq!(after, 3);
+
+        let unlabeled = g
+            .count_triangle_cycles(&TriangleCountSpec {
+                rel_types: [Some("KNOWS"); 3],
+                labels: [None; 3],
+            })
+            .unwrap();
+        assert_eq!(unlabeled, 3);
+    }
+
+    /// Relationship uniqueness: with `a == b == c` every hop is a self-loop,
+    /// so matches are ordered triples of pairwise-distinct self-loop edges.
+    /// Three self-loops give 3! = 6; two give none.
+    #[test]
+    fn self_loop_assignments_respect_relationship_uniqueness() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("Person", &json!({})).unwrap();
+        g.add_edge(a, a, "KNOWS", &json!({})).unwrap();
+        g.add_edge(a, a, "KNOWS", &json!({})).unwrap();
+
+        let two = g
+            .count_triangle_cycles(&spec_all("KNOWS", "Person"))
+            .unwrap();
+        assert_eq!(two, 0);
+
+        g.add_edge(a, a, "KNOWS", &json!({})).unwrap();
+        let three = g
+            .count_triangle_cycles(&spec_all("KNOWS", "Person"))
+            .unwrap();
+        assert_eq!(three, 6);
+    }
+
+    /// A self-loop combined with a 2-cycle yields one assignment per choice
+    /// of the variable bound to the looped node: a=b, b=c, or c=a.
+    #[test]
+    fn self_loop_with_two_cycle_counts_each_position() {
+        let (_dir, g) = open_tmp();
+        let x = g.add_node("Person", &json!({})).unwrap();
+        let y = g.add_node("Person", &json!({})).unwrap();
+        g.add_edge(x, x, "KNOWS", &json!({})).unwrap();
+        g.add_edge(x, y, "KNOWS", &json!({})).unwrap();
+        g.add_edge(y, x, "KNOWS", &json!({})).unwrap();
+
+        let n = g
+            .count_triangle_cycles(&spec_all("KNOWS", "Person"))
+            .unwrap();
+        assert_eq!(n, 3);
+    }
+
+    /// Unknown relationship types and labels match nothing instead of
+    /// erroring: the query layer maps absent registry entries to empty scans.
+    #[test]
+    fn unknown_type_or_label_counts_zero() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("Person", &json!({})).unwrap();
+        let b = g.add_node("Person", &json!({})).unwrap();
+        let c = g.add_node("Person", &json!({})).unwrap();
+        g.add_edge(a, b, "KNOWS", &json!({})).unwrap();
+        g.add_edge(b, c, "KNOWS", &json!({})).unwrap();
+        g.add_edge(c, a, "KNOWS", &json!({})).unwrap();
+
+        assert_eq!(
+            g.count_triangle_cycles(&spec_all("NOPE", "Person"))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            g.count_triangle_cycles(&spec_all("KNOWS", "Ghost"))
+                .unwrap(),
+            0
+        );
+    }
+
+    /// The count must reflect committed writes without an explicit
+    /// `rebuild_csr`: the freshness gate covers this consumer.
+    #[test]
+    fn count_is_fresh_after_writes() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("Person", &json!({})).unwrap();
+        let b = g.add_node("Person", &json!({})).unwrap();
+        let c = g.add_node("Person", &json!({})).unwrap();
+        g.add_edge(a, b, "KNOWS", &json!({})).unwrap();
+        g.add_edge(b, c, "KNOWS", &json!({})).unwrap();
+
+        let before = g
+            .count_triangle_cycles(&spec_all("KNOWS", "Person"))
+            .unwrap();
+        assert_eq!(before, 0);
+
+        g.add_edge(c, a, "KNOWS", &json!({})).unwrap();
+        let after = g
+            .count_triangle_cycles(&spec_all("KNOWS", "Person"))
+            .unwrap();
+        assert_eq!(after, 3);
+    }
+
+    /// An empty graph counts zero without erroring on unmaterialized state.
+    #[test]
+    fn empty_graph_counts_zero() {
+        let (_dir, g) = open_tmp();
+        assert_eq!(
+            g.count_triangle_cycles(&spec_all("KNOWS", "Person"))
+                .unwrap(),
+            0
         );
     }
 }

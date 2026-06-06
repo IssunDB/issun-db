@@ -273,6 +273,7 @@ impl WriteTxn<'_> {
     pub fn update_node(&mut self, id: NodeId, props: &impl Serialize) -> Result<(), Error> {
         self.graph.update_node_impl(&mut self.wtxn, id, props)?;
         self.mutations_count += 1;
+        self.delta.updated_nodes.push(id);
         Ok(())
     }
 

@@ -107,8 +107,12 @@ pub enum PhysicalOperator {
         input: Box<PhysicalOperator>,
         null_vars: Vec<String>,
     },
-    /// Deduplicate rows (DISTINCT).
-    Distinct { input: Box<PhysicalOperator> },
+    /// Deduplicate rows (DISTINCT). `keys` selects the binding names forming
+    /// the dedup key; `None` dedups on the full row.
+    Distinct {
+        input: Box<PhysicalOperator>,
+        keys: Option<Vec<String>>,
+    },
     /// Execute write operations (CREATE, MERGE, SET, DELETE) for each input row.
     /// Binds new nodes or edges from CREATE into the PathMap and passes each row downstream.
     WritePart {
@@ -153,6 +157,23 @@ pub enum PhysicalOperator {
         /// the closing edge must differ from all of them (openCypher
         /// relationship uniqueness).
         closing_unique_rels: Vec<String>,
+    },
+    /// Whole-pattern count of the directed triangle cycle
+    /// `(a)-[t1]->(b)-[t2]->(c)-[t3]->(a)`, evaluated by the core
+    /// sorted-intersect kernel without materializing any rows.
+    ///
+    /// Emitted by the optimizer when a grouping-free, non-distinct `count`
+    /// aggregate sits directly on the `MultiwayJoin`-closed triangle chain
+    /// and nothing else (filters beyond the per-variable labels, projections,
+    /// or variable references) needs the per-row bindings. Produces a single
+    /// row binding `output` to the count.
+    TriangleCount {
+        /// Relationship types for the hops `a -> b`, `b -> c`, and `c -> a`.
+        rel_types: [Option<String>; 3],
+        /// Labels required on `a`, `b`, and `c`.
+        labels: [Option<String>; 3],
+        /// Output column the count is bound to.
+        output: String,
     },
 }
 
@@ -243,8 +264,9 @@ impl PhysicalPlanner {
                     null_vars: null_vars.clone(),
                 }
             }
-            LogicalOperator::Distinct { input } => PhysicalOperator::Distinct {
+            LogicalOperator::Distinct { input, keys } => PhysicalOperator::Distinct {
                 input: Box::new(Self::plan(input)),
+                keys: keys.clone(),
             },
             LogicalOperator::WritePart { input, part } => PhysicalOperator::WritePart {
                 input: Box::new(Self::plan(input)),
@@ -458,8 +480,11 @@ pub fn format_physical_plan(op: &PhysicalOperator, depth: usize) -> String {
             ));
             buf.push_str(&format_physical_plan(input, depth + 1));
         }
-        PhysicalOperator::Distinct { input } => {
-            buf.push_str(&format!("{}Distinct\n", pad));
+        PhysicalOperator::Distinct { input, keys } => {
+            match keys {
+                Some(keys) => buf.push_str(&format!("{}Distinct [{}]\n", pad, keys.join(", "))),
+                None => buf.push_str(&format!("{}Distinct\n", pad)),
+            }
             buf.push_str(&format_physical_plan(input, depth + 1));
         }
         PhysicalOperator::WritePart { input, part } => {
@@ -506,6 +531,36 @@ pub fn format_physical_plan(op: &PhysicalOperator, depth: usize) -> String {
                 pad, closing_src_var
             ));
             buf.push_str(&format_physical_plan(input, depth + 1));
+        }
+        PhysicalOperator::TriangleCount {
+            rel_types,
+            labels,
+            output,
+        } => {
+            let lbl = |l: &Option<String>| l.as_deref().unwrap_or("").to_string();
+            let rel = |r: &Option<String>| r.as_deref().unwrap_or("*").to_string();
+            buf.push_str(&format!(
+                "{}TriangleCount (a{la})-[:{r1}]->(b{lb})-[:{r2}]->(c{lc})-[:{r3}]->(a) AS {output}\n",
+                pad,
+                la = if labels[0].is_some() {
+                    format!(":{}", lbl(&labels[0]))
+                } else {
+                    String::new()
+                },
+                lb = if labels[1].is_some() {
+                    format!(":{}", lbl(&labels[1]))
+                } else {
+                    String::new()
+                },
+                lc = if labels[2].is_some() {
+                    format!(":{}", lbl(&labels[2]))
+                } else {
+                    String::new()
+                },
+                r1 = rel(&rel_types[0]),
+                r2 = rel(&rel_types[1]),
+                r3 = rel(&rel_types[2]),
+            ));
         }
     }
 

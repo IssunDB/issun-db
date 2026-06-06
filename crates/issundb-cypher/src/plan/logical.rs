@@ -86,8 +86,14 @@ pub enum LogicalOperator {
         input: Box<LogicalOperator>,
         items: Vec<SortItem>,
     },
-    /// Deduplicate rows (RETURN/WITH DISTINCT).
-    Distinct { input: Box<LogicalOperator> },
+    /// Deduplicate rows (RETURN/WITH DISTINCT). `keys` selects the binding
+    /// names forming the dedup key; `None` dedups on the full row (WITH
+    /// DISTINCT, where a barrier Project has already narrowed the row to the
+    /// projected aliases).
+    Distinct {
+        input: Box<LogicalOperator>,
+        keys: Option<Vec<String>>,
+    },
     /// Skip and limit the row stream.
     Limit {
         input: Box<LogicalOperator>,
@@ -347,9 +353,14 @@ impl LogicalPlanner {
                             };
                         }
 
-                        // Apply WITH DISTINCT deduplication after project.
+                        // Apply WITH DISTINCT deduplication after project. The
+                        // barrier project narrowed the row to the WITH aliases,
+                        // so the full row is the dedup key.
                         if *distinct {
-                            p = LogicalOperator::Distinct { input: Box::new(p) };
+                            p = LogicalOperator::Distinct {
+                                input: Box::new(p),
+                                keys: None,
+                            };
                         }
 
                         // Apply optional ORDER BY attached to the WITH clause. ORDER BY scope
@@ -554,11 +565,39 @@ impl LogicalPlanner {
             }
         }
 
+        // RETURN DISTINCT deduplicates before ORDER BY and SKIP/LIMIT, so the
+        // Distinct operator sits between Project and Sort, keyed on the
+        // projected columns (the Project is not a barrier, so rows still carry
+        // pre-projection bindings and the subtree stays open to filter
+        // pushdown). `RETURN DISTINCT *` is excluded: the star project passes
+        // rows through unchanged, so the executor dedups its records after
+        // projection instead.
+        let is_return_star = query.return_clause.items.len() == 1
+            && matches!(
+                &query.return_clause.items[0].expr,
+                Expr::FunctionCall { name, .. } if name == "__star__"
+            );
+        let plan_distinct = query.return_clause.distinct && !is_return_star;
+        let distinct_keys: Vec<String> = rewritten_return_items
+            .iter()
+            .map(|item| {
+                item.alias
+                    .clone()
+                    .unwrap_or_else(|| expr_display_name(&item.expr))
+            })
+            .collect();
+
         plan = LogicalOperator::Project {
             input: Box::new(plan),
             items: project_items,
             is_barrier: false,
         };
+        if plan_distinct {
+            plan = LogicalOperator::Distinct {
+                input: Box::new(plan),
+                keys: Some(distinct_keys),
+            };
+        }
 
         // INSERT ORDER BY above Project.
         if let Some(ref items) = order_by_items {

@@ -25,7 +25,7 @@ use crate::{
         ids::{
             adjust_label_count, adjust_type_count, alloc_edge_id, alloc_node_id, get_label,
             get_or_create_label, get_or_create_prop_key, get_or_create_type, get_prop_key,
-            get_prop_key_name,
+            get_prop_key_name, get_type,
         },
         lmdb::Storage,
         props,
@@ -50,6 +50,18 @@ pub enum DegreeDirection {
     Out,
     /// Count both incoming and outgoing edges.
     Both,
+}
+
+/// Pattern description for [`Graph::count_triangle_cycles`]: the directed
+/// cycle `(a)-[t1]->(b)-[t2]->(c)-[t3]->(a)` with an optional relationship
+/// type per hop and an optional label per node variable. `None` means
+/// unconstrained.
+#[derive(Debug, Clone, Default)]
+pub struct TriangleCountSpec<'a> {
+    /// Relationship types for the hops `a -> b`, `b -> c`, and `c -> a`.
+    pub rel_types: [Option<&'a str>; 3],
+    /// Labels required on `a`, `b`, and `c`.
+    pub labels: [Option<&'a str>; 3],
 }
 
 /// Builds a 12-byte composite key `(prefix u32 BE, id u64 BE)` for secondary index lookups.
@@ -278,6 +290,7 @@ pub struct Graph {
     pub(super) _write_lock: Arc<ReentrantMutex<()>>,
     pub(super) csr_cache: Arc<CsrCache>,
     pub(super) matrices: Arc<parking_lot::RwLock<Option<MatrixSet>>>,
+    pub(super) prop_columns: Arc<crate::columns::ColumnsCache>,
     /// Type-erased extension cache. Higher-level crates attach caches (e.g. the
     /// HNSW vector index) to a Graph without creating a circular dependency,
     /// through the `get_extension`, `set_extension`, and
@@ -305,8 +318,10 @@ pub struct WriteTxn<'a> {
 impl Graph {
     pub fn open(path: &Path, map_size_gb: usize) -> Result<Self, Error> {
         let storage = Storage::open(path, map_size_gb)?;
-        let csr_file = path.join("csr_snapshot.bin");
-        let initial = CsrSnapshot::build_mapped(&storage, &csr_file)?;
+        // Older versions persisted the CSR snapshot next to the LMDB files but
+        // never read it back; remove the stale artifact if one is present.
+        let _ = std::fs::remove_file(path.join("csr_snapshot.bin"));
+        let initial = CsrSnapshot::build(&storage)?;
         let storage = Arc::new(storage);
         let csr_cache = Arc::new(CsrCache::new(initial));
         let matrices = {
@@ -319,8 +334,58 @@ impl Graph {
             _write_lock: Arc::new(ReentrantMutex::new(())),
             csr_cache,
             matrices,
+            prop_columns: Arc::new(crate::columns::ColumnsCache::default()),
             extensions: Arc::new(parking_lot::Mutex::new(AHashMap::new())),
         })
+    }
+
+    /// Read one property of a node through the in-memory property columns,
+    /// as the `serde_json::Value` that decoding the stored record would give.
+    /// Returns `None` for a nonexistent node and `Some(Value::Null)` for a
+    /// missing property. Builds or refreshes the columns on first use after a
+    /// write, so the result always reflects committed state.
+    pub fn node_prop_json(
+        &self,
+        id: NodeId,
+        prop: &str,
+    ) -> Result<Option<serde_json::Value>, Error> {
+        self.prop_columns.with_fresh(&self.storage, |cols| {
+            cols.id_to_dense.get(&id).map(|&d| {
+                cols.cols
+                    .get(prop)
+                    .and_then(|c| c.get_json_opt(d as usize))
+                    .unwrap_or(serde_json::Value::Null)
+            })
+        })
+    }
+
+    /// Bulk form of [`Graph::node_prop_json`]: gather `props` for each id in
+    /// `ids` through the in-memory property columns, row-major (`out[i][j]` is
+    /// `props[j]` on `ids[i]`). One columns refresh covers the whole gather,
+    /// and each id resolves to its dense index once. A missing property reads
+    /// as `Value::Null`; a nonexistent node is [`Error::NodeNotFound`].
+    pub fn node_props_json_table(
+        &self,
+        ids: &[NodeId],
+        props: &[&str],
+    ) -> Result<Vec<Vec<serde_json::Value>>, Error> {
+        self.prop_columns
+            .with_fresh(&self.storage, |cols| cols.props_table(ids, props))?
+    }
+
+    /// Group `ids` by the exact value of `prop` through the in-memory
+    /// property columns: one dense group code per id, plus one representative
+    /// value per code (the first occurrence). Null and missing property
+    /// values share one code represented by `Value::Null`; a nonexistent node
+    /// is [`Error::NodeNotFound`]. Codes are assigned under value identity,
+    /// which for the typed columns needs no per-row value materialization.
+    pub fn node_prop_group_codes(
+        &self,
+        ids: &[NodeId],
+        prop: &str,
+    ) -> Result<(Vec<u32>, Vec<serde_json::Value>), Error> {
+        self.prop_columns
+            .with_fresh(&self.storage, |cols| cols.group_codes(ids, prop))?
     }
 
     /// Store an extension value (as `Arc`) keyed by its concrete type.
@@ -398,6 +463,12 @@ impl Graph {
                 let mutations_count = txn.mutations_count;
                 let delta = std::mem::take(&mut txn.delta);
                 txn.wtxn.commit()?;
+                if delta.force_full {
+                    self.prop_columns.record_force_full();
+                } else {
+                    self.prop_columns.record_touched_many(&delta.added_nodes);
+                    self.prop_columns.record_touched_many(&delta.updated_nodes);
+                }
                 self.csr_cache.record_batch(delta);
                 if mutations_count > 0 {
                     self.maybe_spawn_rebuild_n(mutations_count);
@@ -425,15 +496,8 @@ impl Graph {
     /// Synchronously rebuild the CSR snapshot from LMDB. Useful after bulk
     /// loads or when tests need a consistent read view before the threshold
     /// has been crossed.
-    ///
-    /// The snapshot is serialized to `<db_dir>/csr_snapshot.bin` and then
-    /// memory-mapped, enabling out-of-core traversal for graphs that exceed
-    /// available RAM.  Falls back to an in-RAM snapshot if the file cannot be
-    /// written.
     #[instrument(skip(self))]
     pub fn rebuild_csr(&self) -> Result<(), Error> {
-        // Derive the CSR file path from the LMDB env path.
-        let csr_file = self.storage.env.path().join("csr_snapshot.bin");
         // Capture the generation before reading LMDB so writes that land during
         // the build leave the snapshot conservatively stale.
         let built_gen = self.csr_cache.current_gen();
@@ -441,7 +505,7 @@ impl Graph {
         // build land in the emptied delta and are re-applied incrementally later
         // (idempotently) rather than lost.
         self.csr_cache.clear_delta();
-        let snap = CsrSnapshot::build_mapped(&self.storage, &csr_file)?;
+        let snap = CsrSnapshot::build(&self.storage)?;
         let m = MatrixSet::materialize(&snap)?;
         *self.matrices.write() = Some(m);
         self.csr_cache.install_full(snap, built_gen);

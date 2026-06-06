@@ -7,7 +7,7 @@ use super::*;
 ///
 /// If `rel_type` is `Some("A|B|C")`, this expands separately for each type and
 /// merges the results, deduplicating by `(EdgeId, NodeId)` pair.
-fn expand_multi_type(
+pub(super) fn expand_multi_type(
     graph: &Graph,
     src_nodes: &[NodeId],
     rel_type: Option<&str>,
@@ -135,6 +135,26 @@ pub(super) fn execute_read_query(
     // covering both expansion and the projection below.
     let _prop_cache = (!has_write_parts).then(expr::PropCache::install);
 
+    // Columnar fast path: a recognized final projection or aggregation over a
+    // single-hop expansion executes column-at-a-time and produces the result
+    // records directly. Any other shape (and every write query) takes the row
+    // pipeline below.
+    if !has_write_parts && !query.return_clause.items.is_empty() {
+        if let Some(mut records) = super::vectorized::try_execute_vectorized(
+            graph,
+            &optimized,
+            &query.return_clause,
+            params,
+            &schema,
+        )? {
+            let columns: Vec<String> = query.return_clause.items.iter().map(column_name).collect();
+            if query.return_clause.distinct {
+                dedup_records(&mut records);
+            }
+            return Ok(QueryResult { columns, records });
+        }
+    }
+
     let resolved_paths = if has_write_parts {
         graph.with_write_lock(|| execute_physical(graph, &optimized, params, &schema))?
     } else {
@@ -170,29 +190,25 @@ pub(super) fn execute_read_query(
     };
 
     // 4. Read each projected value directly from the row by its canonical key.
-    let mut records = Vec::new();
-    for path in resolved_paths {
-        let mut values = Vec::new();
-        if is_return_star {
+    let mut records = if is_return_star {
+        let mut star_records = Vec::with_capacity(resolved_paths.len());
+        for path in resolved_paths {
+            let mut values = Vec::with_capacity(columns.len());
             for key in &columns {
                 values.push(binding_to_value(graph, path.get_binding(key))?);
             }
-        } else {
-            for item in &query.return_clause.items {
-                let key = projected_key(&item.expr, &item.alias);
-                values.push(binding_to_value(graph, path.get_binding(&key))?);
-            }
+            star_records.push(Record { values });
         }
-        records.push(Record { values });
-    }
+        star_records
+    } else {
+        rows_to_records(graph, &query.return_clause.items, resolved_paths)?
+    };
 
-    // 5. Apply RETURN DISTINCT deduplication if requested.
-    if query.return_clause.distinct {
-        let mut seen = std::collections::HashSet::new();
-        records.retain(|r| {
-            let key = serde_json::to_string(&r.values).unwrap_or_default();
-            seen.insert(key)
-        });
+    // 5. Apply RETURN DISTINCT deduplication for RETURN *. Every other
+    // DISTINCT projection deduplicates inside the plan (a Distinct operator
+    // below Sort and Limit), so the limit caps distinct rows.
+    if query.return_clause.distinct && is_return_star {
+        dedup_records(&mut records);
     }
 
     Ok(QueryResult { columns, records })
@@ -724,6 +740,38 @@ pub(super) fn binding_to_value(
     }
 }
 
+/// Materialize result records for `items` from projected rows: one
+/// `binding_to_value` read per cell, by each item's canonical projected key.
+/// The keys are derived once, not per row.
+pub(super) fn rows_to_records(
+    graph: &Graph,
+    items: &[crate::ast::ReturnItem],
+    rows: Vec<SlotRow>,
+) -> Result<Vec<Record>, String> {
+    let keys: Vec<String> = items
+        .iter()
+        .map(|it| projected_key(&it.expr, &it.alias))
+        .collect();
+    let mut records = Vec::with_capacity(rows.len());
+    for path in rows {
+        let mut values = Vec::with_capacity(keys.len());
+        for key in &keys {
+            values.push(binding_to_value(graph, path.get_binding(key))?);
+        }
+        records.push(Record { values });
+    }
+    Ok(records)
+}
+
+/// Apply RETURN DISTINCT deduplication in place, keyed by the serialized row.
+fn dedup_records(records: &mut Vec<Record>) {
+    let mut seen = std::collections::HashSet::new();
+    records.retain(|r| {
+        let key = serde_json::to_string(&r.values).unwrap_or_default();
+        seen.insert(key)
+    });
+}
+
 /// Convert a `FilterExpr` to the `WhereClause` representation used by `evaluate_where`.
 fn filter_expr_to_where_clause(expression: &FilterExpr) -> WhereClause {
     match expression {
@@ -789,7 +837,7 @@ fn filter_over_expand_batch(
     src_nodes.dedup();
 
     let transitions = expand_multi_type(graph, &src_nodes, rel_type, is_incoming)?;
-    let mut transition_map: HashMap<NodeId, Vec<(EdgeId, NodeId)>> = HashMap::new();
+    let mut transition_map: ahash::AHashMap<NodeId, Vec<(EdgeId, NodeId)>> = ahash::AHashMap::new();
     for (src, eid, dst) in transitions {
         transition_map.entry(src).or_default().push((eid, dst));
     }
@@ -809,9 +857,9 @@ fn filter_over_expand_batch(
             active.sort_unstable();
             active.dedup();
             let filtered = graph
-                .label_filter_and_graphblas(&active, label)
+                .label_filter(&active, label)
                 .map_err(|e| e.to_string())?;
-            let pass_set: HashSet<NodeId> = filtered.into_iter().collect();
+            let pass_set: ahash::AHashSet<NodeId> = filtered.into_iter().collect();
 
             for path in &child_paths {
                 if let Some(GraphBinding::Node(n)) = path.get_binding(variable.as_str()) {
@@ -1048,7 +1096,7 @@ fn expand_from_paths(
         std::slice::from_ref(&is_incoming)
     };
 
-    let mut transition_map: HashMap<NodeId, Vec<(EdgeId, NodeId)>> = HashMap::new();
+    let mut transition_map: ahash::AHashMap<NodeId, Vec<(EdgeId, NodeId)>> = ahash::AHashMap::new();
     for &dir in directions {
         let transitions = expand_multi_type(graph, &src_nodes, rel_type, dir)?;
         for (src, eid, dst) in transitions {
@@ -1685,7 +1733,7 @@ fn execute_expand_chain_n(
 
     // Bulk-expand each hop level. The chain is linear, so level i's source set is
     // the set of nodes reached at level i-1; level 0's sources come from the base.
-    let mut level_maps: Vec<HashMap<NodeId, Vec<(EdgeId, NodeId)>>> =
+    let mut level_maps: Vec<ahash::AHashMap<NodeId, Vec<(EdgeId, NodeId)>>> =
         Vec::with_capacity(hops.len());
     let mut frontier: Vec<NodeId> = base_paths
         .iter()
@@ -1699,7 +1747,7 @@ fn execute_expand_chain_n(
 
     for hop in hops {
         let expanded = expand_multi_type(graph, &frontier, hop.rel_type, hop.is_incoming)?;
-        let mut map: HashMap<NodeId, Vec<(EdgeId, NodeId)>> = HashMap::new();
+        let mut map: ahash::AHashMap<NodeId, Vec<(EdgeId, NodeId)>> = ahash::AHashMap::new();
         for (src, eid, dst) in expanded {
             map.entry(src).or_default().push((eid, dst));
         }
@@ -1743,7 +1791,7 @@ fn thread_chain(
     base_path: &SlotRow,
     src: NodeId,
     hops: &[ChainHop<'_>],
-    level_maps: &[HashMap<NodeId, Vec<(EdgeId, NodeId)>>],
+    level_maps: &[ahash::AHashMap<NodeId, Vec<(EdgeId, NodeId)>>],
     hop_idx: usize,
     stack: &mut Vec<(EdgeId, NodeId)>,
     out: &mut Vec<SlotRow>,
@@ -1813,7 +1861,7 @@ fn json_val_cmp(l: &serde_json::Value, r: &serde_json::Value) -> Option<std::cmp
 
 /// Apply a `Project` operator's RETURN/WITH items to each input row. Extracted
 /// from the `Project` execution arm so the bounded-scan path can reuse it.
-fn project_rows(
+pub(super) fn project_rows(
     graph: &Graph,
     child_paths: Vec<SlotRow>,
     items: &[(Expr, Option<String>)],
@@ -1939,9 +1987,9 @@ pub(super) fn apply_filter(
         active_nodes.dedup();
 
         let filtered_nodes = graph
-            .label_filter_and_graphblas(&active_nodes, label)
+            .label_filter(&active_nodes, label)
             .map_err(|e| e.to_string())?;
-        let filtered_set: HashSet<NodeId> = filtered_nodes.into_iter().collect();
+        let filtered_set: ahash::AHashSet<NodeId> = filtered_nodes.into_iter().collect();
 
         for path in child_paths {
             if let Some(GraphBinding::Node(node)) = path.get_binding(variable) {
@@ -2094,9 +2142,11 @@ enum RowStream {
         out: Option<std::vec::IntoIter<SlotRow>>,
     },
     /// Streaming DISTINCT: a stateful pass-through emitting each row whose dedup
-    /// key has not been seen, so an upstream `LIMIT` can short-circuit.
+    /// key has not been seen, so an upstream `LIMIT` can short-circuit. `keys`
+    /// narrows the dedup key to those binding names; `None` keys the full row.
     Distinct {
         input: Box<RowStream>,
+        keys: Option<Vec<String>>,
         seen: HashSet<String>,
     },
     /// Blocking aggregate: drains and folds `input` on the first pull, then emits
@@ -2374,8 +2424,9 @@ fn build_stream_with_sip(
             bound: None,
             out: None,
         },
-        PhysicalOperator::Distinct { input } => RowStream::Distinct {
+        PhysicalOperator::Distinct { input, keys } => RowStream::Distinct {
             input: Box::new(build_stream_with_sip(input, sip)),
+            keys: keys.clone(),
             seen: HashSet::new(),
         },
         PhysicalOperator::Aggregate {
@@ -2734,7 +2785,7 @@ impl RowStream {
                 };
                 Ok(iter.by_ref().take(STREAM_BATCH).collect())
             }
-            RowStream::Distinct { input, seen } => loop {
+            RowStream::Distinct { input, keys, seen } => loop {
                 let batch = input.next_batch(graph, params, schema)?;
                 if batch.is_empty() {
                     return Ok(vec![]);
@@ -2742,13 +2793,23 @@ impl RowStream {
                 let kept: Vec<SlotRow> = batch
                     .into_iter()
                     .filter(|path| {
-                        // `bound_entries` iterates slots in schema order then
-                        // locals, so the dedup key is deterministic.
-                        let key = path
-                            .bound_entries()
-                            .map(|(k, v)| format!("{}={:?}", k, v))
-                            .collect::<Vec<_>>()
-                            .join("|");
+                        let key = match keys {
+                            // Keyed dedup: only the selected bindings (the
+                            // RETURN DISTINCT projection) form the key.
+                            Some(keys) => keys
+                                .iter()
+                                .map(|k| format!("{:?}", path.get_binding(k)))
+                                .collect::<Vec<_>>()
+                                .join("|"),
+                            // Full-row dedup: `bound_entries` iterates slots in
+                            // schema order then locals, so the key is
+                            // deterministic.
+                            None => path
+                                .bound_entries()
+                                .map(|(k, v)| format!("{}={:?}", k, v))
+                                .collect::<Vec<_>>()
+                                .join("|"),
+                        };
                         seen.insert(key)
                     })
                     .collect();
@@ -2916,6 +2977,270 @@ impl RowStream {
 /// materialized one produce identical groups; output rows are emitted in
 /// `BTreeMap` key order. Shared by the materializing `Aggregate` arm and the
 /// streaming `RowStream::Aggregate` node.
+/// Per-group accumulator for one aggregation function. The fold and finalize
+/// steps are shared by the row-at-a-time `aggregate_all` and the columnar
+/// vectorized aggregate, so both produce identical values.
+pub(super) struct AggState {
+    count: i64,
+    sum: f64,
+    /// True once a non-integer value has been summed. `sum()` over only
+    /// integers returns an integer, matching openCypher numeric typing.
+    sum_is_float: bool,
+    min: Option<serde_json::Value>,
+    max: Option<serde_json::Value>,
+    collect: Vec<serde_json::Value>,
+    distinct_seen: std::collections::HashSet<String>,
+    /// Accumulated numeric values for stDev, stDevP, percentile functions.
+    values: Vec<f64>,
+}
+
+impl AggState {
+    pub(super) fn new() -> Self {
+        Self {
+            count: 0,
+            sum: 0.0,
+            sum_is_float: false,
+            min: None,
+            max: None,
+            collect: Vec::new(),
+            distinct_seen: std::collections::HashSet::new(),
+            values: Vec::new(),
+        }
+    }
+
+    /// Fold one `count(*)` row (no input expression to evaluate).
+    pub(super) fn fold_count_star(&mut self) {
+        self.count += 1;
+    }
+
+    /// Fold one already-evaluated input value, applying openCypher null and
+    /// DISTINCT semantics for `agg_fn`.
+    pub(super) fn fold(&mut self, agg_fn: &AggFn, val: serde_json::Value) {
+        match agg_fn {
+            AggFn::Count { distinct } => {
+                if val != serde_json::Value::Null {
+                    if *distinct {
+                        if self.distinct_seen.insert(val.to_string()) {
+                            self.count += 1;
+                        }
+                    } else {
+                        self.count += 1;
+                    }
+                }
+            }
+            AggFn::Sum { distinct } => {
+                if val != serde_json::Value::Null {
+                    if *distinct && !self.distinct_seen.insert(val.to_string()) {
+                        // already seen, skip
+                    } else if let Some(n) = val.as_f64() {
+                        if val.as_i64().is_none() {
+                            self.sum_is_float = true;
+                        }
+                        self.sum += n;
+                    }
+                }
+            }
+            AggFn::Avg { distinct } => {
+                if val != serde_json::Value::Null {
+                    if *distinct && !self.distinct_seen.insert(val.to_string()) {
+                        // already seen, skip
+                    } else if let Some(n) = val.as_f64() {
+                        self.sum += n;
+                        self.count += 1;
+                    }
+                }
+            }
+            AggFn::Min { .. } => {
+                if val != serde_json::Value::Null {
+                    self.min = Some(match self.min.take() {
+                        None => val,
+                        Some(prev) => {
+                            if json_cmp_total(&val, &prev) == std::cmp::Ordering::Less {
+                                val
+                            } else {
+                                prev
+                            }
+                        }
+                    });
+                }
+            }
+            AggFn::Max { .. } => {
+                if val != serde_json::Value::Null {
+                    self.max = Some(match self.max.take() {
+                        None => val,
+                        Some(prev) => {
+                            if json_cmp_total(&val, &prev) == std::cmp::Ordering::Greater {
+                                val
+                            } else {
+                                prev
+                            }
+                        }
+                    });
+                }
+            }
+            AggFn::Collect { distinct } => {
+                if val != serde_json::Value::Null {
+                    if *distinct && !self.distinct_seen.insert(val.to_string()) {
+                        // already seen, skip
+                    } else {
+                        self.collect.push(val);
+                    }
+                }
+            }
+            AggFn::StDev { .. } | AggFn::StDevP { .. } => {
+                if let Some(n) = val.as_f64() {
+                    self.values.push(n);
+                }
+            }
+            AggFn::PercentileDisc { .. } | AggFn::PercentileCont { .. } => {
+                if let Some(n) = val.as_f64() {
+                    self.values.push(n);
+                }
+            }
+        }
+    }
+
+    /// Produce the final aggregate value for `agg_fn` from this state.
+    pub(super) fn finalize(
+        &self,
+        graph: &Graph,
+        agg_fn: &AggFn,
+        params: &HashMap<String, serde_json::Value>,
+    ) -> Result<serde_json::Value, String> {
+        let state = self;
+        Ok(match agg_fn {
+            AggFn::Count { .. } => serde_json::Value::Number(state.count.into()),
+            AggFn::Sum { .. } => {
+                // Preserve integer typing: a sum over only integer inputs
+                // is an integer, as in openCypher.
+                if !state.sum_is_float
+                    && state.sum.fract() == 0.0
+                    && state.sum.abs() < i64::MAX as f64
+                {
+                    serde_json::Value::Number((state.sum as i64).into())
+                } else {
+                    serde_json::Number::from_f64(state.sum)
+                        .map(serde_json::Value::Number)
+                        .unwrap_or(serde_json::Value::Null)
+                }
+            }
+            AggFn::Avg { .. } => {
+                if state.count == 0 {
+                    serde_json::Value::Null
+                } else {
+                    let avg = state.sum / state.count as f64;
+                    serde_json::Number::from_f64(avg)
+                        .map(serde_json::Value::Number)
+                        .unwrap_or(serde_json::Value::Null)
+                }
+            }
+            AggFn::Min { .. } => state.min.clone().unwrap_or(serde_json::Value::Null),
+            AggFn::Max { .. } => state.max.clone().unwrap_or(serde_json::Value::Null),
+            AggFn::Collect { .. } => serde_json::Value::Array(state.collect.clone()),
+            AggFn::StDev { .. } => {
+                let n = state.values.len();
+                if n < 2 {
+                    serde_json::Value::Number(
+                        serde_json::Number::from_f64(0.0)
+                            .unwrap_or_else(|| serde_json::Number::from(0)),
+                    )
+                } else {
+                    let mean = state.values.iter().sum::<f64>() / n as f64;
+                    let variance = state.values.iter().map(|x| (x - mean).powi(2)).sum::<f64>()
+                        / (n - 1) as f64;
+                    serde_json::Number::from_f64(variance.sqrt())
+                        .map(serde_json::Value::Number)
+                        .unwrap_or(serde_json::Value::Null)
+                }
+            }
+            AggFn::StDevP { .. } => {
+                let n = state.values.len();
+                if n == 0 {
+                    serde_json::Value::Number(
+                        serde_json::Number::from_f64(0.0)
+                            .unwrap_or_else(|| serde_json::Number::from(0)),
+                    )
+                } else {
+                    let mean = state.values.iter().sum::<f64>() / n as f64;
+                    let variance =
+                        state.values.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n as f64;
+                    serde_json::Number::from_f64(variance.sqrt())
+                        .map(serde_json::Value::Number)
+                        .unwrap_or(serde_json::Value::Null)
+                }
+            }
+            AggFn::PercentileDisc { percentile } => {
+                let percentile = evaluate_expr(graph, &PathMap::new(), percentile, params)?
+                    .as_f64()
+                    .ok_or("percentileDisc(): percentile must be a number")?;
+                if !(0.0..=1.0).contains(&percentile) {
+                    return Err(
+                        "ArgumentError(NumberOutOfRange): percentile must be in [0.0, 1.0]"
+                            .to_string(),
+                    );
+                }
+                let mut sorted = state.values.clone();
+                sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let n = sorted.len();
+                if n == 0 {
+                    serde_json::Value::Null
+                } else {
+                    let idx = ((percentile * n as f64).ceil() as usize)
+                        .saturating_sub(1)
+                        .min(n - 1);
+                    serde_json::Number::from_f64(sorted[idx])
+                        .map(serde_json::Value::Number)
+                        .unwrap_or(serde_json::Value::Null)
+                }
+            }
+            AggFn::PercentileCont { percentile } => {
+                let percentile = evaluate_expr(graph, &PathMap::new(), percentile, params)?
+                    .as_f64()
+                    .ok_or("percentileCont(): percentile must be a number")?;
+                if !(0.0..=1.0).contains(&percentile) {
+                    return Err(
+                        "ArgumentError(NumberOutOfRange): percentile must be in [0.0, 1.0]"
+                            .to_string(),
+                    );
+                }
+                let mut sorted = state.values.clone();
+                sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let n = sorted.len();
+                if n == 0 {
+                    serde_json::Value::Null
+                } else {
+                    let rank = percentile * (n - 1) as f64;
+                    let lower = rank.floor() as usize;
+                    let upper = rank.ceil() as usize;
+                    let frac = rank - lower as f64;
+                    let val = sorted[lower] + frac * (sorted[upper.min(n - 1)] - sorted[lower]);
+                    serde_json::Number::from_f64(val)
+                        .map(serde_json::Value::Number)
+                        .unwrap_or(serde_json::Value::Null)
+                }
+            }
+        })
+    }
+}
+
+/// The output column name of a group-by item: its alias when present,
+/// otherwise the canonical display form of the expression. Shared by the
+/// row-at-a-time and vectorized aggregate folds so group rows bind under
+/// identical keys.
+pub(super) fn group_by_column_name(expr: &Expr, alias: &Option<String>) -> String {
+    if let Some(a) = alias {
+        a.clone()
+    } else {
+        match expr {
+            Expr::Prop(var, prop) if prop.is_empty() => var.clone(),
+            Expr::Prop(var, prop) => format!("{}.{}", var, prop),
+            Expr::Literal(lit) => lit.to_string(),
+            Expr::Param(p) => format!("${}", p),
+            other => expr_display_name(other),
+        }
+    }
+}
+
 fn aggregate_all(
     graph: &Graph,
     input: &mut RowStream,
@@ -2925,34 +3250,6 @@ fn aggregate_all(
     schema: &std::sync::Arc<SlotSchema>,
 ) -> Result<Vec<SlotRow>, String> {
     use std::collections::BTreeMap;
-
-    struct AggState {
-        count: i64,
-        sum: f64,
-        /// True once a non-integer value has been summed. `sum()` over only
-        /// integers returns an integer, matching openCypher numeric typing.
-        sum_is_float: bool,
-        min: Option<serde_json::Value>,
-        max: Option<serde_json::Value>,
-        collect: Vec<serde_json::Value>,
-        distinct_seen: std::collections::HashSet<String>,
-        /// Accumulated numeric values for stDev, stDevP, percentile functions.
-        values: Vec<f64>,
-    }
-    impl AggState {
-        fn new() -> Self {
-            Self {
-                count: 0,
-                sum: 0.0,
-                sum_is_float: false,
-                min: None,
-                max: None,
-                collect: Vec::new(),
-                distinct_seen: std::collections::HashSet::new(),
-                values: Vec::new(),
-            }
-        }
-    }
 
     // group_key -> (group-by row, per-aggregation state Vec)
     let mut groups: BTreeMap<String, (SlotRow, Vec<AggState>)> = BTreeMap::new();
@@ -2969,17 +3266,7 @@ fn aggregate_all(
         let mut gb_path = SlotRow::empty(path.schema_arc());
         for (expr, alias) in group_by {
             let val = evaluate_expr(graph, &path, expr, params)?;
-            let col = if let Some(a) = alias {
-                a.clone()
-            } else {
-                match expr {
-                    Expr::Prop(var, prop) if prop.is_empty() => var.clone(),
-                    Expr::Prop(var, prop) => format!("{}.{}", var, prop),
-                    Expr::Literal(lit) => lit.to_string(),
-                    Expr::Param(p) => format!("${}", p),
-                    other => expr_display_name(other),
-                }
-            };
+            let col = group_by_column_name(expr, alias);
             key_parts.push(val.to_string());
             gb_path.bind_local(&col, GraphBinding::Scalar(val));
         }
@@ -2992,99 +3279,11 @@ fn aggregate_all(
 
         for (i, (agg_fn, inner_expr, _col)) in aggregations.iter().enumerate() {
             let state = &mut entry.1[i];
-            match agg_fn {
-                AggFn::Count { distinct } => {
-                    if matches!(inner_expr, Expr::CountStar) {
-                        state.count += 1;
-                    } else {
-                        let val = evaluate_expr(graph, &path, inner_expr, params)?;
-                        if val != serde_json::Value::Null {
-                            if *distinct {
-                                if state.distinct_seen.insert(val.to_string()) {
-                                    state.count += 1;
-                                }
-                            } else {
-                                state.count += 1;
-                            }
-                        }
-                    }
-                }
-                AggFn::Sum { distinct } => {
-                    let val = evaluate_expr(graph, &path, inner_expr, params)?;
-                    if val != serde_json::Value::Null {
-                        if *distinct && !state.distinct_seen.insert(val.to_string()) {
-                            // already seen, skip
-                        } else if let Some(n) = val.as_f64() {
-                            if val.as_i64().is_none() {
-                                state.sum_is_float = true;
-                            }
-                            state.sum += n;
-                        }
-                    }
-                }
-                AggFn::Avg { distinct } => {
-                    let val = evaluate_expr(graph, &path, inner_expr, params)?;
-                    if val != serde_json::Value::Null {
-                        if *distinct && !state.distinct_seen.insert(val.to_string()) {
-                            // already seen, skip
-                        } else if let Some(n) = val.as_f64() {
-                            state.sum += n;
-                            state.count += 1;
-                        }
-                    }
-                }
-                AggFn::Min { .. } => {
-                    let val = evaluate_expr(graph, &path, inner_expr, params)?;
-                    if val != serde_json::Value::Null {
-                        state.min = Some(match state.min.take() {
-                            None => val,
-                            Some(prev) => {
-                                if json_cmp_total(&val, &prev) == std::cmp::Ordering::Less {
-                                    val
-                                } else {
-                                    prev
-                                }
-                            }
-                        });
-                    }
-                }
-                AggFn::Max { .. } => {
-                    let val = evaluate_expr(graph, &path, inner_expr, params)?;
-                    if val != serde_json::Value::Null {
-                        state.max = Some(match state.max.take() {
-                            None => val,
-                            Some(prev) => {
-                                if json_cmp_total(&val, &prev) == std::cmp::Ordering::Greater {
-                                    val
-                                } else {
-                                    prev
-                                }
-                            }
-                        });
-                    }
-                }
-                AggFn::Collect { distinct } => {
-                    let val = evaluate_expr(graph, &path, inner_expr, params)?;
-                    if val != serde_json::Value::Null {
-                        if *distinct && !state.distinct_seen.insert(val.to_string()) {
-                            // already seen, skip
-                        } else {
-                            state.collect.push(val);
-                        }
-                    }
-                }
-                AggFn::StDev { .. } | AggFn::StDevP { .. } => {
-                    let val = evaluate_expr(graph, &path, inner_expr, params)?;
-                    if let Some(n) = val.as_f64() {
-                        state.values.push(n);
-                    }
-                }
-                AggFn::PercentileDisc { .. } | AggFn::PercentileCont { .. } => {
-                    let val = evaluate_expr(graph, &path, inner_expr, params)?;
-                    if let Some(n) = val.as_f64() {
-                        state.values.push(n);
-                    }
-                }
+            if matches!(agg_fn, AggFn::Count { .. }) && matches!(inner_expr, Expr::CountStar) {
+                state.fold_count_star();
+            } else {
+                let val = evaluate_expr(graph, &path, inner_expr, params)?;
+                state.fold(agg_fn, val);
             }
         }
         Ok(())
@@ -3106,118 +3305,7 @@ fn aggregate_all(
     for (_key, (mut gb_path, states)) in groups {
         for (i, (agg_fn, _inner, col)) in aggregations.iter().enumerate() {
             let state = &states[i];
-            let agg_val = match agg_fn {
-                AggFn::Count { .. } => serde_json::Value::Number(state.count.into()),
-                AggFn::Sum { .. } => {
-                    // Preserve integer typing: a sum over only integer inputs
-                    // is an integer, as in openCypher.
-                    if !state.sum_is_float
-                        && state.sum.fract() == 0.0
-                        && state.sum.abs() < i64::MAX as f64
-                    {
-                        serde_json::Value::Number((state.sum as i64).into())
-                    } else {
-                        serde_json::Number::from_f64(state.sum)
-                            .map(serde_json::Value::Number)
-                            .unwrap_or(serde_json::Value::Null)
-                    }
-                }
-                AggFn::Avg { .. } => {
-                    if state.count == 0 {
-                        serde_json::Value::Null
-                    } else {
-                        let avg = state.sum / state.count as f64;
-                        serde_json::Number::from_f64(avg)
-                            .map(serde_json::Value::Number)
-                            .unwrap_or(serde_json::Value::Null)
-                    }
-                }
-                AggFn::Min { .. } => state.min.clone().unwrap_or(serde_json::Value::Null),
-                AggFn::Max { .. } => state.max.clone().unwrap_or(serde_json::Value::Null),
-                AggFn::Collect { .. } => serde_json::Value::Array(state.collect.clone()),
-                AggFn::StDev { .. } => {
-                    let n = state.values.len();
-                    if n < 2 {
-                        serde_json::Value::Number(
-                            serde_json::Number::from_f64(0.0)
-                                .unwrap_or_else(|| serde_json::Number::from(0)),
-                        )
-                    } else {
-                        let mean = state.values.iter().sum::<f64>() / n as f64;
-                        let variance = state.values.iter().map(|x| (x - mean).powi(2)).sum::<f64>()
-                            / (n - 1) as f64;
-                        serde_json::Number::from_f64(variance.sqrt())
-                            .map(serde_json::Value::Number)
-                            .unwrap_or(serde_json::Value::Null)
-                    }
-                }
-                AggFn::StDevP { .. } => {
-                    let n = state.values.len();
-                    if n == 0 {
-                        serde_json::Value::Number(
-                            serde_json::Number::from_f64(0.0)
-                                .unwrap_or_else(|| serde_json::Number::from(0)),
-                        )
-                    } else {
-                        let mean = state.values.iter().sum::<f64>() / n as f64;
-                        let variance =
-                            state.values.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n as f64;
-                        serde_json::Number::from_f64(variance.sqrt())
-                            .map(serde_json::Value::Number)
-                            .unwrap_or(serde_json::Value::Null)
-                    }
-                }
-                AggFn::PercentileDisc { percentile } => {
-                    let percentile = evaluate_expr(graph, &PathMap::new(), percentile, params)?
-                        .as_f64()
-                        .ok_or("percentileDisc(): percentile must be a number")?;
-                    if !(0.0..=1.0).contains(&percentile) {
-                        return Err(
-                            "ArgumentError(NumberOutOfRange): percentile must be in [0.0, 1.0]"
-                                .to_string(),
-                        );
-                    }
-                    let mut sorted = state.values.clone();
-                    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                    let n = sorted.len();
-                    if n == 0 {
-                        serde_json::Value::Null
-                    } else {
-                        let idx = ((percentile * n as f64).ceil() as usize)
-                            .saturating_sub(1)
-                            .min(n - 1);
-                        serde_json::Number::from_f64(sorted[idx])
-                            .map(serde_json::Value::Number)
-                            .unwrap_or(serde_json::Value::Null)
-                    }
-                }
-                AggFn::PercentileCont { percentile } => {
-                    let percentile = evaluate_expr(graph, &PathMap::new(), percentile, params)?
-                        .as_f64()
-                        .ok_or("percentileCont(): percentile must be a number")?;
-                    if !(0.0..=1.0).contains(&percentile) {
-                        return Err(
-                            "ArgumentError(NumberOutOfRange): percentile must be in [0.0, 1.0]"
-                                .to_string(),
-                        );
-                    }
-                    let mut sorted = state.values.clone();
-                    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                    let n = sorted.len();
-                    if n == 0 {
-                        serde_json::Value::Null
-                    } else {
-                        let rank = percentile * (n - 1) as f64;
-                        let lower = rank.floor() as usize;
-                        let upper = rank.ceil() as usize;
-                        let frac = rank - lower as f64;
-                        let val = sorted[lower] + frac * (sorted[upper.min(n - 1)] - sorted[lower]);
-                        serde_json::Number::from_f64(val)
-                            .map(serde_json::Value::Number)
-                            .unwrap_or(serde_json::Value::Null)
-                    }
-                }
-            };
+            let agg_val = state.finalize(graph, agg_fn, params)?;
             gb_path.bind_local(col, GraphBinding::Scalar(agg_val));
         }
         result.push(gb_path);
@@ -3231,7 +3319,7 @@ fn aggregate_all(
 /// the first `k` rows a stable sort would yield, trimming a bounded buffer as it
 /// fills (the `Sort -> Limit` top-N optimization): the input-index tiebreak makes
 /// the trimmed set byte-identical to sort-then-truncate while bounding memory.
-fn sort_all(
+pub(super) fn sort_all(
     graph: &Graph,
     child_paths: Vec<SlotRow>,
     items: &[crate::ast::SortItem],
@@ -3546,6 +3634,32 @@ fn eval_leaf(
             }
         }
         PhysicalOperator::SingleRow => Ok(vec![SlotRow::empty(schema.clone())]),
+        PhysicalOperator::TriangleCount {
+            rel_types,
+            labels,
+            output,
+        } => {
+            // One kernel call over the CSR snapshot replaces the whole
+            // expand-and-close pipeline; the count comes back as one row.
+            let spec = issundb_core::TriangleCountSpec {
+                rel_types: [
+                    rel_types[0].as_deref(),
+                    rel_types[1].as_deref(),
+                    rel_types[2].as_deref(),
+                ],
+                labels: [
+                    labels[0].as_deref(),
+                    labels[1].as_deref(),
+                    labels[2].as_deref(),
+                ],
+            };
+            let count = graph
+                .count_triangle_cycles(&spec)
+                .map_err(|e| e.to_string())?;
+            let mut path = SlotRow::empty(schema.clone());
+            path.bind_local(output, GraphBinding::Scalar(serde_json::Value::from(count)));
+            Ok(vec![path])
+        }
         other => Err(format!("eval_leaf called on non-leaf operator: {other:?}")),
     }
 }
@@ -4173,5 +4287,191 @@ mod stream_join_tests {
             "MATCH (n:R) RETURN n.age AS age ORDER BY n.age ASC SKIP 2",
         );
         assert_eq!(skipped, full[2..].to_vec());
+    }
+}
+
+#[cfg(test)]
+mod triangle_count_exec_tests {
+    //! Plan-shape and parity tests for the `TriangleCount` kernel rewrite.
+    //! The forced row path appends an always-true `IS NULL` predicate: its
+    //! pushed-down `Filter` breaks the rewrite's exact shape match without
+    //! changing the result set, so the same query runs through the
+    //! `MultiwayJoin` row pipeline as a semantic oracle.
+    use super::*;
+    use crate::ast::Statement;
+    use crate::parser;
+    use crate::plan::physical::format_physical_plan;
+    use crate::plan::{LogicalPlanner, Optimizer, PhysicalPlanner};
+    use issundb_core::Graph;
+    use tempfile::TempDir;
+
+    const KERNEL_Q: &str = "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person)\
+         -[:KNOWS]->(a) RETURN count(a) AS n";
+    const ROW_Q: &str = "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person)\
+         -[:KNOWS]->(a) WHERE a.__force_row_path IS NULL RETURN count(a) AS n";
+
+    fn setup() -> (TempDir, Graph) {
+        let dir = TempDir::new().unwrap();
+        let graph = Graph::open(dir.path(), 1).unwrap();
+        (dir, graph)
+    }
+
+    fn plan_text(graph: &Graph, cypher: &str) -> String {
+        let stmt = parser::parse(cypher).unwrap();
+        let q = match stmt {
+            Statement::Query(q) => q,
+            _ => panic!("not a read query: {cypher}"),
+        };
+        let logical = LogicalPlanner::plan(&q).unwrap();
+        let physical = PhysicalPlanner::plan(&logical);
+        format_physical_plan(&Optimizer::optimize(physical, Some(graph)), 0)
+    }
+
+    fn count_result(graph: &Graph, cypher: &str) -> u64 {
+        let result = super::execute(graph, cypher, &HashMap::new()).unwrap();
+        assert_eq!(result.records.len(), 1, "count query must yield one row");
+        result.records[0].values[0].as_u64().unwrap()
+    }
+
+    fn triangle_fixture() -> (TempDir, Graph) {
+        let (dir, graph) = setup();
+        super::execute(
+            &graph,
+            "CREATE (x:Person), (y:Person), (z:Person) \
+             CREATE (x)-[:KNOWS]->(y), (y)-[:KNOWS]->(z), (z)-[:KNOWS]->(x)",
+            &HashMap::new(),
+        )
+        .unwrap();
+        graph.rebuild_csr().unwrap();
+        (dir, graph)
+    }
+
+    /// The harness triangle query plans to the kernel leaf and returns one
+    /// row per rotation of the single cycle.
+    #[test]
+    fn kernel_plan_shape_and_result() {
+        let (_dir, graph) = triangle_fixture();
+        let plan = plan_text(&graph, KERNEL_Q);
+        assert!(
+            plan.contains("TriangleCount"),
+            "expected the kernel leaf:\n{plan}"
+        );
+        assert_eq!(count_result(&graph, KERNEL_Q), 3);
+
+        // The forced row path keeps the MultiwayJoin pipeline and agrees.
+        let row_plan = plan_text(&graph, ROW_Q);
+        assert!(
+            !row_plan.contains("TriangleCount") && row_plan.contains("MultiwayJoin"),
+            "forcing predicate failed to disable the rewrite:\n{row_plan}"
+        );
+        assert_eq!(count_result(&graph, ROW_Q), 3);
+    }
+
+    /// `count(*)` and counts over the other pattern variables take the kernel
+    /// path too; every variable is bound in every match, so the counts agree.
+    #[test]
+    fn kernel_accepts_count_star_and_other_variables() {
+        let (_dir, graph) = triangle_fixture();
+        for ret in ["count(*)", "count(b)", "count(c)", "count(r1)"] {
+            let q = format!(
+                "MATCH (a:Person)-[r1:KNOWS]->(b:Person)-[:KNOWS]->(c:Person)-[:KNOWS]->(a) \
+                 RETURN {ret} AS n"
+            );
+            let plan = plan_text(&graph, &q);
+            assert!(
+                plan.contains("TriangleCount"),
+                "expected the kernel leaf for {ret}:\n{plan}"
+            );
+            assert_eq!(count_result(&graph, &q), 3, "count mismatch for {ret}");
+        }
+    }
+
+    /// Shapes outside the kernel contract must stay on the row pipeline:
+    /// extra predicates, grouping, DISTINCT, undirected or reversed or
+    /// var-length hops, and a missing closing join.
+    #[test]
+    fn unsupported_shapes_keep_the_row_path() {
+        let (_dir, graph) = triangle_fixture();
+        let bail_queries = [
+            // Property predicate on a pattern variable.
+            "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person)-[:KNOWS]->(a) \
+             WHERE b.age > 1 RETURN count(a) AS n",
+            // Grouped aggregation.
+            "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person)-[:KNOWS]->(a) \
+             RETURN b.city AS city, count(a) AS n",
+            // DISTINCT count.
+            "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person)-[:KNOWS]->(a) \
+             RETURN count(DISTINCT a) AS n",
+            // Undirected middle hop.
+            "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]-(c:Person)-[:KNOWS]->(a) \
+             RETURN count(a) AS n",
+            // Reversed closing hop: not a directed cycle.
+            "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person)<-[:KNOWS]-(a) \
+             RETURN count(a) AS n",
+            // Var-length hop.
+            "MATCH (a:Person)-[:KNOWS*1..2]->(b:Person)-[:KNOWS]->(c:Person)-[:KNOWS]->(a) \
+             RETURN count(a) AS n",
+            // Open chain: no closing join at all.
+            "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person) \
+             RETURN count(a) AS n",
+        ];
+        for q in bail_queries {
+            let plan = plan_text(&graph, q);
+            assert!(
+                !plan.contains("TriangleCount"),
+                "rewrite must not fire for `{q}`:\n{plan}"
+            );
+            // The query still executes on the row path.
+            super::execute(&graph, q, &HashMap::new()).unwrap();
+        }
+    }
+
+    /// Differential parity on random multigraphs: the kernel path and the
+    /// forced row path must agree on every graph, including self-loops and
+    /// parallel edges.
+    #[test]
+    fn kernel_matches_row_path_on_random_multigraphs() {
+        use proptest::prelude::*;
+
+        let mut runner = proptest::test_runner::TestRunner::new(ProptestConfig {
+            cases: 24,
+            ..ProptestConfig::default()
+        });
+        let strategy = (
+            1usize..=6,
+            proptest::collection::vec((0usize..6, 0usize..6), 0..24),
+        );
+        runner
+            .run(&strategy, |(n_nodes, edges)| {
+                let (_dir, graph) = setup();
+                let mut create = String::from("CREATE ");
+                for i in 0..n_nodes {
+                    if i > 0 {
+                        create.push_str(", ");
+                    }
+                    create.push_str(&format!("(p{i}:Person)"));
+                }
+                super::execute(&graph, &create, &HashMap::new()).unwrap();
+                let mut ids = Vec::new();
+                for i in 0..n_nodes {
+                    ids.push(i as u64);
+                }
+                for (s, d) in &edges {
+                    let (s, d) = (s % n_nodes, d % n_nodes);
+                    let q = format!(
+                        "MATCH (a:Person), (b:Person) WHERE id(a) = {} AND id(b) = {} \
+                         CREATE (a)-[:KNOWS]->(b)",
+                        ids[s], ids[d]
+                    );
+                    super::execute(&graph, &q, &HashMap::new()).unwrap();
+                }
+                graph.rebuild_csr().unwrap();
+
+                let kernel = count_result(&graph, KERNEL_Q);
+                let row = count_result(&graph, ROW_Q);
+                prop_assert_eq!(kernel, row, "kernel vs row path on {} nodes", n_nodes);
+                Ok(())
+            })
+            .unwrap();
     }
 }
