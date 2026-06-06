@@ -10,7 +10,7 @@ source build as a fallback), and that dependency must never become part of `make
 
 ```bash
 make bench-ladybug
-# or directly (from this directory, so the local toolchain pin applies):
+# Or directly (from this directory, so the local toolchain pin applies):
 cd benchmarks/ladybug-compare && cargo run --release
 ```
 
@@ -41,7 +41,8 @@ Current queries, each sent verbatim to both engines:
 - Node and relationship counts
 - Point lookup by indexed property (IssunDB property index versus LadybugDB primary key)
 - Property range filtering
-- One-, two-, and three-hop typed expansion from a fixed seed
+- One-, two-, three-, and four-hop typed expansion from a fixed seed
+- Combined one-or-two-hop neighborhood counting with duplicate-node elimination
 - Two-hop typed expansion from node 0, the hottest node under Zipf skew
 - Selective property filtering after a one-hop expansion
 - Two-hop expansion with both source and destination fixed
