@@ -39,3 +39,7 @@ path = "gen_testdata.rs"
 [[bin]]
 name = "profile_triangle"
 path = "profile_triangle.rs"
+
+[[bin]]
+name = "profile_query"
+path = "profile_query.rs"

@@ -1,5 +1,5 @@
 {
-  description = "IssunDB: a fast embedded analytical graph database in Rust";
+  description = "IssunDB: a fast embedded graph database in Rust";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";

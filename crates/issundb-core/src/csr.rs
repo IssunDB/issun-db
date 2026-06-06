@@ -1,4 +1,3 @@
-use std::path::Path;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -15,22 +14,6 @@ use crate::{
 
 /// Minimum number of writes between two successive background rebuilds.
 pub const REBUILD_THRESHOLD: u64 = 1_000;
-
-// ---------------------------------------------------------------------------
-// Binary layout for the persisted CSR file
-// ---------------------------------------------------------------------------
-//
-//   [0..8]           magic    u64 LE  = 0x49535355_4E435352  ("ISSUNCSR")
-//   [8..16]          n_nodes  u64 LE
-//   [16..24]         n_edges  u64 LE
-//   [24 .. 24 + (n+1)*8]     row_ptr  u64 LE  (usize stored as u64)
-//   [.. + n_e*4]             col_idx  u32 LE
-//   [.. + n_e*4]             edge_type u32 LE
-//   [.. + n_e*8]             edge_id  u64 LE
-//   [.. + n_e*8]             edge_weight f64 LE
-//   [.. + n*8]               dense_to_id u64 LE
-
-const MAGIC: u64 = 0x4953_5355_4E43_5352;
 
 /// Compressed Sparse Row snapshot of the outgoing adjacency.
 pub struct CsrSnapshot {
@@ -126,62 +109,6 @@ impl CsrSnapshot {
             id_to_dense,
         })
     }
-
-    /// Build a snapshot and serialize it to `path` in the binary layout
-    /// documented above, so external tooling can inspect a snapshot without
-    /// opening LMDB. The returned snapshot always owns its arrays in RAM; a
-    /// failed write is ignored and the snapshot is returned unchanged.
-    pub fn build_persisted(storage: &Storage, path: &Path) -> Result<Self, Error> {
-        let snap = Self::build(storage)?;
-        let _ = snap.persist(path);
-        Ok(snap)
-    }
-
-    /// Serialize the snapshot arrays to `path` through a buffered writer.
-    fn persist(&self, path: &Path) -> Result<(), Error> {
-        use std::io::Write;
-
-        let n = self.dense_to_id.len();
-        let n_edges = self.col_idx.len();
-
-        let file = std::fs::File::create(path).map_err(Error::from)?;
-        let mut out = std::io::BufWriter::new(file);
-
-        // Header.
-        out.write_all(&MAGIC.to_le_bytes()).map_err(Error::from)?;
-        out.write_all(&(n as u64).to_le_bytes())
-            .map_err(Error::from)?;
-        out.write_all(&(n_edges as u64).to_le_bytes())
-            .map_err(Error::from)?;
-
-        // row_ptr: (n+1) u64 values.
-        for &v in &self.row_ptr {
-            out.write_all(&(v as u64).to_le_bytes())
-                .map_err(Error::from)?;
-        }
-        // col_idx: n_edges u32.
-        for &v in &self.col_idx {
-            out.write_all(&v.to_le_bytes()).map_err(Error::from)?;
-        }
-        // edge_type: n_edges u32.
-        for &v in &self.edge_type {
-            out.write_all(&v.to_le_bytes()).map_err(Error::from)?;
-        }
-        // edge_id: n_edges u64.
-        for &v in &self.edge_id {
-            out.write_all(&v.to_le_bytes()).map_err(Error::from)?;
-        }
-        // edge_weight: n_edges f64.
-        for &v in &self.edge_weight {
-            out.write_all(&v.to_le_bytes()).map_err(Error::from)?;
-        }
-        // dense_to_id: n u64.
-        for &v in &self.dense_to_id {
-            out.write_all(&v.to_le_bytes()).map_err(Error::from)?;
-        }
-        out.flush().map_err(Error::from)?;
-        Ok(())
-    }
 }
 
 /// Mutations accumulated since the matrices were last refreshed, sufficient to
@@ -194,9 +121,14 @@ impl CsrSnapshot {
 /// path resolves parallel edges against LMDB before deciding to clear a bit.
 /// Node deletion reshuffles the sorted dense-index mapping, so it sets
 /// `force_full` to fall back to a full rebuild rather than an incremental patch.
+///
+/// `updated_nodes` records property updates on existing nodes. The matrix
+/// refresh ignores it (adjacency is unchanged); the property-column cache
+/// drains it to re-read those records.
 #[derive(Default)]
 pub struct GraphDelta {
     pub added_nodes: Vec<NodeId>,
+    pub updated_nodes: Vec<NodeId>,
     pub added_edges: Vec<(NodeId, NodeId)>,
     pub removed_edges: Vec<(NodeId, NodeId)>,
     pub force_full: bool,
@@ -208,6 +140,7 @@ impl GraphDelta {
     pub fn is_empty(&self) -> bool {
         !self.force_full
             && self.added_nodes.is_empty()
+            && self.updated_nodes.is_empty()
             && self.added_edges.is_empty()
             && self.removed_edges.is_empty()
     }

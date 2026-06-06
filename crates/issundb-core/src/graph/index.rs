@@ -41,6 +41,30 @@ impl Graph {
         Ok(ids)
     }
 
+    /// Returns the subset of `nodes` that carry `label`, preserving input
+    /// order. One `label_idx` point lookup per candidate, so the cost scales
+    /// with the candidate set rather than the label population.
+    #[doc(hidden)]
+    pub fn label_filter(&self, nodes: &[NodeId], label: &str) -> Result<Vec<NodeId>, Error> {
+        let rtxn = self.storage.env.read_txn()?;
+        let label_id = match get_label(&self.storage, &rtxn, label)? {
+            Some(id) => id,
+            None => return Ok(vec![]),
+        };
+        let mut out = Vec::new();
+        for &n in nodes {
+            if self
+                .storage
+                .label_idx
+                .get(&rtxn, &composite_key(label_id, n))?
+                .is_some()
+            {
+                out.push(n);
+            }
+        }
+        Ok(out)
+    }
+
     /// Returns all edge IDs with the given type, in ascending ID order.
     pub fn edges_by_type(&self, etype: &str) -> Result<Vec<EdgeId>, Error> {
         let rtxn = self.storage.env.read_txn()?;
@@ -1258,5 +1282,49 @@ mod tests {
 
         let err = g.update_edge(eid, &json!({})).unwrap_err();
         assert!(matches!(err, Error::RequiredConstraintViolation(..)));
+    }
+}
+
+#[cfg(test)]
+mod label_filter_tests {
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    use crate::Graph;
+
+    fn open_tmp() -> (TempDir, Graph) {
+        let dir = TempDir::new().unwrap();
+        let g = Graph::open(dir.path(), 1).unwrap();
+        (dir, g)
+    }
+
+    #[test]
+    fn label_filter_keeps_only_labeled_nodes() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("Person", &json!({})).unwrap();
+        let b = g.add_node("City", &json!({})).unwrap();
+        let c = g.add_node_multi(&["City", "Person"], &json!({})).unwrap();
+
+        let filtered = g.label_filter(&[a, b, c], "Person").unwrap();
+        assert_eq!(filtered.len(), 2);
+        assert!(filtered.contains(&a));
+        assert!(filtered.contains(&c));
+    }
+
+    #[test]
+    fn label_filter_unknown_label_is_empty() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("Person", &json!({})).unwrap();
+        assert!(g.label_filter(&[a], "Ghost").unwrap().is_empty());
+    }
+
+    #[test]
+    fn label_filter_sees_committed_writes_immediately() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("Person", &json!({})).unwrap();
+        g.add_label(a, "Admin").unwrap();
+        assert_eq!(g.label_filter(&[a], "Admin").unwrap(), vec![a]);
+        g.remove_label(a, "Admin").unwrap();
+        assert!(g.label_filter(&[a], "Admin").unwrap().is_empty());
     }
 }

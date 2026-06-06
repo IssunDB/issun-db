@@ -317,8 +317,10 @@ pub struct WriteTxn<'a> {
 impl Graph {
     pub fn open(path: &Path, map_size_gb: usize) -> Result<Self, Error> {
         let storage = Storage::open(path, map_size_gb)?;
-        let csr_file = path.join("csr_snapshot.bin");
-        let initial = CsrSnapshot::build_persisted(&storage, &csr_file)?;
+        // Older versions persisted the CSR snapshot next to the LMDB files but
+        // never read it back; remove the stale artifact if one is present.
+        let _ = std::fs::remove_file(path.join("csr_snapshot.bin"));
+        let initial = CsrSnapshot::build(&storage)?;
         let storage = Arc::new(storage);
         let csr_cache = Arc::new(CsrCache::new(initial));
         let matrices = {
@@ -437,13 +439,8 @@ impl Graph {
     /// Synchronously rebuild the CSR snapshot from LMDB. Useful after bulk
     /// loads or when tests need a consistent read view before the threshold
     /// has been crossed.
-    ///
-    /// The snapshot is also serialized to `<db_dir>/csr_snapshot.bin`; the
-    /// write is best-effort and the snapshot itself always lives in RAM.
     #[instrument(skip(self))]
     pub fn rebuild_csr(&self) -> Result<(), Error> {
-        // Derive the CSR file path from the LMDB env path.
-        let csr_file = self.storage.env.path().join("csr_snapshot.bin");
         // Capture the generation before reading LMDB so writes that land during
         // the build leave the snapshot conservatively stale.
         let built_gen = self.csr_cache.current_gen();
@@ -451,7 +448,7 @@ impl Graph {
         // build land in the emptied delta and are re-applied incrementally later
         // (idempotently) rather than lost.
         self.csr_cache.clear_delta();
-        let snap = CsrSnapshot::build_persisted(&self.storage, &csr_file)?;
+        let snap = CsrSnapshot::build(&self.storage)?;
         let m = MatrixSet::materialize(&snap)?;
         *self.matrices.write() = Some(m);
         self.csr_cache.install_full(snap, built_gen);

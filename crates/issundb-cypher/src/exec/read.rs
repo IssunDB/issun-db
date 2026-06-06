@@ -809,7 +809,7 @@ fn filter_over_expand_batch(
             active.sort_unstable();
             active.dedup();
             let filtered = graph
-                .label_filter_and_graphblas(&active, label)
+                .label_filter(&active, label)
                 .map_err(|e| e.to_string())?;
             let pass_set: HashSet<NodeId> = filtered.into_iter().collect();
 
@@ -1939,7 +1939,7 @@ pub(super) fn apply_filter(
         active_nodes.dedup();
 
         let filtered_nodes = graph
-            .label_filter_and_graphblas(&active_nodes, label)
+            .label_filter(&active_nodes, label)
             .map_err(|e| e.to_string())?;
         let filtered_set: HashSet<NodeId> = filtered_nodes.into_iter().collect();
 
