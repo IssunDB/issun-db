@@ -66,8 +66,9 @@ Do not invent modules that do not yet exist when answering questions, but do pla
     - `src/graph/algo.rs`: public algorithm dispatch methods and internal traversal helpers.
     - `src/graph/graphblas/`: GraphBLAS algorithm implementations split by family: `traversal.rs`, `analytics.rs`, `paths.rs`, and `flow.rs`.
     - `src/graph/txn.rs`: `ReadTxn` and `WriteTxn` delegation impls and transaction tests.
-    - `src/csr.rs`: in-memory CSR snapshot, rebuilt in the background and swapped via `arc-swap`. Also owns the `GraphDelta` buffer captured on the
-      write path and the `write_gen`/`snapshot_gen` generation counters that drive incremental matrix maintenance and on-demand CSR refresh.
+    - `src/csr.rs`: in-memory CSR snapshot (outgoing arrays plus a transposed incoming view with per-edge type and edge ids), rebuilt in the
+      background and swapped via `arc-swap`. Also owns the `GraphDelta` buffer captured on the write path and the `write_gen`/`snapshot_gen`
+      generation counters that drive incremental matrix maintenance and on-demand CSR refresh.
     - `src/columns.rs`: in-memory property columns for the read path. One typed column (`Int`, `Float`, `Bool`, dictionary-encoded `Str`, or the
       exact-semantics `Json` fallback) per node property name over a self-contained dense node mapping, built lazily from one full node scan and
       kept fresh by a post-commit delta (added and updated nodes are re-read individually; node deletion forces a rebuild). Read through
@@ -144,13 +145,16 @@ Do not invent modules that do not yet exist when answering questions, but do pla
   Prefix-range scans via `prefix_iter` enumerate all nodes or edges for a given label or type in ascending ID order. A multi-label node has one
   `label_idx` entry per label it carries, so it appears in every matching label scan.
 - The GraphBLAS matrices (`MatrixSet`) and the CSR snapshot are the basis for the GraphBLAS algorithms, pattern matching, and multi-source
-  expansion. They are kept fresh through two gates rather than a single periodic rebuild. The write path records a structural delta (added nodes,
+  expansion. They are kept fresh through three gates rather than a single periodic rebuild. The write path records a structural delta (added nodes,
   added edges, and removed edges, plus a `force_full` flag set on any node deletion). The pure-adjacency consumers (`bfs`, `bfs_multi_source`,
   untyped expansion, `degree_centrality`, and `connected_components`) call `ensure_matrix_view`, which applies the delta in place in time
   proportional to the change (resize plus per-element set and drop on `adjacency` and `adjacency_t`), falling back to a full `rebuild_csr` only when
   a node was deleted. The CSR-array and hybrid consumers (everything else, including `dfs`, the path searches, the weighted and flow algorithms,
   `page_rank`, and the remaining centralities) call `ensure_csr_fresh`, which rebuilds on demand gated by a committed-write generation counter
-  (`write_gen` versus `snapshot_gen`). The background rebuild after `REBUILD_THRESHOLD` writes is a compaction safety net, not the freshness path.
+  (`write_gen` versus `snapshot_gen`); when the snapshot is already fresh it still drains the pending delta into the matrices, because a
+  snapshot-only refresh leaves them lagging. Typed bulk expansion calls `ensure_snapshot_fresh`, which rebuilds only the snapshot (no GraphBLAS
+  materialization) and leaves the delta for the matrix path; for a small source set over a stale snapshot it skips the gate entirely and reads
+  per-source LMDB adjacency. The background rebuild after `REBUILD_THRESHOLD` writes is a compaction safety net, not the freshness path.
   Callers needing a guaranteed fresh CSR view still call `rebuild_csr`. Point adjacency lookups (`out_neighbors`, `in_neighbors`, `all_neighbors`)
   read the `out_adj` and `in_adj` stores directly through the transaction, never the snapshot, so they always reflect committed and in-transaction
   writes.
@@ -290,7 +294,10 @@ outside `issundb`.
 - `Record`: `values: Vec<serde_json::Value>`
 
 The executor resolves patterns through the physical plan.
-Untyped expansion uses GraphBLAS SpMV; typed expansion reads adjacency through the transaction. Bulk label filtering uses `label_idx` point
+Untyped expansion uses GraphBLAS SpMV; typed expansion reads the CSR snapshot in bulk behind a snapshot-only freshness gate
+(`ensure_snapshot_fresh`, which skips GraphBLAS matrix materialization), falling back to per-source LMDB point reads when the snapshot is stale
+and the source set is small so a write-then-expand workload never pays a rebuild. The optimizer splits top-level `AND` conjunctions in WHERE so
+each conjunct pushes down to its own lowest binder. Bulk label filtering uses `label_idx` point
 lookups (`Graph::label_filter`), and single-property node reads go through the in-memory property columns (`Graph::node_prop_json`).
 A final projection or aggregation over a single-hop expansion executes column-at-a-time through `exec/vectorized.rs`
 (`Graph::node_props_json_table` and `Graph::node_prop_group_codes`); every other shape runs the row pipeline.

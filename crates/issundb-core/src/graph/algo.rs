@@ -385,6 +385,24 @@ impl Graph {
     pub(crate) fn ensure_csr_fresh(&self) -> Result<(), Error> {
         if self.matrices.read().is_none() || self.csr_cache.snapshot_is_stale() {
             self.rebuild_csr()?;
+        } else {
+            // A snapshot-only refresh (`ensure_snapshot_fresh`) leaves the
+            // structural delta pending, so a fresh snapshot generation does
+            // not imply fresh matrices; drain the delta into them.
+            self.ensure_matrix_view()?;
+        }
+        Ok(())
+    }
+
+    /// Freshness gate for consumers that read only the CSR snapshot (typed
+    /// expansion). Rebuilds the snapshot alone when it lags committed writes,
+    /// skipping GraphBLAS matrix materialization; the pending structural delta
+    /// stays in place for `ensure_matrix_view` to drain later.
+    pub(crate) fn ensure_snapshot_fresh(&self) -> Result<(), Error> {
+        if self.csr_cache.snapshot_is_stale() {
+            let built_gen = self.csr_cache.current_gen();
+            let snap = CsrSnapshot::build(&self.storage)?;
+            self.csr_cache.install_snapshot(snap, built_gen);
         }
         Ok(())
     }

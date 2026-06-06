@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use crate::ast::{AggFn, Expr, Literal};
+use crate::ast::{AggFn, BinaryOperator, Expr, Literal};
 use crate::plan::logical::FilterExpr;
 use crate::plan::physical::PhysicalOperator;
 use crate::plan::stats::StatsProvider;
@@ -12,7 +12,15 @@ impl Optimizer {
     /// Optimize a `PhysicalOperator` plan by standardizing operator sequences,
     /// extracting filter predicates, and pushing them down to the lowest possible nodes.
     pub fn optimize(op: PhysicalOperator, stats: Option<&dyn StatsProvider>) -> PhysicalOperator {
-        let (stripped_op, mut filters) = Self::extract_filters(op);
+        let (stripped_op, raw_filters) = Self::extract_filters(op);
+        // Split top-level AND conjunctions so each conjunct pushes down to its
+        // own lowest binder: `a.id = 1 AND b.age > 30` as a whole references
+        // both endpoints and would stay above the Expand, while its conjuncts
+        // reach the scan and the expansion respectively.
+        let mut filters = Vec::with_capacity(raw_filters.len());
+        for filter in raw_filters {
+            Self::split_conjuncts(filter, &mut filters);
+        }
         // Drop statically-true predicates so they are neither pushed down nor
         // evaluated per row. Only provably-true forms are removed; false or
         // unknown predicates are preserved for normal evaluation.
@@ -44,6 +52,26 @@ impl Optimizer {
         // triangle chain with the core sorted-intersect kernel.
         result = rewrite_triangle_count(result);
         result
+    }
+
+    /// Append `filter` to `out`, recursively splitting top-level `AND`
+    /// conjunctions into their conjuncts. Each conjunct keeps its original
+    /// `Expr` form, so per-conjunct evaluation stays on the same code path;
+    /// only the placement changes. The split preserves three-valued logic: a
+    /// conjunction passes a row exactly when every conjunct evaluates to TRUE,
+    /// which is what sequential Filter nodes compute.
+    fn split_conjuncts(filter: FilterExpr, out: &mut Vec<FilterExpr>) {
+        if let FilterExpr::Expr(Expr::BinaryOp {
+            op: BinaryOperator::And,
+            left,
+            right,
+        }) = filter
+        {
+            Self::split_conjuncts(FilterExpr::Expr(*left), out);
+            Self::split_conjuncts(FilterExpr::Expr(*right), out);
+        } else {
+            out.push(filter);
+        }
     }
 
     /// Extract all filter operators from the physical plan, return a stripped tree,
@@ -2550,6 +2578,69 @@ mod tests {
         } else {
             panic!("expected Project operator");
         }
+    }
+
+    /// Peel consecutive `Filter` nodes off `op`, returning the collected
+    /// predicates and the first non-Filter operator.
+    fn peel_filters(mut op: PhysicalOperator) -> (Vec<FilterExpr>, PhysicalOperator) {
+        let mut filters = Vec::new();
+        while let PhysicalOperator::Filter { input, expression } = op {
+            filters.push(expression);
+            op = *input;
+        }
+        (filters, op)
+    }
+
+    #[test]
+    fn test_and_conjuncts_split_and_push_independently() {
+        // The conjunction as a whole references both `a` and `b`, but each
+        // conjunct references one variable, so the split must let `a.age = 30`
+        // reach the scan below the Expand while `b.age = 40` stays above it.
+        let stmt = parser::parse(
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) \
+             WHERE a.age = 30 AND b.age = 40 RETURN b.name AS name",
+        )
+        .unwrap();
+        let query = match stmt {
+            crate::ast::Statement::Query(q) => q,
+            _ => panic!("expected Query"),
+        };
+
+        let logical_plan = LogicalPlanner::plan(&query).unwrap();
+        let physical_plan = PhysicalPlanner::plan(&logical_plan);
+        let optimized = Optimizer::optimize(physical_plan, None);
+
+        let PhysicalOperator::Project { input, .. } = optimized else {
+            panic!("expected Project at the root");
+        };
+        let (above, expand) = peel_filters(*input);
+        let PhysicalOperator::Expand { input, .. } = expand else {
+            panic!("expected Expand below the b-side filters, got {expand:?}");
+        };
+        let (below, scan) = peel_filters(*input);
+        assert!(matches!(
+            scan,
+            PhysicalOperator::LabelScan { ref variable, .. } if variable == "a"
+        ));
+
+        let refs_only = |f: &FilterExpr, var: &str| {
+            let vars = Optimizer::referenced_vars(f);
+            vars.len() == 1 && vars.contains(var)
+        };
+        assert!(
+            above.iter().all(|f| refs_only(f, "b")),
+            "only b-conjuncts may stay above the Expand, got {above:?}"
+        );
+        assert!(
+            above.iter().any(|f| !matches!(f, FilterExpr::HasLabel(..))),
+            "the b.age conjunct must survive the split, got {above:?}"
+        );
+        assert_eq!(
+            below.len(),
+            1,
+            "exactly the a.age conjunct belongs below the Expand, got {below:?}"
+        );
+        assert!(refs_only(&below[0], "a"));
     }
 
     #[test]

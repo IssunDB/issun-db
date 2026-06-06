@@ -1,5 +1,12 @@
 use super::*;
 
+/// Largest source-set size for which typed expansion over a stale snapshot
+/// stays on per-source LMDB point reads instead of paying the O(nodes + edges)
+/// snapshot refresh. Point reads are a few microseconds each, so below this
+/// size they are cheaper than any refresh; above it the refreshed CSR wins and
+/// also amortizes over subsequent expansions.
+const STALE_POINT_EXPAND_MAX: usize = 64;
+
 impl Graph {
     /// BFS via repeated SpMV over the combined adjacency using the MinPlus semiring.
     ///
@@ -277,37 +284,62 @@ impl Graph {
         };
         use std::collections::HashMap as StdHashMap;
 
-        // The typed path fetches neighbors via direct LMDB lookups to avoid
-        // GraphBLAS boolean-semiring limitations; EdgeId is available directly.
-        // It must run before any matrices access: point adjacency reads are
-        // always fresh, while the cached matrix dimension can be stale (an
-        // empty matrix set on a freshly opened graph would otherwise
-        // short-circuit the expansion to an empty result).
+        // The typed path reads the CSR snapshot per source row: a hash lookup
+        // plus a contiguous slice scan, with edge ids and type ids carried on
+        // the snapshot arrays. It must run before any matrices access (the
+        // cached matrix dimension can be stale) and never needs GraphBLAS, so
+        // freshness is the snapshot-only gate.
         if let Some(t) = rel_type {
             let type_id = {
                 let rtxn = self.storage.env.read_txn()?;
-                let meta_key = format!("type:{t}");
-                match self.storage.meta.get(&rtxn, &meta_key)? {
-                    Some(b) => {
-                        let arr: [u8; 4] = b
-                            .try_into()
-                            .map_err(|_| Error::Corrupt("type id must be 4 bytes"))?;
-                        u32::from_be_bytes(arr)
-                    }
+                match get_type(&self.storage, &rtxn, t)? {
+                    Some(id) => id,
                     None => return Ok(vec![]),
                 }
             };
 
+            // A stale snapshot needs an O(nodes + edges) refresh before the
+            // CSR is readable; for a small source set the per-source LMDB
+            // point reads (always fresh) are cheaper, so an interleaved
+            // write-then-expand workload never pays a rebuild.
+            if self.csr_cache.snapshot_is_stale() && src_nodes.len() <= STALE_POINT_EXPAND_MAX {
+                let mut results = Vec::new();
+                for &src in src_nodes {
+                    let neighbors = if is_incoming {
+                        self.in_neighbors(src)?
+                    } else {
+                        self.out_neighbors(src)?
+                    };
+                    for ne in neighbors {
+                        if ne.edge_type == type_id {
+                            results.push((src, ne.edge, ne.node));
+                        }
+                    }
+                }
+                return Ok(results);
+            }
+
+            self.ensure_snapshot_fresh()?;
+            let snap = self.csr_cache.snapshot.load();
+            let (row_ptr, col_idx, edge_type, edge_id) = if is_incoming {
+                (
+                    &snap.in_row_ptr,
+                    &snap.in_col_idx,
+                    &snap.in_edge_type,
+                    &snap.in_edge_id,
+                )
+            } else {
+                (&snap.row_ptr, &snap.col_idx, &snap.edge_type, &snap.edge_id)
+            };
             let mut results = Vec::new();
             for &src in src_nodes {
-                let neighbors = if is_incoming {
-                    self.in_neighbors(src)?
-                } else {
-                    self.out_neighbors(src)?
+                let d = match snap.id_to_dense.get(&src) {
+                    Some(&d) => d as usize,
+                    None => continue,
                 };
-                for ne in neighbors {
-                    if ne.edge_type == type_id {
-                        results.push((src, ne.edge, ne.node));
+                for k in row_ptr[d]..row_ptr[d + 1] {
+                    if edge_type[k] == type_id {
+                        results.push((src, edge_id[k], snap.dense_to_id[col_idx[k] as usize]));
                     }
                 }
             }
@@ -454,5 +486,90 @@ mod tests {
 
         let out = g.expand_spmv_graphblas(&[a], Some("likes"), false).unwrap();
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn typed_expand_reads_the_csr_when_fresh() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("person", &()).unwrap();
+        let b = g.add_node("person", &()).unwrap();
+        let e_ab = g.add_edge(a, b, "knows", &()).unwrap();
+        let e_ab2 = g.add_edge(a, b, "knows", &()).unwrap();
+        let e_aa = g.add_edge(a, a, "knows", &()).unwrap();
+        g.add_edge(a, b, "likes", &()).unwrap();
+        g.rebuild_csr().unwrap();
+
+        // Per-source results follow the snapshot's edge order (ascending edge
+        // id, so the self-loop comes last), and the type filter drops the
+        // `likes` edge.
+        let out = g.expand_spmv_graphblas(&[a], Some("knows"), false).unwrap();
+        assert_eq!(out, vec![(a, e_ab, b), (a, e_ab2, b), (a, e_aa, a)]);
+
+        // The incoming direction reads the transposed arrays.
+        let incoming = g.expand_spmv_graphblas(&[b], Some("knows"), true).unwrap();
+        assert_eq!(incoming, vec![(b, e_ab, a), (b, e_ab2, a)]);
+    }
+
+    #[test]
+    fn bulk_typed_expand_over_a_stale_snapshot_refreshes_it() {
+        let (_dir, g) = open_tmp();
+        let mut nodes = Vec::new();
+        for _ in 0..66 {
+            nodes.push(g.add_node("person", &()).unwrap());
+        }
+        let mut expected = Vec::new();
+        for w in nodes.windows(2) {
+            let e = g.add_edge(w[0], w[1], "knows", &()).unwrap();
+            expected.push((w[0], e, w[1]));
+        }
+        assert!(g.csr_cache.snapshot_is_stale());
+
+        let out = g
+            .expand_spmv_graphblas(&nodes, Some("knows"), false)
+            .unwrap();
+        assert_eq!(out, expected);
+        assert!(
+            !g.csr_cache.snapshot_is_stale(),
+            "a bulk typed expansion refreshes the snapshot"
+        );
+    }
+
+    #[test]
+    fn stale_point_expand_skips_the_snapshot_rebuild() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("person", &()).unwrap();
+        let b = g.add_node("person", &()).unwrap();
+        let e = g.add_edge(a, b, "knows", &()).unwrap();
+        assert!(g.csr_cache.snapshot_is_stale());
+
+        // A small source set over a stale snapshot stays on the per-source
+        // point reads, so a write-then-expand workload never pays a rebuild.
+        let out = g.expand_spmv_graphblas(&[a], Some("knows"), false).unwrap();
+        assert_eq!(out, vec![(a, e, b)]);
+        assert!(g.csr_cache.snapshot_is_stale());
+    }
+
+    #[test]
+    fn hybrid_consumers_stay_fresh_after_a_snapshot_only_refresh() {
+        let (_dir, g) = open_tmp();
+        let mut nodes = Vec::new();
+        for _ in 0..66 {
+            nodes.push(g.add_node("person", &()).unwrap());
+        }
+        for w in nodes.windows(2) {
+            g.add_edge(w[0], w[1], "knows", &()).unwrap();
+        }
+
+        // The bulk expansion refreshes the snapshot without touching the
+        // matrices, leaving the structural delta pending.
+        g.expand_spmv_graphblas(&nodes, Some("knows"), false)
+            .unwrap();
+        assert!(!g.csr_cache.snapshot_is_stale());
+
+        // A matrix-reading consumer behind `ensure_csr_fresh` must still see
+        // the writes: the pending delta has to reach the matrices even though
+        // the snapshot generation says fresh.
+        let reached = g.dfs(nodes[0], 1).unwrap();
+        assert_eq!(reached, vec![nodes[0], nodes[1]]);
     }
 }
