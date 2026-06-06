@@ -330,6 +330,29 @@ fn workload(nodes: u64) -> Vec<(&'static str, String)> {
                  WHERE a.id = {probe} RETURN count(c) AS n"
             ),
         ),
+        // Node 0 is the hottest node under Zipf skew, so this measures two-hop
+        // fan-out from a hub; under uniform skew it is just another probe.
+        (
+            "two_hop_hub",
+            "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person) \
+             WHERE a.id = 0 RETURN count(c) AS n"
+                .to_string(),
+        ),
+        (
+            "var_length_count",
+            format!(
+                "MATCH (a:Person)-[:KNOWS*2..3]->(c:Person) \
+                 WHERE a.id = {probe} RETURN count(c) AS n"
+            ),
+        ),
+        // Full-scan projection of three properties per row, so per-row property
+        // decode cost shows up instead of being hidden behind count(...).
+        (
+            "prop_projection",
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) \
+             RETURN b.name AS name, b.age AS age, b.city AS city"
+                .to_string(),
+        ),
         (
             "triangle_count",
             "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person)-[:KNOWS]->(a) \
@@ -364,6 +387,10 @@ fn run_at(cfg: &Config, nodes: u64, edges: u64) -> anyhow::Result<Vec<QueryTimin
     let lb_dir = tempfile::tempdir()?;
     let db = Database::new(lb_dir.path().join("db"), SystemConfig::default())?;
     let mut conn = Connection::new(&db)?;
+    // LadybugDB defaults to WALK semantics for variable-length patterns, where
+    // a relationship may repeat within a path; openCypher (and IssunDB) use
+    // TRAIL semantics. Pin TRAIL so both engines match the same paths.
+    conn.query("CALL recursive_pattern_semantic = 'TRAIL';")?;
     let default_threads = conn.get_max_num_threads_for_exec();
     let start = Instant::now();
     load_ladybug(&conn, csv_dir.path())?;

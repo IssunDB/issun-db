@@ -40,6 +40,9 @@ Current queries, each sent verbatim to both engines:
 
 - Point lookup by indexed property (IssunDB property index versus LadybugDB primary key)
 - Two-hop typed expansion from a fixed seed with an aggregate
+- Two-hop typed expansion from node 0, the hottest node under Zipf skew, so hub fan-out is measured rather than only a cold probe
+- Variable-length expansion (`*2..3`) from the fixed seed with an aggregate
+- Full-scan projection of three node properties per row, so per-row property decode cost is visible instead of hidden behind `count(...)`
 - Cyclic triangle count (exercises the IssunDB MultiwayJoin closing hop)
 - Aggregation over a one-hop traversal grouped by city
 
@@ -50,4 +53,6 @@ LadybugDB is measured twice per query: at its default thread count and pinned to
 - Load paths differ structurally: LadybugDB bulk-loads via `COPY FROM` CSV; IssunDB inserts per record through `add_node` and `add_edge`. Both are
   timed and reported, but they measure different ingestion models.
 - The differential check compares normalized string rows; the workload avoids float projections so no formatting reconciliation is needed.
+- LadybugDB defaults to WALK semantics for variable-length patterns (a relationship may repeat within a path); the harness pins
+  `recursive_pattern_semantic = 'TRAIL'` so both engines use the openCypher path semantics on identical query strings.
 - `rebuild_csr` runs once after the IssunDB load so queries start from a fresh snapshot, matching steady-state operation.

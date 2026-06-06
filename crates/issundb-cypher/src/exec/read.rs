@@ -1099,31 +1099,32 @@ fn expand_from_paths(
             } else {
                 Vec::new()
             };
-            let mut visited = HashSet::new();
-            visited.insert(src_node);
-            let mut queue = vec![(src_node, initial_traversed.clone(), visited)];
+            // openCypher trail semantics: a relationship may appear at most once
+            // per path, nodes may repeat, and every distinct trail is one result
+            // row. The per-path edge list is a Vec with a linear membership
+            // check because trails are short; termination on unbounded ranges
+            // follows from the finite edge set emptying the queue.
+            let mut queue = vec![(src_node, initial_traversed.clone(), Vec::<EdgeId>::new())];
             let mut completed_paths: Vec<(NodeId, Vec<serde_json::Value>)> = Vec::new();
-            let mut completed_targets = HashSet::new();
 
             if min_hops == 0 {
                 completed_paths.push((src_node, initial_traversed));
-                completed_targets.insert(src_node);
             }
 
             for hop in 1..=max_hops {
                 let mut next_queue = Vec::new();
-                for (node, traversed, visited_nodes) in queue {
+                for (node, traversed, used_edges) in queue {
                     for &dir in directions {
                         let neighbors = expand_multi_type(graph, &[node], rel_type, dir)?;
                         for (_, eid, neigh_node) in neighbors {
-                            if visited_nodes.contains(&neigh_node) {
+                            if used_edges.contains(&eid) {
                                 continue;
                             }
                             if edge_bound_to_sibling_rel(&path, unique_rels, eid) {
                                 continue;
                             }
-                            let mut next_visited = visited_nodes.clone();
-                            next_visited.insert(neigh_node);
+                            let mut next_used = used_edges.clone();
+                            next_used.push(eid);
 
                             let mut next_traversed = traversed.clone();
                             if needs_path {
@@ -1131,10 +1132,10 @@ fn expand_from_paths(
                                 next_traversed.push(get_node_representation(graph, neigh_node)?);
                             }
 
-                            if hop >= min_hops && completed_targets.insert(neigh_node) {
+                            if hop >= min_hops {
                                 completed_paths.push((neigh_node, next_traversed.clone()));
                             }
-                            next_queue.push((neigh_node, next_traversed, next_visited));
+                            next_queue.push((neigh_node, next_traversed, next_used));
                         }
                     }
                 }
