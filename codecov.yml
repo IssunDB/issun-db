@@ -1,0 +1,10 @@
+ignore:
+  - "tests/*"
+  - "benches/*"
+  - "examples/*"
+  - "docs/*"
+  - "crates/issundb-examples/*"
+  - "crates/issundb-py/*"
+  - "crates/issundb-node/*"
+  - "benchmarks/*"
+  - "scripts/*"
