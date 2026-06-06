@@ -204,8 +204,10 @@ pub(super) fn execute_read_query(
         rows_to_records(graph, &query.return_clause.items, resolved_paths)?
     };
 
-    // 5. Apply RETURN DISTINCT deduplication if requested.
-    if query.return_clause.distinct {
+    // 5. Apply RETURN DISTINCT deduplication for RETURN *. Every other
+    // DISTINCT projection deduplicates inside the plan (a Distinct operator
+    // below Sort and Limit), so the limit caps distinct rows.
+    if query.return_clause.distinct && is_return_star {
         dedup_records(&mut records);
     }
 
@@ -2140,9 +2142,11 @@ enum RowStream {
         out: Option<std::vec::IntoIter<SlotRow>>,
     },
     /// Streaming DISTINCT: a stateful pass-through emitting each row whose dedup
-    /// key has not been seen, so an upstream `LIMIT` can short-circuit.
+    /// key has not been seen, so an upstream `LIMIT` can short-circuit. `keys`
+    /// narrows the dedup key to those binding names; `None` keys the full row.
     Distinct {
         input: Box<RowStream>,
+        keys: Option<Vec<String>>,
         seen: HashSet<String>,
     },
     /// Blocking aggregate: drains and folds `input` on the first pull, then emits
@@ -2420,8 +2424,9 @@ fn build_stream_with_sip(
             bound: None,
             out: None,
         },
-        PhysicalOperator::Distinct { input } => RowStream::Distinct {
+        PhysicalOperator::Distinct { input, keys } => RowStream::Distinct {
             input: Box::new(build_stream_with_sip(input, sip)),
+            keys: keys.clone(),
             seen: HashSet::new(),
         },
         PhysicalOperator::Aggregate {
@@ -2780,7 +2785,7 @@ impl RowStream {
                 };
                 Ok(iter.by_ref().take(STREAM_BATCH).collect())
             }
-            RowStream::Distinct { input, seen } => loop {
+            RowStream::Distinct { input, keys, seen } => loop {
                 let batch = input.next_batch(graph, params, schema)?;
                 if batch.is_empty() {
                     return Ok(vec![]);
@@ -2788,13 +2793,23 @@ impl RowStream {
                 let kept: Vec<SlotRow> = batch
                     .into_iter()
                     .filter(|path| {
-                        // `bound_entries` iterates slots in schema order then
-                        // locals, so the dedup key is deterministic.
-                        let key = path
-                            .bound_entries()
-                            .map(|(k, v)| format!("{}={:?}", k, v))
-                            .collect::<Vec<_>>()
-                            .join("|");
+                        let key = match keys {
+                            // Keyed dedup: only the selected bindings (the
+                            // RETURN DISTINCT projection) form the key.
+                            Some(keys) => keys
+                                .iter()
+                                .map(|k| format!("{:?}", path.get_binding(k)))
+                                .collect::<Vec<_>>()
+                                .join("|"),
+                            // Full-row dedup: `bound_entries` iterates slots in
+                            // schema order then locals, so the key is
+                            // deterministic.
+                            None => path
+                                .bound_entries()
+                                .map(|(k, v)| format!("{}={:?}", k, v))
+                                .collect::<Vec<_>>()
+                                .join("|"),
+                        };
                         seen.insert(key)
                     })
                     .collect();

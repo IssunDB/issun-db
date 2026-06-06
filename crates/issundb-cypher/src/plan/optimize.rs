@@ -274,11 +274,12 @@ impl Optimizer {
                 PhysicalOperator::OptionalMatch { input, null_vars },
                 Vec::new(),
             ),
-            PhysicalOperator::Distinct { input } => {
+            PhysicalOperator::Distinct { input, keys } => {
                 let (inner, inner_filters) = Self::extract_filters(*input);
                 (
                     PhysicalOperator::Distinct {
                         input: Box::new(inner),
+                        keys,
                     },
                     inner_filters,
                 )
@@ -452,7 +453,8 @@ impl Optimizer {
                     null_vars,
                 }
             }
-            PhysicalOperator::Distinct { input } => PhysicalOperator::Distinct {
+            PhysicalOperator::Distinct { input, keys } => PhysicalOperator::Distinct {
+                keys,
                 input: Box::new(Self::reorder_operators(*input, stats)),
             },
             // WritePart is opaque: do not descend into it for reordering.
@@ -984,10 +986,11 @@ impl Optimizer {
                     null_vars,
                 }
             }
-            PhysicalOperator::Distinct { input } => {
+            PhysicalOperator::Distinct { input, keys } => {
                 let optimized = Self::push_down_filters(*input, pending);
                 PhysicalOperator::Distinct {
                     input: Box::new(optimized),
+                    keys,
                 }
             }
             // WritePart is opaque: do not push filters through a write boundary.
@@ -1205,7 +1208,7 @@ impl Optimizer {
                     vars.insert(var.clone());
                 }
             }
-            PhysicalOperator::Distinct { input } => {
+            PhysicalOperator::Distinct { input, .. } => {
                 Self::collect_bound_vars(input, vars);
             }
             // WritePart binds variables from its input plus newly created node/edge variables.
@@ -1854,7 +1857,8 @@ impl Optimizer {
                 skip,
                 count,
             },
-            PhysicalOperator::Distinct { input } => PhysicalOperator::Distinct {
+            PhysicalOperator::Distinct { input, keys } => PhysicalOperator::Distinct {
+                keys,
                 input: Box::new(Self::select_scan_node(*input, filters, stats)),
             },
             op @ PhysicalOperator::Expand { .. } => Self::try_reverse_chain(op, filters, stats),
@@ -2169,7 +2173,8 @@ impl Optimizer {
                 skip,
                 count,
             },
-            PhysicalOperator::Distinct { input } => PhysicalOperator::Distinct {
+            PhysicalOperator::Distinct { input, keys } => PhysicalOperator::Distinct {
+                keys,
                 input: Box::new(Self::reduce_count(*input, stats)),
             },
             other => other,
@@ -2276,7 +2281,8 @@ fn rewrite_closing_expands(op: PhysicalOperator) -> PhysicalOperator {
             input: Box::new(rewrite_closing_expands(*input)),
             null_vars,
         },
-        PhysicalOperator::Distinct { input } => PhysicalOperator::Distinct {
+        PhysicalOperator::Distinct { input, keys } => PhysicalOperator::Distinct {
+            keys,
             input: Box::new(rewrite_closing_expands(*input)),
         },
         PhysicalOperator::WritePart { input, part } => PhysicalOperator::WritePart {
@@ -2339,7 +2345,8 @@ fn rewrite_triangle_count(op: PhysicalOperator) -> PhysicalOperator {
             input: Box::new(rewrite_triangle_count(*input)),
             items,
         },
-        PhysicalOperator::Distinct { input } => PhysicalOperator::Distinct {
+        PhysicalOperator::Distinct { input, keys } => PhysicalOperator::Distinct {
+            keys,
             input: Box::new(rewrite_triangle_count(*input)),
         },
         PhysicalOperator::Filter { input, expression } => PhysicalOperator::Filter {
@@ -3123,7 +3130,7 @@ mod tests {
             | PhysicalOperator::Aggregate { input, .. }
             | PhysicalOperator::Sort { input, .. }
             | PhysicalOperator::Limit { input, .. }
-            | PhysicalOperator::Distinct { input }
+            | PhysicalOperator::Distinct { input, .. }
             | PhysicalOperator::MultiwayJoin { input, .. } => bottom_scan(input),
             _ => None,
         }
@@ -3140,7 +3147,7 @@ mod tests {
             | PhysicalOperator::Aggregate { input, .. }
             | PhysicalOperator::Sort { input, .. }
             | PhysicalOperator::Limit { input, .. }
-            | PhysicalOperator::Distinct { input }
+            | PhysicalOperator::Distinct { input, .. }
             | PhysicalOperator::MultiwayJoin { input, .. } => has_haslabel(input, var, label),
             _ => false,
         }
@@ -3188,7 +3195,7 @@ mod tests {
             | PhysicalOperator::Aggregate { input, .. }
             | PhysicalOperator::Sort { input, .. }
             | PhysicalOperator::Limit { input, .. }
-            | PhysicalOperator::Distinct { input }
+            | PhysicalOperator::Distinct { input, .. }
             | PhysicalOperator::MultiwayJoin { input, .. } => expand_path_flags(input, out),
             _ => {}
         }
@@ -3232,7 +3239,7 @@ mod tests {
                 | PhysicalOperator::Aggregate { input, .. }
                 | PhysicalOperator::Sort { input, .. }
                 | PhysicalOperator::Limit { input, .. }
-                | PhysicalOperator::Distinct { input } => has_multiway(input),
+                | PhysicalOperator::Distinct { input, .. } => has_multiway(input),
                 _ => false,
             }
         }
@@ -3268,7 +3275,7 @@ mod tests {
                 | PhysicalOperator::Aggregate { input, .. }
                 | PhysicalOperator::Sort { input, .. }
                 | PhysicalOperator::Limit { input, .. }
-                | PhysicalOperator::Distinct { input }
+                | PhysicalOperator::Distinct { input, .. }
                 | PhysicalOperator::MultiwayJoin { input, .. } => finds_index_scan_on(input, var),
                 _ => false,
             }
@@ -3341,7 +3348,7 @@ mod tests {
             | PhysicalOperator::Aggregate { input, .. }
             | PhysicalOperator::Sort { input, .. }
             | PhysicalOperator::Limit { input, .. }
-            | PhysicalOperator::Distinct { input }
+            | PhysicalOperator::Distinct { input, .. }
             | PhysicalOperator::MultiwayJoin { input, .. } => finds_id_seek(input, var),
             PhysicalOperator::HashJoin { left, right } => {
                 finds_id_seek(left, var) || finds_id_seek(right, var)
@@ -3394,7 +3401,7 @@ mod tests {
             | PhysicalOperator::Aggregate { input, .. }
             | PhysicalOperator::Sort { input, .. }
             | PhysicalOperator::Limit { input, .. }
-            | PhysicalOperator::Distinct { input }
+            | PhysicalOperator::Distinct { input, .. }
             | PhysicalOperator::Unwind { input, .. }
             | PhysicalOperator::OptionalMatch { input, .. }
             | PhysicalOperator::MultiwayJoin { input, .. } => count_filters(input),

@@ -11,7 +11,7 @@
 //! Recognized shape, from the root down:
 //!
 //! ```text
-//! [Sort]? Project [Aggregate]? Filter(HasLabel)* Expand(1 hop, directed) LabelScan
+//! [Sort]? [Distinct]? Project [Aggregate]? Filter(HasLabel)* Expand(1 hop, directed) LabelScan
 //! ```
 //!
 //! with every projected or grouped expression a single-property read on the
@@ -97,11 +97,17 @@ fn recognize(plan: &PhysicalOperator) -> Option<VecPipeline<'_>> {
         PhysicalOperator::Sort { input, items } => (Some(items.as_slice()), input.as_ref()),
         other => (None, other),
     };
+    // RETURN DISTINCT plans a Distinct directly above the projection; the
+    // caller dedups the built records, so the recognizer sees through it.
+    let below_distinct = match below_sort {
+        PhysicalOperator::Distinct { input, .. } => input.as_ref(),
+        other => other,
+    };
     let PhysicalOperator::Project {
         input,
         items,
         is_barrier,
-    } = below_sort
+    } = below_distinct
     else {
         return None;
     };

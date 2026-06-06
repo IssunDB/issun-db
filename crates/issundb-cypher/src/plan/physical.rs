@@ -107,8 +107,12 @@ pub enum PhysicalOperator {
         input: Box<PhysicalOperator>,
         null_vars: Vec<String>,
     },
-    /// Deduplicate rows (DISTINCT).
-    Distinct { input: Box<PhysicalOperator> },
+    /// Deduplicate rows (DISTINCT). `keys` selects the binding names forming
+    /// the dedup key; `None` dedups on the full row.
+    Distinct {
+        input: Box<PhysicalOperator>,
+        keys: Option<Vec<String>>,
+    },
     /// Execute write operations (CREATE, MERGE, SET, DELETE) for each input row.
     /// Binds new nodes or edges from CREATE into the PathMap and passes each row downstream.
     WritePart {
@@ -260,8 +264,9 @@ impl PhysicalPlanner {
                     null_vars: null_vars.clone(),
                 }
             }
-            LogicalOperator::Distinct { input } => PhysicalOperator::Distinct {
+            LogicalOperator::Distinct { input, keys } => PhysicalOperator::Distinct {
                 input: Box::new(Self::plan(input)),
+                keys: keys.clone(),
             },
             LogicalOperator::WritePart { input, part } => PhysicalOperator::WritePart {
                 input: Box::new(Self::plan(input)),
@@ -475,8 +480,11 @@ pub fn format_physical_plan(op: &PhysicalOperator, depth: usize) -> String {
             ));
             buf.push_str(&format_physical_plan(input, depth + 1));
         }
-        PhysicalOperator::Distinct { input } => {
-            buf.push_str(&format!("{}Distinct\n", pad));
+        PhysicalOperator::Distinct { input, keys } => {
+            match keys {
+                Some(keys) => buf.push_str(&format!("{}Distinct [{}]\n", pad, keys.join(", "))),
+                None => buf.push_str(&format!("{}Distinct\n", pad)),
+            }
             buf.push_str(&format_physical_plan(input, depth + 1));
         }
         PhysicalOperator::WritePart { input, part } => {
