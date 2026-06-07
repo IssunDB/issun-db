@@ -231,12 +231,12 @@ pub(super) fn execute_read_query(
                                 scope = next;
                             }
                         }
-                        QueryPart::Call { yields, .. } => {
-                            if let Some(ys) = yields {
-                                for (name, alias) in ys {
-                                    let v = alias.as_ref().unwrap_or(name);
-                                    scope.insert(v.clone());
-                                }
+                        QueryPart::Call {
+                            yields: Some(ys), ..
+                        } => {
+                            for (name, alias) in ys {
+                                let v = alias.as_ref().unwrap_or(name);
+                                scope.insert(v.clone());
                             }
                         }
                         _ => {}

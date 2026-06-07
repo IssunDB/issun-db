@@ -1784,7 +1784,7 @@ pub(super) fn eval_function_call<B: Bindings>(
             use std::hash::{Hash, Hasher};
             use std::time::SystemTime;
             thread_local! {
-                static COUNTER: Cell<u64> = Cell::new(0);
+                static COUNTER: Cell<u64> = const { Cell::new(0) };
             }
             let mut h = DefaultHasher::new();
             SystemTime::now()

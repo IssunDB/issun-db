@@ -1,9 +1,9 @@
 use super::expr::evaluate_expr;
 use super::read::{
-    binding_to_value, column_name, dedup_records, execute_physical, execute_physical_pathmaps,
-    execute_read_query, project_rows, projected_key, rows_to_records,
+    binding_to_value, column_name, execute_physical, execute_physical_pathmaps, execute_read_query,
+    projected_key,
 };
-use super::row::{Bindings, SlotRow, SlotSchema};
+use super::row::{Bindings, SlotSchema};
 use super::*;
 use crate::ast::{
     CreateAndReturnStatement, DeleteAndReturnStatement, ForeachStatement, MergeAndReturnStatement,
@@ -375,6 +375,17 @@ pub(super) fn execute_delete_and_return(
     params: &HashMap<String, serde_json::Value>,
 ) -> Result<QueryResult, String> {
     graph.with_write_lock(|| {
+        let return_query = Query {
+            match_clauses: stmt.match_clauses.clone(),
+            where_clause: stmt.where_clause.clone(),
+            return_clause: stmt.return_clause.clone(),
+            parts: Vec::new(),
+            order_by: stmt.order_by.clone(),
+            skip: stmt.skip.clone(),
+            limit: stmt.limit.clone(),
+        };
+        let return_result = execute_read_query(graph, &return_query, params)?;
+
         let binding_query = Query {
             match_clauses: stmt.match_clauses.clone(),
             where_clause: stmt.where_clause.clone(),
@@ -403,22 +414,7 @@ pub(super) fn execute_delete_and_return(
         let bound_paths: Vec<PathMap> = bound_rows.iter().map(|r| r.to_path_map()).collect();
         delete_over_paths(graph, &bound_paths, &stmt.targets, stmt.detach, params)?;
 
-        let return_items: Vec<(Expr, Option<String>)> = stmt
-            .return_clause
-            .items
-            .iter()
-            .map(|item| (item.expr.clone(), item.alias.clone()))
-            .collect();
-
-        let projected_rows = project_rows(graph, bound_rows, &return_items, false, params)?;
-
-        let columns: Vec<String> = stmt.return_clause.items.iter().map(column_name).collect();
-        let mut records = rows_to_records(graph, &stmt.return_clause.items, projected_rows)?;
-        if stmt.return_clause.distinct {
-            dedup_records(&mut records);
-        }
-
-        Ok(QueryResult { columns, records })
+        Ok(return_result)
     })
 }
 
