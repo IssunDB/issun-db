@@ -237,12 +237,12 @@ fn test_cypher_index_scan_integration() {
 
 #[test]
 fn test_facade_full_text_search_integration() {
-    use issundb::{TextGraphExt, TextSearchOptions};
+    use issundb::{TextGraphExt, TextIndexExt, TextSearchOptions};
 
     let (_dir, g) = open_tmp();
 
     // Create a node property text index
-    g.create_node_text_index("Movie", "synopsis").unwrap();
+    g.create_text_index("Movie", "synopsis").unwrap();
 
     // Insert some nodes
     let m1 = g

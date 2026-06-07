@@ -841,9 +841,7 @@ mod tests {
     #[test]
     fn hybrid_retrieve_weighted_sum_produces_correct_scores() {
         let (_dir, g) = open_tmp();
-        let a = g
-            .add_node("Doc", &json!({"body": "alpha bravo"}))
-            .unwrap();
+        let a = g.add_node("Doc", &json!({"body": "alpha bravo"})).unwrap();
         let b = g
             .add_node("Doc", &json!({"body": "charlie delta"}))
             .unwrap();
@@ -877,7 +875,10 @@ mod tests {
         )
         .unwrap();
 
-        assert!(sub.scores.contains_key(&a), "vector seed a must have a score");
+        assert!(
+            sub.scores.contains_key(&a),
+            "vector seed a must have a score"
+        );
         assert!(sub.scores.contains_key(&b), "text seed b must have a score");
         assert!(
             (sub.scores[&a] - 0.7).abs() < 1e-5,
@@ -920,7 +921,11 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(sub.nodes.len(), 1, "only the text-matching node should appear");
+        assert_eq!(
+            sub.nodes.len(),
+            1,
+            "only the text-matching node should appear"
+        );
         assert_eq!(sub.nodes[0], a);
         assert!(sub.scores.contains_key(&a));
         assert!(!sub.nodes.contains(&b), "non-matching node must be absent");
