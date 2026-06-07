@@ -25,8 +25,8 @@ GraphRAG pipelines and querying knowledge graphs.
 
 ### Features
 
-* Rust graph engine built on [LMDB](https://www.symas.com/mdb) with ACID, property graph model, and Cypher query language support
-* Fast graph traversal and analytics using [GraphBLAS](https://graphblas.org)-based sparse matrix operations
+* Rust graph engine built with ACID, property graph model, and Cypher query language support
+* Fast graph traversal and analytics using sparse matrix operations
 * Built-in vector, text, and hybrid search and retrieval support
 * Can be used via a wide range of APIs, including native Rust, CLI, HTTP, and MCP
 * Fully cross-platform; supports Linux, macOS, and Windows
