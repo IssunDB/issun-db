@@ -192,8 +192,8 @@ fn bench_local_search_rrf(c: &mut Criterion) {
     let (_dir, graph) = build_graphrag_graph();
     // Perturbed vector for Topic 1 (databases)
     let mut query_vec = vec![0.0_f32; DIMS];
-    query_vec[1 * 20] = 1.0_f32;
-    query_vec[1 * 20 + 10] = 0.5_f32;
+    query_vec[20] = 1.0_f32;
+    query_vec[20 + 10] = 0.5_f32;
     let query_text = "database graph query engine";
 
     let opts = HybridRetrieveOptions {
@@ -227,8 +227,8 @@ fn bench_local_search_weighted(c: &mut Criterion) {
     let (_dir, graph) = build_graphrag_graph();
     // Use the same database-topic query as the RRF case so only fusion differs.
     let mut query_vec = vec![0.0_f32; DIMS];
-    query_vec[1 * 20] = 1.0_f32;
-    query_vec[1 * 20 + 10] = 0.5_f32;
+    query_vec[20] = 1.0_f32;
+    query_vec[20 + 10] = 0.5_f32;
     let query_text = "database graph query engine";
 
     let opts = HybridRetrieveOptions {

@@ -837,4 +837,92 @@ mod tests {
         assert!(sub.nodes.contains(&a), "vector hit a must be present");
         assert!(sub.nodes.contains(&b), "text hit b must be present");
     }
+
+    #[test]
+    fn hybrid_retrieve_weighted_sum_produces_correct_scores() {
+        let (_dir, g) = open_tmp();
+        let a = g
+            .add_node("Doc", &json!({"body": "alpha bravo"}))
+            .unwrap();
+        let b = g
+            .add_node("Doc", &json!({"body": "charlie delta"}))
+            .unwrap();
+        g.upsert_vector(a, &[1.0f32, 0.0]).unwrap();
+        g.upsert_vector(b, &[0.0f32, 1.0]).unwrap();
+        g.update(|txn| txn.create_node_text_index("Doc", "body"))
+            .unwrap();
+        g.rebuild_csr().unwrap();
+
+        // a is the top vector hit (rank 0) and b is the top text hit (rank 0).
+        // vector_k=1, text_k=1, so normalized rank score = (k - rank) / k = 1.0.
+        // WeightedSum: score = 0.7 * vec_norm + 0.3 * text_norm.
+        // a: vec_norm = 1.0, text_norm = 0.0 => 0.7
+        // b: vec_norm = 0.0, text_norm = 1.0 => 0.3
+        let sub = retrieve_hybrid(
+            &g,
+            &[1.0f32, 0.0],
+            "charlie",
+            &HybridRetrieveOptions {
+                vector_k: 1,
+                text_k: 1,
+                text_label: Some("Doc".into()),
+                text_property: Some("body".into()),
+                hops: 0,
+                fusion: FusionStrategy::WeightedSum {
+                    vector_weight: 0.7,
+                    text_weight: 0.3,
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert!(sub.scores.contains_key(&a), "vector seed a must have a score");
+        assert!(sub.scores.contains_key(&b), "text seed b must have a score");
+        assert!(
+            (sub.scores[&a] - 0.7).abs() < 1e-5,
+            "a score should be 0.7, got {}",
+            sub.scores[&a]
+        );
+        assert!(
+            (sub.scores[&b] - 0.3).abs() < 1e-5,
+            "b score should be 0.3, got {}",
+            sub.scores[&b]
+        );
+    }
+
+    #[test]
+    fn hybrid_retrieve_text_only_returns_text_seeds() {
+        let (_dir, g) = open_tmp();
+        let a = g
+            .add_node("Doc", &json!({"body": "quantum computing research"}))
+            .unwrap();
+        let b = g
+            .add_node("Doc", &json!({"body": "classical music orchestra"}))
+            .unwrap();
+        g.update(|txn| txn.create_node_text_index("Doc", "body"))
+            .unwrap();
+        g.rebuild_csr().unwrap();
+
+        // vector_k=0 disables vector search; only text seeds are used.
+        let sub = retrieve_hybrid(
+            &g,
+            &[],
+            "quantum",
+            &HybridRetrieveOptions {
+                vector_k: 0,
+                text_k: 5,
+                text_label: Some("Doc".into()),
+                text_property: Some("body".into()),
+                hops: 0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(sub.nodes.len(), 1, "only the text-matching node should appear");
+        assert_eq!(sub.nodes[0], a);
+        assert!(sub.scores.contains_key(&a));
+        assert!(!sub.nodes.contains(&b), "non-matching node must be absent");
+    }
 }
