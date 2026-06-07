@@ -27,3 +27,8 @@ criterion.workspace = true
 [[bench]]
 name = "hybrid_retrieval"
 harness = false
+
+[[bench]]
+name = "graphrag_retrieval"
+harness = false
+
