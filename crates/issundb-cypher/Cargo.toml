@@ -34,3 +34,8 @@ harness = false
 [[bench]]
 name = "execute"
 harness = false
+
+[[bench]]
+name = "lsqb"
+harness = false
+
