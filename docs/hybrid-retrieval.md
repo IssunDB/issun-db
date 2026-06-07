@@ -148,8 +148,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let query_vector = vec![0.15, 0.75, 0.35];
     let subgraph = retrieve_hybrid(&graph, &query_vector, "transactional storage", &opts)?;
 
-    println!("Retrieved subgraph containing {} nodes and {} edges.", 
-             subgraph.nodes.len(), 
+    println!("Retrieved subgraph containing {} nodes and {} edges.",
+             subgraph.nodes.len(),
              subgraph.edges.len());
 
     Ok(())
