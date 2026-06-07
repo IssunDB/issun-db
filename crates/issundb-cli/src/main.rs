@@ -347,7 +347,7 @@ enum ReplCommand {
         reindex: bool,
     },
 
-    /// Perform full-text search index actions (e.g., `text-index create Person name` or `text-index list`)
+    /// Build/rebuild full-text index on a property (e.g., `text-index create Person name --lang english` or `text-index list`)
     #[command(name = "text-index")]
     TextIndex {
         /// Action: 'create', 'drop', or 'list'
@@ -357,7 +357,7 @@ enum ReplCommand {
         label: Option<String>,
         /// Node property (required for create/drop)
         property: Option<String>,
-        /// Index language for stemming ('english', 'spanish', 'french', 'german', 'italian', 'portuguese')
+        /// Index language for stemming
         #[arg(short, long, default_value = "english", value_parser = ["english", "spanish", "french", "german", "italian", "portuguese"])]
         lang: String,
     },
@@ -440,7 +440,7 @@ Vector and Text Search
   upsert-vec <id> <values...>          Attach/upsert a vector embedding on a node (e.g., upsert-vec 1 0.1 0.2 0.3)
   vsearch <k> <query...>               Query the vector index for k-nearest neighbors (e.g., vsearch 5 0.1 0.2 0.3)
   retrieve <k> <hops> <query...>       Run hybrid vector-graph retrieval search (e.g., retrieve 5 2 0.1 0.2 0.3)
-  text-index create|drop|list [l] [p]  Perform full-text search index actions (e.g., text-index create Person name or text-index list)
+  text-index <act> [label] [property]  Perform full-text index actions (e.g., text-index create Person name --lang german)
   text-search <q> [l] [p] [limit]      Query BM25 full-text search index (e.g., text-search "alice" Person name 5)
 
 System
