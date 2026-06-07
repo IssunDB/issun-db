@@ -232,6 +232,8 @@ All graph operations go through `Graph`; do not call `Storage` directly from out
 - `all_nodes() -> Result<Vec<NodeId>, Error>`
 - `label_name(id: LabelId) -> Result<Option<String>, Error>`
 - `type_name(id: TypeId) -> Result<Option<String>, Error>`
+- `list_node_indexes_and_constraints() -> Result<Vec<(String, String, u8)>, Error>`
+- `list_edge_indexes_and_constraints() -> Result<Vec<(String, String, u8)>, Error>`
 - `node_count_by_label(label: &str) -> Result<u64, Error>`
 - `edge_count_by_type(etype: &str) -> Result<u64, Error>`
 - `put_vector_bytes(n: NodeId, bytes: &[u8]) -> Result<(), Error>`

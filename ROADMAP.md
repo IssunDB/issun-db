@@ -146,5 +146,6 @@ This document outlines the features implemented in IssunDB and the future goals 
 - [x] Property-based and integration tests
 - [x] Language bindings for Python
 - [x] Language bindings for JavaScript (Node.js)
-- [x] Batch data import utilities for JSONL and CSV formats
+- [x] Batch data import utilities for JSONL, CSV, and Parquet formats
+- [x] Comprehensive database export and import functionality (`EXPORT DATABASE` and `IMPORT DATABASE` Cypher queries) with CSV, JSONL, and Parquet formats
 - [x] Online backup, restore, and snapshot tools
