@@ -78,7 +78,7 @@ digraph IssunDBArchitecture {
  // Consumers: bindings, servers, tools. Facade-only.
  // ---------------------------------------------------------------
     subgraph cluster_consumers {
-    label = "Consumers"
+    label = "Consumer Crates"
     fontname = "Helvetica,Arial,sans-serif"
     fontsize = 14
     style = "rounded"

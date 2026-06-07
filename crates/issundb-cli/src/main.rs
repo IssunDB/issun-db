@@ -427,7 +427,7 @@ Vector and Text Search
 System
   :version                             Show the IssunDB version
   help                                 Show this help message
-  quit/exit                            Exit the CLI
+  quit / exit                          Exit the CLI
 "#;
 
 fn print_help() {
@@ -443,9 +443,13 @@ fn print_help() {
             let syntax_limit = 39;
             if line.len() < syntax_limit {
                 let trimmed = line.trim();
-                let (cmd, args) = match trimmed.find(' ') {
-                    Some(idx) => trimmed.split_at(idx),
-                    None => (trimmed, ""),
+                let (cmd, args) = if let Some(idx) = trimmed.find(['<', '[']) {
+                    let (c, a) = trimmed.split_at(idx);
+                    let cmd_trimmed = c.trim_end();
+                    let spaces_count = c.len() - cmd_trimmed.len();
+                    (cmd_trimmed, format!("{}{}", " ".repeat(spaces_count), a))
+                } else {
+                    (trimmed, "".to_owned())
                 };
                 let colored_cmd = if cmd.starts_with(':') {
                     cmd.cyan()
@@ -456,9 +460,13 @@ fn print_help() {
             } else {
                 let (syntax, desc) = line.split_at(syntax_limit);
                 let trimmed_syntax = syntax.trim();
-                let (cmd, args) = match trimmed_syntax.find(' ') {
-                    Some(idx) => trimmed_syntax.split_at(idx),
-                    None => (trimmed_syntax, ""),
+                let (cmd, args) = if let Some(idx) = trimmed_syntax.find(['<', '[']) {
+                    let (c, a) = trimmed_syntax.split_at(idx);
+                    let cmd_trimmed = c.trim_end();
+                    let spaces_count = c.len() - cmd_trimmed.len();
+                    (cmd_trimmed, format!("{}{}", " ".repeat(spaces_count), a))
+                } else {
+                    (trimmed_syntax, "".to_owned())
                 };
                 let colored_cmd = if cmd.starts_with(':') {
                     cmd.cyan()
