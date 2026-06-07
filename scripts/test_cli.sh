@@ -61,16 +61,9 @@ path 0 1
 wpath 0 1
 pagerank 20 0.85
 components
-scc
-detect-cycle
-betweenness
-harmonic
 degree out
 degree in
 degree both
-community 10
-spanning-forest cost max
-max-flow 0 1 capacity
 upsert-vec 0 0.1 0.2 0.3
 upsert-vec 1 0.4 0.5 0.6
 vsearch 5 0.1 0.2 0.3

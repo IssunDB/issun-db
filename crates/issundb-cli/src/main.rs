@@ -292,56 +292,12 @@ enum ReplCommand {
     #[command(name = "components")]
     Components,
 
-    /// Find strongly connected components (e.g., `scc`)
-    #[command(name = "scc")]
-    Scc,
-
-    /// Check if the graph contains any directed cycle (e.g., `detect-cycle`)
-    #[command(name = "detect-cycle")]
-    DetectCycle,
-
-    /// Compute betweenness centrality scores (top 20) (e.g., `betweenness`)
-    #[command(name = "betweenness")]
-    Betweenness,
-
-    /// Compute harmonic centrality scores (top 20) (e.g., `harmonic`)
-    #[command(name = "harmonic")]
-    Harmonic,
-
     /// Compute degree centrality (e.g., `degree out` or `degree both`)
     #[command(name = "degree")]
     Degree {
         /// Traversal direction: 'in', 'out', or 'both'
         #[arg(default_value = "both")]
         direction: String,
-    },
-
-    /// Detect communities via Label Propagation Algorithm (e.g., `community 10`)
-    #[command(name = "community")]
-    Community {
-        /// Maximum iteration steps
-        #[arg(default_value = "10")]
-        max_iters: usize,
-    },
-
-    /// Find minimum or maximum spanning forest by edge property (e.g., `spanning-forest cost max`)
-    #[command(name = "spanning-forest")]
-    SpanningForest {
-        /// Property name holding edge weights
-        prop: String,
-        /// Set to "max" to compute maximum instead of minimum spanning forest
-        max: Option<String>,
-    },
-
-    /// Compute maximum flow by edge capacity property (e.g., `max-flow 1 2 capacity`)
-    #[command(name = "max-flow")]
-    MaxFlow {
-        /// Source Node ID
-        src: u64,
-        /// Sink Node ID
-        dst: u64,
-        /// Property name holding edge capacity
-        prop: String,
     },
 
     /// Attach/upsert a vector embedding on a node (e.g., `upsert-vec 1 0.1 0.2 0.3`)
@@ -459,14 +415,7 @@ Graph Algorithms
   wpath <src> <dst>                    Find the shortest weighted path (Dijkstra) between two nodes (e.g., wpath 1 2)
   pagerank [iters] [damping]           Compute PageRank centrality scores (e.g., pagerank 20 0.85)
   components                           Find weakly connected components (e.g., components)
-  scc                                  Find strongly connected components (e.g., scc)
-  detect-cycle                         Check if the graph contains any directed cycle (e.g., detect-cycle)
-  betweenness                          Compute betweenness centrality scores (top 20) (e.g., betweenness)
-  harmonic                             Compute harmonic centrality scores (top 20) (e.g., harmonic)
   degree [in|out|both]                 Compute degree centrality (e.g., degree out or degree both)
-  community [max_iters]                Detect communities via Label Propagation Algorithm (e.g., community 10)
-  spanning-forest <prop> [max]         Find minimum or maximum spanning forest by edge property (e.g., spanning-forest cost max)
-  max-flow <src> <dst> <prop>          Compute maximum flow by edge capacity property (e.g., max-flow 1 2 capacity)
 
 Vector and Text Search
   upsert-vec <id> <values...>          Attach/upsert a vector embedding on a node (e.g., upsert-vec 1 0.1 0.2 0.3)
@@ -1011,67 +960,7 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
                 }
             }
         }
-        ReplCommand::Scc => {
-            if let Some(g) = &state.graph {
-                match g.strongly_connected_components() {
-                    Ok(map) => {
-                        let n_comps = map.values().collect::<std::collections::HashSet<_>>().len();
-                        println!(
-                            "{} node(s) in {n_comps} strongly connected component(s)",
-                            map.len()
-                        );
-                    }
-                    Err(e) => eprintln!("error: {e}"),
-                }
-            }
-        }
-        ReplCommand::DetectCycle => {
-            if let Some(g) = &state.graph {
-                match g.detect_cycle() {
-                    Ok(true) => println!("cycle detected"),
-                    Ok(false) => println!("no cycle"),
-                    Err(e) => eprintln!("error: {e}"),
-                }
-            }
-        }
-        ReplCommand::Betweenness => {
-            if let Some(g) = &state.graph {
-                match g.betweenness_centrality() {
-                    Ok(scores) => {
-                        let mut sorted: Vec<_> = scores.iter().collect();
-                        sorted.sort_unstable_by(|a, b| {
-                            b.1.partial_cmp(a.1).unwrap_or(std::cmp::Ordering::Equal)
-                        });
-                        for (n, s) in sorted.iter().take(20) {
-                            println!("  node={n} betweenness={s:.6}");
-                        }
-                        if sorted.len() > 20 {
-                            println!("  ... ({} total)", sorted.len());
-                        }
-                    }
-                    Err(e) => eprintln!("error: {e}"),
-                }
-            }
-        }
-        ReplCommand::Harmonic => {
-            if let Some(g) = &state.graph {
-                match g.harmonic_centrality() {
-                    Ok(scores) => {
-                        let mut sorted: Vec<_> = scores.iter().collect();
-                        sorted.sort_unstable_by(|a, b| {
-                            b.1.partial_cmp(a.1).unwrap_or(std::cmp::Ordering::Equal)
-                        });
-                        for (n, s) in sorted.iter().take(20) {
-                            println!("  node={n} harmonic={s:.6}");
-                        }
-                        if sorted.len() > 20 {
-                            println!("  ... ({} total)", sorted.len());
-                        }
-                    }
-                    Err(e) => eprintln!("error: {e}"),
-                }
-            }
-        }
+
         ReplCommand::Degree { direction } => {
             if let Some(g) = &state.graph {
                 let dir = match direction.as_str() {
@@ -1094,39 +983,7 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
                 }
             }
         }
-        ReplCommand::Community { max_iters } => {
-            if let Some(g) = &state.graph {
-                match g.label_propagation(max_iters) {
-                    Ok(map) => {
-                        let n_comps = map.values().collect::<std::collections::HashSet<_>>().len();
-                        println!("{} node(s) in {n_comps} community/communities", map.len());
-                    }
-                    Err(e) => eprintln!("error: {e}"),
-                }
-            }
-        }
-        ReplCommand::SpanningForest { prop, max } => {
-            if let Some(g) = &state.graph {
-                let maximum = max.as_deref() == Some("max");
-                match g.spanning_forest(&prop, maximum) {
-                    Ok(edges) => {
-                        println!("{} edge(s) in spanning forest", edges.len());
-                        for e in &edges {
-                            println!("  edge={e}");
-                        }
-                    }
-                    Err(e) => eprintln!("error: {e}"),
-                }
-            }
-        }
-        ReplCommand::MaxFlow { src, dst, prop } => {
-            if let Some(g) = &state.graph {
-                match g.maximum_flow(NodeId::from(src), NodeId::from(dst), &prop) {
-                    Ok(flow) => println!("max flow = {flow:.6}"),
-                    Err(e) => eprintln!("error: {e}"),
-                }
-            }
-        }
+
         ReplCommand::RebuildCsr => {
             if let Some(g) = &state.graph {
                 match g.rebuild_csr() {
