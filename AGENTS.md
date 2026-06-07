@@ -24,6 +24,9 @@ Priorities, in order:
 - Writes are serialized via the `parking_lot::Mutex<()>` write lock on `Graph`; LMDB enforces the same constraint at the storage level. Do not bypass
   either.
 - Add comments only when they clarify a non-obvious storage invariant, an LMDB lifetime constraint, or a GraphBLAS semiring choice.
+- Maintain the permissive license boundary of the workspace (MIT or Apache-2.0). Do not add dependencies or statically link libraries with copyleft,
+  weak copyleft, or source-available licenses (such as GPL, MPL, or SSPL). Keep any comparison or benchmarking harnesses that link to such external
+  engines excluded from the root Cargo workspace.
 - Format with `rustfmt` (`make format`) and lint with Clippy (`make lint`) before declaring a change done.
 
 Quick examples:
@@ -32,6 +35,8 @@ Quick examples:
 - Good: add a Cypher parser test in `crates/issundb-cypher/src/` against the openCypher TCK subset.
 - Bad: import `heed` directly in `crates/issundb/src/lib.rs` instead of going through `issundb-core`.
 - Bad: store a node cache in a `static` `HashMap` outside `Graph`.
+- Bad: add a cargo dependency to a workspace crate that pulls in a copyleft or source-available library (such as an MPL-licensed or SSPL-licensed
+  library).
 
 ## Writing Style
 
