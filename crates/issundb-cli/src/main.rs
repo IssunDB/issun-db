@@ -1242,3 +1242,61 @@ Maintenance
 "#
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_split_cmd() {
+        assert_eq!(split_cmd("  quit  "), ("quit", ""));
+        assert_eq!(split_cmd(" :open   /tmp/db  "), (":open", "/tmp/db"));
+        assert_eq!(
+            split_cmd("cypher match (n) return n"),
+            ("cypher", "match (n) return n")
+        );
+    }
+
+    #[test]
+    fn test_next_token() {
+        let mut s = "  a  b  c ";
+        assert_eq!(next_token(&mut s), Some("a"));
+        assert_eq!(next_token(&mut s), Some("b"));
+        assert_eq!(next_token(&mut s), Some("c"));
+        assert_eq!(next_token(&mut s), None);
+    }
+
+    #[test]
+    fn test_parse_props() {
+        assert_eq!(parse_props("").unwrap(), serde_json::json!({}));
+        assert_eq!(
+            parse_props(r#"{"name": "Alice"}"#).unwrap(),
+            serde_json::json!({"name": "Alice"})
+        );
+        assert!(parse_props("invalid-json").is_err());
+    }
+
+    #[test]
+    fn test_repl_commands_handle() {
+        let temp = TempDir::new().unwrap();
+        let mut state = State::new(None);
+
+        // 1. Open database via REPL command
+        let open_cmd = format!(":open {}", temp.path().display());
+        assert!(handle(&mut state, &open_cmd));
+        assert!(state.graph.is_some());
+
+        // 2. Add node via REPL command
+        assert!(handle(&mut state, "add Person {\"name\": \"Alice\"}"));
+
+        // 3. Query node
+        assert!(handle(&mut state, "MATCH (n:Person) RETURN n.name"));
+
+        // 4. Algorithm command
+        assert!(handle(&mut state, "pagerank"));
+
+        // 5. Quit command should return false
+        assert!(!handle(&mut state, "quit"));
+    }
+}
