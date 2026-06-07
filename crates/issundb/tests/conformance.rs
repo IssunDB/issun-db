@@ -202,6 +202,7 @@ enum Assertion {
     /// `Then the result should be, in any order:` or `in order:`
     Rows {
         ordered: bool,
+        ignore_list_order: bool,
         columns: Vec<String>,
         rows: Vec<Vec<serde_json::Value>>,
         /// True when at least one cell contained a node/rel display literal.
@@ -562,9 +563,11 @@ fn assertion_from_step(value: &str, table: Option<&gherkin::Table>) -> Assertion
     }
     if value.contains("result should be") {
         let ordered = value.contains("in order") && !value.contains("any order");
+        let ignore_list_order = value.contains("ignoring element order for lists");
         let (columns, rows, has_node_literals) = parse_gherkin_result_table(table);
         return Assertion::Rows {
             ordered,
+            ignore_list_order,
             columns,
             rows,
             has_node_literals,
@@ -920,6 +923,7 @@ fn run_scenario(scenario: &Scenario) -> Result<(), String> {
 
         Assertion::Rows {
             ordered,
+            ignore_list_order,
             columns,
             rows: expected_rows,
             has_node_literals,
@@ -947,6 +951,35 @@ fn run_scenario(scenario: &Scenario) -> Result<(), String> {
                 .map(|r| r.values.into_iter().map(normalize_value).collect())
                 .collect();
             let mut exp = expected_rows.clone();
+
+            if *ignore_list_order {
+                fn sort_lists_in_value(v: &mut serde_json::Value) {
+                    match v {
+                        serde_json::Value::Array(arr) => {
+                            for item in arr.iter_mut() {
+                                sort_lists_in_value(item);
+                            }
+                            arr.sort_by_key(|item| item.to_string());
+                        }
+                        serde_json::Value::Object(obj) => {
+                            for (_, val) in obj.iter_mut() {
+                                sort_lists_in_value(val);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                for row in &mut actual_rows {
+                    for cell in row {
+                        sort_lists_in_value(cell);
+                    }
+                }
+                for row in &mut exp {
+                    for cell in row {
+                        sort_lists_in_value(cell);
+                    }
+                }
+            }
 
             if !*ordered {
                 let key = |r: &Vec<serde_json::Value>| {

@@ -182,7 +182,68 @@ pub(super) fn execute_read_query(
         let mut keys: Vec<String> = resolved_paths
             .first()
             .map(|p| p.bound_entries().map(|(k, _)| k.to_string()).collect())
-            .unwrap_or_default();
+            .unwrap_or_else(|| {
+                let mut scope = std::collections::HashSet::new();
+                for part in &query.parts {
+                    match part {
+                        QueryPart::Match { match_clauses, .. }
+                        | QueryPart::OptionalMatch { match_clauses, .. } => {
+                            for mc in match_clauses {
+                                collect_pattern_vars(&mc.pattern, &mut scope);
+                            }
+                        }
+                        QueryPart::Unwind { variable, .. } => {
+                            scope.insert(variable.clone());
+                        }
+                        QueryPart::Create { patterns } => {
+                            for p in patterns {
+                                collect_pattern_vars(p, &mut scope);
+                            }
+                        }
+                        QueryPart::Merge { merges } => {
+                            for m in merges {
+                                collect_pattern_vars(&m.pattern, &mut scope);
+                            }
+                        }
+                        QueryPart::With { items, .. } => {
+                            let is_star = items.len() == 1
+                                && matches!(
+                                    &items[0].expr,
+                                    Expr::FunctionCall { name, .. } if name == "__star__"
+                                );
+                            if is_star {
+                                for item in items {
+                                    if let Some(alias) = &item.alias {
+                                        scope.insert(alias.clone());
+                                    }
+                                }
+                            } else {
+                                let mut next = std::collections::HashSet::new();
+                                for item in items {
+                                    if let Some(alias) = &item.alias {
+                                        next.insert(alias.clone());
+                                    } else if let Expr::Prop(v, p) = &item.expr {
+                                        if p.is_empty() {
+                                            next.insert(v.clone());
+                                        }
+                                    }
+                                }
+                                scope = next;
+                            }
+                        }
+                        QueryPart::Call { yields, .. } => {
+                            if let Some(ys) = yields {
+                                for (name, alias) in ys {
+                                    let v = alias.as_ref().unwrap_or(name);
+                                    scope.insert(v.clone());
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                scope.into_iter().collect()
+            });
         keys.sort();
         keys
     } else {
@@ -652,7 +713,11 @@ fn format_node_literal(graph: &Graph, nid: NodeId) -> String {
         if let Ok(props) = rmp_serde::from_slice::<serde_json::Value>(&record.props) {
             if let Some(map) = props.as_object() {
                 if !map.is_empty() {
-                    return format!("({} {})", label_str, format_cypher_value(&props));
+                    return if label_str.is_empty() {
+                        format!("({})", format_cypher_value(&props))
+                    } else {
+                        format!("({} {})", label_str, format_cypher_value(&props))
+                    };
                 }
             }
         }
@@ -669,7 +734,11 @@ fn format_edge_literal_string(graph: &Graph, eid: EdgeId) -> String {
         if let Ok(props) = rmp_serde::from_slice::<serde_json::Value>(&record.props) {
             if let Some(map) = props.as_object() {
                 if !map.is_empty() {
-                    return format!("{} {}", type_str, format_cypher_value(&props));
+                    return if type_str.is_empty() {
+                        format_cypher_value(&props)
+                    } else {
+                        format!("{} {}", type_str, format_cypher_value(&props))
+                    };
                 }
             }
         }
@@ -764,7 +833,7 @@ pub(super) fn rows_to_records(
 }
 
 /// Apply RETURN DISTINCT deduplication in place, keyed by the serialized row.
-fn dedup_records(records: &mut Vec<Record>) {
+pub(super) fn dedup_records(records: &mut Vec<Record>) {
     let mut seen = std::collections::HashSet::new();
     records.retain(|r| {
         let key = serde_json::to_string(&r.values).unwrap_or_default();
@@ -1921,36 +1990,18 @@ pub(super) fn project_rows(
                         projected_path.bind_local(&target_var, binding.clone());
                     }
                 }
-                _ => {
-                    // For property expressions (n.age), first check whether the
-                    // Aggregate already emitted a scalar under the target column
-                    // name (e.g., the group-by key alias). If so, reuse it.
-                    // Exception: if the existing binding is a Node/Edge (not a Scalar),
-                    // and there's an alias, always evaluate the expression to avoid
-                    // shadowing issues like `a.id AS a` where a = Node(...).
-                    if let Some(binding) = path.get_binding(&target_var) {
-                        match binding {
-                            GraphBinding::Scalar(_) => {
-                                // Pre-computed scalar (from Aggregate) → reuse.
-                                projected_path.bind_local(&target_var, binding.clone());
-                            }
-                            GraphBinding::Node(_) | GraphBinding::Edge(_) => {
-                                // Node/Edge with a matching key: only reuse if there's
-                                // no alias (variable pass-through).
-                                if alias.is_none() {
-                                    projected_path.bind_local(&target_var, binding.clone());
-                                } else {
-                                    let val = evaluate_expr(graph, &path, expr, params)?;
-                                    projected_path
-                                        .bind_local(&target_var, GraphBinding::Scalar(val));
-                                }
-                            }
-                        }
-                    } else {
-                        let val = evaluate_expr(graph, &path, expr, params)?;
+                _ => match evaluate_expr(graph, &path, expr, params) {
+                    Ok(val) => {
                         projected_path.bind_local(&target_var, GraphBinding::Scalar(val));
                     }
-                }
+                    Err(err) => {
+                        if let Some(binding) = path.get_binding(&target_var) {
+                            projected_path.bind_local(&target_var, binding.clone());
+                            continue;
+                        }
+                        return Err(err);
+                    }
+                },
             }
         }
 
