@@ -88,7 +88,9 @@ impl Config {
         let skew = match std::env::var("LADYBUGDB_COMPARE_SKEW").as_deref() {
             Ok("zipf") => Skew::Zipf,
             Ok("uniform") | Err(_) => Skew::Uniform,
-            Ok(other) => panic!("LADYBUGDB_COMPARE_SKEW must be 'uniform' or 'zipf', got {other:?}"),
+            Ok(other) => {
+                panic!("LADYBUGDB_COMPARE_SKEW must be 'uniform' or 'zipf', got {other:?}")
+            }
         };
         let nodes = var("LADYBUGDB_COMPARE_NODES", 10_000);
         let edges = var("LADYBUGDB_COMPARE_EDGES", 50_000);
