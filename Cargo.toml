@@ -49,6 +49,9 @@ walkdir = "2"
 gherkin = "0.14"
 roaring = "0.10"
 deepsize = { version = "0.2", features = ["derive"] }
+parquet = "58.3.0"
+arrow-array = "58.3.0"
+arrow-schema = "58.3.0"
 
 [profile.release]
 strip = "debuginfo"

@@ -3290,4 +3290,82 @@ mod tests {
             vec![serde_json::json!("Eve"), serde_json::json!(35)]
         );
     }
+
+    #[test]
+    fn test_parquet_export_import() {
+        let (tempdir, graph) = setup_graph();
+        let params = HashMap::new();
+
+        // Let's add some nodes and edges to export
+        execute(
+            &graph,
+            "CREATE (a:Person {name: 'Alice', age: 30, active: true})",
+            &params,
+        )
+        .unwrap();
+        execute(
+            &graph,
+            "CREATE (b:Person {name: 'Bob', age: 40, active: false})",
+            &params,
+        )
+        .unwrap();
+        execute(&graph, "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) CREATE (a)-[:KNOWS {since: 2020}]->(b)", &params).unwrap();
+
+        // Export database to Parquet
+        let export_dir = tempdir.path().join("parquet_export");
+        let export_query = format!(
+            "EXPORT DATABASE '{}' WITH {{format: 'parquet'}}",
+            export_dir.display()
+        );
+        let res_export = execute(&graph, &export_query, &params).unwrap();
+        assert_eq!(
+            res_export.records[0].values[0],
+            serde_json::Value::Bool(true)
+        );
+
+        // Let's create a fresh new graph to import into
+        let (tempdir2, graph2) = setup_graph();
+
+        // Import the database from the exported directory
+        let import_query = format!("IMPORT DATABASE '{}'", export_dir.display());
+        let res_import = execute(&graph2, &import_query, &params).unwrap();
+        assert_eq!(
+            res_import.records[0].values[0],
+            serde_json::Value::Bool(true)
+        );
+
+        // Verify the imported nodes and properties
+        let verify_query = "MATCH (n:Person) RETURN n.name, n.age, n.active ORDER BY n.name";
+        let res_verify = execute(&graph2, verify_query, &params).unwrap();
+        assert_eq!(res_verify.records.len(), 2);
+        assert_eq!(
+            res_verify.records[0].values,
+            vec![
+                serde_json::json!("Alice"),
+                serde_json::json!(30),
+                serde_json::json!(true)
+            ]
+        );
+        assert_eq!(
+            res_verify.records[1].values,
+            vec![
+                serde_json::json!("Bob"),
+                serde_json::json!(40),
+                serde_json::json!(false)
+            ]
+        );
+
+        // Verify the imported relationship
+        let verify_rel = "MATCH (a:Person)-[r:KNOWS]->(b:Person) RETURN a.name, b.name, r.since";
+        let res_verify_rel = execute(&graph2, verify_rel, &params).unwrap();
+        assert_eq!(res_verify_rel.records.len(), 1);
+        assert_eq!(
+            res_verify_rel.records[0].values,
+            vec![
+                serde_json::json!("Alice"),
+                serde_json::json!("Bob"),
+                serde_json::json!(2020)
+            ]
+        );
+    }
 }
