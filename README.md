@@ -78,7 +78,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let result = graph.query(
         "MATCH (a:Person)-[r:KNOWS]->(b:Person) RETURN a.name, b.name, r.since"
     )?;
-    
+
     for record in result.records {
         println!(
             "Match: {} knows {} since {}",

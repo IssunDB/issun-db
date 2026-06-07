@@ -51,6 +51,11 @@ test-conformance: format ## Run the openCypher TCK conformance integration tests
 	@echo "Running openCypher TCK conformance integration tests..."
 	@DEBUG_PROJ=$(DEBUG_PROJ) RUST_BACKTRACE=$(RUST_BACKTRACE) ISSUNDB_CONFORMANCE=1 cargo test --test conformance -- --nocapture
 
+.PHONY: test-cli
+test-cli: format ## Run the CLI integration tests (Unix only)
+	@echo "Running CLI integration tests..."
+	@./scripts/test_cli.sh
+
 .PHONY: coverage
 coverage: format ## Generate test coverage report
 	@echo "Generating test coverage report..."

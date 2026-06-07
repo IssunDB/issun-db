@@ -1,6 +1,6 @@
 use std::{collections::HashMap, fs, io::Write, path::PathBuf};
 
-use clap::{CommandFactory, Parser};
+use clap::Parser;
 use colored::Colorize;
 use issundb::{
     DegreeDirection, EdgeId, Graph, GraphQueryExt, Hit, NodeId, RetrieveOptions, TextGraphExt,
@@ -58,32 +58,32 @@ struct Cli {
 #[derive(Parser, Debug)]
 #[command(no_binary_name = true, disable_help_subcommand = true)]
 enum ReplCommand {
-    /// Open or reopen a database at the given path
+    /// Open or reopen a database at the given path (e.g., `:open ./issundb-data`)
     #[command(name = ":open")]
     Open {
         /// Path to the database
         path: PathBuf,
     },
 
-    /// Execute a script file line by line
+    /// Execute a script file line by line (e.g., `:run ./import.cypher`)
     #[command(name = ":run")]
     Run {
         /// Path to the script file
         file: String,
     },
 
-    /// Save the output of the next query to a file
+    /// Save the output of the next query to a file (e.g., `:save ./output.txt`)
     #[command(name = ":save")]
     Save {
         /// Path to the output file
         file: PathBuf,
     },
 
-    /// List all current query parameters
+    /// List all current query parameters (e.g., `:params`)
     #[command(name = ":params")]
     Params,
 
-    /// Set a query parameter ($name)
+    /// Set a query parameter (e.g., `:set limit 10` or `:set person {"name": "Alice"}`)
     #[command(name = ":set")]
     Set {
         /// Parameter name
@@ -92,56 +92,62 @@ enum ReplCommand {
         value: String,
     },
 
-    /// Remove a query parameter
+    /// Remove a query parameter (e.g., `:unset limit`)
     #[command(name = ":unset")]
     Unset {
         /// Parameter name
         name: String,
     },
 
-    /// Show the optimized physical plan for a Cypher query
-    #[command(name = ":explain")]
-    Explain {
-        /// The Cypher query
-        cypher: String,
-    },
-
-    /// Write a hot backup snapshot of the database
+    /// Write a hot backup snapshot of the database (e.g., `:backup ./backup.db`)
     #[command(name = ":backup")]
     Backup {
         /// Path to backup destination
         file: PathBuf,
     },
 
-    /// Write a compacted backup snapshot of the database
+    /// Write a compacted backup snapshot of the database (e.g., `:backup-compact ./compact.db`)
     #[command(name = ":backup-compact")]
     BackupCompact {
         /// Path to backup destination
         file: PathBuf,
     },
 
-    /// Import nodes from a JSONL file (one JSON object per line)
+    /// Import nodes from a JSONL file (e.g., `:import-jsonl ./nodes.jsonl`)
     #[command(name = ":import-jsonl")]
     ImportJsonl {
         /// Path to the JSONL file
         file: String,
     },
 
-    /// Import nodes from a CSV file (first column as label, rest as properties)
+    /// Import nodes from a CSV file (e.g., `:import-csv ./nodes.csv`)
     #[command(name = ":import-csv")]
     ImportCsv {
         /// Path to the CSV file
         file: String,
     },
 
-    /// Run a Cypher query
+    /// Rebuild the CSR snapshot cache (e.g., `rebuild-csr`)
+    #[command(name = "rebuild-csr")]
+    RebuildCsr,
+
+    /// Show the optimized physical plan for a Cypher query (e.g., `:explain MATCH (n) RETURN n`)
+    #[command(name = ":explain")]
+    Explain {
+        /// The Cypher query
+        #[arg(num_args = 1..)]
+        cypher: Vec<String>,
+    },
+
+    /// Run a Cypher query (e.g., `query MATCH (n) RETURN n`)
     #[command(name = "query", alias = "cypher")]
     Query {
         /// The Cypher query
-        cypher: String,
+        #[arg(num_args = 1..)]
+        cypher: Vec<String>,
     },
 
-    /// Add a node with a label and optional properties
+    /// Add a node with a label and optional properties (e.g., `add-node Person {"name": "Alice"}`)
     #[command(name = "add-node")]
     AddNode {
         /// Node label
@@ -151,14 +157,14 @@ enum ReplCommand {
         props: String,
     },
 
-    /// Get a node by its ID
+    /// Get a node by its ID (e.g., `get-node 1`)
     #[command(name = "get-node")]
     GetNode {
         /// Node ID
         id: u64,
     },
 
-    /// Overwrite a node's properties
+    /// Overwrite a node's properties (e.g., `update-node 1 {"name": "Bob"}`)
     #[command(name = "update-node")]
     UpdateNode {
         /// Node ID
@@ -168,14 +174,14 @@ enum ReplCommand {
         props: String,
     },
 
-    /// Delete a node and its adjacency entries
+    /// Delete a node and its adjacency entries (e.g., `delete-node 1`)
     #[command(name = "delete-node")]
     DeleteNode {
         /// Node ID
         id: u64,
     },
 
-    /// Add a directed edge with a type and optional properties
+    /// Add a directed edge with a type and optional properties (e.g., `add-edge 1 2 KNOWS {"since": 2020}`)
     #[command(name = "add-edge")]
     AddEdge {
         /// Source Node ID
@@ -189,53 +195,53 @@ enum ReplCommand {
         props: String,
     },
 
-    /// Get an edge by its ID
+    /// Get an edge by its ID (e.g., `get-edge 5`)
     #[command(name = "get-edge")]
     GetEdge {
         /// Edge ID
         id: u64,
     },
 
-    /// Delete an edge
+    /// Delete an edge (e.g., `delete-edge 5`)
     #[command(name = "delete-edge")]
     DeleteEdge {
         /// Edge ID
         id: u64,
     },
 
-    /// Get outgoing neighbors of a node
+    /// Get outgoing neighbors of a node (e.g., `out 1`)
     #[command(name = "out")]
     Out {
         /// Node ID
         id: u64,
     },
 
-    /// Get incoming neighbors of a node
+    /// Get incoming neighbors of a node (e.g., `in 1`)
     #[command(name = "in")]
     In {
         /// Node ID
         id: u64,
     },
 
-    /// Find nodes carrying a specific label
+    /// Find nodes carrying a specific label (e.g., `label Person`)
     #[command(name = "label")]
     Label {
         /// Node label
         label: String,
     },
 
-    /// Find edges of a specific type
+    /// Find edges of a specific type (e.g., `etype KNOWS`)
     #[command(name = "etype")]
     Etype {
         /// Edge type
         etype: String,
     },
 
-    /// Display node and edge count statistics
+    /// Display node and edge count statistics (e.g., `stats`)
     #[command(name = "stats")]
     Stats,
 
-    /// Run breadth-first expansion traversal
+    /// Run breadth-first expansion traversal (e.g., `bfs 1 2`)
     #[command(name = "bfs")]
     Bfs {
         /// Start Node ID
@@ -244,7 +250,7 @@ enum ReplCommand {
         hops: u8,
     },
 
-    /// Run depth-first expansion traversal
+    /// Run depth-first expansion traversal (e.g., `dfs 1 2`)
     #[command(name = "dfs")]
     Dfs {
         /// Start Node ID
@@ -253,7 +259,7 @@ enum ReplCommand {
         hops: u8,
     },
 
-    /// Find the shortest unweighted path between two nodes
+    /// Find the shortest unweighted path between two nodes (e.g., `path 1 2`)
     #[command(name = "path")]
     Path {
         /// Source Node ID
@@ -262,7 +268,7 @@ enum ReplCommand {
         dst: u64,
     },
 
-    /// Find the shortest weighted path (Dijkstra) between two nodes
+    /// Find the shortest weighted path (Dijkstra) between two nodes (e.g., `wpath 1 2`)
     #[command(name = "wpath")]
     Wpath {
         /// Source Node ID
@@ -271,7 +277,7 @@ enum ReplCommand {
         dst: u64,
     },
 
-    /// Compute PageRank centrality scores
+    /// Compute PageRank centrality scores (e.g., `pagerank 20 0.85`)
     #[command(name = "pagerank")]
     Pagerank {
         /// Number of power iterations
@@ -282,27 +288,27 @@ enum ReplCommand {
         damping: f32,
     },
 
-    /// Find weakly connected components
+    /// Find weakly connected components (e.g., `components`)
     #[command(name = "components")]
     Components,
 
-    /// Find strongly connected components
+    /// Find strongly connected components (e.g., `scc`)
     #[command(name = "scc")]
     Scc,
 
-    /// Check if the graph contains any directed cycle
+    /// Check if the graph contains any directed cycle (e.g., `detect-cycle`)
     #[command(name = "detect-cycle")]
     DetectCycle,
 
-    /// Compute betweenness centrality scores (top 20)
+    /// Compute betweenness centrality scores (top 20) (e.g., `betweenness`)
     #[command(name = "betweenness")]
     Betweenness,
 
-    /// Compute harmonic centrality scores (top 20)
+    /// Compute harmonic centrality scores (top 20) (e.g., `harmonic`)
     #[command(name = "harmonic")]
     Harmonic,
 
-    /// Compute degree centrality
+    /// Compute degree centrality (e.g., `degree out` or `degree both`)
     #[command(name = "degree")]
     Degree {
         /// Traversal direction: 'in', 'out', or 'both'
@@ -310,7 +316,7 @@ enum ReplCommand {
         direction: String,
     },
 
-    /// Detect communities via Label Propagation Algorithm
+    /// Detect communities via Label Propagation Algorithm (e.g., `community 10`)
     #[command(name = "community")]
     Community {
         /// Maximum iteration steps
@@ -318,7 +324,7 @@ enum ReplCommand {
         max_iters: usize,
     },
 
-    /// Find minimum or maximum spanning forest by edge property
+    /// Find minimum or maximum spanning forest by edge property (e.g., `spanning-forest cost max`)
     #[command(name = "spanning-forest")]
     SpanningForest {
         /// Property name holding edge weights
@@ -327,7 +333,7 @@ enum ReplCommand {
         max: Option<String>,
     },
 
-    /// Compute maximum flow by edge capacity property
+    /// Compute maximum flow by edge capacity property (e.g., `max-flow 1 2 capacity`)
     #[command(name = "max-flow")]
     MaxFlow {
         /// Source Node ID
@@ -338,11 +344,7 @@ enum ReplCommand {
         prop: String,
     },
 
-    /// Rebuild the CSR snapshot cache
-    #[command(name = "rebuild-csr")]
-    RebuildCsr,
-
-    /// Attach/upsert a vector embedding on a node
+    /// Attach/upsert a vector embedding on a node (e.g., `upsert-vec 1 0.1 0.2 0.3`)
     #[command(name = "upsert-vec")]
     UpsertVec {
         /// Node ID
@@ -352,7 +354,7 @@ enum ReplCommand {
         values: Vec<f32>,
     },
 
-    /// Query the vector index for k-nearest neighbors
+    /// Query the vector index for k-nearest neighbors (e.g., `vsearch 5 0.1 0.2 0.3`)
     #[command(name = "vsearch")]
     Vsearch {
         /// Number of results to return
@@ -362,7 +364,7 @@ enum ReplCommand {
         query: Vec<f32>,
     },
 
-    /// Run hybrid vector-graph retrieval search
+    /// Run hybrid vector-graph retrieval search (e.g., `retrieve 5 2 0.1 0.2 0.3`)
     #[command(name = "retrieve")]
     Retrieve {
         /// Number of vector seed results
@@ -374,7 +376,7 @@ enum ReplCommand {
         query: Vec<f32>,
     },
 
-    /// Perform full-text search index actions
+    /// Perform full-text search index actions (e.g., `text-index create Person name` or `text-index list`)
     #[command(name = "text-index")]
     TextIndex {
         /// Action: 'create', 'drop', or 'list'
@@ -386,7 +388,7 @@ enum ReplCommand {
         property: Option<String>,
     },
 
-    /// Query BM25 full-text search index
+    /// Query BM25 full-text search index (e.g., `text-search "alice" Person name 5`)
     #[command(name = "text-search")]
     TextSearch {
         /// Search query terms
@@ -399,13 +401,83 @@ enum ReplCommand {
         limit: Option<usize>,
     },
 
-    /// Show this help message
+    /// Show this help message (e.g., `help`)
     #[command(name = "help")]
     Help,
 
-    /// Exit the program
+    /// Exit the program (e.g., `quit` or `exit`)
     #[command(name = "quit", alias = "exit")]
     Quit,
+}
+
+// ---------------------------------------------------------------------------
+// Help Text Grouping
+// ---------------------------------------------------------------------------
+
+const HELP_TEXT: &str = r#"
+Database Control
+  :open <path>                         Open or reopen a database at the given path (e.g., :open ./issundb-data)
+
+Scripting and Parameters
+  :run <file>                          Execute a script file line by line (e.g., :run ./import.cypher)
+  :save <file>                         Save the output of the next query to a file (e.g., :save ./output.txt)
+  :params                              List all current query parameters (e.g., :params)
+  :set <name> <value>                  Set a query parameter (e.g., :set limit 10 or :set person {"name": "Alice"})
+  :unset <name>                        Remove a query parameter (e.g., :unset limit)
+
+Backup and Import
+  :backup <file>                       Write a hot backup snapshot of the database (e.g., :backup ./backup.db)
+  :backup-compact <file>               Write a compacted backup snapshot of the database (e.g., :backup-compact ./compact.db)
+  :import-jsonl <file>                 Import nodes from a JSONL file (e.g., :import-jsonl ./nodes.jsonl)
+  :import-csv <file>                   Import nodes from a CSV file (e.g., :import-csv ./nodes.csv)
+  rebuild-csr                          Rebuild the CSR snapshot cache (e.g., rebuild-csr)
+
+Query and Mutations
+  :explain <cypher>                    Show the optimized physical plan for a Cypher query (e.g., :explain MATCH (n) RETURN n)
+  query / cypher <cypher>              Run a Cypher query (e.g., query MATCH (n) RETURN n)
+  add-node <label> [props]             Add a node with a label and optional properties (e.g., add-node Person {"name": "Alice"})
+  get-node <id>                        Get a node by its ID (e.g., get-node 1)
+  update-node <id> [props]             Overwrite a node's properties (e.g., update-node 1 {"name": "Bob"})
+  delete-node <id>                     Delete a node and its adjacency entries (e.g., delete-node 1)
+  add-edge <src> <dst> <type> [props]  Add a directed edge with a type and optional properties (e.g., add-edge 1 2 KNOWS {"since": 2020})
+  get-edge <id>                        Get an edge by its ID (e.g., get-edge 5)
+  delete-edge <id>                     Delete an edge (e.g., delete-edge 5)
+  out <id>                             Get outgoing neighbors of a node (e.g., out 1)
+  in <id>                              Get incoming neighbors of a node (e.g., in 1)
+  label <label>                        Find nodes carrying a specific label (e.g., label Person)
+  etype <type>                         Find edges of a specific type (e.g., etype KNOWS)
+  stats                                Display node and edge count statistics (e.g., stats)
+
+Graph Algorithms
+  bfs <id> <hops>                      Run breadth-first expansion traversal (e.g., bfs 1 2)
+  dfs <id> <hops>                      Run depth-first expansion traversal (e.g., dfs 1 2)
+  path <src> <dst>                     Find the shortest unweighted path between two nodes (e.g., path 1 2)
+  wpath <src> <dst>                    Find the shortest weighted path (Dijkstra) between two nodes (e.g., wpath 1 2)
+  pagerank [iters] [damping]           Compute PageRank centrality scores (e.g., pagerank 20 0.85)
+  components                           Find weakly connected components (e.g., components)
+  scc                                  Find strongly connected components (e.g., scc)
+  detect-cycle                         Check if the graph contains any directed cycle (e.g., detect-cycle)
+  betweenness                          Compute betweenness centrality scores (top 20) (e.g., betweenness)
+  harmonic                             Compute harmonic centrality scores (top 20) (e.g., harmonic)
+  degree [in|out|both]                 Compute degree centrality (e.g., degree out or degree both)
+  community [max_iters]                Detect communities via Label Propagation Algorithm (e.g., community 10)
+  spanning-forest <prop> [max]         Find minimum or maximum spanning forest by edge property (e.g., spanning-forest cost max)
+  max-flow <src> <dst> <prop>          Compute maximum flow by edge capacity property (e.g., max-flow 1 2 capacity)
+
+Vector and Text Search
+  upsert-vec <id> <values...>          Attach/upsert a vector embedding on a node (e.g., upsert-vec 1 0.1 0.2 0.3)
+  vsearch <k> <query...>               Query the vector index for k-nearest neighbors (e.g., vsearch 5 0.1 0.2 0.3)
+  retrieve <k> <hops> <query...>       Run hybrid vector-graph retrieval search (e.g., retrieve 5 2 0.1 0.2 0.3)
+  text-index create|drop|list [l] [p]  Perform full-text search index actions (e.g., text-index create Person name or text-index list)
+  text-search <q> [l] [p] [limit]      Query BM25 full-text search index (e.g., text-search "alice" Person name 5)
+
+System
+  help                                 Show this help message
+  quit/exit                            Exit the program
+"#;
+
+fn print_help() {
+    print!("{HELP_TEXT}");
 }
 
 // ---------------------------------------------------------------------------
@@ -509,6 +581,11 @@ fn handle(state: &mut State, line: &str) -> bool {
     }
 
     let tokens = tokenize_line(line_trimmed);
+    if tokens.len() == 1 && (tokens[0] == "help" || tokens[0] == "-h" || tokens[0] == "--help") {
+        print_help();
+        return true;
+    }
+
     match ReplCommand::try_parse_from(tokens) {
         Ok(cmd) => {
             if !execute_cmd(state, cmd) {
@@ -549,9 +626,7 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
     match cmd {
         ReplCommand::Quit => return false,
         ReplCommand::Help => {
-            let mut repl_cmd = ReplCommand::command();
-            let _ = repl_cmd.print_help();
-            println!();
+            print_help();
         }
         ReplCommand::Open { path } => match Graph::open(&path, 1) {
             Ok(g) => {
@@ -592,7 +667,8 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
         }
         ReplCommand::Explain { cypher } => {
             if let Some(g) = &state.graph {
-                match g.explain(&cypher) {
+                let cypher_str = cypher.join(" ");
+                match g.explain(&cypher_str) {
                     Ok(plan) => print!("{plan}"),
                     Err(e) => eprintln!("error: {e}"),
                 }
@@ -621,7 +697,8 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
             cmd_import_csv(state, &file);
         }
         ReplCommand::Query { cypher } => {
-            run_cypher(state, &cypher);
+            let cypher_str = cypher.join(" ");
+            run_cypher(state, &cypher_str);
         }
         ReplCommand::AddNode { label, props } => {
             if let Some(g) = &state.graph {
