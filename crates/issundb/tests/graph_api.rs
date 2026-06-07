@@ -483,3 +483,16 @@ fn fused_chain_breaks_on_labeled_intermediate() {
         .unwrap();
     assert_eq!(pairs(&result), vec![("a".to_string(), "c".to_string())]);
 }
+
+#[test]
+fn test_facade_explain_integration() {
+    let (_dir, g) = open_tmp();
+    g.add_node("Person", &json!({ "name": "Alice" })).unwrap();
+    g.rebuild_csr().unwrap();
+
+    let plan = g
+        .explain("MATCH (n:Person) WHERE n.name = 'Alice' RETURN n.name")
+        .unwrap();
+    assert!(!plan.is_empty());
+    assert!(plan.contains("Person"));
+}
