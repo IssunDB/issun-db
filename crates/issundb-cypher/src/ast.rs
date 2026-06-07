@@ -33,6 +33,8 @@ pub enum Statement {
     DeleteAndReturn(DeleteAndReturnStatement),
     /// MATCH ... REMOVE ... RETURN ...
     RemoveAndReturn(RemoveAndReturnStatement),
+    /// COPY <Label> FROM '<filepath>' [WITH <options>]
+    Copy(CopyStatement),
     /// A sequence of independent statements. Each statement is executed in order;
     /// the result of the last statement is returned. This represents queries like
     /// `CREATE (a) CREATE (b)` or setup scripts with multiple write clauses.
@@ -610,4 +612,12 @@ pub struct MergeAndReturnStatement {
     pub order_by: Option<OrderBy>,
     pub skip: Option<Expr>,
     pub limit: Option<Expr>,
+}
+
+/// A COPY statement to bulk-load data from a file into a node label or edge type.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CopyStatement {
+    pub target: String,
+    pub filepath: String,
+    pub options: Option<HashMap<String, Expr>>,
 }

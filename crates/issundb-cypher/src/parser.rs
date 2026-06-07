@@ -1799,6 +1799,29 @@ fn drop_statement<'a>() -> impl Parser<'a, ParserInput<'a>, Statement, ParserErr
     choice((index_ddl, constraint_ddl))
 }
 
+/// Parses a `COPY <LabelName> FROM '<filepath>' [WITH <options_map>]` statement
+fn copy_statement<'a>() -> impl Parser<'a, ParserInput<'a>, Statement, ParserError<'a>> + Clone {
+    keyword("COPY")
+        .ignore_then(identifier())
+        .then_ignore(keyword("FROM"))
+        .then(any().filter_map(|tok| match tok {
+            Tok::Str(s) => Some(s.clone()),
+            _ => None,
+        }))
+        .then(
+            keyword("WITH")
+                .ignore_then(property_map(expr_parser()))
+                .or_not(),
+        )
+        .map(|((target, filepath), options)| {
+            Statement::Copy(CopyStatement {
+                target,
+                filepath,
+                options,
+            })
+        })
+}
+
 /// Parses a `DELETE` clause / statement
 fn delete_statement<'a>() -> impl Parser<'a, ParserInput<'a>, Statement, ParserError<'a>> + Clone {
     let detach = keyword("DETACH")
@@ -2121,6 +2144,7 @@ fn statement_union_parser(
             remove_stmt,
             foreach_stmt,
             drop_statement(),
+            copy_statement(),
         ));
 
         // Each specialized parser is guarded by `at_statement_boundary` so it only wins
@@ -5240,5 +5264,28 @@ mod tests {
         // null is type-compatible with any graph element; reusing it matches nothing.
         assert!(parse("WITH null AS a OPTIONAL MATCH p = (a)-[r]->() RETURN nodes(p)").is_ok());
         assert!(parse("WITH null AS a MATCH (a) RETURN a").is_ok());
+    }
+
+    #[test]
+    fn parse_copy_statement() {
+        let stmt = parse("COPY Person FROM 'person.csv' WITH {header: true, delimiter: ','}");
+        assert!(stmt.is_ok());
+        if let Ok(Statement::Copy(copy)) = stmt {
+            assert_eq!(copy.target, "Person");
+            assert_eq!(copy.filepath, "person.csv");
+            assert!(copy.options.is_some());
+        } else {
+            panic!("Expected Statement::Copy");
+        }
+
+        let stmt_no_with = parse("COPY Person FROM 'person.csv'");
+        assert!(stmt_no_with.is_ok());
+        if let Ok(Statement::Copy(copy)) = stmt_no_with {
+            assert_eq!(copy.target, "Person");
+            assert_eq!(copy.filepath, "person.csv");
+            assert!(copy.options.is_none());
+        } else {
+            panic!("Expected Statement::Copy");
+        }
     }
 }
