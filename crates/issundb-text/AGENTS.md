@@ -1,6 +1,5 @@
 # `issundb-text` Agent Guide
 
-
 This file covers crate-specific guidance for contributors working inside `crates/issundb-text`. Read the root `AGENTS.md` first; the rules there apply
 everywhere and are not repeated here.
 
@@ -100,14 +99,13 @@ To add support for a new language (the tokenizer constants and selectors live in
 1. **Stop-word list constant definition**: in `crates/issundb-core/src/storage/fts.rs` (e.g., `STOP_WORDS_DUTCH: &[&str]`).
 2. **Stop-word retrieval mapping**: an arm for the new language in `get_stop_words` (same file).
 3. **Stemmer algorithm mapping**: an arm for the new language in `map_algorithm` (same file; the Snowball stemmer language selector).
-4. **Language enum variant**: the new variant in the `Language` enum in `crates/issundb-core/src/schema.rs`, keeping the `#[repr(u8)]` discriminant values contiguous.
+4. **Language enum variant**: the new variant in the `Language` enum in `crates/issundb-core/src/schema.rs`, keeping the `#[repr(u8)]` discriminant
+   values contiguous.
 5. **Unit test validation**: a unit test in `issundb-core` that round-trips the new `Language` variant through `to_u8` / `from_u8`.
-
 
 All five steps are required; partial additions will compile but produce incorrect stemming or serialization.
 
 ## `RoaringTreemap` Vs. `RoaringBitmap`
-
 
 `NodeId` is a `u64`. Use `roaring::RoaringTreemap` for all full-text search candidate sets; it covers the full u64 range. `roaring::RoaringBitmap`
 covers only u32 and must not be used for NodeId sets. The existing code already uses `RoaringTreemap`; do not introduce `RoaringBitmap` for node sets.

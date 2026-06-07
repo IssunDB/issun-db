@@ -38,6 +38,8 @@ repos:
 
       - id: test
         name: Run Tests
-        entry: make nextest
+        entry: |
+          make nextest
+          make test-cli
         language: system
         pass_filenames: false

@@ -8,6 +8,7 @@ use crate::ast::*;
 use crate::parser;
 use crate::plan::{FilterExpr, LogicalPlanner, Optimizer, PhysicalOperator, PhysicalPlanner};
 
+mod copy;
 mod ddl;
 mod expr;
 mod factorize;
@@ -16,6 +17,7 @@ mod row;
 mod vectorized;
 mod write;
 
+use copy::{execute_copy, execute_export_db, execute_import_db};
 use ddl::{
     execute_create_constraint, execute_create_index, execute_drop_constraint, execute_drop_index,
 };
@@ -145,6 +147,9 @@ pub fn explain(graph: &Graph, cypher: &str) -> Result<String, CypherError> {
         Statement::DropConstraint(ref dc) => {
             Ok(format!("DropConstraint {}:{}\n", dc.label, dc.property))
         }
+        Statement::Copy(ref c) => Ok(format!("Copy {} FROM '{}'\n", c.target, c.filepath)),
+        Statement::ExportDatabase(ref e) => Ok(format!("ExportDatabase '{}'\n", e.filepath)),
+        Statement::ImportDatabase(ref i) => Ok(format!("ImportDatabase '{}'\n", i.filepath)),
         Statement::Pipeline(_) => Ok("Pipeline\n".into()),
     }
 }
@@ -324,6 +329,13 @@ fn execute_statement(
         }
         Statement::DropConstraint(dc) => {
             execute_drop_constraint(graph, dc).map_err(to_cypher_error)
+        }
+        Statement::Copy(c) => execute_copy(graph, c, params).map_err(to_cypher_error),
+        Statement::ExportDatabase(e) => {
+            execute_export_db(graph, e, params).map_err(to_cypher_error)
+        }
+        Statement::ImportDatabase(i) => {
+            execute_import_db(graph, i, params).map_err(to_cypher_error)
         }
         Statement::Pipeline(stmts) => execute_pipeline(graph, stmts, params, registry),
     }
@@ -2904,6 +2916,54 @@ mod tests {
         assert_eq!(rows[0][1], serde_json::Value::Null);
     }
 
+    #[test]
+    fn chained_optional_matches_bind_second_branch() {
+        let (_dir, graph) = setup_graph();
+        let p1 = graph
+            .add_node("Post", &serde_json::json!({"title": "p1"}))
+            .unwrap();
+        let p2 = graph
+            .add_node("Post", &serde_json::json!({"title": "p2"}))
+            .unwrap();
+        let c1 = graph
+            .add_node("Comment", &serde_json::json!({"content": "c1"}))
+            .unwrap();
+        let c2 = graph
+            .add_node("Comment", &serde_json::json!({"content": "c2"}))
+            .unwrap();
+        graph
+            .add_edge(p1, c1, "HAS_COMMENT", &serde_json::json!({}))
+            .unwrap();
+        graph
+            .add_edge(p2, c2, "HAS_COMMENT", &serde_json::json!({}))
+            .unwrap();
+        graph
+            .add_edge(p1, c1, "HAS_FEATURED_COMMENT", &serde_json::json!({}))
+            .unwrap();
+        graph.rebuild_csr().unwrap();
+
+        let query = "MATCH (post:Post) \
+             OPTIONAL MATCH (post)-[:HAS_COMMENT]->(comment:Comment) \
+             OPTIONAL MATCH (post)-[:HAS_FEATURED_COMMENT]->(featured:Comment) \
+             RETURN post.title, comment.content, featured.content ORDER BY post.title";
+        let rows = run(&graph, query);
+        assert_eq!(
+            rows,
+            vec![
+                vec![
+                    serde_json::json!("p1"),
+                    serde_json::json!("c1"),
+                    serde_json::json!("c1"),
+                ],
+                vec![
+                    serde_json::json!("p2"),
+                    serde_json::json!("c2"),
+                    serde_json::Value::Null,
+                ],
+            ]
+        );
+    }
+
     // --- Range predicate index pushdown (NodeRangeScan) ---
 
     #[test]
@@ -3150,5 +3210,162 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r2.records.len(), 1);
+    }
+
+    #[test]
+    fn test_copy_statement_execution() {
+        use std::io::Write;
+        let (tempdir, graph) = setup_graph();
+        let params = HashMap::new();
+
+        // 1. Test CSV Import
+        let csv_path = tempdir.path().join("users.csv");
+        {
+            let mut file = std::fs::File::create(&csv_path).unwrap();
+            writeln!(file, "name,age,active").unwrap();
+            writeln!(file, "Alice,30,true").unwrap();
+            writeln!(file, "Bob,40,false").unwrap();
+            writeln!(file, "Charlie,,true").unwrap();
+        }
+
+        let query_csv = format!(
+            "COPY Person FROM '{}' WITH {{header: true, delimiter: ','}}",
+            csv_path.display()
+        );
+        let res_csv = execute(&graph, &query_csv, &params).unwrap();
+        assert_eq!(res_csv.columns, vec!["nodes_imported".to_string()]);
+        assert_eq!(res_csv.records[0].values[0], serde_json::json!(3));
+
+        // Query and verify CSV nodes
+        let query_verify_csv = "MATCH (n:Person) RETURN n.name, n.age, n.active ORDER BY n.name";
+        let res_verify = execute(&graph, query_verify_csv, &params).unwrap();
+        assert_eq!(res_verify.records.len(), 3);
+        assert_eq!(
+            res_verify.records[0].values,
+            vec![
+                serde_json::json!("Alice"),
+                serde_json::json!(30),
+                serde_json::json!(true)
+            ]
+        );
+        assert_eq!(
+            res_verify.records[1].values,
+            vec![
+                serde_json::json!("Bob"),
+                serde_json::json!(40),
+                serde_json::json!(false)
+            ]
+        );
+        assert_eq!(
+            res_verify.records[2].values,
+            vec![
+                serde_json::json!("Charlie"),
+                serde_json::Value::Null,
+                serde_json::json!(true)
+            ]
+        );
+
+        // 2. Test JSONL Import
+        let jsonl_path = tempdir.path().join("users.jsonl");
+        {
+            let mut file = std::fs::File::create(&jsonl_path).unwrap();
+            writeln!(file, "{{\"name\": \"David\", \"age\": 25}}").unwrap();
+            writeln!(file, "{{\"props\": {{\"name\": \"Eve\", \"age\": 35}}}}").unwrap();
+        }
+
+        let query_jsonl = format!("COPY Person FROM '{}'", jsonl_path.display());
+        let res_jsonl = execute(&graph, &query_jsonl, &params).unwrap();
+        assert_eq!(res_jsonl.records[0].values[0], serde_json::json!(2));
+
+        // Query and verify JSONL nodes
+        let query_verify_jsonl = "MATCH (n:Person) WHERE n.name = 'David' OR n.name = 'Eve' RETURN n.name, n.age ORDER BY n.name";
+        let res_verify_j = execute(&graph, query_verify_jsonl, &params).unwrap();
+        assert_eq!(res_verify_j.records.len(), 2);
+        assert_eq!(
+            res_verify_j.records[0].values,
+            vec![serde_json::json!("David"), serde_json::json!(25)]
+        );
+        assert_eq!(
+            res_verify_j.records[1].values,
+            vec![serde_json::json!("Eve"), serde_json::json!(35)]
+        );
+    }
+
+    #[test]
+    fn test_parquet_export_import() {
+        let (tempdir, graph) = setup_graph();
+        let params = HashMap::new();
+
+        // Let's add some nodes and edges to export
+        execute(
+            &graph,
+            "CREATE (a:Person {name: 'Alice', age: 30, active: true})",
+            &params,
+        )
+        .unwrap();
+        execute(
+            &graph,
+            "CREATE (b:Person {name: 'Bob', age: 40, active: false})",
+            &params,
+        )
+        .unwrap();
+        execute(&graph, "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) CREATE (a)-[:KNOWS {since: 2020}]->(b)", &params).unwrap();
+
+        // Export database to Parquet
+        let export_dir = tempdir.path().join("parquet_export");
+        let export_query = format!(
+            "EXPORT DATABASE '{}' WITH {{format: 'parquet'}}",
+            export_dir.display()
+        );
+        let res_export = execute(&graph, &export_query, &params).unwrap();
+        assert_eq!(
+            res_export.records[0].values[0],
+            serde_json::Value::Bool(true)
+        );
+
+        // Let's create a fresh new graph to import into
+        let (tempdir2, graph2) = setup_graph();
+
+        // Import the database from the exported directory
+        let import_query = format!("IMPORT DATABASE '{}'", export_dir.display());
+        let res_import = execute(&graph2, &import_query, &params).unwrap();
+        assert_eq!(
+            res_import.records[0].values[0],
+            serde_json::Value::Bool(true)
+        );
+
+        // Verify the imported nodes and properties
+        let verify_query = "MATCH (n:Person) RETURN n.name, n.age, n.active ORDER BY n.name";
+        let res_verify = execute(&graph2, verify_query, &params).unwrap();
+        assert_eq!(res_verify.records.len(), 2);
+        assert_eq!(
+            res_verify.records[0].values,
+            vec![
+                serde_json::json!("Alice"),
+                serde_json::json!(30),
+                serde_json::json!(true)
+            ]
+        );
+        assert_eq!(
+            res_verify.records[1].values,
+            vec![
+                serde_json::json!("Bob"),
+                serde_json::json!(40),
+                serde_json::json!(false)
+            ]
+        );
+
+        // Verify the imported relationship
+        let verify_rel = "MATCH (a:Person)-[r:KNOWS]->(b:Person) RETURN a.name, b.name, r.since";
+        let res_verify_rel = execute(&graph2, verify_rel, &params).unwrap();
+        assert_eq!(res_verify_rel.records.len(), 1);
+        assert_eq!(
+            res_verify_rel.records[0].values,
+            vec![
+                serde_json::json!("Alice"),
+                serde_json::json!("Bob"),
+                serde_json::json!(2020)
+            ]
+        );
     }
 }

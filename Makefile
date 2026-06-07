@@ -51,6 +51,11 @@ test-conformance: format ## Run the openCypher TCK conformance integration tests
 	@echo "Running openCypher TCK conformance integration tests..."
 	@DEBUG_PROJ=$(DEBUG_PROJ) RUST_BACKTRACE=$(RUST_BACKTRACE) ISSUNDB_CONFORMANCE=1 cargo test --test conformance -- --nocapture
 
+.PHONY: test-cli
+test-cli: format ## Run the CLI integration tests (Unix only)
+	@echo "Running CLI integration tests..."
+	@./scripts/test_cli.sh
+
 .PHONY: coverage
 coverage: format ## Generate test coverage report
 	@echo "Generating test coverage report..."
@@ -225,10 +230,10 @@ bench-cypher: ## Run Cypher parser and query optimizer benchmarks
 	@DEBUG_PROJ=$(DEBUG_PROJ) cargo bench -p issundb-cypher
 	@DEBUG_PROJ=$(DEBUG_PROJ) cargo bench -p issundb --bench query_optimizer
 
-.PHONY: bench-ladybug
-bench-ladybug: ## Run the LadybugDB comparison harness
+.PHONY: bench-ladybugdb
+bench-ladybugdb: ## Run the LadybugDB comparison harness
 	@echo "Running LadybugDB comparison harness..."
-	@cd benchmarks/ladybug-compare && cargo run --release
+	@cd benchmarks/ladybugdb-compare && cargo run --release
 
 .PHONY: audit
 audit: ## Run security audit on Rust dependencies
@@ -337,4 +342,4 @@ setup-hooks: ## Install Git hooks (pre-commit and pre-push)
 .PHONY: test-hooks
 test-hooks: ## Test Git hooks on all files
 	@echo "Testing Git hooks..."
-	@pre-commit run --all-files --show-diff-on-failure
+	@pre-commit run --all-files

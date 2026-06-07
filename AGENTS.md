@@ -24,6 +24,9 @@ Priorities, in order:
 - Writes are serialized via the `parking_lot::Mutex<()>` write lock on `Graph`; LMDB enforces the same constraint at the storage level. Do not bypass
   either.
 - Add comments only when they clarify a non-obvious storage invariant, an LMDB lifetime constraint, or a GraphBLAS semiring choice.
+- Maintain the permissive license boundary of the workspace (MIT or Apache-2.0). Do not add dependencies or statically link libraries with copyleft,
+  weak copyleft, or source-available licenses (such as GPL, MPL, or SSPL). Keep any comparison or benchmarking harnesses that link to such external
+  engines excluded from the root Cargo workspace.
 - Format with `rustfmt` (`make format`) and lint with Clippy (`make lint`) before declaring a change done.
 
 Quick examples:
@@ -32,6 +35,8 @@ Quick examples:
 - Good: add a Cypher parser test in `crates/issundb-cypher/src/` against the openCypher TCK subset.
 - Bad: import `heed` directly in `crates/issundb/src/lib.rs` instead of going through `issundb-core`.
 - Bad: store a node cache in a `static` `HashMap` outside `Graph`.
+- Bad: add a cargo dependency to a workspace crate that pulls in a copyleft or source-available library (such as an MPL-licensed or SSPL-licensed
+  library).
 
 ## Writing Style
 
@@ -116,11 +121,15 @@ Do not invent modules that do not yet exist when answering questions, but do pla
   profiling drivers that load a persistent graph once and rerun a query so a profiler observes query execution without load noise:
   `profile_triangle` (Zipf-skewed graph, cyclic triangle-count query) and `profile_query` (uniform graph with the comparison harness's
   Person/KNOWS schema, arbitrary query via `PROFILE_QUERY`). Depends only on `issundb`.
-- `crates/issundb-core/benches/`: Criterion storage benchmarks.
+- `crates/issundb-core/benches/`: Criterion storage, Pokec dataset, Wikipedia PageRank, and write throughput benchmarks.
+- `crates/issundb-cypher/benches/`: Criterion Cypher parsing, execution, LSQB Q1–Q9 queries, and OLTP transactional read benchmarks.
+- `crates/issundb-vector/benches/`: Criterion vector search benchmarks.
+- `crates/issundb-text/benches/`: Criterion full-text search benchmarks.
+- `crates/issundb-retrieval/benches/`: Criterion hybrid retrieval and GraphRAG local/global query benchmarks.
 - `crates/issundb/tests/conformance/`: openCypher TCK subset integration tests.
-- `benchmarks/ladybug-compare/`: differential comparison harness against LadybugDB. Deliberately excluded from the workspace (own `[workspace]`
+- `benchmarks/ladybugdb-compare/`: differential comparison harness against LadybugDB. Deliberately excluded from the workspace (own `[workspace]`
   stanza, root `exclude`, and own `rust-toolchain.toml`) because the `lbug` crate links the LadybugDB C++ library and needs a newer Rust than the
-  workspace MSRV; it must never become part of `make build` or `make test`. Run via `make bench-ladybug`, which `cd`s into the directory so the
+  workspace MSRV; it must never become part of `make build` or `make test`. Run via `make bench-ladybugdb`, which `cd`s into the directory so the
   local toolchain pin applies. Cross-engine harnesses belong here, not in crate-local `benches/`, which is reserved for Criterion targets.
   The differential row-set check runs before timing, and a divergent query is reported without being timed. Traversal queries anchor at
   deterministic degree-percentile probes (cold, median, and hub) derived from the generated graph. The trail-sensitive queries carry an
@@ -223,6 +232,8 @@ All graph operations go through `Graph`; do not call `Storage` directly from out
 - `all_nodes() -> Result<Vec<NodeId>, Error>`
 - `label_name(id: LabelId) -> Result<Option<String>, Error>`
 - `type_name(id: TypeId) -> Result<Option<String>, Error>`
+- `list_node_indexes_and_constraints() -> Result<Vec<(String, String, u8)>, Error>`
+- `list_edge_indexes_and_constraints() -> Result<Vec<(String, String, u8)>, Error>`
 - `node_count_by_label(label: &str) -> Result<u64, Error>`
 - `edge_count_by_type(etype: &str) -> Result<u64, Error>`
 - `put_vector_bytes(n: NodeId, bytes: &[u8]) -> Result<(), Error>`
@@ -394,7 +405,7 @@ Additional validation when relevant:
 
 - `make bench` for performance-sensitive storage changes.
 - `make test-conformance` for Cypher conformance coverage.
-- `make bench-ladybug` for cross-engine performance comparison and differential correctness checks on the Cypher execution path.
+- `make bench-ladybugdb` for cross-engine performance comparison and differential correctness checks on the Cypher execution path.
 
 ## Testing Expectations
 

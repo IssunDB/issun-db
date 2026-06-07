@@ -830,4 +830,45 @@ mod tests {
 
         Ok(())
     }
+
+    #[test]
+    fn test_text_index_ext_lifecycle() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TempDir::new()?;
+        let graph = Graph::open(temp.path(), 1)?;
+
+        // Ensure initially we have no text indexes
+        assert!(!graph.has_text_index("Doc", "body")?);
+        assert!(graph.list_text_indexes()?.is_empty());
+
+        // Create an index
+        graph.create_text_index("Doc", "body")?;
+        assert!(graph.has_text_index("Doc", "body")?);
+
+        // List indexes and check
+        let list = graph.list_text_indexes()?;
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].0, "Doc");
+        assert_eq!(list[0].1, "body");
+        assert_eq!(list[0].2, Language::English); // Default language
+
+        // Create another index with a specific language
+        graph.create_text_index_with_language("Doc", "title", Language::German)?;
+        assert!(graph.has_text_index("Doc", "title")?);
+
+        let list = graph.list_text_indexes()?;
+        assert_eq!(list.len(), 2);
+        let title_idx = list.iter().find(|(_, p, _)| p == "title").unwrap();
+        assert_eq!(title_idx.2, Language::German);
+
+        // Drop the indexes
+        graph.drop_text_index("Doc", "body")?;
+        assert!(!graph.has_text_index("Doc", "body")?);
+
+        graph.drop_text_index("Doc", "title")?;
+        assert!(!graph.has_text_index("Doc", "title")?);
+
+        assert!(graph.list_text_indexes()?.is_empty());
+
+        Ok(())
+    }
 }

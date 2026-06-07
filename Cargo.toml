@@ -4,7 +4,7 @@ resolver = "2"
 
 # The LadybugDB comparison harness links a C++ library and stays outside the
 # workspace so `make build` and `make test` never compile it.
-exclude = ["benchmarks/ladybug-compare"]
+exclude = ["benchmarks/ladybugdb-compare"]
 
 
 [workspace.package]
@@ -19,6 +19,7 @@ rust-version = "1.85.0"
 
 [workspace.dependencies]
 heed = "0.22"
+colored = "2"
 byteorder = "1"
 zerocopy = { version = "0.8.48", features = ["derive"] }
 rmp-serde = "1"
@@ -48,6 +49,9 @@ walkdir = "2"
 gherkin = "0.14"
 roaring = "0.10"
 deepsize = { version = "0.2", features = ["derive"] }
+parquet = "58.3.0"
+arrow-array = "58.3.0"
+arrow-schema = "58.3.0"
 
 [profile.release]
 strip = "debuginfo"

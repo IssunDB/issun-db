@@ -1,4 +1,4 @@
-use issundb::{Graph, GraphQueryExt, NodeId};
+use issundb::{Graph, GraphQueryExt, NodeId, PropValue};
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -237,12 +237,12 @@ fn test_cypher_index_scan_integration() {
 
 #[test]
 fn test_facade_full_text_search_integration() {
-    use issundb::{TextGraphExt, TextSearchOptions};
+    use issundb::{TextGraphExt, TextIndexExt, TextSearchOptions};
 
     let (_dir, g) = open_tmp();
 
     // Create a node property text index
-    g.create_node_text_index("Movie", "synopsis").unwrap();
+    g.create_text_index("Movie", "synopsis").unwrap();
 
     // Insert some nodes
     let m1 = g
@@ -482,4 +482,66 @@ fn fused_chain_breaks_on_labeled_intermediate() {
         .query("MATCH (a:A)-[:R]->(m:Stop)-[:R]->(z:A) RETURN a.n AS s, z.n AS e")
         .unwrap();
     assert_eq!(pairs(&result), vec![("a".to_string(), "c".to_string())]);
+}
+
+#[test]
+fn test_facade_explain_integration() {
+    let (_dir, g) = open_tmp();
+    g.add_node("Person", &json!({ "name": "Alice" })).unwrap();
+    g.rebuild_csr().unwrap();
+
+    let plan = g
+        .explain("MATCH (n:Person) WHERE n.name = 'Alice' RETURN n.name")
+        .unwrap();
+    assert!(!plan.is_empty());
+    assert!(plan.contains("Person"));
+}
+
+#[test]
+fn test_facade_property_indexes_and_constraints_integration() {
+    let (_dir, g) = open_tmp();
+
+    // 1. Create property index
+    g.create_node_property_index("Person", "age").unwrap();
+
+    let a = g
+        .add_node("Person", &json!({ "name": "Alice", "age": 30 }))
+        .unwrap();
+    let b = g
+        .add_node("Person", &json!({ "name": "Bob", "age": 25 }))
+        .unwrap();
+    g.rebuild_csr().unwrap();
+
+    // 2. nodes_by_property point query
+    let p30 = g
+        .nodes_by_property("Person", "age", PropValue::Int(30))
+        .unwrap();
+    assert_eq!(p30, vec![a]);
+
+    // 3. nodes_by_property_range query
+    let pr = g
+        .nodes_by_property_range(
+            "Person",
+            "age",
+            Some(PropValue::Int(20)),
+            true,
+            Some(PropValue::Int(35)),
+            true,
+        )
+        .unwrap();
+    assert_eq!(pr.len(), 2);
+    assert!(pr.contains(&a));
+    assert!(pr.contains(&b));
+
+    // 4. Unique constraint
+    g.create_node_unique_constraint("User", "email").unwrap();
+    g.add_node("User", &json!({ "email": "alice@example.com" }))
+        .unwrap();
+    let duplicate = g.add_node("User", &json!({ "email": "alice@example.com" }));
+    assert!(duplicate.is_err());
+
+    // 5. Required constraint
+    g.create_node_required_constraint("Task", "title").unwrap();
+    let task_err = g.add_node("Task", &json!({ "done": false }));
+    assert!(task_err.is_err());
 }

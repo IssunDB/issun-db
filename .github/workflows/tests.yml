@@ -71,6 +71,9 @@ jobs:
       - name: Run tests and generate coverage report
         run: make coverage
 
+      - name: Run CLI integration tests
+        run: make test-cli
+
       - name: Upload coverage reports to Codecov
         uses: codecov/codecov-action@v5
         with:

@@ -1799,6 +1799,60 @@ fn drop_statement<'a>() -> impl Parser<'a, ParserInput<'a>, Statement, ParserErr
     choice((index_ddl, constraint_ddl))
 }
 
+/// Parses a `COPY <LabelName> FROM '<filepath>' [WITH <options_map>]` statement
+fn copy_statement<'a>() -> impl Parser<'a, ParserInput<'a>, Statement, ParserError<'a>> + Clone {
+    keyword("COPY")
+        .ignore_then(identifier())
+        .then_ignore(keyword("FROM"))
+        .then(any().filter_map(|tok| match tok {
+            Tok::Str(s) => Some(s.clone()),
+            _ => None,
+        }))
+        .then(
+            keyword("WITH")
+                .ignore_then(property_map(expr_parser()))
+                .or_not(),
+        )
+        .map(|((target, filepath), options)| {
+            Statement::Copy(CopyStatement {
+                target,
+                filepath,
+                options,
+            })
+        })
+}
+
+/// Parses a `EXPORT DATABASE '<filepath>' [WITH <options_map>]` statement
+fn export_database_statement<'a>()
+-> impl Parser<'a, ParserInput<'a>, Statement, ParserError<'a>> + Clone {
+    keyword("EXPORT")
+        .ignore_then(keyword("DATABASE"))
+        .ignore_then(any().filter_map(|tok| match tok {
+            Tok::Str(s) => Some(s.clone()),
+            _ => None,
+        }))
+        .then(
+            keyword("WITH")
+                .ignore_then(property_map(expr_parser()))
+                .or_not(),
+        )
+        .map(|(filepath, options)| {
+            Statement::ExportDatabase(ExportDatabaseStatement { filepath, options })
+        })
+}
+
+/// Parses a `IMPORT DATABASE '<filepath>'` statement
+fn import_database_statement<'a>()
+-> impl Parser<'a, ParserInput<'a>, Statement, ParserError<'a>> + Clone {
+    keyword("IMPORT")
+        .ignore_then(keyword("DATABASE"))
+        .ignore_then(any().filter_map(|tok| match tok {
+            Tok::Str(s) => Some(s.clone()),
+            _ => None,
+        }))
+        .map(|filepath| Statement::ImportDatabase(ImportDatabaseStatement { filepath }))
+}
+
 /// Parses a `DELETE` clause / statement
 fn delete_statement<'a>() -> impl Parser<'a, ParserInput<'a>, Statement, ParserError<'a>> + Clone {
     let detach = keyword("DETACH")
@@ -2121,6 +2175,9 @@ fn statement_union_parser(
             remove_stmt,
             foreach_stmt,
             drop_statement(),
+            copy_statement(),
+            export_database_statement(),
+            import_database_statement(),
         ));
 
         // Each specialized parser is guarded by `at_statement_boundary` so it only wins
@@ -5240,5 +5297,48 @@ mod tests {
         // null is type-compatible with any graph element; reusing it matches nothing.
         assert!(parse("WITH null AS a OPTIONAL MATCH p = (a)-[r]->() RETURN nodes(p)").is_ok());
         assert!(parse("WITH null AS a MATCH (a) RETURN a").is_ok());
+    }
+
+    #[test]
+    fn parse_copy_statement() {
+        let stmt = parse("COPY Person FROM 'person.csv' WITH {header: true, delimiter: ','}");
+        assert!(stmt.is_ok());
+        if let Ok(Statement::Copy(copy)) = stmt {
+            assert_eq!(copy.target, "Person");
+            assert_eq!(copy.filepath, "person.csv");
+            assert!(copy.options.is_some());
+        } else {
+            panic!("Expected Statement::Copy");
+        }
+
+        let stmt_no_with = parse("COPY Person FROM 'person.csv'");
+        assert!(stmt_no_with.is_ok());
+        if let Ok(Statement::Copy(copy)) = stmt_no_with {
+            assert_eq!(copy.target, "Person");
+            assert_eq!(copy.filepath, "person.csv");
+            assert!(copy.options.is_none());
+        } else {
+            panic!("Expected Statement::Copy");
+        }
+    }
+
+    #[test]
+    fn parse_import_export_statements() {
+        let stmt = parse("EXPORT DATABASE 'backups/db1' WITH {format: 'jsonl'}");
+        assert!(stmt.is_ok());
+        if let Ok(Statement::ExportDatabase(export)) = stmt {
+            assert_eq!(export.filepath, "backups/db1");
+            assert!(export.options.is_some());
+        } else {
+            panic!("Expected Statement::ExportDatabase");
+        }
+
+        let stmt_import = parse("IMPORT DATABASE 'backups/db1'");
+        assert!(stmt_import.is_ok());
+        if let Ok(Statement::ImportDatabase(import)) = stmt_import {
+            assert_eq!(import.filepath, "backups/db1");
+        } else {
+            panic!("Expected Statement::ImportDatabase");
+        }
     }
 }

@@ -875,7 +875,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "ladybug-compare"
+name = "ladybugdb-compare"
 version = "0.1.0"
 dependencies = [
  "anyhow",

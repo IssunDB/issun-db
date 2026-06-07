@@ -8,3 +8,4 @@ ignore:
   - "crates/issundb-node/*"
   - "benchmarks/*"
   - "scripts/*"
+  - "crates/issundb-cli/src/main.rs"

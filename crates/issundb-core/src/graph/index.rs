@@ -1018,6 +1018,64 @@ impl Graph {
         }
         Ok(result)
     }
+
+    pub fn list_node_indexes_and_constraints(&self) -> Result<Vec<(String, String, u8)>, Error> {
+        let rtxn = self.storage.env.read_txn()?;
+        let mut result = Vec::new();
+        for entry in self.storage.meta.iter(&rtxn)? {
+            let (key, val) = entry?;
+            if let Some(rest) = key.strip_prefix("idx_meta:node:l:") {
+                let parts: Vec<&str> = rest.split(":p:").collect();
+                if parts.len() == 2 {
+                    if let (Ok(label_id), Ok(prop_key_id)) =
+                        (parts[0].parse::<u32>(), parts[1].parse::<u32>())
+                    {
+                        if let (Some(label_name), Some(prop_name)) = (
+                            self.label_name_impl(&rtxn, label_id)?,
+                            crate::storage::ids::get_prop_key_name(
+                                &self.storage,
+                                &rtxn,
+                                prop_key_id,
+                            )?,
+                        ) {
+                            let flags = val.first().copied().unwrap_or(0x00);
+                            result.push((label_name, prop_name, flags));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    pub fn list_edge_indexes_and_constraints(&self) -> Result<Vec<(String, String, u8)>, Error> {
+        let rtxn = self.storage.env.read_txn()?;
+        let mut result = Vec::new();
+        for entry in self.storage.meta.iter(&rtxn)? {
+            let (key, val) = entry?;
+            if let Some(rest) = key.strip_prefix("idx_meta:edge:t:") {
+                let parts: Vec<&str> = rest.split(":p:").collect();
+                if parts.len() == 2 {
+                    if let (Ok(type_id), Ok(prop_key_id)) =
+                        (parts[0].parse::<u32>(), parts[1].parse::<u32>())
+                    {
+                        if let (Some(type_name), Some(prop_name)) = (
+                            self.type_name_impl(&rtxn, type_id)?,
+                            crate::storage::ids::get_prop_key_name(
+                                &self.storage,
+                                &rtxn,
+                                prop_key_id,
+                            )?,
+                        ) {
+                            let flags = val.first().copied().unwrap_or(0x00);
+                            result.push((type_name, prop_name, flags));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(result)
+    }
 }
 
 #[cfg(test)]
