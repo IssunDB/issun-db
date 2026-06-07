@@ -138,7 +138,7 @@ This document outlines the features implemented in IssunDB and the future goals 
     - [x] OLTP transactional read query benchmark modeled after the LDBC Interactive Short query patterns
     - [x] Write throughput benchmark evaluating single and batched node/edge insertion performance
     - [x] GraphRAG hybrid retrieval benchmark evaluating RRF, weighted sum fusion, PageRank community anchors, and Markdown context serialization
-- [x] A differential comparison harness against LadybugDB (`benchmarks/ladybug-compare`): an identical Cypher workload runs on both engines with
+- [x] A differential comparison harness against LadybugDB (`benchmarks/ladybugdb-compare`): an identical Cypher workload runs on both engines with
   median timings and sorted row-set equality checks (run before timing, so a divergent query is reported rather than timed), with uniform or
   Zipf-skewed synthetic graphs, deterministic degree-percentile traversal probes (cold, median, and hub), an openCypher trail reference that
   attributes LadybugDB walk-semantics divergences on the trail-sensitive queries, a scale-sweep mode reporting per-query scaling ratios split by

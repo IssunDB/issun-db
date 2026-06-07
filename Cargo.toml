@@ -4,7 +4,7 @@ resolver = "2"
 
 # The LadybugDB comparison harness links a C++ library and stays outside the
 # workspace so `make build` and `make test` never compile it.
-exclude = ["benchmarks/ladybug-compare"]
+exclude = ["benchmarks/ladybugdb-compare"]
 
 
 [workspace.package]

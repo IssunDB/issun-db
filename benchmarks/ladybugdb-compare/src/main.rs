@@ -1,5 +1,5 @@
 //! Comparison harness running the same Cypher workload against IssunDB and
-//! LadybugDB (the Kùzu successor, via the `lbug` crate).
+//! LadybugDB (via the `lbug` crate).
 //!
 //! Both engines load an identical synthetic social graph, then each query in
 //! the workload runs on both. The harness reports median wall time per engine
@@ -85,28 +85,28 @@ impl Config {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(default)
         }
-        let skew = match std::env::var("LADYBUG_COMPARE_SKEW").as_deref() {
+        let skew = match std::env::var("LADYBUGDB_COMPARE_SKEW").as_deref() {
             Ok("zipf") => Skew::Zipf,
             Ok("uniform") | Err(_) => Skew::Uniform,
-            Ok(other) => panic!("LADYBUG_COMPARE_SKEW must be 'uniform' or 'zipf', got {other:?}"),
+            Ok(other) => panic!("LADYBUGDB_COMPARE_SKEW must be 'uniform' or 'zipf', got {other:?}"),
         };
-        let nodes = var("LADYBUG_COMPARE_NODES", 10_000);
-        let edges = var("LADYBUG_COMPARE_EDGES", 50_000);
-        let reps = var("LADYBUG_COMPARE_REPS", 10) as usize;
-        let sweep = var("LADYBUG_COMPARE_SWEEP", 0) != 0;
-        assert!(nodes > 0, "LADYBUG_COMPARE_NODES must be at least 1");
+        let nodes = var("LADYBUGDB_COMPARE_NODES", 10_000);
+        let edges = var("LADYBUGDB_COMPARE_EDGES", 50_000);
+        let reps = var("LADYBUGDB_COMPARE_REPS", 10) as usize;
+        let sweep = var("LADYBUGDB_COMPARE_SWEEP", 0) != 0;
+        assert!(nodes > 0, "LADYBUGDB_COMPARE_NODES must be at least 1");
         assert!(
             edges == 0 || nodes > 1,
-            "LADYBUG_COMPARE_EDGES requires at least two nodes \
+            "LADYBUGDB_COMPARE_EDGES requires at least two nodes \
              (edges are distinct non-self-loop pairs)"
         );
-        assert!(reps > 0, "LADYBUG_COMPARE_REPS must be at least 1");
+        assert!(reps > 0, "LADYBUGDB_COMPARE_REPS must be at least 1");
         if sweep {
             let (base_nodes, base_edges) = (nodes / SWEEP_STEP, edges / SWEEP_STEP);
             assert!(
                 base_nodes > 0,
                 "sweep divides the node count by {SWEEP_STEP}; \
-                 LADYBUG_COMPARE_NODES is too small"
+                 LADYBUGDB_COMPARE_NODES is too small"
             );
             assert!(
                 base_edges == 0 || base_nodes > 1,
@@ -117,10 +117,10 @@ impl Config {
             nodes,
             edges,
             reps,
-            warmups: var("LADYBUG_COMPARE_WARMUPS", 3) as usize,
+            warmups: var("LADYBUGDB_COMPARE_WARMUPS", 3) as usize,
             skew,
             sweep,
-            budget: Duration::from_secs(var("LADYBUG_COMPARE_BUDGET_SECS", 30)),
+            budget: Duration::from_secs(var("LADYBUGDB_COMPARE_BUDGET_SECS", 30)),
         }
     }
 }
@@ -207,7 +207,7 @@ fn generate(nodes: u64, edges: u64, skew: Skew) -> Dataset {
         attempts += 1;
         assert!(
             attempts <= max_attempts,
-            "edge sampling saturated; lower LADYBUG_COMPARE_EDGES relative to LADYBUG_COMPARE_NODES"
+            "edge sampling saturated; lower LADYBUGDB_COMPARE_EDGES relative to LADYBUGDB_COMPARE_NODES"
         );
         let (src, dst) = match &zipf {
             Some(z) => (z.sample(rng.unit()), z.sample(rng.unit())),
@@ -294,7 +294,7 @@ fn write_csvs(data: &Dataset, dir: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn load_ladybug(conn: &Connection, csv_dir: &std::path::Path) -> anyhow::Result<()> {
+fn load_ladybugdb(conn: &Connection, csv_dir: &std::path::Path) -> anyhow::Result<()> {
     conn.query(
         "CREATE NODE TABLE Person(id INT64, name STRING, age INT64, city STRING, \
          PRIMARY KEY(id));",
@@ -362,7 +362,7 @@ fn issundb_rows(result: &issundb::QueryResult) -> Vec<Vec<String>> {
         .collect()
 }
 
-fn ladybug_rows(result: lbug::QueryResult) -> Vec<Vec<String>> {
+fn ladybugdb_rows(result: lbug::QueryResult) -> Vec<Vec<String>> {
     result
         .map(|row| row.iter().map(|v| v.to_string()).collect())
         .collect()
@@ -506,7 +506,7 @@ struct QueryTiming {
     name: &'static str,
     scope: Scope,
     issundb: Option<Duration>,
-    ladybug_1t: Option<Duration>,
+    ladybugdb_1t: Option<Duration>,
 }
 
 /// The benchmark queries, anchored at the degree-percentile probes.
@@ -721,7 +721,7 @@ fn run_at(cfg: &Config, nodes: u64, edges: u64) -> anyhow::Result<Vec<QueryTimin
     conn.query("CALL recursive_pattern_semantic = 'TRAIL';")?;
     let default_threads = conn.get_max_num_threads_for_exec();
     let start = Instant::now();
-    load_ladybug(&conn, csv_dir.path())?;
+    load_ladybugdb(&conn, csv_dir.path())?;
     let lb_load = start.elapsed();
 
     let is_dir = tempfile::tempdir()?;
@@ -730,11 +730,11 @@ fn run_at(cfg: &Config, nodes: u64, edges: u64) -> anyhow::Result<Vec<QueryTimin
     load_issundb(&graph, &data)?;
     let is_load = start.elapsed();
 
-    println!("load: issundb {is_load:?} (single write txn), ladybug {lb_load:?} (COPY FROM)\n");
+    println!("load: issundb {is_load:?} (single write txn), ladybugdb {lb_load:?} (COPY FROM)\n");
 
     println!(
         "{:<20} {:>12} {:>12} {:>14} {:>10}  diff",
-        "query", "issundb", "ladybug", "ladybug(1t)", "result"
+        "query", "issundb", "ladybugdb", "ladybugdb(1t)", "result"
     );
     // A trailing `*` marks a median taken from fewer than the requested reps
     // because the per-query budget ran out.
@@ -760,7 +760,7 @@ fn run_at(cfg: &Config, nodes: u64, edges: u64) -> anyhow::Result<Vec<QueryTimin
         // queries, the dataset-computed trail reference adjudicates which
         // engine diverged from openCypher.
         let mut is_rows = issundb_rows(&graph.query(cypher)?);
-        let mut lb_rows = ladybug_rows(conn.query(cypher)?);
+        let mut lb_rows = ladybugdb_rows(conn.query(cypher)?);
         is_rows.sort();
         lb_rows.sort();
         if is_rows != lb_rows {
@@ -781,7 +781,7 @@ fn run_at(cfg: &Config, nodes: u64, edges: u64) -> anyhow::Result<Vec<QueryTimin
                 name,
                 scope: query.scope,
                 issundb: None,
-                ladybug_1t: None,
+                ladybugdb_1t: None,
             });
             if issundb_matches_reference {
                 // A known LadybugDB walk-semantics overcount, reported but
@@ -789,7 +789,7 @@ fn run_at(cfg: &Config, nodes: u64, edges: u64) -> anyhow::Result<Vec<QueryTimin
                 divergences += 1;
                 println!(
                     "{name:<20} {:>12} {:>12} {:>14} {:>10}  DIVERGENT \
-                     (ladybug walk semantics: ladybug {}, openCypher trails {})",
+                     (ladybugdb walk semantics: ladybugdb {}, openCypher trails {})",
                     "-",
                     "-",
                     "-",
@@ -804,7 +804,7 @@ fn run_at(cfg: &Config, nodes: u64, edges: u64) -> anyhow::Result<Vec<QueryTimin
                 mismatches += 1;
                 println!(
                     "{name:<20} {:>12} {:>12} {:>14} {:>10}  MISMATCH \
-                     (issundb {} rows: {:?}..., ladybug {} rows: {:?}...)",
+                     (issundb {} rows: {:?}..., ladybugdb {} rows: {:?}...)",
                     "-",
                     "-",
                     "-",
@@ -852,7 +852,7 @@ fn run_at(cfg: &Config, nodes: u64, edges: u64) -> anyhow::Result<Vec<QueryTimin
             name,
             scope: query.scope,
             issundb: Some(is_time),
-            ladybug_1t: Some(lb_time_1t),
+            ladybugdb_1t: Some(lb_time_1t),
         });
     }
     if truncated {
@@ -918,7 +918,7 @@ fn main() -> anyhow::Result<()> {
         ];
         for (scope, note) in sections {
             println!("\n{note}:");
-            println!("{:<20} {:>16} {:>16}", "query", "issundb", "ladybug(1t)");
+            println!("{:<20} {:>16} {:>16}", "query", "issundb", "ladybugdb(1t)");
             for qi in 0..reports[0].len() {
                 if reports[0][qi].scope != scope {
                     continue;
@@ -944,7 +944,7 @@ fn main() -> anyhow::Result<()> {
                     "{:<20} {:>16} {:>16}",
                     reports[0][qi].name,
                     ratios(|t| t.issundb),
-                    ratios(|t| t.ladybug_1t)
+                    ratios(|t| t.ladybugdb_1t)
                 );
             }
         }

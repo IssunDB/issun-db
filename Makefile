@@ -230,10 +230,10 @@ bench-cypher: ## Run Cypher parser and query optimizer benchmarks
 	@DEBUG_PROJ=$(DEBUG_PROJ) cargo bench -p issundb-cypher
 	@DEBUG_PROJ=$(DEBUG_PROJ) cargo bench -p issundb --bench query_optimizer
 
-.PHONY: bench-ladybug
-bench-ladybug: ## Run the LadybugDB comparison harness
+.PHONY: bench-ladybugdb
+bench-ladybugdb: ## Run the LadybugDB comparison harness
 	@echo "Running LadybugDB comparison harness..."
-	@cd benchmarks/ladybug-compare && cargo run --release
+	@cd benchmarks/ladybugdb-compare && cargo run --release
 
 .PHONY: audit
 audit: ## Run security audit on Rust dependencies

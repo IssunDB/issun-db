@@ -93,4 +93,4 @@ node_modules/
 package-lock.json
 
 # LadybugDB comparison harness build artifacts (in a detached workspace)
-/benchmarks/ladybug-compare/target/
+benchmarks/ladybugdb-compare/target/
