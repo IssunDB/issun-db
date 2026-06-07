@@ -19,6 +19,7 @@ rust-version = "1.85.0"
 
 [workspace.dependencies]
 heed = "0.22"
+colored = "2"
 byteorder = "1"
 zerocopy = { version = "0.8.48", features = ["derive"] }
 rmp-serde = "1"
