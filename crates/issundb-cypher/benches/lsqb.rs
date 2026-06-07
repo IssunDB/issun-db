@@ -183,6 +183,25 @@ fn bench_lsqb(c: &mut Criterion) {
          OPTIONAL MATCH (comment)-[:HAS_CREATOR]->(commenter:Person) \
          RETURN count(*)",
     );
+
+    // LSQB Q8: Pattern Negation via Pattern Comprehension (Comment-REPLY_OF-Post where commenter does not know creator)
+    run(
+        "lsqb_q8",
+        "MATCH (comment:Comment)-[:REPLY_OF]->(post:Post) \
+         MATCH (comment)-[:HAS_CREATOR]->(commenter:Person) \
+         MATCH (post)-[:HAS_CREATOR]->(creator:Person) \
+         WHERE size([ (commenter)-[:KNOWS]->(creator) | 1 ]) = 0 AND commenter.name <> creator.name \
+         RETURN count(*)",
+    );
+
+    // LSQB Q9: Triangle Negation via Pattern Comprehension (Person-KNOWS-Person-KNOWS-Person where p1 does not know p3)
+    run(
+        "lsqb_q9",
+        "MATCH (person1:Person)-[:KNOWS]->(person2:Person) \
+         MATCH (person2)-[:KNOWS]->(person3:Person) \
+         WHERE size([ (person1)-[:KNOWS]->(person3) | 1 ]) = 0 AND person1.name <> person3.name \
+         RETURN count(*)",
+    );
 }
 
 criterion_group!(benches, bench_lsqb);
