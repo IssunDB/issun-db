@@ -41,9 +41,9 @@ The `Graph` struct is the main coordinator for all transactional graph storage, 
 
 Import the `VectorGraphExt` trait to leverage embedding storage and vector similarity search.
 
-- `VectorGraphExt::upsert_vector(n: NodeId, v: &[f32]) -> Result<(), Error>`  
+- `VectorGraphExt::upsert_vector(n: NodeId, v: &[f32]) -> Result<(), VectorError>`  
   Associates a high-dimensional float vector embedding with a node.
-- `VectorGraphExt::vector_search(q: &[f32], k: usize) -> Result<Vec<Hit>, Error>`  
+- `VectorGraphExt::vector_search(q: &[f32], k: usize) -> Result<Vec<Hit>, VectorError>`  
   Retrieves the top-k nearest neighbor nodes matching the query vector.
 
 ---
@@ -52,9 +52,9 @@ Import the `VectorGraphExt` trait to leverage embedding storage and vector simil
 
 Import the `TextIndexExt` and `TextGraphExt` traits to configure and query text indexes.
 
-- `TextIndexExt::create_text_index(label: &str, property: &str) -> Result<(), Error>`  
+- `TextIndexExt::create_text_index(label: &str, property: &str) -> Result<(), TextError>`  
   Creates a full-text search index on a specific node property.
-- `TextIndexExt::drop_text_index(label: &str, property: &str) -> Result<(), Error>`  
+- `TextIndexExt::drop_text_index(label: &str, property: &str) -> Result<(), TextError>`  
   Removes a full-text search index.
 - `TextGraphExt::text_search(query: &str, opts: &TextSearchOptions) -> Result<Vec<TextHit>, TextError>`  
   Queries indexed text fields and ranks matching nodes using BM25 scoring.
@@ -65,9 +65,9 @@ Import the `TextIndexExt` and `TextGraphExt` traits to configure and query text 
 
 Import the `GraphQueryExt` trait to run declarative graph queries.
 
-- `query(cypher: &str) -> Result<QueryResult, String>`  
+- `query(cypher: &str) -> Result<QueryResult, CypherError>`  
   Executes a raw Cypher query string against the database.
-- `query_with_params(cypher: &str, params: &HashMap<String, serde_json::Value>) -> Result<QueryResult, String>`  
+- `query_with_params(cypher: &str, params: &HashMap<String, serde_json::Value>) -> Result<QueryResult, CypherError>`  
   Executes a parameterized Cypher query against the database.
 
 ---
