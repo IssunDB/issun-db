@@ -174,13 +174,11 @@ pub(super) fn execute_copy_internal(
             || headers_found.contains(&"from".to_string()))
             && (headers_found.contains(&"_to".to_string())
                 || headers_found.contains(&"to".to_string()))
+    } else if let Some(first) = entries.first() {
+        (first.contains_key("_from") || first.contains_key("from"))
+            && (first.contains_key("_to") || first.contains_key("to"))
     } else {
-        if let Some(first) = entries.first() {
-            (first.contains_key("_from") || first.contains_key("from"))
-                && (first.contains_key("_to") || first.contains_key("to"))
-        } else {
-            false
-        }
+        false
     };
 
     if is_relationship {
@@ -746,11 +744,7 @@ pub(super) fn execute_import_db(
             if trimmed.is_empty() || trimmed.starts_with("//") || trimmed.starts_with("--") {
                 continue;
             }
-            let cypher_stmt = if trimmed.ends_with(';') {
-                &trimmed[..trimmed.len() - 1]
-            } else {
-                trimmed
-            };
+            let cypher_stmt = trimmed.strip_suffix(';').unwrap_or(trimmed);
 
             let parsed = crate::parser::parse(cypher_stmt)
                 .map_err(|e| format!("parse error on copy line '{}': {}", cypher_stmt, e))?;
@@ -985,7 +979,7 @@ fn build_record_batch(
                     labels_builder.append(true);
                 } else if let Some(s) = val.as_str() {
                     let values_builder = labels_builder.values();
-                    for item in s.split(|c| c == ':' || c == ';').filter(|s| !s.is_empty()) {
+                    for item in s.split([':', ';']).filter(|s| !s.is_empty()) {
                         values_builder.append_value(item);
                     }
                     labels_builder.append(true);
@@ -1002,7 +996,10 @@ fn build_record_batch(
     }
 
     for k in prop_keys {
-        let dtype = col_types.get(k).unwrap().clone();
+        let dtype = col_types
+            .get(k)
+            .ok_or_else(|| format!("missing type for column {}", k))?
+            .clone();
         fields.push(Field::new(k, dtype.clone(), true));
 
         match dtype {
@@ -1060,7 +1057,7 @@ fn build_record_batch(
                         } else if let Some(s) = val.as_str() {
                             builder.append_value(s);
                         } else {
-                            builder.append_value(&val.to_string());
+                            builder.append_value(val.to_string());
                         }
                     } else {
                         builder.append_null();
@@ -1099,12 +1096,12 @@ fn read_parquet_entries(path: &Path) -> Result<Vec<serde_json::Map<String, Value
         File::open(path).map_err(|e| format!("failed to open file {}: {}", path.display(), e))?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)
         .map_err(|e| format!("failed to create reader builder: {}", e))?;
-    let mut reader = builder
+    let reader = builder
         .build()
         .map_err(|e| format!("failed to build reader: {}", e))?;
 
     let mut entries = Vec::new();
-    while let Some(batch_res) = reader.next() {
+    for batch_res in reader {
         let batch = batch_res.map_err(|e| format!("failed to read record batch: {}", e))?;
         let schema = batch.schema();
         let num_rows = batch.num_rows();

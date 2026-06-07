@@ -381,7 +381,7 @@ Database Control
 Scripting and Parameters
   :run <file>                          Execute a script file line by line (e.g., :run ./import.cypher)
   :save <file>                         Save the output of the next query to a file (e.g., :save ./output.txt)
-  :params                              List all current query parameters (e.g., :params)
+  :params                              List all current query parameters
   :set <name> <value>                  Set a query parameter (e.g., :set limit 10 or :set person {"name": "Alice"})
   :unset <name>                        Remove a query parameter (e.g., :unset limit)
 
@@ -390,7 +390,7 @@ Backup and Import
   :backup-compact <file>               Write a compacted backup snapshot of the database (e.g., :backup-compact ./compact.db)
   :import-jsonl <file>                 Import nodes from a JSONL file (e.g., :import-jsonl ./nodes.jsonl)
   :import-csv <file>                   Import nodes from a CSV file (e.g., :import-csv ./nodes.csv)
-  rebuild-csr                          Rebuild the CSR snapshot cache (e.g., rebuild-csr)
+  rebuild-csr                          Rebuild the CSR snapshot cache
 
 Query and Mutations
   :explain <cypher>                    Show the optimized physical plan for a Cypher query (e.g., :explain MATCH (n) RETURN n)
@@ -414,7 +414,7 @@ Graph Algorithms
   path <src> <dst>                     Find the shortest unweighted path between two nodes (e.g., path 1 2)
   wpath <src> <dst>                    Find the shortest weighted path (Dijkstra) between two nodes (e.g., wpath 1 2)
   pagerank [iters] [damping]           Compute PageRank centrality scores (e.g., pagerank 20 0.85)
-  components                           Find weakly connected components (e.g., components)
+  components                           Find weakly connected components
   degree [in|out|both]                 Compute degree centrality (e.g., degree out or degree both)
 
 Vector and Text Search
@@ -588,6 +588,8 @@ fn handle(state: &mut State, line: &str) -> bool {
             | "OPTIONAL"
             | "WHERE"
             | "FOREACH"
+            | "EXPORT"
+            | "IMPORT"
     );
     if is_cypher_kw {
         run_cypher(state, line_trimmed);
@@ -1595,6 +1597,20 @@ mod tests {
 
         // 4. Algorithm command
         assert!(handle(&mut state, "pagerank"));
+
+        // 4a. Export and Import database via Cypher queries
+        let export_path = temp.path().join("cli_export");
+        let export_cmd = format!(
+            "EXPORT DATABASE '{}' WITH {{format: 'parquet'}}",
+            export_path.display()
+        );
+        assert!(handle(&mut state, &export_cmd));
+        assert!(export_path.exists());
+        assert!(export_path.join("nodes.parquet").exists());
+        assert!(export_path.join("edges.parquet").exists());
+
+        let import_cmd = format!("IMPORT DATABASE '{}'", export_path.display());
+        assert!(handle(&mut state, &import_cmd));
 
         // 5. Quit command should return false
         assert!(!handle(&mut state, "quit"));

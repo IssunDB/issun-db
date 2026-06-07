@@ -83,6 +83,8 @@ query MATCH (n) RETURN n
 :run $IMPORT_CYPHER
 :backup $BACKUP_DB
 :backup-compact $COMPACT_DB
+EXPORT DATABASE '$TEMP_DIR/db_export' WITH {format: 'parquet'}
+IMPORT DATABASE '$TEMP_DIR/db_export'
 :import-jsonl $NODES_JSONL
 :import-csv $NODES_CSV
 rebuild-csr
