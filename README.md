@@ -57,28 +57,28 @@ use std::path::Path;
 use issundb::{Graph, GraphQueryExt};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Open a graph database with a 1 GB memory map size limit
+    // Open a graph database (with a 1 GB memory map size limit)
     let graph = Graph::open(Path::new("./issundb-data"), 1)?;
 
-    // Add nodes with properties
+    // Add two nodes with properties
     let alice_props = serde_json::json!({ "name": "Alice", "age": 30 });
     let alice_id = graph.add_node("Person", &alice_props)?;
 
     let bob_props = serde_json::json!({ "name": "Bob", "age": 28 });
     let bob_id = graph.add_node("Person", &bob_props)?;
 
-    // Create an edge connecting the nodes
+    // Add an edge between the nodes
     let edge_props = serde_json::json!({ "since": 2021 });
     graph.add_edge(alice_id, bob_id, "KNOWS", &edge_props)?;
 
     // Rebuild the in-memory CSR snapshot
     graph.rebuild_csr()?;
 
-    // Execute a Cypher query
+    // Run a Cypher query and print the results
     let result = graph.query(
         "MATCH (a:Person)-[r:KNOWS]->(b:Person) RETURN a.name, b.name, r.since"
     )?;
-
+    
     for record in result.records {
         println!(
             "Match: {} knows {} since {}",
