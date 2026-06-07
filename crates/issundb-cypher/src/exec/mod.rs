@@ -2904,6 +2904,54 @@ mod tests {
         assert_eq!(rows[0][1], serde_json::Value::Null);
     }
 
+    #[test]
+    fn chained_optional_matches_bind_second_branch() {
+        let (_dir, graph) = setup_graph();
+        let p1 = graph
+            .add_node("Post", &serde_json::json!({"title": "p1"}))
+            .unwrap();
+        let p2 = graph
+            .add_node("Post", &serde_json::json!({"title": "p2"}))
+            .unwrap();
+        let c1 = graph
+            .add_node("Comment", &serde_json::json!({"content": "c1"}))
+            .unwrap();
+        let c2 = graph
+            .add_node("Comment", &serde_json::json!({"content": "c2"}))
+            .unwrap();
+        graph
+            .add_edge(p1, c1, "HAS_COMMENT", &serde_json::json!({}))
+            .unwrap();
+        graph
+            .add_edge(p2, c2, "HAS_COMMENT", &serde_json::json!({}))
+            .unwrap();
+        graph
+            .add_edge(p1, c1, "HAS_FEATURED_COMMENT", &serde_json::json!({}))
+            .unwrap();
+        graph.rebuild_csr().unwrap();
+
+        let query = "MATCH (post:Post) \
+             OPTIONAL MATCH (post)-[:HAS_COMMENT]->(comment:Comment) \
+             OPTIONAL MATCH (post)-[:HAS_FEATURED_COMMENT]->(featured:Comment) \
+             RETURN post.title, comment.content, featured.content ORDER BY post.title";
+        let rows = run(&graph, query);
+        assert_eq!(
+            rows,
+            vec![
+                vec![
+                    serde_json::json!("p1"),
+                    serde_json::json!("c1"),
+                    serde_json::json!("c1"),
+                ],
+                vec![
+                    serde_json::json!("p2"),
+                    serde_json::json!("c2"),
+                    serde_json::Value::Null,
+                ],
+            ]
+        );
+    }
+
     // --- Range predicate index pushdown (NodeRangeScan) ---
 
     #[test]

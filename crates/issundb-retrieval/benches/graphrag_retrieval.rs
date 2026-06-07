@@ -134,7 +134,9 @@ fn serialize_subgraph(graph: &Graph, subgraph: &Subgraph) -> String {
     let mut out = String::with_capacity(4096);
     out.push_str("# Subgraph Context\n\n");
     out.push_str("## Nodes\n");
-    for &nid in &subgraph.nodes {
+    let mut nodes = subgraph.nodes.clone();
+    nodes.sort_unstable();
+    for nid in nodes {
         let label = graph.node_labels(nid).unwrap_or_default().join(", ");
         let body = match graph.node_prop_json(nid, "body") {
             Ok(Some(serde_json::Value::String(s))) => s,
@@ -148,7 +150,9 @@ fn serialize_subgraph(graph: &Graph, subgraph: &Subgraph) -> String {
         out.push_str(&format!("- Node {nid} ({label}){score}: \"{body}\"\n"));
     }
     out.push_str("\n## Relationships\n");
-    for &eid in &subgraph.edges {
+    let mut edges = subgraph.edges.clone();
+    edges.sort_unstable();
+    for eid in edges {
         if let Ok(Some(record)) = graph.get_edge(eid) {
             let label = graph
                 .type_name(record.edge_type)
@@ -161,6 +165,27 @@ fn serialize_subgraph(graph: &Graph, subgraph: &Subgraph) -> String {
         }
     }
     out
+}
+
+fn validate_local_search(
+    graph: &Graph,
+    query_vec: &[f32],
+    query_text: &str,
+    opts: &HybridRetrieveOptions,
+) {
+    let subgraph = retrieve_hybrid(graph, query_vec, query_text, opts).unwrap();
+    assert!(
+        !subgraph.nodes.is_empty(),
+        "local search must retrieve nodes"
+    );
+    assert!(
+        !subgraph.edges.is_empty(),
+        "two-hop expansion must retrieve edges"
+    );
+    assert!(
+        serialize_subgraph(graph, &subgraph).contains("## Relationships"),
+        "context serialization must include relationships"
+    );
 }
 
 fn bench_local_search_rrf(c: &mut Criterion) {
@@ -181,6 +206,8 @@ fn bench_local_search_rrf(c: &mut Criterion) {
         ..Default::default()
     };
 
+    validate_local_search(&graph, &query_vec, query_text, &opts);
+
     c.bench_function("graphrag_local_search_rrf", |b| {
         b.iter(|| {
             let sub = retrieve_hybrid(
@@ -198,11 +225,11 @@ fn bench_local_search_rrf(c: &mut Criterion) {
 
 fn bench_local_search_weighted(c: &mut Criterion) {
     let (_dir, graph) = build_graphrag_graph();
-    // Perturbed vector for Topic 2 (vector search)
+    // Use the same database-topic query as the RRF case so only fusion differs.
     let mut query_vec = vec![0.0_f32; DIMS];
-    query_vec[2 * 20] = 1.0_f32;
-    query_vec[2 * 20 + 10] = 0.5_f32;
-    let query_text = "vector search similarity cosine";
+    query_vec[1 * 20] = 1.0_f32;
+    query_vec[1 * 20 + 10] = 0.5_f32;
+    let query_text = "database graph query engine";
 
     let opts = HybridRetrieveOptions {
         vector_k: 10,
@@ -216,6 +243,8 @@ fn bench_local_search_weighted(c: &mut Criterion) {
         },
         ..Default::default()
     };
+
+    validate_local_search(&graph, &query_vec, query_text, &opts);
 
     c.bench_function("graphrag_local_search_weighted", |b| {
         b.iter(|| {
@@ -240,7 +269,7 @@ fn bench_global_search_pagerank(c: &mut Criterion) {
             // 1. Identify global community anchors using PageRank
             let pr = graph.page_rank(10, 0.85).unwrap();
             let mut sorted_nodes: Vec<NodeId> = pr.keys().copied().collect();
-            sorted_nodes.sort_by(|x, y| pr[y].partial_cmp(&pr[x]).unwrap());
+            sorted_nodes.sort_by(|x, y| pr[y].total_cmp(&pr[x]).then_with(|| x.cmp(y)));
 
             // Take the top 5 central entities
             let anchors = &sorted_nodes[0..5];

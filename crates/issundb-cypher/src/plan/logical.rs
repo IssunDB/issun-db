@@ -127,6 +127,7 @@ pub struct LogicalPlanner;
 
 impl LogicalPlanner {
     pub fn plan(query: &Query) -> Result<LogicalOperator, CypherError> {
+        let mut match_scope = 0usize;
         let mut plan = if query.parts.is_empty() {
             // Legacy single-MATCH planning flow.
             // When match_clauses is also empty this is a bare RETURN query (e.g. `RETURN 1 + 2`).
@@ -149,7 +150,8 @@ impl LogicalPlanner {
             let mut current_plan: Option<LogicalOperator> = None;
 
             for match_clause in &query.match_clauses {
-                let match_plan = Self::plan_match(match_clause)?;
+                let match_plan = Self::plan_match(match_clause, match_scope)?;
+                match_scope += 1;
                 current_plan = match current_plan {
                     Some(existing) => Some(LogicalOperator::Join {
                         left: Box::new(existing),
@@ -198,7 +200,8 @@ impl LogicalPlanner {
                         }
                         let mut part_match_plan: Option<LogicalOperator> = None;
                         for match_clause in match_clauses {
-                            let mp = Self::plan_match(match_clause)?;
+                            let mp = Self::plan_match(match_clause, match_scope)?;
+                            match_scope += 1;
                             part_match_plan = match part_match_plan {
                                 Some(existing) => Some(LogicalOperator::Join {
                                     left: Box::new(existing),
@@ -412,7 +415,8 @@ impl LogicalPlanner {
                                     null_vars.push(v.clone());
                                 }
                             }
-                            let mp = Self::plan_match(match_clause)?;
+                            let mp = Self::plan_match(match_clause, match_scope)?;
+                            match_scope += 1;
                             part_match_plan = match part_match_plan {
                                 Some(existing) => Some(LogicalOperator::Join {
                                     left: Box::new(existing),
@@ -631,13 +635,16 @@ impl LogicalPlanner {
 
         Ok(plan)
     }
-    fn plan_match(match_clause: &MatchClause) -> Result<LogicalOperator, CypherError> {
+    fn plan_match(
+        match_clause: &MatchClause,
+        match_scope: usize,
+    ) -> Result<LogicalOperator, CypherError> {
         let pattern = &match_clause.pattern;
         let seed_var = pattern
             .node
             .variable
             .clone()
-            .unwrap_or_else(|| "_seed".to_string());
+            .unwrap_or_else(|| format!("_seed_{match_scope}"));
 
         // Scan by the first label; additional labels become HasLabel filters so
         // a multi-label pattern such as (n:A:B) requires the node to carry all of them.
@@ -668,16 +675,16 @@ impl LogicalPlanner {
         let mut prior_rel_vars: Vec<String> = Vec::new();
 
         for (seg_idx, (rel_pat, node_pat)) in pattern.rels.iter().enumerate() {
-            // Use segment-indexed fallback names so auto-generated variables do not
+            // Use clause- and segment-indexed fallback names so auto-generated variables do not
             // collide across multiple relationship segments in the same pattern.
             let rel_var = rel_pat
                 .variable
                 .clone()
-                .unwrap_or_else(|| format!("_rel_{}", seg_idx));
+                .unwrap_or_else(|| format!("_rel_{match_scope}_{seg_idx}"));
             let target_var = node_pat
                 .variable
                 .clone()
-                .unwrap_or_else(|| format!("_target_{}", seg_idx));
+                .unwrap_or_else(|| format!("_target_{match_scope}_{seg_idx}"));
 
             let min_hops = rel_pat.range.as_ref().and_then(|r| r.min).unwrap_or(1) as usize;
             // Three cases must be distinguished (mirrors exec.rs):
@@ -749,10 +756,9 @@ impl LogicalPlanner {
                 }
             } else {
                 let last_target_var = if let Some((_, last_node_pat)) = pattern.rels.last() {
-                    last_node_pat
-                        .variable
-                        .clone()
-                        .unwrap_or_else(|| format!("_target_{}", pattern.rels.len() - 1))
+                    last_node_pat.variable.clone().unwrap_or_else(|| {
+                        format!("_target_{match_scope}_{}", pattern.rels.len() - 1)
+                    })
                 } else {
                     seed_var.clone()
                 };
