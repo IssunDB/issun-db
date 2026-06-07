@@ -3,8 +3,9 @@ use std::{collections::HashMap, fs, io::Write, path::PathBuf};
 use clap::Parser;
 use colored::Colorize;
 use issundb::{
-    DegreeDirection, EdgeId, Graph, GraphQueryExt, Hit, NodeId, RetrieveOptions, TextGraphExt,
-    TextIndexExt, TextSearchOptions, VectorGraphExt, retrieve_with,
+    DegreeDirection, EdgeId, Graph, GraphQueryExt, Hit, Language, NodeId, RetrieveOptions,
+    TextGraphExt, TextIndexExt, TextSearchOptions, VectorGraphExt, VectorIndexOptions,
+    VectorMetric, VectorQuantization, retrieve_with,
 };
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
@@ -332,6 +333,20 @@ enum ReplCommand {
         query: Vec<f32>,
     },
 
+    /// Configure or reindex vector metric and quantization (e.g., `configure-vec cosine float32`)
+    #[command(name = "configure-vec")]
+    ConfigureVec {
+        /// Metric: 'cosine', 'l2', 'dot', or 'hamming'
+        #[arg(value_parser = ["cosine", "l2", "dot", "hamming"])]
+        metric: String,
+        /// Quantization: 'float32', 'float16', or 'int8'
+        #[arg(value_parser = ["float32", "float16", "int8"], default_value = "float32")]
+        quantization: String,
+        /// Rebuild the index if vector embeddings already exist
+        #[arg(short, long)]
+        reindex: bool,
+    },
+
     /// Perform full-text search index actions (e.g., `text-index create Person name` or `text-index list`)
     #[command(name = "text-index")]
     TextIndex {
@@ -342,6 +357,9 @@ enum ReplCommand {
         label: Option<String>,
         /// Node property (required for create/drop)
         property: Option<String>,
+        /// Index language for stemming ('english', 'spanish', 'french', 'german', 'italian', 'portuguese')
+        #[arg(short, long, default_value = "english", value_parser = ["english", "spanish", "french", "german", "italian", "portuguese"])]
+        lang: String,
     },
 
     /// Query BM25 full-text search index (e.g., `text-search "alice" Person name 5`)
@@ -418,6 +436,7 @@ Graph Algorithms
   degree [in|out|both]                 Compute degree centrality (e.g., degree out or degree both)
 
 Vector and Text Search
+  configure-vec <metric> [quantization] Configure or reindex vector metric and quantization (e.g., configure-vec cosine float32)
   upsert-vec <id> <values...>          Attach/upsert a vector embedding on a node (e.g., upsert-vec 1 0.1 0.2 0.3)
   vsearch <k> <query...>               Query the vector index for k-nearest neighbors (e.g., vsearch 5 0.1 0.2 0.3)
   retrieve <k> <hops> <query...>       Run hybrid vector-graph retrieval search (e.g., retrieve 5 2 0.1 0.2 0.3)
@@ -1043,10 +1062,43 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
                 }
             }
         }
+        ReplCommand::ConfigureVec {
+            metric,
+            quantization,
+            reindex,
+        } => {
+            if let Some(g) = &state.graph {
+                let v_metric = match metric.to_lowercase().as_str() {
+                    "l2" => VectorMetric::L2,
+                    "dot" => VectorMetric::Dot,
+                    "hamming" => VectorMetric::Hamming,
+                    _ => VectorMetric::Cosine,
+                };
+                let v_quant = match quantization.to_lowercase().as_str() {
+                    "float16" => VectorQuantization::Float16,
+                    "int8" => VectorQuantization::Int8,
+                    _ => VectorQuantization::Float32,
+                };
+                let opts = VectorIndexOptions {
+                    metric: v_metric,
+                    quantization: v_quant,
+                };
+                let res = if reindex {
+                    g.reindex_vector_index(opts)
+                } else {
+                    g.configure_vector_index(opts)
+                };
+                match res {
+                    Ok(()) => println!("ok"),
+                    Err(e) => eprintln!("error: {e}"),
+                }
+            }
+        }
         ReplCommand::TextIndex {
             action,
             label,
             property,
+            lang,
         } => {
             if let Some(g) = &state.graph {
                 match action.as_str() {
@@ -1056,7 +1108,15 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
                         if lbl.is_empty() || prop.is_empty() {
                             eprintln!("label and property are required for create");
                         } else {
-                            match g.create_text_index(lbl, prop) {
+                            let language = match lang.to_lowercase().as_str() {
+                                "spanish" => Language::Spanish,
+                                "french" => Language::French,
+                                "german" => Language::German,
+                                "italian" => Language::Italian,
+                                "portuguese" => Language::Portuguese,
+                                _ => Language::English,
+                            };
+                            match g.create_text_index_with_language(lbl, prop, language) {
                                 Ok(()) => println!("ok"),
                                 Err(e) => eprintln!("error: {e}"),
                             }
@@ -1079,8 +1139,8 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
                             if idxs.is_empty() {
                                 println!("(no text indexes)");
                             } else {
-                                for (label, prop, _lang) in &idxs {
-                                    println!("  {label}.{prop}");
+                                for (label, prop, lang) in &idxs {
+                                    println!("  {label}.{prop} (language: {lang:?})");
                                 }
                             }
                         }
@@ -1611,6 +1671,16 @@ mod tests {
 
         let import_cmd = format!("IMPORT DATABASE '{}'", export_path.display());
         assert!(handle(&mut state, &import_cmd));
+
+        // 4b. Configure vector index
+        assert!(handle(&mut state, "configure-vec l2 float16"));
+
+        // 4c. Create FTS index with custom language, then list it
+        assert!(handle(
+            &mut state,
+            "text-index create Person name --lang german"
+        ));
+        assert!(handle(&mut state, "text-index list"));
 
         // 5. Quit command should return false
         assert!(!handle(&mut state, "quit"));
