@@ -378,6 +378,7 @@ impl Graph {
     #[instrument(skip(self))]
     pub fn delete_node(&self, id: NodeId) -> Result<(), Error> {
         let _guard = self._write_lock.lock();
+        println!("DEBUG delete_node: id = {}", id);
         let mut wtxn = self.storage.env.write_txn()?;
         self.delete_node_impl(&mut wtxn, id)?;
         wtxn.commit()?;

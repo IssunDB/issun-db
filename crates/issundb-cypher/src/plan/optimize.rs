@@ -12,7 +12,7 @@ impl Optimizer {
     /// Optimize a `PhysicalOperator` plan by standardizing operator sequences,
     /// extracting filter predicates, and pushing them down to the lowest possible nodes.
     pub fn optimize(op: PhysicalOperator, stats: Option<&dyn StatsProvider>) -> PhysicalOperator {
-        let (stripped_op, raw_filters) = Self::extract_filters(op);
+        let (stripped_op, raw_filters) = Self::extract_filters(op, stats);
         // Split top-level AND conjunctions so each conjunct pushes down to its
         // own lowest binder: `a.id = 1 AND b.age > 30` as a whole references
         // both endpoints and would stay above the Expand, while its conjuncts
@@ -76,10 +76,13 @@ impl Optimizer {
 
     /// Extract all filter operators from the physical plan, return a stripped tree,
     /// and collect all predicates into a single collection.
-    fn extract_filters(op: PhysicalOperator) -> (PhysicalOperator, Vec<FilterExpr>) {
+    fn extract_filters(
+        op: PhysicalOperator,
+        stats: Option<&dyn StatsProvider>,
+    ) -> (PhysicalOperator, Vec<FilterExpr>) {
         match op {
             PhysicalOperator::Filter { input, expression } => {
-                let (inner_op, mut inner_filters) = Self::extract_filters(*input);
+                let (inner_op, mut inner_filters) = Self::extract_filters(*input, stats);
                 inner_filters.push(expression);
                 (inner_op, inner_filters)
             }
@@ -89,7 +92,7 @@ impl Optimizer {
                 expr,
                 variable,
             } => {
-                let (inner_op, inner_filters) = Self::extract_filters(*input);
+                let (inner_op, inner_filters) = Self::extract_filters(*input, stats);
                 (
                     PhysicalOperator::Unwind {
                         input: Box::new(inner_op),
@@ -161,7 +164,7 @@ impl Optimizer {
                 unique_rels,
                 needs_path,
             } => {
-                let (inner_op, inner_filters) = Self::extract_filters(*input);
+                let (inner_op, inner_filters) = Self::extract_filters(*input, stats);
                 (
                     PhysicalOperator::Expand {
                         input: Box::new(inner_op),
@@ -190,17 +193,18 @@ impl Optimizer {
                     // predicate, which sees pre-projection variables. Extracting those
                     // filters would re-place them above the barrier, where the variables
                     // they reference are no longer in scope. Treat barrier projects as
-                    // opaque: do not extract filters from inside them.
+                    // opaque: do not extract filters from inside them, but optimize their subplan.
+                    let optimized_input = Self::optimize(*input, stats);
                     (
                         PhysicalOperator::Project {
-                            input,
+                            input: Box::new(optimized_input),
                             items,
-                            is_barrier,
+                            is_barrier: true,
                         },
                         Vec::new(),
                     )
                 } else {
-                    let (inner_op, inner_filters) = Self::extract_filters(*input);
+                    let (inner_op, inner_filters) = Self::extract_filters(*input, stats);
                     (
                         PhysicalOperator::Project {
                             input: Box::new(inner_op),
@@ -212,8 +216,8 @@ impl Optimizer {
                 }
             }
             PhysicalOperator::HashJoin { left, right } => {
-                let (left_op, mut left_filters) = Self::extract_filters(*left);
-                let (right_op, right_filters) = Self::extract_filters(*right);
+                let (left_op, mut left_filters) = Self::extract_filters(*left, stats);
+                let (right_op, right_filters) = Self::extract_filters(*right, stats);
                 left_filters.extend(right_filters);
                 (
                     PhysicalOperator::HashJoin {
@@ -230,7 +234,7 @@ impl Optimizer {
                 group_by,
                 aggregations,
             } => {
-                let (inner, filters) = Self::extract_filters(*input);
+                let (inner, filters) = Self::extract_filters(*input, stats);
                 (
                     PhysicalOperator::Aggregate {
                         input: Box::new(inner),
@@ -241,7 +245,7 @@ impl Optimizer {
                 )
             }
             PhysicalOperator::Sort { input, items } => {
-                let (inner, filters) = Self::extract_filters(*input);
+                let (inner, filters) = Self::extract_filters(*input, stats);
                 (
                     PhysicalOperator::Sort {
                         input: Box::new(inner),
@@ -251,7 +255,7 @@ impl Optimizer {
                 )
             }
             PhysicalOperator::Limit { input, skip, count } => {
-                let (inner, filters) = Self::extract_filters(*input);
+                let (inner, filters) = Self::extract_filters(*input, stats);
                 (
                     PhysicalOperator::Limit {
                         input: Box::new(inner),
@@ -275,7 +279,7 @@ impl Optimizer {
                 Vec::new(),
             ),
             PhysicalOperator::Distinct { input, keys } => {
-                let (inner, inner_filters) = Self::extract_filters(*input);
+                let (inner, inner_filters) = Self::extract_filters(*input, stats);
                 (
                     PhysicalOperator::Distinct {
                         input: Box::new(inner),
@@ -284,9 +288,17 @@ impl Optimizer {
                     inner_filters,
                 )
             }
-            // WritePart operators are opaque: do not extract filters from inside them.
+            // WritePart operators are opaque: do not extract filters from inside them,
+            // but recursively optimize their input subplans.
             PhysicalOperator::WritePart { input, part } => {
-                (PhysicalOperator::WritePart { input, part }, Vec::new())
+                let optimized_input = Self::optimize(*input, stats);
+                (
+                    PhysicalOperator::WritePart {
+                        input: Box::new(optimized_input),
+                        part,
+                    },
+                    Vec::new(),
+                )
             }
             // ProcedureCall is opaque: it produces rows from a resolved table and
             // has no filters to extract.
@@ -312,7 +324,7 @@ impl Optimizer {
                 closing_is_undirected,
                 closing_unique_rels,
             } => {
-                let (inner_op, inner_filters) = Self::extract_filters(*input);
+                let (inner_op, inner_filters) = Self::extract_filters(*input, stats);
                 (
                     PhysicalOperator::MultiwayJoin {
                         input: Box::new(inner_op),

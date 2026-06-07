@@ -3324,7 +3324,7 @@ mod tests {
         );
 
         // Let's create a fresh new graph to import into
-        let (tempdir2, graph2) = setup_graph();
+        let (_, graph2) = setup_graph();
 
         // Import the database from the exported directory
         let import_query = format!("IMPORT DATABASE '{}'", export_dir.display());

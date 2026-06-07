@@ -193,8 +193,8 @@ pub(super) fn evaluate_expr<B: Bindings>(
             let list_val = evaluate_expr(graph, path, list, params)?;
             let items = match list_val {
                 serde_json::Value::Array(arr) => arr,
-                serde_json::Value::Null => vec![],
-                other => vec![other],
+                serde_json::Value::Null => return Ok(serde_json::Value::Null),
+                _ => return Err("quantifier requires a list".into()),
             };
 
             let result = match kind {
@@ -571,6 +571,13 @@ pub(super) fn evaluate_expr<B: Bindings>(
             };
             match binding {
                 GraphBinding::Node(node_id) => {
+                    if graph
+                        .get_node(*node_id)
+                        .map_err(|e| e.to_string())?
+                        .is_none()
+                    {
+                        return Err(format!("node not found: {}", node_id));
+                    }
                     if prop.is_empty() {
                         let actual_json = node_props(graph, *node_id)?
                             .ok_or_else(|| format!("node not found: {}", node_id))?;
@@ -596,6 +603,13 @@ pub(super) fn evaluate_expr<B: Bindings>(
                     }
                 }
                 GraphBinding::Edge(edge_id) => {
+                    if graph
+                        .get_edge(*edge_id)
+                        .map_err(|e| e.to_string())?
+                        .is_none()
+                    {
+                        return Err(format!("edge not found: {}", edge_id));
+                    }
                     // The whole-edge form needs `src`/`dst` from the record, which the
                     // property cache does not hold, so it reads the record directly;
                     // the hot single-property form goes through the cache.
@@ -1765,17 +1779,27 @@ pub(super) fn eval_function_call<B: Bindings>(
             .unwrap_or(serde_json::Value::Null)),
         "rand" => {
             // Returns a random float in [0.0, 1.0).
+            use std::cell::Cell;
             use std::collections::hash_map::DefaultHasher;
             use std::hash::{Hash, Hasher};
             use std::time::SystemTime;
+            thread_local! {
+                static COUNTER: Cell<u64> = const { Cell::new(0) };
+            }
             let mut h = DefaultHasher::new();
             SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap_or_default()
                 .subsec_nanos()
                 .hash(&mut h);
-            // Mix with thread id for uniqueness.
+            // Mix with thread id and a thread-local counter for uniqueness within the same nanosecond.
             std::thread::current().id().hash(&mut h);
+            let count = COUNTER.with(|c| {
+                let val = c.get();
+                c.set(val.wrapping_add(1));
+                val
+            });
+            count.hash(&mut h);
             let bits = h.finish();
             let f = (bits as f64) / (u64::MAX as f64);
             Ok(serde_json::Number::from_f64(f)
@@ -1862,6 +1886,9 @@ pub(super) fn eval_function_call<B: Bindings>(
                         .and_then(|i| i.as_i64())
                         .ok_or("labels(): malformed node value")?
                         as u64;
+                    if graph.get_node(nid).map_err(|e| e.to_string())?.is_none() {
+                        return Err(format!("node not found: {}", nid));
+                    }
                     let labels = graph.node_labels(nid).map_err(|e| e.to_string())?;
                     Ok(serde_json::Value::Array(
                         labels.into_iter().map(serde_json::Value::String).collect(),

@@ -98,7 +98,7 @@ This document outlines the features implemented in IssunDB and the future goals 
 - [x] Lazy named-path materialization: per-row path objects are built only when the pattern binds a path variable (`MATCH p = ...`), removing
   three record decodes and a JSON tree per expanded row from plain patterns (a 3-4x speedup on cyclic and aggregation traversals), while the
   fused-chain, closing-join, and chain-reversal rewrites are disabled for named-path patterns so the path binding survives them
-- [ ] Full openCypher TCK conformance: as of 2026-06-06, 3,424 of 3,473 executed scenarios pass (98.6%; a further 424 scenarios are
+- [ ] Full openCypher TCK conformance: as of 2026-06-07, 3,443 of 3,469 executed scenarios pass (99.3%; a further 428 scenarios are
   skipped as intentional exclusions, such as negative-test tags and node, relationship, or path display-literal representational mismatches).
   Notable remaining capability gaps:
     - [x] Temporal expression conformance: timezone resolution for named and historical zones (DST and local-mean-time offsets via the IANA

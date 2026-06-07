@@ -1,7 +1,9 @@
 use super::expr::evaluate_expr;
 use super::read::{
-    binding_to_value, column_name, execute_physical_pathmaps, execute_read_query, projected_key,
+    binding_to_value, column_name, execute_physical, execute_physical_pathmaps, execute_read_query,
+    projected_key,
 };
+use super::row::{Bindings, SlotSchema};
 use super::*;
 use crate::ast::{
     CreateAndReturnStatement, DeleteAndReturnStatement, ForeachStatement, MergeAndReturnStatement,
@@ -373,23 +375,17 @@ pub(super) fn execute_delete_and_return(
     params: &HashMap<String, serde_json::Value>,
 ) -> Result<QueryResult, String> {
     graph.with_write_lock(|| {
-        // Build a synthetic read query for MATCH + WHERE.
-        let synthetic_query = Query {
+        let return_query = Query {
             match_clauses: stmt.match_clauses.clone(),
             where_clause: stmt.where_clause.clone(),
-            return_clause: ReturnClause {
-                items: stmt.return_clause.items.clone(),
-                distinct: stmt.return_clause.distinct,
-            },
+            return_clause: stmt.return_clause.clone(),
             parts: Vec::new(),
             order_by: stmt.order_by.clone(),
             skip: stmt.skip.clone(),
             limit: stmt.limit.clone(),
         };
-        // Execute the read to get RETURN results before deletion.
-        let read_result = execute_read_query(graph, &synthetic_query, params)?;
+        let return_result = execute_read_query(graph, &return_query, params)?;
 
-        // Now perform the deletion using the same match.
         let binding_query = Query {
             match_clauses: stmt.match_clauses.clone(),
             where_clause: stmt.where_clause.clone(),
@@ -398,22 +394,27 @@ pub(super) fn execute_delete_and_return(
                 distinct: false,
             },
             parts: Vec::new(),
-            order_by: None,
-            skip: None,
-            limit: None,
+            order_by: stmt.order_by.clone(),
+            skip: stmt.skip.clone(),
+            limit: stmt.limit.clone(),
         };
         let logical = LogicalPlanner::plan(&binding_query).map_err(|e| e.to_string())?;
         let physical = PhysicalPlanner::plan(&logical);
         let optimized = Optimizer::optimize(physical, Some(graph));
-        let binding_plan = match optimized {
-            PhysicalOperator::Project { input, items, .. } if items.is_empty() => *input,
-            other => other,
+        let binding_plan = match &optimized {
+            PhysicalOperator::Project { input, items, .. } if items.is_empty() => {
+                input.as_ref().clone()
+            }
+            other => other.clone(),
         };
-        let bound_paths = execute_physical_pathmaps(graph, &binding_plan, params)?;
 
+        let schema = std::sync::Arc::new(SlotSchema::from_plan(&binding_plan));
+        let bound_rows = execute_physical(graph, &binding_plan, params, &schema)?;
+
+        let bound_paths: Vec<PathMap> = bound_rows.iter().map(|r| r.to_path_map()).collect();
         delete_over_paths(graph, &bound_paths, &stmt.targets, stmt.detach, params)?;
 
-        Ok(read_result)
+        Ok(return_result)
     })
 }
 
@@ -717,7 +718,11 @@ pub(super) fn apply_set_item(
                     let mut props: serde_json::Value =
                         rmp_serde::from_slice(&record.props).map_err(|e| e.to_string())?;
                     if let Some(obj) = props.as_object_mut() {
-                        obj.insert(property.clone(), new_val);
+                        if new_val.is_null() {
+                            obj.remove(property);
+                        } else {
+                            obj.insert(property.clone(), new_val);
+                        }
                     }
                     graph.update_node(nid, &props).map_err(|e| e.to_string())?;
                 }
@@ -729,7 +734,11 @@ pub(super) fn apply_set_item(
                     let mut props: serde_json::Value =
                         rmp_serde::from_slice(&record.props).map_err(|e| e.to_string())?;
                     if let Some(obj) = props.as_object_mut() {
-                        obj.insert(property.clone(), new_val);
+                        if new_val.is_null() {
+                            obj.remove(property);
+                        } else {
+                            obj.insert(property.clone(), new_val);
+                        }
                     }
                     graph.update_edge(eid, &props).map_err(|e| e.to_string())?;
                 }

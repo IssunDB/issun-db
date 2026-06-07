@@ -2942,6 +2942,18 @@ fn validate_query_order_by(query: &Query) -> Result<(), String> {
         }
     }
 
+    let is_return_star = query.return_clause.items.len() == 1
+        && matches!(
+            &query.return_clause.items[0].expr,
+            Expr::FunctionCall { name, .. } if name == "__star__"
+        );
+    if is_return_star && bound.is_empty() {
+        return Err(
+            "SyntaxError(NoVariablesInScope): RETURN * without variables in scope is not allowed"
+                .to_string(),
+        );
+    }
+
     if let Some(ref ob) = query.order_by {
         let mut out = std::collections::HashSet::new();
         for item in &query.return_clause.items {
@@ -3329,6 +3341,117 @@ fn has_aggregation(expr: &Expr) -> bool {
     }
 }
 
+fn is_known_function(name: &str) -> bool {
+    matches!(
+        name,
+        "__grouped__"
+            | "__list__"
+            | "__path__"
+            | "__map__"
+            | "__star__"
+            | "__neg_min_int__"
+            | "__in__"
+            | "__contains__"
+            | "__starts_with__"
+            | "__ends_with__"
+            | "__regex__"
+            | "range"
+            | "size"
+            | "type"
+            | "id"
+            | "labels"
+            | "length"
+            | "substring"
+            | "trim"
+            | "ltrim"
+            | "rtrim"
+            | "properties"
+            | "startnode"
+            | "endnode"
+            | "isnull"
+            | "isnotnull"
+            | "exists"
+            | "left"
+            | "right"
+            | "coalesce"
+            | "tostring"
+            | "tointeger"
+            | "toint"
+            | "tofloat"
+            | "toboolean"
+            | "keys"
+            | "head"
+            | "last"
+            | "tail"
+            | "timestamp"
+            | "max"
+            | "min"
+            | "abs"
+            | "sqrt"
+            | "floor"
+            | "ceil"
+            | "ceiling"
+            | "round"
+            | "sign"
+            | "log"
+            | "log10"
+            | "exp"
+            | "sin"
+            | "cos"
+            | "tan"
+            | "asin"
+            | "acos"
+            | "atan"
+            | "atan2"
+            | "pi"
+            | "e"
+            | "rand"
+            | "degrees"
+            | "radians"
+            | "haversin"
+            | "date"
+            | "localtime"
+            | "time"
+            | "localdatetime"
+            | "datetime"
+            | "duration"
+            | "datetime.fromepoch"
+            | "datetime.fromepochmillis"
+            | "date.truncate"
+            | "datetime.truncate"
+            | "localdatetime.truncate"
+            | "localtime.truncate"
+            | "time.truncate"
+            | "duration.between"
+            | "duration.indays"
+            | "duration.inmonths"
+            | "duration.inseconds"
+            | "date.transaction"
+            | "date.statement"
+            | "date.realtime"
+            | "datetime.transaction"
+            | "datetime.statement"
+            | "datetime.realtime"
+            | "localtime.transaction"
+            | "localtime.statement"
+            | "localtime.realtime"
+            | "localdatetime.transaction"
+            | "localdatetime.statement"
+            | "localdatetime.realtime"
+            | "time.transaction"
+            | "time.statement"
+            | "time.realtime"
+            | "split"
+            | "reverse"
+            | "replace"
+            | "toupper"
+            | "tolower"
+            | "nodes"
+            | "relationships"
+            | "rels"
+    )
+}
+
 fn check_expr_size_on_path(
     expr: &Expr,
     path_vars: &std::collections::HashSet<String>,
@@ -3343,6 +3466,13 @@ fn check_expr_size_on_path(
                 return Err(
                     "SyntaxError(IntegerOverflow): integer literal out of range".to_string()
                 );
+            }
+            let name_lc = name.to_ascii_lowercase();
+            if !is_known_function(&name_lc) {
+                return Err(format!(
+                    "SyntaxError(UnknownFunction): unknown function: {}",
+                    name
+                ));
             }
             let name_lc = name.to_lowercase();
             if name_lc == "size" && args.len() == 1 {
@@ -4489,9 +4619,198 @@ fn validate_projection_semantics(stmt: &Statement) -> Result<(), String> {
         for item in items {
             check_aggregation_arg(&item.expr)?;
         }
+        check_ambiguous_aggregations(items)?;
     }
     check_with_aliasing(stmt)?;
     check_no_aggregate_in_where(stmt)?;
+    Ok(())
+}
+
+fn check_ambiguous_aggregations(items: &[ReturnItem]) -> Result<(), String> {
+    let has_agg = items.iter().any(|item| expr_contains_aggregate(&item.expr));
+    if !has_agg {
+        return Ok(());
+    }
+
+    let mut grouping_exprs = Vec::new();
+    let mut grouping_aliases = std::collections::HashSet::new();
+
+    for item in items {
+        if !expr_contains_aggregate(&item.expr) {
+            grouping_exprs.push(&item.expr);
+            if let Some(alias) = &item.alias {
+                grouping_aliases.insert(alias.clone());
+            } else if let Expr::Prop(v, p) = &item.expr {
+                if p.is_empty() {
+                    grouping_aliases.insert(v.clone());
+                }
+            }
+        }
+    }
+
+    let local_vars = std::collections::HashSet::new();
+    for item in items {
+        if expr_contains_aggregate(&item.expr) {
+            check_expr_non_agg(&item.expr, &grouping_exprs, &grouping_aliases, &local_vars)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn check_expr_non_agg(
+    expr: &Expr,
+    grouping_exprs: &[&Expr],
+    grouping_aliases: &std::collections::HashSet<String>,
+    local_vars: &std::collections::HashSet<String>,
+) -> Result<(), String> {
+    if matches!(expr, Expr::CountStar) || matches!(expr, Expr::Agg(_, _)) {
+        return Ok(());
+    }
+
+    if matches!(expr, Expr::Literal(_) | Expr::Param(_)) {
+        return Ok(());
+    }
+
+    if matches!(expr, Expr::Prop(_, _)) && grouping_exprs.iter().any(|&ge| ge == expr) {
+        return Ok(());
+    }
+
+    if let Expr::Prop(v, p) = expr {
+        if p.is_empty() && grouping_aliases.contains(v) {
+            return Ok(());
+        }
+        if local_vars.contains(v) {
+            return Ok(());
+        }
+    }
+
+    if let Expr::Prop(v, _) = expr {
+        return Err(format!(
+            "SyntaxError(AmbiguousAggregationExpression): variable '{}' is not a grouping key",
+            v
+        ));
+    }
+
+    match expr {
+        Expr::HasLabel { variable, .. } => {
+            if !grouping_aliases.contains(variable) && !local_vars.contains(variable) {
+                return Err(format!(
+                    "SyntaxError(AmbiguousAggregationExpression): variable '{}' is not a grouping key",
+                    variable
+                ));
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            check_expr_non_agg(left, grouping_exprs, grouping_aliases, local_vars)?;
+            check_expr_non_agg(right, grouping_exprs, grouping_aliases, local_vars)?;
+        }
+        Expr::FunctionCall { args, .. } => {
+            for arg in args {
+                check_expr_non_agg(arg, grouping_exprs, grouping_aliases, local_vars)?;
+            }
+        }
+        Expr::Not(inner) | Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
+            check_expr_non_agg(inner, grouping_exprs, grouping_aliases, local_vars)?;
+        }
+        Expr::Subscript { expr, index } => {
+            check_expr_non_agg(expr, grouping_exprs, grouping_aliases, local_vars)?;
+            check_expr_non_agg(index, grouping_exprs, grouping_aliases, local_vars)?;
+        }
+        Expr::Slice { expr, start, end } => {
+            check_expr_non_agg(expr, grouping_exprs, grouping_aliases, local_vars)?;
+            if let Some(s) = start {
+                check_expr_non_agg(s, grouping_exprs, grouping_aliases, local_vars)?;
+            }
+            if let Some(e) = end {
+                check_expr_non_agg(e, grouping_exprs, grouping_aliases, local_vars)?;
+            }
+        }
+        Expr::ListComprehension {
+            variable,
+            list,
+            predicate,
+            transform,
+        } => {
+            check_expr_non_agg(list, grouping_exprs, grouping_aliases, local_vars)?;
+            let mut local_vars = local_vars.clone();
+            local_vars.insert(variable.clone());
+            if let Some(p) = predicate {
+                check_expr_non_agg(p, grouping_exprs, grouping_aliases, &local_vars)?;
+            }
+            if let Some(t) = transform {
+                check_expr_non_agg(t, grouping_exprs, grouping_aliases, &local_vars)?;
+            }
+        }
+        Expr::PatternComprehension {
+            pattern,
+            predicate,
+            transform,
+        } => {
+            let mut local_vars = local_vars.clone();
+            if let Some(ref pv) = pattern.path_variable {
+                local_vars.insert(pv.clone());
+            }
+            if let Some(ref nv) = pattern.node.variable {
+                local_vars.insert(nv.clone());
+            }
+            for (rel, node) in &pattern.rels {
+                if let Some(ref nv) = node.variable {
+                    local_vars.insert(nv.clone());
+                }
+                if let Some(ref rv) = rel.variable {
+                    local_vars.insert(rv.clone());
+                }
+            }
+            if let Some(p) = predicate {
+                check_expr_non_agg(p, grouping_exprs, grouping_aliases, &local_vars)?;
+            }
+            check_expr_non_agg(transform, grouping_exprs, grouping_aliases, &local_vars)?;
+        }
+        Expr::Reduce {
+            accumulator,
+            initial,
+            variable,
+            list,
+            expression,
+        } => {
+            check_expr_non_agg(initial, grouping_exprs, grouping_aliases, local_vars)?;
+            check_expr_non_agg(list, grouping_exprs, grouping_aliases, local_vars)?;
+            let mut local_vars = local_vars.clone();
+            local_vars.insert(accumulator.clone());
+            local_vars.insert(variable.clone());
+            check_expr_non_agg(expression, grouping_exprs, grouping_aliases, &local_vars)?;
+        }
+        Expr::Quantifier {
+            variable,
+            list,
+            predicate,
+            ..
+        } => {
+            check_expr_non_agg(list, grouping_exprs, grouping_aliases, local_vars)?;
+            let mut local_vars = local_vars.clone();
+            local_vars.insert(variable.clone());
+            check_expr_non_agg(predicate, grouping_exprs, grouping_aliases, &local_vars)?;
+        }
+        Expr::Case {
+            subject,
+            arms,
+            else_expr,
+        } => {
+            if let Some(s) = subject {
+                check_expr_non_agg(s, grouping_exprs, grouping_aliases, local_vars)?;
+            }
+            for arm in arms {
+                check_expr_non_agg(&arm.when, grouping_exprs, grouping_aliases, local_vars)?;
+                check_expr_non_agg(&arm.then, grouping_exprs, grouping_aliases, local_vars)?;
+            }
+            if let Some(e) = else_expr {
+                check_expr_non_agg(e, grouping_exprs, grouping_aliases, local_vars)?;
+            }
+        }
+        _ => {}
+    }
+
     Ok(())
 }
 
