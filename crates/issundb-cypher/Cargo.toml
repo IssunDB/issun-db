@@ -39,3 +39,6 @@ harness = false
 name = "lsqb"
 harness = false
 
+[[bench]]
+name = "oltp_transaction"
+harness = false

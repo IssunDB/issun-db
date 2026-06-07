@@ -67,21 +67,36 @@ fn build_lsqb_graph() -> (TempDir, Graph) {
     let knows_offsets = [1, 7, 13];
     for i in 0..NUM_PERSONS {
         for off in knows_offsets {
-            g.add_edge(persons[i], persons[(i + off) % NUM_PERSONS], "KNOWS", &json!({}))
-                .unwrap();
+            g.add_edge(
+                persons[i],
+                persons[(i + off) % NUM_PERSONS],
+                "KNOWS",
+                &json!({}),
+            )
+            .unwrap();
         }
     }
 
     // 7. Connect Posts with HAS_CREATOR to Persons
     for i in 0..NUM_POSTS {
-        g.add_edge(posts[i], persons[i % NUM_PERSONS], "HAS_CREATOR", &json!({}))
-            .unwrap();
+        g.add_edge(
+            posts[i],
+            persons[i % NUM_PERSONS],
+            "HAS_CREATOR",
+            &json!({}),
+        )
+        .unwrap();
     }
 
     // 8. Connect Comments with HAS_CREATOR to Persons and REPLY_OF to Posts
     for i in 0..NUM_COMMENTS {
-        g.add_edge(comments[i], persons[i % NUM_PERSONS], "HAS_CREATOR", &json!({}))
-            .unwrap();
+        g.add_edge(
+            comments[i],
+            persons[i % NUM_PERSONS],
+            "HAS_CREATOR",
+            &json!({}),
+        )
+        .unwrap();
         g.add_edge(comments[i], posts[i % NUM_POSTS], "REPLY_OF", &json!({}))
             .unwrap();
     }
@@ -147,6 +162,25 @@ fn bench_lsqb(c: &mut Criterion) {
         "MATCH (a:Person)-[:KNOWS]->(b:Person) \
          MATCH (b)-[:KNOWS]->(c:Person) \
          WHERE a.age < b.age AND b.age < c.age \
+         RETURN count(*)",
+    );
+
+    // LSQB Q6: Multi-hop Join with Inequality (Person-KNOWS-Person-KNOWS-Person LIVES_IN City)
+    run(
+        "lsqb_q6",
+        "MATCH (p1:Person)-[:KNOWS]->(p2:Person) \
+         MATCH (p2)-[:KNOWS]->(p3:Person) \
+         MATCH (p3)-[:LIVES_IN]->(c:City) \
+         WHERE p1.name <> p3.name \
+         RETURN count(*)",
+    );
+
+    // LSQB Q7: Double OPTIONAL MATCH Join (Post HAS_CREATOR Person, OPTIONAL Comment REPLY_OF, OPTIONAL Comment HAS_CREATOR)
+    run(
+        "lsqb_q7",
+        "MATCH (post:Post)-[:HAS_CREATOR]->(creator:Person) \
+         OPTIONAL MATCH (comment:Comment)-[:REPLY_OF]->(post) \
+         OPTIONAL MATCH (comment)-[:HAS_CREATOR]->(commenter:Person) \
          RETURN count(*)",
     );
 }

@@ -8,9 +8,7 @@ use std::collections::HashMap;
 
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use issundb_core::{Graph, NodeId};
-use issundb_retrieval::{
-    FusionStrategy, HybridRetrieveOptions, Subgraph, retrieve_hybrid,
-};
+use issundb_retrieval::{FusionStrategy, HybridRetrieveOptions, Subgraph, retrieve_hybrid};
 use issundb_vector::VectorGraphExt;
 use serde_json::json;
 use tempfile::TempDir;
@@ -248,11 +246,8 @@ fn bench_global_search_pagerank(c: &mut Criterion) {
             let anchors = &sorted_nodes[0..5];
 
             // 2. Expand their 1-hop neighborhoods
-            let node_list = graph
-                .bfs_multi_source_graphblas(anchors, 1, None)
-                .unwrap();
-            let node_set: std::collections::HashSet<NodeId> =
-                node_list.into_iter().collect();
+            let node_list = graph.bfs_multi_source_graphblas(anchors, 1, None).unwrap();
+            let node_set: std::collections::HashSet<NodeId> = node_list.into_iter().collect();
 
             // 3. Extract subgraph edges connecting those nodes
             let mut edges = Vec::new();

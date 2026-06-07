@@ -31,4 +31,3 @@ harness = false
 [[bench]]
 name = "graphrag_retrieval"
 harness = false
-

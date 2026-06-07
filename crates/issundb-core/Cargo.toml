@@ -49,5 +49,9 @@ harness = false
 name = "wiki_pagerank"
 harness = false
 
+[[bench]]
+name = "write_throughput"
+harness = false
+
 [build-dependencies]
 cmake = "0.1"
