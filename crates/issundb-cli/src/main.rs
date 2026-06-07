@@ -401,6 +401,10 @@ enum ReplCommand {
         limit: Option<usize>,
     },
 
+    /// Show the CLI version (e.g., `:version`)
+    #[command(name = ":version")]
+    Version,
+
     /// Show this help message (e.g., `help`)
     #[command(name = "help")]
     Help,
@@ -472,12 +476,62 @@ Vector and Text Search
   text-search <q> [l] [p] [limit]      Query BM25 full-text search index (e.g., text-search "alice" Person name 5)
 
 System
+  :version                             Show the IssunDB version
   help                                 Show this help message
-  quit/exit                            Exit the program
+  quit/exit                            Exit the CLI
 "#;
 
 fn print_help() {
-    print!("{HELP_TEXT}");
+    for line in HELP_TEXT.lines() {
+        if line.trim().is_empty() {
+            println!();
+            continue;
+        }
+        let leading_spaces = line.len() - line.trim_start().len();
+        if leading_spaces == 0 {
+            println!("{}", line.bold().blue());
+        } else {
+            let syntax_limit = 39;
+            if line.len() < syntax_limit {
+                let trimmed = line.trim();
+                let (cmd, args) = match trimmed.find(' ') {
+                    Some(idx) => trimmed.split_at(idx),
+                    None => (trimmed, ""),
+                };
+                let colored_cmd = if cmd.starts_with(':') {
+                    cmd.cyan()
+                } else {
+                    cmd.green()
+                };
+                println!("{}{}{}", " ".repeat(leading_spaces), colored_cmd, args);
+            } else {
+                let (syntax, desc) = line.split_at(syntax_limit);
+                let trimmed_syntax = syntax.trim();
+                let (cmd, args) = match trimmed_syntax.find(' ') {
+                    Some(idx) => trimmed_syntax.split_at(idx),
+                    None => (trimmed_syntax, ""),
+                };
+                let colored_cmd = if cmd.starts_with(':') {
+                    cmd.cyan()
+                } else {
+                    cmd.green()
+                };
+
+                let uncolored_len = cmd.len() + args.len();
+                let target_len = syntax.len() - leading_spaces;
+                let padding = target_len.saturating_sub(uncolored_len);
+
+                print!(
+                    "{}{}{}{}",
+                    " ".repeat(leading_spaces),
+                    colored_cmd,
+                    args,
+                    " ".repeat(padding)
+                );
+                println!("{}", desc.dimmed());
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -512,7 +566,10 @@ fn main() {
         let _ = rl.load_history(hp);
     }
 
-    println!("IssunDB REPL: type `help` for commands, `quit` to exit.");
+    println!(
+        "IssunDB CLI (v{}): type `help` for command list, `quit` to exit.",
+        env!("CARGO_PKG_VERSION")
+    );
 
     loop {
         let prompt = if state.graph.is_some() {
@@ -616,6 +673,7 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
             | ReplCommand::Save { .. }
             | ReplCommand::Help
             | ReplCommand::Quit
+            | ReplCommand::Version
     );
 
     if needs_db && state.graph.is_none() {
@@ -627,6 +685,9 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
         ReplCommand::Quit => return false,
         ReplCommand::Help => {
             print_help();
+        }
+        ReplCommand::Version => {
+            println!("IssunDB v{}", env!("CARGO_PKG_VERSION"));
         }
         ReplCommand::Open { path } => match Graph::open(&path, 1) {
             Ok(g) => {

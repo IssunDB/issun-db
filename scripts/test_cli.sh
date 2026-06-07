@@ -95,6 +95,7 @@ query MATCH (n) RETURN n
 rebuild-csr
 delete-edge 0
 delete-node 0
+:version
 help
 quit
 EOF
