@@ -350,7 +350,7 @@ enum ReplCommand {
         /// Node ID
         id: u64,
         /// Float embedding values
-        #[arg(num_args = 1..)]
+        #[arg(num_args = 1.., allow_negative_numbers = true)]
         values: Vec<f32>,
     },
 
@@ -360,7 +360,7 @@ enum ReplCommand {
         /// Number of results to return
         k: usize,
         /// Query embedding vector values
-        #[arg(num_args = 1..)]
+        #[arg(num_args = 1.., allow_negative_numbers = true)]
         query: Vec<f32>,
     },
 
@@ -372,7 +372,7 @@ enum ReplCommand {
         /// Traversal hops limit for BFS expansion
         hops: u8,
         /// Query embedding vector values
-        #[arg(num_args = 1..)]
+        #[arg(num_args = 1.., allow_negative_numbers = true)]
         query: Vec<f32>,
     },
 
@@ -1292,6 +1292,7 @@ fn run_cypher(state: &mut State, cypher: &str) {
         }
     };
 
+    let save_path = state.save_path.take();
     let result = if state.params.is_empty() {
         g.query(cypher)
     } else {
@@ -1302,7 +1303,7 @@ fn run_cypher(state: &mut State, cypher: &str) {
         Err(e) => eprintln!("{}", format!("error: {e}").red()),
         Ok(qr) => {
             let output = format_query_result(&qr);
-            if let Some(ref save) = state.save_path.take() {
+            if let Some(ref save) = save_path {
                 match fs::File::create(save) {
                     Ok(mut f) => {
                         if let Err(e) = f.write_all(output.as_bytes()) {
@@ -1367,26 +1368,37 @@ fn tokenize_line(s: &str) -> Vec<String> {
     let mut in_quotes = false;
     let mut quote_char = '\0';
     let mut brace_depth: usize = 0;
+    let mut escaped = false;
 
     for c in s.chars() {
-        if c == '{' {
+        if escaped {
+            current.push(c);
+            escaped = false;
+        } else if c == '\\' {
+            current.push(c);
+            escaped = true;
+        } else if in_quotes {
+            if c == quote_char {
+                in_quotes = false;
+                if brace_depth > 0 {
+                    current.push(c);
+                }
+            } else {
+                current.push(c);
+            }
+        } else if c == '"' || c == '\'' {
+            in_quotes = true;
+            quote_char = c;
+            if brace_depth > 0 {
+                current.push(c);
+            }
+        } else if c == '{' {
             brace_depth += 1;
             current.push(c);
         } else if c == '}' {
             brace_depth = brace_depth.saturating_sub(1);
             current.push(c);
-        } else if (c == '"' || c == '\'') && brace_depth == 0 {
-            if in_quotes {
-                if c == quote_char {
-                    in_quotes = false;
-                } else {
-                    current.push(c);
-                }
-            } else {
-                in_quotes = true;
-                quote_char = c;
-            }
-        } else if c.is_whitespace() && !in_quotes && brace_depth == 0 {
+        } else if c.is_whitespace() && brace_depth == 0 {
             if !current.is_empty() {
                 tokens.push(current.clone());
                 current.clear();
@@ -1503,6 +1515,31 @@ fn cmd_import_jsonl(state: &mut State, path: &str) {
     }
 }
 
+fn parse_csv_line(s: &str) -> Vec<String> {
+    let mut cols = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut chars = s.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c == '"' {
+            if in_quotes && chars.peek() == Some(&'"') {
+                chars.next();
+                current.push('"');
+            } else {
+                in_quotes = !in_quotes;
+            }
+        } else if c == ',' && !in_quotes {
+            cols.push(current.trim().to_owned());
+            current.clear();
+        } else {
+            current.push(c);
+        }
+    }
+    cols.push(current.trim().to_owned());
+    cols
+}
+
 fn cmd_import_csv(state: &mut State, path: &str) {
     let g = match state.graph.as_ref() {
         Some(g) => g,
@@ -1528,7 +1565,7 @@ fn cmd_import_csv(state: &mut State, path: &str) {
         }
     };
 
-    let headers: Vec<&str> = header_line.split(',').map(|s| s.trim()).collect();
+    let headers = parse_csv_line(header_line);
     if headers.is_empty() {
         eprintln!("CSV has no columns");
         return;
@@ -1539,11 +1576,15 @@ fn cmd_import_csv(state: &mut State, path: &str) {
     let mut entries: Vec<(String, serde_json::Value)> = Vec::new();
 
     for line in lines {
-        let cols: Vec<&str> = line.split(',').collect();
-        let label = cols.first().map(|s| s.trim()).unwrap_or("Node").to_owned();
+        let cols = parse_csv_line(line);
+        let label = cols
+            .first()
+            .map(|s| s.as_str())
+            .unwrap_or("Node")
+            .to_owned();
         let mut props = serde_json::Map::new();
-        for (j, &header) in prop_headers.iter().enumerate() {
-            let val_str = cols.get(j + 1).map(|s| s.trim()).unwrap_or("");
+        for (j, header) in prop_headers.iter().enumerate() {
+            let val_str = cols.get(j + 1).map(|s| s.as_str()).unwrap_or("");
             let val = if val_str.is_empty() {
                 serde_json::Value::Null
             } else if let Ok(n) = val_str.parse::<i64>() {
@@ -1617,6 +1658,46 @@ mod tests {
                 "spanning-forest".to_owned(),
                 "weight".to_owned(),
                 "--max".to_owned()
+            ]
+        );
+        assert_eq!(
+            tokenize_line("add-node Person {\"name\": \"Alice {bracket}\"}"),
+            vec![
+                "add-node".to_owned(),
+                "Person".to_owned(),
+                "{\"name\": \"Alice {bracket}\"}".to_owned()
+            ]
+        );
+        assert_eq!(
+            tokenize_line("text-search \"hello \\\"world\\\"\" Person"),
+            vec![
+                "text-search".to_owned(),
+                "hello \\\"world\\\"".to_owned(),
+                "Person".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_csv_line() {
+        assert_eq!(
+            parse_csv_line("label,name,age"),
+            vec!["label".to_owned(), "name".to_owned(), "age".to_owned()]
+        );
+        assert_eq!(
+            parse_csv_line("Person,\"Alice, Smith\",30"),
+            vec![
+                "Person".to_owned(),
+                "Alice, Smith".to_owned(),
+                "30".to_owned()
+            ]
+        );
+        assert_eq!(
+            parse_csv_line("Person,\"Alice \"\"The Great\"\" Smith\",30"),
+            vec![
+                "Person".to_owned(),
+                "Alice \"The Great\" Smith".to_owned(),
+                "30".to_owned()
             ]
         );
     }
