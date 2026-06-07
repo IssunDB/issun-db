@@ -8,6 +8,7 @@ out.
 
 from typing import List, Optional
 
+
 class IssunDB:
     """A handle to an IssunDB graph database.
 

@@ -1,6 +1,5 @@
 # `issundb-vector` Agent Guide
 
-
 This file covers crate-specific guidance for contributors working inside `crates/issundb-vector`. Read the root `AGENTS.md` first; the rules there
 apply everywhere and are not repeated here.
 
@@ -11,12 +10,14 @@ apply everywhere and are not repeated here.
 1. **Empty**: no usearch index exists yet; the dimension count is unknown.
 2. **Ready**: the index is live with a fixed dimension count; `upsert` and `search` both operate against it.
 
-State transitions are guarded by an internal `parking_lot::Mutex<Inner>`. Initialization happens inside the mutex: create an `IndexOptions`, call
-`Index::new`, call `index.reserve(64)`, then insert the first vector. Once `Ready`, the dimension count is immutable for the lifetime of the index.
+State transitions are guarded by an internal `parking_lot::Mutex<Inner>`.
+Initialization happens inside the mutex: create an `IndexOptions`, call `Index::new`, call `index.reserve(64)`, then insert the first vector.
+Once `Ready`, the dimension count is immutable for the lifetime of the index.
 
 ## Dimension Contract
 
-All vectors added to a given `VectorIndex` must have the same number of dimensions. This is enforced at the API boundary:
+All vectors added to a given `VectorIndex` must have the same number of dimensions.
+This is enforced at the API boundary:
 
 - In `upsert`, if `v.len() != dims` for a `Ready` index, return `Err(Error::Vector(...))` immediately. Never silently truncate or pad the vector.
 - In `search`, if `q.len() != dims`, return `Err(Error::Vector(...))`.
@@ -42,7 +43,6 @@ Do not add any path that changes `dims` after initialization.
 The metric and quantization are fixed at index construction time and cannot be changed without rebuilding the index from scratch.
 
 ## `usearch` API Notes
-
 
 The usearch `Index` does not auto-grow its internal capacity. Follow these rules:
 

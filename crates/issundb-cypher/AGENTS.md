@@ -1,6 +1,5 @@
 # `issundb-cypher` Agent Guide
 
-
 This file covers crate-specific guidance for contributors working inside `crates/issundb-cypher`. Read the root `AGENTS.md` first; the rules there
 apply everywhere and are not repeated here.
 
@@ -76,7 +75,6 @@ Follow this checklist in order:
 All seven steps are required for the change to be considered complete.
 
 ## `FilterExpr` Vs. `Expr`
-
 
 - `Expr` (defined in `src/ast.rs`) is the general expression type produced by the parser. It covers literals, property accesses, function calls,
   arithmetic, comparisons, and boolean combinators.

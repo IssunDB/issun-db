@@ -347,7 +347,7 @@ enum ReplCommand {
         reindex: bool,
     },
 
-    /// Build/rebuild full-text index on a property (e.g., `text-index create Person name --lang english` or `text-index list`)
+    /// Perform full-text index actions (e.g., `text-index create Person name --lang english` or `text-index list`)
     #[command(name = "text-index")]
     TextIndex {
         /// Action: 'create', 'drop', or 'list'
