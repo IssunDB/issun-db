@@ -116,7 +116,11 @@ Do not invent modules that do not yet exist when answering questions, but do pla
   profiling drivers that load a persistent graph once and rerun a query so a profiler observes query execution without load noise:
   `profile_triangle` (Zipf-skewed graph, cyclic triangle-count query) and `profile_query` (uniform graph with the comparison harness's
   Person/KNOWS schema, arbitrary query via `PROFILE_QUERY`). Depends only on `issundb`.
-- `crates/issundb-core/benches/`: Criterion storage benchmarks.
+- `crates/issundb-core/benches/`: Criterion storage, Pokec dataset, Wikipedia PageRank, and write throughput benchmarks.
+- `crates/issundb-cypher/benches/`: Criterion Cypher parsing, execution, LSQB Q1–Q9 queries, and OLTP transactional read benchmarks.
+- `crates/issundb-vector/benches/`: Criterion vector search benchmarks.
+- `crates/issundb-text/benches/`: Criterion full-text search benchmarks.
+- `crates/issundb-retrieval/benches/`: Criterion hybrid retrieval and GraphRAG local/global query benchmarks.
 - `crates/issundb/tests/conformance/`: openCypher TCK subset integration tests.
 - `benchmarks/ladybug-compare/`: differential comparison harness against LadybugDB. Deliberately excluded from the workspace (own `[workspace]`
   stanza, root `exclude`, and own `rust-toolchain.toml`) because the `lbug` crate links the LadybugDB C++ library and needs a newer Rust than the

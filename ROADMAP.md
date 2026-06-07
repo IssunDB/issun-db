@@ -133,7 +133,11 @@ This document outlines the features implemented in IssunDB and the future goals 
 - [x] An interactive REPL
 - [x] An HTTP REST API server with node, edge, query, vector search, and full-text search routes
 - [x] An MCP server over stdio or Streamable HTTP, exposing node and edge CRUD, query, explanation, full-text search, and vector search as tools
-- [x] A benchmarking suite that measures throughput and load scaling
+- [x] A benchmarking suite that measures throughput and load scaling:
+    - [x] LSQB (Labelled Subgraph Query Benchmark) query patterns Q1–Q9 modeled via Cypher and pattern comprehension negation
+    - [x] OLTP transactional read query benchmark modeled after the LDBC Interactive Short query patterns
+    - [x] Write throughput benchmark evaluating single and batched node/edge insertion performance
+    - [x] GraphRAG hybrid retrieval benchmark evaluating RRF, weighted sum fusion, PageRank community anchors, and Markdown context serialization
 - [x] A differential comparison harness against LadybugDB (`benchmarks/ladybug-compare`): an identical Cypher workload runs on both engines with
   median timings and sorted row-set equality checks (run before timing, so a divergent query is reported rather than timed), with uniform or
   Zipf-skewed synthetic graphs, deterministic degree-percentile traversal probes (cold, median, and hub), an openCypher trail reference that
