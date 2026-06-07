@@ -17,7 +17,7 @@ mod row;
 mod vectorized;
 mod write;
 
-use copy::execute_copy;
+use copy::{execute_copy, execute_export_db, execute_import_db};
 use ddl::{
     execute_create_constraint, execute_create_index, execute_drop_constraint, execute_drop_index,
 };
@@ -148,6 +148,8 @@ pub fn explain(graph: &Graph, cypher: &str) -> Result<String, CypherError> {
             Ok(format!("DropConstraint {}:{}\n", dc.label, dc.property))
         }
         Statement::Copy(ref c) => Ok(format!("Copy {} FROM '{}'\n", c.target, c.filepath)),
+        Statement::ExportDatabase(ref e) => Ok(format!("ExportDatabase '{}'\n", e.filepath)),
+        Statement::ImportDatabase(ref i) => Ok(format!("ImportDatabase '{}'\n", i.filepath)),
         Statement::Pipeline(_) => Ok("Pipeline\n".into()),
     }
 }
@@ -329,6 +331,12 @@ fn execute_statement(
             execute_drop_constraint(graph, dc).map_err(to_cypher_error)
         }
         Statement::Copy(c) => execute_copy(graph, c, params).map_err(to_cypher_error),
+        Statement::ExportDatabase(e) => {
+            execute_export_db(graph, e, params).map_err(to_cypher_error)
+        }
+        Statement::ImportDatabase(i) => {
+            execute_import_db(graph, i, params).map_err(to_cypher_error)
+        }
         Statement::Pipeline(stmts) => execute_pipeline(graph, stmts, params, registry),
     }
 }

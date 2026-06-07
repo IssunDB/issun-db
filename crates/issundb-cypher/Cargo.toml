@@ -11,6 +11,7 @@ rust-version.workspace = true
 
 [dependencies]
 issundb-core = { path = "../issundb-core" }
+issundb-text = { path = "../issundb-text" }
 ahash.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
