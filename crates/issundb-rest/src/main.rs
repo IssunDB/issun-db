@@ -1,6 +1,6 @@
 mod routes;
 
-use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc};
 
 use clap::Parser;
 use issundb::Graph;
@@ -35,9 +35,11 @@ async fn main() -> anyhow::Result<()> {
 
     let router = routes::build_router(graph);
 
-    let addr: SocketAddr = format!("{}:{}", args.host, args.port).parse()?;
-    info!(%addr, "listening");
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    // Bind via `(host, port)` so a hostname (for example `localhost`) is
+    // resolved through DNS; parsing into a `SocketAddr` first would reject
+    // anything that is not a literal IP address.
+    let listener = tokio::net::TcpListener::bind((args.host.as_str(), args.port)).await?;
+    info!(addr = %listener.local_addr()?, "listening");
     axum::serve(listener, router).await?;
 
     Ok(())

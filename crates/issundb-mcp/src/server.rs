@@ -359,3 +359,364 @@ impl ServerHandler for IssunMcp {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+// The tool methods are inherent methods on `IssunMcp`, so they are exercised
+// directly here against a fresh `TempDir`-backed `Graph`; the JSON-RPC and
+// transport layers are not involved. Each test opens its own graph and shares
+// no state with the others.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use issundb::TextIndexExt;
+    use tempfile::TempDir;
+
+    /// Open a fresh graph in a temp directory and wrap it in an `IssunMcp`. The
+    /// `TempDir` is returned so the caller keeps it alive for the test.
+    fn fresh() -> (IssunMcp, TempDir) {
+        let dir = TempDir::new().expect("temp dir");
+        let graph = Graph::open(dir.path(), 1).expect("open graph");
+        (IssunMcp::new(Arc::new(graph)), dir)
+    }
+
+    /// Parse the JSON text payload a tool returned on success.
+    fn body(result: CallToolResult) -> Value {
+        let text = result.content[0]
+            .as_text()
+            .expect("text content")
+            .text
+            .clone();
+        serde_json::from_str(&text).expect("json body")
+    }
+
+    fn add_person(mcp: &IssunMcp, name: &str) -> u64 {
+        let result = mcp
+            .add_node(Parameters(AddNodeArgs {
+                label: "Person".to_string(),
+                props: json!({ "name": name }),
+            }))
+            .expect("add_node");
+        body(result)["id"].as_u64().expect("id")
+    }
+
+    #[test]
+    fn add_node_returns_id() {
+        let (mcp, _dir) = fresh();
+        let result = mcp
+            .add_node(Parameters(AddNodeArgs {
+                label: "Person".to_string(),
+                props: json!({ "name": "Ada" }),
+            }))
+            .expect("add_node");
+        assert!(body(result)["id"].is_u64());
+    }
+
+    #[test]
+    fn get_node_round_trips_label_and_props() {
+        let (mcp, _dir) = fresh();
+        let id = add_person(&mcp, "Ada");
+        let result = mcp
+            .get_node(Parameters(NodeIdArgs { id }))
+            .expect("get_node");
+        let value = body(result);
+        assert_eq!(value["id"].as_u64(), Some(id));
+        assert_eq!(value["label"], "Person");
+        assert_eq!(value["props"]["name"], "Ada");
+    }
+
+    #[test]
+    fn get_node_missing_is_invalid_params() {
+        let (mcp, _dir) = fresh();
+        let err = mcp
+            .get_node(Parameters(NodeIdArgs { id: 999 }))
+            .expect_err("missing node");
+        assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn update_node_replaces_props() {
+        let (mcp, _dir) = fresh();
+        let id = add_person(&mcp, "Ada");
+        mcp.update_node(Parameters(UpdateNodeArgs {
+            id,
+            props: json!({ "name": "Grace" }),
+        }))
+        .expect("update_node");
+        let value = body(
+            mcp.get_node(Parameters(NodeIdArgs { id }))
+                .expect("get_node"),
+        );
+        assert_eq!(value["props"]["name"], "Grace");
+    }
+
+    #[test]
+    fn update_node_missing_is_invalid_params() {
+        let (mcp, _dir) = fresh();
+        let err = mcp
+            .update_node(Parameters(UpdateNodeArgs {
+                id: 999,
+                props: json!({}),
+            }))
+            .expect_err("missing node");
+        assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn delete_node_marks_deleted_and_removes_it() {
+        let (mcp, _dir) = fresh();
+        let id = add_person(&mcp, "Ada");
+        let value = body(
+            mcp.delete_node(Parameters(NodeIdArgs { id }))
+                .expect("delete"),
+        );
+        assert_eq!(value["deleted"], true);
+        let err = mcp
+            .get_node(Parameters(NodeIdArgs { id }))
+            .expect_err("gone");
+        assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn delete_node_missing_is_idempotent() {
+        // `Graph::delete_node` does not report `NodeNotFound` for an absent id;
+        // deletion is idempotent, so the tool reports success.
+        let (mcp, _dir) = fresh();
+        let value = body(
+            mcp.delete_node(Parameters(NodeIdArgs { id: 999 }))
+                .expect("delete_node"),
+        );
+        assert_eq!(value["deleted"], true);
+    }
+
+    #[test]
+    fn add_edge_returns_id() {
+        let (mcp, _dir) = fresh();
+        let a = add_person(&mcp, "Ada");
+        let b = add_person(&mcp, "Grace");
+        let result = mcp
+            .add_edge(Parameters(AddEdgeArgs {
+                src: a,
+                dst: b,
+                edge_type: "KNOWS".to_string(),
+                props: json!({}),
+            }))
+            .expect("add_edge");
+        assert!(body(result)["id"].is_u64());
+    }
+
+    #[test]
+    fn add_edge_with_missing_endpoint_currently_succeeds() {
+        // Pins the issue #14 behavior: `Graph::add_edge` does not validate that
+        // its endpoints exist, so a dangling edge is created instead of an error.
+        // When the core adds endpoint validation, the server's `NodeNotFound`
+        // arm becomes reachable and this test should flip to expect a rejection.
+        let (mcp, _dir) = fresh();
+        let a = add_person(&mcp, "Ada");
+        let result = mcp
+            .add_edge(Parameters(AddEdgeArgs {
+                src: a,
+                dst: 999,
+                edge_type: "KNOWS".to_string(),
+                props: json!({}),
+            }))
+            .expect("add_edge currently succeeds");
+        assert!(body(result)["id"].is_u64());
+    }
+
+    #[test]
+    fn get_edge_round_trips_endpoints_and_type() {
+        let (mcp, _dir) = fresh();
+        let a = add_person(&mcp, "Ada");
+        let b = add_person(&mcp, "Grace");
+        let edge_id = body(
+            mcp.add_edge(Parameters(AddEdgeArgs {
+                src: a,
+                dst: b,
+                edge_type: "KNOWS".to_string(),
+                props: json!({ "since": 2020 }),
+            }))
+            .expect("add_edge"),
+        )["id"]
+            .as_u64()
+            .expect("edge id");
+        let value = body(
+            mcp.get_edge(Parameters(EdgeIdArgs { id: edge_id }))
+                .expect("get_edge"),
+        );
+        assert_eq!(value["src"].as_u64(), Some(a));
+        assert_eq!(value["dst"].as_u64(), Some(b));
+        assert_eq!(value["type"], "KNOWS");
+        assert_eq!(value["props"]["since"], 2020);
+    }
+
+    #[test]
+    fn get_edge_missing_is_invalid_params() {
+        let (mcp, _dir) = fresh();
+        let err = mcp
+            .get_edge(Parameters(EdgeIdArgs { id: 999 }))
+            .expect_err("missing edge");
+        assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn delete_edge_marks_deleted() {
+        let (mcp, _dir) = fresh();
+        let a = add_person(&mcp, "Ada");
+        let b = add_person(&mcp, "Grace");
+        let edge_id = body(
+            mcp.add_edge(Parameters(AddEdgeArgs {
+                src: a,
+                dst: b,
+                edge_type: "KNOWS".to_string(),
+                props: json!({}),
+            }))
+            .expect("add_edge"),
+        )["id"]
+            .as_u64()
+            .expect("edge id");
+        let value = body(
+            mcp.delete_edge(Parameters(EdgeIdArgs { id: edge_id }))
+                .expect("delete_edge"),
+        );
+        assert_eq!(value["deleted"], true);
+    }
+
+    #[test]
+    fn delete_edge_missing_is_idempotent() {
+        // As with node deletion, `Graph::delete_edge` does not report
+        // `EdgeNotFound` for an absent id; the tool reports success.
+        let (mcp, _dir) = fresh();
+        let value = body(
+            mcp.delete_edge(Parameters(EdgeIdArgs { id: 999 }))
+                .expect("delete_edge"),
+        );
+        assert_eq!(value["deleted"], true);
+    }
+
+    #[test]
+    fn cypher_query_returns_columns_and_records() {
+        let (mcp, _dir) = fresh();
+        add_person(&mcp, "Ada");
+        let result = mcp
+            .cypher_query(Parameters(CypherArgs {
+                query: "MATCH (n:Person) RETURN n.name AS name".to_string(),
+                params: HashMap::new(),
+            }))
+            .expect("cypher_query");
+        let value = body(result);
+        assert_eq!(value["columns"], json!(["name"]));
+        assert_eq!(value["records"], json!([["Ada"]]));
+    }
+
+    #[test]
+    fn cypher_query_honors_params() {
+        let (mcp, _dir) = fresh();
+        add_person(&mcp, "Ada");
+        add_person(&mcp, "Grace");
+        let mut params = HashMap::new();
+        params.insert("who".to_string(), json!("Grace"));
+        let result = mcp
+            .cypher_query(Parameters(CypherArgs {
+                query: "MATCH (n:Person) WHERE n.name = $who RETURN n.name AS name".to_string(),
+                params,
+            }))
+            .expect("cypher_query");
+        assert_eq!(body(result)["records"], json!([["Grace"]]));
+    }
+
+    #[test]
+    fn cypher_query_invalid_is_invalid_params() {
+        let (mcp, _dir) = fresh();
+        let err = mcp
+            .cypher_query(Parameters(CypherArgs {
+                query: "MATCH (n RETURN".to_string(),
+                params: HashMap::new(),
+            }))
+            .expect_err("parse error");
+        assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn explain_returns_plan() {
+        let (mcp, _dir) = fresh();
+        let result = mcp
+            .explain(Parameters(ExplainArgs {
+                query: "MATCH (n:Person) RETURN n".to_string(),
+            }))
+            .expect("explain");
+        assert!(body(result)["plan"].as_str().is_some_and(|p| !p.is_empty()));
+    }
+
+    #[test]
+    fn explain_invalid_is_invalid_params() {
+        let (mcp, _dir) = fresh();
+        let err = mcp
+            .explain(Parameters(ExplainArgs {
+                query: "MATCH (n RETURN".to_string(),
+            }))
+            .expect_err("parse error");
+        assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn text_search_returns_ranked_hits() {
+        let (mcp, _dir) = fresh();
+        mcp.graph
+            .create_text_index("Doc", "body")
+            .expect("create index");
+        let id = mcp
+            .graph
+            .add_node("Doc", &json!({ "body": "the quick brown fox" }))
+            .expect("add doc");
+        let result = mcp
+            .text_search(Parameters(TextSearchArgs {
+                query: "quick fox".to_string(),
+                label: Some("Doc".to_string()),
+                property: Some("body".to_string()),
+                limit: 10,
+            }))
+            .expect("text_search");
+        let hits = body(result);
+        assert_eq!(hits.as_array().map(|a| a.len()), Some(1));
+        assert_eq!(hits[0]["node"].as_u64(), Some(id));
+    }
+
+    #[test]
+    fn vector_search_returns_nearest_node() {
+        let (mcp, _dir) = fresh();
+        let a = add_person(&mcp, "Ada");
+        let b = add_person(&mcp, "Grace");
+        mcp.graph
+            .upsert_vector(a, &[1.0, 0.0, 0.0])
+            .expect("upsert a");
+        mcp.graph
+            .upsert_vector(b, &[0.0, 1.0, 0.0])
+            .expect("upsert b");
+        let result = mcp
+            .vector_search(Parameters(VectorSearchArgs {
+                vector: vec![1.0, 0.0, 0.0],
+                k: 1,
+                label: None,
+            }))
+            .expect("vector_search");
+        let hits = body(result);
+        assert_eq!(hits.as_array().map(|a| a.len()), Some(1));
+        assert_eq!(hits[0]["node"].as_u64(), Some(a));
+    }
+
+    #[test]
+    fn vector_search_empty_vector_is_invalid_params() {
+        let (mcp, _dir) = fresh();
+        let err = mcp
+            .vector_search(Parameters(VectorSearchArgs {
+                vector: vec![],
+                k: 5,
+                label: None,
+            }))
+            .expect_err("empty vector");
+        assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
+    }
+}
