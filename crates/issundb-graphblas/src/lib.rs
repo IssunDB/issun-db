@@ -741,4 +741,325 @@ mod tests {
         t.sort_by_key(|&(r, c, _)| (r, c));
         assert_eq!(t, vec![(0, 1, 2.5), (1, 0, 4.0)]);
     }
+
+    #[test]
+    fn context_call_raw_success() {
+        let ctx = Context::init_default().unwrap();
+        // A successful raw call (querying nvals on an empty vector) should return Ok.
+        let v = Vector::<i32>::new(ctx.clone(), 4).unwrap();
+        let mut n: u64 = 0;
+        ctx.call_raw(|| unsafe { gb::GrB_Vector_nvals(&mut n, v.ptr) })
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn set_global_threads_succeeds() {
+        let _ctx = Context::init_default().unwrap();
+        set_global_threads(1).unwrap();
+    }
+
+    #[test]
+    fn vector_nvals_direct() {
+        let ctx = Context::init_default().unwrap();
+        let empty = Vector::<i32>::new(ctx.clone(), 5).unwrap();
+        assert_eq!(empty.nvals().unwrap(), 0);
+
+        let v =
+            Vector::<i32>::from_pairs(ctx.clone(), 5, &[(1, 10), (3, 20)], Reducer::First)
+                .unwrap();
+        assert_eq!(v.nvals().unwrap(), 2);
+    }
+
+    #[test]
+    fn vector_get_or_default_missing() {
+        let ctx = Context::init_default().unwrap();
+        let v =
+            Vector::<i32>::from_pairs(ctx.clone(), 4, &[(0, 42)], Reducer::First).unwrap();
+        assert_eq!(v.get_or_default(0).unwrap(), 42);
+        // Index 2 has no stored element; should return default (0).
+        assert_eq!(v.get_or_default(2).unwrap(), 0);
+    }
+
+    #[test]
+    fn matrix_set_and_nvals() {
+        let ctx = Context::init_default().unwrap();
+        let mut m = Matrix::<f32>::new(ctx.clone(), 3, 3).unwrap();
+        assert_eq!(m.nvals().unwrap(), 0);
+
+        m.set(0, 1, 1.5).unwrap();
+        m.set(2, 0, 3.0).unwrap();
+        assert_eq!(m.nvals().unwrap(), 2);
+
+        let mut t = m.triples().unwrap();
+        t.sort_by_key(|&(r, c, _)| (r, c));
+        assert_eq!(t, vec![(0, 1, 1.5), (2, 0, 3.0)]);
+    }
+
+    #[test]
+    fn matrix_drop_element() {
+        let ctx = Context::init_default().unwrap();
+        let mut m = Matrix::<i32>::from_triples(
+            ctx.clone(),
+            3,
+            3,
+            &[(0, 1, 10), (1, 2, 20), (2, 0, 30)],
+            Reducer::First,
+        )
+        .unwrap();
+        assert_eq!(m.nvals().unwrap(), 3);
+
+        m.drop_element(1, 2).unwrap();
+        assert_eq!(m.nvals().unwrap(), 2);
+
+        let mut t = m.triples().unwrap();
+        t.sort_by_key(|&(r, c, _)| (r, c));
+        assert_eq!(t, vec![(0, 1, 10), (2, 0, 30)]);
+    }
+
+    #[test]
+    fn matrix_resize_expands() {
+        let ctx = Context::init_default().unwrap();
+        let mut m = Matrix::<i32>::from_triples(
+            ctx.clone(),
+            2,
+            2,
+            &[(0, 0, 1), (1, 1, 2)],
+            Reducer::First,
+        )
+        .unwrap();
+
+        // Grow the matrix and add an element in the expanded region.
+        m.resize(4, 4).unwrap();
+        m.set(3, 3, 99).unwrap();
+        assert_eq!(m.nvals().unwrap(), 3);
+
+        let mut t = m.triples().unwrap();
+        t.sort_by_key(|&(r, c, _)| (r, c));
+        assert_eq!(t, vec![(0, 0, 1), (1, 1, 2), (3, 3, 99)]);
+    }
+
+    #[test]
+    fn mxv_plus_times_semiring() {
+        // A = [[1,2],[3,4]], x = [1,1]. A^T *.(+,*) x = [1*1+3*1, 2*1+4*1] = [4,6].
+        let ctx = Context::init_default().unwrap();
+        let a = Matrix::<i32>::from_triples(
+            ctx.clone(),
+            2,
+            2,
+            &[(0, 0, 1), (0, 1, 2), (1, 0, 3), (1, 1, 4)],
+            Reducer::First,
+        )
+        .unwrap();
+        let x =
+            Vector::<i32>::from_pairs(ctx.clone(), 2, &[(0, 1), (1, 1)], Reducer::First).unwrap();
+        let mut out = Vector::<i32>::new(ctx.clone(), 2).unwrap();
+        mxv(
+            &mut out,
+            None,
+            Semiring::PlusTimes,
+            &a,
+            &x,
+            Descriptor::new(false, false, false, true),
+        )
+        .unwrap();
+        assert_eq!(out.get_or_default(0).unwrap(), 4);
+        assert_eq!(out.get_or_default(1).unwrap(), 6);
+    }
+
+    #[test]
+    fn mxv_min_second_semiring() {
+        // MinSecond: multiply = second(a, b) = b, combine = min.
+        // A = [[_,1],[1,_]], x = [10,20]. A^T *.(min,second) x:
+        //   column 0 feeds row 0 via (1,0)=1 -> second(1,x[1])=x[1]=20 -> out[0]=20
+        //   column 1 feeds row 1 via (0,1)=1 -> second(1,x[0])=x[0]=10 -> out[1]=10
+        let ctx = Context::init_default().unwrap();
+        let a = Matrix::<i32>::from_triples(
+            ctx.clone(),
+            2,
+            2,
+            &[(0, 1, 1), (1, 0, 1)],
+            Reducer::First,
+        )
+        .unwrap();
+        let x =
+            Vector::<i32>::from_pairs(ctx.clone(), 2, &[(0, 10), (1, 20)], Reducer::First)
+                .unwrap();
+        let mut out = Vector::<i32>::new(ctx.clone(), 2).unwrap();
+        mxv(
+            &mut out,
+            None,
+            Semiring::MinSecond,
+            &a,
+            &x,
+            Descriptor::new(false, false, false, true),
+        )
+        .unwrap();
+        assert_eq!(out.get_or_default(0).unwrap(), 20);
+        assert_eq!(out.get_or_default(1).unwrap(), 10);
+    }
+
+    #[test]
+    fn ewise_add_plus_sums() {
+        let ctx = Context::init_default().unwrap();
+        let a =
+            Vector::<i32>::from_pairs(ctx.clone(), 4, &[(0, 5), (1, 2)], Reducer::First).unwrap();
+        let b =
+            Vector::<i32>::from_pairs(ctx.clone(), 4, &[(1, 9), (3, 1)], Reducer::First).unwrap();
+        let mut out = Vector::<i32>::new(ctx.clone(), 4).unwrap();
+        ewise_add(&mut out, None, Monoid::Plus, &a, &b, Descriptor::NULL).unwrap();
+        assert_eq!(out.indices().unwrap(), vec![0, 1, 3]);
+        assert_eq!(out.get_or_default(0).unwrap(), 5); // 5 + implicit 0
+        assert_eq!(out.get_or_default(1).unwrap(), 11); // 2 + 9
+        assert_eq!(out.get_or_default(3).unwrap(), 1);
+    }
+
+    #[test]
+    fn mxv_with_structural_mask() {
+        // Mask restricts output to index 0 only.
+        let ctx = Context::init_default().unwrap();
+        let a = Matrix::<i32>::from_triples(
+            ctx.clone(),
+            2,
+            2,
+            &[(0, 0, 1), (0, 1, 1), (1, 0, 1), (1, 1, 1)],
+            Reducer::First,
+        )
+        .unwrap();
+        let x =
+            Vector::<i32>::from_pairs(ctx.clone(), 2, &[(0, 1), (1, 1)], Reducer::First).unwrap();
+        let mask =
+            Vector::<i32>::from_pairs(ctx.clone(), 2, &[(0, 1)], Reducer::First).unwrap();
+        let mut out = Vector::<i32>::new(ctx.clone(), 2).unwrap();
+        mxv(
+            &mut out,
+            Some(&mask),
+            Semiring::PlusTimes,
+            &a,
+            &x,
+            Descriptor::new(false, true, false, true),
+        )
+        .unwrap();
+        // Only index 0 passes the mask.
+        assert_eq!(out.indices().unwrap(), vec![0]);
+        assert_eq!(out.get_or_default(0).unwrap(), 2);
+        assert_eq!(out.get_or_default(1).unwrap(), 0);
+    }
+
+    #[test]
+    fn mxv_with_complement_mask() {
+        // Complement mask: index 0 is masked, so only index 1 should appear.
+        let ctx = Context::init_default().unwrap();
+        let a = Matrix::<i32>::from_triples(
+            ctx.clone(),
+            2,
+            2,
+            &[(0, 0, 1), (0, 1, 1), (1, 0, 1), (1, 1, 1)],
+            Reducer::First,
+        )
+        .unwrap();
+        let x =
+            Vector::<i32>::from_pairs(ctx.clone(), 2, &[(0, 1), (1, 1)], Reducer::First).unwrap();
+        let mask =
+            Vector::<i32>::from_pairs(ctx.clone(), 2, &[(0, 1)], Reducer::First).unwrap();
+        let mut out = Vector::<i32>::new(ctx.clone(), 2).unwrap();
+        mxv(
+            &mut out,
+            Some(&mask),
+            Semiring::PlusTimes,
+            &a,
+            &x,
+            Descriptor::new(false, true, true, true),
+        )
+        .unwrap();
+        assert_eq!(out.indices().unwrap(), vec![1]);
+        assert_eq!(out.get_or_default(1).unwrap(), 2);
+    }
+
+    #[test]
+    fn mxv_with_replace_clears_prior() {
+        // Pre-populate out, then run with replace=true: prior values outside the
+        // result should be cleared.
+        let ctx = Context::init_default().unwrap();
+        let a = Matrix::<i32>::from_triples(
+            ctx.clone(),
+            3,
+            3,
+            &[(0, 1, 1)],
+            Reducer::First,
+        )
+        .unwrap();
+        let x =
+            Vector::<i32>::from_pairs(ctx.clone(), 3, &[(0, 5)], Reducer::First).unwrap();
+        let mask =
+            Vector::<i32>::from_pairs(ctx.clone(), 3, &[(1, 1)], Reducer::First).unwrap();
+        let mut out = Vector::<i32>::new(ctx.clone(), 3).unwrap();
+        out.set(2, 99).unwrap();
+        mxv(
+            &mut out,
+            Some(&mask),
+            Semiring::PlusTimes,
+            &a,
+            &x,
+            Descriptor::new(true, true, false, true),
+        )
+        .unwrap();
+        // Replace mode: index 2 was outside the mask, so it should be gone.
+        assert_eq!(out.indices().unwrap(), vec![1]);
+    }
+
+    #[test]
+    fn reducer_plus_sums_duplicates() {
+        let ctx = Context::init_default().unwrap();
+        // Two triples at the same coordinate: Plus should sum them.
+        let m = Matrix::<i32>::from_triples(
+            ctx.clone(),
+            2,
+            2,
+            &[(0, 1, 3), (0, 1, 7)],
+            Reducer::Plus,
+        )
+        .unwrap();
+        let mut t = m.triples().unwrap();
+        t.sort_by_key(|&(r, c, _)| (r, c));
+        assert_eq!(t, vec![(0, 1, 10)]);
+    }
+
+    #[test]
+    fn reducer_first_keeps_first_duplicate() {
+        let ctx = Context::init_default().unwrap();
+        let v =
+            Vector::<i32>::from_pairs(ctx.clone(), 3, &[(1, 100), (1, 200)], Reducer::First)
+                .unwrap();
+        // First keeps the first value seen.
+        assert_eq!(v.get_or_default(1).unwrap(), 100);
+    }
+
+    #[test]
+    fn f32_vector_round_trip() {
+        let ctx = Context::init_default().unwrap();
+        let v = Vector::<f32>::from_pairs(
+            ctx.clone(),
+            3,
+            &[(0, 1.5), (2, 3.25)],
+            Reducer::First,
+        )
+        .unwrap();
+        assert_eq!(v.nvals().unwrap(), 2);
+        assert_eq!(v.get_or_default(0).unwrap(), 1.5);
+        assert_eq!(v.get_or_default(2).unwrap(), 3.25);
+        assert_eq!(v.get_or_default(1).unwrap(), 0.0);
+    }
+
+    #[test]
+    fn empty_collections() {
+        let ctx = Context::init_default().unwrap();
+        let v = Vector::<i32>::from_pairs(ctx.clone(), 4, &[], Reducer::First).unwrap();
+        assert_eq!(v.nvals().unwrap(), 0);
+        assert!(v.indices().unwrap().is_empty());
+
+        let m = Matrix::<i32>::from_triples(ctx.clone(), 3, 3, &[], Reducer::First).unwrap();
+        assert_eq!(m.nvals().unwrap(), 0);
+        assert!(m.triples().unwrap().is_empty());
+    }
 }
