@@ -200,6 +200,12 @@ mcp-http: ## Launch the MCP server over Streamable HTTP (MCP_PATH=<dir> db path,
 	@RUST_BACKTRACE=$(RUST_BACKTRACE) cargo run -p issundb-mcp -- --db-path $(or $(MCP_PATH),./issundb-data)\
  	--transport http --bind $(or $(MCP_BIND),127.0.0.1:8000)
 
+.PHONY: rest
+rest: ## Launch the HTTP REST API server (pass REST_PATH=<dir> db path, REST_HOST=<addr> bind host, REST_PORT=<port> port)
+	@echo "Starting IssunDB REST API server at $(or $(REST_HOST),127.0.0.1):$(or $(REST_PORT),7474) (database: $(or $(REST_PATH),./issundb-data))..."
+	@RUST_BACKTRACE=$(RUST_BACKTRACE) cargo run -p issundb-rest -- --db-path $(or $(REST_PATH),./issundb-data)\
+ 	--host $(or $(REST_HOST),127.0.0.1) --port $(or $(REST_PORT),7474)
+
 .PHONY: bench
 bench: ## Run all workspace benchmarks
 	@echo "Running all benchmarks..."
