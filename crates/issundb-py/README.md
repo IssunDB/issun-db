@@ -15,25 +15,22 @@ pip install issundb
 
 ### Quickstart
 
-Property maps and query results cross the boundary as JSON strings, so callers serialize with `json.dumps` on the way in and `json.loads` on the
-way out.
-
 ```python
 import json
 
 from issundb import IssunDB
 
-# Open (or create) a graph database directory
+# Open or create a database
 db = IssunDB("./issundb-data")
 
-# Add two nodes with properties
+# Add two nodes (with properties)
 alice = db.add_node("Person", json.dumps({"name": "Alice", "age": 30}))
 bob = db.add_node("Person", json.dumps({"name": "Bob", "age": 28}))
 
 # Add a directed edge between the nodes
 db.add_edge(alice, bob, "KNOWS", json.dumps({"since": 2021}))
 
-# Run a Cypher query and decode the JSON result
+# Run a Cypher query and and print the results
 result = json.loads(
     db.query("MATCH (a:Person)-[r:KNOWS]->(b:Person) RETURN a.name, b.name, r.since")
 )
@@ -49,20 +46,9 @@ for record in result["records"]:
 ['Alice', 'Bob', 2021]
 ```
 
-### API
-
-The extension exports a single `IssunDB` class.
-See [`issundb.pyi`](issundb.pyi) for the full typed surface, including:
-
-- Node and edge CRUD: `add_node`, `get_node`, `update_node`, `delete_node`, and `add_edge`.
-- Cypher: `query` and `explain`.
-- Vector search: `upsert_vector` and `vector_search`.
-- Full-text search: `text_search`, `create_text_index`, and `drop_text_index`.
-- Backup and restore: `backup`, `backup_compact`, and `restore`.
-
 ### Documentation
 
-Visit IssunDB's [documentation page](https://IssunDB.github.io/issun-db/) for detailed information including examples and API references.
+Visit [IssunDB's documentation](https://IssunDB.github.io/issun-db/) for detailed information including examples and API references.
 
 ### License
 
