@@ -36,7 +36,8 @@ This document outlines the features implemented in IssunDB and the future goals 
   (BFS, multi-source BFS, untyped expansion, degree centrality, and connected components) stay fresh without a full O(V+E) rebuild. Consumers
   that read the CSR snapshot arrays rebuild on demand, gated by a committed-write generation counter that also closes the prior edge-only
   staleness gap
-- [x] Configurable OpenMP multi-threading defaulting to 1 thread, respecting the `ISSUNDB_NUM_THREADS` environment variable, and exposing a programmatic thread count API
+- [x] Configurable OpenMP multi-threading defaulting to 1 thread, respecting the `ISSUNDB_NUM_THREADS` environment variable, and exposing a
+  programmatic thread count API
 - [x] SuiteSparse:GraphBLAS algorithm suite executing via sparse matrix-vector multiplication kernels:
     - [x] Single and multi-source BFS
     - [x] PageRank via power iterations
@@ -152,5 +153,6 @@ This document outlines the features implemented in IssunDB and the future goals 
 - [x] Property-based and integration tests
 - [x] Language bindings for Python
 - [x] Batch data import utilities for JSONL, CSV, and Parquet formats
-- [x] Comprehensive database export and import functionality (`EXPORT DATABASE` and `IMPORT DATABASE` Cypher queries) with CSV, JSONL, and Parquet formats
+- [x] Comprehensive database export and import functionality (`EXPORT DATABASE` and `IMPORT DATABASE` Cypher queries) with CSV, JSONL, and Parquet
+  formats
 - [x] Online backup, restore, and snapshot tools
