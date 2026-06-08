@@ -64,7 +64,8 @@ test-cli: format ## Run the CLI integration tests (Unix only)
 .PHONY: coverage
 coverage: format ## Generate test coverage report (llvm-cov over nextest, lcov output)
 	@echo "Generating test coverage report..."
-	@DEBUG_PROJ=$(DEBUG_PROJ) RUST_BACKTRACE=$(RUST_BACKTRACE) cargo llvm-cov nextest --workspace --exclude issundb-cli --exclude issundb-node --exclude issundb-py --lcov --output-path lcov.info
+	@DEBUG_PROJ=$(DEBUG_PROJ) RUST_BACKTRACE=$(RUST_BACKTRACE) cargo llvm-cov nextest --workspace --exclude issundb-cli\
+ 	--exclude issundb-node --exclude issundb-py --lcov --output-path lcov.info
 
 .PHONY: build
 build: format ## Build the binary for the current platform
