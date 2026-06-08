@@ -178,6 +178,10 @@ Do not invent modules that do not yet exist when answering questions, but do pla
   non-optional dependencies.
 - Async is not used in the core engine. LMDB and GraphBLAS are synchronous. `tokio` is an optional dependency for server mode only; do not add
   `.await` inside `issundb-core`.
+- GraphBLAS initializes a process-global context and OpenMP thread pool on first use (`GxB_init`), and the crate never finalizes it. Under
+  `cargo nextest` (process-per-test, used by `make coverage`) every test process pays this cost independently, so on small CI runners the thread
+  pools oversubscribe and a GraphBLAS call can fail intermittently. The coverage job pins `OMP_NUM_THREADS=1` and sets `NEXTEST_RETRIES=2` to
+  compensate.
 
 ## Dependency Boundaries
 
