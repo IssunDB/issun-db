@@ -137,6 +137,50 @@ async fn create_multi_label_node_round_trip() {
 }
 
 #[tokio::test]
+async fn malformed_json_body_returns_json_error_envelope() {
+    let (graph, _dir) = fresh_graph();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/nodes")
+        .header("content-type", "application/json")
+        .body(Body::from("{ not valid json"))
+        .unwrap();
+    let (status, body) = send(&graph, req).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body["error"].is_string(),
+        "expected JSON error envelope, got {body}"
+    );
+}
+
+#[tokio::test]
+async fn missing_content_type_returns_json_error_envelope() {
+    let (graph, _dir) = fresh_graph();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/nodes")
+        .body(Body::from(json!({ "label": "Person" }).to_string()))
+        .unwrap();
+    let (status, body) = send(&graph, req).await;
+    assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert!(
+        body["error"].is_string(),
+        "expected JSON error envelope, got {body}"
+    );
+}
+
+#[tokio::test]
+async fn unparseable_path_id_returns_json_error_envelope() {
+    let (graph, _dir) = fresh_graph();
+    let (status, body) = send(&graph, get("/v1/nodes/notanumber")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body["error"].is_string(),
+        "expected JSON error envelope, got {body}"
+    );
+}
+
+#[tokio::test]
 async fn create_node_without_label_is_bad_request() {
     let (graph, _dir) = fresh_graph();
     let (status, body) = send(&graph, post("/v1/nodes", json!({ "props": {} }))).await;

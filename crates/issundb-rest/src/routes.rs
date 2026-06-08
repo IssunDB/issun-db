@@ -2,14 +2,16 @@ use std::sync::Arc;
 
 use axum::{
     Json, Router,
-    extract::{Path, State},
-    http::StatusCode,
+    extract::{FromRequest, FromRequestParts, Path, Request, State},
+    http::{StatusCode, request::Parts},
     response::{IntoResponse, Response},
     routing::{delete, get, post, put},
 };
 use issundb::{
-    Graph, GraphQueryExt, TextGraphExt, TextSearchOptions, VectorGraphExt, VectorSearchOptions,
+    CypherError, Graph, GraphQueryExt, TextGraphExt, TextSearchOptions, VectorGraphExt,
+    VectorSearchOptions,
 };
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -40,11 +42,69 @@ fn bad_request(msg: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
     err_json(msg, StatusCode::BAD_REQUEST)
 }
 
+/// Map a Cypher error to an HTTP status: query-shape faults (parse, plan, type,
+/// unbound variable, and math) are client errors, while execution and storage
+/// faults on an otherwise-valid query are server errors.
+fn cypher_status(e: &CypherError) -> StatusCode {
+    match e {
+        CypherError::Parse(_)
+        | CypherError::Plan(_)
+        | CypherError::TypeMismatch(_)
+        | CypherError::VariableNotBound(_)
+        | CypherError::Math(_) => StatusCode::BAD_REQUEST,
+        CypherError::Execution(_) | CypherError::Storage(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
 /// Await a blocking graph task, mapping a join failure (panic or cancellation)
 /// to a 500. The synchronous `Graph` calls run on a blocking thread so they do
 /// not stall the async worker pool.
 async fn join(handle: tokio::task::JoinHandle<Response>) -> Response {
     handle.await.unwrap_or_else(|e| internal(e).into_response())
+}
+
+// ---------------------------------------------------------------------------
+// Extractors
+// ---------------------------------------------------------------------------
+
+/// `Json` body extractor that renders a deserialization or content-type
+/// rejection with the same `{"error": ...}` envelope the handlers use, instead
+/// of axum's default plain-text rejection body.
+pub struct JsonBody<T>(pub T);
+
+#[axum::async_trait]
+impl<T, S> FromRequest<S> for JsonBody<T>
+where
+    T: DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        match Json::<T>::from_request(req, state).await {
+            Ok(Json(value)) => Ok(JsonBody(value)),
+            Err(rej) => Err(err_json(rej.body_text(), rej.status()).into_response()),
+        }
+    }
+}
+
+/// `Path<u64>` extractor that renders an unparseable id with the JSON error
+/// envelope rather than axum's plain-text rejection body.
+pub struct PathU64(pub u64);
+
+#[axum::async_trait]
+impl<S> FromRequestParts<S> for PathU64
+where
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        match Path::<u64>::from_request_parts(parts, state).await {
+            Ok(Path(id)) => Ok(PathU64(id)),
+            Err(rej) => Err(err_json(rej.body_text(), rej.status()).into_response()),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -122,7 +182,7 @@ fn default_k() -> usize {
 
 pub async fn create_node(
     State(graph): State<AppState>,
-    Json(body): Json<CreateNodeBody>,
+    JsonBody(body): JsonBody<CreateNodeBody>,
 ) -> Response {
     join(tokio::task::spawn_blocking(move || {
         // Merge the singular `label` (placed first) with any `labels`, dropping
@@ -148,7 +208,7 @@ pub async fn create_node(
     .await
 }
 
-pub async fn get_node(State(graph): State<AppState>, Path(id): Path<u64>) -> Response {
+pub async fn get_node(State(graph): State<AppState>, PathU64(id): PathU64) -> Response {
     join(tokio::task::spawn_blocking(move || {
         match graph.get_node(id) {
             Ok(Some(record)) => {
@@ -178,8 +238,8 @@ pub async fn get_node(State(graph): State<AppState>, Path(id): Path<u64>) -> Res
 
 pub async fn update_node(
     State(graph): State<AppState>,
-    Path(id): Path<u64>,
-    Json(body): Json<UpdateNodeBody>,
+    PathU64(id): PathU64,
+    JsonBody(body): JsonBody<UpdateNodeBody>,
 ) -> Response {
     join(tokio::task::spawn_blocking(move || {
         match graph.update_node(id, &body.props) {
@@ -193,7 +253,7 @@ pub async fn update_node(
     .await
 }
 
-pub async fn delete_node(State(graph): State<AppState>, Path(id): Path<u64>) -> Response {
+pub async fn delete_node(State(graph): State<AppState>, PathU64(id): PathU64) -> Response {
     join(tokio::task::spawn_blocking(move || {
         match graph.delete_node(id) {
             Ok(()) => StatusCode::NO_CONTENT.into_response(),
@@ -212,7 +272,7 @@ pub async fn delete_node(State(graph): State<AppState>, Path(id): Path<u64>) -> 
 
 pub async fn create_edge(
     State(graph): State<AppState>,
-    Json(body): Json<CreateEdgeBody>,
+    JsonBody(body): JsonBody<CreateEdgeBody>,
 ) -> Response {
     join(tokio::task::spawn_blocking(move || {
         match graph.add_edge(body.src, body.dst, &body.edge_type, &body.props) {
@@ -226,7 +286,7 @@ pub async fn create_edge(
     .await
 }
 
-pub async fn get_edge(State(graph): State<AppState>, Path(id): Path<u64>) -> Response {
+pub async fn get_edge(State(graph): State<AppState>, PathU64(id): PathU64) -> Response {
     join(tokio::task::spawn_blocking(move || {
         match graph.get_edge(id) {
             Ok(Some(record)) => {
@@ -258,7 +318,7 @@ pub async fn get_edge(State(graph): State<AppState>, Path(id): Path<u64>) -> Res
     .await
 }
 
-pub async fn delete_edge(State(graph): State<AppState>, Path(id): Path<u64>) -> Response {
+pub async fn delete_edge(State(graph): State<AppState>, PathU64(id): PathU64) -> Response {
     join(tokio::task::spawn_blocking(move || {
         match graph.delete_edge(id) {
             Ok(()) => StatusCode::NO_CONTENT.into_response(),
@@ -277,7 +337,7 @@ pub async fn delete_edge(State(graph): State<AppState>, Path(id): Path<u64>) -> 
 
 pub async fn execute_query(
     State(graph): State<AppState>,
-    Json(body): Json<CypherQueryBody>,
+    JsonBody(body): JsonBody<CypherQueryBody>,
 ) -> Response {
     join(tokio::task::spawn_blocking(move || {
         match graph.query_with_params(&body.query, &body.params) {
@@ -293,7 +353,7 @@ pub async fn execute_query(
                 )
                     .into_response()
             }
-            Err(e) => bad_request(e).into_response(),
+            Err(e) => err_json(&e, cypher_status(&e)).into_response(),
         }
     }))
     .await
@@ -301,12 +361,12 @@ pub async fn execute_query(
 
 pub async fn explain_query(
     State(graph): State<AppState>,
-    Json(body): Json<ExplainBody>,
+    JsonBody(body): JsonBody<ExplainBody>,
 ) -> Response {
     join(tokio::task::spawn_blocking(move || {
         match graph.explain(&body.query) {
             Ok(plan) => (StatusCode::OK, Json(json!({ "plan": plan }))).into_response(),
-            Err(e) => bad_request(e).into_response(),
+            Err(e) => err_json(&e, cypher_status(&e)).into_response(),
         }
     }))
     .await
@@ -324,7 +384,7 @@ struct TextHitResponse {
 
 pub async fn search_text(
     State(graph): State<AppState>,
-    Json(body): Json<TextSearchBody>,
+    JsonBody(body): JsonBody<TextSearchBody>,
 ) -> Response {
     join(tokio::task::spawn_blocking(move || {
         let opts = TextSearchOptions {
@@ -358,7 +418,7 @@ struct VectorHitResponse {
 
 pub async fn search_vector(
     State(graph): State<AppState>,
-    Json(body): Json<VectorSearchBody>,
+    JsonBody(body): JsonBody<VectorSearchBody>,
 ) -> Response {
     if body.vector.is_empty() {
         return bad_request("vector must not be empty").into_response();
