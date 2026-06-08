@@ -18,7 +18,7 @@ PY_MNGR := uv
 WHEEL_FILE := $(shell ls $(PY_DIR)/$(WHEEL_DIR)/issundb-*.whl 2>/dev/null | head -n 1)
 
 # Pinned versions for development tools
-TARPAULIN_VERSION := 0.32.8
+LLVM_COV_VERSION := 0.6.16
 NEXTEST_VERSION := 0.9.100
 AUDIT_VERSION := 0.21.2
 CAREFUL_VERSION := 0.4.8
@@ -62,9 +62,9 @@ test-cli: format ## Run the CLI integration tests (Unix only)
 	@./scripts/test_cli.sh
 
 .PHONY: coverage
-coverage: format ## Generate test coverage report
+coverage: format ## Generate test coverage report (llvm-cov over nextest, lcov output)
 	@echo "Generating test coverage report..."
-	@DEBUG_PROJ=$(DEBUG_PROJ) cargo tarpaulin --workspace --exclude issundb-cli --exclude issundb-node --exclude issundb-py --out Xml --out Html
+	@DEBUG_PROJ=$(DEBUG_PROJ) RUST_BACKTRACE=$(RUST_BACKTRACE) cargo llvm-cov nextest --workspace --exclude issundb-cli --exclude issundb-node --exclude issundb-py --lcov --output-path lcov.info
 
 .PHONY: build
 build: format ## Build the binary for the current platform
@@ -116,8 +116,8 @@ submodules: ## Initialize and update all git submodules recursively
 .PHONY: install-deps
 install-deps: install-snap submodules ## Install development dependencies
 	@echo "Installing dependencies..."
-	@rustup component add rustfmt clippy
-	@cargo install --locked cargo-tarpaulin --version $(TARPAULIN_VERSION)
+	@rustup component add rustfmt clippy llvm-tools-preview
+	@cargo install --locked cargo-llvm-cov --version $(LLVM_COV_VERSION)
 	@cargo install --locked cargo-audit --version $(AUDIT_VERSION)
 	@cargo install --locked cargo-careful --version $(CAREFUL_VERSION)
 	@cargo install --locked cargo-nextest --version $(NEXTEST_VERSION)
