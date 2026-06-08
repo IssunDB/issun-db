@@ -55,6 +55,7 @@ This layout describes the current structure and target decoupled crate boundarie
 Do not invent modules that do not yet exist when answering questions, but do place new modules according to this map.
 
 - `crates/issundb-core/`: storage engine. Public surface is `Graph` and the schema types.
+    - `src/bin/gen_testdata.rs`: the `gen_testdata` binary that regenerates the versioned LMDB storage-format snapshot (works with `make testdata`).
     - `src/schema.rs`: `NodeId`, `EdgeId`, `LabelId`, `TypeId`, `AdjEntry`, `NodeRecord`, and `EdgeRecord`. `NodeRecord` holds `labels: Vec<LabelId>`
       (a node carries zero or more labels); use `primary_label` and `has_label` to inspect them.
     - `src/storage/lmdb.rs`: `Storage` struct; opens and owns all LMDB sub-databases.
@@ -106,13 +107,17 @@ Do not invent modules that do not yet exist when answering questions, but do pla
   `suitesparse_graphblas_sys`.
 - `crates/issundb-graphblas/`: minimal safe wrapper over the GraphBLAS operations the engine uses (typed `Matrix`/`Vector` over `i32`/`f32`/`f64`,
   build from triples, `mxv` over predefined semirings, `ewise_add` over predefined monoids, and the descriptor flags). Depends only on
-  `issundb-graphblas-sys`. `issundb-core` reaches GraphBLAS exclusively through this crate. Replaces the non-permissive `graphblas-sparse-linear-algebra`.
+  `issundb-graphblas-sys`. `issundb-core` reaches GraphBLAS exclusively through this crate. Replaces the non-permissive
+  `graphblas-sparse-linear-algebra`.
 - `crates/issundb-vector/`: vector index abstraction, vector metadata, vector storage integration, and vector search APIs.
 - `crates/issundb-text/`: tokenization, full-text index storage, text search APIs, and ranking.
 - `crates/issundb-retrieval/`: hybrid retrieval over graph traversal, vector hits, text hits, property filters, score fusion, and subgraph
   materialization.
 - `crates/issundb/`: public facade. Re-exports the deliberate public surface from `issundb-core`, `issundb-vector`, `issundb-text`,
   `issundb-retrieval`, and `issundb-cypher`. Do not re-export internal storage types like `Storage`.
+    - `benches/`: Criterion query optimizer benchmark, and two profiling drivers that load a persistent graph once and rerun a query so a profiler
+      observes query execution without load noise: `profile_triangle` (Zipf-skewed graph, cyclic triangle-count query) and `profile_query` (uniform
+      graph with the comparison harness's Person/KNOWS schema, arbitrary query via `PROFILE_QUERY`).
 - `crates/issundb-cli/`: interactive REPL binary. Uses only the `issundb` public facade for manual exploration and demos.
 - `crates/issundb-rest/`: Axum-based HTTP REST API server. Exposes node and edge CRUD, Cypher query execution, query plan explanation, vector
   search, and full-text search over HTTP. Uses `tokio` as its async runtime; depends only on `issundb`.
@@ -122,10 +127,7 @@ Do not invent modules that do not yet exist when answering questions, but do pla
 - `crates/issundb-py/`: Python bindings via PyO3. Exposes the `IssunDB` class with node, edge, query, vector search, text search, and backup
   methods. Depends only on `issundb`.
 - `crates/issundb-examples/`: standalone example programs (`quickstart.rs`, `hybrid_retrieval_quickstart.rs`, `neo4j_migration.rs`, and
-  `load_ldbc.rs`), the `gen_testdata` binary that regenerates the versioned LMDB storage-format snapshot (driven by `make testdata`), and two
-  profiling drivers that load a persistent graph once and rerun a query so a profiler observes query execution without load noise:
-  `profile_triangle` (Zipf-skewed graph, cyclic triangle-count query) and `profile_query` (uniform graph with the comparison harness's
-  Person/KNOWS schema, arbitrary query via `PROFILE_QUERY`). Depends only on `issundb`.
+  `load_ldbc.rs`). Depends only on `issundb`.
 - `crates/issundb-core/benches/`: Criterion storage, Pokec dataset, Wikipedia PageRank, and write throughput benchmarks.
 - `crates/issundb-cypher/benches/`: Criterion Cypher parsing, execution, LSQB Q1–Q9 queries, and OLTP transactional read benchmarks.
 - `crates/issundb-vector/benches/`: Criterion vector search benchmarks.
@@ -243,7 +245,8 @@ All graph operations go through `Graph`; do not call `Storage` directly from out
   lookup per candidate)
 - `edges_by_type(etype: &str) -> Result<Vec<EdgeId>, Error>`
 - `rebuild_csr() -> Result<(), Error>`
-- `set_thread_count(n: i32) -> Result<(), Error>`: sets the thread count for GraphBLAS matrix computations, overriding the `ISSUNDB_NUM_THREADS` environment variable (set to 0 to restore default behavior).
+- `set_thread_count(n: i32) -> Result<(), Error>`: sets the thread count for GraphBLAS matrix computations, overriding the `ISSUNDB_NUM_THREADS`
+  environment variable (set to 0 to restore default behavior).
 - `all_nodes() -> Result<Vec<NodeId>, Error>`
 - `label_name(id: LabelId) -> Result<Option<String>, Error>`
 - `type_name(id: TypeId) -> Result<Option<String>, Error>`

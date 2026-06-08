@@ -1,6 +1,6 @@
 # API Reference
 
-This page documents the principal structures, modules, and extension traits exposed through the public `issundb` facade.
+This page documents the structures, modules, and extension traits exposed through the public `issundb` facade.
 
 ## Core Graph Interface
 
@@ -42,7 +42,7 @@ The `Graph` struct is the main coordinator for all transactional graph storage, 
 Import the `VectorGraphExt` trait to leverage embedding storage and vector similarity search.
 
 - `VectorGraphExt::upsert_vector(n: NodeId, v: &[f32]) -> Result<(), VectorError>`  
-  Associates a high-dimensional float vector embedding with a node.
+  Associates a float vector embedding with a node.
 - `VectorGraphExt::vector_search(q: &[f32], k: usize) -> Result<Vec<Hit>, VectorError>`  
   Retrieves the top-k nearest neighbor nodes matching the query vector.
 

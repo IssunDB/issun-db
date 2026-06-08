@@ -1,10 +1,10 @@
 # Code Examples
 
-This page provides functional examples demonstrating vector search, full-text search, and Cypher query execution.
+This page provides examples demonstrating vector search, full-text search, and Cypher query execution.
 
 ## Vector Search Example
 
-You can insert vector embeddings for nodes and perform high-performance k-nearest-neighbor search:
+You can insert vector embeddings for nodes and perform k-nearest-neighbor search:
 
 ```rust
 use issundb::{Graph, VectorGraphExt};

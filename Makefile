@@ -318,7 +318,7 @@ testdata: ## Regenerate versioned LMDB snapshots
 	@VERSION=$$(cargo metadata --no-deps --format-version 1 | python3 -c "import sys,json; print(next(p['version'] for p in json.load(sys.stdin)['packages'] if p['name'] == 'issundb'))"); \
 	 SNAP_DIR="test_data/v$$VERSION/db"; \
 	 mkdir -p "$$SNAP_DIR"; \
-	 cargo run -p issundb-examples --bin gen_testdata -- "$$SNAP_DIR"
+	 cargo run -p issundb-core --bin gen_testdata -- "$$SNAP_DIR"
 	@echo "Snapshot written. Commit test_data/ to record the current storage format."
 
 .PHONY: oracle-fixtures
