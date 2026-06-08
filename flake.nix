@@ -53,7 +53,6 @@
               pkgs.python3
               pkgs.uv
               pkgs.maturin
-              pkgs.nodejs
               pkgs.openssl
               pkgs.llvmPackages.libclang
               pkgs.clang
@@ -76,7 +75,6 @@
               echo "  Welcome to the IssunDB development environment!        "
               echo "  Rust version:  $(rustc --version)                       "
               echo "  Python:        $(python3 --version 2>/dev/null || echo 'not found')"
-              echo "  Node.js:       $(node --version 2>/dev/null || echo 'not found')"
               echo "=========================================================="
             '';
           };

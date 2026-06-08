@@ -28,9 +28,8 @@ GraphRAG pipelines and querying knowledge graphs.
 * Rust graph engine built with ACID, property graph model, and Cypher query language support
 * Fast graph traversal and analytics using sparse matrix operations
 * Built-in vector, text, and hybrid search and retrieval support
-* Can be used via a wide range of APIs, including native Rust, CLI, HTTP, and MCP
+* Can be used via a wide range of APIs, including native Rust, Python bindings, CLI, HTTP, and MCP
 * Fully cross-platform; supports Linux, macOS, and Windows
-* Bindings for Python and JavaScript (other languages coming soon)
 
 See [ROADMAP.md](ROADMAP.md) for the full list of implemented and planned features.
 
@@ -97,6 +96,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 Match: "Alice" knows "Bob" since 2021
 ```
 
+> [!IMPORTANT]
+> An IssunDB database can include only a single graph.
+> But you can create multiple databases and work with them simultaneously in your application.
+
 ---
 
 ### Running IssunDB in a Container
@@ -127,6 +130,10 @@ docker run --rm -p 8000:8000 -v issundb-data:/data ghcr.io/issundb/issundb:lates
 ### Documentation
 
 The project documentation is available [here](https://IssunDB.github.io/issun-db/).
+
+#### Rust Examples
+
+Check out the [issundb-examples](crates/issundb-examples) crate for more examples using IssunDB using the Rust API.
 
 ---
 

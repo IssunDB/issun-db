@@ -547,6 +547,7 @@ impl Graph {
             let cache = Arc::clone(&self.csr_cache);
             let storage = Arc::clone(&self.storage);
             let matrices = Arc::clone(&self.matrices);
+            let thread_count = Arc::clone(&self.n_threads);
             std::thread::spawn(move || {
                 // Rebuild until the dirty count drops below the threshold: writes
                 // that commit while a rebuild runs keep the count above zero, and
@@ -562,7 +563,10 @@ impl Graph {
                     cache.clear_delta();
                     match CsrSnapshot::build(&storage) {
                         Ok(snap) => {
-                            if let Ok(m) = MatrixSet::materialize(&snap) {
+                            if let Ok(m) = MatrixSet::materialize(
+                                &snap,
+                                thread_count.load(std::sync::atomic::Ordering::Acquire),
+                            ) {
                                 *matrices.write() = Some(m);
                             }
                             if !cache.install(snap, built_gen) {
@@ -726,8 +730,7 @@ fn typed_in_sorted(snap: &CsrSnapshot, type_id: Option<TypeId>) -> TypedSortedAd
 
 #[cfg(test)]
 mod incremental_matrix_tests {
-    use graphblas_sparse_linear_algebra::collections::sparse_matrix::SparseMatrix;
-    use graphblas_sparse_linear_algebra::collections::sparse_matrix::operations::GetSparseMatrixElementList;
+    use issundb_graphblas::Matrix;
     use serde_json::json;
     use tempfile::TempDir;
 
@@ -761,14 +764,12 @@ mod incremental_matrix_tests {
 
     /// Sorted, deduplicated `(row, col)` coordinates of a boolean adjacency
     /// matrix, for set comparison independent of internal storage order.
-    fn matrix_coords(m: &SparseMatrix<i32>) -> Vec<(usize, usize)> {
-        let list = m.element_list().expect("element_list");
-        let rows = list.row_indices_ref();
-        let cols = list.column_indices_ref();
-        let mut out: Vec<(usize, usize)> = rows
-            .iter()
-            .zip(cols.iter())
-            .map(|(&r, &c)| (r, c))
+    fn matrix_coords(m: &Matrix<i32>) -> Vec<(usize, usize)> {
+        let mut out: Vec<(usize, usize)> = m
+            .triples()
+            .expect("triples")
+            .into_iter()
+            .map(|(r, c, _)| (r, c))
             .collect();
         out.sort_unstable();
         out.dedup();
@@ -1040,6 +1041,67 @@ mod incremental_matrix_tests {
             !g.all_paths(a, c).unwrap().is_empty(),
             "path a->b->c reflected without an explicit rebuild"
         );
+    }
+
+    /// After a write, `ensure_matrix_view` applies the delta with
+    /// `GrB_Matrix_setElement` (lazy in non-blocking mode), then drops the write
+    /// lock. Multiple `bfs` calls then take the shared `matrices.read()` lock and
+    /// run `mxv` concurrently. If the pending operations were not materialized
+    /// under the write lock, the first `mxv` triggers GraphBLAS lazy completion,
+    /// which mutates the shared matrix's internal representation while other
+    /// readers race on it: undefined behavior. With the fix (`apply_delta`
+    /// materializes the adjacency matrices before releasing the write lock),
+    /// every concurrent `bfs` returns the full reachable set deterministically.
+    #[test]
+    fn concurrent_bfs_after_incremental_write_is_consistent() {
+        use std::sync::Barrier;
+
+        let dir = TempDir::new().unwrap();
+        let g = Graph::open(dir.path(), 1).unwrap();
+
+        // A chain 0 -> 1 -> ... -> 29: bfs from node 0 reaches all 30 nodes.
+        const N: usize = 30;
+        let start = g.add_node("N", &json!({ "v": 0 })).unwrap();
+        let mut prev = start;
+        for i in 1..N {
+            let node = g.add_node("N", &json!({ "v": i })).unwrap();
+            g.add_edge(prev, node, "R", &json!({})).unwrap();
+            prev = node;
+        }
+        g.rebuild_csr().unwrap();
+
+        const THREADS: usize = 6;
+        const ROUNDS: usize = 200;
+        let mut expected = N;
+        for r in 0..ROUNDS {
+            // Attach a fresh node directly to `start`. The edge start -> new is a
+            // brand-new matrix coordinate, so `apply_delta` records a pending
+            // `setElement` (lazy in non-blocking mode), re-opening the
+            // lazy-completion race window. The reachable set from `start` grows by
+            // exactly one, keeping the expected count deterministic.
+            let leaf = g.add_node("N", &json!({ "leaf": r })).unwrap();
+            g.add_edge(start, leaf, "R", &json!({})).unwrap();
+            expected += 1;
+
+            let barrier = Barrier::new(THREADS);
+            std::thread::scope(|s| {
+                for _ in 0..THREADS {
+                    let g = &g;
+                    let barrier = &barrier;
+                    s.spawn(move || {
+                        // Synchronize so the threads reach the shared-read `mxv`
+                        // together, maximizing the overlap on the pending matrix.
+                        barrier.wait();
+                        let reached = g.bfs(start, u8::MAX).unwrap();
+                        assert_eq!(
+                            reached.len(),
+                            expected,
+                            "concurrent bfs saw a partially materialized matrix"
+                        );
+                    });
+                }
+            });
+        }
     }
 }
 

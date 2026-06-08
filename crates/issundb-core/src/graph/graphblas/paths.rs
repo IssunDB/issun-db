@@ -9,27 +9,7 @@ impl Graph {
         src: NodeId,
         dst: NodeId,
     ) -> Result<Option<Vec<NodeId>>, Error> {
-        use graphblas_sparse_linear_algebra::{
-            collections::{
-                Collection,
-                sparse_vector::{
-                    SparseVector,
-                    operations::{GetSparseVectorElementIndices, SetSparseVectorElement},
-                },
-            },
-            operators::{
-                binary_operator::Assignment,
-                element_wise_addition::{
-                    ApplyElementWiseVectorAdditionMonoidOperator,
-                    ElementWiseVectorAdditionMonoidOperator,
-                },
-                mask::SelectEntireVector,
-                monoid::Plus,
-                multiplication::{MatrixVectorMultiplicationOperator, MultiplyMatrixByVector},
-                options::{OperatorOptions, OptionsForOperatorWithMatrixAsFirstArgument},
-                semiring::MinPlus,
-            },
-        };
+        use issundb_graphblas::{Descriptor, Monoid, Semiring, Vector, ewise_add, mxv};
 
         if src == dst {
             return Ok(Some(vec![src]));
@@ -52,14 +32,11 @@ impl Graph {
             None => return Ok(None),
         };
 
-        let mxv = MatrixVectorMultiplicationOperator::new();
-        let ewise_add = ElementWiseVectorAdditionMonoidOperator::new();
-        let opts_next = OptionsForOperatorWithMatrixAsFirstArgument::new(false, true, true, true);
-        let opts_merge = OperatorOptions::new_default();
+        let opts_next = Descriptor::new(false, true, true, true);
 
-        let mut dist = SparseVector::<i32>::new(m.context.clone(), n)
+        let mut dist = Vector::<i32>::new(m.context.clone(), n)
             .map_err(|e| Error::GraphBLAS(e.to_string()))?;
-        dist.set_value(src_dense, 0)
+        dist.set(src_dense, 0)
             .map_err(|e| Error::GraphBLAS(e.to_string()))?;
 
         // dist_vals[d] = Some(hop) once node d is reached.
@@ -70,30 +47,25 @@ impl Graph {
         let mut reached_dst = false;
 
         for hop in 1..=(n as i32) {
-            let mut next = SparseVector::<i32>::new(m.context.clone(), n)
+            let mut next = Vector::<i32>::new(m.context.clone(), n)
                 .map_err(|e| Error::GraphBLAS(e.to_string()))?;
-            mxv.apply(
-                &m.adjacency,
-                &MinPlus::<i32>::new(),
-                &dist,
-                &Assignment::new(),
+            mxv(
                 &mut next,
+                Some(&dist),
+                Semiring::MinPlus,
+                &m.adjacency,
                 &dist,
-                &opts_next,
+                opts_next,
             )
             .map_err(|e| Error::GraphBLAS(e.to_string()))?;
 
-            if next
-                .number_of_stored_elements()
-                .map_err(|e| Error::GraphBLAS(e.to_string()))?
-                == 0
-            {
+            if next.nvals().map_err(|e| Error::GraphBLAS(e.to_string()))? == 0 {
                 break;
             }
 
             // Iteration k produces nodes at hop distance k; record before merging.
             let new_indices: Vec<usize> = next
-                .element_indices()
+                .indices()
                 .map_err(|e| Error::GraphBLAS(e.to_string()))?;
             for &idx in &new_indices {
                 dist_vals[idx] = Some(hop);
@@ -102,19 +74,17 @@ impl Graph {
                 }
             }
 
-            let mut merged = SparseVector::<i32>::new(m.context.clone(), n)
+            let mut merged = Vector::<i32>::new(m.context.clone(), n)
                 .map_err(|e| Error::GraphBLAS(e.to_string()))?;
-            ewise_add
-                .apply(
-                    &dist,
-                    &Plus::<i32>::new(),
-                    &next,
-                    &Assignment::new(),
-                    &mut merged,
-                    &SelectEntireVector::new(m.context.clone()),
-                    &opts_merge,
-                )
-                .map_err(|e| Error::GraphBLAS(e.to_string()))?;
+            ewise_add(
+                &mut merged,
+                None,
+                Monoid::Plus,
+                &dist,
+                &next,
+                Descriptor::NULL,
+            )
+            .map_err(|e| Error::GraphBLAS(e.to_string()))?;
             dist = merged;
 
             if reached_dst {
@@ -169,27 +139,7 @@ impl Graph {
         src: NodeId,
         dst: NodeId,
     ) -> Result<Option<WeightedPath>, Error> {
-        use graphblas_sparse_linear_algebra::{
-            collections::sparse_vector::{
-                SparseVector,
-                operations::{
-                    GetSparseVectorElementIndices, GetSparseVectorElementValue,
-                    SetSparseVectorElement,
-                },
-            },
-            operators::{
-                binary_operator::Assignment,
-                element_wise_addition::{
-                    ApplyElementWiseVectorAdditionMonoidOperator,
-                    ElementWiseVectorAdditionMonoidOperator,
-                },
-                mask::SelectEntireVector,
-                monoid::Min,
-                multiplication::{MatrixVectorMultiplicationOperator, MultiplyMatrixByVector},
-                options::{OperatorOptions, OptionsForOperatorWithMatrixAsFirstArgument},
-                semiring::MinPlus,
-            },
-        };
+        use issundb_graphblas::{Descriptor, Monoid, Semiring, Vector, ewise_add, mxv};
 
         if src == dst {
             return Ok(Some(WeightedPath {
@@ -208,62 +158,56 @@ impl Graph {
             None => return Ok(None),
         };
 
-        let mxv = MatrixVectorMultiplicationOperator::new();
-        let ewise_min = ElementWiseVectorAdditionMonoidOperator::new();
-        let opts_next = OptionsForOperatorWithMatrixAsFirstArgument::new(false, true, false, true);
-        let opts_merge = OperatorOptions::new_default();
+        let opts_next = Descriptor::new(false, true, false, true);
 
-        let mut dist = SparseVector::<f64>::new(m.context.clone(), n)
+        let mut dist = Vector::<f64>::new(m.context.clone(), n)
             .map_err(|e| Error::GraphBLAS(e.to_string()))?;
-        dist.set_value(src_dense, 0.0)
+        dist.set(src_dense, 0.0)
             .map_err(|e| Error::GraphBLAS(e.to_string()))?;
 
         let mut dist_vals: Vec<Option<f64>> = vec![None; n];
         dist_vals[src_dense] = Some(0.0);
 
         for _ in 1..=n {
-            let mut next = SparseVector::<f64>::new(m.context.clone(), n)
+            let mut next = Vector::<f64>::new(m.context.clone(), n)
                 .map_err(|e| Error::GraphBLAS(e.to_string()))?;
-            mxv.apply(
-                &m.weight_matrix,
-                &MinPlus::<f64>::new(),
-                &dist,
-                &Assignment::new(),
+            mxv(
                 &mut next,
-                &SelectEntireVector::new(m.context.clone()),
-                &opts_next,
+                None,
+                Semiring::MinPlus,
+                &m.weight_matrix,
+                &dist,
+                opts_next,
             )
             .map_err(|e| Error::GraphBLAS(e.to_string()))?;
 
-            let mut merged = SparseVector::<f64>::new(m.context.clone(), n)
+            let mut merged = Vector::<f64>::new(m.context.clone(), n)
                 .map_err(|e| Error::GraphBLAS(e.to_string()))?;
-            ewise_min
-                .apply(
-                    &dist,
-                    &Min::<f64>::new(),
-                    &next,
-                    &Assignment::new(),
-                    &mut merged,
-                    &SelectEntireVector::new(m.context.clone()),
-                    &opts_merge,
-                )
-                .map_err(|e| Error::GraphBLAS(e.to_string()))?;
+            ewise_add(
+                &mut merged,
+                None,
+                Monoid::Min,
+                &dist,
+                &next,
+                Descriptor::NULL,
+            )
+            .map_err(|e| Error::GraphBLAS(e.to_string()))?;
 
             let new_indices = merged
-                .element_indices()
+                .indices()
                 .map_err(|e| Error::GraphBLAS(e.to_string()))?;
             let old_indices = dist
-                .element_indices()
+                .indices()
                 .map_err(|e| Error::GraphBLAS(e.to_string()))?;
 
             let mut changed = new_indices.len() != old_indices.len();
             if !changed {
                 for &idx in &new_indices {
                     let new_v = merged
-                        .element_value_or_default(idx)
+                        .get_or_default(idx)
                         .map_err(|e| Error::GraphBLAS(e.to_string()))?;
                     let old_v = dist
-                        .element_value_or_default(idx)
+                        .get_or_default(idx)
                         .map_err(|e| Error::GraphBLAS(e.to_string()))?;
                     if (new_v - old_v).abs() > 1e-9 {
                         changed = true;
@@ -279,11 +223,11 @@ impl Graph {
         }
 
         let indices = dist
-            .element_indices()
+            .indices()
             .map_err(|e| Error::GraphBLAS(e.to_string()))?;
         for idx in indices {
             let v = dist
-                .element_value_or_default(idx)
+                .get_or_default(idx)
                 .map_err(|e| Error::GraphBLAS(e.to_string()))?;
             dist_vals[idx] = Some(v);
         }
@@ -478,27 +422,7 @@ impl Graph {
         src: NodeId,
         dst: NodeId,
     ) -> Result<Vec<Vec<NodeId>>, Error> {
-        use graphblas_sparse_linear_algebra::{
-            collections::{
-                Collection,
-                sparse_vector::{
-                    SparseVector,
-                    operations::{GetSparseVectorElementIndices, SetSparseVectorElement},
-                },
-            },
-            operators::{
-                binary_operator::Assignment,
-                element_wise_addition::{
-                    ApplyElementWiseVectorAdditionMonoidOperator,
-                    ElementWiseVectorAdditionMonoidOperator,
-                },
-                mask::SelectEntireVector,
-                monoid::Plus,
-                multiplication::{MatrixVectorMultiplicationOperator, MultiplyMatrixByVector},
-                options::{OperatorOptions, OptionsForOperatorWithMatrixAsFirstArgument},
-                semiring::MinPlus,
-            },
-        };
+        use issundb_graphblas::{Descriptor, Monoid, Semiring, Vector, ewise_add, mxv};
 
         if src == dst {
             return Ok(vec![vec![src]]);
@@ -514,14 +438,11 @@ impl Graph {
             None => return Ok(vec![]),
         };
 
-        let mxv = MatrixVectorMultiplicationOperator::new();
-        let ewise_add = ElementWiseVectorAdditionMonoidOperator::new();
-        let opts_next = OptionsForOperatorWithMatrixAsFirstArgument::new(false, true, true, true);
-        let opts_merge = OperatorOptions::new_default();
+        let opts_next = Descriptor::new(false, true, true, true);
 
-        let mut dist = SparseVector::<i32>::new(m.context.clone(), n)
+        let mut dist = Vector::<i32>::new(m.context.clone(), n)
             .map_err(|e| Error::GraphBLAS(e.to_string()))?;
-        dist.set_value(src_dense, 0)
+        dist.set(src_dense, 0)
             .map_err(|e| Error::GraphBLAS(e.to_string()))?;
 
         let mut dist_vals: Vec<Option<i32>> = vec![None; n];
@@ -530,29 +451,24 @@ impl Graph {
         let mut reached_dst = false;
 
         for hop in 1..=(n as i32) {
-            let mut next = SparseVector::<i32>::new(m.context.clone(), n)
+            let mut next = Vector::<i32>::new(m.context.clone(), n)
                 .map_err(|e| Error::GraphBLAS(e.to_string()))?;
-            mxv.apply(
-                &m.adjacency,
-                &MinPlus::<i32>::new(),
-                &dist,
-                &Assignment::new(),
+            mxv(
                 &mut next,
+                Some(&dist),
+                Semiring::MinPlus,
+                &m.adjacency,
                 &dist,
-                &opts_next,
+                opts_next,
             )
             .map_err(|e| Error::GraphBLAS(e.to_string()))?;
 
-            if next
-                .number_of_stored_elements()
-                .map_err(|e| Error::GraphBLAS(e.to_string()))?
-                == 0
-            {
+            if next.nvals().map_err(|e| Error::GraphBLAS(e.to_string()))? == 0 {
                 break;
             }
 
             let new_indices: Vec<usize> = next
-                .element_indices()
+                .indices()
                 .map_err(|e| Error::GraphBLAS(e.to_string()))?;
             for &idx in &new_indices {
                 dist_vals[idx] = Some(hop);
@@ -561,19 +477,17 @@ impl Graph {
                 }
             }
 
-            let mut merged = SparseVector::<i32>::new(m.context.clone(), n)
+            let mut merged = Vector::<i32>::new(m.context.clone(), n)
                 .map_err(|e| Error::GraphBLAS(e.to_string()))?;
-            ewise_add
-                .apply(
-                    &dist,
-                    &Plus::<i32>::new(),
-                    &next,
-                    &Assignment::new(),
-                    &mut merged,
-                    &SelectEntireVector::new(m.context.clone()),
-                    &opts_merge,
-                )
-                .map_err(|e| Error::GraphBLAS(e.to_string()))?;
+            ewise_add(
+                &mut merged,
+                None,
+                Monoid::Plus,
+                &dist,
+                &next,
+                Descriptor::NULL,
+            )
+            .map_err(|e| Error::GraphBLAS(e.to_string()))?;
             dist = merged;
 
             if reached_dst {

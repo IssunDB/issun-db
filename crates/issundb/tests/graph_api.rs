@@ -545,3 +545,17 @@ fn test_facade_property_indexes_and_constraints_integration() {
     let task_err = g.add_node("Task", &json!({ "done": false }));
     assert!(task_err.is_err());
 }
+
+#[test]
+fn test_set_thread_count() {
+    let (_dir, g) = open_tmp();
+    // Test setting to 2 threads
+    g.set_thread_count(2).unwrap();
+
+    // Add nodes and rebuild matrices to verify it runs with the thread configuration
+    let _a = g.add_node("Person", &json!({ "name": "Alice" })).unwrap();
+    g.rebuild_csr().unwrap();
+
+    // Reset to default
+    g.set_thread_count(0).unwrap();
+}

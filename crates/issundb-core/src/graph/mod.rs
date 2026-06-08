@@ -291,6 +291,7 @@ pub struct Graph {
     pub(super) csr_cache: Arc<CsrCache>,
     pub(super) matrices: Arc<parking_lot::RwLock<Option<MatrixSet>>>,
     pub(super) prop_columns: Arc<crate::columns::ColumnsCache>,
+    pub(super) n_threads: Arc<std::sync::atomic::AtomicI32>,
     /// Type-erased extension cache. Higher-level crates attach caches (e.g. the
     /// HNSW vector index) to a Graph without creating a circular dependency,
     /// through the `get_extension`, `set_extension`, and
@@ -326,7 +327,7 @@ impl Graph {
         let csr_cache = Arc::new(CsrCache::new(initial));
         let matrices = {
             let initial_snap = csr_cache.snapshot.load();
-            let m = MatrixSet::materialize(&initial_snap)?;
+            let m = MatrixSet::materialize(&initial_snap, 0)?;
             Arc::new(parking_lot::RwLock::new(Some(m)))
         };
         Ok(Self {
@@ -335,8 +336,18 @@ impl Graph {
             csr_cache,
             matrices,
             prop_columns: Arc::new(crate::columns::ColumnsCache::default()),
+            n_threads: Arc::new(std::sync::atomic::AtomicI32::new(0)),
             extensions: Arc::new(parking_lot::Mutex::new(AHashMap::new())),
         })
+    }
+
+    /// Set the thread count for GraphBLAS matrix computations, overriding the
+    /// `ISSUNDB_NUM_THREADS` environment variable. Set to 0 to restore the default behavior.
+    pub fn set_thread_count(&self, n: i32) -> Result<(), Error> {
+        self.n_threads
+            .store(n, std::sync::atomic::Ordering::Release);
+        issundb_graphblas::set_global_threads(n).map_err(|e| Error::GraphBLAS(e.to_string()))?;
+        Ok(())
     }
 
     /// Read one property of a node through the in-memory property columns,
@@ -506,7 +517,10 @@ impl Graph {
         // (idempotently) rather than lost.
         self.csr_cache.clear_delta();
         let snap = CsrSnapshot::build(&self.storage)?;
-        let m = MatrixSet::materialize(&snap)?;
+        let m = MatrixSet::materialize(
+            &snap,
+            self.n_threads.load(std::sync::atomic::Ordering::Acquire),
+        )?;
         *self.matrices.write() = Some(m);
         self.csr_cache.install_full(snap, built_gen);
         Ok(())

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use parking_lot::Mutex;
+use parking_lot::RwLock;
 use tracing::instrument;
 use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
 
@@ -73,7 +73,7 @@ enum Inner {
 /// callers use the graph-backed `VectorGraphExt` methods instead.
 pub(crate) struct VectorIndex {
     opts: VectorIndexOptions,
-    inner: Mutex<Inner>,
+    inner: RwLock<Inner>,
 }
 
 impl Default for VectorIndex {
@@ -92,7 +92,7 @@ impl VectorIndex {
     pub fn new_with_options(opts: VectorIndexOptions) -> Self {
         Self {
             opts,
-            inner: Mutex::new(Inner::Empty),
+            inner: RwLock::new(Inner::Empty),
         }
     }
 
@@ -108,7 +108,7 @@ impl VectorIndex {
                 "embedding must not be empty".into(),
             ));
         }
-        let mut guard = self.inner.lock();
+        let mut guard = self.inner.write();
         match &mut *guard {
             Inner::Empty => {
                 let opts = IndexOptions {
@@ -155,7 +155,7 @@ impl VectorIndex {
 
     /// Remove the embedding for `node` from the index.
     pub fn remove(&self, node: NodeId) -> Result<(), VectorError> {
-        let mut guard = self.inner.lock();
+        let mut guard = self.inner.write();
         if let Inner::Ready { index, .. } = &mut *guard {
             if index.contains(node) {
                 index
@@ -171,7 +171,7 @@ impl VectorIndex {
     /// Returns an empty slice when the index has no vectors or `k == 0`.
     /// `k` is silently clamped to the number of indexed vectors.
     pub fn search(&self, q: &[f32], k: usize) -> Result<Vec<Hit>, VectorError> {
-        let guard = self.inner.lock();
+        let guard = self.inner.read();
         match &*guard {
             Inner::Empty => Ok(vec![]),
             Inner::Ready { index, dims } => {
@@ -273,7 +273,7 @@ pub trait VectorGraphExt {
 }
 
 /// Key type used to store the persistent HNSW cache in `Graph::extensions`.
-struct VectorIndexCache(Mutex<VectorIndex>);
+struct VectorIndexCache(VectorIndex);
 
 impl VectorGraphExt for Graph {
     fn configure_vector_index(&self, opts: VectorIndexOptions) -> Result<(), VectorError> {
@@ -293,8 +293,8 @@ impl VectorGraphExt for Graph {
         self.put_vector_config(&encode_config(opts))?;
         // Replace any lazily built default cache so later upserts use the new
         // configuration. Safe because no vectors exist yet.
-        self.set_extension(Arc::new(VectorIndexCache(Mutex::new(
-            VectorIndex::new_with_options(opts),
+        self.set_extension(Arc::new(VectorIndexCache(VectorIndex::new_with_options(
+            opts,
         ))));
         Ok(())
     }
@@ -305,7 +305,7 @@ impl VectorGraphExt for Graph {
         // swap so a mid-rebuild failure leaves the previous cache in place.
         self.put_vector_config(&encode_config(opts))?;
         let rebuilt = build_index(self, opts)?;
-        self.set_extension(Arc::new(VectorIndexCache(Mutex::new(rebuilt))));
+        self.set_extension(Arc::new(VectorIndexCache(rebuilt)));
         Ok(())
     }
 
@@ -321,7 +321,7 @@ impl VectorGraphExt for Graph {
         // fails) only drops an in-memory entry that the next reopen rebuilds
         // consistently, so it is the safe ordering.
         let arc = get_or_init_cache(self)?;
-        arc.0.lock().upsert(n, v)?;
+        arc.0.upsert(n, v)?;
         self.put_vector_bytes(n, &bytes)?;
         Ok(())
     }
@@ -330,7 +330,7 @@ impl VectorGraphExt for Graph {
         self.delete_vector_bytes(n)?;
         // Remove from in-memory HNSW index if the cache has been built.
         if let Some(arc) = self.get_extension::<VectorIndexCache>() {
-            arc.0.lock().remove(n)?;
+            arc.0.remove(n)?;
         }
         Ok(())
     }
@@ -338,8 +338,8 @@ impl VectorGraphExt for Graph {
     #[instrument(skip(self, q), fields(k = %k, dims = q.len()))]
     fn vector_search(&self, q: &[f32], k: usize) -> Result<Vec<Hit>, VectorError> {
         let arc = get_or_init_cache(self)?;
-        let result = arc.0.lock().search(q, k);
-        result
+
+        arc.0.search(q, k)
     }
 
     #[instrument(skip(self, q), fields(k = %opts.k, label = ?opts.label, dims = q.len()))]
@@ -390,9 +390,7 @@ fn get_or_init_cache(graph: &Graph) -> Result<Arc<VectorIndexCache>, VectorError
     // held, so reading from storage here cannot deadlock against it.
     graph.get_or_init_extension_with(|| {
         let opts = load_config(graph)?.unwrap_or_default();
-        Ok(Arc::new(VectorIndexCache(Mutex::new(build_index(
-            graph, opts,
-        )?))))
+        Ok(Arc::new(VectorIndexCache(build_index(graph, opts)?)))
     })
 }
 
@@ -748,5 +746,28 @@ mod tests {
         assert_eq!(h1.len(), 1);
         assert_eq!(h2.len(), 1);
         assert_eq!(h1[0].node, h2[0].node);
+    }
+
+    #[test]
+    fn test_concurrent_vector_searches() {
+        let (_dir, graph) = open_tmp();
+        let a = graph.add_node("N", &json!({})).unwrap();
+        graph.upsert_vector(a, &[1.0f32, 0.0, 0.0]).unwrap();
+
+        let graph = Arc::new(graph);
+        let mut handles = vec![];
+        for _ in 0..10 {
+            let g = Arc::clone(&graph);
+            let target_node = a;
+            handles.push(std::thread::spawn(move || {
+                let hits = g.vector_search(&[1.0f32, 0.0, 0.0], 1).unwrap();
+                assert_eq!(hits.len(), 1);
+                assert_eq!(hits[0].node, target_node);
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
     }
 }

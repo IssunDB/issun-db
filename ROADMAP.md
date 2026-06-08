@@ -26,13 +26,17 @@ This document outlines the features implemented in IssunDB and the future goals 
 ### Unified GraphBLAS Analytics
 
 - [x] Thread-safe in-memory CSR snapshot cache
+- [x] In-house permissively-licensed GraphBLAS binding (`issundb-graphblas` safe wrapper over `issundb-graphblas-sys`), building the Apache-2.0
+  SuiteSparse:GraphBLAS C library from the `external/GraphBLAS` submodule as a position-independent static library with dynamic OpenMP. This
+  replaces the CC-BY-NC `graphblas-sparse-linear-algebra` and `suitesparse_graphblas_sys` crates (restoring the MIT/Apache license boundary) and
+  lets the Python extension `cdylib` link
 - [x] Dynamic, zero-overhead GraphBLAS matrix materialization triggered by database writes
 - [x] Incremental (delta) maintenance of the adjacency matrices: a structural delta captured on the write path is applied in place
   (resize plus per-element set and drop) in time proportional to the change rather than the full graph, so the pure-adjacency consumers
   (BFS, multi-source BFS, untyped expansion, degree centrality, and connected components) stay fresh without a full O(V+E) rebuild. Consumers
   that read the CSR snapshot arrays rebuild on demand, gated by a committed-write generation counter that also closes the prior edge-only
   staleness gap
-- [x] Threshold-gated OpenMP multi-threading (graphs with more than 100k edges use all available CPU cores)
+- [x] Configurable OpenMP multi-threading defaulting to 1 thread, respecting the `ISSUNDB_NUM_THREADS` environment variable, and exposing a programmatic thread count API
 - [x] SuiteSparse:GraphBLAS algorithm suite executing via sparse matrix-vector multiplication kernels:
     - [x] Single and multi-source BFS
     - [x] PageRank via power iterations
@@ -57,6 +61,7 @@ This document outlines the features implemented in IssunDB and the future goals 
 - [x] Property-filtered vector search constraints
 - [x] Hybrid retrieval that combines vector search, full-text search, and graph queries
 - [x] Retrieval score fusion, attribution scoring, and result limiters
+- [x] Concurrent multi-threaded vector search queries using reader-writer locking
 
 ---
 
@@ -130,7 +135,7 @@ This document outlines the features implemented in IssunDB and the future goals 
 
 ### Ecosystem and Tooling
 
-- [x] An interactive REPL
+- [x] An interactive REPL supporting dynamic thread configuration via `:threads` command
 - [x] An HTTP REST API server with node, edge, query, vector search, and full-text search routes
 - [x] An MCP server over stdio or Streamable HTTP, exposing node and edge CRUD, query, explanation, full-text search, and vector search as tools
 - [x] A container image bundling the CLI, REST, and MCP binaries, configurable through environment variables
@@ -146,7 +151,6 @@ This document outlines the features implemented in IssunDB and the future goals 
   query scope, and a per-query time budget
 - [x] Property-based and integration tests
 - [x] Language bindings for Python
-- [x] Language bindings for JavaScript (Node.js)
 - [x] Batch data import utilities for JSONL, CSV, and Parquet formats
 - [x] Comprehensive database export and import functionality (`EXPORT DATABASE` and `IMPORT DATABASE` Cypher queries) with CSV, JSONL, and Parquet formats
 - [x] Online backup, restore, and snapshot tools
