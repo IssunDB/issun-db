@@ -27,6 +27,22 @@ digraph IssunDBArchitecture {
     ]
 
     // ---------------------------------------------------------------
+ // GraphBLAS foundation: raw FFI and safe wrapper.
+ // ---------------------------------------------------------------
+    subgraph cluster_graphblas {
+    label = "GraphBLAS Foundation"
+    fontname = "Helvetica,Arial,sans-serif"
+    fontsize = 14
+    style = "rounded"
+    color = "#0891B2"
+    penwidth = 1.4
+    margin = 16
+
+    graphblas_sys [label = "issundb-graphblas-sys", fillcolor = "#CFFAFE", color = "#0891B2"]
+    graphblas [label = "issundb-graphblas", fillcolor = "#CFFAFE", color = "#0891B2"]
+    }
+
+    // ---------------------------------------------------------------
  // Storage engine: the foundation crate.
  // ---------------------------------------------------------------
     subgraph cluster_core {
@@ -91,6 +107,7 @@ digraph IssunDBArchitecture {
     mcp [label = "issundb-mcp", fillcolor = "#E9D5FF", color = "#7C3AED"]
     node_bind [label = "issundb-node", fillcolor = "#E9D5FF", color = "#7C3AED"]
     py_bind [label = "issundb-py", fillcolor = "#E9D5FF", color = "#7C3AED"]
+    examples [label = "issundb-examples", fillcolor = "#E9D5FF", color = "#7C3AED"]
     }
 
     // ---------------------------------------------------------------
@@ -98,19 +115,31 @@ digraph IssunDBArchitecture {
  // lhead/ltail clip the edge at the cluster border (compound = true)
  // so arrows attach to the enclosing cluster, not the inner box.
  // ---------------------------------------------------------------
+
+    // GraphBLAS internal edge.
+    graphblas -> graphblas_sys
+
+    // Core depends on the safe GraphBLAS wrapper.
+    core -> graphblas [lhead = cluster_graphblas]
+
+    // Extension crates depend on core.
     vector -> core [lhead = cluster_core]
     text -> core [lhead = cluster_core]
     retrieval -> core [lhead = cluster_core]
     retrieval -> vector
     retrieval -> text
     cypher -> core [lhead = cluster_core]
+    cypher -> text
 
+    // Facade composes the extensions and core.
     facade -> core [ltail = cluster_facade, lhead = cluster_core]
     facade -> vector [ltail = cluster_facade, lhead = cluster_ext]
 
+    // Consumers depend only on the facade.
     cli -> facade [ltail = cluster_consumers, lhead = cluster_facade]
     rest -> facade [ltail = cluster_consumers, lhead = cluster_facade]
     mcp -> facade [ltail = cluster_consumers, lhead = cluster_facade]
     node_bind -> facade [ltail = cluster_consumers, lhead = cluster_facade]
     py_bind -> facade [ltail = cluster_consumers, lhead = cluster_facade]
+    examples -> facade [ltail = cluster_consumers, lhead = cluster_facade]
 }
