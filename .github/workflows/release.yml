@@ -95,12 +95,12 @@ jobs:
             runner: macos-14
             archive_ext: tar.gz
             content_type: application/gzip
-          - name: macos-amd64
-            runner: macos-13
-            archive_ext: tar.gz
-            content_type: application/gzip
           - name: windows-amd64
             runner: windows-latest
+            archive_ext: zip
+            content_type: application/zip
+          - name: windows-arm64
+            runner: windows-11-arm
             archive_ext: zip
             content_type: application/zip
     steps:
@@ -134,6 +134,10 @@ jobs:
         # comes with the Visual Studio build tools. bindgen needs libclang from
         # the preinstalled LLVM.
         run: echo "LIBCLANG_PATH=$env:ProgramFiles\LLVM\bin" >> $env:GITHUB_ENV
+
+      - name: Configure macOS linker workaround
+        if: matrix.runner == 'macos-14'
+        run: echo "RUSTFLAGS=-C link-arg=-Wl,-ld_classic" >> $GITHUB_ENV
 
       - name: Build release binaries
         run: cargo build --release -p issundb-cli -p issundb-rest -p issundb-mcp

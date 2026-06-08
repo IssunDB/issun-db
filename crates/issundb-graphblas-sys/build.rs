@@ -31,6 +31,7 @@ fn main() {
         .expect(
             "external/GraphBLAS submodule not found; run `git submodule update --init external/GraphBLAS`",
         );
+    let graphblas_src = clean_canonicalized_path(graphblas_src);
     let header = graphblas_src.join("Include/GraphBLAS.h");
     assert!(
         header.exists(),
@@ -165,4 +166,22 @@ fn find_libomp_prefix() -> Option<String> {
     .into_iter()
     .find(|prefix| has_libomp(prefix))
     .map(str::to_string)
+}
+
+/// Helper function to clean UNC prefixes from canonicalized paths on Windows.
+/// This prevents CMake and MSBuild build failures due to long-path syntax (`\\?\`).
+fn clean_canonicalized_path<P: AsRef<Path>>(path: P) -> PathBuf {
+    let path = path.as_ref();
+    #[cfg(windows)]
+    {
+        if let Some(path_str) = path.to_str() {
+            if let Some(stripped) = path_str.strip_prefix("\\\\?\\") {
+                if let Some(unc_stripped) = stripped.strip_prefix("UNC\\") {
+                    return PathBuf::from(format!("\\\\{}", unc_stripped));
+                }
+                return PathBuf::from(stripped);
+            }
+        }
+    }
+    path.to_path_buf()
 }
