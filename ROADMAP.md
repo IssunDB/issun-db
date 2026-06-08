@@ -133,6 +133,7 @@ This document outlines the features implemented in IssunDB and the future goals 
 - [x] An interactive REPL
 - [x] An HTTP REST API server with node, edge, query, vector search, and full-text search routes
 - [x] An MCP server over stdio or Streamable HTTP, exposing node and edge CRUD, query, explanation, full-text search, and vector search as tools
+- [x] A container image bundling the CLI, REST, and MCP binaries, configurable through environment variables
 - [x] A benchmarking suite that measures throughput and load scaling:
     - [x] LSQB (Labelled Subgraph Query Benchmark) query patterns Q1–Q9 modeled via Cypher and pattern comprehension negation
     - [x] OLTP transactional read query benchmark modeled after the LDBC Interactive Short query patterns
