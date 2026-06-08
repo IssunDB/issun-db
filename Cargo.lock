@@ -1617,7 +1617,6 @@ dependencies = [
  "issundb",
  "rmp-serde",
  "rustyline",
- "serde",
  "serde_json",
  "tempfile",
 ]

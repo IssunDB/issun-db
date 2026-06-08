@@ -37,20 +37,26 @@ enum Transport {
     about = "Model Context Protocol server for IssunDB"
 )]
 struct Args {
-    /// Path to the LMDB database directory.
-    #[arg(long)]
+    /// Path to the LMDB database directory. Falls back to the ISSUNDB_DB_PATH
+    /// environment variable when the flag is omitted (the container image sets
+    /// it to /data).
+    #[arg(long, env = "ISSUNDB_DB_PATH")]
     db_path: PathBuf,
 
     /// LMDB map size in gibibytes.
     #[arg(long, default_value_t = 4)]
     map_size_gb: usize,
 
-    /// Transport to serve MCP over.
-    #[arg(long, value_enum, default_value_t = Transport::Stdio)]
+    /// Transport to serve MCP over. Falls back to the ISSUNDB_MCP_TRANSPORT
+    /// environment variable when the flag is omitted (the container image sets
+    /// it to http).
+    #[arg(long, value_enum, env = "ISSUNDB_MCP_TRANSPORT", default_value_t = Transport::Stdio)]
     transport: Transport,
 
-    /// Address to bind when `--transport http` is used.
-    #[arg(long, default_value = "127.0.0.1:8000")]
+    /// Address to bind when `--transport http` is used. Falls back to the
+    /// ISSUNDB_MCP_BIND environment variable when the flag is omitted (the
+    /// container image sets it to 0.0.0.0:8000).
+    #[arg(long, env = "ISSUNDB_MCP_BIND", default_value = "127.0.0.1:8000")]
     bind: String,
 
     /// Path the Streamable HTTP endpoint is mounted at when `--transport http` is used.

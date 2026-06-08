@@ -39,7 +39,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
         -p issundb-rest \
         -p issundb-mcp \
     && mkdir -p /out \
-    && cp target/release/issundb target/release/issundb-rest target/release/issundb-mcp /out/
+    && cp target/release/issundb-cli target/release/issundb-rest target/release/issundb-mcp /out/
 
 # ---------------------------------------------------------------------------
 # Runtime stage
@@ -56,19 +56,29 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     nano htop duff \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=build /out/issundb /out/issundb-rest /out/issundb-mcp /usr/local/bin/
+COPY --from=build /out/issundb-cli /out/issundb-rest /out/issundb-mcp /usr/local/bin/
 
 # Default location for the LMDB database directory; mount a volume here to
-# persist data across container restarts.
+# persist data across container restarts. ISSUNDB_DB_PATH makes every binary
+# default to this directory, so no --db-path argument is needed. The REST and
+# MCP defaults are set for container use (bound to all interfaces, MCP over
+# Streamable HTTP) so each server with no flags listens on its published port;
+# the binaries themselves default to loopback and MCP stdio when run outside
+# the image.
+ENV ISSUNDB_DB_PATH=/data
+ENV ISSUNDB_REST_HOST=0.0.0.0
+ENV ISSUNDB_REST_PORT=7474
+ENV ISSUNDB_MCP_TRANSPORT=http
+ENV ISSUNDB_MCP_BIND=0.0.0.0:8000
 VOLUME ["/data"]
 
 # The REST API listens here by default; the MCP HTTP transport uses 8000.
 EXPOSE 7474
 
-# Default to the REST server bound to all interfaces (the container network is
-# the isolation boundary; TLS and auth are the reverse proxy's job). Override
-# the command to run `issundb` (CLI) or `issundb-mcp` instead, for example:
-#   docker run --rm -it -v db:/data IMAGE issundb /data
-#   docker run --rm -p 8000:8000 -v db:/data IMAGE \
-#     issundb-mcp --db-path /data --transport http --bind 0.0.0.0:8000
-CMD ["issundb-rest", "--db-path", "/data", "--host", "0.0.0.0", "--port", "7474"]
+# Default to the interactive CLI against the mounted database (run with -it).
+# The container network is the isolation boundary for the servers; TLS and auth
+# are the reverse proxy's job. Override the command to run a server instead, for
+# example:
+#   docker run --rm -p 7474:7474 -v db:/data IMAGE issundb-rest
+#   docker run --rm -p 8000:8000 -v db:/data IMAGE issundb-mcp
+CMD ["issundb-cli"]
