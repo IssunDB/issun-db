@@ -29,7 +29,7 @@ GraphRAG pipelines and querying knowledge graphs.
 * Fast graph traversal and analytics using sparse matrix operations
 * Fast vectorized query execution with multi-core query parallelism and serializable transactions
 * Built-in vector, text, and hybrid search and retrieval
-* Can be used via a wide range of APIs, including native Rust, Python bindings, CLI, HTTP, and MCP
+* Provides a wide range of APIs, including native Rust, Python bindings, CLI, HTTP (REST), and MCP
 * Fully cross-platform; supports Linux, macOS, and Windows
 
 See [ROADMAP.md](ROADMAP.md) for the full list of implemented and planned features.
