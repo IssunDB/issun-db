@@ -74,6 +74,10 @@ jobs:
           brew install fontconfig
         if: startsWith(matrix.os, 'macos-')
 
+      - name: Configure macOS linker workaround
+        if: matrix.os == 'macos-14'
+        run: echo "RUSTFLAGS=-C link-arg=-Wl,-ld_classic" >> $GITHUB_ENV
+
       - name: Build wheel (Linux with Zig)
         run: |
           cd crates/issundb-py
