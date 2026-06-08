@@ -1042,6 +1042,67 @@ mod incremental_matrix_tests {
             "path a->b->c reflected without an explicit rebuild"
         );
     }
+
+    /// After a write, `ensure_matrix_view` applies the delta with
+    /// `GrB_Matrix_setElement` (lazy in non-blocking mode), then drops the write
+    /// lock. Multiple `bfs` calls then take the shared `matrices.read()` lock and
+    /// run `mxv` concurrently. If the pending operations were not materialized
+    /// under the write lock, the first `mxv` triggers GraphBLAS lazy completion,
+    /// which mutates the shared matrix's internal representation while other
+    /// readers race on it: undefined behavior. With the fix (`apply_delta`
+    /// materializes the adjacency matrices before releasing the write lock),
+    /// every concurrent `bfs` returns the full reachable set deterministically.
+    #[test]
+    fn concurrent_bfs_after_incremental_write_is_consistent() {
+        use std::sync::Barrier;
+
+        let dir = TempDir::new().unwrap();
+        let g = Graph::open(dir.path(), 1).unwrap();
+
+        // A chain 0 -> 1 -> ... -> 29: bfs from node 0 reaches all 30 nodes.
+        const N: usize = 30;
+        let start = g.add_node("N", &json!({ "v": 0 })).unwrap();
+        let mut prev = start;
+        for i in 1..N {
+            let node = g.add_node("N", &json!({ "v": i })).unwrap();
+            g.add_edge(prev, node, "R", &json!({})).unwrap();
+            prev = node;
+        }
+        g.rebuild_csr().unwrap();
+
+        const THREADS: usize = 6;
+        const ROUNDS: usize = 200;
+        let mut expected = N;
+        for r in 0..ROUNDS {
+            // Attach a fresh node directly to `start`. The edge start -> new is a
+            // brand-new matrix coordinate, so `apply_delta` records a pending
+            // `setElement` (lazy in non-blocking mode), re-opening the
+            // lazy-completion race window. The reachable set from `start` grows by
+            // exactly one, keeping the expected count deterministic.
+            let leaf = g.add_node("N", &json!({ "leaf": r })).unwrap();
+            g.add_edge(start, leaf, "R", &json!({})).unwrap();
+            expected += 1;
+
+            let barrier = Barrier::new(THREADS);
+            std::thread::scope(|s| {
+                for _ in 0..THREADS {
+                    let g = &g;
+                    let barrier = &barrier;
+                    s.spawn(move || {
+                        // Synchronize so the threads reach the shared-read `mxv`
+                        // together, maximizing the overlap on the pending matrix.
+                        barrier.wait();
+                        let reached = g.bfs(start, u8::MAX).unwrap();
+                        assert_eq!(
+                            reached.len(),
+                            expected,
+                            "concurrent bfs saw a partially materialized matrix"
+                        );
+                    });
+                }
+            });
+        }
+    }
 }
 
 #[cfg(test)]

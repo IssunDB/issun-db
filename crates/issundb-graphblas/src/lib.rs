@@ -580,6 +580,21 @@ impl<T: GbType> Matrix<T> {
         )
     }
 
+    /// Materialize all pending operations (`GrB_Matrix_wait(GrB_MATERIALIZE)`).
+    ///
+    /// In non-blocking mode `set` and `drop_element` only enqueue pending tuples
+    /// and zombies; the next read (e.g. `mxv`) would otherwise flush them lazily,
+    /// which mutates the matrix's internal representation. Calling this after a
+    /// batch of mutations, while the writer still holds exclusive access, leaves
+    /// the matrix fully materialized so concurrent readers can share it (`&Matrix`
+    /// across threads) without racing on lazy completion.
+    pub fn wait(&mut self) -> Result<()> {
+        check(
+            unsafe { gb::GrB_Matrix_wait(self.ptr, gb::GrB_WaitMode_GrB_MATERIALIZE as c_int) },
+            "GrB_Matrix_wait",
+        )
+    }
+
     /// Drop a single element if present.
     pub fn drop_element(&mut self, row: usize, col: usize) -> Result<()> {
         check(

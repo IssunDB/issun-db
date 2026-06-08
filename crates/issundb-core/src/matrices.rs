@@ -192,6 +192,19 @@ impl MatrixSet {
                 .drop_element(d as usize, s as usize)
                 .map_err(gb)?;
         }
+
+        // `set` and `drop_element` are lazy in non-blocking mode: they leave
+        // pending tuples and zombies that the first read would otherwise flush,
+        // mutating the matrix's internal representation. `apply_delta` runs under
+        // the matrices write lock, but the read-path consumers (`bfs`, untyped
+        // expansion, `connected_components`, ...) only take the shared read lock
+        // and then run `mxv` concurrently. Materialize now, while exclusive, so no
+        // concurrent reader triggers lazy completion on a shared `&Matrix`.
+        // `page_rank_matrix` and `weight_matrix` receive only a resize here (no
+        // pending element ops), and their incremental edge maintenance is
+        // deferred, so they are not read in this state.
+        self.adjacency.wait().map_err(gb)?;
+        self.adjacency_t.wait().map_err(gb)?;
         Ok(())
     }
 }
