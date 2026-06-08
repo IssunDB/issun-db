@@ -50,9 +50,15 @@ impl State {
 // ---------------------------------------------------------------------------
 
 #[derive(Parser, Debug)]
-#[command(name = "issundb", version, about = "IssunDB command-line interface")]
+#[command(
+    name = "issundb-cli",
+    version,
+    about = "IssunDB command-line interface"
+)]
 struct Cli {
-    /// Path to the database directory
+    /// Path to the database directory. Defaults to the ISSUNDB_DB_PATH
+    /// environment variable when set (the container image sets it to /data).
+    #[arg(env = "ISSUNDB_DB_PATH")]
     db_path: Option<PathBuf>,
 }
 

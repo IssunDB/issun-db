@@ -10,16 +10,21 @@ use tracing_subscriber::{EnvFilter, fmt};
 #[derive(Parser, Debug)]
 #[command(name = "issundb-rest", about = "HTTP REST API server for IssunDB")]
 struct Args {
-    /// Path to the LMDB database directory.
-    #[arg(long)]
+    /// Path to the LMDB database directory. Falls back to the ISSUNDB_DB_PATH
+    /// environment variable when the flag is omitted (the container image sets
+    /// it to /data).
+    #[arg(long, env = "ISSUNDB_DB_PATH")]
     db_path: PathBuf,
 
-    /// Host address to listen on.
-    #[arg(long, default_value = "127.0.0.1")]
+    /// Host address to listen on. Falls back to the ISSUNDB_REST_HOST
+    /// environment variable when the flag is omitted (the container image sets
+    /// it to 0.0.0.0).
+    #[arg(long, env = "ISSUNDB_REST_HOST", default_value = "127.0.0.1")]
     host: String,
 
-    /// TCP port to listen on.
-    #[arg(long, default_value_t = 7474)]
+    /// TCP port to listen on. Falls back to the ISSUNDB_REST_PORT environment
+    /// variable when the flag is omitted.
+    #[arg(long, env = "ISSUNDB_REST_PORT", default_value_t = 7474)]
     port: u16,
 }
 
