@@ -37,7 +37,7 @@ repository = "https://github.com/IssunDB/issun-db"
 [tool.maturin]
 module-name = "issundb"
 bindings = "pyo3"
-features = ["pyo3/extension-module"]
+features = ["extension-module"]
 include = [
     { path = ".", format = "sdist" },
     { path = "issundb.pyi", format = ["sdist", "wheel"] },
