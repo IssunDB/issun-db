@@ -99,6 +99,26 @@ Match: "Alice" knows "Bob" since 2021
 
 ---
 
+### Docker
+
+```bash
+# Run IssunDB with the default HTTP API on port 7474
+docker run --rm -p 7474:7474 -v issundb-data:/data ghcr.io/issundb/issundb:latest
+```
+
+```bash
+# Run IssunDB with the MCP API on port 8000
+docker run --rm -p 8000:8000 -v issundb-data:/data ghcr.io/issundb/issundb:latest \
+  issundb-mcp --db-path /data --transport http --bind 0.0.0.0:8000
+```
+
+```bash
+# Run IssunDB with the CLI
+docker run --rm -v issundb-data:/data ghcr.io/issundb/issundb:latest issundb-cli
+```
+
+---
+
 ### Documentation
 
 The project documentation is available [here](https://IssunDB.github.io/issun-db/).

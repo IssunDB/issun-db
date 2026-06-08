@@ -46,13 +46,14 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 # ---------------------------------------------------------------------------
 FROM debian:trixie-slim
 
-# Shared libraries the binaries link at runtime: libgomp for the GraphBLAS
-# OpenMP pool and libstdc++ for the C++ engine libraries. ca-certificates is
-# included for completeness.
+# The only non-base shared library the binaries link is libstdc++ for the C++
+# engine libraries (usearch and GraphBLAS); GraphBLAS vendors its OpenMP runtime
+# statically, so libgomp is not a runtime dependency, and libgcc_s ships in the
+# slim base. ca-certificates is included for completeness.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libgomp1 \
     libstdc++6 \
     ca-certificates \
+    nano htop duff \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /out/issundb /out/issundb-rest /out/issundb-mcp /usr/local/bin/
