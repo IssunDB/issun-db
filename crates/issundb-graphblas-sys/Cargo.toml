@@ -1,0 +1,18 @@
+[package]
+name = "issundb-graphblas-sys"
+description = "Raw FFI bindings to the SuiteSparse:GraphBLAS C library (built PIC with dynamic OpenMP)."
+links = "graphblas"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "issundb_graphblas_sys"
+
+[build-dependencies]
+bindgen = "0.72"
+cmake = "0.1"

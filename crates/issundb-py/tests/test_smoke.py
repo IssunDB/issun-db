@@ -30,4 +30,4 @@ def test_cypher_query():
         db.add_node("Person", json.dumps({"name": "Grace"}))
         result = json.loads(db.query("MATCH (n:Person) RETURN n.name AS name"))
         assert result["columns"] == ["name"]
-        assert ["Grace"] in result["records"]
+        assert ["Grace"] in [record["values"] for record in result["records"]]

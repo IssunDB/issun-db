@@ -26,6 +26,10 @@ This document outlines the features implemented in IssunDB and the future goals 
 ### Unified GraphBLAS Analytics
 
 - [x] Thread-safe in-memory CSR snapshot cache
+- [x] In-house permissively-licensed GraphBLAS binding (`issundb-graphblas` safe wrapper over `issundb-graphblas-sys`), building the Apache-2.0
+  SuiteSparse:GraphBLAS C library from the `external/GraphBLAS` submodule as a position-independent static library with dynamic OpenMP. This
+  replaces the CC-BY-NC `graphblas-sparse-linear-algebra` and `suitesparse_graphblas_sys` crates (restoring the MIT/Apache license boundary) and
+  lets the Python and Node.js extension `cdylib`s link
 - [x] Dynamic, zero-overhead GraphBLAS matrix materialization triggered by database writes
 - [x] Incremental (delta) maintenance of the adjacency matrices: a structural delta captured on the write path is applied in place
   (resize plus per-element set and drop) in time proportional to the change rather than the full graph, so the pure-adjacency consumers

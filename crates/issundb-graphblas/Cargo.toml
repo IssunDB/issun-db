@@ -1,0 +1,21 @@
+[package]
+name = "issundb-graphblas"
+description = "Minimal safe Rust wrapper over the SuiteSparse:GraphBLAS operations that IssunDB uses."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "issundb_graphblas"
+
+[dependencies]
+# Raw FFI to the Apache-2.0 SuiteSparse:GraphBLAS C library, built PIC with
+# dynamic OpenMP so this wrapper links into shared objects.
+issundb-graphblas-sys = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]

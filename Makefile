@@ -114,7 +114,9 @@ clean: ## Remove generated and temporary files
 install-snap: ## Install a few dependencies using Snapcraft
 	@echo "Installing the snap package..."
 	@sudo apt-get update
-	@sudo apt-get install -y snapd graphviz wget
+	@# cmake, clang, and libclang build the GraphBLAS submodule (issundb-graphblas-sys);
+	@# patchelf lets maturin set the libgomp rpath when packaging the Python wheel.
+	@sudo apt-get install -y snapd graphviz wget cmake clang libclang-dev patchelf
 	@sudo snap refresh
 	@sudo snap install rustup --classic
 

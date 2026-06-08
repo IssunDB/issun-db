@@ -1,16 +1,9 @@
 #![allow(clippy::duplicated_attributes)]
 
 use std::collections::HashMap;
-use std::os::raw::c_int;
 use std::sync::Arc;
 
-use graphblas_sparse_linear_algebra::collections::sparse_matrix::operations::FromMatrixElementList;
-use graphblas_sparse_linear_algebra::collections::sparse_matrix::{
-    MatrixElementList, Size, SparseMatrix,
-};
-use graphblas_sparse_linear_algebra::context::Context;
-use graphblas_sparse_linear_algebra::operators::binary_operator::{First, Plus};
-use suitesparse_graphblas_sys::{GxB_Global_Option_set, GxB_NTHREADS};
+use issundb_graphblas::{Context, Matrix, Reducer};
 
 use ahash::AHashMap;
 
@@ -25,13 +18,13 @@ use crate::{csr::CsrSnapshot, error::Error, schema::NodeId};
 pub struct MatrixSet {
     pub context: Arc<Context>,
     /// Combined outgoing adjacency: `A[i][j] = 1` for any edge i→j.
-    pub adjacency: SparseMatrix<i32>,
+    pub adjacency: Matrix<i32>,
     /// Combined transpose adjacency: `A^T[i][j] = 1` if edge j→i exists.
-    pub adjacency_t: SparseMatrix<i32>,
+    pub adjacency_t: Matrix<i32>,
     /// Column-stochastic matrix: `M[j][i] = 1 / out_degree(i)` for each edge i→j.
-    pub page_rank_matrix: SparseMatrix<f32>,
+    pub page_rank_matrix: Matrix<f32>,
     /// Weighted adjacency: `W[i][j] = weight` for each edge i→j.
-    pub weight_matrix: SparseMatrix<f64>,
+    pub weight_matrix: Matrix<f64>,
     pub n_nodes: usize,
     /// Dense-index → node id, mirroring the CSR snapshot the matrices were built
     /// from. Owned here so the matrix view is self-contained and can be extended
@@ -50,21 +43,17 @@ impl MatrixSet {
         // graph is large enough that the per-thread overhead is amortized. Below
         // 100 000 edges the single-threaded path avoids context-switching noise.
         let n_edges = csr.col_idx.len();
-        let n_threads: c_int = if n_edges > 100_000 {
+        let n_threads: i32 = if n_edges > 100_000 {
             std::thread::available_parallelism()
-                .map(|n| n.get() as c_int)
+                .map(|n| n.get() as i32)
                 .unwrap_or(1)
         } else {
             1
         };
-        context
-            .call_without_detailed_error_information(|| unsafe {
-                GxB_Global_Option_set(GxB_NTHREADS as c_int, n_threads)
-            })
+        issundb_graphblas::set_global_threads(n_threads)
             .map_err(|e| Error::GraphBLAS(e.to_string()))?;
 
         let n_nodes = csr.dense_to_id.len();
-        let matrix_size = Size::from((n_nodes, n_nodes));
 
         let mut adj_elements: Vec<(usize, usize, i32)> = Vec::new();
         let mut adj_t_elements: Vec<(usize, usize, i32)> = Vec::new();
@@ -92,69 +81,42 @@ impl MatrixSet {
         let pr_elements: Vec<(usize, usize, f32)> =
             pr_map.into_iter().map(|((r, c), v)| (r, c, v)).collect();
 
-        let adjacency = if adj_elements.is_empty() {
-            SparseMatrix::<i32>::new(context.clone(), matrix_size)
-                .map_err(|e| Error::GraphBLAS(e.to_string()))?
-        } else {
-            let element_list = MatrixElementList::<i32>::from_element_vector(
-                adj_elements.into_iter().map(|c| c.into()).collect(),
-            );
-            SparseMatrix::<i32>::from_element_list(
-                context.clone(),
-                matrix_size,
-                element_list,
-                &First::<i32>::new(),
-            )
-            .map_err(|e| Error::GraphBLAS(e.to_string()))?
-        };
+        let gb = |e: issundb_graphblas::GraphblasError| Error::GraphBLAS(e.to_string());
 
-        let adjacency_t = if adj_t_elements.is_empty() {
-            SparseMatrix::<i32>::new(context.clone(), matrix_size)
-                .map_err(|e| Error::GraphBLAS(e.to_string()))?
-        } else {
-            let element_list = MatrixElementList::<i32>::from_element_vector(
-                adj_t_elements.into_iter().map(|c| c.into()).collect(),
-            );
-            SparseMatrix::<i32>::from_element_list(
-                context.clone(),
-                matrix_size,
-                element_list,
-                &First::<i32>::new(),
-            )
-            .map_err(|e| Error::GraphBLAS(e.to_string()))?
-        };
-
-        let page_rank_matrix = if pr_elements.is_empty() {
-            SparseMatrix::<f32>::new(context.clone(), matrix_size)
-                .map_err(|e| Error::GraphBLAS(e.to_string()))?
-        } else {
-            let element_list = MatrixElementList::<f32>::from_element_vector(
-                pr_elements.into_iter().map(|c| c.into()).collect(),
-            );
-            SparseMatrix::<f32>::from_element_list(
-                context.clone(),
-                matrix_size,
-                element_list,
-                &Plus::<f32>::new(),
-            )
-            .map_err(|e| Error::GraphBLAS(e.to_string()))?
-        };
-
-        let weight_matrix = if weight_elements.is_empty() {
-            SparseMatrix::<f64>::new(context.clone(), matrix_size)
-                .map_err(|e| Error::GraphBLAS(e.to_string()))?
-        } else {
-            let element_list = MatrixElementList::<f64>::from_element_vector(
-                weight_elements.into_iter().map(|c| c.into()).collect(),
-            );
-            SparseMatrix::<f64>::from_element_list(
-                context.clone(),
-                matrix_size,
-                element_list,
-                &Plus::<f64>::new(),
-            )
-            .map_err(|e| Error::GraphBLAS(e.to_string()))?
-        };
+        // First-wins union for the boolean adjacency matrices; Plus to sum the
+        // contributions of parallel edges in the PageRank and weight matrices.
+        let adjacency = Matrix::<i32>::from_triples(
+            context.clone(),
+            n_nodes,
+            n_nodes,
+            &adj_elements,
+            Reducer::First,
+        )
+        .map_err(gb)?;
+        let adjacency_t = Matrix::<i32>::from_triples(
+            context.clone(),
+            n_nodes,
+            n_nodes,
+            &adj_t_elements,
+            Reducer::First,
+        )
+        .map_err(gb)?;
+        let page_rank_matrix = Matrix::<f32>::from_triples(
+            context.clone(),
+            n_nodes,
+            n_nodes,
+            &pr_elements,
+            Reducer::Plus,
+        )
+        .map_err(gb)?;
+        let weight_matrix = Matrix::<f64>::from_triples(
+            context.clone(),
+            n_nodes,
+            n_nodes,
+            &weight_elements,
+            Reducer::Plus,
+        )
+        .map_err(gb)?;
 
         Ok(Self {
             context,
@@ -188,14 +150,7 @@ impl MatrixSet {
         set_edges: &[(NodeId, NodeId)],
         clear_edges: &[(NodeId, NodeId)],
     ) -> Result<(), Error> {
-        use graphblas_sparse_linear_algebra::collections::sparse_matrix::{
-            Size,
-            operations::{DropSparseMatrixElement, ResizeSparseMatrix, SetSparseMatrixElement},
-        };
-
-        let gb = |e: graphblas_sparse_linear_algebra::error::SparseLinearAlgebraError| {
-            Error::GraphBLAS(e.to_string())
-        };
+        let gb = |e: issundb_graphblas::GraphblasError| Error::GraphBLAS(e.to_string());
 
         // Extend the dense-index mapping with the new nodes. Monotonic ids append
         // in sorted order, so existing dense indices stay valid.
@@ -209,11 +164,10 @@ impl MatrixSet {
         }
         let new_n = self.dense_to_id.len();
         if new_n > self.n_nodes {
-            let size = Size::from((new_n, new_n));
-            self.adjacency.resize(size).map_err(gb)?;
-            self.adjacency_t.resize(size).map_err(gb)?;
-            self.page_rank_matrix.resize(size).map_err(gb)?;
-            self.weight_matrix.resize(size).map_err(gb)?;
+            self.adjacency.resize(new_n, new_n).map_err(gb)?;
+            self.adjacency_t.resize(new_n, new_n).map_err(gb)?;
+            self.page_rank_matrix.resize(new_n, new_n).map_err(gb)?;
+            self.weight_matrix.resize(new_n, new_n).map_err(gb)?;
             self.n_nodes = new_n;
         }
 
@@ -222,11 +176,9 @@ impl MatrixSet {
             else {
                 continue;
             };
-            self.adjacency
-                .set_value(s as usize, d as usize, 1)
-                .map_err(gb)?;
+            self.adjacency.set(s as usize, d as usize, 1).map_err(gb)?;
             self.adjacency_t
-                .set_value(d as usize, s as usize, 1)
+                .set(d as usize, s as usize, 1)
                 .map_err(gb)?;
         }
         for &(src, dst) in clear_edges {

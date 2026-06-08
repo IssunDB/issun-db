@@ -14,10 +14,13 @@ FROM rust:1.85-bookworm AS build
 WORKDIR /src
 
 # Native build dependencies for the engine's C/C++ libraries:
-#   - Cmake builds the vendored SuiteSparse:GraphBLAS (suitesparse_graphblas_sys).
+#   - Cmake builds SuiteSparse:GraphBLAS from the external/GraphBLAS submodule
+#     (issundb-graphblas-sys), position-independent with a dynamic libgomp.
 #   - Clang plus libclang-dev back the bindgen invocations.
-#   - G++/gcc/make (build-essential) compile usearch and the LMDB sources.
+#   - G++/gcc/make (build-essential) compile GraphBLAS, usearch, and the LMDB sources.
 #   - Pkg-config plus libssl-dev resolve the remaining system libraries.
+# The build context must include the checked-out external/GraphBLAS submodule
+# (run `git submodule update --init external/GraphBLAS` before building).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     clang \
@@ -46,12 +49,13 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 # ---------------------------------------------------------------------------
 FROM debian:trixie-slim
 
-# The only non-base shared library the binaries link is libstdc++ for the C++
-# engine libraries (usearch and GraphBLAS); GraphBLAS vendors its OpenMP runtime
-# statically, so libgomp is not a runtime dependency, and libgcc_s ships in the
-# slim base. ca-certificates is included for completeness.
+# Shared libraries the binaries link: libstdc++ for the C++ engine libraries
+# (usearch), and libgomp (the GNU OpenMP runtime) which GraphBLAS now links
+# dynamically rather than bundling statically. libgcc_s ships in the slim base.
+# ca-certificates is included for completeness.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libstdc++6 \
+    libgomp1 \
     ca-certificates \
     nano htop duff \
     && rm -rf /var/lib/apt/lists/*

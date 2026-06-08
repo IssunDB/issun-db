@@ -2,6 +2,8 @@
 
 import json
 
+from conftest import rows
+
 
 def test_add_edge_returns_id(db):
     alice = db.add_node("Person", json.dumps({"name": "Alice"}))
@@ -21,7 +23,7 @@ def test_edge_is_traversable_with_cypher(db):
         )
     )
     assert result["columns"] == ["src", "dst", "since"]
-    assert ["Alice", "Bob", 2021] in result["records"]
+    assert ["Alice", "Bob", 2021] in rows(result)
 
 
 def test_delete_node_detaches_edges(db):
@@ -32,4 +34,4 @@ def test_delete_node_detaches_edges(db):
     result = json.loads(
         db.query("MATCH (:Person)-[r:KNOWS]->(:Person) RETURN count(r) AS c")
     )
-    assert result["records"] == [[0]]
+    assert rows(result) == [[0]]

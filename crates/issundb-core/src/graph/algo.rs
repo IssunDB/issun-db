@@ -726,8 +726,7 @@ fn typed_in_sorted(snap: &CsrSnapshot, type_id: Option<TypeId>) -> TypedSortedAd
 
 #[cfg(test)]
 mod incremental_matrix_tests {
-    use graphblas_sparse_linear_algebra::collections::sparse_matrix::SparseMatrix;
-    use graphblas_sparse_linear_algebra::collections::sparse_matrix::operations::GetSparseMatrixElementList;
+    use issundb_graphblas::Matrix;
     use serde_json::json;
     use tempfile::TempDir;
 
@@ -761,14 +760,12 @@ mod incremental_matrix_tests {
 
     /// Sorted, deduplicated `(row, col)` coordinates of a boolean adjacency
     /// matrix, for set comparison independent of internal storage order.
-    fn matrix_coords(m: &SparseMatrix<i32>) -> Vec<(usize, usize)> {
-        let list = m.element_list().expect("element_list");
-        let rows = list.row_indices_ref();
-        let cols = list.column_indices_ref();
-        let mut out: Vec<(usize, usize)> = rows
-            .iter()
-            .zip(cols.iter())
-            .map(|(&r, &c)| (r, c))
+    fn matrix_coords(m: &Matrix<i32>) -> Vec<(usize, usize)> {
+        let mut out: Vec<(usize, usize)> = m
+            .triples()
+            .expect("triples")
+            .into_iter()
+            .map(|(r, c, _)| (r, c))
             .collect();
         out.sort_unstable();
         out.dedup();

@@ -37,7 +37,7 @@ result = json.loads(
 
 print(result["columns"])
 for record in result["records"]:
-    print(record)
+    print(record["values"])
 ```
 
 ```

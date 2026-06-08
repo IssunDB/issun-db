@@ -4,26 +4,28 @@ import json
 
 import pytest
 
+from conftest import rows
+
 
 def test_query_result_shape(db):
     db.add_node("Person", json.dumps({"name": "Grace"}))
     result = json.loads(db.query("MATCH (n:Person) RETURN n.name AS name"))
     assert set(result.keys()) == {"columns", "records"}
     assert result["columns"] == ["name"]
-    assert result["records"] == [["Grace"]]
+    assert rows(result) == [["Grace"]]
 
 
 def test_query_create_then_match(db):
     db.query("CREATE (:City {name: 'Tokyo'})")
     result = json.loads(db.query("MATCH (c:City) RETURN c.name AS name"))
-    assert ["Tokyo"] in result["records"]
+    assert ["Tokyo"] in rows(result)
 
 
 def test_query_aggregation(db):
     db.add_node("Person", json.dumps({"name": "Ada"}))
     db.add_node("Person", json.dumps({"name": "Bob"}))
     result = json.loads(db.query("MATCH (n:Person) RETURN count(n) AS c"))
-    assert result["records"] == [[2]]
+    assert rows(result) == [[2]]
 
 
 def test_explain_returns_plan_text(db):

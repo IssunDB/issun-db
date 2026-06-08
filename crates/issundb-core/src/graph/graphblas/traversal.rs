@@ -15,27 +15,7 @@ impl Graph {
     /// nodes not yet reached. The level vector is then extended with the new frontier.
     #[doc(hidden)]
     pub fn bfs_graphblas(&self, start: NodeId, hops: u8) -> Result<Vec<NodeId>, Error> {
-        use graphblas_sparse_linear_algebra::{
-            collections::{
-                Collection,
-                sparse_vector::{
-                    SparseVector,
-                    operations::{GetSparseVectorElementIndices, SetSparseVectorElement},
-                },
-            },
-            operators::{
-                binary_operator::Assignment,
-                element_wise_addition::{
-                    ApplyElementWiseVectorAdditionMonoidOperator,
-                    ElementWiseVectorAdditionMonoidOperator,
-                },
-                mask::SelectEntireVector,
-                monoid::Plus,
-                multiplication::{MatrixVectorMultiplicationOperator, MultiplyMatrixByVector},
-                options::{OperatorOptions, OptionsForOperatorWithMatrixAsFirstArgument},
-                semiring::MinPlus,
-            },
-        };
+        use issundb_graphblas::{Descriptor, Monoid, Semiring, Vector, ewise_add, mxv};
 
         let guard = self.matrices.read();
         let m = match guard.as_ref() {
@@ -52,60 +32,50 @@ impl Graph {
         };
 
         // level[d] = BFS hop count to dense node d; absent = not yet reached.
-        let mut level = SparseVector::<i32>::new(m.context.clone(), n)
+        let mut level = Vector::<i32>::new(m.context.clone(), n)
             .map_err(|e| Error::GraphBLAS(e.to_string()))?;
         level
-            .set_value(start_dense, 0)
+            .set(start_dense, 0)
             .map_err(|e| Error::GraphBLAS(e.to_string()))?;
 
-        let mxv = MatrixVectorMultiplicationOperator::new();
-        let ewise_add = ElementWiseVectorAdditionMonoidOperator::new();
         // Transpose A so product[j] = min_i(A[i][j] + level[i]) = min incoming hop + 1.
         // Structural complement mask restricts writes to unvisited nodes only.
-        let opts_next = OptionsForOperatorWithMatrixAsFirstArgument::new(false, true, true, true);
-        let opts_merge = OperatorOptions::new_default();
+        let opts_next = Descriptor::new(false, true, true, true);
 
         for _ in 0..hops {
-            let mut next = SparseVector::<i32>::new(m.context.clone(), n)
+            let mut next = Vector::<i32>::new(m.context.clone(), n)
                 .map_err(|e| Error::GraphBLAS(e.to_string()))?;
-            mxv.apply(
-                &m.adjacency,
-                &MinPlus::<i32>::new(),
-                &level,
-                &Assignment::new(),
+            mxv(
                 &mut next,
+                Some(&level),
+                Semiring::MinPlus,
+                &m.adjacency,
                 &level,
-                &opts_next,
+                opts_next,
             )
             .map_err(|e| Error::GraphBLAS(e.to_string()))?;
 
-            if next
-                .number_of_stored_elements()
-                .map_err(|e| Error::GraphBLAS(e.to_string()))?
-                == 0
-            {
+            if next.nvals().map_err(|e| Error::GraphBLAS(e.to_string()))? == 0 {
                 break;
             }
 
             // Union next into level (disjoint due to complement mask).
-            let mut merged = SparseVector::<i32>::new(m.context.clone(), n)
+            let mut merged = Vector::<i32>::new(m.context.clone(), n)
                 .map_err(|e| Error::GraphBLAS(e.to_string()))?;
-            ewise_add
-                .apply(
-                    &level,
-                    &Plus::<i32>::new(),
-                    &next,
-                    &Assignment::new(),
-                    &mut merged,
-                    &SelectEntireVector::new(m.context.clone()),
-                    &opts_merge,
-                )
-                .map_err(|e| Error::GraphBLAS(e.to_string()))?;
+            ewise_add(
+                &mut merged,
+                None,
+                Monoid::Plus,
+                &level,
+                &next,
+                Descriptor::NULL,
+            )
+            .map_err(|e| Error::GraphBLAS(e.to_string()))?;
             level = merged;
         }
 
         let dense_indices: Vec<usize> = level
-            .element_indices()
+            .indices()
             .map_err(|e| Error::GraphBLAS(e.to_string()))?;
         Ok(dense_indices
             .into_iter()
@@ -124,27 +94,7 @@ impl Graph {
         hops: u8,
         max_nodes: Option<usize>,
     ) -> Result<Vec<NodeId>, Error> {
-        use graphblas_sparse_linear_algebra::{
-            collections::{
-                Collection,
-                sparse_vector::{
-                    SparseVector,
-                    operations::{GetSparseVectorElementIndices, SetSparseVectorElement},
-                },
-            },
-            operators::{
-                binary_operator::Assignment,
-                element_wise_addition::{
-                    ApplyElementWiseVectorAdditionMonoidOperator,
-                    ElementWiseVectorAdditionMonoidOperator,
-                },
-                mask::SelectEntireVector,
-                monoid::Plus,
-                multiplication::{MatrixVectorMultiplicationOperator, MultiplyMatrixByVector},
-                options::{OperatorOptions, OptionsForOperatorWithMatrixAsFirstArgument},
-                semiring::MinPlus,
-            },
-        };
+        use issundb_graphblas::{Descriptor, Monoid, Semiring, Vector, ewise_add, mxv};
 
         self.ensure_matrix_view()?;
 
@@ -159,7 +109,7 @@ impl Graph {
         }
 
         // level[d] = BFS hop count to dense node d; absent = not yet reached.
-        let mut level = SparseVector::<i32>::new(m.context.clone(), n)
+        let mut level = Vector::<i32>::new(m.context.clone(), n)
             .map_err(|e| Error::GraphBLAS(e.to_string()))?;
 
         // Seed the level vector.
@@ -170,7 +120,7 @@ impl Graph {
             }
             if let Some(&d) = m.id_to_dense.get(&start) {
                 level
-                    .set_value(d as usize, 0)
+                    .set(d as usize, 0)
                     .map_err(|e| Error::GraphBLAS(e.to_string()))?;
                 seeds_added += 1;
             }
@@ -180,40 +130,32 @@ impl Graph {
             return Ok(vec![]);
         }
 
-        let mxv = MatrixVectorMultiplicationOperator::new();
-        let ewise_add = ElementWiseVectorAdditionMonoidOperator::new();
         // Transpose A so product[j] = min_i(A[i][j] + level[i]) = min incoming hop + 1.
         // Structural complement mask restricts writes to unvisited nodes only.
-        let opts_next = OptionsForOperatorWithMatrixAsFirstArgument::new(false, true, true, true);
-        let opts_merge = OperatorOptions::new_default();
+        let opts_next = Descriptor::new(false, true, true, true);
 
         let mut current_hop = 0;
         for _ in 0..hops {
             current_hop += 1;
-            let mut next = SparseVector::<i32>::new(m.context.clone(), n)
+            let mut next = Vector::<i32>::new(m.context.clone(), n)
                 .map_err(|e| Error::GraphBLAS(e.to_string()))?;
-            mxv.apply(
-                &m.adjacency,
-                &MinPlus::<i32>::new(),
-                &level,
-                &Assignment::new(),
+            mxv(
                 &mut next,
+                Some(&level),
+                Semiring::MinPlus,
+                &m.adjacency,
                 &level,
-                &opts_next,
+                opts_next,
             )
             .map_err(|e| Error::GraphBLAS(e.to_string()))?;
 
-            let next_count = next
-                .number_of_stored_elements()
-                .map_err(|e| Error::GraphBLAS(e.to_string()))?;
+            let next_count = next.nvals().map_err(|e| Error::GraphBLAS(e.to_string()))?;
 
             if next_count == 0 {
                 break;
             }
 
-            let current_count = level
-                .number_of_stored_elements()
-                .map_err(|e| Error::GraphBLAS(e.to_string()))?;
+            let current_count = level.nvals().map_err(|e| Error::GraphBLAS(e.to_string()))?;
 
             if let Some(max) = max_nodes {
                 if current_count >= max {
@@ -222,11 +164,11 @@ impl Graph {
                 if current_count + next_count > max {
                     let allowed = max - current_count;
                     let next_indices: Vec<usize> = next
-                        .element_indices()
+                        .indices()
                         .map_err(|e| Error::GraphBLAS(e.to_string()))?;
                     for &idx in next_indices.iter().take(allowed) {
                         level
-                            .set_value(idx, current_hop)
+                            .set(idx, current_hop)
                             .map_err(|e| Error::GraphBLAS(e.to_string()))?;
                     }
                     break;
@@ -234,24 +176,22 @@ impl Graph {
             }
 
             // Union next into level (disjoint due to complement mask).
-            let mut merged = SparseVector::<i32>::new(m.context.clone(), n)
+            let mut merged = Vector::<i32>::new(m.context.clone(), n)
                 .map_err(|e| Error::GraphBLAS(e.to_string()))?;
-            ewise_add
-                .apply(
-                    &level,
-                    &Plus::<i32>::new(),
-                    &next,
-                    &Assignment::new(),
-                    &mut merged,
-                    &SelectEntireVector::new(m.context.clone()),
-                    &opts_merge,
-                )
-                .map_err(|e| Error::GraphBLAS(e.to_string()))?;
+            ewise_add(
+                &mut merged,
+                None,
+                Monoid::Plus,
+                &level,
+                &next,
+                Descriptor::NULL,
+            )
+            .map_err(|e| Error::GraphBLAS(e.to_string()))?;
             level = merged;
         }
 
         let dense_indices: Vec<usize> = level
-            .element_indices()
+            .indices()
             .map_err(|e| Error::GraphBLAS(e.to_string()))?;
         Ok(dense_indices
             .into_iter()
@@ -269,19 +209,7 @@ impl Graph {
         rel_type: Option<&str>,
         is_incoming: bool,
     ) -> Result<Vec<(NodeId, EdgeId, NodeId)>, Error> {
-        use graphblas_sparse_linear_algebra::{
-            collections::sparse_vector::{
-                SparseVector,
-                operations::{GetSparseVectorElementIndices, SetSparseVectorElement},
-            },
-            operators::{
-                binary_operator::Assignment,
-                mask::SelectEntireVector,
-                multiplication::{MatrixVectorMultiplicationOperator, MultiplyMatrixByVector},
-                options::OptionsForOperatorWithMatrixAsFirstArgument,
-                semiring::MinPlus,
-            },
-        };
+        use issundb_graphblas::{Descriptor, Semiring, Vector, mxv};
         use std::collections::HashMap as StdHashMap;
 
         // The typed path reads the CSR snapshot per source row: a hash lookup
@@ -375,11 +303,9 @@ impl Graph {
             return Ok(vec![]);
         }
 
-        let mxv = MatrixVectorMultiplicationOperator::new();
         // Propagate outgoing edges via the transposed adjacency matrix;
         // incoming edges use the original. See `bfs_multi_source_graphblas` for the derivation.
-        let opts =
-            OptionsForOperatorWithMatrixAsFirstArgument::new(true, false, false, !is_incoming);
+        let opts = Descriptor::new(true, false, false, !is_incoming);
 
         let mut results = Vec::new();
 
@@ -405,31 +331,30 @@ impl Graph {
                     .collect()
             };
 
-            let mut level = SparseVector::<i32>::new(m.context.clone(), n)
+            let mut level = Vector::<i32>::new(m.context.clone(), n)
                 .map_err(|e| Error::GraphBLAS(e.to_string()))?;
             level
-                .set_value(src_dense, 0)
+                .set(src_dense, 0)
                 .map_err(|e| Error::GraphBLAS(e.to_string()))?;
 
-            let mut next = SparseVector::<i32>::new(m.context.clone(), n)
+            let mut next = Vector::<i32>::new(m.context.clone(), n)
                 .map_err(|e| Error::GraphBLAS(e.to_string()))?;
 
             // next = adjacency * level (or adjacency^T * level) with MinPlus semiring.
-            // SelectEntireVector passes all output positions through without masking so
-            // that neighbors at any dense index are written into `next`.
-            mxv.apply(
-                &m.adjacency,
-                &MinPlus::<i32>::new(),
-                &level,
-                &Assignment::new(),
+            // No mask passes all output positions through so that neighbors at any
+            // dense index are written into `next`.
+            mxv(
                 &mut next,
-                &SelectEntireVector::new(m.context.clone()),
-                &opts,
+                None,
+                Semiring::MinPlus,
+                &m.adjacency,
+                &level,
+                opts,
             )
             .map_err(|e| Error::GraphBLAS(e.to_string()))?;
 
             let target_indices: Vec<usize> = next
-                .element_indices()
+                .indices()
                 .map_err(|e| Error::GraphBLAS(e.to_string()))?;
 
             for idx in target_indices {
