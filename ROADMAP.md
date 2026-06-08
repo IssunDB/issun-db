@@ -36,7 +36,7 @@ This document outlines the features implemented in IssunDB and the future goals 
   (BFS, multi-source BFS, untyped expansion, degree centrality, and connected components) stay fresh without a full O(V+E) rebuild. Consumers
   that read the CSR snapshot arrays rebuild on demand, gated by a committed-write generation counter that also closes the prior edge-only
   staleness gap
-- [x] Threshold-gated OpenMP multi-threading (graphs with more than 100k edges use all available CPU cores)
+- [x] Configurable OpenMP multi-threading defaulting to 1 thread, respecting the `ISSUNDB_NUM_THREADS` environment variable, and exposing a programmatic thread count API
 - [x] SuiteSparse:GraphBLAS algorithm suite executing via sparse matrix-vector multiplication kernels:
     - [x] Single and multi-source BFS
     - [x] PageRank via power iterations
@@ -61,6 +61,7 @@ This document outlines the features implemented in IssunDB and the future goals 
 - [x] Property-filtered vector search constraints
 - [x] Hybrid retrieval that combines vector search, full-text search, and graph queries
 - [x] Retrieval score fusion, attribution scoring, and result limiters
+- [x] Concurrent multi-threaded vector search queries using reader-writer locking
 
 ---
 
@@ -134,7 +135,7 @@ This document outlines the features implemented in IssunDB and the future goals 
 
 ### Ecosystem and Tooling
 
-- [x] An interactive REPL
+- [x] An interactive REPL supporting dynamic thread configuration via `:threads` command
 - [x] An HTTP REST API server with node, edge, query, vector search, and full-text search routes
 - [x] An MCP server over stdio or Streamable HTTP, exposing node and edge CRUD, query, explanation, full-text search, and vector search as tools
 - [x] A container image bundling the CLI, REST, and MCP binaries, configurable through environment variables

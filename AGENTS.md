@@ -245,6 +245,7 @@ All graph operations go through `Graph`; do not call `Storage` directly from out
   lookup per candidate)
 - `edges_by_type(etype: &str) -> Result<Vec<EdgeId>, Error>`
 - `rebuild_csr() -> Result<(), Error>`
+- `set_thread_count(n: i32) -> Result<(), Error>`: sets the thread count for GraphBLAS matrix computations, overriding the `ISSUNDB_NUM_THREADS` environment variable (set to 0 to restore default behavior).
 - `all_nodes() -> Result<Vec<NodeId>, Error>`
 - `label_name(id: LabelId) -> Result<Option<String>, Error>`
 - `type_name(id: TypeId) -> Result<Option<String>, Error>`
