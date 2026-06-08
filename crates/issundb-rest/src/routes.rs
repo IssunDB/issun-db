@@ -4,7 +4,7 @@ use axum::{
     Json, Router,
     extract::{Path, State},
     http::StatusCode,
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::{delete, get, post, put},
 };
 use issundb::{
@@ -40,13 +40,25 @@ fn bad_request(msg: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
     err_json(msg, StatusCode::BAD_REQUEST)
 }
 
+/// Await a blocking graph task, mapping a join failure (panic or cancellation)
+/// to a 500. The synchronous `Graph` calls run on a blocking thread so they do
+/// not stall the async worker pool.
+async fn join(handle: tokio::task::JoinHandle<Response>) -> Response {
+    handle.await.unwrap_or_else(|e| internal(e).into_response())
+}
+
 // ---------------------------------------------------------------------------
 // Request / response types
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
 pub struct CreateNodeBody {
-    pub label: String,
+    /// Single primary label. Either this or `labels` must be present.
+    pub label: Option<String>,
+    /// Additional labels for a multi-label node. Merged with `label`, which is
+    /// placed first when both are given.
+    #[serde(default)]
+    pub labels: Vec<String>,
     #[serde(default)]
     pub props: Value,
 }
@@ -111,57 +123,87 @@ fn default_k() -> usize {
 pub async fn create_node(
     State(graph): State<AppState>,
     Json(body): Json<CreateNodeBody>,
-) -> impl IntoResponse {
-    match graph.add_node(&body.label, &body.props) {
-        Ok(id) => (StatusCode::OK, Json(json!({ "id": id }))).into_response(),
-        Err(e) => internal(e).into_response(),
-    }
+) -> Response {
+    join(tokio::task::spawn_blocking(move || {
+        // Merge the singular `label` (placed first) with any `labels`, dropping
+        // duplicates while preserving order.
+        let mut labels: Vec<String> = Vec::new();
+        if let Some(label) = body.label {
+            labels.push(label);
+        }
+        for label in body.labels {
+            if !labels.contains(&label) {
+                labels.push(label);
+            }
+        }
+        if labels.is_empty() {
+            return bad_request("a node requires at least one label").into_response();
+        }
+        let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+        match graph.add_node_multi(&refs, &body.props) {
+            Ok(id) => (StatusCode::OK, Json(json!({ "id": id }))).into_response(),
+            Err(e) => internal(e).into_response(),
+        }
+    }))
+    .await
 }
 
-pub async fn get_node(State(graph): State<AppState>, Path(id): Path<u64>) -> impl IntoResponse {
-    match graph.get_node(id) {
-        Ok(Some(record)) => {
-            let label = match graph.node_labels(id) {
-                Ok(labels) => labels.into_iter().next().unwrap_or_default(),
-                Err(e) => return internal(e).into_response(),
-            };
-            let props: Value = match rmp_serde::from_slice(&record.props) {
-                Ok(v) => v,
-                Err(e) => return internal(e).into_response(),
-            };
-            (
-                StatusCode::OK,
-                Json(json!({ "id": id, "label": label, "props": props })),
-            )
-                .into_response()
+pub async fn get_node(State(graph): State<AppState>, Path(id): Path<u64>) -> Response {
+    join(tokio::task::spawn_blocking(move || {
+        match graph.get_node(id) {
+            Ok(Some(record)) => {
+                let labels = match graph.node_labels(id) {
+                    Ok(labels) => labels,
+                    Err(e) => return internal(e).into_response(),
+                };
+                let props: Value = match rmp_serde::from_slice(&record.props) {
+                    Ok(v) => v,
+                    Err(e) => return internal(e).into_response(),
+                };
+                // `label` is the primary (first) label, kept for convenience;
+                // `labels` carries the full set so multi-label nodes round-trip.
+                let primary = labels.first().cloned().unwrap_or_default();
+                (
+                    StatusCode::OK,
+                    Json(json!({ "id": id, "label": primary, "labels": labels, "props": props })),
+                )
+                    .into_response()
+            }
+            Ok(None) => not_found(format!("node {id} not found")).into_response(),
+            Err(e) => internal(e).into_response(),
         }
-        Ok(None) => not_found(format!("node {id} not found")).into_response(),
-        Err(e) => internal(e).into_response(),
-    }
+    }))
+    .await
 }
 
 pub async fn update_node(
     State(graph): State<AppState>,
     Path(id): Path<u64>,
     Json(body): Json<UpdateNodeBody>,
-) -> impl IntoResponse {
-    match graph.update_node(id, &body.props) {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(issundb::Error::NodeNotFound(_)) => {
-            not_found(format!("node {id} not found")).into_response()
+) -> Response {
+    join(tokio::task::spawn_blocking(move || {
+        match graph.update_node(id, &body.props) {
+            Ok(()) => StatusCode::NO_CONTENT.into_response(),
+            Err(issundb::Error::NodeNotFound(_)) => {
+                not_found(format!("node {id} not found")).into_response()
+            }
+            Err(e) => internal(e).into_response(),
         }
-        Err(e) => internal(e).into_response(),
-    }
+    }))
+    .await
 }
 
-pub async fn delete_node(State(graph): State<AppState>, Path(id): Path<u64>) -> impl IntoResponse {
-    match graph.delete_node(id) {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(issundb::Error::NodeNotFound(_)) => {
-            not_found(format!("node {id} not found")).into_response()
+pub async fn delete_node(State(graph): State<AppState>, Path(id): Path<u64>) -> Response {
+    join(tokio::task::spawn_blocking(move || {
+        match graph.delete_node(id) {
+            Ok(()) => StatusCode::NO_CONTENT.into_response(),
+            Err(issundb::Error::NodeNotFound(_)) => {
+                not_found(format!("node {id} not found")).into_response()
+            }
+            Err(e) => internal(e).into_response(),
         }
-        Err(e) => internal(e).into_response(),
-    }
+    }))
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -171,53 +213,62 @@ pub async fn delete_node(State(graph): State<AppState>, Path(id): Path<u64>) -> 
 pub async fn create_edge(
     State(graph): State<AppState>,
     Json(body): Json<CreateEdgeBody>,
-) -> impl IntoResponse {
-    match graph.add_edge(body.src, body.dst, &body.edge_type, &body.props) {
-        Ok(id) => (StatusCode::OK, Json(json!({ "id": id }))).into_response(),
-        Err(issundb::Error::NodeNotFound(n)) => {
-            bad_request(format!("node {n} not found")).into_response()
+) -> Response {
+    join(tokio::task::spawn_blocking(move || {
+        match graph.add_edge(body.src, body.dst, &body.edge_type, &body.props) {
+            Ok(id) => (StatusCode::OK, Json(json!({ "id": id }))).into_response(),
+            Err(issundb::Error::NodeNotFound(n)) => {
+                bad_request(format!("node {n} not found")).into_response()
+            }
+            Err(e) => internal(e).into_response(),
         }
-        Err(e) => internal(e).into_response(),
-    }
+    }))
+    .await
 }
 
-pub async fn get_edge(State(graph): State<AppState>, Path(id): Path<u64>) -> impl IntoResponse {
-    match graph.get_edge(id) {
-        Ok(Some(record)) => {
-            let edge_type = match graph.type_name(record.edge_type) {
-                Ok(Some(t)) => t,
-                Ok(None) => String::new(),
-                Err(e) => return internal(e).into_response(),
-            };
-            let props: Value = match rmp_serde::from_slice(&record.props) {
-                Ok(v) => v,
-                Err(e) => return internal(e).into_response(),
-            };
-            (
-                StatusCode::OK,
-                Json(json!({
-                    "id": id,
-                    "src": record.src,
-                    "dst": record.dst,
-                    "type": edge_type,
-                    "props": props
-                })),
-            )
-                .into_response()
+pub async fn get_edge(State(graph): State<AppState>, Path(id): Path<u64>) -> Response {
+    join(tokio::task::spawn_blocking(move || {
+        match graph.get_edge(id) {
+            Ok(Some(record)) => {
+                let edge_type = match graph.type_name(record.edge_type) {
+                    Ok(Some(t)) => t,
+                    Ok(None) => String::new(),
+                    Err(e) => return internal(e).into_response(),
+                };
+                let props: Value = match rmp_serde::from_slice(&record.props) {
+                    Ok(v) => v,
+                    Err(e) => return internal(e).into_response(),
+                };
+                (
+                    StatusCode::OK,
+                    Json(json!({
+                        "id": id,
+                        "src": record.src,
+                        "dst": record.dst,
+                        "type": edge_type,
+                        "props": props
+                    })),
+                )
+                    .into_response()
+            }
+            Ok(None) => not_found(format!("edge {id} not found")).into_response(),
+            Err(e) => internal(e).into_response(),
         }
-        Ok(None) => not_found(format!("edge {id} not found")).into_response(),
-        Err(e) => internal(e).into_response(),
-    }
+    }))
+    .await
 }
 
-pub async fn delete_edge(State(graph): State<AppState>, Path(id): Path<u64>) -> impl IntoResponse {
-    match graph.delete_edge(id) {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(issundb::Error::EdgeNotFound(_)) => {
-            not_found(format!("edge {id} not found")).into_response()
+pub async fn delete_edge(State(graph): State<AppState>, Path(id): Path<u64>) -> Response {
+    join(tokio::task::spawn_blocking(move || {
+        match graph.delete_edge(id) {
+            Ok(()) => StatusCode::NO_CONTENT.into_response(),
+            Err(issundb::Error::EdgeNotFound(_)) => {
+                not_found(format!("edge {id} not found")).into_response()
+            }
+            Err(e) => internal(e).into_response(),
         }
-        Err(e) => internal(e).into_response(),
-    }
+    }))
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -227,32 +278,38 @@ pub async fn delete_edge(State(graph): State<AppState>, Path(id): Path<u64>) -> 
 pub async fn execute_query(
     State(graph): State<AppState>,
     Json(body): Json<CypherQueryBody>,
-) -> impl IntoResponse {
-    match graph.query_with_params(&body.query, &body.params) {
-        Ok(result) => {
-            let records: Vec<Vec<Value>> =
-                result.records.iter().map(|r| r.values.clone()).collect();
-            (
-                StatusCode::OK,
-                Json(json!({
-                    "columns": result.columns,
-                    "records": records
-                })),
-            )
-                .into_response()
+) -> Response {
+    join(tokio::task::spawn_blocking(move || {
+        match graph.query_with_params(&body.query, &body.params) {
+            Ok(result) => {
+                let records: Vec<Vec<Value>> =
+                    result.records.iter().map(|r| r.values.clone()).collect();
+                (
+                    StatusCode::OK,
+                    Json(json!({
+                        "columns": result.columns,
+                        "records": records
+                    })),
+                )
+                    .into_response()
+            }
+            Err(e) => bad_request(e).into_response(),
         }
-        Err(e) => bad_request(e).into_response(),
-    }
+    }))
+    .await
 }
 
 pub async fn explain_query(
     State(graph): State<AppState>,
     Json(body): Json<ExplainBody>,
-) -> impl IntoResponse {
-    match graph.explain(&body.query) {
-        Ok(plan) => (StatusCode::OK, Json(json!({ "plan": plan }))).into_response(),
-        Err(e) => bad_request(e).into_response(),
-    }
+) -> Response {
+    join(tokio::task::spawn_blocking(move || {
+        match graph.explain(&body.query) {
+            Ok(plan) => (StatusCode::OK, Json(json!({ "plan": plan }))).into_response(),
+            Err(e) => bad_request(e).into_response(),
+        }
+    }))
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -268,26 +325,29 @@ struct TextHitResponse {
 pub async fn search_text(
     State(graph): State<AppState>,
     Json(body): Json<TextSearchBody>,
-) -> impl IntoResponse {
-    let opts = TextSearchOptions {
-        label: body.label,
-        property: body.property,
-        limit: body.limit,
-        ..Default::default()
-    };
-    match graph.text_search(&body.query, &opts) {
-        Ok(hits) => {
-            let response: Vec<TextHitResponse> = hits
-                .iter()
-                .map(|h| TextHitResponse {
-                    node: h.node,
-                    score: h.score,
-                })
-                .collect();
-            (StatusCode::OK, Json(json!(response))).into_response()
+) -> Response {
+    join(tokio::task::spawn_blocking(move || {
+        let opts = TextSearchOptions {
+            label: body.label,
+            property: body.property,
+            limit: body.limit,
+            ..Default::default()
+        };
+        match graph.text_search(&body.query, &opts) {
+            Ok(hits) => {
+                let response: Vec<TextHitResponse> = hits
+                    .iter()
+                    .map(|h| TextHitResponse {
+                        node: h.node,
+                        score: h.score,
+                    })
+                    .collect();
+                (StatusCode::OK, Json(json!(response))).into_response()
+            }
+            Err(e) => internal(e).into_response(),
         }
-        Err(e) => internal(e).into_response(),
-    }
+    }))
+    .await
 }
 
 #[derive(Serialize)]
@@ -299,27 +359,30 @@ struct VectorHitResponse {
 pub async fn search_vector(
     State(graph): State<AppState>,
     Json(body): Json<VectorSearchBody>,
-) -> impl IntoResponse {
+) -> Response {
     if body.vector.is_empty() {
         return bad_request("vector must not be empty").into_response();
     }
-    let opts = VectorSearchOptions {
-        k: body.k,
-        label: body.label,
-    };
-    match graph.vector_search_with(&body.vector, &opts) {
-        Ok(hits) => {
-            let response: Vec<VectorHitResponse> = hits
-                .iter()
-                .map(|h| VectorHitResponse {
-                    node: h.node,
-                    distance: h.distance,
-                })
-                .collect();
-            (StatusCode::OK, Json(json!(response))).into_response()
+    join(tokio::task::spawn_blocking(move || {
+        let opts = VectorSearchOptions {
+            k: body.k,
+            label: body.label,
+        };
+        match graph.vector_search_with(&body.vector, &opts) {
+            Ok(hits) => {
+                let response: Vec<VectorHitResponse> = hits
+                    .iter()
+                    .map(|h| VectorHitResponse {
+                        node: h.node,
+                        distance: h.distance,
+                    })
+                    .collect();
+                (StatusCode::OK, Json(json!(response))).into_response()
+            }
+            Err(e) => internal(e).into_response(),
         }
-        Err(e) => internal(e).into_response(),
-    }
+    }))
+    .await
 }
 
 // ---------------------------------------------------------------------------

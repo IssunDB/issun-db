@@ -114,6 +114,37 @@ async fn create_then_get_node_round_trip() {
 }
 
 #[tokio::test]
+async fn create_multi_label_node_round_trip() {
+    let (graph, _dir) = fresh_graph();
+    let (status, body) = send(
+        &graph,
+        post(
+            "/v1/nodes",
+            json!({ "labels": ["Person", "Admin"], "props": { "name": "Ada" } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "create body: {body}");
+    let id = body["id"].as_u64().expect("node id");
+
+    let (status, body) = send(&graph, get(&format!("/v1/nodes/{id}"))).await;
+    assert_eq!(status, StatusCode::OK);
+    let labels = body["labels"].as_array().expect("labels array");
+    assert!(labels.contains(&json!("Person")));
+    assert!(labels.contains(&json!("Admin")));
+    // `label` is the primary (first) label.
+    assert_eq!(body["label"], body["labels"][0]);
+}
+
+#[tokio::test]
+async fn create_node_without_label_is_bad_request() {
+    let (graph, _dir) = fresh_graph();
+    let (status, body) = send(&graph, post("/v1/nodes", json!({ "props": {} }))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"].is_string());
+}
+
+#[tokio::test]
 async fn get_missing_node_is_not_found() {
     let (graph, _dir) = fresh_graph();
     let (status, body) = send(&graph, get("/v1/nodes/999")).await;
