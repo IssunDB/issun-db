@@ -55,6 +55,3 @@ harness = false
 [[bin]]
 name = "gen_testdata"
 path = "src/bin/gen_testdata.rs"
-
-[build-dependencies]
-cmake = "0.1"
