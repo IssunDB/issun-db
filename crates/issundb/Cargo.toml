@@ -32,3 +32,11 @@ criterion.workspace = true
 [[bench]]
 name = "query_optimizer"
 harness = false
+
+[[bench]]
+name = "profile_query"
+harness = false
+
+[[bench]]
+name = "profile_triangle"
+harness = false

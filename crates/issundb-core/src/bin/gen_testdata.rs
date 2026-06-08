@@ -3,7 +3,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use issundb::Graph;
+use issundb_core::Graph;
 use serde_json::json;
 
 fn main() {

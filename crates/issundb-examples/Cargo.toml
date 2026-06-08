@@ -31,15 +31,3 @@ path = "load_ldbc.rs"
 [[example]]
 name = "neo4j_migration"
 path = "neo4j_migration.rs"
-
-[[bin]]
-name = "gen_testdata"
-path = "gen_testdata.rs"
-
-[[bin]]
-name = "profile_triangle"
-path = "profile_triangle.rs"
-
-[[bin]]
-name = "profile_query"
-path = "profile_query.rs"
