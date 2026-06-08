@@ -61,12 +61,6 @@ impl Context {
         check(GB_INIT_INFO.load(Ordering::SeqCst), "GrB_init")?;
         Ok(Arc::new(Self { _private: () }))
     }
-
-    /// Run a raw GraphBLAS call and map a non-success status to an error. Kept for
-    /// callers that need to drive a `GxB_*` option not modeled by this crate.
-    pub fn call_raw<F: FnMut() -> gb::GrB_Info>(&self, mut f: F) -> Result<()> {
-        check(f(), "GraphBLAS call")
-    }
 }
 
 /// Set the global number of OpenMP threads GraphBLAS may use (`GxB_NTHREADS`).
@@ -79,15 +73,24 @@ pub fn set_global_threads(n: i32) -> Result<()> {
 
 // --- Element types ---------------------------------------------------------
 
-/// Element types the engine materializes matrices and vectors over. Each method
-/// resolves to a predefined `GrB_*` object or the typed `GrB_*_<TYPE>` FFI call.
+mod sealed {
+    pub trait Sealed {}
+    impl Sealed for i32 {}
+    impl Sealed for f32 {}
+    impl Sealed for f64 {}
+}
+
+/// Element types the engine materializes matrices and vectors over.
+///
+/// This trait is sealed: only `i32`, `f32`, and `f64` implement it. External
+/// crates can name the bound in generic contexts but cannot add implementations.
 ///
 /// The `unsafe` methods are thin dispatch shims to the GraphBLAS C API; they
 /// carry the standard FFI contract (valid object handles, correctly sized
 /// buffers) and are only ever called from this crate's checked wrappers, so they
 /// are not documented individually.
 #[allow(clippy::missing_safety_doc)]
-pub trait GbType: Copy + Default {
+pub trait GbType: sealed::Sealed + Copy + Default {
     fn gb_type() -> gb::GrB_Type;
     fn min_plus_semiring() -> gb::GrB_Semiring;
     fn plus_times_semiring() -> gb::GrB_Semiring;
@@ -743,17 +746,6 @@ mod tests {
     }
 
     #[test]
-    fn context_call_raw_success() {
-        let ctx = Context::init_default().unwrap();
-        // A successful raw call (querying nvals on an empty vector) should return Ok.
-        let v = Vector::<i32>::new(ctx.clone(), 4).unwrap();
-        let mut n: u64 = 0;
-        ctx.call_raw(|| unsafe { gb::GrB_Vector_nvals(&mut n, v.ptr) })
-            .unwrap();
-        assert_eq!(n, 0);
-    }
-
-    #[test]
     fn set_global_threads_succeeds() {
         let _ctx = Context::init_default().unwrap();
         set_global_threads(1).unwrap();
@@ -766,16 +758,14 @@ mod tests {
         assert_eq!(empty.nvals().unwrap(), 0);
 
         let v =
-            Vector::<i32>::from_pairs(ctx.clone(), 5, &[(1, 10), (3, 20)], Reducer::First)
-                .unwrap();
+            Vector::<i32>::from_pairs(ctx.clone(), 5, &[(1, 10), (3, 20)], Reducer::First).unwrap();
         assert_eq!(v.nvals().unwrap(), 2);
     }
 
     #[test]
     fn vector_get_or_default_missing() {
         let ctx = Context::init_default().unwrap();
-        let v =
-            Vector::<i32>::from_pairs(ctx.clone(), 4, &[(0, 42)], Reducer::First).unwrap();
+        let v = Vector::<i32>::from_pairs(ctx.clone(), 4, &[(0, 42)], Reducer::First).unwrap();
         assert_eq!(v.get_or_default(0).unwrap(), 42);
         // Index 2 has no stored element; should return default (0).
         assert_eq!(v.get_or_default(2).unwrap(), 0);
@@ -820,14 +810,9 @@ mod tests {
     #[test]
     fn matrix_resize_expands() {
         let ctx = Context::init_default().unwrap();
-        let mut m = Matrix::<i32>::from_triples(
-            ctx.clone(),
-            2,
-            2,
-            &[(0, 0, 1), (1, 1, 2)],
-            Reducer::First,
-        )
-        .unwrap();
+        let mut m =
+            Matrix::<i32>::from_triples(ctx.clone(), 2, 2, &[(0, 0, 1), (1, 1, 2)], Reducer::First)
+                .unwrap();
 
         // Grow the matrix and add an element in the expanded region.
         m.resize(4, 4).unwrap();
@@ -874,17 +859,11 @@ mod tests {
         //   column 0 feeds row 0 via (1,0)=1 -> second(1,x[1])=x[1]=20 -> out[0]=20
         //   column 1 feeds row 1 via (0,1)=1 -> second(1,x[0])=x[0]=10 -> out[1]=10
         let ctx = Context::init_default().unwrap();
-        let a = Matrix::<i32>::from_triples(
-            ctx.clone(),
-            2,
-            2,
-            &[(0, 1, 1), (1, 0, 1)],
-            Reducer::First,
-        )
-        .unwrap();
-        let x =
-            Vector::<i32>::from_pairs(ctx.clone(), 2, &[(0, 10), (1, 20)], Reducer::First)
+        let a =
+            Matrix::<i32>::from_triples(ctx.clone(), 2, 2, &[(0, 1, 1), (1, 0, 1)], Reducer::First)
                 .unwrap();
+        let x =
+            Vector::<i32>::from_pairs(ctx.clone(), 2, &[(0, 10), (1, 20)], Reducer::First).unwrap();
         let mut out = Vector::<i32>::new(ctx.clone(), 2).unwrap();
         mxv(
             &mut out,
@@ -928,8 +907,7 @@ mod tests {
         .unwrap();
         let x =
             Vector::<i32>::from_pairs(ctx.clone(), 2, &[(0, 1), (1, 1)], Reducer::First).unwrap();
-        let mask =
-            Vector::<i32>::from_pairs(ctx.clone(), 2, &[(0, 1)], Reducer::First).unwrap();
+        let mask = Vector::<i32>::from_pairs(ctx.clone(), 2, &[(0, 1)], Reducer::First).unwrap();
         let mut out = Vector::<i32>::new(ctx.clone(), 2).unwrap();
         mxv(
             &mut out,
@@ -960,8 +938,7 @@ mod tests {
         .unwrap();
         let x =
             Vector::<i32>::from_pairs(ctx.clone(), 2, &[(0, 1), (1, 1)], Reducer::First).unwrap();
-        let mask =
-            Vector::<i32>::from_pairs(ctx.clone(), 2, &[(0, 1)], Reducer::First).unwrap();
+        let mask = Vector::<i32>::from_pairs(ctx.clone(), 2, &[(0, 1)], Reducer::First).unwrap();
         let mut out = Vector::<i32>::new(ctx.clone(), 2).unwrap();
         mxv(
             &mut out,
@@ -981,18 +958,10 @@ mod tests {
         // Pre-populate out, then run with replace=true: prior values outside the
         // result should be cleared.
         let ctx = Context::init_default().unwrap();
-        let a = Matrix::<i32>::from_triples(
-            ctx.clone(),
-            3,
-            3,
-            &[(0, 1, 1)],
-            Reducer::First,
-        )
-        .unwrap();
-        let x =
-            Vector::<i32>::from_pairs(ctx.clone(), 3, &[(0, 5)], Reducer::First).unwrap();
-        let mask =
-            Vector::<i32>::from_pairs(ctx.clone(), 3, &[(1, 1)], Reducer::First).unwrap();
+        let a =
+            Matrix::<i32>::from_triples(ctx.clone(), 3, 3, &[(0, 1, 1)], Reducer::First).unwrap();
+        let x = Vector::<i32>::from_pairs(ctx.clone(), 3, &[(0, 5)], Reducer::First).unwrap();
+        let mask = Vector::<i32>::from_pairs(ctx.clone(), 3, &[(1, 1)], Reducer::First).unwrap();
         let mut out = Vector::<i32>::new(ctx.clone(), 3).unwrap();
         out.set(2, 99).unwrap();
         mxv(
@@ -1012,14 +981,9 @@ mod tests {
     fn reducer_plus_sums_duplicates() {
         let ctx = Context::init_default().unwrap();
         // Two triples at the same coordinate: Plus should sum them.
-        let m = Matrix::<i32>::from_triples(
-            ctx.clone(),
-            2,
-            2,
-            &[(0, 1, 3), (0, 1, 7)],
-            Reducer::Plus,
-        )
-        .unwrap();
+        let m =
+            Matrix::<i32>::from_triples(ctx.clone(), 2, 2, &[(0, 1, 3), (0, 1, 7)], Reducer::Plus)
+                .unwrap();
         let mut t = m.triples().unwrap();
         t.sort_by_key(|&(r, c, _)| (r, c));
         assert_eq!(t, vec![(0, 1, 10)]);
@@ -1028,9 +992,8 @@ mod tests {
     #[test]
     fn reducer_first_keeps_first_duplicate() {
         let ctx = Context::init_default().unwrap();
-        let v =
-            Vector::<i32>::from_pairs(ctx.clone(), 3, &[(1, 100), (1, 200)], Reducer::First)
-                .unwrap();
+        let v = Vector::<i32>::from_pairs(ctx.clone(), 3, &[(1, 100), (1, 200)], Reducer::First)
+            .unwrap();
         // First keeps the first value seen.
         assert_eq!(v.get_or_default(1).unwrap(), 100);
     }
@@ -1038,13 +1001,8 @@ mod tests {
     #[test]
     fn f32_vector_round_trip() {
         let ctx = Context::init_default().unwrap();
-        let v = Vector::<f32>::from_pairs(
-            ctx.clone(),
-            3,
-            &[(0, 1.5), (2, 3.25)],
-            Reducer::First,
-        )
-        .unwrap();
+        let v = Vector::<f32>::from_pairs(ctx.clone(), 3, &[(0, 1.5), (2, 3.25)], Reducer::First)
+            .unwrap();
         assert_eq!(v.nvals().unwrap(), 2);
         assert_eq!(v.get_or_default(0).unwrap(), 1.5);
         assert_eq!(v.get_or_default(2).unwrap(), 3.25);
