@@ -198,7 +198,8 @@ mcp: ## Launch the MCP server over stdio (pass MCP_PATH=<dir> to set the databas
 .PHONY: mcp-http
 mcp-http: ## Launch the MCP server over Streamable HTTP (MCP_PATH=<dir> db path, MCP_BIND=<addr> bind address)
 	@echo "Starting IssunDB MCP server over HTTP at $(or $(MCP_BIND),127.0.0.1:8000) (database: $(or $(MCP_PATH),./issundb-data))..."
-	@RUST_BACKTRACE=$(RUST_BACKTRACE) cargo run -p issundb-mcp -- --db-path $(or $(MCP_PATH),./issundb-data) --transport http --bind $(or $(MCP_BIND),127.0.0.1:8000)
+	@RUST_BACKTRACE=$(RUST_BACKTRACE) cargo run -p issundb-mcp -- --db-path $(or $(MCP_PATH),./issundb-data)\
+ 	--transport http --bind $(or $(MCP_BIND),127.0.0.1:8000)
 
 .PHONY: bench
 bench: ## Run all workspace benchmarks
@@ -271,7 +272,8 @@ figs: ## Generate the figures in the assets directory
 .PHONY: fix-lint
 fix-lint: ## Fix the linter warnings
 	@echo "Fixing linter warnings..."
-	@cargo clippy --fix --allow-dirty --allow-staged --all-targets --workspace --all-features -- -D warnings -D clippy::unwrap_used -D clippy::expect_used
+	@cargo clippy --fix --allow-dirty --allow-staged --all-targets --workspace --all-features -- -D warnings\
+ 	-D clippy::unwrap_used -D clippy::expect_used
 
 .PHONY: run-examples
 run-examples: ## Run all examples in crates/issundb-examples one by one
