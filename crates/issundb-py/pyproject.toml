@@ -1,20 +1,47 @@
 [build-system]
-requires = ["maturin>=1.4,<2.0"]
+requires = ["maturin (>=1.0,<2.0)", "setuptools", "wheel"]
 build-backend = "maturin"
 
 [project]
 name = "issundb"
 description = "Python bindings for IssunDB"
-requires-python = ">=3.8"
+authors = [{ name = "Hassan Abedi", email = "hassan.abedi.t+issundb@gmail.com" }]
+maintainers = [{ name = "Hassan Abedi", email = "hassan.abedi.t+issundb@gmail.com" }]
+keywords = ["graph-analytics", "graph-database", "data-science"]
+requires-python = ">=3.10"
 license = { text = "MIT" }
+readme = "README.md"
+dynamic = ['version']
 classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
     "Programming Language :: Python :: Implementation :: PyPy",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: Software Development :: Libraries :: Python Modules",
 ]
-dynamic = ["version"]
+
+[project.urls]
+homepage = "https://github.com/IssunDB/issun-db"
+documentation = "https://github.com/IssunDB/issun-db"
+repository = "https://github.com/IssunDB/issun-db"
 
 [tool.maturin]
-features = ["extension-module"]
 module-name = "issundb"
-python-source = "python"
+bindings = "pyo3"
+features = ["pyo3/extension-module"]
+include = [
+    { path = ".", format = "sdist" },
+    { path = "issundb.pyi", format = ["sdist", "wheel"] },
+    { path = "py.typed", format = ["sdist", "wheel"] }
+]
+strip = true
+release = true
