@@ -5,7 +5,6 @@ ignore:
   - "docs/*"
   - "crates/issundb-examples/*"
   - "crates/issundb-py/*"
-  - "crates/issundb-node/*"
   - "benchmarks/*"
   - "scripts/*"
   - "crates/issundb-cli/src/main.rs"

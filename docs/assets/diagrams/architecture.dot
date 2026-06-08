@@ -105,7 +105,6 @@ digraph IssunDBArchitecture {
     cli [label = "issundb-cli", fillcolor = "#E9D5FF", color = "#7C3AED"]
     rest [label = "issundb-rest", fillcolor = "#E9D5FF", color = "#7C3AED"]
     mcp [label = "issundb-mcp", fillcolor = "#E9D5FF", color = "#7C3AED"]
-    node_bind [label = "issundb-node", fillcolor = "#E9D5FF", color = "#7C3AED"]
     py_bind [label = "issundb-py", fillcolor = "#E9D5FF", color = "#7C3AED"]
     examples [label = "issundb-examples", fillcolor = "#E9D5FF", color = "#7C3AED"]
     }
@@ -139,7 +138,6 @@ digraph IssunDBArchitecture {
     cli -> facade [ltail = cluster_consumers, lhead = cluster_facade]
     rest -> facade [ltail = cluster_consumers, lhead = cluster_facade]
     mcp -> facade [ltail = cluster_consumers, lhead = cluster_facade]
-    node_bind -> facade [ltail = cluster_consumers, lhead = cluster_facade]
     py_bind -> facade [ltail = cluster_consumers, lhead = cluster_facade]
     examples -> facade [ltail = cluster_consumers, lhead = cluster_facade]
 }

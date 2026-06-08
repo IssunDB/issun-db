@@ -18,7 +18,7 @@ Priorities, in order:
 - Prefer small, focused changes over broad rewrites.
 - Keep the workspace modular: `issundb-core` owns graph storage, `issundb-vector` owns vector search, `issundb-text` owns full-text search,
   `issundb-retrieval` owns hybrid retrieval, `issundb-cypher` owns the query layer, `issundb` is the public facade, `issundb-cli` uses only
-  the public facade, and the binding crates (`issundb-rest`, `issundb-mcp`, `issundb-node`, `issundb-py`) consume only the
+  the public facade, and the binding crates (`issundb-rest`, `issundb-mcp`, `issundb-py`) consume only the
   `issundb` facade and its extension crates. Do not import across those boundaries in the wrong direction.
 - Keep all mutable state inside `Graph` and `Storage`; do not introduce module-level `static mut` or `lazy_static` globals for runtime state.
 - Writes are serialized via the `parking_lot::Mutex<()>` write lock on `Graph`; LMDB enforces the same constraint at the storage level. Do not bypass
@@ -119,10 +119,8 @@ Do not invent modules that do not yet exist when answering questions, but do pla
 - `crates/issundb-mcp/`: Model Context Protocol server built on the `rmcp` SDK, serving over either stdio or MCP's Streamable HTTP transport.
   Exposes node and edge CRUD, Cypher query execution, query plan explanation, full-text search, and vector search as MCP tools. Uses `tokio` as
   its async runtime; depends only on `issundb`.
-- `crates/issundb-node/`: Node.js bindings via NAPI-RS. Exposes the `IssunDB` class with node, edge, query, vector search, text search, and
-  backup methods. Depends only on `issundb`.
-- `crates/issundb-py/`: Python bindings via PyO3. Exposes the `IssunDB` class with the same surface as the Node.js bindings. Depends only on
-  `issundb`.
+- `crates/issundb-py/`: Python bindings via PyO3. Exposes the `IssunDB` class with node, edge, query, vector search, text search, and backup
+  methods. Depends only on `issundb`.
 - `crates/issundb-examples/`: standalone example programs (`quickstart.rs`, `hybrid_retrieval_quickstart.rs`, `neo4j_migration.rs`, and
   `load_ldbc.rs`), the `gen_testdata` binary that regenerates the versioned LMDB storage-format snapshot (driven by `make testdata`), and two
   profiling drivers that load a persistent graph once and rerun a query so a profiler observes query execution without load noise:
@@ -206,7 +204,7 @@ Target dependency direction:
 5. `issundb-cypher` may depend on public APIs from core, vector, text, and retrieval crates, but not storage internals.
 6. `issundb` composes and re-exports the stable public API.
 7. `issundb-cli` uses only the `issundb` facade.
-8. `issundb-rest`, `issundb-mcp`, `issundb-node`, and `issundb-py` must depend only on `issundb`; they must not import
+8. `issundb-rest`, `issundb-mcp`, and `issundb-py` must depend only on `issundb`; they must not import
    `issundb-core`, `issundb-vector`, `issundb-text`, `issundb-retrieval`, or `issundb-cypher` directly.
 
 Lower-level crates must not know about higher-level crates.
@@ -371,18 +369,13 @@ header allowlist middleware. The allowlist defaults to the loopback names (`loca
 Tools: `add_node`, `get_node`, `update_node`, `delete_node`, `add_edge`, `get_edge`, `delete_edge`, `cypher_query`, `explain`, `text_search`, and
 `vector_search`.
 
-### `issundb_node`
+### `issundb_py`
 
-Node.js bindings via NAPI-RS. Exposes a single `IssunDB` class. Depends only on `issundb`; the `napi-module` feature must be enabled for the
-NAPI entry point to compile.
+Python bindings via PyO3. Exposes a single `IssunDB` class. The `extension-module` feature must be enabled for the Python extension to compile.
+Depends only on `issundb`.
 
 Methods: `add_node`, `get_node`, `update_node`, `delete_node`, `add_edge`, `query`, `explain`, `upsert_vector`, `vector_search`,
 `text_search`, `create_text_index`, `drop_text_index`, `backup`, `backup_compact`, `restore`.
-
-### `issundb_py`
-
-Python bindings via PyO3. Exposes a single `IssunDB` class with the same method surface as `issundb_node`. The `extension-module` feature must
-be enabled for the Python extension to compile. Depends only on `issundb`.
 
 ### `issundb_core::Storage`
 

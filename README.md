@@ -28,9 +28,8 @@ GraphRAG pipelines and querying knowledge graphs.
 * Rust graph engine built with ACID, property graph model, and Cypher query language support
 * Fast graph traversal and analytics using sparse matrix operations
 * Built-in vector, text, and hybrid search and retrieval support
-* Can be used via a wide range of APIs, including native Rust, CLI, HTTP, and MCP
+* Can be used via a wide range of APIs, including native Rust, Python bindings, CLI, HTTP, and MCP
 * Fully cross-platform; supports Linux, macOS, and Windows
-* Bindings for Python and JavaScript (other languages coming soon)
 
 See [ROADMAP.md](ROADMAP.md) for the full list of implemented and planned features.
 
