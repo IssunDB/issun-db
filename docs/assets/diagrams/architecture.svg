@@ -12,7 +12,7 @@
 <g id="clust1" class="cluster">
 <title>cluster_graphblas</title>
 <path fill="white" stroke="#0891b2" stroke-width="1.4" d="M20,-345C20,-345 403,-345 403,-345 409,-345 415,-351 415,-357 415,-357 415,-424 415,-424 415,-430 409,-436 403,-436 403,-436 20,-436 20,-436 14,-436 8,-430 8,-424 8,-424 8,-357 8,-357 8,-351 14,-345 20,-345"/>
-<text text-anchor="middle" x="211.5" y="-420.8" font-family="Helvetica,Arial,sans-serif" font-size="14.00">GraphBLAS Foundation</text>
+<text text-anchor="middle" x="211.5" y="-420.8" font-family="Helvetica,Arial,sans-serif" font-size="14.00">GraphBLAS Wapper</text>
 </g>
 <g id="clust2" class="cluster">
 <title>cluster_core</title>
