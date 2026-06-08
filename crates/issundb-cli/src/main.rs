@@ -385,6 +385,13 @@ enum ReplCommand {
     #[command(name = ":version")]
     Version,
 
+    /// Set the thread count for GraphBLAS matrix computations (e.g., `:threads 4`)
+    #[command(name = ":threads")]
+    Threads {
+        /// Number of threads (0 to restore default behavior)
+        count: i32,
+    },
+
     /// Show this help message (e.g., `help`)
     #[command(name = "help")]
     Help,
@@ -401,6 +408,7 @@ enum ReplCommand {
 const HELP_TEXT: &str = r#"
 Database Control
   :open <path>                         Open or reopen a database at the given path (e.g., :open ./issundb-data)
+  :threads <count>                     Set the thread count for GraphBLAS computations (e.g., :threads 4)
 
 Scripting and Parameters
   :run <file>                          Execute a script file line by line (e.g., :run ./import.cypher)
@@ -672,6 +680,18 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
         }
         ReplCommand::Version => {
             println!("IssunDB v{}", env!("CARGO_PKG_VERSION"));
+        }
+        ReplCommand::Threads { count } => {
+            if let Some(ref g) = state.graph {
+                match g.set_thread_count(count) {
+                    Ok(_) => {
+                        println!("{}", format!("thread count set to: {}", count).green());
+                    }
+                    Err(e) => {
+                        eprintln!("{}", format!("error: {}", e).red());
+                    }
+                }
+            }
         }
         ReplCommand::Open { path } => match Graph::open(&path, 1) {
             Ok(g) => {

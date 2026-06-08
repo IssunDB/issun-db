@@ -44,6 +44,8 @@ echo "Running end-to-end CLI integration test..."
 # Run the CLI binary with all example commands
 ./target/debug/issundb-cli <<EOF
 :open $DB_PATH
+:threads 4
+:threads 0
 add-node Person {"name": "Alice"}
 add-node Person {"name": "Bob"}
 get-node 0
