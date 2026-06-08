@@ -36,6 +36,11 @@ format: ## Format Rust files
 	@echo "Formatting Rust files..."
 	@cargo fmt
 
+.PHONY: format-check
+format-check: ## Check Rust formatting without modifying files (for CI)
+	@echo "Checking Rust formatting..."
+	@cargo fmt --all --check
+
 .PHONY: doctest
 doctest: ## Run documentation tests (code examples in comments)
 	@echo "Running documentation tests..."
@@ -308,7 +313,7 @@ check-module-deps: ## Verify crate boundary rules: lower-level crates must not i
 .PHONY: testdata
 testdata: ## Regenerate versioned LMDB snapshots
 	@echo "Regenerating versioned test snapshots..."
-	@VERSION=$$(cargo metadata --no-deps --format-version 1 | python3 -c "import sys,json; print(json.load(sys.stdin)['packages'][0]['version'])"); \
+	@VERSION=$$(cargo metadata --no-deps --format-version 1 | python3 -c "import sys,json; print(next(p['version'] for p in json.load(sys.stdin)['packages'] if p['name'] == 'issundb'))"); \
 	 SNAP_DIR="test_data/v$$VERSION/db"; \
 	 mkdir -p "$$SNAP_DIR"; \
 	 cargo run -p issundb-examples --bin gen_testdata -- "$$SNAP_DIR"
