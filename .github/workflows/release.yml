@@ -1,0 +1,221 @@
+name: Create Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  call-tests:
+    uses: ./.github/workflows/tests.yml
+
+  create-release:
+    name: Create release draft
+    runs-on: ubuntu-latest
+    needs: call-tests
+    permissions:
+      contents: write
+    outputs:
+      upload_url: ${{ steps.create_release.outputs.upload_url }}
+      release_tag: ${{ steps.release_tag.outputs.release_tag }}
+    steps:
+      - name: Set release tag
+        id: release_tag
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            echo "release_tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "release_tag=draft-${{ github.run_id }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.release_tag.outputs.release_tag }}
+          release_name: Release ${{ steps.release_tag.outputs.release_tag }}
+          commitish: ${{ github.sha }}
+          draft: true
+          prerelease: false
+          body: |
+            ### What's Included
+
+            Pre-built IssunDB server and CLI binaries for each platform. Every
+            archive bundles all three executables:
+
+            - `issundb-cli`: interactive REPL over the public facade.
+            - `issundb-rest`: Axum-based HTTP REST API server.
+            - `issundb-mcp`: Model Context Protocol server (stdio or Streamable HTTP).
+
+            The binaries statically link SuiteSparse:GraphBLAS and dynamically link
+            the platform's OpenMP runtime: `libgomp` on glibc Linux, `libomp` on
+            macOS, and `vcomp` (Visual C++ Runtime) on Windows. These ship with the
+            standard toolchain runtime on each platform.
+
+            ### Container Image
+
+            The same release is published as a container image to GHCR:
+
+            ```bash
+            docker pull ghcr.io/${{ github.repository_owner }}/issundb:${{ steps.release_tag.outputs.release_tag }}
+            ```
+
+  build-binaries:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    needs: create-release
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-amd64
+            runner: ubuntu-latest
+            archive_ext: tar.gz
+            content_type: application/gzip
+          - name: linux-arm64
+            runner: ubuntu-24.04-arm
+            archive_ext: tar.gz
+            content_type: application/gzip
+          - name: macos-arm64
+            runner: macos-14
+            archive_ext: tar.gz
+            content_type: application/gzip
+          - name: macos-amd64
+            runner: macos-13
+            archive_ext: tar.gz
+            content_type: application/gzip
+          - name: windows-amd64
+            runner: windows-latest
+            archive_ext: zip
+            content_type: application/zip
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Rust (stable)
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          cache: true
+          cache-key: release-${{ matrix.name }}
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang cmake pkg-config libssl-dev
+
+      - name: Install macOS dependencies
+        if: runner.os == 'macOS'
+        # libomp is the OpenMP runtime Apple Clang links GraphBLAS against;
+        # cmake and clang (libclang for bindgen) ship with the runner image.
+        run: brew install libomp
+
+      - name: Point bindgen at the runner's libclang (Windows)
+        if: runner.os == 'Windows'
+        # cmake ships with the Windows runner; the MSVC OpenMP runtime (vcomp)
+        # comes with the Visual Studio build tools. bindgen needs libclang from
+        # the preinstalled LLVM.
+        run: echo "LIBCLANG_PATH=$env:ProgramFiles\LLVM\bin" >> $env:GITHUB_ENV
+
+      - name: Build release binaries
+        run: cargo build --release -p issundb-cli -p issundb-rest -p issundb-mcp
+
+      - name: Package release asset (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          tar -czf "issundb-${{ matrix.name }}.${{ matrix.archive_ext }}" -C target/release \
+            issundb-cli issundb-rest issundb-mcp
+
+      - name: Package release asset (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path `
+            "target\release\issundb-cli.exe", `
+            "target\release\issundb-rest.exe", `
+            "target\release\issundb-mcp.exe" `
+            -DestinationPath "issundb-${{ matrix.name }}.${{ matrix.archive_ext }}" -Force
+
+      - name: Upload release asset
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ needs.create-release.outputs.upload_url }}
+          asset_path: ./issundb-${{ matrix.name }}.${{ matrix.archive_ext }}
+          asset_name: issundb-${{ matrix.name }}.${{ matrix.archive_ext }}
+          asset_content_type: ${{ matrix.content_type }}
+
+  build-image:
+    name: Build and push Docker image
+    runs-on: ubuntu-latest
+    needs: call-tests
+    if: success()
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+          submodules: recursive
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Downcase registry owner
+        run: |
+          echo "OWNER_LC=${GITHUB_REPOSITORY_OWNER,,}" >> ${GITHUB_ENV}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ env.OWNER_LC }}/issundb
+          # `latest` is reserved for actual tag pushes; manual workflow_dispatch
+          # runs publish under `develop` instead so they cannot overwrite a
+          # released image.
+          tags: |
+            type=raw,value=latest,enable=${{ github.ref_type == 'tag' }}
+            type=raw,value=develop,enable=${{ github.event_name == 'workflow_dispatch' }}
+            type=ref,event=tag
+          labels: |
+            org.opencontainers.image.title=IssunDB
+            org.opencontainers.image.description=IssunDB CLI, REST, and MCP server binaries
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

@@ -4,8 +4,15 @@ This guide provides instructions to help you get started with building, configur
 
 ## Build from Source
 
-Ensure you have Rust 1.85.0 or later installed on your system. You can build the entire workspace, including the core storage library, query layer,
-and interactive CLI:
+Ensure you have Rust 1.85.0 or later installed on your system. The engine builds SuiteSparse:GraphBLAS from the vendored submodule, so a native
+toolchain is also required:
+
+- CMake and a C/C++ compiler (Clang or GCC) to build the GraphBLAS sources.
+- `libclang`, which `bindgen` uses to generate the FFI bindings.
+- An OpenMP runtime, resolved per platform: `libgomp` (bundled with GCC) on Linux, `libomp` on macOS (`brew install libomp`), and `vcomp`
+  (part of the Visual C++ runtime) on Windows.
+
+You can build the entire workspace, including the core storage library, query layer, and interactive CLI:
 
 ```bash
 # Clone the repository and initialize submodules
