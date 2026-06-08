@@ -51,6 +51,8 @@
               pkgs.gnumake
               pkgs.graphviz
               pkgs.python3
+              pkgs.uv
+              pkgs.maturin
               pkgs.nodejs
               pkgs.openssl
               pkgs.llvmPackages.libclang
@@ -60,10 +62,11 @@
               pkgs.cargo-zigbuild
 
               # Dev tools used in Makefile
-              pkgs.cargo-tarpaulin
+              pkgs.cargo-llvm-cov
               pkgs.cargo-audit
               pkgs.cargo-careful
               pkgs.cargo-nextest
+              pkgs.cargo-deny
             ] ++ darwinDeps;
 
             # We set LIBCLANG_PATH for rust-bindgen to work properly.

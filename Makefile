@@ -23,6 +23,14 @@ NEXTEST_VERSION := 0.9.100
 AUDIT_VERSION := 0.21.2
 CAREFUL_VERSION := 0.4.8
 
+# GraphBLAS initializes a process-global OpenMP pool on first use, and the
+# coverage run is process-per-test under nextest, so the pools oversubscribe on
+# smaller or loaded machines and a GraphBLAS call can fail intermittently.
+# Pinning the pool to one thread and retrying twice compensates. Both are
+# overridable from the environment (CI sets them at the job level).
+OMP_NUM_THREADS ?= 1
+NEXTEST_RETRIES ?= 2
+
 # Default target
 .DEFAULT_GOAL := help
 
@@ -64,7 +72,8 @@ test-cli: format ## Run the CLI integration tests (Unix only)
 .PHONY: coverage
 coverage: format ## Generate test coverage report (llvm-cov over nextest, lcov output)
 	@echo "Generating test coverage report..."
-	@DEBUG_PROJ=$(DEBUG_PROJ) RUST_BACKTRACE=$(RUST_BACKTRACE) cargo llvm-cov nextest --workspace --exclude issundb-cli\
+	@OMP_NUM_THREADS=$(OMP_NUM_THREADS) NEXTEST_RETRIES=$(NEXTEST_RETRIES) DEBUG_PROJ=$(DEBUG_PROJ) RUST_BACKTRACE=$(RUST_BACKTRACE)\
+ 	cargo llvm-cov nextest --workspace --exclude issundb-cli\
  	--exclude issundb-node --exclude issundb-py --lcov --output-path lcov.info
 
 .PHONY: build
@@ -334,7 +343,8 @@ oracle-fixtures: ## Regenerate the NetworkX oracle corpora (needs Python3 and Ne
 .PHONY: nextest
 nextest: ## Run tests using nextest
 	@echo "Running tests using nextest..."
-	@DEBUG_PROJ=$(DEBUG_PROJ) RUST_BACKTRACE=$(RUST_BACKTRACE) cargo nextest run
+	@OMP_NUM_THREADS=$(OMP_NUM_THREADS) NEXTEST_RETRIES=$(NEXTEST_RETRIES) DEBUG_PROJ=$(DEBUG_PROJ)\
+ 	RUST_BACKTRACE=$(RUST_BACKTRACE) cargo nextest run
 
 .PHONY: setup-hooks
 setup-hooks: ## Install Git hooks (pre-commit and pre-push)
