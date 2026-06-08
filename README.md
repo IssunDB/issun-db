@@ -13,7 +13,7 @@
 [![Docs](https://img.shields.io/badge/docs-read-007ec6?label=docs&style=flat&labelColor=282c34&logo=readthedocs)](https://IssunDB.github.io/issun-db/)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-007ec6?style=flat&labelColor=282c34&logo=open-source-initiative)](https://github.com/IssunDB/issun-db)
 
-A fast embedded graph database for AI applications and graph analytics
+An embedded graph database for AI applications and graph analytics
 
 </div>
 
@@ -27,7 +27,9 @@ GraphRAG pipelines and querying knowledge graphs.
 
 * Rust graph engine built with ACID, property graph model, and Cypher query language support
 * Fast graph traversal and analytics using sparse matrix operations
-* Built-in vector, text, and hybrid search and retrieval support
+* Columnar sparse row (CSR) in-memory adjacency lists for traversals
+* Vectorized and factorized query execution, multi-core query parallelism, and serializable ACID transactions
+* Built-in vector, text, and hybrid search and retrieval
 * Can be used via a wide range of APIs, including native Rust, Python bindings, CLI, HTTP, and MCP
 * Fully cross-platform; supports Linux, macOS, and Windows
 
