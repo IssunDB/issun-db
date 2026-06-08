@@ -39,14 +39,10 @@ impl MatrixSet {
     pub fn materialize(csr: &CsrSnapshot) -> Result<Self, Error> {
         let context = Context::init_default().map_err(|e| Error::GraphBLAS(e.to_string()))?;
 
-        // Threshold-gate OpenMP parallelism: enable multi-threading only when the
-        // graph is large enough that the per-thread overhead is amortized. Below
-        // 100 000 edges the single-threaded path avoids context-switching noise.
-        let n_edges = csr.col_idx.len();
-        let n_threads: i32 = if n_edges > 100_000 {
-            std::thread::available_parallelism()
-                .map(|n| n.get() as i32)
-                .unwrap_or(1)
+        // Support checking for an ISSUNDB_NUM_THREADS environment variable to override
+        // the thread count. If absent, default to 1.
+        let n_threads: i32 = if let Ok(val) = std::env::var("ISSUNDB_NUM_THREADS") {
+            val.parse::<i32>().unwrap_or(1).max(1)
         } else {
             1
         };
@@ -194,5 +190,28 @@ impl MatrixSet {
                 .map_err(gb)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_num_threads_env_override() {
+        // Test default execution (should default to 1 thread)
+        let csr = CsrSnapshot::empty();
+        let ms_default = MatrixSet::materialize(&csr).unwrap();
+        assert_eq!(ms_default.n_nodes, 0);
+
+        // Test explicit override
+        unsafe {
+            std::env::set_var("ISSUNDB_NUM_THREADS", "2");
+        }
+        let ms_override = MatrixSet::materialize(&csr).unwrap();
+        unsafe {
+            std::env::remove_var("ISSUNDB_NUM_THREADS");
+        }
+        assert_eq!(ms_override.n_nodes, 0);
     }
 }

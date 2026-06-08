@@ -97,6 +97,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 Match: "Alice" knows "Bob" since 2021
 ```
 
+> [!IMPORTANT]
+> An IssunDB database can include only a single graph.
+> But you can create multiple databases and work with them simultaneously in your application.
+
 ---
 
 ### Running IssunDB in a Container
@@ -127,6 +131,10 @@ docker run --rm -p 8000:8000 -v issundb-data:/data ghcr.io/issundb/issundb:lates
 ### Documentation
 
 The project documentation is available [here](https://IssunDB.github.io/issun-db/).
+
+#### Rust Examples
+
+Check out the [issundb-examples](crates/issundb-examples) crate for more examples using IssunDB using the Rust API.
 
 ---
 
