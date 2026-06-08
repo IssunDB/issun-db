@@ -17,8 +17,6 @@ on:
     paths-ignore:
       - '**.md'
       - 'docs/**'
-    tags:
-      - 'v*'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -28,13 +26,11 @@ permissions:
   contents: read
 
 jobs:
-  test:
+  coverage:
     runs-on: ubuntu-latest
-
-    strategy:
-      matrix:
-        # Define the Rust versions to test against
-        rust-version: [ "1.85.0", "stable" ]
+    env:
+      OMP_NUM_THREADS: 1
+      NEXTEST_RETRIES: 2
 
     steps:
       - name: Checkout repository
@@ -43,22 +39,23 @@ jobs:
           lfs: true
           submodules: recursive
 
-      - name: Set up Rust ${{ matrix.rust-version }}
+      - name: Set up Rust (stable)
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          toolchain: ${{ matrix.rust-version }}
-          components: rustfmt, clippy
+          toolchain: stable
+          components: rustfmt, llvm-tools-preview
           cache: true
+          cache-key: coverage
 
       - name: Install system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y clang pkg-config libssl-dev
 
-      - name: Install cargo-tarpaulin
+      - name: Install cargo-nextest and cargo-llvm-cov
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-tarpaulin@0.32.8
+          tool: cargo-nextest@0.9.100,cargo-llvm-cov@0.6.16
 
       - name: Download test datasets (for integration and E2E tests)
         run: |
@@ -71,6 +68,9 @@ jobs:
       - name: Run tests and generate coverage report
         run: make coverage
 
+      - name: Run doctests
+        run: make doctest
+
       - name: Run CLI integration tests
         run: make test-cli
 
@@ -78,4 +78,30 @@ jobs:
         uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
+          files: lcov.info
         continue-on-error: true
+
+  msrv:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+          submodules: recursive
+
+      - name: Set up Rust (1.85.0)
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: '1.85.0'
+          cache: true
+          cache-key: msrv
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang pkg-config libssl-dev
+
+      - name: Check that the workspace compiles on the MSRV
+        run: cargo check --workspace --all-targets --locked

@@ -78,14 +78,14 @@ jobs:
         run: |
           cd crates/issundb-py
           pip install maturin
-          maturin build --release --out dist --zig
+          maturin build --release --out dist --zig --target ${{ matrix.target }}
         if: matrix.os == 'ubuntu-latest'
 
       - name: Build wheel (macOS/Windows)
         run: |
           cd crates/issundb-py
           pip install maturin
-          maturin build --release --out dist
+          maturin build --release --out dist --target ${{ matrix.target }}
         if: matrix.os != 'ubuntu-latest'
         shell: bash
 

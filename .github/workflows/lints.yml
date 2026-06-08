@@ -48,5 +48,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y clang pkg-config libssl-dev
 
+      - name: Check formatting
+        run: make format-check
+
       - name: Run linters
         run: make lint

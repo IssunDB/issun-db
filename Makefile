@@ -18,7 +18,7 @@ PY_MNGR := uv
 WHEEL_FILE := $(shell ls $(PY_DIR)/$(WHEEL_DIR)/issundb-*.whl 2>/dev/null | head -n 1)
 
 # Pinned versions for development tools
-TARPAULIN_VERSION := 0.32.8
+LLVM_COV_VERSION := 0.6.16
 NEXTEST_VERSION := 0.9.100
 AUDIT_VERSION := 0.21.2
 CAREFUL_VERSION := 0.4.8
@@ -35,6 +35,11 @@ help: ## Show help messages for all available targets
 format: ## Format Rust files
 	@echo "Formatting Rust files..."
 	@cargo fmt
+
+.PHONY: format-check
+format-check: ## Check Rust formatting without modifying files (for CI)
+	@echo "Checking Rust formatting..."
+	@cargo fmt --all --check
 
 .PHONY: doctest
 doctest: ## Run documentation tests (code examples in comments)
@@ -57,9 +62,10 @@ test-cli: format ## Run the CLI integration tests (Unix only)
 	@./scripts/test_cli.sh
 
 .PHONY: coverage
-coverage: format ## Generate test coverage report
+coverage: format ## Generate test coverage report (llvm-cov over nextest, lcov output)
 	@echo "Generating test coverage report..."
-	@DEBUG_PROJ=$(DEBUG_PROJ) cargo tarpaulin --workspace --exclude issundb-cli --exclude issundb-node --exclude issundb-py --out Xml --out Html
+	@DEBUG_PROJ=$(DEBUG_PROJ) RUST_BACKTRACE=$(RUST_BACKTRACE) cargo llvm-cov nextest --workspace --exclude issundb-cli\
+ 	--exclude issundb-node --exclude issundb-py --lcov --output-path lcov.info
 
 .PHONY: build
 build: format ## Build the binary for the current platform
@@ -111,8 +117,8 @@ submodules: ## Initialize and update all git submodules recursively
 .PHONY: install-deps
 install-deps: install-snap submodules ## Install development dependencies
 	@echo "Installing dependencies..."
-	@rustup component add rustfmt clippy
-	@cargo install --locked cargo-tarpaulin --version $(TARPAULIN_VERSION)
+	@rustup component add rustfmt clippy llvm-tools-preview
+	@cargo install --locked cargo-llvm-cov --version $(LLVM_COV_VERSION)
 	@cargo install --locked cargo-audit --version $(AUDIT_VERSION)
 	@cargo install --locked cargo-careful --version $(CAREFUL_VERSION)
 	@cargo install --locked cargo-nextest --version $(NEXTEST_VERSION)
@@ -192,7 +198,8 @@ mcp: ## Launch the MCP server over stdio (pass MCP_PATH=<dir> to set the databas
 .PHONY: mcp-http
 mcp-http: ## Launch the MCP server over Streamable HTTP (MCP_PATH=<dir> db path, MCP_BIND=<addr> bind address)
 	@echo "Starting IssunDB MCP server over HTTP at $(or $(MCP_BIND),127.0.0.1:8000) (database: $(or $(MCP_PATH),./issundb-data))..."
-	@RUST_BACKTRACE=$(RUST_BACKTRACE) cargo run -p issundb-mcp -- --db-path $(or $(MCP_PATH),./issundb-data) --transport http --bind $(or $(MCP_BIND),127.0.0.1:8000)
+	@RUST_BACKTRACE=$(RUST_BACKTRACE) cargo run -p issundb-mcp -- --db-path $(or $(MCP_PATH),./issundb-data)\
+ 	--transport http --bind $(or $(MCP_BIND),127.0.0.1:8000)
 
 .PHONY: bench
 bench: ## Run all workspace benchmarks
@@ -265,7 +272,8 @@ figs: ## Generate the figures in the assets directory
 .PHONY: fix-lint
 fix-lint: ## Fix the linter warnings
 	@echo "Fixing linter warnings..."
-	@cargo clippy --fix --allow-dirty --allow-staged --all-targets --workspace --all-features -- -D warnings -D clippy::unwrap_used -D clippy::expect_used
+	@cargo clippy --fix --allow-dirty --allow-staged --all-targets --workspace --all-features -- -D warnings\
+ 	-D clippy::unwrap_used -D clippy::expect_used
 
 .PHONY: run-examples
 run-examples: ## Run all examples in crates/issundb-examples one by one
@@ -308,7 +316,7 @@ check-module-deps: ## Verify crate boundary rules: lower-level crates must not i
 .PHONY: testdata
 testdata: ## Regenerate versioned LMDB snapshots
 	@echo "Regenerating versioned test snapshots..."
-	@VERSION=$$(cargo metadata --no-deps --format-version 1 | python3 -c "import sys,json; print(json.load(sys.stdin)['packages'][0]['version'])"); \
+	@VERSION=$$(cargo metadata --no-deps --format-version 1 | python3 -c "import sys,json; print(next(p['version'] for p in json.load(sys.stdin)['packages'] if p['name'] == 'issundb'))"); \
 	 SNAP_DIR="test_data/v$$VERSION/db"; \
 	 mkdir -p "$$SNAP_DIR"; \
 	 cargo run -p issundb-examples --bin gen_testdata -- "$$SNAP_DIR"

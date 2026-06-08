@@ -242,11 +242,6 @@ impl Ord for OrderedF32 {
     }
 }
 
-/// Upper bound on the heap capacity reserved up front in `wand_top_k`. The
-/// caller-supplied `k` is clamped to this value for the initial allocation
-/// only; the heap still grows past it when that many results genuinely exist.
-const TOPK_PREALLOC_CAP: usize = 1024;
-
 /// Run Weak-AND (WAND) top-k retrieval over multiple sorted posting lists.
 ///
 /// Returns up to `k` `(NodeId, score)` pairs, sorted by descending score.
@@ -270,11 +265,13 @@ fn wand_top_k(
     // Wrapped in Reverse so the heap root is the *minimum* of the top-k,
     // giving us the current pruning threshold efficiently.
     //
-    // Cap the initial reservation so a large caller-supplied `k` cannot drive
-    // an unbounded allocation up front. The heap still grows to the true `k`
-    // as documents are pushed, but only after real results exist to fill it.
-    let mut heap: BinaryHeap<Reverse<(OrderedF32, NodeId)>> =
-        BinaryHeap::with_capacity(k.min(TOPK_PREALLOC_CAP) + 1);
+    // The heap is grown lazily rather than reserved from `k` up front: it is
+    // bounded to `k` entries by the pop-on-overflow below, so its peak size is
+    // `min(k, matching_docs)`, and amortized doubling makes the growth cost
+    // negligible next to the heap operations. Sizing the reservation from the
+    // caller-supplied `k` would let a large `k` drive an allocation before any
+    // result exists to fill it.
+    let mut heap: BinaryHeap<Reverse<(OrderedF32, NodeId)>> = BinaryHeap::new();
     let mut threshold = 0.0_f32;
 
     loop {
