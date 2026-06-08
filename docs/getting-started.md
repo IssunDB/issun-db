@@ -26,7 +26,7 @@ make build
 
 ## Basic CLI Usage
 
-IssunDB comes with an interactive Command Line Interface (CLI) that allows you to interact with your graph database using the Cypher query language:
+IssunDB comes with a Command Line Interface (CLI) that allows you to interact with your graph database using the Cypher query language:
 
 ```bash
 # Launch the CLI with the default database location
