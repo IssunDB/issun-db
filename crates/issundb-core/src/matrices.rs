@@ -36,12 +36,15 @@ pub struct MatrixSet {
 
 impl MatrixSet {
     /// Materialize all sparse matrices from the CSR snapshot.
-    pub fn materialize(csr: &CsrSnapshot) -> Result<Self, Error> {
+    pub fn materialize(csr: &CsrSnapshot, programmatic_threads: i32) -> Result<Self, Error> {
         let context = Context::init_default().map_err(|e| Error::GraphBLAS(e.to_string()))?;
 
-        // Support checking for an ISSUNDB_NUM_THREADS environment variable to override
-        // the thread count. If absent, default to 1.
-        let n_threads: i32 = if let Ok(val) = std::env::var("ISSUNDB_NUM_THREADS") {
+        // Support checking for programmatic thread override. If 0/unset, fall back to
+        // checking the ISSUNDB_NUM_THREADS environment variable. If that is also
+        // absent, default to 1.
+        let n_threads: i32 = if programmatic_threads > 0 {
+            programmatic_threads
+        } else if let Ok(val) = std::env::var("ISSUNDB_NUM_THREADS") {
             val.parse::<i32>().unwrap_or(1).max(1)
         } else {
             1
@@ -201,17 +204,27 @@ mod tests {
     fn test_num_threads_env_override() {
         // Test default execution (should default to 1 thread)
         let csr = CsrSnapshot::empty();
-        let ms_default = MatrixSet::materialize(&csr).unwrap();
+        let ms_default = MatrixSet::materialize(&csr, 0).unwrap();
         assert_eq!(ms_default.n_nodes, 0);
 
-        // Test explicit override
+        // Test explicit override via environment variable
         unsafe {
             std::env::set_var("ISSUNDB_NUM_THREADS", "2");
         }
-        let ms_override = MatrixSet::materialize(&csr).unwrap();
+        let ms_override = MatrixSet::materialize(&csr, 0).unwrap();
         unsafe {
             std::env::remove_var("ISSUNDB_NUM_THREADS");
         }
         assert_eq!(ms_override.n_nodes, 0);
+
+        // Test explicit override via programmatic parameter (higher precedence)
+        unsafe {
+            std::env::set_var("ISSUNDB_NUM_THREADS", "2");
+        }
+        let ms_prog = MatrixSet::materialize(&csr, 4).unwrap();
+        unsafe {
+            std::env::remove_var("ISSUNDB_NUM_THREADS");
+        }
+        assert_eq!(ms_prog.n_nodes, 0);
     }
 }

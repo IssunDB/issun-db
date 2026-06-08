@@ -547,6 +547,7 @@ impl Graph {
             let cache = Arc::clone(&self.csr_cache);
             let storage = Arc::clone(&self.storage);
             let matrices = Arc::clone(&self.matrices);
+            let thread_count = Arc::clone(&self.n_threads);
             std::thread::spawn(move || {
                 // Rebuild until the dirty count drops below the threshold: writes
                 // that commit while a rebuild runs keep the count above zero, and
@@ -562,7 +563,10 @@ impl Graph {
                     cache.clear_delta();
                     match CsrSnapshot::build(&storage) {
                         Ok(snap) => {
-                            if let Ok(m) = MatrixSet::materialize(&snap) {
+                            if let Ok(m) = MatrixSet::materialize(
+                                &snap,
+                                thread_count.load(std::sync::atomic::Ordering::Acquire),
+                            ) {
                                 *matrices.write() = Some(m);
                             }
                             if !cache.install(snap, built_gen) {
