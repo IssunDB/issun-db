@@ -28,6 +28,9 @@ permissions:
 jobs:
   coverage:
     runs-on: ubuntu-latest
+    env:
+      OMP_NUM_THREADS: 1
+      NEXTEST_RETRIES: 2
 
     steps:
       - name: Checkout repository
