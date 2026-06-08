@@ -360,10 +360,11 @@ impl VectorGraphExt for Graph {
         let candidates = self.vector_search(q, fetch_k)?;
 
         // Bound the pre-allocation by the number of candidates actually
-        // returned, not by the caller-supplied `opts.k`. The result holds at
-        // most `min(opts.k, candidates.len())` hits, so this avoids reserving
-        // an unbounded amount of memory for a large `k`.
-        let mut out = Vec::with_capacity(opts.k.min(candidates.len()));
+        // returned, never by the caller-supplied `opts.k`. `candidates` is
+        // already capped at the index size (`vector_search` clamps the
+        // request), and the loop pushes at most one entry per candidate, so
+        // this cannot reserve an unbounded amount of memory for a large `k`.
+        let mut out = Vec::with_capacity(candidates.len());
         for hit in candidates {
             if out.len() >= opts.k {
                 break;
