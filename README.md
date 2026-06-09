@@ -97,10 +97,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 Match: "Alice" knows "Bob" since 2021
 ```
 
-> [!IMPORTANT]
-> An IssunDB database can include only a single graph.
-> But you can create multiple databases and work with them simultaneously in your application.
-
 ---
 
 ### Running IssunDB in a Container
