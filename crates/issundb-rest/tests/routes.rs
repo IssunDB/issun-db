@@ -529,3 +529,47 @@ async fn removed_admin_routes_are_not_found() {
         assert_eq!(status, StatusCode::NOT_FOUND, "uri {uri} should be gone");
     }
 }
+
+#[tokio::test]
+async fn openapi_json_describes_the_live_routes() {
+    let (graph, _dir) = fresh_graph();
+    let (status, body) = send(&graph, get("/v1/openapi.json")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["openapi"].as_str().unwrap_or(""), "3.1.0");
+    assert_eq!(
+        body["info"]["title"].as_str().unwrap_or(""),
+        "IssunDB REST API"
+    );
+    let paths = body["paths"].as_object().expect("paths object");
+    // Every served route is documented.
+    for path in [
+        "/v1/nodes",
+        "/v1/nodes/{id}",
+        "/v1/edges",
+        "/v1/edges/{id}",
+        "/v1/query",
+        "/v1/explain",
+        "/v1/search/text",
+        "/v1/search/vector",
+        "/v1/vectors",
+        "/v1/retrieve",
+        "/health",
+    ] {
+        assert!(paths.contains_key(path), "missing documented path {path}");
+    }
+    // The removed admin surface must not reappear in the document.
+    for path in ["/v1/index/vector", "/v1/admin/backup", "/v1/admin/threads"] {
+        assert!(!paths.contains_key(path), "stale path {path} documented");
+    }
+}
+
+#[tokio::test]
+async fn docs_ui_is_served_as_html() {
+    let (graph, _dir) = fresh_graph();
+    let app = build_router(graph.clone());
+    let resp = app.oneshot(get("/v1/docs")).await.expect("response");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let html = String::from_utf8(bytes.to_vec()).expect("utf8 html");
+    assert!(html.contains("<!doctype html") || html.contains("<!DOCTYPE html"));
+}

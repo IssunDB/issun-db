@@ -121,7 +121,8 @@ Do not invent modules that do not yet exist when answering questions, but do pla
 - `crates/issundb-cli/`: interactive REPL binary. Uses only the `issundb` public facade for manual exploration and demos.
 - `crates/issundb-rest/`: Axum-based HTTP REST API server. Exposes the data plane and retrieval over HTTP: node and edge CRUD, Cypher query
   execution, query plan explanation, vector upsert and search, full-text search, and hybrid retrieval. Index administration and host operations
-  (backup, restore, thread control) are intentionally not exposed over HTTP. Uses `tokio` as its async runtime; depends only on `issundb`.
+  (backup, restore, thread control) are intentionally not exposed over HTTP. Serves a generated OpenAPI 3.1 document at `/v1/openapi.json` and a
+  Scalar UI at `/v1/docs`. Uses `tokio` as its async runtime; depends only on `issundb`.
 - `crates/issundb-mcp/`: Model Context Protocol server built on the `rmcp` SDK, serving over either stdio or MCP's Streamable HTTP transport.
   Exposes a curated read, query, and retrieval surface for LLM agents: node and edge reads, Cypher query execution (the mutation path), query
   plan explanation, full-text search, vector search, and hybrid retrieval. Index administration, vector loading, and host operations are
@@ -356,6 +357,14 @@ REST exposes the data plane and retrieval only. Index administration (vector ind
 thread control, and backup/restore are intentionally absent: provisioning and host operations are done through the CLI or the Python surface, not
 over HTTP. This keeps the network surface to data and queries and avoids exposing host-filesystem operations to network callers.
 
+The API is self-describing: the OpenAPI 3.1 document is generated from the handler annotations (`#[utoipa::path]`) and the request and response
+`ToSchema` derives, so it cannot drift from the routes. It is served as JSON at `GET /v1/openapi.json`, with an interactive Scalar UI at
+`GET /v1/docs`. The generator crates are `utoipa` and `utoipa-scalar` (both MIT or Apache-2.0), pinned to the axum 0.7 line. Because the
+handlers build their JSON bodies inline with `json!`, the documentation-only response structs (`NodeResponse`, `EdgeResponse`, `IdResponse`,
+`QueryResponse`, `ExplainResponse`, `RetrieveResponse`, `HealthResponse`, and `ErrorResponse`) describe the response shapes and must be kept in
+sync with those literals. The Cypher result is documented as columns plus row-major records of arbitrary JSON, because the per-query value types
+are not statically known.
+
 Routes:
 
 - `POST /v1/nodes`, `GET /v1/nodes/:id`, `PUT /v1/nodes/:id`, `DELETE /v1/nodes/:id`
@@ -364,6 +373,7 @@ Routes:
 - `POST /v1/search/text`, `POST /v1/search/vector`
 - `POST /v1/vectors` (upsert embedding)
 - `POST /v1/retrieve` (hybrid retrieval)
+- `GET /v1/openapi.json` (OpenAPI 3.1 document), `GET /v1/docs` (Scalar UI)
 - `GET /health` (unversioned)
 
 ### `issundb_mcp`

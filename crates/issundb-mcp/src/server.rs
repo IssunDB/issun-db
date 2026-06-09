@@ -161,7 +161,7 @@ impl IssunMcp {
         }
     }
 
-    #[tool(description = "Fetch a node by id, returning its label, labels, and properties.")]
+    #[tool(description = "Fetch a node by id; returning its labels and properties.")]
     fn get_node(
         &self,
         Parameters(args): Parameters<NodeIdArgs>,
@@ -177,7 +177,7 @@ impl IssunMcp {
         }
     }
 
-    #[tool(description = "Fetch an edge by id, returning its endpoints, type, and properties.")]
+    #[tool(description = "Fetch an edge by id; returning its endpoints, type, and properties.")]
     fn get_edge(
         &self,
         Parameters(args): Parameters<EdgeIdArgs>,
@@ -249,7 +249,7 @@ impl IssunMcp {
     }
 
     #[tool(
-        description = "Nearest-neighbor vector search; returns the k closest nodes by distance, with optional label and property filtering."
+        description = "Nearest-neighbor vector search; returns the k closest nodes by distance (with optional label and property filtering)."
     )]
     fn vector_search(
         &self,
@@ -275,7 +275,7 @@ impl IssunMcp {
     }
 
     #[tool(
-        description = "Execute a hybrid retrieval (GraphRAG) query combining vector/semantic search, full-text keyword search, and relationship expansion."
+        description = "Execute a hybrid retrieval query that combines vector/semantic search, full-text keyword search, and relationship expansion."
     )]
     fn retrieve_hybrid(
         &self,

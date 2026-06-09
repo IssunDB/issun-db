@@ -15,6 +15,8 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use utoipa::{OpenApi, ToSchema};
+use utoipa_scalar::{Scalar, Servable};
 
 // ---------------------------------------------------------------------------
 // Shared state
@@ -111,7 +113,7 @@ where
 // Request / response types
 // ---------------------------------------------------------------------------
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub struct CreateNodeBody {
     /// Single primary label. Either this or `labels` must be present.
     pub label: Option<String>,
@@ -119,39 +121,43 @@ pub struct CreateNodeBody {
     /// placed first when both are given.
     #[serde(default)]
     pub labels: Vec<String>,
+    /// Free-form JSON property map for the node.
     #[serde(default)]
     pub props: Value,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub struct UpdateNodeBody {
+    /// Replacement JSON property map for the node.
     #[serde(default)]
     pub props: Value,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub struct CreateEdgeBody {
     pub src: u64,
     pub dst: u64,
     #[serde(rename = "type")]
     pub edge_type: String,
+    /// Free-form JSON property map for the edge.
     #[serde(default)]
     pub props: Value,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub struct CypherQueryBody {
     pub query: String,
+    /// Optional named query parameters referenced as `$name` in the query.
     #[serde(default)]
     pub params: HashMap<String, Value>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub struct ExplainBody {
     pub query: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub struct TextSearchBody {
     pub query: String,
     pub label: Option<String>,
@@ -160,12 +166,13 @@ pub struct TextSearchBody {
     pub limit: usize,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub struct VectorSearchBody {
     pub vector: Vec<f32>,
     #[serde(default = "default_k")]
     pub k: usize,
     pub label: Option<String>,
+    /// Optional exact-match property filter applied to candidate nodes.
     pub properties: Option<std::collections::HashMap<String, serde_json::Value>>,
 }
 
@@ -177,13 +184,13 @@ fn default_k() -> usize {
     5
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub struct UpsertVectorBody {
     pub id: u64,
     pub vector: Vec<f32>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub struct HybridRetrieveBody {
     pub vector: Option<Vec<f32>>,
     pub text_query: Option<String>,
@@ -224,9 +231,96 @@ fn parse_fusion(body: &HybridRetrieveBody) -> Result<FusionStrategy, String> {
 }
 
 // ---------------------------------------------------------------------------
+// Response schemas (documentation only)
+//
+// The handlers build their JSON bodies inline with `json!`, so these structs
+// are never constructed. They exist to give the OpenAPI document an accurate
+// response shape; keep them in sync with the `json!` literals above.
+// ---------------------------------------------------------------------------
+
+/// `{"error": "..."}` envelope returned on every non-success status.
+#[derive(Serialize, ToSchema)]
+#[allow(dead_code)]
+pub struct ErrorResponse {
+    pub error: String,
+}
+
+/// `{"id": ...}` envelope returned by create and upsert endpoints.
+#[derive(Serialize, ToSchema)]
+#[allow(dead_code)]
+pub struct IdResponse {
+    pub id: u64,
+}
+
+#[derive(Serialize, ToSchema)]
+#[allow(dead_code)]
+pub struct NodeResponse {
+    pub id: u64,
+    /// Primary (first) label, kept for convenience.
+    pub label: String,
+    /// Full label set, so multi-label nodes round-trip.
+    pub labels: Vec<String>,
+    pub props: Value,
+}
+
+#[derive(Serialize, ToSchema)]
+#[allow(dead_code)]
+pub struct EdgeResponse {
+    pub id: u64,
+    pub src: u64,
+    pub dst: u64,
+    #[serde(rename = "type")]
+    pub edge_type: String,
+    pub props: Value,
+}
+
+#[derive(Serialize, ToSchema)]
+#[allow(dead_code)]
+pub struct QueryResponse {
+    pub columns: Vec<String>,
+    /// Row-major result records. Each record is a list of arbitrary JSON values
+    /// aligned with `columns`; the per-query value types are not statically
+    /// known.
+    pub records: Vec<Vec<Value>>,
+}
+
+#[derive(Serialize, ToSchema)]
+#[allow(dead_code)]
+pub struct ExplainResponse {
+    pub plan: String,
+}
+
+#[derive(Serialize, ToSchema)]
+#[allow(dead_code)]
+pub struct RetrieveResponse {
+    pub nodes: Vec<u64>,
+    pub edges: Vec<u64>,
+    /// Fused relevance score per node id.
+    pub scores: HashMap<u64, f32>,
+}
+
+#[derive(Serialize, ToSchema)]
+#[allow(dead_code)]
+pub struct HealthResponse {
+    pub status: String,
+    pub version: String,
+    pub api: String,
+}
+
+// ---------------------------------------------------------------------------
 // Node handlers
 // ---------------------------------------------------------------------------
 
+/// Create a node with one or more labels and a JSON property map.
+#[utoipa::path(
+    post, path = "/v1/nodes", tag = "nodes",
+    request_body = CreateNodeBody,
+    responses(
+        (status = 200, description = "Node created", body = IdResponse),
+        (status = 400, description = "No label given or malformed body", body = ErrorResponse),
+        (status = 500, description = "Storage error", body = ErrorResponse),
+    ),
+)]
 pub async fn create_node(
     State(graph): State<AppState>,
     JsonBody(body): JsonBody<CreateNodeBody>,
@@ -255,6 +349,16 @@ pub async fn create_node(
     .await
 }
 
+/// Fetch a node by id, including its full label set and properties.
+#[utoipa::path(
+    get, path = "/v1/nodes/{id}", tag = "nodes",
+    params(("id" = u64, Path, description = "Node id")),
+    responses(
+        (status = 200, description = "Node found", body = NodeResponse),
+        (status = 404, description = "Node not found", body = ErrorResponse),
+        (status = 500, description = "Storage error", body = ErrorResponse),
+    ),
+)]
 pub async fn get_node(State(graph): State<AppState>, PathU64(id): PathU64) -> Response {
     join(tokio::task::spawn_blocking(move || {
         match graph.get_node(id) {
@@ -283,6 +387,17 @@ pub async fn get_node(State(graph): State<AppState>, PathU64(id): PathU64) -> Re
     .await
 }
 
+/// Replace a node's property map.
+#[utoipa::path(
+    put, path = "/v1/nodes/{id}", tag = "nodes",
+    params(("id" = u64, Path, description = "Node id")),
+    request_body = UpdateNodeBody,
+    responses(
+        (status = 204, description = "Node updated"),
+        (status = 404, description = "Node not found", body = ErrorResponse),
+        (status = 500, description = "Storage error", body = ErrorResponse),
+    ),
+)]
 pub async fn update_node(
     State(graph): State<AppState>,
     PathU64(id): PathU64,
@@ -300,6 +415,16 @@ pub async fn update_node(
     .await
 }
 
+/// Delete a node and its incident edges.
+#[utoipa::path(
+    delete, path = "/v1/nodes/{id}", tag = "nodes",
+    params(("id" = u64, Path, description = "Node id")),
+    responses(
+        (status = 204, description = "Node deleted"),
+        (status = 404, description = "Node not found", body = ErrorResponse),
+        (status = 500, description = "Storage error", body = ErrorResponse),
+    ),
+)]
 pub async fn delete_node(State(graph): State<AppState>, PathU64(id): PathU64) -> Response {
     join(tokio::task::spawn_blocking(move || {
         match graph.delete_node(id) {
@@ -317,6 +442,16 @@ pub async fn delete_node(State(graph): State<AppState>, PathU64(id): PathU64) ->
 // Edge handlers
 // ---------------------------------------------------------------------------
 
+/// Create a typed edge between two existing nodes.
+#[utoipa::path(
+    post, path = "/v1/edges", tag = "edges",
+    request_body = CreateEdgeBody,
+    responses(
+        (status = 200, description = "Edge created", body = IdResponse),
+        (status = 400, description = "Endpoint node not found or malformed body", body = ErrorResponse),
+        (status = 500, description = "Storage error", body = ErrorResponse),
+    ),
+)]
 pub async fn create_edge(
     State(graph): State<AppState>,
     JsonBody(body): JsonBody<CreateEdgeBody>,
@@ -333,6 +468,16 @@ pub async fn create_edge(
     .await
 }
 
+/// Fetch an edge by id, including its endpoints, type, and properties.
+#[utoipa::path(
+    get, path = "/v1/edges/{id}", tag = "edges",
+    params(("id" = u64, Path, description = "Edge id")),
+    responses(
+        (status = 200, description = "Edge found", body = EdgeResponse),
+        (status = 404, description = "Edge not found", body = ErrorResponse),
+        (status = 500, description = "Storage error", body = ErrorResponse),
+    ),
+)]
 pub async fn get_edge(State(graph): State<AppState>, PathU64(id): PathU64) -> Response {
     join(tokio::task::spawn_blocking(move || {
         match graph.get_edge(id) {
@@ -365,6 +510,16 @@ pub async fn get_edge(State(graph): State<AppState>, PathU64(id): PathU64) -> Re
     .await
 }
 
+/// Delete an edge by id.
+#[utoipa::path(
+    delete, path = "/v1/edges/{id}", tag = "edges",
+    params(("id" = u64, Path, description = "Edge id")),
+    responses(
+        (status = 204, description = "Edge deleted"),
+        (status = 404, description = "Edge not found", body = ErrorResponse),
+        (status = 500, description = "Storage error", body = ErrorResponse),
+    ),
+)]
 pub async fn delete_edge(State(graph): State<AppState>, PathU64(id): PathU64) -> Response {
     join(tokio::task::spawn_blocking(move || {
         match graph.delete_edge(id) {
@@ -382,6 +537,17 @@ pub async fn delete_edge(State(graph): State<AppState>, PathU64(id): PathU64) ->
 // Cypher handlers
 // ---------------------------------------------------------------------------
 
+/// Execute a Cypher query, including mutations (CREATE, SET, REMOVE, DELETE,
+/// MERGE), and return the column names and row-major records.
+#[utoipa::path(
+    post, path = "/v1/query", tag = "cypher",
+    request_body = CypherQueryBody,
+    responses(
+        (status = 200, description = "Query executed", body = QueryResponse),
+        (status = 400, description = "Parse, plan, type, unbound-variable, or math error", body = ErrorResponse),
+        (status = 500, description = "Execution or storage error", body = ErrorResponse),
+    ),
+)]
 pub async fn execute_query(
     State(graph): State<AppState>,
     JsonBody(body): JsonBody<CypherQueryBody>,
@@ -406,6 +572,16 @@ pub async fn execute_query(
     .await
 }
 
+/// Return the physical query plan for a Cypher query without executing it.
+#[utoipa::path(
+    post, path = "/v1/explain", tag = "cypher",
+    request_body = ExplainBody,
+    responses(
+        (status = 200, description = "Plan produced", body = ExplainResponse),
+        (status = 400, description = "Parse, plan, type, unbound-variable, or math error", body = ErrorResponse),
+        (status = 500, description = "Storage error", body = ErrorResponse),
+    ),
+)]
 pub async fn explain_query(
     State(graph): State<AppState>,
     JsonBody(body): JsonBody<ExplainBody>,
@@ -423,12 +599,21 @@ pub async fn explain_query(
 // Search handlers
 // ---------------------------------------------------------------------------
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 struct TextHitResponse {
     node: u64,
     score: f32,
 }
 
+/// Full-text search over indexed node properties, ranked by relevance.
+#[utoipa::path(
+    post, path = "/v1/search/text", tag = "search",
+    request_body = TextSearchBody,
+    responses(
+        (status = 200, description = "Ranked text hits", body = [TextHitResponse]),
+        (status = 500, description = "Storage error", body = ErrorResponse),
+    ),
+)]
 pub async fn search_text(
     State(graph): State<AppState>,
     JsonBody(body): JsonBody<TextSearchBody>,
@@ -457,12 +642,22 @@ pub async fn search_text(
     .await
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 struct VectorHitResponse {
     node: u64,
     distance: f32,
 }
 
+/// Nearest-neighbor vector search with optional label and property filters.
+#[utoipa::path(
+    post, path = "/v1/search/vector", tag = "search",
+    request_body = VectorSearchBody,
+    responses(
+        (status = 200, description = "Nearest neighbors by distance", body = [VectorHitResponse]),
+        (status = 400, description = "Empty query vector", body = ErrorResponse),
+        (status = 500, description = "Storage error", body = ErrorResponse),
+    ),
+)]
 pub async fn search_vector(
     State(graph): State<AppState>,
     JsonBody(body): JsonBody<VectorSearchBody>,
@@ -497,6 +692,16 @@ pub async fn search_vector(
 // Vector upsert handler
 // ---------------------------------------------------------------------------
 
+/// Upsert the embedding vector for a node id.
+#[utoipa::path(
+    post, path = "/v1/vectors", tag = "vectors",
+    request_body = UpsertVectorBody,
+    responses(
+        (status = 200, description = "Vector stored", body = IdResponse),
+        (status = 400, description = "Empty vector", body = ErrorResponse),
+        (status = 500, description = "Storage error", body = ErrorResponse),
+    ),
+)]
 pub async fn upsert_vector(
     State(graph): State<AppState>,
     JsonBody(body): JsonBody<UpsertVectorBody>,
@@ -517,6 +722,17 @@ pub async fn upsert_vector(
 // Hybrid retrieval handler
 // ---------------------------------------------------------------------------
 
+/// Hybrid retrieval fusing vector and text hits, then expanding the graph
+/// neighborhood, returning the induced subgraph and per-node scores.
+#[utoipa::path(
+    post, path = "/v1/retrieve", tag = "retrieve",
+    request_body = HybridRetrieveBody,
+    responses(
+        (status = 200, description = "Induced subgraph with fused scores", body = RetrieveResponse),
+        (status = 400, description = "Invalid fusion strategy", body = ErrorResponse),
+        (status = 500, description = "Storage error", body = ErrorResponse),
+    ),
+)]
 pub async fn retrieve(
     State(graph): State<AppState>,
     JsonBody(body): JsonBody<HybridRetrieveBody>,
@@ -559,6 +775,11 @@ pub async fn retrieve(
 // Health handler
 // ---------------------------------------------------------------------------
 
+/// Liveness probe reporting the crate version and API version.
+#[utoipa::path(
+    get, path = "/health", tag = "health",
+    responses((status = 200, description = "Service is up", body = HealthResponse)),
+)]
 pub async fn health() -> impl IntoResponse {
     (
         StatusCode::OK,
@@ -569,6 +790,46 @@ pub async fn health() -> impl IntoResponse {
         })),
     )
 }
+
+// ---------------------------------------------------------------------------
+// OpenAPI document
+// ---------------------------------------------------------------------------
+
+/// OpenAPI document for the REST API, generated from the `#[utoipa::path]`
+/// annotations on the handlers and the `ToSchema` derives on the request and
+/// response types. Served as JSON at `GET /v1/openapi.json`.
+#[derive(utoipa::OpenApi)]
+#[openapi(
+    info(
+        title = "IssunDB REST API",
+        description = "A REST API server implementation for IssunDB graph database.\
+         The server exposes the core functionalies of IssunDB over HTTP.",
+    ),
+    paths(
+        create_node, get_node, update_node, delete_node,
+        create_edge, get_edge, delete_edge,
+        execute_query, explain_query,
+        search_text, search_vector,
+        upsert_vector, retrieve, health,
+    ),
+    components(schemas(
+        CreateNodeBody, UpdateNodeBody, CreateEdgeBody, CypherQueryBody, ExplainBody,
+        TextSearchBody, VectorSearchBody, UpsertVectorBody, HybridRetrieveBody,
+        ErrorResponse, IdResponse, NodeResponse, EdgeResponse, QueryResponse,
+        ExplainResponse, TextHitResponse, VectorHitResponse, RetrieveResponse,
+        HealthResponse,
+    )),
+    tags(
+        (name = "nodes", description = "Node CRUD"),
+        (name = "edges", description = "Edge CRUD"),
+        (name = "cypher", description = "Cypher query and plan"),
+        (name = "search", description = "Text and vector search"),
+        (name = "vectors", description = "Embedding upsert"),
+        (name = "retrieve", description = "Hybrid retrieval"),
+        (name = "health", description = "Liveness"),
+    ),
+)]
+pub struct ApiDoc;
 
 // ---------------------------------------------------------------------------
 // Router builder
@@ -593,5 +854,18 @@ pub fn build_router(graph: Arc<Graph>) -> Router {
         .route("/retrieve", post(retrieve))
         .with_state(graph);
 
-    Router::new().route("/health", get(health)).nest("/v1", v1)
+    // Serve the generated OpenAPI document and an interactive Scalar UI. The
+    // document is generated from the handler annotations, so it cannot drift
+    // from the routes above.
+    let docs: Router = Scalar::with_url("/v1/docs", ApiDoc::openapi()).into();
+    Router::new()
+        .route("/health", get(health))
+        .route("/v1/openapi.json", get(openapi_json))
+        .merge(docs)
+        .nest("/v1", v1)
+}
+
+/// Return the generated OpenAPI document as JSON.
+async fn openapi_json() -> Json<utoipa::openapi::OpenApi> {
+    Json(ApiDoc::openapi())
 }
