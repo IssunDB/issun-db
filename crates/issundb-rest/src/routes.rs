@@ -802,8 +802,8 @@ pub async fn health() -> impl IntoResponse {
 #[openapi(
     info(
         title = "IssunDB REST API",
-        description = "A REST API server implementation for IssunDB graph database.\
-         The server exposes the core functionalies of IssunDB over HTTP.",
+        description = "A REST API server implementation for IssunDB graph database. \
+         The server implementation exposes the core functionalies of IssunDB over HTTP.",
     ),
     paths(
         create_node, get_node, update_node, delete_node,
