@@ -31,3 +31,11 @@ path = "load_ldbc.rs"
 [[example]]
 name = "neo4j_migration"
 path = "neo4j_migration.rs"
+
+[[example]]
+name = "graph_analytics"
+path = "graph_analytics.rs"
+
+[[example]]
+name = "concurrent_ops"
+path = "concurrent_ops.rs"

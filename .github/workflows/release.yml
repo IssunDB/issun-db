@@ -53,8 +53,7 @@ jobs:
           body: |
             ### What's Included
 
-            Pre-built IssunDB server and CLI binaries for each platform. Every
-            archive bundles all three executables:
+            Pre-built IssunDB server and CLI binaries for each platform:
 
             - `issundb-cli`: interactive REPL over the public facade.
             - `issundb-rest`: Axum-based HTTP REST API server.
@@ -85,15 +84,15 @@ jobs:
         include:
           - name: linux-amd64
             runner: ubuntu-latest
-            archive_ext: tar.gz
+            archive_ext: gz
             content_type: application/gzip
           - name: linux-arm64
             runner: ubuntu-24.04-arm
-            archive_ext: tar.gz
+            archive_ext: gz
             content_type: application/gzip
           - name: macos-arm64
             runner: macos-14
-            archive_ext: tar.gz
+            archive_ext: gz
             content_type: application/gzip
           - name: windows-amd64
             runner: windows-latest
@@ -149,27 +148,46 @@ jobs:
       - name: Package release asset (Unix)
         if: runner.os != 'Windows'
         run: |
-          tar -czf "issundb-${{ matrix.name }}.${{ matrix.archive_ext }}" -C target/release \
-            issundb-cli issundb-rest issundb-mcp
+          gzip -c target/release/issundb-cli > "issundb-cli-${{ matrix.name }}.${{ matrix.archive_ext }}"
+          gzip -c target/release/issundb-mcp > "issundb-mcp-${{ matrix.name }}.${{ matrix.archive_ext }}"
+          gzip -c target/release/issundb-rest > "issundb-rest-${{ matrix.name }}.${{ matrix.archive_ext }}"
 
       - name: Package release asset (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          Compress-Archive -Path `
-            "target\release\issundb-cli.exe", `
-            "target\release\issundb-rest.exe", `
-            "target\release\issundb-mcp.exe" `
-            -DestinationPath "issundb-${{ matrix.name }}.${{ matrix.archive_ext }}" -Force
+          Compress-Archive -Path "target\release\issundb-cli.exe" -DestinationPath "issundb-cli-${{ matrix.name }}.${{ matrix.archive_ext }}" -Force
+          Compress-Archive -Path "target\release\issundb-mcp.exe" -DestinationPath "issundb-mcp-${{ matrix.name }}.${{ matrix.archive_ext }}" -Force
+          Compress-Archive -Path "target\release\issundb-rest.exe" -DestinationPath "issundb-rest-${{ matrix.name }}.${{ matrix.archive_ext }}" -Force
 
-      - name: Upload release asset
+      - name: Upload issundb-cli
         uses: actions/upload-release-asset@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           upload_url: ${{ needs.create-release.outputs.upload_url }}
-          asset_path: ./issundb-${{ matrix.name }}.${{ matrix.archive_ext }}
-          asset_name: issundb-${{ matrix.name }}.${{ matrix.archive_ext }}
+          asset_path: ./issundb-cli-${{ matrix.name }}.${{ matrix.archive_ext }}
+          asset_name: issundb-cli-${{ matrix.name }}.${{ matrix.archive_ext }}
+          asset_content_type: ${{ matrix.content_type }}
+
+      - name: Upload issundb-mcp
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ needs.create-release.outputs.upload_url }}
+          asset_path: ./issundb-mcp-${{ matrix.name }}.${{ matrix.archive_ext }}
+          asset_name: issundb-mcp-${{ matrix.name }}.${{ matrix.archive_ext }}
+          asset_content_type: ${{ matrix.content_type }}
+
+      - name: Upload issundb-rest
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ needs.create-release.outputs.upload_url }}
+          asset_path: ./issundb-rest-${{ matrix.name }}.${{ matrix.archive_ext }}
+          asset_name: issundb-rest-${{ matrix.name }}.${{ matrix.archive_ext }}
           asset_content_type: ${{ matrix.content_type }}
 
   build-image:

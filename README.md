@@ -10,7 +10,7 @@
 [![Code Coverage](https://img.shields.io/codecov/c/github/IssunDB/issun-db?label=coverage&style=flat&labelColor=282c34&logo=codecov)](https://codecov.io/gh/IssunDB/issun-db)
 [![Crates.io](https://img.shields.io/crates/v/issundb.svg?label=crates.io&style=flat&labelColor=282c34&color=fc8d62&logo=rust)](https://crates.io/crates/issundb)
 [![Docs.rs](https://img.shields.io/badge/docs-issundb-66c2a5?style=flat&labelColor=282c34&logo=docs.rs)](https://docs.rs/issundb)
-[![Docs](https://img.shields.io/badge/docs-read-007ec6?label=docs&style=flat&labelColor=282c34&logo=readthedocs)](https://IssunDB.github.io/issun-db/)
+[![Documentation](https://img.shields.io/badge/docs-read-007ec6?label=docs&style=flat&labelColor=282c34&logo=readthedocs)](https://issundb.github.io/issun-db/)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-007ec6?style=flat&labelColor=282c34&logo=open-source-initiative)](https://github.com/IssunDB/issun-db)
 
 An embedded graph database for AI applications and graph analytics
@@ -126,11 +126,15 @@ docker run --rm -p 8000:8000 -v issundb-data:/data ghcr.io/issundb/issundb:lates
 
 ### Documentation
 
-The project documentation is available [here](https://IssunDB.github.io/issun-db/).
+The project documentation is available [here](https://issundb.github.io/issun-db/).
 
 #### Rust Examples
 
 Check out the [issundb-examples](crates/issundb-examples) crate for more examples using IssunDB using the Rust API.
+
+#### Python Examples
+
+See the [issundb-py/examples](crates/issundb-py/examples) directory for example usage of the Python API.
 
 ---
 
