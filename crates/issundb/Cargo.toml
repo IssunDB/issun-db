@@ -10,11 +10,11 @@ homepage.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-issundb-core = { path = "../issundb-core" }
-issundb-cypher = { path = "../issundb-cypher" }
-issundb-vector = { path = "../issundb-vector" }
-issundb-text = { path = "../issundb-text" }
-issundb-retrieval = { path = "../issundb-retrieval" }
+issundb-core.workspace = true
+issundb-cypher.workspace = true
+issundb-vector.workspace = true
+issundb-text.workspace = true
+issundb-retrieval.workspace = true
 serde_json = "1"
 
 [features]

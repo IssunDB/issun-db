@@ -5,7 +5,7 @@ from issundb import IssunDB
 
 def main():
     db_path = "./issundb-py-quickstart-data"
-    
+
     # Clean up from previous run if any
     if os.path.exists(db_path):
         shutil.rmtree(db_path)
@@ -34,10 +34,10 @@ def main():
     # 4. Query using Cypher
     cypher_query = "MATCH (a:Person)-[r:KNOWS]->(b:Person) RETURN a.name, b.name, r.since"
     print(f"\nExecuting query: {cypher_query}")
-    
+
     result_str = db.query(cypher_query)
     result = json.loads(result_str)
-    
+
     print("\nQuery results:")
     print("Columns:", result["columns"])
     for record in result["records"]:

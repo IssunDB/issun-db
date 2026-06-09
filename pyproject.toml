@@ -34,10 +34,10 @@ dev = [
 ]
 
 [tool.pytest.ini_options]
-testpaths = ["python/tests"]
+testpaths = ["crates/issundb-py/tests"]
 addopts = [
     "--tb=short",
-    "--cov=python",
+    "--cov=crates/issundb-py",
     "--cov-branch",
     "--cov-report=term",
     "--cov-report=xml",
@@ -65,7 +65,7 @@ check_untyped_defs = true
 warn_return_any = true
 strict_optional = true
 warn_redundant_casts = true
-exclude = "^(tests/)"
+exclude = "^(crates/issundb-py/tests/|crates/issundb-py/examples/)"
 
 [tool.ruff]
 exclude = [
@@ -76,7 +76,7 @@ exclude = [
 ]
 line-length = 100
 indent-width = 4
-src = ["python"]
+src = ["crates/issundb-py"]
 target-version = "py310"
 
 [tool.ruff.lint]

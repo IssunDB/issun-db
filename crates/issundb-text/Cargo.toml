@@ -10,7 +10,7 @@ homepage.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-issundb-core = { path = "../issundb-core" }
+issundb-core.workspace = true
 thiserror.workspace = true
 roaring.workspace = true
 

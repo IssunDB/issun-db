@@ -17,6 +17,15 @@ jobs:
   build_wheels:
     name: Build wheels on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    env:
+      RUSTUP_TOOLCHAIN: '1.85.0'
+      NK_TARGET_NEON: '1'
+      NK_TARGET_NEONSDOT: '0'
+      NK_TARGET_SVE: '0'
+      NK_TARGET_SVE2: '0'
+      NK_TARGET_SVE2P1: '0'
+      NK_TARGET_SVESDOT: '0'
+      NK_TARGET_SVEBFDOT: '0'
     strategy:
       fail-fast: false
       matrix:
@@ -73,7 +82,7 @@ jobs:
 
       - name: Install dependencies (macOS)
         run: |
-          brew install fontconfig
+          brew install fontconfig libomp
         if: startsWith(matrix.os, 'macos-')
 
       - name: Configure macOS linker workaround
