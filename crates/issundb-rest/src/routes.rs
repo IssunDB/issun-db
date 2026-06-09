@@ -8,13 +8,15 @@ use axum::{
     routing::{delete, get, post, put},
 };
 use issundb::{
-    CypherError, Graph, GraphQueryExt, TextGraphExt, TextSearchOptions, VectorGraphExt,
-    VectorSearchOptions,
+    CypherError, FusionStrategy, Graph, GraphQueryExt, HybridRetrieveOptions, Language,
+    TextGraphExt, TextIndexExt, TextSearchOptions, VectorGraphExt, VectorIndexOptions,
+    VectorMetric, VectorQuantization, VectorSearchOptions, retrieve_hybrid,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::path::Path as FsPath;
 
 // ---------------------------------------------------------------------------
 // Shared state
@@ -175,6 +177,99 @@ fn default_limit() -> usize {
 
 fn default_k() -> usize {
     5
+}
+
+#[derive(Deserialize)]
+pub struct UpsertVectorBody {
+    pub id: u64,
+    pub vector: Vec<f32>,
+}
+
+#[derive(Deserialize)]
+pub struct ConfigureVectorBody {
+    /// Distance metric: 'cosine', 'l2', or 'dot' (alias 'ip').
+    pub metric: String,
+    /// Quantization: 'float32', 'float16', or 'int8'.
+    pub quantization: String,
+    /// Rebuild the index from existing stored vectors under the new configuration.
+    #[serde(default)]
+    pub reindex: bool,
+}
+
+#[derive(Deserialize)]
+pub struct CreateTextIndexBody {
+    pub label: String,
+    pub property: String,
+    /// Optional stemming language; defaults to English.
+    pub language: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct DropTextIndexBody {
+    pub label: String,
+    pub property: String,
+}
+
+#[derive(Deserialize)]
+pub struct HybridRetrieveBody {
+    pub vector: Option<Vec<f32>>,
+    pub text_query: Option<String>,
+    pub vector_k: Option<usize>,
+    pub text_k: Option<usize>,
+    pub text_label: Option<String>,
+    pub text_property: Option<String>,
+    pub vector_label: Option<String>,
+    pub hops: Option<u8>,
+    pub max_distance: Option<f32>,
+    pub max_nodes: Option<usize>,
+    /// 'rrf' (default) or 'weighted_sum' (alias 'weighted').
+    pub fusion_strategy: Option<String>,
+    pub rrf_k: Option<u32>,
+    pub vector_weight: Option<f32>,
+    pub text_weight: Option<f32>,
+}
+
+#[derive(Deserialize)]
+pub struct ThreadCountBody {
+    pub count: i32,
+}
+
+#[derive(Deserialize)]
+pub struct BackupBody {
+    /// Server-side destination path for the snapshot file.
+    pub path: String,
+    /// Write a compacted snapshot instead of a hot copy.
+    #[serde(default)]
+    pub compact: bool,
+}
+
+#[derive(Deserialize)]
+pub struct RestoreBody {
+    /// Server-side path to an existing snapshot file.
+    pub snapshot: String,
+    /// Server-side destination directory for the restored database.
+    pub destination: String,
+}
+
+/// Parse the fusion-strategy name and parameters into a [`FusionStrategy`].
+/// Shared by the hybrid-retrieve handler so REST and MCP agree on the names.
+fn parse_fusion(body: &HybridRetrieveBody) -> Result<FusionStrategy, String> {
+    match body
+        .fusion_strategy
+        .as_deref()
+        .unwrap_or("rrf")
+        .to_lowercase()
+        .as_str()
+    {
+        "rrf" => Ok(FusionStrategy::Rrf {
+            k: body.rrf_k.unwrap_or(60),
+        }),
+        "weighted_sum" | "weighted" => Ok(FusionStrategy::WeightedSum {
+            vector_weight: body.vector_weight.unwrap_or(0.5),
+            text_weight: body.text_weight.unwrap_or(0.5),
+        }),
+        s => Err(format!("invalid fusion strategy: {s}")),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -448,6 +543,215 @@ pub async fn search_vector(
 }
 
 // ---------------------------------------------------------------------------
+// Vector index handlers
+// ---------------------------------------------------------------------------
+
+pub async fn upsert_vector(
+    State(graph): State<AppState>,
+    JsonBody(body): JsonBody<UpsertVectorBody>,
+) -> Response {
+    if body.vector.is_empty() {
+        return bad_request("vector must not be empty").into_response();
+    }
+    join(tokio::task::spawn_blocking(move || {
+        match graph.upsert_vector(body.id, &body.vector) {
+            Ok(()) => (StatusCode::OK, Json(json!({ "id": body.id }))).into_response(),
+            Err(e) => internal(e).into_response(),
+        }
+    }))
+    .await
+}
+
+pub async fn configure_vector_index(
+    State(graph): State<AppState>,
+    JsonBody(body): JsonBody<ConfigureVectorBody>,
+) -> Response {
+    let metric = match body.metric.parse::<VectorMetric>() {
+        Ok(m) => m,
+        Err(e) => return bad_request(e).into_response(),
+    };
+    let quantization = match body.quantization.parse::<VectorQuantization>() {
+        Ok(q) => q,
+        Err(e) => return bad_request(e).into_response(),
+    };
+    join(tokio::task::spawn_blocking(move || {
+        let opts = VectorIndexOptions {
+            metric,
+            quantization,
+        };
+        let result = if body.reindex {
+            graph.reindex_vector_index(opts)
+        } else {
+            graph.configure_vector_index(opts)
+        };
+        match result {
+            Ok(()) => StatusCode::NO_CONTENT.into_response(),
+            Err(e) => internal(e).into_response(),
+        }
+    }))
+    .await
+}
+
+// ---------------------------------------------------------------------------
+// Text index handlers
+// ---------------------------------------------------------------------------
+
+pub async fn create_text_index(
+    State(graph): State<AppState>,
+    JsonBody(body): JsonBody<CreateTextIndexBody>,
+) -> Response {
+    let language = match body
+        .language
+        .as_deref()
+        .unwrap_or("english")
+        .parse::<Language>()
+    {
+        Ok(l) => l,
+        Err(e) => return bad_request(e).into_response(),
+    };
+    join(tokio::task::spawn_blocking(move || {
+        match graph.create_text_index_with_language(&body.label, &body.property, language) {
+            Ok(()) => StatusCode::NO_CONTENT.into_response(),
+            Err(e) => internal(e).into_response(),
+        }
+    }))
+    .await
+}
+
+pub async fn drop_text_index(
+    State(graph): State<AppState>,
+    JsonBody(body): JsonBody<DropTextIndexBody>,
+) -> Response {
+    join(tokio::task::spawn_blocking(move || {
+        match graph.drop_text_index(&body.label, &body.property) {
+            Ok(()) => StatusCode::NO_CONTENT.into_response(),
+            Err(e) => internal(e).into_response(),
+        }
+    }))
+    .await
+}
+
+pub async fn list_text_indexes(State(graph): State<AppState>) -> Response {
+    join(tokio::task::spawn_blocking(move || {
+        match graph.list_text_indexes() {
+            Ok(indexes) => {
+                let list: Vec<Value> = indexes
+                    .into_iter()
+                    .map(|(label, property, language)| {
+                        json!({
+                            "label": label,
+                            "property": property,
+                            "language": format!("{language:?}").to_lowercase(),
+                        })
+                    })
+                    .collect();
+                (StatusCode::OK, Json(json!(list))).into_response()
+            }
+            Err(e) => internal(e).into_response(),
+        }
+    }))
+    .await
+}
+
+// ---------------------------------------------------------------------------
+// Hybrid retrieval handler
+// ---------------------------------------------------------------------------
+
+pub async fn retrieve(
+    State(graph): State<AppState>,
+    JsonBody(body): JsonBody<HybridRetrieveBody>,
+) -> Response {
+    let fusion = match parse_fusion(&body) {
+        Ok(f) => f,
+        Err(e) => return bad_request(e).into_response(),
+    };
+    join(tokio::task::spawn_blocking(move || {
+        let vector = body.vector.unwrap_or_default();
+        let text_query = body.text_query.unwrap_or_default();
+        let opts = HybridRetrieveOptions {
+            vector_k: body.vector_k.unwrap_or(10),
+            text_k: body.text_k.unwrap_or(10),
+            text_label: body.text_label,
+            text_property: body.text_property,
+            hops: body.hops.unwrap_or(2),
+            max_distance: body.max_distance.unwrap_or(f32::MAX),
+            max_nodes: body.max_nodes,
+            vector_label: body.vector_label,
+            fusion,
+        };
+        match retrieve_hybrid(&graph, &vector, &text_query, &opts) {
+            Ok(subgraph) => (
+                StatusCode::OK,
+                Json(json!({
+                    "nodes": subgraph.nodes,
+                    "edges": subgraph.edges,
+                    "scores": subgraph.scores,
+                })),
+            )
+                .into_response(),
+            Err(e) => internal(e).into_response(),
+        }
+    }))
+    .await
+}
+
+// ---------------------------------------------------------------------------
+// Admin handlers
+// ---------------------------------------------------------------------------
+
+pub async fn set_thread_count(
+    State(graph): State<AppState>,
+    JsonBody(body): JsonBody<ThreadCountBody>,
+) -> Response {
+    join(tokio::task::spawn_blocking(move || {
+        match graph.set_thread_count(body.count) {
+            Ok(()) => StatusCode::NO_CONTENT.into_response(),
+            Err(e) => internal(e).into_response(),
+        }
+    }))
+    .await
+}
+
+pub async fn backup(
+    State(graph): State<AppState>,
+    JsonBody(body): JsonBody<BackupBody>,
+) -> Response {
+    join(tokio::task::spawn_blocking(move || {
+        let path = FsPath::new(&body.path);
+        let result = if body.compact {
+            graph.backup_compact(path)
+        } else {
+            graph.backup(path)
+        };
+        match result {
+            Ok(()) => (
+                StatusCode::OK,
+                Json(json!({ "path": body.path, "compact": body.compact })),
+            )
+                .into_response(),
+            Err(e) => internal(e).into_response(),
+        }
+    }))
+    .await
+}
+
+pub async fn restore(JsonBody(body): JsonBody<RestoreBody>) -> Response {
+    // Restore does not touch the running graph; it materializes a fresh database
+    // directory on the server host. Reopen the server against it to use it.
+    join(tokio::task::spawn_blocking(move || {
+        match Graph::restore(FsPath::new(&body.snapshot), FsPath::new(&body.destination)) {
+            Ok(()) => (
+                StatusCode::OK,
+                Json(json!({ "destination": body.destination })),
+            )
+                .into_response(),
+            Err(e) => internal(e).into_response(),
+        }
+    }))
+    .await
+}
+
+// ---------------------------------------------------------------------------
 // Health handler
 // ---------------------------------------------------------------------------
 
@@ -481,6 +785,15 @@ pub fn build_router(graph: Arc<Graph>) -> Router {
         .route("/explain", post(explain_query))
         .route("/search/text", post(search_text))
         .route("/search/vector", post(search_vector))
+        .route("/vectors", post(upsert_vector))
+        .route("/index/vector", post(configure_vector_index))
+        .route("/index/text", post(create_text_index))
+        .route("/index/text", delete(drop_text_index))
+        .route("/index/text", get(list_text_indexes))
+        .route("/retrieve", post(retrieve))
+        .route("/admin/threads", post(set_thread_count))
+        .route("/admin/backup", post(backup))
+        .route("/admin/restore", post(restore))
         .with_state(graph);
 
     Router::new().route("/health", get(health)).nest("/v1", v1)

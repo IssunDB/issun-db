@@ -59,6 +59,41 @@ pub enum VectorQuantization {
     Int8,
 }
 
+impl std::str::FromStr for VectorMetric {
+    type Err = VectorError;
+
+    /// Parse a metric name. Case-insensitive. Accepts `cosine`, `l2`, and `dot`
+    /// (with the alias `ip` for inner product). This is the one canonical
+    /// mapping every binding (CLI, REST, MCP, and Python) parses through.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "cosine" => Ok(Self::Cosine),
+            "l2" => Ok(Self::L2),
+            "dot" | "ip" => Ok(Self::Dot),
+            other => Err(VectorError::InvalidConfig(format!(
+                "unknown metric '{other}' (expected 'cosine', 'l2', or 'dot')"
+            ))),
+        }
+    }
+}
+
+impl std::str::FromStr for VectorQuantization {
+    type Err = VectorError;
+
+    /// Parse a quantization name. Case-insensitive. Accepts `float32`,
+    /// `float16`, and `int8`. The one canonical mapping shared by every binding.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "float32" => Ok(Self::Float32),
+            "float16" => Ok(Self::Float16),
+            "int8" => Ok(Self::Int8),
+            other => Err(VectorError::InvalidConfig(format!(
+                "unknown quantization '{other}' (expected 'float32', 'float16', or 'int8')"
+            ))),
+        }
+    }
+}
+
 /// Construction options for `VectorIndex`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct VectorIndexOptions {
@@ -565,6 +600,35 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let graph = Graph::open(dir.path(), 1).unwrap();
         (dir, graph)
+    }
+
+    #[test]
+    fn metric_from_str_is_case_insensitive_with_alias() {
+        assert_eq!(
+            "cosine".parse::<VectorMetric>().unwrap(),
+            VectorMetric::Cosine
+        );
+        assert_eq!("L2".parse::<VectorMetric>().unwrap(), VectorMetric::L2);
+        assert_eq!("Dot".parse::<VectorMetric>().unwrap(), VectorMetric::Dot);
+        assert_eq!("ip".parse::<VectorMetric>().unwrap(), VectorMetric::Dot);
+        assert!("hamming".parse::<VectorMetric>().is_err());
+    }
+
+    #[test]
+    fn quantization_from_str_is_case_insensitive() {
+        assert_eq!(
+            "float32".parse::<VectorQuantization>().unwrap(),
+            VectorQuantization::Float32
+        );
+        assert_eq!(
+            "Float16".parse::<VectorQuantization>().unwrap(),
+            VectorQuantization::Float16
+        );
+        assert_eq!(
+            "INT8".parse::<VectorQuantization>().unwrap(),
+            VectorQuantization::Int8
+        );
+        assert!("b1".parse::<VectorQuantization>().is_err());
     }
 
     #[test]

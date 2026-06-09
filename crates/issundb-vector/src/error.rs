@@ -14,6 +14,9 @@ pub enum VectorError {
     #[error("usearch library fault: {0}")]
     IndexFault(String),
 
+    #[error("invalid vector configuration: {0}")]
+    InvalidConfig(String),
+
     #[error("underlying storage error: {0}")]
     Storage(#[from] issundb_core::Error),
 }

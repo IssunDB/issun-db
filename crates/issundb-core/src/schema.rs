@@ -43,6 +43,27 @@ impl Language {
     }
 }
 
+impl std::str::FromStr for Language {
+    type Err = crate::error::Error;
+
+    /// Parse a language name. Case-insensitive. Accepts the six supported
+    /// stemming languages. This is the canonical mapping every binding parses
+    /// through, so an unknown name is rejected rather than silently defaulting.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "english" => Ok(Self::English),
+            "spanish" => Ok(Self::Spanish),
+            "french" => Ok(Self::French),
+            "german" => Ok(Self::German),
+            "italian" => Ok(Self::Italian),
+            "portuguese" => Ok(Self::Portuguese),
+            other => Err(crate::error::Error::InvalidArgument(format!(
+                "unknown language '{other}' (expected one of: english, spanish, french, german, italian, portuguese)"
+            ))),
+        }
+    }
+}
+
 /// One adjacency entry stored as a raw LMDB duplicate value.
 ///
 /// Fixed 20-byte `#[repr(C, packed)]` layout satisfies `DUPFIXED` (all
@@ -170,5 +191,21 @@ impl From<String> for PropValue {
 impl<'a> From<&'a str> for PropValue {
     fn from(v: &'a str) -> Self {
         PropValue::Str(v.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn language_from_str_is_case_insensitive_and_rejects_unknown() {
+        assert_eq!("english".parse::<Language>().unwrap(), Language::English);
+        assert_eq!("German".parse::<Language>().unwrap(), Language::German);
+        assert_eq!(
+            "PORTUGUESE".parse::<Language>().unwrap(),
+            Language::Portuguese
+        );
+        assert!("klingon".parse::<Language>().is_err());
     }
 }

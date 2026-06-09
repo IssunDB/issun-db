@@ -3,12 +3,13 @@ use std::{collections::HashMap, fs, io::Write, path::PathBuf};
 use clap::Parser;
 use colored::Colorize;
 use issundb::{
-    DegreeDirection, EdgeId, Graph, GraphQueryExt, Hit, Language, NodeId, RetrieveOptions,
-    TextGraphExt, TextIndexExt, TextSearchOptions, VectorGraphExt, VectorIndexOptions,
-    VectorMetric, VectorQuantization, retrieve_with,
+    DegreeDirection, EdgeId, FusionStrategy, Graph, GraphQueryExt, Hit, HybridRetrieveOptions,
+    Language, NodeId, TextGraphExt, TextIndexExt, TextSearchOptions, VectorGraphExt,
+    VectorIndexOptions, VectorMetric, VectorQuantization, VectorSearchOptions, retrieve_hybrid,
 };
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
+use std::str::FromStr;
 
 // ---------------------------------------------------------------------------
 // History file location
@@ -120,6 +121,15 @@ enum ReplCommand {
         file: PathBuf,
     },
 
+    /// Restore a snapshot into a new database directory (e.g., `:restore ./snap.db ./restored`)
+    #[command(name = ":restore")]
+    Restore {
+        /// Path to the snapshot file to restore from
+        snapshot: PathBuf,
+        /// Destination directory for the restored database
+        dst: PathBuf,
+    },
+
     /// Import nodes from a JSONL file (e.g., `:import-jsonl ./nodes.jsonl`)
     #[command(name = ":import-jsonl")]
     ImportJsonl {
@@ -154,10 +164,11 @@ enum ReplCommand {
         cypher: Vec<String>,
     },
 
-    /// Add a node with a label and optional properties (e.g., `add-node Person {"name": "Alice"}`)
+    /// Add a node with one or more colon-separated labels and optional properties
+    /// (e.g., `add-node Person {"name": "Alice"}` or `add-node Person:Admin {...}`)
     #[command(name = "add-node")]
     AddNode {
-        /// Node label
+        /// Node label, or colon-separated labels for a multi-label node (e.g., `Person:Admin`)
         label: String,
         /// Node properties JSON
         #[arg(default_value = "{}")]
@@ -317,7 +328,8 @@ enum ReplCommand {
         values: Vec<f32>,
     },
 
-    /// Query the vector index for k-nearest neighbors (e.g., `vsearch 5 0.1 0.2 0.3`)
+    /// Query the vector index for k-nearest neighbors, optionally filtered by
+    /// label and property values (e.g., `vsearch 5 0.1 0.2 0.3 --label Person`)
     #[command(name = "vsearch")]
     Vsearch {
         /// Number of results to return
@@ -325,18 +337,37 @@ enum ReplCommand {
         /// Query embedding vector values
         #[arg(num_args = 1.., allow_negative_numbers = true)]
         query: Vec<f32>,
+        /// Restrict results to nodes carrying this label
+        #[arg(long)]
+        label: Option<String>,
+        /// JSON object of property key-value filters (e.g., `--props {"team":"blue"}`)
+        #[arg(long)]
+        props: Option<String>,
     },
 
-    /// Run hybrid vector-graph retrieval search (e.g., `retrieve 5 2 0.1 0.2 0.3`)
+    /// Run hybrid retrieval over vector seeds, optional text seeds, and graph
+    /// expansion (e.g., `retrieve 5 2 0.1 0.2 0.3 --text alice`)
     #[command(name = "retrieve")]
     Retrieve {
-        /// Number of vector seed results
+        /// Number of seed results from each enabled source
         k: usize,
         /// Traversal hops limit for BFS expansion
         hops: u8,
         /// Query embedding vector values
         #[arg(num_args = 1.., allow_negative_numbers = true)]
         query: Vec<f32>,
+        /// Full-text query string to add text seeds (vector-only when omitted)
+        #[arg(long)]
+        text: Option<String>,
+        /// Restrict text seeds to this label
+        #[arg(long = "text-label")]
+        text_label: Option<String>,
+        /// Restrict text seeds to this property
+        #[arg(long = "text-prop")]
+        text_property: Option<String>,
+        /// Score fusion strategy: 'rrf' or 'weighted_sum'
+        #[arg(long, default_value = "rrf", value_parser = ["rrf", "weighted_sum"])]
+        fusion: String,
     },
 
     /// Configure or reindex vector metric and quantization (e.g., `configure-vec cosine float32`)
@@ -420,6 +451,7 @@ Scripting and Parameters
 Backup and Import
   :backup <file>                       Write a hot backup snapshot of the database (e.g., :backup ./backup.db)
   :backup-compact <file>               Write a compacted backup snapshot of the database (e.g., :backup-compact ./compact.db)
+  :restore <snapshot> <dst>            Restore a snapshot into a new database directory (e.g., :restore ./snap.db ./restored)
   :import-jsonl <file>                 Import nodes from a JSONL file (e.g., :import-jsonl ./nodes.jsonl)
   :import-csv <file>                   Import nodes from a CSV file (e.g., :import-csv ./nodes.csv)
   rebuild-csr                          Rebuild the CSR snapshot cache
@@ -427,7 +459,7 @@ Backup and Import
 Query and Mutations
   :explain <cypher>                    Show the optimized physical plan for a Cypher query (e.g., :explain MATCH (n) RETURN n)
   query / cypher <cypher>              Run a Cypher query (e.g., query MATCH (n) RETURN n)
-  add-node <label> [props]             Add a node with a label and optional properties (e.g., add-node Person {"name": "Alice"})
+  add-node <label[:label...]> [props]  Add a node with one or more colon-separated labels (e.g., add-node Person:Admin {"name": "Alice"})
   get-node <id>                        Get a node by its ID (e.g., get-node 1)
   update-node <id> [props]             Overwrite a node's properties (e.g., update-node 1 {"name": "Bob"})
   delete-node <id>                     Delete a node and its adjacency entries (e.g., delete-node 1)
@@ -452,8 +484,8 @@ Graph Algorithms
 Vector and Text Search
   configure-vec <metric> [quantization] Configure or reindex vector metric and quantization (e.g., configure-vec cosine float32)
   upsert-vec <id> <values...>          Attach/upsert a vector embedding on a node (e.g., upsert-vec 1 0.1 0.2 0.3)
-  vsearch <k> <query...>               Query the vector index for k-nearest neighbors (e.g., vsearch 5 0.1 0.2 0.3)
-  retrieve <k> <hops> <query...>       Run hybrid vector-graph retrieval search (e.g., retrieve 5 2 0.1 0.2 0.3)
+  vsearch <k> <query...> [--label L]   Query the vector index for k-nearest neighbors (e.g., vsearch 5 0.1 0.2 0.3 --label Person)
+  retrieve <k> <hops> <query...>       Run hybrid retrieval; add --text <q> for text seeds (e.g., retrieve 5 2 0.1 0.2 0.3 --text alice)
   text-index <act> [label] [property]  Perform full-text index actions (e.g., text-index create Person name --lang german)
   text-search <q> [l] [p] [limit]      Query BM25 full-text search index (e.g., text-search "alice" Person name 5)
 
@@ -663,6 +695,7 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
             | ReplCommand::Set { .. }
             | ReplCommand::Unset { .. }
             | ReplCommand::Save { .. }
+            | ReplCommand::Restore { .. }
             | ReplCommand::Help
             | ReplCommand::Quit
             | ReplCommand::Version
@@ -755,6 +788,19 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
                 }
             }
         }
+        ReplCommand::Restore { snapshot, dst } => {
+            // Restore materializes a fresh database directory; it does not touch
+            // the currently open graph. Use `:open <dst>` afterward to switch to it.
+            match Graph::restore(&snapshot, &dst) {
+                Ok(()) => eprintln!(
+                    "restored {} into {} (use `:open {}` to switch)",
+                    snapshot.display(),
+                    dst.display(),
+                    dst.display()
+                ),
+                Err(e) => eprintln!("restore failed: {e}"),
+            }
+        }
         ReplCommand::ImportJsonl { file } => {
             cmd_import_jsonl(state, &file);
         }
@@ -769,10 +815,20 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
             if let Some(g) = &state.graph {
                 match parse_props(&props) {
                     Err(e) => eprintln!("invalid props: {e}"),
-                    Ok(parsed_props) => match g.add_node(&label, &parsed_props) {
-                        Ok(id) => println!("{id}"),
-                        Err(e) => eprintln!("error: {e}"),
-                    },
+                    Ok(parsed_props) => {
+                        // A colon-separated label string creates a multi-label node,
+                        // matching the Cypher `(n:A:B)` convention.
+                        let labels: Vec<&str> =
+                            label.split(':').filter(|s| !s.is_empty()).collect();
+                        let result = match labels.as_slice() {
+                            [single] => g.add_node(single, &parsed_props),
+                            _ => g.add_node_multi(&labels, &parsed_props),
+                        };
+                        match result {
+                            Ok(id) => println!("{id}"),
+                            Err(e) => eprintln!("error: {e}"),
+                        }
+                    }
                 }
             }
         }
@@ -1055,22 +1111,63 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
                 }
             }
         }
-        ReplCommand::Vsearch { k, query } => {
+        ReplCommand::Vsearch {
+            k,
+            query,
+            label,
+            props,
+        } => {
             if let Some(g) = &state.graph {
-                match g.vector_search(&query, k) {
+                let properties = match props.as_deref().map(parse_prop_filters) {
+                    None => None,
+                    Some(Ok(map)) => Some(map),
+                    Some(Err(e)) => {
+                        eprintln!("invalid props: {e}");
+                        return true;
+                    }
+                };
+                let opts = VectorSearchOptions {
+                    k,
+                    label,
+                    properties,
+                };
+                match g.vector_search_with(&query, &opts) {
                     Ok(hits) => print_hits(&hits),
                     Err(e) => eprintln!("error: {e}"),
                 }
             }
         }
-        ReplCommand::Retrieve { k, hops, query } => {
+        ReplCommand::Retrieve {
+            k,
+            hops,
+            query,
+            text,
+            text_label,
+            text_property,
+            fusion,
+        } => {
             if let Some(g) = &state.graph {
-                let opts = RetrieveOptions {
-                    k,
-                    hops,
-                    ..Default::default()
+                let fusion_strategy = match fusion.as_str() {
+                    "weighted_sum" => FusionStrategy::WeightedSum {
+                        vector_weight: 0.5,
+                        text_weight: 0.5,
+                    },
+                    _ => FusionStrategy::Rrf { k: 60 },
                 };
-                match retrieve_with(g, &query, &opts) {
+                let text_query = text.clone().unwrap_or_default();
+                let opts = HybridRetrieveOptions {
+                    vector_k: k,
+                    // Text seeds are only drawn when a text query is supplied.
+                    text_k: if text.is_some() { k } else { 0 },
+                    text_label,
+                    text_property,
+                    hops,
+                    max_distance: f32::MAX,
+                    max_nodes: None,
+                    vector_label: None,
+                    fusion: fusion_strategy,
+                };
+                match retrieve_hybrid(g, &query, &text_query, &opts) {
                     Ok(sub) => {
                         println!(
                             "{} node(s), {} edge(s), {} seed(s)",
@@ -1079,9 +1176,9 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
                             sub.scores.len()
                         );
                         let mut seeds: Vec<_> = sub.scores.iter().collect();
-                        seeds.sort_unstable_by(|a, b| a.1.total_cmp(b.1));
-                        for (n, d) in seeds {
-                            println!("  seed node={n} dist={d:.6}");
+                        seeds.sort_unstable_by(|a, b| b.1.total_cmp(a.1));
+                        for (n, score) in seeds {
+                            println!("  seed node={n} score={score:.6}");
                         }
                     }
                     Err(e) => eprintln!("error: {e}"),
@@ -1094,19 +1191,9 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
             reindex,
         } => {
             if let Some(g) = &state.graph {
-                let v_metric = match metric.to_lowercase().as_str() {
-                    "l2" => VectorMetric::L2,
-                    "dot" => VectorMetric::Dot,
-                    _ => VectorMetric::Cosine,
-                };
-                let v_quant = match quantization.to_lowercase().as_str() {
-                    "float16" => VectorQuantization::Float16,
-                    "int8" => VectorQuantization::Int8,
-                    _ => VectorQuantization::Float32,
-                };
                 let opts = VectorIndexOptions {
-                    metric: v_metric,
-                    quantization: v_quant,
+                    metric: VectorMetric::from_str(&metric).unwrap_or_default(),
+                    quantization: VectorQuantization::from_str(&quantization).unwrap_or_default(),
                 };
                 let res = if reindex {
                     g.reindex_vector_index(opts)
@@ -1133,14 +1220,7 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
                         if lbl.is_empty() || prop.is_empty() {
                             eprintln!("label and property are required for create");
                         } else {
-                            let language = match lang.to_lowercase().as_str() {
-                                "spanish" => Language::Spanish,
-                                "french" => Language::French,
-                                "german" => Language::German,
-                                "italian" => Language::Italian,
-                                "portuguese" => Language::Portuguese,
-                                _ => Language::English,
-                            };
+                            let language = Language::from_str(&lang).unwrap_or_default();
                             match g.create_text_index_with_language(lbl, prop, language) {
                                 Ok(()) => println!("ok"),
                                 Err(e) => eprintln!("error: {e}"),
@@ -1369,6 +1449,11 @@ fn parse_props(s: &str) -> Result<serde_json::Value, String> {
     if s.is_empty() {
         return Ok(serde_json::json!({}));
     }
+    serde_json::from_str(s).map_err(|e| e.to_string())
+}
+
+/// Parse a JSON object string into property key-value filters for vector search.
+fn parse_prop_filters(s: &str) -> Result<HashMap<String, serde_json::Value>, String> {
     serde_json::from_str(s).map_err(|e| e.to_string())
 }
 
@@ -1706,6 +1791,38 @@ mod tests {
             "text-index create Person name --lang german"
         ));
         assert!(handle(&mut state, "text-index list"));
+
+        // 4d. Multi-label node creation via colon-separated labels.
+        assert!(handle(
+            &mut state,
+            "add-node Person:Admin {\"name\": \"Bob\"}"
+        ));
+        // Both labels must be queryable.
+        assert!(handle(&mut state, "MATCH (n:Admin) RETURN n.name"));
+
+        // 4e. Vector upsert, then filtered nearest-neighbor search.
+        assert!(handle(&mut state, "upsert-vec 1 0.1 0.2 0.3"));
+        assert!(handle(&mut state, "vsearch 5 0.1 0.2 0.3 --label Person"));
+        assert!(handle(
+            &mut state,
+            "vsearch 5 0.1 0.2 0.3 --props {\"name\":\"Alice\"}"
+        ));
+
+        // 4f. Hybrid retrieval with text seeds.
+        assert!(handle(
+            &mut state,
+            "retrieve 5 2 0.1 0.2 0.3 --text Bob --text-label Person --text-prop name"
+        ));
+
+        // 4g. Backup then restore into a fresh directory.
+        let snap = temp.path().join("snap.db");
+        assert!(handle(&mut state, &format!(":backup {}", snap.display())));
+        let restored = temp.path().join("restored");
+        assert!(handle(
+            &mut state,
+            &format!(":restore {} {}", snap.display(), restored.display())
+        ));
+        assert!(restored.exists());
 
         // 5. Quit command should return false
         assert!(!handle(&mut state, "quit"));

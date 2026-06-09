@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, path::Path, sync::Arc};
 
 use issundb::{
     Error, FusionStrategy, Graph, GraphQueryExt, HybridRetrieveOptions, Language, TextGraphExt,
@@ -210,6 +210,31 @@ pub struct HybridRetrieveArgs {
     pub text_weight: Option<f32>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct UpsertVectorArgs {
+    /// Identifier of the node to attach the embedding to.
+    pub id: u64,
+    /// Dense float32 embedding. Its dimension must match the configured index.
+    pub vector: Vec<f32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct BackupArgs {
+    /// Server-side destination path for the snapshot file.
+    pub path: String,
+    /// Write a compacted snapshot (smaller, slower) instead of a hot copy.
+    #[serde(default)]
+    pub compact: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RestoreArgs {
+    /// Server-side path to an existing snapshot file.
+    pub snapshot: String,
+    /// Server-side destination directory for the restored database.
+    pub destination: String,
+}
+
 // ---------------------------------------------------------------------------
 // Tools
 // ---------------------------------------------------------------------------
@@ -388,6 +413,20 @@ impl IssunMcp {
         ok_json(json!(response))
     }
 
+    #[tool(description = "Attach or replace the dense float32 embedding for a node.")]
+    fn upsert_vector(
+        &self,
+        Parameters(args): Parameters<UpsertVectorArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        if args.vector.is_empty() {
+            return Err(invalid("vector must not be empty"));
+        }
+        self.graph
+            .upsert_vector(args.id, &args.vector)
+            .map_err(internal)?;
+        ok_json(json!({ "id": args.id, "upserted": true }))
+    }
+
     #[tool(
         description = "Nearest-neighbor vector search; returns the k closest nodes by distance, with optional property filtering."
     )]
@@ -426,29 +465,43 @@ impl IssunMcp {
     }
 
     #[tool(
+        description = "Write a snapshot of the database to a server-side path. Set 'compact' for a smaller compacted snapshot."
+    )]
+    fn backup(&self, Parameters(args): Parameters<BackupArgs>) -> Result<CallToolResult, McpError> {
+        let path = Path::new(&args.path);
+        let result = if args.compact {
+            self.graph.backup_compact(path)
+        } else {
+            self.graph.backup(path)
+        };
+        result.map_err(internal)?;
+        ok_json(json!({ "path": args.path, "compact": args.compact, "success": true }))
+    }
+
+    #[tool(
+        description = "Restore a snapshot file into a new database directory on the server host. Does not hot-swap the running graph; reopen the server against the destination to use it."
+    )]
+    fn restore(
+        &self,
+        Parameters(args): Parameters<RestoreArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        Graph::restore(Path::new(&args.snapshot), Path::new(&args.destination))
+            .map_err(internal)?;
+        ok_json(json!({ "destination": args.destination, "success": true }))
+    }
+
+    #[tool(
         description = "Configure or rebuild the vector index. Option metric: 'cosine', 'l2', or 'dot' (alias 'ip'). Option quantization: 'float32', 'float16', or 'int8'."
     )]
     fn configure_vector_index(
         &self,
         Parameters(args): Parameters<ConfigureVectorIndexArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let metric = match args.metric.to_lowercase().as_str() {
-            "cosine" => VectorMetric::Cosine,
-            "l2" => VectorMetric::L2,
-            "dot" | "ip" => VectorMetric::Dot,
-            _ => return Err(invalid(format!("invalid metric: {}", args.metric))),
-        };
-        let quantization = match args.quantization.to_lowercase().as_str() {
-            "float32" => VectorQuantization::Float32,
-            "float16" => VectorQuantization::Float16,
-            "int8" => VectorQuantization::Int8,
-            _ => {
-                return Err(invalid(format!(
-                    "invalid quantization: {}",
-                    args.quantization
-                )));
-            }
-        };
+        let metric = args.metric.parse::<VectorMetric>().map_err(invalid)?;
+        let quantization = args
+            .quantization
+            .parse::<VectorQuantization>()
+            .map_err(invalid)?;
         let opts = VectorIndexOptions {
             metric,
             quantization,
@@ -468,21 +521,12 @@ impl IssunMcp {
         &self,
         Parameters(args): Parameters<CreateTextIndexArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let language = match args
+        let language = args
             .language
             .as_deref()
             .unwrap_or("english")
-            .to_lowercase()
-            .as_str()
-        {
-            "spanish" => Language::Spanish,
-            "french" => Language::French,
-            "german" => Language::German,
-            "italian" => Language::Italian,
-            "portuguese" => Language::Portuguese,
-            "english" => Language::English,
-            lang => return Err(invalid(format!("invalid language: {}", lang))),
-        };
+            .parse::<Language>()
+            .map_err(invalid)?;
         self.graph
             .create_text_index_with_language(&args.label, &args.property, language)
             .map_err(internal)?;
@@ -585,8 +629,9 @@ impl ServerHandler for IssunMcp {
             instructions: Some(
                 "IssunDB graph database. Tools: add_node, get_node, update_node, delete_node, \
                  add_edge, get_edge, delete_edge, cypher_query, explain, text_search, \
-                 vector_search, configure_vector_index, create_text_index, drop_text_index, \
-                 list_text_indexes, retrieve_hybrid, and set_thread_count."
+                 upsert_vector, vector_search, configure_vector_index, create_text_index, \
+                 drop_text_index, list_text_indexes, retrieve_hybrid, set_thread_count, backup, \
+                 and restore."
                     .to_string(),
             ),
         }
@@ -1007,6 +1052,78 @@ mod tests {
         let hits = body(result);
         assert_eq!(hits.as_array().map(|a| a.len()), Some(1));
         assert_eq!(hits[0]["node"].as_u64(), Some(b));
+    }
+
+    #[test]
+    fn upsert_vector_then_search_finds_it() {
+        let (mcp, _dir) = fresh();
+        let a = add_person(&mcp, "Ada");
+        mcp.upsert_vector(Parameters(UpsertVectorArgs {
+            id: a,
+            vector: vec![1.0, 0.0, 0.0],
+        }))
+        .expect("upsert_vector");
+        let result = mcp
+            .vector_search(Parameters(VectorSearchArgs {
+                vector: vec![1.0, 0.0, 0.0],
+                k: 1,
+                label: None,
+                properties: None,
+            }))
+            .expect("vector_search");
+        let hits = body(result);
+        assert_eq!(hits[0]["node"].as_u64(), Some(a));
+    }
+
+    #[test]
+    fn upsert_vector_empty_is_invalid_params() {
+        let (mcp, _dir) = fresh();
+        let a = add_person(&mcp, "Ada");
+        let err = mcp
+            .upsert_vector(Parameters(UpsertVectorArgs {
+                id: a,
+                vector: vec![],
+            }))
+            .expect_err("empty vector");
+        assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn backup_and_restore_round_trip() {
+        let (mcp, dir) = fresh();
+        let a = add_person(&mcp, "Ada");
+
+        let snapshot = dir.path().join("snap.db");
+        mcp.backup(Parameters(BackupArgs {
+            path: snapshot.to_string_lossy().into_owned(),
+            compact: false,
+        }))
+        .expect("backup");
+        assert!(snapshot.exists());
+
+        let restored = dir.path().join("restored");
+        mcp.restore(Parameters(RestoreArgs {
+            snapshot: snapshot.to_string_lossy().into_owned(),
+            destination: restored.to_string_lossy().into_owned(),
+        }))
+        .expect("restore");
+
+        // The restored database holds the node created before the backup.
+        let reopened = Graph::open(&restored, 1).expect("open restored");
+        assert!(reopened.get_node(a).expect("get_node").is_some());
+    }
+
+    #[test]
+    fn configure_vector_index_rejects_unknown_metric() {
+        let (mcp, _dir) = fresh();
+        let err = mcp
+            .configure_vector_index(Parameters(ConfigureVectorIndexArgs {
+                metric: "hamming".to_string(),
+                quantization: "float32".to_string(),
+                reindex: false,
+            }))
+            .expect_err("unknown metric");
+        assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
     }
 
     #[test]

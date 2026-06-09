@@ -120,12 +120,15 @@ Do not invent modules that do not yet exist when answering questions, but do pla
       graph with the comparison harness's Person/KNOWS schema, arbitrary query via `PROFILE_QUERY`).
 - `crates/issundb-cli/`: interactive REPL binary. Uses only the `issundb` public facade for manual exploration and demos.
 - `crates/issundb-rest/`: Axum-based HTTP REST API server. Exposes node and edge CRUD, Cypher query execution, query plan explanation, vector
-  search, and full-text search over HTTP. Uses `tokio` as its async runtime; depends only on `issundb`.
+  upsert and search, full-text search, hybrid retrieval, text and vector index administration, GraphBLAS thread-count control, and host-side
+  backup and restore over HTTP. Uses `tokio` as its async runtime; depends only on `issundb`.
 - `crates/issundb-mcp/`: Model Context Protocol server built on the `rmcp` SDK, serving over either stdio or MCP's Streamable HTTP transport.
-  Exposes node and edge CRUD, Cypher query execution, query plan explanation, full-text search, and vector search as MCP tools. Uses `tokio` as
-  its async runtime; depends only on `issundb`.
-- `crates/issundb-py/`: Python bindings via PyO3. Exposes the `IssunDB` class with node, edge, query, vector search, text search, and backup
-  methods. Depends only on `issundb`.
+  Exposes node and edge CRUD, Cypher query execution, query plan explanation, full-text search, vector upsert and search, hybrid retrieval, text
+  and vector index administration, GraphBLAS thread-count control, and host-side backup and restore as MCP tools. Uses `tokio` as its async
+  runtime; depends only on `issundb`.
+- `crates/issundb-py/`: Python bindings via PyO3. Exposes the `IssunDB` class with node and edge CRUD, Cypher query and explain, vector upsert
+  and search, vector index configuration, full-text search and index administration, hybrid retrieval, GraphBLAS thread-count control, and
+  backup and restore methods. Depends only on `issundb`.
 - `crates/issundb-examples/`: standalone example programs (`quickstart.rs`, `hybrid_retrieval_quickstart.rs`, `neo4j_migration.rs`, and
   `load_ldbc.rs`). Depends only on `issundb`.
 - `crates/issundb-core/benches/`: Criterion storage, Pokec dataset, Wikipedia PageRank, and write throughput benchmarks.
@@ -355,7 +358,13 @@ Routes:
 - `POST /v1/edges`, `GET /v1/edges/:id`, `DELETE /v1/edges/:id`
 - `POST /v1/query` (Cypher execution), `POST /v1/explain` (query plan)
 - `POST /v1/search/text`, `POST /v1/search/vector`
+- `POST /v1/vectors` (upsert embedding), `POST /v1/index/vector` (configure or reindex)
+- `POST /v1/index/text` (create), `DELETE /v1/index/text` (drop), `GET /v1/index/text` (list)
+- `POST /v1/retrieve` (hybrid retrieval)
+- `POST /v1/admin/threads` (GraphBLAS thread count), `POST /v1/admin/backup`, `POST /v1/admin/restore`
 - `GET /health` (unversioned)
+
+`POST /v1/admin/restore` materializes a fresh database directory on the server host from a snapshot; it does not hot-swap the running graph.
 
 ### `issundb_mcp`
 
@@ -369,16 +378,20 @@ validate the `Host` header (DNS rebinding, GHSA-89vp-x53w-74fx, fixed upstream o
 header allowlist middleware. The allowlist defaults to the loopback names (`localhost`, `127.0.0.1`, `::1`) plus the `--bind` host; repeat
 `--allowed-host` to add the public hostnames a reverse proxy forwards under. Requests with a missing or non-allowlisted `Host` header get HTTP 403.
 
-Tools: `add_node`, `get_node`, `update_node`, `delete_node`, `add_edge`, `get_edge`, `delete_edge`, `cypher_query`, `explain`, `text_search`, and
-`vector_search`.
+Tools: `add_node`, `get_node`, `update_node`, `delete_node`, `add_edge`, `get_edge`, `delete_edge`, `cypher_query`, `explain`, `text_search`,
+`upsert_vector`, `vector_search`, `configure_vector_index`, `create_text_index`, `drop_text_index`, `list_text_indexes`, `retrieve_hybrid`,
+`set_thread_count`, `backup`, and `restore`. The `backup` and `restore` tools read and write snapshot files on the server host; `restore`
+materializes a fresh database directory and does not hot-swap the running graph.
 
 ### `issundb_py`
 
 Python bindings via PyO3. Exposes a single `IssunDB` class. The `extension-module` feature must be enabled for the Python extension to compile.
 Depends only on `issundb`.
 
-Methods: `add_node`, `get_node`, `update_node`, `delete_node`, `add_edge`, `query`, `explain`, `upsert_vector`, `vector_search`,
-`text_search`, `create_text_index`, `drop_text_index`, `backup`, `backup_compact`, `restore`.
+Methods: `add_node` (accepts a single label string or a list of label strings), `get_node`, `update_node`, `delete_node`, `add_edge`,
+`get_edge`, `delete_edge`, `query`, `explain`, `upsert_vector`, `vector_search` (with optional `label` and JSON-object `properties` filters),
+`configure_vector_index`, `text_search`, `create_text_index` (with optional `language`), `drop_text_index`, `list_text_indexes`,
+`retrieve_hybrid`, `set_thread_count`, `backup`, `backup_compact`, and `restore`.
 
 ### `issundb_core::Storage`
 

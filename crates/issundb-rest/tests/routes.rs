@@ -431,3 +431,215 @@ async fn vector_search_returns_nearest_node() {
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0]["node"].as_u64(), Some(a));
 }
+
+// ---------------------------------------------------------------------------
+// Vector index, text index, hybrid retrieval, and admin routes
+// ---------------------------------------------------------------------------
+
+/// Build a DELETE request carrying a JSON body.
+fn delete_with_body(uri: &str, body: Value) -> Request<Body> {
+    Request::builder()
+        .method("DELETE")
+        .uri(uri)
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn upsert_vector_then_search_finds_it() {
+    let (graph, _dir) = fresh_graph();
+    let a = create_node(&graph, "Doc", json!({})).await;
+
+    let (status, _body) = send(
+        &graph,
+        post("/v1/vectors", json!({ "id": a, "vector": [1.0, 0.0, 0.0] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = send(
+        &graph,
+        post(
+            "/v1/search/vector",
+            json!({ "vector": [1.0, 0.0, 0.0], "k": 1 }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "search body: {body}");
+    assert_eq!(body[0]["node"].as_u64(), Some(a));
+}
+
+#[tokio::test]
+async fn upsert_vector_empty_is_bad_request() {
+    let (graph, _dir) = fresh_graph();
+    let a = create_node(&graph, "Doc", json!({})).await;
+    let (status, body) = send(
+        &graph,
+        post("/v1/vectors", json!({ "id": a, "vector": [] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"].is_string());
+}
+
+#[tokio::test]
+async fn configure_vector_index_then_reindex() {
+    let (graph, _dir) = fresh_graph();
+    let (status, _b) = send(
+        &graph,
+        post(
+            "/v1/index/vector",
+            json!({ "metric": "l2", "quantization": "float16" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (status, _b) = send(
+        &graph,
+        post(
+            "/v1/index/vector",
+            json!({ "metric": "cosine", "quantization": "float32", "reindex": true }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn configure_vector_index_unknown_metric_is_bad_request() {
+    let (graph, _dir) = fresh_graph();
+    let (status, body) = send(
+        &graph,
+        post(
+            "/v1/index/vector",
+            json!({ "metric": "hamming", "quantization": "float32" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"].is_string());
+}
+
+#[tokio::test]
+async fn text_index_create_list_drop_lifecycle() {
+    let (graph, _dir) = fresh_graph();
+
+    let (status, _b) = send(
+        &graph,
+        post(
+            "/v1/index/text",
+            json!({ "label": "Doc", "property": "body", "language": "german" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (status, body) = send(&graph, get("/v1/index/text")).await;
+    assert_eq!(status, StatusCode::OK);
+    let list = body.as_array().expect("index list");
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0]["label"], "Doc");
+    assert_eq!(list[0]["property"], "body");
+    assert_eq!(list[0]["language"], "german");
+
+    let (status, _b) = send(
+        &graph,
+        delete_with_body(
+            "/v1/index/text",
+            json!({ "label": "Doc", "property": "body" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (status, body) = send(&graph, get("/v1/index/text")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.as_array().expect("index list").is_empty());
+}
+
+#[tokio::test]
+async fn retrieve_hybrid_returns_subgraph() {
+    let (graph, _dir) = fresh_graph();
+    // Index a node on text and vector so both seed sources hit it.
+    let (status, _b) = send(
+        &graph,
+        post(
+            "/v1/index/text",
+            json!({ "label": "Doc", "property": "body" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let a = create_node(&graph, "Doc", json!({ "body": "alpha" })).await;
+    let (status, _b) = send(
+        &graph,
+        post("/v1/vectors", json!({ "id": a, "vector": [1.0, 0.0, 0.0] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = send(
+        &graph,
+        post(
+            "/v1/retrieve",
+            json!({
+                "vector": [1.0, 0.0, 0.0],
+                "text_query": "alpha",
+                "vector_k": 1,
+                "text_k": 1,
+                "text_label": "Doc",
+                "text_property": "body",
+                "hops": 1,
+                "fusion_strategy": "rrf"
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "retrieve body: {body}");
+    let nodes = body["nodes"].as_array().expect("nodes array");
+    assert!(nodes.contains(&json!(a)));
+}
+
+#[tokio::test]
+async fn set_thread_count_succeeds() {
+    let (graph, _dir) = fresh_graph();
+    let (status, _b) = send(&graph, post("/v1/admin/threads", json!({ "count": 2 }))).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn backup_then_restore_round_trip() {
+    let (graph, dir) = fresh_graph();
+    let a = create_node(&graph, "Person", json!({ "name": "Ada" })).await;
+
+    let snapshot = dir.path().join("snap.db");
+    let (status, _b) = send(
+        &graph,
+        post(
+            "/v1/admin/backup",
+            json!({ "path": snapshot.to_string_lossy() }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(snapshot.exists());
+
+    let restored = dir.path().join("restored");
+    let (status, _b) = send(
+        &graph,
+        post(
+            "/v1/admin/restore",
+            json!({
+                "snapshot": snapshot.to_string_lossy(),
+                "destination": restored.to_string_lossy()
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let reopened = Graph::open(&restored, 1).expect("open restored");
+    assert!(reopened.get_node(a).expect("get_node").is_some());
+}
