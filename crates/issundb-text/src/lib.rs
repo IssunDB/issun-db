@@ -447,6 +447,15 @@ impl TextGraphExt for Graph {
             }
         }
 
+        // Scores accumulate across indexes: a node indexed under more than one
+        // (label, property) pair sums its per-index contributions below. When
+        // more than one index is active, per-index top-k pruning is unsound for
+        // that sum, because a node ranked below the per-index cutoff in every
+        // index can still own the highest summed score. In that case each index
+        // is scored exhaustively (no WAND threshold pruning) and the global
+        // top-k is taken after the merge. A single active index needs no sum, so
+        // it keeps the WAND top-k fast path.
+        let multi_index = active_indices.len() > 1;
         let mut scores: HashMap<NodeId, f32> = HashMap::new();
 
         for (label, property, lang) in active_indices {
@@ -527,8 +536,13 @@ impl TextGraphExt for Graph {
                 }
             }
 
-            // Run WAND top-k.
-            let top_k = wand_top_k(cursors, opts.limit, scorer, &doc_lengths, avgdl);
+            // Run WAND top-k. With multiple active indexes, pass an unbounded k
+            // so every matching document is scored: the threshold never rises,
+            // pruning is disabled, and the cross-index sum sees full per-index
+            // scores. The global top-k truncation after the merge applies the
+            // caller's limit.
+            let index_k = if multi_index { usize::MAX } else { opts.limit };
+            let top_k = wand_top_k(cursors, index_k, scorer, &doc_lengths, avgdl);
             for (node_id, score) in top_k {
                 *scores.entry(node_id).or_insert(0.0) += score;
             }
@@ -702,6 +716,46 @@ mod tests {
             "Should return IndexNotFound error after index drop"
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_cross_index_summed_score_outranks_single_index_leaders()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // A node indexed under two (label, property) pairs accumulates its score
+        // across both indexes. A node that ranks just below the per-index cutoff
+        // in each index individually, but whose summed score is the global best,
+        // must still surface. This guards against per-index top-k pruning being
+        // applied before the cross-index sum, which would drop such a node.
+        let temp = TempDir::new()?;
+        let graph = Graph::open(temp.path(), 1)?;
+
+        // Single-word fields keep BM25 length normalization symmetric, so the
+        // title and body indexes are structurally identical. "rust" appears in
+        // a's title, b's body, and both of x's fields.
+        let a = graph.add_node("Doc", &json!({ "title": "rust", "body": "apple" }))?;
+        let b = graph.add_node("Doc", &json!({ "title": "apple", "body": "rust" }))?;
+        let x = graph.add_node("Doc", &json!({ "title": "rust", "body": "rust" }))?;
+
+        graph.create_text_index("Doc", "title")?;
+        graph.create_text_index("Doc", "body")?;
+
+        // No label/property filter, so both indexes are active. With limit 1, the
+        // per-index leaders are a (title) and b (body); x trails in each index but
+        // its title+body sum is the global best.
+        let opts = TextSearchOptions {
+            label: None,
+            property: None,
+            limit: 1,
+            ..Default::default()
+        };
+        let hits = graph.text_search("rust", &opts)?;
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].node, x,
+            "the node matching in both indexes must outrank single-index leaders {a} and {b}"
+        );
         Ok(())
     }
 
