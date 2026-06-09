@@ -71,7 +71,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let edge_props = serde_json::json!({ "since": 2021 });
     graph.add_edge(alice_id, bob_id, "KNOWS", &edge_props)?;
 
-    // Rebuild the in-memory CSR snapshot
+    // Optional: rebuild CSR snapshot manually after bulk writes
     graph.rebuild_csr()?;
 
     // Run a Cypher query and print the results
@@ -96,10 +96,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 # Output:
 Match: "Alice" knows "Bob" since 2021
 ```
-
-> [!IMPORTANT]
-> An IssunDB database can include only a single graph.
-> But you can create multiple databases and work with them simultaneously in your application.
 
 ---
 

@@ -431,3 +431,145 @@ async fn vector_search_returns_nearest_node() {
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0]["node"].as_u64(), Some(a));
 }
+
+// ---------------------------------------------------------------------------
+// Vector upsert and hybrid retrieval routes
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn upsert_vector_then_search_finds_it() {
+    let (graph, _dir) = fresh_graph();
+    let a = create_node(&graph, "Doc", json!({})).await;
+
+    let (status, _body) = send(
+        &graph,
+        post("/v1/vectors", json!({ "id": a, "vector": [1.0, 0.0, 0.0] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = send(
+        &graph,
+        post(
+            "/v1/search/vector",
+            json!({ "vector": [1.0, 0.0, 0.0], "k": 1 }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "search body: {body}");
+    assert_eq!(body[0]["node"].as_u64(), Some(a));
+}
+
+#[tokio::test]
+async fn upsert_vector_empty_is_bad_request() {
+    let (graph, _dir) = fresh_graph();
+    let a = create_node(&graph, "Doc", json!({})).await;
+    let (status, body) = send(
+        &graph,
+        post("/v1/vectors", json!({ "id": a, "vector": [] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"].is_string());
+}
+
+#[tokio::test]
+async fn retrieve_hybrid_returns_subgraph() {
+    use issundb::TextIndexExt;
+
+    let (graph, _dir) = fresh_graph();
+    // Index administration is not a REST route; provision the text index through
+    // the shared graph handle, the way an operator would (CLI or Python).
+    graph
+        .create_text_index("Doc", "body")
+        .expect("create text index");
+    let a = create_node(&graph, "Doc", json!({ "body": "alpha" })).await;
+    let (status, _b) = send(
+        &graph,
+        post("/v1/vectors", json!({ "id": a, "vector": [1.0, 0.0, 0.0] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = send(
+        &graph,
+        post(
+            "/v1/retrieve",
+            json!({
+                "vector": [1.0, 0.0, 0.0],
+                "text_query": "alpha",
+                "vector_k": 1,
+                "text_k": 1,
+                "text_label": "Doc",
+                "text_property": "body",
+                "hops": 1,
+                "fusion_strategy": "rrf"
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "retrieve body: {body}");
+    let nodes = body["nodes"].as_array().expect("nodes array");
+    assert!(nodes.contains(&json!(a)));
+}
+
+#[tokio::test]
+async fn removed_admin_routes_are_not_found() {
+    // The index-administration and host-operations routes were removed; the
+    // router must no longer recognize them.
+    let (graph, _dir) = fresh_graph();
+    for uri in [
+        "/v1/index/vector",
+        "/v1/index/text",
+        "/v1/admin/threads",
+        "/v1/admin/backup",
+        "/v1/admin/restore",
+    ] {
+        let (status, _b) = send(&graph, post(uri, json!({}))).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "uri {uri} should be gone");
+    }
+}
+
+#[tokio::test]
+async fn openapi_json_describes_the_live_routes() {
+    let (graph, _dir) = fresh_graph();
+    let (status, body) = send(&graph, get("/v1/openapi.json")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["openapi"].as_str().unwrap_or(""), "3.1.0");
+    assert_eq!(
+        body["info"]["title"].as_str().unwrap_or(""),
+        "IssunDB REST API"
+    );
+    let paths = body["paths"].as_object().expect("paths object");
+    // Every served route is documented.
+    for path in [
+        "/v1/nodes",
+        "/v1/nodes/{id}",
+        "/v1/edges",
+        "/v1/edges/{id}",
+        "/v1/query",
+        "/v1/explain",
+        "/v1/search/text",
+        "/v1/search/vector",
+        "/v1/vectors",
+        "/v1/retrieve",
+        "/health",
+    ] {
+        assert!(paths.contains_key(path), "missing documented path {path}");
+    }
+    // The removed admin surface must not reappear in the document.
+    for path in ["/v1/index/vector", "/v1/admin/backup", "/v1/admin/threads"] {
+        assert!(!paths.contains_key(path), "stale path {path} documented");
+    }
+}
+
+#[tokio::test]
+async fn docs_ui_is_served_as_html() {
+    let (graph, _dir) = fresh_graph();
+    let app = build_router(graph.clone());
+    let resp = app.oneshot(get("/v1/docs")).await.expect("response");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let html = String::from_utf8(bytes.to_vec()).expect("utf8 html");
+    assert!(html.contains("<!doctype html") || html.contains("<!DOCTYPE html"));
+}

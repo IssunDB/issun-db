@@ -447,6 +447,15 @@ impl TextGraphExt for Graph {
             }
         }
 
+        // Scores accumulate across indexes: a node indexed under more than one
+        // (label, property) pair sums its per-index contributions below. When
+        // more than one index is active, per-index top-k pruning is unsound for
+        // that sum, because a node ranked below the per-index cutoff in every
+        // index can still own the highest summed score. In that case each index
+        // is scored exhaustively (no WAND threshold pruning) and the global
+        // top-k is taken after the merge. A single active index needs no sum, so
+        // it keeps the WAND top-k fast path.
+        let multi_index = active_indices.len() > 1;
         let mut scores: HashMap<NodeId, f32> = HashMap::new();
 
         for (label, property, lang) in active_indices {
@@ -527,8 +536,13 @@ impl TextGraphExt for Graph {
                 }
             }
 
-            // Run WAND top-k.
-            let top_k = wand_top_k(cursors, opts.limit, scorer, &doc_lengths, avgdl);
+            // Run WAND top-k. With multiple active indexes, pass an unbounded k
+            // so every matching document is scored: the threshold never rises,
+            // pruning is disabled, and the cross-index sum sees full per-index
+            // scores. The global top-k truncation after the merge applies the
+            // caller's limit.
+            let index_k = if multi_index { usize::MAX } else { opts.limit };
+            let top_k = wand_top_k(cursors, index_k, scorer, &doc_lengths, avgdl);
             for (node_id, score) in top_k {
                 *scores.entry(node_id).or_insert(0.0) += score;
             }
@@ -603,6 +617,7 @@ impl TextIndexExt for Graph {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use serde_json::json;
     use tempfile::TempDir;
 
@@ -702,6 +717,46 @@ mod tests {
             "Should return IndexNotFound error after index drop"
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_cross_index_summed_score_outranks_single_index_leaders()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // A node indexed under two (label, property) pairs accumulates its score
+        // across both indexes. A node that ranks just below the per-index cutoff
+        // in each index individually, but whose summed score is the global best,
+        // must still surface. This guards against per-index top-k pruning being
+        // applied before the cross-index sum, which would drop such a node.
+        let temp = TempDir::new()?;
+        let graph = Graph::open(temp.path(), 1)?;
+
+        // Single-word fields keep BM25 length normalization symmetric, so the
+        // title and body indexes are structurally identical. "rust" appears in
+        // a's title, b's body, and both of x's fields.
+        let a = graph.add_node("Doc", &json!({ "title": "rust", "body": "apple" }))?;
+        let b = graph.add_node("Doc", &json!({ "title": "apple", "body": "rust" }))?;
+        let x = graph.add_node("Doc", &json!({ "title": "rust", "body": "rust" }))?;
+
+        graph.create_text_index("Doc", "title")?;
+        graph.create_text_index("Doc", "body")?;
+
+        // No label/property filter, so both indexes are active. With limit 1, the
+        // per-index leaders are a (title) and b (body); x trails in each index but
+        // its title+body sum is the global best.
+        let opts = TextSearchOptions {
+            label: None,
+            property: None,
+            limit: 1,
+            ..Default::default()
+        };
+        let hits = graph.text_search("rust", &opts)?;
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].node, x,
+            "the node matching in both indexes must outrank single-index leaders {a} and {b}"
+        );
         Ok(())
     }
 
@@ -867,5 +922,96 @@ mod tests {
         assert!(graph.list_text_indexes()?.is_empty());
 
         Ok(())
+    }
+
+    // Generate a WAND input: per-document lengths and, for each query term, an
+    // optional term frequency per document (`Some(tf)` means the term occurs in
+    // that document). Document ids are the vector indices, so postings are
+    // naturally sorted and unique, matching the storage invariant.
+    fn wand_input_strategy() -> impl Strategy<Value = (Vec<u32>, Vec<Vec<Option<u32>>>)> {
+        (1usize..=12).prop_flat_map(|doc_count| {
+            let lens = prop::collection::vec(1u32..=30, doc_count);
+            let terms = prop::collection::vec(
+                prop::collection::vec(prop::option::weighted(0.5, 1u32..=10), doc_count),
+                1..=5,
+            );
+            (lens, terms)
+        })
+    }
+
+    proptest! {
+        /// WAND top-k must match exhaustive scoring. WAND prunes documents whose
+        /// maximum possible score cannot beat the running threshold; with valid
+        /// per-term upper bounds it must never drop a document that belongs in
+        /// the true top-k. This compares it against a brute-force oracle that
+        /// scores every matching document.
+        #[test]
+        fn prop_wand_matches_exhaustive_oracle(
+            (doc_lens, terms) in wand_input_strategy(),
+            k in 1usize..=15,
+        ) {
+            let scorer = Bm25Scorer::default();
+            let doc_count = doc_lens.len();
+            let n_docs = doc_count as f32;
+            let avgdl = doc_lens.iter().map(|&l| l as f32).sum::<f32>() / n_docs;
+            let doc_lengths: HashMap<NodeId, u32> = doc_lens
+                .iter()
+                .enumerate()
+                .map(|(i, &len)| (i as NodeId, len))
+                .collect();
+
+            // Shared per-term data (postings, idf, qtf) so the oracle and the
+            // cursors score identically. qtf is fixed at 1 (each query term once).
+            let mut term_data: Vec<(Vec<(NodeId, u32)>, f32, f32)> = Vec::new();
+            for term in &terms {
+                let postings: Vec<(NodeId, u32)> = term
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, occ)| occ.map(|tf| (i as NodeId, tf)))
+                    .collect();
+                if postings.is_empty() {
+                    continue;
+                }
+                let idf = scorer.idf(n_docs, postings.len() as f32);
+                term_data.push((postings, idf, 1.0));
+            }
+
+            // Brute-force oracle: full score for every matching document.
+            let mut oracle: HashMap<NodeId, f32> = HashMap::new();
+            for (postings, idf, qtf) in &term_data {
+                for &(doc, tf) in postings {
+                    let dl = doc_lengths[&doc] as f32;
+                    *oracle.entry(doc).or_insert(0.0) +=
+                        scorer.score(tf as f32, dl, avgdl, *idf, *qtf);
+                }
+            }
+            let mut expected_scores: Vec<f32> =
+                oracle.values().copied().filter(|s| *s > 0.0).collect();
+            expected_scores.sort_by(|a, b| b.partial_cmp(a).unwrap());
+            expected_scores.truncate(k);
+
+            // WAND under test, fed cursors built from the identical term data.
+            let cursors: Vec<PostingCursor> = term_data
+                .iter()
+                .map(|(postings, idf, qtf)| {
+                    let ub = scorer.upper_bound(*idf) * *qtf;
+                    PostingCursor::new(postings.clone(), *idf, ub, *qtf)
+                })
+                .collect();
+            let results = wand_top_k(cursors, k, &scorer, &doc_lengths, avgdl);
+
+            prop_assert_eq!(results.len(), expected_scores.len());
+            for (i, (node, score)) in results.iter().enumerate() {
+                // The score WAND reports for a document matches the oracle's.
+                let oracle_score = *oracle.get(node).expect("returned node must score");
+                prop_assert!((oracle_score - score).abs() < 1e-3);
+                // The returned set is the true top-k by score (tie-break aside).
+                prop_assert!((expected_scores[i] - score).abs() < 1e-3);
+                // Results are ordered by descending score.
+                if i > 0 {
+                    prop_assert!(results[i - 1].1 + 1e-4 >= *score);
+                }
+            }
+        }
     }
 }

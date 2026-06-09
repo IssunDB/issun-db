@@ -97,7 +97,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!("Upserted 4-dimensional embeddings on all 6 Movie nodes.\n");
 
-    // Rebuild CSR so GraphBLAS BFS expansion is current.
+    // Optional: rebuild CSR snapshot manually after bulk writes
     graph.rebuild_csr()?;
 
     // ---- 6. Run retrieve_hybrid and print the scored subgraph --------------

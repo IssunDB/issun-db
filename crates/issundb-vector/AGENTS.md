@@ -1,7 +1,7 @@
 # `issundb-vector` Agent Guide
 
-This file covers crate-specific guidance for contributors working inside `crates/issundb-vector`. Read the root `AGENTS.md` first; the rules there
-apply everywhere and are not repeated here.
+This file covers crate-specific guidance for contributors working inside `crates/issundb-vector`.
+Read the root `AGENTS.md` first; the rules there apply everywhere and are not repeated here.
 
 ## `VectorIndex` Lifecycle
 
@@ -33,12 +33,10 @@ Do not add any path that changes `dims` after initialization.
     - `Cosine`: angular similarity; suitable for normalized text embeddings.
     - `L2`: Euclidean distance; suitable for spatial or non-normalized vectors.
     - `Dot`: inner product; use when vectors are already normalized to unit length and maximum dot product is the goal.
-    - `Hamming`: bit-level distance for binary vectors; requires `B1` quantization.
 - `quantization: VectorQuantization` (default: `F32`): scalar precision for stored vectors. Trade-offs:
-    - `F32`: full precision, no recall loss.
-    - `F16`: 2x memory reduction, minor recall loss (typically < 1 %).
-    - `I8`: 4x memory reduction, moderate recall loss; suitable for large corpora where approximate results are acceptable.
-    - `B1`: 32x memory reduction, significant recall loss; use only for binary vectors with `Hamming` metric.
+    - `Float32`: full precision, no recall loss.
+    - `Float16`: 2x memory reduction, minor recall loss (typically < 1 %).
+    - `Int8`: 4x memory reduction, moderate recall loss; suitable for large corpora where approximate results are acceptable.
 
 The metric and quantization are fixed at index construction time and cannot be changed without rebuilding the index from scratch.
 

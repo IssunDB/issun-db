@@ -195,6 +195,7 @@ pub fn retrieve_hybrid(
             &VectorSearchOptions {
                 k: opts.vector_k,
                 label: opts.vector_label.clone(),
+                properties: None,
             },
         )?;
         for (rank, hit) in hits.iter().enumerate() {

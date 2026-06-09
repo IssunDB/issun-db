@@ -26,6 +26,32 @@ def test_edge_is_traversable_with_cypher(db):
     assert ["Alice", "Bob", 2021] in rows(result)
 
 
+def test_get_edge_round_trip(db):
+    alice = db.add_node("Person", json.dumps({"name": "Alice"}))
+    bob = db.add_node("Person", json.dumps({"name": "Bob"}))
+    eid = db.add_edge(alice, bob, "KNOWS", json.dumps({"since": 2021}))
+    edge = json.loads(db.get_edge(eid))
+    assert edge["src"] == alice
+    assert edge["dst"] == bob
+    assert edge["type"] == "KNOWS"
+    assert edge["props"] == {"since": 2021}
+
+
+def test_missing_edge_is_none(db):
+    assert db.get_edge(999) is None
+
+
+def test_delete_edge_removes_it(db):
+    alice = db.add_node("Person", json.dumps({"name": "Alice"}))
+    bob = db.add_node("Person", json.dumps({"name": "Bob"}))
+    eid = db.add_edge(alice, bob, "KNOWS", json.dumps({}))
+    db.delete_edge(eid)
+    assert db.get_edge(eid) is None
+    # The endpoints survive an edge deletion.
+    assert db.get_node(alice) is not None
+    assert db.get_node(bob) is not None
+
+
 def test_delete_node_detaches_edges(db):
     alice = db.add_node("Person", json.dumps({"name": "Alice"}))
     bob = db.add_node("Person", json.dumps({"name": "Bob"}))

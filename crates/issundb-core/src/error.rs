@@ -20,6 +20,9 @@ pub enum Error {
     #[error("corrupt storage: {0}")]
     Corrupt(&'static str),
 
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
+
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 

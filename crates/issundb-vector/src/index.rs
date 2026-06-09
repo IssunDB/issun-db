@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::sync::Arc;
 
 use parking_lot::RwLock;
@@ -20,11 +21,17 @@ pub struct VectorSearchOptions {
     pub k: usize,
     /// If set, only nodes carrying this exact label are included in results.
     pub label: Option<String>,
+    /// Optional property key-value filters. Only nodes matching all filters are returned.
+    pub properties: Option<std::collections::HashMap<String, serde_json::Value>>,
 }
 
 impl Default for VectorSearchOptions {
     fn default() -> Self {
-        Self { k: 10, label: None }
+        Self {
+            k: 10,
+            label: None,
+            properties: None,
+        }
     }
 }
 
@@ -38,8 +45,6 @@ pub enum VectorMetric {
     L2,
     /// Inner product / dot product.
     Dot,
-    /// Hamming distance (for binary vectors).
-    Hamming,
 }
 
 /// Quantization format for in-memory vector storage.
@@ -52,6 +57,41 @@ pub enum VectorQuantization {
     Float16,
     /// Int8 quantization (quarter memory footprint).
     Int8,
+}
+
+impl std::str::FromStr for VectorMetric {
+    type Err = VectorError;
+
+    /// Parse a metric name. Case-insensitive. Accepts `cosine`, `l2`, and `dot`
+    /// (with the alias `ip` for inner product). This is the one canonical
+    /// mapping every binding (CLI, REST, MCP, and Python) parses through.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "cosine" => Ok(Self::Cosine),
+            "l2" => Ok(Self::L2),
+            "dot" | "ip" => Ok(Self::Dot),
+            other => Err(VectorError::InvalidConfig(format!(
+                "unknown metric '{other}' (expected 'cosine', 'l2', or 'dot')"
+            ))),
+        }
+    }
+}
+
+impl std::str::FromStr for VectorQuantization {
+    type Err = VectorError;
+
+    /// Parse a quantization name. Case-insensitive. Accepts `float32`,
+    /// `float16`, and `int8`. The one canonical mapping shared by every binding.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "float32" => Ok(Self::Float32),
+            "float16" => Ok(Self::Float16),
+            "int8" => Ok(Self::Int8),
+            other => Err(VectorError::InvalidConfig(format!(
+                "unknown quantization '{other}' (expected 'float32', 'float16', or 'int8')"
+            ))),
+        }
+    }
 }
 
 /// Construction options for `VectorIndex`.
@@ -197,6 +237,49 @@ impl VectorIndex {
             }
         }
     }
+
+    /// Return up to `k` approximate nearest neighbors to `q` that satisfy
+    /// `predicate`.
+    ///
+    /// The predicate is evaluated during the HNSW traversal, so the search keeps
+    /// expanding until it has `k` matching neighbors or exhausts the reachable
+    /// graph. Unlike post-filtering a fixed over-fetch, this does not silently
+    /// truncate the result set when the filter is selective.
+    pub fn search_filtered<F>(
+        &self,
+        q: &[f32],
+        k: usize,
+        predicate: F,
+    ) -> Result<Vec<Hit>, VectorError>
+    where
+        F: Fn(NodeId) -> bool,
+    {
+        let guard = self.inner.read();
+        match &*guard {
+            Inner::Empty => Ok(vec![]),
+            Inner::Ready { index, dims } => {
+                if q.len() != *dims {
+                    return Err(VectorError::DimensionMismatch {
+                        expected: *dims,
+                        got: q.len(),
+                    });
+                }
+                if k == 0 || index.size() == 0 {
+                    return Ok(vec![]);
+                }
+                let actual_k = k.min(index.size());
+                let matches = index
+                    .filtered_search::<f32, _>(q, actual_k, predicate)
+                    .map_err(|e| VectorError::IndexFault(e.to_string()))?;
+                Ok(matches
+                    .keys
+                    .iter()
+                    .zip(matches.distances.iter())
+                    .map(|(&node, &distance)| Hit { node, distance })
+                    .collect())
+            }
+        }
+    }
 }
 
 fn encode_vector(v: &[f32]) -> Result<Vec<u8>, VectorError> {
@@ -258,13 +341,18 @@ pub trait VectorGraphExt {
     /// Return the `k` approximate nearest neighbors to `q` by cosine distance.
     fn vector_search(&self, q: &[f32], k: usize) -> Result<Vec<Hit>, VectorError>;
 
-    /// Return the `k` approximate nearest neighbors whose label matches `opts.label`.
+    /// Return the `opts.k` approximate nearest neighbors that satisfy the label
+    /// and property filters in `opts`.
     ///
-    /// When `opts.label` is `None` the call is identical to `vector_search(q, opts.k)`.
-    /// When a label filter is set the index is over-fetched (up to `opts.k * 4` candidates)
-    /// and candidates whose stored label does not match are discarded. The first `opts.k`
-    /// survivors are returned; fewer may be returned when the index contains fewer matching
-    /// nodes.
+    /// When neither `opts.label` nor `opts.properties` is set the call is
+    /// identical to `vector_search(q, opts.k)`. When a filter is set, it is
+    /// applied during the HNSW traversal through a predicate, so the search
+    /// keeps expanding until it has `opts.k` matching neighbors rather than
+    /// post-filtering a fixed over-fetch (which silently under-returns for
+    /// selective filters). A node matches when it carries `opts.label` (if set)
+    /// and every entry in `opts.properties` (if set) equals the node's value for
+    /// that property. Fewer than `opts.k` results are returned only when the
+    /// index genuinely contains fewer matching nodes.
     fn vector_search_with(
         &self,
         q: &[f32],
@@ -348,36 +436,57 @@ impl VectorGraphExt for Graph {
         q: &[f32],
         opts: &VectorSearchOptions,
     ) -> Result<Vec<Hit>, VectorError> {
-        let label_filter = match &opts.label {
-            None => return self.vector_search(q, opts.k),
-            Some(l) => l.clone(),
+        if opts.label.is_none() && opts.properties.is_none() {
+            return self.vector_search(q, opts.k);
+        }
+
+        let arc = get_or_init_cache(self)?;
+
+        // Evaluate the label and property filters during the HNSW traversal via
+        // a predicate, so the search keeps expanding until it has `opts.k`
+        // matching neighbors instead of post-filtering a fixed over-fetch, which
+        // silently under-returns when the filter is selective. The predicate
+        // reads through the core accessors (`label_filter` point lookup and the
+        // in-memory property columns via `node_prop_json`) rather than decoding
+        // raw node records, to respect the crate boundary. A storage error
+        // cannot travel through the `Fn(NodeId) -> bool` callback, so it is
+        // captured and surfaced after the search; once set, the predicate
+        // rejects every remaining candidate to end the traversal promptly.
+        let pred_err: RefCell<Option<VectorError>> = RefCell::new(None);
+        let matches_filters = |node: NodeId| -> Result<bool, VectorError> {
+            if let Some(label) = &opts.label {
+                if self.label_filter(&[node], label)?.is_empty() {
+                    return Ok(false);
+                }
+            }
+            if let Some(filters) = &opts.properties {
+                for (key, want) in filters {
+                    match self.node_prop_json(node, key)? {
+                        Some(got) if &got == want => {}
+                        _ => return Ok(false),
+                    }
+                }
+            }
+            Ok(true)
+        };
+        let predicate = |node: NodeId| -> bool {
+            if pred_err.borrow().is_some() {
+                return false;
+            }
+            match matches_filters(node) {
+                Ok(keep) => keep,
+                Err(e) => {
+                    *pred_err.borrow_mut() = Some(e);
+                    false
+                }
+            }
         };
 
-        // Over-fetch to increase the chance of finding opts.k label-matching
-        // results. Saturating arithmetic keeps a very large `opts.k` from
-        // overflowing; `vector_search` clamps the request to the index size.
-        let fetch_k = opts.k.saturating_mul(4).max(opts.k.saturating_add(64));
-        let candidates = self.vector_search(q, fetch_k)?;
-
-        // Bound the pre-allocation by the number of candidates actually
-        // returned, never by the caller-supplied `opts.k`. `candidates` is
-        // already capped at the index size (`vector_search` clamps the
-        // request), and the loop pushes at most one entry per candidate, so
-        // this cannot reserve an unbounded amount of memory for a large `k`.
-        let mut out = Vec::with_capacity(candidates.len());
-        for hit in candidates {
-            if out.len() >= opts.k {
-                break;
-            }
-            // Keep the hit if any of the node's labels matches the filter. A
-            // storage error here is surfaced rather than silently dropping the
-            // candidate, which would under-report results without explanation.
-            let labels = self.node_labels(hit.node)?;
-            if labels.iter().any(|l| *l == label_filter) {
-                out.push(hit);
-            }
+        let hits = arc.0.search_filtered(q, opts.k, predicate)?;
+        if let Some(e) = pred_err.into_inner() {
+            return Err(e);
         }
-        Ok(out)
+        Ok(hits)
     }
 }
 
@@ -421,7 +530,6 @@ fn encode_config(opts: VectorIndexOptions) -> [u8; 2] {
         VectorMetric::Cosine => 0,
         VectorMetric::L2 => 1,
         VectorMetric::Dot => 2,
-        VectorMetric::Hamming => 3,
     };
     let quant = match opts.quantization {
         VectorQuantization::Float32 => 0,
@@ -443,7 +551,6 @@ fn decode_config(bytes: &[u8]) -> Result<VectorIndexOptions, VectorError> {
         0 => VectorMetric::Cosine,
         1 => VectorMetric::L2,
         2 => VectorMetric::Dot,
-        3 => VectorMetric::Hamming,
         other => {
             return Err(VectorError::IndexFault(format!(
                 "unknown vector metric tag {other}"
@@ -471,7 +578,6 @@ fn metric_to_usearch(m: VectorMetric) -> MetricKind {
         VectorMetric::Cosine => MetricKind::Cos,
         VectorMetric::L2 => MetricKind::L2sq,
         VectorMetric::Dot => MetricKind::IP,
-        VectorMetric::Hamming => MetricKind::Hamming,
     }
 }
 
@@ -494,6 +600,35 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let graph = Graph::open(dir.path(), 1).unwrap();
         (dir, graph)
+    }
+
+    #[test]
+    fn metric_from_str_is_case_insensitive_with_alias() {
+        assert_eq!(
+            "cosine".parse::<VectorMetric>().unwrap(),
+            VectorMetric::Cosine
+        );
+        assert_eq!("L2".parse::<VectorMetric>().unwrap(), VectorMetric::L2);
+        assert_eq!("Dot".parse::<VectorMetric>().unwrap(), VectorMetric::Dot);
+        assert_eq!("ip".parse::<VectorMetric>().unwrap(), VectorMetric::Dot);
+        assert!("hamming".parse::<VectorMetric>().is_err());
+    }
+
+    #[test]
+    fn quantization_from_str_is_case_insensitive() {
+        assert_eq!(
+            "float32".parse::<VectorQuantization>().unwrap(),
+            VectorQuantization::Float32
+        );
+        assert_eq!(
+            "Float16".parse::<VectorQuantization>().unwrap(),
+            VectorQuantization::Float16
+        );
+        assert_eq!(
+            "INT8".parse::<VectorQuantization>().unwrap(),
+            VectorQuantization::Int8
+        );
+        assert!("b1".parse::<VectorQuantization>().is_err());
     }
 
     #[test]
@@ -595,6 +730,7 @@ mod tests {
         let opts = VectorSearchOptions {
             k: 3,
             label: Some("Article".into()),
+            properties: None,
         };
         let hits = graph
             .vector_search_with(&[1.0f32, 0.0, 0.0], &opts)
@@ -606,6 +742,42 @@ mod tests {
         );
         assert!(hits.len() <= 2);
         assert!(hits.iter().any(|h| h.node == a));
+    }
+
+    #[test]
+    fn vector_search_with_selective_property_filter_finds_distant_matches() {
+        // Regression guard: a selective property filter must not silently
+        // under-return. Many non-matching nodes sit nearest the query, and the
+        // matching nodes rank far below them. A post-filter over a fixed
+        // over-fetch would discard every candidate and return nothing; the
+        // predicate-driven traversal keeps expanding until it finds them.
+        let (_dir, graph) = open_tmp();
+        // 200 "red" decoys, all nearer the query than any "blue" node.
+        for i in 0..200u32 {
+            let n = graph.add_node("N", &json!({ "team": "red" })).unwrap();
+            let jitter = (i as f32) * 1e-4;
+            graph.upsert_vector(n, &[1.0, jitter, 0.0]).unwrap();
+        }
+        // 2 "blue" matches, farther from the query in cosine distance.
+        let blue1 = graph.add_node("N", &json!({ "team": "blue" })).unwrap();
+        let blue2 = graph.add_node("N", &json!({ "team": "blue" })).unwrap();
+        graph.upsert_vector(blue1, &[0.6, 0.8, 0.0]).unwrap();
+        graph.upsert_vector(blue2, &[0.5, 0.85, 0.0]).unwrap();
+
+        let mut filters = std::collections::HashMap::new();
+        filters.insert("team".to_string(), json!("blue"));
+        let opts = VectorSearchOptions {
+            k: 2,
+            label: None,
+            properties: Some(filters),
+        };
+        let hits = graph
+            .vector_search_with(&[1.0f32, 0.0, 0.0], &opts)
+            .unwrap();
+
+        assert_eq!(hits.len(), 2, "both blue matches must be returned");
+        assert!(hits.iter().any(|h| h.node == blue1));
+        assert!(hits.iter().any(|h| h.node == blue2));
     }
 
     #[test]
@@ -769,5 +941,58 @@ mod tests {
         for h in handles {
             h.join().unwrap();
         }
+    }
+
+    #[test]
+    fn vector_search_with_int8_quantization_finds_nearest() {
+        // Int8 quantization is wired to usearch's ScalarKind::I8. Precision is
+        // reduced, but well-separated vectors must still rank correctly.
+        let (_dir, graph) = open_tmp();
+        graph
+            .configure_vector_index(VectorIndexOptions {
+                metric: VectorMetric::Cosine,
+                quantization: VectorQuantization::Int8,
+            })
+            .unwrap();
+        let a = graph.add_node("N", &json!({})).unwrap();
+        let b = graph.add_node("N", &json!({})).unwrap();
+        let c = graph.add_node("N", &json!({})).unwrap();
+        graph.upsert_vector(a, &[1.0, 0.0, 0.0]).unwrap();
+        graph.upsert_vector(b, &[0.0, 1.0, 0.0]).unwrap();
+        graph.upsert_vector(c, &[0.0, 0.0, 1.0]).unwrap();
+
+        let hits = graph.vector_search(&[1.0, 0.0, 0.0], 1).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].node, a);
+    }
+
+    #[test]
+    fn vector_search_with_multiple_property_filters_requires_all() {
+        // A property filter with several keys is an AND: only nodes matching
+        // every key/value pair qualify. The nearest node matches one key but not
+        // the other and must be excluded.
+        let (_dir, graph) = open_tmp();
+        let near = graph
+            .add_node("N", &json!({ "team": "blue", "role": "ic" }))
+            .unwrap();
+        let far = graph
+            .add_node("N", &json!({ "team": "blue", "role": "lead" }))
+            .unwrap();
+        graph.upsert_vector(near, &[1.0, 0.0, 0.0]).unwrap();
+        graph.upsert_vector(far, &[0.9, 0.1, 0.0]).unwrap();
+
+        let mut filters = std::collections::HashMap::new();
+        filters.insert("team".to_string(), json!("blue"));
+        filters.insert("role".to_string(), json!("lead"));
+        let opts = VectorSearchOptions {
+            k: 2,
+            label: None,
+            properties: Some(filters),
+        };
+        let hits = graph.vector_search_with(&[1.0, 0.0, 0.0], &opts).unwrap();
+
+        // `near` is closer but is role=ic, so only `far` satisfies both filters.
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].node, far);
     }
 }

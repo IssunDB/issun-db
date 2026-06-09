@@ -94,6 +94,18 @@ All data and query endpoints are prefixed with `/v1`.
     }
     ```
 
+#### API Reference (OpenAPI)
+
+The server publishes a machine-readable OpenAPI 3.1 document generated from the route handlers, so it always matches the live API. Use it to
+generate typed clients or to browse the full request and response schemas, including the routes not enumerated above (`POST /v1/vectors` and
+`POST /v1/retrieve`).
+
+* OpenAPI document: `GET /v1/openapi.json`
+* Interactive Scalar UI: `GET /v1/docs`
+
+The Scalar UI loads its front-end assets from a CDN, so the documentation page needs outbound network access to render; the
+`GET /v1/openapi.json` document itself is fully self-contained and works offline.
+
 ---
 
 ## Model Context Protocol (MCP) Server

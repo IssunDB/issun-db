@@ -119,13 +119,17 @@ Do not invent modules that do not yet exist when answering questions, but do pla
       observes query execution without load noise: `profile_triangle` (Zipf-skewed graph, cyclic triangle-count query) and `profile_query` (uniform
       graph with the comparison harness's Person/KNOWS schema, arbitrary query via `PROFILE_QUERY`).
 - `crates/issundb-cli/`: interactive REPL binary. Uses only the `issundb` public facade for manual exploration and demos.
-- `crates/issundb-rest/`: Axum-based HTTP REST API server. Exposes node and edge CRUD, Cypher query execution, query plan explanation, vector
-  search, and full-text search over HTTP. Uses `tokio` as its async runtime; depends only on `issundb`.
+- `crates/issundb-rest/`: Axum-based HTTP REST API server. Exposes the data plane and retrieval over HTTP: node and edge CRUD, Cypher query
+  execution, query plan explanation, vector upsert and search, full-text search, and hybrid retrieval. Index administration and host operations
+  (backup, restore, thread control) are intentionally not exposed over HTTP. Serves a generated OpenAPI 3.1 document at `/v1/openapi.json` and a
+  Scalar UI at `/v1/docs`. Uses `tokio` as its async runtime; depends only on `issundb`.
 - `crates/issundb-mcp/`: Model Context Protocol server built on the `rmcp` SDK, serving over either stdio or MCP's Streamable HTTP transport.
-  Exposes node and edge CRUD, Cypher query execution, query plan explanation, full-text search, and vector search as MCP tools. Uses `tokio` as
-  its async runtime; depends only on `issundb`.
-- `crates/issundb-py/`: Python bindings via PyO3. Exposes the `IssunDB` class with node, edge, query, vector search, text search, and backup
-  methods. Depends only on `issundb`.
+  Exposes a curated read, query, and retrieval surface for LLM agents: node and edge reads, Cypher query execution (the mutation path), query
+  plan explanation, full-text search, vector search, and hybrid retrieval. Index administration, vector loading, and host operations are
+  intentionally excluded. Uses `tokio` as its async runtime; depends only on `issundb`.
+- `crates/issundb-py/`: Python bindings via PyO3. Exposes the `IssunDB` class with node and edge CRUD, Cypher query and explain, vector upsert
+  and search, vector index configuration, full-text search and index administration, hybrid retrieval, GraphBLAS thread-count control, and
+  backup and restore methods. Depends only on `issundb`.
 - `crates/issundb-examples/`: standalone example programs (`quickstart.rs`, `hybrid_retrieval_quickstart.rs`, `neo4j_migration.rs`, and
   `load_ldbc.rs`). Depends only on `issundb`.
 - `crates/issundb-core/benches/`: Criterion storage, Pokec dataset, Wikipedia PageRank, and write throughput benchmarks.
@@ -349,12 +353,27 @@ Data and query routes are versioned under a `/v1` prefix.
 `GET /health` stays unversioned so infrastructure probes do not track the API version; its body reports the crate `version` and the current `api`
 version.
 
+REST exposes the data plane and retrieval only. Index administration (vector index configuration, text index create/drop/list), GraphBLAS
+thread control, and backup/restore are intentionally absent: provisioning and host operations are done through the CLI or the Python surface, not
+over HTTP. This keeps the network surface to data and queries and avoids exposing host-filesystem operations to network callers.
+
+The API is self-describing: the OpenAPI 3.1 document is generated from the handler annotations (`#[utoipa::path]`) and the request and response
+`ToSchema` derives, so it cannot drift from the routes. It is served as JSON at `GET /v1/openapi.json`, with an interactive Scalar UI at
+`GET /v1/docs`. The generator crates are `utoipa` and `utoipa-scalar` (both MIT or Apache-2.0), pinned to the axum 0.7 line. Because the
+handlers build their JSON bodies inline with `json!`, the documentation-only response structs (`NodeResponse`, `EdgeResponse`, `IdResponse`,
+`QueryResponse`, `ExplainResponse`, `RetrieveResponse`, `HealthResponse`, and `ErrorResponse`) describe the response shapes and must be kept in
+sync with those literals. The Cypher result is documented as columns plus row-major records of arbitrary JSON, because the per-query value types
+are not statically known.
+
 Routes:
 
 - `POST /v1/nodes`, `GET /v1/nodes/:id`, `PUT /v1/nodes/:id`, `DELETE /v1/nodes/:id`
 - `POST /v1/edges`, `GET /v1/edges/:id`, `DELETE /v1/edges/:id`
 - `POST /v1/query` (Cypher execution), `POST /v1/explain` (query plan)
 - `POST /v1/search/text`, `POST /v1/search/vector`
+- `POST /v1/vectors` (upsert embedding)
+- `POST /v1/retrieve` (hybrid retrieval)
+- `GET /v1/openapi.json` (OpenAPI 3.1 document), `GET /v1/docs` (Scalar UI)
 - `GET /health` (unversioned)
 
 ### `issundb_mcp`
@@ -369,16 +388,21 @@ validate the `Host` header (DNS rebinding, GHSA-89vp-x53w-74fx, fixed upstream o
 header allowlist middleware. The allowlist defaults to the loopback names (`localhost`, `127.0.0.1`, `::1`) plus the `--bind` host; repeat
 `--allowed-host` to add the public hostnames a reverse proxy forwards under. Requests with a missing or non-allowlisted `Host` header get HTTP 403.
 
-Tools: `add_node`, `get_node`, `update_node`, `delete_node`, `add_edge`, `get_edge`, `delete_edge`, `cypher_query`, `explain`, `text_search`, and
-`vector_search`.
+The tool surface is deliberately curated for an LLM agent: reads, queries, and retrieval only. Tools: `get_node`, `get_edge`, `cypher_query`,
+`explain`, `text_search`, `vector_search`, and `retrieve_hybrid`. There are no typed mutation tools: graph mutations are expressed as Cypher
+(`CREATE`, `SET`, `REMOVE`, `DELETE`, `MERGE`) through `cypher_query`. There are also no index-administration, vector-loading, thread-control, or
+backup/restore tools; those are operator concerns driven through the CLI or the Python and REST surfaces, not through an agent. Keep this surface
+minimal: every additional tool dilutes the agent's tool selection, so new agent-facing capability should clear that bar before being added here.
 
 ### `issundb_py`
 
 Python bindings via PyO3. Exposes a single `IssunDB` class. The `extension-module` feature must be enabled for the Python extension to compile.
 Depends only on `issundb`.
 
-Methods: `add_node`, `get_node`, `update_node`, `delete_node`, `add_edge`, `query`, `explain`, `upsert_vector`, `vector_search`,
-`text_search`, `create_text_index`, `drop_text_index`, `backup`, `backup_compact`, `restore`.
+Methods: `add_node` (accepts a single label string or a list of label strings), `get_node`, `update_node`, `delete_node`, `add_edge`,
+`get_edge`, `delete_edge`, `query`, `explain`, `upsert_vector`, `vector_search` (with optional `label` and JSON-object `properties` filters),
+`configure_vector_index`, `text_search`, `create_text_index` (with optional `language`), `drop_text_index`, `list_text_indexes`,
+`retrieve_hybrid`, `set_thread_count`, `backup`, `backup_compact`, and `restore`.
 
 ### `issundb_core::Storage`
 

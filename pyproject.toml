@@ -48,7 +48,7 @@ addopts = [
 branch = true
 parallel = true
 source = ["."]
-omit = ["tests/*"]
+omit = ["crates/issundb-py/tests/*"]
 
 [tool.coverage.report]
 show_missing = false
@@ -96,4 +96,4 @@ line-ending = "auto"
 convention = "google"
 
 [tool.ruff.lint.per-file-ignores]
-"python/tests/**/*.py" = []
+"crates/issundb-py/tests/**/*.py" = []
