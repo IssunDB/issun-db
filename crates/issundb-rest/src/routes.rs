@@ -166,6 +166,7 @@ pub struct VectorSearchBody {
     #[serde(default = "default_k")]
     pub k: usize,
     pub label: Option<String>,
+    pub properties: Option<std::collections::HashMap<String, serde_json::Value>>,
 }
 
 fn default_limit() -> usize {
@@ -427,6 +428,7 @@ pub async fn search_vector(
         let opts = VectorSearchOptions {
             k: body.k,
             label: body.label,
+            properties: body.properties,
         };
         match graph.vector_search_with(&body.vector, &opts) {
             Ok(hits) => {

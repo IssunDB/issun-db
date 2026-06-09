@@ -1,8 +1,9 @@
 use std::{collections::HashMap, sync::Arc};
 
 use issundb::{
-    Error, Graph, GraphQueryExt, TextGraphExt, TextSearchOptions, VectorGraphExt,
-    VectorSearchOptions,
+    Error, FusionStrategy, Graph, GraphQueryExt, HybridRetrieveOptions, Language, TextGraphExt,
+    TextIndexExt, TextSearchOptions, VectorGraphExt, VectorIndexOptions, VectorMetric,
+    VectorQuantization, VectorSearchOptions, retrieve_hybrid,
 };
 use rmcp::{
     ErrorData as McpError, ServerHandler,
@@ -49,8 +50,10 @@ fn invalid(e: impl std::fmt::Display) -> McpError {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct AddNodeArgs {
-    /// Label to attach to the new node.
-    pub label: String,
+    /// Primary label to attach to the new node. Required unless 'labels' is provided.
+    pub label: Option<String>,
+    /// List of labels to attach to the new node (multi-label support). Required unless 'label' is provided.
+    pub labels: Option<Vec<String>>,
     /// Arbitrary JSON property map for the node.
     #[serde(default)]
     pub props: Value,
@@ -128,6 +131,8 @@ pub struct VectorSearchArgs {
     pub k: usize,
     /// Optional label to restrict the search to.
     pub label: Option<String>,
+    /// Optional property key-value filters. Only nodes matching all filters are returned.
+    pub properties: Option<HashMap<String, Value>>,
 }
 
 fn default_limit() -> usize {
@@ -136,6 +141,73 @@ fn default_limit() -> usize {
 
 fn default_k() -> usize {
     5
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SetThreadCountArgs {
+    /// The number of threads to use for GraphBLAS computations (set to 0 to restore default behavior).
+    pub count: i32,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ConfigureVectorIndexArgs {
+    /// Distance metric: 'cosine', 'l2', 'dot' (alias 'ip'), or 'hamming'.
+    pub metric: String,
+    /// Quantization mode: 'float32', 'float16', or 'int8'.
+    pub quantization: String,
+    /// Rebuild the index from existing stored vectors under the new configuration.
+    #[serde(default)]
+    pub reindex: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CreateTextIndexArgs {
+    /// Label to attach the index to.
+    pub label: String,
+    /// Property name to index.
+    pub property: String,
+    /// Optional stemming/tokenization language: 'english', 'spanish', 'french', 'german', 'italian', or 'portuguese'.
+    pub language: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DropTextIndexArgs {
+    /// Label of the index to drop.
+    pub label: String,
+    /// Property name of the index to drop.
+    pub property: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct HybridRetrieveArgs {
+    /// Query vector for semantic/vector search. Optional; if omitted, vector search is skipped.
+    pub vector: Option<Vec<f32>>,
+    /// Query string for full-text search. Optional; if omitted, text search is skipped.
+    pub text_query: Option<String>,
+    /// Maximum number of seeds to retrieve from vector search (defaults to 10).
+    pub vector_k: Option<usize>,
+    /// Maximum number of seeds to retrieve from text search (defaults to 10).
+    pub text_k: Option<usize>,
+    /// Optional label filter for text search.
+    pub text_label: Option<String>,
+    /// Optional property filter for text search.
+    pub text_property: Option<String>,
+    /// Optional label filter for vector search.
+    pub vector_label: Option<String>,
+    /// BFS expansion depth from seed nodes (defaults to 2).
+    pub hops: Option<u8>,
+    /// Maximum cosine distance for vector hits to qualify as seeds.
+    pub max_distance: Option<f32>,
+    /// Optional hard cap on total subgraph nodes returned.
+    pub max_nodes: Option<usize>,
+    /// Fusion strategy: 'rrf' (Reciprocal Rank Fusion) or 'weighted_sum' (defaults to 'rrf').
+    pub fusion_strategy: Option<String>,
+    /// Constant parameter for 'rrf' strategy (defaults to 60).
+    pub rrf_k: Option<u32>,
+    /// Vector weight for 'weighted_sum' strategy (defaults to 0.5).
+    pub vector_weight: Option<f32>,
+    /// Text weight for 'weighted_sum' strategy (defaults to 0.5).
+    pub text_weight: Option<f32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -152,35 +224,43 @@ impl IssunMcp {
     }
 
     #[tool(
-        description = "Create a node with a label and JSON properties; returns the new node id."
+        description = "Create a node with one or more labels and JSON properties; returns the new node id."
     )]
     fn add_node(
         &self,
         Parameters(args): Parameters<AddNodeArgs>,
     ) -> Result<CallToolResult, McpError> {
+        let labels = match &args.labels {
+            Some(l) => l.clone(),
+            None => match &args.label {
+                Some(l) => vec![l.clone()],
+                None => Vec::new(),
+            },
+        };
+        if labels.is_empty() {
+            return Err(invalid(
+                "a node requires at least one label (provide 'label' or 'labels')",
+            ));
+        }
+        let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
         let id = self
             .graph
-            .add_node(&args.label, &args.props)
+            .add_node_multi(&refs, &args.props)
             .map_err(internal)?;
         ok_json(json!({ "id": id }))
     }
 
-    #[tool(description = "Fetch a node by id, returning its label and properties.")]
+    #[tool(description = "Fetch a node by id, returning its label, labels, and properties.")]
     fn get_node(
         &self,
         Parameters(args): Parameters<NodeIdArgs>,
     ) -> Result<CallToolResult, McpError> {
         match self.graph.get_node(args.id).map_err(internal)? {
             Some(record) => {
-                let label = self
-                    .graph
-                    .node_labels(args.id)
-                    .map_err(internal)?
-                    .into_iter()
-                    .next()
-                    .unwrap_or_default();
+                let labels = self.graph.node_labels(args.id).map_err(internal)?;
+                let label = labels.first().cloned().unwrap_or_default();
                 let props: Value = rmp_serde::from_slice(&record.props).map_err(internal)?;
-                ok_json(json!({ "id": args.id, "label": label, "props": props }))
+                ok_json(json!({ "id": args.id, "label": label, "labels": labels, "props": props }))
             }
             None => Err(invalid(format!("node {} not found", args.id))),
         }
@@ -309,7 +389,7 @@ impl IssunMcp {
     }
 
     #[tool(
-        description = "Nearest-neighbor vector search; returns the k closest nodes by distance."
+        description = "Nearest-neighbor vector search; returns the k closest nodes by distance, with optional property filtering."
     )]
     fn vector_search(
         &self,
@@ -321,6 +401,7 @@ impl IssunMcp {
         let opts = VectorSearchOptions {
             k: args.k,
             label: args.label,
+            properties: args.properties,
         };
         let hits = self
             .graph
@@ -331,6 +412,158 @@ impl IssunMcp {
             .map(|h| json!({ "node": h.node, "distance": h.distance }))
             .collect();
         ok_json(json!(response))
+    }
+
+    #[tool(
+        description = "Set the thread count for GraphBLAS computations; set to 0 to restore default behavior."
+    )]
+    fn set_thread_count(
+        &self,
+        Parameters(args): Parameters<SetThreadCountArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.graph.set_thread_count(args.count).map_err(internal)?;
+        ok_json(json!({ "success": true }))
+    }
+
+    #[tool(
+        description = "Configure or rebuild the vector index. Option metric: 'cosine', 'dot', 'l2', or 'hamming'. Option quantization: 'float32', 'float16', or 'int8'."
+    )]
+    fn configure_vector_index(
+        &self,
+        Parameters(args): Parameters<ConfigureVectorIndexArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let metric = match args.metric.to_lowercase().as_str() {
+            "cosine" => VectorMetric::Cosine,
+            "l2" => VectorMetric::L2,
+            "dot" | "ip" => VectorMetric::Dot,
+            "hamming" => VectorMetric::Hamming,
+            _ => return Err(invalid(format!("invalid metric: {}", args.metric))),
+        };
+        let quantization = match args.quantization.to_lowercase().as_str() {
+            "float32" => VectorQuantization::Float32,
+            "float16" => VectorQuantization::Float16,
+            "int8" => VectorQuantization::Int8,
+            _ => {
+                return Err(invalid(format!(
+                    "invalid quantization: {}",
+                    args.quantization
+                )));
+            }
+        };
+        let opts = VectorIndexOptions {
+            metric,
+            quantization,
+        };
+        if args.reindex {
+            self.graph.reindex_vector_index(opts).map_err(internal)?;
+        } else {
+            self.graph.configure_vector_index(opts).map_err(internal)?;
+        }
+        ok_json(json!({ "success": true }))
+    }
+
+    #[tool(
+        description = "Create a text search index on a label and property, optionally specifying stemming/tokenization language."
+    )]
+    fn create_text_index(
+        &self,
+        Parameters(args): Parameters<CreateTextIndexArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let language = match args
+            .language
+            .as_deref()
+            .unwrap_or("english")
+            .to_lowercase()
+            .as_str()
+        {
+            "spanish" => Language::Spanish,
+            "french" => Language::French,
+            "german" => Language::German,
+            "italian" => Language::Italian,
+            "portuguese" => Language::Portuguese,
+            "english" => Language::English,
+            lang => return Err(invalid(format!("invalid language: {}", lang))),
+        };
+        self.graph
+            .create_text_index_with_language(&args.label, &args.property, language)
+            .map_err(internal)?;
+        ok_json(json!({ "success": true }))
+    }
+
+    #[tool(description = "Drop an existing text search index.")]
+    fn drop_text_index(
+        &self,
+        Parameters(args): Parameters<DropTextIndexArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.graph
+            .drop_text_index(&args.label, &args.property)
+            .map_err(internal)?;
+        ok_json(json!({ "success": true }))
+    }
+
+    #[tool(description = "List all active text search indexes.")]
+    fn list_text_indexes(&self) -> Result<CallToolResult, McpError> {
+        let indexes = self.graph.list_text_indexes().map_err(internal)?;
+        let list: Vec<Value> = indexes
+            .into_iter()
+            .map(|(label, property, language)| {
+                json!({
+                    "label": label,
+                    "property": property,
+                    "language": format!("{:?}", language).to_lowercase(),
+                })
+            })
+            .collect();
+        ok_json(json!(list))
+    }
+
+    #[tool(
+        description = "Execute a hybrid retrieval (GraphRAG) query combining vector/semantic search, full-text keyword search, and relationship expansion."
+    )]
+    fn retrieve_hybrid(
+        &self,
+        Parameters(args): Parameters<HybridRetrieveArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let vector = args.vector.unwrap_or_default();
+        let text_query = args.text_query.unwrap_or_default();
+
+        let fusion = match args
+            .fusion_strategy
+            .as_deref()
+            .unwrap_or("rrf")
+            .to_lowercase()
+            .as_str()
+        {
+            "rrf" => FusionStrategy::Rrf {
+                k: args.rrf_k.unwrap_or(60),
+            },
+            "weighted_sum" | "weighted" => FusionStrategy::WeightedSum {
+                vector_weight: args.vector_weight.unwrap_or(0.5),
+                text_weight: args.text_weight.unwrap_or(0.5),
+            },
+            s => return Err(invalid(format!("invalid fusion strategy: {}", s))),
+        };
+
+        let opts = HybridRetrieveOptions {
+            vector_k: args.vector_k.unwrap_or(10),
+            text_k: args.text_k.unwrap_or(10),
+            text_label: args.text_label,
+            text_property: args.text_property,
+            hops: args.hops.unwrap_or(2),
+            max_distance: args.max_distance.unwrap_or(f32::MAX),
+            max_nodes: args.max_nodes,
+            vector_label: args.vector_label,
+            fusion,
+        };
+
+        let subgraph =
+            retrieve_hybrid(&self.graph, &vector, &text_query, &opts).map_err(internal)?;
+
+        ok_json(json!({
+            "nodes": subgraph.nodes,
+            "edges": subgraph.edges,
+            "scores": subgraph.scores,
+        }))
     }
 }
 
@@ -352,8 +585,9 @@ impl ServerHandler for IssunMcp {
             },
             instructions: Some(
                 "IssunDB graph database. Tools: add_node, get_node, update_node, delete_node, \
-                 add_edge, get_edge, delete_edge, cypher_query, explain, text_search, and \
-                 vector_search."
+                 add_edge, get_edge, delete_edge, cypher_query, explain, text_search, \
+                 vector_search, configure_vector_index, create_text_index, drop_text_index, \
+                 list_text_indexes, retrieve_hybrid, and set_thread_count."
                     .to_string(),
             ),
         }
@@ -395,7 +629,8 @@ mod tests {
     fn add_person(mcp: &IssunMcp, name: &str) -> u64 {
         let result = mcp
             .add_node(Parameters(AddNodeArgs {
-                label: "Person".to_string(),
+                label: Some("Person".to_string()),
+                labels: None,
                 props: json!({ "name": name }),
             }))
             .expect("add_node");
@@ -407,7 +642,8 @@ mod tests {
         let (mcp, _dir) = fresh();
         let result = mcp
             .add_node(Parameters(AddNodeArgs {
-                label: "Person".to_string(),
+                label: Some("Person".to_string()),
+                labels: None,
                 props: json!({ "name": "Ada" }),
             }))
             .expect("add_node");
@@ -424,7 +660,30 @@ mod tests {
         let value = body(result);
         assert_eq!(value["id"].as_u64(), Some(id));
         assert_eq!(value["label"], "Person");
+        assert_eq!(value["labels"], json!(["Person"]));
         assert_eq!(value["props"]["name"], "Ada");
+    }
+
+    #[test]
+    fn add_node_multi_labels_round_trip() {
+        let (mcp, _dir) = fresh();
+        let result = mcp
+            .add_node(Parameters(AddNodeArgs {
+                label: None,
+                labels: Some(vec!["Person".to_string(), "Actor".to_string()]),
+                props: json!({ "name": "Keanu" }),
+            }))
+            .expect("add_node");
+        let id = body(result)["id"].as_u64().expect("id");
+
+        let result = mcp
+            .get_node(Parameters(NodeIdArgs { id }))
+            .expect("get_node");
+        let value = body(result);
+        assert_eq!(value["id"].as_u64(), Some(id));
+        assert_eq!(value["label"], "Person");
+        assert_eq!(value["labels"], json!(["Person", "Actor"]));
+        assert_eq!(value["props"]["name"], "Keanu");
     }
 
     #[test]
@@ -700,6 +959,7 @@ mod tests {
                 vector: vec![1.0, 0.0, 0.0],
                 k: 1,
                 label: None,
+                properties: None,
             }))
             .expect("vector_search");
         let hits = body(result);
@@ -715,8 +975,127 @@ mod tests {
                 vector: vec![],
                 k: 5,
                 label: None,
+                properties: None,
             }))
             .expect_err("empty vector");
         assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn vector_search_with_property_filter_succeeds() {
+        let (mcp, _dir) = fresh();
+        let a = add_person(&mcp, "Ada");
+        let b = add_person(&mcp, "Grace");
+        mcp.graph
+            .upsert_vector(a, &[1.0, 0.0, 0.0])
+            .expect("upsert a");
+        mcp.graph
+            .upsert_vector(b, &[0.9, 0.1, 0.0])
+            .expect("upsert b");
+
+        // Nearest vector is a ("Ada"), but we filter for name == "Grace".
+        let mut filters = HashMap::new();
+        filters.insert("name".to_string(), json!("Grace"));
+
+        let result = mcp
+            .vector_search(Parameters(VectorSearchArgs {
+                vector: vec![1.0, 0.0, 0.0],
+                k: 1,
+                label: None,
+                properties: Some(filters),
+            }))
+            .expect("vector_search with filter");
+        let hits = body(result);
+        assert_eq!(hits.as_array().map(|a| a.len()), Some(1));
+        assert_eq!(hits[0]["node"].as_u64(), Some(b));
+    }
+
+    #[test]
+    fn set_thread_count_succeeds() {
+        let (mcp, _dir) = fresh();
+        let result = mcp
+            .set_thread_count(Parameters(SetThreadCountArgs { count: 2 }))
+            .expect("set_thread_count");
+        let value = body(result);
+        assert_eq!(value["success"], true);
+    }
+
+    #[test]
+    fn configure_vector_index_and_reindex_succeeds() {
+        let (mcp, _dir) = fresh();
+        mcp.configure_vector_index(Parameters(ConfigureVectorIndexArgs {
+            metric: "l2".to_string(),
+            quantization: "float16".to_string(),
+            reindex: false,
+        }))
+        .expect("configure_vector_index");
+
+        mcp.configure_vector_index(Parameters(ConfigureVectorIndexArgs {
+            metric: "cosine".to_string(),
+            quantization: "float32".to_string(),
+            reindex: true,
+        }))
+        .expect("reindex_vector_index");
+    }
+
+    #[test]
+    fn text_index_lifecycle_succeeds() {
+        let (mcp, _dir) = fresh();
+        mcp.create_text_index(Parameters(CreateTextIndexArgs {
+            label: "Doc".to_string(),
+            property: "body".to_string(),
+            language: Some("german".to_string()),
+        }))
+        .expect("create_text_index");
+
+        let list = body(mcp.list_text_indexes().expect("list_text_indexes"));
+        assert_eq!(list.as_array().map(|a| a.len()), Some(1));
+        assert_eq!(list[0]["label"], "Doc");
+        assert_eq!(list[0]["property"], "body");
+        assert_eq!(list[0]["language"], "german");
+
+        mcp.drop_text_index(Parameters(DropTextIndexArgs {
+            label: "Doc".to_string(),
+            property: "body".to_string(),
+        }))
+        .expect("drop_text_index");
+
+        let list_empty = body(mcp.list_text_indexes().expect("list_text_indexes"));
+        assert!(list_empty.as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn retrieve_hybrid_succeeds() {
+        let (mcp, _dir) = fresh();
+        mcp.graph
+            .create_text_index("Person", "name")
+            .expect("create text index");
+        let id = add_person(&mcp, "Ada");
+        mcp.graph
+            .upsert_vector(id, &[1.0, 0.0, 0.0])
+            .expect("upsert vector");
+
+        let result = mcp
+            .retrieve_hybrid(Parameters(HybridRetrieveArgs {
+                vector: Some(vec![1.0, 0.0, 0.0]),
+                text_query: Some("Ada".to_string()),
+                vector_k: Some(1),
+                text_k: Some(1),
+                text_label: Some("Person".to_string()),
+                text_property: Some("name".to_string()),
+                vector_label: None,
+                hops: Some(1),
+                max_distance: None,
+                max_nodes: None,
+                fusion_strategy: Some("rrf".to_string()),
+                rrf_k: Some(60),
+                vector_weight: None,
+                text_weight: None,
+            }))
+            .expect("retrieve_hybrid");
+
+        let value = body(result);
+        assert_eq!(value["nodes"].as_array().map(|a| a.len()), Some(1));
+        assert_eq!(value["nodes"][0].as_u64(), Some(id));
     }
 }
