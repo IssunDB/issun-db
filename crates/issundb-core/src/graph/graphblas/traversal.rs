@@ -209,166 +209,69 @@ impl Graph {
         rel_type: Option<&str>,
         is_incoming: bool,
     ) -> Result<Vec<(NodeId, EdgeId, NodeId)>, Error> {
-        use issundb_graphblas::{Descriptor, Semiring, Vector, mxv};
-        use std::collections::HashMap as StdHashMap;
-
-        // The typed path reads the CSR snapshot per source row: a hash lookup
-        // plus a contiguous slice scan, with edge ids and type ids carried on
-        // the snapshot arrays. It must run before any matrices access (the
-        // cached matrix dimension can be stale) and never needs GraphBLAS, so
-        // freshness is the snapshot-only gate.
-        if let Some(t) = rel_type {
-            let type_id = {
-                let rtxn = self.storage.env.read_txn()?;
-                match get_type(&self.storage, &rtxn, t)? {
-                    Some(id) => id,
-                    None => return Ok(vec![]),
-                }
-            };
-
-            // A stale snapshot needs an O(nodes + edges) refresh before the
-            // CSR is readable; for a small source set the per-source LMDB
-            // point reads (always fresh) are cheaper, so an interleaved
-            // write-then-expand workload never pays a rebuild.
-            if self.csr_cache.snapshot_is_stale() && src_nodes.len() <= STALE_POINT_EXPAND_MAX {
-                let mut results = Vec::new();
-                for &src in src_nodes {
-                    let neighbors = if is_incoming {
-                        self.in_neighbors(src)?
-                    } else {
-                        self.out_neighbors(src)?
-                    };
-                    for ne in neighbors {
-                        if ne.edge_type == type_id {
-                            results.push((src, ne.edge, ne.node));
-                        }
-                    }
-                }
-                return Ok(results);
+        let type_id = if let Some(t) = rel_type {
+            let rtxn = self.storage.env.read_txn()?;
+            match get_type(&self.storage, &rtxn, t)? {
+                Some(id) => Some(id),
+                None => return Ok(vec![]),
             }
+        } else {
+            None
+        };
 
-            self.ensure_snapshot_fresh()?;
-            let snap = self.csr_cache.snapshot.load();
-            let (row_ptr, col_idx, edge_type, edge_id) = if is_incoming {
-                (
-                    &snap.in_row_ptr,
-                    &snap.in_col_idx,
-                    &snap.in_edge_type,
-                    &snap.in_edge_id,
-                )
-            } else {
-                (&snap.row_ptr, &snap.col_idx, &snap.edge_type, &snap.edge_id)
-            };
+        // A stale snapshot needs an O(nodes + edges) refresh before the
+        // CSR is readable; for a small source set the per-source LMDB
+        // point reads (always fresh) are cheaper, so an interleaved
+        // write-then-expand workload never pays a rebuild.
+        if self.csr_cache.snapshot_is_stale() && src_nodes.len() <= STALE_POINT_EXPAND_MAX {
             let mut results = Vec::new();
             for &src in src_nodes {
-                let d = match snap.id_to_dense.get(&src) {
-                    Some(&d) => d as usize,
-                    None => continue,
+                let neighbors = if is_incoming {
+                    self.in_neighbors(src)?
+                } else {
+                    self.out_neighbors(src)?
                 };
-                for k in row_ptr[d]..row_ptr[d + 1] {
-                    if edge_type[k] == type_id {
-                        results.push((src, edge_id[k], snap.dense_to_id[col_idx[k] as usize]));
+                for ne in neighbors {
+                    if let Some(tid) = type_id {
+                        if ne.edge_type == tid {
+                            results.push((src, ne.edge, ne.node));
+                        }
+                    } else {
+                        results.push((src, ne.edge, ne.node));
                     }
                 }
             }
             return Ok(results);
         }
 
-        // The untyped path reaches reachability through the adjacency matrix,
-        // so it needs the incremental matrix view fresh.
-        self.ensure_matrix_view()?;
-
-        let guard = self.matrices.read();
-        let m = match guard.as_ref() {
-            Some(m) => m,
-            None => {
-                // Fall back to LMDB if matrices are not yet materialized.
-                let mut results = Vec::new();
-                for &src in src_nodes {
-                    let neighbors = if is_incoming {
-                        self.in_neighbors(src)?
-                    } else {
-                        self.out_neighbors(src)?
-                    };
-                    for ne in neighbors {
-                        results.push((src, ne.edge, ne.node));
-                    }
-                }
-                return Ok(results);
-            }
+        self.ensure_snapshot_fresh()?;
+        let snap = self.csr_cache.snapshot.load();
+        let (row_ptr, col_idx, edge_type, edge_id) = if is_incoming {
+            (
+                &snap.in_row_ptr,
+                &snap.in_col_idx,
+                &snap.in_edge_type,
+                &snap.in_edge_id,
+            )
+        } else {
+            (&snap.row_ptr, &snap.col_idx, &snap.edge_type, &snap.edge_id)
         };
-
-        let n = m.n_nodes;
-        if src_nodes.is_empty() || n == 0 {
-            return Ok(vec![]);
-        }
-
-        // Propagate outgoing edges via the transposed adjacency matrix;
-        // incoming edges use the original. See `bfs_multi_source_graphblas` for the derivation.
-        let opts = Descriptor::new(true, false, false, !is_incoming);
-
         let mut results = Vec::new();
-
         for &src in src_nodes {
-            let src_dense = match m.id_to_dense.get(&src) {
+            let d = match snap.id_to_dense.get(&src) {
                 Some(&d) => d as usize,
                 None => continue,
             };
-
-            // Build a dense-index → EdgeId lookup so the SpMV result can be paired with
-            // a correct EdgeId. Both directions read from LMDB so the lookup is always
-            // fresh: EdgeId 0 is the legitimate first allocated edge (alloc_edge_id starts
-            // from 0), so it must never be used as a "missing" sentinel.
-            let edge_lookup: StdHashMap<usize, EdgeId> = if is_incoming {
-                self.in_neighbors(src)?
-                    .into_iter()
-                    .filter_map(|ne| m.id_to_dense.get(&ne.node).map(|&d| (d as usize, ne.edge)))
-                    .collect()
-            } else {
-                self.out_neighbors(src)?
-                    .into_iter()
-                    .filter_map(|ne| m.id_to_dense.get(&ne.node).map(|&d| (d as usize, ne.edge)))
-                    .collect()
-            };
-
-            let mut level = Vector::<i32>::new(m.context.clone(), n)
-                .map_err(|e| Error::GraphBLAS(e.to_string()))?;
-            level
-                .set(src_dense, 0)
-                .map_err(|e| Error::GraphBLAS(e.to_string()))?;
-
-            let mut next = Vector::<i32>::new(m.context.clone(), n)
-                .map_err(|e| Error::GraphBLAS(e.to_string()))?;
-
-            // next = adjacency * level (or adjacency^T * level) with MinPlus semiring.
-            // No mask passes all output positions through so that neighbors at any
-            // dense index are written into `next`.
-            mxv(
-                &mut next,
-                None,
-                Semiring::MinPlus,
-                &m.adjacency,
-                &level,
-                opts,
-            )
-            .map_err(|e| Error::GraphBLAS(e.to_string()))?;
-
-            let target_indices: Vec<usize> = next
-                .indices()
-                .map_err(|e| Error::GraphBLAS(e.to_string()))?;
-
-            for idx in target_indices {
-                if let Some(&dst) = m.dense_to_id.get(idx) {
-                    // Skip entries whose EdgeId is not in the LMDB-backed lookup; this
-                    // can only happen if the edge was deleted between the LMDB query and
-                    // the SpMV pass, which is not possible in a single-writer model.
-                    if let Some(&edge_id) = edge_lookup.get(&idx) {
-                        results.push((src, edge_id, dst));
+            for k in row_ptr[d]..row_ptr[d + 1] {
+                if let Some(tid) = type_id {
+                    if edge_type[k] == tid {
+                        results.push((src, edge_id[k], snap.dense_to_id[col_idx[k] as usize]));
                     }
+                } else {
+                    results.push((src, edge_id[k], snap.dense_to_id[col_idx[k] as usize]));
                 }
             }
         }
-
         Ok(results)
     }
 }
@@ -496,5 +399,19 @@ mod tests {
         // the snapshot generation says fresh.
         let reached = g.dfs(nodes[0], 1).unwrap();
         assert_eq!(reached, vec![nodes[0], nodes[1]]);
+    }
+
+    #[test]
+    fn untyped_expand_preserves_parallel_edges_and_multiple_types() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("person", &()).unwrap();
+        let b = g.add_node("person", &()).unwrap();
+        let e_ab = g.add_edge(a, b, "knows", &()).unwrap();
+        let e_ab2 = g.add_edge(a, b, "knows", &()).unwrap();
+        let e_likes = g.add_edge(a, b, "likes", &()).unwrap();
+        g.rebuild_csr().unwrap();
+
+        let out = g.expand_spmv_graphblas(&[a], None, false).unwrap();
+        assert_eq!(out, vec![(a, e_ab, b), (a, e_ab2, b), (a, e_likes, b)]);
     }
 }
