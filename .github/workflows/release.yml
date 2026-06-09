@@ -103,6 +103,7 @@ jobs:
             runner: windows-11-arm
             archive_ext: zip
             content_type: application/zip
+            cflags: "-DNK_TARGET_HASWELL=0 -DNK_TARGET_SKYLAKE=0 -DNK_TARGET_ICELAKE=0 -DNK_TARGET_GENOA=0 -DNK_TARGET_DIAMOND=0 -DNK_TARGET_SAPPHIRE=0 -DNK_TARGET_SAPPHIREAMX=0 -DNK_TARGET_GRANITEAMX=0 -DNK_TARGET_TURIN=0 -DNK_TARGET_ALDER=0 -DNK_TARGET_SIERRA=0"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -141,6 +142,9 @@ jobs:
 
       - name: Build release binaries
         run: cargo build --release -p issundb-cli -p issundb-rest -p issundb-mcp
+        env:
+          CFLAGS_aarch64_pc_windows_msvc: ${{ matrix.cflags || '' }}
+          CFLAGS_aarch64-pc-windows-msvc: ${{ matrix.cflags || '' }}
 
       - name: Package release asset (Unix)
         if: runner.os != 'Windows'
