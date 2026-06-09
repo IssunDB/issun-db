@@ -308,6 +308,16 @@ run-examples: ## Run all examples in crates/issundb-examples one by one
 	   cargo run -p issundb-examples --example $$example_name; \
 	done
 
+.PHONY: run-examples-py
+run-examples-py: develop-py ## Run all Python examples one by one
+	@echo "Running all Python examples..."
+	@for example in $(PY_DIR)/examples/*.py; do \
+	   example_name=$$(basename $$example); \
+	   echo "Running Python example: $$example_name"; \
+	   (cd $(PY_DIR) && $(PY_MNGR) run --no-sync python examples/$$example_name); \
+	done
+
+
 .PHONY: check-module-deps
 check-module-deps: ## Verify crate boundary rules: lower-level crates must not import from higher-level crates
 	@echo "Checking crate dependency boundaries..."
