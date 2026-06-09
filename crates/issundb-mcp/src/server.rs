@@ -1,9 +1,8 @@
-use std::{collections::HashMap, path::Path, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 
 use issundb::{
-    Error, FusionStrategy, Graph, GraphQueryExt, HybridRetrieveOptions, Language, TextGraphExt,
-    TextIndexExt, TextSearchOptions, VectorGraphExt, VectorIndexOptions, VectorMetric,
-    VectorQuantization, VectorSearchOptions, retrieve_hybrid,
+    FusionStrategy, Graph, GraphQueryExt, HybridRetrieveOptions, TextGraphExt, TextSearchOptions,
+    VectorGraphExt, VectorSearchOptions, retrieve_hybrid,
 };
 use rmcp::{
     ErrorData as McpError, ServerHandler,
@@ -20,6 +19,13 @@ use serde_json::{Value, json};
 
 /// MCP server over a shared `Graph`. All tools dispatch through the `issundb`
 /// public facade; this crate never touches storage internals.
+///
+/// The tool surface is deliberately curated for an LLM agent: reads, queries,
+/// and retrieval. There are no typed mutation, index-administration, or
+/// host-operations tools. Graph mutations are expressed as Cypher through
+/// `cypher_query` (`CREATE`, `SET`, `DELETE`); index provisioning, vector
+/// loading, backups, and tuning are operator concerns driven through the CLI or
+/// the Python and REST surfaces, not through an agent.
 #[derive(Clone)]
 pub struct IssunMcp {
     graph: Arc<Graph>,
@@ -49,43 +55,9 @@ fn invalid(e: impl std::fmt::Display) -> McpError {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct AddNodeArgs {
-    /// Primary label to attach to the new node. Required unless 'labels' is provided.
-    pub label: Option<String>,
-    /// List of labels to attach to the new node (multi-label support). Required unless 'label' is provided.
-    pub labels: Option<Vec<String>>,
-    /// Arbitrary JSON property map for the node.
-    #[serde(default)]
-    pub props: Value,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct NodeIdArgs {
     /// Node identifier.
     pub id: u64,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct UpdateNodeArgs {
-    /// Identifier of the node to update.
-    pub id: u64,
-    /// New JSON property map; replaces the existing properties.
-    #[serde(default)]
-    pub props: Value,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct AddEdgeArgs {
-    /// Source node identifier.
-    pub src: u64,
-    /// Destination node identifier.
-    pub dst: u64,
-    /// Edge type name.
-    #[serde(rename = "type")]
-    pub edge_type: String,
-    /// Arbitrary JSON property map for the edge.
-    #[serde(default)]
-    pub props: Value,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -96,7 +68,8 @@ pub struct EdgeIdArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CypherArgs {
-    /// Cypher query text.
+    /// Cypher query text. Supports reads (`MATCH`) and mutations (`CREATE`,
+    /// `SET`, `REMOVE`, `DELETE`, `DETACH DELETE`, `MERGE`).
     pub query: String,
     /// Optional parameter bindings referenced by `$name` in the query.
     #[serde(default)]
@@ -144,41 +117,6 @@ fn default_k() -> usize {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct SetThreadCountArgs {
-    /// The number of threads to use for GraphBLAS computations (set to 0 to restore default behavior).
-    pub count: i32,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct ConfigureVectorIndexArgs {
-    /// Distance metric: 'cosine', 'l2', or 'dot' (alias 'ip').
-    pub metric: String,
-    /// Quantization mode: 'float32', 'float16', or 'int8'.
-    pub quantization: String,
-    /// Rebuild the index from existing stored vectors under the new configuration.
-    #[serde(default)]
-    pub reindex: bool,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct CreateTextIndexArgs {
-    /// Label to attach the index to.
-    pub label: String,
-    /// Property name to index.
-    pub property: String,
-    /// Optional stemming/tokenization language: 'english', 'spanish', 'french', 'german', 'italian', or 'portuguese'.
-    pub language: Option<String>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct DropTextIndexArgs {
-    /// Label of the index to drop.
-    pub label: String,
-    /// Property name of the index to drop.
-    pub property: String,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct HybridRetrieveArgs {
     /// Query vector for semantic/vector search. Optional; if omitted, vector search is skipped.
     pub vector: Option<Vec<f32>>,
@@ -210,31 +148,6 @@ pub struct HybridRetrieveArgs {
     pub text_weight: Option<f32>,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct UpsertVectorArgs {
-    /// Identifier of the node to attach the embedding to.
-    pub id: u64,
-    /// Dense float32 embedding. Its dimension must match the configured index.
-    pub vector: Vec<f32>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct BackupArgs {
-    /// Server-side destination path for the snapshot file.
-    pub path: String,
-    /// Write a compacted snapshot (smaller, slower) instead of a hot copy.
-    #[serde(default)]
-    pub compact: bool,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct RestoreArgs {
-    /// Server-side path to an existing snapshot file.
-    pub snapshot: String,
-    /// Server-side destination directory for the restored database.
-    pub destination: String,
-}
-
 // ---------------------------------------------------------------------------
 // Tools
 // ---------------------------------------------------------------------------
@@ -246,33 +159,6 @@ impl IssunMcp {
             graph,
             tool_router: Self::tool_router(),
         }
-    }
-
-    #[tool(
-        description = "Create a node with one or more labels and JSON properties; returns the new node id."
-    )]
-    fn add_node(
-        &self,
-        Parameters(args): Parameters<AddNodeArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        let labels = match &args.labels {
-            Some(l) => l.clone(),
-            None => match &args.label {
-                Some(l) => vec![l.clone()],
-                None => Vec::new(),
-            },
-        };
-        if labels.is_empty() {
-            return Err(invalid(
-                "a node requires at least one label (provide 'label' or 'labels')",
-            ));
-        }
-        let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
-        let id = self
-            .graph
-            .add_node_multi(&refs, &args.props)
-            .map_err(internal)?;
-        ok_json(json!({ "id": id }))
     }
 
     #[tool(description = "Fetch a node by id, returning its label, labels, and properties.")]
@@ -288,45 +174,6 @@ impl IssunMcp {
                 ok_json(json!({ "id": args.id, "label": label, "labels": labels, "props": props }))
             }
             None => Err(invalid(format!("node {} not found", args.id))),
-        }
-    }
-
-    #[tool(description = "Replace the properties of an existing node.")]
-    fn update_node(
-        &self,
-        Parameters(args): Parameters<UpdateNodeArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        match self.graph.update_node(args.id, &args.props) {
-            Ok(()) => ok_json(json!({ "id": args.id, "updated": true })),
-            Err(Error::NodeNotFound(_)) => Err(invalid(format!("node {} not found", args.id))),
-            Err(e) => Err(internal(e)),
-        }
-    }
-
-    #[tool(description = "Delete a node by id along with its incident edges.")]
-    fn delete_node(
-        &self,
-        Parameters(args): Parameters<NodeIdArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        match self.graph.delete_node(args.id) {
-            Ok(()) => ok_json(json!({ "id": args.id, "deleted": true })),
-            Err(Error::NodeNotFound(_)) => Err(invalid(format!("node {} not found", args.id))),
-            Err(e) => Err(internal(e)),
-        }
-    }
-
-    #[tool(description = "Create a directed edge between two nodes; returns the new edge id.")]
-    fn add_edge(
-        &self,
-        Parameters(args): Parameters<AddEdgeArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        match self
-            .graph
-            .add_edge(args.src, args.dst, &args.edge_type, &args.props)
-        {
-            Ok(id) => ok_json(json!({ "id": id })),
-            Err(Error::NodeNotFound(n)) => Err(invalid(format!("node {n} not found"))),
-            Err(e) => Err(internal(e)),
         }
     }
 
@@ -355,20 +202,8 @@ impl IssunMcp {
         }
     }
 
-    #[tool(description = "Delete an edge by id.")]
-    fn delete_edge(
-        &self,
-        Parameters(args): Parameters<EdgeIdArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        match self.graph.delete_edge(args.id) {
-            Ok(()) => ok_json(json!({ "id": args.id, "deleted": true })),
-            Err(Error::EdgeNotFound(_)) => Err(invalid(format!("edge {} not found", args.id))),
-            Err(e) => Err(internal(e)),
-        }
-    }
-
     #[tool(
-        description = "Execute a Cypher query with optional parameters; returns columns and records."
+        description = "Execute a Cypher query with optional parameters; returns columns and records. Use CREATE, SET, REMOVE, DELETE, and MERGE to mutate the graph."
     )]
     fn cypher_query(
         &self,
@@ -413,22 +248,8 @@ impl IssunMcp {
         ok_json(json!(response))
     }
 
-    #[tool(description = "Attach or replace the dense float32 embedding for a node.")]
-    fn upsert_vector(
-        &self,
-        Parameters(args): Parameters<UpsertVectorArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        if args.vector.is_empty() {
-            return Err(invalid("vector must not be empty"));
-        }
-        self.graph
-            .upsert_vector(args.id, &args.vector)
-            .map_err(internal)?;
-        ok_json(json!({ "id": args.id, "upserted": true }))
-    }
-
     #[tool(
-        description = "Nearest-neighbor vector search; returns the k closest nodes by distance, with optional property filtering."
+        description = "Nearest-neighbor vector search; returns the k closest nodes by distance, with optional label and property filtering."
     )]
     fn vector_search(
         &self,
@@ -451,113 +272,6 @@ impl IssunMcp {
             .map(|h| json!({ "node": h.node, "distance": h.distance }))
             .collect();
         ok_json(json!(response))
-    }
-
-    #[tool(
-        description = "Set the thread count for GraphBLAS computations; set to 0 to restore default behavior."
-    )]
-    fn set_thread_count(
-        &self,
-        Parameters(args): Parameters<SetThreadCountArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        self.graph.set_thread_count(args.count).map_err(internal)?;
-        ok_json(json!({ "success": true }))
-    }
-
-    #[tool(
-        description = "Write a snapshot of the database to a server-side path. Set 'compact' for a smaller compacted snapshot."
-    )]
-    fn backup(&self, Parameters(args): Parameters<BackupArgs>) -> Result<CallToolResult, McpError> {
-        let path = Path::new(&args.path);
-        let result = if args.compact {
-            self.graph.backup_compact(path)
-        } else {
-            self.graph.backup(path)
-        };
-        result.map_err(internal)?;
-        ok_json(json!({ "path": args.path, "compact": args.compact, "success": true }))
-    }
-
-    #[tool(
-        description = "Restore a snapshot file into a new database directory on the server host. Does not hot-swap the running graph; reopen the server against the destination to use it."
-    )]
-    fn restore(
-        &self,
-        Parameters(args): Parameters<RestoreArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        Graph::restore(Path::new(&args.snapshot), Path::new(&args.destination))
-            .map_err(internal)?;
-        ok_json(json!({ "destination": args.destination, "success": true }))
-    }
-
-    #[tool(
-        description = "Configure or rebuild the vector index. Option metric: 'cosine', 'l2', or 'dot' (alias 'ip'). Option quantization: 'float32', 'float16', or 'int8'."
-    )]
-    fn configure_vector_index(
-        &self,
-        Parameters(args): Parameters<ConfigureVectorIndexArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        let metric = args.metric.parse::<VectorMetric>().map_err(invalid)?;
-        let quantization = args
-            .quantization
-            .parse::<VectorQuantization>()
-            .map_err(invalid)?;
-        let opts = VectorIndexOptions {
-            metric,
-            quantization,
-        };
-        if args.reindex {
-            self.graph.reindex_vector_index(opts).map_err(internal)?;
-        } else {
-            self.graph.configure_vector_index(opts).map_err(internal)?;
-        }
-        ok_json(json!({ "success": true }))
-    }
-
-    #[tool(
-        description = "Create a text search index on a label and property, optionally specifying stemming/tokenization language."
-    )]
-    fn create_text_index(
-        &self,
-        Parameters(args): Parameters<CreateTextIndexArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        let language = args
-            .language
-            .as_deref()
-            .unwrap_or("english")
-            .parse::<Language>()
-            .map_err(invalid)?;
-        self.graph
-            .create_text_index_with_language(&args.label, &args.property, language)
-            .map_err(internal)?;
-        ok_json(json!({ "success": true }))
-    }
-
-    #[tool(description = "Drop an existing text search index.")]
-    fn drop_text_index(
-        &self,
-        Parameters(args): Parameters<DropTextIndexArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        self.graph
-            .drop_text_index(&args.label, &args.property)
-            .map_err(internal)?;
-        ok_json(json!({ "success": true }))
-    }
-
-    #[tool(description = "List all active text search indexes.")]
-    fn list_text_indexes(&self) -> Result<CallToolResult, McpError> {
-        let indexes = self.graph.list_text_indexes().map_err(internal)?;
-        let list: Vec<Value> = indexes
-            .into_iter()
-            .map(|(label, property, language)| {
-                json!({
-                    "label": label,
-                    "property": property,
-                    "language": format!("{:?}", language).to_lowercase(),
-                })
-            })
-            .collect();
-        ok_json(json!(list))
     }
 
     #[tool(
@@ -627,11 +341,10 @@ impl ServerHandler for IssunMcp {
                 ..Default::default()
             },
             instructions: Some(
-                "IssunDB graph database. Tools: add_node, get_node, update_node, delete_node, \
-                 add_edge, get_edge, delete_edge, cypher_query, explain, text_search, \
-                 upsert_vector, vector_search, configure_vector_index, create_text_index, \
-                 drop_text_index, list_text_indexes, retrieve_hybrid, set_thread_count, backup, \
-                 and restore."
+                "IssunDB graph database. Tools: get_node, get_edge, cypher_query, explain, \
+                 text_search, vector_search, and retrieve_hybrid. Mutate the graph by sending \
+                 CREATE, SET, REMOVE, DELETE, or MERGE through cypher_query; there are no \
+                 separate write, index-administration, or backup tools."
                     .to_string(),
             ),
         }
@@ -644,8 +357,9 @@ impl ServerHandler for IssunMcp {
 
 // The tool methods are inherent methods on `IssunMcp`, so they are exercised
 // directly here against a fresh `TempDir`-backed `Graph`; the JSON-RPC and
-// transport layers are not involved. Each test opens its own graph and shares
-// no state with the others.
+// transport layers are not involved. Setup that the curated tool surface does
+// not expose (creating nodes, indexes, or vectors) is done through the shared
+// `Graph` handle. Each test opens its own graph and shares no state.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -670,34 +384,18 @@ mod tests {
         serde_json::from_str(&text).expect("json body")
     }
 
-    fn add_person(mcp: &IssunMcp, name: &str) -> u64 {
-        let result = mcp
-            .add_node(Parameters(AddNodeArgs {
-                label: Some("Person".to_string()),
-                labels: None,
-                props: json!({ "name": name }),
-            }))
-            .expect("add_node");
-        body(result)["id"].as_u64().expect("id")
-    }
-
-    #[test]
-    fn add_node_returns_id() {
-        let (mcp, _dir) = fresh();
-        let result = mcp
-            .add_node(Parameters(AddNodeArgs {
-                label: Some("Person".to_string()),
-                labels: None,
-                props: json!({ "name": "Ada" }),
-            }))
-            .expect("add_node");
-        assert!(body(result)["id"].is_u64());
+    /// Seed a Person node directly through the graph (the MCP surface has no
+    /// node-creation tool; agents would use `cypher_query` with `CREATE`).
+    fn seed_person(mcp: &IssunMcp, name: &str) -> u64 {
+        mcp.graph
+            .add_node("Person", &json!({ "name": name }))
+            .expect("seed person")
     }
 
     #[test]
     fn get_node_round_trips_label_and_props() {
         let (mcp, _dir) = fresh();
-        let id = add_person(&mcp, "Ada");
+        let id = seed_person(&mcp, "Ada");
         let result = mcp
             .get_node(Parameters(NodeIdArgs { id }))
             .expect("get_node");
@@ -706,28 +404,6 @@ mod tests {
         assert_eq!(value["label"], "Person");
         assert_eq!(value["labels"], json!(["Person"]));
         assert_eq!(value["props"]["name"], "Ada");
-    }
-
-    #[test]
-    fn add_node_multi_labels_round_trip() {
-        let (mcp, _dir) = fresh();
-        let result = mcp
-            .add_node(Parameters(AddNodeArgs {
-                label: None,
-                labels: Some(vec!["Person".to_string(), "Actor".to_string()]),
-                props: json!({ "name": "Keanu" }),
-            }))
-            .expect("add_node");
-        let id = body(result)["id"].as_u64().expect("id");
-
-        let result = mcp
-            .get_node(Parameters(NodeIdArgs { id }))
-            .expect("get_node");
-        let value = body(result);
-        assert_eq!(value["id"].as_u64(), Some(id));
-        assert_eq!(value["label"], "Person");
-        assert_eq!(value["labels"], json!(["Person", "Actor"]));
-        assert_eq!(value["props"]["name"], "Keanu");
     }
 
     #[test]
@@ -740,111 +416,14 @@ mod tests {
     }
 
     #[test]
-    fn update_node_replaces_props() {
-        let (mcp, _dir) = fresh();
-        let id = add_person(&mcp, "Ada");
-        mcp.update_node(Parameters(UpdateNodeArgs {
-            id,
-            props: json!({ "name": "Grace" }),
-        }))
-        .expect("update_node");
-        let value = body(
-            mcp.get_node(Parameters(NodeIdArgs { id }))
-                .expect("get_node"),
-        );
-        assert_eq!(value["props"]["name"], "Grace");
-    }
-
-    #[test]
-    fn update_node_missing_is_invalid_params() {
-        let (mcp, _dir) = fresh();
-        let err = mcp
-            .update_node(Parameters(UpdateNodeArgs {
-                id: 999,
-                props: json!({}),
-            }))
-            .expect_err("missing node");
-        assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
-    }
-
-    #[test]
-    fn delete_node_marks_deleted_and_removes_it() {
-        let (mcp, _dir) = fresh();
-        let id = add_person(&mcp, "Ada");
-        let value = body(
-            mcp.delete_node(Parameters(NodeIdArgs { id }))
-                .expect("delete"),
-        );
-        assert_eq!(value["deleted"], true);
-        let err = mcp
-            .get_node(Parameters(NodeIdArgs { id }))
-            .expect_err("gone");
-        assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
-    }
-
-    #[test]
-    fn delete_node_missing_is_idempotent() {
-        // `Graph::delete_node` does not report `NodeNotFound` for an absent id;
-        // deletion is idempotent, so the tool reports success.
-        let (mcp, _dir) = fresh();
-        let value = body(
-            mcp.delete_node(Parameters(NodeIdArgs { id: 999 }))
-                .expect("delete_node"),
-        );
-        assert_eq!(value["deleted"], true);
-    }
-
-    #[test]
-    fn add_edge_returns_id() {
-        let (mcp, _dir) = fresh();
-        let a = add_person(&mcp, "Ada");
-        let b = add_person(&mcp, "Grace");
-        let result = mcp
-            .add_edge(Parameters(AddEdgeArgs {
-                src: a,
-                dst: b,
-                edge_type: "KNOWS".to_string(),
-                props: json!({}),
-            }))
-            .expect("add_edge");
-        assert!(body(result)["id"].is_u64());
-    }
-
-    #[test]
-    fn add_edge_with_missing_endpoint_currently_succeeds() {
-        // Pins the issue #14 behavior: `Graph::add_edge` does not validate that
-        // its endpoints exist, so a dangling edge is created instead of an error.
-        // When the core adds endpoint validation, the server's `NodeNotFound`
-        // arm becomes reachable and this test should flip to expect a rejection.
-        let (mcp, _dir) = fresh();
-        let a = add_person(&mcp, "Ada");
-        let result = mcp
-            .add_edge(Parameters(AddEdgeArgs {
-                src: a,
-                dst: 999,
-                edge_type: "KNOWS".to_string(),
-                props: json!({}),
-            }))
-            .expect("add_edge currently succeeds");
-        assert!(body(result)["id"].is_u64());
-    }
-
-    #[test]
     fn get_edge_round_trips_endpoints_and_type() {
         let (mcp, _dir) = fresh();
-        let a = add_person(&mcp, "Ada");
-        let b = add_person(&mcp, "Grace");
-        let edge_id = body(
-            mcp.add_edge(Parameters(AddEdgeArgs {
-                src: a,
-                dst: b,
-                edge_type: "KNOWS".to_string(),
-                props: json!({ "since": 2020 }),
-            }))
-            .expect("add_edge"),
-        )["id"]
-            .as_u64()
-            .expect("edge id");
+        let a = seed_person(&mcp, "Ada");
+        let b = seed_person(&mcp, "Grace");
+        let edge_id = mcp
+            .graph
+            .add_edge(a, b, "KNOWS", &json!({ "since": 2020 }))
+            .expect("add edge");
         let value = body(
             mcp.get_edge(Parameters(EdgeIdArgs { id: edge_id }))
                 .expect("get_edge"),
@@ -865,44 +444,9 @@ mod tests {
     }
 
     #[test]
-    fn delete_edge_marks_deleted() {
-        let (mcp, _dir) = fresh();
-        let a = add_person(&mcp, "Ada");
-        let b = add_person(&mcp, "Grace");
-        let edge_id = body(
-            mcp.add_edge(Parameters(AddEdgeArgs {
-                src: a,
-                dst: b,
-                edge_type: "KNOWS".to_string(),
-                props: json!({}),
-            }))
-            .expect("add_edge"),
-        )["id"]
-            .as_u64()
-            .expect("edge id");
-        let value = body(
-            mcp.delete_edge(Parameters(EdgeIdArgs { id: edge_id }))
-                .expect("delete_edge"),
-        );
-        assert_eq!(value["deleted"], true);
-    }
-
-    #[test]
-    fn delete_edge_missing_is_idempotent() {
-        // As with node deletion, `Graph::delete_edge` does not report
-        // `EdgeNotFound` for an absent id; the tool reports success.
-        let (mcp, _dir) = fresh();
-        let value = body(
-            mcp.delete_edge(Parameters(EdgeIdArgs { id: 999 }))
-                .expect("delete_edge"),
-        );
-        assert_eq!(value["deleted"], true);
-    }
-
-    #[test]
     fn cypher_query_returns_columns_and_records() {
         let (mcp, _dir) = fresh();
-        add_person(&mcp, "Ada");
+        seed_person(&mcp, "Ada");
         let result = mcp
             .cypher_query(Parameters(CypherArgs {
                 query: "MATCH (n:Person) RETURN n.name AS name".to_string(),
@@ -917,8 +461,8 @@ mod tests {
     #[test]
     fn cypher_query_honors_params() {
         let (mcp, _dir) = fresh();
-        add_person(&mcp, "Ada");
-        add_person(&mcp, "Grace");
+        seed_person(&mcp, "Ada");
+        seed_person(&mcp, "Grace");
         let mut params = HashMap::new();
         params.insert("who".to_string(), json!("Grace"));
         let result = mcp
@@ -928,6 +472,40 @@ mod tests {
             }))
             .expect("cypher_query");
         assert_eq!(body(result)["records"], json!([["Grace"]]));
+    }
+
+    #[test]
+    fn cypher_query_mutates_via_create_and_delete() {
+        // The aggressive MCP surface has no typed write tools; mutation must work
+        // through Cypher. Create a node, confirm it, then delete it.
+        let (mcp, _dir) = fresh();
+        mcp.cypher_query(Parameters(CypherArgs {
+            query: "CREATE (n:Person {name: 'Ada'})".to_string(),
+            params: HashMap::new(),
+        }))
+        .expect("create");
+        let after_create = body(
+            mcp.cypher_query(Parameters(CypherArgs {
+                query: "MATCH (n:Person) RETURN n.name AS name".to_string(),
+                params: HashMap::new(),
+            }))
+            .expect("match"),
+        );
+        assert_eq!(after_create["records"], json!([["Ada"]]));
+
+        mcp.cypher_query(Parameters(CypherArgs {
+            query: "MATCH (n:Person {name: 'Ada'}) DELETE n".to_string(),
+            params: HashMap::new(),
+        }))
+        .expect("delete");
+        let after_delete = body(
+            mcp.cypher_query(Parameters(CypherArgs {
+                query: "MATCH (n:Person) RETURN n.name AS name".to_string(),
+                params: HashMap::new(),
+            }))
+            .expect("match"),
+        );
+        assert_eq!(after_delete["records"], json!([]));
     }
 
     #[test]
@@ -990,8 +568,8 @@ mod tests {
     #[test]
     fn vector_search_returns_nearest_node() {
         let (mcp, _dir) = fresh();
-        let a = add_person(&mcp, "Ada");
-        let b = add_person(&mcp, "Grace");
+        let a = seed_person(&mcp, "Ada");
+        let b = seed_person(&mcp, "Grace");
         mcp.graph
             .upsert_vector(a, &[1.0, 0.0, 0.0])
             .expect("upsert a");
@@ -1028,8 +606,8 @@ mod tests {
     #[test]
     fn vector_search_with_property_filter_succeeds() {
         let (mcp, _dir) = fresh();
-        let a = add_person(&mcp, "Ada");
-        let b = add_person(&mcp, "Grace");
+        let a = seed_person(&mcp, "Ada");
+        let b = seed_person(&mcp, "Grace");
         mcp.graph
             .upsert_vector(a, &[1.0, 0.0, 0.0])
             .expect("upsert a");
@@ -1055,138 +633,12 @@ mod tests {
     }
 
     #[test]
-    fn upsert_vector_then_search_finds_it() {
-        let (mcp, _dir) = fresh();
-        let a = add_person(&mcp, "Ada");
-        mcp.upsert_vector(Parameters(UpsertVectorArgs {
-            id: a,
-            vector: vec![1.0, 0.0, 0.0],
-        }))
-        .expect("upsert_vector");
-        let result = mcp
-            .vector_search(Parameters(VectorSearchArgs {
-                vector: vec![1.0, 0.0, 0.0],
-                k: 1,
-                label: None,
-                properties: None,
-            }))
-            .expect("vector_search");
-        let hits = body(result);
-        assert_eq!(hits[0]["node"].as_u64(), Some(a));
-    }
-
-    #[test]
-    fn upsert_vector_empty_is_invalid_params() {
-        let (mcp, _dir) = fresh();
-        let a = add_person(&mcp, "Ada");
-        let err = mcp
-            .upsert_vector(Parameters(UpsertVectorArgs {
-                id: a,
-                vector: vec![],
-            }))
-            .expect_err("empty vector");
-        assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
-    }
-
-    #[test]
-    fn backup_and_restore_round_trip() {
-        let (mcp, dir) = fresh();
-        let a = add_person(&mcp, "Ada");
-
-        let snapshot = dir.path().join("snap.db");
-        mcp.backup(Parameters(BackupArgs {
-            path: snapshot.to_string_lossy().into_owned(),
-            compact: false,
-        }))
-        .expect("backup");
-        assert!(snapshot.exists());
-
-        let restored = dir.path().join("restored");
-        mcp.restore(Parameters(RestoreArgs {
-            snapshot: snapshot.to_string_lossy().into_owned(),
-            destination: restored.to_string_lossy().into_owned(),
-        }))
-        .expect("restore");
-
-        // The restored database holds the node created before the backup.
-        let reopened = Graph::open(&restored, 1).expect("open restored");
-        assert!(reopened.get_node(a).expect("get_node").is_some());
-    }
-
-    #[test]
-    fn configure_vector_index_rejects_unknown_metric() {
-        let (mcp, _dir) = fresh();
-        let err = mcp
-            .configure_vector_index(Parameters(ConfigureVectorIndexArgs {
-                metric: "hamming".to_string(),
-                quantization: "float32".to_string(),
-                reindex: false,
-            }))
-            .expect_err("unknown metric");
-        assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
-    }
-
-    #[test]
-    fn set_thread_count_succeeds() {
-        let (mcp, _dir) = fresh();
-        let result = mcp
-            .set_thread_count(Parameters(SetThreadCountArgs { count: 2 }))
-            .expect("set_thread_count");
-        let value = body(result);
-        assert_eq!(value["success"], true);
-    }
-
-    #[test]
-    fn configure_vector_index_and_reindex_succeeds() {
-        let (mcp, _dir) = fresh();
-        mcp.configure_vector_index(Parameters(ConfigureVectorIndexArgs {
-            metric: "l2".to_string(),
-            quantization: "float16".to_string(),
-            reindex: false,
-        }))
-        .expect("configure_vector_index");
-
-        mcp.configure_vector_index(Parameters(ConfigureVectorIndexArgs {
-            metric: "cosine".to_string(),
-            quantization: "float32".to_string(),
-            reindex: true,
-        }))
-        .expect("reindex_vector_index");
-    }
-
-    #[test]
-    fn text_index_lifecycle_succeeds() {
-        let (mcp, _dir) = fresh();
-        mcp.create_text_index(Parameters(CreateTextIndexArgs {
-            label: "Doc".to_string(),
-            property: "body".to_string(),
-            language: Some("german".to_string()),
-        }))
-        .expect("create_text_index");
-
-        let list = body(mcp.list_text_indexes().expect("list_text_indexes"));
-        assert_eq!(list.as_array().map(|a| a.len()), Some(1));
-        assert_eq!(list[0]["label"], "Doc");
-        assert_eq!(list[0]["property"], "body");
-        assert_eq!(list[0]["language"], "german");
-
-        mcp.drop_text_index(Parameters(DropTextIndexArgs {
-            label: "Doc".to_string(),
-            property: "body".to_string(),
-        }))
-        .expect("drop_text_index");
-
-        let list_empty = body(mcp.list_text_indexes().expect("list_text_indexes"));
-        assert!(list_empty.as_array().unwrap().is_empty());
-    }
-
-    #[test]
     fn retrieve_hybrid_succeeds() {
         let (mcp, _dir) = fresh();
         mcp.graph
             .create_text_index("Person", "name")
             .expect("create text index");
-        let id = add_person(&mcp, "Ada");
+        let id = seed_person(&mcp, "Ada");
         mcp.graph
             .upsert_vector(id, &[1.0, 0.0, 0.0])
             .expect("upsert vector");

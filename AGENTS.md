@@ -119,13 +119,13 @@ Do not invent modules that do not yet exist when answering questions, but do pla
       observes query execution without load noise: `profile_triangle` (Zipf-skewed graph, cyclic triangle-count query) and `profile_query` (uniform
       graph with the comparison harness's Person/KNOWS schema, arbitrary query via `PROFILE_QUERY`).
 - `crates/issundb-cli/`: interactive REPL binary. Uses only the `issundb` public facade for manual exploration and demos.
-- `crates/issundb-rest/`: Axum-based HTTP REST API server. Exposes node and edge CRUD, Cypher query execution, query plan explanation, vector
-  upsert and search, full-text search, hybrid retrieval, text and vector index administration, GraphBLAS thread-count control, and host-side
-  backup and restore over HTTP. Uses `tokio` as its async runtime; depends only on `issundb`.
+- `crates/issundb-rest/`: Axum-based HTTP REST API server. Exposes the data plane and retrieval over HTTP: node and edge CRUD, Cypher query
+  execution, query plan explanation, vector upsert and search, full-text search, and hybrid retrieval. Index administration and host operations
+  (backup, restore, thread control) are intentionally not exposed over HTTP. Uses `tokio` as its async runtime; depends only on `issundb`.
 - `crates/issundb-mcp/`: Model Context Protocol server built on the `rmcp` SDK, serving over either stdio or MCP's Streamable HTTP transport.
-  Exposes node and edge CRUD, Cypher query execution, query plan explanation, full-text search, vector upsert and search, hybrid retrieval, text
-  and vector index administration, GraphBLAS thread-count control, and host-side backup and restore as MCP tools. Uses `tokio` as its async
-  runtime; depends only on `issundb`.
+  Exposes a curated read, query, and retrieval surface for LLM agents: node and edge reads, Cypher query execution (the mutation path), query
+  plan explanation, full-text search, vector search, and hybrid retrieval. Index administration, vector loading, and host operations are
+  intentionally excluded. Uses `tokio` as its async runtime; depends only on `issundb`.
 - `crates/issundb-py/`: Python bindings via PyO3. Exposes the `IssunDB` class with node and edge CRUD, Cypher query and explain, vector upsert
   and search, vector index configuration, full-text search and index administration, hybrid retrieval, GraphBLAS thread-count control, and
   backup and restore methods. Depends only on `issundb`.
@@ -352,19 +352,19 @@ Data and query routes are versioned under a `/v1` prefix.
 `GET /health` stays unversioned so infrastructure probes do not track the API version; its body reports the crate `version` and the current `api`
 version.
 
+REST exposes the data plane and retrieval only. Index administration (vector index configuration, text index create/drop/list), GraphBLAS
+thread control, and backup/restore are intentionally absent: provisioning and host operations are done through the CLI or the Python surface, not
+over HTTP. This keeps the network surface to data and queries and avoids exposing host-filesystem operations to network callers.
+
 Routes:
 
 - `POST /v1/nodes`, `GET /v1/nodes/:id`, `PUT /v1/nodes/:id`, `DELETE /v1/nodes/:id`
 - `POST /v1/edges`, `GET /v1/edges/:id`, `DELETE /v1/edges/:id`
 - `POST /v1/query` (Cypher execution), `POST /v1/explain` (query plan)
 - `POST /v1/search/text`, `POST /v1/search/vector`
-- `POST /v1/vectors` (upsert embedding), `POST /v1/index/vector` (configure or reindex)
-- `POST /v1/index/text` (create), `DELETE /v1/index/text` (drop), `GET /v1/index/text` (list)
+- `POST /v1/vectors` (upsert embedding)
 - `POST /v1/retrieve` (hybrid retrieval)
-- `POST /v1/admin/threads` (GraphBLAS thread count), `POST /v1/admin/backup`, `POST /v1/admin/restore`
 - `GET /health` (unversioned)
-
-`POST /v1/admin/restore` materializes a fresh database directory on the server host from a snapshot; it does not hot-swap the running graph.
 
 ### `issundb_mcp`
 
@@ -378,10 +378,11 @@ validate the `Host` header (DNS rebinding, GHSA-89vp-x53w-74fx, fixed upstream o
 header allowlist middleware. The allowlist defaults to the loopback names (`localhost`, `127.0.0.1`, `::1`) plus the `--bind` host; repeat
 `--allowed-host` to add the public hostnames a reverse proxy forwards under. Requests with a missing or non-allowlisted `Host` header get HTTP 403.
 
-Tools: `add_node`, `get_node`, `update_node`, `delete_node`, `add_edge`, `get_edge`, `delete_edge`, `cypher_query`, `explain`, `text_search`,
-`upsert_vector`, `vector_search`, `configure_vector_index`, `create_text_index`, `drop_text_index`, `list_text_indexes`, `retrieve_hybrid`,
-`set_thread_count`, `backup`, and `restore`. The `backup` and `restore` tools read and write snapshot files on the server host; `restore`
-materializes a fresh database directory and does not hot-swap the running graph.
+The tool surface is deliberately curated for an LLM agent: reads, queries, and retrieval only. Tools: `get_node`, `get_edge`, `cypher_query`,
+`explain`, `text_search`, `vector_search`, and `retrieve_hybrid`. There are no typed mutation tools: graph mutations are expressed as Cypher
+(`CREATE`, `SET`, `REMOVE`, `DELETE`, `MERGE`) through `cypher_query`. There are also no index-administration, vector-loading, thread-control, or
+backup/restore tools; those are operator concerns driven through the CLI or the Python and REST surfaces, not through an agent. Keep this surface
+minimal: every additional tool dilutes the agent's tool selection, so new agent-facing capability should clear that bar before being added here.
 
 ### `issundb_py`
 
