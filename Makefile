@@ -14,7 +14,7 @@ WHEEL_DIR := dist
 PY_MNGR := uv
 
 # Latest built issundb wheel, used by the publish target
-WHEEL_FILE := $(shell ls $(PY_DIR)/$(WHEEL_DIR)/issundb-*.whl 2>/dev/null | head -n 1)
+WHEEL_FILE = $(shell ls $(PY_DIR)/$(WHEEL_DIR)/issundb-*.whl 2>/dev/null | head -n 1)
 
 # Pinned versions for development tools
 LLVM_COV_VERSION := 0.6.16
@@ -288,7 +288,7 @@ docs: format ## Generate the documentation
 	@echo "Generating MkDocs documentation..."
 	@uv run python -c "import yaml.nodes; import yaml; yaml.Node = yaml.nodes.Node; from mkdocs.__main__ import cli; cli()" build
 
-.PHONE: figs
+.PHONY: figs
 figs: ## Generate the figures in the assets directory
 	@echo "Generating figures..."
 	@$(SHELL) $(ASSET_DIR)/diagrams/make_figures.sh $(ASSET_DIR)/diagrams
@@ -349,10 +349,10 @@ testdata: ## Regenerate versioned LMDB snapshots
 .PHONY: oracle-fixtures
 oracle-fixtures: ## Regenerate the NetworkX oracle corpora (needs Python3 and NetworkX)
 	@echo "Regenerating NetworkX oracle corpora..."
-	@python3 $SCRIPTS_DIR/gen_oracle_fixtures.py crates/issundb/tests/fixtures/networkx_oracle.json
-	@python3 $SCRIPTS_DIR/gen_pagerank_fixtures.py crates/issundb/tests/fixtures/networkx_pagerank.json
-	@python3 $SCRIPTS_DIR/gen_centrality_fixtures.py crates/issundb/tests/fixtures/networkx_centrality.json
-	@python3 $SCRIPTS_DIR/gen_paths_fixtures.py crates/issundb/tests/fixtures/networkx_paths.json
+	@python3 $(SCRIPTS_DIR)/gen_oracle_fixtures.py crates/issundb/tests/fixtures/networkx_oracle.json
+	@python3 $(SCRIPTS_DIR)/gen_pagerank_fixtures.py crates/issundb/tests/fixtures/networkx_pagerank.json
+	@python3 $(SCRIPTS_DIR)/gen_centrality_fixtures.py crates/issundb/tests/fixtures/networkx_centrality.json
+	@python3 $(SCRIPTS_DIR)/gen_paths_fixtures.py crates/issundb/tests/fixtures/networkx_paths.json
 	@echo "Corpora written. Commit crates/issundb/tests/fixtures/ to record the oracle."
 
 .PHONY: nextest
