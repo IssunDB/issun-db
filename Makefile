@@ -155,6 +155,10 @@ publish: ## Publish the package to crates.io (requires CARGO_REGISTRY_TOKEN to b
 .PHONY: develop-py
 develop-py: ## Build issundb-py and install it into the active Python environment
 	@echo "Building and installing issundb-py..."
+	@# Drop maturin's prior output so a re-run cannot hardlink and re-patch a stale
+	@# copy: re-patching zeroes the shared inode (including cargo's target/debug
+	@# copy), which cargo's fingerprint then treats as current.
+	@rm -rf target/maturin
 	@# Maturin fails when CONDA_PREFIX and VIRTUAL_ENV are both set; clear the former.
 	@(cd $(PY_DIR) && unset CONDA_PREFIX && maturin develop)
 
@@ -169,9 +173,24 @@ wheel-py-manylinux: ## Build the manylinux issundb-py wheel using Zig
 	@(cd $(PY_DIR) && maturin build --release --out $(WHEEL_DIR) --auditwheel check --zig)
 
 .PHONY: test-py
-test-py: develop-py ## Build issundb-py and run the Python binding tests
+test-py: ## Build issundb-py and run the Python binding tests
+	@echo "Syncing Python test dependencies..."
+	@# Sync the dev group (pytest) without letting uv install the project itself:
+	@# uv would register issundb as an editable install, which cannot resolve the
+	@# compiled PyO3 extension. Maturin places the working extension instead.
+	@(cd $(PY_DIR) && $(PY_MNGR) sync --group dev --no-install-project)
+	@echo "Building and installing issundb-py..."
+	@# Drop maturin's prior output so it cannot hardlink and re-patch a stale copy:
+	@# re-patching an existing artifact zeroes the shared inode (including cargo's
+	@# target/debug copy), which cargo's fingerprint then treats as current.
+	@rm -rf target/maturin
+	@# Maturin fails when CONDA_PREFIX and VIRTUAL_ENV are both set; clear the former.
+	@# Run maturin through uv so the dev-group patchelf is on PATH; without it the
+	@# libgomp rpath step fails and leaves a corrupt extension.
+	@(cd $(PY_DIR) && unset CONDA_PREFIX && $(PY_MNGR) run --no-sync maturin develop)
 	@echo "Running Python binding tests..."
-	@(cd $(PY_DIR) && $(PY_MNGR) run pytest)
+	@# --no-sync keeps uv from replacing the maturin-installed extension on run.
+	@(cd $(PY_DIR) && $(PY_MNGR) run --no-sync pytest)
 
 .PHONY: publish-py
 publish-py: wheel-py-manylinux ## Publish the issundb-py wheel to PyPI (requires PYPI_TOKEN to be set)
