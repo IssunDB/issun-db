@@ -71,7 +71,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let edge_props = serde_json::json!({ "since": 2021 });
     graph.add_edge(alice_id, bob_id, "KNOWS", &edge_props)?;
 
-    // Rebuild the in-memory CSR snapshot
+    // Optional: rebuild CSR snapshot manually after bulk writes
     graph.rebuild_csr()?;
 
     // Run a Cypher query and print the results

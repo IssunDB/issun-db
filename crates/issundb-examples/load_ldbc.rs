@@ -69,7 +69,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  {} -> {}", src_name, dst_name);
     }
 
-    // Rebuild the CSR snapshot so GraphBLAS-backed analytics are up to date.
+    // Optional: rebuild CSR snapshot manually after bulk writes to avoid query-time latency
     graph.rebuild_csr()?;
 
     // ---- 3. PageRank: top-3 nodes by score ---------------------------------
