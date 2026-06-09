@@ -1705,6 +1705,7 @@ version = "0.1.0-alpha.1"
 dependencies = [
  "criterion",
  "issundb-core",
+ "proptest",
  "roaring",
  "serde_json",
  "tempfile",

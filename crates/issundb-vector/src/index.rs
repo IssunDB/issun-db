@@ -45,8 +45,6 @@ pub enum VectorMetric {
     L2,
     /// Inner product / dot product.
     Dot,
-    /// Hamming distance (for binary vectors).
-    Hamming,
 }
 
 /// Quantization format for in-memory vector storage.
@@ -497,7 +495,6 @@ fn encode_config(opts: VectorIndexOptions) -> [u8; 2] {
         VectorMetric::Cosine => 0,
         VectorMetric::L2 => 1,
         VectorMetric::Dot => 2,
-        VectorMetric::Hamming => 3,
     };
     let quant = match opts.quantization {
         VectorQuantization::Float32 => 0,
@@ -519,7 +516,6 @@ fn decode_config(bytes: &[u8]) -> Result<VectorIndexOptions, VectorError> {
         0 => VectorMetric::Cosine,
         1 => VectorMetric::L2,
         2 => VectorMetric::Dot,
-        3 => VectorMetric::Hamming,
         other => {
             return Err(VectorError::IndexFault(format!(
                 "unknown vector metric tag {other}"
@@ -547,7 +543,6 @@ fn metric_to_usearch(m: VectorMetric) -> MetricKind {
         VectorMetric::Cosine => MetricKind::Cos,
         VectorMetric::L2 => MetricKind::L2sq,
         VectorMetric::Dot => MetricKind::IP,
-        VectorMetric::Hamming => MetricKind::Hamming,
     }
 }
 
@@ -882,5 +877,58 @@ mod tests {
         for h in handles {
             h.join().unwrap();
         }
+    }
+
+    #[test]
+    fn vector_search_with_int8_quantization_finds_nearest() {
+        // Int8 quantization is wired to usearch's ScalarKind::I8. Precision is
+        // reduced, but well-separated vectors must still rank correctly.
+        let (_dir, graph) = open_tmp();
+        graph
+            .configure_vector_index(VectorIndexOptions {
+                metric: VectorMetric::Cosine,
+                quantization: VectorQuantization::Int8,
+            })
+            .unwrap();
+        let a = graph.add_node("N", &json!({})).unwrap();
+        let b = graph.add_node("N", &json!({})).unwrap();
+        let c = graph.add_node("N", &json!({})).unwrap();
+        graph.upsert_vector(a, &[1.0, 0.0, 0.0]).unwrap();
+        graph.upsert_vector(b, &[0.0, 1.0, 0.0]).unwrap();
+        graph.upsert_vector(c, &[0.0, 0.0, 1.0]).unwrap();
+
+        let hits = graph.vector_search(&[1.0, 0.0, 0.0], 1).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].node, a);
+    }
+
+    #[test]
+    fn vector_search_with_multiple_property_filters_requires_all() {
+        // A property filter with several keys is an AND: only nodes matching
+        // every key/value pair qualify. The nearest node matches one key but not
+        // the other and must be excluded.
+        let (_dir, graph) = open_tmp();
+        let near = graph
+            .add_node("N", &json!({ "team": "blue", "role": "ic" }))
+            .unwrap();
+        let far = graph
+            .add_node("N", &json!({ "team": "blue", "role": "lead" }))
+            .unwrap();
+        graph.upsert_vector(near, &[1.0, 0.0, 0.0]).unwrap();
+        graph.upsert_vector(far, &[0.9, 0.1, 0.0]).unwrap();
+
+        let mut filters = std::collections::HashMap::new();
+        filters.insert("team".to_string(), json!("blue"));
+        filters.insert("role".to_string(), json!("lead"));
+        let opts = VectorSearchOptions {
+            k: 2,
+            label: None,
+            properties: Some(filters),
+        };
+        let hits = graph.vector_search_with(&[1.0, 0.0, 0.0], &opts).unwrap();
+
+        // `near` is closer but is role=ic, so only `far` satisfies both filters.
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].node, far);
     }
 }

@@ -617,6 +617,7 @@ impl TextIndexExt for Graph {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use serde_json::json;
     use tempfile::TempDir;
 
@@ -921,5 +922,96 @@ mod tests {
         assert!(graph.list_text_indexes()?.is_empty());
 
         Ok(())
+    }
+
+    // Generate a WAND input: per-document lengths and, for each query term, an
+    // optional term frequency per document (`Some(tf)` means the term occurs in
+    // that document). Document ids are the vector indices, so postings are
+    // naturally sorted and unique, matching the storage invariant.
+    fn wand_input_strategy() -> impl Strategy<Value = (Vec<u32>, Vec<Vec<Option<u32>>>)> {
+        (1usize..=12).prop_flat_map(|doc_count| {
+            let lens = prop::collection::vec(1u32..=30, doc_count);
+            let terms = prop::collection::vec(
+                prop::collection::vec(prop::option::weighted(0.5, 1u32..=10), doc_count),
+                1..=5,
+            );
+            (lens, terms)
+        })
+    }
+
+    proptest! {
+        /// WAND top-k must match exhaustive scoring. WAND prunes documents whose
+        /// maximum possible score cannot beat the running threshold; with valid
+        /// per-term upper bounds it must never drop a document that belongs in
+        /// the true top-k. This compares it against a brute-force oracle that
+        /// scores every matching document.
+        #[test]
+        fn prop_wand_matches_exhaustive_oracle(
+            (doc_lens, terms) in wand_input_strategy(),
+            k in 1usize..=15,
+        ) {
+            let scorer = Bm25Scorer::default();
+            let doc_count = doc_lens.len();
+            let n_docs = doc_count as f32;
+            let avgdl = doc_lens.iter().map(|&l| l as f32).sum::<f32>() / n_docs;
+            let doc_lengths: HashMap<NodeId, u32> = doc_lens
+                .iter()
+                .enumerate()
+                .map(|(i, &len)| (i as NodeId, len))
+                .collect();
+
+            // Shared per-term data (postings, idf, qtf) so the oracle and the
+            // cursors score identically. qtf is fixed at 1 (each query term once).
+            let mut term_data: Vec<(Vec<(NodeId, u32)>, f32, f32)> = Vec::new();
+            for term in &terms {
+                let postings: Vec<(NodeId, u32)> = term
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, occ)| occ.map(|tf| (i as NodeId, tf)))
+                    .collect();
+                if postings.is_empty() {
+                    continue;
+                }
+                let idf = scorer.idf(n_docs, postings.len() as f32);
+                term_data.push((postings, idf, 1.0));
+            }
+
+            // Brute-force oracle: full score for every matching document.
+            let mut oracle: HashMap<NodeId, f32> = HashMap::new();
+            for (postings, idf, qtf) in &term_data {
+                for &(doc, tf) in postings {
+                    let dl = doc_lengths[&doc] as f32;
+                    *oracle.entry(doc).or_insert(0.0) +=
+                        scorer.score(tf as f32, dl, avgdl, *idf, *qtf);
+                }
+            }
+            let mut expected_scores: Vec<f32> =
+                oracle.values().copied().filter(|s| *s > 0.0).collect();
+            expected_scores.sort_by(|a, b| b.partial_cmp(a).unwrap());
+            expected_scores.truncate(k);
+
+            // WAND under test, fed cursors built from the identical term data.
+            let cursors: Vec<PostingCursor> = term_data
+                .iter()
+                .map(|(postings, idf, qtf)| {
+                    let ub = scorer.upper_bound(*idf) * *qtf;
+                    PostingCursor::new(postings.clone(), *idf, ub, *qtf)
+                })
+                .collect();
+            let results = wand_top_k(cursors, k, &scorer, &doc_lengths, avgdl);
+
+            prop_assert_eq!(results.len(), expected_scores.len());
+            for (i, (node, score)) in results.iter().enumerate() {
+                // The score WAND reports for a document matches the oracle's.
+                let oracle_score = *oracle.get(node).expect("returned node must score");
+                prop_assert!((oracle_score - score).abs() < 1e-3);
+                // The returned set is the true top-k by score (tie-break aside).
+                prop_assert!((expected_scores[i] - score).abs() < 1e-3);
+                // Results are ordered by descending score.
+                if i > 0 {
+                    prop_assert!(results[i - 1].1 + 1e-4 >= *score);
+                }
+            }
+        }
     }
 }

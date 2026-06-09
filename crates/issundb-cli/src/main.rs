@@ -342,8 +342,8 @@ enum ReplCommand {
     /// Configure or reindex vector metric and quantization (e.g., `configure-vec cosine float32`)
     #[command(name = "configure-vec")]
     ConfigureVec {
-        /// Metric: 'cosine', 'l2', 'dot', or 'hamming'
-        #[arg(value_parser = ["cosine", "l2", "dot", "hamming"])]
+        /// Metric: 'cosine', 'l2', or 'dot'
+        #[arg(value_parser = ["cosine", "l2", "dot"])]
         metric: String,
         /// Quantization: 'float32', 'float16', or 'int8'
         #[arg(value_parser = ["float32", "float16", "int8"], default_value = "float32")]
@@ -1097,7 +1097,6 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
                 let v_metric = match metric.to_lowercase().as_str() {
                     "l2" => VectorMetric::L2,
                     "dot" => VectorMetric::Dot,
-                    "hamming" => VectorMetric::Hamming,
                     _ => VectorMetric::Cosine,
                 };
                 let v_quant = match quantization.to_lowercase().as_str() {

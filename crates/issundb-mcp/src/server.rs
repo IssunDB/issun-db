@@ -151,7 +151,7 @@ pub struct SetThreadCountArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ConfigureVectorIndexArgs {
-    /// Distance metric: 'cosine', 'l2', 'dot' (alias 'ip'), or 'hamming'.
+    /// Distance metric: 'cosine', 'l2', or 'dot' (alias 'ip').
     pub metric: String,
     /// Quantization mode: 'float32', 'float16', or 'int8'.
     pub quantization: String,
@@ -426,7 +426,7 @@ impl IssunMcp {
     }
 
     #[tool(
-        description = "Configure or rebuild the vector index. Option metric: 'cosine', 'dot', 'l2', or 'hamming'. Option quantization: 'float32', 'float16', or 'int8'."
+        description = "Configure or rebuild the vector index. Option metric: 'cosine', 'l2', or 'dot' (alias 'ip'). Option quantization: 'float32', 'float16', or 'int8'."
     )]
     fn configure_vector_index(
         &self,
@@ -436,7 +436,6 @@ impl IssunMcp {
             "cosine" => VectorMetric::Cosine,
             "l2" => VectorMetric::L2,
             "dot" | "ip" => VectorMetric::Dot,
-            "hamming" => VectorMetric::Hamming,
             _ => return Err(invalid(format!("invalid metric: {}", args.metric))),
         };
         let quantization = match args.quantization.to_lowercase().as_str() {
