@@ -286,7 +286,7 @@ enum ReplCommand {
         dst: u64,
     },
 
-    /// Find the shortest weighted path (Dijkstra) between two nodes (e.g., `wpath 1 2`)
+    /// Find the shortest weighted path between two nodes (e.g., `wpath 1 2`)
     #[command(name = "wpath")]
     Wpath {
         /// Source Node ID
@@ -476,7 +476,7 @@ Graph Algorithms
   bfs <id> <hops>                      Run breadth-first expansion traversal (e.g., bfs 1 2)
   dfs <id> <hops>                      Run depth-first expansion traversal (e.g., dfs 1 2)
   path <src> <dst>                     Find the shortest unweighted path between two nodes (e.g., path 1 2)
-  wpath <src> <dst>                    Find the shortest weighted path (Dijkstra) between two nodes (e.g., wpath 1 2)
+  wpath <src> <dst>                    Find the shortest weighted path between two nodes (e.g., wpath 1 2)
   pagerank [iters] [damping]           Compute PageRank centrality scores (e.g., pagerank 20 0.85)
   components                           Find weakly connected components
   degree [in|out|both]                 Compute degree centrality (e.g., degree out or degree both)

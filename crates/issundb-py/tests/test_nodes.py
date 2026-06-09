@@ -52,3 +52,17 @@ def test_update_node_rejects_invalid_json(db):
     nid = db.add_node("Person", json.dumps({"name": "Ada"}))
     with pytest.raises(ValueError):
         db.update_node(nid, "{")
+
+
+def test_add_node_with_multiple_labels(db):
+    nid = db.add_node(["Person", "Admin"], json.dumps({"name": "Ada"}))
+    assert isinstance(nid, int)
+    # A multi-label node matches a pattern that requires both of its labels.
+    result = json.loads(db.query("MATCH (n:Person:Admin) RETURN n.name AS name"))
+    assert result["columns"] == ["name"]
+    assert ["Ada"] in [record["values"] for record in result["records"]]
+
+
+def test_add_node_rejects_non_string_labels(db):
+    with pytest.raises(ValueError):
+        db.add_node(42, json.dumps({"name": "Ada"}))
