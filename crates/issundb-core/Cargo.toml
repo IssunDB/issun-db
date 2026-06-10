@@ -1,6 +1,7 @@
 [package]
 name = "issundb-core"
 description = "IssunDB's storage engine and core data structures"
+readme = "README.md"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

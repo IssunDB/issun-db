@@ -1,6 +1,7 @@
 [package]
 name = "issundb-graphblas"
 description = "Rust wrapper over the SuiteSparse:GraphBLAS operations that IssunDB uses"
+readme = "README.md"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
