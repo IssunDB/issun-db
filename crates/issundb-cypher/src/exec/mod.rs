@@ -3292,6 +3292,49 @@ mod tests {
     }
 
     #[test]
+    fn test_copy_retains_user_id_property() {
+        use std::io::Write;
+        let (tempdir, graph) = setup_graph();
+        let params = HashMap::new();
+
+        // A bare `id` column is a user-defined property and must survive the
+        // import; only the system-prefixed `_id` key is structural metadata.
+        let jsonl_path = tempdir.path().join("people.jsonl");
+        {
+            let mut file = std::fs::File::create(&jsonl_path).unwrap();
+            writeln!(file, "{{\"id\": 108, \"name\": \"Alice\"}}").unwrap();
+            writeln!(file, "{{\"_id\": 7, \"id\": 109, \"name\": \"Bob\"}}").unwrap();
+        }
+
+        let query = format!("COPY Person FROM '{}'", jsonl_path.display());
+        let res = execute(&graph, &query, &params).unwrap();
+        assert_eq!(res.records[0].values[0], serde_json::json!(2));
+
+        let res_id = execute(
+            &graph,
+            "MATCH (p:Person) WHERE p.id = 108 RETURN p.name",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(res_id.records.len(), 1);
+        assert_eq!(res_id.records[0].values, vec![serde_json::json!("Alice")]);
+
+        // `id` is retained even when `_id` is also present, and `_id` itself
+        // is never stored as a property.
+        let res_both = execute(
+            &graph,
+            "MATCH (p:Person) WHERE p.id = 109 RETURN p.name, p._id",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(res_both.records.len(), 1);
+        assert_eq!(
+            res_both.records[0].values,
+            vec![serde_json::json!("Bob"), serde_json::Value::Null]
+        );
+    }
+
+    #[test]
     fn test_parquet_export_import() {
         let (tempdir, graph) = setup_graph();
         let params = HashMap::new();
