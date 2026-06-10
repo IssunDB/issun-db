@@ -1,6 +1,6 @@
 [package]
 name = "issundb-vector"
-description = "Vector search APIs and indexing for IssunDB"
+description = "Vector indexing and search for IssunDB"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

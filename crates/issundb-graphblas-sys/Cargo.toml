@@ -1,6 +1,6 @@
 [package]
 name = "issundb-graphblas-sys"
-description = "Raw FFI bindings to SuiteSparse:GraphBLAS."
+description = "Raw FFI bindings to SuiteSparse:GraphBLAS"
 links = "graphblas"
 version.workspace = true
 edition.workspace = true

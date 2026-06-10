@@ -1,6 +1,6 @@
 [package]
 name = "issundb-text"
-description = "Full-text search APIs and indexing for IssunDB"
+description = "Full-text indexing and search for IssunDB"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
