@@ -17,10 +17,10 @@ doc = false
 
 [features]
 default = []
-extension-module = ["dep:pyo3", "pyo3/extension-module"]
+extension-module = ["dep:pyo3", "pyo3/extension-module", "pyo3/generate-import-lib"]
 
 [dependencies]
 pyo3 = { workspace = true, optional = true }
-issundb = { path = "../issundb" }
+issundb.workspace = true
 serde_json = { workspace = true }
 rmp-serde = { workspace = true }

@@ -1,12 +1,7 @@
-# Keep the build context lean. The build needs every workspace crate's
-# Cargo.toml, the sources, and the committed Cargo.lock; everything below is
-# either rebuilt, irrelevant to a release build, or large test fixtures.
-
-# Rust build output (rebuilt inside the image).
-/target
+# Rust build output
 **/target
 
-# Version control and editor or tooling state.
+# Version control and editor or tooling state
 .git
 .github
 .vscode
@@ -16,18 +11,17 @@
 .codex
 .antigravitycli
 
-# Python tooling for the dataset scripts (not needed to build the binaries).
+# Python tooling for the dataset scripts (not needed to build the binaries)
 .venv
 venv
 __pycache__
 *.pyc
 
-# Docs and the excluded LadybugDB comparison harness, which is not part of the
-# workspace build.
+# Docs and LadybugDB comparison harness
 docs
-benchmarks/ladybugdb-compare/target
+benchmarks
 
-# Container and meta files.
+# Container and meta files
 Dockerfile
 .dockerignore
 *.md

@@ -51,5 +51,8 @@ jobs:
       - name: Check formatting
         run: make format-check
 
+      - name: Check GraphBLAS pin consistency
+        run: make check-graphblas-pin
+
       - name: Run linters
         run: make lint

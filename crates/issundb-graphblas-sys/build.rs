@@ -5,6 +5,16 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+
+/// Pinned GraphBLAS release, used when the `external/GraphBLAS` submodule is not
+/// present (a crate consumed from crates.io carries no submodule, because
+/// `cargo package` never descends into submodules). The tarball is fetched and
+/// checksum-verified at build time. The version tracks the submodule pin.
+const GRAPHBLAS_VERSION: &str = "10.3.1";
+const GRAPHBLAS_URL: &str =
+    "https://github.com/DrTimothyAldenDavis/GraphBLAS/archive/refs/tags/v10.3.1.tar.gz";
+const GRAPHBLAS_SHA256: &str = "a3c4de775f47d9b448d0f548234a6c321c45f9f6a54e32c9e3a41b28df55cd0a";
 
 /// These are macros that their definitions confuse bindgen (they expand to floating-point
 /// classification constants); ignore them so binding generation succeeds.
@@ -22,20 +32,18 @@ impl bindgen::callbacks::ParseCallbacks for IgnoreMacros {
 }
 
 fn main() {
-    // The GraphBLAS C source is the `external/GraphBLAS` submodule at the
-    // workspace root, two levels up from this crate's manifest.
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
-    let graphblas_src = manifest_dir
-        .join("../../external/GraphBLAS")
-        .canonicalize()
-        .expect(
-            "external/GraphBLAS submodule not found; run `git submodule update --init external/GraphBLAS`",
-        );
-    let graphblas_src = clean_canonicalized_path(graphblas_src);
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+
+    // Resolve the GraphBLAS C source: an explicit override, then the
+    // `external/GraphBLAS` submodule (the in-repo path; no network), then the
+    // pinned tarball downloaded into OUT_DIR (for a crate consumed from
+    // crates.io, which carries no submodule).
+    let graphblas_src = resolve_graphblas_src(&manifest_dir, &out_dir);
     let header = graphblas_src.join("Include/GraphBLAS.h");
     assert!(
         header.exists(),
-        "GraphBLAS.h missing at {}; the submodule is not checked out",
+        "GraphBLAS.h missing at {}",
         header.display()
     );
 
@@ -104,6 +112,7 @@ fn main() {
     // Regenerate bindings if the pinned header changes.
     println!("cargo:rerun-if-changed={}", header.display());
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=ISSUNDB_GRAPHBLAS_SRC");
 
     let ignored = IgnoreMacros(
         [
@@ -129,6 +138,105 @@ fn main() {
     bindings
         .write_to_file(&out_path)
         .expect("failed to write GraphBLAS bindings");
+}
+
+/// Resolve the GraphBLAS C source tree, in priority order:
+///
+/// 1. `ISSUNDB_GRAPHBLAS_SRC`: an explicit path to a checkout, for offline
+///    builds or a custom source.
+/// 2. The `external/GraphBLAS` submodule at the workspace root, two levels up
+///    from this crate's manifest. This is the in-repo path (local development
+///    and the wheel builds, which check out submodules), and uses no network.
+/// 3. The pinned tarball, downloaded into `OUT_DIR` and checksum-verified. This
+///    is the path for a crate consumed from crates.io, whose package tarball
+///    carries no submodule.
+fn resolve_graphblas_src(manifest_dir: &Path, out_dir: &Path) -> PathBuf {
+    let has_header = |dir: &Path| dir.join("Include/GraphBLAS.h").exists();
+
+    if let Ok(src) = std::env::var("ISSUNDB_GRAPHBLAS_SRC") {
+        let src = PathBuf::from(src);
+        assert!(
+            has_header(&src),
+            "ISSUNDB_GRAPHBLAS_SRC={} does not contain Include/GraphBLAS.h",
+            src.display()
+        );
+        return clean_canonicalized_path(src.canonicalize().unwrap());
+    }
+
+    let submodule = manifest_dir.join("../../external/GraphBLAS");
+    if has_header(&submodule) {
+        return clean_canonicalized_path(submodule.canonicalize().unwrap());
+    }
+
+    download_graphblas(out_dir)
+}
+
+/// Download and extract the pinned GraphBLAS tarball into `OUT_DIR`, verifying
+/// its SHA-256 before extraction. Uses the system `curl` and `tar`, which are
+/// present on every platform that can already build the C library (a C
+/// compiler, cmake, and clang are also required). Re-downloads are skipped when
+/// the extracted tree is already present, so incremental builds pay nothing.
+fn download_graphblas(out_dir: &Path) -> PathBuf {
+    let extracted = out_dir.join(format!("GraphBLAS-{GRAPHBLAS_VERSION}"));
+    if extracted.join("Include/GraphBLAS.h").exists() {
+        return clean_canonicalized_path(extracted.canonicalize().unwrap());
+    }
+
+    let tarball = out_dir.join("graphblas.tar.gz");
+    run(
+        Command::new("curl")
+            .args(["-sSfL", "--retry", "3", "-o"])
+            .arg(&tarball)
+            .arg(GRAPHBLAS_URL),
+        "downloading GraphBLAS; set ISSUNDB_GRAPHBLAS_SRC to build offline",
+    );
+
+    let bytes = std::fs::read(&tarball).expect("failed to read the downloaded GraphBLAS tarball");
+    let digest = sha256_hex(&bytes);
+    assert_eq!(
+        digest, GRAPHBLAS_SHA256,
+        "GraphBLAS tarball checksum mismatch (expected {GRAPHBLAS_SHA256}, got {digest}); \
+         the download is corrupt or the upstream archive changed"
+    );
+
+    run(
+        Command::new("tar")
+            .arg("xzf")
+            .arg(&tarball)
+            .arg("-C")
+            .arg(out_dir),
+        "extracting GraphBLAS tarball",
+    );
+    assert!(
+        extracted.join("Include/GraphBLAS.h").exists(),
+        "GraphBLAS tarball extracted to an unexpected layout at {}",
+        extracted.display()
+    );
+    clean_canonicalized_path(extracted.canonicalize().unwrap())
+}
+
+/// Run a command, panicking with `context` if it cannot be spawned or exits
+/// non-zero.
+fn run(cmd: &mut Command, context: &str) {
+    let status = cmd.status().unwrap_or_else(|e| {
+        panic!(
+            "failed to spawn `{:?}` while {context}: {e}",
+            cmd.get_program()
+        )
+    });
+    assert!(status.success(), "command failed while {context}: {status}");
+}
+
+/// Lowercase hex SHA-256 of `bytes`.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    let mut s = String::with_capacity(digest.len() * 2);
+    for b in digest {
+        use std::fmt::Write;
+        write!(s, "{b:02x}").unwrap();
+    }
+    s
 }
 
 /// Locate the macOS `libomp` install prefix so cmake can resolve OpenMP.

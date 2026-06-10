@@ -10,9 +10,9 @@ homepage.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-issundb-core = { path = "../issundb-core" }
-issundb-vector = { path = "../issundb-vector" }
-issundb-text = { path = "../issundb-text" }
+issundb-core.workspace = true
+issundb-vector.workspace = true
+issundb-text.workspace = true
 thiserror.workspace = true
 ahash.workspace = true
 

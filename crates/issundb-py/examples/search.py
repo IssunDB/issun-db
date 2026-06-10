@@ -5,7 +5,7 @@ from issundb import IssunDB
 
 def main():
     db_path = "./issundb-py-search-data"
-    
+
     # Clean up from previous run if any
     if os.path.exists(db_path):
         shutil.rmtree(db_path)
@@ -47,7 +47,7 @@ def main():
     print(f"Query: '{query_text}'")
     fts_results_str = db.text_search(query_text, label="Movie", property="description", limit=2)
     fts_results = json.loads(fts_results_str)
-    
+
     for hit in fts_results:
         node_id = hit["node"]
         score = hit["score"]

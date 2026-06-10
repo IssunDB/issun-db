@@ -16,7 +16,7 @@ path = "src/main.rs"
 doc = false
 
 [dependencies]
-issundb = { path = "../issundb" }
+issundb.workspace = true
 rmcp = { version = "=0.11", features = [
     "server",
     "macros",

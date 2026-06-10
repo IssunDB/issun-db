@@ -11,7 +11,7 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
-issundb = { path = "../issundb" }
+issundb.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 rmp-serde.workspace = true
