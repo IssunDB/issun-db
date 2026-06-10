@@ -53,11 +53,9 @@ jobs:
           body: |
             ### What's Included
 
-            Pre-built IssunDB server and CLI binaries for each platform:
-
-            - `issundb-cli`: interactive REPL over the public facade.
-            - `issundb-rest`: Axum-based HTTP REST API server.
-            - `issundb-mcp`: Model Context Protocol server (stdio or Streamable HTTP).
+            - `issundb-cli`: IssunDB's CLI
+            - `issundb-rest`: IssunDB with a REST API server
+            - `issundb-mcp`: IssunDB with an MCP server
 
             The binaries statically link SuiteSparse:GraphBLAS and dynamically link
             the platform's OpenMP runtime: `libgomp` on glibc Linux, `libomp` on
