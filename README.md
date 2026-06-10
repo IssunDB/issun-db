@@ -23,7 +23,7 @@ IssunDB is a fast, embedded graph database written in Rust.
 It can be embedded in Rust applications without the need for a server, and can be used for a wide range of applications such as building
 GraphRAG pipelines and querying knowledge graphs.
 
-### Features
+### Key Features
 
 * Rust graph engine built with ACID, property graph model, and Cypher query language support
 * Fast graph traversal and analytics using sparse matrix operations
