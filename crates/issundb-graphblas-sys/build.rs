@@ -35,6 +35,15 @@ fn main() {
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
 
+    // On docs.rs, skip compiling the C library and use pre-generated bindings.
+    if std::env::var("DOCS_RS").is_ok() {
+        let bindings_path = manifest_dir.join("bindings.rs");
+        let out_path = out_dir.join("bindings.rs");
+        std::fs::copy(&bindings_path, &out_path)
+            .expect("failed to copy pre-generated bindings for docs.rs");
+        return;
+    }
+
     // Resolve the GraphBLAS C source: an explicit override, then the
     // `external/GraphBLAS` submodule (the in-repo path; no network), then the
     // pinned tarball downloaded into OUT_DIR (for a crate consumed from

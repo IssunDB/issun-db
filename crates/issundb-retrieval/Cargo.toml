@@ -1,6 +1,6 @@
 [package]
 name = "issundb-retrieval"
-description = "Hybrid retrieval (vector,text, and graph) for IssunDB"
+description = "Hybrid retrieval (vector, text, and graph) for IssunDB"
 readme = "README.md"
 version.workspace = true
 edition.workspace = true
