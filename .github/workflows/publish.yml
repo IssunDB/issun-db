@@ -44,7 +44,7 @@ jobs:
         # so a dependent crate can be published immediately after the crate it depends on.
         run: |
           set -euo pipefail
-          for crate in issundb-core issundb-vector issundb-text issundb-retrieval issundb-cypher issundb; do
+          for crate in issundb-graphblas-sys issundb-graphblas issundb-core issundb-vector issundb-text issundb-retrieval issundb-cypher issundb; do
             echo "Publishing $crate..."
             cargo publish -p "$crate" --token "$CARGO_REGISTRY_TOKEN"
           done

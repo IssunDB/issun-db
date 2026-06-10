@@ -14,8 +14,51 @@ permissions:
   contents: read
 
 jobs:
-  build_wheels:
-    name: Build wheels on ${{ matrix.os }}
+  build_linux:
+    name: Build wheels (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    env:
+      NK_TARGET_NEON: '1'
+      NK_TARGET_NEONSDOT: '0'
+      NK_TARGET_SVE: '0'
+      NK_TARGET_SVE2: '0'
+      NK_TARGET_SVE2P1: '0'
+      NK_TARGET_SVESDOT: '0'
+      NK_TARGET_SVEBFDOT: '0'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          manylinux: '2_28'
+          rust-toolchain: '1.85.0'
+          working-directory: crates/issundb-py
+          args: --release --out dist
+          before-script-linux: |
+            dnf install -y clang cmake gcc gcc-c++
+
+      - name: Upload wheels as artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.target }}
+          path: crates/issundb-py/dist/
+
+  build_native:
+    name: Build wheels (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
     env:
       RUSTUP_TOOLCHAIN: '1.85.0'
@@ -29,13 +72,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-14, windows-latest]
         include:
-          # Linux builds (x86_64 and aarch64)
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
           # macOS ARM64 (Apple Silicon)
           - os: macos-14
             target: aarch64-apple-darwin
@@ -64,44 +101,20 @@ jobs:
           toolchain: '1.85.0'
           targets: ${{ matrix.target }}
 
-      - name: Install Zig (for cross-compilation)
-        uses: mlugg/setup-zig@v1
-        with:
-          version: 0.13.0
-        if: matrix.os == 'ubuntu-latest'
-
-      - name: Install uv
-        run: |
-          pip install uv
-
-      - name: Install dependencies (Linux)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libfontconfig1-dev
-        if: matrix.os == 'ubuntu-latest'
-
       - name: Install dependencies (macOS)
         run: |
-          brew install fontconfig libomp
+          brew install libomp
         if: startsWith(matrix.os, 'macos-')
 
       - name: Configure macOS linker workaround
         if: matrix.os == 'macos-14'
         run: echo "RUSTFLAGS=-C link-arg=-Wl,-ld_classic" >> $GITHUB_ENV
 
-      - name: Build wheel (Linux with Zig)
-        run: |
-          cd crates/issundb-py
-          pip install maturin
-          maturin build --release --out dist --zig --target ${{ matrix.target }}
-        if: matrix.os == 'ubuntu-latest'
-
-      - name: Build wheel (macOS/Windows)
+      - name: Build wheel
         run: |
           cd crates/issundb-py
           pip install maturin
           maturin build --release --out dist --target ${{ matrix.target }}
-        if: matrix.os != 'ubuntu-latest'
         shell: bash
         env:
           CFLAGS_aarch64_pc_windows_msvc: ${{ matrix.cflags || '' }}
@@ -110,12 +123,12 @@ jobs:
       - name: Upload wheels as artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: wheels-${{ matrix.os }}-${{ matrix.target }}
+          name: wheels-${{ matrix.target }}
           path: crates/issundb-py/dist/
 
   publish_to_pypi:
     name: Publish to PyPI
-    needs: build_wheels
+    needs: [build_linux, build_native]
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
 
