@@ -1,9 +1,9 @@
 ## issundb-text
 
-Full-text indexing and search for [IssunDB](https://github.com/IssunDB/issun-db), an embedded graph database written in Rust.
+Full-text indexing and search for [IssunDB](https://github.com/IssunDB/issun-db).
 
-This crate owns tokenization, inverted index storage, ranking, and the text search APIs.
-It is an internal crate; applications should depend on the [`issundb`](https://crates.io/crates/issundb) facade instead.
+This crate provides features like tokenization, inverted index storage, ranking, and the text search APIs.
+It is an internal crate; applications should use the [`issundb`](https://crates.io/crates/issundb) crate instead. 
 
 ### License
 

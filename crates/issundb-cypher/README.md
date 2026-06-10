@@ -1,10 +1,9 @@
 ## issundb-cypher
 
-Cypher query language support for [IssunDB](https://github.com/IssunDB/issun-db), an embedded graph database written in Rust.
+Cypher query language support for [IssunDB](https://github.com/IssunDB/issun-db).
 
-This crate owns the Cypher parser, AST, logical and physical planners, optimizer, and executor.
-It is an internal crate; applications should depend on the [`issundb`](https://crates.io/crates/issundb) facade instead, which exposes querying
-through the `GraphQueryExt` trait.
+This crate includes the implementations of the Cypher parser, AST, logical and physical planners, optimizer, and executor.
+It is an internal crate; applications should depend on the [`issundb`](https://crates.io/crates/issundb) crate instead, which exposes querying through the `GraphQueryExt` trait.
 
 ### License
 
