@@ -1,6 +1,6 @@
 [package]
 name = "issundb-graphblas"
-description = "Minimal safe Rust wrapper over the SuiteSparse:GraphBLAS operations that IssunDB uses."
+description = "Rust wrapper over the SuiteSparse:GraphBLAS operations that IssunDB uses"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

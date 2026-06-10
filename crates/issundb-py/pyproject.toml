@@ -8,12 +8,12 @@ description = "Python bindings for IssunDB"
 authors = [{ name = "Hassan Abedi", email = "hassan.abedi.t+issundb@gmail.com" }]
 maintainers = [{ name = "Hassan Abedi", email = "hassan.abedi.t+issundb@gmail.com" }]
 keywords = ["graph-analytics", "graph-database", "data-science"]
-requires-python = ">=3.8,<4.0"
+requires-python = ">=3.10,<4.0"
 license = { text = "MIT" }
 readme = "README.md"
 dynamic = ['version']
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",

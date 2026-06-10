@@ -1,6 +1,6 @@
 [package]
 name = "issundb-retrieval"
-description = "Hybrid retrieval APIs for IssunDB"
+description = "Hybrid retrieval (vector,text, and graph) for IssunDB"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

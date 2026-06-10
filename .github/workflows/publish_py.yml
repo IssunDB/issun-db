@@ -79,10 +79,6 @@ jobs:
           # Windows x86_64
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-          # Windows ARM64
-          - os: windows-latest
-            target: aarch64-pc-windows-msvc
-            cflags: "-DNK_TARGET_HASWELL=0 -DNK_TARGET_SKYLAKE=0 -DNK_TARGET_ICELAKE=0 -DNK_TARGET_GENOA=0 -DNK_TARGET_DIAMOND=0 -DNK_TARGET_SAPPHIRE=0 -DNK_TARGET_SAPPHIREAMX=0 -DNK_TARGET_GRANITEAMX=0 -DNK_TARGET_TURIN=0 -DNK_TARGET_ALDER=0 -DNK_TARGET_SIERRA=0"
 
     steps:
       - name: Checkout repository
@@ -91,7 +87,7 @@ jobs:
           submodules: recursive
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: "3.10"
 
@@ -116,9 +112,6 @@ jobs:
           pip install maturin
           maturin build --release --out dist --target ${{ matrix.target }}
         shell: bash
-        env:
-          CFLAGS_aarch64_pc_windows_msvc: ${{ matrix.cflags || '' }}
-          CFLAGS_aarch64-pc-windows-msvc: ${{ matrix.cflags || '' }}
 
       - name: Upload wheels as artifacts
         uses: actions/upload-artifact@v4
