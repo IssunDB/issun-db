@@ -255,7 +255,6 @@ pub(super) fn execute_copy_internal(
                     let mut props_filtered = serde_json::Map::new();
                     for (k, v) in obj {
                         if k != "_id"
-                            && k != "id"
                             && k != "_labels"
                             && k != "labels"
                             && k != "_label"

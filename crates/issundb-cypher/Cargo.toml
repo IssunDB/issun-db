@@ -1,6 +1,7 @@
 [package]
 name = "issundb-cypher"
 description = "Cypher query language support for IssunDB"
+readme = "README.md"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

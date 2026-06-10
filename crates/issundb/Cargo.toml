@@ -1,6 +1,7 @@
 [package]
 name = "issundb"
 description = "IssunDB's main crate; it exposes the public API for IssunDB"
+readme = "README.md"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

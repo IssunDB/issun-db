@@ -1,6 +1,7 @@
 [package]
 name = "issundb-text"
 description = "Full-text indexing and search for IssunDB"
+readme = "README.md"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
