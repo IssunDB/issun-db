@@ -84,7 +84,16 @@ fn main() {
     // `lib64` (Fedora-like); search both.
     println!("cargo:rustc-link-search=native={}/lib", dst.display());
     println!("cargo:rustc-link-search=native={}/lib64", dst.display());
-    println!("cargo:rustc-link-lib=static=graphblas");
+    // GraphBLAS names the static library `graphblas` everywhere except MSVC,
+    // where it appends `_static` (OUTPUT_NAME graphblas_static) so the static
+    // archive does not collide with the DLL import library of the same base
+    // name. We build static only, but the rename still applies, so the link
+    // name must follow it on MSVC.
+    if target_os == "windows" && target_env == "msvc" {
+        println!("cargo:rustc-link-lib=static=graphblas_static");
+    } else {
+        println!("cargo:rustc-link-lib=static=graphblas");
+    }
 
     // GraphBLAS links its OpenMP runtime dynamically rather than bundling it in
     // the static archive, so the consuming binary must pull it in. The runtime
