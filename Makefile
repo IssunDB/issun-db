@@ -143,6 +143,10 @@ lint: format ## Run the linters
 	@echo "Linting Rust files..."
 	@DEBUG_PROJ=$(DEBUG_PROJ) cargo clippy -- -D warnings -D clippy::unwrap_used -D clippy::expect_used
 
+.PHONY: check-graphblas-pin
+check-graphblas-pin: ## Verify the GraphBLAS pin is consistent (across build.rs, the submodule, and .gitmodules)
+	@./scripts/check_graphblas_pin.sh
+
 .PHONY: publish
 publish: ## Publish the package to crates.io (requires CARGO_REGISTRY_TOKEN to be set)
 	@echo "Publishing the package to Cargo registry..."
