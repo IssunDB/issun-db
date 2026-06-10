@@ -1,9 +1,10 @@
 ## issundb-vector
 
-Vector indexing and search for [IssunDB](https://github.com/IssunDB/issun-db), an embedded graph database written in Rust.
+Vector indexing and search for [IssunDB](https://github.com/IssunDB/issun-db).
 
-This crate owns the vector index abstraction, vector metadata, vector storage integration, and the vector search APIs.
-It is an internal crate; applications should depend on the [`issundb`](https://crates.io/crates/issundb) facade instead.
+This crate provides features like the vector index abstraction, vector metadata, vector storage integration, and the vector search APIs.
+It is an internal crate; applications should use the API provided by [`issundb`](https://crates.io/crates/issundb), instead of directly using this
+crate.
 
 ### License
 
