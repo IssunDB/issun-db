@@ -50,7 +50,7 @@ chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
 rust-stemmers = "1.2.0"
 unicode-segmentation = "1.13.2"
-pyo3 = { version = "0.25", features = ["abi3-py38"] }
+pyo3 = { version = "0.25", features = ["abi3-py310"] }
 walkdir = "2"
 gherkin = "0.14"
 roaring = "0.10"
