@@ -126,9 +126,9 @@ Standard for local client integrations where the LLM application launches the se
 cargo run -p issundb-mcp -- --db-path /path/to/db-dir --transport stdio
 ```
 
-#### HTTP SSE Transport
+#### Streamable HTTP Transport
 
-For remote connections, using Server-Sent Events (SSE).
+For remote connections, using streamable HTTP.
 
 ```bash
 cargo run -p issundb-mcp -- --db-path /path/to/db-dir --transport http --bind 127.0.0.1:8000
