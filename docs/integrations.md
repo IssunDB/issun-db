@@ -31,13 +31,18 @@ All data and query endpoints are prefixed with `/v1`.
         "props": { "name": "Alice", "age": 30 }
       }
       ```
-    * Response: Returns the generated `NodeId` as a JSON number.
+    * Response: Returns the generated `NodeId` wrapped in a JSON object, e.g., `{"id": 1}`.
 * Get node: `GET /v1/nodes/:id`
     * Response: A JSON object containing the node's unique ID, labels, and properties.
 * Update node: `PUT /v1/nodes/:id`
-    * Request body: JSON properties to replace the existing property map.
+    * Request body:
+      ```json
+      {
+        "props": { "name": "Bob", "age": 32 }
+      }
+      ```
 * Delete node: `DELETE /v1/nodes/:id`
-    * Response: `200 OK` upon successful removal.
+    * Response: `204 No Content` on successful removal.
 
 #### Edge Operations
 
@@ -51,10 +56,11 @@ All data and query endpoints are prefixed with `/v1`.
         "props": { "since": 2020 }
       }
       ```
-    * Response: Returns the generated `EdgeId` as a JSON number.
+    * Response: Returns the generated `EdgeId` wrapped in a JSON object, e.g., `{"id": 1}`.
 * Get edge: `GET /v1/edges/:id`
     * Response: A JSON object containing the edge's unique ID, source/destination node IDs, type, and properties.
 * Delete edge: `DELETE /v1/edges/:id`
+    * Response: `204 No Content` upon successful removal.
 
 #### Search and Query Operations
 
@@ -138,23 +144,19 @@ cargo run -p issundb-mcp -- --db-path /path/to/db-dir --transport http --bind 12
 
 The server registers the following tools with the connecting client:
 
-1. `add_node`: Creates a node with a label and properties.
-2. `get_node`: Retrieves a node's details by ID.
-3. `update_node`: Updates a node's property map.
-4. `delete_node`: Deletes a node and its attached edges.
-5. `add_edge`: Creates a directed relationship between two nodes.
-6. `get_edge`: Retrieves an edge's details by ID.
-7. `delete_edge`: Removes an edge by ID.
-8. `query`: Executes a Cypher query with optional parameter bindings.
-9. `explain`: Evaluates and prints a Cypher query's physical plan.
-10. `search_text`: Queries the BM25 full-text search index.
-11. `search_vector`: Performs a k-nearest-neighbor vector similarity search.
+1. `get_node`: Fetch a node by ID; returning its labels and properties.
+2. `get_edge`: Fetch an edge by ID; returning its endpoints, type, and properties.
+3. `cypher_query`: Execute a Cypher query with optional parameter bindings. Use CREATE, SET, REMOVE, DELETE, and MERGE to mutate the graph.
+4. `explain`: Return the physical query plan for a Cypher query as an indented tree.
+5. `text_search`: Full-text search over indexed node properties; returns ranked hits.
+6. `vector_search`: Nearest-neighbor vector search; returns the $k$ closest nodes by distance (with optional label and property filtering).
+7. `retrieve_hybrid`: Execute a hybrid retrieval query that combines vector/semantic search, full-text keyword search, and relationship expansion.
 
 ### Client Configurations
 
 To connect an LLM client (like Claude Code) to the IssunDB MCP server, you can use the following configurations:
 
-### Streamable HTTP
+#### Streamable HTTP
 
 ```json
 {

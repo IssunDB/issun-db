@@ -28,12 +28,16 @@ The `Graph` struct is the main coordinator for all transactional graph storage, 
   Adds a directed relationship between two nodes with specific properties.
 - `get_edge(id: EdgeId) -> Result<Option<EdgeRecord>, Error>`  
   Retrieves an edge record by its unique identifier.
+- `update_edge(id: EdgeId, props: &impl Serialize) -> Result<(), Error>`  
+  Updates the properties of an existing edge.
 - `delete_edge(id: EdgeId) -> Result<(), Error>`  
   Deletes a relationship from the graph.
 - `out_neighbors(node: NodeId) -> Result<Vec<NeighborEntry>, Error>`  
   Retrieves all outgoing relationships and target neighbors for a given node.
 - `in_neighbors(node: NodeId) -> Result<Vec<NeighborEntry>, Error>`  
   Retrieves all incoming relationships and source neighbors for a given node.
+- `node_has_relationships(node: NodeId) -> Result<bool, Error>`  
+  Checks if a node has any incident (incoming or outgoing) relationships.
 
 ---
 
@@ -53,7 +57,7 @@ been committed.
   Finds the shortest unweighted path between two nodes.
 - `shortest_path_dijkstra(src: NodeId, dst: NodeId) -> Result<Option<WeightedPath>, Error>`  
   Finds the shortest weighted path between two nodes using Dijkstra's algorithm.
-- `shortest_path_top_k(src: NodeId, dst: NodeId, k: usize, weight_property: &str) -> Result<Vec<Vec<NodeId>>, Error>`  
+- `shortest_path_top_k(src: NodeId, dst: NodeId, k: usize, weight_property: &str) -> Result<Vec<WeightedPath>, Error>`  
   Finds the top-$k$ shortest weighted paths using Yen's algorithm.
 - `all_paths(src: NodeId, dst: NodeId) -> Result<Vec<Vec<NodeId>>, Error>`  
   Returns all simple paths between the source and destination nodes.
@@ -79,8 +83,8 @@ been committed.
   Finds weakly connected components, returning a mapping of each Node ID to its component label.
 - `strongly_connected_components() -> Result<HashMap<NodeId, u64>, Error>`  
   Finds strongly connected components in directed graphs.
-- `spanning_forest(start: NodeId) -> Result<Vec<EdgeId>, Error>`  
-  Generates a minimum spanning forest/tree starting from the specified node.
+- `spanning_forest(weight_property: &str, maximum: bool) -> Result<Vec<EdgeId>, Error>`  
+  Computes the Minimum or Maximum Spanning Forest (MSF) of the graph.
 - `maximum_flow(src: NodeId, dst: NodeId, capacity_property: &str) -> Result<f64, Error>`  
   Computes the maximum flow capacity between two nodes.
 - `detect_cycle() -> Result<bool, Error>`  
@@ -96,10 +100,18 @@ been committed.
 
 Import the `VectorGraphExt` trait to leverage embedding storage and vector similarity search.
 
+- `VectorGraphExt::configure_vector_index(opts: VectorIndexOptions) -> Result<(), VectorError>`  
+  Configures the metric and quantization for the graph's vector index.
+- `VectorGraphExt::reindex_vector_index(opts: VectorIndexOptions) -> Result<(), VectorError>`  
+  Changes the metric and quantization and rebuilds the index from the persisted embeddings.
 - `VectorGraphExt::upsert_vector(n: NodeId, v: &[f32]) -> Result<(), VectorError>`  
   Associates a float vector embedding with a node.
+- `VectorGraphExt::remove_vector(n: NodeId) -> Result<(), VectorError>`  
+  Removes the embedding for a node from the index and from storage.
 - `VectorGraphExt::vector_search(q: &[f32], k: usize) -> Result<Vec<Hit>, VectorError>`  
-  Retrieves the top-k nearest neighbor nodes matching the query vector.
+  Retrieves the top-$k$ nearest neighbor nodes matching the query vector.
+- `VectorGraphExt::vector_search_with(q: &[f32], opts: &VectorSearchOptions) -> Result<Vec<Hit>, VectorError>`  
+  Retrieves the top-$k$ nearest neighbor nodes satisfying label and property filters.
 
 ---
 
@@ -109,8 +121,14 @@ Import the `TextIndexExt` and `TextGraphExt` traits to configure and query text 
 
 - `TextIndexExt::create_text_index(label: &str, property: &str) -> Result<(), TextError>`  
   Creates a full-text search index on a specific node property.
+- `TextIndexExt::create_text_index_with_language(label: &str, property: &str, lang: Language) -> Result<(), TextError>`  
+  Creates a full-text search index for a specific language.
 - `TextIndexExt::drop_text_index(label: &str, property: &str) -> Result<(), TextError>`  
   Removes a full-text search index.
+- `TextIndexExt::has_text_index(label: &str, property: &str) -> Result<bool, TextError>`  
+  Checks if a full-text search index exists for a label and property.
+- `TextIndexExt::list_text_indexes() -> Result<Vec<(String, String, Language)>, TextError>`  
+  Lists all active full-text search indexes.
 - `TextGraphExt::text_search(query: &str, opts: &TextSearchOptions) -> Result<Vec<TextHit>, TextError>`  
   Queries indexed text fields and ranks matching nodes using BM25 scoring.
 

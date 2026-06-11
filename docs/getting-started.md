@@ -81,21 +81,24 @@ These subcommands perform direct graph operations, algorithm executions, vector 
 | `pagerank`            | Compute PageRank centrality scores (e.g., `pagerank 20 0.85`).                                     |
 | `components`          | Find weakly connected components in the graph.                                                     |
 | `degree`              | Compute degree centrality (e.g., `degree out`).                                                    |
+| `rebuild-csr`         | Rebuild the in-memory CSR snapshot cache.                                                          |
 | `upsert-vec`          | Attach/upsert a vector embedding on a node (e.g., `upsert-vec 1 0.1 0.2 0.3`).                     |
 | `vsearch`             | Query the vector index for $k$-nearest neighbors (e.g., `vsearch 5 0.1 0.2 0.3`).                  |
 | `retrieve`            | Execute hybrid retrieval over vector and text indexes (e.g., `retrieve 5 2 0.1 0.2 --text query`). |
 | `configure-vec`       | Configure vector index metric and quantization (e.g., `configure-vec cosine int8`).                |
 | `text-index`          | Configure and manage full-text indexes (e.g., `text-index create Book title`).                     |
+| `text-search`         | Query the BM25 full-text search index (e.g., `text-search "query" Book summary 5`).                |
 
 ---
 
 ## Embed in a Rust Project
 
-To use the database in your own Rust application, add the `issundb` facade dependency to your `Cargo.toml` file:
+To use the database in your own Rust application, add the `issundb` facade and `serde_json` dependencies to your `Cargo.toml` file:
 
 ```toml
 [dependencies]
-issundb = "verson" # Like "0.1.0" or "0.1.1-alpha.4"
+issundb = "version" # Like "0.1.0" or "0.1.1-alpha.4"
+serde_json = "1.0"   # Used to construct property maps
 ```
 
 Or
