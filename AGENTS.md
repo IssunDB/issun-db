@@ -78,7 +78,11 @@ Do not invent modules that do not yet exist when answering questions, but do pla
     - `src/columns.rs`: in-memory property columns for the read path. One typed column (`Int`, `Float`, `Bool`, dictionary-encoded `Str`, or the
       exact-semantics `Json` fallback) per node property name over a self-contained dense node mapping, built lazily from one full node scan and
       kept fresh by a post-commit delta (added and updated nodes are re-read individually; node deletion forces a rebuild). Read through
-      `Graph::node_prop_json`.
+      `Graph::node_prop_json`. Also owns the lazily computed per-property statistics (`PropStats`: min and max bounds, an equi-depth histogram,
+      and the most common values), computed on first access through `Graph::node_prop_min_max` or the selectivity estimates and invalidated by
+      the post-commit patch, so the gather path never pays for them.
+    - `src/histogram.rs`: equi-depth histogram over property values with equality and range selectivity estimates; backs `PropStats`. Nothing
+      here is persisted.
     - `src/matrices.rs`: GraphBLAS matrix materialization from the CSR snapshot, plus `MatrixSet::apply_delta` for incremental in-place maintenance
       (resize plus per-element set and drop) and the self-contained `dense_to_id`/`id_to_dense` mapping the matrix-view consumers read.
     - `src/error.rs`: `Error` enum; all storage and serialization errors unify here.
@@ -238,6 +242,14 @@ All graph operations go through `Graph`; do not call `Storage` directly from out
 - `node_prop_group_codes(ids: &[NodeId], prop: &str) -> Result<(Vec<u32>, Vec<serde_json::Value>), Error>` (dense group codes under exact
   value identity of one property, plus one representative value per code; null and missing values share one `Value::Null` code; on a typed
   column no per-row value is materialized)
+- `node_prop_min_max(prop: &str) -> Result<Option<(serde_json::Value, serde_json::Value)>, Error>` (bounds of one property's non-null values
+  from the lazily computed column statistics; `None` for a `Json` fallback column or no non-null values; backs the vectorized executor's
+  zone-map filter pruning)
+- `estimate_range_selectivity(prop: &str, lower: Option<&serde_json::Value>, upper: Option<&serde_json::Value>) -> Result<Option<f64>, Error>`
+  (estimated fraction of non-null values inside the bounds, from the property's equi-depth histogram)
+- `estimate_equality_selectivity(prop: &str, val: &serde_json::Value) -> Result<Option<f64>, Error>` (estimated fraction of non-null values
+  equal to `val`: exact for the property's most common values, histogram-estimated otherwise; both estimates feed the optimizer's
+  selectivity-aware `Filter` plan weight)
 - `update_node(id: NodeId, props: &impl Serialize) -> Result<(), Error>`
 - `delete_node(id: NodeId) -> Result<(), Error>`
 - `add_label(id: NodeId, label: &str) -> Result<(), Error>`
@@ -303,6 +315,10 @@ It may depend on `issundb-core`; it must not depend on `issundb-text`, `issundb-
   f32, so they re-index under any metric; this is O(n) in the stored vector count and is an administrative operation, not a concurrent one.
 - `VectorGraphExt::upsert_vector(n: NodeId, v: &[f32]) -> Result<(), VectorError>`
 - `VectorGraphExt::vector_search(q: &[f32], k: usize) -> Result<Vec<Hit>, VectorError>`
+- `VectorGraphExt::vector_search_with(q: &[f32], opts: &VectorSearchOptions) -> Result<Vec<Hit>, VectorError>`: adds an exact-label filter,
+  property equality filters (both evaluated during the HNSW traversal), and `rescore_factor`. On a quantized index the search defaults to
+  fetching `2k` candidates and re-ranking them by exact distance against the raw f32 vectors persisted in LMDB, which recovers most of the
+  recall lost to quantization; `Some(1)` disables the rescore and a `Float32` index never rescores by default.
 
 ### `issundb_text`
 
@@ -342,7 +358,8 @@ Untyped expansion uses GraphBLAS SpMV; typed expansion reads the CSR snapshot in
 and the source set is small so a write-then-expand workload never pays a rebuild. The optimizer splits top-level `AND` conjunctions in WHERE so
 each conjunct pushes down to its own lowest binder, and rewrites an equality or range filter over a labeled scan into `NodeIndexScan` or
 `NodeRangeScan` when the property has a declared index; the rewrite recurses through every single-input operator (including `Aggregate`, `Sort`,
-`Limit`, and `Distinct`) and treats a split conjunct's expression form like the structured comparison forms. Bulk label filtering uses `label_idx` point
+`Limit`, and `Distinct`) and treats a split conjunct's expression form like the structured comparison forms. Bulk label filtering uses `label_idx`
+point
 lookups (`Graph::label_filter`), and single-property node reads go through the in-memory property columns (`Graph::node_prop_json`).
 A final projection or aggregation over a single-hop expansion executes column-at-a-time through `exec/vectorized.rs`
 (`Graph::node_props_json_table` and `Graph::node_prop_group_codes`); every other shape runs the row pipeline.

@@ -212,11 +212,44 @@ fn intern(dict: &mut Vec<String>, lookup: &mut AHashMap<String, u32>, s: String)
     i
 }
 
+/// Lazily computed distribution statistics over one typed column's non-null
+/// values: bounds, an equi-depth histogram, and the most common values.
+pub(crate) struct PropStats {
+    pub(crate) min: Value,
+    pub(crate) max: Value,
+    pub(crate) histogram: crate::histogram::Histogram,
+    /// Up to [`MCV_LIMIT`] `(value, row_count)` pairs, most frequent first.
+    pub(crate) mcvs: Vec<(Value, u64)>,
+}
+
+const MCV_LIMIT: usize = 8;
+const HISTOGRAM_BUCKETS: usize = 10;
+
+impl PropStats {
+    /// Estimated fraction of non-null rows equal to `value`: the exact share
+    /// when `value` is a most-common value, the histogram's uniform-in-bucket
+    /// estimate otherwise.
+    pub(crate) fn equality_selectivity(&self, value: &Value) -> f64 {
+        for (v, count) in &self.mcvs {
+            if v == value {
+                return *count as f64 / self.histogram.total_rows as f64;
+            }
+        }
+        self.histogram.estimate_equality_selectivity(value)
+    }
+}
+
 /// The materialized column set with its own dense node mapping.
 pub(crate) struct PropColumns {
     pub(crate) id_to_dense: AHashMap<NodeId, u32>,
     pub(crate) dense_to_id: Vec<NodeId>,
     pub(crate) cols: AHashMap<String, PropColumn>,
+    /// Per-property stats, computed on first access through [`prop_stats`]
+    /// and invalidated wholesale by [`patch`] (a patch clears the touched
+    /// rows in every column, so every property's distribution may change).
+    /// `None` is cached for columns with no usable stats (`Json` fallback
+    /// columns and all-null columns).
+    stats: AHashMap<String, Option<PropStats>>,
 }
 
 impl PropColumns {
@@ -247,7 +280,7 @@ impl PropColumns {
                 }
             }
         }
-        let cols = values
+        let cols: AHashMap<String, PropColumn> = values
             .into_iter()
             .map(|(k, v)| (k, PropColumn::from_values(v)))
             .collect();
@@ -255,7 +288,19 @@ impl PropColumns {
             id_to_dense,
             dense_to_id,
             cols,
+            stats: AHashMap::new(),
         })
+    }
+
+    /// Statistics for `prop`, computed on first access and cached until the
+    /// next patch or rebuild. `None` when the property has no column, the
+    /// column is the `Json` fallback, or it holds no non-null values.
+    pub(crate) fn prop_stats(&mut self, prop: &str) -> Option<&PropStats> {
+        if !self.stats.contains_key(prop) {
+            let computed = self.cols.get(prop).and_then(compute_prop_stats);
+            self.stats.insert(prop.to_string(), computed);
+        }
+        self.stats.get(prop).and_then(|s| s.as_ref())
     }
 
     /// Gather `props` for each id in `ids`, row-major: `out[i][j]` is the
@@ -451,6 +496,12 @@ impl PropColumns {
     /// Re-read `touched` node records and patch their slots in place. New
     /// nodes extend the dense mapping; new property names start a new column.
     fn patch(&mut self, storage: &Storage, touched: &[NodeId]) -> Result<(), Error> {
+        // A patch clears the touched rows in every column before re-setting
+        // the present properties, so every cached distribution may be stale,
+        // including ones whose property the new records no longer carry.
+        if !touched.is_empty() {
+            self.stats.clear();
+        }
         let rtxn = storage.env.read_txn()?;
         for &id in touched {
             let bytes = match storage.nodes.get(&rtxn, &id)? {
@@ -489,6 +540,60 @@ impl PropColumns {
         }
         Ok(())
     }
+}
+
+/// Sorted non-null values of a typed column. `None` for the `Json` fallback,
+/// whose mixed kinds have no total order to summarize.
+fn sorted_non_null_values(col: &PropColumn) -> Option<Vec<Value>> {
+    let mut vals: Vec<Value> = match col {
+        PropColumn::Int(v) => v.iter().flatten().map(|&x| Value::from(x)).collect(),
+        // NaN is excluded: it is unordered, and a NaN cell fails every
+        // comparison the estimates model, so leaving it out keeps bounds
+        // and histogram mass conservative.
+        PropColumn::Float(v) => v
+            .iter()
+            .flatten()
+            .filter(|x| !x.is_nan())
+            .map(|&x| Value::from(x))
+            .collect(),
+        PropColumn::Bool(v) => v.iter().flatten().map(|&x| Value::Bool(x)).collect(),
+        PropColumn::Str { dict, idx, .. } => idx
+            .iter()
+            .filter(|&&i| i != STR_NULL)
+            .map(|&i| Value::String(dict[i as usize].clone()))
+            .collect(),
+        PropColumn::Json(_) => return None,
+    };
+    vals.sort_unstable_by(|a, b| {
+        crate::histogram::compare_values(a, b).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    Some(vals)
+}
+
+fn compute_prop_stats(col: &PropColumn) -> Option<PropStats> {
+    let vals = sorted_non_null_values(col)?;
+    let (min, max) = match (vals.first(), vals.last()) {
+        (Some(mn), Some(mx)) => (mn.clone(), mx.clone()),
+        _ => return None,
+    };
+    let histogram = crate::histogram::Histogram::build(&vals, HISTOGRAM_BUCKETS);
+
+    let mut runs: Vec<(Value, u64)> = Vec::new();
+    for v in &vals {
+        match runs.last_mut() {
+            Some((last, count)) if last == v => *count += 1,
+            _ => runs.push((v.clone(), 1)),
+        }
+    }
+    runs.sort_by(|a, b| b.1.cmp(&a.1));
+    runs.truncate(MCV_LIMIT);
+
+    Some(PropStats {
+        min,
+        max,
+        histogram,
+        mcvs: runs,
+    })
 }
 
 /// Pending node mutations the columns have not absorbed yet.
@@ -555,6 +660,29 @@ impl ColumnsCache {
             }
             // Loop back to the fast path so a delta that landed during the
             // rebuild is also absorbed before serving.
+        }
+    }
+
+    /// Like [`with_fresh`], but with mutable column access, for readers that
+    /// fill the lazy statistics cache. Takes the write lock for the whole
+    /// call, so this is for optimizer-time stats reads, not the gather path.
+    pub(crate) fn with_fresh_mut<T>(
+        &self,
+        storage: &Storage,
+        f: impl FnOnce(&mut PropColumns) -> T,
+    ) -> Result<T, Error> {
+        let mut guard = self.columns.write();
+        loop {
+            let delta = std::mem::take(&mut *self.pending.lock());
+            if delta.touched.is_empty() && !delta.force_full {
+                if let Some(cols) = guard.as_mut() {
+                    return Ok(f(cols));
+                }
+            }
+            match guard.as_mut() {
+                Some(cols) if !delta.force_full => cols.patch(storage, &delta.touched)?,
+                _ => *guard = Some(PropColumns::build(storage)?),
+            }
         }
     }
 }
@@ -807,5 +935,118 @@ mod tests {
             .unwrap();
         assert_eq!(g.node_prop_json(a, "x").unwrap(), Some(json!(10)));
         assert_eq!(g.node_prop_json(b, "x").unwrap(), Some(json!(20)));
+    }
+
+    #[test]
+    fn prop_column_min_max_bounds() {
+        let (_dir, g) = open_tmp();
+        let _a = g
+            .add_node(
+                "N",
+                &json!({ "age": 30, "weight": 70.5, "active": true, "name": "ada" }),
+            )
+            .unwrap();
+        let _b = g
+            .add_node(
+                "N",
+                &json!({ "age": 40, "weight": 80.2, "active": false, "name": "bob" }),
+            )
+            .unwrap();
+        let c = g
+            .add_node(
+                "N",
+                &json!({ "age": 20, "weight": 60.1, "active": true, "name": "charlie" }),
+            )
+            .unwrap();
+
+        let (min_age, max_age) = g.node_prop_min_max("age").unwrap().unwrap();
+        assert_eq!(min_age, json!(20));
+        assert_eq!(max_age, json!(40));
+
+        let (min_w, max_w) = g.node_prop_min_max("weight").unwrap().unwrap();
+        assert_eq!(min_w, json!(60.1));
+        assert_eq!(max_w, json!(80.2));
+
+        let (min_act, max_act) = g.node_prop_min_max("active").unwrap().unwrap();
+        assert_eq!(min_act, json!(false));
+        assert_eq!(max_act, json!(true));
+
+        let (min_name, max_name) = g.node_prop_min_max("name").unwrap().unwrap();
+        assert_eq!(min_name, json!("ada"));
+        assert_eq!(max_name, json!("charlie"));
+
+        // An unknown property has no statistics.
+        assert!(g.node_prop_min_max("nope").unwrap().is_none());
+
+        // An update invalidates the cached statistics: 20 is gone and 50 is
+        // the new maximum.
+        g.update_node(c, &json!({ "age": 50, "weight": 90.0 }))
+            .unwrap();
+        let (min_age, max_age) = g.node_prop_min_max("age").unwrap().unwrap();
+        assert_eq!(min_age, json!(30));
+        assert_eq!(max_age, json!(50));
+    }
+
+    #[test]
+    fn prop_stats_refresh_when_update_removes_the_property() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("N", &json!({ "age": 10 })).unwrap();
+        let _b = g.add_node("N", &json!({ "age": 99 })).unwrap();
+        let (_, max_age) = g.node_prop_min_max("age").unwrap().unwrap();
+        assert_eq!(max_age, json!(99));
+
+        // The new record no longer carries `age` at all, so the key is absent
+        // from the patched property map; the stats must still refresh.
+        g.update_node(a + 1, &json!({ "renamed": 1 })).unwrap();
+        let (min_age, max_age) = g.node_prop_min_max("age").unwrap().unwrap();
+        assert_eq!(min_age, json!(10));
+        assert_eq!(max_age, json!(10));
+    }
+
+    #[test]
+    fn equality_selectivity_uses_most_common_values() {
+        let (_dir, g) = open_tmp();
+        for _ in 0..90 {
+            g.add_node("N", &json!({ "team": "blue" })).unwrap();
+        }
+        for i in 0..10 {
+            g.add_node("N", &json!({ "team": format!("t{i}") }))
+                .unwrap();
+        }
+        let sel = g
+            .estimate_equality_selectivity("team", &json!("blue"))
+            .unwrap()
+            .unwrap();
+        assert!((sel - 0.9).abs() < 1e-9, "got {sel}");
+        // A value outside the column's bounds estimates to zero.
+        let sel = g
+            .estimate_equality_selectivity("team", &json!("zzz"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(sel, 0.0);
+        // No statistics exist for an unknown property.
+        assert!(
+            g.estimate_equality_selectivity("nope", &json!(1))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn range_selectivity_estimates_fraction() {
+        let (_dir, g) = open_tmp();
+        for i in 0..100 {
+            g.add_node("N", &json!({ "age": i })).unwrap();
+        }
+        let sel = g
+            .estimate_range_selectivity("age", Some(&json!(50)), None)
+            .unwrap()
+            .unwrap();
+        assert!((sel - 0.5).abs() < 0.05, "got {sel}");
+        let sel = g
+            .estimate_range_selectivity("age", None, Some(&json!(1000)))
+            .unwrap()
+            .unwrap();
+        assert!((sel - 1.0).abs() < 1e-9, "got {sel}");
     }
 }

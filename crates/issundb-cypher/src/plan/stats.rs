@@ -21,6 +21,11 @@ pub trait StatsProvider {
     fn has_node_property_index(&self, _label: &str, _property: &str) -> bool {
         false
     }
+
+    /// Estimate the selectivity of a filter expression.
+    fn estimate_filter_selectivity(&self, _expr: &crate::plan::logical::FilterExpr) -> Option<f64> {
+        None
+    }
 }
 
 impl StatsProvider for Graph {
@@ -39,5 +44,75 @@ impl StatsProvider for Graph {
     fn has_node_property_index(&self, label: &str, property: &str) -> bool {
         self.has_node_property_index(label, property)
             .unwrap_or(false)
+    }
+
+    fn estimate_filter_selectivity(&self, expr: &crate::plan::logical::FilterExpr) -> Option<f64> {
+        use crate::ast::{Expr, Literal};
+        use crate::plan::logical::FilterExpr;
+
+        fn literal_to_value(lit: &Literal) -> serde_json::Value {
+            match lit {
+                Literal::Str(s) => serde_json::Value::String(s.clone()),
+                Literal::Int(i) => serde_json::Value::Number((*i).into()),
+                Literal::Float(f) => serde_json::Number::from_f64(*f)
+                    .map(serde_json::Value::Number)
+                    .unwrap_or(serde_json::Value::Null),
+                Literal::Bool(b) => serde_json::Value::Bool(*b),
+                Literal::Null => serde_json::Value::Null,
+                Literal::List(l) => {
+                    serde_json::Value::Array(l.iter().map(literal_to_value).collect())
+                }
+            }
+        }
+
+        fn extract_prop_and_literal(
+            l: &Expr,
+            r: &Expr,
+        ) -> Option<(String, serde_json::Value, bool)> {
+            match (l, r) {
+                (Expr::Prop(_, prop), Expr::Literal(lit)) => {
+                    Some((prop.clone(), literal_to_value(lit), true))
+                }
+                (Expr::Literal(lit), Expr::Prop(_, prop)) => {
+                    Some((prop.clone(), literal_to_value(lit), false))
+                }
+                _ => None,
+            }
+        }
+
+        match expr {
+            FilterExpr::Eq(l, r) => {
+                let (prop, val, _) = extract_prop_and_literal(l, r)?;
+                self.estimate_equality_selectivity(&prop, &val).ok()?
+            }
+            FilterExpr::Ne(l, r) => {
+                let (prop, val, _) = extract_prop_and_literal(l, r)?;
+                let eq_sel = self.estimate_equality_selectivity(&prop, &val).ok()??;
+                Some((1.0 - eq_sel).max(0.0))
+            }
+            // The histogram estimate does not model bound inclusivity, so Lt
+            // pairs with Le and Gt pairs with Ge.
+            FilterExpr::Lt(l, r) | FilterExpr::Le(l, r) => {
+                let (prop, val, is_col_lhs) = extract_prop_and_literal(l, r)?;
+                if is_col_lhs {
+                    self.estimate_range_selectivity(&prop, None, Some(&val))
+                        .ok()?
+                } else {
+                    self.estimate_range_selectivity(&prop, Some(&val), None)
+                        .ok()?
+                }
+            }
+            FilterExpr::Gt(l, r) | FilterExpr::Ge(l, r) => {
+                let (prop, val, is_col_lhs) = extract_prop_and_literal(l, r)?;
+                if is_col_lhs {
+                    self.estimate_range_selectivity(&prop, Some(&val), None)
+                        .ok()?
+                } else {
+                    self.estimate_range_selectivity(&prop, None, Some(&val))
+                        .ok()?
+                }
+            }
+            _ => None,
+        }
     }
 }

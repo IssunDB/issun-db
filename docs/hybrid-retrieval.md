@@ -9,7 +9,8 @@ A hybrid retrieval workflow follows three sequential steps:
 
 1. Seed selection: Query inputs (vector embeddings, text queries, or both) identify initial "seed" nodes using vector indexes and full-text indexes.
 2. Score fusion: Relevance scores from different index hits are combined into a single ranking using a configurable fusion strategy.
-3. Graph traversal: A multi-source Breadth-First Search (BFS) expands outward from the top-ranked seed nodes to gather neighboring nodes and edges, materializing a self-contained subgraph.
+3. Graph traversal: A multi-source Breadth-First Search (BFS) expands outward from the top-ranked seed nodes to gather neighboring nodes and edges,
+   materializing a self-contained subgraph.
 
 ---
 
@@ -84,8 +85,10 @@ pub struct HybridRetrieveOptions {
 
 Relevance scores from different sources are merged using one of the following strategies:
 
-* Reciprocal Rank Fusion (RRF): Merges ranked lists using the reciprocal of the rank: `score = Σ 1 / (k + rank)`. This is the default strategy and is effective when relevance scores have different scales.
-* Weighted Linear Combination: Combines raw relevance scores linearly: `score = α * vector_score + β * text_score`. Use this when you want to prioritize one index over another.
+* Reciprocal Rank Fusion (RRF): Merges ranked lists using the reciprocal of the rank: `score = Σ 1 / (k + rank)`. This is the default strategy and is
+  effective when relevance scores have different scales.
+* Weighted Linear Combination: Combines raw relevance scores linearly: `score = α * vector_score + β * text_score`. Use this when you want to
+  prioritize one index over another.
 
 ```rust
 pub enum FusionStrategy {

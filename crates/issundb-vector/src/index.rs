@@ -23,6 +23,14 @@ pub struct VectorSearchOptions {
     pub label: Option<String>,
     /// Optional property key-value filters. Only nodes matching all filters are returned.
     pub properties: Option<std::collections::HashMap<String, serde_json::Value>>,
+    /// Rescore factor. When greater than 1, search fetches `k * rescore_factor`
+    /// candidates from the index and re-ranks them by exact distance against
+    /// the full-precision vectors stored in LMDB. Defaults to 2 on a quantized
+    /// index and 1 (no rescore) on a Float32 index. The default applies to
+    /// filtered searches too, where the over-fetch means the traversal must
+    /// find `k * rescore_factor` predicate-matching candidates; pass
+    /// `Some(1)` to disable rescoring for a selective filter.
+    pub rescore_factor: Option<usize>,
 }
 
 impl Default for VectorSearchOptions {
@@ -31,6 +39,7 @@ impl Default for VectorSearchOptions {
             k: 10,
             label: None,
             properties: None,
+            rescore_factor: None,
         }
     }
 }
@@ -425,9 +434,11 @@ impl VectorGraphExt for Graph {
 
     #[instrument(skip(self, q), fields(k = %k, dims = q.len()))]
     fn vector_search(&self, q: &[f32], k: usize) -> Result<Vec<Hit>, VectorError> {
-        let arc = get_or_init_cache(self)?;
-
-        arc.0.search(q, k)
+        let opts = VectorSearchOptions {
+            k,
+            ..Default::default()
+        };
+        self.vector_search_with(q, &opts)
     }
 
     #[instrument(skip(self, q), fields(k = %opts.k, label = ?opts.label, dims = q.len()))]
@@ -436,57 +447,147 @@ impl VectorGraphExt for Graph {
         q: &[f32],
         opts: &VectorSearchOptions,
     ) -> Result<Vec<Hit>, VectorError> {
-        if opts.label.is_none() && opts.properties.is_none() {
-            return self.vector_search(q, opts.k);
-        }
-
         let arc = get_or_init_cache(self)?;
 
-        // Evaluate the label and property filters during the HNSW traversal via
-        // a predicate, so the search keeps expanding until it has `opts.k`
-        // matching neighbors instead of post-filtering a fixed over-fetch, which
-        // silently under-returns when the filter is selective. The predicate
-        // reads through the core accessors (`label_filter` point lookup and the
-        // in-memory property columns via `node_prop_json`) rather than decoding
-        // raw node records, to respect the crate boundary. A storage error
-        // cannot travel through the `Fn(NodeId) -> bool` callback, so it is
-        // captured and surfaced after the search; once set, the predicate
-        // rejects every remaining candidate to end the traversal promptly.
-        let pred_err: RefCell<Option<VectorError>> = RefCell::new(None);
-        let matches_filters = |node: NodeId| -> Result<bool, VectorError> {
-            if let Some(label) = &opts.label {
-                if self.label_filter(&[node], label)?.is_empty() {
-                    return Ok(false);
-                }
-            }
-            if let Some(filters) = &opts.properties {
-                for (key, want) in filters {
-                    match self.node_prop_json(node, key)? {
-                        Some(got) if &got == want => {}
-                        _ => return Ok(false),
-                    }
-                }
-            }
-            Ok(true)
-        };
-        let predicate = |node: NodeId| -> bool {
-            if pred_err.borrow().is_some() {
-                return false;
-            }
-            match matches_filters(node) {
-                Ok(keep) => keep,
-                Err(e) => {
-                    *pred_err.borrow_mut() = Some(e);
-                    false
-                }
-            }
+        let index_quantization = arc.0.opts.quantization;
+        let rescore_factor =
+            opts.rescore_factor
+                .unwrap_or(if index_quantization != VectorQuantization::Float32 {
+                    2
+                } else {
+                    1
+                });
+
+        let fetch_k = if rescore_factor > 1 {
+            opts.k.saturating_mul(rescore_factor)
+        } else {
+            opts.k
         };
 
-        let hits = arc.0.search_filtered(q, opts.k, predicate)?;
-        if let Some(e) = pred_err.into_inner() {
-            return Err(e);
+        let hits = if opts.label.is_some() || opts.properties.is_some() {
+            // Evaluate the label and property filters during the HNSW traversal via
+            // a predicate, so the search keeps expanding until it has `opts.k`
+            // matching neighbors instead of post-filtering a fixed over-fetch, which
+            // silently under-returns when the filter is selective. The predicate
+            // reads through the core accessors (`label_filter` point lookup and the
+            // in-memory property columns via `node_prop_json`) rather than decoding
+            // raw node records, to respect the crate boundary. A storage error
+            // cannot travel through the `Fn(NodeId) -> bool` callback, so it is
+            // captured and surfaced after the search; once set, the predicate
+            // rejects every remaining candidate to end the traversal promptly.
+            let pred_err: RefCell<Option<VectorError>> = RefCell::new(None);
+            let matches_filters = |node: NodeId| -> Result<bool, VectorError> {
+                if let Some(label) = &opts.label {
+                    if self.label_filter(&[node], label)?.is_empty() {
+                        return Ok(false);
+                    }
+                }
+                if let Some(filters) = &opts.properties {
+                    for (key, want) in filters {
+                        match self.node_prop_json(node, key)? {
+                            Some(got) if &got == want => {}
+                            _ => return Ok(false),
+                        }
+                    }
+                }
+                Ok(true)
+            };
+            let predicate = |node: NodeId| -> bool {
+                if pred_err.borrow().is_some() {
+                    return false;
+                }
+                match matches_filters(node) {
+                    Ok(keep) => keep,
+                    Err(e) => {
+                        *pred_err.borrow_mut() = Some(e);
+                        false
+                    }
+                }
+            };
+
+            let results = arc.0.search_filtered(q, fetch_k, predicate)?;
+            if let Some(e) = pred_err.into_inner() {
+                return Err(e);
+            }
+            results
+        } else {
+            arc.0.search(q, fetch_k)?
+        };
+
+        let mut final_hits = if rescore_factor > 1 && !hits.is_empty() {
+            // One read transaction covers every stored-vector lookup. A hit
+            // whose stored bytes are absent keeps its approximate distance,
+            // so a vacuous index entry degrades the estimate, not the call.
+            let byte_rows: Vec<(Hit, Option<Vec<u8>>)> = self.view(|txn| {
+                hits.into_iter()
+                    .map(|hit| {
+                        let bytes = txn.get_vector_bytes(hit.node)?;
+                        Ok((hit, bytes))
+                    })
+                    .collect()
+            })?;
+            let mut rescored = Vec::with_capacity(byte_rows.len());
+            for (hit, bytes) in byte_rows {
+                rescored.push(match bytes {
+                    Some(b) => Hit {
+                        node: hit.node,
+                        distance: exact_distance(q, &decode_vector(&b)?, arc.0.opts.metric),
+                    },
+                    None => hit,
+                });
+            }
+            rescored.sort_unstable_by(|a, b| {
+                a.distance
+                    .partial_cmp(&b.distance)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            rescored
+        } else {
+            hits
+        };
+
+        final_hits.truncate(opts.k);
+        Ok(final_hits)
+    }
+}
+
+/// Full-precision distance between `q` and a stored vector, matching the
+/// distance convention `usearch` reports for the same metric (squared L2,
+/// `1 - dot` for inner product) so rescored and approximate distances stay
+/// comparable.
+fn exact_distance(q: &[f32], v: &[f32], metric: VectorMetric) -> f32 {
+    match metric {
+        VectorMetric::Cosine => {
+            let mut dot = 0.0;
+            let mut norm_q = 0.0;
+            let mut norm_v = 0.0;
+            for (&qi, &vi) in q.iter().zip(v.iter()) {
+                dot += qi * vi;
+                norm_q += qi * qi;
+                norm_v += vi * vi;
+            }
+            if norm_q > 0.0 && norm_v > 0.0 {
+                // Clamped at zero: rounding can push the ratio past 1.
+                (1.0 - (dot / (norm_q.sqrt() * norm_v.sqrt()))).max(0.0)
+            } else {
+                1.0
+            }
         }
-        Ok(hits)
+        VectorMetric::L2 => {
+            let mut sum = 0.0;
+            for (&qi, &vi) in q.iter().zip(v.iter()) {
+                let diff = qi - vi;
+                sum += diff * diff;
+            }
+            sum
+        }
+        VectorMetric::Dot => {
+            let mut dot = 0.0;
+            for (&qi, &vi) in q.iter().zip(v.iter()) {
+                dot += qi * vi;
+            }
+            1.0 - dot
+        }
     }
 }
 
@@ -731,6 +832,7 @@ mod tests {
             k: 3,
             label: Some("Article".into()),
             properties: None,
+            rescore_factor: None,
         };
         let hits = graph
             .vector_search_with(&[1.0f32, 0.0, 0.0], &opts)
@@ -770,6 +872,7 @@ mod tests {
             k: 2,
             label: None,
             properties: Some(filters),
+            rescore_factor: None,
         };
         let hits = graph
             .vector_search_with(&[1.0f32, 0.0, 0.0], &opts)
@@ -988,11 +1091,45 @@ mod tests {
             k: 2,
             label: None,
             properties: Some(filters),
+            rescore_factor: None,
         };
         let hits = graph.vector_search_with(&[1.0, 0.0, 0.0], &opts).unwrap();
 
         // `near` is closer but is role=ic, so only `far` satisfies both filters.
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].node, far);
+    }
+
+    #[test]
+    fn vector_search_quantized_rescore() {
+        let (_dir, graph) = open_tmp();
+        graph
+            .configure_vector_index(VectorIndexOptions {
+                metric: VectorMetric::Cosine,
+                quantization: VectorQuantization::Int8,
+            })
+            .unwrap();
+
+        let n1 = graph.add_node("N", &json!({})).unwrap();
+        let n2 = graph.add_node("N", &json!({})).unwrap();
+
+        graph.upsert_vector(n1, &[0.9, 0.1]).unwrap();
+        graph.upsert_vector(n2, &[0.95, 0.05]).unwrap();
+
+        let query = &[1.0, 0.0];
+
+        // Search with rescoring active
+        let opts = VectorSearchOptions {
+            k: 2,
+            rescore_factor: Some(2),
+            ..Default::default()
+        };
+        let hits = graph.vector_search_with(query, &opts).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].node, n2);
+        assert_eq!(hits[1].node, n1);
+
+        // Verify the exact distances are computed and ordered correctly
+        assert!(hits[0].distance < hits[1].distance);
     }
 }

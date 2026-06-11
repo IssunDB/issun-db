@@ -196,6 +196,7 @@ pub fn retrieve_hybrid(
                 k: opts.vector_k,
                 label: opts.vector_label.clone(),
                 properties: None,
+                rescore_factor: None,
             },
         )?;
         for (rank, hit) in hits.iter().enumerate() {

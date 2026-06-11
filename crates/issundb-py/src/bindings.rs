@@ -161,13 +161,14 @@ impl PyGraph {
     /// `label` restricts results to nodes carrying that label. `properties` is a
     /// JSON object string of key-value filters; only nodes matching every filter
     /// are returned. Both filters are applied during index traversal.
-    #[pyo3(signature = (vec, k, label=None, properties=None))]
+    #[pyo3(signature = (vec, k, label=None, properties=None, rescore_factor=None))]
     fn vector_search(
         &self,
         vec: Vec<f32>,
         k: usize,
         label: Option<String>,
         properties: Option<String>,
+        rescore_factor: Option<usize>,
     ) -> PyResult<String> {
         let properties = match properties {
             None => None,
@@ -181,6 +182,7 @@ impl PyGraph {
             k,
             label,
             properties,
+            rescore_factor,
         };
         let hits = self.graph.vector_search_with(&vec, &opts).map_err(rt)?;
         let json_hits: Vec<serde_json::Value> = hits

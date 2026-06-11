@@ -95,4 +95,19 @@ impl Graph {
         }
         Ok(out)
     }
+
+    /// Return the raw vector bytes for `n`, or `None` if absent.
+    #[doc(hidden)]
+    pub fn get_vector_bytes(&self, n: NodeId) -> Result<Option<Vec<u8>>, Error> {
+        let rtxn = self.storage.env.read_txn()?;
+        self.get_vector_bytes_impl(&rtxn, n)
+    }
+
+    pub(super) fn get_vector_bytes_impl(
+        &self,
+        rtxn: &heed::RoTxn,
+        n: NodeId,
+    ) -> Result<Option<Vec<u8>>, Error> {
+        Ok(self.storage.vectors.get(rtxn, &n)?.map(|b| b.to_vec()))
+    }
 }

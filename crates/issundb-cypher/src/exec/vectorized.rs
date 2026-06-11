@@ -740,15 +740,107 @@ fn apply_stage(
             lhs,
             rhs,
         } => {
-            let lv = resolve_operand(graph, lhs, params, schema, src_var, cols)?;
-            let rv = resolve_operand(graph, rhs, params, schema, src_var, cols)?;
-            (0..n)
-                .map(|i| cmp_keeps(*structured, *op, lv.get(i), rv.get(i)))
-                .collect()
+            if let Some(pruned_mask) =
+                try_prune_comparison(graph, lhs, rhs, *op, params, schema, src_var, cols)
+            {
+                pruned_mask
+            } else {
+                let lv = resolve_operand(graph, lhs, params, schema, src_var, cols)?;
+                let rv = resolve_operand(graph, rhs, params, schema, src_var, cols)?;
+                (0..n)
+                    .map(|i| cmp_keeps(*structured, *op, lv.get(i), rv.get(i)))
+                    .collect()
+            }
         }
     };
     cols.compact(&mask);
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_prune_comparison(
+    graph: &Graph,
+    lhs: &VecOperand<'_>,
+    rhs: &VecOperand<'_>,
+    op: CmpOp,
+    params: &HashMap<String, Value>,
+    schema: &std::sync::Arc<SlotSchema>,
+    src_var: &str,
+    cols: &IdCols,
+) -> Option<Vec<bool>> {
+    let (prop, const_expr, is_col_lhs) = match (lhs, rhs) {
+        (VecOperand::Col { var, prop }, VecOperand::Const(expr)) if *var == src_var => {
+            (prop, expr, true)
+        }
+        (VecOperand::Const(expr), VecOperand::Col { var, prop }) if *var == src_var => {
+            (prop, expr, false)
+        }
+        _ => return None,
+    };
+
+    let mm = graph.node_prop_min_max(prop).ok()??;
+    let const_val =
+        evaluate_expr(graph, &SlotRow::empty(schema.clone()), const_expr, params).ok()?;
+    if const_val.is_null() {
+        return None;
+    }
+
+    let (min_val, max_val) = mm;
+    let n = cols.srcs.len();
+
+    let impossible = match op {
+        CmpOp::Eq => {
+            json_cmp(&const_val, &min_val) == Some(std::cmp::Ordering::Less)
+                || json_cmp(&const_val, &max_val) == Some(std::cmp::Ordering::Greater)
+        }
+        CmpOp::Lt => {
+            if is_col_lhs {
+                matches!(
+                    json_cmp(&const_val, &min_val),
+                    Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+                )
+            } else {
+                matches!(
+                    json_cmp(&const_val, &max_val),
+                    Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)
+                )
+            }
+        }
+        CmpOp::Gt => {
+            if is_col_lhs {
+                matches!(
+                    json_cmp(&const_val, &max_val),
+                    Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)
+                )
+            } else {
+                matches!(
+                    json_cmp(&const_val, &min_val),
+                    Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+                )
+            }
+        }
+        CmpOp::Le => {
+            if is_col_lhs {
+                json_cmp(&const_val, &min_val) == Some(std::cmp::Ordering::Less)
+            } else {
+                json_cmp(&const_val, &max_val) == Some(std::cmp::Ordering::Greater)
+            }
+        }
+        CmpOp::Ge => {
+            if is_col_lhs {
+                json_cmp(&const_val, &max_val) == Some(std::cmp::Ordering::Greater)
+            } else {
+                json_cmp(&const_val, &min_val) == Some(std::cmp::Ordering::Less)
+            }
+        }
+        CmpOp::Ne => false,
+    };
+
+    if impossible {
+        Some(vec![false; n])
+    } else {
+        None
+    }
 }
 
 /// Extract the leaf's node ids through the row pipeline's leaf evaluator,
@@ -1652,6 +1744,87 @@ mod tests {
         let ada = g.nodes_by_label("Person").unwrap()[0];
         g.add_edge(ada, eve, "KNOWS", &json!({})).unwrap();
         assert_matches_row_path(&g, cypher);
+    }
+
+    #[test]
+    fn vectorized_filter_pruning_via_zone_maps() {
+        let (_dir, g) = fixture();
+        // `age` is mixed-kind in the fixture, so it has no statistics and the
+        // prune declines; these exercise the no-stats fallback.
+        assert_matches_row_path(
+            &g,
+            "MATCH (p:Person) WHERE p.age > 100 RETURN p.name AS name",
+        );
+        assert_matches_row_path(&g, "MATCH (p:Person) WHERE p.age < 0 RETURN p.name AS name");
+        // `name` is a clean string column, so these bounds-impossible filters
+        // take the prune path end to end.
+        assert_matches_row_path(
+            &g,
+            "MATCH (p:Person) WHERE p.name > 'zzz' RETURN p.name AS name",
+        );
+        assert_matches_row_path(
+            &g,
+            "MATCH (p:Person) WHERE p.name = 'zzz' RETURN p.name AS name",
+        );
+    }
+
+    #[test]
+    fn zone_map_prune_emits_all_false_mask_only_when_impossible() {
+        let dir = TempDir::new().unwrap();
+        let g = Graph::open(dir.path(), 1).unwrap();
+        for age in [4i64, 17, 36] {
+            g.add_node("Person", &json!({ "age": age })).unwrap();
+        }
+        let srcs = g.nodes_by_label("Person").unwrap();
+        let n = srcs.len();
+        let cols = IdCols { srcs, dsts: None };
+        let schema = std::sync::Arc::new(SlotSchema::empty());
+        let params = HashMap::new();
+        let col = VecOperand::Col {
+            var: "p",
+            prop: "age",
+        };
+
+        // Above the maximum: the prune must fire with an all-false mask.
+        let high = Expr::Literal(crate::ast::Literal::Int(1000));
+        let mask = try_prune_comparison(
+            &g,
+            &col,
+            &VecOperand::Const(&high),
+            CmpOp::Gt,
+            &params,
+            &schema,
+            "p",
+            &cols,
+        );
+        assert_eq!(mask, Some(vec![false; n]));
+
+        // Reversed operands: `1000 < p.age` is equally impossible.
+        let mask = try_prune_comparison(
+            &g,
+            &VecOperand::Const(&high),
+            &col,
+            CmpOp::Lt,
+            &params,
+            &schema,
+            "p",
+            &cols,
+        );
+        assert_eq!(mask, Some(vec![false; n]));
+
+        // Inside the bounds: the prune must decline so rows are compared.
+        let mid = Expr::Literal(crate::ast::Literal::Int(10));
+        let mask = try_prune_comparison(
+            &g,
+            &col,
+            &VecOperand::Const(&mid),
+            CmpOp::Gt,
+            &params,
+            &schema,
+            "p",
+            &cols,
+        );
+        assert!(mask.is_none());
     }
 
     proptest::proptest! {

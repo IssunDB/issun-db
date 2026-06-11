@@ -1,10 +1,9 @@
 //! IssunDB is an embedded graph database with vector search, full-text search,
 //! and hybrid retrieval.
 //!
-//! This crate is the public facade. It re-exports the deliberate public surface
-//! of the storage engine, vector index, text index, hybrid retrieval layer, and
-//! Cypher query engine. Application code, bindings, and tools depend on this
-//! crate only; the internal crates (`issundb-core`, `issundb-vector`,
+//! This is the main crate of IssunDB, and exposes the `Graph` type, Cypher query execution,
+//! vector search, full-text search, and hybrid retrieval APIs. Application code, bindings,
+//! and tools depend on this crate only; the internal crates (`issundb-core`, `issundb-vector`,
 //! `issundb-text`, `issundb-retrieval`, and `issundb-cypher`) are not part of
 //! the stable API.
 //!

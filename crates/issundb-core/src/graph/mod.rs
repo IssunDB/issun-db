@@ -413,6 +413,47 @@ impl Graph {
             .with_fresh(&self.storage, |cols| cols.group_codes(ids, prop))?
     }
 
+    /// The minimum and maximum non-null value of one node property, from the
+    /// lazily computed statistics over the in-memory property columns.
+    /// `None` when the property has no typed column or no non-null values.
+    pub fn node_prop_min_max(
+        &self,
+        prop: &str,
+    ) -> Result<Option<(serde_json::Value, serde_json::Value)>, Error> {
+        self.prop_columns.with_fresh_mut(&self.storage, |cols| {
+            cols.prop_stats(prop)
+                .map(|s| (s.min.clone(), s.max.clone()))
+        })
+    }
+
+    /// Estimated fraction of non-null values of `prop` inside the given
+    /// bounds (either bound optional), from the property's equi-depth
+    /// histogram. `None` when no statistics exist for the property.
+    pub fn estimate_range_selectivity(
+        &self,
+        prop: &str,
+        lower: Option<&serde_json::Value>,
+        upper: Option<&serde_json::Value>,
+    ) -> Result<Option<f64>, Error> {
+        self.prop_columns.with_fresh_mut(&self.storage, |cols| {
+            cols.prop_stats(prop)
+                .map(|s| s.histogram.estimate_range_selectivity(lower, upper))
+        })
+    }
+
+    /// Estimated fraction of non-null values of `prop` equal to `val`: exact
+    /// for the property's most common values, histogram-estimated otherwise.
+    /// `None` when no statistics exist for the property.
+    pub fn estimate_equality_selectivity(
+        &self,
+        prop: &str,
+        val: &serde_json::Value,
+    ) -> Result<Option<f64>, Error> {
+        self.prop_columns.with_fresh_mut(&self.storage, |cols| {
+            cols.prop_stats(prop).map(|s| s.equality_selectivity(val))
+        })
+    }
+
     /// Store an extension value (as `Arc`) keyed by its concrete type.
     /// Replaces any existing value of the same type.
     pub fn set_extension<T: Any + Send + Sync>(&self, val: Arc<T>) {

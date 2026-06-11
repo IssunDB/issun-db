@@ -1,10 +1,10 @@
 # Code Examples
 
-This page provides examples demonstrating vector search, full-text search, and Cypher query execution.
+This page provides practical examples demonstrating vector search, full-text search, Cypher query execution, and GraphBLAS algorithm execution.
 
 ## Vector Search Example
 
-You can insert vector embeddings for nodes and perform k-nearest-neighbor search:
+You can insert vector embeddings for nodes and perform $k$-nearest-neighbor search:
 
 ```rust
 use issundb::{Graph, VectorGraphExt};
@@ -84,6 +84,43 @@ fn run_cypher(graph: &Graph) -> Result<(), Box<dyn std::error::Error>> {
     for record in result.records {
         println!("Matched friendship: {} knows {}", record.values[0], record.values[1]);
     }
+    Ok(())
+}
+```
+
+## GraphBLAS Algorithms Example
+
+Leverage safe GraphBLAS bindings for high-performance path-finding and centrality algorithms:
+
+```rust
+use issundb::{Graph, NodeId};
+
+fn run_algorithms(graph: &Graph) -> Result<(), Box<dyn std::error::Error>> {
+    // Populate a sample path
+    let n1 = graph.add_node("Station", &serde_json::json!({ "name": "Station A" }))?;
+    let n2 = graph.add_node("Station", &serde_json::json!({ "name": "Station B" }))?;
+    let n3 = graph.add_node("Station", &serde_json::json!({ "name": "Station C" }))?;
+
+    // Add weighted edges for path-finding (weight property is 'cost')
+    graph.add_edge(n1, n2, "CONNECTS", &serde_json::json!({ "cost": 5 }))?;
+    graph.add_edge(n2, n3, "CONNECTS", &serde_json::json!({ "cost": 10 }))?;
+    graph.add_edge(n1, n3, "CONNECTS", &serde_json::json!({ "cost": 20 }))?;;
+
+    // Rebuild the in-memory CSR snapshot for GraphBLAS algorithms
+    graph.rebuild_csr()?;
+
+    // 1. Dijkstra Shortest Path: Finds the cheapest path using the 'cost' property
+    let path = graph.shortest_path_top_k(n1, n3, 1, "cost")?;
+    if let Some(shortest) = path.first() {
+        println!("Cheapest path: {:?}", shortest); // Should go A -> B -> C (total cost = 15)
+    }
+
+    // 2. PageRank: Run 20 iterations of PageRank centrality with damping 0.85
+    let ranks = graph.page_rank(20, 0.85)?;
+    for (node_id, rank) in ranks.iter().take(5) {
+        println!("Node ID: {:?}, PageRank Score: {}", node_id, rank);
+    }
+
     Ok(())
 }
 ```

@@ -174,6 +174,8 @@ pub struct VectorSearchBody {
     pub label: Option<String>,
     /// Optional exact-match property filter applied to candidate nodes.
     pub properties: Option<std::collections::HashMap<String, serde_json::Value>>,
+    /// Optional rescore factor for quantized indexes.
+    pub rescore_factor: Option<usize>,
 }
 
 fn default_limit() -> usize {
@@ -670,6 +672,7 @@ pub async fn search_vector(
             k: body.k,
             label: body.label,
             properties: body.properties,
+            rescore_factor: body.rescore_factor,
         };
         match graph.vector_search_with(&body.vector, &opts) {
             Ok(hits) => {
