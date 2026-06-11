@@ -925,6 +925,9 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
             if let Some(g) = &state.graph {
                 match g.out_neighbors(NodeId::from(id)) {
                     Ok(v) => {
+                        if v.is_empty() {
+                            println!("(0 rows)");
+                        }
                         for ne in v {
                             let etype = g
                                 .type_name(ne.edge_type)
@@ -942,6 +945,9 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
             if let Some(g) = &state.graph {
                 match g.in_neighbors(NodeId::from(id)) {
                     Ok(v) => {
+                        if v.is_empty() {
+                            println!("(0 rows)");
+                        }
                         for ne in v {
                             let etype = g
                                 .type_name(ne.edge_type)
