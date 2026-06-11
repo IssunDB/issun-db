@@ -3035,6 +3035,101 @@ mod tests {
         assert_eq!(ages, vec![20, 30, 40]);
     }
 
+    #[test]
+    fn null_equality_with_declared_index_returns_no_rows() {
+        // `prop = null` is never TRUE. With a declared index the equality
+        // must still evaluate as a filter that drops every row, not become an
+        // index scan that errors on the null lookup value.
+        let (_dir, graph) = setup_graph();
+        run(&graph, "CREATE INDEX FOR (n:Person) ON (n.age)");
+        graph
+            .add_node("Person", &serde_json::json!({"age": 30}))
+            .unwrap();
+        graph
+            .add_node(
+                "Person",
+                &serde_json::json!({"age": serde_json::Value::Null}),
+            )
+            .unwrap();
+        let rows = run(
+            &graph,
+            "MATCH (n:Person) WHERE n.age = null RETURN count(n) AS n",
+        );
+        assert_eq!(rows, vec![vec![serde_json::json!(0)]]);
+    }
+
+    #[test]
+    fn null_parameter_with_declared_index_returns_no_rows() {
+        // The planner cannot see parameter values, so `n.age = $p` plans an
+        // index scan; a null parameter must then match nothing at evaluation,
+        // for both the equality and range forms.
+        let (_dir, graph) = setup_graph();
+        run(&graph, "CREATE INDEX FOR (n:Person) ON (n.age)");
+        graph
+            .add_node("Person", &serde_json::json!({"age": 30}))
+            .unwrap();
+        let params: HashMap<String, serde_json::Value> =
+            [("p".to_string(), serde_json::Value::Null)].into();
+        for cypher in [
+            "MATCH (n:Person) WHERE n.age = $p RETURN count(n) AS n",
+            "MATCH (n:Person) WHERE n.age >= $p RETURN count(n) AS n",
+        ] {
+            let result = execute(&graph, cypher, &params).unwrap();
+            assert_eq!(
+                result.records[0].values,
+                vec![serde_json::json!(0)],
+                "{cypher}"
+            );
+        }
+    }
+
+    #[test]
+    fn index_scan_verifies_string_with_embedded_nul() {
+        // The index encodes strings NUL-terminated, so the prefix scan for
+        // "a" also matches the entry for "a\0b"; the verify step must filter
+        // the false positive.
+        let (_dir, graph) = setup_graph();
+        graph
+            .add_node("Person", &serde_json::json!({"name": "a"}))
+            .unwrap();
+        graph
+            .add_node("Person", &serde_json::json!({"name": "a\u{0}b"}))
+            .unwrap();
+        let rows = run(
+            &graph,
+            "MATCH (n:Person) WHERE n.name = 'a' RETURN n.name AS name",
+        );
+        assert_eq!(rows, vec![vec![serde_json::json!("a")]]);
+    }
+
+    #[test]
+    fn range_scan_excludes_mixed_kind_values() {
+        // A min-bound-only range: strings sort after numbers in the encoded
+        // index, so a string-valued candidate reaches the verify step and
+        // must be excluded there; null and missing values never match.
+        let (_dir, graph) = setup_graph();
+        graph
+            .add_node("Person", &serde_json::json!({"age": 30}))
+            .unwrap();
+        graph
+            .add_node("Person", &serde_json::json!({"age": "thirty"}))
+            .unwrap();
+        graph
+            .add_node(
+                "Person",
+                &serde_json::json!({"age": serde_json::Value::Null}),
+            )
+            .unwrap();
+        graph
+            .add_node("Person", &serde_json::json!({"name": "no-age"}))
+            .unwrap();
+        let rows = run(
+            &graph,
+            "MATCH (n:Person) WHERE n.age >= 30 RETURN n.age AS age",
+        );
+        assert_eq!(rows, vec![vec![serde_json::json!(30)]]);
+    }
+
     // --- Chained two-hop factorized expand ---
 
     #[test]

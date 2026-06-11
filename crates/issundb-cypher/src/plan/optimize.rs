@@ -1445,11 +1445,34 @@ impl Optimizer {
             PhysicalOperator::Filter { input, expression } => {
                 let optimized_input = Self::optimize_index_scans(*input, stats);
 
+                // A conjunct split from a top-level AND keeps its `Expr`
+                // comparison form. Both forms pass a row only when the
+                // comparison is TRUE, and the scan executor re-checks every
+                // candidate's actual value, so for scan selection the two
+                // forms rewrite identically. An unrewritten filter is wrapped
+                // back with its original `expression`, keeping its own
+                // evaluation semantics.
+                let normalized = match &expression {
+                    FilterExpr::Expr(Expr::BinaryOp { op, left, right }) => {
+                        let cmp = match op {
+                            BinaryOperator::Eq => Some(FilterExpr::Eq as fn(_, _) -> _),
+                            BinaryOperator::Lt => Some(FilterExpr::Lt as fn(_, _) -> _),
+                            BinaryOperator::Gt => Some(FilterExpr::Gt as fn(_, _) -> _),
+                            BinaryOperator::Le => Some(FilterExpr::Le as fn(_, _) -> _),
+                            BinaryOperator::Ge => Some(FilterExpr::Ge as fn(_, _) -> _),
+                            _ => None,
+                        };
+                        cmp.map(|f| f((**left).clone(), (**right).clone()))
+                    }
+                    _ => None,
+                };
+                let probe = normalized.as_ref().unwrap_or(&expression);
+
                 // `WHERE id(n) = <const>` over a node scan becomes a primary-key seek.
                 // Applies to labeled and unlabeled scans; the label, when present, is
                 // re-checked by the seek executor.
                 if let PhysicalOperator::LabelScan { variable, label } = &optimized_input {
-                    if let FilterExpr::Eq(l, r) = &expression {
+                    if let FilterExpr::Eq(l, r) = probe {
                         if let Some(id_value) = Self::id_seek_value(l, r, variable) {
                             return PhysicalOperator::NodeByIdSeek {
                                 variable: variable.clone(),
@@ -1460,16 +1483,27 @@ impl Optimizer {
                     }
                 }
 
+                // A literal or parameter the index can look up. A null
+                // literal is excluded: `prop = null` is never TRUE, and the
+                // scan evaluator has no null lookup form; the filter then
+                // stays a filter and drops every row. A list literal is
+                // excluded because list values are never indexed.
+                let indexable_const = |e: &Expr| match e {
+                    Expr::Literal(crate::ast::Literal::Null)
+                    | Expr::Literal(crate::ast::Literal::List(_)) => false,
+                    Expr::Literal(_) | Expr::Param(_) => true,
+                    _ => false,
+                };
                 // Helper: extract (variable, property, value_expr) when a relational filter
                 // references a node property on one side and a literal/param on the other.
                 let try_prop_literal = |l: &Expr, r: &Expr, var: &str| -> Option<(String, Expr)> {
                     if let Expr::Prop(v, prop) = l {
-                        if v == var && matches!(r, Expr::Literal(_) | Expr::Param(_)) {
+                        if v == var && indexable_const(r) {
                             return Some((prop.clone(), r.clone()));
                         }
                     }
                     if let Expr::Prop(v, prop) = r {
-                        if v == var && matches!(l, Expr::Literal(_) | Expr::Param(_)) {
+                        if v == var && indexable_const(l) {
                             return Some((prop.clone(), l.clone()));
                         }
                     }
@@ -1483,7 +1517,7 @@ impl Optimizer {
                 } = &optimized_input
                 {
                     if let Some(s) = stats {
-                        match &expression {
+                        match probe {
                             FilterExpr::Eq(l, r) => {
                                 if let Some((prop, val)) = try_prop_literal(l, r, variable) {
                                     if s.has_node_property_index(lbl, &prop) {
@@ -1636,24 +1670,18 @@ impl Optimizer {
                         if s.has_node_property_index(&label, &property) {
                             let try_same_prop = |l: &Expr, r: &Expr| -> Option<(Expr, bool)> {
                                 if let Expr::Prop(v, p) = l {
-                                    if *v == variable
-                                        && *p == property
-                                        && matches!(r, Expr::Literal(_) | Expr::Param(_))
-                                    {
+                                    if *v == variable && *p == property && indexable_const(r) {
                                         return Some((r.clone(), true));
                                     }
                                 }
                                 if let Expr::Prop(v, p) = r {
-                                    if *v == variable
-                                        && *p == property
-                                        && matches!(l, Expr::Literal(_) | Expr::Param(_))
-                                    {
+                                    if *v == variable && *p == property && indexable_const(l) {
                                         return Some((l.clone(), false));
                                     }
                                 }
                                 None
                             };
-                            match &expression {
+                            match probe {
                                 FilterExpr::Lt(l, r) => {
                                     if let Some((val, prop_on_left)) = try_same_prop(l, r) {
                                         return PhysicalOperator::NodeRangeScan {
@@ -1812,6 +1840,47 @@ impl Optimizer {
                 closing_is_incoming,
                 closing_is_undirected,
                 closing_unique_rels,
+            },
+            PhysicalOperator::Aggregate {
+                input,
+                group_by,
+                aggregations,
+            } => PhysicalOperator::Aggregate {
+                input: Box::new(Self::optimize_index_scans(*input, stats)),
+                group_by,
+                aggregations,
+            },
+            PhysicalOperator::Sort { input, items } => PhysicalOperator::Sort {
+                input: Box::new(Self::optimize_index_scans(*input, stats)),
+                items,
+            },
+            PhysicalOperator::Limit { input, skip, count } => PhysicalOperator::Limit {
+                input: Box::new(Self::optimize_index_scans(*input, stats)),
+                skip,
+                count,
+            },
+            PhysicalOperator::Distinct { input, keys } => PhysicalOperator::Distinct {
+                input: Box::new(Self::optimize_index_scans(*input, stats)),
+                keys,
+            },
+            PhysicalOperator::OptionalMatch { input, null_vars } => {
+                PhysicalOperator::OptionalMatch {
+                    input: Box::new(Self::optimize_index_scans(*input, stats)),
+                    null_vars,
+                }
+            }
+            PhysicalOperator::WritePart { input, part } => PhysicalOperator::WritePart {
+                input: Box::new(Self::optimize_index_scans(*input, stats)),
+                part,
+            },
+            PhysicalOperator::ProcedureCall {
+                input,
+                output_vars,
+                rows,
+            } => PhysicalOperator::ProcedureCall {
+                input: Box::new(Self::optimize_index_scans(*input, stats)),
+                output_vars,
+                rows,
             },
             leaf => leaf,
         }
@@ -3295,6 +3364,111 @@ mod tests {
         assert!(
             finds_index_scan_on(&plan, "a"),
             "index-backed endpoint must win over raw cardinality: {plan:?}"
+        );
+    }
+
+    /// True when the plan contains a `NodeIndexScan` binding `var`, looking
+    /// through every single-input operator.
+    fn contains_index_scan_on(op: &PhysicalOperator, var: &str) -> bool {
+        match op {
+            PhysicalOperator::NodeIndexScan { variable, .. } => variable == var,
+            PhysicalOperator::Expand { input, .. }
+            | PhysicalOperator::Filter { input, .. }
+            | PhysicalOperator::Project { input, .. }
+            | PhysicalOperator::Aggregate { input, .. }
+            | PhysicalOperator::Sort { input, .. }
+            | PhysicalOperator::Limit { input, .. }
+            | PhysicalOperator::Distinct { input, .. }
+            | PhysicalOperator::MultiwayJoin { input, .. } => contains_index_scan_on(input, var),
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn index_scan_rewrite_reaches_below_an_aggregate() {
+        // The probe-count shape: an equality filter on the anchored start node
+        // under a grouping-free count. The Aggregate sits between the plan root
+        // and the filtered scan, and must not stop the index-scan pass.
+        let stats = TestStats::new(&[("Person", 10_000)]).with_index("Person", "id");
+        let plan = optimize_query(
+            "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person) \
+             WHERE a.id = 1 RETURN count(c) AS n",
+            &stats,
+        );
+        assert!(
+            contains_index_scan_on(&plan, "a"),
+            "aggregate root must not block the index-scan rewrite: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn index_scan_rewrite_applies_to_split_conjuncts() {
+        // A conjunct split from a top-level AND keeps its `Expr` comparison
+        // form; the index-scan pass must treat it like the structured form.
+        let stats = TestStats::new(&[("Person", 10_000)]).with_index("Person", "id");
+        let plan = optimize_query(
+            "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person) \
+             WHERE a.id = 1 AND c.id = 2 RETURN count(b) AS n",
+            &stats,
+        );
+        assert!(
+            contains_index_scan_on(&plan, "a"),
+            "an AND-split equality conjunct must rewrite to NodeIndexScan: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn range_scan_rewrite_applies_to_split_conjuncts() {
+        fn find_range_scan(op: &PhysicalOperator) -> Option<(&Option<Expr>, &Option<Expr>)> {
+            match op {
+                PhysicalOperator::NodeRangeScan { lo, hi, .. } => Some((lo, hi)),
+                PhysicalOperator::Expand { input, .. }
+                | PhysicalOperator::Filter { input, .. }
+                | PhysicalOperator::Project { input, .. }
+                | PhysicalOperator::Aggregate { input, .. } => find_range_scan(input),
+                _ => None,
+            }
+        }
+        let stats = TestStats::new(&[("Person", 10_000)]).with_index("Person", "age");
+        let plan = optimize_query(
+            "MATCH (a:Person) WHERE a.age >= 30 AND a.age < 40 RETURN count(a) AS n",
+            &stats,
+        );
+        let (lo, hi) = find_range_scan(&plan)
+            .unwrap_or_else(|| panic!("AND-split range conjuncts must rewrite: {plan:?}"));
+        assert!(
+            lo.is_some() && hi.is_some(),
+            "both conjuncts must narrow into one NodeRangeScan: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn index_scan_rewrite_declines_null_literals() {
+        // `prop = null` is never TRUE, but a NodeIndexScan with a null value
+        // errors at evaluation (`json_to_prop_value` has no null form); the
+        // filter must stay a filter and drop every row instead.
+        let stats = TestStats::new(&[("Person", 10_000)]).with_index("Person", "age");
+        let plan = optimize_query(
+            "MATCH (a:Person) WHERE a.age = null RETURN count(a) AS n",
+            &stats,
+        );
+        assert!(
+            !contains_index_scan_on(&plan, "a"),
+            "a null-literal equality must not become an index scan: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn index_scan_rewrite_reaches_below_sort_distinct_and_limit() {
+        let stats = TestStats::new(&[("Person", 10_000)]).with_index("Person", "city");
+        let plan = optimize_query(
+            "MATCH (a:Person) WHERE a.city = 'london' \
+             RETURN DISTINCT a.age AS age ORDER BY age LIMIT 5",
+            &stats,
+        );
+        assert!(
+            contains_index_scan_on(&plan, "a"),
+            "Limit, Sort, and Distinct must not block the index-scan rewrite: {plan:?}"
         );
     }
 

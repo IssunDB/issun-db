@@ -126,6 +126,14 @@ fn bench_execution(c: &mut Criterion) {
         "MATCH (a:Person)-[:KNOWS]->(b:Person) \
          MATCH (c:Person)-[:KNOWS]->(b) RETURN a, c LIMIT 5",
     );
+    // A property-filtered projection over the full single-hop expansion: the
+    // columnar fast path runs the range conjuncts as bulk filter stages over
+    // the flat id columns instead of evaluating them per row.
+    run(
+        "exec_filtered_projection",
+        "MATCH (a:Person)-[:KNOWS]->(b:Person) \
+         WHERE b.age > 25 AND b.age < 50 RETURN b.name AS name",
+    );
     // A grouped aggregation over the full single-hop expansion. The Aggregate
     // operator's child chain is streamable, so it folds rows a batch at a time
     // instead of materializing the whole expansion before grouping. Aggregation
@@ -149,6 +157,15 @@ fn bench_execution(c: &mut Criterion) {
     run(
         "exec_distinct_limit",
         "MATCH (a:Person)-[:KNOWS]->(b:Person) WITH DISTINCT b RETURN b LIMIT 5",
+    );
+    // DISTINCT under ORDER BY ... LIMIT: the plan is `Limit -> Sort ->
+    // Distinct -> Project`, so the sort blocks and every row is deduplicated
+    // before the limit truncates. The columnar fast path dedups on the
+    // gathered projection cells and sorts only the surviving rows.
+    run(
+        "exec_distinct_order_limit",
+        "MATCH (a:Person)-[:KNOWS]->(b:Person) \
+         RETURN DISTINCT b.age AS age ORDER BY age ASC LIMIT 5",
     );
 
     // A small LIMIT over a MultiwayJoin closing hop, on the triangle graph (the

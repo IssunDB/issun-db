@@ -284,6 +284,28 @@ impl PropColumns {
         Ok(out)
     }
 
+    /// Gather one property for each id in `ids`: `out[i]` is the value of
+    /// `prop` on `ids[i]`. The single-property form of `props_table`,
+    /// returning one flat vector so the gather does not pay one row vector
+    /// allocation per id. Same semantics: a missing property (or a property
+    /// name with no column) reads as `Value::Null`; a missing node is an
+    /// error.
+    pub(crate) fn prop_column(&self, ids: &[NodeId], prop: &str) -> Result<Vec<Value>, Error> {
+        let col = self.cols.get(prop);
+        let mut out = Vec::with_capacity(ids.len());
+        for &id in ids {
+            let dense = *self
+                .id_to_dense
+                .get(&id)
+                .ok_or_else(|| Error::NodeNotFound(id))? as usize;
+            out.push(
+                col.and_then(|c| c.get_json_opt(dense))
+                    .unwrap_or(Value::Null),
+            );
+        }
+        Ok(out)
+    }
+
     /// Assign one dense group code per id under exact value identity of
     /// `prop`, plus one representative value per code (the first occurrence).
     /// Null and missing values share one code whose representative is
@@ -724,6 +746,31 @@ mod tests {
 
         // Missing node is an error, like the table gather.
         assert!(g.node_prop_group_codes(&[a + 999], "s").is_err());
+    }
+
+    #[test]
+    fn prop_column_gathers_in_input_order() {
+        let (_dir, g) = open_tmp();
+        let a = g
+            .add_node("N", &json!({ "name": "ada", "age": 36 }))
+            .unwrap();
+        let b = g.add_node("N", &json!({ "name": "bob" })).unwrap();
+
+        // Duplicate ids are allowed; a missing property reads as null.
+        let col = g.node_prop_json_column(&[b, a, b], "age").unwrap();
+        assert_eq!(
+            col,
+            vec![serde_json::Value::Null, json!(36), serde_json::Value::Null]
+        );
+
+        // An unknown property name yields a null column, not an error.
+        let col = g.node_prop_json_column(&[a, b], "nope").unwrap();
+        assert_eq!(col, vec![serde_json::Value::Null; 2]);
+
+        // Empty input is fine; a missing node is an error, like the table.
+        assert!(g.node_prop_json_column(&[], "age").unwrap().is_empty());
+        let err = g.node_prop_json_column(&[a + 999], "age").unwrap_err();
+        assert!(matches!(err, crate::error::Error::NodeNotFound(id) if id == a + 999));
     }
 
     #[test]

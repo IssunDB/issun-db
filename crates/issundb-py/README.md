@@ -3,8 +3,8 @@
 [![Python version](https://img.shields.io/badge/python-%3E=3.10-3776ab?style=flat&labelColor=282c34&logo=python)](https://github.com/IssunDB/issun-db)
 [![PyPI version](https://img.shields.io/pypi/v/issundb?style=flat&labelColor=282c34&color=3776ab&logo=pypi)](https://pypi.org/project/issundb/)
 [![Documentation](https://img.shields.io/badge/docs-read-3776ab?style=flat&labelColor=282c34&logo=readthedocs)](https://issundb.github.io/issun-db/)
-[![Examples](https://img.shields.io/badge/examples-view-ffd343?style=flat&labelColor=282c34&logo=python)](examples)
-[![License: MIT](https://img.shields.io/badge/license-MIT-ffd343?style=flat&labelColor=282c34&logo=open-source-initiative)](../../LICENSE-MIT)
+[![Examples](https://img.shields.io/badge/examples-view-ffd343?style=flat&labelColor=282c34&logo=python)](https://github.com/IssunDB/issun-db/tree/main/crates/issundb-py/examples)
+[![License: MIT](https://img.shields.io/badge/license-MIT-ffd343?style=flat&labelColor=282c34&logo=open-source-initiative)](https://github.com/IssunDB/issun-db/blob/main/LICENSE-MIT)
 
 This directory contains the Python bindings for [IssunDB](https://github.com/IssunDB/issun-db).
 
@@ -53,4 +53,4 @@ Visit [IssunDB's documentation](https://IssunDB.github.io/issun-db/) for detaile
 
 ### License
 
-The content in this directory are licensed under the [MIT License](../../LICENSE-MIT).
+The content of this directory are avaible under the [MIT License](https://github.com/IssunDB/issun-db/blob/main/LICENSE-MIT).

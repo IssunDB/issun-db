@@ -1,56 +1,208 @@
-//! Columnar fast path for the final projection or aggregation over a single-hop expansion.
+//! Columnar fast path for the final projection or aggregation over at most a
+//! single-hop expansion.
 //!
 //! The per-row pipeline pays one `SlotRow` clone per expansion row, another
 //! per projection row, and one property-columns lookup per property access.
-//! For the plan shape this module recognizes, none of that is needed: the
+//! For the plan shapes this module recognizes, none of that is needed: the
 //! whole result is computable from flat id columns (one bulk expansion, one
-//! bulk label filter per predicate, one bulk property gather per variable),
-//! so the executor here works column-at-a-time and builds the result records
-//! directly.
+//! bulk label or property filter per predicate, and one bulk property gather
+//! per variable), so the executor here works column-at-a-time and builds the
+//! result records directly.
 //!
 //! Recognized shape, from the root down:
 //!
 //! ```text
-//! [Sort]? [Distinct]? Project [Aggregate]? Filter(HasLabel)* Expand(1 hop, directed) LabelScan
+//! [Limit]? [Sort]? [Distinct]? Project [Aggregate]? Stage* [Expand(1 hop, directed) Stage*] Leaf
+//! Leaf  := LabelScan | NodeByIdSeek | NodeIndexScan | NodeRangeScan
+//! Stage := Filter(HasLabel)
+//!        | Filter(comparison over single-property reads, literals, and parameters)
 //! ```
 //!
 //! with every projected or grouped expression a single-property read on the
-//! scan or expansion variable. `Sort` is accepted only over an `Aggregate`
-//! (where the output is small enough that the regular `sort_all` runs on it).
+//! leaf or expansion variable. `Limit` is accepted only directly above a
+//! `Sort` (the row pipeline's top-N shape; a bare `Limit` short-circuits the
+//! streaming row path, which the columnar path could not match). Over a plain
+//! `Project`, every sort key must resolve to a single-property read on a
+//! pipeline variable, either directly (`ORDER BY p.age`) or through a
+//! projected alias (`ORDER BY age` for `p.age AS age`); the sort then runs as
+//! a bulk key gather plus an index sort, and only the surviving window is
+//! projected. Over an `Aggregate` the output is small, so the regular
+//! `sort_all` runs on it. A `Distinct` with no limit is transparent here
+//! because the caller deduplicates the built records; under a limited sort
+//! the row pipeline deduplicates before the limit truncates, so the
+//! projection root dedups in-path on the raw projected cells (keeping the
+//! first occurrence in row order) before the sort window, which requires the
+//! plan's dedup keys to be exactly the projected columns and an `Aggregate`
+//! root to decline.
+//!
 //! Anything else returns `None` and the row pipeline runs unchanged, so
 //! correctness never depends on this recognizer; only performance does. Row
-//! order, group identity, aggregate typing, and error surfaces match the row
-//! pipeline exactly: the expansion is flattened per source in scan order, the
-//! aggregation reuses `AggState`, and the operators above the aggregate are
-//! the regular `project_rows` and `sort_all`.
+//! order, group identity, predicate three-valued logic, aggregate typing, and
+//! error surfaces match the row pipeline exactly: the leaf ids come from the
+//! shared leaf evaluator (ascending for a label scan), the expansion is
+//! flattened per source in scan order, each filter stage compacts the id
+//! columns order-preservingly under the same comparison semantics
+//! (`evaluate_where` for the structured forms, `eval_binary_op` for
+//! comparisons inside `FilterExpr::Expr`), the sort comparator is `sort_all`'s
+//! (`json_cmp` falling back to `json_cmp_total`, input index as the tiebreak),
+//! the aggregation reuses `AggState`, and the operators above the aggregate
+//! are the regular `project_rows` and `sort_all`.
 
 use std::collections::HashMap;
 
 use issundb_core::{EdgeId, Graph, NodeId};
 use serde_json::Value;
 
-use crate::ast::{AggFn, Expr, ReturnClause, SortItem};
+use crate::ast::{AggFn, BinaryOperator, Expr, ReturnClause, SortItem};
 use crate::plan::{FilterExpr, PhysicalOperator};
 
+use super::expr::{cypher_eq, evaluate_expr, is_nan, json_cmp};
 use super::read::{
-    AggState, expand_multi_type, group_by_column_name, project_rows, projected_key,
-    rows_to_records, sort_all, unpack_sentinels,
+    AggState, eval_leaf, expand_multi_type, group_by_column_name, json_cmp_total, project_rows,
+    projected_key, rows_to_records, sort_all, unpack_sentinels,
 };
 use super::row::{Bindings, SlotRow, SlotSchema};
 use super::{GraphBinding, Record};
 
-/// The recognized pipeline: one scan, one expansion, label predicates, and a
-/// projection or aggregation root.
+/// The recognized pipeline: one id-producing leaf, an optional single-hop
+/// expansion, vectorizable filter stages, and a projection or aggregation
+/// root.
 struct VecPipeline<'a> {
-    scan_label: Option<&'a str>,
+    leaf: VecLeaf<'a>,
+    /// The variable the leaf binds (and the expansion starts from).
     src_var: &'a str,
+    expand: Option<VecExpand<'a>>,
+    /// Stages between the expansion (or the root chain, when there is no
+    /// expansion) and the leaf, in bottom-up application order. They may
+    /// reference only `src_var`.
+    below_stages: Vec<VecStage<'a>>,
+    /// Stages above the expansion, in bottom-up application order.
+    above_stages: Vec<VecStage<'a>>,
+    root: VecRoot<'a>,
+    /// Resolved sort keys when a `Sort` sits over a plain projection root.
+    project_sort: Option<Vec<VecSortKey<'a>>>,
+    /// `(skip, count)` from a `Limit` directly above the `Sort`.
+    limit: Option<(usize, usize)>,
+    /// A `Distinct` under a limited sort: the projection root deduplicates
+    /// on the projected cells, in row order, before the sort window.
+    distinct: bool,
+}
+
+/// One project-root sort key, resolved to a bulk-gatherable property read.
+struct VecSortKey<'a> {
+    is_src: bool,
+    prop: &'a str,
+    ascending: bool,
+}
+
+enum VecLeaf<'a> {
+    /// Ids come from `nodes_by_label` (or `all_nodes`), ascending.
+    LabelScan { label: Option<&'a str> },
+    /// `NodeByIdSeek`, `NodeIndexScan`, or `NodeRangeScan`: ids come from the
+    /// row pipeline's own leaf evaluator, preserving its order and checks.
+    Seek(&'a PhysicalOperator),
+}
+
+struct VecExpand<'a> {
+    rel_var: &'a str,
     dst_var: &'a str,
     rel_type: Option<&'a str>,
     is_incoming: bool,
-    /// `HasLabel` predicates above the expand, each on the source or target
-    /// node variable.
-    label_filters: Vec<(&'a str, &'a str)>,
-    root: VecRoot<'a>,
+}
+
+/// One vectorizable filter stage.
+enum VecStage<'a> {
+    /// `FilterExpr::HasLabel`: a bulk label-membership test.
+    HasLabel { var: &'a str, label: &'a str },
+    /// A single comparison whose operands are single-property reads on
+    /// pipeline variables, literals, or parameters.
+    Cmp {
+        /// True for the structured `FilterExpr::Eq..Ge` forms, which follow
+        /// `evaluate_where`; false for a comparison inside `FilterExpr::Expr`,
+        /// which follows `eval_binary_op`. The two differ on NaN and null
+        /// handling, so each is mirrored exactly.
+        structured: bool,
+        op: CmpOp,
+        lhs: VecOperand<'a>,
+        rhs: VecOperand<'a>,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum CmpOp {
+    Eq,
+    Ne,
+    Lt,
+    Gt,
+    Le,
+    Ge,
+}
+
+enum VecOperand<'a> {
+    /// A single-property read on a pipeline variable.
+    Col { var: &'a str, prop: &'a str },
+    /// A literal or parameter, evaluated once per stage application.
+    Const(&'a Expr),
+}
+
+impl<'a> VecStage<'a> {
+    /// Pipeline variables the stage reads.
+    fn vars(&self) -> Vec<&'a str> {
+        match self {
+            VecStage::HasLabel { var, .. } => vec![var],
+            VecStage::Cmp { lhs, rhs, .. } => [lhs, rhs]
+                .into_iter()
+                .filter_map(|operand| match operand {
+                    VecOperand::Col { var, .. } => Some(*var),
+                    VecOperand::Const(_) => None,
+                })
+                .collect(),
+        }
+    }
+}
+
+fn vec_operand(expr: &Expr) -> Option<VecOperand<'_>> {
+    match expr {
+        Expr::Prop(var, prop) if !prop.is_empty() => Some(VecOperand::Col { var, prop }),
+        Expr::Literal(_) | Expr::Param(_) => Some(VecOperand::Const(expr)),
+        _ => None,
+    }
+}
+
+fn cmp_stage<'a>(structured: bool, op: CmpOp, l: &'a Expr, r: &'a Expr) -> Option<VecStage<'a>> {
+    Some(VecStage::Cmp {
+        structured,
+        op,
+        lhs: vec_operand(l)?,
+        rhs: vec_operand(r)?,
+    })
+}
+
+/// Match one `Filter` predicate against the vectorizable stage forms, or
+/// `None` to decline the whole pipeline.
+fn vec_stage(expression: &FilterExpr) -> Option<VecStage<'_>> {
+    match expression {
+        FilterExpr::HasLabel(var, label) => Some(VecStage::HasLabel { var, label }),
+        FilterExpr::Eq(l, r) => cmp_stage(true, CmpOp::Eq, l, r),
+        FilterExpr::Ne(l, r) => cmp_stage(true, CmpOp::Ne, l, r),
+        FilterExpr::Lt(l, r) => cmp_stage(true, CmpOp::Lt, l, r),
+        FilterExpr::Gt(l, r) => cmp_stage(true, CmpOp::Gt, l, r),
+        FilterExpr::Le(l, r) => cmp_stage(true, CmpOp::Le, l, r),
+        FilterExpr::Ge(l, r) => cmp_stage(true, CmpOp::Ge, l, r),
+        FilterExpr::Expr(Expr::BinaryOp { op, left, right }) => {
+            let cmp = match op {
+                BinaryOperator::Eq => CmpOp::Eq,
+                BinaryOperator::Ne => CmpOp::Ne,
+                BinaryOperator::Lt => CmpOp::Lt,
+                BinaryOperator::Gt => CmpOp::Gt,
+                BinaryOperator::Le => CmpOp::Le,
+                BinaryOperator::Ge => CmpOp::Ge,
+                _ => return None,
+            };
+            cmp_stage(false, cmp, left, right)
+        }
+        FilterExpr::Expr(_) => None,
+    }
 }
 
 enum VecRoot<'a> {
@@ -75,15 +227,15 @@ enum AggIn {
     Cell(bool, usize),
 }
 
-/// A single-property read on the scan or expansion variable, the only
+/// A single-property read on the leaf or expansion variable, the only
 /// expression form the columnar executor evaluates itself.
-fn prop_read<'a>(expr: &'a Expr, src_var: &str, dst_var: &str) -> Option<(bool, &'a str)> {
+fn prop_read<'a>(expr: &'a Expr, src_var: &str, dst_var: Option<&str>) -> Option<(bool, &'a str)> {
     if let Expr::Prop(var, prop) = expr {
         if !prop.is_empty() {
             if var == src_var {
                 return Some((true, prop.as_str()));
             }
-            if var == dst_var {
+            if dst_var == Some(var.as_str()) {
                 return Some((false, prop.as_str()));
             }
         }
@@ -91,18 +243,91 @@ fn prop_read<'a>(expr: &'a Expr, src_var: &str, dst_var: &str) -> Option<(bool, 
     None
 }
 
+/// Resolve the sort keys of a `Sort` over a plain projection root into bulk
+/// property reads, or `None` to decline. A key is either a direct property
+/// read on a pipeline variable, or a reference to a projected alias whose
+/// expression is one; the projected value of such an item is the raw gathered
+/// cell, so both forms order rows exactly as `evaluate_sort_key` does.
+fn resolve_sort_keys<'a>(
+    sort_items: &'a [SortItem],
+    items: &'a [(Expr, Option<String>)],
+    src_var: &str,
+    dst_var: Option<&str>,
+    rel_var: Option<&str>,
+) -> Option<Vec<VecSortKey<'a>>> {
+    let keys: Vec<String> = items
+        .iter()
+        .map(|(expr, alias)| projected_key(expr, alias))
+        .collect();
+    let mut out = Vec::with_capacity(sort_items.len());
+    for si in sort_items {
+        let (is_src, prop) = match &si.expr {
+            Expr::Prop(var, prop) if prop.is_empty() => {
+                // An alias reference. A pipeline variable of the same name
+                // would shadow the projected binding in the row pipeline.
+                if var == src_var || dst_var == Some(var.as_str()) || rel_var == Some(var.as_str())
+                {
+                    return None;
+                }
+                let idx = keys.iter().position(|k| k == var)?;
+                prop_read(&items[idx].0, src_var, dst_var)?
+            }
+            expr => {
+                let read = prop_read(expr, src_var, dst_var)?;
+                // When the property is null, `evaluate_sort_key` falls back
+                // to the `var.prop` and bare `prop` projected bindings, so a
+                // projected key of either name carrying a different value
+                // would diverge from the bulk gather.
+                let Expr::Prop(var, _) = expr else {
+                    return None;
+                };
+                let full = format!("{var}.{}", read.1);
+                for (key, (item_expr, _)) in keys.iter().zip(items) {
+                    if (key == read.1 || *key == full)
+                        && prop_read(item_expr, src_var, dst_var) != Some(read)
+                    {
+                        return None;
+                    }
+                }
+                read
+            }
+        };
+        out.push(VecSortKey {
+            is_src,
+            prop,
+            ascending: si.ascending,
+        });
+    }
+    Some(out)
+}
+
 /// Match `plan` against the recognized shape, or `None` for the row pipeline.
 fn recognize(plan: &PhysicalOperator) -> Option<VecPipeline<'_>> {
-    let (sort_items, below_sort) = match plan {
+    // A Limit is recognized only directly above a Sort: the row pipeline's
+    // top-N shape. A bare Limit short-circuits the streaming row path.
+    let (limit, below_limit) = match plan {
+        PhysicalOperator::Limit { input, skip, count }
+            if matches!(input.as_ref(), PhysicalOperator::Sort { .. }) =>
+        {
+            (Some((*skip, *count)), input.as_ref())
+        }
+        other => (None, other),
+    };
+    let (sort_items, below_sort) = match below_limit {
         PhysicalOperator::Sort { input, items } => (Some(items.as_slice()), input.as_ref()),
         other => (None, other),
     };
-    // RETURN DISTINCT plans a Distinct directly above the projection; the
-    // caller dedups the built records, so the recognizer sees through it.
-    let below_distinct = match below_sort {
-        PhysicalOperator::Distinct { input, .. } => input.as_ref(),
-        other => other,
+    // RETURN DISTINCT plans a Distinct directly above the projection. With
+    // no limit the caller dedups the built records, so the recognizer just
+    // sees through it; under a limit the row pipeline deduplicates before
+    // the limit truncates, so the executor here must dedup in-path before
+    // the window, which needs the dedup key to be exactly the projected
+    // columns (checked against the plan keys in the root section below).
+    let (has_distinct, distinct_keys, below_distinct) = match below_sort {
+        PhysicalOperator::Distinct { input, keys } => (true, keys.as_ref(), input.as_ref()),
+        other => (false, None, other),
     };
+    let limited_distinct = limit.is_some() && has_distinct;
     let PhysicalOperator::Project {
         input,
         items,
@@ -127,87 +352,145 @@ fn recognize(plan: &PhysicalOperator) -> Option<VecPipeline<'_>> {
             agg_input.as_ref(),
         ),
         other => {
-            // A sort over a plain projection would need the full row set; the
-            // top-N and row paths handle those shapes.
-            if sort_items.is_some() {
+            // Sort keys over a plain projection evaluate against the
+            // projected row; a barrier project drops the pipeline variables,
+            // so the bulk gather could diverge from the fallback lookups.
+            if sort_items.is_some() && *is_barrier {
                 return None;
             }
             (VecRoot::Project { items }, other)
         }
     };
 
-    let mut label_filters = Vec::new();
+    // Filter stages under the root chain. Reversed below to the bottom-up
+    // order the row pipeline applies them in.
+    let mut upper_stages = Vec::new();
     let mut cur = chain_top;
     while let PhysicalOperator::Filter { input, expression } = cur {
-        let FilterExpr::HasLabel(var, label) = expression else {
-            return None;
-        };
-        label_filters.push((var.as_str(), label.as_str()));
+        upper_stages.push(vec_stage(expression)?);
         cur = input.as_ref();
     }
+    upper_stages.reverse();
 
-    let PhysicalOperator::Expand {
-        input,
-        src_var,
-        rel_var,
-        dst_var,
-        rel_type,
-        is_incoming,
-        is_undirected: false,
-        min_hops: 1,
-        max_hops: 1,
-        unique_rels,
-        needs_path: false,
-    } = cur
-    else {
-        return None;
+    // Optional single-hop directed expansion. Source labels and predicates
+    // (`(a:Person:Vip)`, a pushed-down conjunct on `a`) plan as filters
+    // between the expand and the leaf.
+    let (expand, expand_src, below_stages, above_stages, cur) = match cur {
+        PhysicalOperator::Expand {
+            input,
+            src_var,
+            rel_var,
+            dst_var,
+            rel_type,
+            is_incoming,
+            is_undirected: false,
+            min_hops: 1,
+            max_hops: 1,
+            unique_rels,
+            needs_path: false,
+        } => {
+            // A single hop has no sibling relationships; a populated list
+            // means the optimizer wired this hop into a larger pattern.
+            if !unique_rels.is_empty() {
+                return None;
+            }
+            // A self-referencing hop `(a)-->(a)` needs the pre-bound target
+            // guard.
+            if src_var == dst_var {
+                return None;
+            }
+            let mut below_stages = Vec::new();
+            let mut under = input.as_ref();
+            while let PhysicalOperator::Filter { input, expression } = under {
+                below_stages.push(vec_stage(expression)?);
+                under = input.as_ref();
+            }
+            below_stages.reverse();
+            let expand = VecExpand {
+                rel_var,
+                dst_var,
+                rel_type: rel_type.as_deref(),
+                is_incoming: *is_incoming,
+            };
+            (
+                Some(expand),
+                Some(src_var.as_str()),
+                below_stages,
+                upper_stages,
+                under,
+            )
+        }
+        other => (None, None, upper_stages, Vec::new(), other),
     };
-    // A single hop has no sibling relationships; a populated list means the
-    // optimizer wired this hop into a larger pattern.
-    if !unique_rels.is_empty() {
-        return None;
-    }
-    // A self-referencing hop `(a)-->(a)` needs the pre-bound target guard.
-    if src_var == dst_var {
-        return None;
-    }
-    // Additional source labels (`(a:Person:Vip)`) plan as `HasLabel` filters
-    // between the expand and the scan; they restrict the same source rows.
-    let mut below = input.as_ref();
-    while let PhysicalOperator::Filter { input, expression } = below {
-        let FilterExpr::HasLabel(var, label) = expression else {
+
+    let (leaf, leaf_var) = match cur {
+        PhysicalOperator::LabelScan { variable, label } => (
+            VecLeaf::LabelScan {
+                label: label.as_deref(),
+            },
+            variable.as_str(),
+        ),
+        PhysicalOperator::NodeByIdSeek { variable, .. }
+        | PhysicalOperator::NodeIndexScan { variable, .. }
+        | PhysicalOperator::NodeRangeScan { variable, .. } => {
+            (VecLeaf::Seek(cur), variable.as_str())
+        }
+        _ => return None,
+    };
+    // With an expansion the leaf must bind the expansion's source variable.
+    if let Some(src) = expand_src {
+        if leaf_var != src {
             return None;
-        };
-        label_filters.push((var.as_str(), label.as_str()));
-        below = input.as_ref();
+        }
     }
-    let PhysicalOperator::LabelScan { variable, label } = below else {
-        return None;
-    };
-    if variable != src_var {
-        return None;
+    let src_var = leaf_var;
+    let dst_var = expand.as_ref().map(|x| x.dst_var);
+
+    // Stage variable scoping: below the expansion only the leaf variable is
+    // bound; above it, the leaf and target variables are.
+    for stage in &below_stages {
+        if stage.vars().iter().any(|v| *v != src_var) {
+            return None;
+        }
     }
-    for (var, _) in &label_filters {
-        if *var != src_var && *var != dst_var {
+    for stage in &above_stages {
+        if stage
+            .vars()
+            .iter()
+            .any(|v| *v != src_var && Some(*v) != dst_var)
+        {
             return None;
         }
     }
 
-    let pipeline = VecPipeline {
-        scan_label: label.as_deref(),
-        src_var,
-        dst_var,
-        rel_type: rel_type.as_deref(),
-        is_incoming: *is_incoming,
-        label_filters,
-        root,
-    };
-
     // Per-root expression eligibility.
-    match &pipeline.root {
+    let mut project_sort = None;
+    match &root {
         VecRoot::Project { items } => {
             for (expr, _) in items.iter() {
-                prop_read(expr, pipeline.src_var, pipeline.dst_var)?;
+                prop_read(expr, src_var, dst_var)?;
+            }
+            if let Some(sis) = sort_items {
+                let rel_var = expand.as_ref().map(|x| x.rel_var);
+                project_sort = Some(resolve_sort_keys(sis, items, src_var, dst_var, rel_var)?);
+            }
+            if limited_distinct {
+                // The in-path dedup keys on every projected cell, so the
+                // plan's dedup keys must name exactly the projected columns
+                // (RETURN DISTINCT plans them that way; full-row dedup or a
+                // key subset would be a different equivalence).
+                let mut plan_keys = distinct_keys?.clone();
+                let mut projected: Vec<String> = items
+                    .iter()
+                    .map(|(expr, alias)| projected_key(expr, alias))
+                    .collect();
+                plan_keys.sort();
+                plan_keys.dedup();
+                projected.sort();
+                projected.dedup();
+                if plan_keys != projected {
+                    return None;
+                }
             }
         }
         VecRoot::Aggregate {
@@ -215,8 +498,13 @@ fn recognize(plan: &PhysicalOperator) -> Option<VecPipeline<'_>> {
             aggregations,
             ..
         } => {
+            // The aggregate root runs the regular operators above the fold,
+            // which have no dedup-before-limit step.
+            if limited_distinct {
+                return None;
+            }
             for (expr, _) in group_by.iter() {
-                prop_read(expr, pipeline.src_var, pipeline.dst_var)?;
+                prop_read(expr, src_var, dst_var)?;
             }
             for (agg_fn, inner, _) in aggregations.iter() {
                 let count_like = match inner {
@@ -226,13 +514,14 @@ fn recognize(plan: &PhysicalOperator) -> Option<VecPipeline<'_>> {
                     // aggregate over a whole variable needs the row value.
                     Expr::Prop(var, prop) if prop.is_empty() => {
                         matches!(agg_fn, AggFn::Count { distinct: false })
-                            && (var == pipeline.src_var
-                                || var == pipeline.dst_var
-                                || var == rel_var)
+                            && (var == src_var
+                                || expand
+                                    .as_ref()
+                                    .is_some_and(|x| var == x.dst_var || var == x.rel_var))
                     }
                     _ => false,
                 };
-                if !count_like && prop_read(inner, pipeline.src_var, pipeline.dst_var).is_none() {
+                if !count_like && prop_read(inner, src_var, dst_var).is_none() {
                     return None;
                 }
             }
@@ -241,7 +530,17 @@ fn recognize(plan: &PhysicalOperator) -> Option<VecPipeline<'_>> {
         }
     }
 
-    Some(pipeline)
+    Some(VecPipeline {
+        leaf,
+        src_var,
+        expand,
+        below_stages,
+        above_stages,
+        root,
+        project_sort,
+        limit,
+        distinct: limited_distinct,
+    })
 }
 
 fn props_table(graph: &Graph, ids: &[NodeId], props: &[&str]) -> Result<Vec<Vec<Value>>, String> {
@@ -256,9 +555,292 @@ fn props_table(graph: &Graph, ids: &[NodeId], props: &[&str]) -> Result<Vec<Vec<
         })
 }
 
+/// Single-property gather as one flat column, avoiding the row-major table's
+/// per-row vector allocation.
+fn prop_column(graph: &Graph, ids: &[NodeId], prop: &str) -> Result<Vec<Value>, String> {
+    graph.node_prop_json_column(ids, prop).map_err(|e| match e {
+        issundb_core::Error::NodeNotFound(id) => format!("node not found: {}", id),
+        other => other.to_string(),
+    })
+}
+
+/// The pipeline's flat id columns: the leaf column, plus the expansion target
+/// column once the expansion ran. Filter stages compact both in lockstep, so
+/// row pairs survive or drop together.
+struct IdCols {
+    srcs: Vec<NodeId>,
+    dsts: Option<Vec<NodeId>>,
+}
+
+impl IdCols {
+    fn ids_of(&self, is_src: bool) -> &[NodeId] {
+        if is_src {
+            &self.srcs
+        } else {
+            self.dsts.as_deref().unwrap_or(&[])
+        }
+    }
+
+    /// Order-preserving compaction by a per-row keep mask.
+    fn compact(&mut self, mask: &[bool]) {
+        let mut w = 0;
+        for (i, keep) in mask.iter().enumerate() {
+            if *keep {
+                self.srcs[w] = self.srcs[i];
+                if let Some(dsts) = &mut self.dsts {
+                    dsts[w] = dsts[i];
+                }
+                w += 1;
+            }
+        }
+        self.srcs.truncate(w);
+        if let Some(dsts) = &mut self.dsts {
+            dsts.truncate(w);
+        }
+    }
+}
+
+/// A resolved comparison operand: one gathered cell per row, or one constant.
+enum OperandVals {
+    Cells(Vec<Value>),
+    Const(Value),
+}
+
+impl OperandVals {
+    fn get(&self, i: usize) -> &Value {
+        match self {
+            OperandVals::Cells(cells) => &cells[i],
+            OperandVals::Const(value) => value,
+        }
+    }
+}
+
+fn resolve_operand(
+    graph: &Graph,
+    operand: &VecOperand<'_>,
+    params: &HashMap<String, Value>,
+    schema: &std::sync::Arc<SlotSchema>,
+    src_var: &str,
+    cols: &IdCols,
+) -> Result<OperandVals, String> {
+    match operand {
+        VecOperand::Col { var, prop } => {
+            let ids = cols.ids_of(*var == src_var);
+            Ok(OperandVals::Cells(prop_column(graph, ids, prop)?))
+        }
+        // Literals and parameters read no row, so an empty row evaluates them
+        // exactly as the row pipeline would, including the missing-parameter
+        // error.
+        VecOperand::Const(expr) => {
+            let empty = SlotRow::empty(schema.clone());
+            Ok(OperandVals::Const(evaluate_expr(
+                graph, &empty, expr, params,
+            )?))
+        }
+    }
+}
+
+/// One comparison outcome, mirroring the row pipeline exactly: a row passes
+/// only on TRUE, so the null, NaN, and incomparable outcomes all drop it.
+fn cmp_keeps(structured: bool, op: CmpOp, lv: &Value, rv: &Value) -> bool {
+    use std::cmp::Ordering;
+    if structured {
+        // The structured `FilterExpr::Eq..Ge` forms follow `evaluate_where`.
+        match op {
+            CmpOp::Eq => cypher_eq(lv, rv) == Value::Bool(true),
+            CmpOp::Ne => cypher_eq(lv, rv) == Value::Bool(false),
+            CmpOp::Lt => json_cmp(lv, rv) == Some(Ordering::Less),
+            CmpOp::Gt => json_cmp(lv, rv) == Some(Ordering::Greater),
+            CmpOp::Le => matches!(json_cmp(lv, rv), Some(Ordering::Less | Ordering::Equal)),
+            CmpOp::Ge => matches!(json_cmp(lv, rv), Some(Ordering::Greater | Ordering::Equal)),
+        }
+    } else {
+        // A comparison inside `FilterExpr::Expr` follows `eval_binary_op`.
+        if lv.is_null() || rv.is_null() {
+            return false;
+        }
+        match op {
+            CmpOp::Eq => cypher_eq(lv, rv) == Value::Bool(true),
+            CmpOp::Ne => cypher_eq(lv, rv) == Value::Bool(false),
+            CmpOp::Lt | CmpOp::Gt | CmpOp::Le | CmpOp::Ge => {
+                // An ordered comparison with NaN is FALSE against a number and
+                // NULL otherwise; neither passes the row.
+                if is_nan(lv) || is_nan(rv) {
+                    return false;
+                }
+                match json_cmp(lv, rv) {
+                    None => false,
+                    Some(c) => match op {
+                        CmpOp::Lt => c == Ordering::Less,
+                        CmpOp::Gt => c == Ordering::Greater,
+                        CmpOp::Le => c != Ordering::Greater,
+                        CmpOp::Ge => c != Ordering::Less,
+                        CmpOp::Eq | CmpOp::Ne => false,
+                    },
+                }
+            }
+        }
+    }
+}
+
+/// Bulk label-membership set for `ids`: a label smaller than the column comes
+/// from one `label_idx` prefix scan, a larger one from point lookups on the
+/// distinct ids.
+fn label_pass_set(
+    graph: &Graph,
+    ids: &[NodeId],
+    label: &str,
+) -> Result<ahash::AHashSet<NodeId>, String> {
+    let label_count = graph
+        .node_count_by_label(label)
+        .map_err(|e| e.to_string())? as usize;
+    if label_count <= ids.len() {
+        Ok(graph
+            .nodes_by_label(label)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .collect())
+    } else {
+        let mut distinct = ids.to_vec();
+        distinct.sort_unstable();
+        distinct.dedup();
+        Ok(graph
+            .label_filter(&distinct, label)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .collect())
+    }
+}
+
+/// Apply one filter stage to the id columns in place.
+fn apply_stage(
+    graph: &Graph,
+    stage: &VecStage<'_>,
+    params: &HashMap<String, Value>,
+    schema: &std::sync::Arc<SlotSchema>,
+    src_var: &str,
+    cols: &mut IdCols,
+) -> Result<(), String> {
+    let n = cols.srcs.len();
+    // The row pipeline evaluates a predicate per row, so over zero rows
+    // neither its constants nor its property reads run; a missing parameter
+    // must not error here either.
+    if n == 0 {
+        return Ok(());
+    }
+    let mask: Vec<bool> = match stage {
+        VecStage::HasLabel { var, label } => {
+            let ids = cols.ids_of(*var == src_var);
+            let pass = label_pass_set(graph, ids, label)?;
+            ids.iter().map(|id| pass.contains(id)).collect()
+        }
+        VecStage::Cmp {
+            structured,
+            op,
+            lhs,
+            rhs,
+        } => {
+            let lv = resolve_operand(graph, lhs, params, schema, src_var, cols)?;
+            let rv = resolve_operand(graph, rhs, params, schema, src_var, cols)?;
+            (0..n)
+                .map(|i| cmp_keeps(*structured, *op, lv.get(i), rv.get(i)))
+                .collect()
+        }
+    };
+    cols.compact(&mask);
+    Ok(())
+}
+
+/// Extract the leaf's node ids through the row pipeline's leaf evaluator,
+/// preserving its emission order. `Ok(None)` declines (the leaf bound
+/// something other than a plain node).
+fn leaf_node_ids(
+    graph: &Graph,
+    op: &PhysicalOperator,
+    var: &str,
+    params: &HashMap<String, Value>,
+    schema: &std::sync::Arc<SlotSchema>,
+) -> Result<Option<Vec<NodeId>>, String> {
+    let rows = eval_leaf(graph, op, params, schema)?;
+    let mut ids = Vec::with_capacity(rows.len());
+    for row in rows {
+        match row.get_binding(var) {
+            Some(GraphBinding::Node(n)) => ids.push(*n),
+            _ => return Ok(None),
+        }
+    }
+    Ok(Some(ids))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only switch: when true, `try_execute_vectorized` declines every
+    /// plan, so the row pipeline executes the identical optimized plan and
+    /// the differential tests compare the two executors and nothing else.
+    static DISABLE_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Execute `plan` column-at-a-time if it matches the recognized shape,
 /// producing the final result records directly. `Ok(None)` means the plan is
 /// not eligible and the row pipeline must run instead.
+/// Gather one raw key column per project-root sort item over the id columns.
+fn gather_sort_key_cols(
+    graph: &Graph,
+    sort_keys: &[VecSortKey],
+    srcs: &[NodeId],
+    dsts: &[NodeId],
+) -> Result<Vec<Vec<Value>>, String> {
+    let mut key_cols = Vec::with_capacity(sort_keys.len());
+    for key in sort_keys {
+        let ids = if key.is_src { srcs } else { dsts };
+        key_cols.push(prop_column(graph, ids, key.prop)?);
+    }
+    Ok(key_cols)
+}
+
+/// Order the row indices `0..n` with `sort_all`'s comparator (`json_cmp`
+/// falling back to `json_cmp_total`, the input index as the tiebreak) over
+/// the gathered key columns and return the limit window. The index tiebreak
+/// makes the comparator a total order, so a partition at the limit boundary
+/// selects exactly the rows a full stable sort would put first.
+fn sorted_window(
+    key_cols: &[Vec<Value>],
+    sort_keys: &[VecSortKey],
+    n: usize,
+    limit: Option<(usize, usize)>,
+) -> Vec<usize> {
+    let cmp = |&a: &usize, &b: &usize| {
+        for (k, key) in sort_keys.iter().enumerate() {
+            let (ka, kb) = (&key_cols[k][a], &key_cols[k][b]);
+            let ord = json_cmp(ka, kb).unwrap_or_else(|| json_cmp_total(ka, kb));
+            let ord = if key.ascending { ord } else { ord.reverse() };
+            if ord != std::cmp::Ordering::Equal {
+                return ord;
+            }
+        }
+        a.cmp(&b)
+    };
+    let mut order: Vec<usize> = (0..n).collect();
+    match limit {
+        Some((skip, count)) => {
+            let hi = skip.saturating_add(count).min(n);
+            if hi > 0 {
+                if hi < n {
+                    order.select_nth_unstable_by(hi - 1, cmp);
+                }
+                order[..hi].sort_by(cmp);
+            }
+            order.truncate(hi);
+            order.drain(..skip.min(hi));
+            order
+        }
+        None => {
+            order.sort_by(cmp);
+            order
+        }
+    }
+}
+
 pub(super) fn try_execute_vectorized(
     graph: &Graph,
     plan: &PhysicalOperator,
@@ -266,9 +848,14 @@ pub(super) fn try_execute_vectorized(
     params: &HashMap<String, Value>,
     schema: &std::sync::Arc<SlotSchema>,
 ) -> Result<Option<Vec<Record>>, String> {
+    #[cfg(test)]
+    if DISABLE_FOR_TEST.with(|d| d.get()) {
+        return Ok(None);
+    }
     let Some(p) = recognize(plan) else {
         return Ok(None);
     };
+    let dst_var = p.expand.as_ref().map(|x| x.dst_var);
 
     // For the projection root, the records are built positionally from the
     // plan items, so the plan items must correspond one-to-one (by projected
@@ -294,76 +881,64 @@ pub(super) fn try_execute_vectorized(
         }
     }
 
-    // 1. Scan ids, ascending, exactly as the label scan emits them.
-    let mut src_ids = match p.scan_label {
-        Some(l) => graph.nodes_by_label(l).map_err(|e| e.to_string())?,
-        None => graph.all_nodes().map_err(|e| e.to_string())?,
+    // 1. Leaf ids, exactly as the row pipeline's leaf emits them: ascending
+    //    for a label scan, the leaf evaluator's order for a seek.
+    let leaf_ids = match p.leaf {
+        VecLeaf::LabelScan { label } => match label {
+            Some(l) => graph.nodes_by_label(l).map_err(|e| e.to_string())?,
+            None => graph.all_nodes().map_err(|e| e.to_string())?,
+        },
+        VecLeaf::Seek(op) => match leaf_node_ids(graph, op, p.src_var, params, schema)? {
+            Some(ids) => ids,
+            None => return Ok(None),
+        },
+    };
+    let mut cols = IdCols {
+        srcs: leaf_ids,
+        dsts: None,
     };
 
-    // 2. Source-side label predicates read only the source, so restricting
-    //    the sources before expansion yields the same rows in the same order
-    //    as the row pipeline's post-expansion filter.
-    for (_, label) in p.label_filters.iter().filter(|(v, _)| *v == p.src_var) {
-        src_ids = graph
-            .label_filter(&src_ids, label)
-            .map_err(|e| e.to_string())?;
+    // 2. Stages below the expansion restrict the leaf rows, in plan order;
+    //    they read only the leaf variable, so restricting before expansion
+    //    yields the same rows in the same order as the row pipeline.
+    for stage in &p.below_stages {
+        apply_stage(graph, stage, params, schema, p.src_var, &mut cols)?;
     }
 
     // 3. Bulk expansion, flattened per source in scan order: the row order
     //    the per-row pipeline produces.
-    let transitions = expand_multi_type(graph, &src_ids, p.rel_type, p.is_incoming)?;
-    let mut per_src: ahash::AHashMap<NodeId, Vec<(EdgeId, NodeId)>> = ahash::AHashMap::new();
-    for (s, e, d) in transitions {
-        per_src.entry(s).or_default().push((e, d));
-    }
-    let row_estimate: usize = per_src.values().map(Vec::len).sum();
-    let mut srcs: Vec<NodeId> = Vec::with_capacity(row_estimate);
-    let mut dsts: Vec<NodeId> = Vec::with_capacity(row_estimate);
-    for &s in &src_ids {
-        if let Some(v) = per_src.get(&s) {
-            for &(_, d) in v {
-                srcs.push(s);
-                dsts.push(d);
+    if let Some(x) = &p.expand {
+        let transitions = expand_multi_type(graph, &cols.srcs, x.rel_type, x.is_incoming)?;
+        let mut per_src: ahash::AHashMap<NodeId, Vec<(EdgeId, NodeId)>> = ahash::AHashMap::new();
+        for (s, e, d) in transitions {
+            per_src.entry(s).or_default().push((e, d));
+        }
+        let row_estimate: usize = per_src.values().map(Vec::len).sum();
+        let mut srcs: Vec<NodeId> = Vec::with_capacity(row_estimate);
+        let mut dsts: Vec<NodeId> = Vec::with_capacity(row_estimate);
+        for &s in &cols.srcs {
+            if let Some(v) = per_src.get(&s) {
+                for &(_, d) in v {
+                    srcs.push(s);
+                    dsts.push(d);
+                }
             }
         }
+        cols = IdCols {
+            srcs,
+            dsts: Some(dsts),
+        };
     }
 
-    // 4. Target-side label predicates: one bulk membership set, then an
-    //    order-preserving compaction of the id columns. A label smaller than
-    //    the target column comes from one `label_idx` prefix scan; a larger
-    //    one from point lookups on the distinct targets.
-    for (_, label) in p.label_filters.iter().filter(|(v, _)| *v == p.dst_var) {
-        let label_count = graph
-            .node_count_by_label(label)
-            .map_err(|e| e.to_string())? as usize;
-        let pass: ahash::AHashSet<NodeId> = if label_count <= dsts.len() {
-            graph
-                .nodes_by_label(label)
-                .map_err(|e| e.to_string())?
-                .into_iter()
-                .collect()
-        } else {
-            let mut distinct = dsts.clone();
-            distinct.sort_unstable();
-            distinct.dedup();
-            graph
-                .label_filter(&distinct, label)
-                .map_err(|e| e.to_string())?
-                .into_iter()
-                .collect()
-        };
-        let mut w = 0;
-        for i in 0..dsts.len() {
-            if pass.contains(&dsts[i]) {
-                srcs[w] = srcs[i];
-                dsts[w] = dsts[i];
-                w += 1;
-            }
-        }
-        srcs.truncate(w);
-        dsts.truncate(w);
+    // 4. Stages above the expansion, in plan order, each compacting the id
+    //    columns in lockstep.
+    for stage in &p.above_stages {
+        apply_stage(graph, stage, params, schema, p.src_var, &mut cols)?;
     }
-    let n = dsts.len();
+
+    let n = cols.srcs.len();
+    let srcs = cols.srcs;
+    let dsts = cols.dsts.unwrap_or_default();
 
     match p.root {
         VecRoot::Project { items } => {
@@ -374,7 +949,7 @@ pub(super) fn try_execute_vectorized(
             let mut item_cols = Vec::with_capacity(items.len());
             for (expr, _) in items.iter() {
                 // Already validated by `recognize`; decline rather than panic.
-                let Some((is_src, prop)) = prop_read(expr, p.src_var, p.dst_var) else {
+                let Some((is_src, prop)) = prop_read(expr, p.src_var, dst_var) else {
                     return Ok(None);
                 };
                 if is_src {
@@ -385,6 +960,85 @@ pub(super) fn try_execute_vectorized(
                     dst_props.push(prop);
                 }
             }
+
+            if p.distinct {
+                // `recognize` sets `distinct` only under a limited sort over
+                // this root; decline rather than panic.
+                let (Some(sort_keys), Some(limit)) = (&p.project_sort, p.limit) else {
+                    return Ok(None);
+                };
+                let mut src_table = props_table(graph, &srcs, &src_props)?;
+                let mut dst_table = props_table(graph, &dsts, &dst_props)?;
+                // The Distinct operator runs below the Sort: dedup on the
+                // raw projected cells (the values the row pipeline keys its
+                // dedup on), keeping the first occurrence in row order, so a
+                // sort key that is not projected reads the surviving row's
+                // value.
+                let mut seen: ahash::AHashSet<String> = ahash::AHashSet::new();
+                let mut survivors: Vec<usize> = Vec::new();
+                for i in 0..n {
+                    use std::fmt::Write as _;
+                    let mut key = String::new();
+                    for &(is_src, j) in &item_cols {
+                        let cell = if is_src {
+                            &src_table[i][j]
+                        } else {
+                            &dst_table[i][j]
+                        };
+                        // `{:?}` escapes string content, so the separator
+                        // cannot collide with a cell.
+                        let _ = write!(key, "{cell:?}\x00");
+                    }
+                    if seen.insert(key) {
+                        survivors.push(i);
+                    }
+                }
+                let surv_srcs: Vec<NodeId> = survivors.iter().map(|&i| srcs[i]).collect();
+                let surv_dsts: Vec<NodeId> = if p.expand.is_some() {
+                    survivors.iter().map(|&i| dsts[i]).collect()
+                } else {
+                    Vec::new()
+                };
+                let key_cols = gather_sort_key_cols(graph, sort_keys, &surv_srcs, &surv_dsts)?;
+                // Survivor positions are in row order, so the window's index
+                // tiebreak matches `sort_all`'s stable order over the
+                // deduplicated stream.
+                let selected = sorted_window(&key_cols, sort_keys, survivors.len(), Some(limit));
+                let mut records = Vec::with_capacity(selected.len());
+                for &s in &selected {
+                    let i = survivors[s];
+                    let mut values = Vec::with_capacity(items.len());
+                    for &(is_src, j) in &item_cols {
+                        let cell = if is_src {
+                            std::mem::take(&mut src_table[i][j])
+                        } else {
+                            std::mem::take(&mut dst_table[i][j])
+                        };
+                        values.push(unpack_sentinels(graph, cell));
+                    }
+                    records.push(Record { values });
+                }
+                return Ok(Some(records));
+            }
+
+            // Sort over the projection: gather one key column per sort item,
+            // order the row indices, and keep only the limit window, so the
+            // projection below gathers and builds just the surviving rows.
+            let (srcs, dsts, n) = match &p.project_sort {
+                Some(sort_keys) => {
+                    let key_cols = gather_sort_key_cols(graph, sort_keys, &srcs, &dsts)?;
+                    let selected = sorted_window(&key_cols, sort_keys, n, p.limit);
+                    let sorted_srcs: Vec<NodeId> = selected.iter().map(|&i| srcs[i]).collect();
+                    let sorted_dsts: Vec<NodeId> = if p.expand.is_some() {
+                        selected.iter().map(|&i| dsts[i]).collect()
+                    } else {
+                        Vec::new()
+                    };
+                    let m = sorted_srcs.len();
+                    (sorted_srcs, sorted_dsts, m)
+                }
+                None => (srcs, dsts, n),
+            };
             let mut src_table = props_table(graph, &srcs, &src_props)?;
             let mut dst_table = props_table(graph, &dsts, &dst_props)?;
 
@@ -416,7 +1070,7 @@ pub(super) fn try_execute_vectorized(
             let mut group_codes = Vec::with_capacity(group_by.len());
             for (expr, _) in group_by.iter() {
                 // Already validated by `recognize`; decline rather than panic.
-                let Some((is_src, prop)) = prop_read(expr, p.src_var, p.dst_var) else {
+                let Some((is_src, prop)) = prop_read(expr, p.src_var, dst_var) else {
                     return Ok(None);
                 };
                 let ids = if is_src { &srcs } else { &dsts };
@@ -435,7 +1089,7 @@ pub(super) fn try_execute_vectorized(
             let mut dst_props: Vec<&str> = Vec::new();
             let mut agg_inputs = Vec::with_capacity(aggregations.len());
             for (_, inner, _) in aggregations.iter() {
-                match prop_read(inner, p.src_var, p.dst_var) {
+                match prop_read(inner, p.src_var, dst_var) {
                     Some((is_src, prop)) => {
                         let props = if is_src {
                             &mut src_props
@@ -533,11 +1187,19 @@ pub(super) fn try_execute_vectorized(
             // aggregate are the regular ones, so their semantics cannot
             // diverge from the row pipeline.
             let rows = project_rows(graph, agg_rows, project_items, project_is_barrier, params)?;
+            let bound = p.limit.map(|(skip, count)| skip.saturating_add(count));
             let rows = match sort_items {
-                Some(items) => sort_all(graph, rows, items, None, params),
+                Some(items) => sort_all(graph, rows, items, bound, params),
                 None => rows,
             };
-            Ok(Some(rows_to_records(graph, &return_clause.items, rows)?))
+            let mut records = rows_to_records(graph, &return_clause.items, rows)?;
+            if let Some((skip, count)) = p.limit {
+                if skip > 0 {
+                    records.drain(..skip.min(records.len()));
+                }
+                records.truncate(count);
+            }
+            Ok(Some(records))
         }
     }
 }
@@ -596,34 +1258,52 @@ mod tests {
         (dir, g)
     }
 
-    /// Run `cypher` (vectorized-eligible) and its row-path twin, asserting
-    /// identical columns and records, in order. The twin disables the fast
-    /// path with a residual filter no recognizer arm accepts.
+    /// Run `cypher` with the fast path declined, so the row pipeline executes
+    /// the identical optimized plan.
+    fn row_path_execute(
+        graph: &Graph,
+        cypher: &str,
+        params: &std::collections::HashMap<String, serde_json::Value>,
+    ) -> Result<crate::QueryResult, crate::CypherError> {
+        DISABLE_FOR_TEST.with(|d| d.set(true));
+        let out = execute(graph, cypher, params);
+        DISABLE_FOR_TEST.with(|d| d.set(false));
+        out
+    }
+
+    /// Run `cypher` (vectorized-eligible) through both executors over the same
+    /// optimized plan, asserting identical columns and records, in order, or
+    /// an identical error.
     fn assert_matches_row_path(graph: &Graph, cypher: &str) {
+        assert_matches_row_path_with_params(graph, cypher, &std::collections::HashMap::new());
+    }
+
+    fn assert_matches_row_path_with_params(
+        graph: &Graph,
+        cypher: &str,
+        params: &std::collections::HashMap<String, serde_json::Value>,
+    ) {
         let plan = optimized_plan(graph, cypher);
         assert!(
             recognize(&plan).is_some(),
             "expected a vectorized-eligible plan for: {cypher}\n{plan:?}"
         );
-        let forced = match cypher.find(" RETURN ") {
-            Some(idx) => format!(
-                "{} WHERE a.__force_row_path IS NULL {}",
-                &cypher[..idx],
-                &cypher[idx + 1..]
-            ),
-            None => panic!("query has no RETURN"),
-        };
-        assert!(
-            recognize(&optimized_plan(graph, &forced)).is_none(),
-            "the forced twin must not vectorize: {forced}"
-        );
-        let params = std::collections::HashMap::new();
-        let fast = execute(graph, cypher, &params).unwrap();
-        let slow = execute(graph, &forced, &params).unwrap();
-        assert_eq!(fast.columns, slow.columns, "columns for: {cypher}");
-        let fast_rows: Vec<_> = fast.records.iter().map(|r| &r.values).collect();
-        let slow_rows: Vec<_> = slow.records.iter().map(|r| &r.values).collect();
-        assert_eq!(fast_rows, slow_rows, "records for: {cypher}");
+        let fast = execute(graph, cypher, params);
+        let slow = row_path_execute(graph, cypher, params);
+        match (fast, slow) {
+            (Ok(fast), Ok(slow)) => {
+                assert_eq!(fast.columns, slow.columns, "columns for: {cypher}");
+                let fast_rows: Vec<_> = fast.records.iter().map(|r| &r.values).collect();
+                let slow_rows: Vec<_> = slow.records.iter().map(|r| &r.values).collect();
+                assert_eq!(fast_rows, slow_rows, "records for: {cypher}");
+            }
+            (Err(fast), Err(slow)) => {
+                assert_eq!(fast.to_string(), slow.to_string(), "errors for: {cypher}");
+            }
+            (fast, slow) => {
+                panic!("one path errored for: {cypher}\nfast: {fast:?}\nslow: {slow:?}")
+            }
+        }
     }
 
     #[test]
@@ -666,12 +1346,33 @@ mod tests {
             "MATCH (a:Person)-[:KNOWS*1..2]->(b:Person) RETURN b.name AS name",
             // Undirected hop.
             "MATCH (a:Person)-[:KNOWS]-(b:Person) RETURN b.name AS name",
-            // Non-label residual predicate.
-            "MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE b.age > 1 RETURN b.name AS name",
+            // Relationship-property predicate.
+            "MATCH (a:Person)-[r:KNOWS]->(b:Person) WHERE r.weight > 1 RETURN b.name AS name",
+            // Arithmetic inside a comparison operand.
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE b.age + 1 > 2 RETURN b.name AS name",
+            // IS NULL predicate.
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE b.city IS NULL RETURN b.name AS name",
+            // OR predicate.
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) \
+             WHERE b.age > 90 OR b.age < 2 RETURN b.name AS name",
+            // Whole-variable comparison operand.
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE a = b RETURN b.name AS name",
             // Whole-variable projection.
             "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN b",
-            // Sort over a plain projection.
-            "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN b.name AS name ORDER BY name",
+            // Arithmetic sort key.
+            "MATCH (p:Person) RETURN p.name AS name ORDER BY p.age + 1 ASC LIMIT 2",
+            // Whole-node sort key.
+            "MATCH (p:Person) RETURN p.name AS name ORDER BY p LIMIT 2",
+            // Sort key referencing an alias bound to a different property:
+            // the row pipeline's null fallback reads the alias binding, so
+            // the bulk gather of `p.city` could diverge on a missing city.
+            "MATCH (p:Person) RETURN p.name AS city ORDER BY p.city ASC LIMIT 2",
+            // LIMIT without a sort stays on the streaming row path.
+            "MATCH (p:Person) RETURN p.name AS name LIMIT 2",
+            // DISTINCT under a limited sort over an aggregate root: the
+            // operators above the fold have no dedup-before-limit step.
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) \
+             RETURN DISTINCT b.city AS city, count(a) AS n ORDER BY city ASC LIMIT 1",
             // Two-hop chain.
             "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person) RETURN c.name AS name",
             // Relationship property projection.
@@ -739,6 +1440,171 @@ mod tests {
         ] {
             assert_matches_row_path(&g, cypher);
         }
+    }
+
+    #[test]
+    fn property_filters_match_row_path() {
+        let (_dir, g) = fixture();
+        for cypher in [
+            // Range conjuncts on the expansion target.
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) \
+             WHERE b.age >= 4 AND b.age < 40 RETURN b.name AS name",
+            // Equality on a string property, including a node missing it.
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE b.city = 'oslo' RETURN b.name AS name",
+            // Inequality.
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE b.age <> 4 RETURN b.name AS name",
+            // Constant on the left.
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE 4 <= b.age RETURN b.name AS name",
+            // Two property reads compared to each other.
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE a.age > b.age RETURN b.name AS name",
+            // Mixed-kind column: cal's age is the string \"old\".
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE b.age > 0 RETURN b.name AS name",
+            // Source-side property predicate (pushes below the expand).
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE a.age > 5 RETURN b.name AS name",
+            // Filter feeding an aggregation.
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) \
+             WHERE b.age >= 4 RETURN b.city AS city, count(a) AS n ORDER BY city",
+            // Equality predicate on the source: an index-scan leaf when the
+            // optimizer rewrites it, a filter stage otherwise.
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE a.name = 'ada' RETURN b.name AS name",
+            // Comparison with a null literal matches no row.
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE b.age = null RETURN b.name AS name",
+        ] {
+            assert_matches_row_path(&g, cypher);
+        }
+    }
+
+    #[test]
+    fn scan_only_pipelines_match_row_path() {
+        let (_dir, g) = fixture();
+        for cypher in [
+            // Full-scan projection with no expansion.
+            "MATCH (p:Person) RETURN p.name AS name, p.age AS age, p.city AS city",
+            // Scan-only filter plus projection.
+            "MATCH (p:Person) WHERE p.age >= 4 RETURN p.name AS name",
+            // Range conjuncts: an index range-scan leaf when rewritten.
+            "MATCH (p:Person) WHERE p.age >= 4 AND p.age < 40 RETURN count(p) AS n",
+            // Scan-only grouped aggregation.
+            "MATCH (p:Person) RETURN p.city AS city, count(*) AS n ORDER BY city",
+            // Scan-only equality.
+            "MATCH (p:Person) WHERE p.city = 'oslo' RETURN p.name AS name",
+            // Unlabeled scan with a filter.
+            "MATCH (p) WHERE p.age <= 4 RETURN p.name AS name",
+            // Empty result: no such label.
+            "MATCH (p:Ghost) WHERE p.age > 1 RETURN p.name AS name",
+        ] {
+            assert_matches_row_path(&g, cypher);
+        }
+    }
+
+    #[test]
+    fn order_by_limit_matches_row_path() {
+        let (_dir, g) = fixture();
+        for cypher in [
+            // Alias sort keys over a plain projection, mixed directions.
+            "MATCH (p:Person) RETURN p.name AS name, p.age AS age \
+             ORDER BY age DESC, name ASC LIMIT 2",
+            // Direct property sort key that is not projected.
+            "MATCH (p:Person) RETURN p.name AS name ORDER BY p.age ASC LIMIT 2",
+            // Mixed-kind sort column: cal's age is the string \"old\", so the
+            // total-order fallback decides cross-type comparisons.
+            "MATCH (p:Person) RETURN p.name AS name ORDER BY p.age DESC LIMIT 3",
+            // ORDER BY without a LIMIT.
+            "MATCH (p:Person) RETURN p.name AS name, p.age AS age ORDER BY age ASC",
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN b.name AS name ORDER BY name",
+            // Sort on the expansion target; parallel edges produce equal rows,
+            // so ties fall back to input order.
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) \
+             RETURN b.name AS name ORDER BY b.age DESC LIMIT 3",
+            // Sort key projected without an alias.
+            "MATCH (p:Person) RETURN p.name, p.age ORDER BY p.age ASC LIMIT 2",
+            // SKIP with LIMIT, and SKIP alone.
+            "MATCH (p:Person) RETURN p.name AS name ORDER BY name ASC SKIP 1 LIMIT 2",
+            "MATCH (p:Person) RETURN p.name AS name ORDER BY name ASC SKIP 2",
+            // LIMIT 0.
+            "MATCH (p:Person) RETURN p.name AS name ORDER BY name ASC LIMIT 0",
+            // Sort key missing on some nodes (no city on cal).
+            "MATCH (p:Person) RETURN p.name AS name ORDER BY p.city ASC",
+            // Filter stage under a limited sort.
+            "MATCH (p:Person) WHERE p.age >= 4 \
+             RETURN p.name AS name ORDER BY p.age DESC LIMIT 2",
+            // Aggregate root under Sort and Limit.
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) \
+             RETURN b.city AS city, count(a) AS n ORDER BY n DESC, city ASC LIMIT 1",
+            // DISTINCT with an unlimited sort.
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) \
+             RETURN DISTINCT b.name AS name ORDER BY name DESC",
+        ] {
+            assert_matches_row_path(&g, cypher);
+        }
+    }
+
+    #[test]
+    fn distinct_limit_matches_row_path() {
+        let (_dir, g) = fixture();
+        for cypher in [
+            // Duplicates collapse before the limit binds: parallel edges and
+            // the shared oslo city produce repeated rows.
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) \
+             RETURN DISTINCT b.name AS name ORDER BY name ASC LIMIT 2",
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) \
+             RETURN DISTINCT b.city AS city ORDER BY city ASC LIMIT 2",
+            // Filter stage under the limited distinct sort.
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE a.age >= 4 \
+             RETURN DISTINCT b.city AS city ORDER BY city ASC LIMIT 5",
+            // Scan-only pipeline.
+            "MATCH (p:Person) RETURN DISTINCT p.city AS city ORDER BY city DESC LIMIT 2",
+            // Two projected columns, sort on one.
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) \
+             RETURN DISTINCT b.name AS name, b.city AS city ORDER BY name ASC LIMIT 3",
+            // SKIP with LIMIT over the deduplicated rows.
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) \
+             RETURN DISTINCT b.name AS name ORDER BY name ASC SKIP 1 LIMIT 2",
+            // LIMIT 0.
+            "MATCH (p:Person) RETURN DISTINCT p.city AS city ORDER BY city ASC LIMIT 0",
+            // Missing property: cal has no city, so a null joins the dedup.
+            "MATCH (p:Person) RETURN DISTINCT p.city AS city ORDER BY city ASC LIMIT 3",
+            // Mixed-kind dedup column: cal's age is the string "old".
+            "MATCH (p:Person) RETURN DISTINCT p.age AS age ORDER BY age DESC LIMIT 3",
+        ] {
+            assert_matches_row_path(&g, cypher);
+        }
+    }
+
+    #[test]
+    fn param_filters_match_row_path() {
+        let (_dir, g) = fixture();
+        let params: std::collections::HashMap<String, serde_json::Value> =
+            [("min".to_string(), json!(4))].into_iter().collect();
+        for cypher in [
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE b.age >= $min RETURN b.name AS name",
+            "MATCH (p:Person) WHERE p.age >= $min RETURN p.name AS name",
+        ] {
+            assert_matches_row_path_with_params(&g, cypher, &params);
+        }
+    }
+
+    #[test]
+    fn missing_param_matches_row_path_errors() {
+        let (_dir, g) = fixture();
+        let params = std::collections::HashMap::new();
+        // With matching rows reaching the filter, both paths surface the same
+        // missing-parameter error.
+        let cypher = "MATCH (a:Person)-[:KNOWS]->(b:Person) \
+                      WHERE b.age >= $min RETURN b.name AS name";
+        assert!(recognize(&optimized_plan(&g, cypher)).is_some());
+        let fast = execute(&g, cypher, &params).unwrap_err();
+        let slow = row_path_execute(&g, cypher, &params).unwrap_err();
+        assert_eq!(fast.to_string(), slow.to_string());
+
+        // With no rows reaching the filter, neither path evaluates the
+        // parameter, so neither errors.
+        let cypher = "MATCH (a:Ghost)-[:KNOWS]->(b:Person) \
+                      WHERE b.age >= $min RETURN b.name AS name";
+        assert!(recognize(&optimized_plan(&g, cypher)).is_some());
+        let fast = execute(&g, cypher, &params).unwrap();
+        let slow = row_path_execute(&g, cypher, &params).unwrap();
+        assert!(fast.records.is_empty() && slow.records.is_empty());
     }
 
     #[test]
@@ -824,6 +1690,23 @@ mod tests {
                 "MATCH (a:P)-[:T]->(b:P) RETURN a.city AS ac, b.city AS bc, b.age AS age",
                 "MATCH (a:P)-[:T]->(b:P) \
                  RETURN b.city AS city, count(a) AS n, sum(b.age) AS s ORDER BY city",
+                // Property predicates over the mixed-kind city column (strings,
+                // a number, and missing values) and the numeric age column.
+                "MATCH (a:P)-[:T]->(b:P) WHERE b.age >= 2 RETURN b.city AS bc, b.age AS age",
+                "MATCH (a:P)-[:T]->(b:P) WHERE a.city = 'x' AND b.age < 3 \
+                 RETURN b.city AS bc, count(a) AS n ORDER BY bc",
+                "MATCH (a:P) WHERE a.age <> 1 RETURN a.city AS city, a.age AS age",
+                // Top-N over the mixed-kind city column (ties, missing values,
+                // and cross-type ordering), keyed by alias and by property.
+                "MATCH (a:P)-[:T]->(b:P) \
+                 RETURN b.city AS city, b.age AS age ORDER BY city DESC, age ASC LIMIT 3",
+                "MATCH (a:P) RETURN a.age AS age ORDER BY a.city ASC SKIP 1 LIMIT 2",
+                // Limited distinct over the mixed-kind city column: dedup
+                // runs before the sort window.
+                "MATCH (a:P)-[:T]->(b:P) \
+                 RETURN DISTINCT b.city AS city ORDER BY city ASC LIMIT 2",
+                "MATCH (a:P) RETURN DISTINCT a.city AS city, a.age AS age \
+                 ORDER BY age DESC, city ASC SKIP 1 LIMIT 2",
             ] {
                 assert_matches_row_path(&g, cypher);
             }
