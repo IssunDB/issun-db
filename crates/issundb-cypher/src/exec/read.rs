@@ -3581,6 +3581,11 @@ pub(super) fn eval_leaf(
             value,
         } => {
             let val = evaluate_expr(graph, &PathMap::new(), value, params)?;
+            // A null lookup value (a parameter resolving to null) matches
+            // nothing: `prop = null` is never TRUE.
+            if val.is_null() {
+                return Ok(vec![]);
+            }
             let prop_val = json_to_prop_value(&val)
                 .ok_or_else(|| format!("unsupported property value type for index scan: {val}"))?;
             let candidates = graph
@@ -3614,6 +3619,13 @@ pub(super) fn eval_leaf(
                 .as_ref()
                 .map(|e| evaluate_expr(graph, &PathMap::new(), e, params))
                 .transpose()?;
+            // A null bound (a parameter resolving to null) matches nothing:
+            // an ordered comparison with null is never TRUE.
+            if lo_val.as_ref().is_some_and(|v| v.is_null())
+                || hi_val.as_ref().is_some_and(|v| v.is_null())
+            {
+                return Ok(vec![]);
+            }
 
             let lo_prop = lo_val.as_ref().and_then(json_to_prop_value);
             let hi_prop = hi_val.as_ref().and_then(json_to_prop_value);
