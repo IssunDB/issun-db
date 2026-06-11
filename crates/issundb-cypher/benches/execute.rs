@@ -158,6 +158,15 @@ fn bench_execution(c: &mut Criterion) {
         "exec_distinct_limit",
         "MATCH (a:Person)-[:KNOWS]->(b:Person) WITH DISTINCT b RETURN b LIMIT 5",
     );
+    // DISTINCT under ORDER BY ... LIMIT: the plan is `Limit -> Sort ->
+    // Distinct -> Project`, so the sort blocks and every row is deduplicated
+    // before the limit truncates. The columnar fast path dedups on the
+    // gathered projection cells and sorts only the surviving rows.
+    run(
+        "exec_distinct_order_limit",
+        "MATCH (a:Person)-[:KNOWS]->(b:Person) \
+         RETURN DISTINCT b.age AS age ORDER BY age ASC LIMIT 5",
+    );
 
     // A small LIMIT over a MultiwayJoin closing hop, on the triangle graph (the
     // main graph's forward-only edges form no short cycles). The plan is

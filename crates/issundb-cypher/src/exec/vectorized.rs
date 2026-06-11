@@ -27,9 +27,13 @@
 //! projected alias (`ORDER BY age` for `p.age AS age`); the sort then runs as
 //! a bulk key gather plus an index sort, and only the surviving window is
 //! projected. Over an `Aggregate` the output is small, so the regular
-//! `sort_all` runs on it. A `Distinct` under a limited sort declines, because
-//! the row pipeline deduplicates before the limit truncates while the caller
-//! deduplicates the built records afterwards.
+//! `sort_all` runs on it. A `Distinct` with no limit is transparent here
+//! because the caller deduplicates the built records; under a limited sort
+//! the row pipeline deduplicates before the limit truncates, so the
+//! projection root dedups in-path on the raw projected cells (keeping the
+//! first occurrence in row order) before the sort window, which requires the
+//! plan's dedup keys to be exactly the projected columns and an `Aggregate`
+//! root to decline.
 //!
 //! Anything else returns `None` and the row pipeline runs unchanged, so
 //! correctness never depends on this recognizer; only performance does. Row
@@ -79,6 +83,9 @@ struct VecPipeline<'a> {
     project_sort: Option<Vec<VecSortKey<'a>>>,
     /// `(skip, count)` from a `Limit` directly above the `Sort`.
     limit: Option<(usize, usize)>,
+    /// A `Distinct` under a limited sort: the projection root deduplicates
+    /// on the projected cells, in row order, before the sort window.
+    distinct: bool,
 }
 
 /// One project-root sort key, resolved to a bulk-gatherable property read.
@@ -310,17 +317,17 @@ fn recognize(plan: &PhysicalOperator) -> Option<VecPipeline<'_>> {
         PhysicalOperator::Sort { input, items } => (Some(items.as_slice()), input.as_ref()),
         other => (None, other),
     };
-    // RETURN DISTINCT plans a Distinct directly above the projection; the
-    // caller dedups the built records, so the recognizer sees through it.
-    let (has_distinct, below_distinct) = match below_sort {
-        PhysicalOperator::Distinct { input, .. } => (true, input.as_ref()),
-        other => (false, other),
+    // RETURN DISTINCT plans a Distinct directly above the projection. With
+    // no limit the caller dedups the built records, so the recognizer just
+    // sees through it; under a limit the row pipeline deduplicates before
+    // the limit truncates, so the executor here must dedup in-path before
+    // the window, which needs the dedup key to be exactly the projected
+    // columns (checked against the plan keys in the root section below).
+    let (has_distinct, distinct_keys, below_distinct) = match below_sort {
+        PhysicalOperator::Distinct { input, keys } => (true, keys.as_ref(), input.as_ref()),
+        other => (false, None, other),
     };
-    // The row pipeline deduplicates below the sort, before the limit
-    // truncates; the caller's dedup runs after, so the combination declines.
-    if limit.is_some() && has_distinct {
-        return None;
-    }
+    let limited_distinct = limit.is_some() && has_distinct;
     let PhysicalOperator::Project {
         input,
         items,
@@ -467,12 +474,35 @@ fn recognize(plan: &PhysicalOperator) -> Option<VecPipeline<'_>> {
                 let rel_var = expand.as_ref().map(|x| x.rel_var);
                 project_sort = Some(resolve_sort_keys(sis, items, src_var, dst_var, rel_var)?);
             }
+            if limited_distinct {
+                // The in-path dedup keys on every projected cell, so the
+                // plan's dedup keys must name exactly the projected columns
+                // (RETURN DISTINCT plans them that way; full-row dedup or a
+                // key subset would be a different equivalence).
+                let mut plan_keys = distinct_keys?.clone();
+                let mut projected: Vec<String> = items
+                    .iter()
+                    .map(|(expr, alias)| projected_key(expr, alias))
+                    .collect();
+                plan_keys.sort();
+                plan_keys.dedup();
+                projected.sort();
+                projected.dedup();
+                if plan_keys != projected {
+                    return None;
+                }
+            }
         }
         VecRoot::Aggregate {
             group_by,
             aggregations,
             ..
         } => {
+            // The aggregate root runs the regular operators above the fold,
+            // which have no dedup-before-limit step.
+            if limited_distinct {
+                return None;
+            }
             for (expr, _) in group_by.iter() {
                 prop_read(expr, src_var, dst_var)?;
             }
@@ -509,6 +539,7 @@ fn recognize(plan: &PhysicalOperator) -> Option<VecPipeline<'_>> {
         root,
         project_sort,
         limit,
+        distinct: limited_distinct,
     })
 }
 
@@ -747,6 +778,68 @@ thread_local! {
 /// Execute `plan` column-at-a-time if it matches the recognized shape,
 /// producing the final result records directly. `Ok(None)` means the plan is
 /// not eligible and the row pipeline must run instead.
+/// Gather one raw key column per project-root sort item over the id columns.
+fn gather_sort_key_cols(
+    graph: &Graph,
+    sort_keys: &[VecSortKey],
+    srcs: &[NodeId],
+    dsts: &[NodeId],
+) -> Result<Vec<Vec<Value>>, String> {
+    let mut key_cols = Vec::with_capacity(sort_keys.len());
+    for key in sort_keys {
+        let ids = if key.is_src { srcs } else { dsts };
+        let cells = props_table(graph, ids, &[key.prop])?
+            .into_iter()
+            .map(|mut row| row.pop().unwrap_or(Value::Null))
+            .collect();
+        key_cols.push(cells);
+    }
+    Ok(key_cols)
+}
+
+/// Order the row indices `0..n` with `sort_all`'s comparator (`json_cmp`
+/// falling back to `json_cmp_total`, the input index as the tiebreak) over
+/// the gathered key columns and return the limit window. The index tiebreak
+/// makes the comparator a total order, so a partition at the limit boundary
+/// selects exactly the rows a full stable sort would put first.
+fn sorted_window(
+    key_cols: &[Vec<Value>],
+    sort_keys: &[VecSortKey],
+    n: usize,
+    limit: Option<(usize, usize)>,
+) -> Vec<usize> {
+    let cmp = |&a: &usize, &b: &usize| {
+        for (k, key) in sort_keys.iter().enumerate() {
+            let (ka, kb) = (&key_cols[k][a], &key_cols[k][b]);
+            let ord = json_cmp(ka, kb).unwrap_or_else(|| json_cmp_total(ka, kb));
+            let ord = if key.ascending { ord } else { ord.reverse() };
+            if ord != std::cmp::Ordering::Equal {
+                return ord;
+            }
+        }
+        a.cmp(&b)
+    };
+    let mut order: Vec<usize> = (0..n).collect();
+    match limit {
+        Some((skip, count)) => {
+            let hi = skip.saturating_add(count).min(n);
+            if hi > 0 {
+                if hi < n {
+                    order.select_nth_unstable_by(hi - 1, cmp);
+                }
+                order[..hi].sort_by(cmp);
+            }
+            order.truncate(hi);
+            order.drain(..skip.min(hi));
+            order
+        }
+        None => {
+            order.sort_by(cmp);
+            order
+        }
+    }
+}
+
 pub(super) fn try_execute_vectorized(
     graph: &Graph,
     plan: &PhysicalOperator,
@@ -848,64 +941,6 @@ pub(super) fn try_execute_vectorized(
 
     match p.root {
         VecRoot::Project { items } => {
-            // Sort over the projection: gather one key column per sort item,
-            // order the row indices with `sort_all`'s comparator (the input
-            // index is the tiebreak, matching its stable order), and keep
-            // only the limit window, so the projection below gathers and
-            // builds just the surviving rows.
-            let (srcs, dsts, n) = match &p.project_sort {
-                Some(sort_keys) => {
-                    let mut key_cols: Vec<Vec<Value>> = Vec::with_capacity(sort_keys.len());
-                    for key in sort_keys {
-                        let ids = if key.is_src { &srcs } else { &dsts };
-                        let cells = props_table(graph, ids, &[key.prop])?
-                            .into_iter()
-                            .map(|mut row| row.pop().unwrap_or(Value::Null))
-                            .collect();
-                        key_cols.push(cells);
-                    }
-                    // The index tiebreak makes this a total order, so a
-                    // partition at the limit boundary selects exactly the
-                    // rows a full stable sort would put first.
-                    let cmp = |&a: &usize, &b: &usize| {
-                        for (k, key) in sort_keys.iter().enumerate() {
-                            let (ka, kb) = (&key_cols[k][a], &key_cols[k][b]);
-                            let ord = json_cmp(ka, kb).unwrap_or_else(|| json_cmp_total(ka, kb));
-                            let ord = if key.ascending { ord } else { ord.reverse() };
-                            if ord != std::cmp::Ordering::Equal {
-                                return ord;
-                            }
-                        }
-                        a.cmp(&b)
-                    };
-                    let mut order: Vec<usize> = (0..n).collect();
-                    let selected = match p.limit {
-                        Some((skip, count)) => {
-                            let hi = skip.saturating_add(count).min(n);
-                            if hi > 0 {
-                                if hi < n {
-                                    order.select_nth_unstable_by(hi - 1, cmp);
-                                }
-                                order[..hi].sort_by(cmp);
-                            }
-                            &order[skip.min(n)..hi]
-                        }
-                        None => {
-                            order.sort_by(cmp);
-                            &order[..]
-                        }
-                    };
-                    let sorted_srcs: Vec<NodeId> = selected.iter().map(|&i| srcs[i]).collect();
-                    let sorted_dsts: Vec<NodeId> = if p.expand.is_some() {
-                        selected.iter().map(|&i| dsts[i]).collect()
-                    } else {
-                        Vec::new()
-                    };
-                    let m = sorted_srcs.len();
-                    (sorted_srcs, sorted_dsts, m)
-                }
-                None => (srcs, dsts, n),
-            };
             // One gather per variable covers every projected property; the
             // record cells are moved out of the tables, not re-cloned.
             let mut src_props: Vec<&str> = Vec::new();
@@ -924,6 +959,85 @@ pub(super) fn try_execute_vectorized(
                     dst_props.push(prop);
                 }
             }
+
+            if p.distinct {
+                // `recognize` sets `distinct` only under a limited sort over
+                // this root; decline rather than panic.
+                let (Some(sort_keys), Some(limit)) = (&p.project_sort, p.limit) else {
+                    return Ok(None);
+                };
+                let mut src_table = props_table(graph, &srcs, &src_props)?;
+                let mut dst_table = props_table(graph, &dsts, &dst_props)?;
+                // The Distinct operator runs below the Sort: dedup on the
+                // raw projected cells (the values the row pipeline keys its
+                // dedup on), keeping the first occurrence in row order, so a
+                // sort key that is not projected reads the surviving row's
+                // value.
+                let mut seen: ahash::AHashSet<String> = ahash::AHashSet::new();
+                let mut survivors: Vec<usize> = Vec::new();
+                for i in 0..n {
+                    use std::fmt::Write as _;
+                    let mut key = String::new();
+                    for &(is_src, j) in &item_cols {
+                        let cell = if is_src {
+                            &src_table[i][j]
+                        } else {
+                            &dst_table[i][j]
+                        };
+                        // `{:?}` escapes string content, so the separator
+                        // cannot collide with a cell.
+                        let _ = write!(key, "{cell:?}\x00");
+                    }
+                    if seen.insert(key) {
+                        survivors.push(i);
+                    }
+                }
+                let surv_srcs: Vec<NodeId> = survivors.iter().map(|&i| srcs[i]).collect();
+                let surv_dsts: Vec<NodeId> = if p.expand.is_some() {
+                    survivors.iter().map(|&i| dsts[i]).collect()
+                } else {
+                    Vec::new()
+                };
+                let key_cols = gather_sort_key_cols(graph, sort_keys, &surv_srcs, &surv_dsts)?;
+                // Survivor positions are in row order, so the window's index
+                // tiebreak matches `sort_all`'s stable order over the
+                // deduplicated stream.
+                let selected = sorted_window(&key_cols, sort_keys, survivors.len(), Some(limit));
+                let mut records = Vec::with_capacity(selected.len());
+                for &s in &selected {
+                    let i = survivors[s];
+                    let mut values = Vec::with_capacity(items.len());
+                    for &(is_src, j) in &item_cols {
+                        let cell = if is_src {
+                            std::mem::take(&mut src_table[i][j])
+                        } else {
+                            std::mem::take(&mut dst_table[i][j])
+                        };
+                        values.push(unpack_sentinels(graph, cell));
+                    }
+                    records.push(Record { values });
+                }
+                return Ok(Some(records));
+            }
+
+            // Sort over the projection: gather one key column per sort item,
+            // order the row indices, and keep only the limit window, so the
+            // projection below gathers and builds just the surviving rows.
+            let (srcs, dsts, n) = match &p.project_sort {
+                Some(sort_keys) => {
+                    let key_cols = gather_sort_key_cols(graph, sort_keys, &srcs, &dsts)?;
+                    let selected = sorted_window(&key_cols, sort_keys, n, p.limit);
+                    let sorted_srcs: Vec<NodeId> = selected.iter().map(|&i| srcs[i]).collect();
+                    let sorted_dsts: Vec<NodeId> = if p.expand.is_some() {
+                        selected.iter().map(|&i| dsts[i]).collect()
+                    } else {
+                        Vec::new()
+                    };
+                    let m = sorted_srcs.len();
+                    (sorted_srcs, sorted_dsts, m)
+                }
+                None => (srcs, dsts, n),
+            };
             let mut src_table = props_table(graph, &srcs, &src_props)?;
             let mut dst_table = props_table(graph, &dsts, &dst_props)?;
 
@@ -1252,12 +1366,12 @@ mod tests {
             // the row pipeline's null fallback reads the alias binding, so
             // the bulk gather of `p.city` could diverge on a missing city.
             "MATCH (p:Person) RETURN p.name AS city ORDER BY p.city ASC LIMIT 2",
-            // DISTINCT under a limited sort: the row pipeline deduplicates
-            // before the limit truncates.
-            "MATCH (a:Person)-[:KNOWS]->(b:Person) \
-             RETURN DISTINCT b.name AS name ORDER BY name ASC LIMIT 2",
             // LIMIT without a sort stays on the streaming row path.
             "MATCH (p:Person) RETURN p.name AS name LIMIT 2",
+            // DISTINCT under a limited sort over an aggregate root: the
+            // operators above the fold have no dedup-before-limit step.
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) \
+             RETURN DISTINCT b.city AS city, count(a) AS n ORDER BY city ASC LIMIT 1",
             // Two-hop chain.
             "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person) RETURN c.name AS name",
             // Relationship property projection.
@@ -1425,6 +1539,38 @@ mod tests {
     }
 
     #[test]
+    fn distinct_limit_matches_row_path() {
+        let (_dir, g) = fixture();
+        for cypher in [
+            // Duplicates collapse before the limit binds: parallel edges and
+            // the shared oslo city produce repeated rows.
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) \
+             RETURN DISTINCT b.name AS name ORDER BY name ASC LIMIT 2",
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) \
+             RETURN DISTINCT b.city AS city ORDER BY city ASC LIMIT 2",
+            // Filter stage under the limited distinct sort.
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE a.age >= 4 \
+             RETURN DISTINCT b.city AS city ORDER BY city ASC LIMIT 5",
+            // Scan-only pipeline.
+            "MATCH (p:Person) RETURN DISTINCT p.city AS city ORDER BY city DESC LIMIT 2",
+            // Two projected columns, sort on one.
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) \
+             RETURN DISTINCT b.name AS name, b.city AS city ORDER BY name ASC LIMIT 3",
+            // SKIP with LIMIT over the deduplicated rows.
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) \
+             RETURN DISTINCT b.name AS name ORDER BY name ASC SKIP 1 LIMIT 2",
+            // LIMIT 0.
+            "MATCH (p:Person) RETURN DISTINCT p.city AS city ORDER BY city ASC LIMIT 0",
+            // Missing property: cal has no city, so a null joins the dedup.
+            "MATCH (p:Person) RETURN DISTINCT p.city AS city ORDER BY city ASC LIMIT 3",
+            // Mixed-kind dedup column: cal's age is the string "old".
+            "MATCH (p:Person) RETURN DISTINCT p.age AS age ORDER BY age DESC LIMIT 3",
+        ] {
+            assert_matches_row_path(&g, cypher);
+        }
+    }
+
+    #[test]
     fn param_filters_match_row_path() {
         let (_dir, g) = fixture();
         let params: std::collections::HashMap<String, serde_json::Value> =
@@ -1554,6 +1700,12 @@ mod tests {
                 "MATCH (a:P)-[:T]->(b:P) \
                  RETURN b.city AS city, b.age AS age ORDER BY city DESC, age ASC LIMIT 3",
                 "MATCH (a:P) RETURN a.age AS age ORDER BY a.city ASC SKIP 1 LIMIT 2",
+                // Limited distinct over the mixed-kind city column: dedup
+                // runs before the sort window.
+                "MATCH (a:P)-[:T]->(b:P) \
+                 RETURN DISTINCT b.city AS city ORDER BY city ASC LIMIT 2",
+                "MATCH (a:P) RETURN DISTINCT a.city AS city, a.age AS age \
+                 ORDER BY age DESC, city ASC SKIP 1 LIMIT 2",
             ] {
                 assert_matches_row_path(&g, cypher);
             }
