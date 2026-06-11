@@ -555,6 +555,15 @@ fn props_table(graph: &Graph, ids: &[NodeId], props: &[&str]) -> Result<Vec<Vec<
         })
 }
 
+/// Single-property gather as one flat column, avoiding the row-major table's
+/// per-row vector allocation.
+fn prop_column(graph: &Graph, ids: &[NodeId], prop: &str) -> Result<Vec<Value>, String> {
+    graph.node_prop_json_column(ids, prop).map_err(|e| match e {
+        issundb_core::Error::NodeNotFound(id) => format!("node not found: {}", id),
+        other => other.to_string(),
+    })
+}
+
 /// The pipeline's flat id columns: the leaf column, plus the expansion target
 /// column once the expansion ran. Filter stages compact both in lockstep, so
 /// row pairs survive or drop together.
@@ -617,11 +626,7 @@ fn resolve_operand(
     match operand {
         VecOperand::Col { var, prop } => {
             let ids = cols.ids_of(*var == src_var);
-            let cells = props_table(graph, ids, &[prop])?
-                .into_iter()
-                .map(|mut row| row.pop().unwrap_or(Value::Null))
-                .collect();
-            Ok(OperandVals::Cells(cells))
+            Ok(OperandVals::Cells(prop_column(graph, ids, prop)?))
         }
         // Literals and parameters read no row, so an empty row evaluates them
         // exactly as the row pipeline would, including the missing-parameter
@@ -788,11 +793,7 @@ fn gather_sort_key_cols(
     let mut key_cols = Vec::with_capacity(sort_keys.len());
     for key in sort_keys {
         let ids = if key.is_src { srcs } else { dsts };
-        let cells = props_table(graph, ids, &[key.prop])?
-            .into_iter()
-            .map(|mut row| row.pop().unwrap_or(Value::Null))
-            .collect();
-        key_cols.push(cells);
+        key_cols.push(prop_column(graph, ids, key.prop)?);
     }
     Ok(key_cols)
 }

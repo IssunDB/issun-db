@@ -3535,6 +3535,33 @@ fn write_part_rows(
     Ok(result_paths)
 }
 
+/// Resolve the verify value of `property` for each index-scan candidate.
+///
+/// The index encoding is not exact (string keys are NUL-terminated and range
+/// bounds compare encoded bytes), so every candidate's actual value must be
+/// re-checked. The in-memory property columns answer that in bulk without
+/// decoding node records; a missing property comes back as `Value::Null`,
+/// which no equality or range check matches, same as the per-record skip. If
+/// the bulk gather fails (a candidate deleted between the index read and the
+/// columns refresh), fall back to per-record reads, which skip such nodes.
+fn index_verify_values(
+    graph: &Graph,
+    candidates: &[NodeId],
+    property: &str,
+) -> Vec<(NodeId, serde_json::Value)> {
+    match graph.node_prop_json_column(candidates, property) {
+        Ok(col) => candidates.iter().copied().zip(col).collect(),
+        Err(_) => candidates
+            .iter()
+            .filter_map(|&cand| {
+                let record = graph.get_node(cand).ok()??;
+                let props = rmp_serde::from_slice::<serde_json::Value>(&record.props).ok()?;
+                Some((cand, props.get(property).cloned()?))
+            })
+            .collect(),
+    }
+}
+
 /// Directly evaluate a streamable leaf operator that is not a `LabelScan`
 /// (`NodeByIdSeek`, `NodeIndexScan`, `NodeRangeScan`, or `SingleRow`). These are
 /// O(1) or index-bounded, so `RowStream::Materialized` evaluates them once on
@@ -3561,17 +3588,11 @@ pub(super) fn eval_leaf(
                 .map_err(|e| e.to_string())?;
 
             let mut filtered = Vec::new();
-            for cand in candidates {
-                if let Ok(Some(record)) = graph.get_node(cand) {
-                    if let Ok(props) = rmp_serde::from_slice::<serde_json::Value>(&record.props) {
-                        if let Some(actual_val) = props.get(property) {
-                            if json_vals_are_equal(actual_val, &val) {
-                                let mut path = SlotRow::empty(schema.clone());
-                                path.bind_local(variable, GraphBinding::Node(cand));
-                                filtered.push(path);
-                            }
-                        }
-                    }
+            for (cand, actual_val) in index_verify_values(graph, &candidates, property) {
+                if json_vals_are_equal(&actual_val, &val) {
+                    let mut path = SlotRow::empty(schema.clone());
+                    path.bind_local(variable, GraphBinding::Node(cand));
+                    filtered.push(path);
                 }
             }
             Ok(filtered)
@@ -3609,34 +3630,28 @@ pub(super) fn eval_leaf(
                 .map_err(|e| e.to_string())?;
 
             let mut filtered = Vec::new();
-            for cand in candidates {
-                if let Ok(Some(record)) = graph.get_node(cand) {
-                    if let Ok(props) = rmp_serde::from_slice::<serde_json::Value>(&record.props) {
-                        if let Some(actual_val) = props.get(property) {
-                            let mut ok = true;
-                            if let Some(ref l_val) = lo_val {
-                                match json_val_cmp(actual_val, l_val) {
-                                    Some(std::cmp::Ordering::Greater) => {}
-                                    Some(std::cmp::Ordering::Equal) if *lo_inclusive => {}
-                                    _ => ok = false,
-                                }
-                            }
-                            if ok {
-                                if let Some(ref h_val) = hi_val {
-                                    match json_val_cmp(actual_val, h_val) {
-                                        Some(std::cmp::Ordering::Less) => {}
-                                        Some(std::cmp::Ordering::Equal) if *hi_inclusive => {}
-                                        _ => ok = false,
-                                    }
-                                }
-                            }
-                            if ok {
-                                let mut path = SlotRow::empty(schema.clone());
-                                path.bind_local(variable, GraphBinding::Node(cand));
-                                filtered.push(path);
-                            }
+            for (cand, actual_val) in index_verify_values(graph, &candidates, property) {
+                let mut ok = true;
+                if let Some(ref l_val) = lo_val {
+                    match json_val_cmp(&actual_val, l_val) {
+                        Some(std::cmp::Ordering::Greater) => {}
+                        Some(std::cmp::Ordering::Equal) if *lo_inclusive => {}
+                        _ => ok = false,
+                    }
+                }
+                if ok {
+                    if let Some(ref h_val) = hi_val {
+                        match json_val_cmp(&actual_val, h_val) {
+                            Some(std::cmp::Ordering::Less) => {}
+                            Some(std::cmp::Ordering::Equal) if *hi_inclusive => {}
+                            _ => ok = false,
                         }
                     }
+                }
+                if ok {
+                    let mut path = SlotRow::empty(schema.clone());
+                    path.bind_local(variable, GraphBinding::Node(cand));
+                    filtered.push(path);
                 }
             }
             Ok(filtered)

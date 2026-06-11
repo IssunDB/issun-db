@@ -384,6 +384,20 @@ impl Graph {
             .with_fresh(&self.storage, |cols| cols.props_table(ids, props))?
     }
 
+    /// Single-property column form of [`Graph::node_props_json_table`]:
+    /// `out[i]` is the value of `prop` on `ids[i]`, as one flat vector, so a
+    /// bulk single-property gather does not pay one row vector allocation per
+    /// id. A missing property reads as `Value::Null`; a nonexistent node is
+    /// [`Error::NodeNotFound`].
+    pub fn node_prop_json_column(
+        &self,
+        ids: &[NodeId],
+        prop: &str,
+    ) -> Result<Vec<serde_json::Value>, Error> {
+        self.prop_columns
+            .with_fresh(&self.storage, |cols| cols.prop_column(ids, prop))?
+    }
+
     /// Group `ids` by the exact value of `prop` through the in-memory
     /// property columns: one dense group code per id, plus one representative
     /// value per code (the first occurrence). Null and missing property

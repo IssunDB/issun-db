@@ -233,6 +233,8 @@ All graph operations go through `Graph`; do not call `Storage` directly from out
 - `node_props_json_table(ids: &[NodeId], props: &[&str]) -> Result<Vec<Vec<serde_json::Value>>, Error>` (bulk row-major property gather
   through the property columns; one columns refresh and one dense-index resolution per id, `Value::Null` for a missing property, and
   `Error::NodeNotFound` for a nonexistent node)
+- `node_prop_json_column(ids: &[NodeId], prop: &str) -> Result<Vec<serde_json::Value>, Error>` (single-property column form of the table
+  gather: one flat vector with no per-row vector allocation; same null and missing-node semantics)
 - `node_prop_group_codes(ids: &[NodeId], prop: &str) -> Result<(Vec<u32>, Vec<serde_json::Value>), Error>` (dense group codes under exact
   value identity of one property, plus one representative value per code; null and missing values share one `Value::Null` code; on a typed
   column no per-row value is materialized)

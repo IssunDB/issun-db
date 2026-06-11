@@ -3035,6 +3035,53 @@ mod tests {
         assert_eq!(ages, vec![20, 30, 40]);
     }
 
+    #[test]
+    fn index_scan_verifies_string_with_embedded_nul() {
+        // The index encodes strings NUL-terminated, so the prefix scan for
+        // "a" also matches the entry for "a\0b"; the verify step must filter
+        // the false positive.
+        let (_dir, graph) = setup_graph();
+        graph
+            .add_node("Person", &serde_json::json!({"name": "a"}))
+            .unwrap();
+        graph
+            .add_node("Person", &serde_json::json!({"name": "a\u{0}b"}))
+            .unwrap();
+        let rows = run(
+            &graph,
+            "MATCH (n:Person) WHERE n.name = 'a' RETURN n.name AS name",
+        );
+        assert_eq!(rows, vec![vec![serde_json::json!("a")]]);
+    }
+
+    #[test]
+    fn range_scan_excludes_mixed_kind_values() {
+        // A min-bound-only range: strings sort after numbers in the encoded
+        // index, so a string-valued candidate reaches the verify step and
+        // must be excluded there; null and missing values never match.
+        let (_dir, graph) = setup_graph();
+        graph
+            .add_node("Person", &serde_json::json!({"age": 30}))
+            .unwrap();
+        graph
+            .add_node("Person", &serde_json::json!({"age": "thirty"}))
+            .unwrap();
+        graph
+            .add_node(
+                "Person",
+                &serde_json::json!({"age": serde_json::Value::Null}),
+            )
+            .unwrap();
+        graph
+            .add_node("Person", &serde_json::json!({"name": "no-age"}))
+            .unwrap();
+        let rows = run(
+            &graph,
+            "MATCH (n:Person) WHERE n.age >= 30 RETURN n.age AS age",
+        );
+        assert_eq!(rows, vec![vec![serde_json::json!(30)]]);
+    }
+
     // --- Chained two-hop factorized expand ---
 
     #[test]
