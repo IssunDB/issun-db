@@ -845,7 +845,7 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
                             .join(":");
                         println!("label={label} props={}", decode_props(&r.props));
                     }
-                    Ok(None) => eprintln!("not found"),
+                    Ok(None) => eprintln!("node {id} not found"),
                     Err(e) => eprintln!("error: {e}"),
                 }
             }
@@ -908,7 +908,7 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
                             decode_props(&r.props)
                         );
                     }
-                    Ok(None) => eprintln!("not found"),
+                    Ok(None) => eprintln!("edge {id} not found"),
                     Err(e) => eprintln!("error: {e}"),
                 }
             }
@@ -926,7 +926,7 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
                 match g.out_neighbors(NodeId::from(id)) {
                     Ok(v) => {
                         if v.is_empty() {
-                            println!("(0 rows)");
+                            println!("no outgoing edges for node {id}");
                         }
                         for ne in v {
                             let etype = g
@@ -946,7 +946,7 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
                 match g.in_neighbors(NodeId::from(id)) {
                     Ok(v) => {
                         if v.is_empty() {
-                            println!("(0 rows)");
+                            println!("no incoming edges for node {id}");
                         }
                         for ne in v {
                             let etype = g
@@ -965,9 +965,13 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
             if let Some(g) = &state.graph {
                 match g.nodes_by_label(&label) {
                     Ok(ids) => {
-                        println!("{} node(s)", ids.len());
-                        for id in &ids {
-                            println!("  {id}");
+                        if ids.is_empty() {
+                            println!("no nodes found for label \"{label}\"");
+                        } else {
+                            println!("{} node(s)", ids.len());
+                            for id in &ids {
+                                println!("  {id}");
+                            }
                         }
                     }
                     Err(e) => eprintln!("error: {e}"),
@@ -978,9 +982,13 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
             if let Some(g) = &state.graph {
                 match g.edges_by_type(&etype) {
                     Ok(ids) => {
-                        println!("{} edge(s)", ids.len());
-                        for id in &ids {
-                            println!("  {id}");
+                        if ids.is_empty() {
+                            println!("no edges found for type \"{etype}\"");
+                        } else {
+                            println!("{} edge(s)", ids.len());
+                            for id in &ids {
+                                println!("  {id}");
+                            }
                         }
                     }
                     Err(e) => eprintln!("error: {e}"),
