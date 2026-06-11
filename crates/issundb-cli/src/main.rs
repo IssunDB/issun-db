@@ -863,8 +863,13 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
         }
         ReplCommand::DeleteNode { id } => {
             if let Some(g) = &state.graph {
-                match g.delete_node(NodeId::from(id)) {
-                    Ok(()) => println!("ok"),
+                let node_id = NodeId::from(id);
+                match g.get_node(node_id) {
+                    Ok(Some(_)) => match g.delete_node(node_id) {
+                        Ok(()) => println!("ok"),
+                        Err(e) => eprintln!("error: {e}"),
+                    },
+                    Ok(None) => eprintln!("node {id} not found"),
                     Err(e) => eprintln!("error: {e}"),
                 }
             }
@@ -915,8 +920,13 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
         }
         ReplCommand::DeleteEdge { id } => {
             if let Some(g) = &state.graph {
-                match g.delete_edge(EdgeId::from(id)) {
-                    Ok(()) => println!("ok"),
+                let edge_id = EdgeId::from(id);
+                match g.get_edge(edge_id) {
+                    Ok(Some(_)) => match g.delete_edge(edge_id) {
+                        Ok(()) => println!("ok"),
+                        Err(e) => eprintln!("error: {e}"),
+                    },
+                    Ok(None) => eprintln!("edge {id} not found"),
                     Err(e) => eprintln!("error: {e}"),
                 }
             }
