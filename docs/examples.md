@@ -90,7 +90,7 @@ fn run_cypher(graph: &Graph) -> Result<(), Box<dyn std::error::Error>> {
 
 ## GraphBLAS Algorithms Example
 
-Leverage safe GraphBLAS bindings for high-performance path-finding and centrality algorithms:
+Use GraphBLAS bindings for path-finding and centrality algorithms:
 
 ```rust
 use issundb::{Graph, NodeId};
@@ -104,7 +104,7 @@ fn run_algorithms(graph: &Graph) -> Result<(), Box<dyn std::error::Error>> {
     // Add weighted edges for path-finding (weight property is 'cost')
     graph.add_edge(n1, n2, "CONNECTS", &serde_json::json!({ "cost": 5 }))?;
     graph.add_edge(n2, n3, "CONNECTS", &serde_json::json!({ "cost": 10 }))?;
-    graph.add_edge(n1, n3, "CONNECTS", &serde_json::json!({ "cost": 20 }))?;;
+    graph.add_edge(n1, n3, "CONNECTS", &serde_json::json!({ "cost": 20 }))?;
 
     // Rebuild the in-memory CSR snapshot for GraphBLAS algorithms
     graph.rebuild_csr()?;

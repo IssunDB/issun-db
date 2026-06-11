@@ -26,7 +26,7 @@ The database is built as a set of modular crates:
 | `issundb-cypher`    | Cypher query parser, AST definitions, planners, and executors.              |
 | `issundb`           | Public facade of IssunDB that provides a unified API for use.               |
 | `issundb-cli`       | IssunDB's REPL.                                                             |
-| `issundb-rest`      | An HTTP server that exposes IssunDB's functionalies over REST API.          |
+| `issundb-rest`      | An HTTP server that exposes IssunDB's functionalities over REST API.        |
 | `issundb-mcp`       | MCP server implementation for IssunDB.                                      |
 | `issundb-py`        | Python bindings for IssunDB.                                                |
 
@@ -36,7 +36,7 @@ The database is built as a set of modular crates:
 
 ## Documentation Sections
 
-- [Getting Started](getting-started.md): Installation, build instructions, basic CLI usage, and using in Rust projects.
+- [Getting Started](getting-started.md): Installation, build instructions, basic CLI usage, and usage in Rust projects.
 - [Code Examples](examples.md): Practical code examples for vector search, text search, and Cypher query execution.
 - [API Reference](api-reference.md): Public Rust API reference, types, and Cypher DDL syntax.
 - [Hybrid Retrieval](hybrid-retrieval.md): Concept overview and implementation guide for GraphRAG pipelines.
