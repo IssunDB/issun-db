@@ -340,7 +340,9 @@ The executor resolves patterns through the physical plan.
 Untyped expansion uses GraphBLAS SpMV; typed expansion reads the CSR snapshot in bulk behind a snapshot-only freshness gate
 (`ensure_snapshot_fresh`, which skips GraphBLAS matrix materialization), falling back to per-source LMDB point reads when the snapshot is stale
 and the source set is small so a write-then-expand workload never pays a rebuild. The optimizer splits top-level `AND` conjunctions in WHERE so
-each conjunct pushes down to its own lowest binder. Bulk label filtering uses `label_idx` point
+each conjunct pushes down to its own lowest binder, and rewrites an equality or range filter over a labeled scan into `NodeIndexScan` or
+`NodeRangeScan` when the property has a declared index; the rewrite recurses through every single-input operator (including `Aggregate`, `Sort`,
+`Limit`, and `Distinct`) and treats a split conjunct's expression form like the structured comparison forms. Bulk label filtering uses `label_idx` point
 lookups (`Graph::label_filter`), and single-property node reads go through the in-memory property columns (`Graph::node_prop_json`).
 A final projection or aggregation over a single-hop expansion executes column-at-a-time through `exec/vectorized.rs`
 (`Graph::node_props_json_table` and `Graph::node_prop_group_codes`); every other shape runs the row pipeline.
