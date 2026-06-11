@@ -12,15 +12,25 @@
 //! Recognized shape, from the root down:
 //!
 //! ```text
-//! [Sort]? [Distinct]? Project [Aggregate]? Stage* [Expand(1 hop, directed) Stage*] Leaf
+//! [Limit]? [Sort]? [Distinct]? Project [Aggregate]? Stage* [Expand(1 hop, directed) Stage*] Leaf
 //! Leaf  := LabelScan | NodeByIdSeek | NodeIndexScan | NodeRangeScan
 //! Stage := Filter(HasLabel)
 //!        | Filter(comparison over single-property reads, literals, and parameters)
 //! ```
 //!
 //! with every projected or grouped expression a single-property read on the
-//! leaf or expansion variable. `Sort` is accepted only over an `Aggregate`
-//! (where the output is small enough that the regular `sort_all` runs on it).
+//! leaf or expansion variable. `Limit` is accepted only directly above a
+//! `Sort` (the row pipeline's top-N shape; a bare `Limit` short-circuits the
+//! streaming row path, which the columnar path could not match). Over a plain
+//! `Project`, every sort key must resolve to a single-property read on a
+//! pipeline variable, either directly (`ORDER BY p.age`) or through a
+//! projected alias (`ORDER BY age` for `p.age AS age`); the sort then runs as
+//! a bulk key gather plus an index sort, and only the surviving window is
+//! projected. Over an `Aggregate` the output is small, so the regular
+//! `sort_all` runs on it. A `Distinct` under a limited sort declines, because
+//! the row pipeline deduplicates before the limit truncates while the caller
+//! deduplicates the built records afterwards.
+//!
 //! Anything else returns `None` and the row pipeline runs unchanged, so
 //! correctness never depends on this recognizer; only performance does. Row
 //! order, group identity, predicate three-valued logic, aggregate typing, and
@@ -29,9 +39,10 @@
 //! flattened per source in scan order, each filter stage compacts the id
 //! columns order-preservingly under the same comparison semantics
 //! (`evaluate_where` for the structured forms, `eval_binary_op` for
-//! comparisons inside `FilterExpr::Expr`), the aggregation reuses `AggState`,
-//! and the operators above the aggregate are the regular `project_rows` and
-//! `sort_all`.
+//! comparisons inside `FilterExpr::Expr`), the sort comparator is `sort_all`'s
+//! (`json_cmp` falling back to `json_cmp_total`, input index as the tiebreak),
+//! the aggregation reuses `AggState`, and the operators above the aggregate
+//! are the regular `project_rows` and `sort_all`.
 
 use std::collections::HashMap;
 
@@ -43,8 +54,8 @@ use crate::plan::{FilterExpr, PhysicalOperator};
 
 use super::expr::{cypher_eq, evaluate_expr, is_nan, json_cmp};
 use super::read::{
-    AggState, eval_leaf, expand_multi_type, group_by_column_name, project_rows, projected_key,
-    rows_to_records, sort_all, unpack_sentinels,
+    AggState, eval_leaf, expand_multi_type, group_by_column_name, json_cmp_total, project_rows,
+    projected_key, rows_to_records, sort_all, unpack_sentinels,
 };
 use super::row::{Bindings, SlotRow, SlotSchema};
 use super::{GraphBinding, Record};
@@ -64,6 +75,17 @@ struct VecPipeline<'a> {
     /// Stages above the expansion, in bottom-up application order.
     above_stages: Vec<VecStage<'a>>,
     root: VecRoot<'a>,
+    /// Resolved sort keys when a `Sort` sits over a plain projection root.
+    project_sort: Option<Vec<VecSortKey<'a>>>,
+    /// `(skip, count)` from a `Limit` directly above the `Sort`.
+    limit: Option<(usize, usize)>,
+}
+
+/// One project-root sort key, resolved to a bulk-gatherable property read.
+struct VecSortKey<'a> {
+    is_src: bool,
+    prop: &'a str,
+    ascending: bool,
 }
 
 enum VecLeaf<'a> {
@@ -214,18 +236,91 @@ fn prop_read<'a>(expr: &'a Expr, src_var: &str, dst_var: Option<&str>) -> Option
     None
 }
 
+/// Resolve the sort keys of a `Sort` over a plain projection root into bulk
+/// property reads, or `None` to decline. A key is either a direct property
+/// read on a pipeline variable, or a reference to a projected alias whose
+/// expression is one; the projected value of such an item is the raw gathered
+/// cell, so both forms order rows exactly as `evaluate_sort_key` does.
+fn resolve_sort_keys<'a>(
+    sort_items: &'a [SortItem],
+    items: &'a [(Expr, Option<String>)],
+    src_var: &str,
+    dst_var: Option<&str>,
+    rel_var: Option<&str>,
+) -> Option<Vec<VecSortKey<'a>>> {
+    let keys: Vec<String> = items
+        .iter()
+        .map(|(expr, alias)| projected_key(expr, alias))
+        .collect();
+    let mut out = Vec::with_capacity(sort_items.len());
+    for si in sort_items {
+        let (is_src, prop) = match &si.expr {
+            Expr::Prop(var, prop) if prop.is_empty() => {
+                // An alias reference. A pipeline variable of the same name
+                // would shadow the projected binding in the row pipeline.
+                if var == src_var || dst_var == Some(var.as_str()) || rel_var == Some(var.as_str())
+                {
+                    return None;
+                }
+                let idx = keys.iter().position(|k| k == var)?;
+                prop_read(&items[idx].0, src_var, dst_var)?
+            }
+            expr => {
+                let read = prop_read(expr, src_var, dst_var)?;
+                // When the property is null, `evaluate_sort_key` falls back
+                // to the `var.prop` and bare `prop` projected bindings, so a
+                // projected key of either name carrying a different value
+                // would diverge from the bulk gather.
+                let Expr::Prop(var, _) = expr else {
+                    return None;
+                };
+                let full = format!("{var}.{}", read.1);
+                for (key, (item_expr, _)) in keys.iter().zip(items) {
+                    if (key == read.1 || *key == full)
+                        && prop_read(item_expr, src_var, dst_var) != Some(read)
+                    {
+                        return None;
+                    }
+                }
+                read
+            }
+        };
+        out.push(VecSortKey {
+            is_src,
+            prop,
+            ascending: si.ascending,
+        });
+    }
+    Some(out)
+}
+
 /// Match `plan` against the recognized shape, or `None` for the row pipeline.
 fn recognize(plan: &PhysicalOperator) -> Option<VecPipeline<'_>> {
-    let (sort_items, below_sort) = match plan {
+    // A Limit is recognized only directly above a Sort: the row pipeline's
+    // top-N shape. A bare Limit short-circuits the streaming row path.
+    let (limit, below_limit) = match plan {
+        PhysicalOperator::Limit { input, skip, count }
+            if matches!(input.as_ref(), PhysicalOperator::Sort { .. }) =>
+        {
+            (Some((*skip, *count)), input.as_ref())
+        }
+        other => (None, other),
+    };
+    let (sort_items, below_sort) = match below_limit {
         PhysicalOperator::Sort { input, items } => (Some(items.as_slice()), input.as_ref()),
         other => (None, other),
     };
     // RETURN DISTINCT plans a Distinct directly above the projection; the
     // caller dedups the built records, so the recognizer sees through it.
-    let below_distinct = match below_sort {
-        PhysicalOperator::Distinct { input, .. } => input.as_ref(),
-        other => other,
+    let (has_distinct, below_distinct) = match below_sort {
+        PhysicalOperator::Distinct { input, .. } => (true, input.as_ref()),
+        other => (false, other),
     };
+    // The row pipeline deduplicates below the sort, before the limit
+    // truncates; the caller's dedup runs after, so the combination declines.
+    if limit.is_some() && has_distinct {
+        return None;
+    }
     let PhysicalOperator::Project {
         input,
         items,
@@ -250,9 +345,10 @@ fn recognize(plan: &PhysicalOperator) -> Option<VecPipeline<'_>> {
             agg_input.as_ref(),
         ),
         other => {
-            // A sort over a plain projection would need the full row set; the
-            // top-N and row paths handle those shapes.
-            if sort_items.is_some() {
+            // Sort keys over a plain projection evaluate against the
+            // projected row; a barrier project drops the pipeline variables,
+            // so the bulk gather could diverge from the fallback lookups.
+            if sort_items.is_some() && *is_barrier {
                 return None;
             }
             (VecRoot::Project { items }, other)
@@ -360,20 +456,16 @@ fn recognize(plan: &PhysicalOperator) -> Option<VecPipeline<'_>> {
         }
     }
 
-    let pipeline = VecPipeline {
-        leaf,
-        src_var,
-        expand,
-        below_stages,
-        above_stages,
-        root,
-    };
-
     // Per-root expression eligibility.
-    match &pipeline.root {
+    let mut project_sort = None;
+    match &root {
         VecRoot::Project { items } => {
             for (expr, _) in items.iter() {
-                prop_read(expr, pipeline.src_var, dst_var)?;
+                prop_read(expr, src_var, dst_var)?;
+            }
+            if let Some(sis) = sort_items {
+                let rel_var = expand.as_ref().map(|x| x.rel_var);
+                project_sort = Some(resolve_sort_keys(sis, items, src_var, dst_var, rel_var)?);
             }
         }
         VecRoot::Aggregate {
@@ -382,7 +474,7 @@ fn recognize(plan: &PhysicalOperator) -> Option<VecPipeline<'_>> {
             ..
         } => {
             for (expr, _) in group_by.iter() {
-                prop_read(expr, pipeline.src_var, dst_var)?;
+                prop_read(expr, src_var, dst_var)?;
             }
             for (agg_fn, inner, _) in aggregations.iter() {
                 let count_like = match inner {
@@ -392,15 +484,14 @@ fn recognize(plan: &PhysicalOperator) -> Option<VecPipeline<'_>> {
                     // aggregate over a whole variable needs the row value.
                     Expr::Prop(var, prop) if prop.is_empty() => {
                         matches!(agg_fn, AggFn::Count { distinct: false })
-                            && (var == pipeline.src_var
-                                || pipeline
-                                    .expand
+                            && (var == src_var
+                                || expand
                                     .as_ref()
                                     .is_some_and(|x| var == x.dst_var || var == x.rel_var))
                     }
                     _ => false,
                 };
-                if !count_like && prop_read(inner, pipeline.src_var, dst_var).is_none() {
+                if !count_like && prop_read(inner, src_var, dst_var).is_none() {
                     return None;
                 }
             }
@@ -409,7 +500,16 @@ fn recognize(plan: &PhysicalOperator) -> Option<VecPipeline<'_>> {
         }
     }
 
-    Some(pipeline)
+    Some(VecPipeline {
+        leaf,
+        src_var,
+        expand,
+        below_stages,
+        above_stages,
+        root,
+        project_sort,
+        limit,
+    })
 }
 
 fn props_table(graph: &Graph, ids: &[NodeId], props: &[&str]) -> Result<Vec<Vec<Value>>, String> {
@@ -748,6 +848,64 @@ pub(super) fn try_execute_vectorized(
 
     match p.root {
         VecRoot::Project { items } => {
+            // Sort over the projection: gather one key column per sort item,
+            // order the row indices with `sort_all`'s comparator (the input
+            // index is the tiebreak, matching its stable order), and keep
+            // only the limit window, so the projection below gathers and
+            // builds just the surviving rows.
+            let (srcs, dsts, n) = match &p.project_sort {
+                Some(sort_keys) => {
+                    let mut key_cols: Vec<Vec<Value>> = Vec::with_capacity(sort_keys.len());
+                    for key in sort_keys {
+                        let ids = if key.is_src { &srcs } else { &dsts };
+                        let cells = props_table(graph, ids, &[key.prop])?
+                            .into_iter()
+                            .map(|mut row| row.pop().unwrap_or(Value::Null))
+                            .collect();
+                        key_cols.push(cells);
+                    }
+                    // The index tiebreak makes this a total order, so a
+                    // partition at the limit boundary selects exactly the
+                    // rows a full stable sort would put first.
+                    let cmp = |&a: &usize, &b: &usize| {
+                        for (k, key) in sort_keys.iter().enumerate() {
+                            let (ka, kb) = (&key_cols[k][a], &key_cols[k][b]);
+                            let ord = json_cmp(ka, kb).unwrap_or_else(|| json_cmp_total(ka, kb));
+                            let ord = if key.ascending { ord } else { ord.reverse() };
+                            if ord != std::cmp::Ordering::Equal {
+                                return ord;
+                            }
+                        }
+                        a.cmp(&b)
+                    };
+                    let mut order: Vec<usize> = (0..n).collect();
+                    let selected = match p.limit {
+                        Some((skip, count)) => {
+                            let hi = skip.saturating_add(count).min(n);
+                            if hi > 0 {
+                                if hi < n {
+                                    order.select_nth_unstable_by(hi - 1, cmp);
+                                }
+                                order[..hi].sort_by(cmp);
+                            }
+                            &order[skip.min(n)..hi]
+                        }
+                        None => {
+                            order.sort_by(cmp);
+                            &order[..]
+                        }
+                    };
+                    let sorted_srcs: Vec<NodeId> = selected.iter().map(|&i| srcs[i]).collect();
+                    let sorted_dsts: Vec<NodeId> = if p.expand.is_some() {
+                        selected.iter().map(|&i| dsts[i]).collect()
+                    } else {
+                        Vec::new()
+                    };
+                    let m = sorted_srcs.len();
+                    (sorted_srcs, sorted_dsts, m)
+                }
+                None => (srcs, dsts, n),
+            };
             // One gather per variable covers every projected property; the
             // record cells are moved out of the tables, not re-cloned.
             let mut src_props: Vec<&str> = Vec::new();
@@ -914,11 +1072,19 @@ pub(super) fn try_execute_vectorized(
             // aggregate are the regular ones, so their semantics cannot
             // diverge from the row pipeline.
             let rows = project_rows(graph, agg_rows, project_items, project_is_barrier, params)?;
+            let bound = p.limit.map(|(skip, count)| skip.saturating_add(count));
             let rows = match sort_items {
-                Some(items) => sort_all(graph, rows, items, None, params),
+                Some(items) => sort_all(graph, rows, items, bound, params),
                 None => rows,
             };
-            Ok(Some(rows_to_records(graph, &return_clause.items, rows)?))
+            let mut records = rows_to_records(graph, &return_clause.items, rows)?;
+            if let Some((skip, count)) = p.limit {
+                if skip > 0 {
+                    records.drain(..skip.min(records.len()));
+                }
+                records.truncate(count);
+            }
+            Ok(Some(records))
         }
     }
 }
@@ -1078,8 +1244,20 @@ mod tests {
             "MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE a = b RETURN b.name AS name",
             // Whole-variable projection.
             "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN b",
-            // Sort over a plain projection.
-            "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN b.name AS name ORDER BY name",
+            // Arithmetic sort key.
+            "MATCH (p:Person) RETURN p.name AS name ORDER BY p.age + 1 ASC LIMIT 2",
+            // Whole-node sort key.
+            "MATCH (p:Person) RETURN p.name AS name ORDER BY p LIMIT 2",
+            // Sort key referencing an alias bound to a different property:
+            // the row pipeline's null fallback reads the alias binding, so
+            // the bulk gather of `p.city` could diverge on a missing city.
+            "MATCH (p:Person) RETURN p.name AS city ORDER BY p.city ASC LIMIT 2",
+            // DISTINCT under a limited sort: the row pipeline deduplicates
+            // before the limit truncates.
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) \
+             RETURN DISTINCT b.name AS name ORDER BY name ASC LIMIT 2",
+            // LIMIT without a sort stays on the streaming row path.
+            "MATCH (p:Person) RETURN p.name AS name LIMIT 2",
             // Two-hop chain.
             "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person) RETURN c.name AS name",
             // Relationship property projection.
@@ -1199,6 +1377,48 @@ mod tests {
             "MATCH (p) WHERE p.age <= 4 RETURN p.name AS name",
             // Empty result: no such label.
             "MATCH (p:Ghost) WHERE p.age > 1 RETURN p.name AS name",
+        ] {
+            assert_matches_row_path(&g, cypher);
+        }
+    }
+
+    #[test]
+    fn order_by_limit_matches_row_path() {
+        let (_dir, g) = fixture();
+        for cypher in [
+            // Alias sort keys over a plain projection, mixed directions.
+            "MATCH (p:Person) RETURN p.name AS name, p.age AS age \
+             ORDER BY age DESC, name ASC LIMIT 2",
+            // Direct property sort key that is not projected.
+            "MATCH (p:Person) RETURN p.name AS name ORDER BY p.age ASC LIMIT 2",
+            // Mixed-kind sort column: cal's age is the string \"old\", so the
+            // total-order fallback decides cross-type comparisons.
+            "MATCH (p:Person) RETURN p.name AS name ORDER BY p.age DESC LIMIT 3",
+            // ORDER BY without a LIMIT.
+            "MATCH (p:Person) RETURN p.name AS name, p.age AS age ORDER BY age ASC",
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN b.name AS name ORDER BY name",
+            // Sort on the expansion target; parallel edges produce equal rows,
+            // so ties fall back to input order.
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) \
+             RETURN b.name AS name ORDER BY b.age DESC LIMIT 3",
+            // Sort key projected without an alias.
+            "MATCH (p:Person) RETURN p.name, p.age ORDER BY p.age ASC LIMIT 2",
+            // SKIP with LIMIT, and SKIP alone.
+            "MATCH (p:Person) RETURN p.name AS name ORDER BY name ASC SKIP 1 LIMIT 2",
+            "MATCH (p:Person) RETURN p.name AS name ORDER BY name ASC SKIP 2",
+            // LIMIT 0.
+            "MATCH (p:Person) RETURN p.name AS name ORDER BY name ASC LIMIT 0",
+            // Sort key missing on some nodes (no city on cal).
+            "MATCH (p:Person) RETURN p.name AS name ORDER BY p.city ASC",
+            // Filter stage under a limited sort.
+            "MATCH (p:Person) WHERE p.age >= 4 \
+             RETURN p.name AS name ORDER BY p.age DESC LIMIT 2",
+            // Aggregate root under Sort and Limit.
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) \
+             RETURN b.city AS city, count(a) AS n ORDER BY n DESC, city ASC LIMIT 1",
+            // DISTINCT with an unlimited sort.
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) \
+             RETURN DISTINCT b.name AS name ORDER BY name DESC",
         ] {
             assert_matches_row_path(&g, cypher);
         }
@@ -1329,6 +1549,11 @@ mod tests {
                 "MATCH (a:P)-[:T]->(b:P) WHERE a.city = 'x' AND b.age < 3 \
                  RETURN b.city AS bc, count(a) AS n ORDER BY bc",
                 "MATCH (a:P) WHERE a.age <> 1 RETURN a.city AS city, a.age AS age",
+                // Top-N over the mixed-kind city column (ties, missing values,
+                // and cross-type ordering), keyed by alias and by property.
+                "MATCH (a:P)-[:T]->(b:P) \
+                 RETURN b.city AS city, b.age AS age ORDER BY city DESC, age ASC LIMIT 3",
+                "MATCH (a:P) RETURN a.age AS age ORDER BY a.city ASC SKIP 1 LIMIT 2",
             ] {
                 assert_matches_row_path(&g, cypher);
             }
