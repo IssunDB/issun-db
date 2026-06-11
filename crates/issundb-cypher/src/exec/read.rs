@@ -3540,7 +3540,7 @@ fn write_part_rows(
 /// O(1) or index-bounded, so `RowStream::Materialized` evaluates them once on
 /// the first pull and drains the result. Kept separate from the `execute_physical`
 /// sink so the sink/leaf relationship cannot recurse.
-fn eval_leaf(
+pub(super) fn eval_leaf(
     graph: &Graph,
     op: &PhysicalOperator,
     params: &HashMap<String, serde_json::Value>,

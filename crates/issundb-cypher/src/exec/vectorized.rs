@@ -1,56 +1,179 @@
-//! Columnar fast path for the final projection or aggregation over a single-hop expansion.
+//! Columnar fast path for the final projection or aggregation over at most a
+//! single-hop expansion.
 //!
 //! The per-row pipeline pays one `SlotRow` clone per expansion row, another
 //! per projection row, and one property-columns lookup per property access.
-//! For the plan shape this module recognizes, none of that is needed: the
+//! For the plan shapes this module recognizes, none of that is needed: the
 //! whole result is computable from flat id columns (one bulk expansion, one
-//! bulk label filter per predicate, one bulk property gather per variable),
-//! so the executor here works column-at-a-time and builds the result records
-//! directly.
+//! bulk label or property filter per predicate, and one bulk property gather
+//! per variable), so the executor here works column-at-a-time and builds the
+//! result records directly.
 //!
 //! Recognized shape, from the root down:
 //!
 //! ```text
-//! [Sort]? [Distinct]? Project [Aggregate]? Filter(HasLabel)* Expand(1 hop, directed) LabelScan
+//! [Sort]? [Distinct]? Project [Aggregate]? Stage* [Expand(1 hop, directed) Stage*] Leaf
+//! Leaf  := LabelScan | NodeByIdSeek | NodeIndexScan | NodeRangeScan
+//! Stage := Filter(HasLabel)
+//!        | Filter(comparison over single-property reads, literals, and parameters)
 //! ```
 //!
 //! with every projected or grouped expression a single-property read on the
-//! scan or expansion variable. `Sort` is accepted only over an `Aggregate`
+//! leaf or expansion variable. `Sort` is accepted only over an `Aggregate`
 //! (where the output is small enough that the regular `sort_all` runs on it).
 //! Anything else returns `None` and the row pipeline runs unchanged, so
 //! correctness never depends on this recognizer; only performance does. Row
-//! order, group identity, aggregate typing, and error surfaces match the row
-//! pipeline exactly: the expansion is flattened per source in scan order, the
-//! aggregation reuses `AggState`, and the operators above the aggregate are
-//! the regular `project_rows` and `sort_all`.
+//! order, group identity, predicate three-valued logic, aggregate typing, and
+//! error surfaces match the row pipeline exactly: the leaf ids come from the
+//! shared leaf evaluator (ascending for a label scan), the expansion is
+//! flattened per source in scan order, each filter stage compacts the id
+//! columns order-preservingly under the same comparison semantics
+//! (`evaluate_where` for the structured forms, `eval_binary_op` for
+//! comparisons inside `FilterExpr::Expr`), the aggregation reuses `AggState`,
+//! and the operators above the aggregate are the regular `project_rows` and
+//! `sort_all`.
 
 use std::collections::HashMap;
 
 use issundb_core::{EdgeId, Graph, NodeId};
 use serde_json::Value;
 
-use crate::ast::{AggFn, Expr, ReturnClause, SortItem};
+use crate::ast::{AggFn, BinaryOperator, Expr, ReturnClause, SortItem};
 use crate::plan::{FilterExpr, PhysicalOperator};
 
+use super::expr::{cypher_eq, evaluate_expr, is_nan, json_cmp};
 use super::read::{
-    AggState, expand_multi_type, group_by_column_name, project_rows, projected_key,
+    AggState, eval_leaf, expand_multi_type, group_by_column_name, project_rows, projected_key,
     rows_to_records, sort_all, unpack_sentinels,
 };
 use super::row::{Bindings, SlotRow, SlotSchema};
 use super::{GraphBinding, Record};
 
-/// The recognized pipeline: one scan, one expansion, label predicates, and a
-/// projection or aggregation root.
+/// The recognized pipeline: one id-producing leaf, an optional single-hop
+/// expansion, vectorizable filter stages, and a projection or aggregation
+/// root.
 struct VecPipeline<'a> {
-    scan_label: Option<&'a str>,
+    leaf: VecLeaf<'a>,
+    /// The variable the leaf binds (and the expansion starts from).
     src_var: &'a str,
+    expand: Option<VecExpand<'a>>,
+    /// Stages between the expansion (or the root chain, when there is no
+    /// expansion) and the leaf, in bottom-up application order. They may
+    /// reference only `src_var`.
+    below_stages: Vec<VecStage<'a>>,
+    /// Stages above the expansion, in bottom-up application order.
+    above_stages: Vec<VecStage<'a>>,
+    root: VecRoot<'a>,
+}
+
+enum VecLeaf<'a> {
+    /// Ids come from `nodes_by_label` (or `all_nodes`), ascending.
+    LabelScan { label: Option<&'a str> },
+    /// `NodeByIdSeek`, `NodeIndexScan`, or `NodeRangeScan`: ids come from the
+    /// row pipeline's own leaf evaluator, preserving its order and checks.
+    Seek(&'a PhysicalOperator),
+}
+
+struct VecExpand<'a> {
+    rel_var: &'a str,
     dst_var: &'a str,
     rel_type: Option<&'a str>,
     is_incoming: bool,
-    /// `HasLabel` predicates above the expand, each on the source or target
-    /// node variable.
-    label_filters: Vec<(&'a str, &'a str)>,
-    root: VecRoot<'a>,
+}
+
+/// One vectorizable filter stage.
+enum VecStage<'a> {
+    /// `FilterExpr::HasLabel`: a bulk label-membership test.
+    HasLabel { var: &'a str, label: &'a str },
+    /// A single comparison whose operands are single-property reads on
+    /// pipeline variables, literals, or parameters.
+    Cmp {
+        /// True for the structured `FilterExpr::Eq..Ge` forms, which follow
+        /// `evaluate_where`; false for a comparison inside `FilterExpr::Expr`,
+        /// which follows `eval_binary_op`. The two differ on NaN and null
+        /// handling, so each is mirrored exactly.
+        structured: bool,
+        op: CmpOp,
+        lhs: VecOperand<'a>,
+        rhs: VecOperand<'a>,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum CmpOp {
+    Eq,
+    Ne,
+    Lt,
+    Gt,
+    Le,
+    Ge,
+}
+
+enum VecOperand<'a> {
+    /// A single-property read on a pipeline variable.
+    Col { var: &'a str, prop: &'a str },
+    /// A literal or parameter, evaluated once per stage application.
+    Const(&'a Expr),
+}
+
+impl<'a> VecStage<'a> {
+    /// Pipeline variables the stage reads.
+    fn vars(&self) -> Vec<&'a str> {
+        match self {
+            VecStage::HasLabel { var, .. } => vec![var],
+            VecStage::Cmp { lhs, rhs, .. } => [lhs, rhs]
+                .into_iter()
+                .filter_map(|operand| match operand {
+                    VecOperand::Col { var, .. } => Some(*var),
+                    VecOperand::Const(_) => None,
+                })
+                .collect(),
+        }
+    }
+}
+
+fn vec_operand(expr: &Expr) -> Option<VecOperand<'_>> {
+    match expr {
+        Expr::Prop(var, prop) if !prop.is_empty() => Some(VecOperand::Col { var, prop }),
+        Expr::Literal(_) | Expr::Param(_) => Some(VecOperand::Const(expr)),
+        _ => None,
+    }
+}
+
+fn cmp_stage<'a>(structured: bool, op: CmpOp, l: &'a Expr, r: &'a Expr) -> Option<VecStage<'a>> {
+    Some(VecStage::Cmp {
+        structured,
+        op,
+        lhs: vec_operand(l)?,
+        rhs: vec_operand(r)?,
+    })
+}
+
+/// Match one `Filter` predicate against the vectorizable stage forms, or
+/// `None` to decline the whole pipeline.
+fn vec_stage(expression: &FilterExpr) -> Option<VecStage<'_>> {
+    match expression {
+        FilterExpr::HasLabel(var, label) => Some(VecStage::HasLabel { var, label }),
+        FilterExpr::Eq(l, r) => cmp_stage(true, CmpOp::Eq, l, r),
+        FilterExpr::Ne(l, r) => cmp_stage(true, CmpOp::Ne, l, r),
+        FilterExpr::Lt(l, r) => cmp_stage(true, CmpOp::Lt, l, r),
+        FilterExpr::Gt(l, r) => cmp_stage(true, CmpOp::Gt, l, r),
+        FilterExpr::Le(l, r) => cmp_stage(true, CmpOp::Le, l, r),
+        FilterExpr::Ge(l, r) => cmp_stage(true, CmpOp::Ge, l, r),
+        FilterExpr::Expr(Expr::BinaryOp { op, left, right }) => {
+            let cmp = match op {
+                BinaryOperator::Eq => CmpOp::Eq,
+                BinaryOperator::Ne => CmpOp::Ne,
+                BinaryOperator::Lt => CmpOp::Lt,
+                BinaryOperator::Gt => CmpOp::Gt,
+                BinaryOperator::Le => CmpOp::Le,
+                BinaryOperator::Ge => CmpOp::Ge,
+                _ => return None,
+            };
+            cmp_stage(false, cmp, left, right)
+        }
+        FilterExpr::Expr(_) => None,
+    }
 }
 
 enum VecRoot<'a> {
@@ -75,15 +198,15 @@ enum AggIn {
     Cell(bool, usize),
 }
 
-/// A single-property read on the scan or expansion variable, the only
+/// A single-property read on the leaf or expansion variable, the only
 /// expression form the columnar executor evaluates itself.
-fn prop_read<'a>(expr: &'a Expr, src_var: &str, dst_var: &str) -> Option<(bool, &'a str)> {
+fn prop_read<'a>(expr: &'a Expr, src_var: &str, dst_var: Option<&str>) -> Option<(bool, &'a str)> {
     if let Expr::Prop(var, prop) = expr {
         if !prop.is_empty() {
             if var == src_var {
                 return Some((true, prop.as_str()));
             }
-            if var == dst_var {
+            if dst_var == Some(var.as_str()) {
                 return Some((false, prop.as_str()));
             }
         }
@@ -136,70 +259,113 @@ fn recognize(plan: &PhysicalOperator) -> Option<VecPipeline<'_>> {
         }
     };
 
-    let mut label_filters = Vec::new();
+    // Filter stages under the root chain. Reversed below to the bottom-up
+    // order the row pipeline applies them in.
+    let mut upper_stages = Vec::new();
     let mut cur = chain_top;
     while let PhysicalOperator::Filter { input, expression } = cur {
-        let FilterExpr::HasLabel(var, label) = expression else {
-            return None;
-        };
-        label_filters.push((var.as_str(), label.as_str()));
+        upper_stages.push(vec_stage(expression)?);
         cur = input.as_ref();
     }
+    upper_stages.reverse();
 
-    let PhysicalOperator::Expand {
-        input,
-        src_var,
-        rel_var,
-        dst_var,
-        rel_type,
-        is_incoming,
-        is_undirected: false,
-        min_hops: 1,
-        max_hops: 1,
-        unique_rels,
-        needs_path: false,
-    } = cur
-    else {
-        return None;
+    // Optional single-hop directed expansion. Source labels and predicates
+    // (`(a:Person:Vip)`, a pushed-down conjunct on `a`) plan as filters
+    // between the expand and the leaf.
+    let (expand, expand_src, below_stages, above_stages, cur) = match cur {
+        PhysicalOperator::Expand {
+            input,
+            src_var,
+            rel_var,
+            dst_var,
+            rel_type,
+            is_incoming,
+            is_undirected: false,
+            min_hops: 1,
+            max_hops: 1,
+            unique_rels,
+            needs_path: false,
+        } => {
+            // A single hop has no sibling relationships; a populated list
+            // means the optimizer wired this hop into a larger pattern.
+            if !unique_rels.is_empty() {
+                return None;
+            }
+            // A self-referencing hop `(a)-->(a)` needs the pre-bound target
+            // guard.
+            if src_var == dst_var {
+                return None;
+            }
+            let mut below_stages = Vec::new();
+            let mut under = input.as_ref();
+            while let PhysicalOperator::Filter { input, expression } = under {
+                below_stages.push(vec_stage(expression)?);
+                under = input.as_ref();
+            }
+            below_stages.reverse();
+            let expand = VecExpand {
+                rel_var,
+                dst_var,
+                rel_type: rel_type.as_deref(),
+                is_incoming: *is_incoming,
+            };
+            (
+                Some(expand),
+                Some(src_var.as_str()),
+                below_stages,
+                upper_stages,
+                under,
+            )
+        }
+        other => (None, None, upper_stages, Vec::new(), other),
     };
-    // A single hop has no sibling relationships; a populated list means the
-    // optimizer wired this hop into a larger pattern.
-    if !unique_rels.is_empty() {
-        return None;
-    }
-    // A self-referencing hop `(a)-->(a)` needs the pre-bound target guard.
-    if src_var == dst_var {
-        return None;
-    }
-    // Additional source labels (`(a:Person:Vip)`) plan as `HasLabel` filters
-    // between the expand and the scan; they restrict the same source rows.
-    let mut below = input.as_ref();
-    while let PhysicalOperator::Filter { input, expression } = below {
-        let FilterExpr::HasLabel(var, label) = expression else {
+
+    let (leaf, leaf_var) = match cur {
+        PhysicalOperator::LabelScan { variable, label } => (
+            VecLeaf::LabelScan {
+                label: label.as_deref(),
+            },
+            variable.as_str(),
+        ),
+        PhysicalOperator::NodeByIdSeek { variable, .. }
+        | PhysicalOperator::NodeIndexScan { variable, .. }
+        | PhysicalOperator::NodeRangeScan { variable, .. } => {
+            (VecLeaf::Seek(cur), variable.as_str())
+        }
+        _ => return None,
+    };
+    // With an expansion the leaf must bind the expansion's source variable.
+    if let Some(src) = expand_src {
+        if leaf_var != src {
             return None;
-        };
-        label_filters.push((var.as_str(), label.as_str()));
-        below = input.as_ref();
+        }
     }
-    let PhysicalOperator::LabelScan { variable, label } = below else {
-        return None;
-    };
-    if variable != src_var {
-        return None;
+    let src_var = leaf_var;
+    let dst_var = expand.as_ref().map(|x| x.dst_var);
+
+    // Stage variable scoping: below the expansion only the leaf variable is
+    // bound; above it, the leaf and target variables are.
+    for stage in &below_stages {
+        if stage.vars().iter().any(|v| *v != src_var) {
+            return None;
+        }
     }
-    for (var, _) in &label_filters {
-        if *var != src_var && *var != dst_var {
+    for stage in &above_stages {
+        if stage
+            .vars()
+            .iter()
+            .any(|v| *v != src_var && Some(*v) != dst_var)
+        {
             return None;
         }
     }
 
     let pipeline = VecPipeline {
-        scan_label: label.as_deref(),
+        leaf,
         src_var,
-        dst_var,
-        rel_type: rel_type.as_deref(),
-        is_incoming: *is_incoming,
-        label_filters,
+        expand,
+        below_stages,
+        above_stages,
         root,
     };
 
@@ -207,7 +373,7 @@ fn recognize(plan: &PhysicalOperator) -> Option<VecPipeline<'_>> {
     match &pipeline.root {
         VecRoot::Project { items } => {
             for (expr, _) in items.iter() {
-                prop_read(expr, pipeline.src_var, pipeline.dst_var)?;
+                prop_read(expr, pipeline.src_var, dst_var)?;
             }
         }
         VecRoot::Aggregate {
@@ -216,7 +382,7 @@ fn recognize(plan: &PhysicalOperator) -> Option<VecPipeline<'_>> {
             ..
         } => {
             for (expr, _) in group_by.iter() {
-                prop_read(expr, pipeline.src_var, pipeline.dst_var)?;
+                prop_read(expr, pipeline.src_var, dst_var)?;
             }
             for (agg_fn, inner, _) in aggregations.iter() {
                 let count_like = match inner {
@@ -227,12 +393,14 @@ fn recognize(plan: &PhysicalOperator) -> Option<VecPipeline<'_>> {
                     Expr::Prop(var, prop) if prop.is_empty() => {
                         matches!(agg_fn, AggFn::Count { distinct: false })
                             && (var == pipeline.src_var
-                                || var == pipeline.dst_var
-                                || var == rel_var)
+                                || pipeline
+                                    .expand
+                                    .as_ref()
+                                    .is_some_and(|x| var == x.dst_var || var == x.rel_var))
                     }
                     _ => false,
                 };
-                if !count_like && prop_read(inner, pipeline.src_var, pipeline.dst_var).is_none() {
+                if !count_like && prop_read(inner, pipeline.src_var, dst_var).is_none() {
                     return None;
                 }
             }
@@ -256,6 +424,226 @@ fn props_table(graph: &Graph, ids: &[NodeId], props: &[&str]) -> Result<Vec<Vec<
         })
 }
 
+/// The pipeline's flat id columns: the leaf column, plus the expansion target
+/// column once the expansion ran. Filter stages compact both in lockstep, so
+/// row pairs survive or drop together.
+struct IdCols {
+    srcs: Vec<NodeId>,
+    dsts: Option<Vec<NodeId>>,
+}
+
+impl IdCols {
+    fn ids_of(&self, is_src: bool) -> &[NodeId] {
+        if is_src {
+            &self.srcs
+        } else {
+            self.dsts.as_deref().unwrap_or(&[])
+        }
+    }
+
+    /// Order-preserving compaction by a per-row keep mask.
+    fn compact(&mut self, mask: &[bool]) {
+        let mut w = 0;
+        for (i, keep) in mask.iter().enumerate() {
+            if *keep {
+                self.srcs[w] = self.srcs[i];
+                if let Some(dsts) = &mut self.dsts {
+                    dsts[w] = dsts[i];
+                }
+                w += 1;
+            }
+        }
+        self.srcs.truncate(w);
+        if let Some(dsts) = &mut self.dsts {
+            dsts.truncate(w);
+        }
+    }
+}
+
+/// A resolved comparison operand: one gathered cell per row, or one constant.
+enum OperandVals {
+    Cells(Vec<Value>),
+    Const(Value),
+}
+
+impl OperandVals {
+    fn get(&self, i: usize) -> &Value {
+        match self {
+            OperandVals::Cells(cells) => &cells[i],
+            OperandVals::Const(value) => value,
+        }
+    }
+}
+
+fn resolve_operand(
+    graph: &Graph,
+    operand: &VecOperand<'_>,
+    params: &HashMap<String, Value>,
+    schema: &std::sync::Arc<SlotSchema>,
+    src_var: &str,
+    cols: &IdCols,
+) -> Result<OperandVals, String> {
+    match operand {
+        VecOperand::Col { var, prop } => {
+            let ids = cols.ids_of(*var == src_var);
+            let cells = props_table(graph, ids, &[prop])?
+                .into_iter()
+                .map(|mut row| row.pop().unwrap_or(Value::Null))
+                .collect();
+            Ok(OperandVals::Cells(cells))
+        }
+        // Literals and parameters read no row, so an empty row evaluates them
+        // exactly as the row pipeline would, including the missing-parameter
+        // error.
+        VecOperand::Const(expr) => {
+            let empty = SlotRow::empty(schema.clone());
+            Ok(OperandVals::Const(evaluate_expr(
+                graph, &empty, expr, params,
+            )?))
+        }
+    }
+}
+
+/// One comparison outcome, mirroring the row pipeline exactly: a row passes
+/// only on TRUE, so the null, NaN, and incomparable outcomes all drop it.
+fn cmp_keeps(structured: bool, op: CmpOp, lv: &Value, rv: &Value) -> bool {
+    use std::cmp::Ordering;
+    if structured {
+        // The structured `FilterExpr::Eq..Ge` forms follow `evaluate_where`.
+        match op {
+            CmpOp::Eq => cypher_eq(lv, rv) == Value::Bool(true),
+            CmpOp::Ne => cypher_eq(lv, rv) == Value::Bool(false),
+            CmpOp::Lt => json_cmp(lv, rv) == Some(Ordering::Less),
+            CmpOp::Gt => json_cmp(lv, rv) == Some(Ordering::Greater),
+            CmpOp::Le => matches!(json_cmp(lv, rv), Some(Ordering::Less | Ordering::Equal)),
+            CmpOp::Ge => matches!(json_cmp(lv, rv), Some(Ordering::Greater | Ordering::Equal)),
+        }
+    } else {
+        // A comparison inside `FilterExpr::Expr` follows `eval_binary_op`.
+        if lv.is_null() || rv.is_null() {
+            return false;
+        }
+        match op {
+            CmpOp::Eq => cypher_eq(lv, rv) == Value::Bool(true),
+            CmpOp::Ne => cypher_eq(lv, rv) == Value::Bool(false),
+            CmpOp::Lt | CmpOp::Gt | CmpOp::Le | CmpOp::Ge => {
+                // An ordered comparison with NaN is FALSE against a number and
+                // NULL otherwise; neither passes the row.
+                if is_nan(lv) || is_nan(rv) {
+                    return false;
+                }
+                match json_cmp(lv, rv) {
+                    None => false,
+                    Some(c) => match op {
+                        CmpOp::Lt => c == Ordering::Less,
+                        CmpOp::Gt => c == Ordering::Greater,
+                        CmpOp::Le => c != Ordering::Greater,
+                        CmpOp::Ge => c != Ordering::Less,
+                        CmpOp::Eq | CmpOp::Ne => false,
+                    },
+                }
+            }
+        }
+    }
+}
+
+/// Bulk label-membership set for `ids`: a label smaller than the column comes
+/// from one `label_idx` prefix scan, a larger one from point lookups on the
+/// distinct ids.
+fn label_pass_set(
+    graph: &Graph,
+    ids: &[NodeId],
+    label: &str,
+) -> Result<ahash::AHashSet<NodeId>, String> {
+    let label_count = graph
+        .node_count_by_label(label)
+        .map_err(|e| e.to_string())? as usize;
+    if label_count <= ids.len() {
+        Ok(graph
+            .nodes_by_label(label)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .collect())
+    } else {
+        let mut distinct = ids.to_vec();
+        distinct.sort_unstable();
+        distinct.dedup();
+        Ok(graph
+            .label_filter(&distinct, label)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .collect())
+    }
+}
+
+/// Apply one filter stage to the id columns in place.
+fn apply_stage(
+    graph: &Graph,
+    stage: &VecStage<'_>,
+    params: &HashMap<String, Value>,
+    schema: &std::sync::Arc<SlotSchema>,
+    src_var: &str,
+    cols: &mut IdCols,
+) -> Result<(), String> {
+    let n = cols.srcs.len();
+    // The row pipeline evaluates a predicate per row, so over zero rows
+    // neither its constants nor its property reads run; a missing parameter
+    // must not error here either.
+    if n == 0 {
+        return Ok(());
+    }
+    let mask: Vec<bool> = match stage {
+        VecStage::HasLabel { var, label } => {
+            let ids = cols.ids_of(*var == src_var);
+            let pass = label_pass_set(graph, ids, label)?;
+            ids.iter().map(|id| pass.contains(id)).collect()
+        }
+        VecStage::Cmp {
+            structured,
+            op,
+            lhs,
+            rhs,
+        } => {
+            let lv = resolve_operand(graph, lhs, params, schema, src_var, cols)?;
+            let rv = resolve_operand(graph, rhs, params, schema, src_var, cols)?;
+            (0..n)
+                .map(|i| cmp_keeps(*structured, *op, lv.get(i), rv.get(i)))
+                .collect()
+        }
+    };
+    cols.compact(&mask);
+    Ok(())
+}
+
+/// Extract the leaf's node ids through the row pipeline's leaf evaluator,
+/// preserving its emission order. `Ok(None)` declines (the leaf bound
+/// something other than a plain node).
+fn leaf_node_ids(
+    graph: &Graph,
+    op: &PhysicalOperator,
+    var: &str,
+    params: &HashMap<String, Value>,
+    schema: &std::sync::Arc<SlotSchema>,
+) -> Result<Option<Vec<NodeId>>, String> {
+    let rows = eval_leaf(graph, op, params, schema)?;
+    let mut ids = Vec::with_capacity(rows.len());
+    for row in rows {
+        match row.get_binding(var) {
+            Some(GraphBinding::Node(n)) => ids.push(*n),
+            _ => return Ok(None),
+        }
+    }
+    Ok(Some(ids))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only switch: when true, `try_execute_vectorized` declines every
+    /// plan, so the row pipeline executes the identical optimized plan and
+    /// the differential tests compare the two executors and nothing else.
+    static DISABLE_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Execute `plan` column-at-a-time if it matches the recognized shape,
 /// producing the final result records directly. `Ok(None)` means the plan is
 /// not eligible and the row pipeline must run instead.
@@ -266,9 +654,14 @@ pub(super) fn try_execute_vectorized(
     params: &HashMap<String, Value>,
     schema: &std::sync::Arc<SlotSchema>,
 ) -> Result<Option<Vec<Record>>, String> {
+    #[cfg(test)]
+    if DISABLE_FOR_TEST.with(|d| d.get()) {
+        return Ok(None);
+    }
     let Some(p) = recognize(plan) else {
         return Ok(None);
     };
+    let dst_var = p.expand.as_ref().map(|x| x.dst_var);
 
     // For the projection root, the records are built positionally from the
     // plan items, so the plan items must correspond one-to-one (by projected
@@ -294,76 +687,64 @@ pub(super) fn try_execute_vectorized(
         }
     }
 
-    // 1. Scan ids, ascending, exactly as the label scan emits them.
-    let mut src_ids = match p.scan_label {
-        Some(l) => graph.nodes_by_label(l).map_err(|e| e.to_string())?,
-        None => graph.all_nodes().map_err(|e| e.to_string())?,
+    // 1. Leaf ids, exactly as the row pipeline's leaf emits them: ascending
+    //    for a label scan, the leaf evaluator's order for a seek.
+    let leaf_ids = match p.leaf {
+        VecLeaf::LabelScan { label } => match label {
+            Some(l) => graph.nodes_by_label(l).map_err(|e| e.to_string())?,
+            None => graph.all_nodes().map_err(|e| e.to_string())?,
+        },
+        VecLeaf::Seek(op) => match leaf_node_ids(graph, op, p.src_var, params, schema)? {
+            Some(ids) => ids,
+            None => return Ok(None),
+        },
+    };
+    let mut cols = IdCols {
+        srcs: leaf_ids,
+        dsts: None,
     };
 
-    // 2. Source-side label predicates read only the source, so restricting
-    //    the sources before expansion yields the same rows in the same order
-    //    as the row pipeline's post-expansion filter.
-    for (_, label) in p.label_filters.iter().filter(|(v, _)| *v == p.src_var) {
-        src_ids = graph
-            .label_filter(&src_ids, label)
-            .map_err(|e| e.to_string())?;
+    // 2. Stages below the expansion restrict the leaf rows, in plan order;
+    //    they read only the leaf variable, so restricting before expansion
+    //    yields the same rows in the same order as the row pipeline.
+    for stage in &p.below_stages {
+        apply_stage(graph, stage, params, schema, p.src_var, &mut cols)?;
     }
 
     // 3. Bulk expansion, flattened per source in scan order: the row order
     //    the per-row pipeline produces.
-    let transitions = expand_multi_type(graph, &src_ids, p.rel_type, p.is_incoming)?;
-    let mut per_src: ahash::AHashMap<NodeId, Vec<(EdgeId, NodeId)>> = ahash::AHashMap::new();
-    for (s, e, d) in transitions {
-        per_src.entry(s).or_default().push((e, d));
-    }
-    let row_estimate: usize = per_src.values().map(Vec::len).sum();
-    let mut srcs: Vec<NodeId> = Vec::with_capacity(row_estimate);
-    let mut dsts: Vec<NodeId> = Vec::with_capacity(row_estimate);
-    for &s in &src_ids {
-        if let Some(v) = per_src.get(&s) {
-            for &(_, d) in v {
-                srcs.push(s);
-                dsts.push(d);
+    if let Some(x) = &p.expand {
+        let transitions = expand_multi_type(graph, &cols.srcs, x.rel_type, x.is_incoming)?;
+        let mut per_src: ahash::AHashMap<NodeId, Vec<(EdgeId, NodeId)>> = ahash::AHashMap::new();
+        for (s, e, d) in transitions {
+            per_src.entry(s).or_default().push((e, d));
+        }
+        let row_estimate: usize = per_src.values().map(Vec::len).sum();
+        let mut srcs: Vec<NodeId> = Vec::with_capacity(row_estimate);
+        let mut dsts: Vec<NodeId> = Vec::with_capacity(row_estimate);
+        for &s in &cols.srcs {
+            if let Some(v) = per_src.get(&s) {
+                for &(_, d) in v {
+                    srcs.push(s);
+                    dsts.push(d);
+                }
             }
         }
+        cols = IdCols {
+            srcs,
+            dsts: Some(dsts),
+        };
     }
 
-    // 4. Target-side label predicates: one bulk membership set, then an
-    //    order-preserving compaction of the id columns. A label smaller than
-    //    the target column comes from one `label_idx` prefix scan; a larger
-    //    one from point lookups on the distinct targets.
-    for (_, label) in p.label_filters.iter().filter(|(v, _)| *v == p.dst_var) {
-        let label_count = graph
-            .node_count_by_label(label)
-            .map_err(|e| e.to_string())? as usize;
-        let pass: ahash::AHashSet<NodeId> = if label_count <= dsts.len() {
-            graph
-                .nodes_by_label(label)
-                .map_err(|e| e.to_string())?
-                .into_iter()
-                .collect()
-        } else {
-            let mut distinct = dsts.clone();
-            distinct.sort_unstable();
-            distinct.dedup();
-            graph
-                .label_filter(&distinct, label)
-                .map_err(|e| e.to_string())?
-                .into_iter()
-                .collect()
-        };
-        let mut w = 0;
-        for i in 0..dsts.len() {
-            if pass.contains(&dsts[i]) {
-                srcs[w] = srcs[i];
-                dsts[w] = dsts[i];
-                w += 1;
-            }
-        }
-        srcs.truncate(w);
-        dsts.truncate(w);
+    // 4. Stages above the expansion, in plan order, each compacting the id
+    //    columns in lockstep.
+    for stage in &p.above_stages {
+        apply_stage(graph, stage, params, schema, p.src_var, &mut cols)?;
     }
-    let n = dsts.len();
+
+    let n = cols.srcs.len();
+    let srcs = cols.srcs;
+    let dsts = cols.dsts.unwrap_or_default();
 
     match p.root {
         VecRoot::Project { items } => {
@@ -374,7 +755,7 @@ pub(super) fn try_execute_vectorized(
             let mut item_cols = Vec::with_capacity(items.len());
             for (expr, _) in items.iter() {
                 // Already validated by `recognize`; decline rather than panic.
-                let Some((is_src, prop)) = prop_read(expr, p.src_var, p.dst_var) else {
+                let Some((is_src, prop)) = prop_read(expr, p.src_var, dst_var) else {
                     return Ok(None);
                 };
                 if is_src {
@@ -416,7 +797,7 @@ pub(super) fn try_execute_vectorized(
             let mut group_codes = Vec::with_capacity(group_by.len());
             for (expr, _) in group_by.iter() {
                 // Already validated by `recognize`; decline rather than panic.
-                let Some((is_src, prop)) = prop_read(expr, p.src_var, p.dst_var) else {
+                let Some((is_src, prop)) = prop_read(expr, p.src_var, dst_var) else {
                     return Ok(None);
                 };
                 let ids = if is_src { &srcs } else { &dsts };
@@ -435,7 +816,7 @@ pub(super) fn try_execute_vectorized(
             let mut dst_props: Vec<&str> = Vec::new();
             let mut agg_inputs = Vec::with_capacity(aggregations.len());
             for (_, inner, _) in aggregations.iter() {
-                match prop_read(inner, p.src_var, p.dst_var) {
+                match prop_read(inner, p.src_var, dst_var) {
                     Some((is_src, prop)) => {
                         let props = if is_src {
                             &mut src_props
@@ -596,34 +977,52 @@ mod tests {
         (dir, g)
     }
 
-    /// Run `cypher` (vectorized-eligible) and its row-path twin, asserting
-    /// identical columns and records, in order. The twin disables the fast
-    /// path with a residual filter no recognizer arm accepts.
+    /// Run `cypher` with the fast path declined, so the row pipeline executes
+    /// the identical optimized plan.
+    fn row_path_execute(
+        graph: &Graph,
+        cypher: &str,
+        params: &std::collections::HashMap<String, serde_json::Value>,
+    ) -> Result<crate::QueryResult, crate::CypherError> {
+        DISABLE_FOR_TEST.with(|d| d.set(true));
+        let out = execute(graph, cypher, params);
+        DISABLE_FOR_TEST.with(|d| d.set(false));
+        out
+    }
+
+    /// Run `cypher` (vectorized-eligible) through both executors over the same
+    /// optimized plan, asserting identical columns and records, in order, or
+    /// an identical error.
     fn assert_matches_row_path(graph: &Graph, cypher: &str) {
+        assert_matches_row_path_with_params(graph, cypher, &std::collections::HashMap::new());
+    }
+
+    fn assert_matches_row_path_with_params(
+        graph: &Graph,
+        cypher: &str,
+        params: &std::collections::HashMap<String, serde_json::Value>,
+    ) {
         let plan = optimized_plan(graph, cypher);
         assert!(
             recognize(&plan).is_some(),
             "expected a vectorized-eligible plan for: {cypher}\n{plan:?}"
         );
-        let forced = match cypher.find(" RETURN ") {
-            Some(idx) => format!(
-                "{} WHERE a.__force_row_path IS NULL {}",
-                &cypher[..idx],
-                &cypher[idx + 1..]
-            ),
-            None => panic!("query has no RETURN"),
-        };
-        assert!(
-            recognize(&optimized_plan(graph, &forced)).is_none(),
-            "the forced twin must not vectorize: {forced}"
-        );
-        let params = std::collections::HashMap::new();
-        let fast = execute(graph, cypher, &params).unwrap();
-        let slow = execute(graph, &forced, &params).unwrap();
-        assert_eq!(fast.columns, slow.columns, "columns for: {cypher}");
-        let fast_rows: Vec<_> = fast.records.iter().map(|r| &r.values).collect();
-        let slow_rows: Vec<_> = slow.records.iter().map(|r| &r.values).collect();
-        assert_eq!(fast_rows, slow_rows, "records for: {cypher}");
+        let fast = execute(graph, cypher, params);
+        let slow = row_path_execute(graph, cypher, params);
+        match (fast, slow) {
+            (Ok(fast), Ok(slow)) => {
+                assert_eq!(fast.columns, slow.columns, "columns for: {cypher}");
+                let fast_rows: Vec<_> = fast.records.iter().map(|r| &r.values).collect();
+                let slow_rows: Vec<_> = slow.records.iter().map(|r| &r.values).collect();
+                assert_eq!(fast_rows, slow_rows, "records for: {cypher}");
+            }
+            (Err(fast), Err(slow)) => {
+                assert_eq!(fast.to_string(), slow.to_string(), "errors for: {cypher}");
+            }
+            (fast, slow) => {
+                panic!("one path errored for: {cypher}\nfast: {fast:?}\nslow: {slow:?}")
+            }
+        }
     }
 
     #[test]
@@ -666,8 +1065,17 @@ mod tests {
             "MATCH (a:Person)-[:KNOWS*1..2]->(b:Person) RETURN b.name AS name",
             // Undirected hop.
             "MATCH (a:Person)-[:KNOWS]-(b:Person) RETURN b.name AS name",
-            // Non-label residual predicate.
-            "MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE b.age > 1 RETURN b.name AS name",
+            // Relationship-property predicate.
+            "MATCH (a:Person)-[r:KNOWS]->(b:Person) WHERE r.weight > 1 RETURN b.name AS name",
+            // Arithmetic inside a comparison operand.
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE b.age + 1 > 2 RETURN b.name AS name",
+            // IS NULL predicate.
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE b.city IS NULL RETURN b.name AS name",
+            // OR predicate.
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) \
+             WHERE b.age > 90 OR b.age < 2 RETURN b.name AS name",
+            // Whole-variable comparison operand.
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE a = b RETURN b.name AS name",
             // Whole-variable projection.
             "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN b",
             // Sort over a plain projection.
@@ -739,6 +1147,97 @@ mod tests {
         ] {
             assert_matches_row_path(&g, cypher);
         }
+    }
+
+    #[test]
+    fn property_filters_match_row_path() {
+        let (_dir, g) = fixture();
+        for cypher in [
+            // Range conjuncts on the expansion target.
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) \
+             WHERE b.age >= 4 AND b.age < 40 RETURN b.name AS name",
+            // Equality on a string property, including a node missing it.
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE b.city = 'oslo' RETURN b.name AS name",
+            // Inequality.
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE b.age <> 4 RETURN b.name AS name",
+            // Constant on the left.
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE 4 <= b.age RETURN b.name AS name",
+            // Two property reads compared to each other.
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE a.age > b.age RETURN b.name AS name",
+            // Mixed-kind column: cal's age is the string \"old\".
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE b.age > 0 RETURN b.name AS name",
+            // Source-side property predicate (pushes below the expand).
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE a.age > 5 RETURN b.name AS name",
+            // Filter feeding an aggregation.
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) \
+             WHERE b.age >= 4 RETURN b.city AS city, count(a) AS n ORDER BY city",
+            // Equality predicate on the source: an index-scan leaf when the
+            // optimizer rewrites it, a filter stage otherwise.
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE a.name = 'ada' RETURN b.name AS name",
+            // Comparison with a null literal matches no row.
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE b.age = null RETURN b.name AS name",
+        ] {
+            assert_matches_row_path(&g, cypher);
+        }
+    }
+
+    #[test]
+    fn scan_only_pipelines_match_row_path() {
+        let (_dir, g) = fixture();
+        for cypher in [
+            // Full-scan projection with no expansion.
+            "MATCH (p:Person) RETURN p.name AS name, p.age AS age, p.city AS city",
+            // Scan-only filter plus projection.
+            "MATCH (p:Person) WHERE p.age >= 4 RETURN p.name AS name",
+            // Range conjuncts: an index range-scan leaf when rewritten.
+            "MATCH (p:Person) WHERE p.age >= 4 AND p.age < 40 RETURN count(p) AS n",
+            // Scan-only grouped aggregation.
+            "MATCH (p:Person) RETURN p.city AS city, count(*) AS n ORDER BY city",
+            // Scan-only equality.
+            "MATCH (p:Person) WHERE p.city = 'oslo' RETURN p.name AS name",
+            // Unlabeled scan with a filter.
+            "MATCH (p) WHERE p.age <= 4 RETURN p.name AS name",
+            // Empty result: no such label.
+            "MATCH (p:Ghost) WHERE p.age > 1 RETURN p.name AS name",
+        ] {
+            assert_matches_row_path(&g, cypher);
+        }
+    }
+
+    #[test]
+    fn param_filters_match_row_path() {
+        let (_dir, g) = fixture();
+        let params: std::collections::HashMap<String, serde_json::Value> =
+            [("min".to_string(), json!(4))].into_iter().collect();
+        for cypher in [
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE b.age >= $min RETURN b.name AS name",
+            "MATCH (p:Person) WHERE p.age >= $min RETURN p.name AS name",
+        ] {
+            assert_matches_row_path_with_params(&g, cypher, &params);
+        }
+    }
+
+    #[test]
+    fn missing_param_matches_row_path_errors() {
+        let (_dir, g) = fixture();
+        let params = std::collections::HashMap::new();
+        // With matching rows reaching the filter, both paths surface the same
+        // missing-parameter error.
+        let cypher = "MATCH (a:Person)-[:KNOWS]->(b:Person) \
+                      WHERE b.age >= $min RETURN b.name AS name";
+        assert!(recognize(&optimized_plan(&g, cypher)).is_some());
+        let fast = execute(&g, cypher, &params).unwrap_err();
+        let slow = row_path_execute(&g, cypher, &params).unwrap_err();
+        assert_eq!(fast.to_string(), slow.to_string());
+
+        // With no rows reaching the filter, neither path evaluates the
+        // parameter, so neither errors.
+        let cypher = "MATCH (a:Ghost)-[:KNOWS]->(b:Person) \
+                      WHERE b.age >= $min RETURN b.name AS name";
+        assert!(recognize(&optimized_plan(&g, cypher)).is_some());
+        let fast = execute(&g, cypher, &params).unwrap();
+        let slow = row_path_execute(&g, cypher, &params).unwrap();
+        assert!(fast.records.is_empty() && slow.records.is_empty());
     }
 
     #[test]
@@ -824,6 +1323,12 @@ mod tests {
                 "MATCH (a:P)-[:T]->(b:P) RETURN a.city AS ac, b.city AS bc, b.age AS age",
                 "MATCH (a:P)-[:T]->(b:P) \
                  RETURN b.city AS city, count(a) AS n, sum(b.age) AS s ORDER BY city",
+                // Property predicates over the mixed-kind city column (strings,
+                // a number, and missing values) and the numeric age column.
+                "MATCH (a:P)-[:T]->(b:P) WHERE b.age >= 2 RETURN b.city AS bc, b.age AS age",
+                "MATCH (a:P)-[:T]->(b:P) WHERE a.city = 'x' AND b.age < 3 \
+                 RETURN b.city AS bc, count(a) AS n ORDER BY bc",
+                "MATCH (a:P) WHERE a.age <> 1 RETURN a.city AS city, a.age AS age",
             ] {
                 assert_matches_row_path(&g, cypher);
             }
