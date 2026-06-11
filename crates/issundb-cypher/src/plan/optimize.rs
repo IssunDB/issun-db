@@ -1813,6 +1813,47 @@ impl Optimizer {
                 closing_is_undirected,
                 closing_unique_rels,
             },
+            PhysicalOperator::Aggregate {
+                input,
+                group_by,
+                aggregations,
+            } => PhysicalOperator::Aggregate {
+                input: Box::new(Self::optimize_index_scans(*input, stats)),
+                group_by,
+                aggregations,
+            },
+            PhysicalOperator::Sort { input, items } => PhysicalOperator::Sort {
+                input: Box::new(Self::optimize_index_scans(*input, stats)),
+                items,
+            },
+            PhysicalOperator::Limit { input, skip, count } => PhysicalOperator::Limit {
+                input: Box::new(Self::optimize_index_scans(*input, stats)),
+                skip,
+                count,
+            },
+            PhysicalOperator::Distinct { input, keys } => PhysicalOperator::Distinct {
+                input: Box::new(Self::optimize_index_scans(*input, stats)),
+                keys,
+            },
+            PhysicalOperator::OptionalMatch { input, null_vars } => {
+                PhysicalOperator::OptionalMatch {
+                    input: Box::new(Self::optimize_index_scans(*input, stats)),
+                    null_vars,
+                }
+            }
+            PhysicalOperator::WritePart { input, part } => PhysicalOperator::WritePart {
+                input: Box::new(Self::optimize_index_scans(*input, stats)),
+                part,
+            },
+            PhysicalOperator::ProcedureCall {
+                input,
+                output_vars,
+                rows,
+            } => PhysicalOperator::ProcedureCall {
+                input: Box::new(Self::optimize_index_scans(*input, stats)),
+                output_vars,
+                rows,
+            },
             leaf => leaf,
         }
     }
@@ -3295,6 +3336,54 @@ mod tests {
         assert!(
             finds_index_scan_on(&plan, "a"),
             "index-backed endpoint must win over raw cardinality: {plan:?}"
+        );
+    }
+
+    /// True when the plan contains a `NodeIndexScan` binding `var`, looking
+    /// through every single-input operator.
+    fn contains_index_scan_on(op: &PhysicalOperator, var: &str) -> bool {
+        match op {
+            PhysicalOperator::NodeIndexScan { variable, .. } => variable == var,
+            PhysicalOperator::Expand { input, .. }
+            | PhysicalOperator::Filter { input, .. }
+            | PhysicalOperator::Project { input, .. }
+            | PhysicalOperator::Aggregate { input, .. }
+            | PhysicalOperator::Sort { input, .. }
+            | PhysicalOperator::Limit { input, .. }
+            | PhysicalOperator::Distinct { input, .. }
+            | PhysicalOperator::MultiwayJoin { input, .. } => contains_index_scan_on(input, var),
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn index_scan_rewrite_reaches_below_an_aggregate() {
+        // The probe-count shape: an equality filter on the anchored start node
+        // under a grouping-free count. The Aggregate sits between the plan root
+        // and the filtered scan, and must not stop the index-scan pass.
+        let stats = TestStats::new(&[("Person", 10_000)]).with_index("Person", "id");
+        let plan = optimize_query(
+            "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person) \
+             WHERE a.id = 1 RETURN count(c) AS n",
+            &stats,
+        );
+        assert!(
+            contains_index_scan_on(&plan, "a"),
+            "aggregate root must not block the index-scan rewrite: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn index_scan_rewrite_reaches_below_sort_distinct_and_limit() {
+        let stats = TestStats::new(&[("Person", 10_000)]).with_index("Person", "city");
+        let plan = optimize_query(
+            "MATCH (a:Person) WHERE a.city = 'london' \
+             RETURN DISTINCT a.age AS age ORDER BY age LIMIT 5",
+            &stats,
+        );
+        assert!(
+            contains_index_scan_on(&plan, "a"),
+            "Limit, Sort, and Distinct must not block the index-scan rewrite: {plan:?}"
         );
     }
 
