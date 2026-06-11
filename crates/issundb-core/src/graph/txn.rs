@@ -50,6 +50,11 @@ impl ReadTxn<'_> {
         self.graph.vector_bytes_impl(&self.rtxn)
     }
 
+    #[doc(hidden)]
+    pub fn get_vector_bytes(&self, n: NodeId) -> Result<Option<Vec<u8>>, Error> {
+        self.graph.get_vector_bytes_impl(&self.rtxn, n)
+    }
+
     pub fn has_node_property_index(&self, label: &str, property: &str) -> Result<bool, Error> {
         self.graph
             .has_node_property_index_impl(&self.rtxn, label, property)
@@ -193,6 +198,11 @@ impl WriteTxn<'_> {
     #[doc(hidden)]
     pub fn vector_bytes(&self) -> Result<Vec<(NodeId, Vec<u8>)>, Error> {
         self.graph.vector_bytes_impl(&self.wtxn)
+    }
+
+    #[doc(hidden)]
+    pub fn get_vector_bytes(&self, n: NodeId) -> Result<Option<Vec<u8>>, Error> {
+        self.graph.get_vector_bytes_impl(&self.wtxn, n)
     }
 
     pub fn has_node_property_index(&self, label: &str, property: &str) -> Result<bool, Error> {

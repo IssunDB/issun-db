@@ -559,9 +559,17 @@ impl Optimizer {
                 input_weight.saturating_mul(rel_weight)
             }
             // Filter nodes inside barrier-Project subtrees are not stripped by
-            // `extract_filters` (barrier Projects are opaque).  When `plan_weight`
-            // recurses into such a subtree, treat the Filter as transparent.
-            PhysicalOperator::Filter { input, .. } => Self::plan_weight(input, stats),
+            // `extract_filters` (barrier Projects are opaque). Scale the child
+            // weight by the estimated filter selectivity. The no-estimate
+            // fallback is 1.0 (a transparent filter, the prior behavior), so
+            // plan choice only changes when statistics actually exist.
+            PhysicalOperator::Filter { input, expression } => {
+                let child_weight = Self::plan_weight(input, stats);
+                let selectivity = stats
+                    .and_then(|s| s.estimate_filter_selectivity(expression))
+                    .unwrap_or(1.0);
+                ((child_weight as f64 * selectivity).ceil() as usize).max(1)
+            }
             PhysicalOperator::Project { input, .. } => Self::plan_weight(input, stats),
             PhysicalOperator::HashJoin { left, right } => {
                 Self::plan_weight(left, stats).saturating_mul(Self::plan_weight(right, stats))
@@ -2980,6 +2988,71 @@ mod tests {
         } else {
             panic!("expected HashJoin");
         }
+    }
+
+    #[test]
+    fn test_filter_selectivity_weight() {
+        struct SelectiveStats {
+            selectivity: Option<f64>,
+        }
+        impl StatsProvider for SelectiveStats {
+            fn node_count_by_label(&self, _label: &str) -> Option<u64> {
+                Some(1000)
+            }
+            fn edge_count_by_type(&self, _etype: &str) -> Option<u64> {
+                None
+            }
+            fn estimate_filter_selectivity(&self, _expr: &FilterExpr) -> Option<f64> {
+                self.selectivity
+            }
+        }
+
+        let input_scan = PhysicalOperator::LabelScan {
+            variable: "a".to_string(),
+            label: Some("Person".to_string()),
+        };
+        // Weight of scan is node_count_by_label("Person") = 1000 when stats is present.
+
+        let filter_plan = PhysicalOperator::Filter {
+            input: Box::new(input_scan),
+            expression: FilterExpr::Eq(
+                Expr::Prop("a".to_string(), "age".to_string()),
+                Expr::Literal(Literal::Int(42)),
+            ),
+        };
+
+        // Case 1: no selectivity estimate. The filter is transparent, the
+        // behavior before selectivity-aware weighting.
+        let stats_none = SelectiveStats { selectivity: None };
+        assert_eq!(
+            Optimizer::plan_weight(&filter_plan, Some(&stats_none)),
+            1000
+        );
+
+        // Case 2: Stats provider with 0.1 selectivity.
+        // ceil(1000 * 0.1) = 100.
+        let stats_01 = SelectiveStats {
+            selectivity: Some(0.1),
+        };
+        assert_eq!(Optimizer::plan_weight(&filter_plan, Some(&stats_01)), 100);
+
+        // Case 3: Stats provider with 0.05 selectivity.
+        // ceil(1000 * 0.05) = 50.
+        let stats_005 = SelectiveStats {
+            selectivity: Some(0.05),
+        };
+        assert_eq!(Optimizer::plan_weight(&filter_plan, Some(&stats_005)), 50);
+
+        // Case 4: Highly selective filter where selectivity = 0.0001.
+        // ceil(1000 * 0.0001) = 1, ensuring `.max(1)` works.
+        let stats_00001 = SelectiveStats {
+            selectivity: Some(0.0001),
+        };
+        assert_eq!(Optimizer::plan_weight(&filter_plan, Some(&stats_00001)), 1);
+
+        // Case 5: no stats provider at all. The label scan weight defaults to
+        // 1 and the filter stays transparent.
+        assert_eq!(Optimizer::plan_weight(&filter_plan, None), 1);
     }
 
     #[test]

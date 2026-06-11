@@ -106,6 +106,8 @@ pub struct VectorSearchArgs {
     pub label: Option<String>,
     /// Optional property key-value filters. Only nodes matching all filters are returned.
     pub properties: Option<HashMap<String, Value>>,
+    /// Optional rescore factor for quantized indexes.
+    pub rescore_factor: Option<usize>,
 }
 
 fn default_limit() -> usize {
@@ -262,6 +264,7 @@ impl IssunMcp {
             k: args.k,
             label: args.label,
             properties: args.properties,
+            rescore_factor: args.rescore_factor,
         };
         let hits = self
             .graph
@@ -582,6 +585,7 @@ mod tests {
                 k: 1,
                 label: None,
                 properties: None,
+                rescore_factor: None,
             }))
             .expect("vector_search");
         let hits = body(result);
@@ -598,6 +602,7 @@ mod tests {
                 k: 5,
                 label: None,
                 properties: None,
+                rescore_factor: None,
             }))
             .expect_err("empty vector");
         assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
@@ -625,6 +630,7 @@ mod tests {
                 k: 1,
                 label: None,
                 properties: Some(filters),
+                rescore_factor: None,
             }))
             .expect("vector_search with filter");
         let hits = body(result);

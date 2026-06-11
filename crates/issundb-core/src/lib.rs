@@ -2,6 +2,7 @@ pub(crate) mod columns;
 pub(crate) mod csr;
 mod error;
 mod graph;
+pub(crate) mod histogram;
 pub(crate) mod matrices;
 mod schema;
 pub(crate) mod storage;

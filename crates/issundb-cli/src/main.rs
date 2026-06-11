@@ -343,6 +343,9 @@ enum ReplCommand {
         /// JSON object of property key-value filters (e.g., `--props {"team":"blue"}`)
         #[arg(long)]
         props: Option<String>,
+        /// Optional rescore factor for quantized indexes
+        #[arg(long = "rescore-factor")]
+        rescore_factor: Option<usize>,
     },
 
     /// Run hybrid retrieval over vector seeds, optional text seeds, and graph
@@ -1116,6 +1119,7 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
             query,
             label,
             props,
+            rescore_factor,
         } => {
             if let Some(g) = &state.graph {
                 let properties = match props.as_deref().map(parse_prop_filters) {
@@ -1130,6 +1134,7 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
                     k,
                     label,
                     properties,
+                    rescore_factor,
                 };
                 match g.vector_search_with(&query, &opts) {
                     Ok(hits) => print_hits(&hits),
