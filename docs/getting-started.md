@@ -6,9 +6,9 @@ This guide provides instructions to help you build, configure, and query IssunDB
 
 To compile the database and its native dependencies, ensure you have Rust 1.85.0 or later installed on your system, along with the following:
 
-- **Build Tools**: CMake and a C/C++ compiler (Clang or GCC) to build the SuiteSparse:GraphBLAS static library.
-- **FFI Bindings**: `libclang`, which `bindgen` uses to build raw GraphBLAS wrappers.
-- **OpenMP Runtime**: Resolves to `libgomp` (bundled with GCC) on Linux, `libomp` on macOS (`brew install libomp`), and `vcomp` (part of the MSVC
+- Build Tools: CMake and a C/C++ compiler (Clang or GCC) to build the SuiteSparse:GraphBLAS static library.
+- FFI Bindings: `libclang`, which `bindgen` uses to build raw GraphBLAS wrappers.
+- OpenMP Runtime: Resolves to `libgomp` (bundled with GCC) on Linux, `libomp` on macOS (`brew install libomp`), and `vcomp` (part of the MSVC
   runtime) on Windows.
 
 ## Build from Source
@@ -16,12 +16,11 @@ To compile the database and its native dependencies, ensure you have Rust 1.85.0
 You can build the workspace (including the core storage engine, query layer, and interactive CLI) by running:
 
 ```bash
-# Clone the repository and initialize submodules
-git clone https://github.com/IssunDB/issun-db.git
+# Clone the repository (with Git submodules included)
+git clone --recursive https://github.com/IssunDB/issun-db.git
 cd issun-db
-git submodule update --init --recursive
 
-# Build release binaries
+# Build release binaries (this can take a while first time)
 make build
 ```
 
@@ -30,7 +29,7 @@ make build
 Launch the interactive REPL binary to manage and query your database manually:
 
 ```bash
-# Launch with the default database location
+# Launch the CLI (with the default database location)
 make repl
 
 # Launch with a custom database directory
@@ -82,31 +81,41 @@ These subcommands perform direct graph operations, algorithm executions, vector 
 | `pagerank`            | Compute PageRank centrality scores (e.g., `pagerank 20 0.85`).                                     |
 | `components`          | Find weakly connected components in the graph.                                                     |
 | `degree`              | Compute degree centrality (e.g., `degree out`).                                                    |
+| `rebuild-csr`         | Rebuild the in-memory CSR snapshot cache.                                                          |
 | `upsert-vec`          | Attach/upsert a vector embedding on a node (e.g., `upsert-vec 1 0.1 0.2 0.3`).                     |
 | `vsearch`             | Query the vector index for $k$-nearest neighbors (e.g., `vsearch 5 0.1 0.2 0.3`).                  |
 | `retrieve`            | Execute hybrid retrieval over vector and text indexes (e.g., `retrieve 5 2 0.1 0.2 --text query`). |
 | `configure-vec`       | Configure vector index metric and quantization (e.g., `configure-vec cosine int8`).                |
 | `text-index`          | Configure and manage full-text indexes (e.g., `text-index create Book title`).                     |
+| `text-search`         | Query the BM25 full-text search index (e.g., `text-search "query" Book summary 5`).                |
 
 ---
 
 ## Embed in a Rust Project
 
-To use the database in your own Rust application, add the `issundb` facade dependency to your `Cargo.toml` file:
+To use the database in your own Rust application, add the `issundb` facade and `serde_json` dependencies to your `Cargo.toml` file:
+
+```toml
+[dependencies]
+issundb = "version" # Like "0.1.0" or "0.1.1-alpha.4"
+serde_json = "1.0"   # Used to construct property maps
+```
+
+Or
 
 ```toml
 [dependencies]
 issundb = { path = "../path/to/crates/issundb" }
 ```
 
-You can then open a database environment, execute transactions, and run queries programmatically:
+You can then open a database environment, execute transactions, and run queries through the Rust API:
 
 ```rust
 use std::path::Path;
 use issundb::Graph;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Open the graph database with a map size limit (in GB)
+    // Open the graph database with a memory map size limit (in GB)
     let graph = Graph::open(Path::new("./data"), 10)?;
 
     // Insert nodes and edges via the API

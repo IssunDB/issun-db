@@ -8,9 +8,10 @@ You can insert vector embeddings for nodes and perform $k$-nearest-neighbor sear
 
 ```rust
 use issundb::{Graph, VectorGraphExt};
+use serde_json::json;
 
 fn run_vector_search(graph: &Graph) -> Result<(), Box<dyn std::error::Error>> {
-    let doc_node = graph.add_node("Document", &serde_json::json!({ "title": "Rust Guide" }))?;
+    let doc_node = graph.add_node("Document", &json!({ "title": "Rust Guide" }))?;
 
     // Upsert a 3-dimensional vector embedding for the node
     graph.upsert_vector(doc_node, &[0.1, 0.9, 0.4])?;
@@ -20,7 +21,7 @@ fn run_vector_search(graph: &Graph) -> Result<(), Box<dyn std::error::Error>> {
     let hits = graph.vector_search(&query_vector, 5)?;
 
     for hit in hits {
-        println!("Node ID: {:?}, Distance: {}", hit.node_id, hit.distance);
+        println!("Node ID: {:?}, Distance: {}", hit.node, hit.distance);
     }
     Ok(())
 }
@@ -32,13 +33,14 @@ Create a text index on specific node properties to support unstructured text que
 
 ```rust
 use issundb::{Graph, TextIndexExt, TextGraphExt, TextSearchOptions};
+use serde_json::json;
 
 fn run_text_search(graph: &Graph) -> Result<(), Box<dyn std::error::Error>> {
     // Create full-text search index
     graph.create_text_index("Book", "summary")?;
 
     // Add nodes with indexed properties
-    graph.add_node("Book", &serde_json::json!({
+    graph.add_node("Book", &json!({
         "title": "Programming in Rust",
         "summary": "An introduction to Rust, systems programming, and memory safety."
     }))?;
@@ -48,7 +50,7 @@ fn run_text_search(graph: &Graph) -> Result<(), Box<dyn std::error::Error>> {
     let hits = graph.text_search("memory safety", &opts)?;
 
     for hit in hits {
-        println!("Match found on Node: {:?} with score: {}", hit.node_id, hit.score);
+        println!("Match found on Node: {:?} with score: {}", hit.node, hit.score);
     }
     Ok(())
 }
@@ -90,21 +92,22 @@ fn run_cypher(graph: &Graph) -> Result<(), Box<dyn std::error::Error>> {
 
 ## GraphBLAS Algorithms Example
 
-Leverage safe GraphBLAS bindings for high-performance path-finding and centrality algorithms:
+Use GraphBLAS bindings for path-finding and centrality algorithms:
 
 ```rust
 use issundb::{Graph, NodeId};
+use serde_json::json;
 
 fn run_algorithms(graph: &Graph) -> Result<(), Box<dyn std::error::Error>> {
     // Populate a sample path
-    let n1 = graph.add_node("Station", &serde_json::json!({ "name": "Station A" }))?;
-    let n2 = graph.add_node("Station", &serde_json::json!({ "name": "Station B" }))?;
-    let n3 = graph.add_node("Station", &serde_json::json!({ "name": "Station C" }))?;
+    let n1 = graph.add_node("Station", &json!({ "name": "Station A" }))?;
+    let n2 = graph.add_node("Station", &json!({ "name": "Station B" }))?;
+    let n3 = graph.add_node("Station", &json!({ "name": "Station C" }))?;
 
     // Add weighted edges for path-finding (weight property is 'cost')
-    graph.add_edge(n1, n2, "CONNECTS", &serde_json::json!({ "cost": 5 }))?;
-    graph.add_edge(n2, n3, "CONNECTS", &serde_json::json!({ "cost": 10 }))?;
-    graph.add_edge(n1, n3, "CONNECTS", &serde_json::json!({ "cost": 20 }))?;;
+    graph.add_edge(n1, n2, "CONNECTS", &json!({ "cost": 5 }))?;
+    graph.add_edge(n2, n3, "CONNECTS", &json!({ "cost": 10 }))?;
+    graph.add_edge(n1, n3, "CONNECTS", &json!({ "cost": 20 }))?;
 
     // Rebuild the in-memory CSR snapshot for GraphBLAS algorithms
     graph.rebuild_csr()?;
@@ -112,7 +115,8 @@ fn run_algorithms(graph: &Graph) -> Result<(), Box<dyn std::error::Error>> {
     // 1. Dijkstra Shortest Path: Finds the cheapest path using the 'cost' property
     let path = graph.shortest_path_top_k(n1, n3, 1, "cost")?;
     if let Some(shortest) = path.first() {
-        println!("Cheapest path: {:?}", shortest); // Should go A -> B -> C (total cost = 15)
+        println!("Cheapest path nodes: {:?}", shortest.nodes); // Should go Station A -> Station B -> Station C
+        println!("Total cost: {}", shortest.total_weight);     // Total cost = 15.0
     }
 
     // 2. PageRank: Run 20 iterations of PageRank centrality with damping 0.85
