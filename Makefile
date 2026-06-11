@@ -292,6 +292,11 @@ docs: format ## Generate the documentation
 	@echo "Generating MkDocs documentation..."
 	@uv run python -c "import yaml.nodes; import yaml; yaml.Node = yaml.nodes.Node; from mkdocs.__main__ import cli; cli()" build
 
+.PHONY: docs-serve
+docs-serve: ## Serve the MkDocs documentation locally
+	@echo "Serving MkDocs documentation..."
+	@uv run python -c "import yaml.nodes; import yaml; yaml.Node = yaml.nodes.Node; from mkdocs.__main__ import cli; cli()" serve
+
 .PHONY: figs
 figs: ## Generate the figures in the assets directory
 	@echo "Generating figures..."

@@ -2,7 +2,7 @@ site_name: IssunDB Documentation
 site_description: A fast embedded graph database in Rust
 repo_url: https://github.com/IssunDB/issun-db
 repo_name: IssunDB/issun-db
-site_url: https://habedi.github.io/ricevm/
+site_url: https://issundb.github.io/issun-db/
 
 theme:
   name: material
