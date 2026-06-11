@@ -97,7 +97,7 @@ To use the database in your own Rust application, add the `issundb` facade and `
 
 ```toml
 [dependencies]
-issundb = "version" # Like "0.1.0" or "0.1.1-alpha.4"
+issundb = "version" # Like "0.1.0" or "0.1.0-alpha.4"
 serde_json = "1.0"   # Used to construct property maps
 ```
 
