@@ -6,8 +6,8 @@ IssunDB provides integration servers to expose graph operations, vector search, 
 
 ## HTTP REST API
 
-The `issundb-rest` crate provides an HTTP REST server built on Axum. It serves versioned endpoints for node/edge CRUD, text/vector searches, and query
-execution.
+The `issundb-rest` crate provides an HTTP REST server built on Axum. It serves versioned endpoints for node/edge CRUD, text and vector searches,
+and query execution.
 
 ### Start the REST Server
 
@@ -149,3 +149,39 @@ The server registers the following tools with the connecting client:
 9. `explain`: Evaluates and prints a Cypher query's physical plan.
 10. `search_text`: Queries the BM25 full-text search index.
 11. `search_vector`: Performs a k-nearest-neighbor vector similarity search.
+
+### Client Configurations
+
+To connect an LLM client (like Claude Code) to the IssunDB MCP server, you can use the following configurations:
+
+### Streamable HTTP
+
+```json
+{
+    "mcpServers": {
+        "issundb": {
+            "url": "http://issundb-mcp-server-host:8000/mcp/"
+        }
+    }
+}
+```
+
+Note that `issundb-mcp-server-host:8000` must be the actual host (or ip) and port of the MCP server.
+
+#### Stdio
+
+```json
+{
+    "mcpServers": {
+        "issundb": {
+            "command": "/absolute/path/to/issun-db/target/release/issundb-mcp",
+            "args": [
+                "--db-path",
+                "/absolute/path/to/db-dir",
+                "--transport",
+                "stdio"
+            ]
+        }
+    }
+}
+```
