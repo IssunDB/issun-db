@@ -24,7 +24,7 @@ The database is built as a set of modular crates:
 | `issundb-text`      | Tokenizer implementation, inverted indexes, and BM25 text search scoring.   |
 | `issundb-retrieval` | Multi-source hybrid retrieval, rank fusion, and graph traversal.            |
 | `issundb-cypher`    | Cypher query parser, AST definitions, planners, and executors.              |
-| `issundb`           | Public facade of IssunDB that provides a unified API for use.               |
+| `issundb`           | Public facade (the API) of IssunDB that provides a unified API for use.     |
 | `issundb-cli`       | IssunDB's REPL.                                                             |
 | `issundb-rest`      | An HTTP server that exposes IssunDB's functionalities over REST API.        |
 | `issundb-mcp`       | MCP server implementation for IssunDB.                                      |

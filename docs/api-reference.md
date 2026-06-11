@@ -1,6 +1,6 @@
 # API Reference
 
-This page documents the structures, modules, and extension traits exposed through the public `issundb` facade.
+This page documents the structures, modules, and extension traits exposed through the public `issundb` facade (the API exposed by `issundb` crate).
 
 ## Core Graph Interface
 
