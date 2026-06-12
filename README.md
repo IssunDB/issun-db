@@ -23,7 +23,8 @@ IssunDB is a fast embedded graph database written in Rust.
 It can be embedded in Rust applications without the need for a server, and can be used for a wide range of applications such as building
 GraphRAG pipelines and querying knowledge graphs.
 
-**Check out the benchmarks for IssunDB against a few other graph databases [here](https://github.com/IssunDB/graph-benchmarks).**
+* **Check out the benchmarks for IssunDB against a few other graph databases [here](https://github.com/IssunDB/graph-benchmarks).**
+* **Check out a few example applications built using IssunDB [here](https://github.com/IssunDB/example-apps).**
 
 ### Key Features
 
@@ -129,6 +130,7 @@ docker run --rm -p 8000:8000 -v issundb-data:/data ghcr.io/issundb/issundb:lates
 ### Documentation
 
 The project documentation is available [here](https://issundb.github.io/issun-db/).
+The rust API documentation is available on [docs.rs/issundb](https://docs.rs/issundb).
 
 #### Rust Examples
 
