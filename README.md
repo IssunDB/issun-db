@@ -130,7 +130,7 @@ docker run --rm -p 8000:8000 -v issundb-data:/data ghcr.io/issundb/issundb:lates
 ### Documentation
 
 The project documentation is available [here](https://issundb.github.io/issun-db/).
-The rust API documentation is available on [docs.rs/issundb](https://docs.rs/issundb).
+The Rust API documentation is available on [docs.rs/issundb](https://docs.rs/issundb).
 
 #### Rust Examples
 
