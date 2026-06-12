@@ -1,7 +1,7 @@
 # Clippy configuration for IssunDB.
 # Applied when running: cargo clippy --workspace
 
-# Storage functions can be long
+# Some of the functions in the storage engine can be long
 cognitive-complexity-threshold = 30
 
 # Minimum supported Rust version
