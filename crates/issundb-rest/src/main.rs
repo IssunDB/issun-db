@@ -16,6 +16,10 @@ struct Args {
     #[arg(long, env = "ISSUNDB_DB_PATH")]
     db_path: PathBuf,
 
+    /// LMDB map size in gigabytes (defaults to 4).
+    #[arg(long, default_value_t = 4)]
+    map_size_gb: usize,
+
     /// Host address to listen on. Falls back to the ISSUNDB_REST_HOST
     /// environment variable when the flag is omitted (the container image sets
     /// it to 0.0.0.0).
@@ -35,7 +39,7 @@ async fn main() -> anyhow::Result<()> {
     fmt().with_env_filter(EnvFilter::from_default_env()).init();
 
     info!(db_path = %args.db_path.display(), "opening graph");
-    let graph = Graph::open(&args.db_path, 4)?;
+    let graph = Graph::open(&args.db_path, args.map_size_gb)?;
     let graph = Arc::new(graph);
 
     let router = routes::build_router(graph);

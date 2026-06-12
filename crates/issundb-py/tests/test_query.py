@@ -37,3 +37,15 @@ def test_explain_returns_plan_text(db):
 def test_query_rejects_invalid_cypher(db):
     with pytest.raises(RuntimeError):
         db.query("MATCH (n RETURN n")
+
+
+def test_query_with_params(db):
+    db.add_node("Person", json.dumps({"name": "Ada"}))
+    db.add_node("Person", json.dumps({"name": "Bob"}))
+    result = json.loads(
+        db.query(
+            "MATCH (n:Person) WHERE n.name = $who RETURN n.name AS name",
+            json.dumps({"who": "Ada"})
+        )
+    )
+    assert rows(result) == [["Ada"]]

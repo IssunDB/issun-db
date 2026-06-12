@@ -38,10 +38,12 @@ pub struct PyGraph {
 
 #[pymethods]
 impl PyGraph {
-    /// Open or create an IssunDB graph at `path`.
+    /// Open or create an IssunDB graph at `path`, specifying optional LMDB map size in GB.
     #[new]
-    fn new(path: &str) -> PyResult<Self> {
-        let graph = Graph::open(Path::new(path), 1)
+    #[pyo3(signature = (path, map_size_gb=None))]
+    fn new(path: &str, map_size_gb: Option<usize>) -> PyResult<Self> {
+        let size = map_size_gb.unwrap_or(1);
+        let graph = Graph::open(Path::new(path), size)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
         Ok(Self { graph })
     }
@@ -96,6 +98,20 @@ impl PyGraph {
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
 
+    /// Add a label to node `id`. No-op if it already has it.
+    fn add_label(&self, id: u64, label: &str) -> PyResult<()> {
+        self.graph
+            .add_label(id, label)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Remove a label from node `id`. No-op if missing.
+    fn remove_label(&self, id: u64, label: &str) -> PyResult<()> {
+        self.graph
+            .remove_label(id, label)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+
     /// Insert a directed edge from `src` to `dst` with edge type `etype` and JSON-encoded `props`.
     /// Returns the new edge ID.
     fn add_edge(&self, src: u64, dst: u64, etype: &str, props: &str) -> PyResult<u64> {
@@ -126,21 +142,34 @@ impl PyGraph {
         }
     }
 
+    /// Replace the properties of edge `id` with JSON-encoded `props`.
+    fn update_edge(&self, id: u64, props: &str) -> PyResult<()> {
+        let value: serde_json::Value = serde_json::from_str(props)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        self.graph
+            .update_edge(id, &value)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+
     /// Delete edge `id`.
     fn delete_edge(&self, id: u64) -> PyResult<()> {
         self.graph.delete_edge(id).map_err(rt)
     }
 
-    /// Execute a Cypher query and return the result as a JSON string.
+    /// Execute a Cypher query with optional JSON-encoded parameter bindings and return the result as a JSON string.
     ///
     /// The returned object has the shape `{"columns": [...], "records": [[...]]}`.
-    fn query(&self, cypher: &str) -> PyResult<String> {
-        let result = self
-            .graph
-            .query(cypher)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-        serde_json::to_string(&result)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    #[pyo3(signature = (cypher, params=None))]
+    fn query(&self, cypher: &str, params: Option<String>) -> PyResult<String> {
+        let result = match params {
+            None => self.graph.query(cypher).map_err(rt)?,
+            Some(s) => {
+                let map: HashMap<String, serde_json::Value> = serde_json::from_str(&s)
+                    .map_err(|e| val(format!("parameters must be a JSON object: {e}")))?;
+                self.graph.query_with_params(cypher, &map).map_err(rt)?
+            }
+        };
+        serde_json::to_string(&result).map_err(rt)
     }
 
     /// Compile `cypher`, optimize the physical plan, and return it as a human-readable tree.
@@ -380,6 +409,16 @@ impl PyGraph {
         self.graph
             .backup_compact(Path::new(path))
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Remove the indexed vector for node `id`.
+    fn remove_vector(&self, id: u64) -> PyResult<()> {
+        self.graph.remove_vector(id).map_err(rt)
+    }
+
+    /// Check if a full-text index exists on `property` for nodes with `label`.
+    fn has_text_index(&self, label: &str, property: &str) -> PyResult<bool> {
+        self.graph.has_text_index(label, property).map_err(rt)
     }
 
     /// Restore a snapshot file at `snapshot` into a new database directory at `dst`.

@@ -573,3 +573,109 @@ async fn docs_ui_is_served_as_html() {
     let html = String::from_utf8(bytes.to_vec()).expect("utf8 html");
     assert!(html.contains("<!doctype html") || html.contains("<!DOCTYPE html"));
 }
+
+#[tokio::test]
+async fn delete_vector_is_idempotent() {
+    let (graph, _dir) = fresh_graph();
+    let id = create_node(&graph, "Doc", json!({})).await;
+    let (status, _) = send(
+        &graph,
+        post(
+            "/v1/vectors",
+            json!({ "id": id, "vector": [1.0, 0.0, 0.0] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _) = send(&graph, delete(&format!("/v1/vectors/{id}"))).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // A repeat delete of the same vector also reports 204.
+    let (status, _) = send(&graph, delete(&format!("/v1/vectors/{id}"))).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn add_and_remove_node_label() {
+    let (graph, _dir) = fresh_graph();
+    let id = create_node(&graph, "Person", json!({ "name": "Ada" })).await;
+
+    let (status, _) = send(
+        &graph,
+        post(&format!("/v1/nodes/{id}/labels/Admin"), json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (status, body) = send(&graph, get(&format!("/v1/nodes/{id}"))).await;
+    assert_eq!(status, StatusCode::OK);
+    let labels = body["labels"].as_array().expect("labels array");
+    assert!(labels.contains(&json!("Admin")), "labels: {labels:?}");
+
+    let (status, _) = send(&graph, delete(&format!("/v1/nodes/{id}/labels/Admin"))).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (status, body) = send(&graph, get(&format!("/v1/nodes/{id}"))).await;
+    assert_eq!(status, StatusCode::OK);
+    let labels = body["labels"].as_array().expect("labels array");
+    assert!(!labels.contains(&json!("Admin")), "labels: {labels:?}");
+}
+
+#[tokio::test]
+async fn add_label_to_missing_node_is_not_found() {
+    let (graph, _dir) = fresh_graph();
+    let (status, _) = send(&graph, post("/v1/nodes/999/labels/Admin", json!({}))).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn remove_label_from_missing_node_is_idempotent() {
+    // `Graph::remove_label` is a no-op for a missing node or label, so the
+    // route reports 204.
+    let (graph, _dir) = fresh_graph();
+    let (status, _) = send(&graph, delete("/v1/nodes/999/labels/Admin")).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn update_edge_replaces_props() {
+    let (graph, _dir) = fresh_graph();
+    let src = create_node(&graph, "Person", json!({})).await;
+    let dst = create_node(&graph, "Person", json!({})).await;
+    let (_, body) = send(
+        &graph,
+        post(
+            "/v1/edges",
+            json!({ "src": src, "dst": dst, "type": "KNOWS", "props": { "since": 2020 } }),
+        ),
+    )
+    .await;
+    let edge_id = body["id"].as_u64().unwrap();
+
+    let (status, _) = send(
+        &graph,
+        put(
+            &format!("/v1/edges/{edge_id}"),
+            json!({ "props": { "since": 2024, "source": "referral" } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (status, body) = send(&graph, get(&format!("/v1/edges/{edge_id}"))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["props"]["since"], 2024);
+    assert_eq!(body["props"]["source"], "referral");
+}
+
+#[tokio::test]
+async fn update_missing_edge_is_not_found() {
+    let (graph, _dir) = fresh_graph();
+    let (status, _) = send(
+        &graph,
+        put("/v1/edges/999", json!({ "props": { "since": 2024 } })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}

@@ -61,3 +61,12 @@ def test_delete_node_detaches_edges(db):
         db.query("MATCH (:Person)-[r:KNOWS]->(:Person) RETURN count(r) AS c")
     )
     assert rows(result) == [[0]]
+
+
+def test_update_edge(db):
+    alice = db.add_node("Person", json.dumps({"name": "Alice"}))
+    bob = db.add_node("Person", json.dumps({"name": "Bob"}))
+    eid = db.add_edge(alice, bob, "KNOWS", json.dumps({"since": 2021}))
+    db.update_edge(eid, json.dumps({"since": 2022, "source": "referral"}))
+    edge = json.loads(db.get_edge(eid))
+    assert edge["props"] == {"since": 2022, "source": "referral"}

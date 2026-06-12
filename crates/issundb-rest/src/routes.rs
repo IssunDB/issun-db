@@ -134,6 +134,13 @@ pub struct UpdateNodeBody {
 }
 
 #[derive(Deserialize, ToSchema)]
+pub struct UpdateEdgeBody {
+    /// Replacement JSON property map for the edge.
+    #[serde(default)]
+    pub props: Value,
+}
+
+#[derive(Deserialize, ToSchema)]
 pub struct CreateEdgeBody {
     pub src: u64,
     pub dst: u64,
@@ -423,7 +430,6 @@ pub async fn update_node(
     params(("id" = u64, Path, description = "Node id")),
     responses(
         (status = 204, description = "Node deleted"),
-        (status = 404, description = "Node not found", body = ErrorResponse),
         (status = 500, description = "Storage error", body = ErrorResponse),
     ),
 )]
@@ -431,9 +437,60 @@ pub async fn delete_node(State(graph): State<AppState>, PathU64(id): PathU64) ->
     join(tokio::task::spawn_blocking(move || {
         match graph.delete_node(id) {
             Ok(()) => StatusCode::NO_CONTENT.into_response(),
+            Err(e) => internal(e).into_response(),
+        }
+    }))
+    .await
+}
+
+/// Add a label to a node.
+#[utoipa::path(
+    post, path = "/v1/nodes/{id}/labels/{label}", tag = "nodes",
+    params(
+        ("id" = u64, Path, description = "Node id"),
+        ("label" = String, Path, description = "Label name")
+    ),
+    responses(
+        (status = 204, description = "Label added"),
+        (status = 404, description = "Node not found", body = ErrorResponse),
+        (status = 500, description = "Storage error", body = ErrorResponse),
+    ),
+)]
+pub async fn add_node_label(
+    State(graph): State<AppState>,
+    Path((id, label)): Path<(u64, String)>,
+) -> Response {
+    join(tokio::task::spawn_blocking(move || {
+        match graph.add_label(id, &label) {
+            Ok(()) => StatusCode::NO_CONTENT.into_response(),
             Err(issundb::Error::NodeNotFound(_)) => {
                 not_found(format!("node {id} not found")).into_response()
             }
+            Err(e) => internal(e).into_response(),
+        }
+    }))
+    .await
+}
+
+/// Remove a label from a node.
+#[utoipa::path(
+    delete, path = "/v1/nodes/{id}/labels/{label}", tag = "nodes",
+    params(
+        ("id" = u64, Path, description = "Node id"),
+        ("label" = String, Path, description = "Label name")
+    ),
+    responses(
+        (status = 204, description = "Label removed"),
+        (status = 500, description = "Storage error", body = ErrorResponse),
+    ),
+)]
+pub async fn remove_node_label(
+    State(graph): State<AppState>,
+    Path((id, label)): Path<(u64, String)>,
+) -> Response {
+    join(tokio::task::spawn_blocking(move || {
+        match graph.remove_label(id, &label) {
+            Ok(()) => StatusCode::NO_CONTENT.into_response(),
             Err(e) => internal(e).into_response(),
         }
     }))
@@ -512,13 +569,40 @@ pub async fn get_edge(State(graph): State<AppState>, PathU64(id): PathU64) -> Re
     .await
 }
 
+/// Replace an edge's property map.
+#[utoipa::path(
+    put, path = "/v1/edges/{id}", tag = "edges",
+    params(("id" = u64, Path, description = "Edge id")),
+    request_body = UpdateEdgeBody,
+    responses(
+        (status = 204, description = "Edge updated"),
+        (status = 404, description = "Edge not found", body = ErrorResponse),
+        (status = 500, description = "Storage error", body = ErrorResponse),
+    ),
+)]
+pub async fn update_edge(
+    State(graph): State<AppState>,
+    PathU64(id): PathU64,
+    JsonBody(body): JsonBody<UpdateEdgeBody>,
+) -> Response {
+    join(tokio::task::spawn_blocking(move || {
+        match graph.update_edge(id, &body.props) {
+            Ok(()) => StatusCode::NO_CONTENT.into_response(),
+            Err(issundb::Error::EdgeNotFound(_)) => {
+                not_found(format!("edge {id} not found")).into_response()
+            }
+            Err(e) => internal(e).into_response(),
+        }
+    }))
+    .await
+}
+
 /// Delete an edge by id.
 #[utoipa::path(
     delete, path = "/v1/edges/{id}", tag = "edges",
     params(("id" = u64, Path, description = "Edge id")),
     responses(
         (status = 204, description = "Edge deleted"),
-        (status = 404, description = "Edge not found", body = ErrorResponse),
         (status = 500, description = "Storage error", body = ErrorResponse),
     ),
 )]
@@ -526,9 +610,6 @@ pub async fn delete_edge(State(graph): State<AppState>, PathU64(id): PathU64) ->
     join(tokio::task::spawn_blocking(move || {
         match graph.delete_edge(id) {
             Ok(()) => StatusCode::NO_CONTENT.into_response(),
-            Err(issundb::Error::EdgeNotFound(_)) => {
-                not_found(format!("edge {id} not found")).into_response()
-            }
             Err(e) => internal(e).into_response(),
         }
     }))
@@ -794,6 +875,25 @@ pub async fn health() -> impl IntoResponse {
     )
 }
 
+/// Delete the vector embedding for a node.
+#[utoipa::path(
+    delete, path = "/v1/vectors/{id}", tag = "vectors",
+    params(("id" = u64, Path, description = "Node id")),
+    responses(
+        (status = 204, description = "Vector deleted"),
+        (status = 500, description = "Storage error", body = ErrorResponse),
+    ),
+)]
+pub async fn delete_vector(State(graph): State<AppState>, PathU64(id): PathU64) -> Response {
+    join(tokio::task::spawn_blocking(move || {
+        match graph.remove_vector(id) {
+            Ok(()) => StatusCode::NO_CONTENT.into_response(),
+            Err(e) => internal(e).into_response(),
+        }
+    }))
+    .await
+}
+
 // ---------------------------------------------------------------------------
 // OpenAPI document
 // ---------------------------------------------------------------------------
@@ -810,13 +910,14 @@ pub async fn health() -> impl IntoResponse {
     ),
     paths(
         create_node, get_node, update_node, delete_node,
-        create_edge, get_edge, delete_edge,
+        add_node_label, remove_node_label,
+        create_edge, get_edge, update_edge, delete_edge,
         execute_query, explain_query,
         search_text, search_vector,
-        upsert_vector, retrieve, health,
+        upsert_vector, delete_vector, retrieve, health,
     ),
     components(schemas(
-        CreateNodeBody, UpdateNodeBody, CreateEdgeBody, CypherQueryBody, ExplainBody,
+        CreateNodeBody, UpdateNodeBody, CreateEdgeBody, UpdateEdgeBody, CypherQueryBody, ExplainBody,
         TextSearchBody, VectorSearchBody, UpsertVectorBody, HybridRetrieveBody,
         ErrorResponse, IdResponse, NodeResponse, EdgeResponse, QueryResponse,
         ExplainResponse, TextHitResponse, VectorHitResponse, RetrieveResponse,
@@ -827,7 +928,7 @@ pub async fn health() -> impl IntoResponse {
         (name = "edges", description = "Edge CRUD"),
         (name = "cypher", description = "Cypher query and plan"),
         (name = "search", description = "Text and vector search"),
-        (name = "vectors", description = "Embedding upsert"),
+        (name = "vectors", description = "Embedding upsert and delete"),
         (name = "retrieve", description = "Hybrid retrieval"),
         (name = "health", description = "Liveness"),
     ),
@@ -846,14 +947,18 @@ pub fn build_router(graph: Arc<Graph>) -> Router {
         .route("/nodes/:id", get(get_node))
         .route("/nodes/:id", put(update_node))
         .route("/nodes/:id", delete(delete_node))
+        .route("/nodes/:id/labels/:label", post(add_node_label))
+        .route("/nodes/:id/labels/:label", delete(remove_node_label))
         .route("/edges", post(create_edge))
         .route("/edges/:id", get(get_edge))
+        .route("/edges/:id", put(update_edge))
         .route("/edges/:id", delete(delete_edge))
         .route("/query", post(execute_query))
         .route("/explain", post(explain_query))
         .route("/search/text", post(search_text))
         .route("/search/vector", post(search_vector))
         .route("/vectors", post(upsert_vector))
+        .route("/vectors/:id", delete(delete_vector))
         .route("/retrieve", post(retrieve))
         .with_state(graph);
 

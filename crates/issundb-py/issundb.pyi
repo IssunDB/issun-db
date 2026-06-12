@@ -16,12 +16,13 @@ class IssunDB:
     Writes are serialized internally, so a single handle is safe to share.
     """
 
-    def __init__(self, path: str) -> None:
+    def __init__(self, path: str, map_size_gb: Optional[int] = None) -> None:
         """Open or create an IssunDB graph at ``path``.
 
         Args:
             path: Filesystem directory for the LMDB environment. It is created
                 if it does not exist.
+            map_size_gb: Optional map size in gigabytes (defaults to 1).
 
         Raises:
             RuntimeError: If the environment cannot be opened.
@@ -68,7 +69,7 @@ class IssunDB:
 
         Raises:
             ValueError: If ``props`` is not valid JSON.
-            RuntimeError: If the write fails.
+            RuntimeError: If the node does not exist or the write fails.
         """
         ...
 
@@ -77,6 +78,30 @@ class IssunDB:
 
         Args:
             id: The node ID.
+
+        Raises:
+            RuntimeError: If the write fails.
+        """
+        ...
+
+    def add_label(self, id: int, label: str) -> None:
+        """Add a label to node ``id``.
+
+        Args:
+            id: The node ID.
+            label: The label to add.
+
+        Raises:
+            RuntimeError: If the node does not exist or the write fails.
+        """
+        ...
+
+    def remove_label(self, id: int, label: str) -> None:
+        """Remove a label from node ``id``. No-op when the node or label is missing.
+
+        Args:
+            id: The node ID.
+            label: The label to remove.
 
         Raises:
             RuntimeError: If the write fails.
@@ -101,17 +126,59 @@ class IssunDB:
         """
         ...
 
-    def query(self, cypher: str) -> str:
+    def get_edge(self, id: int) -> Optional[str]:
+        """Return edge ``id`` as a JSON string.
+
+        Args:
+            id: The edge ID.
+
+        Returns:
+            A JSON object string of the shape
+            ``{"src": int, "dst": int, "type": str, "props": {...}}``, or
+            ``None`` if no such edge exists.
+
+        Raises:
+            RuntimeError: If the read or decode fails.
+        """
+        ...
+
+    def update_edge(self, id: int, props: str) -> None:
+        """Replace the properties of edge ``id`` with JSON-encoded ``props``.
+
+        Args:
+            id: The edge ID.
+            props: A JSON object string holding the replacement properties.
+
+        Raises:
+            ValueError: If ``props`` is not valid JSON.
+            RuntimeError: If the edge does not exist or the write fails.
+        """
+        ...
+
+    def delete_edge(self, id: int) -> None:
+        """Delete edge ``id``.
+
+        Args:
+            id: The edge ID.
+
+        Raises:
+            RuntimeError: If the write fails.
+        """
+        ...
+
+    def query(self, cypher: str, params: Optional[str] = None) -> str:
         """Execute a Cypher query and return the result as a JSON string.
 
         Args:
             cypher: The Cypher query text.
+            params: An optional JSON object string holding parameter bindings.
 
         Returns:
             A JSON object string of the shape
             ``{"columns": [...], "records": [[...]]}``.
 
         Raises:
+            ValueError: If ``params`` is not a JSON object string.
             RuntimeError: If the query fails to parse, plan, or execute.
         """
         ...
@@ -142,18 +209,60 @@ class IssunDB:
         """
         ...
 
-    def vector_search(self, vec: List[float], k: int) -> str:
+    def remove_vector(self, id: int) -> None:
+        """Remove the indexed vector for node ``id``. No-op when absent.
+
+        Args:
+            id: The node ID.
+
+        Raises:
+            RuntimeError: If the write fails.
+        """
+        ...
+
+    def vector_search(
+        self,
+        vec: List[float],
+        k: int,
+        label: Optional[str] = None,
+        properties: Optional[str] = None,
+        rescore_factor: Optional[int] = None,
+    ) -> str:
         """Return the ``k`` nearest neighbors to ``vec``.
 
         Args:
             vec: The query embedding as a list of floats.
             k: The number of neighbors to return.
+            label: Restricts search to nodes carrying this label.
+            properties: A JSON object string of key-value property filters.
+            rescore_factor: Optional candidate over-fetching multiplier.
 
         Returns:
             A JSON array string of ``{"node": int, "distance": float}`` objects.
 
         Raises:
             RuntimeError: If the search fails.
+        """
+        ...
+
+    def configure_vector_index(
+        self,
+        metric: str,
+        quantization: str = "float32",
+        reindex: bool = False,
+    ) -> None:
+        """Configure or rebuild the vector index.
+
+        Args:
+            metric: One of 'cosine', 'l2', or 'dot'.
+            quantization: One of 'float32', 'float16', or 'int8'.
+            reindex: Rebuild the index from existing vectors under the new
+                configuration.
+
+        Raises:
+            RuntimeError: If the configuration is invalid or, without
+                ``reindex``, vectors already exist under a different
+                configuration.
         """
         ...
 
@@ -180,12 +289,18 @@ class IssunDB:
         """
         ...
 
-    def create_text_index(self, label: str, property: str) -> None:
+    def create_text_index(
+        self,
+        label: str,
+        property: str,
+        language: Optional[str] = None,
+    ) -> None:
         """Create a full-text index on ``property`` for nodes with ``label``.
 
         Args:
             label: The node label to index.
             property: The property to index.
+            language: Optional analyzer language (defaults to English).
 
         Raises:
             RuntimeError: If the index cannot be created.
@@ -201,6 +316,72 @@ class IssunDB:
 
         Raises:
             RuntimeError: If the index cannot be dropped.
+        """
+        ...
+
+    def has_text_index(self, label: str, property: str) -> bool:
+        """Check whether a full-text index exists on ``property`` for ``label``.
+
+        Args:
+            label: The node label.
+            property: The property name.
+
+        Returns:
+            ``True`` if the index exists, ``False`` otherwise.
+
+        Raises:
+            RuntimeError: If the read fails.
+        """
+        ...
+
+    def list_text_indexes(self) -> str:
+        """List all full-text indexes.
+
+        Returns:
+            A JSON array string of
+            ``{"label": str, "property": str, "language": str}`` objects.
+
+        Raises:
+            RuntimeError: If the read fails.
+        """
+        ...
+
+    def retrieve_hybrid(
+        self,
+        vector: Optional[List[float]] = None,
+        text_query: Optional[str] = None,
+        vector_k: int = 10,
+        text_k: int = 10,
+        text_label: Optional[str] = None,
+        text_property: Optional[str] = None,
+        vector_label: Optional[str] = None,
+        hops: int = 2,
+        max_distance: Optional[float] = None,
+        max_nodes: Optional[int] = None,
+        fusion_strategy: str = "rrf",
+        rrf_k: int = 60,
+        vector_weight: float = 0.5,
+        text_weight: float = 0.5,
+    ) -> str:
+        """Execute a hybrid retrieval combining vector, text, and graph expansion.
+
+        Returns:
+            A JSON object string of the shape
+            ``{"nodes": [...], "edges": [...], "scores": {...}}``.
+
+        Raises:
+            RuntimeError: If the retrieval fails.
+        """
+        ...
+
+    def set_thread_count(self, count: int) -> None:
+        """Set the GraphBLAS thread count (0 restores the default).
+
+        Args:
+            count: The number of threads.
+
+        Raises:
+            RuntimeError: If the count cannot be applied.
         """
         ...
 

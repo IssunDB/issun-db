@@ -34,14 +34,18 @@ struct State {
     params: HashMap<String, serde_json::Value>,
     /// Path to capture the next query output into, then cleared.
     save_path: Option<PathBuf>,
+    /// Map size from the launch flag; the `:open` default when the positional
+    /// map size is omitted.
+    map_size_gb: usize,
 }
 
 impl State {
-    fn new(graph: Option<Graph>) -> Self {
+    fn new(graph: Option<Graph>, map_size_gb: usize) -> Self {
         Self {
             graph,
             params: HashMap::new(),
             save_path: None,
+            map_size_gb,
         }
     }
 }
@@ -61,16 +65,22 @@ struct Cli {
     /// environment variable when set (the container image sets it to /data).
     #[arg(env = "ISSUNDB_DB_PATH")]
     db_path: Option<PathBuf>,
+
+    /// LMDB memory map size in gigabytes (defaults to 1).
+    #[arg(long, default_value_t = 1)]
+    map_size_gb: usize,
 }
 
 #[derive(Parser, Debug)]
 #[command(no_binary_name = true, disable_help_subcommand = true)]
 enum ReplCommand {
-    /// Open or reopen a database at the given path (e.g., `:open ./issundb-data`)
+    /// Open or reopen a database at the given path (e.g., `:open ./issundb-data 1`)
     #[command(name = ":open")]
     Open {
         /// Path to the database
         path: PathBuf,
+        /// Optional map size in GB (defaults to the launch `--map-size-gb` value)
+        map_size_gb: Option<usize>,
     },
 
     /// Execute a script file line by line (e.g., `:run ./import.cypher`)
@@ -199,6 +209,24 @@ enum ReplCommand {
         id: u64,
     },
 
+    /// Add a label to a node (e.g., `add-label 1 Admin`)
+    #[command(name = "add-label")]
+    AddLabel {
+        /// Node ID
+        id: u64,
+        /// Label to add
+        label: String,
+    },
+
+    /// Remove a label from a node (e.g., `remove-label 1 Admin`)
+    #[command(name = "remove-label")]
+    RemoveLabel {
+        /// Node ID
+        id: u64,
+        /// Label to remove
+        label: String,
+    },
+
     /// Add a directed edge with a type and optional properties (e.g., `add-edge 1 2 KNOWS {"since": 2020}`)
     #[command(name = "add-edge")]
     AddEdge {
@@ -218,6 +246,16 @@ enum ReplCommand {
     GetEdge {
         /// Edge ID
         id: u64,
+    },
+
+    /// Overwrite an edge's properties (e.g., `update-edge 5 {"weight": 2.5}`)
+    #[command(name = "update-edge")]
+    UpdateEdge {
+        /// Edge ID
+        id: u64,
+        /// Edge properties JSON
+        #[arg(default_value = "{}")]
+        props: String,
     },
 
     /// Delete an edge (e.g., `delete-edge 5`)
@@ -328,6 +366,13 @@ enum ReplCommand {
         values: Vec<f32>,
     },
 
+    /// Remove the vector embedding from a node (e.g., `remove-vec 1`)
+    #[command(name = "remove-vec")]
+    RemoveVec {
+        /// Node ID
+        id: u64,
+    },
+
     /// Query the vector index for k-nearest neighbors, optionally filtered by
     /// label and property values (e.g., `vsearch 5 0.1 0.2 0.3 --label Person`)
     #[command(name = "vsearch")]
@@ -390,8 +435,8 @@ enum ReplCommand {
     /// Perform full-text index actions (e.g., `text-index create Person name --lang english` or `text-index list`)
     #[command(name = "text-index")]
     TextIndex {
-        /// Action: 'create', 'drop', or 'list'
-        #[arg(value_parser = ["create", "drop", "list"])]
+        /// Action: 'create', 'drop', 'list', or 'has'
+        #[arg(value_parser = ["create", "drop", "list", "has"])]
         action: String,
         /// Node label (required for create/drop)
         label: Option<String>,
@@ -441,7 +486,7 @@ enum ReplCommand {
 
 const HELP_TEXT: &str = r#"
 Database Control
-  :open <path>                         Open or reopen a database at the given path (e.g., :open ./issundb-data)
+  :open <path> [map_size_gb]           Open or reopen a database at the given path (e.g., :open ./issundb-data 2)
   :threads <count>                     Set the thread count for GraphBLAS computations (e.g., :threads 4)
 
 Scripting and Parameters
@@ -466,8 +511,11 @@ Query and Mutations
   get-node <id>                        Get a node by its ID (e.g., get-node 1)
   update-node <id> [props]             Overwrite a node's properties (e.g., update-node 1 {"name": "Bob"})
   delete-node <id>                     Delete a node and its adjacency entries (e.g., delete-node 1)
+  add-label <id> <label>               Add a label to a node (e.g., add-label 1 Admin)
+  remove-label <id> <label>            Remove a label from a node (e.g., remove-label 1 Admin)
   add-edge <src> <dst> <type> [props]  Add a directed edge with a type and optional properties (e.g., add-edge 1 2 KNOWS {"since": 2020})
   get-edge <id>                        Get an edge by its ID (e.g., get-edge 5)
+  update-edge <id> [props]             Overwrite an edge's properties (e.g., update-edge 5 {"weight": 2.5})
   delete-edge <id>                     Delete an edge (e.g., delete-edge 5)
   out <id>                             Get outgoing neighbors of a node (e.g., out 1)
   in <id>                              Get incoming neighbors of a node (e.g., in 1)
@@ -565,18 +613,21 @@ fn print_help() {
 
 fn main() {
     let cli = Cli::parse();
-    let graph = cli.db_path.as_ref().and_then(|p| match Graph::open(p, 1) {
-        Ok(g) => {
-            eprintln!("{}", format!("opened: {}", p.display()).green());
-            Some(g)
-        }
-        Err(e) => {
-            eprintln!("{}", format!("error opening {}: {e}", p.display()).red());
-            None
-        }
-    });
+    let graph = cli
+        .db_path
+        .as_ref()
+        .and_then(|p| match Graph::open(p, cli.map_size_gb) {
+            Ok(g) => {
+                eprintln!("{}", format!("opened: {}", p.display()).green());
+                Some(g)
+            }
+            Err(e) => {
+                eprintln!("{}", format!("error opening {}: {e}", p.display()).red());
+                None
+            }
+        });
 
-    let mut state = State::new(graph);
+    let mut state = State::new(graph, cli.map_size_gb);
 
     let mut rl = match DefaultEditor::new() {
         Ok(r) => r,
@@ -729,13 +780,15 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
                 }
             }
         }
-        ReplCommand::Open { path } => match Graph::open(&path, 1) {
-            Ok(g) => {
-                eprintln!("{}", format!("opened: {}", path.display()).green());
-                state.graph = Some(g);
+        ReplCommand::Open { path, map_size_gb } => {
+            match Graph::open(&path, map_size_gb.unwrap_or(state.map_size_gb)) {
+                Ok(g) => {
+                    eprintln!("{}", format!("opened: {}", path.display()).green());
+                    state.graph = Some(g);
+                }
+                Err(e) => eprintln!("{}", format!("error: {e}").red()),
             }
-            Err(e) => eprintln!("{}", format!("error: {e}").red()),
-        },
+        }
         ReplCommand::Run { file } => {
             run_script(state, &file);
         }
@@ -874,6 +927,22 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
                 }
             }
         }
+        ReplCommand::AddLabel { id, label } => {
+            if let Some(g) = &state.graph {
+                match g.add_label(NodeId::from(id), &label) {
+                    Ok(()) => println!("ok"),
+                    Err(e) => eprintln!("error: {e}"),
+                }
+            }
+        }
+        ReplCommand::RemoveLabel { id, label } => {
+            if let Some(g) = &state.graph {
+                match g.remove_label(NodeId::from(id), &label) {
+                    Ok(()) => println!("ok"),
+                    Err(e) => eprintln!("error: {e}"),
+                }
+            }
+        }
         ReplCommand::AddEdge {
             src,
             dst,
@@ -915,6 +984,17 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
                     }
                     Ok(None) => eprintln!("edge {id} not found"),
                     Err(e) => eprintln!("error: {e}"),
+                }
+            }
+        }
+        ReplCommand::UpdateEdge { id, props } => {
+            if let Some(g) = &state.graph {
+                match parse_props(&props) {
+                    Err(e) => eprintln!("invalid props: {e}"),
+                    Ok(parsed_props) => match g.update_edge(EdgeId::from(id), &parsed_props) {
+                        Ok(()) => println!("ok"),
+                        Err(e) => eprintln!("error: {e}"),
+                    },
                 }
             }
         }
@@ -1138,6 +1218,14 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
                 }
             }
         }
+        ReplCommand::RemoveVec { id } => {
+            if let Some(g) = &state.graph {
+                match g.remove_vector(NodeId::from(id)) {
+                    Ok(()) => println!("ok"),
+                    Err(e) => eprintln!("error: {e}"),
+                }
+            }
+        }
         ReplCommand::Vsearch {
             k,
             query,
@@ -1264,6 +1352,18 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
                         } else {
                             match g.drop_text_index(lbl, prop) {
                                 Ok(()) => println!("ok"),
+                                Err(e) => eprintln!("error: {e}"),
+                            }
+                        }
+                    }
+                    "has" => {
+                        let lbl = label.as_deref().unwrap_or("");
+                        let prop = property.as_deref().unwrap_or("");
+                        if lbl.is_empty() || prop.is_empty() {
+                            eprintln!("label and property are required for has");
+                        } else {
+                            match g.has_text_index(lbl, prop) {
+                                Ok(exists) => println!("{}", exists),
                                 Err(e) => eprintln!("error: {e}"),
                             }
                         }
@@ -1781,7 +1881,7 @@ mod tests {
     #[test]
     fn test_repl_commands_handle() {
         let temp = TempDir::new().unwrap();
-        let mut state = State::new(None);
+        let mut state = State::new(None, 1);
 
         // 1. Open database via REPL command
         let open_cmd = format!(":open {}", temp.path().display());
