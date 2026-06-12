@@ -42,7 +42,7 @@ These commands manage database sessions, backups, parameters, and bulk imports:
 
 | Command           | Usage                                        | Description                                           |
 |-------------------|----------------------------------------------|-------------------------------------------------------|
-| `:open`           | `:open /path/to/db`                          | Open or reopen a database at the specified directory. |
+| `:open`           | `:open /path/to/db [map_size_gb]`            | Open or reopen a database at the specified directory; the map size defaults to the launch `--map-size-gb` value. |
 | `:run`            | `:run /path/to/script.cypher`                | Execute a file line by line.                          |
 | `:save`           | `:save /path/to/output.txt`                  | Direct the output of the next query to a file.        |
 | `:params`         | `:params`                                    | List all current query parameters.                    |
@@ -66,8 +66,11 @@ These subcommands perform direct graph operations, algorithm executions, vector 
 | `get-node`            | Retrieve a node record by its identifier (e.g., `get-node 1`).                                     |
 | `update-node`         | Overwrite properties on a node (e.g., `update-node 1 {"name": "Bob"}`).                            |
 | `delete-node`         | Delete a node and all associated edges (e.g., `delete-node 1`).                                    |
+| `add-label`           | Add a label to an existing node (e.g., `add-label 1 Admin`).                                       |
+| `remove-label`        | Remove a label from a node (e.g., `remove-label 1 Admin`).                                         |
 | `add-edge`            | Create a directed relationship (e.g., `add-edge 1 2 KNOWS {"since": 2020}`).                       |
 | `get-edge`            | Retrieve a relationship record by its identifier (e.g., `get-edge 5`).                             |
+| `update-edge`         | Overwrite properties on a relationship (e.g., `update-edge 5 {"since": 2021}`).                    |
 | `delete-edge`         | Delete a relationship (e.g., `delete-edge 5`).                                                     |
 | `out`                 | Get all outgoing neighbors and relationships of a node (e.g., `out 1`).                            |
 | `in`                  | Get all incoming neighbors and relationships of a node (e.g., `in 1`).                             |
@@ -83,11 +86,13 @@ These subcommands perform direct graph operations, algorithm executions, vector 
 | `degree`              | Compute degree centrality (e.g., `degree out`).                                                    |
 | `rebuild-csr`         | Rebuild the in-memory CSR snapshot cache.                                                          |
 | `upsert-vec`          | Attach/upsert a vector embedding on a node (e.g., `upsert-vec 1 0.1 0.2 0.3`).                     |
+| `remove-vec`          | Remove the vector embedding from a node (e.g., `remove-vec 1`).                                    |
 | `vsearch`             | Query the vector index for $k$-nearest neighbors (e.g., `vsearch 5 0.1 0.2 0.3`).                  |
 | `retrieve`            | Execute hybrid retrieval over vector and text indexes (e.g., `retrieve 5 2 0.1 0.2 --text query`). |
 | `configure-vec`       | Configure vector index metric and quantization (e.g., `configure-vec cosine int8`).                |
 | `text-index`          | Configure and manage full-text indexes (e.g., `text-index create Book title`).                     |
 | `text-search`         | Query the BM25 full-text search index (e.g., `text-search "query" Book summary 5`).                |
+| `threads`             | Set the GraphBLAS thread count, with 0 restoring the default (e.g., `threads 4`).                  |
 
 ---
 
@@ -97,7 +102,7 @@ To use the database in your own Rust application, add the `issundb` facade and `
 
 ```toml
 [dependencies]
-issundb = "version" # Like "0.1.0" or "0.1.1-alpha.4"
+issundb = "version" # Like "0.1.0" or "0.1.0-alpha.4"
 serde_json = "1.0"   # Used to construct property maps
 ```
 

@@ -134,9 +134,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create an edge establishing a relationship
     graph.add_edge(id1, id2, "REFERENCES", &serde_json::json!({}))?;
 
-    // Rebuild the CSR snapshot to prepare traversal matrices
-    graph.rebuild_csr()?;
-
     // Configure hybrid retrieval options
     let opts = HybridRetrieveOptions {
         vector_k: 5,

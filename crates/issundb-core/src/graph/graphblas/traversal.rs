@@ -17,18 +17,18 @@ impl Graph {
     pub fn bfs_graphblas(&self, start: NodeId, hops: u8) -> Result<Vec<NodeId>, Error> {
         use issundb_graphblas::{Descriptor, Monoid, Semiring, Vector, ewise_add, mxv};
 
+        self.ensure_matrix_view()?;
         let guard = self.matrices.read();
-        let m = match guard.as_ref() {
-            Some(m) => m,
-            None => return self.bfs(start, hops),
-        };
+        let m = guard
+            .as_ref()
+            .ok_or(Error::Corrupt("matrices not initialized"))?;
         let n = m.n_nodes;
         if n == 0 {
             return Ok(vec![]);
         }
         let start_dense = match m.id_to_dense.get(&start) {
             Some(&d) => d as usize,
-            None => return self.bfs(start, hops),
+            None => return Ok(vec![]),
         };
 
         // level[d] = BFS hop count to dense node d; absent = not yet reached.
@@ -413,5 +413,17 @@ mod tests {
 
         let out = g.expand_spmv_graphblas(&[a], None, false).unwrap();
         assert_eq!(out, vec![(a, e_ab, b), (a, e_ab2, b), (a, e_likes, b)]);
+    }
+
+    #[test]
+    fn bfs_graphblas_unknown_start_is_empty() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("person", &()).unwrap();
+        let b = g.add_node("person", &()).unwrap();
+        g.add_edge(a, b, "knows", &()).unwrap();
+        g.rebuild_csr().unwrap();
+
+        let out = g.bfs_graphblas(999_999, 2).unwrap();
+        assert!(out.is_empty());
     }
 }

@@ -98,3 +98,36 @@ def test_set_thread_count_is_accepted(db):
     # A bounded count and the 0 sentinel (restore default) both succeed.
     db.set_thread_count(1)
     db.set_thread_count(0)
+
+
+def test_label_management(db):
+    nid = db.add_node("Person", json.dumps({"name": "Ada"}))
+    db.add_label(nid, "Admin")
+    # Verify via Cypher
+    res = json.loads(db.query("MATCH (n:Admin) RETURN n.name AS name"))
+    assert ["Ada"] in [r["values"] for r in res["records"]]
+
+    db.remove_label(nid, "Admin")
+    res = json.loads(db.query("MATCH (n:Admin) RETURN n.name AS name"))
+    assert len(res["records"]) == 0
+
+
+def test_has_text_index(db):
+    db.create_text_index("Person", "bio")
+    assert db.has_text_index("Person", "bio") is True
+    assert db.has_text_index("Person", "missing") is False
+
+
+def test_remove_vector(db):
+    db.configure_vector_index("l2")
+    nid = db.add_node("Doc", json.dumps({}))
+    db.upsert_vector(nid, [1.0, 0.0, 0.0])
+    hits = json.loads(db.vector_search([1.0, 0.0, 0.0], 5))
+    assert any(h["node"] == nid for h in hits)
+
+    db.remove_vector(nid)
+    hits = json.loads(db.vector_search([1.0, 0.0, 0.0], 5))
+    assert not any(h["node"] == nid for h in hits)
+
+    # A repeat removal of the same vector is a no-op.
+    db.remove_vector(nid)

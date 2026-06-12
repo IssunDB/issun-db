@@ -14,12 +14,18 @@ pub(super) fn expand_multi_type(
     is_incoming: bool,
 ) -> Result<Vec<(NodeId, EdgeId, NodeId)>, String> {
     match rel_type {
-        None => graph
-            .expand_spmv_graphblas(src_nodes, None, is_incoming)
-            .map_err(|e| e.to_string()),
-        Some(t) if !t.contains('|') => graph
-            .expand_spmv_graphblas(src_nodes, Some(t), is_incoming)
-            .map_err(|e| e.to_string()),
+        None => sanitize_transitions(
+            graph
+                .expand_spmv_graphblas(src_nodes, None, is_incoming)
+                .map_err(|e| e.to_string())?,
+            graph,
+        ),
+        Some(t) if !t.contains('|') => sanitize_transitions(
+            graph
+                .expand_spmv_graphblas(src_nodes, Some(t), is_incoming)
+                .map_err(|e| e.to_string())?,
+            graph,
+        ),
         Some(t) => {
             let mut seen: std::collections::HashSet<(NodeId, EdgeId, NodeId)> =
                 std::collections::HashSet::new();
@@ -38,9 +44,69 @@ pub(super) fn expand_multi_type(
                     }
                 }
             }
-            Ok(all)
+            sanitize_transitions(all, graph)
         }
     }
+}
+
+/// Drop expansion triples that reference missing node or edge records.
+///
+/// This protects read execution against pre-existing dangling adjacency data in a
+/// persisted database: malformed triples are ignored rather than surfacing
+/// `node not found`/`edge not found` execution errors.
+fn sanitize_transitions(
+    transitions: Vec<(NodeId, EdgeId, NodeId)>,
+    graph: &Graph,
+) -> Result<Vec<(NodeId, EdgeId, NodeId)>, String> {
+    if transitions.is_empty() {
+        return Ok(transitions);
+    }
+
+    let mut node_exists: ahash::AHashMap<NodeId, bool> = ahash::AHashMap::new();
+    let mut edge_exists: ahash::AHashMap<EdgeId, bool> = ahash::AHashMap::new();
+    let mut out = Vec::with_capacity(transitions.len());
+
+    for (src, eid, dst) in transitions {
+        let src_ok = match node_exists.get(&src) {
+            Some(ok) => *ok,
+            None => {
+                let ok = graph.get_node(src).map_err(|e| e.to_string())?.is_some();
+                node_exists.insert(src, ok);
+                ok
+            }
+        };
+        if !src_ok {
+            continue;
+        }
+
+        let dst_ok = match node_exists.get(&dst) {
+            Some(ok) => *ok,
+            None => {
+                let ok = graph.get_node(dst).map_err(|e| e.to_string())?.is_some();
+                node_exists.insert(dst, ok);
+                ok
+            }
+        };
+        if !dst_ok {
+            continue;
+        }
+
+        let edge_ok = match edge_exists.get(&eid) {
+            Some(ok) => *ok,
+            None => {
+                let ok = graph.get_edge(eid).map_err(|e| e.to_string())?.is_some();
+                edge_exists.insert(eid, ok);
+                ok
+            }
+        };
+        if !edge_ok {
+            continue;
+        }
+
+        out.push((src, eid, dst));
+    }
+
+    Ok(out)
 }
 
 /// Validate a SKIP or LIMIT parameter value at runtime.
@@ -3996,6 +4062,23 @@ mod stream_join_tests {
         let dir = TempDir::new().unwrap();
         let graph = Graph::open(dir.path(), 1).unwrap();
         (dir, graph)
+    }
+
+    #[test]
+    fn sanitize_transitions_skips_missing_records() {
+        let (_dir, graph) = setup();
+        let a = graph.add_node("N", &serde_json::json!({})).unwrap();
+        let b = graph.add_node("N", &serde_json::json!({})).unwrap();
+        let e = graph.add_edge(a, b, "R", &serde_json::json!({})).unwrap();
+
+        let transitions = vec![
+            (a, e, b),
+            (a, e, b + 10_000),
+            (a + 10_000, e, b),
+            (a, e + 10_000, b),
+        ];
+        let sanitized = super::sanitize_transitions(transitions, &graph).unwrap();
+        assert_eq!(sanitized, vec![(a, e, b)]);
     }
 
     fn exec(graph: &Graph, cypher: &str) {
