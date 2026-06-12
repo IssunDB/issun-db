@@ -35,6 +35,11 @@ impl Graph {
         self.has_node_text_index_impl(&rtxn, label, property)
     }
 
+    /// List the active text indexes as `(label, property, language)` tuples.
+    ///
+    /// Hidden contract method for `issundb-text`; `pub` only because crate
+    /// visibility cannot span crates. Use `TextIndexExt::list_text_indexes`
+    /// instead.
     #[doc(hidden)]
     pub fn active_text_indexes(&self) -> Result<Vec<(String, String, Language)>, Error> {
         let rtxn = self.storage.env.read_txn()?;
@@ -438,6 +443,10 @@ impl Graph {
         Ok(())
     }
 
+    /// Corpus statistics `(doc count, total token count)` for one text index.
+    ///
+    /// Hidden contract method for the BM25 scorer in `issundb-text`; `pub`
+    /// only because crate visibility cannot span crates. Not public API.
     #[doc(hidden)]
     pub fn fts_stats(&self, label: &str, property: &str) -> Result<Option<(u64, u64)>, Error> {
         let rtxn = self.storage.env.read_txn()?;
@@ -487,6 +496,10 @@ impl Graph {
         Ok(Some((n, sum_dl)))
     }
 
+    /// Stored token count of one indexed document.
+    ///
+    /// Hidden contract method for the BM25 scorer in `issundb-text`; `pub`
+    /// only because crate visibility cannot span crates. Not public API.
     #[doc(hidden)]
     pub fn fts_doc_len(
         &self,
@@ -523,6 +536,10 @@ impl Graph {
         }
     }
 
+    /// Postings list `(node, term frequency)` for one term in one text index.
+    ///
+    /// Hidden contract method for the BM25 scorer in `issundb-text`; `pub`
+    /// only because crate visibility cannot span crates. Not public API.
     #[doc(hidden)]
     pub fn fts_postings(
         &self,
