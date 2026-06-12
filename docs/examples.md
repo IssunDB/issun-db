@@ -109,8 +109,8 @@ fn run_algorithms(graph: &Graph) -> Result<(), Box<dyn std::error::Error>> {
     graph.add_edge(n2, n3, "CONNECTS", &json!({ "cost": 10 }))?;
     graph.add_edge(n1, n3, "CONNECTS", &json!({ "cost": 20 }))?;
 
-    // Rebuild the in-memory CSR snapshot for GraphBLAS algorithms
-    graph.rebuild_csr()?;
+    // The algorithms refresh the in-memory CSR snapshot on demand, so no
+    // explicit rebuild call is needed after the writes above.
 
     // 1. Dijkstra Shortest Path: Finds the cheapest path using the 'cost' property
     let path = graph.shortest_path_top_k(n1, n3, 1, "cost")?;

@@ -15,12 +15,23 @@ The `Graph` struct is the main coordinator for all transactional graph storage, 
 
 - `add_node(label: &str, props: &impl Serialize) -> Result<NodeId, Error>`  
   Adds a new node to the database with a specific label and serializable properties.
+- `add_node_multi(labels: &[&str], props: &impl Serialize) -> Result<NodeId, Error>`  
+  Adds a new node carrying zero or more labels.
 - `get_node(id: NodeId) -> Result<Option<NodeRecord>, Error>`  
   Retrieves a node record by its unique identifier.
 - `update_node(id: NodeId, props: &impl Serialize) -> Result<(), Error>`  
   Updates the properties of an existing node.
 - `delete_node(id: NodeId) -> Result<(), Error>`  
   Removes a node and all of its associated edges from the graph.
+
+### Label Management
+
+- `add_label(id: NodeId, label: &str) -> Result<(), Error>`  
+  Adds a label to an existing node; a no-op if the node already carries it.
+- `remove_label(id: NodeId, label: &str) -> Result<(), Error>`  
+  Removes a label from a node; a no-op if the node does not carry it.
+- `node_labels(id: NodeId) -> Result<Vec<String>, Error>`  
+  Returns the label names a node carries.
 
 ### Edge and Adjacency CRUD
 
@@ -44,13 +55,13 @@ The `Graph` struct is the main coordinator for all transactional graph storage, 
 ## GraphBLAS Algorithms
 
 The following path-finding, network centrality, and connectivity algorithms are backed by Apache-2.0 SuiteSparse:GraphBLAS operations. They execute on
-the in-memory CSR (Compressed Sparse Row) snapshot. Ensure you call `graph.rebuild_csr()?` before running these algorithms if recent mutations have
-been committed.
+the in-memory CSR (Compressed Sparse Row) snapshot and the GraphBLAS matrices derived from it. Each algorithm refreshes that state on demand before
+running, so committed mutations are always visible; an explicit `graph.rebuild_csr()?` call is never required for correctness.
 
 ### Traversal and Paths
 
 - `bfs(start: NodeId, hops: u8) -> Result<Vec<NodeId>, Error>`  
-  Performs a multi-source Breadth-First Search traversal outward from the start node up to the specified depth.
+  Performs a Breadth-First Search traversal outward from the start node up to the specified depth.
 - `dfs(start: NodeId, hops: u8) -> Result<Vec<NodeId>, Error>`  
   Performs a Depth-First Search traversal from the start node up to the specified depth.
 - `shortest_path(src: NodeId, dst: NodeId) -> Result<Option<Vec<NodeId>>, Error>`  
@@ -70,7 +81,7 @@ been committed.
 
 - `page_rank(iterations: u32, damping: f32) -> Result<HashMap<NodeId, f32>, Error>`  
   Computes PageRank centrality scores across all nodes.
-- `degree_centrality(direction: DegreeDirection) -> Result<HashMap<NodeId, u32>, Error>`  
+- `degree_centrality(direction: DegreeDirection) -> Result<HashMap<NodeId, u64>, Error>`  
   Computes the degree centrality for each node based on incoming, outgoing, or combined edges.
 - `betweenness_centrality() -> Result<HashMap<NodeId, f64>, Error>`  
   Computes the betweenness centrality score for all nodes.

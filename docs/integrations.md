@@ -43,6 +43,10 @@ All data and query endpoints are prefixed with `/v1`.
       ```
 * Delete node: `DELETE /v1/nodes/:id`
     * Response: `204 No Content` on successful removal.
+* Add label: `POST /v1/nodes/:id/labels/:label`
+    * Response: `204 No Content`; `404 Not Found` when the node does not exist.
+* Remove label: `DELETE /v1/nodes/:id/labels/:label`
+    * Response: `204 No Content`; removal is idempotent.
 
 #### Edge Operations
 
@@ -59,6 +63,14 @@ All data and query endpoints are prefixed with `/v1`.
     * Response: Returns the generated `EdgeId` wrapped in a JSON object, e.g., `{"id": 1}`.
 * Get edge: `GET /v1/edges/:id`
     * Response: A JSON object containing the edge's unique ID, source/destination node IDs, type, and properties.
+* Update edge: `PUT /v1/edges/:id`
+    * Request body:
+      ```json
+      {
+        "props": { "since": 2021 }
+      }
+      ```
+    * Response: `204 No Content`; `404 Not Found` when the edge does not exist.
 * Delete edge: `DELETE /v1/edges/:id`
     * Response: `204 No Content` upon successful removal.
 
@@ -104,8 +116,8 @@ All data and query endpoints are prefixed with `/v1`.
 #### API Reference (OpenAPI)
 
 The server publishes a machine-readable OpenAPI 3.1 document generated from the route handlers, so it always matches the live API. Use it to
-generate typed clients or to browse the full request and response schemas, including the routes not enumerated above (`POST /v1/vectors` and
-`POST /v1/retrieve`).
+generate typed clients or to browse the full request and response schemas, including the routes not enumerated above (`POST /v1/vectors`,
+`DELETE /v1/vectors/:id`, and `POST /v1/retrieve`).
 
 * OpenAPI document: `GET /v1/openapi.json`
 * Interactive Scalar UI: `GET /v1/docs`
