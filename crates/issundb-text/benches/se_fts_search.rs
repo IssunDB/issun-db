@@ -67,14 +67,18 @@ fn opts() -> TextSearchOptions {
     }
 }
 
-fn bench_se_fts_single_term(c: &mut Criterion) {
+fn bench_se_fts_search(c: &mut Criterion) {
     let Some(dir) = se_dataset::data_dir() else {
         eprintln!("se_fts_search: ISSUNDB_BENCH_SEARCH_DIR not set; skipping");
         return;
     };
     let rows = se_dataset::load(&dir);
+    if rows.is_empty() {
+        eprintln!("se_fts_search: dataset loaded zero rows; skipping");
+        return;
+    }
     let (_dir, graph) = setup(&rows);
-    let (single, _) = queries(&rows);
+    let (single, multi) = queries(&rows);
     let opts = opts();
 
     c.bench_function("se_fts_search_single_term", |b| {
@@ -86,16 +90,6 @@ fn bench_se_fts_single_term(c: &mut Criterion) {
             )
         });
     });
-}
-
-fn bench_se_fts_multi_term(c: &mut Criterion) {
-    let Some(dir) = se_dataset::data_dir() else {
-        return;
-    };
-    let rows = se_dataset::load(&dir);
-    let (_dir, graph) = setup(&rows);
-    let (_, multi) = queries(&rows);
-    let opts = opts();
 
     c.bench_function("se_fts_search_multi_term", |b| {
         b.iter(|| {
@@ -108,5 +102,5 @@ fn bench_se_fts_multi_term(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_se_fts_single_term, bench_se_fts_multi_term);
+criterion_group!(benches, bench_se_fts_search);
 criterion_main!(benches);

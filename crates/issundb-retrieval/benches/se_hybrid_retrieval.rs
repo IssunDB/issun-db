@@ -67,77 +67,55 @@ fn text_query(rows: &[Row]) -> String {
         .join(" ")
 }
 
-fn bench_se_hybrid_rrf(c: &mut Criterion) {
+fn bench_se_hybrid_retrieval(c: &mut Criterion) {
     let Some(dir) = se_dataset::data_dir() else {
         eprintln!("se_hybrid_retrieval: ISSUNDB_BENCH_SEARCH_DIR not set; skipping");
         return;
     };
     let rows = se_dataset::load(&dir);
-    let (_dir, graph) = setup(&rows);
-    let query_vec = rows[0].vec.clone();
-    let query_text = text_query(&rows);
-
-    let opts = HybridRetrieveOptions {
-        vector_k: 10,
-        text_k: 10,
-        text_label: Some("Post".to_string()),
-        text_property: Some("body".to_string()),
-        hops: 2,
-        fusion: FusionStrategy::Rrf { k: 60 },
-        ..Default::default()
-    };
-
-    c.bench_function("se_hybrid_retrieve_rrf", |b| {
-        b.iter(|| {
-            black_box(
-                retrieve_hybrid(
-                    black_box(&graph),
-                    black_box(&query_vec),
-                    black_box(&query_text),
-                    black_box(&opts),
-                )
-                .unwrap(),
-            )
-        });
-    });
-}
-
-fn bench_se_hybrid_weighted(c: &mut Criterion) {
-    let Some(dir) = se_dataset::data_dir() else {
+    if rows.is_empty() {
+        eprintln!("se_hybrid_retrieval: dataset loaded zero rows; skipping");
         return;
-    };
-    let rows = se_dataset::load(&dir);
+    }
     let (_dir, graph) = setup(&rows);
     let query_vec = rows[0].vec.clone();
     let query_text = text_query(&rows);
 
-    let opts = HybridRetrieveOptions {
+    // One options value per fusion strategy; the rest of the fields match.
+    let opts = |fusion| HybridRetrieveOptions {
         vector_k: 10,
         text_k: 10,
         text_label: Some("Post".to_string()),
         text_property: Some("body".to_string()),
         hops: 2,
-        fusion: FusionStrategy::WeightedSum {
-            vector_weight: 0.6,
-            text_weight: 0.4,
-        },
+        fusion,
         ..Default::default()
     };
-
-    c.bench_function("se_hybrid_retrieve_weighted", |b| {
-        b.iter(|| {
-            black_box(
-                retrieve_hybrid(
-                    black_box(&graph),
-                    black_box(&query_vec),
-                    black_box(&query_text),
-                    black_box(&opts),
-                )
-                .unwrap(),
-            )
-        });
+    let rrf = opts(FusionStrategy::Rrf { k: 60 });
+    let weighted = opts(FusionStrategy::WeightedSum {
+        vector_weight: 0.6,
+        text_weight: 0.4,
     });
+
+    for (name, opts) in [
+        ("se_hybrid_retrieve_rrf", &rrf),
+        ("se_hybrid_retrieve_weighted", &weighted),
+    ] {
+        c.bench_function(name, |b| {
+            b.iter(|| {
+                black_box(
+                    retrieve_hybrid(
+                        black_box(&graph),
+                        black_box(&query_vec),
+                        black_box(&query_text),
+                        black_box(opts),
+                    )
+                    .unwrap(),
+                )
+            });
+        });
+    }
 }
 
-criterion_group!(benches, bench_se_hybrid_rrf, bench_se_hybrid_weighted);
+criterion_group!(benches, bench_se_hybrid_retrieval);
 criterion_main!(benches);

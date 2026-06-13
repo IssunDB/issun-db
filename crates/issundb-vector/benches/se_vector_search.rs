@@ -33,50 +33,33 @@ fn setup(rows: &[Row]) -> (TempDir, Graph) {
     (dir, graph)
 }
 
-fn bench_se_vector_search_k10(c: &mut Criterion) {
+fn bench_se_vector_search(c: &mut Criterion) {
     let Some(dir) = se_dataset::data_dir() else {
         eprintln!("se_vector_search: ISSUNDB_BENCH_SEARCH_DIR not set; skipping");
         return;
     };
     let rows = se_dataset::load(&dir);
+    if rows.is_empty() {
+        eprintln!("se_vector_search: dataset loaded zero rows; skipping");
+        return;
+    }
     let (_dir, graph) = setup(&rows);
     // Query with the first post's own vector so the search exercises a real
     // neighborhood rather than an arbitrary point.
     let query = rows[0].vec.clone();
 
-    c.bench_function("se_vector_search_k10", |b| {
-        b.iter(|| {
-            criterion::black_box(
-                graph
-                    .vector_search(criterion::black_box(&query), criterion::black_box(10))
-                    .unwrap(),
-            )
+    for k in [10usize, 100] {
+        c.bench_function(&format!("se_vector_search_k{k}"), |b| {
+            b.iter(|| {
+                criterion::black_box(
+                    graph
+                        .vector_search(criterion::black_box(&query), criterion::black_box(k))
+                        .unwrap(),
+                )
+            });
         });
-    });
+    }
 }
 
-fn bench_se_vector_search_k100(c: &mut Criterion) {
-    let Some(dir) = se_dataset::data_dir() else {
-        return;
-    };
-    let rows = se_dataset::load(&dir);
-    let (_dir, graph) = setup(&rows);
-    let query = rows[0].vec.clone();
-
-    c.bench_function("se_vector_search_k100", |b| {
-        b.iter(|| {
-            criterion::black_box(
-                graph
-                    .vector_search(criterion::black_box(&query), criterion::black_box(100))
-                    .unwrap(),
-            )
-        });
-    });
-}
-
-criterion_group!(
-    benches,
-    bench_se_vector_search_k10,
-    bench_se_vector_search_k100
-);
+criterion_group!(benches, bench_se_vector_search);
 criterion_main!(benches);
