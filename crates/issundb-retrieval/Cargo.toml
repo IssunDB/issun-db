@@ -9,8 +9,6 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 rust-version.workspace = true
-# Bench targets are declared explicitly because the benches directory holds a
-# shared loader module (se_dataset.rs) that is not itself a bench target.
 autobenches = false
 
 [dependencies]
