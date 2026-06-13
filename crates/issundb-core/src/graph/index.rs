@@ -691,6 +691,18 @@ impl Graph {
         val: PropValue,
     ) -> Result<Vec<NodeId>, Error> {
         let val = val.into_json();
+
+        // A value that cannot be index-encoded (currently only a string longer
+        // than `MAX_INDEXED_STRING_LEN`) is absent from `node_prop_idx`, and its
+        // property may have no `prop_key` registered at all, so the index path
+        // below would wrongly report no matches. Fall back to a label scan that
+        // compares the stored value directly. This must precede the `label_id`
+        // and `prop_key_id` lookups, which short-circuit to an empty result.
+        let encoded = match encode_property_value(&val) {
+            Some(e) => e,
+            None => return self.scan_label_for_property_eq(rtxn, label, property, &val),
+        };
+
         let label_key = format!("label:{label}");
         let label_id = match self.storage.meta.get(rtxn, &label_key)? {
             Some(b) => {
@@ -713,11 +725,6 @@ impl Graph {
             None => return Ok(Vec::new()),
         };
 
-        let encoded = match encode_property_value(&val) {
-            Some(e) => e,
-            None => return Ok(Vec::new()),
-        };
-
         let mut prefix = Vec::with_capacity(4 + 4 + encoded.len());
         prefix.extend_from_slice(&label_id.to_be_bytes());
         prefix.extend_from_slice(&prop_key_id.to_be_bytes());
@@ -730,6 +737,28 @@ impl Graph {
                 let mut node_id_bytes = [0u8; 8];
                 node_id_bytes.copy_from_slice(&key[key.len() - 8..]);
                 result.push(u64::from_be_bytes(node_id_bytes));
+            }
+        }
+        Ok(result)
+    }
+
+    /// Equality lookup fallback for a node property whose value is not present
+    /// in `node_prop_idx` (an over-long string). Scans the label and compares
+    /// the stored property value directly, preserving ascending ID order.
+    fn scan_label_for_property_eq(
+        &self,
+        rtxn: &heed::RoTxn,
+        label: &str,
+        property: &str,
+        val: &serde_json::Value,
+    ) -> Result<Vec<NodeId>, Error> {
+        let mut result = Vec::new();
+        for id in self.nodes_by_label_impl(rtxn, label)? {
+            if let Some(record) = self.get_node_impl(rtxn, id)? {
+                let props: serde_json::Value = props::decode(&record.props)?;
+                if props.get(property) == Some(val) {
+                    result.push(id);
+                }
             }
         }
         Ok(result)
@@ -896,6 +925,15 @@ impl Graph {
         val: PropValue,
     ) -> Result<Vec<EdgeId>, Error> {
         let val = val.into_json();
+
+        // See `nodes_by_property_impl`: an unindexable value (long string) is
+        // absent from `edge_prop_idx` and may have no registered `prop_key`, so
+        // fall back to a type scan before the short-circuiting meta lookups.
+        let encoded = match encode_property_value(&val) {
+            Some(e) => e,
+            None => return self.scan_type_for_property_eq(rtxn, etype, property, &val),
+        };
+
         let type_key = format!("type:{etype}");
         let type_id = match self.storage.meta.get(rtxn, &type_key)? {
             Some(b) => {
@@ -918,11 +956,6 @@ impl Graph {
             None => return Ok(Vec::new()),
         };
 
-        let encoded = match encode_property_value(&val) {
-            Some(e) => e,
-            None => return Ok(Vec::new()),
-        };
-
         let mut prefix = Vec::with_capacity(4 + 4 + encoded.len());
         prefix.extend_from_slice(&type_id.to_be_bytes());
         prefix.extend_from_slice(&prop_key_id.to_be_bytes());
@@ -935,6 +968,28 @@ impl Graph {
                 let mut edge_id_bytes = [0u8; 8];
                 edge_id_bytes.copy_from_slice(&key[key.len() - 8..]);
                 result.push(u64::from_be_bytes(edge_id_bytes));
+            }
+        }
+        Ok(result)
+    }
+
+    /// Equality lookup fallback for an edge property whose value is not present
+    /// in `edge_prop_idx` (an over-long string). Scans the type and compares the
+    /// stored property value directly, preserving ascending ID order.
+    fn scan_type_for_property_eq(
+        &self,
+        rtxn: &heed::RoTxn,
+        etype: &str,
+        property: &str,
+        val: &serde_json::Value,
+    ) -> Result<Vec<EdgeId>, Error> {
+        let mut result = Vec::new();
+        for id in self.edges_by_type_impl(rtxn, etype)? {
+            if let Some(record) = self.get_edge_impl(rtxn, id)? {
+                let props: serde_json::Value = props::decode(&record.props)?;
+                if props.get(property) == Some(val) {
+                    result.push(id);
+                }
             }
         }
         Ok(result)
@@ -1106,6 +1161,28 @@ mod tests {
                 .unwrap(),
             vec![id],
             "auto-index entries must survive dropping the explicit index"
+        );
+    }
+
+    /// A string property too long to fit an LMDB index key is left unindexed,
+    /// so an equality lookup must fall back to a label scan rather than wrongly
+    /// reporting no matches.
+    #[test]
+    fn nodes_by_property_finds_unindexed_long_string() {
+        let (_dir, g) = open_tmp();
+        let long = "word ".repeat(4000); // ~20 KB, well over the index key bound
+        let id = g
+            .add_node("Post", &json!({ "body": long.clone() }))
+            .unwrap();
+        // A different long body must not match.
+        g.add_node("Post", &json!({ "body": "other ".repeat(4000) }))
+            .unwrap();
+
+        assert_eq!(
+            g.nodes_by_property("Post", "body", PropValue::Str(long))
+                .unwrap(),
+            vec![id],
+            "equality lookup on an unindexed long string must scan and match"
         );
     }
 

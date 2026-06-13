@@ -53,14 +53,13 @@ jobs:
           body: |
             ### What's Included
 
-            - `issundb-cli`: IssunDB's CLI
+            - `issundb-cli`: IssunDB CLI
             - `issundb-rest`: IssunDB with a REST API server
             - `issundb-mcp`: IssunDB with an MCP server
 
-            The binaries statically link SuiteSparse:GraphBLAS and dynamically link
-            the platform's OpenMP runtime: `libgomp` on glibc Linux, `libomp` on
-            macOS, and `vcomp` (Visual C++ Runtime) on Windows. These ship with the
-            standard toolchain runtime on each platform.
+            Note that the binaries need a working OpenMP runtime to work on your system.
+            That means that typically `libgomp` on glibc Linux, `libomp` on macOS, and `vcomp` (Visual C++ Runtime)
+            on Windows, should be installed on your system.
 
             ### Container Image
 

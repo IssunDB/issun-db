@@ -1,17 +1,11 @@
 # Clippy configuration for IssunDB.
 # Applied when running: cargo clippy --workspace
-#
-# These settings tune project-wide thresholds. Attribute-level overrides
-# (#[allow(...)]) should be rare and always carry a comment explaining why.
 
-# Storage functions can be long but must not be convoluted.
+# Some of the functions in the storage engine can be long
 cognitive-complexity-threshold = 30
 
-# Minimum supported Rust version (mirrors rust-toolchain.toml).
+# Minimum supported Rust version
 msrv = "1.85.0"
 
-# Avoid magic numbers in storage key construction; prefer named constants.
-# (Lint is "clippy::unreadable_literal" — keep the default warn level.)
-
-# Avoid overly nested match arms in the query executor.
+# Avoid overly nested match arms in the query executor
 too-many-lines-threshold = 200

@@ -1,6 +1,6 @@
 ## IssunDB
 
-IssunDB is a fast embedded graph database with vector search, full-text search, and hybrid retrieval, written in Rust.
+IssunDB is an embedded graph database in Rust.
 
 This is the main crate of IssunDB, and exposes the `Graph` type, Cypher query execution, vector search, full-text search, and hybrid retrieval APIs.
 Applications should depend on this crate rather than on the internal workspace crates.

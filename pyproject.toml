@@ -31,6 +31,7 @@ dev = [
     "pyyaml (>=6.0.1,<7.0.0)",
     "rundoc (>=0.2.3,<0.3.0)",
     "hypothesis (>=6.150.2,<7.0.0)",
+    "huggingface-hub (>=0.29.3,<0.40.0)",
 ]
 
 [tool.pytest.ini_options]
