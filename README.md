@@ -19,7 +19,7 @@ An embedded graph database for AI applications and graph analytics
 
 ---
 
-IssunDB is a fast embedded graph database written in Rust.
+IssunDB is a fast embedded graph database, written in Rust.
 It can be embedded in Rust applications without the need for a server, and can be used for a wide range of applications such as building
 GraphRAG pipelines and querying knowledge graphs.
 
@@ -29,7 +29,7 @@ GraphRAG pipelines and querying knowledge graphs.
 
 * Rust graph engine built with ACID, property graph model, and Cypher query language support
 * Fast graph traversal and analytics using sparse matrix operations
-* Fast vectorized query execution with multi-core query parallelism and serializable transactions
+* Fast vectorized query execution with multi-core parallelism and serializable transactions
 * Built-in vector, text, and hybrid search and retrieval
 * Provides a wide range of APIs, including native Rust, Python bindings, CLI, HTTP (REST), and MCP
 * Fully cross-platform; supports Linux, macOS, and Windows
@@ -48,7 +48,7 @@ To use IssunDB in your Rust project, add the dependency to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-issundb = "0.1.0-alpha.6"
+issundb = "0.1.0-alpha.7"
 serde_json = "1.0"
 ```
 
