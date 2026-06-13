@@ -1741,10 +1741,12 @@ name = "issundb-retrieval"
 version = "0.1.0-alpha.6"
 dependencies = [
  "ahash",
+ "arrow-array",
  "criterion",
  "issundb-core",
  "issundb-text",
  "issundb-vector",
+ "parquet",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
@@ -1754,8 +1756,10 @@ dependencies = [
 name = "issundb-text"
 version = "0.1.0-alpha.6"
 dependencies = [
+ "arrow-array",
  "criterion",
  "issundb-core",
+ "parquet",
  "proptest",
  "roaring",
  "serde_json",
@@ -1767,9 +1771,11 @@ dependencies = [
 name = "issundb-vector"
 version = "0.1.0-alpha.6"
 dependencies = [
+ "arrow-array",
  "criterion",
  "issundb-core",
  "parking_lot",
+ "parquet",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",

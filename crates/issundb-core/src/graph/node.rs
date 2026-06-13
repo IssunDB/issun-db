@@ -527,6 +527,27 @@ mod tests {
         assert_eq!(g.node_count_by_label("B").unwrap(), 1);
     }
 
+    /// A node with a string property longer than the LMDB key limit must still
+    /// insert and round-trip: the value is simply left out of the auto-index
+    /// rather than overflowing the key and failing the write.
+    #[test]
+    fn add_node_with_long_string_property_succeeds() {
+        let (_dir, g) = open_tmp();
+        let body = "word ".repeat(4000); // ~20 KB, far over the index key limit
+        let id = g
+            .add_node("Post", &json!({ "title": "short", "body": body }))
+            .unwrap();
+
+        let stored = g.node_prop_json(id, "body").unwrap().unwrap();
+        assert_eq!(stored, json!(body));
+        // The short property is still indexed and reachable by equality.
+        assert_eq!(
+            g.nodes_by_property("Post", "title", PropValue::Str("short".into()))
+                .unwrap(),
+            vec![id]
+        );
+    }
+
     /// An empty label slice creates an unlabeled node.
     #[test]
     fn multi_label_empty_creates_unlabeled_node() {

@@ -79,6 +79,16 @@ pub(super) const ENCODED_NULL: u8 = 0x00;
 /// `i64` values sort in ascending numeric order as big-endian bytes.
 const SORT_SIGN_BIT: u64 = 0x8000_0000_0000_0000;
 
+/// Maximum string length (in bytes) that can be auto-indexed. The property
+/// index key is `(label_id, prop_key_id, encoded_val, node_id)`, so it carries
+/// 16 bytes of fixed fields plus the 2-byte string-encoding frame (`0x04` tag
+/// and `0x00` terminator) around the value. LMDB's default maximum key size is
+/// 511 bytes; a string longer than this would overflow that limit and cannot be
+/// indexed, so `encode_property_value` declines it and the value is left
+/// unindexed (equality lookups fall back to a scan, and long text belongs in a
+/// full-text index anyway). The bound is conservative to leave headroom.
+pub(super) const MAX_INDEXED_STRING_LEN: usize = 480;
+
 /// Encodes a JSON property value into a sortable byte representation for the index.
 ///
 /// Numbers use a fixed 17-byte encoding: a `0x03` tag, then 8 bytes of the
@@ -126,6 +136,11 @@ pub(super) fn encode_property_value(val: &serde_json::Value) -> Option<Vec<u8>> 
             Some(buf)
         }
         serde_json::Value::String(s) => {
+            // A string too long to fit an LMDB key cannot be indexed; decline it
+            // so the property is left unindexed rather than crashing the write.
+            if s.len() > MAX_INDEXED_STRING_LEN {
+                return None;
+            }
             let mut buf = Vec::with_capacity(1 + s.len() + 1);
             buf.push(0x04);
             buf.extend_from_slice(s.as_bytes());
@@ -693,7 +708,23 @@ mod extension_tests {
 mod encode_tests {
     use serde_json::json;
 
-    use super::{decode_property_value, encode_property_value};
+    use super::{MAX_INDEXED_STRING_LEN, decode_property_value, encode_property_value};
+
+    /// A string up to the indexable bound encodes and round-trips; one byte over
+    /// the bound is declined so it never overflows the LMDB key size.
+    #[test]
+    fn over_long_strings_are_not_indexed() {
+        let at_limit = json!("a".repeat(MAX_INDEXED_STRING_LEN));
+        let encoded = encode_property_value(&at_limit).expect("at-limit string indexes");
+        assert_eq!(decode_property_value(&encoded), Some(at_limit));
+
+        let too_long = json!("a".repeat(MAX_INDEXED_STRING_LEN + 1));
+        assert_eq!(
+            encode_property_value(&too_long),
+            None,
+            "a string over the bound must not be indexed",
+        );
+    }
 
     /// Distinct integers beyond 2^53 must encode to distinct keys. Encoding
     /// purely through `f64` (the previous behavior) collapsed them, causing

@@ -9,6 +9,9 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 rust-version.workspace = true
+# Bench targets are declared explicitly because the benches directory holds a
+# shared loader module (se_dataset.rs) that is not itself a bench target.
+autobenches = false
 
 [dependencies]
 issundb-core.workspace = true
@@ -24,6 +27,8 @@ default = []
 tempfile.workspace = true
 serde_json = "1"
 criterion.workspace = true
+parquet.workspace = true
+arrow-array.workspace = true
 
 [[bench]]
 name = "hybrid_retrieval"
@@ -31,4 +36,8 @@ harness = false
 
 [[bench]]
 name = "graphrag_retrieval"
+harness = false
+
+[[bench]]
+name = "se_hybrid_retrieval"
 harness = false

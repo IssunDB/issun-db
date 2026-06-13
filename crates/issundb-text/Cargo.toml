@@ -9,6 +9,9 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 rust-version.workspace = true
+# Bench targets are declared explicitly because the benches directory holds a
+# shared loader module (se_dataset.rs) that is not itself a bench target.
+autobenches = false
 
 [dependencies]
 issundb-core.workspace = true
@@ -20,7 +23,13 @@ tempfile.workspace = true
 serde_json.workspace = true
 criterion.workspace = true
 proptest.workspace = true
+parquet.workspace = true
+arrow-array.workspace = true
 
 [[bench]]
 name = "fts_search"
+harness = false
+
+[[bench]]
+name = "se_fts_search"
 harness = false

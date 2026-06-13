@@ -259,6 +259,11 @@ bench-retrieval: ## Run hybrid retrieval benchmarks
 	@echo "Running hybrid retrieval benchmarks..."
 	@DEBUG_PROJ=$(DEBUG_PROJ) cargo bench -p issundb-retrieval
 
+.PHONY: bench-search-data
+bench-search-data: ## Download the Stack Exchange datasets for the search benchmarks
+	@echo "Downloading search benchmark datasets..."
+	@bash scripts/download_search_datasets.sh
+
 .PHONY: bench-cypher
 bench-cypher: ## Run Cypher parser and query optimizer benchmarks
 	@echo "Running Cypher and query optimizer benchmarks..."
