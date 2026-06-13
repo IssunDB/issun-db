@@ -76,11 +76,9 @@ Do not invent modules that do not yet exist when answering questions, but do pla
       background and swapped via `arc-swap`. Also owns the `GraphDelta` buffer captured on the write path and the `write_gen`/`snapshot_gen`
       generation counters that drive incremental matrix maintenance and on-demand CSR refresh.
     - `src/columns.rs`: in-memory property columns for the read path. One typed column (`Int`, `Float`, `Bool`, dictionary-encoded `Str`, or the
-      exact-semantics `Json` fallback) per node property name over a self-contained dense node mapping, built lazily from one full node scan and
-      kept fresh by a post-commit delta (added and updated nodes are re-read individually; node deletion forces a rebuild). Read through
-      `Graph::node_prop_json`. Also owns the lazily computed per-property statistics (`PropStats`: min and max bounds, an equi-depth histogram,
-      and the most common values), computed on first access through `Graph::node_prop_min_max` or the selectivity estimates and invalidated by
-      the post-commit patch, so the gather path never pays for them.
+      exact-semantics `Json` fallback) per node property, built lazily from one full node scan and kept fresh by a post-commit delta (node
+      deletion forces a rebuild). Read through `Graph::node_prop_json`. Also owns the lazily computed per-property statistics (`PropStats`: bounds,
+      an equi-depth histogram, and the most common values) that back the selectivity estimates, invalidated by the post-commit patch.
     - `src/histogram.rs`: equi-depth histogram over property values with equality and range selectivity estimates; backs `PropStats`. Nothing
       here is persisted.
     - `src/matrices.rs`: GraphBLAS matrix materialization from the CSR snapshot, plus `MatrixSet::apply_delta` for incremental in-place maintenance
@@ -147,12 +145,9 @@ Do not invent modules that do not yet exist when answering questions, but do pla
 - `benchmarks/ladybugdb-compare/`: differential comparison harness against LadybugDB. Deliberately excluded from the workspace (own `[workspace]`
   stanza, root `exclude`, and own `rust-toolchain.toml`) because the `lbug` crate links the LadybugDB C++ library and needs a newer Rust than the
   workspace MSRV; it must never become part of `make build` or `make test`. Run via `make bench-ladybugdb`, which `cd`s into the directory so the
-  local toolchain pin applies. Cross-engine harnesses belong here, not in crate-local `benches/`, which is reserved for Criterion targets.
-  The differential row-set check runs before timing, and a divergent query is reported without being timed. Traversal queries anchor at
-  deterministic degree-percentile probes (cold, median, and hub) derived from the generated graph. The trail-sensitive queries carry an
-  openCypher trail reference computed from the dataset, because LadybugDB matches walks (its `recursive_pattern_semantic` setting registers
-  but is inert in the pinned `lbug` build, and fixed-length chains never enforce relationship uniqueness; `tests/lbug_trail_semantics.rs`
-  pins this). A `DIVERGENT` verdict is an attributed LadybugDB walk-semantics overcount and does not fail the run; a `MISMATCH` does.
+  local toolchain pin applies. Cross-engine harnesses belong here, not in crate-local `benches/`, which is reserved for Criterion targets. The
+  differential row-set check runs before timing; a `DIVERGENT` verdict is an attributed LadybugDB walk-semantics overcount and does not fail the
+  run, but a `MISMATCH` does (`tests/lbug_trail_semantics.rs` pins the walk-versus-trail divergence).
 - `Cargo.toml`: workspace root with shared `[workspace.dependencies]`. All version pins live here.
 - `Makefile`: developer workflow entry points.
 
@@ -232,10 +227,16 @@ Lower-level crates must not know about higher-level crates.
 The central coordination type.
 All graph operations go through `Graph`; do not call `Storage` directly from outside `issundb-core`.
 
-- `Graph::open(path: &Path, map_size_gb: usize) -> Result<Self, Error>`
-- `add_node(label: &str, props: &impl Serialize) -> Result<NodeId, Error>`
-- `add_node_multi(labels: &[&str], props: &impl Serialize) -> Result<NodeId, Error>`
-- `get_node(id: NodeId) -> Result<Option<NodeRecord>, Error>`
+- `Graph::open(path: &Path, map_size_gb: usize) -> Result<Self, Error>` is the only constructor.
+
+Node and edge CRUD, accessors, and registry lookups have predictable signatures; read them from the source rather than this file. Methods:
+`add_node`, `add_node_multi`, `get_node`, `update_node`, `delete_node`, `add_label`, `remove_label`, `node_labels`, `add_edge`, `get_edge`,
+`out_neighbors`, `in_neighbors`, `node_has_relationships`, `nodes_by_label`, `edges_by_type`, `all_nodes`, `label_name`, `type_name`,
+`list_node_indexes_and_constraints`, `list_edge_indexes_and_constraints`, `node_count_by_label`, `edge_count_by_type`, `put_vector_bytes`,
+`vector_bytes`, and `rebuild_csr`.
+
+The read-path and statistics methods carry non-obvious semantics:
+
 - `node_prop_json(id: NodeId, prop: &str) -> Result<Option<serde_json::Value>, Error>` (single-property read through the in-memory property
   columns; `None` for a nonexistent node, `Some(Value::Null)` for a missing property)
 - `node_props_json_table(ids: &[NodeId], props: &[&str]) -> Result<Vec<Vec<serde_json::Value>>, Error>` (bulk row-major property gather
@@ -254,57 +255,23 @@ All graph operations go through `Graph`; do not call `Storage` directly from out
 - `estimate_equality_selectivity(prop: &str, val: &serde_json::Value) -> Result<Option<f64>, Error>` (estimated fraction of non-null values
   equal to `val`: exact for the property's most common values, histogram-estimated otherwise; both estimates feed the optimizer's
   selectivity-aware `Filter` plan weight)
-- `update_node(id: NodeId, props: &impl Serialize) -> Result<(), Error>`
-- `delete_node(id: NodeId) -> Result<(), Error>`
-- `add_label(id: NodeId, label: &str) -> Result<(), Error>`
-- `remove_label(id: NodeId, label: &str) -> Result<(), Error>`
-- `node_labels(id: NodeId) -> Result<Vec<String>, Error>`
-- `add_edge(src: NodeId, dst: NodeId, etype: &str, props: &impl Serialize) -> Result<EdgeId, Error>`
-- `get_edge(id: EdgeId) -> Result<Option<EdgeRecord>, Error>`
-- `out_neighbors(node: NodeId) -> Result<Vec<NeighborEntry>, Error>`
-- `in_neighbors(node: NodeId) -> Result<Vec<NeighborEntry>, Error>`
-- `node_has_relationships(node: NodeId) -> Result<bool, Error>`
-- `nodes_by_label(label: &str) -> Result<Vec<NodeId>, Error>`
 - `label_filter(nodes: &[NodeId], label: &str) -> Result<Vec<NodeId>, Error>` (subset of `nodes` carrying `label`, via one `label_idx` point
   lookup per candidate)
-- `edges_by_type(etype: &str) -> Result<Vec<EdgeId>, Error>`
-- `rebuild_csr() -> Result<(), Error>`
 - `set_thread_count(n: i32) -> Result<(), Error>`: sets the thread count for GraphBLAS matrix computations, overriding the `ISSUNDB_NUM_THREADS`
   environment variable (set to 0 to restore default behavior).
-- `all_nodes() -> Result<Vec<NodeId>, Error>`
-- `label_name(id: LabelId) -> Result<Option<String>, Error>`
-- `type_name(id: TypeId) -> Result<Option<String>, Error>`
-- `list_node_indexes_and_constraints() -> Result<Vec<(String, String, u8)>, Error>`
-- `list_edge_indexes_and_constraints() -> Result<Vec<(String, String, u8)>, Error>`
-- `node_count_by_label(label: &str) -> Result<u64, Error>`
-- `edge_count_by_type(etype: &str) -> Result<u64, Error>`
-- `put_vector_bytes(n: NodeId, bytes: &[u8]) -> Result<(), Error>`
-- `vector_bytes() -> Result<Vec<(NodeId, Vec<u8>)>, Error>`
-- `bfs(start: NodeId, hops: u8) -> Result<Vec<NodeId>, Error>`
-- `dfs(start: NodeId, hops: u8) -> Result<Vec<NodeId>, Error>`
-- `shortest_path(src: NodeId, dst: NodeId) -> Result<Option<Vec<NodeId>>, Error>`
+
+Graph algorithms have self-describing signatures over `NodeId` and `EdgeId`: `bfs`, `dfs`, `shortest_path`, `all_paths`, `all_shortest_paths`,
+`longest_path`, `shortest_path_top_k`, `page_rank`, `connected_components`, `strongly_connected_components`, `detect_cycle`, `label_propagation`,
+`degree_centrality`, `betweenness_centrality`, `harmonic_centrality`, `spanning_forest`, `maximum_flow`, and `all_neighbors`. Two carry behavior
+worth pinning:
+
 - `shortest_path_dijkstra(src: NodeId, dst: NodeId) -> Result<Option<WeightedPath>, Error>` (edge weight is the first present of the `weight`, `cost`,
   `capacity`, or `cap` property, default `1.0`; the source is fixed, so unlike `shortest_path_top_k` and `spanning_forest` this method takes no
   weight-property argument)
-- `all_paths(src: NodeId, dst: NodeId) -> Result<Vec<Vec<NodeId>>, Error>`
-- `all_shortest_paths(src: NodeId, dst: NodeId) -> Result<Vec<Vec<NodeId>>, Error>`
-- `longest_path(src: NodeId, dst: NodeId) -> Result<Option<Vec<NodeId>>, Error>`
-- `shortest_path_top_k(src: NodeId, dst: NodeId, k: usize, weight_property: &str) -> Result<Vec<WeightedPath>, Error>`
-- `page_rank(iterations: u32, damping: f32) -> Result<HashMap<NodeId, f32>, Error>`
-- `connected_components() -> Result<HashMap<NodeId, u64>, Error>`
-- `strongly_connected_components() -> Result<HashMap<NodeId, u64>, Error>`
-- `detect_cycle() -> Result<bool, Error>`
 - `count_triangle_cycles(spec: &TriangleCountSpec) -> Result<u64, Error>` (assignment count of the directed triangle pattern
   `(a)-[t1]->(b)-[t2]->(c)-[t3]->(a)` with optional per-hop relationship types and per-variable labels, following Cypher MATCH row
   semantics including relationship uniqueness; the Cypher optimizer lowers grouping-free `count` aggregates over that pattern to this
   kernel via the `TriangleCount` physical operator)
-- `label_propagation(max_iterations: usize) -> Result<HashMap<NodeId, u64>, Error>`
-- `degree_centrality(direction: DegreeDirection) -> Result<HashMap<NodeId, u64>, Error>`
-- `betweenness_centrality() -> Result<HashMap<NodeId, f64>, Error>`
-- `harmonic_centrality() -> Result<HashMap<NodeId, f64>, Error>`
-- `spanning_forest(weight_property: &str, maximum: bool) -> Result<Vec<EdgeId>, Error>`
-- `maximum_flow(source: NodeId, sink: NodeId, capacity_property: &str) -> Result<f64, Error>`
-- `all_neighbors(node: NodeId) -> Result<Vec<DirectedNeighborEntry>, Error>`
 
 ### `issundb_vector`
 
