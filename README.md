@@ -53,6 +53,9 @@ issundb = "0.1.0-alpha.6"
 serde_json = "1.0"
 ```
 
+> [!NOTE]
+> IssunDB needs Rust 1.85.0 or newer.
+
 Here is a basic example showing how to open a database, insert nodes, establish relationships, and query the graph using Cypher:
 
 ```rust
