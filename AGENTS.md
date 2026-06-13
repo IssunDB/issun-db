@@ -176,6 +176,10 @@ Do not invent modules that do not yet exist when answering questions, but do pla
 - Secondary indexes (`label_idx`, `type_idx`) use 12-byte composite keys `(u32 BE, u64 BE)` stored in plain LMDB databases with `Unit` values.
   Prefix-range scans via `prefix_iter` enumerate all nodes or edges for a given label or type in ascending ID order. A multi-label node has one
   `label_idx` entry per label it carries, so it appears in every matching label scan.
+- Property indexes (`node_prop_idx`, `edge_prop_idx`) embed the encoded property value inside the LMDB key, so an indexable value is bounded by
+  LMDB's 511-byte key limit. `encode_property_value` declines a string longer than `MAX_INDEXED_STRING_LEN` (480 bytes, conservative), leaving that
+  value out of the index; the property is still stored, and equality lookups (`nodes_by_property`, `edges_by_property`) fall back to a label or type
+  scan that compares the stored value directly, so results stay correct. Long text belongs in a full-text index, not a property index.
 - The GraphBLAS matrices (`MatrixSet`) and the CSR snapshot are the basis for the GraphBLAS algorithms, pattern matching, and multi-source
   expansion. They are kept fresh through three gates rather than a single periodic rebuild. The write path records a structural delta (added nodes,
   added edges, and removed edges, plus a `force_full` flag set on any node deletion). The pure-adjacency consumers (`bfs`, `bfs_multi_source`,
@@ -466,6 +470,8 @@ Additional validation when relevant:
 - `make bench` for performance-sensitive storage changes.
 - `make test-conformance` for Cypher conformance coverage.
 - `make bench-ladybugdb` for cross-engine performance comparison and differential correctness checks on the Cypher execution path.
+- `make bench-search-data` to download the Stack Exchange datasets (into the gitignored `data/` path) that back the text, vector, and hybrid
+  retrieval benchmarks. Those benches are gated on `ISSUNDB_BENCH_SEARCH_DIR` and skip cleanly when it is unset, so they never block `make bench`.
 
 ## Testing Expectations
 
