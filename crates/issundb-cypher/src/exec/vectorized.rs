@@ -1513,7 +1513,10 @@ mod tests {
         for cypher in [
             "MATCH (a:Person)-[:KNOWS]->(b:Person) \
              RETURN b.city AS city, count(a) AS n ORDER BY city",
-            "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN count(*) AS n",
+            // A grouping-free `count(*)` or `count(var)` over a single hop is
+            // promoted to the `PathCount` kernel (see `path_count_exec_tests`),
+            // so it no longer reaches the vectorized path; `count(b.city)` over
+            // a property still does.
             "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN count(b.city) AS n",
             "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN count(DISTINCT b.city) AS n",
             // Mixed-kind ages: sum and avg skip the non-numeric, min/max use
@@ -1527,7 +1530,7 @@ mod tests {
             "MATCH (a:Person)-[:KNOWS]->(b:Person) \
              RETURN a.city AS city, count(*) AS n ORDER BY n DESC, city",
             // Empty input keeps the grouping-free zero row and drops groups.
-            "MATCH (a:Ghost)-[:KNOWS]->(b:Person) RETURN count(a) AS n",
+            // (The grouping-free `count(a)` form is now a `PathCount` kernel.)
             "MATCH (a:Ghost)-[:KNOWS]->(b:Person) RETURN b.city AS city, count(a) AS n",
         ] {
             assert_matches_row_path(&g, cypher);

@@ -175,6 +175,23 @@ pub enum PhysicalOperator {
         /// Output column the count is bound to.
         output: String,
     },
+    /// Whole-pattern count of an open directed path of one or two hops,
+    /// `(v0)-[t1]->(v1)` or `(v0)-[t1]->(v1)-[t2]->(v2)`, evaluated by the core
+    /// kernel without materializing any rows.
+    ///
+    /// Emitted by the optimizer when a grouping-free, non-distinct `count`
+    /// aggregate sits directly on a one-hop or two-hop directed expansion and
+    /// nothing else (filters beyond the per-variable labels, projections, or
+    /// variable references) needs the per-row bindings. Produces a single row
+    /// binding `output` to the count.
+    PathCount {
+        /// Relationship type per hop, in path order. Length 1 or 2.
+        rel_types: Vec<Option<String>>,
+        /// Label per node variable, in path order. Length `rel_types.len() + 1`.
+        labels: Vec<Option<String>>,
+        /// Output column the count is bound to.
+        output: String,
+    },
 }
 
 /// A physical planner that compiles logical query plans into physical, executable plans.
@@ -561,6 +578,22 @@ pub fn format_physical_plan(op: &PhysicalOperator, depth: usize) -> String {
                 r2 = rel(&rel_types[1]),
                 r3 = rel(&rel_types[2]),
             ));
+        }
+        PhysicalOperator::PathCount {
+            rel_types,
+            labels,
+            output,
+        } => {
+            let node = |i: usize| match labels.get(i).and_then(|l| l.as_deref()) {
+                Some(l) => format!("(v{i}:{l})"),
+                None => format!("(v{i})"),
+            };
+            let mut pattern = node(0);
+            for (h, rt) in rel_types.iter().enumerate() {
+                let rel = rt.as_deref().unwrap_or("*");
+                pattern.push_str(&format!("-[:{rel}]->{}", node(h + 1)));
+            }
+            buf.push_str(&format!("{pad}PathCount {pattern} AS {output}\n"));
         }
     }
 

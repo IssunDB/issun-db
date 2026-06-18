@@ -370,16 +370,70 @@ fn ladybugdb_rows(result: lbug::QueryResult) -> Vec<Vec<String>> {
         .collect()
 }
 
-fn median(mut times: Vec<Duration>) -> Duration {
-    times.sort();
-    times[times.len() / 2]
+/// Bootstrap resamples used to estimate the confidence interval of the median.
+const BOOTSTRAP_RESAMPLES: usize = 2000;
+
+/// A timed measurement: the median wall time, a 95% confidence interval for
+/// that median, and the number of timed samples taken.
+#[derive(Clone, Copy)]
+struct BenchStat {
+    median: Duration,
+    ci_lo: Duration,
+    ci_hi: Duration,
+    samples: usize,
+}
+
+/// Median of an already-sorted, non-empty slice.
+fn median_sorted(sorted: &[Duration]) -> Duration {
+    sorted[sorted.len() / 2]
+}
+
+/// 95% confidence interval for the median by percentile bootstrap: draw
+/// `BOOTSTRAP_RESAMPLES` resamples of size `n` with replacement from the timed
+/// rounds, take each resample's median, and return the 2.5th and 97.5th
+/// percentiles of those medians. Resampling uses a fixed-seed xorshift
+/// generator seeded from the sample values, so the interval is reproducible
+/// for a given set of timings and differs across queries.
+fn bootstrap_ci95(sorted: &[Duration]) -> (Duration, Duration) {
+    let n = sorted.len();
+    if n <= 1 {
+        let only = sorted.first().copied().unwrap_or_default();
+        return (only, only);
+    }
+    let nanos: Vec<u128> = sorted.iter().map(Duration::as_nanos).collect();
+    let mut seed: u64 = 0x9E37_79B9_7F4A_7C15 ^ (n as u64);
+    for &v in &nanos {
+        seed = seed.wrapping_mul(0x100_0000_01B3).wrapping_add(v as u64);
+    }
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    let mut medians = Vec::with_capacity(BOOTSTRAP_RESAMPLES);
+    let mut sample = vec![0u128; n];
+    for _ in 0..BOOTSTRAP_RESAMPLES {
+        for s in sample.iter_mut() {
+            *s = nanos[(next() as usize) % n];
+        }
+        sample.sort_unstable();
+        medians.push(sample[n / 2]);
+    }
+    medians.sort_unstable();
+    let lo = medians[(BOOTSTRAP_RESAMPLES as f64 * 0.025) as usize];
+    let hi = medians[((BOOTSTRAP_RESAMPLES as f64 * 0.975) as usize).min(BOOTSTRAP_RESAMPLES - 1)];
+    (
+        Duration::from_nanos(lo as u64),
+        Duration::from_nanos(hi as u64),
+    )
 }
 
 /// Runs `f` for up to `warmups` untimed and `reps` timed repetitions, stopping
 /// each phase early once `budget` is spent in it, and returns the median timed
-/// duration plus the number of timed samples actually taken (always at least
-/// one).
-fn bench(warmups: usize, reps: usize, budget: Duration, mut f: impl FnMut()) -> (Duration, usize) {
+/// duration with its 95% bootstrap confidence interval plus the number of
+/// timed samples actually taken (always at least one).
+fn bench(warmups: usize, reps: usize, budget: Duration, mut f: impl FnMut()) -> BenchStat {
     let warmup_start = Instant::now();
     for _ in 0..warmups {
         f();
@@ -397,8 +451,14 @@ fn bench(warmups: usize, reps: usize, budget: Duration, mut f: impl FnMut()) -> 
             break;
         }
     }
-    let samples = times.len();
-    (median(times), samples)
+    times.sort();
+    let (ci_lo, ci_hi) = bootstrap_ci95(&times);
+    BenchStat {
+        median: median_sorted(&times),
+        ci_lo,
+        ci_hi,
+        samples: times.len(),
+    }
 }
 
 /// How a query's work grows with dataset size, used to split the sweep's
@@ -735,14 +795,23 @@ fn run_at(cfg: &Config, nodes: u64, edges: u64) -> anyhow::Result<Vec<QueryTimin
     println!("load: issundb {is_load:?} (single write txn), ladybugdb {lb_load:?} (COPY FROM)\n");
 
     println!(
-        "{:<20} {:>12} {:>12} {:>14} {:>10}  diff",
+        "{:<20} {:>16} {:>16} {:>16} {:>10}  diff",
         "query", "issundb", "ladybugdb", "ladybugdb(1t)", "result"
     );
-    // A trailing `*` marks a median taken from fewer than the requested reps
-    // because the per-query budget ran out.
-    let fmt = |d: Duration, samples: usize| {
-        let s = format!("{d:.2?}");
-        if samples < cfg.reps {
+    println!(
+        "(timings are median±h, where h is the half-width of the 95% bootstrap \
+         confidence interval over {} timed rounds; a trailing * marks fewer than \
+         {} rounds because the per-query budget ran out)\n",
+        cfg.reps, cfg.reps
+    );
+    // Render a measured timing as `median±h%`, where the percentage is the
+    // 95% CI half-width relative to the median.
+    let fmt = |b: &BenchStat| {
+        let med = b.median.as_nanos().max(1) as f64;
+        let half = (b.ci_hi.as_nanos() as f64 - b.ci_lo.as_nanos() as f64) / 2.0;
+        let pct = (half / med * 100.0).round() as i64;
+        let s = format!("{:.2?}±{pct}%", b.median);
+        if b.samples < cfg.reps {
             format!("{s}*")
         } else {
             s
@@ -790,7 +859,7 @@ fn run_at(cfg: &Config, nodes: u64, edges: u64) -> anyhow::Result<Vec<QueryTimin
                 // not a harness failure; the run stays usable.
                 divergences += 1;
                 println!(
-                    "{name:<20} {:>12} {:>12} {:>14} {:>10}  DIVERGENT \
+                    "{name:<20} {:>16} {:>16} {:>16} {:>10}  DIVERGENT \
                      (ladybugdb walk semantics: ladybugdb {}, openCypher trails {})",
                     "-",
                     "-",
@@ -805,7 +874,7 @@ fn run_at(cfg: &Config, nodes: u64, edges: u64) -> anyhow::Result<Vec<QueryTimin
             } else {
                 mismatches += 1;
                 println!(
-                    "{name:<20} {:>12} {:>12} {:>14} {:>10}  MISMATCH \
+                    "{name:<20} {:>16} {:>16} {:>16} {:>10}  MISMATCH \
                      (issundb {} rows: {:?}..., ladybugdb {} rows: {:?}...)",
                     "-",
                     "-",
@@ -829,37 +898,39 @@ fn run_at(cfg: &Config, nodes: u64, edges: u64) -> anyhow::Result<Vec<QueryTimin
             format!("{} rows", is_rows.len())
         };
 
-        let (is_time, is_n) = bench(cfg.warmups, cfg.reps, cfg.budget, || {
+        let is_stat = bench(cfg.warmups, cfg.reps, cfg.budget, || {
             graph.query(cypher).unwrap();
         });
 
         conn.set_max_num_threads_for_exec(default_threads);
-        let (lb_time, lb_n) = bench(cfg.warmups, cfg.reps, cfg.budget, || {
+        let lb_stat = bench(cfg.warmups, cfg.reps, cfg.budget, || {
             for _row in conn.query(cypher).unwrap() {}
         });
         conn.set_max_num_threads_for_exec(1);
-        let (lb_time_1t, lb_1t_n) = bench(cfg.warmups, cfg.reps, cfg.budget, || {
+        let lb_1t_stat = bench(cfg.warmups, cfg.reps, cfg.budget, || {
             for _row in conn.query(cypher).unwrap() {}
         });
-        truncated |= is_n < cfg.reps || lb_n < cfg.reps || lb_1t_n < cfg.reps;
+        truncated |= is_stat.samples < cfg.reps
+            || lb_stat.samples < cfg.reps
+            || lb_1t_stat.samples < cfg.reps;
 
         println!(
-            "{name:<20} {:>12} {:>12} {:>14} {:>10}  OK",
-            fmt(is_time, is_n),
-            fmt(lb_time, lb_n),
-            fmt(lb_time_1t, lb_1t_n),
+            "{name:<20} {:>16} {:>16} {:>16} {:>10}  OK",
+            fmt(&is_stat),
+            fmt(&lb_stat),
+            fmt(&lb_1t_stat),
             result
         );
         timings.push(QueryTiming {
             name,
             scope: query.scope,
-            issundb: Some(is_time),
-            ladybugdb_1t: Some(lb_time_1t),
+            issundb: Some(is_stat.median),
+            ladybugdb_1t: Some(lb_1t_stat.median),
         });
     }
     if truncated {
         println!(
-            "* median from fewer than {} reps; {}s per-query budget reached",
+            "* median and CI from fewer than {} reps; {}s per-query budget reached",
             cfg.reps,
             cfg.budget.as_secs()
         );

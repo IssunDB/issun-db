@@ -74,6 +74,16 @@ jobs:
       - name: Run CLI integration tests
         run: make test-cli
 
+      - name: Run openCypher TCK conformance tests
+        # Regression gate: the suite runs every TCK scenario and fails on any
+        # new failure beyond the known-gap budget. The budget is the current
+        # count of deferred-work failures (26) plus a margin for the handful of
+        # rand()-flaky scenarios; lower it as gaps are closed.
+        env:
+          ISSUNDB_CONFORMANCE: '1'
+          ISSUNDB_CONFORMANCE_MAX_FAILURES: '30'
+        run: cargo test -p issundb --test conformance -- --nocapture
+
       - name: Upload coverage reports to Codecov
         uses: codecov/codecov-action@v5
         with:

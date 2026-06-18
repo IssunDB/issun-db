@@ -1,6 +1,6 @@
 # IssunDB
 
-IssunDB is a fast embedded graph database written in Rust.
+IssunDB is a fast embedded graph database, written in Rust.
 It can be embedded in Rust applications without the need for a server, and can be used for a wide range of applications such as building
 GraphRAG pipelines and querying knowledge graphs.
 
@@ -25,7 +25,7 @@ The database is built as a set of modular crates:
 | `issundb-retrieval` | Multi-source hybrid retrieval, rank fusion, and graph traversal.            |
 | `issundb-cypher`    | Cypher query parser, AST definitions, planners, and executors.              |
 | `issundb`           | Public facade (the API) of IssunDB that provides a unified API for use.     |
-| `issundb-cli`       | IssunDB's REPL.                                                             |
+| `issundb-cli`       | An interactive CLI for IssunDB.                                             |
 | `issundb-rest`      | An HTTP server that exposes IssunDB's functionalities over REST API.        |
 | `issundb-mcp`       | MCP server implementation for IssunDB.                                      |
 | `issundb-py`        | Python bindings for IssunDB.                                                |
