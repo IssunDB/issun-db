@@ -210,6 +210,29 @@ impl Graph {
                 masks[i] = Some(mask);
             }
         }
+        // Per-variable allow-sets from pushed-down property predicates. A
+        // present set intersects with the label mask (a node passes only when it
+        // is in both); a node id absent from the snapshot maps to no dense index
+        // and is simply dropped, counting zero without a special case. An empty
+        // `vertex_allow` (the default) leaves every mask as the label mask, so an
+        // unfiltered path count is unchanged.
+        for (i, allow) in spec.vertex_allow.iter().enumerate() {
+            let Some(ids) = allow else { continue };
+            let mut amask = vec![false; n];
+            for &id in ids {
+                if let Some(&d) = snap.id_to_dense.get(&id) {
+                    amask[d as usize] = true;
+                }
+            }
+            match &mut masks[i] {
+                Some(m) => {
+                    for (slot, &keep) in m.iter_mut().zip(amask.iter()) {
+                        *slot = *slot && keep;
+                    }
+                }
+                None => masks[i] = Some(amask),
+            }
+        }
         let label_ok = |mask: &Option<Vec<bool>>, d: usize| mask.as_ref().is_none_or(|m| m[d]);
 
         if hops == 1 {
@@ -1250,7 +1273,63 @@ mod linear_path_count_tests {
         PathCountSpec {
             rel_types: rels.to_vec(),
             labels: labels.to_vec(),
+            vertex_allow: Vec::new(),
         }
+    }
+
+    /// A per-variable allow-set intersects with the label, restricting the
+    /// counted paths to the supplied node ids exactly as a brute-force count
+    /// over the same restriction does.
+    #[test]
+    fn two_hop_allow_set_restricts_middle_and_dest() {
+        let (_dir, g) = open_tmp();
+        // Five people; ages drive the allow-sets below.
+        let p: Vec<_> = (0..5)
+            .map(|i| {
+                g.add_node("Person", &json!({ "age": 20 + i * 10 }))
+                    .unwrap()
+            })
+            .collect();
+        // A small FOLLOWS web with two-hop paths through several middles.
+        let edges = [(0, 1), (0, 2), (1, 2), (1, 3), (2, 3), (2, 4), (3, 4)];
+        for &(s, d) in &edges {
+            g.add_edge(p[s], p[d], "FOLLOWS", &json!({})).unwrap();
+        }
+
+        // Allow middles {p1, p2} and destinations {p3, p4}. Brute-force the
+        // count of (a)-[FOLLOWS]->(b)-[FOLLOWS]->(c) with b in the middle set
+        // and c in the dest set.
+        let mid = [p[1], p[2]];
+        let dst = [p[3], p[4]];
+        let mut expected = 0u64;
+        for &(_s1, d1) in &edges {
+            if !mid.contains(&p[d1]) {
+                continue;
+            }
+            for &(s2, d2) in &edges {
+                if p[s2] == p[d1] && dst.contains(&p[d2]) {
+                    expected += 1;
+                }
+            }
+        }
+        assert!(expected > 0, "test graph must have qualifying paths");
+
+        let filtered = PathCountSpec {
+            rel_types: vec![Some("FOLLOWS"), Some("FOLLOWS")],
+            labels: vec![Some("Person"), Some("Person"), Some("Person")],
+            vertex_allow: vec![None, Some(mid.to_vec()), Some(dst.to_vec())],
+        };
+        assert_eq!(g.count_linear_paths(&filtered).unwrap(), expected);
+
+        // The same pattern with no allow-sets counts every two-hop path, so the
+        // restriction strictly reduces the count.
+        let unfiltered = g
+            .count_linear_paths(&spec(
+                &[Some("FOLLOWS"), Some("FOLLOWS")],
+                &[Some("Person"); 3],
+            ))
+            .unwrap();
+        assert!(unfiltered > expected);
     }
 
     /// One hop counts typed edges whose endpoints carry the required labels.

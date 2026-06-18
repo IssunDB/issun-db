@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use crate::ast::{AggFn, BinaryOperator, Expr, Literal};
 use crate::plan::logical::FilterExpr;
-use crate::plan::physical::PhysicalOperator;
+use crate::plan::physical::{PhysicalOperator, VertexCmp, VertexPred};
 use crate::plan::stats::StatsProvider;
 
 /// An optimizer that applies relational algebra optimization passes to physical plans.
@@ -2703,17 +2703,181 @@ fn rewrite_path_count(op: PhysicalOperator) -> PhysicalOperator {
     }
 }
 
+/// A single-variable constraint peeled from the `Filter` run above an expand:
+/// either a required label or a `property CMP literal` comparison. The kernel
+/// resolves a label to a label mask and a predicate to an index allow-set, so
+/// either form restricts the counted paths without per-row evaluation.
+enum VertexConstraint<'a> {
+    Label { var: &'a str, label: &'a str },
+    Pred { var: &'a str, pred: VertexPred },
+}
+
+/// Recognize a `FilterExpr` as a single-variable `property CMP literal`
+/// comparison, returning the variable and the predicate. Handles both the
+/// structured comparison forms and the `Expr(BinaryOp)` form a split top-level
+/// `AND` conjunct keeps. The comparison flips when the property is on the right
+/// (`50 > b.age` becomes `b.age < 50`). Anything else returns `None`.
+fn as_vertex_pred(expr: &FilterExpr) -> Option<(&str, VertexPred)> {
+    let (cmp, left, right): (VertexCmp, &Expr, &Expr) = match expr {
+        FilterExpr::Eq(l, r) => (VertexCmp::Eq, l, r),
+        FilterExpr::Lt(l, r) => (VertexCmp::Lt, l, r),
+        FilterExpr::Gt(l, r) => (VertexCmp::Gt, l, r),
+        FilterExpr::Le(l, r) => (VertexCmp::Le, l, r),
+        FilterExpr::Ge(l, r) => (VertexCmp::Ge, l, r),
+        FilterExpr::Expr(Expr::BinaryOp { op, left, right }) => {
+            let cmp = match op {
+                BinaryOperator::Eq => VertexCmp::Eq,
+                BinaryOperator::Lt => VertexCmp::Lt,
+                BinaryOperator::Gt => VertexCmp::Gt,
+                BinaryOperator::Le => VertexCmp::Le,
+                BinaryOperator::Ge => VertexCmp::Ge,
+                _ => return None,
+            };
+            (cmp, left.as_ref(), right.as_ref())
+        }
+        _ => return None,
+    };
+    let flip = |c: VertexCmp| match c {
+        VertexCmp::Lt => VertexCmp::Gt,
+        VertexCmp::Gt => VertexCmp::Lt,
+        VertexCmp::Le => VertexCmp::Ge,
+        VertexCmp::Ge => VertexCmp::Le,
+        VertexCmp::Eq => VertexCmp::Eq,
+    };
+    if let Expr::Prop(v, prop) = left {
+        if let Some(value) = pushdown_literal(right, cmp) {
+            return Some((
+                v.as_str(),
+                VertexPred {
+                    property: prop.clone(),
+                    cmp,
+                    value,
+                },
+            ));
+        }
+    }
+    if let Expr::Prop(v, prop) = right {
+        let cmp = flip(cmp);
+        if let Some(value) = pushdown_literal(left, cmp) {
+            return Some((
+                v.as_str(),
+                VertexPred {
+                    property: prop.clone(),
+                    cmp,
+                    value,
+                },
+            ));
+        }
+    }
+    None
+}
+
+/// A literal the kernel can resolve to a node-id allow-set through the property
+/// index. Equality accepts any non-null, non-list literal (string equality
+/// falls back to a label scan when unindexable). A range comparison accepts
+/// only a numeric literal, because the sortable index ordering the range scan
+/// relies on is defined for numbers; non-numeric ranges fall back to the row
+/// pipeline. Parameters are excluded so resolution needs no execution-time
+/// value, keeping the recognizer's decision self-contained.
+fn pushdown_literal(e: &Expr, cmp: VertexCmp) -> Option<Expr> {
+    let Expr::Literal(lit) = e else {
+        return None;
+    };
+    match lit {
+        Literal::Null | Literal::List(_) => None,
+        Literal::Int(_) | Literal::Float(_) => Some(e.clone()),
+        _ if cmp == VertexCmp::Eq => Some(e.clone()),
+        _ => None,
+    }
+}
+
+/// Peel a contiguous run of `Filter` operators that are each a single-variable
+/// constraint (`HasLabel` or a `property CMP literal` comparison), returning the
+/// constraints (outermost first) and the operator beneath the run. Stops at, and
+/// does not consume, the first `Filter` that is not a recognized single-variable
+/// constraint; `match_forward_expand` then fails on that residual `Filter` and
+/// the rewrite is skipped, so an unrecognized predicate always keeps evaluation
+/// on the row pipeline.
+fn peel_vertex_constraints(
+    mut op: &PhysicalOperator,
+) -> (Vec<VertexConstraint<'_>>, &PhysicalOperator) {
+    let mut out = Vec::new();
+    while let PhysicalOperator::Filter { input, expression } = op {
+        if let FilterExpr::HasLabel(var, label) = expression {
+            out.push(VertexConstraint::Label {
+                var: var.as_str(),
+                label: label.as_str(),
+            });
+            op = input.as_ref();
+        } else if let Some((var, pred)) = as_vertex_pred(expression) {
+            out.push(VertexConstraint::Pred { var, pred });
+            op = input.as_ref();
+        } else {
+            break;
+        }
+    }
+    (out, op)
+}
+
+/// Collapse the constraints peeled above one expand into that node variable's
+/// single label and its property predicates. Every constraint must reference
+/// `var` (pushdown places each conjunct at its binder, so a stray reference to
+/// another variable forfeits the rewrite), and the variable takes at most one
+/// label because the kernel masks a single label per node.
+fn resolve_vertex_constraints(
+    cons: &[VertexConstraint<'_>],
+    var: &str,
+) -> Option<(Option<String>, Vec<VertexPred>)> {
+    let mut label: Option<String> = None;
+    let mut preds: Vec<VertexPred> = Vec::new();
+    for c in cons {
+        match c {
+            VertexConstraint::Label { var: v, label: l } => {
+                if *v != var {
+                    return None;
+                }
+                match &label {
+                    None => label = Some((*l).to_string()),
+                    Some(existing) if existing == l => {}
+                    Some(_) => return None,
+                }
+            }
+            VertexConstraint::Pred { var: v, pred } => {
+                if *v != var {
+                    return None;
+                }
+                preds.push(pred.clone());
+            }
+        }
+    }
+    Some((label, preds))
+}
+
+/// Reconcile a `LabelScan`'s label with a `HasLabel` constraint on the same
+/// source variable: at most one distinct label survives, two conflicting labels
+/// forfeit the rewrite (the kernel masks a single label).
+fn merge_scan_label(scan: Option<String>, has_label: Option<String>) -> Option<Option<String>> {
+    match (scan, has_label) {
+        (Some(a), Some(b)) if a != b => None,
+        (Some(a), _) => Some(Some(a)),
+        (None, b) => Some(b),
+    }
+}
+
 /// Match the one-hop or two-hop path-count plan shape and build its
 /// replacement.
 ///
 /// Required shape, top-down: an `Aggregate` with no grouping whose only
 /// aggregation is a non-distinct `count(*)` or `count(var)` over a pattern
-/// variable; then a directed, single forward `Expand` (optionally under one
-/// `HasLabel` on its destination); then either a `LabelScan` (one hop) or a
-/// second directed forward `Expand` whose relationship is unique against the
-/// first (optionally under one `HasLabel` on the middle node) over a
-/// `LabelScan` (two hops). Anything else returns `None` and the plan runs the
-/// row pipeline, so correctness never depends on this recognizer.
+/// variable; then a directed, single forward `Expand`; then either a
+/// `LabelScan` (one hop) or a second directed forward `Expand` whose
+/// relationship is unique against the first over a `LabelScan` (two hops).
+/// Above each expand (and above the `LabelScan`) the recognizer peels a run of
+/// single-variable constraints: an optional `HasLabel` plus any number of
+/// `property CMP literal` comparisons on that node. Labels become per-variable
+/// kernel masks and predicates become index allow-sets, so a filtered count
+/// stays a kernel call. Anything else returns `None` and the plan runs the row
+/// pipeline, so correctness never depends on this recognizer.
 fn try_path_count(op: &PhysicalOperator) -> Option<PhysicalOperator> {
     let PhysicalOperator::Aggregate {
         input,
@@ -2731,21 +2895,22 @@ fn try_path_count(op: &PhysicalOperator) -> Option<PhysicalOperator> {
         return None;
     }
 
-    // Outermost (last) hop, with an optional label on its destination node.
-    let (last_label, exp_last) = peel_one_haslabel(input.as_ref());
+    // Outermost (last) hop: the destination's constraints, then the expand.
+    let (cons_last, exp_last) = peel_vertex_constraints(input.as_ref());
     let (below_last, src_last, _rel_last, dst_last, t_last, unique_last) =
         match_forward_expand(exp_last)?;
 
-    // Two hops: a second forward expand sits below, optionally under one
-    // `HasLabel` on the middle node, over a `LabelScan`.
-    let (mid_label, below_mid) = peel_one_haslabel(below_last);
+    // Two hops: the middle's constraints, a second forward expand, the source's
+    // constraints, then a `LabelScan`.
+    let (cons_mid, below_mid) = peel_vertex_constraints(below_last);
     if let Some((below_first, src_first, rel_first, dst_first, t_first, unique_first)) =
         match_forward_expand(below_mid)
     {
+        let (cons_src, scan) = peel_vertex_constraints(below_first);
         let PhysicalOperator::LabelScan {
             variable: v0,
             label: l0,
-        } = below_first
+        } = scan
         else {
             return None;
         };
@@ -2757,16 +2922,6 @@ fn try_path_count(op: &PhysicalOperator) -> Option<PhysicalOperator> {
         if v0 == v1 || v1 == v2 || v0 == v2 {
             return None;
         }
-        if let Some((v, _)) = mid_label {
-            if v != v1 {
-                return None;
-            }
-        }
-        if let Some((v, _)) = last_label {
-            if v != v2 {
-                return None;
-            }
-        }
         // One-pattern relationship uniqueness: the second hop must differ from
         // the first, and nothing more.
         if !unique_first.is_empty() || unique_last.as_slice() != [rel_first.clone()] {
@@ -2775,22 +2930,32 @@ fn try_path_count(op: &PhysicalOperator) -> Option<PhysicalOperator> {
         if !count_arg_is_nonnull(count_expr, &[v0, v1, v2, rel_first, _rel_last]) {
             return None;
         }
+        let (lab0, pred0) = resolve_vertex_constraints(&cons_src, v0)?;
+        let (lab1, pred1) = resolve_vertex_constraints(&cons_mid, v1)?;
+        let (lab2, pred2) = resolve_vertex_constraints(&cons_last, v2)?;
+        let label0 = merge_scan_label(l0.clone(), lab0)?;
+        // The property index is label-scoped, so a filtered vertex must carry a
+        // label; otherwise the predicate cannot resolve and we fall back.
+        if (!pred0.is_empty() && label0.is_none())
+            || (!pred1.is_empty() && lab1.is_none())
+            || (!pred2.is_empty() && lab2.is_none())
+        {
+            return None;
+        }
         return Some(PhysicalOperator::PathCount {
             rel_types: vec![t_first.clone(), t_last.clone()],
-            labels: vec![
-                l0.clone(),
-                mid_label.map(|(_, l)| l.to_string()),
-                last_label.map(|(_, l)| l.to_string()),
-            ],
+            labels: vec![label0, lab1, lab2],
+            vertex_filters: vec![pred0, pred1, pred2],
             output: out_name.clone(),
         });
     }
 
-    // One hop: the expand sits directly over a `LabelScan`.
+    // One hop: the source's constraints sit directly over a `LabelScan`.
+    let (cons_src, scan) = peel_vertex_constraints(below_last);
     let PhysicalOperator::LabelScan {
         variable: v0,
         label: l0,
-    } = below_last
+    } = scan
     else {
         return None;
     };
@@ -2798,20 +2963,22 @@ fn try_path_count(op: &PhysicalOperator) -> Option<PhysicalOperator> {
     if src_last != v0 || v0 == v1 {
         return None;
     }
-    if let Some((v, _)) = last_label {
-        if v != v1 {
-            return None;
-        }
-    }
     if !unique_last.is_empty() {
         return None;
     }
     if !count_arg_is_nonnull(count_expr, &[v0, v1, _rel_last]) {
         return None;
     }
+    let (lab0, pred0) = resolve_vertex_constraints(&cons_src, v0)?;
+    let (lab1, pred1) = resolve_vertex_constraints(&cons_last, v1)?;
+    let label0 = merge_scan_label(l0.clone(), lab0)?;
+    if (!pred0.is_empty() && label0.is_none()) || (!pred1.is_empty() && lab1.is_none()) {
+        return None;
+    }
     Some(PhysicalOperator::PathCount {
         rel_types: vec![t_last.clone()],
-        labels: vec![l0.clone(), last_label.map(|(_, l)| l.to_string())],
+        labels: vec![label0, lab1],
+        vertex_filters: vec![pred0, pred1],
         output: out_name.clone(),
     })
 }

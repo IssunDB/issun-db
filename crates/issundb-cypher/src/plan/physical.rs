@@ -189,9 +189,38 @@ pub enum PhysicalOperator {
         rel_types: Vec<Option<String>>,
         /// Label per node variable, in path order. Length `rel_types.len() + 1`.
         labels: Vec<Option<String>>,
+        /// Per-vertex property predicates pushed down into the kernel, in path
+        /// order (length matches `labels`). Each inner vector holds the
+        /// `prop CMP literal` constraints on that node variable; the executor
+        /// resolves them to an allow-set via the property index so the filtered
+        /// count stays a kernel call. An empty inner vector means the variable
+        /// carries no property predicate.
+        vertex_filters: Vec<Vec<VertexPred>>,
         /// Output column the count is bound to.
         output: String,
     },
+}
+
+/// Comparison operator of a per-vertex property predicate pushed into the
+/// `PathCount` kernel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VertexCmp {
+    Eq,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+/// A single per-vertex property predicate `property CMP value` bound to one
+/// node variable of a `PathCount` pattern. `value` is a constant expression (a
+/// literal), evaluated once at execution and resolved to a node-id allow-set
+/// through the property index.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VertexPred {
+    pub property: String,
+    pub cmp: VertexCmp,
+    pub value: Expr,
 }
 
 /// A physical planner that compiles logical query plans into physical, executable plans.
@@ -582,11 +611,39 @@ pub fn format_physical_plan(op: &PhysicalOperator, depth: usize) -> String {
         PhysicalOperator::PathCount {
             rel_types,
             labels,
+            vertex_filters,
             output,
         } => {
-            let node = |i: usize| match labels.get(i).and_then(|l| l.as_deref()) {
-                Some(l) => format!("(v{i}:{l})"),
-                None => format!("(v{i})"),
+            let cmp = |c: &VertexCmp| match c {
+                VertexCmp::Eq => "=",
+                VertexCmp::Lt => "<",
+                VertexCmp::Le => "<=",
+                VertexCmp::Gt => ">",
+                VertexCmp::Ge => ">=",
+            };
+            let node = |i: usize| {
+                let label = match labels.get(i).and_then(|l| l.as_deref()) {
+                    Some(l) => format!(":{l}"),
+                    None => String::new(),
+                };
+                let preds = match vertex_filters.get(i) {
+                    Some(ps) if !ps.is_empty() => {
+                        let parts: Vec<String> = ps
+                            .iter()
+                            .map(|p| {
+                                format!(
+                                    "v{i}.{} {} {}",
+                                    p.property,
+                                    cmp(&p.cmp),
+                                    fmt_expr(&p.value)
+                                )
+                            })
+                            .collect();
+                        format!(" {{{}}}", parts.join(", "))
+                    }
+                    _ => String::new(),
+                };
+                format!("(v{i}{label}{preds})")
             };
             let mut pattern = node(0);
             for (h, rt) in rel_types.iter().enumerate() {
