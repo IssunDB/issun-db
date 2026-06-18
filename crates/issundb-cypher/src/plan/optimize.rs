@@ -51,6 +51,10 @@ impl Optimizer {
         // Replace a grouping-free count over a MultiwayJoin-closed directed
         // triangle chain with the core sorted-intersect kernel.
         result = rewrite_triangle_count(result);
+        // Replace a grouping-free count over a one-hop or two-hop directed
+        // expansion with the core path-count kernel. Runs after the triangle
+        // rewrite so a closed triangle is never mistaken for an open path.
+        result = rewrite_path_count(result);
         result
     }
 
@@ -340,7 +344,9 @@ impl Optimizer {
                 )
             }
             // A leaf produced after this pass; nothing to extract.
-            t @ PhysicalOperator::TriangleCount { .. } => (t, Vec::new()),
+            t @ PhysicalOperator::TriangleCount { .. } | t @ PhysicalOperator::PathCount { .. } => {
+                (t, Vec::new())
+            }
         }
     }
 
@@ -502,7 +508,9 @@ impl Optimizer {
                 closing_is_undirected,
                 closing_unique_rels,
             },
-            t @ PhysicalOperator::TriangleCount { .. } => t,
+            t @ PhysicalOperator::TriangleCount { .. } | t @ PhysicalOperator::PathCount { .. } => {
+                t
+            }
         }
     }
 
@@ -583,7 +591,7 @@ impl Optimizer {
             | PhysicalOperator::WritePart { input, .. }
             | PhysicalOperator::ProcedureCall { input, .. } => Self::plan_weight(input, stats),
             // A single kernel call producing one row.
-            PhysicalOperator::TriangleCount { .. } => 1,
+            PhysicalOperator::TriangleCount { .. } | PhysicalOperator::PathCount { .. } => 1,
             // MultiwayJoin is cheaper than a regular Expand because the closing check is O(1)
             // per row after a single bulk expansion. Weight as the input cost.
             PhysicalOperator::MultiwayJoin { input, .. } => Self::plan_weight(input, stats),
@@ -1084,7 +1092,9 @@ impl Optimizer {
                 current_node
             }
             // A leaf produced after this pass; no children to push into.
-            t @ PhysicalOperator::TriangleCount { .. } => t,
+            t @ PhysicalOperator::TriangleCount { .. } | t @ PhysicalOperator::PathCount { .. } => {
+                t
+            }
         }
     }
 
@@ -1289,7 +1299,8 @@ impl Optimizer {
                     vars.insert(v.clone());
                 }
             }
-            PhysicalOperator::TriangleCount { output, .. } => {
+            PhysicalOperator::TriangleCount { output, .. }
+            | PhysicalOperator::PathCount { output, .. } => {
                 vars.insert(output.clone());
             }
         }
@@ -2599,6 +2610,212 @@ fn try_triangle_count(op: &PhysicalOperator) -> Option<PhysicalOperator> {
     })
 }
 
+/// Borrowed view of a single directed, single-hop, forward `Expand` with no
+/// path binding: `(input, src_var, rel_var, dst_var, rel_type, unique_rels)`.
+/// Any other expand shape (incoming, undirected, variable-length, or
+/// path-binding) returns `None`, which forfeits the fast path without
+/// affecting correctness.
+type ForwardExpand<'a> = (
+    &'a PhysicalOperator,
+    &'a String,
+    &'a String,
+    &'a String,
+    &'a Option<String>,
+    &'a Vec<String>,
+);
+
+fn match_forward_expand(op: &PhysicalOperator) -> Option<ForwardExpand<'_>> {
+    if let PhysicalOperator::Expand {
+        input,
+        src_var,
+        rel_var,
+        dst_var,
+        rel_type,
+        is_incoming: false,
+        is_undirected: false,
+        min_hops: 1,
+        max_hops: 1,
+        unique_rels,
+        needs_path: false,
+    } = op
+    {
+        Some((
+            input.as_ref(),
+            src_var,
+            rel_var,
+            dst_var,
+            rel_type,
+            unique_rels,
+        ))
+    } else {
+        None
+    }
+}
+
+/// True when the counted expression is non-null in every match, so a `count`
+/// over it equals the assignment count: either `count(*)` or a bare reference
+/// to one of the pattern's node or relationship variables.
+fn count_arg_is_nonnull(expr: &Expr, vars: &[&String]) -> bool {
+    match expr {
+        Expr::CountStar => true,
+        Expr::Prop(v, p) if p.is_empty() => vars.iter().any(|x| *x == v),
+        _ => false,
+    }
+}
+
+/// Replace a grouping-free, non-distinct `count` aggregate sitting directly on
+/// a one-hop or two-hop directed expansion with the leaf `PathCount` operator,
+/// which the executor answers via one core kernel call instead of
+/// materializing every row of the pattern. Recursion mirrors
+/// `rewrite_triangle_count`.
+fn rewrite_path_count(op: PhysicalOperator) -> PhysicalOperator {
+    if let Some(t) = try_path_count(&op) {
+        return t;
+    }
+    match op {
+        PhysicalOperator::Project {
+            input,
+            items,
+            is_barrier,
+        } => PhysicalOperator::Project {
+            input: Box::new(rewrite_path_count(*input)),
+            items,
+            is_barrier,
+        },
+        PhysicalOperator::Limit { input, skip, count } => PhysicalOperator::Limit {
+            input: Box::new(rewrite_path_count(*input)),
+            skip,
+            count,
+        },
+        PhysicalOperator::Sort { input, items } => PhysicalOperator::Sort {
+            input: Box::new(rewrite_path_count(*input)),
+            items,
+        },
+        PhysicalOperator::Distinct { input, keys } => PhysicalOperator::Distinct {
+            keys,
+            input: Box::new(rewrite_path_count(*input)),
+        },
+        PhysicalOperator::Filter { input, expression } => PhysicalOperator::Filter {
+            input: Box::new(rewrite_path_count(*input)),
+            expression,
+        },
+        other => other,
+    }
+}
+
+/// Match the one-hop or two-hop path-count plan shape and build its
+/// replacement.
+///
+/// Required shape, top-down: an `Aggregate` with no grouping whose only
+/// aggregation is a non-distinct `count(*)` or `count(var)` over a pattern
+/// variable; then a directed, single forward `Expand` (optionally under one
+/// `HasLabel` on its destination); then either a `LabelScan` (one hop) or a
+/// second directed forward `Expand` whose relationship is unique against the
+/// first (optionally under one `HasLabel` on the middle node) over a
+/// `LabelScan` (two hops). Anything else returns `None` and the plan runs the
+/// row pipeline, so correctness never depends on this recognizer.
+fn try_path_count(op: &PhysicalOperator) -> Option<PhysicalOperator> {
+    let PhysicalOperator::Aggregate {
+        input,
+        group_by,
+        aggregations,
+    } = op
+    else {
+        return None;
+    };
+    if !group_by.is_empty() || aggregations.len() != 1 {
+        return None;
+    }
+    let (agg_fn, count_expr, out_name) = &aggregations[0];
+    if !matches!(agg_fn, AggFn::Count { distinct: false }) {
+        return None;
+    }
+
+    // Outermost (last) hop, with an optional label on its destination node.
+    let (last_label, exp_last) = peel_one_haslabel(input.as_ref());
+    let (below_last, src_last, _rel_last, dst_last, t_last, unique_last) =
+        match_forward_expand(exp_last)?;
+
+    // Two hops: a second forward expand sits below, optionally under one
+    // `HasLabel` on the middle node, over a `LabelScan`.
+    let (mid_label, below_mid) = peel_one_haslabel(below_last);
+    if let Some((below_first, src_first, rel_first, dst_first, t_first, unique_first)) =
+        match_forward_expand(below_mid)
+    {
+        let PhysicalOperator::LabelScan {
+            variable: v0,
+            label: l0,
+        } = below_first
+        else {
+            return None;
+        };
+        let (v1, v2) = (dst_first, dst_last);
+        // Cycle-free chain wiring over three distinct node variables.
+        if src_first != v0 || src_last != v1 {
+            return None;
+        }
+        if v0 == v1 || v1 == v2 || v0 == v2 {
+            return None;
+        }
+        if let Some((v, _)) = mid_label {
+            if v != v1 {
+                return None;
+            }
+        }
+        if let Some((v, _)) = last_label {
+            if v != v2 {
+                return None;
+            }
+        }
+        // One-pattern relationship uniqueness: the second hop must differ from
+        // the first, and nothing more.
+        if !unique_first.is_empty() || unique_last.as_slice() != [rel_first.clone()] {
+            return None;
+        }
+        if !count_arg_is_nonnull(count_expr, &[v0, v1, v2, rel_first, _rel_last]) {
+            return None;
+        }
+        return Some(PhysicalOperator::PathCount {
+            rel_types: vec![t_first.clone(), t_last.clone()],
+            labels: vec![
+                l0.clone(),
+                mid_label.map(|(_, l)| l.to_string()),
+                last_label.map(|(_, l)| l.to_string()),
+            ],
+            output: out_name.clone(),
+        });
+    }
+
+    // One hop: the expand sits directly over a `LabelScan`.
+    let PhysicalOperator::LabelScan {
+        variable: v0,
+        label: l0,
+    } = below_last
+    else {
+        return None;
+    };
+    let v1 = dst_last;
+    if src_last != v0 || v0 == v1 {
+        return None;
+    }
+    if let Some((v, _)) = last_label {
+        if v != v1 {
+            return None;
+        }
+    }
+    if !unique_last.is_empty() {
+        return None;
+    }
+    if !count_arg_is_nonnull(count_expr, &[v0, v1, _rel_last]) {
+        return None;
+    }
+    Some(PhysicalOperator::PathCount {
+        rel_types: vec![t_last.clone()],
+        labels: vec![l0.clone(), last_label.map(|(_, l)| l.to_string())],
+        output: out_name.clone(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3737,14 +3954,16 @@ mod tests {
     #[test]
     fn reduce_count_skips_non_reducible_edge_counts() {
         let stats = TestStats::new(&[("Person", 42)]).with_type("KNOWS", 7);
+        // The directed single-hop edge counts that `reduce_count` correctly
+        // declines to fold into a type-metadata constant are now answered by
+        // the `PathCount` kernel instead (a correct per-pattern count, not the
+        // metadata shortcut this test guards against); their parity lives in
+        // `path_count_exec_tests`. The cases below remain non-reducible and
+        // stay on a scan.
         for q in [
             // Undirected: each edge matches in both directions, so the type
             // metadata would undercount by half.
             "MATCH ()-[r:KNOWS]-() RETURN count(r)",
-            // A labeled endpoint constrains the rows; type metadata ignores labels.
-            "MATCH (a:Person)-[r:KNOWS]->() RETURN count(r)",
-            // An untyped relationship has no metadata count.
-            "MATCH ()-[r]->() RETURN count(r)",
             // Variable-length: row count is path count, not edge count.
             "MATCH ()-[:KNOWS*1..2]->() RETURN count(*)",
             // A residual predicate must be evaluated per row.

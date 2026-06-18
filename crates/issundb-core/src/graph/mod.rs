@@ -64,6 +64,24 @@ pub struct TriangleCountSpec<'a> {
     pub labels: [Option<&'a str>; 3],
 }
 
+/// Pattern description for [`Graph::count_linear_paths`]: an open directed
+/// path of one or two hops, `(v0)-[t1]->(v1)` or
+/// `(v0)-[t1]->(v1)-[t2]->(v2)`, with an optional relationship type per hop
+/// and an optional label per node variable. `None` means unconstrained.
+///
+/// `rel_types.len()` is the hop count (1 or 2); `labels.len()` is the node
+/// count (hop count plus one). The two-hop count follows Cypher MATCH
+/// relationship-uniqueness semantics: the two relationships must be distinct,
+/// which only constrains self-loop assignments where one edge could fill both
+/// hops.
+#[derive(Debug, Clone, Default)]
+pub struct PathCountSpec<'a> {
+    /// Relationship type per hop, in path order. Length 1 or 2.
+    pub rel_types: Vec<Option<&'a str>>,
+    /// Label per node variable, in path order. Length is `rel_types.len() + 1`.
+    pub labels: Vec<Option<&'a str>>,
+}
+
 /// Builds a 12-byte composite key `(prefix u32 BE, id u64 BE)` for secondary index lookups.
 pub(super) fn composite_key(prefix: u32, id: u64) -> [u8; 12] {
     let mut key = [0u8; 12];

@@ -204,6 +204,9 @@ impl SlotSchema {
             TriangleCount { output, .. } => {
                 self.bind(output);
             }
+            PathCount { output, .. } => {
+                self.bind(output);
+            }
         }
     }
 

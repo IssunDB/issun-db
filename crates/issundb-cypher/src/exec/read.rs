@@ -3804,6 +3804,22 @@ pub(super) fn eval_leaf(
             path.bind_local(output, GraphBinding::Scalar(serde_json::Value::from(count)));
             Ok(vec![path])
         }
+        PhysicalOperator::PathCount {
+            rel_types,
+            labels,
+            output,
+        } => {
+            // One kernel call over the CSR snapshot replaces the row-pipeline
+            // expansion; the count of matching paths comes back as one row.
+            let spec = issundb_core::PathCountSpec {
+                rel_types: rel_types.iter().map(|t| t.as_deref()).collect(),
+                labels: labels.iter().map(|l| l.as_deref()).collect(),
+            };
+            let count = graph.count_linear_paths(&spec).map_err(|e| e.to_string())?;
+            let mut path = SlotRow::empty(schema.clone());
+            path.bind_local(output, GraphBinding::Scalar(serde_json::Value::from(count)));
+            Ok(vec![path])
+        }
         other => Err(format!("eval_leaf called on non-leaf operator: {other:?}")),
     }
 }
@@ -4631,6 +4647,169 @@ mod triangle_count_exec_tests {
                 let kernel = count_result(&graph, KERNEL_Q);
                 let row = count_result(&graph, ROW_Q);
                 prop_assert_eq!(kernel, row, "kernel vs row path on {} nodes", n_nodes);
+                Ok(())
+            })
+            .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod path_count_exec_tests {
+    //! Plan-shape and parity tests for the `PathCount` kernel rewrite over
+    //! open one-hop and two-hop expansions. As with the triangle tests, an
+    //! always-true `IS NULL` predicate pushes a `Filter` that breaks the exact
+    //! shape match without changing the result, forcing the row pipeline as a
+    //! semantic oracle.
+    use super::*;
+    use crate::ast::Statement;
+    use crate::parser;
+    use crate::plan::physical::format_physical_plan;
+    use crate::plan::{LogicalPlanner, Optimizer, PhysicalPlanner};
+    use issundb_core::Graph;
+    use tempfile::TempDir;
+
+    const ONE_HOP_KERNEL: &str = "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN count(*) AS n";
+    const ONE_HOP_ROW: &str =
+        "MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE a.__force IS NULL RETURN count(*) AS n";
+    const TWO_HOP_KERNEL: &str =
+        "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person) RETURN count(*) AS n";
+    const TWO_HOP_ROW: &str = "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person) \
+         WHERE a.__force IS NULL RETURN count(*) AS n";
+
+    fn setup() -> (TempDir, Graph) {
+        let dir = TempDir::new().unwrap();
+        let graph = Graph::open(dir.path(), 1).unwrap();
+        (dir, graph)
+    }
+
+    fn plan_text(graph: &Graph, cypher: &str) -> String {
+        let stmt = parser::parse(cypher).unwrap();
+        let q = match stmt {
+            Statement::Query(q) => q,
+            _ => panic!("not a read query: {cypher}"),
+        };
+        let logical = LogicalPlanner::plan(&q).unwrap();
+        let physical = PhysicalPlanner::plan(&logical);
+        format_physical_plan(&Optimizer::optimize(physical, Some(graph)), 0)
+    }
+
+    fn count_result(graph: &Graph, cypher: &str) -> u64 {
+        let result = super::execute(graph, cypher, &HashMap::new()).unwrap();
+        assert_eq!(result.records.len(), 1, "count query must yield one row");
+        result.records[0].values[0].as_u64().unwrap()
+    }
+
+    /// The one-hop and two-hop count queries plan to the `PathCount` leaf,
+    /// while forcing a pushed-down predicate keeps the row pipeline.
+    #[test]
+    fn kernel_plan_shape() {
+        let (_dir, graph) = setup();
+        super::execute(
+            &graph,
+            "CREATE (x:Person), (y:Person), (z:Person) \
+             CREATE (x)-[:KNOWS]->(y), (y)-[:KNOWS]->(z)",
+            &HashMap::new(),
+        )
+        .unwrap();
+        graph.rebuild_csr().unwrap();
+
+        for q in [ONE_HOP_KERNEL, TWO_HOP_KERNEL] {
+            let plan = plan_text(&graph, q);
+            assert!(plan.contains("PathCount"), "expected kernel leaf:\n{plan}");
+        }
+        for q in [ONE_HOP_ROW, TWO_HOP_ROW] {
+            let plan = plan_text(&graph, q);
+            assert!(
+                !plan.contains("PathCount"),
+                "forcing predicate failed to disable the rewrite:\n{plan}"
+            );
+        }
+    }
+
+    /// Shapes outside the kernel contract stay on the row pipeline.
+    #[test]
+    fn unsupported_shapes_keep_the_row_path() {
+        let (_dir, graph) = setup();
+        super::execute(
+            &graph,
+            "CREATE (x:Person)-[:KNOWS]->(y:Person)",
+            &HashMap::new(),
+        )
+        .unwrap();
+        graph.rebuild_csr().unwrap();
+        let bail = [
+            // Property predicate on a pattern variable.
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE b.age > 1 RETURN count(*) AS n",
+            // Grouped aggregation.
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN b.city AS c, count(*) AS n",
+            // DISTINCT count.
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN count(DISTINCT a) AS n",
+            // Reversed hop binds the scan node as the destination.
+            "MATCH (a:Person)<-[:KNOWS]-(b:Person) RETURN count(*) AS n",
+            // Var-length hop.
+            "MATCH (a:Person)-[:KNOWS*1..2]->(b:Person) RETURN count(*) AS n",
+            // Three hops.
+            "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person)-[:KNOWS]->(d:Person) \
+             RETURN count(*) AS n",
+        ];
+        for q in bail {
+            let plan = plan_text(&graph, q);
+            assert!(
+                !plan.contains("PathCount"),
+                "rewrite must not fire for `{q}`:\n{plan}"
+            );
+            super::execute(&graph, q, &HashMap::new()).unwrap();
+        }
+    }
+
+    /// Differential parity on random multigraphs (self-loops and parallel
+    /// edges included): the kernel path and the forced row path agree for both
+    /// the one-hop and two-hop counts.
+    #[test]
+    fn kernel_matches_row_path_on_random_multigraphs() {
+        use proptest::prelude::*;
+
+        let mut runner = proptest::test_runner::TestRunner::new(ProptestConfig {
+            cases: 32,
+            ..ProptestConfig::default()
+        });
+        let strategy = (
+            1usize..=6,
+            proptest::collection::vec((0usize..6, 0usize..6), 0..24),
+        );
+        runner
+            .run(&strategy, |(n_nodes, edges)| {
+                let (_dir, graph) = setup();
+                let mut create = String::from("CREATE ");
+                for i in 0..n_nodes {
+                    if i > 0 {
+                        create.push_str(", ");
+                    }
+                    create.push_str(&format!("(p{i}:Person)"));
+                }
+                super::execute(&graph, &create, &HashMap::new()).unwrap();
+                for (s, d) in &edges {
+                    let (s, d) = (s % n_nodes, d % n_nodes);
+                    let q = format!(
+                        "MATCH (a:Person), (b:Person) WHERE id(a) = {s} AND id(b) = {d} \
+                         CREATE (a)-[:KNOWS]->(b)"
+                    );
+                    super::execute(&graph, &q, &HashMap::new()).unwrap();
+                }
+                graph.rebuild_csr().unwrap();
+
+                prop_assert_eq!(
+                    count_result(&graph, ONE_HOP_KERNEL),
+                    count_result(&graph, ONE_HOP_ROW),
+                    "one-hop kernel vs row on {} nodes",
+                    n_nodes
+                );
+                prop_assert_eq!(
+                    count_result(&graph, TWO_HOP_KERNEL),
+                    count_result(&graph, TWO_HOP_ROW),
+                    "two-hop kernel vs row on {} nodes",
+                    n_nodes
+                );
                 Ok(())
             })
             .unwrap();

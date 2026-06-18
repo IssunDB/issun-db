@@ -156,6 +156,131 @@ impl Graph {
         Ok(total)
     }
 
+    /// Counts variable assignments of an open directed path of one or two hops
+    /// under `spec`'s per-hop relationship types and per-variable labels, with
+    /// no materialization of the matched rows.
+    ///
+    /// The count follows Cypher MATCH semantics: each distinct assignment of
+    /// the node and relationship variables is one match, nodes may repeat,
+    /// parallel edges multiply, and for the two-hop pattern the two
+    /// relationships must be distinct (relationship uniqueness). That
+    /// uniqueness only removes assignments where a single edge could fill both
+    /// hops, which requires a self-loop shared by both hops.
+    ///
+    /// The Cypher optimizer lowers a grouping-free `count` over a one-hop or
+    /// two-hop directed expansion to this kernel via the `PathCount` physical operator.
+    pub fn count_linear_paths(&self, spec: &PathCountSpec) -> Result<u64, Error> {
+        let hops = spec.rel_types.len();
+        debug_assert!(hops == 1 || hops == 2, "count_linear_paths: 1 or 2 hops");
+        debug_assert_eq!(spec.labels.len(), hops + 1, "labels must be hops + 1");
+
+        self.ensure_csr_fresh()?;
+        let snap = self.csr_cache.snapshot.load();
+        let n = snap.dense_to_id.len();
+        if n == 0 {
+            return Ok(0);
+        }
+
+        // A named but unregistered relationship type matches nothing.
+        let mut type_ids: Vec<Option<TypeId>> = vec![None; hops];
+        {
+            let rtxn = self.storage.env.read_txn()?;
+            for (i, name) in spec.rel_types.iter().enumerate() {
+                if let Some(name) = name {
+                    match get_type(&self.storage, &rtxn, name)? {
+                        Some(tid) => type_ids[i] = Some(tid),
+                        None => return Ok(0),
+                    }
+                }
+            }
+        }
+
+        // Dense-index masks for the per-variable labels; `None` is
+        // unconstrained. An unknown label yields an all-false mask, counting
+        // zero without a special case.
+        let mut masks: Vec<Option<Vec<bool>>> = vec![None; hops + 1];
+        for (i, label) in spec.labels.iter().enumerate() {
+            if let Some(name) = label {
+                let mut mask = vec![false; n];
+                for id in self.nodes_by_label(name)? {
+                    if let Some(&d) = snap.id_to_dense.get(&id) {
+                        mask[d as usize] = true;
+                    }
+                }
+                masks[i] = Some(mask);
+            }
+        }
+        let label_ok = |mask: &Option<Vec<bool>>, d: usize| mask.as_ref().is_none_or(|m| m[d]);
+
+        if hops == 1 {
+            // Count typed edges `v0 -> v1` with `v0` and `v1` inside their masks.
+            let out1 = typed_out_sorted(&snap, type_ids[0]);
+            let mut total: u64 = 0;
+            for v0 in 0..n {
+                if !label_ok(&masks[0], v0) {
+                    continue;
+                }
+                for &(dst, _e) in out1.row(v0) {
+                    if label_ok(&masks[1], dst as usize) {
+                        total += 1;
+                    }
+                }
+            }
+            return Ok(total);
+        }
+
+        // Two hops `(v0:m0)-[t1]->(v1:m1)-[t2]->(v2:m2)`. The path count
+        // factors through the middle node: for each `v1`, the number of
+        // matches is the count of qualifying hop-1 in-edges times the count of
+        // qualifying hop-2 out-edges. Relationship uniqueness then removes the
+        // assignments where hop 1 and hop 2 bind the same edge, which is only
+        // possible for a self-loop at `v1` that satisfies both hops.
+        let in1 = typed_in_sorted(&snap, type_ids[0]); // edges into v1, type t1
+        let out2 = typed_out_sorted(&snap, type_ids[1]); // edges out of v1, type t2
+        let mut total: u64 = 0;
+        for b in 0..n {
+            if !label_ok(&masks[1], b) {
+                continue;
+            }
+            let in_row = in1.row(b);
+            let indeg = in_row
+                .iter()
+                .filter(|&&(src, _)| label_ok(&masks[0], src as usize))
+                .count() as u64;
+            if indeg == 0 {
+                continue;
+            }
+            let out_row = out2.row(b);
+            let outdeg = out_row
+                .iter()
+                .filter(|&&(dst, _)| label_ok(&masks[2], dst as usize))
+                .count() as u64;
+            total += indeg * outdeg;
+
+            // Relationship-uniqueness correction. A single edge can fill both
+            // hops only when it is a self-loop at `b` and `b` satisfies the
+            // first and last masks. Such an edge appears in both rows with
+            // neighbor `b`; intersect those self-loop entries by edge id. Rows
+            // are sorted by `(neighbor, edge id)`, so the self-loop entries for
+            // each row are a contiguous, edge-id-ascending run.
+            if label_ok(&masks[0], b) && label_ok(&masks[2], b) {
+                let in_self: Vec<EdgeId> = in_row
+                    .iter()
+                    .filter(|&&(src, _)| src as usize == b)
+                    .map(|&(_, e)| e)
+                    .collect();
+                if !in_self.is_empty() {
+                    let shared = out_row
+                        .iter()
+                        .filter(|&&(dst, e)| dst as usize == b && in_self.binary_search(&e).is_ok())
+                        .count() as u64;
+                    total = total.saturating_sub(shared);
+                }
+            }
+        }
+        Ok(total)
+    }
+
     /// Detects if there is at least one directed cycle in the graph.
     pub fn detect_cycle(&self) -> Result<bool, Error> {
         self.ensure_csr_fresh()?;
@@ -1102,6 +1227,138 @@ mod incremental_matrix_tests {
                 }
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod linear_path_count_tests {
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    use crate::{Graph, PathCountSpec};
+
+    fn open_tmp() -> (TempDir, Graph) {
+        let dir = TempDir::new().unwrap();
+        let g = Graph::open(dir.path(), 1).unwrap();
+        (dir, g)
+    }
+
+    fn spec(
+        rels: &[Option<&'static str>],
+        labels: &[Option<&'static str>],
+    ) -> PathCountSpec<'static> {
+        PathCountSpec {
+            rel_types: rels.to_vec(),
+            labels: labels.to_vec(),
+        }
+    }
+
+    /// One hop counts typed edges whose endpoints carry the required labels.
+    #[test]
+    fn one_hop_counts_typed_edges() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("Person", &json!({})).unwrap();
+        let b = g.add_node("Person", &json!({})).unwrap();
+        let c = g.add_node("Person", &json!({})).unwrap();
+        g.add_edge(a, b, "KNOWS", &json!({})).unwrap();
+        g.add_edge(a, c, "KNOWS", &json!({})).unwrap();
+
+        let n = g
+            .count_linear_paths(&spec(&[Some("KNOWS")], &[Some("Person"), Some("Person")]))
+            .unwrap();
+        assert_eq!(n, 2);
+    }
+
+    /// A one-hop label predicate on the far endpoint excludes mismatched
+    /// targets.
+    #[test]
+    fn one_hop_label_filter_excludes_endpoint() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("Person", &json!({})).unwrap();
+        let b = g.add_node("Person", &json!({})).unwrap();
+        let c = g.add_node("City", &json!({})).unwrap();
+        g.add_edge(a, b, "KNOWS", &json!({})).unwrap();
+        g.add_edge(a, c, "KNOWS", &json!({})).unwrap();
+
+        let n = g
+            .count_linear_paths(&spec(&[Some("KNOWS")], &[Some("Person"), Some("Person")]))
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    /// Two distinct hops over distinct nodes count once.
+    #[test]
+    fn two_hop_distinct_nodes_count_once() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("Person", &json!({})).unwrap();
+        let b = g.add_node("Person", &json!({})).unwrap();
+        let c = g.add_node("Person", &json!({})).unwrap();
+        g.add_edge(a, b, "KNOWS", &json!({})).unwrap();
+        g.add_edge(b, c, "KNOWS", &json!({})).unwrap();
+
+        let n = g
+            .count_linear_paths(&spec(
+                &[Some("KNOWS"), Some("KNOWS")],
+                &[Some("Person"), Some("Person"), Some("Person")],
+            ))
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    /// Parallel edges on one hop multiply the assignment count.
+    #[test]
+    fn two_hop_parallel_edges_multiply() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("Person", &json!({})).unwrap();
+        let b = g.add_node("Person", &json!({})).unwrap();
+        let c = g.add_node("Person", &json!({})).unwrap();
+        g.add_edge(a, b, "KNOWS", &json!({})).unwrap();
+        g.add_edge(a, b, "KNOWS", &json!({})).unwrap();
+        g.add_edge(b, c, "KNOWS", &json!({})).unwrap();
+
+        let n = g
+            .count_linear_paths(&spec(
+                &[Some("KNOWS"), Some("KNOWS")],
+                &[Some("Person"), Some("Person"), Some("Person")],
+            ))
+            .unwrap();
+        assert_eq!(n, 2);
+    }
+
+    /// Relationship uniqueness removes the assignment where one self-loop edge
+    /// would fill both hops, while keeping the path that leaves the self-loop.
+    #[test]
+    fn two_hop_self_loop_respects_relationship_uniqueness() {
+        let (_dir, g) = open_tmp();
+        let x = g.add_node("Person", &json!({})).unwrap();
+        let y = g.add_node("Person", &json!({})).unwrap();
+        g.add_edge(x, x, "KNOWS", &json!({})).unwrap(); // self-loop
+        g.add_edge(x, y, "KNOWS", &json!({})).unwrap();
+
+        // Without the uniqueness rule the middle-node product would be 2
+        // (in-degree 1 times out-degree 2 at x); the shared self-loop edge is
+        // the one excluded pair, leaving the single (self-loop, x->y) path.
+        let n = g
+            .count_linear_paths(&spec(
+                &[Some("KNOWS"), Some("KNOWS")],
+                &[Some("Person"), Some("Person"), Some("Person")],
+            ))
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    /// An unregistered relationship type matches nothing.
+    #[test]
+    fn unknown_relationship_type_counts_zero() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("Person", &json!({})).unwrap();
+        let b = g.add_node("Person", &json!({})).unwrap();
+        g.add_edge(a, b, "KNOWS", &json!({})).unwrap();
+
+        let n = g
+            .count_linear_paths(&spec(&[Some("LIKES")], &[Some("Person"), Some("Person")]))
+            .unwrap();
+        assert_eq!(n, 0);
     }
 }
 
