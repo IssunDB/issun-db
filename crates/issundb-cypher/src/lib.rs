@@ -4,6 +4,7 @@
 // the `issundb` facade consumes.
 #[doc(hidden)]
 pub mod ast;
+mod builtin_procs;
 mod error;
 mod exec;
 #[doc(hidden)]

@@ -94,8 +94,11 @@ pub fn execute(
 
 /// Execute a Cypher query, resolving any `CALL` clauses against `registry`.
 ///
-/// IssunDB ships no built-in procedures, so the default `execute` passes an empty
-/// registry; callers that register table-backed procedures use this entry point.
+/// The built-in `issundb.*` graph-algorithm procedures (PageRank, the
+/// centralities, connected components, and label propagation) are always
+/// available and resolved before the registry, so the default `execute` passes
+/// an empty registry; callers that register additional table-backed procedures
+/// use this entry point.
 #[instrument(skip(graph, params, registry), fields(cypher = %cypher))]
 pub fn execute_with_procedures(
     graph: &Graph,

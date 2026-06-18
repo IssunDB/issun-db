@@ -439,16 +439,33 @@ pub(super) fn resolve_call_parts(
                 for arg in args.iter() {
                     arg_values.push(evaluate_expr(graph, &PathMap::new(), arg, params)?);
                 }
-                let rc = registry.resolve(
-                    name,
-                    &arg_values,
-                    *implicit_args,
-                    !standalone,
-                    yields,
-                    *yield_star,
-                    &scope,
-                    params,
-                )?;
+                // Built-in `issundb.*` graph-algorithm procedures run against the
+                // live graph and synthesize a procedure on the fly; everything
+                // else resolves against the table-backed registry. The built-ins
+                // reuse the registry's YIELD and validation logic via
+                // `resolve_against`.
+                let rc = match crate::builtin_procs::build(graph, name, &arg_values)? {
+                    Some(proc) => crate::procedure::resolve_against(
+                        &proc,
+                        &arg_values,
+                        *implicit_args,
+                        !standalone,
+                        yields,
+                        *yield_star,
+                        &scope,
+                        params,
+                    )?,
+                    None => registry.resolve(
+                        name,
+                        &arg_values,
+                        *implicit_args,
+                        !standalone,
+                        yields,
+                        *yield_star,
+                        &scope,
+                        params,
+                    )?,
+                };
                 for v in &rc.output_vars {
                     scope.insert(v.clone());
                 }
