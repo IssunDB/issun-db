@@ -439,16 +439,33 @@ pub(super) fn resolve_call_parts(
                 for arg in args.iter() {
                     arg_values.push(evaluate_expr(graph, &PathMap::new(), arg, params)?);
                 }
-                let rc = registry.resolve(
-                    name,
-                    &arg_values,
-                    *implicit_args,
-                    !standalone,
-                    yields,
-                    *yield_star,
-                    &scope,
-                    params,
-                )?;
+                // Built-in `issundb.*` graph-algorithm procedures run against the
+                // live graph and synthesize a procedure on the fly; everything
+                // else resolves against the table-backed registry. The built-ins
+                // reuse the registry's YIELD and validation logic via
+                // `resolve_against`.
+                let rc = match crate::builtin_procs::build(graph, name, &arg_values)? {
+                    Some(proc) => crate::procedure::resolve_against(
+                        &proc,
+                        &arg_values,
+                        *implicit_args,
+                        !standalone,
+                        yields,
+                        *yield_star,
+                        &scope,
+                        params,
+                    )?,
+                    None => registry.resolve(
+                        name,
+                        &arg_values,
+                        *implicit_args,
+                        !standalone,
+                        yields,
+                        *yield_star,
+                        &scope,
+                        params,
+                    )?,
+                };
                 for v in &rc.output_vars {
                     scope.insert(v.clone());
                 }
@@ -3628,6 +3645,71 @@ fn index_verify_values(
     }
 }
 
+/// Resolve one pushed-down per-vertex `PathCount` predicate (`property CMP
+/// literal` on a labeled node) to the set of node ids that satisfy it. Mirrors
+/// the `NodeIndexScan` / `NodeRangeScan` executors: the index gives candidates,
+/// then each candidate's stored value is re-checked against the predicate so an
+/// inexact index encoding never admits a wrong node. A null comparison value
+/// matches nothing, the same as those executors.
+fn resolve_path_count_pred(
+    graph: &Graph,
+    label: &str,
+    pred: &crate::plan::physical::VertexPred,
+    params: &HashMap<String, serde_json::Value>,
+) -> Result<std::collections::HashSet<NodeId>, String> {
+    use crate::plan::physical::VertexCmp;
+    use std::cmp::Ordering;
+
+    let val = evaluate_expr(graph, &PathMap::new(), &pred.value, params)?;
+    if val.is_null() {
+        return Ok(std::collections::HashSet::new());
+    }
+    let prop_val = json_to_prop_value(&val)
+        .ok_or_else(|| format!("unsupported property value type for path-count filter: {val}"))?;
+    let property = pred.property.as_str();
+    let candidates = match pred.cmp {
+        VertexCmp::Eq => graph.nodes_by_property(label, property, prop_val),
+        VertexCmp::Lt => {
+            graph.nodes_by_property_range(label, property, None, false, Some(prop_val), false)
+        }
+        VertexCmp::Le => {
+            graph.nodes_by_property_range(label, property, None, false, Some(prop_val), true)
+        }
+        VertexCmp::Gt => {
+            graph.nodes_by_property_range(label, property, Some(prop_val), false, None, false)
+        }
+        VertexCmp::Ge => {
+            graph.nodes_by_property_range(label, property, Some(prop_val), true, None, false)
+        }
+    }
+    .map_err(|e| e.to_string())?;
+
+    let mut out = std::collections::HashSet::new();
+    for (cand, actual) in index_verify_values(graph, &candidates, property) {
+        let keep = match pred.cmp {
+            VertexCmp::Eq => json_vals_are_equal(&actual, &val),
+            VertexCmp::Lt => json_val_cmp(&actual, &val) == Some(Ordering::Less),
+            VertexCmp::Le => {
+                matches!(
+                    json_val_cmp(&actual, &val),
+                    Some(Ordering::Less | Ordering::Equal)
+                )
+            }
+            VertexCmp::Gt => json_val_cmp(&actual, &val) == Some(Ordering::Greater),
+            VertexCmp::Ge => {
+                matches!(
+                    json_val_cmp(&actual, &val),
+                    Some(Ordering::Greater | Ordering::Equal)
+                )
+            }
+        };
+        if keep {
+            out.insert(cand);
+        }
+    }
+    Ok(out)
+}
+
 /// Directly evaluate a streamable leaf operator that is not a `LabelScan`
 /// (`NodeByIdSeek`, `NodeIndexScan`, `NodeRangeScan`, or `SingleRow`). These are
 /// O(1) or index-bounded, so `RowStream::Materialized` evaluates them once on
@@ -3807,13 +3889,42 @@ pub(super) fn eval_leaf(
         PhysicalOperator::PathCount {
             rel_types,
             labels,
+            vertex_filters,
             output,
         } => {
+            // Resolve each variable's pushed-down property predicates to an
+            // allow-set of node ids via the property index, then hand the sets to
+            // the kernel as per-variable masks. The recognizer guarantees a
+            // filtered variable carries a label (the index is label-scoped), so
+            // the label lookup below is always present when predicates exist.
+            let mut vertex_allow: Vec<Option<Vec<NodeId>>> = Vec::with_capacity(labels.len());
+            for (i, preds) in vertex_filters.iter().enumerate() {
+                if preds.is_empty() {
+                    vertex_allow.push(None);
+                    continue;
+                }
+                let label = labels[i]
+                    .as_deref()
+                    .ok_or("path-count vertex filter requires a label")?;
+                // Intersect the verified candidate set across this variable's
+                // predicates (each conjunct narrows the allow-set).
+                let mut allow: Option<std::collections::HashSet<NodeId>> = None;
+                for pred in preds {
+                    let resolved = resolve_path_count_pred(graph, label, pred, params)?;
+                    allow = Some(match allow {
+                        None => resolved,
+                        Some(acc) => acc.intersection(&resolved).copied().collect(),
+                    });
+                }
+                vertex_allow.push(Some(allow.unwrap_or_default().into_iter().collect()));
+            }
+
             // One kernel call over the CSR snapshot replaces the row-pipeline
             // expansion; the count of matching paths comes back as one row.
             let spec = issundb_core::PathCountSpec {
                 rel_types: rel_types.iter().map(|t| t.as_deref()).collect(),
                 labels: labels.iter().map(|l| l.as_deref()).collect(),
+                vertex_allow,
             };
             let count = graph.count_linear_paths(&spec).map_err(|e| e.to_string())?;
             let mut path = SlotRow::empty(schema.clone());
@@ -4738,8 +4849,11 @@ mod path_count_exec_tests {
         .unwrap();
         graph.rebuild_csr().unwrap();
         let bail = [
-            // Property predicate on a pattern variable.
-            "MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE b.age > 1 RETURN count(*) AS n",
+            // Cross-variable comparison: neither side is a literal, so it cannot
+            // become an index allow-set and must stay a per-row filter.
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE b.age > a.age RETURN count(*) AS n",
+            // Non-comparison predicate on a pattern variable.
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE b.age IS NOT NULL RETURN count(*) AS n",
             // Grouped aggregation.
             "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN b.city AS c, count(*) AS n",
             // DISTINCT count.
@@ -4760,6 +4874,102 @@ mod path_count_exec_tests {
             );
             super::execute(&graph, q, &HashMap::new()).unwrap();
         }
+    }
+
+    /// A filtered two-hop count fires the kernel and agrees with the forced row
+    /// pipeline, and the predicate actually removes paths the unfiltered count
+    /// includes.
+    #[test]
+    fn filtered_two_hop_matches_row_path() {
+        let (_dir, graph) = setup();
+        super::execute(
+            &graph,
+            "CREATE (a:Person {age: 20}), (b:Person {age: 30}), (c:Person {age: 40}), \
+                    (d:Person {age: 60}), (e:Person {age: 25}) \
+             CREATE (a)-[:KNOWS]->(b), (a)-[:KNOWS]->(d), (b)-[:KNOWS]->(c), \
+                    (b)-[:KNOWS]->(e), (d)-[:KNOWS]->(c), (c)-[:KNOWS]->(e)",
+            &HashMap::new(),
+        )
+        .unwrap();
+        graph.rebuild_csr().unwrap();
+
+        let kernel_q = "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person) \
+                        WHERE b.age < 50 AND c.age > 25 RETURN count(*) AS n";
+        // The trailing always-true `IS NULL` conjunct pushes a residual Filter
+        // onto the source scan, breaking the kernel shape so the same query runs
+        // the row pipeline as a semantic oracle.
+        let row_q = "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person) \
+                     WHERE b.age < 50 AND c.age > 25 AND a.__force IS NULL RETURN count(*) AS n";
+
+        assert!(
+            plan_text(&graph, kernel_q).contains("PathCount"),
+            "filtered query must fire the kernel:\n{}",
+            plan_text(&graph, kernel_q)
+        );
+        assert!(
+            !plan_text(&graph, row_q).contains("PathCount"),
+            "forced query must keep the row pipeline:\n{}",
+            plan_text(&graph, row_q)
+        );
+
+        assert_eq!(count_result(&graph, kernel_q), count_result(&graph, row_q));
+        assert!(
+            count_result(&graph, kernel_q) < count_result(&graph, TWO_HOP_KERNEL),
+            "the filter must exclude some unfiltered paths"
+        );
+    }
+
+    /// Differential parity for filtered two-hop counts on random graphs with
+    /// random ages: the kernel allow-set path equals the forced row pipeline for
+    /// predicates on the middle and destination nodes.
+    #[test]
+    fn filtered_kernel_matches_row_path_on_random_graphs() {
+        use proptest::prelude::*;
+
+        let mut runner = proptest::test_runner::TestRunner::new(ProptestConfig {
+            cases: 32,
+            ..ProptestConfig::default()
+        });
+        let strategy = (
+            2usize..=6,
+            proptest::collection::vec((0usize..6, 0usize..6), 0..24),
+            proptest::collection::vec(0i64..100, 6),
+        );
+        runner
+            .run(&strategy, |(n_nodes, edges, ages)| {
+                let (_dir, graph) = setup();
+                let mut create = String::from("CREATE ");
+                for i in 0..n_nodes {
+                    if i > 0 {
+                        create.push_str(", ");
+                    }
+                    create.push_str(&format!("(p{i}:Person {{age: {}}})", ages[i % ages.len()]));
+                }
+                super::execute(&graph, &create, &HashMap::new()).unwrap();
+                for (s, d) in &edges {
+                    let (s, d) = (s % n_nodes, d % n_nodes);
+                    let q = format!(
+                        "MATCH (a:Person), (b:Person) WHERE id(a) = {s} AND id(b) = {d} \
+                         CREATE (a)-[:KNOWS]->(b)"
+                    );
+                    super::execute(&graph, &q, &HashMap::new()).unwrap();
+                }
+                graph.rebuild_csr().unwrap();
+
+                let kernel_q = "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person) \
+                                WHERE b.age < 50 AND c.age >= 25 RETURN count(*) AS n";
+                let row_q = "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person) \
+                             WHERE b.age < 50 AND c.age >= 25 AND a.__force IS NULL \
+                             RETURN count(*) AS n";
+                prop_assert_eq!(
+                    count_result(&graph, kernel_q),
+                    count_result(&graph, row_q),
+                    "filtered kernel vs row on {} nodes",
+                    n_nodes
+                );
+                Ok(())
+            })
+            .unwrap();
     }
 
     /// Differential parity on random multigraphs (self-loops and parallel

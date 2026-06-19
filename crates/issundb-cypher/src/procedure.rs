@@ -137,7 +137,37 @@ impl ProcedureRegistry {
                 name
             )
         })?;
+        resolve_against(
+            proc,
+            args,
+            implicit,
+            in_query,
+            yields,
+            yield_star,
+            already_bound,
+            params,
+        )
+    }
+}
 
+/// Resolve a `CALL` against a concrete [`Procedure`] (already looked up in a
+/// registry or synthesized on the fly by a built-in). This holds the shared
+/// argument validation, table filtering, and `YIELD` projection logic so that
+/// the table-backed registry and the built-in graph-algorithm procedures behave
+/// identically. See [`ProcedureRegistry::resolve`] for the argument meanings.
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_against(
+    proc: &Procedure,
+    args: &[Value],
+    implicit: bool,
+    in_query: bool,
+    yields: &Option<Vec<(String, Option<String>)>>,
+    yield_star: bool,
+    already_bound: &HashSet<String>,
+    params: &HashMap<String, Value>,
+) -> Result<ResolvedCall, String> {
+    let name = proc.name.as_str();
+    {
         // Determine the effective argument tuple.
         let effective_args: Vec<Value> = if implicit {
             if in_query && !proc.inputs.is_empty() {

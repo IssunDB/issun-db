@@ -50,7 +50,7 @@
 
 use std::collections::HashMap;
 
-use issundb_core::{EdgeId, Graph, NodeId};
+use issundb_core::{Graph, NodeId};
 use serde_json::Value;
 
 use crate::ast::{AggFn, BinaryOperator, Expr, ReturnClause, SortItem};
@@ -69,15 +69,23 @@ use super::{GraphBinding, Record};
 /// root.
 struct VecPipeline<'a> {
     leaf: VecLeaf<'a>,
-    /// The variable the leaf binds (and the expansion starts from).
+    /// The variable the leaf binds (and the first expansion starts from); also
+    /// `chain_vars[0]`.
     src_var: &'a str,
-    expand: Option<VecExpand<'a>>,
-    /// Stages between the expansion (or the root chain, when there is no
-    /// expansion) and the leaf, in bottom-up application order. They may
-    /// reference only `src_var`.
-    below_stages: Vec<VecStage<'a>>,
-    /// Stages above the expansion, in bottom-up application order.
-    above_stages: Vec<VecStage<'a>>,
+    /// One id column per node variable in the chain, in column order: the leaf
+    /// variable, then each expansion's destination. Length is `expands.len()
+    /// + 1`. A property read resolves a variable to its index here.
+    chain_vars: Vec<&'a str>,
+    /// The directed single hops, in bottom-up (execution) order: `expands[0]`
+    /// starts from the leaf, `expands[k]` from `expands[k-1]`'s destination.
+    /// Empty for a leaf-only pipeline, one entry for a single hop, two for a
+    /// two-hop chain.
+    expands: Vec<VecExpand<'a>>,
+    /// Filter stages by chain level, in bottom-up application order:
+    /// `stages[0]` runs over the leaf column before any expansion, and
+    /// `stages[k]` runs after `expands[k-1]`. Length is `expands.len() + 1`.
+    /// Within each level the stages are in bottom-up order.
+    stages: Vec<Vec<VecStage<'a>>>,
     root: VecRoot<'a>,
     /// Resolved sort keys when a `Sort` sits over a plain projection root.
     project_sort: Option<Vec<VecSortKey<'a>>>,
@@ -88,9 +96,10 @@ struct VecPipeline<'a> {
     distinct: bool,
 }
 
-/// One project-root sort key, resolved to a bulk-gatherable property read.
+/// One project-root sort key, resolved to a bulk-gatherable property read on
+/// the chain column at index `col`.
 struct VecSortKey<'a> {
-    is_src: bool,
+    col: usize,
     prop: &'a str,
     ascending: bool,
 }
@@ -103,7 +112,9 @@ enum VecLeaf<'a> {
     Seek(&'a PhysicalOperator),
 }
 
+#[derive(Clone, Copy)]
 struct VecExpand<'a> {
+    src_var: &'a str,
     rel_var: &'a str,
     dst_var: &'a str,
     rel_type: Option<&'a str>,
@@ -223,20 +234,24 @@ enum AggIn {
     /// `count(*)` or a non-distinct `count` over a whole bound variable: the
     /// binding is never null in this pipeline, so every row counts.
     RowCount,
-    /// A gathered property column: `(from_src_table, column_index)`.
-    Cell(bool, usize),
+    /// A gathered property cell: `(chain_column, index_into_that_column's_props)`.
+    Cell(usize, usize),
 }
 
-/// A single-property read on the leaf or expansion variable, the only
-/// expression form the columnar executor evaluates itself.
-fn prop_read<'a>(expr: &'a Expr, src_var: &str, dst_var: Option<&str>) -> Option<(bool, &'a str)> {
+/// Index of `var` among the chain's node variables, or `None` when it names no
+/// chain column.
+fn col_of(chain_vars: &[&str], var: &str) -> Option<usize> {
+    chain_vars.iter().position(|v| *v == var)
+}
+
+/// A single-property read on a chain node variable, the only expression form
+/// the columnar executor evaluates itself. Returns the chain column index and
+/// the property name.
+fn prop_read<'a>(expr: &'a Expr, chain_vars: &[&str]) -> Option<(usize, &'a str)> {
     if let Expr::Prop(var, prop) = expr {
         if !prop.is_empty() {
-            if var == src_var {
-                return Some((true, prop.as_str()));
-            }
-            if dst_var == Some(var.as_str()) {
-                return Some((false, prop.as_str()));
+            if let Some(col) = col_of(chain_vars, var) {
+                return Some((col, prop.as_str()));
             }
         }
     }
@@ -251,9 +266,8 @@ fn prop_read<'a>(expr: &'a Expr, src_var: &str, dst_var: Option<&str>) -> Option
 fn resolve_sort_keys<'a>(
     sort_items: &'a [SortItem],
     items: &'a [(Expr, Option<String>)],
-    src_var: &str,
-    dst_var: Option<&str>,
-    rel_var: Option<&str>,
+    chain_vars: &[&str],
+    rel_vars: &[&str],
 ) -> Option<Vec<VecSortKey<'a>>> {
     let keys: Vec<String> = items
         .iter()
@@ -261,19 +275,18 @@ fn resolve_sort_keys<'a>(
         .collect();
     let mut out = Vec::with_capacity(sort_items.len());
     for si in sort_items {
-        let (is_src, prop) = match &si.expr {
+        let (col, prop) = match &si.expr {
             Expr::Prop(var, prop) if prop.is_empty() => {
                 // An alias reference. A pipeline variable of the same name
                 // would shadow the projected binding in the row pipeline.
-                if var == src_var || dst_var == Some(var.as_str()) || rel_var == Some(var.as_str())
-                {
+                if col_of(chain_vars, var).is_some() || rel_vars.contains(&var.as_str()) {
                     return None;
                 }
                 let idx = keys.iter().position(|k| k == var)?;
-                prop_read(&items[idx].0, src_var, dst_var)?
+                prop_read(&items[idx].0, chain_vars)?
             }
             expr => {
-                let read = prop_read(expr, src_var, dst_var)?;
+                let read = prop_read(expr, chain_vars)?;
                 // When the property is null, `evaluate_sort_key` falls back
                 // to the `var.prop` and bare `prop` projected bindings, so a
                 // projected key of either name carrying a different value
@@ -284,7 +297,7 @@ fn resolve_sort_keys<'a>(
                 let full = format!("{var}.{}", read.1);
                 for (key, (item_expr, _)) in keys.iter().zip(items) {
                     if (key == read.1 || *key == full)
-                        && prop_read(item_expr, src_var, dst_var) != Some(read)
+                        && prop_read(item_expr, chain_vars) != Some(read)
                     {
                         return None;
                     }
@@ -293,7 +306,7 @@ fn resolve_sort_keys<'a>(
             }
         };
         out.push(VecSortKey {
-            is_src,
+            col,
             prop,
             ascending: si.ascending,
         });
@@ -362,66 +375,60 @@ fn recognize(plan: &PhysicalOperator) -> Option<VecPipeline<'_>> {
         }
     };
 
-    // Filter stages under the root chain. Reversed below to the bottom-up
-    // order the row pipeline applies them in.
-    let mut upper_stages = Vec::new();
+    // Walk the linear chain top-down, alternating a filter region with one
+    // directed single hop, capturing up to two hops. `regions_topdown[i]` holds
+    // the filters sitting above `expands_topdown[i]`; the final region sits
+    // above the leaf. Each expand carries the relationship variables earlier
+    // hops bound (openCypher relationship uniqueness), checked below.
+    let mut regions_topdown: Vec<Vec<VecStage>> = Vec::new();
+    let mut expands_topdown: Vec<(VecExpand, &[String])> = Vec::new();
     let mut cur = chain_top;
-    while let PhysicalOperator::Filter { input, expression } = cur {
-        upper_stages.push(vec_stage(expression)?);
-        cur = input.as_ref();
-    }
-    upper_stages.reverse();
-
-    // Optional single-hop directed expansion. Source labels and predicates
-    // (`(a:Person:Vip)`, a pushed-down conjunct on `a`) plan as filters
-    // between the expand and the leaf.
-    let (expand, expand_src, below_stages, above_stages, cur) = match cur {
-        PhysicalOperator::Expand {
-            input,
-            src_var,
-            rel_var,
-            dst_var,
-            rel_type,
-            is_incoming,
-            is_undirected: false,
-            min_hops: 1,
-            max_hops: 1,
-            unique_rels,
-            needs_path: false,
-        } => {
-            // A single hop has no sibling relationships; a populated list
-            // means the optimizer wired this hop into a larger pattern.
-            if !unique_rels.is_empty() {
-                return None;
-            }
-            // A self-referencing hop `(a)-->(a)` needs the pre-bound target
-            // guard.
-            if src_var == dst_var {
-                return None;
-            }
-            let mut below_stages = Vec::new();
-            let mut under = input.as_ref();
-            while let PhysicalOperator::Filter { input, expression } = under {
-                below_stages.push(vec_stage(expression)?);
-                under = input.as_ref();
-            }
-            below_stages.reverse();
-            let expand = VecExpand {
+    loop {
+        let mut region = Vec::new();
+        while let PhysicalOperator::Filter { input, expression } = cur {
+            region.push(vec_stage(expression)?);
+            cur = input.as_ref();
+        }
+        // Reverse to the bottom-up order the row pipeline applies filters in.
+        region.reverse();
+        regions_topdown.push(region);
+        if expands_topdown.len() >= 2 {
+            break;
+        }
+        match cur {
+            PhysicalOperator::Expand {
+                input,
+                src_var,
                 rel_var,
                 dst_var,
-                rel_type: rel_type.as_deref(),
-                is_incoming: *is_incoming,
-            };
-            (
-                Some(expand),
-                Some(src_var.as_str()),
-                below_stages,
-                upper_stages,
-                under,
-            )
+                rel_type,
+                is_incoming,
+                is_undirected: false,
+                min_hops: 1,
+                max_hops: 1,
+                unique_rels,
+                needs_path: false,
+            } => {
+                // A self-referencing hop `(a)-->(a)` needs the pre-bound target
+                // guard the row pipeline applies; decline it here.
+                if src_var == dst_var {
+                    return None;
+                }
+                expands_topdown.push((
+                    VecExpand {
+                        src_var,
+                        rel_var,
+                        dst_var,
+                        rel_type: rel_type.as_deref(),
+                        is_incoming: *is_incoming,
+                    },
+                    unique_rels.as_slice(),
+                ));
+                cur = input.as_ref();
+            }
+            _ => break,
         }
-        other => (None, None, upper_stages, Vec::new(), other),
-    };
+    }
 
     let (leaf, leaf_var) = match cur {
         PhysicalOperator::LabelScan { variable, label } => (
@@ -437,29 +444,64 @@ fn recognize(plan: &PhysicalOperator) -> Option<VecPipeline<'_>> {
         }
         _ => return None,
     };
-    // With an expansion the leaf must bind the expansion's source variable.
-    if let Some(src) = expand_src {
-        if leaf_var != src {
-            return None;
-        }
-    }
     let src_var = leaf_var;
-    let dst_var = expand.as_ref().map(|x| x.dst_var);
 
-    // Stage variable scoping: below the expansion only the leaf variable is
-    // bound; above it, the leaf and target variables are.
-    for stage in &below_stages {
-        if stage.vars().iter().any(|v| *v != src_var) {
+    // Bottom-up order: the leaf hop first. `stages[0]` is the leaf region;
+    // `stages[k]` runs after `expands[k-1]`.
+    let expands_meta: Vec<(VecExpand, &[String])> = expands_topdown.into_iter().rev().collect();
+    let mut stages: Vec<Vec<VecStage>> = regions_topdown;
+    stages.reverse();
+    let expands: Vec<VecExpand> = expands_meta.iter().map(|(e, _)| *e).collect();
+
+    // Chain wiring: each hop starts where the previous ended, the node
+    // variables are pairwise distinct, and the leaf binds the first source.
+    let mut chain_vars: Vec<&str> = vec![src_var];
+    for (i, e) in expands.iter().enumerate() {
+        let expected_src = if i == 0 {
+            src_var
+        } else {
+            expands[i - 1].dst_var
+        };
+        if e.src_var != expected_src {
+            return None;
+        }
+        if chain_vars.contains(&e.dst_var) {
+            return None;
+        }
+        chain_vars.push(e.dst_var);
+    }
+    let rel_vars: Vec<&str> = expands.iter().map(|e| e.rel_var).collect();
+
+    // Relationship uniqueness. Each hop's `unique_rels` must reference only
+    // relationship variables inside this chain (otherwise the pattern extends
+    // beyond what we captured and uniqueness could remove rows we never see).
+    // For a multi-hop chain we additionally require every hop's relationship
+    // type to be present and pairwise distinct, so no single edge can fill two
+    // hops; relationship uniqueness is then vacuous and the column fan-out,
+    // which does not track edge identity, matches the row pipeline exactly.
+    for (_, uniq) in &expands_meta {
+        if uniq.iter().any(|u| !rel_vars.contains(&u.as_str())) {
             return None;
         }
     }
-    for stage in &above_stages {
-        if stage
-            .vars()
-            .iter()
-            .any(|v| *v != src_var && Some(*v) != dst_var)
-        {
-            return None;
+    if expands.len() >= 2 {
+        for (i, a) in expands.iter().enumerate() {
+            let ta = a.rel_type?;
+            for b in &expands[i + 1..] {
+                if b.rel_type == Some(ta) {
+                    return None;
+                }
+            }
+        }
+    }
+
+    // Stage variable scoping: `stages[k]` runs after `k` expansions, so the
+    // bound columns are `chain_vars[0..=k]`; a stage may read only those.
+    for (k, level) in stages.iter().enumerate() {
+        for stage in level {
+            if stage.vars().iter().any(|v| !chain_vars[..=k].contains(v)) {
+                return None;
+            }
         }
     }
 
@@ -468,11 +510,10 @@ fn recognize(plan: &PhysicalOperator) -> Option<VecPipeline<'_>> {
     match &root {
         VecRoot::Project { items } => {
             for (expr, _) in items.iter() {
-                prop_read(expr, src_var, dst_var)?;
+                prop_read(expr, &chain_vars)?;
             }
             if let Some(sis) = sort_items {
-                let rel_var = expand.as_ref().map(|x| x.rel_var);
-                project_sort = Some(resolve_sort_keys(sis, items, src_var, dst_var, rel_var)?);
+                project_sort = Some(resolve_sort_keys(sis, items, &chain_vars, &rel_vars)?);
             }
             if limited_distinct {
                 // The in-path dedup keys on every projected cell, so the
@@ -504,7 +545,7 @@ fn recognize(plan: &PhysicalOperator) -> Option<VecPipeline<'_>> {
                 return None;
             }
             for (expr, _) in group_by.iter() {
-                prop_read(expr, src_var, dst_var)?;
+                prop_read(expr, &chain_vars)?;
             }
             for (agg_fn, inner, _) in aggregations.iter() {
                 let count_like = match inner {
@@ -514,14 +555,12 @@ fn recognize(plan: &PhysicalOperator) -> Option<VecPipeline<'_>> {
                     // aggregate over a whole variable needs the row value.
                     Expr::Prop(var, prop) if prop.is_empty() => {
                         matches!(agg_fn, AggFn::Count { distinct: false })
-                            && (var == src_var
-                                || expand
-                                    .as_ref()
-                                    .is_some_and(|x| var == x.dst_var || var == x.rel_var))
+                            && (col_of(&chain_vars, var).is_some()
+                                || rel_vars.contains(&var.as_str()))
                     }
                     _ => false,
                 };
-                if !count_like && prop_read(inner, src_var, dst_var).is_none() {
+                if !count_like && prop_read(inner, &chain_vars).is_none() {
                     return None;
                 }
             }
@@ -533,9 +572,9 @@ fn recognize(plan: &PhysicalOperator) -> Option<VecPipeline<'_>> {
     Some(VecPipeline {
         leaf,
         src_var,
-        expand,
-        below_stages,
-        above_stages,
+        chain_vars,
+        expands,
+        stages,
         root,
         project_sort,
         limit,
@@ -564,38 +603,36 @@ fn prop_column(graph: &Graph, ids: &[NodeId], prop: &str) -> Result<Vec<Value>, 
     })
 }
 
-/// The pipeline's flat id columns: the leaf column, plus the expansion target
-/// column once the expansion ran. Filter stages compact both in lockstep, so
-/// row pairs survive or drop together.
+/// The pipeline's flat id columns, one per chain node variable in chain order:
+/// the leaf column, then one column per expansion target as each hop runs. All
+/// columns share the same length; filter stages compact them in lockstep, so a
+/// row's bindings survive or drop together.
 struct IdCols {
-    srcs: Vec<NodeId>,
-    dsts: Option<Vec<NodeId>>,
+    cols: Vec<Vec<NodeId>>,
 }
 
 impl IdCols {
-    fn ids_of(&self, is_src: bool) -> &[NodeId] {
-        if is_src {
-            &self.srcs
-        } else {
-            self.dsts.as_deref().unwrap_or(&[])
-        }
+    fn ids_of(&self, col: usize) -> &[NodeId] {
+        &self.cols[col]
     }
 
-    /// Order-preserving compaction by a per-row keep mask.
+    /// Number of rows (every column has this length).
+    fn len(&self) -> usize {
+        self.cols.first().map_or(0, Vec::len)
+    }
+
+    /// Order-preserving compaction by a per-row keep mask, applied to every
+    /// column.
     fn compact(&mut self, mask: &[bool]) {
-        let mut w = 0;
-        for (i, keep) in mask.iter().enumerate() {
-            if *keep {
-                self.srcs[w] = self.srcs[i];
-                if let Some(dsts) = &mut self.dsts {
-                    dsts[w] = dsts[i];
+        for col in &mut self.cols {
+            let mut w = 0;
+            for (i, keep) in mask.iter().enumerate() {
+                if *keep {
+                    col[w] = col[i];
+                    w += 1;
                 }
-                w += 1;
             }
-        }
-        self.srcs.truncate(w);
-        if let Some(dsts) = &mut self.dsts {
-            dsts.truncate(w);
+            col.truncate(w);
         }
     }
 }
@@ -620,12 +657,13 @@ fn resolve_operand(
     operand: &VecOperand<'_>,
     params: &HashMap<String, Value>,
     schema: &std::sync::Arc<SlotSchema>,
-    src_var: &str,
+    chain_vars: &[&str],
     cols: &IdCols,
 ) -> Result<OperandVals, String> {
     match operand {
         VecOperand::Col { var, prop } => {
-            let ids = cols.ids_of(*var == src_var);
+            let col = col_of(chain_vars, var).ok_or("vectorized: unbound stage variable")?;
+            let ids = cols.ids_of(col);
             Ok(OperandVals::Cells(prop_column(graph, ids, prop)?))
         }
         // Literals and parameters read no row, so an empty row evaluates them
@@ -718,10 +756,10 @@ fn apply_stage(
     stage: &VecStage<'_>,
     params: &HashMap<String, Value>,
     schema: &std::sync::Arc<SlotSchema>,
-    src_var: &str,
+    chain_vars: &[&str],
     cols: &mut IdCols,
 ) -> Result<(), String> {
-    let n = cols.srcs.len();
+    let n = cols.len();
     // The row pipeline evaluates a predicate per row, so over zero rows
     // neither its constants nor its property reads run; a missing parameter
     // must not error here either.
@@ -730,7 +768,8 @@ fn apply_stage(
     }
     let mask: Vec<bool> = match stage {
         VecStage::HasLabel { var, label } => {
-            let ids = cols.ids_of(*var == src_var);
+            let col = col_of(chain_vars, var).ok_or("vectorized: unbound stage variable")?;
+            let ids = cols.ids_of(col);
             let pass = label_pass_set(graph, ids, label)?;
             ids.iter().map(|id| pass.contains(id)).collect()
         }
@@ -741,12 +780,12 @@ fn apply_stage(
             rhs,
         } => {
             if let Some(pruned_mask) =
-                try_prune_comparison(graph, lhs, rhs, *op, params, schema, src_var, cols)
+                try_prune_comparison(graph, lhs, rhs, *op, params, schema, chain_vars, cols)
             {
                 pruned_mask
             } else {
-                let lv = resolve_operand(graph, lhs, params, schema, src_var, cols)?;
-                let rv = resolve_operand(graph, rhs, params, schema, src_var, cols)?;
+                let lv = resolve_operand(graph, lhs, params, schema, chain_vars, cols)?;
+                let rv = resolve_operand(graph, rhs, params, schema, chain_vars, cols)?;
                 (0..n)
                     .map(|i| cmp_keeps(*structured, *op, lv.get(i), rv.get(i)))
                     .collect()
@@ -765,14 +804,19 @@ fn try_prune_comparison(
     op: CmpOp,
     params: &HashMap<String, Value>,
     schema: &std::sync::Arc<SlotSchema>,
-    src_var: &str,
+    chain_vars: &[&str],
     cols: &IdCols,
 ) -> Option<Vec<bool>> {
+    // Pruning by the property's global min/max only narrows a comparison on the
+    // leaf column (col 0); a `node_prop_min_max` bound holds over every node, so
+    // an out-of-range constant means no row passes regardless of column, but the
+    // leaf restriction matches the prior behavior and keeps the check simple.
+    let is_leaf = |var: &str| col_of(chain_vars, var) == Some(0);
     let (prop, const_expr, is_col_lhs) = match (lhs, rhs) {
-        (VecOperand::Col { var, prop }, VecOperand::Const(expr)) if *var == src_var => {
+        (VecOperand::Col { var, prop }, VecOperand::Const(expr)) if is_leaf(var) => {
             (prop, expr, true)
         }
-        (VecOperand::Const(expr), VecOperand::Col { var, prop }) if *var == src_var => {
+        (VecOperand::Const(expr), VecOperand::Col { var, prop }) if is_leaf(var) => {
             (prop, expr, false)
         }
         _ => return None,
@@ -786,7 +830,7 @@ fn try_prune_comparison(
     }
 
     let (min_val, max_val) = mm;
-    let n = cols.srcs.len();
+    let n = cols.len();
 
     let impossible = match op {
         CmpOp::Eq => {
@@ -875,17 +919,16 @@ thread_local! {
 /// Execute `plan` column-at-a-time if it matches the recognized shape,
 /// producing the final result records directly. `Ok(None)` means the plan is
 /// not eligible and the row pipeline must run instead.
-/// Gather one raw key column per project-root sort item over the id columns.
+/// Gather one raw key column per project-root sort item over the id columns,
+/// reading each key from its chain column.
 fn gather_sort_key_cols(
     graph: &Graph,
     sort_keys: &[VecSortKey],
-    srcs: &[NodeId],
-    dsts: &[NodeId],
+    cols: &[Vec<NodeId>],
 ) -> Result<Vec<Vec<Value>>, String> {
     let mut key_cols = Vec::with_capacity(sort_keys.len());
     for key in sort_keys {
-        let ids = if key.is_src { srcs } else { dsts };
-        key_cols.push(prop_column(graph, ids, key.prop)?);
+        key_cols.push(prop_column(graph, &cols[key.col], key.prop)?);
     }
     Ok(key_cols)
 }
@@ -947,7 +990,6 @@ pub(super) fn try_execute_vectorized(
     let Some(p) = recognize(plan) else {
         return Ok(None);
     };
-    let dst_var = p.expand.as_ref().map(|x| x.dst_var);
 
     // For the projection root, the records are built positionally from the
     // plan items, so the plan items must correspond one-to-one (by projected
@@ -986,72 +1028,73 @@ pub(super) fn try_execute_vectorized(
         },
     };
     let mut cols = IdCols {
-        srcs: leaf_ids,
-        dsts: None,
+        cols: vec![leaf_ids],
     };
 
-    // 2. Stages below the expansion restrict the leaf rows, in plan order;
-    //    they read only the leaf variable, so restricting before expansion
-    //    yields the same rows in the same order as the row pipeline.
-    for stage in &p.below_stages {
-        apply_stage(graph, stage, params, schema, p.src_var, &mut cols)?;
+    // 2. Apply the leaf-level stages, then each hop followed by that hop's
+    //    stages, matching the row pipeline's bottom-up filter order. Each hop
+    //    bulk-expands the current last column (distinct sources only, sorted
+    //    like the row pipeline's chain frontier), then fans out every column in
+    //    lockstep, iterating the current rows in order so the emitted row order
+    //    matches the row pipeline's depth-first chain threading.
+    for stage in &p.stages[0] {
+        apply_stage(graph, stage, params, schema, &p.chain_vars, &mut cols)?;
     }
-
-    // 3. Bulk expansion, flattened per source in scan order: the row order
-    //    the per-row pipeline produces.
-    if let Some(x) = &p.expand {
-        let transitions = expand_multi_type(graph, &cols.srcs, x.rel_type, x.is_incoming)?;
-        let mut per_src: ahash::AHashMap<NodeId, Vec<(EdgeId, NodeId)>> = ahash::AHashMap::new();
-        for (s, e, d) in transitions {
-            per_src.entry(s).or_default().push((e, d));
+    for (k, x) in p.expands.iter().enumerate() {
+        let width = cols.cols.len();
+        let mut distinct: Vec<NodeId> = cols.cols[width - 1].clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        let transitions = expand_multi_type(graph, &distinct, x.rel_type, x.is_incoming)?;
+        let mut per_src: ahash::AHashMap<NodeId, Vec<NodeId>> = ahash::AHashMap::new();
+        for (s, _e, d) in transitions {
+            per_src.entry(s).or_default().push(d);
         }
-        let row_estimate: usize = per_src.values().map(Vec::len).sum();
-        let mut srcs: Vec<NodeId> = Vec::with_capacity(row_estimate);
-        let mut dsts: Vec<NodeId> = Vec::with_capacity(row_estimate);
-        for &s in &cols.srcs {
-            if let Some(v) = per_src.get(&s) {
-                for &(_, d) in v {
-                    srcs.push(s);
-                    dsts.push(d);
+        let n = cols.len();
+        let mut new_cols: Vec<Vec<NodeId>> = vec![Vec::new(); width + 1];
+        for i in 0..n {
+            if let Some(neighbors) = per_src.get(&cols.cols[width - 1][i]) {
+                for &d in neighbors {
+                    for (new_col, old_col) in new_cols.iter_mut().zip(&cols.cols) {
+                        new_col.push(old_col[i]);
+                    }
+                    new_cols[width].push(d);
                 }
             }
         }
-        cols = IdCols {
-            srcs,
-            dsts: Some(dsts),
-        };
+        cols = IdCols { cols: new_cols };
+        for stage in &p.stages[k + 1] {
+            apply_stage(graph, stage, params, schema, &p.chain_vars, &mut cols)?;
+        }
     }
 
-    // 4. Stages above the expansion, in plan order, each compacting the id
-    //    columns in lockstep.
-    for stage in &p.above_stages {
-        apply_stage(graph, stage, params, schema, p.src_var, &mut cols)?;
-    }
-
-    let n = cols.srcs.len();
-    let srcs = cols.srcs;
-    let dsts = cols.dsts.unwrap_or_default();
+    let n = cols.len();
+    let id_cols = cols.cols;
 
     match p.root {
         VecRoot::Project { items } => {
-            // One gather per variable covers every projected property; the
-            // record cells are moved out of the tables, not re-cloned.
-            let mut src_props: Vec<&str> = Vec::new();
-            let mut dst_props: Vec<&str> = Vec::new();
+            // One gather per chain column covers every projected property read
+            // on its variable; the record cells are moved out of the tables,
+            // not re-cloned. `item_cols[i]` is `(chain column, index into that
+            // column's props)`.
+            let ncols = id_cols.len();
+            let mut col_props: Vec<Vec<&str>> = vec![Vec::new(); ncols];
             let mut item_cols = Vec::with_capacity(items.len());
             for (expr, _) in items.iter() {
                 // Already validated by `recognize`; decline rather than panic.
-                let Some((is_src, prop)) = prop_read(expr, p.src_var, dst_var) else {
+                let Some((col, prop)) = prop_read(expr, &p.chain_vars) else {
                     return Ok(None);
                 };
-                if is_src {
-                    item_cols.push((true, src_props.len()));
-                    src_props.push(prop);
-                } else {
-                    item_cols.push((false, dst_props.len()));
-                    dst_props.push(prop);
-                }
+                item_cols.push((col, col_props[col].len()));
+                col_props[col].push(prop);
             }
+
+            // Reorder every id column by a selected row order.
+            let reorder = |ids: &[Vec<NodeId>], sel: &[usize]| -> Vec<Vec<NodeId>> {
+                ids.iter()
+                    .map(|c| sel.iter().map(|&i| c[i]).collect())
+                    .collect()
+            };
 
             if p.distinct {
                 // `recognize` sets `distinct` only under a limited sort over
@@ -1059,8 +1102,11 @@ pub(super) fn try_execute_vectorized(
                 let (Some(sort_keys), Some(limit)) = (&p.project_sort, p.limit) else {
                     return Ok(None);
                 };
-                let mut src_table = props_table(graph, &srcs, &src_props)?;
-                let mut dst_table = props_table(graph, &dsts, &dst_props)?;
+                let mut tables: Vec<Vec<Vec<Value>>> = id_cols
+                    .iter()
+                    .zip(&col_props)
+                    .map(|(ids, props)| props_table(graph, ids, props))
+                    .collect::<Result<_, _>>()?;
                 // The Distinct operator runs below the Sort: dedup on the
                 // raw projected cells (the values the row pipeline keys its
                 // dedup on), keeping the first occurrence in row order, so a
@@ -1071,27 +1117,17 @@ pub(super) fn try_execute_vectorized(
                 for i in 0..n {
                     use std::fmt::Write as _;
                     let mut key = String::new();
-                    for &(is_src, j) in &item_cols {
-                        let cell = if is_src {
-                            &src_table[i][j]
-                        } else {
-                            &dst_table[i][j]
-                        };
+                    for &(col, j) in &item_cols {
                         // `{:?}` escapes string content, so the separator
                         // cannot collide with a cell.
-                        let _ = write!(key, "{cell:?}\x00");
+                        let _ = write!(key, "{:?}\x00", tables[col][i][j]);
                     }
                     if seen.insert(key) {
                         survivors.push(i);
                     }
                 }
-                let surv_srcs: Vec<NodeId> = survivors.iter().map(|&i| srcs[i]).collect();
-                let surv_dsts: Vec<NodeId> = if p.expand.is_some() {
-                    survivors.iter().map(|&i| dsts[i]).collect()
-                } else {
-                    Vec::new()
-                };
-                let key_cols = gather_sort_key_cols(graph, sort_keys, &surv_srcs, &surv_dsts)?;
+                let surv_cols = reorder(&id_cols, &survivors);
+                let key_cols = gather_sort_key_cols(graph, sort_keys, &surv_cols)?;
                 // Survivor positions are in row order, so the window's index
                 // tiebreak matches `sort_all`'s stable order over the
                 // deduplicated stream.
@@ -1100,12 +1136,8 @@ pub(super) fn try_execute_vectorized(
                 for &s in &selected {
                     let i = survivors[s];
                     let mut values = Vec::with_capacity(items.len());
-                    for &(is_src, j) in &item_cols {
-                        let cell = if is_src {
-                            std::mem::take(&mut src_table[i][j])
-                        } else {
-                            std::mem::take(&mut dst_table[i][j])
-                        };
+                    for &(col, j) in &item_cols {
+                        let cell = std::mem::take(&mut tables[col][i][j]);
                         values.push(unpack_sentinels(graph, cell));
                     }
                     records.push(Record { values });
@@ -1116,33 +1148,26 @@ pub(super) fn try_execute_vectorized(
             // Sort over the projection: gather one key column per sort item,
             // order the row indices, and keep only the limit window, so the
             // projection below gathers and builds just the surviving rows.
-            let (srcs, dsts, n) = match &p.project_sort {
+            let (id_cols, n) = match &p.project_sort {
                 Some(sort_keys) => {
-                    let key_cols = gather_sort_key_cols(graph, sort_keys, &srcs, &dsts)?;
+                    let key_cols = gather_sort_key_cols(graph, sort_keys, &id_cols)?;
                     let selected = sorted_window(&key_cols, sort_keys, n, p.limit);
-                    let sorted_srcs: Vec<NodeId> = selected.iter().map(|&i| srcs[i]).collect();
-                    let sorted_dsts: Vec<NodeId> = if p.expand.is_some() {
-                        selected.iter().map(|&i| dsts[i]).collect()
-                    } else {
-                        Vec::new()
-                    };
-                    let m = sorted_srcs.len();
-                    (sorted_srcs, sorted_dsts, m)
+                    let m = selected.len();
+                    (reorder(&id_cols, &selected), m)
                 }
-                None => (srcs, dsts, n),
+                None => (id_cols, n),
             };
-            let mut src_table = props_table(graph, &srcs, &src_props)?;
-            let mut dst_table = props_table(graph, &dsts, &dst_props)?;
+            let mut tables: Vec<Vec<Vec<Value>>> = id_cols
+                .iter()
+                .zip(&col_props)
+                .map(|(ids, props)| props_table(graph, ids, props))
+                .collect::<Result<_, _>>()?;
 
             let mut records = Vec::with_capacity(n);
             for i in 0..n {
                 let mut values = Vec::with_capacity(items.len());
-                for &(is_src, j) in &item_cols {
-                    let cell = if is_src {
-                        std::mem::take(&mut src_table[i][j])
-                    } else {
-                        std::mem::take(&mut dst_table[i][j])
-                    };
+                for &(col, j) in &item_cols {
+                    let cell = std::mem::take(&mut tables[col][i][j]);
                     values.push(unpack_sentinels(graph, cell));
                 }
                 records.push(Record { values });
@@ -1159,43 +1184,40 @@ pub(super) fn try_execute_vectorized(
             // Group keys come as dense value-identity codes per group column
             // (no per-row value materialization); aggregate inputs come as
             // gathered cells, each consumed exactly once by the fold.
+            let ncols = id_cols.len();
             let mut group_codes = Vec::with_capacity(group_by.len());
             for (expr, _) in group_by.iter() {
                 // Already validated by `recognize`; decline rather than panic.
-                let Some((is_src, prop)) = prop_read(expr, p.src_var, dst_var) else {
+                let Some((col, prop)) = prop_read(expr, &p.chain_vars) else {
                     return Ok(None);
                 };
-                let ids = if is_src { &srcs } else { &dsts };
-                group_codes.push(
-                    graph
-                        .node_prop_group_codes(ids, prop)
-                        .map_err(|e| match e {
-                            issundb_core::Error::NodeNotFound(id) => {
-                                format!("node not found: {}", id)
-                            }
-                            other => other.to_string(),
-                        })?,
-                );
+                group_codes.push(graph.node_prop_group_codes(&id_cols[col], prop).map_err(
+                    |e| match e {
+                        issundb_core::Error::NodeNotFound(id) => {
+                            format!("node not found: {}", id)
+                        }
+                        other => other.to_string(),
+                    },
+                )?);
             }
-            let mut src_props: Vec<&str> = Vec::new();
-            let mut dst_props: Vec<&str> = Vec::new();
+            // Aggregate inputs gathered per chain column; `AggIn::Cell(col, j)`
+            // indexes the j-th gathered property of that column.
+            let mut col_props: Vec<Vec<&str>> = vec![Vec::new(); ncols];
             let mut agg_inputs = Vec::with_capacity(aggregations.len());
             for (_, inner, _) in aggregations.iter() {
-                match prop_read(inner, p.src_var, dst_var) {
-                    Some((is_src, prop)) => {
-                        let props = if is_src {
-                            &mut src_props
-                        } else {
-                            &mut dst_props
-                        };
-                        agg_inputs.push(AggIn::Cell(is_src, props.len()));
-                        props.push(prop);
+                match prop_read(inner, &p.chain_vars) {
+                    Some((col, prop)) => {
+                        agg_inputs.push(AggIn::Cell(col, col_props[col].len()));
+                        col_props[col].push(prop);
                     }
                     None => agg_inputs.push(AggIn::RowCount),
                 }
             }
-            let mut src_table = props_table(graph, &srcs, &src_props)?;
-            let mut dst_table = props_table(graph, &dsts, &dst_props)?;
+            let mut tables: Vec<Vec<Vec<Value>>> = id_cols
+                .iter()
+                .zip(&col_props)
+                .map(|(ids, props)| props_table(graph, ids, props))
+                .collect::<Result<_, _>>()?;
 
             // Composite group key: the per-column codes packed by stride into
             // one integer. Overflow would need the product of per-column
@@ -1239,12 +1261,8 @@ pub(super) fn try_execute_vectorized(
                 for (k, (agg_fn, _, _)) in aggregations.iter().enumerate() {
                     match agg_inputs[k] {
                         AggIn::RowCount => states[k].fold_count_star(),
-                        AggIn::Cell(is_src, j) => {
-                            let cell = if is_src {
-                                std::mem::take(&mut src_table[i][j])
-                            } else {
-                                std::mem::take(&mut dst_table[i][j])
-                            };
+                        AggIn::Cell(col, j) => {
+                            let cell = std::mem::take(&mut tables[col][i][j]);
                             states[k].fold(agg_fn, cell);
                         }
                     }
@@ -1780,7 +1798,8 @@ mod tests {
         }
         let srcs = g.nodes_by_label("Person").unwrap();
         let n = srcs.len();
-        let cols = IdCols { srcs, dsts: None };
+        let cols = IdCols { cols: vec![srcs] };
+        let chain_vars: [&str; 1] = ["p"];
         let schema = std::sync::Arc::new(SlotSchema::empty());
         let params = HashMap::new();
         let col = VecOperand::Col {
@@ -1797,7 +1816,7 @@ mod tests {
             CmpOp::Gt,
             &params,
             &schema,
-            "p",
+            &chain_vars,
             &cols,
         );
         assert_eq!(mask, Some(vec![false; n]));
@@ -1810,7 +1829,7 @@ mod tests {
             CmpOp::Lt,
             &params,
             &schema,
-            "p",
+            &chain_vars,
             &cols,
         );
         assert_eq!(mask, Some(vec![false; n]));
@@ -1824,7 +1843,7 @@ mod tests {
             CmpOp::Gt,
             &params,
             &schema,
-            "p",
+            &chain_vars,
             &cols,
         );
         assert!(mask.is_none());
@@ -1883,6 +1902,137 @@ mod tests {
                  RETURN DISTINCT b.city AS city ORDER BY city ASC LIMIT 2",
                 "MATCH (a:P) RETURN DISTINCT a.city AS city, a.age AS age \
                  ORDER BY age DESC, city ASC SKIP 1 LIMIT 2",
+            ] {
+                assert_matches_row_path(&g, cypher);
+            }
+        }
+    }
+
+    /// A two-hop social fixture: people follow people (`F`), and live in cities
+    /// (`L`). The two hops carry distinct relationship types, so the columnar
+    /// two-hop path is eligible.
+    fn two_hop_fixture() -> (TempDir, Graph) {
+        let dir = TempDir::new().unwrap();
+        let g = Graph::open(dir.path(), 1).unwrap();
+        let cities: Vec<_> = ["london", "oslo", "rome"]
+            .iter()
+            .enumerate()
+            .map(|(i, nm)| {
+                g.add_node("City", &json!({"name": nm, "cid": i as i64}))
+                    .unwrap()
+            })
+            .collect();
+        let ages = [20i64, 30, 40, 60, 25];
+        let people: Vec<_> = ages
+            .iter()
+            .enumerate()
+            .map(|(i, age)| {
+                g.add_node("Person", &json!({"id": i as i64, "age": age}))
+                    .unwrap()
+            })
+            .collect();
+        let follows = [(0, 1), (0, 3), (1, 2), (1, 4), (3, 2), (2, 4), (4, 0)];
+        for (s, d) in follows {
+            g.add_edge(people[s], people[d], "F", &json!({})).unwrap();
+        }
+        // Each person lives in one city (functional second hop).
+        for (i, &p) in people.iter().enumerate() {
+            g.add_edge(p, cities[i % cities.len()], "L", &json!({}))
+                .unwrap();
+        }
+        g.rebuild_csr().unwrap();
+        (dir, g)
+    }
+
+    /// The benchmark's `top_followed_city` shape (a grouped count over a
+    /// two-hop chain with a sort and limit) takes the columnar two-hop path and
+    /// matches the row pipeline exactly.
+    #[test]
+    fn two_hop_grouped_aggregation_matches_row_path() {
+        let (_dir, g) = two_hop_fixture();
+        let q = "MATCH (f:Person)-[:F]->(p:Person)-[:L]->(c:City) \
+                 RETURN p.id AS id, count(f.id) AS num, c.name AS city \
+                 ORDER BY num DESC, id LIMIT 1";
+        assert!(
+            matches!(
+                recognize(&optimized_plan(&g, q)),
+                Some(VecPipeline {
+                    root: VecRoot::Aggregate { .. },
+                    ..
+                })
+            ),
+            "two-hop grouped aggregation must take the columnar path"
+        );
+        assert_matches_row_path(&g, q);
+    }
+
+    /// Two hops of the same relationship type, or a third hop, keep the row
+    /// pipeline: relationship uniqueness could then remove rows the
+    /// edge-identity-free column fan-out cannot, and three hops exceed the
+    /// recognized chain length.
+    #[test]
+    fn two_hop_same_type_or_three_hops_decline() {
+        let (_dir, g) = two_hop_fixture();
+        for q in [
+            "MATCH (a:Person)-[:F]->(b:Person)-[:F]->(c:Person) \
+             RETURN c.id AS id, count(a) AS n ORDER BY id",
+            "MATCH (a:Person)-[:F]->(b:Person)-[:L]->(c:City)-[:L]->(d:City) \
+             RETURN d.name AS city, count(a) AS n",
+        ] {
+            assert!(
+                recognize(&optimized_plan(&g, q)).is_none(),
+                "must decline to the row pipeline: {q}"
+            );
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(48))]
+        /// Differential check for the columnar two-hop path: a projection and a
+        /// grouped aggregation over `(a:P)-[:F]->(b:P)-[:L]->(c:C)` must agree,
+        /// in order, with the row pipeline over random graphs. The unordered
+        /// projection pins the row order of the two-hop column fan-out against
+        /// the row pipeline's depth-first chain threading.
+        #[test]
+        fn two_hop_vectorized_matches_row_path(
+            ages in proptest::collection::vec(0u8..4, 2..7),
+            f_edges in proptest::collection::vec((0usize..7, 0usize..7), 0..18),
+            l_edges in proptest::collection::vec((0usize..7, 0usize..3), 0..14),
+        ) {
+            let dir = TempDir::new().unwrap();
+            let g = Graph::open(dir.path(), 1).unwrap();
+            let cids: Vec<_> = ["x", "y", "z"]
+                .iter()
+                .map(|nm| g.add_node("C", &json!({"name": nm})).unwrap())
+                .collect();
+            let pids: Vec<_> = ages
+                .iter()
+                .enumerate()
+                .map(|(i, age)| g.add_node("P", &json!({"id": i as i64, "age": *age as i64})).unwrap())
+                .collect();
+            for (s, d) in &f_edges {
+                if *s < pids.len() && *d < pids.len() {
+                    g.add_edge(pids[*s], pids[*d], "F", &json!({})).unwrap();
+                }
+            }
+            for (s, c) in &l_edges {
+                if *s < pids.len() && *c < cids.len() {
+                    g.add_edge(pids[*s], cids[*c], "L", &json!({})).unwrap();
+                }
+            }
+            for cypher in [
+                // Unordered projection over all three chain variables: the
+                // strongest check of fan-out row order.
+                "MATCH (a:P)-[:F]->(b:P)-[:L]->(c:C) RETURN a.id AS aid, b.age AS age, c.name AS city",
+                // Grouped count with sort and limit (the benchmark shape).
+                "MATCH (a:P)-[:F]->(b:P)-[:L]->(c:C) \
+                 RETURN b.id AS id, count(a) AS num, c.name AS city ORDER BY num DESC, id LIMIT 2",
+                // A predicate on the middle node before the second hop.
+                "MATCH (a:P)-[:F]->(b:P)-[:L]->(c:C) WHERE b.age >= 2 \
+                 RETURN c.name AS city, count(a) AS num ORDER BY num DESC, city",
+                // Top-N over a two-hop projection with mixed keys.
+                "MATCH (a:P)-[:F]->(b:P)-[:L]->(c:C) \
+                 RETURN c.name AS city, b.age AS age ORDER BY city DESC, age ASC LIMIT 3",
             ] {
                 assert_matches_row_path(&g, cypher);
             }

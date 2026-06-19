@@ -80,6 +80,14 @@ pub struct PathCountSpec<'a> {
     pub rel_types: Vec<Option<&'a str>>,
     /// Label per node variable, in path order. Length is `rel_types.len() + 1`.
     pub labels: Vec<Option<&'a str>>,
+    /// Optional explicit allow-set of node ids per variable, in path order. A
+    /// `Some(ids)` entry restricts that variable to `ids` (intersected with its
+    /// label, if any); `None` leaves it unconstrained beyond the label. The
+    /// caller resolves these sets by pushing per-vertex property predicates down
+    /// into index lookups, so a filtered path count stays a kernel call instead
+    /// of materializing rows. An empty vector (the default) means no variable is
+    /// constrained, identical to the unfiltered path count.
+    pub vertex_allow: Vec<Option<Vec<NodeId>>>,
 }
 
 /// Builds a 12-byte composite key `(prefix u32 BE, id u64 BE)` for secondary index lookups.

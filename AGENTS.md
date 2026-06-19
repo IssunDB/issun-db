@@ -93,12 +93,15 @@ Do not invent modules that do not yet exist when answering questions, but do pla
     - `src/exec/mod.rs`: public entry points (`execute`, `explain`), shared type definitions, and tests.
     - `src/exec/read.rs`: `execute_physical` and read-path helpers (`evaluate_where`, `evaluate_sort_key`, `json_to_prop_value`,
       `execute_filter_over_expand`).
-    - `src/exec/vectorized.rs`: columnar fast path for the final projection or aggregation over a single-hop expansion. A structural
-      recognizer matches `[Sort]? [Distinct]? Project [Aggregate]? Filter(HasLabel)* Expand(one directed hop) LabelScan` with single-property
-      expressions, then executes column-at-a-time (bulk expansion, bulk label membership, bulk property gather via
-      `Graph::node_props_json_table`, and group-by-code aggregation via `Graph::node_prop_group_codes`), building the result records
-      directly. The recognizer sees through a `Distinct` operator because the caller deduplicates the built records. Any unrecognized
-      shape falls back to the row pipeline, so correctness never depends on the recognizer.
+I    - `src/exec/vectorized.rs`: columnar fast path for the final projection or aggregation over a one-hop or two-hop directed expansion. A
+      structural recognizer matches `[Limit]? [Sort]? [Distinct]? Project [Aggregate]? Filter* Expand(directed single hop) [Filter* Expand]
+      LabelScan` with single-property expressions, modeling the chain as one id column per node variable (the leaf plus each hop's
+      destination). It executes column-at-a-time (per-hop bulk expansion with the fan-out preserving the row pipeline's depth-first order,
+      bulk label membership, bulk property gather via `Graph::node_props_json_table`, and group-by-code aggregation via
+      `Graph::node_prop_group_codes`), building the result records directly. A two-hop chain is recognized only when the two hops carry
+      distinct relationship types, so no single edge can fill both hops and relationship uniqueness is vacuous (the column fan-out tracks no
+      edge identity); same-type or longer chains fall back. The recognizer sees through a `Distinct` operator because the caller deduplicates
+      the built records. Any unrecognized shape falls back to the row pipeline, so correctness never depends on the recognizer.
     - `src/exec/factorize.rs`: `FactorizedRecordGroup` (shared `Arc<PathMap>` prefix plus per-row extensions) and `filter_refs_in_expr`.
     - `src/exec/expr.rs`: expression evaluation (`evaluate_expr`, `eval_binary_op`, `eval_arithmetic`, `eval_function_call`).
     - `src/exec/write.rs`: mutation execution (`execute_create`, `execute_set`, `execute_delete`, `execute_merge`).
@@ -332,8 +335,11 @@ each conjunct pushes down to its own lowest binder, and rewrites an equality or 
 `Limit`, and `Distinct`) and treats a split conjunct's expression form like the structured comparison forms. Bulk label filtering uses `label_idx`
 point
 lookups (`Graph::label_filter`), and single-property node reads go through the in-memory property columns (`Graph::node_prop_json`).
-A final projection or aggregation over a single-hop expansion executes column-at-a-time through `exec/vectorized.rs`
+A final projection or aggregation over a one-hop or two-hop directed expansion executes column-at-a-time through `exec/vectorized.rs`
 (`Graph::node_props_json_table` and `Graph::node_prop_group_codes`); every other shape runs the row pipeline.
+A grouping-free `count` over a one-hop or two-hop directed expansion lowers instead to the `PathCount` kernel
+(`Graph::count_linear_paths`); per-vertex `prop CMP literal` predicates on the path's labeled variables push down into the kernel as
+index-resolved node-id allow-sets (`PathCountSpec::vertex_allow`), so a filtered path count stays a kernel call rather than materializing rows.
 `RETURN DISTINCT` plans a `Distinct` operator between the final `Project` and `Sort`, keyed on the projected columns, so deduplication
 happens before `ORDER BY` and `SKIP`/`LIMIT`; `WITH DISTINCT` keeps full-row deduplication behind its barrier project, and only
 `RETURN DISTINCT *` deduplicates records after projection in the executor.
