@@ -8,7 +8,9 @@ mod schema;
 pub(crate) mod storage;
 
 pub use error::Error;
-pub use graph::{DegreeDirection, Graph, PathCountSpec, ReadTxn, TriangleCountSpec, WriteTxn};
+pub use graph::{
+    DegreeDirection, Graph, GroupedDegreeSpec, PathCountSpec, ReadTxn, TriangleCountSpec, WriteTxn,
+};
 pub use schema::{
     DirectedNeighborEntry, EdgeId, EdgeRecord, LabelId, Language, NeighborEntry, NodeId,
     NodeRecord, PropValue, TypeId, WeightedPath,

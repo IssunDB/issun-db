@@ -1,5 +1,5 @@
-//! Columnar fast path for the final projection or aggregation over at most a
-//! single-hop expansion.
+//! Columnar fast path for the final projection or aggregation over a linear
+//! chain of up to `MAX_VEC_HOPS` directed single hops.
 //!
 //! The per-row pipeline pays one `SlotRow` clone per expansion row, another
 //! per projection row, and one property-columns lookup per property access.
@@ -12,7 +12,7 @@
 //! Recognized shape, from the root down:
 //!
 //! ```text
-//! [Limit]? [Sort]? [Distinct]? Project [Aggregate]? Stage* [Expand(1 hop, directed) Stage*] Leaf
+//! [Limit]? [Sort]? [Distinct]? Project [Aggregate]? Stage* (Expand(1 hop, directed) Stage*){0,MAX_VEC_HOPS} Leaf
 //! Leaf  := LabelScan | NodeByIdSeek | NodeIndexScan | NodeRangeScan
 //! Stage := Filter(HasLabel)
 //!        | Filter(comparison over single-property reads, literals, and parameters)
@@ -314,6 +314,16 @@ fn resolve_sort_keys<'a>(
     Some(out)
 }
 
+/// Upper bound on the number of directed single hops the columnar path
+/// recognizes in one linear chain. The per-hop bulk expansion fully
+/// materializes every intermediate id column (the row pipeline streams them),
+/// so the cap bounds worst-case materialization; the recognizer also requires
+/// every hop's relationship type to be present and pairwise distinct for a
+/// multi-hop chain, which keeps the realized depth small in practice. A chain
+/// longer than this falls back to the row pipeline, so correctness never
+/// depends on the bound.
+const MAX_VEC_HOPS: usize = 6;
+
 /// Match `plan` against the recognized shape, or `None` for the row pipeline.
 fn recognize(plan: &PhysicalOperator) -> Option<VecPipeline<'_>> {
     // A Limit is recognized only directly above a Sort: the row pipeline's
@@ -376,7 +386,8 @@ fn recognize(plan: &PhysicalOperator) -> Option<VecPipeline<'_>> {
     };
 
     // Walk the linear chain top-down, alternating a filter region with one
-    // directed single hop, capturing up to two hops. `regions_topdown[i]` holds
+    // directed single hop, capturing up to `MAX_VEC_HOPS` hops.
+    // `regions_topdown[i]` holds
     // the filters sitting above `expands_topdown[i]`; the final region sits
     // above the leaf. Each expand carries the relationship variables earlier
     // hops bound (openCypher relationship uniqueness), checked below.
@@ -392,7 +403,7 @@ fn recognize(plan: &PhysicalOperator) -> Option<VecPipeline<'_>> {
         // Reverse to the bottom-up order the row pipeline applies filters in.
         region.reverse();
         regions_topdown.push(region);
-        if expands_topdown.len() >= 2 {
+        if expands_topdown.len() >= MAX_VEC_HOPS {
             break;
         }
         match cur {
@@ -1434,7 +1445,7 @@ mod tests {
         let plan = optimized_plan(
             &g,
             "MATCH (a:Person)-[:KNOWS]->(b:Person) \
-             RETURN b.city AS city, count(a) AS n ORDER BY city",
+             RETURN b.city AS city, count(b.name) AS n ORDER BY city",
         );
         match recognize(&plan) {
             Some(VecPipeline {
@@ -1482,7 +1493,7 @@ mod tests {
             // DISTINCT under a limited sort over an aggregate root: the
             // operators above the fold have no dedup-before-limit step.
             "MATCH (a:Person)-[:KNOWS]->(b:Person) \
-             RETURN DISTINCT b.city AS city, count(a) AS n ORDER BY city ASC LIMIT 1",
+             RETURN DISTINCT b.city AS city, count(b.name) AS n ORDER BY city ASC LIMIT 1",
             // Two-hop chain.
             "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person) RETURN c.name AS name",
             // Relationship property projection.
@@ -1530,7 +1541,7 @@ mod tests {
         let (_dir, g) = fixture();
         for cypher in [
             "MATCH (a:Person)-[:KNOWS]->(b:Person) \
-             RETURN b.city AS city, count(a) AS n ORDER BY city",
+             RETURN b.city AS city, count(b.name) AS n ORDER BY city",
             // A grouping-free `count(*)` or `count(var)` over a single hop is
             // promoted to the `PathCount` kernel (see `path_count_exec_tests`),
             // so it no longer reaches the vectorized path; `count(b.city)` over
@@ -1547,9 +1558,11 @@ mod tests {
             // Group on a source property, sort descending on the count.
             "MATCH (a:Person)-[:KNOWS]->(b:Person) \
              RETURN a.city AS city, count(*) AS n ORDER BY n DESC, city",
-            // Empty input keeps the grouping-free zero row and drops groups.
-            // (The grouping-free `count(a)` form is now a `PathCount` kernel.)
-            "MATCH (a:Ghost)-[:KNOWS]->(b:Person) RETURN b.city AS city, count(a) AS n",
+            // Empty input drops every group. Counting a destination property
+            // keeps this on the vectorized aggregate; a count over the source
+            // variable would instead lower to the `GroupedDegree` kernel (see
+            // `grouped_degree_exec_tests`).
+            "MATCH (a:Ghost)-[:KNOWS]->(b:Person) RETURN b.city AS city, count(b.name) AS n",
         ] {
             assert_matches_row_path(&g, cypher);
         }
@@ -1576,7 +1589,7 @@ mod tests {
             "MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE a.age > 5 RETURN b.name AS name",
             // Filter feeding an aggregation.
             "MATCH (a:Person)-[:KNOWS]->(b:Person) \
-             WHERE b.age >= 4 RETURN b.city AS city, count(a) AS n ORDER BY city",
+             WHERE b.age >= 4 RETURN b.city AS city, count(b.name) AS n ORDER BY city",
             // Equality predicate on the source: an index-scan leaf when the
             // optimizer rewrites it, a filter stage otherwise.
             "MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE a.name = 'ada' RETURN b.name AS name",
@@ -1643,7 +1656,7 @@ mod tests {
              RETURN p.name AS name ORDER BY p.age DESC LIMIT 2",
             // Aggregate root under Sort and Limit.
             "MATCH (a:Person)-[:KNOWS]->(b:Person) \
-             RETURN b.city AS city, count(a) AS n ORDER BY n DESC, city ASC LIMIT 1",
+             RETURN b.city AS city, count(b.name) AS n ORDER BY n DESC, city ASC LIMIT 1",
             // DISTINCT with an unlimited sort.
             "MATCH (a:Person)-[:KNOWS]->(b:Person) \
              RETURN DISTINCT b.name AS name ORDER BY name DESC",
@@ -1756,7 +1769,7 @@ mod tests {
     fn writes_after_first_run_stay_visible() {
         let (_dir, g) = fixture();
         let cypher = "MATCH (a:Person)-[:KNOWS]->(b:Person) \
-                      RETURN b.city AS city, count(a) AS n ORDER BY city";
+                      RETURN b.city AS city, count(b.name) AS n ORDER BY city";
         assert_matches_row_path(&g, cypher);
 
         let eve = g
@@ -1884,12 +1897,12 @@ mod tests {
             for cypher in [
                 "MATCH (a:P)-[:T]->(b:P) RETURN a.city AS ac, b.city AS bc, b.age AS age",
                 "MATCH (a:P)-[:T]->(b:P) \
-                 RETURN b.city AS city, count(a) AS n, sum(b.age) AS s ORDER BY city",
+                 RETURN b.city AS city, count(b.name) AS n, sum(b.age) AS s ORDER BY city",
                 // Property predicates over the mixed-kind city column (strings,
                 // a number, and missing values) and the numeric age column.
                 "MATCH (a:P)-[:T]->(b:P) WHERE b.age >= 2 RETURN b.city AS bc, b.age AS age",
                 "MATCH (a:P)-[:T]->(b:P) WHERE a.city = 'x' AND b.age < 3 \
-                 RETURN b.city AS bc, count(a) AS n ORDER BY bc",
+                 RETURN b.city AS bc, count(b.name) AS n ORDER BY bc",
                 "MATCH (a:P) WHERE a.age <> 1 RETURN a.city AS city, a.age AS age",
                 // Top-N over the mixed-kind city column (ties, missing values,
                 // and cross-type ordering), keyed by alias and by property.
@@ -1944,6 +1957,53 @@ mod tests {
         (dir, g)
     }
 
+    /// A three-hop fixture mirroring the benchmark's geographic chain:
+    /// `(:Person)-[:LIVES]->(:City)-[:CITYIN]->(:State)-[:STATEIN]->(:Country)`.
+    /// All three hops carry distinct relationship types, so the columnar
+    /// N-hop path is eligible.
+    fn three_hop_fixture() -> (TempDir, Graph) {
+        let dir = TempDir::new().unwrap();
+        let g = Graph::open(dir.path(), 1).unwrap();
+        let countries: Vec<_> = ["us", "no"]
+            .iter()
+            .map(|nm| g.add_node("Country", &json!({"name": nm})).unwrap())
+            .collect();
+        let states: Vec<_> = ["ca", "ny", "oslo_s"]
+            .iter()
+            .enumerate()
+            .map(|(i, nm)| g.add_node("State", &json!({"name": nm, "sid": i as i64})).unwrap())
+            .collect();
+        let cities: Vec<_> = ["sf", "la", "nyc", "oslo"]
+            .iter()
+            .enumerate()
+            .map(|(i, nm)| g.add_node("City", &json!({"name": nm, "cid": i as i64})).unwrap())
+            .collect();
+        let ages = [20i64, 30, 40, 60, 25, 33];
+        let people: Vec<_> = ages
+            .iter()
+            .enumerate()
+            .map(|(i, age)| g.add_node("Person", &json!({"id": i as i64, "age": age})).unwrap())
+            .collect();
+        // Functional forward chain: each person lives in one city, each city in
+        // one state, each state in one country.
+        for (i, &p) in people.iter().enumerate() {
+            g.add_edge(p, cities[i % cities.len()], "LIVES", &json!({}))
+                .unwrap();
+        }
+        let city_state = [0usize, 0, 1, 2]; // sf,la -> ca; nyc -> ny; oslo -> oslo_s
+        for (ci, &si) in city_state.iter().enumerate() {
+            g.add_edge(cities[ci], states[si], "CITYIN", &json!({}))
+                .unwrap();
+        }
+        let state_country = [0usize, 0, 1]; // ca,ny -> us; oslo_s -> no
+        for (si, &coi) in state_country.iter().enumerate() {
+            g.add_edge(states[si], countries[coi], "STATEIN", &json!({}))
+                .unwrap();
+        }
+        g.rebuild_csr().unwrap();
+        (dir, g)
+    }
+
     /// The benchmark's `top_followed_city` shape (a grouped count over a
     /// two-hop chain with a sort and limit) takes the columnar two-hop path and
     /// matches the row pipeline exactly.
@@ -1966,23 +2026,47 @@ mod tests {
         assert_matches_row_path(&g, q);
     }
 
-    /// Two hops of the same relationship type, or a third hop, keep the row
+    /// A repeated relationship type anywhere in a multi-hop chain keeps the row
     /// pipeline: relationship uniqueness could then remove rows the
-    /// edge-identity-free column fan-out cannot, and three hops exceed the
-    /// recognized chain length.
+    /// edge-identity-free column fan-out cannot. The cap on chain length
+    /// (`MAX_VEC_HOPS`) is the only other length bound, so a chain longer than
+    /// that also declines.
     #[test]
-    fn two_hop_same_type_or_three_hops_decline() {
+    fn repeated_rel_type_or_overlong_chain_declines() {
         let (_dir, g) = two_hop_fixture();
         for q in [
             "MATCH (a:Person)-[:F]->(b:Person)-[:F]->(c:Person) \
-             RETURN c.id AS id, count(a) AS n ORDER BY id",
+             RETURN c.id AS id, count(b.name) AS n ORDER BY id",
             "MATCH (a:Person)-[:F]->(b:Person)-[:L]->(c:City)-[:L]->(d:City) \
-             RETURN d.name AS city, count(a) AS n",
+             RETURN d.name AS city, count(b.name) AS n",
         ] {
             assert!(
                 recognize(&optimized_plan(&g, q)).is_none(),
                 "must decline to the row pipeline: {q}"
             );
+        }
+    }
+
+    /// A linear chain of distinct-relationship-type forward hops, regardless of
+    /// length up to `MAX_VEC_HOPS`, is the benchmark's `youngest_cities` and
+    /// `age_band` shape: it takes the columnar path. This is the three-hop
+    /// recognition the two-hop cap previously excluded.
+    #[test]
+    fn three_hop_distinct_types_recognized() {
+        let (_dir, g) = three_hop_fixture();
+        for q in [
+            // age_band shape: filter on the leaf, group by the far end.
+            "MATCH (p:Person)-[:LIVES]->(c:City)-[:CITYIN]->(s:State)-[:STATEIN]->(co:Country) \
+             WHERE p.age >= 2 RETURN co.name AS country, count(p.id) AS num ORDER BY num DESC, country",
+            // youngest_cities shape: filter on the far end, group by the middle.
+            "MATCH (p:Person)-[:LIVES]->(c:City)-[:CITYIN]->(s:State)-[:STATEIN]->(co:Country) \
+             WHERE co.name = 'us' RETURN c.name AS city, avg(p.age) AS avg_age ORDER BY avg_age, city",
+        ] {
+            assert!(
+                recognize(&optimized_plan(&g, q)).is_some(),
+                "three-hop distinct-type chain must take the columnar path: {q}"
+            );
+            assert_matches_row_path(&g, q);
         }
     }
 
@@ -2026,13 +2110,302 @@ mod tests {
                 "MATCH (a:P)-[:F]->(b:P)-[:L]->(c:C) RETURN a.id AS aid, b.age AS age, c.name AS city",
                 // Grouped count with sort and limit (the benchmark shape).
                 "MATCH (a:P)-[:F]->(b:P)-[:L]->(c:C) \
-                 RETURN b.id AS id, count(a) AS num, c.name AS city ORDER BY num DESC, id LIMIT 2",
+                 RETURN b.id AS id, count(b.name) AS num, c.name AS city ORDER BY num DESC, id LIMIT 2",
                 // A predicate on the middle node before the second hop.
                 "MATCH (a:P)-[:F]->(b:P)-[:L]->(c:C) WHERE b.age >= 2 \
-                 RETURN c.name AS city, count(a) AS num ORDER BY num DESC, city",
+                 RETURN c.name AS city, count(b.name) AS num ORDER BY num DESC, city",
                 // Top-N over a two-hop projection with mixed keys.
                 "MATCH (a:P)-[:F]->(b:P)-[:L]->(c:C) \
                  RETURN c.name AS city, b.age AS age ORDER BY city DESC, age ASC LIMIT 3",
+            ] {
+                assert_matches_row_path(&g, cypher);
+            }
+        }
+    }
+
+    /// Temporary timing probe: build a benchmark-shaped geographic graph and
+    /// time the 3-hop `age_band` and `youngest_cities` shapes on the columnar
+    /// path versus the row pipeline. Run with
+    /// `cargo test -p issundb-cypher --lib three_hop_timing -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn three_hop_timing() {
+        use std::time::Instant;
+        let dir = TempDir::new().unwrap();
+        let g = Graph::open(dir.path(), 4).unwrap();
+        let n_persons = 100_000i64;
+        let n_cities = 2000i64;
+        let n_states = 50i64;
+        let n_countries = 5i64;
+        let countries: Vec<_> = (0..n_countries)
+            .map(|i| g.add_node("Country", &json!({"name": format!("country{i}")})).unwrap())
+            .collect();
+        let states: Vec<_> = (0..n_states)
+            .map(|i| g.add_node("State", &json!({"name": format!("state{i}")})).unwrap())
+            .collect();
+        let cities: Vec<_> = (0..n_cities)
+            .map(|i| g.add_node("City", &json!({"name": format!("city{i}")})).unwrap())
+            .collect();
+        for (i, &s) in states.iter().enumerate() {
+            g.add_edge(s, countries[i % n_countries as usize], "STATE_IN", &json!({})).unwrap();
+        }
+        for (i, &c) in cities.iter().enumerate() {
+            g.add_edge(c, states[i % n_states as usize], "CITY_IN", &json!({})).unwrap();
+        }
+        let n_interests = 40i64;
+        let interests: Vec<_> = (0..n_interests)
+            .map(|i| g.add_node("Interest", &json!({"name": format!("interest{i}")})).unwrap())
+            .collect();
+        for i in 0..n_persons {
+            let p = g
+                .add_node(
+                    "Person",
+                    &json!({"id": i, "age": 18 + (i % 60), "gender": if i % 2 == 0 { "male" } else { "female" }}),
+                )
+                .unwrap();
+            g.add_edge(p, cities[(i % n_cities) as usize], "LIVES_IN", &json!({})).unwrap();
+            // Each person has a few interests.
+            for k in 0..3 {
+                g.add_edge(p, interests[((i + k) % n_interests) as usize], "HAS_INTEREST", &json!({}))
+                    .unwrap();
+            }
+        }
+        g.rebuild_csr().unwrap();
+        let params = std::collections::HashMap::new();
+        let queries = [
+            ("age_band", "MATCH (p:Person)-[:LIVES_IN]->(c:City)-[:CITY_IN]->(s:State)-[:STATE_IN]->(co:Country) \
+                 WHERE p.age >= 30 AND p.age <= 40 RETURN co.name AS country, count(p.id) AS num ORDER BY num DESC, country LIMIT 5"),
+            ("youngest_cities", "MATCH (p:Person)-[:LIVES_IN]->(c:City)-[:CITY_IN]->(s:State)-[:STATE_IN]->(co:Country) \
+                 WHERE co.name = 'country0' RETURN c.name AS city, avg(p.age) AS avg_age ORDER BY avg_age, city LIMIT 5"),
+            ("interest_gender", "MATCH (p:Person)-[:HAS_INTEREST]->(i:Interest) MATCH (p)-[:LIVES_IN]->(c:City) \
+                 WHERE i.name = 'interest3' AND p.gender = 'male' RETURN count(p.id) AS num, c.name AS city ORDER BY num DESC, city LIMIT 5"),
+        ];
+        for (name, q) in queries {
+            assert!(recognize(&optimized_plan(&g, q)).is_some(), "{name} must vectorize");
+            // warmup
+            let _ = execute(&g, q, &params).unwrap();
+            let t0 = Instant::now();
+            for _ in 0..5 { let _ = execute(&g, q, &params).unwrap(); }
+            let vec_ms = t0.elapsed().as_secs_f64() * 1000.0 / 5.0;
+            DISABLE_FOR_TEST.with(|d| d.set(true));
+            let _ = execute(&g, q, &params).unwrap();
+            let t1 = Instant::now();
+            for _ in 0..5 { let _ = execute(&g, q, &params).unwrap(); }
+            let row_ms = t1.elapsed().as_secs_f64() * 1000.0 / 5.0;
+            DISABLE_FOR_TEST.with(|d| d.set(false));
+            println!("{name}: vectorized {vec_ms:.1}ms  row {row_ms:.1}ms  ({:.1}x)", row_ms / vec_ms);
+        }
+    }
+
+    /// Temporary: dump the optimized plan for the benchmark's top_followed_city
+    /// shape with City-much-smaller-than-Person stats, to decide the task #9
+    /// design (whether the optimizer reverses the chain).
+    #[test]
+    #[ignore]
+    fn dump_top_followed_city_plan() {
+        let dir = TempDir::new().unwrap();
+        let g = Graph::open(dir.path(), 2).unwrap();
+        let cities: Vec<_> = (0..2000i64)
+            .map(|i| g.add_node("City", &json!({"name": format!("c{i}")})).unwrap())
+            .collect();
+        let people: Vec<_> = (0..50000i64)
+            .map(|i| g.add_node("Person", &json!({"id": i})).unwrap())
+            .collect();
+        for (i, &p) in people.iter().enumerate() {
+            g.add_edge(p, cities[i % 2000], "LIVES_IN", &json!({})).unwrap();
+            // a handful of follows edges
+            for k in 1..4 {
+                g.add_edge(people[(i + k) % people.len()], p, "FOLLOWS", &json!({}))
+                    .unwrap();
+            }
+        }
+        g.rebuild_csr().unwrap();
+        let q = "MATCH (f:Person)-[:FOLLOWS]->(p:Person)-[:LIVES_IN]->(c:City) \
+                 RETURN p.id AS id, count(f.id) AS num, c.name AS city ORDER BY num DESC, id LIMIT 1";
+        println!("PLAN:\n{}", crate::exec::explain(&g, q).unwrap());
+        println!("recognized: {}", recognize(&optimized_plan(&g, q)).is_some());
+    }
+
+    /// The benchmark's `interest_gender_by_city` shape: two `MATCH` clauses that
+    /// share the pivot `p`. After the join-to-expand rewrite it plans as a
+    /// linear two-hop chain anchored at the selective interest index scan, so it
+    /// takes the columnar path and matches the row pipeline exactly.
+    #[test]
+    fn multi_match_shared_pivot_recognized() {
+        let dir = TempDir::new().unwrap();
+        let g = Graph::open(dir.path(), 1).unwrap();
+        let interests: Vec<_> = (0..4)
+            .map(|i| g.add_node("Interest", &json!({"name": format!("int{i}")})).unwrap())
+            .collect();
+        let cities: Vec<_> = (0..3)
+            .map(|i| g.add_node("City", &json!({"name": format!("city{i}")})).unwrap())
+            .collect();
+        for i in 0..30i64 {
+            let p = g
+                .add_node(
+                    "Person",
+                    &json!({"id": i, "gender": if i % 2 == 0 { "male" } else { "female" }}),
+                )
+                .unwrap();
+            g.add_edge(p, interests[(i % 4) as usize], "HAS_INTEREST", &json!({}))
+                .unwrap();
+            g.add_edge(p, cities[(i % 3) as usize], "LIVES_IN", &json!({}))
+                .unwrap();
+        }
+        g.rebuild_csr().unwrap();
+        let q = "MATCH (p:Person)-[:HAS_INTEREST]->(i:Interest) \
+                 MATCH (p)-[:LIVES_IN]->(c:City) \
+                 WHERE i.name = 'int1' AND p.gender = 'male' \
+                 RETURN count(p.id) AS num, c.name AS city ORDER BY num DESC, city LIMIT 5";
+        assert!(
+            recognize(&optimized_plan(&g, q)).is_some(),
+            "multi-MATCH shared-pivot shape must vectorize after the join-to-expand rewrite"
+        );
+        assert_matches_row_path(&g, q);
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(48))]
+        /// Independent oracle check for the join-to-expand rewrite over the
+        /// multi-MATCH `interest_gender_by_city` shape. The expected
+        /// `(num, city)` multiset is computed directly from the generated edges
+        /// (honoring parallel edges and the interest/gender filters), so the
+        /// test does not trust either executor. Random parallel `HAS_INTEREST`
+        /// and `LIVES_IN` edges exercise the natural-join cardinality the graft
+        /// must preserve.
+        #[test]
+        fn multi_match_join_to_expand_matches_oracle(
+            // Per person: gender flag, list of interest ids (with repeats), list
+            // of city ids (with repeats).
+            people in proptest::collection::vec(
+                (
+                    proptest::bool::ANY,
+                    proptest::collection::vec(0usize..4, 0..3),
+                    proptest::collection::vec(0usize..3, 0..3),
+                ),
+                1..8,
+            ),
+            target in 0usize..4,
+        ) {
+            let dir = TempDir::new().unwrap();
+            let g = Graph::open(dir.path(), 1).unwrap();
+            let interests: Vec<_> = (0..4)
+                .map(|i| g.add_node("Interest", &json!({"name": format!("int{i}")})).unwrap())
+                .collect();
+            let cities: Vec<_> = (0..3)
+                .map(|i| g.add_node("City", &json!({"name": format!("city{i}")})).unwrap())
+                .collect();
+            // count[city name] from the oracle: for each male person with at
+            // least one HAS_INTEREST edge to the target, each LIVES_IN edge adds
+            // (number of HAS_INTEREST edges to the target) to that city.
+            let mut oracle: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+            for (idx, (male, ints, cs)) in people.iter().enumerate() {
+                let p = g
+                    .add_node(
+                        "Person",
+                        &json!({"id": idx as i64, "gender": if *male { "male" } else { "female" }}),
+                    )
+                    .unwrap();
+                for &ii in ints {
+                    g.add_edge(p, interests[ii], "HAS_INTEREST", &json!({})).unwrap();
+                }
+                for &ci in cs {
+                    g.add_edge(p, cities[ci], "LIVES_IN", &json!({})).unwrap();
+                }
+                let hi = ints.iter().filter(|&&ii| ii == target).count() as i64;
+                if *male && hi > 0 {
+                    for &ci in cs {
+                        *oracle.entry(format!("city{ci}")).or_default() += hi;
+                    }
+                }
+            }
+            g.rebuild_csr().unwrap();
+            let mut expected: Vec<(i64, String)> =
+                oracle.into_iter().map(|(city, num)| (num, city)).collect();
+            // ORDER BY num DESC, city ASC, then LIMIT 5.
+            expected.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+            expected.truncate(5);
+
+            let q = format!(
+                "MATCH (p:Person)-[:HAS_INTEREST]->(i:Interest) \
+                 MATCH (p)-[:LIVES_IN]->(c:City) \
+                 WHERE i.name = 'int{target}' AND p.gender = 'male' \
+                 RETURN count(p.id) AS num, c.name AS city ORDER BY num DESC, city LIMIT 5"
+            );
+            let params = std::collections::HashMap::new();
+            let got = execute(&g, &q, &params).unwrap();
+            let got_rows: Vec<(i64, String)> = got
+                .records
+                .iter()
+                .map(|r| {
+                    (
+                        r.values[0].as_i64().unwrap(),
+                        r.values[1].as_str().unwrap().to_string(),
+                    )
+                })
+                .collect();
+            proptest::prop_assert_eq!(got_rows, expected);
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(48))]
+        /// Differential check for the columnar N-hop path over a three-hop
+        /// chain `(p:P)-[:L]->(c:C)-[:S]->(t:T)-[:U]->(co:O)` with distinct
+        /// relationship types. Covers the benchmark's `age_band` (filter on the
+        /// leaf, group by the far end) and `youngest_cities` (filter on the far
+        /// end, group by the middle, an `avg`) shapes plus an unordered
+        /// projection that pins the fan-out row order against the row pipeline's
+        /// depth-first chain threading. Random edges exercise non-functional
+        /// fan-out the benchmark's functional chain does not.
+        #[test]
+        fn three_hop_vectorized_matches_row_path(
+            ages in proptest::collection::vec(0u8..5, 2..7),
+            l_edges in proptest::collection::vec((0usize..7, 0usize..4), 0..14),
+            s_edges in proptest::collection::vec((0usize..4, 0usize..3), 0..9),
+            u_edges in proptest::collection::vec((0usize..3, 0usize..2), 0..6),
+        ) {
+            let dir = TempDir::new().unwrap();
+            let g = Graph::open(dir.path(), 1).unwrap();
+            let oids: Vec<_> = ["us", "no"]
+                .iter()
+                .map(|nm| g.add_node("O", &json!({"name": nm})).unwrap())
+                .collect();
+            let tids: Vec<_> = ["ca", "ny", "os"]
+                .iter()
+                .map(|nm| g.add_node("T", &json!({"name": nm})).unwrap())
+                .collect();
+            let cids: Vec<_> = ["sf", "la", "nyc", "oslo"]
+                .iter()
+                .map(|nm| g.add_node("C", &json!({"name": nm})).unwrap())
+                .collect();
+            let pids: Vec<_> = ages
+                .iter()
+                .enumerate()
+                .map(|(i, age)| g.add_node("P", &json!({"id": i as i64, "age": *age as i64})).unwrap())
+                .collect();
+            for (p, c) in &l_edges {
+                if *p < pids.len() && *c < cids.len() {
+                    g.add_edge(pids[*p], cids[*c], "L", &json!({})).unwrap();
+                }
+            }
+            for (c, t) in &s_edges {
+                if *c < cids.len() && *t < tids.len() {
+                    g.add_edge(cids[*c], tids[*t], "S", &json!({})).unwrap();
+                }
+            }
+            for (t, o) in &u_edges {
+                if *t < tids.len() && *o < oids.len() {
+                    g.add_edge(tids[*t], oids[*o], "U", &json!({})).unwrap();
+                }
+            }
+            for cypher in [
+                "MATCH (p:P)-[:L]->(c:C)-[:S]->(t:T)-[:U]->(co:O) \
+                 RETURN p.id AS pid, c.name AS city, t.name AS state, co.name AS country",
+                "MATCH (p:P)-[:L]->(c:C)-[:S]->(t:T)-[:U]->(co:O) WHERE p.age >= 2 \
+                 RETURN co.name AS country, count(p.id) AS num ORDER BY num DESC, country LIMIT 3",
+                "MATCH (p:P)-[:L]->(c:C)-[:S]->(t:T)-[:U]->(co:O) WHERE co.name = 'us' \
+                 RETURN c.name AS city, avg(p.age) AS avg_age ORDER BY avg_age, city LIMIT 5",
             ] {
                 assert_matches_row_path(&g, cypher);
             }

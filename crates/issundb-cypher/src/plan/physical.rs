@@ -199,6 +199,38 @@ pub enum PhysicalOperator {
         /// Output column the count is bound to.
         output: String,
     },
+    /// Per-group `count` over a single directed hop, grouped by one endpoint of
+    /// the hop, evaluated by the core grouped-degree kernel as an integer pass
+    /// over adjacency instead of expanding and folding every edge row.
+    ///
+    /// Emitted by the optimizer when an `Aggregate` whose group keys are all
+    /// single-property reads on one endpoint of a one-hop directed expansion
+    /// carries exactly one non-distinct `count` over the other endpoint (or
+    /// `count(*)`). Produces one row per surviving group, binding each group
+    /// column (as the row-pipeline `Aggregate` would) plus `output` to the
+    /// count, so the `Project`/`Sort`/`Limit` above it run unchanged.
+    GroupedDegree {
+        /// Relationship type of the hop, or `None` for any type.
+        rel_type: Option<String>,
+        /// Group by the edge destination (count incoming) when true; by the
+        /// edge source (count outgoing) when false.
+        group_is_dst: bool,
+        /// Label required on the group endpoint, if any.
+        group_label: Option<String>,
+        /// Label required on the counted endpoint, if any.
+        counted_label: Option<String>,
+        /// Property that must be non-null on the counted endpoint for an edge
+        /// to count (`count(v.prop)`); `None` for `count(*)` or `count(v)`.
+        counted_nonnull_prop: Option<String>,
+        /// The variable bound to the group endpoint node, so the executor can
+        /// evaluate the group-by expressions against it.
+        group_var: String,
+        /// The aggregate's group-by expressions, each a single-property read on
+        /// `group_var`, with the same aliases the row pipeline would carry.
+        group_by: Vec<(Expr, Option<String>)>,
+        /// Output column the count is bound to.
+        output: String,
+    },
 }
 
 /// Comparison operator of a per-vertex property predicate pushed into the
@@ -651,6 +683,40 @@ pub fn format_physical_plan(op: &PhysicalOperator, depth: usize) -> String {
                 pattern.push_str(&format!("-[:{rel}]->{}", node(h + 1)));
             }
             buf.push_str(&format!("{pad}PathCount {pattern} AS {output}\n"));
+        }
+        PhysicalOperator::GroupedDegree {
+            rel_type,
+            group_is_dst,
+            group_label,
+            counted_label,
+            counted_nonnull_prop,
+            group_var,
+            group_by,
+            output,
+        } => {
+            let rel = rel_type.as_deref().unwrap_or("*");
+            let glab = group_label
+                .as_deref()
+                .map(|l| format!(":{l}"))
+                .unwrap_or_default();
+            let clab = counted_label
+                .as_deref()
+                .map(|l| format!(":{l}"))
+                .unwrap_or_default();
+            let arrow = if *group_is_dst {
+                format!("(c{clab})-[:{rel}]->({group_var}{glab})")
+            } else {
+                format!("({group_var}{glab})-[:{rel}]->(c{clab})")
+            };
+            let keys: Vec<String> = group_by.iter().map(|(e, _)| fmt_expr(e)).collect();
+            let counted = match counted_nonnull_prop {
+                Some(p) => format!("count(c.{p})"),
+                None => "count(*)".to_string(),
+            };
+            buf.push_str(&format!(
+                "{pad}GroupedDegree {arrow} group=[{}] {counted} AS {output}\n",
+                keys.join(", ")
+            ));
         }
     }
 

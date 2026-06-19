@@ -187,6 +187,19 @@ impl PropColumn {
         *self = Self::Json(json(self));
     }
 
+    /// Whether the slot at `dense` holds a non-null value, without
+    /// materializing it (a string slot would otherwise clone its dictionary
+    /// entry). Backs the grouped-degree kernel's `count(v.prop)` null filter.
+    pub(crate) fn is_present(&self, dense: usize) -> bool {
+        match self {
+            Self::Int(v) => v[dense].is_some(),
+            Self::Float(v) => v[dense].is_some(),
+            Self::Bool(v) => v[dense].is_some(),
+            Self::Str { idx, .. } => idx[dense] != STR_NULL,
+            Self::Json(v) => v[dense].is_some(),
+        }
+    }
+
     /// The value at `dense`, or `None` for null/missing.
     pub(crate) fn get_json_opt(&self, dense: usize) -> Option<Value> {
         match self {
