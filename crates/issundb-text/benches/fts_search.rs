@@ -51,7 +51,7 @@ fn bench_fts_index_build(c: &mut Criterion) {
                 graph.add_node("Article", &json!({ "body": body })).unwrap();
             }
             graph.create_node_text_index("Article", "body").unwrap();
-            criterion::black_box(());
+            std::hint::black_box(());
             // Hold `dir` alive until end of iteration.
             drop(dir);
         });
@@ -69,9 +69,9 @@ fn bench_fts_search_single_term(c: &mut Criterion) {
 
     c.bench_function("fts_search_single_term", |b| {
         b.iter(|| {
-            criterion::black_box(
+            std::hint::black_box(
                 graph
-                    .text_search(criterion::black_box("graph"), &opts)
+                    .text_search(std::hint::black_box("graph"), &opts)
                     .unwrap(),
             )
         });
@@ -89,9 +89,9 @@ fn bench_fts_search_multi_term(c: &mut Criterion) {
 
     c.bench_function("fts_search_multi_term", |b| {
         b.iter(|| {
-            criterion::black_box(
+            std::hint::black_box(
                 graph
-                    .text_search(criterion::black_box("graph database storage"), &opts)
+                    .text_search(std::hint::black_box("graph database storage"), &opts)
                     .unwrap(),
             )
         });

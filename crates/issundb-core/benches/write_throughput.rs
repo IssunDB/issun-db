@@ -4,7 +4,9 @@
 //! versus large batched commits (inserting multiple records within a single transaction)
 //! for both nodes and edges.
 
-use criterion::{BatchSize, Criterion, black_box, criterion_group, criterion_main};
+use std::hint::black_box;
+
+use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use issundb_core::Graph;
 use serde_json::json;
 use tempfile::TempDir;

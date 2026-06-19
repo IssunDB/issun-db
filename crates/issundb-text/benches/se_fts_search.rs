@@ -83,9 +83,9 @@ fn bench_se_fts_search(c: &mut Criterion) {
 
     c.bench_function("se_fts_search_single_term", |b| {
         b.iter(|| {
-            criterion::black_box(
+            std::hint::black_box(
                 graph
-                    .text_search(criterion::black_box(&single), &opts)
+                    .text_search(std::hint::black_box(&single), &opts)
                     .unwrap(),
             )
         });
@@ -93,9 +93,9 @@ fn bench_se_fts_search(c: &mut Criterion) {
 
     c.bench_function("se_fts_search_multi_term", |b| {
         b.iter(|| {
-            criterion::black_box(
+            std::hint::black_box(
                 graph
-                    .text_search(criterion::black_box(&multi), &opts)
+                    .text_search(std::hint::black_box(&multi), &opts)
                     .unwrap(),
             )
         });

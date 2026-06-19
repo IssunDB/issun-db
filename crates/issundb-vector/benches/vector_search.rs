@@ -32,9 +32,9 @@ fn bench_vector_upsert(c: &mut Criterion) {
     c.bench_function("vector_upsert_into_100_entry_index", |b| {
         b.iter(|| {
             graph
-                .upsert_vector(criterion::black_box(target), criterion::black_box(&new_vec))
+                .upsert_vector(std::hint::black_box(target), std::hint::black_box(&new_vec))
                 .unwrap();
-            criterion::black_box(())
+            std::hint::black_box(())
         });
     });
 }
@@ -45,9 +45,9 @@ fn bench_vector_search_k1(c: &mut Criterion) {
 
     c.bench_function("vector_search_k1", |b| {
         b.iter(|| {
-            criterion::black_box(
+            std::hint::black_box(
                 graph
-                    .vector_search(criterion::black_box(&query), criterion::black_box(1))
+                    .vector_search(std::hint::black_box(&query), std::hint::black_box(1))
                     .unwrap(),
             )
         });
@@ -60,9 +60,9 @@ fn bench_vector_search_k10(c: &mut Criterion) {
 
     c.bench_function("vector_search_k10", |b| {
         b.iter(|| {
-            criterion::black_box(
+            std::hint::black_box(
                 graph
-                    .vector_search(criterion::black_box(&query), criterion::black_box(10))
+                    .vector_search(std::hint::black_box(&query), std::hint::black_box(10))
                     .unwrap(),
             )
         });

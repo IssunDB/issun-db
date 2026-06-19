@@ -51,9 +51,9 @@ fn bench_se_vector_search(c: &mut Criterion) {
     for k in [10usize, 100] {
         c.bench_function(&format!("se_vector_search_k{k}"), |b| {
             b.iter(|| {
-                criterion::black_box(
+                std::hint::black_box(
                     graph
-                        .vector_search(criterion::black_box(&query), criterion::black_box(k))
+                        .vector_search(std::hint::black_box(&query), std::hint::black_box(k))
                         .unwrap(),
                 )
             });
