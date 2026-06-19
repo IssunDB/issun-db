@@ -27,7 +27,7 @@ issundb-cypher = { path = "crates/issundb-cypher", version = "0.1.0-alpha.9" }
 issundb-graphblas-sys = { path = "crates/issundb-graphblas-sys", version = "0.1.0-alpha.9" }
 issundb-graphblas = { path = "crates/issundb-graphblas", version = "0.1.0-alpha.9" }
 heed = "0.22"
-colored = "2"
+colored = "3.1.1"
 byteorder = "1"
 zerocopy = { version = "0.8.48", features = ["derive"] }
 rmp-serde = "1"
