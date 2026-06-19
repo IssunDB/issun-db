@@ -85,7 +85,8 @@ Do not invent modules that do not yet exist when answering questions, but do pla
       (resize plus per-element set and drop) and the self-contained `dense_to_id`/`id_to_dense` mapping the matrix-view consumers read.
     - `src/error.rs`: `Error` enum; all storage and serialization errors unify here.
 - `crates/issundb-cypher/`: Cypher parser, AST, logical planner, physical planner, optimizer, and executor.
-    - `src/parser.rs`: hand-written recursive-descent parser for MATCH (including inline relationship property maps and multi-label node patterns
+    - `src/parser.rs`: Cypher parser built with the `chumsky` parser-combinator library (with a Pratt parser for operator-precedence expressions) for
+      MATCH (including inline relationship property maps and multi-label node patterns
       such as `(n:A:B)`), WHERE, RETURN, CREATE, SET (property and label assignment), REMOVE (label and property), and DELETE/DETACH DELETE over
       arbitrary expression targets.
     - `src/ast.rs`: AST node types.
@@ -93,7 +94,7 @@ Do not invent modules that do not yet exist when answering questions, but do pla
     - `src/exec/mod.rs`: public entry points (`execute`, `explain`), shared type definitions, and tests.
     - `src/exec/read.rs`: `execute_physical` and read-path helpers (`evaluate_where`, `evaluate_sort_key`, `json_to_prop_value`,
       `execute_filter_over_expand`).
-I    - `src/exec/vectorized.rs`: columnar fast path for the final projection or aggregation over a one-hop or two-hop directed expansion. A
+      I - `src/exec/vectorized.rs`: columnar fast path for the final projection or aggregation over a one-hop or two-hop directed expansion. A
       structural recognizer matches `[Limit]? [Sort]? [Distinct]? Project [Aggregate]? Filter* Expand(directed single hop) [Filter* Expand]
       LabelScan` with single-property expressions, modeling the chain as one id column per node variable (the leaf plus each hop's
       destination). It executes column-at-a-time (per-hop bulk expansion with the fan-out preserving the row pipeline's depth-first order,

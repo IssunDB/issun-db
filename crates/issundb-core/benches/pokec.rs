@@ -35,7 +35,7 @@ use std::{
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use issundb_core::Graph;
-use rand::Rng;
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 
@@ -84,19 +84,26 @@ fn pokec_size() -> (usize, usize) {
 fn load_synthetic(n_nodes: usize, n_edges: usize) -> BenchState {
     let dir = TempDir::new().unwrap();
     let g = Graph::open(dir.path(), 4).unwrap();
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
 
     let mut ids = Vec::with_capacity(n_nodes);
     for _ in 0..n_nodes {
         let props = UserProps {
-            cmpl_pct: rng.gen_range(0..100),
-            gender: if rng.gen_bool(0.9) {
-                Some(if rng.gen_bool(0.5) { "male" } else { "female" }.into())
+            cmpl_pct: rng.random_range(0..100),
+            gender: if rng.random_bool(0.9) {
+                Some(
+                    if rng.random_bool(0.5) {
+                        "male"
+                    } else {
+                        "female"
+                    }
+                    .into(),
+                )
             } else {
                 None
             },
-            age: if rng.gen_bool(0.8) {
-                Some(rng.gen_range(14..80))
+            age: if rng.random_bool(0.8) {
+                Some(rng.random_range(14..80))
             } else {
                 None
             },
@@ -229,7 +236,7 @@ fn setup() -> BenchState {
 // ---------------------------------------------------------------------------
 
 fn random_id(ids: &[u64]) -> u64 {
-    ids[rand::thread_rng().gen_range(0..ids.len())]
+    ids[rand::rng().random_range(0..ids.len())]
 }
 
 fn age_from_props(props: &[u8]) -> Option<i32> {
@@ -342,11 +349,11 @@ fn bench_single_edge_write(c: &mut Criterion, state: &BenchState) {
     let ids = &state.node_ids;
     c.bench_function("single_edge_write", |b| {
         b.iter(|| {
-            let mut rng = rand::thread_rng();
-            let i = rng.gen_range(0..ids.len());
-            let mut j = rng.gen_range(0..ids.len());
+            let mut rng = rand::rng();
+            let i = rng.random_range(0..ids.len());
+            let mut j = rng.random_range(0..ids.len());
             while j == i {
-                j = rng.gen_range(0..ids.len());
+                j = rng.random_range(0..ids.len());
             }
             state.graph.add_edge(ids[i], ids[j], "Friend", &()).unwrap()
         })

@@ -74,7 +74,6 @@ async fn join(handle: tokio::task::JoinHandle<Response>) -> Response {
 /// of axum's default plain-text rejection body.
 pub struct JsonBody<T>(pub T);
 
-#[axum::async_trait]
 impl<T, S> FromRequest<S> for JsonBody<T>
 where
     T: DeserializeOwned,
@@ -94,7 +93,6 @@ where
 /// envelope rather than axum's plain-text rejection body.
 pub struct PathU64(pub u64);
 
-#[axum::async_trait]
 impl<S> FromRequestParts<S> for PathU64
 where
     S: Send + Sync,
@@ -944,21 +942,21 @@ pub fn build_router(graph: Arc<Graph>) -> Router {
     // infrastructure probes do not need to track the API version.
     let v1 = Router::new()
         .route("/nodes", post(create_node))
-        .route("/nodes/:id", get(get_node))
-        .route("/nodes/:id", put(update_node))
-        .route("/nodes/:id", delete(delete_node))
-        .route("/nodes/:id/labels/:label", post(add_node_label))
-        .route("/nodes/:id/labels/:label", delete(remove_node_label))
+        .route("/nodes/{id}", get(get_node))
+        .route("/nodes/{id}", put(update_node))
+        .route("/nodes/{id}", delete(delete_node))
+        .route("/nodes/{id}/labels/{label}", post(add_node_label))
+        .route("/nodes/{id}/labels/{label}", delete(remove_node_label))
         .route("/edges", post(create_edge))
-        .route("/edges/:id", get(get_edge))
-        .route("/edges/:id", put(update_edge))
-        .route("/edges/:id", delete(delete_edge))
+        .route("/edges/{id}", get(get_edge))
+        .route("/edges/{id}", put(update_edge))
+        .route("/edges/{id}", delete(delete_edge))
         .route("/query", post(execute_query))
         .route("/explain", post(explain_query))
         .route("/search/text", post(search_text))
         .route("/search/vector", post(search_vector))
         .route("/vectors", post(upsert_vector))
-        .route("/vectors/:id", delete(delete_vector))
+        .route("/vectors/{id}", delete(delete_vector))
         .route("/retrieve", post(retrieve))
         .with_state(graph);
 
