@@ -169,7 +169,17 @@ develop-py: ## Build issundb-py and install it into the active Python environmen
 .PHONY: wheel-py
 wheel-py: ## Build the issundb-py wheel for the current platform
 	@echo "Building the issundb-py wheel..."
-	@(cd $(PY_DIR) && maturin build --release --out $(WHEEL_DIR) --auditwheel check)
+	@# Sync the dev group (patchelf) without installing the project; auditwheel
+	@# repair needs patchelf on PATH to copy libgomp into the wheel and patch the
+	@# rpath, and only the dev-group binary is available.
+	@(cd $(PY_DIR) && $(PY_MNGR) sync --group dev --no-install-project)
+	@# Drop maturin's prior output so it cannot hardlink and re-patch a stale copy.
+	@rm -rf target/maturin
+	@# Maturin fails when CONDA_PREFIX and VIRTUAL_ENV are both set; clear the former.
+	@# Run through uv so the dev-group patchelf is on PATH. "repair" (the maturin
+	@# default) bundles the external libgomp for the host platform; "check" only
+	@# verifies compliance and errors when a library needs copying.
+	@(cd $(PY_DIR) && unset CONDA_PREFIX && $(PY_MNGR) run --no-sync maturin build --release --out $(WHEEL_DIR) --auditwheel repair)
 
 .PHONY: wheel-py-manylinux
 wheel-py-manylinux: ## Build the manylinux issundb-py wheel using Zig

@@ -4619,7 +4619,14 @@ mod tests {
     #[test]
     fn join_to_expand_grafts_single_shared_var() {
         // driver binds {i, p}: (i)<-[:HAS_INTEREST]-(p) anchored at i.
-        let driver = expand(scan("i", Some("Interest")), "i", "r0", "p", "HAS_INTEREST", true);
+        let driver = expand(
+            scan("i", Some("Interest")),
+            "i",
+            "r0",
+            "p",
+            "HAS_INTEREST",
+            true,
+        );
         // chain binds {p, c} and roots at a bare LabelScan(p): (p)-[:LIVES_IN]->(c).
         let chain = expand(scan("p", None), "p", "r1", "c", "LIVES_IN", false);
         let join = PhysicalOperator::HashJoin {
@@ -4659,7 +4666,14 @@ mod tests {
     fn join_to_expand_keeps_optional_match() {
         // An OPTIONAL MATCH side is a left-outer join; grafting would expand off
         // a possibly-null variable and drop preserved rows, so it is never done.
-        let required = expand(scan("i", Some("Interest")), "i", "r0", "p", "HAS_INTEREST", true);
+        let required = expand(
+            scan("i", Some("Interest")),
+            "i",
+            "r0",
+            "p",
+            "HAS_INTEREST",
+            true,
+        );
         let optional = PhysicalOperator::OptionalMatch {
             input: Box::new(expand(scan("p", None), "p", "r1", "c", "LIVES_IN", false)),
             null_vars: vec!["c".to_string(), "r1".to_string()],
