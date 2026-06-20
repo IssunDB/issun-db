@@ -8,7 +8,7 @@ IssunDB is an embedded graph database with vector and full-text search, written 
 Priorities, in order:
 
 1. Correct storage behavior: ACID transactions, adjacency consistency, and ID uniqueness.
-2. Clear boundaries between the storage engine, query layer, vector index, and public facade.
+2. Clear boundaries between the storage engine, query layer, vector and text indexes, and public facade.
 3. Reproducible, benchmark-backed performance; no premature optimization before correctness is covered.
 4. Idiomatic Rust: ownership, zero-cost abstractions, and `unsafe` only where necessary and documented.
 
