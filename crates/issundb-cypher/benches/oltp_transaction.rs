@@ -111,11 +111,11 @@ fn bench_oltp(c: &mut Criterion) {
             }
             c.bench_function(name, |b| {
                 b.iter(|| {
-                    criterion::black_box(
+                    std::hint::black_box(
                         execute(
                             &g,
-                            criterion::black_box(query),
-                            criterion::black_box(&params),
+                            std::hint::black_box(query),
+                            std::hint::black_box(&params),
                         )
                         .unwrap(),
                     )

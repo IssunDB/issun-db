@@ -92,7 +92,7 @@ fn bench_execution(c: &mut Criterion) {
         execute(&g, query, &params).unwrap();
         c.bench_function(name, |b| {
             b.iter(|| {
-                criterion::black_box(execute(&g, criterion::black_box(query), &params).unwrap())
+                std::hint::black_box(execute(&g, std::hint::black_box(query), &params).unwrap())
             });
         });
     };
@@ -177,8 +177,8 @@ fn bench_execution(c: &mut Criterion) {
     execute(&tg, triangle_query, &params).unwrap();
     c.bench_function("exec_limit_behind_multiway", |b| {
         b.iter(|| {
-            criterion::black_box(
-                execute(&tg, criterion::black_box(triangle_query), &params).unwrap(),
+            std::hint::black_box(
+                execute(&tg, std::hint::black_box(triangle_query), &params).unwrap(),
             )
         });
     });

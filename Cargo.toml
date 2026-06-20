@@ -8,7 +8,7 @@ exclude = ["benchmarks/ladybugdb-compare"]
 
 
 [workspace.package]
-version = "0.1.0-alpha.8"
+version = "0.1.0-alpha.9"
 edition = "2024"
 authors = ["Hassan Abedi <hassan.abedi.t+issundb@gmail.com>"]
 license = "MIT OR Apache-2.0"
@@ -18,16 +18,16 @@ rust-version = "1.85.0"
 
 
 [workspace.dependencies]
-issundb = { path = "crates/issundb", version = "0.1.0-alpha.8" }
-issundb-core = { path = "crates/issundb-core", version = "0.1.0-alpha.8" }
-issundb-vector = { path = "crates/issundb-vector", version = "0.1.0-alpha.8" }
-issundb-text = { path = "crates/issundb-text", version = "0.1.0-alpha.8" }
-issundb-retrieval = { path = "crates/issundb-retrieval", version = "0.1.0-alpha.8" }
-issundb-cypher = { path = "crates/issundb-cypher", version = "0.1.0-alpha.8" }
-issundb-graphblas-sys = { path = "crates/issundb-graphblas-sys", version = "0.1.0-alpha.8" }
-issundb-graphblas = { path = "crates/issundb-graphblas", version = "0.1.0-alpha.8" }
+issundb = { path = "crates/issundb", version = "0.1.0-alpha.9" }
+issundb-core = { path = "crates/issundb-core", version = "0.1.0-alpha.9" }
+issundb-vector = { path = "crates/issundb-vector", version = "0.1.0-alpha.9" }
+issundb-text = { path = "crates/issundb-text", version = "0.1.0-alpha.9" }
+issundb-retrieval = { path = "crates/issundb-retrieval", version = "0.1.0-alpha.9" }
+issundb-cypher = { path = "crates/issundb-cypher", version = "0.1.0-alpha.9" }
+issundb-graphblas-sys = { path = "crates/issundb-graphblas-sys", version = "0.1.0-alpha.9" }
+issundb-graphblas = { path = "crates/issundb-graphblas", version = "0.1.0-alpha.9" }
 heed = "0.22"
-colored = "2"
+colored = "3.1.1"
 byteorder = "1"
 zerocopy = { version = "0.8.48", features = ["derive"] }
 rmp-serde = "1"
@@ -42,22 +42,22 @@ tracing = "0.1"
 ahash = "0.8"
 tempfile = "3"
 proptest = "1"
-rand = "0.8"
-criterion = { version = "0.5.1", features = ["html_reports"] }
+rand = "0.10.1"
+criterion = { version = "=0.7.0", features = ["html_reports"] }
 usearch = "2"
 chumsky = { version = "0.13.0", features = ["pratt"] }
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
 rust-stemmers = "1.2.0"
 unicode-segmentation = "1.13.2"
-pyo3 = { version = "0.25", features = ["abi3-py310"] }
+pyo3 = { version = "0.29.0", features = ["abi3-py310"] }
 walkdir = "2"
-gherkin = "0.14"
-roaring = "0.10"
+gherkin = "=0.14"
+roaring = "=0.10"
 deepsize = { version = "0.2", features = ["derive"] }
-parquet = "58.3.0"
-arrow-array = "58.3.0"
-arrow-schema = "58.3.0"
+parquet = "59.0.0"
+arrow-array = "59.0.0"
+arrow-schema = "59.0.0"
 
 [profile.release]
 strip = "debuginfo"

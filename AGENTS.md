@@ -8,7 +8,7 @@ IssunDB is an embedded graph database with vector and full-text search, written 
 Priorities, in order:
 
 1. Correct storage behavior: ACID transactions, adjacency consistency, and ID uniqueness.
-2. Clear boundaries between the storage engine, query layer, vector index, and public facade.
+2. Clear boundaries between the storage engine, query layer, vector and text indexes, and public facade.
 3. Reproducible, benchmark-backed performance; no premature optimization before correctness is covered.
 4. Idiomatic Rust: ownership, zero-cost abstractions, and `unsafe` only where necessary and documented.
 
@@ -21,7 +21,7 @@ Priorities, in order:
   the public facade, and the binding crates (`issundb-rest`, `issundb-mcp`, `issundb-py`) consume only the
   `issundb` facade and its extension crates. Do not import across those boundaries in the wrong direction.
 - Keep all mutable state inside `Graph` and `Storage`; do not introduce module-level `static mut` or `lazy_static` globals for runtime state.
-- Writes are serialized via the `parking_lot::Mutex<()>` write lock on `Graph`; LMDB enforces the same constraint at the storage level. Do not bypass
+- Writes are serialized via the `parking_lot::ReentrantMutex<()>` write lock on `Graph`; LMDB enforces the same constraint at the storage level. Do not bypass
   either.
 - Add comments only when they clarify a non-obvious storage invariant, an LMDB lifetime constraint, or a GraphBLAS semiring choice.
 - Maintain the permissive license boundary of the workspace (MIT or Apache-2.0). Do not add dependencies or statically link libraries with copyleft,
@@ -43,13 +43,13 @@ Quick examples:
 - Use Oxford commas in inline lists: "a, b, and c" not "a, b, c".
 - Do not use em dashes. Restructure the sentence, or use a colon or semicolon instead.
 - Avoid colorful adjectives and adverbs. Write "adjacency query" not "blazing adjacency query".
-- Use noun phrases for checklist items, not imperative verbs. Write "temp directory teardown" not "tear down the temp directory".
+- Prefer noun phrases for checklist items over imperative verbs. Write "temp directory teardown" not "tear down the temp directory".
 - Headings in Markdown files must be in title case: "Build from Source" not "Build from source". Minor words (a, an, the, and, but, or, for, in, on,
   at, to, by, of) stay lowercase unless they are the first word.
 
 ## Repository Layout
 
-The current tree includes storage, CSR snapshots, vector search, hybrid retrieval primitives, Cypher, the CLI, an REST API, language bindings,
+The current tree includes storage, CSR snapshots, vector search, hybrid retrieval primitives, Cypher, the CLI, a REST API, language bindings,
 and shared test utilities.
 This layout describes the current structure and target decoupled crate boundaries.
 Do not invent modules that do not yet exist when answering questions, but do place new modules according to this map.
@@ -85,7 +85,8 @@ Do not invent modules that do not yet exist when answering questions, but do pla
       (resize plus per-element set and drop) and the self-contained `dense_to_id`/`id_to_dense` mapping the matrix-view consumers read.
     - `src/error.rs`: `Error` enum; all storage and serialization errors unify here.
 - `crates/issundb-cypher/`: Cypher parser, AST, logical planner, physical planner, optimizer, and executor.
-    - `src/parser.rs`: hand-written recursive-descent parser for MATCH (including inline relationship property maps and multi-label node patterns
+    - `src/parser.rs`: Cypher parser built with the `chumsky` parser-combinator library (with a Pratt parser for operator-precedence expressions) for
+      MATCH (including inline relationship property maps and multi-label node patterns
       such as `(n:A:B)`), WHERE, RETURN, CREATE, SET (property and label assignment), REMOVE (label and property), and DELETE/DETACH DELETE over
       arbitrary expression targets.
     - `src/ast.rs`: AST node types.
@@ -93,15 +94,19 @@ Do not invent modules that do not yet exist when answering questions, but do pla
     - `src/exec/mod.rs`: public entry points (`execute`, `explain`), shared type definitions, and tests.
     - `src/exec/read.rs`: `execute_physical` and read-path helpers (`evaluate_where`, `evaluate_sort_key`, `json_to_prop_value`,
       `execute_filter_over_expand`).
-I    - `src/exec/vectorized.rs`: columnar fast path for the final projection or aggregation over a one-hop or two-hop directed expansion. A
-      structural recognizer matches `[Limit]? [Sort]? [Distinct]? Project [Aggregate]? Filter* Expand(directed single hop) [Filter* Expand]
-      LabelScan` with single-property expressions, modeling the chain as one id column per node variable (the leaf plus each hop's
-      destination). It executes column-at-a-time (per-hop bulk expansion with the fan-out preserving the row pipeline's depth-first order,
-      bulk label membership, bulk property gather via `Graph::node_props_json_table`, and group-by-code aggregation via
-      `Graph::node_prop_group_codes`), building the result records directly. A two-hop chain is recognized only when the two hops carry
-      distinct relationship types, so no single edge can fill both hops and relationship uniqueness is vacuous (the column fan-out tracks no
-      edge identity); same-type or longer chains fall back. The recognizer sees through a `Distinct` operator because the caller deduplicates
-      the built records. Any unrecognized shape falls back to the row pipeline, so correctness never depends on the recognizer.
+    - `src/exec/vectorized.rs`: columnar fast path for the final projection or aggregation over a linear chain of up to `MAX_VEC_HOPS`
+      directed single hops. A structural recognizer matches `[Limit]? [Sort]? [Distinct]? Project [Aggregate]? Stage* (Expand(directed single
+      hop) Stage*){0,MAX_VEC_HOPS} Leaf` with single-property expressions, modeling the chain as one id column per node variable (the leaf
+      plus each hop's destination). It executes column-at-a-time (per-hop bulk expansion with the fan-out preserving the row pipeline's
+      depth-first order, bulk label membership, bulk property gather via `Graph::node_props_json_table`, and group-by-code aggregation via
+      `Graph::node_prop_group_codes`), building the result records directly. A multi-hop chain is recognized only when every hop carries a
+      distinct relationship type, so no single edge can fill two hops and relationship uniqueness is vacuous (the column fan-out tracks no
+      edge identity); a repeated type, or a chain longer than `MAX_VEC_HOPS`, falls back. When the single aggregate is a non-distinct `count`
+      over the chain's terminal variable and that variable feeds no group key, the executor collapses the final hop: instead of materializing
+      every terminal row it counts each source's qualifying neighbors once (`execute_collapsed_count`), so a `count` of upstream-grouped
+      neighbors stays proportional to the edges scanned rather than the rows produced. The recognizer sees through a `Distinct` operator
+      because the caller deduplicates the built records. Any unrecognized shape falls back to the row pipeline, so correctness never depends
+      on the recognizer.
     - `src/exec/factorize.rs`: `FactorizedRecordGroup` (shared `Arc<PathMap>` prefix plus per-row extensions) and `filter_refs_in_expr`.
     - `src/exec/expr.rs`: expression evaluation (`evaluate_expr`, `eval_binary_op`, `eval_arithmetic`, `eval_function_call`).
     - `src/exec/write.rs`: mutation execution (`execute_create`, `execute_set`, `execute_delete`, `execute_merge`).
@@ -234,9 +239,9 @@ All graph operations go through `Graph`; do not call `Storage` directly from out
 
 Node and edge CRUD, accessors, and registry lookups have predictable signatures; read them from the source rather than this file. Methods:
 `add_node`, `add_node_multi`, `get_node`, `update_node`, `delete_node`, `add_label`, `remove_label`, `node_labels`, `add_edge`, `get_edge`,
-`out_neighbors`, `in_neighbors`, `node_has_relationships`, `nodes_by_label`, `edges_by_type`, `all_nodes`, `label_name`, `type_name`,
-`list_node_indexes_and_constraints`, `list_edge_indexes_and_constraints`, `node_count_by_label`, `edge_count_by_type`, `put_vector_bytes`,
-`vector_bytes`, and `rebuild_csr`.
+`update_edge`, `delete_edge`, `out_neighbors`, `in_neighbors`, `node_has_relationships`, `nodes_by_label`, `edges_by_type`, `all_nodes`,
+`label_name`, `type_name`, `list_node_indexes_and_constraints`, `list_edge_indexes_and_constraints`, `node_count_by_label`,
+`edge_count_by_type`, `put_vector_bytes`, `vector_bytes`, and `rebuild_csr`.
 
 The read-path and statistics methods carry non-obvious semantics:
 
@@ -288,6 +293,7 @@ It may depend on `issundb-core`; it must not depend on `issundb-text`, `issundb-
   populated graph and rebuilds the index from the persisted embeddings under the new configuration. The stored vectors are raw, metric-agnostic
   f32, so they re-index under any metric; this is O(n) in the stored vector count and is an administrative operation, not a concurrent one.
 - `VectorGraphExt::upsert_vector(n: NodeId, v: &[f32]) -> Result<(), VectorError>`
+- `VectorGraphExt::remove_vector(n: NodeId) -> Result<(), VectorError>`: removes the embedding for a node from both memory and storage.
 - `VectorGraphExt::vector_search(q: &[f32], k: usize) -> Result<Vec<Hit>, VectorError>`
 - `VectorGraphExt::vector_search_with(q: &[f32], opts: &VectorSearchOptions) -> Result<Vec<Hit>, VectorError>`: adds an exact-label filter,
   property equality filters (both evaluated during the HNSW traversal), and `rescore_factor`. On a quantized index the search defaults to
@@ -313,16 +319,21 @@ retrieve functions are free functions, not methods on `Graph`, to preserve the c
 
 - `retrieve(graph: &Graph, q: &[f32], k: usize, hops: u8) -> Result<Subgraph, RetrievalError>`
 - `retrieve_with(graph: &Graph, q: &[f32], opts: &RetrieveOptions) -> Result<Subgraph, RetrievalError>`
+- `retrieve_hybrid(graph: &Graph, q: &[f32], text_query: &str, opts: &HybridRetrieveOptions) -> Result<Subgraph, RetrievalError>`: fuses vector and text search seed relevance scores before running expansion.
 - `Subgraph`: `nodes: Vec<NodeId>`, `edges: Vec<EdgeId>`, `scores: HashMap<NodeId, f32>`
 - `RetrieveOptions`: `k`, `hops`, `max_distance`, `max_nodes`
+- `HybridRetrieveOptions`: `vector_k`, `text_k`, `text_label`, `text_property`, `hops`, `max_distance`, `max_nodes`, `vector_label`, `fusion`
+- `FusionStrategy`: reciprocal rank fusion (`Rrf { k }`) or linear combination (`WeightedSum { vector_weight, text_weight }`)
 
 ### `issundb_cypher`
 
 Cypher query execution. Exposed through the `issundb` facade via the `GraphQueryExt` trait; do not call `issundb_cypher::execute` directly from
 outside `issundb`.
 
-- `query(cypher: &str) -> Result<QueryResult, CypherError>` and
-  `query_with_params(cypher: &str, params: &HashMap<String, serde_json::Value>) -> Result<QueryResult, CypherError>`
+- `query(cypher: &str) -> Result<QueryResult, CypherError>`,
+  `query_with_params(cypher: &str, params: &HashMap<String, serde_json::Value>) -> Result<QueryResult, CypherError>`,
+  `query_with_procedures(cypher: &str, params: &HashMap<String, serde_json::Value>, registry: &ProcedureRegistry) -> Result<QueryResult, CypherError>`, and
+  `explain(cypher: &str) -> Result<String, CypherError>`
 - `QueryResult`: `columns: Vec<String>`, `records: Vec<Record>`
 - `Record`: `values: Vec<serde_json::Value>`
 
@@ -332,10 +343,13 @@ Untyped expansion uses GraphBLAS SpMV; typed expansion reads the CSR snapshot in
 and the source set is small so a write-then-expand workload never pays a rebuild. The optimizer splits top-level `AND` conjunctions in WHERE so
 each conjunct pushes down to its own lowest binder, and rewrites an equality or range filter over a labeled scan into `NodeIndexScan` or
 `NodeRangeScan` when the property has a declared index; the rewrite recurses through every single-input operator (including `Aggregate`, `Sort`,
-`Limit`, and `Distinct`) and treats a split conjunct's expression form like the structured comparison forms. Bulk label filtering uses `label_idx`
-point
+`Limit`, and `Distinct`) and treats a split conjunct's expression form like the structured comparison forms. A natural inner `HashJoin` whose one
+side merely re-scans a variable the other already binds (the shape a multi-`MATCH` sharing a pivot produces) is rewritten into a linear
+"expand into" chain (`rewrite_join_to_expand`), grafting the redundant-scan side's `Filter`/`Expand` chain onto the driver so the full re-scan is
+eliminated and the columnar path and closing-join rewrite can both exploit the chain; it fires only when the two sides share exactly the one rooted
+variable and never across an `OptionalMatch`. Bulk label filtering uses `label_idx` point
 lookups (`Graph::label_filter`), and single-property node reads go through the in-memory property columns (`Graph::node_prop_json`).
-A final projection or aggregation over a one-hop or two-hop directed expansion executes column-at-a-time through `exec/vectorized.rs`
+A final projection or aggregation over a linear chain of up to `MAX_VEC_HOPS` directed hops executes column-at-a-time through `exec/vectorized.rs`
 (`Graph::node_props_json_table` and `Graph::node_prop_group_codes`); every other shape runs the row pipeline.
 A grouping-free `count` over a one-hop or two-hop directed expansion lowers instead to the `PathCount` kernel
 (`Graph::count_linear_paths`); per-vertex `prop CMP literal` predicates on the path's labeled variables push down into the kernel as
@@ -459,7 +473,6 @@ Additional validation when relevant:
 - Public API docs are generated from `rustdoc` on `crates/issundb/src/lib.rs`. Keep that module focused on the deliberate public surface; do not
   re-export `Storage` or other internals.
 - User workflow changes should update `README.md`.
-- Phase progress and completeness changes should update `ROADMAP.md`.
 - If you detect stale docs while changing related code, fix them in the same patch.
 
 ## Review Guidelines (P0/P1 Focus)

@@ -1,5 +1,5 @@
-//! Columnar fast path for the final projection or aggregation over at most a
-//! single-hop expansion.
+//! Columnar fast path for the final projection or aggregation over a linear
+//! chain of up to `MAX_VEC_HOPS` directed single hops.
 //!
 //! The per-row pipeline pays one `SlotRow` clone per expansion row, another
 //! per projection row, and one property-columns lookup per property access.
@@ -12,7 +12,7 @@
 //! Recognized shape, from the root down:
 //!
 //! ```text
-//! [Limit]? [Sort]? [Distinct]? Project [Aggregate]? Stage* [Expand(1 hop, directed) Stage*] Leaf
+//! [Limit]? [Sort]? [Distinct]? Project [Aggregate]? Stage* (Expand(1 hop, directed) Stage*){0,MAX_VEC_HOPS} Leaf
 //! Leaf  := LabelScan | NodeByIdSeek | NodeIndexScan | NodeRangeScan
 //! Stage := Filter(HasLabel)
 //!        | Filter(comparison over single-property reads, literals, and parameters)
@@ -94,6 +94,22 @@ struct VecPipeline<'a> {
     /// A `Distinct` under a limited sort: the projection root deduplicates
     /// on the projected cells, in row order, before the sort window.
     distinct: bool,
+    /// When set, the single `count` aggregate is over the chain's terminal
+    /// variable, which appears in no group key. The executor then collapses the
+    /// final hop: rather than materializing every terminal row, it counts each
+    /// source's qualifying neighbors. See [`TerminalCount`].
+    collapse: Option<TerminalCount<'a>>,
+}
+
+/// The non-null discriminant for a collapsed terminal `count`. A `count(*)` or
+/// `count(terminal)` counts every neighbor that passes the final region's
+/// filters; a `count(terminal.prop)` counts only those whose `prop` is non-null,
+/// while a qualifying neighbor still makes the group exist (with count zero),
+/// matching the row pipeline's value-keyed aggregate.
+#[derive(Clone, Copy)]
+enum TerminalCount<'a> {
+    All,
+    NonNull(&'a str),
 }
 
 /// One project-root sort key, resolved to a bulk-gatherable property read on
@@ -314,6 +330,16 @@ fn resolve_sort_keys<'a>(
     Some(out)
 }
 
+/// Upper bound on the number of directed single hops the columnar path
+/// recognizes in one linear chain. The per-hop bulk expansion fully
+/// materializes every intermediate id column (the row pipeline streams them),
+/// so the cap bounds worst-case materialization; the recognizer also requires
+/// every hop's relationship type to be present and pairwise distinct for a
+/// multi-hop chain, which keeps the realized depth small in practice. A chain
+/// longer than this falls back to the row pipeline, so correctness never
+/// depends on the bound.
+const MAX_VEC_HOPS: usize = 6;
+
 /// Match `plan` against the recognized shape, or `None` for the row pipeline.
 fn recognize(plan: &PhysicalOperator) -> Option<VecPipeline<'_>> {
     // A Limit is recognized only directly above a Sort: the row pipeline's
@@ -376,7 +402,8 @@ fn recognize(plan: &PhysicalOperator) -> Option<VecPipeline<'_>> {
     };
 
     // Walk the linear chain top-down, alternating a filter region with one
-    // directed single hop, capturing up to two hops. `regions_topdown[i]` holds
+    // directed single hop, capturing up to `MAX_VEC_HOPS` hops.
+    // `regions_topdown[i]` holds
     // the filters sitting above `expands_topdown[i]`; the final region sits
     // above the leaf. Each expand carries the relationship variables earlier
     // hops bound (openCypher relationship uniqueness), checked below.
@@ -392,7 +419,7 @@ fn recognize(plan: &PhysicalOperator) -> Option<VecPipeline<'_>> {
         // Reverse to the bottom-up order the row pipeline applies filters in.
         region.reverse();
         regions_topdown.push(region);
-        if expands_topdown.len() >= 2 {
+        if expands_topdown.len() >= MAX_VEC_HOPS {
             break;
         }
         match cur {
@@ -507,6 +534,7 @@ fn recognize(plan: &PhysicalOperator) -> Option<VecPipeline<'_>> {
 
     // Per-root expression eligibility.
     let mut project_sort = None;
+    let mut collapse = None;
     match &root {
         VecRoot::Project { items } => {
             for (expr, _) in items.iter() {
@@ -566,6 +594,41 @@ fn recognize(plan: &PhysicalOperator) -> Option<VecPipeline<'_>> {
             }
             // The projection and sort above the aggregate run through the
             // regular operators, so their expressions need no eligibility.
+
+            // Terminal count-collapse: when the single aggregate is a
+            // non-distinct `count` over the chain's terminal variable, and that
+            // variable feeds no group key, the executor can count each source's
+            // qualifying neighbors at the final hop instead of materializing
+            // every terminal row. The final region's filters must read only the
+            // terminal variable, so a neighbor's qualification is independent of
+            // the pre-row it extends.
+            if !expands.is_empty() && aggregations.len() == 1 {
+                let (agg_fn, inner, _) = &aggregations[0];
+                let terminal = chain_vars[chain_vars.len() - 1];
+                let tc = match inner {
+                    _ if !matches!(agg_fn, AggFn::Count { distinct: false }) => None,
+                    Expr::CountStar => Some(TerminalCount::All),
+                    Expr::Prop(v, p) if v.as_str() == terminal && p.is_empty() => {
+                        Some(TerminalCount::All)
+                    }
+                    Expr::Prop(v, p) if v.as_str() == terminal && !p.is_empty() => {
+                        Some(TerminalCount::NonNull(p.as_str()))
+                    }
+                    _ => None,
+                };
+                if let Some(tc) = tc {
+                    let term_col = chain_vars.len() - 1;
+                    let term_in_group = group_by.iter().any(
+                        |(e, _)| matches!(prop_read(e, &chain_vars), Some((c, _)) if c == term_col),
+                    );
+                    let last_region_terminal_only = stages.last().is_none_or(|lvl| {
+                        lvl.iter().all(|s| s.vars().iter().all(|v| *v == terminal))
+                    });
+                    if !term_in_group && last_region_terminal_only {
+                        collapse = Some(tc);
+                    }
+                }
+            }
         }
     }
 
@@ -579,6 +642,7 @@ fn recognize(plan: &PhysicalOperator) -> Option<VecPipeline<'_>> {
         project_sort,
         limit,
         distinct: limited_distinct,
+        collapse,
     })
 }
 
@@ -1040,7 +1104,11 @@ pub(super) fn try_execute_vectorized(
     for stage in &p.stages[0] {
         apply_stage(graph, stage, params, schema, &p.chain_vars, &mut cols)?;
     }
-    for (k, x) in p.expands.iter().enumerate() {
+    // A terminal count-collapse materializes one fewer hop: the final hop is
+    // not fanned out into rows but folded into per-source neighbor counts.
+    let collapse = p.collapse;
+    let materialized_hops = p.expands.len() - usize::from(collapse.is_some());
+    for (k, x) in p.expands.iter().take(materialized_hops).enumerate() {
         let width = cols.cols.len();
         let mut distinct: Vec<NodeId> = cols.cols[width - 1].clone();
         distinct.sort_unstable();
@@ -1066,6 +1134,11 @@ pub(super) fn try_execute_vectorized(
         for stage in &p.stages[k + 1] {
             apply_stage(graph, stage, params, schema, &p.chain_vars, &mut cols)?;
         }
+    }
+
+    if let Some(tc) = collapse {
+        return execute_collapsed_count(graph, &p, tc, cols, params, schema, return_clause)
+            .map(Some);
     }
 
     let n = cols.len();
@@ -1314,6 +1387,207 @@ pub(super) fn try_execute_vectorized(
     }
 }
 
+/// Execute a recognized aggregate pipeline whose single `count` is over the
+/// chain's terminal variable, collapsing the final hop.
+///
+/// `cols` holds the pre-rows: every chain column except the terminal, already
+/// fanned out and filtered through the second-to-last hop. Instead of fanning
+/// the final hop into one row per terminal neighbor, this counts each source's
+/// qualifying neighbors once and folds that weight into the group the source's
+/// pre-row belongs to. A neighbor "qualifies" when it passes the final region's
+/// (terminal-only) filters; for `count(terminal.prop)` only neighbors with a
+/// non-null `prop` add to the count, but any qualifying neighbor still makes the
+/// group exist with count zero, exactly as the row pipeline's value-keyed fold
+/// does. Parallel edges are counted per transition, so the cardinality matches a
+/// full materialization.
+#[allow(clippy::too_many_arguments)]
+fn execute_collapsed_count(
+    graph: &Graph,
+    p: &VecPipeline<'_>,
+    tc: TerminalCount<'_>,
+    cols: IdCols,
+    params: &HashMap<String, Value>,
+    schema: &std::sync::Arc<SlotSchema>,
+    return_clause: &ReturnClause,
+) -> Result<Vec<Record>, String> {
+    let VecRoot::Aggregate {
+        group_by,
+        aggregations,
+        project_items,
+        project_is_barrier,
+        sort_items,
+    } = &p.root
+    else {
+        return Err("vectorized: collapse on a non-aggregate root".into());
+    };
+    let last = p
+        .expands
+        .last()
+        .ok_or("vectorized: collapse with no final hop")?;
+    let src_col = cols
+        .cols
+        .last()
+        .ok_or("vectorized: collapse with no source column")?;
+    let n = src_col.len();
+
+    // Bulk-expand the distinct sources once through the final hop.
+    let mut distinct: Vec<NodeId> = src_col.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+    let transitions = expand_multi_type(graph, &distinct, last.rel_type, last.is_incoming)?;
+
+    // Qualify the distinct neighbors against the final region's terminal-only
+    // filters by running those exact stages over a one-column frame, reusing
+    // the row pipeline's predicate semantics.
+    let terminal = p.chain_vars[p.chain_vars.len() - 1];
+    let mut distinct_neighbors: Vec<NodeId> = transitions.iter().map(|(_, _, d)| *d).collect();
+    distinct_neighbors.sort_unstable();
+    distinct_neighbors.dedup();
+    let mut mini = IdCols {
+        cols: vec![distinct_neighbors],
+    };
+    let term_only_vars = [terminal];
+    if let Some(level) = p.stages.last() {
+        for stage in level {
+            apply_stage(graph, stage, params, schema, &term_only_vars, &mut mini)?;
+        }
+    }
+    let qualifying: ahash::AHashSet<NodeId> = mini.cols[0].iter().copied().collect();
+
+    // For `count(terminal.prop)`, the qualifying neighbors whose `prop` is
+    // non-null: only those add to the count.
+    let counts_nonnull: Option<ahash::AHashSet<NodeId>> = match tc {
+        TerminalCount::All => None,
+        TerminalCount::NonNull(prop) => {
+            let ids: Vec<NodeId> = qualifying.iter().copied().collect();
+            let vals = prop_column(graph, &ids, prop)?;
+            Some(
+                ids.iter()
+                    .zip(vals)
+                    .filter(|(_, v)| !v.is_null())
+                    .map(|(id, _)| *id)
+                    .collect(),
+            )
+        }
+    };
+
+    // Per-source tallies: `exists` is the number of qualifying neighbors (a
+    // positive value means the source's pre-rows produce terminal rows, so
+    // their group exists); `counted` is the number that also pass the non-null
+    // filter (the count contribution). They differ only for
+    // `count(terminal.prop)`.
+    let mut exists: ahash::AHashMap<NodeId, u64> = ahash::AHashMap::new();
+    let mut counted: ahash::AHashMap<NodeId, u64> = ahash::AHashMap::new();
+    for (s, _e, d) in &transitions {
+        if !qualifying.contains(d) {
+            continue;
+        }
+        *exists.entry(*s).or_default() += 1;
+        let adds = counts_nonnull.as_ref().is_none_or(|set| set.contains(d));
+        if adds {
+            *counted.entry(*s).or_default() += 1;
+        }
+    }
+
+    // Group the pre-rows by the group-by value codes (all group keys read
+    // pre-row columns; the terminal is excluded by the collapse eligibility).
+    let mut group_codes = Vec::with_capacity(group_by.len());
+    for (expr, _) in group_by.iter() {
+        let (col, prop) =
+            prop_read(expr, &p.chain_vars).ok_or("vectorized: collapse group key not a prop")?;
+        if col >= cols.cols.len() {
+            return Err("vectorized: collapse group key over the terminal".into());
+        }
+        group_codes.push(
+            graph
+                .node_prop_group_codes(&cols.cols[col], prop)
+                .map_err(|e| e.to_string())?,
+        );
+    }
+    let mut strides = vec![1u64; group_by.len()];
+    {
+        let mut acc: u64 = 1;
+        for k in (0..group_by.len()).rev() {
+            strides[k] = acc;
+            match acc.checked_mul(group_codes[k].1.len().max(1) as u64) {
+                Some(next) => acc = next,
+                None => return Err("vectorized: collapse group cardinality overflow".into()),
+            }
+        }
+    }
+
+    // Fold each pre-row's weight into its group; a source with no qualifying
+    // neighbor contributes no row, hence no group.
+    let mut slot_by_key: ahash::AHashMap<u64, usize> = ahash::AHashMap::new();
+    let mut groups: Vec<(Vec<u32>, u64)> = Vec::new();
+    if group_by.is_empty() {
+        groups.push((Vec::new(), 0));
+    }
+    for i in 0..n {
+        let src = src_col[i];
+        if exists.get(&src).copied().unwrap_or(0) == 0 {
+            continue;
+        }
+        let add = match tc {
+            TerminalCount::All => exists.get(&src).copied().unwrap_or(0),
+            TerminalCount::NonNull(_) => counted.get(&src).copied().unwrap_or(0),
+        };
+        let slot = if group_by.is_empty() {
+            0
+        } else {
+            let mut key = 0u64;
+            for (k, (codes, _)) in group_codes.iter().enumerate() {
+                key += codes[i] as u64 * strides[k];
+            }
+            *slot_by_key.entry(key).or_insert_with(|| {
+                let codes = group_codes.iter().map(|(codes, _)| codes[i]).collect();
+                groups.push((codes, 0));
+                groups.len() - 1
+            })
+        };
+        groups[slot].1 += add;
+    }
+
+    // Finalize each group, ordered by the same serialized key the row
+    // pipeline's BTreeMap fold orders by.
+    let group_cols: Vec<String> = group_by
+        .iter()
+        .map(|(expr, alias)| group_by_column_name(expr, alias))
+        .collect();
+    let out_name = &aggregations[0].2;
+    let mut keyed_rows = Vec::with_capacity(groups.len());
+    for (codes, cnt) in groups {
+        let mut gb = SlotRow::empty(schema.clone());
+        let mut key_parts = Vec::with_capacity(group_cols.len());
+        for (k, col) in group_cols.iter().enumerate() {
+            let rep = &group_codes[k].1[codes[k] as usize];
+            key_parts.push(rep.to_string());
+            gb.bind_local(col, GraphBinding::Scalar(rep.clone()));
+        }
+        gb.bind_local(out_name, GraphBinding::Scalar(serde_json::Value::from(cnt)));
+        keyed_rows.push((key_parts.join("\x00"), gb));
+    }
+    keyed_rows.sort_by(|a, b| a.0.cmp(&b.0));
+    let agg_rows: Vec<SlotRow> = keyed_rows.into_iter().map(|(_, gb)| gb).collect();
+
+    // The grouped row set is small; the operators above the aggregate are the
+    // regular ones, identical to the non-collapsed aggregate path.
+    let rows = project_rows(graph, agg_rows, project_items, *project_is_barrier, params)?;
+    let bound = p.limit.map(|(skip, count)| skip.saturating_add(count));
+    let rows = match sort_items {
+        Some(items) => sort_all(graph, rows, items, bound, params),
+        None => rows,
+    };
+    let mut records = rows_to_records(graph, &return_clause.items, rows)?;
+    if let Some((skip, count)) = p.limit {
+        if skip > 0 {
+            records.drain(..skip.min(records.len()));
+        }
+        records.truncate(count);
+    }
+    Ok(records)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1434,7 +1708,7 @@ mod tests {
         let plan = optimized_plan(
             &g,
             "MATCH (a:Person)-[:KNOWS]->(b:Person) \
-             RETURN b.city AS city, count(a) AS n ORDER BY city",
+             RETURN b.city AS city, count(b.name) AS n ORDER BY city",
         );
         match recognize(&plan) {
             Some(VecPipeline {
@@ -1482,7 +1756,7 @@ mod tests {
             // DISTINCT under a limited sort over an aggregate root: the
             // operators above the fold have no dedup-before-limit step.
             "MATCH (a:Person)-[:KNOWS]->(b:Person) \
-             RETURN DISTINCT b.city AS city, count(a) AS n ORDER BY city ASC LIMIT 1",
+             RETURN DISTINCT b.city AS city, count(b.name) AS n ORDER BY city ASC LIMIT 1",
             // Two-hop chain.
             "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person) RETURN c.name AS name",
             // Relationship property projection.
@@ -1530,7 +1804,7 @@ mod tests {
         let (_dir, g) = fixture();
         for cypher in [
             "MATCH (a:Person)-[:KNOWS]->(b:Person) \
-             RETURN b.city AS city, count(a) AS n ORDER BY city",
+             RETURN b.city AS city, count(b.name) AS n ORDER BY city",
             // A grouping-free `count(*)` or `count(var)` over a single hop is
             // promoted to the `PathCount` kernel (see `path_count_exec_tests`),
             // so it no longer reaches the vectorized path; `count(b.city)` over
@@ -1547,9 +1821,11 @@ mod tests {
             // Group on a source property, sort descending on the count.
             "MATCH (a:Person)-[:KNOWS]->(b:Person) \
              RETURN a.city AS city, count(*) AS n ORDER BY n DESC, city",
-            // Empty input keeps the grouping-free zero row and drops groups.
-            // (The grouping-free `count(a)` form is now a `PathCount` kernel.)
-            "MATCH (a:Ghost)-[:KNOWS]->(b:Person) RETURN b.city AS city, count(a) AS n",
+            // Empty input drops every group. Counting a destination property
+            // keeps this on the vectorized aggregate; a count over the source
+            // variable would instead lower to the `GroupedDegree` kernel (see
+            // `grouped_degree_exec_tests`).
+            "MATCH (a:Ghost)-[:KNOWS]->(b:Person) RETURN b.city AS city, count(b.name) AS n",
         ] {
             assert_matches_row_path(&g, cypher);
         }
@@ -1576,7 +1852,7 @@ mod tests {
             "MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE a.age > 5 RETURN b.name AS name",
             // Filter feeding an aggregation.
             "MATCH (a:Person)-[:KNOWS]->(b:Person) \
-             WHERE b.age >= 4 RETURN b.city AS city, count(a) AS n ORDER BY city",
+             WHERE b.age >= 4 RETURN b.city AS city, count(b.name) AS n ORDER BY city",
             // Equality predicate on the source: an index-scan leaf when the
             // optimizer rewrites it, a filter stage otherwise.
             "MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE a.name = 'ada' RETURN b.name AS name",
@@ -1643,7 +1919,7 @@ mod tests {
              RETURN p.name AS name ORDER BY p.age DESC LIMIT 2",
             // Aggregate root under Sort and Limit.
             "MATCH (a:Person)-[:KNOWS]->(b:Person) \
-             RETURN b.city AS city, count(a) AS n ORDER BY n DESC, city ASC LIMIT 1",
+             RETURN b.city AS city, count(b.name) AS n ORDER BY n DESC, city ASC LIMIT 1",
             // DISTINCT with an unlimited sort.
             "MATCH (a:Person)-[:KNOWS]->(b:Person) \
              RETURN DISTINCT b.name AS name ORDER BY name DESC",
@@ -1756,7 +2032,7 @@ mod tests {
     fn writes_after_first_run_stay_visible() {
         let (_dir, g) = fixture();
         let cypher = "MATCH (a:Person)-[:KNOWS]->(b:Person) \
-                      RETURN b.city AS city, count(a) AS n ORDER BY city";
+                      RETURN b.city AS city, count(b.name) AS n ORDER BY city";
         assert_matches_row_path(&g, cypher);
 
         let eve = g
@@ -1884,12 +2160,12 @@ mod tests {
             for cypher in [
                 "MATCH (a:P)-[:T]->(b:P) RETURN a.city AS ac, b.city AS bc, b.age AS age",
                 "MATCH (a:P)-[:T]->(b:P) \
-                 RETURN b.city AS city, count(a) AS n, sum(b.age) AS s ORDER BY city",
+                 RETURN b.city AS city, count(b.name) AS n, sum(b.age) AS s ORDER BY city",
                 // Property predicates over the mixed-kind city column (strings,
                 // a number, and missing values) and the numeric age column.
                 "MATCH (a:P)-[:T]->(b:P) WHERE b.age >= 2 RETURN b.city AS bc, b.age AS age",
                 "MATCH (a:P)-[:T]->(b:P) WHERE a.city = 'x' AND b.age < 3 \
-                 RETURN b.city AS bc, count(a) AS n ORDER BY bc",
+                 RETURN b.city AS bc, count(b.name) AS n ORDER BY bc",
                 "MATCH (a:P) WHERE a.age <> 1 RETURN a.city AS city, a.age AS age",
                 // Top-N over the mixed-kind city column (ties, missing values,
                 // and cross-type ordering), keyed by alias and by property.
@@ -1944,6 +2220,124 @@ mod tests {
         (dir, g)
     }
 
+    /// A terminal `count` over the chain's last variable, grouped by an upstream
+    /// variable, takes the columnar path with the final hop collapsed (the
+    /// `collapse` field is set) and matches the row pipeline exactly. The 1-hop
+    /// shape `(a)-[:F]->(b)` counting `b` grouped by `a` is deterministic: the
+    /// chain does not reverse (both endpoints share the `Person` label), so `b`
+    /// stays the terminal.
+    #[test]
+    fn terminal_count_collapse_fires_and_matches() {
+        let (_dir, g) = two_hop_fixture();
+        for q in [
+            "MATCH (a:Person)-[:F]->(b:Person) RETURN a.id AS id, count(b.id) AS num \
+             ORDER BY num DESC, id",
+            "MATCH (a:Person)-[:F]->(b:Person) RETURN a.id AS id, count(*) AS num \
+             ORDER BY num DESC, id",
+            // count(b.age) counts only non-null ages, but a follower still makes
+            // the group exist; here all ages are present, so it equals out-degree.
+            "MATCH (a:Person)-[:F]->(b:Person) RETURN a.id AS id, count(b.age) AS num \
+             ORDER BY num DESC, id",
+        ] {
+            let plan = optimized_plan(&g, q);
+            assert!(
+                matches!(recognize(&plan), Some(ref pipe) if pipe.collapse.is_some()),
+                "terminal count must collapse the final hop: {q}\n{plan:?}"
+            );
+            assert_matches_row_path(&g, q);
+        }
+    }
+
+    /// The benchmark's `top_followed_city` shape, on a fixture skewed so the
+    /// optimizer reverses the chain to start from the rarer `City`: the count is
+    /// then over the terminal follower `f`, which the collapse path handles.
+    #[test]
+    fn top_followed_city_reversed_chain_collapses() {
+        let dir = TempDir::new().unwrap();
+        let g = Graph::open(dir.path(), 1).unwrap();
+        let cities: Vec<_> = ["london", "oslo"]
+            .iter()
+            .map(|nm| g.add_node("City", &json!({"name": nm})).unwrap())
+            .collect();
+        let people: Vec<_> = (0..12i64)
+            .map(|i| g.add_node("Person", &json!({"id": i})).unwrap())
+            .collect();
+        for (i, &p) in people.iter().enumerate() {
+            g.add_edge(p, cities[i % cities.len()], "LIVES_IN", &json!({}))
+                .unwrap();
+            // Each person follows the next few, giving varied in-degrees.
+            for k in 1..=((i % 3) + 1) {
+                g.add_edge(p, people[(i + k) % people.len()], "FOLLOWS", &json!({}))
+                    .unwrap();
+            }
+        }
+        g.rebuild_csr().unwrap();
+        let q = "MATCH (f:Person)-[:FOLLOWS]->(p:Person)-[:LIVES_IN]->(c:City) \
+                 RETURN p.id AS id, count(f.id) AS num, c.name AS city ORDER BY num DESC, id LIMIT 3";
+        let plan = optimized_plan(&g, q);
+        assert!(
+            matches!(recognize(&plan), Some(ref pipe) if pipe.collapse.is_some()),
+            "reversed top_followed_city must collapse the terminal count: {plan:?}"
+        );
+        assert_matches_row_path(&g, q);
+    }
+
+    /// A three-hop fixture mirroring the benchmark's geographic chain:
+    /// `(:Person)-[:LIVES]->(:City)-[:CITYIN]->(:State)-[:STATEIN]->(:Country)`.
+    /// All three hops carry distinct relationship types, so the columnar
+    /// N-hop path is eligible.
+    fn three_hop_fixture() -> (TempDir, Graph) {
+        let dir = TempDir::new().unwrap();
+        let g = Graph::open(dir.path(), 1).unwrap();
+        let countries: Vec<_> = ["us", "no"]
+            .iter()
+            .map(|nm| g.add_node("Country", &json!({"name": nm})).unwrap())
+            .collect();
+        let states: Vec<_> = ["ca", "ny", "oslo_s"]
+            .iter()
+            .enumerate()
+            .map(|(i, nm)| {
+                g.add_node("State", &json!({"name": nm, "sid": i as i64}))
+                    .unwrap()
+            })
+            .collect();
+        let cities: Vec<_> = ["sf", "la", "nyc", "oslo"]
+            .iter()
+            .enumerate()
+            .map(|(i, nm)| {
+                g.add_node("City", &json!({"name": nm, "cid": i as i64}))
+                    .unwrap()
+            })
+            .collect();
+        let ages = [20i64, 30, 40, 60, 25, 33];
+        let people: Vec<_> = ages
+            .iter()
+            .enumerate()
+            .map(|(i, age)| {
+                g.add_node("Person", &json!({"id": i as i64, "age": age}))
+                    .unwrap()
+            })
+            .collect();
+        // Functional forward chain: each person lives in one city, each city in
+        // one state, each state in one country.
+        for (i, &p) in people.iter().enumerate() {
+            g.add_edge(p, cities[i % cities.len()], "LIVES", &json!({}))
+                .unwrap();
+        }
+        let city_state = [0usize, 0, 1, 2]; // sf,la -> ca; nyc -> ny; oslo -> oslo_s
+        for (ci, &si) in city_state.iter().enumerate() {
+            g.add_edge(cities[ci], states[si], "CITYIN", &json!({}))
+                .unwrap();
+        }
+        let state_country = [0usize, 0, 1]; // ca,ny -> us; oslo_s -> no
+        for (si, &coi) in state_country.iter().enumerate() {
+            g.add_edge(states[si], countries[coi], "STATEIN", &json!({}))
+                .unwrap();
+        }
+        g.rebuild_csr().unwrap();
+        (dir, g)
+    }
+
     /// The benchmark's `top_followed_city` shape (a grouped count over a
     /// two-hop chain with a sort and limit) takes the columnar two-hop path and
     /// matches the row pipeline exactly.
@@ -1966,23 +2360,47 @@ mod tests {
         assert_matches_row_path(&g, q);
     }
 
-    /// Two hops of the same relationship type, or a third hop, keep the row
+    /// A repeated relationship type anywhere in a multi-hop chain keeps the row
     /// pipeline: relationship uniqueness could then remove rows the
-    /// edge-identity-free column fan-out cannot, and three hops exceed the
-    /// recognized chain length.
+    /// edge-identity-free column fan-out cannot. The cap on chain length
+    /// (`MAX_VEC_HOPS`) is the only other length bound, so a chain longer than
+    /// that also declines.
     #[test]
-    fn two_hop_same_type_or_three_hops_decline() {
+    fn repeated_rel_type_or_overlong_chain_declines() {
         let (_dir, g) = two_hop_fixture();
         for q in [
             "MATCH (a:Person)-[:F]->(b:Person)-[:F]->(c:Person) \
-             RETURN c.id AS id, count(a) AS n ORDER BY id",
+             RETURN c.id AS id, count(b.name) AS n ORDER BY id",
             "MATCH (a:Person)-[:F]->(b:Person)-[:L]->(c:City)-[:L]->(d:City) \
-             RETURN d.name AS city, count(a) AS n",
+             RETURN d.name AS city, count(b.name) AS n",
         ] {
             assert!(
                 recognize(&optimized_plan(&g, q)).is_none(),
                 "must decline to the row pipeline: {q}"
             );
+        }
+    }
+
+    /// A linear chain of distinct-relationship-type forward hops, regardless of
+    /// length up to `MAX_VEC_HOPS`, is the benchmark's `youngest_cities` and
+    /// `age_band` shape: it takes the columnar path. This is the three-hop
+    /// recognition the two-hop cap previously excluded.
+    #[test]
+    fn three_hop_distinct_types_recognized() {
+        let (_dir, g) = three_hop_fixture();
+        for q in [
+            // age_band shape: filter on the leaf, group by the far end.
+            "MATCH (p:Person)-[:LIVES]->(c:City)-[:CITYIN]->(s:State)-[:STATEIN]->(co:Country) \
+             WHERE p.age >= 2 RETURN co.name AS country, count(p.id) AS num ORDER BY num DESC, country",
+            // youngest_cities shape: filter on the far end, group by the middle.
+            "MATCH (p:Person)-[:LIVES]->(c:City)-[:CITYIN]->(s:State)-[:STATEIN]->(co:Country) \
+             WHERE co.name = 'us' RETURN c.name AS city, avg(p.age) AS avg_age ORDER BY avg_age, city",
+        ] {
+            assert!(
+                recognize(&optimized_plan(&g, q)).is_some(),
+                "three-hop distinct-type chain must take the columnar path: {q}"
+            );
+            assert_matches_row_path(&g, q);
         }
     }
 
@@ -2026,13 +2444,257 @@ mod tests {
                 "MATCH (a:P)-[:F]->(b:P)-[:L]->(c:C) RETURN a.id AS aid, b.age AS age, c.name AS city",
                 // Grouped count with sort and limit (the benchmark shape).
                 "MATCH (a:P)-[:F]->(b:P)-[:L]->(c:C) \
-                 RETURN b.id AS id, count(a) AS num, c.name AS city ORDER BY num DESC, id LIMIT 2",
+                 RETURN b.id AS id, count(b.name) AS num, c.name AS city ORDER BY num DESC, id LIMIT 2",
                 // A predicate on the middle node before the second hop.
                 "MATCH (a:P)-[:F]->(b:P)-[:L]->(c:C) WHERE b.age >= 2 \
-                 RETURN c.name AS city, count(a) AS num ORDER BY num DESC, city",
+                 RETURN c.name AS city, count(b.name) AS num ORDER BY num DESC, city",
                 // Top-N over a two-hop projection with mixed keys.
                 "MATCH (a:P)-[:F]->(b:P)-[:L]->(c:C) \
                  RETURN c.name AS city, b.age AS age ORDER BY city DESC, age ASC LIMIT 3",
+            ] {
+                assert_matches_row_path(&g, cypher);
+            }
+        }
+    }
+
+    /// The benchmark's `interest_gender_by_city` shape: two `MATCH` clauses that
+    /// share the pivot `p`. After the join-to-expand rewrite it plans as a
+    /// linear two-hop chain anchored at the selective interest index scan, so it
+    /// takes the columnar path and matches the row pipeline exactly.
+    #[test]
+    fn multi_match_shared_pivot_recognized() {
+        let dir = TempDir::new().unwrap();
+        let g = Graph::open(dir.path(), 1).unwrap();
+        let interests: Vec<_> = (0..4)
+            .map(|i| {
+                g.add_node("Interest", &json!({"name": format!("int{i}")}))
+                    .unwrap()
+            })
+            .collect();
+        let cities: Vec<_> = (0..3)
+            .map(|i| {
+                g.add_node("City", &json!({"name": format!("city{i}")}))
+                    .unwrap()
+            })
+            .collect();
+        for i in 0..30i64 {
+            let p = g
+                .add_node(
+                    "Person",
+                    &json!({"id": i, "gender": if i % 2 == 0 { "male" } else { "female" }}),
+                )
+                .unwrap();
+            g.add_edge(p, interests[(i % 4) as usize], "HAS_INTEREST", &json!({}))
+                .unwrap();
+            g.add_edge(p, cities[(i % 3) as usize], "LIVES_IN", &json!({}))
+                .unwrap();
+        }
+        g.rebuild_csr().unwrap();
+        let q = "MATCH (p:Person)-[:HAS_INTEREST]->(i:Interest) \
+                 MATCH (p)-[:LIVES_IN]->(c:City) \
+                 WHERE i.name = 'int1' AND p.gender = 'male' \
+                 RETURN count(p.id) AS num, c.name AS city ORDER BY num DESC, city LIMIT 5";
+        assert!(
+            recognize(&optimized_plan(&g, q)).is_some(),
+            "multi-MATCH shared-pivot shape must vectorize after the join-to-expand rewrite"
+        );
+        assert_matches_row_path(&g, q);
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(48))]
+        /// Independent oracle check for the join-to-expand rewrite over the
+        /// multi-MATCH `interest_gender_by_city` shape. The expected
+        /// `(num, city)` multiset is computed directly from the generated edges
+        /// (honoring parallel edges and the interest/gender filters), so the
+        /// test does not trust either executor. Random parallel `HAS_INTEREST`
+        /// and `LIVES_IN` edges exercise the natural-join cardinality the graft
+        /// must preserve.
+        #[test]
+        fn multi_match_join_to_expand_matches_oracle(
+            // Per person: gender flag, list of interest ids (with repeats), list
+            // of city ids (with repeats).
+            people in proptest::collection::vec(
+                (
+                    proptest::bool::ANY,
+                    proptest::collection::vec(0usize..4, 0..3),
+                    proptest::collection::vec(0usize..3, 0..3),
+                ),
+                1..8,
+            ),
+            target in 0usize..4,
+        ) {
+            let dir = TempDir::new().unwrap();
+            let g = Graph::open(dir.path(), 1).unwrap();
+            let interests: Vec<_> = (0..4)
+                .map(|i| g.add_node("Interest", &json!({"name": format!("int{i}")})).unwrap())
+                .collect();
+            let cities: Vec<_> = (0..3)
+                .map(|i| g.add_node("City", &json!({"name": format!("city{i}")})).unwrap())
+                .collect();
+            // count[city name] from the oracle: for each male person with at
+            // least one HAS_INTEREST edge to the target, each LIVES_IN edge adds
+            // (number of HAS_INTEREST edges to the target) to that city.
+            let mut oracle: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+            for (idx, (male, ints, cs)) in people.iter().enumerate() {
+                let p = g
+                    .add_node(
+                        "Person",
+                        &json!({"id": idx as i64, "gender": if *male { "male" } else { "female" }}),
+                    )
+                    .unwrap();
+                for &ii in ints {
+                    g.add_edge(p, interests[ii], "HAS_INTEREST", &json!({})).unwrap();
+                }
+                for &ci in cs {
+                    g.add_edge(p, cities[ci], "LIVES_IN", &json!({})).unwrap();
+                }
+                let hi = ints.iter().filter(|&&ii| ii == target).count() as i64;
+                if *male && hi > 0 {
+                    for &ci in cs {
+                        *oracle.entry(format!("city{ci}")).or_default() += hi;
+                    }
+                }
+            }
+            g.rebuild_csr().unwrap();
+            let mut expected: Vec<(i64, String)> =
+                oracle.into_iter().map(|(city, num)| (num, city)).collect();
+            // ORDER BY num DESC, city ASC, then LIMIT 5.
+            expected.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+            expected.truncate(5);
+
+            let q = format!(
+                "MATCH (p:Person)-[:HAS_INTEREST]->(i:Interest) \
+                 MATCH (p)-[:LIVES_IN]->(c:City) \
+                 WHERE i.name = 'int{target}' AND p.gender = 'male' \
+                 RETURN count(p.id) AS num, c.name AS city ORDER BY num DESC, city LIMIT 5"
+            );
+            let params = std::collections::HashMap::new();
+            let got = execute(&g, &q, &params).unwrap();
+            let got_rows: Vec<(i64, String)> = got
+                .records
+                .iter()
+                .map(|r| {
+                    (
+                        r.values[0].as_i64().unwrap(),
+                        r.values[1].as_str().unwrap().to_string(),
+                    )
+                })
+                .collect();
+            proptest::prop_assert_eq!(got_rows, expected);
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(48))]
+        /// Differential check for the terminal count-collapse. The 1-hop chain
+        /// `(a:P)-[:F]->(b:P)` counts `b` grouped by `a`; the chain does not
+        /// reverse (shared label), so `b` is the collapsed terminal. Covers
+        /// `count(*)` (every follower), `count(b.id)` (always present), and
+        /// `count(b.tag)` (sometimes null: a follower still makes the group
+        /// exist with count zero). Random self-edges, parallel edges, and null
+        /// tags exercise the exists-versus-counted split against the row
+        /// pipeline.
+        #[test]
+        fn terminal_count_collapse_matches_row_path(
+            // Per person: whether `tag` is present, and outgoing F targets.
+            people in proptest::collection::vec(
+                (proptest::bool::ANY, proptest::collection::vec(0usize..6, 0..4)),
+                1..7,
+            ),
+        ) {
+            let dir = TempDir::new().unwrap();
+            let g = Graph::open(dir.path(), 1).unwrap();
+            let ids: Vec<_> = people
+                .iter()
+                .enumerate()
+                .map(|(i, (has_tag, _))| {
+                    let props = if *has_tag {
+                        json!({"id": i as i64, "tag": i as i64})
+                    } else {
+                        json!({"id": i as i64})
+                    };
+                    g.add_node("P", &props).unwrap()
+                })
+                .collect();
+            for (i, (_, targets)) in people.iter().enumerate() {
+                for &t in targets {
+                    if t < ids.len() {
+                        g.add_edge(ids[i], ids[t], "F", &json!({})).unwrap();
+                    }
+                }
+            }
+            g.rebuild_csr().unwrap();
+            for cypher in [
+                "MATCH (a:P)-[:F]->(b:P) RETURN a.id AS id, count(*) AS num ORDER BY num DESC, id",
+                "MATCH (a:P)-[:F]->(b:P) RETURN a.id AS id, count(b.id) AS num ORDER BY num DESC, id",
+                "MATCH (a:P)-[:F]->(b:P) RETURN a.id AS id, count(b.tag) AS num ORDER BY num DESC, id",
+            ] {
+                // The collapse must fire for these terminal counts.
+                proptest::prop_assert!(
+                    matches!(recognize(&optimized_plan(&g, cypher)), Some(ref p) if p.collapse.is_some()),
+                    "collapse must fire: {}", cypher
+                );
+                assert_matches_row_path(&g, cypher);
+            }
+        }
+
+        /// Differential check for the columnar N-hop path over a three-hop
+        /// chain `(p:P)-[:L]->(c:C)-[:S]->(t:T)-[:U]->(co:O)` with distinct
+        /// relationship types. Covers the benchmark's `age_band` (filter on the
+        /// leaf, group by the far end) and `youngest_cities` (filter on the far
+        /// end, group by the middle, an `avg`) shapes plus an unordered
+        /// projection that pins the fan-out row order against the row pipeline's
+        /// depth-first chain threading. Random edges exercise non-functional
+        /// fan-out the benchmark's functional chain does not.
+        #[test]
+        fn three_hop_vectorized_matches_row_path(
+            ages in proptest::collection::vec(0u8..5, 2..7),
+            l_edges in proptest::collection::vec((0usize..7, 0usize..4), 0..14),
+            s_edges in proptest::collection::vec((0usize..4, 0usize..3), 0..9),
+            u_edges in proptest::collection::vec((0usize..3, 0usize..2), 0..6),
+        ) {
+            let dir = TempDir::new().unwrap();
+            let g = Graph::open(dir.path(), 1).unwrap();
+            let oids: Vec<_> = ["us", "no"]
+                .iter()
+                .map(|nm| g.add_node("O", &json!({"name": nm})).unwrap())
+                .collect();
+            let tids: Vec<_> = ["ca", "ny", "os"]
+                .iter()
+                .map(|nm| g.add_node("T", &json!({"name": nm})).unwrap())
+                .collect();
+            let cids: Vec<_> = ["sf", "la", "nyc", "oslo"]
+                .iter()
+                .map(|nm| g.add_node("C", &json!({"name": nm})).unwrap())
+                .collect();
+            let pids: Vec<_> = ages
+                .iter()
+                .enumerate()
+                .map(|(i, age)| g.add_node("P", &json!({"id": i as i64, "age": *age as i64})).unwrap())
+                .collect();
+            for (p, c) in &l_edges {
+                if *p < pids.len() && *c < cids.len() {
+                    g.add_edge(pids[*p], cids[*c], "L", &json!({})).unwrap();
+                }
+            }
+            for (c, t) in &s_edges {
+                if *c < cids.len() && *t < tids.len() {
+                    g.add_edge(cids[*c], tids[*t], "S", &json!({})).unwrap();
+                }
+            }
+            for (t, o) in &u_edges {
+                if *t < tids.len() && *o < oids.len() {
+                    g.add_edge(tids[*t], oids[*o], "U", &json!({})).unwrap();
+                }
+            }
+            for cypher in [
+                "MATCH (p:P)-[:L]->(c:C)-[:S]->(t:T)-[:U]->(co:O) \
+                 RETURN p.id AS pid, c.name AS city, t.name AS state, co.name AS country",
+                "MATCH (p:P)-[:L]->(c:C)-[:S]->(t:T)-[:U]->(co:O) WHERE p.age >= 2 \
+                 RETURN co.name AS country, count(p.id) AS num ORDER BY num DESC, country LIMIT 3",
+                "MATCH (p:P)-[:L]->(c:C)-[:S]->(t:T)-[:U]->(co:O) WHERE co.name = 'us' \
+                 RETURN c.name AS city, avg(p.age) AS avg_age ORDER BY avg_age, city LIMIT 5",
             ] {
                 assert_matches_row_path(&g, cypher);
             }

@@ -34,8 +34,6 @@ GraphRAG pipelines and querying knowledge graphs.
 * Provides a wide range of APIs, including native Rust, Python bindings, CLI, HTTP (REST), and MCP
 * Fully cross-platform; supports Linux, macOS, and Windows
 
-See [ROADMAP.md](ROADMAP.md) for the full list of implemented and planned features.
-
 > [!IMPORTANT]
 > This project is still in early development, so bugs and breaking changes are expected.
 > Please use the [issue page](https://github.com/IssunDB/issun-db/issues) to report bugs or request features.
@@ -48,7 +46,7 @@ To use IssunDB in your Rust project, add the dependency to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-issundb = "0.1.0-alpha.8"
+issundb = "0.1.0-alpha.9"
 serde_json = "1.0"
 ```
 

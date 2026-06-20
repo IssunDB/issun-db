@@ -58,8 +58,7 @@ jobs:
             - `issundb-mcp`: IssunDB with an MCP server
 
             Note that the binaries need a working OpenMP runtime to work on your system.
-            That means that typically `libgomp` on glibc Linux, `libomp` on macOS, and `vcomp` (Visual C++ Runtime)
-            on Windows, should be installed on your system.
+            That means that typically `libgomp` on Linux, `libomp` on macOS, and `vcomp` on Windows, should be installed on your system.
 
             ### Container Image
 

@@ -1,6 +1,6 @@
 //! Equi-depth histograms over property column values, used for filter
 //! selectivity estimates. Built lazily from the in-memory property columns;
-//! nothing here is persisted.
+//! nothing here is persisted on disk.
 
 use serde_json::Value;
 use std::cmp::Ordering;

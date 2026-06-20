@@ -205,7 +205,7 @@ fn bench_lsqb(c: &mut Criterion) {
         );
         c.bench_function(name, |b| {
             b.iter(|| {
-                criterion::black_box(execute(&g, criterion::black_box(query), &params).unwrap())
+                std::hint::black_box(execute(&g, std::hint::black_box(query), &params).unwrap())
             });
         });
     };
@@ -288,7 +288,7 @@ fn bench_lsqb(c: &mut Criterion) {
     drop(run);
     c.bench_function("lsqb_q7", |b| {
         b.iter(|| {
-            criterion::black_box(execute(&g, criterion::black_box(Q7_QUERY), &params).unwrap())
+            std::hint::black_box(execute(&g, std::hint::black_box(Q7_QUERY), &params).unwrap())
         });
     });
 }

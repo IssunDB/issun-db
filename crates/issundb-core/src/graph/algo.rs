@@ -304,6 +304,132 @@ impl Graph {
         Ok(total)
     }
 
+    /// Counts typed edges grouped by one endpoint, returning `(group node id, count)`
+    /// for every group node with a non-zero count. See [`GroupedDegreeSpec`]
+    /// for the grouping and filtering semantics.
+    ///
+    /// This scans the CSR snapshot's outgoing adjacency once, incrementing a
+    /// per-node counter, so it is `O(nodes + edges)` with no per-edge row
+    /// materialization. It is the kernel the Cypher optimizer lowers a
+    /// `count` aggregation grouped by one endpoint of a single directed hop
+    /// to (the `GroupedDegree` physical operator), turning what would be a
+    /// full expansion-and-fold into an integer pass over adjacency.
+    pub fn grouped_edge_counts(
+        &self,
+        spec: &GroupedDegreeSpec,
+    ) -> Result<Vec<(NodeId, u64)>, Error> {
+        self.ensure_csr_fresh()?;
+        let snap = self.csr_cache.snapshot.load();
+        let n = snap.dense_to_id.len();
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+
+        // A named but unregistered relationship type matches nothing.
+        let type_id = match spec.rel_type {
+            Some(name) => {
+                let rtxn = self.storage.env.read_txn()?;
+                match get_type(&self.storage, &rtxn, name)? {
+                    Some(tid) => Some(tid),
+                    None => return Ok(Vec::new()),
+                }
+            }
+            None => None,
+        };
+
+        // Dense label masks; an unknown label yields an all-false mask, which
+        // counts zero without a special case.
+        let label_mask = |label: Option<&str>| -> Result<Option<Vec<bool>>, Error> {
+            match label {
+                Some(name) => {
+                    let mut mask = vec![false; n];
+                    for id in self.nodes_by_label(name)? {
+                        if let Some(&d) = snap.id_to_dense.get(&id) {
+                            mask[d as usize] = true;
+                        }
+                    }
+                    Ok(Some(mask))
+                }
+                None => Ok(None),
+            }
+        };
+        let group_mask = label_mask(spec.group_label)?;
+        // The endpoints usually carry the same label (e.g. `(:Person)->(:Person)`);
+        // reuse the mask instead of scanning that label a second time.
+        let counted_mask = if spec.counted_label == spec.group_label {
+            group_mask.clone()
+        } else {
+            label_mask(spec.counted_label)?
+        };
+
+        // Non-null mask for the counted endpoint's property: dense index `d` is
+        // true when the property is present on `dense_to_id[d]`. The property
+        // columns carry their own dense mapping, so resolve each CSR node id
+        // through it. A missing column (no such property anywhere) leaves the
+        // mask all-false, so `count(v.prop)` over an absent property counts
+        // zero, matching the row pipeline.
+        let nonnull_mask: Option<Vec<bool>> = match spec.counted_nonnull_prop {
+            Some(prop) => Some(self.prop_columns.with_fresh(&self.storage, |cols| {
+                let mut mask = vec![false; n];
+                if let Some(col) = cols.cols.get(prop) {
+                    for (d, id) in snap.dense_to_id.iter().enumerate() {
+                        if let Some(&cd) = cols.id_to_dense.get(id) {
+                            mask[d] = col.is_present(cd as usize);
+                        }
+                    }
+                }
+                mask
+            })?),
+            None => None,
+        };
+
+        let ok = |mask: &Option<Vec<bool>>, d: usize| mask.as_ref().is_none_or(|m| m[d]);
+
+        // `present` marks a group node with at least one label-qualifying edge,
+        // so it produces a MATCH row and therefore a group. `counts` is the
+        // number of those edges whose counted endpoint also passes the non-null
+        // filter. The two differ for `count(v.prop)`: a group can exist (an edge
+        // reaches it) while its count is zero (every counted source has a null
+        // property), and that group must still appear with count zero, exactly
+        // as the row pipeline emits it.
+        let mut counts = vec![0u64; n];
+        let mut present = vec![false; n];
+        for v0 in 0..n {
+            for k in snap.row_ptr[v0]..snap.row_ptr[v0 + 1] {
+                if let Some(tid) = type_id {
+                    if snap.edge_type[k] != tid {
+                        continue;
+                    }
+                }
+                let v1 = snap.col_idx[k] as usize;
+                // Map the stored edge `v0 -> v1` to the group and counted
+                // endpoints per the grouping direction.
+                let (group_d, counted_d) = if spec.group_is_dst {
+                    (v1, v0)
+                } else {
+                    (v0, v1)
+                };
+                // Label constraints decide which edges match (existence); the
+                // non-null property filter only narrows the count within them.
+                if !ok(&group_mask, group_d) || !ok(&counted_mask, counted_d) {
+                    continue;
+                }
+                present[group_d] = true;
+                if ok(&nonnull_mask, counted_d) {
+                    counts[group_d] += 1;
+                }
+            }
+        }
+
+        let mut out = Vec::new();
+        for (d, &p) in present.iter().enumerate() {
+            if p {
+                out.push((snap.dense_to_id[d], counts[d]));
+            }
+        }
+        Ok(out)
+    }
+
     /// Detects if there is at least one directed cycle in the graph.
     pub fn detect_cycle(&self) -> Result<bool, Error> {
         self.ensure_csr_fresh()?;

@@ -28,7 +28,7 @@ use std::{
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use issundb_core::Graph;
-use rand::Rng;
+use rand::RngExt;
 use tempfile::TempDir;
 
 // ---------------------------------------------------------------------------
@@ -48,7 +48,7 @@ struct BenchState {
 fn load_synthetic() -> BenchState {
     let dir = TempDir::new().unwrap();
     let g = Graph::open(dir.path(), 8).unwrap();
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
 
     let (n_nodes, n_edges) = if std::env::var("ISSUNDB_LARGE_BENCH").is_ok() {
         (500_000, 2_000_000)
@@ -65,7 +65,7 @@ fn load_synthetic() -> BenchState {
         let src = ids[i % n];
         let dst = ids[(i
             .wrapping_mul(6_364_136_223_846_793_005_usize)
-            .wrapping_add(rng.gen_range(0..n)))
+            .wrapping_add(rng.random_range(0..n)))
             % n];
         g.add_edge(src, dst, "Link", &()).unwrap();
     }

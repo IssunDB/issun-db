@@ -145,6 +145,19 @@ Import the `TextIndexExt` and `TextGraphExt` traits to configure and query text 
 
 ---
 
+## Hybrid Retrieval Extensions
+
+Import the hybrid retrieval free functions from the facade to combine vector and full-text keyword searches with GraphBLAS multi-source expansion.
+
+- `retrieve(graph: &Graph, q: &[f32], k: usize, hops: u8) -> Result<Subgraph, RetrievalError>`  
+  Runs a vector search to find `k` seed nodes, then performs a BFS traversal up to `hops` depth to build the result subgraph.
+- `retrieve_with(graph: &Graph, q: &[f32], opts: &RetrieveOptions) -> Result<Subgraph, RetrievalError>`  
+  Runs a vector search to find seeds with fine-grained control over distance and traversal limits.
+- `retrieve_hybrid(graph: &Graph, q: &[f32], text_query: &str, opts: &HybridRetrieveOptions) -> Result<Subgraph, RetrievalError>`  
+  Merges seed nodes from vector and full-text keyword searches, fuses their scores, and performs GraphBLAS multi-source expansion.
+
+---
+
 ## Cypher Query Extensions
 
 Import the `GraphQueryExt` trait to run declarative graph queries.
@@ -153,6 +166,10 @@ Import the `GraphQueryExt` trait to run declarative graph queries.
   Executes a raw Cypher query string against the database.
 - `query_with_params(cypher: &str, params: &HashMap<String, serde_json::Value>) -> Result<QueryResult, CypherError>`  
   Executes a parameterized Cypher query against the database.
+- `query_with_procedures(cypher: &str, params: &HashMap<String, serde_json::Value>, registry: &ProcedureRegistry) -> Result<QueryResult, CypherError>`  
+  Executes a Cypher query resolving `CALL` clauses against the custom procedure registry.
+- `explain(cypher: &str) -> Result<String, CypherError>`  
+  Compiles and optimizes the physical query plan, returning it as an indented human-readable tree.
 
 ---
 

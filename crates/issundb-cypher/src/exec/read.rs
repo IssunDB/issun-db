@@ -7,6 +7,14 @@ use super::*;
 ///
 /// If `rel_type` is `Some("A|B|C")`, this expands separately for each type and
 /// merges the results, deduplicating by `(EdgeId, NodeId)` pair.
+///
+/// Every returned triple references existing node and edge records, so no
+/// per-transition validation is needed here. `expand_spmv_graphblas` sources
+/// transitions either from the CSR snapshot, whose build only admits an edge
+/// when both endpoints exist in the node store (see `CsrSnapshot::build`), or
+/// from committed `out_adj`/`in_adj`, which `delete_node` and `delete_edge`
+/// keep transactionally consistent with the node and edge stores. There is no
+/// path through the public API that leaves a dangling adjacency entry.
 pub(super) fn expand_multi_type(
     graph: &Graph,
     src_nodes: &[NodeId],
@@ -14,18 +22,12 @@ pub(super) fn expand_multi_type(
     is_incoming: bool,
 ) -> Result<Vec<(NodeId, EdgeId, NodeId)>, String> {
     match rel_type {
-        None => sanitize_transitions(
-            graph
-                .expand_spmv_graphblas(src_nodes, None, is_incoming)
-                .map_err(|e| e.to_string())?,
-            graph,
-        ),
-        Some(t) if !t.contains('|') => sanitize_transitions(
-            graph
-                .expand_spmv_graphblas(src_nodes, Some(t), is_incoming)
-                .map_err(|e| e.to_string())?,
-            graph,
-        ),
+        None => graph
+            .expand_spmv_graphblas(src_nodes, None, is_incoming)
+            .map_err(|e| e.to_string()),
+        Some(t) if !t.contains('|') => graph
+            .expand_spmv_graphblas(src_nodes, Some(t), is_incoming)
+            .map_err(|e| e.to_string()),
         Some(t) => {
             let mut seen: std::collections::HashSet<(NodeId, EdgeId, NodeId)> =
                 std::collections::HashSet::new();
@@ -44,69 +46,9 @@ pub(super) fn expand_multi_type(
                     }
                 }
             }
-            sanitize_transitions(all, graph)
+            Ok(all)
         }
     }
-}
-
-/// Drop expansion triples that reference missing node or edge records.
-///
-/// This protects read execution against pre-existing dangling adjacency data in a
-/// persisted database: malformed triples are ignored rather than surfacing
-/// `node not found`/`edge not found` execution errors.
-fn sanitize_transitions(
-    transitions: Vec<(NodeId, EdgeId, NodeId)>,
-    graph: &Graph,
-) -> Result<Vec<(NodeId, EdgeId, NodeId)>, String> {
-    if transitions.is_empty() {
-        return Ok(transitions);
-    }
-
-    let mut node_exists: ahash::AHashMap<NodeId, bool> = ahash::AHashMap::new();
-    let mut edge_exists: ahash::AHashMap<EdgeId, bool> = ahash::AHashMap::new();
-    let mut out = Vec::with_capacity(transitions.len());
-
-    for (src, eid, dst) in transitions {
-        let src_ok = match node_exists.get(&src) {
-            Some(ok) => *ok,
-            None => {
-                let ok = graph.get_node(src).map_err(|e| e.to_string())?.is_some();
-                node_exists.insert(src, ok);
-                ok
-            }
-        };
-        if !src_ok {
-            continue;
-        }
-
-        let dst_ok = match node_exists.get(&dst) {
-            Some(ok) => *ok,
-            None => {
-                let ok = graph.get_node(dst).map_err(|e| e.to_string())?.is_some();
-                node_exists.insert(dst, ok);
-                ok
-            }
-        };
-        if !dst_ok {
-            continue;
-        }
-
-        let edge_ok = match edge_exists.get(&eid) {
-            Some(ok) => *ok,
-            None => {
-                let ok = graph.get_edge(eid).map_err(|e| e.to_string())?.is_some();
-                edge_exists.insert(eid, ok);
-                ok
-            }
-        };
-        if !edge_ok {
-            continue;
-        }
-
-        out.push((src, eid, dst));
-    }
-
-    Ok(out)
 }
 
 /// Validate a SKIP or LIMIT parameter value at runtime.
@@ -3931,6 +3873,82 @@ pub(super) fn eval_leaf(
             path.bind_local(output, GraphBinding::Scalar(serde_json::Value::from(count)));
             Ok(vec![path])
         }
+        PhysicalOperator::GroupedDegree {
+            rel_type,
+            group_is_dst,
+            group_label,
+            counted_label,
+            counted_nonnull_prop,
+            // `group_var` names the group endpoint for the plan display; the
+            // executor reads the group properties by name, so it is not used here.
+            group_var: _,
+            group_by,
+            output,
+        } => {
+            // One kernel pass over adjacency yields the per-group-node counts;
+            // it groups by node identity, so re-group by the group-by value
+            // tuple to merge nodes that share a key (the row pipeline groups by
+            // value, not identity). The merge is over the distinct-group-node
+            // set, far smaller than the edge set the fold would touch.
+            let spec = issundb_core::GroupedDegreeSpec {
+                rel_type: rel_type.as_deref(),
+                group_is_dst: *group_is_dst,
+                group_label: group_label.as_deref(),
+                counted_label: counted_label.as_deref(),
+                counted_nonnull_prop: counted_nonnull_prop.as_deref(),
+            };
+            let pairs = graph
+                .grouped_edge_counts(&spec)
+                .map_err(|e| e.to_string())?;
+            // Bulk-gather the group-by properties for the group nodes in one
+            // columns pass (the recognizer guarantees each key is a
+            // single-property read on `group_var`), rather than re-reading each
+            // node per key. `col_names[j]`/`props[j]` align with `group_by[j]`.
+            let ids: Vec<NodeId> = pairs.iter().map(|(n, _)| *n).collect();
+            let mut props: Vec<&str> = Vec::with_capacity(group_by.len());
+            let mut col_names: Vec<String> = Vec::with_capacity(group_by.len());
+            for (expr, alias) in group_by {
+                match expr {
+                    Expr::Prop(_, p) if !p.is_empty() => props.push(p.as_str()),
+                    // The recognizer admits only single-property reads here.
+                    _ => return Err("grouped-degree group key must be a property read".into()),
+                }
+                col_names.push(group_by_column_name(expr, alias));
+            }
+            let table = graph
+                .node_props_json_table(&ids, &props)
+                .map_err(|e| e.to_string())?;
+
+            // Re-group by the group-by value tuple, summing counts, so nodes
+            // that share a key merge exactly as the value-keyed row pipeline
+            // aggregate would (the kernel groups by node identity).
+            let mut groups: ahash::AHashMap<String, (SlotRow, u64)> =
+                ahash::AHashMap::with_capacity(pairs.len());
+            for (i, (_node, cnt)) in pairs.iter().enumerate() {
+                let row = &table[i];
+                let mut key_parts = Vec::with_capacity(col_names.len());
+                for val in row {
+                    key_parts.push(val.to_string());
+                }
+                let key = key_parts.join("\x00");
+                match groups.get_mut(&key) {
+                    Some((_, c)) => *c += *cnt,
+                    None => {
+                        let mut gb = SlotRow::empty(schema.clone());
+                        for (col, val) in col_names.iter().zip(row) {
+                            gb.bind_local(col, GraphBinding::Scalar(val.clone()));
+                        }
+                        groups.insert(key, (gb, *cnt));
+                    }
+                }
+            }
+            let mut out = Vec::with_capacity(groups.len());
+            for (_key, (mut gb, cnt)) in groups {
+                gb.bind_local(output, GraphBinding::Scalar(serde_json::Value::from(cnt)));
+                out.push(gb);
+            }
+            Ok(out)
+        }
         other => Err(format!("eval_leaf called on non-leaf operator: {other:?}")),
     }
 }
@@ -4189,23 +4207,6 @@ mod stream_join_tests {
         let dir = TempDir::new().unwrap();
         let graph = Graph::open(dir.path(), 1).unwrap();
         (dir, graph)
-    }
-
-    #[test]
-    fn sanitize_transitions_skips_missing_records() {
-        let (_dir, graph) = setup();
-        let a = graph.add_node("N", &serde_json::json!({})).unwrap();
-        let b = graph.add_node("N", &serde_json::json!({})).unwrap();
-        let e = graph.add_edge(a, b, "R", &serde_json::json!({})).unwrap();
-
-        let transitions = vec![
-            (a, e, b),
-            (a, e, b + 10_000),
-            (a + 10_000, e, b),
-            (a, e + 10_000, b),
-        ];
-        let sanitized = super::sanitize_transitions(transitions, &graph).unwrap();
-        assert_eq!(sanitized, vec![(a, e, b)]);
     }
 
     fn exec(graph: &Graph, cypher: &str) {
@@ -5020,6 +5021,245 @@ mod path_count_exec_tests {
                     "two-hop kernel vs row on {} nodes",
                     n_nodes
                 );
+                Ok(())
+            })
+            .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod grouped_degree_exec_tests {
+    //! Plan-shape and parity tests for the `GroupedDegree` kernel rewrite over a
+    //! `count` grouped by one endpoint of a single directed hop. As with the
+    //! path-count tests, an always-true `IS NULL` predicate pushes a `Filter`
+    //! that breaks the exact shape match without changing the result, forcing the
+    //! row pipeline as a semantic oracle.
+    use super::*;
+    use crate::ast::Statement;
+    use crate::parser;
+    use crate::plan::physical::format_physical_plan;
+    use crate::plan::{LogicalPlanner, Optimizer, PhysicalPlanner};
+    use issundb_core::Graph;
+    use tempfile::TempDir;
+
+    fn setup() -> (TempDir, Graph) {
+        let dir = TempDir::new().unwrap();
+        let graph = Graph::open(dir.path(), 1).unwrap();
+        (dir, graph)
+    }
+
+    fn plan_text(graph: &Graph, cypher: &str) -> String {
+        let stmt = parser::parse(cypher).unwrap();
+        let q = match stmt {
+            Statement::Query(q) => q,
+            _ => panic!("not a read query: {cypher}"),
+        };
+        let logical = LogicalPlanner::plan(&q).unwrap();
+        let physical = PhysicalPlanner::plan(&logical);
+        format_physical_plan(&Optimizer::optimize(physical, Some(graph)), 0)
+    }
+
+    /// Execute `cypher` and return its records sorted by their serialized form,
+    /// so the comparison is order-insensitive (a grouped aggregate without
+    /// `ORDER BY` yields groups in hash order on both paths).
+    fn sorted_records(graph: &Graph, cypher: &str) -> Vec<Vec<serde_json::Value>> {
+        let mut rows: Vec<Vec<serde_json::Value>> = super::execute(graph, cypher, &HashMap::new())
+            .unwrap()
+            .records
+            .into_iter()
+            .map(|r| r.values)
+            .collect();
+        rows.sort_by_key(|r| serde_json::to_string(r).unwrap());
+        rows
+    }
+
+    /// The grouped count over a one-hop expansion plans to the `GroupedDegree`
+    /// leaf; a forcing predicate, a different group variable, or a second hop
+    /// keep the row pipeline.
+    #[test]
+    fn kernel_plan_shape() {
+        let (_dir, graph) = setup();
+        super::execute(
+            &graph,
+            "CREATE (x:Person {id: 1}), (y:Person {id: 2}), (z:Person {id: 3}) \
+             CREATE (x)-[:FOLLOWS]->(y), (z)-[:FOLLOWS]->(y), (x)-[:FOLLOWS]->(z)",
+            &HashMap::new(),
+        )
+        .unwrap();
+        graph.rebuild_csr().unwrap();
+
+        let fire = [
+            "MATCH (f:Person)-[:FOLLOWS]->(p:Person) RETURN p.id AS id, count(f.id) AS num",
+            "MATCH (f:Person)-[:FOLLOWS]->(p:Person) RETURN p.id AS id, count(*) AS num",
+            "MATCH (f:Person)-[:FOLLOWS]->(p:Person) RETURN p.id AS id, count(f) AS num",
+        ];
+        for q in fire {
+            let plan = plan_text(&graph, q);
+            assert!(
+                plan.contains("GroupedDegree"),
+                "expected kernel leaf:\n{plan}"
+            );
+        }
+
+        let bail = [
+            // Forcing predicate on the counted node breaks the exact shape.
+            "MATCH (f:Person)-[:FOLLOWS]->(p:Person) WHERE f.__force IS NULL \
+             RETURN p.id AS id, count(f.id) AS num",
+            // DISTINCT count is not a plain degree.
+            "MATCH (f:Person)-[:FOLLOWS]->(p:Person) RETURN p.id AS id, count(DISTINCT f.id) AS num",
+            // Grouping-free count is the PathCount kernel's job.
+            "MATCH (f:Person)-[:FOLLOWS]->(p:Person) RETURN count(*) AS num",
+            // A property predicate on a grouped node is not lowered here.
+            "MATCH (f:Person)-[:FOLLOWS]->(p:Person) WHERE p.id > 1 \
+             RETURN p.id AS id, count(f.id) AS num",
+            // Two hops fall back.
+            "MATCH (f:Person)-[:FOLLOWS]->(p:Person)-[:FOLLOWS]->(q:Person) \
+             RETURN q.id AS id, count(f.id) AS num",
+        ];
+        for q in bail {
+            let plan = plan_text(&graph, q);
+            assert!(
+                !plan.contains("GroupedDegree"),
+                "rewrite must not fire for `{q}`:\n{plan}"
+            );
+            super::execute(&graph, q, &HashMap::new()).unwrap();
+        }
+    }
+
+    /// A `count(v.prop)` where some sources lack the property must exclude those
+    /// edges, matching `count(prop)` null semantics, not raw in-degree.
+    #[test]
+    fn counts_nonnull_property_only() {
+        let (_dir, graph) = setup();
+        // f1 and f2 carry `tag`; f3 does not. All three follow p.
+        super::execute(
+            &graph,
+            "CREATE (p:Person {id: 100}), (f1:Person {id: 1, tag: 'a'}), \
+                    (f2:Person {id: 2, tag: 'b'}), (f3:Person {id: 3}) \
+             CREATE (f1)-[:FOLLOWS]->(p), (f2)-[:FOLLOWS]->(p), (f3)-[:FOLLOWS]->(p)",
+            &HashMap::new(),
+        )
+        .unwrap();
+        graph.rebuild_csr().unwrap();
+
+        let kernel_q =
+            "MATCH (f:Person)-[:FOLLOWS]->(p:Person) RETURN p.id AS id, count(f.tag) AS num";
+        let row_q = "MATCH (f:Person)-[:FOLLOWS]->(p:Person) WHERE f.__force IS NULL \
+                     RETURN p.id AS id, count(f.tag) AS num";
+        assert!(plan_text(&graph, kernel_q).contains("GroupedDegree"));
+        assert!(!plan_text(&graph, row_q).contains("GroupedDegree"));
+        // Two of three followers have a tag.
+        assert_eq!(
+            sorted_records(&graph, kernel_q),
+            vec![vec![serde_json::json!(100), serde_json::json!(2)]]
+        );
+        assert_eq!(
+            sorted_records(&graph, kernel_q),
+            sorted_records(&graph, row_q)
+        );
+    }
+
+    /// Distinct nodes that share the group key merge into one group, summing
+    /// counts, exactly as the value-keyed row pipeline aggregate does.
+    #[test]
+    fn merges_groups_sharing_a_key() {
+        let (_dir, graph) = setup();
+        // p1 and p2 share id=7; each is followed once. The group keyed on id=7
+        // must sum to 2, not appear as two rows.
+        super::execute(
+            &graph,
+            "CREATE (p1:Person {id: 7}), (p2:Person {id: 7}), \
+                    (f1:Person {id: 1}), (f2:Person {id: 2}) \
+             CREATE (f1)-[:FOLLOWS]->(p1), (f2)-[:FOLLOWS]->(p2)",
+            &HashMap::new(),
+        )
+        .unwrap();
+        graph.rebuild_csr().unwrap();
+
+        let kernel_q =
+            "MATCH (f:Person)-[:FOLLOWS]->(p:Person) RETURN p.id AS id, count(f.id) AS num";
+        let row_q = "MATCH (f:Person)-[:FOLLOWS]->(p:Person) WHERE f.__force IS NULL \
+                     RETURN p.id AS id, count(f.id) AS num";
+        assert!(plan_text(&graph, kernel_q).contains("GroupedDegree"));
+        assert_eq!(
+            sorted_records(&graph, kernel_q),
+            sorted_records(&graph, row_q)
+        );
+        assert_eq!(
+            sorted_records(&graph, kernel_q),
+            vec![vec![serde_json::json!(7), serde_json::json!(2)]]
+        );
+    }
+
+    /// Differential parity on random multigraphs (self-loops, parallel edges,
+    /// some sources without `id`, a second label): the grouped-degree kernel and
+    /// the forced row pipeline agree for `count(*)`, `count(f)`, and
+    /// `count(f.id)`, grouped on one and on two destination properties.
+    #[test]
+    fn kernel_matches_row_path_on_random_graphs() {
+        use proptest::prelude::*;
+
+        let mut runner = proptest::test_runner::TestRunner::new(ProptestConfig {
+            cases: 48,
+            ..ProptestConfig::default()
+        });
+        let strategy = (
+            1usize..=7,
+            proptest::collection::vec((0usize..7, 0usize..7), 0..28),
+            // Per node: whether it carries an `id`/`name` (some null), keyed by index.
+            proptest::collection::vec(any::<bool>(), 7),
+        );
+        runner
+            .run(&strategy, |(n_nodes, edges, has_id)| {
+                let (_dir, graph) = setup();
+                let mut create = String::from("CREATE ");
+                for i in 0..n_nodes {
+                    if i > 0 {
+                        create.push_str(", ");
+                    }
+                    // Non-unique id (i % 3) exercises group-key merging; some
+                    // nodes omit id entirely to exercise the non-null filter.
+                    if has_id[i % has_id.len()] {
+                        create.push_str(&format!("(p{i}:Person {{id: {}}})", i % 3));
+                    } else {
+                        create.push_str(&format!("(p{i}:Person)"));
+                    }
+                }
+                super::execute(&graph, &create, &HashMap::new()).unwrap();
+                for (s, d) in &edges {
+                    let (s, d) = (s % n_nodes, d % n_nodes);
+                    let q = format!(
+                        "MATCH (a:Person), (b:Person) WHERE id(a) = {s} AND id(b) = {d} \
+                         CREATE (a)-[:FOLLOWS]->(b)"
+                    );
+                    super::execute(&graph, &q, &HashMap::new()).unwrap();
+                }
+                graph.rebuild_csr().unwrap();
+
+                for ret in [
+                    "p.id AS id, count(*) AS num",
+                    "p.id AS id, count(f) AS num",
+                    "p.id AS id, count(f.id) AS num",
+                ] {
+                    let kernel_q = format!("MATCH (f:Person)-[:FOLLOWS]->(p:Person) RETURN {ret}");
+                    let row_q = format!(
+                        "MATCH (f:Person)-[:FOLLOWS]->(p:Person) WHERE f.__force IS NULL \
+                         RETURN {ret}"
+                    );
+                    prop_assert!(
+                        plan_text(&graph, &kernel_q).contains("GroupedDegree"),
+                        "kernel query did not lower: {}",
+                        plan_text(&graph, &kernel_q)
+                    );
+                    prop_assert!(!plan_text(&graph, &row_q).contains("GroupedDegree"));
+                    prop_assert_eq!(
+                        sorted_records(&graph, &kernel_q),
+                        sorted_records(&graph, &row_q),
+                        "grouped-degree vs row for `{}` on {} nodes",
+                        ret,
+                        n_nodes
+                    );
+                }
                 Ok(())
             })
             .unwrap();

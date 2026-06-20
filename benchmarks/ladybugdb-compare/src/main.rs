@@ -1,10 +1,10 @@
 //! Comparison harness running the same Cypher workload against IssunDB and
 //! LadybugDB (via the `lbug` crate).
 //!
-//! Both engines load an identical synthetic social graph, then each query in
+//! Both databases load an identical synthetic social graph, then each query in
 //! the workload runs on both. The harness reports median wall time per engine
 //! and asserts row-set equality, so it doubles as a differential correctness check.
-//! The differential check runs before timing: medians for a query the engines
+//! The differential check runs before timing: medians for a query the databases
 //! disagree on are meaningless, so a divergent query is reported and not timed.
 //! Trail-sensitive queries carry an openCypher trail reference computed from
 //! the dataset (see `Oracle`), so a known LadybugDB walk-semantics overcount
@@ -127,7 +127,7 @@ impl Config {
     }
 }
 
-/// Deterministic 64-bit LCG (Knuth MMIX constants) so both engines always see
+/// Deterministic 64-bit LCG (Knuth MMIX constants) so both databases always see
 /// the same graph and runs are reproducible without pulling in `rand`.
 struct Lcg(u64);
 
@@ -344,7 +344,7 @@ fn load_issundb(graph: &Graph, data: &Dataset) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Normalizes a result row to plain strings so both engines compare equal on
+/// Normalizes a result row to plain strings so both databases compare equal on
 /// identical logical values. Strings drop their JSON quoting; everything else
 /// keeps its display form. The workload avoids floats in projections, so no
 /// float formatting reconciliation is needed.
@@ -473,7 +473,7 @@ enum Scope {
     ProbeLocal,
 }
 
-/// How a row-set divergence between the engines is adjudicated.
+/// How a row-set divergence between the databases is adjudicated.
 ///
 /// openCypher requires pairwise-distinct relationships within a MATCH pattern
 /// (trail semantics). LadybugDB matches walks instead: fixed-length chains
@@ -554,7 +554,7 @@ fn count_trail_endpoints(adjacency: &[Vec<u64>], start: u64, hops: u8) -> u64 {
     endpoints.len() as u64
 }
 
-/// One benchmark query; the Cypher is sent verbatim to both engines.
+/// One benchmark query; the Cypher is sent verbatim to both databases.
 struct Query {
     name: &'static str,
     cypher: String,
@@ -754,7 +754,7 @@ fn workload(probes: &Probes) -> Vec<Query> {
     ]
 }
 
-/// Loads both engines at the given size, runs the workload, prints the result
+/// Loads both databases at the given size, runs the workload, prints the result
 /// table, and returns the per-query timings for the sweep's scaling summary.
 fn run_at(cfg: &Config, nodes: u64, edges: u64) -> anyhow::Result<Vec<QueryTiming>> {
     println!(
@@ -770,7 +770,7 @@ fn run_at(cfg: &Config, nodes: u64, edges: u64) -> anyhow::Result<Vec<QueryTimin
     let csv_dir = tempfile::tempdir()?;
     write_csvs(&data, csv_dir.path())?;
 
-    // ---- Load both engines, timing each once ------------------------------
+    // ---- Load both databases, timing each once ------------------------------
     let lb_dir = tempfile::tempdir()?;
     let db = Database::new(lb_dir.path().join("db"), SystemConfig::default())?;
     let mut conn = Connection::new(&db)?;
@@ -824,7 +824,7 @@ fn run_at(cfg: &Config, nodes: u64, edges: u64) -> anyhow::Result<Vec<QueryTimin
     for query in &workload(&probes) {
         let (name, cypher) = (query.name, &query.cypher);
 
-        // Differential check before timing: medians for a query the engines
+        // Differential check before timing: medians for a query the databases
         // disagree on are meaningless (an engine doing the wrong amount of
         // work can look faster), so a divergent query is reported and not
         // timed. Sorted row sets must match exactly; for the trail-sensitive

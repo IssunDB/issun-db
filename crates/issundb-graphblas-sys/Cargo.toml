@@ -17,4 +17,4 @@ name = "issundb_graphblas_sys"
 [build-dependencies]
 bindgen = "0.72"
 cmake = "0.1"
-sha2 = "0.10"
+sha2 = "0.11.0"

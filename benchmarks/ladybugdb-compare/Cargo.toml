@@ -16,7 +16,7 @@ anyhow = "1"
 # CMake as a fallback), and that must never become part of `make build` or `make test`.
 [workspace]
 
-# This mirror the root release profile so the issundb side is measured with the same flags as `make bench`.
+# This uses the root release profile so the issundb side is measured with the same flags as `make bench`.
 [profile.release]
 strip = "debuginfo"
 panic = "unwind"

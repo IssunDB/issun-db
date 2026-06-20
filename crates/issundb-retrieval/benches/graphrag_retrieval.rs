@@ -6,7 +6,9 @@
 
 use std::collections::HashMap;
 
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use std::hint::black_box;
+
+use criterion::{Criterion, criterion_group, criterion_main};
 use issundb_core::{Graph, NodeId};
 use issundb_retrieval::{FusionStrategy, HybridRetrieveOptions, Subgraph, retrieve_hybrid};
 use issundb_vector::VectorGraphExt;

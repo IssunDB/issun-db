@@ -90,6 +90,32 @@ pub struct PathCountSpec<'a> {
     pub vertex_allow: Vec<Option<Vec<NodeId>>>,
 }
 
+/// Pattern description for [`Graph::grouped_edge_counts`]: count typed edges
+/// grouped by one endpoint. With `group_is_dst`, edges are grouped by their
+/// destination and the source is the counted endpoint (in-degree per
+/// destination); otherwise edges are grouped by their source and the
+/// destination is counted (out-degree per source). `group_label` and
+/// `counted_label` optionally constrain each endpoint (`None` is
+/// unconstrained). `counted_nonnull_prop` counts an edge only when the counted
+/// endpoint's property is non-null (the semantics of `count(v.prop)` over the
+/// expansion); `None` counts every qualifying edge (the semantics of
+/// `count(*)` or `count(v)`, where a bound node variable is never null).
+#[derive(Debug, Clone, Default)]
+pub struct GroupedDegreeSpec<'a> {
+    /// Relationship type to count, or `None` for any type.
+    pub rel_type: Option<&'a str>,
+    /// Group by the edge destination (count incoming) when true; by the edge
+    /// source (count outgoing) when false.
+    pub group_is_dst: bool,
+    /// Label required on the group endpoint.
+    pub group_label: Option<&'a str>,
+    /// Label required on the counted endpoint.
+    pub counted_label: Option<&'a str>,
+    /// Property that must be non-null on the counted endpoint for an edge to
+    /// count; `None` counts every qualifying edge.
+    pub counted_nonnull_prop: Option<&'a str>,
+}
+
 /// Builds a 12-byte composite key `(prefix u32 BE, id u64 BE)` for secondary index lookups.
 pub(super) fn composite_key(prefix: u32, id: u64) -> [u8; 12] {
     let mut key = [0u8; 12];

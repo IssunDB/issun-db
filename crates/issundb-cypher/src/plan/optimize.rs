@@ -42,6 +42,13 @@ impl Optimizer {
             };
         }
         result = Self::optimize_index_scans(result, stats);
+        // Convert a natural inner `HashJoin` whose one side merely re-scans a
+        // variable the other side already binds into a linear "expand into"
+        // chain. Runs after index-scan optimization so the driver side keeps
+        // its selective `NodeIndexScan`/`NodeByIdSeek` leaf while the redundant
+        // full re-scan is eliminated, and before the closing-expand rewrite so
+        // the resulting chain can still close into a `MultiwayJoin`.
+        result = rewrite_join_to_expand(result);
         // Rewrite closing Expand nodes into MultiwayJoin after index-scan optimization
         // so that both passes benefit each other.
         result = rewrite_closing_expands(result);
@@ -55,6 +62,10 @@ impl Optimizer {
         // expansion with the core path-count kernel. Runs after the triangle
         // rewrite so a closed triangle is never mistaken for an open path.
         result = rewrite_path_count(result);
+        // Replace a count grouped by one endpoint of a single directed hop with
+        // the grouped-degree kernel. Runs after the path-count rewrite, which
+        // claims the grouping-free counts; only grouped aggregates remain here.
+        result = rewrite_grouped_degree(result);
         result
     }
 
@@ -344,9 +355,9 @@ impl Optimizer {
                 )
             }
             // A leaf produced after this pass; nothing to extract.
-            t @ PhysicalOperator::TriangleCount { .. } | t @ PhysicalOperator::PathCount { .. } => {
-                (t, Vec::new())
-            }
+            t @ PhysicalOperator::TriangleCount { .. }
+            | t @ PhysicalOperator::PathCount { .. }
+            | t @ PhysicalOperator::GroupedDegree { .. } => (t, Vec::new()),
         }
     }
 
@@ -508,9 +519,9 @@ impl Optimizer {
                 closing_is_undirected,
                 closing_unique_rels,
             },
-            t @ PhysicalOperator::TriangleCount { .. } | t @ PhysicalOperator::PathCount { .. } => {
-                t
-            }
+            t @ PhysicalOperator::TriangleCount { .. }
+            | t @ PhysicalOperator::PathCount { .. }
+            | t @ PhysicalOperator::GroupedDegree { .. } => t,
         }
     }
 
@@ -592,6 +603,8 @@ impl Optimizer {
             | PhysicalOperator::ProcedureCall { input, .. } => Self::plan_weight(input, stats),
             // A single kernel call producing one row.
             PhysicalOperator::TriangleCount { .. } | PhysicalOperator::PathCount { .. } => 1,
+            // One kernel pass over adjacency producing one row per group.
+            PhysicalOperator::GroupedDegree { .. } => 1,
             // MultiwayJoin is cheaper than a regular Expand because the closing check is O(1)
             // per row after a single bulk expansion. Weight as the input cost.
             PhysicalOperator::MultiwayJoin { input, .. } => Self::plan_weight(input, stats),
@@ -1092,9 +1105,9 @@ impl Optimizer {
                 current_node
             }
             // A leaf produced after this pass; no children to push into.
-            t @ PhysicalOperator::TriangleCount { .. } | t @ PhysicalOperator::PathCount { .. } => {
-                t
-            }
+            t @ PhysicalOperator::TriangleCount { .. }
+            | t @ PhysicalOperator::PathCount { .. }
+            | t @ PhysicalOperator::GroupedDegree { .. } => t,
         }
     }
 
@@ -1302,6 +1315,27 @@ impl Optimizer {
             PhysicalOperator::TriangleCount { output, .. }
             | PhysicalOperator::PathCount { output, .. } => {
                 vars.insert(output.clone());
+            }
+            // Binds the same variables a row-pipeline `Aggregate` would: the
+            // group columns plus the count under `output`.
+            PhysicalOperator::GroupedDegree {
+                group_by, output, ..
+            } => {
+                vars.insert(output.clone());
+                for (expr, alias) in group_by {
+                    let name = if let Some(a) = alias {
+                        a.clone()
+                    } else if let Expr::Prop(var, prop) = expr {
+                        if prop.is_empty() {
+                            var.clone()
+                        } else {
+                            format!("{}.{}", var, prop)
+                        }
+                    } else {
+                        continue;
+                    };
+                    vars.insert(name);
+                }
             }
         }
     }
@@ -2287,6 +2321,242 @@ impl Optimizer {
 /// or undirected, where the closing check would otherwise iterate all neighbors
 /// and filter by value. Undirected closing hops set `closing_is_undirected` so
 /// the executor checks both edge directions.
+/// Convert a natural inner `HashJoin` whose one side is a redundant re-scan of a
+/// variable the other side already binds into a linear "expand into" chain,
+/// eliminating the redundant scan.
+///
+/// A multi-`MATCH` that shares a variable, such as
+/// `MATCH (p)-[:R]->(x) MATCH (p)-[:S]->(y)`, plans as a natural inner
+/// `HashJoin` on the shared `p`: one side re-scans every `p` (a full
+/// `LabelScan`) and expands, only for the join to keep the rows whose `p`
+/// matches the other side. When that side is a chain of `Filter` and single
+/// forward or incoming `Expand` operators rooted at a bare `LabelScan(p)`, the
+/// join result equals threading the chain's expansions off the other side's
+/// already-bound `p`: the natural join keyed on `{p}` pairs each driver row
+/// with exactly that row's expansions. Grafting the chain onto the driver (its
+/// `LabelScan(p)` leaf replaced by the driver, the scan's label preserved as a
+/// `HasLabel` filter) removes the full re-scan and yields a linear chain that
+/// the columnar path and the closing-join rewrite can both exploit.
+///
+/// The rewrite is purely structural. It fires only on an inner join (never
+/// across an `OptionalMatch`, whose left-outer rows would be dropped by
+/// expanding off a null variable) whose two sides share exactly the one rooted
+/// variable, so the result multiset is unchanged; anything else keeps the
+/// `HashJoin`, so correctness never depends on it.
+fn rewrite_join_to_expand(op: PhysicalOperator) -> PhysicalOperator {
+    match op {
+        PhysicalOperator::HashJoin { left, right } => {
+            let left = rewrite_join_to_expand(*left);
+            let right = rewrite_join_to_expand(*right);
+            if matches!(left, PhysicalOperator::OptionalMatch { .. })
+                || matches!(right, PhysicalOperator::OptionalMatch { .. })
+            {
+                return PhysicalOperator::HashJoin {
+                    left: Box::new(left),
+                    right: Box::new(right),
+                };
+            }
+            // Try grafting either side's chain onto the other. The chain side's
+            // root scan is the one eliminated; restricting it to a bare
+            // `LabelScan` (not an index or id seek) keeps the selective side as
+            // the driver.
+            match try_graft_join(left, right) {
+                Ok(grafted) => grafted,
+                Err((left, right)) => match try_graft_join(right, left) {
+                    Ok(grafted) => grafted,
+                    Err((right, left)) => PhysicalOperator::HashJoin {
+                        left: Box::new(left),
+                        right: Box::new(right),
+                    },
+                },
+            }
+        }
+        PhysicalOperator::Filter { input, expression } => PhysicalOperator::Filter {
+            input: Box::new(rewrite_join_to_expand(*input)),
+            expression,
+        },
+        PhysicalOperator::Project {
+            input,
+            items,
+            is_barrier,
+        } => PhysicalOperator::Project {
+            input: Box::new(rewrite_join_to_expand(*input)),
+            items,
+            is_barrier,
+        },
+        PhysicalOperator::Aggregate {
+            input,
+            group_by,
+            aggregations,
+        } => PhysicalOperator::Aggregate {
+            input: Box::new(rewrite_join_to_expand(*input)),
+            group_by,
+            aggregations,
+        },
+        PhysicalOperator::Sort { input, items } => PhysicalOperator::Sort {
+            input: Box::new(rewrite_join_to_expand(*input)),
+            items,
+        },
+        PhysicalOperator::Limit { input, skip, count } => PhysicalOperator::Limit {
+            input: Box::new(rewrite_join_to_expand(*input)),
+            skip,
+            count,
+        },
+        PhysicalOperator::Distinct { input, keys } => PhysicalOperator::Distinct {
+            keys,
+            input: Box::new(rewrite_join_to_expand(*input)),
+        },
+        PhysicalOperator::Expand {
+            input,
+            src_var,
+            rel_var,
+            dst_var,
+            rel_type,
+            is_incoming,
+            is_undirected,
+            min_hops,
+            max_hops,
+            unique_rels,
+            needs_path,
+        } => PhysicalOperator::Expand {
+            input: Box::new(rewrite_join_to_expand(*input)),
+            src_var,
+            rel_var,
+            dst_var,
+            rel_type,
+            is_incoming,
+            is_undirected,
+            min_hops,
+            max_hops,
+            unique_rels,
+            needs_path,
+        },
+        PhysicalOperator::Unwind {
+            input,
+            expr,
+            variable,
+        } => PhysicalOperator::Unwind {
+            input: Box::new(rewrite_join_to_expand(*input)),
+            expr,
+            variable,
+        },
+        PhysicalOperator::OptionalMatch { input, null_vars } => PhysicalOperator::OptionalMatch {
+            input: Box::new(rewrite_join_to_expand(*input)),
+            null_vars,
+        },
+        PhysicalOperator::WritePart { input, part } => PhysicalOperator::WritePart {
+            input: Box::new(rewrite_join_to_expand(*input)),
+            part,
+        },
+        leaf => leaf,
+    }
+}
+
+/// If `chain` is a run of `Filter` and single-hop `Expand` operators rooted at a
+/// bare `LabelScan(v)` whose `v` is the only variable shared with `driver`,
+/// return the chain grafted onto `driver`. Otherwise return the two operators
+/// unchanged so the caller can try the other orientation or keep the join.
+fn try_graft_join(
+    driver: PhysicalOperator,
+    chain: PhysicalOperator,
+) -> Result<PhysicalOperator, (PhysicalOperator, PhysicalOperator)> {
+    let Some((v, label)) = graftable_chain_root(&chain) else {
+        return Err((driver, chain));
+    };
+    let v = v.to_string();
+    let label = label.map(str::to_string);
+    let driver_bound = Optimizer::bound_vars(&driver);
+    let chain_bound = Optimizer::bound_vars(&chain);
+    // The grafted variable must be produced by the driver, and it must be the
+    // only variable the two sides share: the natural join then keys on `{v}`
+    // alone, which threading the chain off the driver's `v` reproduces exactly.
+    // Any additional shared variable would be a further equi-join key the graft
+    // cannot enforce.
+    if !driver_bound.contains(&v) || !chain_bound.contains(&v) {
+        return Err((driver, chain));
+    }
+    if driver_bound.intersection(&chain_bound).count() != 1 {
+        return Err((driver, chain));
+    }
+    Ok(graft_chain_onto(chain, driver, &v, label.as_deref()))
+}
+
+/// Walk a chain of `Filter` and single-hop, non-path `Expand` operators to its
+/// leaf; return `(v, label)` when the leaf is a bare `LabelScan(v)`. Any other
+/// spine operator, or a non-`LabelScan` leaf (an index or id seek independently
+/// constrains the variable, so it is not a redundant re-scan), returns `None`.
+fn graftable_chain_root(chain: &PhysicalOperator) -> Option<(&str, Option<&str>)> {
+    let mut cur = chain;
+    loop {
+        match cur {
+            PhysicalOperator::Filter { input, .. } => cur = input.as_ref(),
+            PhysicalOperator::Expand {
+                input,
+                min_hops: 1,
+                max_hops: 1,
+                needs_path: false,
+                ..
+            } => cur = input.as_ref(),
+            PhysicalOperator::LabelScan { variable, label } => {
+                return Some((variable.as_str(), label.as_deref()));
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// Rebuild `chain` with its `LabelScan(v)` leaf replaced by `driver`. When the
+/// scan carried a label, a `HasLabel(v, label)` filter wraps `driver` so the
+/// scan's label constraint survives the graft.
+fn graft_chain_onto(
+    chain: PhysicalOperator,
+    driver: PhysicalOperator,
+    v: &str,
+    label: Option<&str>,
+) -> PhysicalOperator {
+    match chain {
+        PhysicalOperator::Filter { input, expression } => PhysicalOperator::Filter {
+            input: Box::new(graft_chain_onto(*input, driver, v, label)),
+            expression,
+        },
+        PhysicalOperator::Expand {
+            input,
+            src_var,
+            rel_var,
+            dst_var,
+            rel_type,
+            is_incoming,
+            is_undirected,
+            min_hops,
+            max_hops,
+            unique_rels,
+            needs_path,
+        } => PhysicalOperator::Expand {
+            input: Box::new(graft_chain_onto(*input, driver, v, label)),
+            src_var,
+            rel_var,
+            dst_var,
+            rel_type,
+            is_incoming,
+            is_undirected,
+            min_hops,
+            max_hops,
+            unique_rels,
+            needs_path,
+        },
+        PhysicalOperator::LabelScan { .. } => match label {
+            Some(l) => PhysicalOperator::Filter {
+                input: Box::new(driver),
+                expression: FilterExpr::HasLabel(v.to_string(), l.to_string()),
+            },
+            None => driver,
+        },
+        // Unreachable: `graftable_chain_root` validated the spine is only
+        // Filter/Expand down to a LabelScan. Leave it intact rather than panic.
+        other => other,
+    }
+}
+
 fn rewrite_closing_expands(op: PhysicalOperator) -> PhysicalOperator {
     match op {
         PhysicalOperator::Expand {
@@ -2701,6 +2971,147 @@ fn rewrite_path_count(op: PhysicalOperator) -> PhysicalOperator {
         },
         other => other,
     }
+}
+
+/// Replace an `Aggregate` whose group keys are all single-property reads on one
+/// endpoint of a single directed hop, carrying one non-distinct `count` over
+/// the other endpoint, with the leaf `GroupedDegree` operator. The executor
+/// answers it with one core kernel pass over adjacency instead of expanding and
+/// folding every edge. Recursion mirrors `rewrite_path_count`; it runs after it
+/// so a grouping-free count (handled by `PathCount`) is never reconsidered here.
+fn rewrite_grouped_degree(op: PhysicalOperator) -> PhysicalOperator {
+    if let Some(t) = try_grouped_degree(&op) {
+        return t;
+    }
+    match op {
+        PhysicalOperator::Project {
+            input,
+            items,
+            is_barrier,
+        } => PhysicalOperator::Project {
+            input: Box::new(rewrite_grouped_degree(*input)),
+            items,
+            is_barrier,
+        },
+        PhysicalOperator::Limit { input, skip, count } => PhysicalOperator::Limit {
+            input: Box::new(rewrite_grouped_degree(*input)),
+            skip,
+            count,
+        },
+        PhysicalOperator::Sort { input, items } => PhysicalOperator::Sort {
+            input: Box::new(rewrite_grouped_degree(*input)),
+            items,
+        },
+        PhysicalOperator::Distinct { input, keys } => PhysicalOperator::Distinct {
+            keys,
+            input: Box::new(rewrite_grouped_degree(*input)),
+        },
+        PhysicalOperator::Filter { input, expression } => PhysicalOperator::Filter {
+            input: Box::new(rewrite_grouped_degree(*input)),
+            expression,
+        },
+        other => other,
+    }
+}
+
+/// Match the grouped-degree plan shape and build its replacement.
+///
+/// Required shape, top-down: an `Aggregate` with at least one group key and
+/// exactly one non-distinct `count` aggregation; then a single directed forward
+/// `Expand`; then a `LabelScan` (optionally under a run of single-variable
+/// constraints on the source). Every group key must be a property read on the
+/// expansion destination (the group endpoint), and the count argument must be
+/// `count(*)`, the source variable, or a property of the source variable. Node
+/// labels become kernel masks; a `count(src.prop)` becomes the kernel's
+/// non-null filter. Per-vertex property predicates are not lowered here, so any
+/// such filter (or any shape mismatch, including a second hop) returns `None`
+/// and the plan runs the existing vectorized or row pipeline. Correctness never
+/// depends on this recognizer.
+fn try_grouped_degree(op: &PhysicalOperator) -> Option<PhysicalOperator> {
+    let PhysicalOperator::Aggregate {
+        input,
+        group_by,
+        aggregations,
+    } = op
+    else {
+        return None;
+    };
+    if group_by.is_empty() || aggregations.len() != 1 {
+        return None;
+    }
+    let (agg_fn, count_expr, out_name) = &aggregations[0];
+    if !matches!(agg_fn, AggFn::Count { distinct: false }) {
+        return None;
+    }
+
+    // The group endpoint's constraints sit above the single forward expand.
+    let (cons_dst, exp) = peel_vertex_constraints(input.as_ref());
+    let (below, src_var, _rel_var, dst_var, rel_type, unique) = match_forward_expand(exp)?;
+    if !unique.is_empty() || src_var == dst_var {
+        return None;
+    }
+
+    // One hop only: the source's constraints sit directly over a `LabelScan`.
+    // A second expand beneath leaves `scan` non-`LabelScan`, so a two-hop chain
+    // falls back here.
+    let (cons_src, scan) = peel_vertex_constraints(below);
+    let PhysicalOperator::LabelScan {
+        variable: v0,
+        label: l0,
+    } = scan
+    else {
+        return None;
+    };
+    if v0 != src_var {
+        return None;
+    }
+
+    // Every group key is a single-property read on the destination (group)
+    // endpoint, so the executor can bulk-gather the keys by property name. A
+    // whole-variable key (`group by p`) is not handled here.
+    for (expr, _alias) in group_by {
+        match expr {
+            Expr::Prop(v, p) if v == dst_var && !p.is_empty() => {}
+            _ => return None,
+        }
+    }
+
+    // The count argument fixes the non-null filter: `count(*)` and `count(src)`
+    // count every edge; `count(src.prop)` counts edges whose source has a
+    // non-null `prop`. A count over any other expression forfeits the rewrite.
+    let counted_nonnull_prop = match count_expr {
+        Expr::CountStar => None,
+        Expr::Prop(v, p) if v == src_var => {
+            if p.is_empty() {
+                None
+            } else {
+                Some(p.clone())
+            }
+        }
+        _ => return None,
+    };
+
+    // Resolve the per-endpoint labels. Property predicates are not lowered into
+    // the grouped-degree kernel, so any predicate forfeits the rewrite.
+    let (group_label, group_preds) = resolve_vertex_constraints(&cons_dst, dst_var)?;
+    let (src_label, src_preds) = resolve_vertex_constraints(&cons_src, v0)?;
+    if !group_preds.is_empty() || !src_preds.is_empty() {
+        return None;
+    }
+    let counted_label = merge_scan_label(l0.clone(), src_label)?;
+
+    Some(PhysicalOperator::GroupedDegree {
+        rel_type: rel_type.clone(),
+        // A forward expand binds the destination as the edge destination, so
+        // grouping by it counts incoming edges.
+        group_is_dst: true,
+        group_label,
+        counted_label,
+        counted_nonnull_prop,
+        group_var: dst_var.clone(),
+        group_by: group_by.clone(),
+        output: out_name.clone(),
+    })
 }
 
 /// A single-variable constraint peeled from the `Filter` run above an expand:
@@ -4153,6 +4564,128 @@ mod tests {
         assert!(
             bottom_scan(&plan).is_some(),
             "zero count must fall through to normal execution"
+        );
+    }
+
+    /// True if any `HashJoin` remains anywhere in the plan tree.
+    fn contains_hashjoin(op: &PhysicalOperator) -> bool {
+        match op {
+            PhysicalOperator::HashJoin { .. } => true,
+            PhysicalOperator::Expand { input, .. }
+            | PhysicalOperator::Filter { input, .. }
+            | PhysicalOperator::Project { input, .. }
+            | PhysicalOperator::Aggregate { input, .. }
+            | PhysicalOperator::Sort { input, .. }
+            | PhysicalOperator::Limit { input, .. }
+            | PhysicalOperator::Distinct { input, .. }
+            | PhysicalOperator::Unwind { input, .. }
+            | PhysicalOperator::OptionalMatch { input, .. }
+            | PhysicalOperator::WritePart { input, .. } => contains_hashjoin(input),
+            _ => false,
+        }
+    }
+
+    /// A single forward `Expand` of `rel` from `src` to `dst` over `input`.
+    fn expand(
+        input: PhysicalOperator,
+        src: &str,
+        rel_var: &str,
+        dst: &str,
+        rel: &str,
+        is_incoming: bool,
+    ) -> PhysicalOperator {
+        PhysicalOperator::Expand {
+            input: Box::new(input),
+            src_var: src.to_string(),
+            rel_var: rel_var.to_string(),
+            dst_var: dst.to_string(),
+            rel_type: Some(rel.to_string()),
+            is_incoming,
+            is_undirected: false,
+            min_hops: 1,
+            max_hops: 1,
+            unique_rels: vec![],
+            needs_path: false,
+        }
+    }
+
+    fn scan(var: &str, label: Option<&str>) -> PhysicalOperator {
+        PhysicalOperator::LabelScan {
+            variable: var.to_string(),
+            label: label.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn join_to_expand_grafts_single_shared_var() {
+        // driver binds {i, p}: (i)<-[:HAS_INTEREST]-(p) anchored at i.
+        let driver = expand(
+            scan("i", Some("Interest")),
+            "i",
+            "r0",
+            "p",
+            "HAS_INTEREST",
+            true,
+        );
+        // chain binds {p, c} and roots at a bare LabelScan(p): (p)-[:LIVES_IN]->(c).
+        let chain = expand(scan("p", None), "p", "r1", "c", "LIVES_IN", false);
+        let join = PhysicalOperator::HashJoin {
+            left: Box::new(driver),
+            right: Box::new(chain),
+        };
+        let rewritten = rewrite_join_to_expand(join);
+        assert!(
+            !contains_hashjoin(&rewritten),
+            "single shared variable must linearize: {rewritten:?}"
+        );
+        // The grafted result expands p->c over the driver subtree.
+        assert!(matches!(
+            rewritten,
+            PhysicalOperator::Expand { ref dst_var, .. } if dst_var == "c"
+        ));
+    }
+
+    #[test]
+    fn join_to_expand_keeps_two_shared_var_join() {
+        // Both sides bind {a, b}: the join keys on two variables, which the
+        // graft cannot reproduce, so the HashJoin must survive.
+        let left = expand(scan("a", Some("Person")), "a", "r0", "b", "F", false);
+        let right = expand(scan("a", None), "a", "r1", "b", "G", false);
+        let join = PhysicalOperator::HashJoin {
+            left: Box::new(left),
+            right: Box::new(right),
+        };
+        let rewritten = rewrite_join_to_expand(join);
+        assert!(
+            contains_hashjoin(&rewritten),
+            "a two-shared-variable join must not be grafted: {rewritten:?}"
+        );
+    }
+
+    #[test]
+    fn join_to_expand_keeps_optional_match() {
+        // An OPTIONAL MATCH side is a left-outer join; grafting would expand off
+        // a possibly-null variable and drop preserved rows, so it is never done.
+        let required = expand(
+            scan("i", Some("Interest")),
+            "i",
+            "r0",
+            "p",
+            "HAS_INTEREST",
+            true,
+        );
+        let optional = PhysicalOperator::OptionalMatch {
+            input: Box::new(expand(scan("p", None), "p", "r1", "c", "LIVES_IN", false)),
+            null_vars: vec!["c".to_string(), "r1".to_string()],
+        };
+        let join = PhysicalOperator::HashJoin {
+            left: Box::new(required),
+            right: Box::new(optional),
+        };
+        let rewritten = rewrite_join_to_expand(join);
+        assert!(
+            contains_hashjoin(&rewritten),
+            "an OPTIONAL MATCH join must be preserved: {rewritten:?}"
         );
     }
 }

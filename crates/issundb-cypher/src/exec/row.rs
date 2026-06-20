@@ -207,6 +207,25 @@ impl SlotSchema {
             PathCount { output, .. } => {
                 self.bind(output);
             }
+            GroupedDegree {
+                group_by, output, ..
+            } => {
+                // Bind the same variables the row-pipeline `Aggregate` would:
+                // the leaf emits group columns plus the count under `output`.
+                for (expr, alias) in group_by {
+                    match alias {
+                        Some(alias) => self.bind(alias),
+                        None => {
+                            if let crate::ast::Expr::Prop(var, prop) = expr {
+                                if prop.is_empty() {
+                                    self.bind(var);
+                                }
+                            }
+                        }
+                    }
+                }
+                self.bind(output);
+            }
         }
     }
 
