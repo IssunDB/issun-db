@@ -21,7 +21,7 @@ Priorities, in order:
   the public facade, and the binding crates (`issundb-rest`, `issundb-mcp`, `issundb-py`) consume only the
   `issundb` facade and its extension crates. Do not import across those boundaries in the wrong direction.
 - Keep all mutable state inside `Graph` and `Storage`; do not introduce module-level `static mut` or `lazy_static` globals for runtime state.
-- Writes are serialized via the `parking_lot::Mutex<()>` write lock on `Graph`; LMDB enforces the same constraint at the storage level. Do not bypass
+- Writes are serialized via the `parking_lot::ReentrantMutex<()>` write lock on `Graph`; LMDB enforces the same constraint at the storage level. Do not bypass
   either.
 - Add comments only when they clarify a non-obvious storage invariant, an LMDB lifetime constraint, or a GraphBLAS semiring choice.
 - Maintain the permissive license boundary of the workspace (MIT or Apache-2.0). Do not add dependencies or statically link libraries with copyleft,
@@ -49,7 +49,7 @@ Quick examples:
 
 ## Repository Layout
 
-The current tree includes storage, CSR snapshots, vector search, hybrid retrieval primitives, Cypher, the CLI, an REST API, language bindings,
+The current tree includes storage, CSR snapshots, vector search, hybrid retrieval primitives, Cypher, the CLI, a REST API, language bindings,
 and shared test utilities.
 This layout describes the current structure and target decoupled crate boundaries.
 Do not invent modules that do not yet exist when answering questions, but do place new modules according to this map.
@@ -239,9 +239,9 @@ All graph operations go through `Graph`; do not call `Storage` directly from out
 
 Node and edge CRUD, accessors, and registry lookups have predictable signatures; read them from the source rather than this file. Methods:
 `add_node`, `add_node_multi`, `get_node`, `update_node`, `delete_node`, `add_label`, `remove_label`, `node_labels`, `add_edge`, `get_edge`,
-`out_neighbors`, `in_neighbors`, `node_has_relationships`, `nodes_by_label`, `edges_by_type`, `all_nodes`, `label_name`, `type_name`,
-`list_node_indexes_and_constraints`, `list_edge_indexes_and_constraints`, `node_count_by_label`, `edge_count_by_type`, `put_vector_bytes`,
-`vector_bytes`, and `rebuild_csr`.
+`update_edge`, `delete_edge`, `out_neighbors`, `in_neighbors`, `node_has_relationships`, `nodes_by_label`, `edges_by_type`, `all_nodes`,
+`label_name`, `type_name`, `list_node_indexes_and_constraints`, `list_edge_indexes_and_constraints`, `node_count_by_label`,
+`edge_count_by_type`, `put_vector_bytes`, `vector_bytes`, and `rebuild_csr`.
 
 The read-path and statistics methods carry non-obvious semantics:
 
@@ -293,6 +293,7 @@ It may depend on `issundb-core`; it must not depend on `issundb-text`, `issundb-
   populated graph and rebuilds the index from the persisted embeddings under the new configuration. The stored vectors are raw, metric-agnostic
   f32, so they re-index under any metric; this is O(n) in the stored vector count and is an administrative operation, not a concurrent one.
 - `VectorGraphExt::upsert_vector(n: NodeId, v: &[f32]) -> Result<(), VectorError>`
+- `VectorGraphExt::remove_vector(n: NodeId) -> Result<(), VectorError>`: removes the embedding for a node from both memory and storage.
 - `VectorGraphExt::vector_search(q: &[f32], k: usize) -> Result<Vec<Hit>, VectorError>`
 - `VectorGraphExt::vector_search_with(q: &[f32], opts: &VectorSearchOptions) -> Result<Vec<Hit>, VectorError>`: adds an exact-label filter,
   property equality filters (both evaluated during the HNSW traversal), and `rescore_factor`. On a quantized index the search defaults to
@@ -318,16 +319,21 @@ retrieve functions are free functions, not methods on `Graph`, to preserve the c
 
 - `retrieve(graph: &Graph, q: &[f32], k: usize, hops: u8) -> Result<Subgraph, RetrievalError>`
 - `retrieve_with(graph: &Graph, q: &[f32], opts: &RetrieveOptions) -> Result<Subgraph, RetrievalError>`
+- `retrieve_hybrid(graph: &Graph, q: &[f32], text_query: &str, opts: &HybridRetrieveOptions) -> Result<Subgraph, RetrievalError>`: fuses vector and text search seed relevance scores before running expansion.
 - `Subgraph`: `nodes: Vec<NodeId>`, `edges: Vec<EdgeId>`, `scores: HashMap<NodeId, f32>`
 - `RetrieveOptions`: `k`, `hops`, `max_distance`, `max_nodes`
+- `HybridRetrieveOptions`: `vector_k`, `text_k`, `text_label`, `text_property`, `hops`, `max_distance`, `max_nodes`, `vector_label`, `fusion`
+- `FusionStrategy`: reciprocal rank fusion (`Rrf { k }`) or linear combination (`WeightedSum { vector_weight, text_weight }`)
 
 ### `issundb_cypher`
 
 Cypher query execution. Exposed through the `issundb` facade via the `GraphQueryExt` trait; do not call `issundb_cypher::execute` directly from
 outside `issundb`.
 
-- `query(cypher: &str) -> Result<QueryResult, CypherError>` and
-  `query_with_params(cypher: &str, params: &HashMap<String, serde_json::Value>) -> Result<QueryResult, CypherError>`
+- `query(cypher: &str) -> Result<QueryResult, CypherError>`,
+  `query_with_params(cypher: &str, params: &HashMap<String, serde_json::Value>) -> Result<QueryResult, CypherError>`,
+  `query_with_procedures(cypher: &str, params: &HashMap<String, serde_json::Value>, registry: &ProcedureRegistry) -> Result<QueryResult, CypherError>`, and
+  `explain(cypher: &str) -> Result<String, CypherError>`
 - `QueryResult`: `columns: Vec<String>`, `records: Vec<Record>`
 - `Record`: `values: Vec<serde_json::Value>`
 
@@ -341,8 +347,7 @@ each conjunct pushes down to its own lowest binder, and rewrites an equality or 
 side merely re-scans a variable the other already binds (the shape a multi-`MATCH` sharing a pivot produces) is rewritten into a linear
 "expand into" chain (`rewrite_join_to_expand`), grafting the redundant-scan side's `Filter`/`Expand` chain onto the driver so the full re-scan is
 eliminated and the columnar path and closing-join rewrite can both exploit the chain; it fires only when the two sides share exactly the one rooted
-variable and never across an `OptionalMatch`. Bulk label filtering uses `label_idx`
-point
+variable and never across an `OptionalMatch`. Bulk label filtering uses `label_idx` point
 lookups (`Graph::label_filter`), and single-property node reads go through the in-memory property columns (`Graph::node_prop_json`).
 A final projection or aggregation over a linear chain of up to `MAX_VEC_HOPS` directed hops executes column-at-a-time through `exec/vectorized.rs`
 (`Graph::node_props_json_table` and `Graph::node_prop_group_codes`); every other shape runs the row pipeline.
