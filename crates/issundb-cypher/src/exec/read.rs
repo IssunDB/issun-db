@@ -1153,6 +1153,52 @@ fn extend_or_create_path(
     Ok(serde_json::Value::Object(m))
 }
 
+/// Build the adjacency of every node reachable from `src_nodes` within
+/// `max_hops` edges, merging the requested directions and deduplicating each
+/// node's `(edge, neighbor)` entries the same way `transition_map` does.
+///
+/// Each batched frontier expansion resolves the relationship type and runs one
+/// SpMV for the whole frontier, so the variable-length BFS that consumes this
+/// map pays a hash-map lookup per step instead of a per-node graph query. A
+/// node's neighbors are computed once (the first time it enters the frontier);
+/// `seen` makes the build terminate on cyclic graphs and unbounded ranges.
+fn build_reachable_adjacency(
+    graph: &Graph,
+    src_nodes: &[NodeId],
+    rel_type: Option<&str>,
+    directions: &[bool],
+    max_hops: usize,
+) -> Result<ahash::AHashMap<NodeId, Vec<(EdgeId, NodeId)>>, String> {
+    let mut closure: ahash::AHashMap<NodeId, Vec<(EdgeId, NodeId)>> = ahash::AHashMap::new();
+    let mut seen: ahash::AHashSet<NodeId> = src_nodes.iter().copied().collect();
+    let mut frontier: Vec<NodeId> = src_nodes.to_vec();
+
+    // The trail BFS expands nodes at hop distance 0..max_hops-1 from a source,
+    // so building adjacency through that many frontier rounds covers every node
+    // it can reach. An unbounded range (usize::MAX) stops when the frontier
+    // drains.
+    let mut hop = 0usize;
+    while !frontier.is_empty() && hop < max_hops {
+        hop += 1;
+        let mut next_frontier: Vec<NodeId> = Vec::new();
+        for &dir in directions {
+            let transitions = expand_multi_type(graph, &frontier, rel_type, dir)?;
+            for (src, eid, dst) in transitions {
+                let entry = closure.entry(src).or_default();
+                if !entry.iter().any(|&(e, d)| e == eid && d == dst) {
+                    entry.push((eid, dst));
+                }
+                if seen.insert(dst) {
+                    next_frontier.push(dst);
+                }
+            }
+        }
+        frontier = next_frontier;
+    }
+
+    Ok(closure)
+}
+
 /// Execute the body of an `Expand` operator given pre-computed child paths.
 ///
 /// Shared by the `RowStream::Expand` node (per batch) without duplicating the
@@ -1200,6 +1246,18 @@ fn expand_from_paths(
             }
         }
     }
+
+    // Variable-length traversals walk one node at a time per source path. Rather
+    // than issue a single-source graph query for every node at every hop (each
+    // resolves the relationship type and runs an SpMV), build the adjacency for
+    // the whole reachable closure once with batched frontier expansions and walk
+    // that in-memory map. `transition_map` already covers the single-hop case.
+    let closure_map: ahash::AHashMap<NodeId, Vec<(EdgeId, NodeId)>> =
+        if min_hops == 1 && max_hops == 1 {
+            ahash::AHashMap::new()
+        } else {
+            build_reachable_adjacency(graph, &src_nodes, rel_type, directions, max_hops)?
+        };
 
     for path in child_paths {
         let src_node = match path.get_binding(src_var) {
@@ -1266,29 +1324,30 @@ fn expand_from_paths(
             for hop in 1..=max_hops {
                 let mut next_queue = Vec::new();
                 for (node, traversed, used_edges) in queue {
-                    for &dir in directions {
-                        let neighbors = expand_multi_type(graph, &[node], rel_type, dir)?;
-                        for (_, eid, neigh_node) in neighbors {
-                            if used_edges.contains(&eid) {
-                                continue;
-                            }
-                            if edge_bound_to_sibling_rel(&path, unique_rels, eid) {
-                                continue;
-                            }
-                            let mut next_used = used_edges.clone();
-                            next_used.push(eid);
-
-                            let mut next_traversed = traversed.clone();
-                            if needs_path {
-                                next_traversed.push(get_edge_representation(graph, eid)?);
-                                next_traversed.push(get_node_representation(graph, neigh_node)?);
-                            }
-
-                            if hop >= min_hops {
-                                completed_paths.push((neigh_node, next_traversed.clone()));
-                            }
-                            next_queue.push((neigh_node, next_traversed, next_used));
+                    let neighbors = match closure_map.get(&node) {
+                        Some(n) => n.as_slice(),
+                        None => continue,
+                    };
+                    for &(eid, neigh_node) in neighbors {
+                        if used_edges.contains(&eid) {
+                            continue;
                         }
+                        if edge_bound_to_sibling_rel(&path, unique_rels, eid) {
+                            continue;
+                        }
+                        let mut next_used = used_edges.clone();
+                        next_used.push(eid);
+
+                        let mut next_traversed = traversed.clone();
+                        if needs_path {
+                            next_traversed.push(get_edge_representation(graph, eid)?);
+                            next_traversed.push(get_node_representation(graph, neigh_node)?);
+                        }
+
+                        if hop >= min_hops {
+                            completed_paths.push((neigh_node, next_traversed.clone()));
+                        }
+                        next_queue.push((neigh_node, next_traversed, next_used));
                     }
                 }
                 queue = next_queue;
@@ -3341,8 +3400,32 @@ fn aggregate_all(
         let mut key_parts = Vec::new();
         let mut gb_path = SlotRow::empty(path.schema_arc());
         for (expr, alias) in group_by {
-            let val = evaluate_expr(graph, &path, expr, params)?;
             let col = group_by_column_name(expr, alias);
+            // Grouping by a bare node or edge variable (`Prop(var, "")`) keys on
+            // its identity. Evaluating it would materialize the whole element to
+            // a JSON object and stringifying the key would serialize the entire
+            // property bag for every input row; the id is the identity, and
+            // keeping the `Node`/`Edge` binding lets the downstream projection
+            // read properties through the columnar fast path rather than a
+            // pre-built object.
+            if let Expr::Prop(var, prop) = expr {
+                if prop.is_empty() {
+                    match path.get_binding(var.as_str()) {
+                        Some(GraphBinding::Node(id)) => {
+                            key_parts.push(format!("\x01N{}", id));
+                            gb_path.bind_local(&col, GraphBinding::Node(*id));
+                            continue;
+                        }
+                        Some(GraphBinding::Edge(id)) => {
+                            key_parts.push(format!("\x01E{}", id));
+                            gb_path.bind_local(&col, GraphBinding::Edge(*id));
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            let val = evaluate_expr(graph, &path, expr, params)?;
             key_parts.push(val.to_string());
             gb_path.bind_local(&col, GraphBinding::Scalar(val));
         }

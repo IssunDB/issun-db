@@ -330,6 +330,7 @@ impl WriteTxn<'_> {
             .add_edge_impl(&mut self.wtxn, src, dst, etype, props)?;
         self.mutations_count += 1;
         self.delta.added_edges.push((src, dst));
+        self.delta.added_edge_ids.push(edge_id);
         Ok(edge_id)
     }
 

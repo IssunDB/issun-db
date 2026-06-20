@@ -357,7 +357,8 @@ pub struct Graph {
     pub(super) _write_lock: Arc<ReentrantMutex<()>>,
     pub(super) csr_cache: Arc<CsrCache>,
     pub(super) matrices: Arc<parking_lot::RwLock<Option<MatrixSet>>>,
-    pub(super) prop_columns: Arc<crate::columns::ColumnsCache>,
+    pub(super) prop_columns: Arc<crate::columns::ColumnsCache<crate::columns::NodeSource>>,
+    pub(super) edge_columns: Arc<crate::columns::ColumnsCache<crate::columns::EdgeSource>>,
     pub(super) n_threads: Arc<std::sync::atomic::AtomicI32>,
     /// Type-erased extension cache. Higher-level crates attach caches (e.g. the
     /// HNSW vector index) to a Graph without creating a circular dependency,
@@ -403,6 +404,7 @@ impl Graph {
             csr_cache,
             matrices,
             prop_columns: Arc::new(crate::columns::ColumnsCache::default()),
+            edge_columns: Arc::new(crate::columns::ColumnsCache::default()),
             n_threads: Arc::new(std::sync::atomic::AtomicI32::new(0)),
             extensions: Arc::new(parking_lot::Mutex::new(AHashMap::new())),
         })
@@ -477,6 +479,67 @@ impl Graph {
         prop: &str,
     ) -> Result<(Vec<u32>, Vec<serde_json::Value>), Error> {
         self.prop_columns
+            .with_fresh(&self.storage, |cols| cols.group_codes(ids, prop))?
+    }
+
+    // ------------------------------------------------------------------
+    // Edge property columns
+    //
+    // The edge counterparts of the node column readers above, backed by an
+    // independent columnar cache over the `edges` sub-database. They let the
+    // query layer gather edge (relationship) properties in bulk through a
+    // dense-index read instead of an LMDB point lookup plus a msgpack decode
+    // per access. Semantics mirror the node methods exactly: a missing
+    // property reads as `Value::Null`; a nonexistent edge is
+    // [`Error::EdgeNotFound`].
+    // ------------------------------------------------------------------
+
+    /// Read one property of an edge through the in-memory edge property
+    /// columns. Returns `None` for a nonexistent edge and `Some(Value::Null)`
+    /// for a missing property.
+    pub fn edge_prop_json(
+        &self,
+        id: EdgeId,
+        prop: &str,
+    ) -> Result<Option<serde_json::Value>, Error> {
+        self.edge_columns.with_fresh(&self.storage, |cols| {
+            cols.id_to_dense.get(&id).map(|&d| {
+                cols.cols
+                    .get(prop)
+                    .and_then(|c| c.get_json_opt(d as usize))
+                    .unwrap_or(serde_json::Value::Null)
+            })
+        })
+    }
+
+    /// Bulk row-major gather of `props` for each edge id in `ids`.
+    pub fn edge_props_json_table(
+        &self,
+        ids: &[EdgeId],
+        props: &[&str],
+    ) -> Result<Vec<Vec<serde_json::Value>>, Error> {
+        self.edge_columns
+            .with_fresh(&self.storage, |cols| cols.props_table(ids, props))?
+    }
+
+    /// Single-property column gather for edges: `out[i]` is `prop` on `ids[i]`.
+    pub fn edge_prop_json_column(
+        &self,
+        ids: &[EdgeId],
+        prop: &str,
+    ) -> Result<Vec<serde_json::Value>, Error> {
+        self.edge_columns
+            .with_fresh(&self.storage, |cols| cols.prop_column(ids, prop))?
+    }
+
+    /// Group `ids` by the exact value of edge property `prop`: one dense group
+    /// code per id plus one representative value per code.
+    pub fn edge_prop_group_codes(
+        &self,
+        ids: &[EdgeId],
+        prop: &str,
+    ) -> Result<(Vec<u32>, Vec<serde_json::Value>), Error> {
+        self.edge_columns
             .with_fresh(&self.storage, |cols| cols.group_codes(ids, prop))?
     }
 
@@ -601,6 +664,14 @@ impl Graph {
                 } else {
                     self.prop_columns.record_touched_many(&delta.added_nodes);
                     self.prop_columns.record_touched_many(&delta.updated_nodes);
+                }
+                // Edge columns: an edge removal (or a node deletion that may
+                // cascade to edges) reshuffles the dense edge mapping, so fall
+                // back to a full rebuild; otherwise patch the added edges in.
+                if delta.force_full || !delta.removed_edges.is_empty() {
+                    self.edge_columns.record_force_full();
+                } else {
+                    self.edge_columns.record_touched_many(&delta.added_edge_ids);
                 }
                 self.csr_cache.record_batch(delta);
                 if mutations_count > 0 {

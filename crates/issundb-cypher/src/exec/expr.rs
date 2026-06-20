@@ -571,13 +571,9 @@ pub(super) fn evaluate_expr<B: Bindings>(
             };
             match binding {
                 GraphBinding::Node(node_id) => {
-                    if graph
-                        .get_node(*node_id)
-                        .map_err(|e| e.to_string())?
-                        .is_none()
-                    {
-                        return Err(format!("node not found: {}", node_id));
-                    }
+                    // Both forms below surface a missing node (`node_props` and
+                    // `node_prop_json` return `None` for an absent id), so no
+                    // separate existence probe is needed.
                     if prop.is_empty() {
                         let actual_json = node_props(graph, *node_id)?
                             .ok_or_else(|| format!("node not found: {}", node_id))?;
@@ -603,16 +599,12 @@ pub(super) fn evaluate_expr<B: Bindings>(
                     }
                 }
                 GraphBinding::Edge(edge_id) => {
-                    if graph
-                        .get_edge(*edge_id)
-                        .map_err(|e| e.to_string())?
-                        .is_none()
-                    {
-                        return Err(format!("edge not found: {}", edge_id));
-                    }
-                    // The whole-edge form needs `src`/`dst` from the record, which the
-                    // property cache does not hold, so it reads the record directly;
-                    // the hot single-property form goes through the cache.
+                    // The whole-edge form needs `src`/`dst` from the record, so it
+                    // reads the record directly (which also surfaces a missing edge).
+                    // The hot single-property form reads the in-memory edge property
+                    // columns: a dense-index lookup instead of a point read plus a
+                    // full record decode, and it returns `None` for a missing edge so
+                    // no separate existence probe is needed.
                     if prop.is_empty() {
                         let record = graph
                             .get_edge(*edge_id)
@@ -640,12 +632,10 @@ pub(super) fn evaluate_expr<B: Bindings>(
                         m.insert("properties".to_string(), actual_json);
                         Ok(serde_json::Value::Object(m))
                     } else {
-                        let actual_json = edge_props(graph, *edge_id)?
-                            .ok_or_else(|| format!("edge not found: {}", edge_id))?;
-                        Ok(actual_json
-                            .get(prop)
-                            .cloned()
-                            .unwrap_or(serde_json::Value::Null))
+                        graph
+                            .edge_prop_json(*edge_id, prop)
+                            .map_err(|e| e.to_string())?
+                            .ok_or_else(|| format!("edge not found: {}", edge_id))
                     }
                 }
                 GraphBinding::Scalar(val) => {
