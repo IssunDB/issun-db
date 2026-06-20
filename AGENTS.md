@@ -468,7 +468,6 @@ Additional validation when relevant:
 - Public API docs are generated from `rustdoc` on `crates/issundb/src/lib.rs`. Keep that module focused on the deliberate public surface; do not
   re-export `Storage` or other internals.
 - User workflow changes should update `README.md`.
-- Phase progress and completeness changes should update `ROADMAP.md`.
 - If you detect stale docs while changing related code, fix them in the same patch.
 
 ## Review Guidelines (P0/P1 Focus)
