@@ -45,7 +45,7 @@ All mutations to the graph go through the `Graph` API. Inside `Graph`:
 - The `RwTxn` must be opened **inside** the lock scope, not before acquiring it. Pattern:
 
   ```rust
-  let _guard = self.write_lock.lock();
+  let _guard = self._write_lock.lock();
   let mut wtxn = self.storage.env.write_txn()?;
   // ... mutations ...
   wtxn.commit()?;

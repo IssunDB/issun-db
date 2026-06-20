@@ -65,9 +65,9 @@ The usearch `Index` does not auto-grow its internal capacity. Follow these rules
 
 Never call `graph.vector_bytes()` or any `Graph` method while holding the `extensions` mutex.
 
-## `VectorSearchOptions.label` Filter
+## `VectorSearchOptions` Filters
 
-When `opts.label` is `Some(label)`:
+When `opts.label` or `opts.properties` are set:
 
 1. Over-fetch from the index: request `(opts.k * 4).max(opts.k + 64)` candidates.
 2. For each candidate, call `graph.get_node(hit.node)` and `graph.label_name(record.label)` to verify the label.
