@@ -1,12 +1,12 @@
 # Variables
-BINARY := target/release/issun-db
-PATH := /snap/bin:$(PATH)
-DEBUG_PROJ := 0
-RUST_BACKTRACE := 1
-ASSET_DIR := docs/assets
+BINARY := target/release/issundb-cli
+export PATH := /snap/bin:$(PATH)
+ASSET_DIR := docs/assets/diagrams
 SCRIPTS_DIR := scripts
 SHELL := /bin/bash
 MSRV := 1.85.0
+DEBUG_PROJ ?= 0
+RUST_BACKTRACE ?= 1
 
 # Binding crates and Python dependency manager
 PY_DIR := crates/issundb-py
@@ -25,8 +25,8 @@ CAREFUL_VERSION := 0.4.8
 # GraphBLAS initializes a process-global OpenMP pool on first use, and the
 # coverage run is process-per-test under nextest, so the pools oversubscribe on
 # smaller or loaded machines and a GraphBLAS call can fail intermittently.
-# Pinning the pool to one thread and retrying twice compensates. Both are
-# overridable from the environment (CI sets them at the job level).
+# Pinning the pool to one thread and retrying twice compensates.
+# Both are overridable from the environment.
 OMP_NUM_THREADS ?= 1
 NEXTEST_RETRIES ?= 2
 
@@ -96,9 +96,11 @@ build-zig-arm64: format ## Cross-compile the release binary for AArch64 Linux us
 	@DEBUG_PROJ=$(DEBUG_PROJ) cargo zigbuild --release --target aarch64-unknown-linux-gnu
 
 .PHONY: run
-run: build ## Build and run the binary
+run: ## Build the release binary and run it (pass REPL_PATH=<dir> to set the database path; defaults to ./issundb-data)
+	@echo "Building the project..."
+	@DEBUG_PROJ=$(DEBUG_PROJ) cargo build --release
 	@echo "Running the $(BINARY) binary..."
-	@DEBUG_PROJ=$(DEBUG_PROJ) ./$(BINARY)
+	@DEBUG_PROJ=$(DEBUG_PROJ) RUST_BACKTRACE=$(RUST_BACKTRACE) ./$(BINARY) $(or $(REPL_PATH),./issundb-data)
 
 .PHONY: clean
 clean: ## Remove generated and temporary files
@@ -106,7 +108,7 @@ clean: ## Remove generated and temporary files
 	@cargo clean
 	@rm -rf $(PY_DIR)/$(WHEEL_DIR)
 	@rm -f $(PY_DIR)/python/issundb/*.so
-	@rm -f $(ASSET_DIR)/*.svg && echo "Removed SVG files; might want to run 'make figs' to regenerate them."
+	@test -n "$(ASSET_DIR)" && rm -f $(ASSET_DIR)/*.svg && echo "Removed SVG files; might want to run 'make figs' to regenerate them."
 
 .PHONY: install-snap
 install-snap: ## Install a few dependencies using Snapcraft
@@ -150,7 +152,11 @@ check-graphblas-pin: ## Verify the GraphBLAS pin is consistent (across build.rs,
 .PHONY: publish
 publish: ## Publish the package to crates.io (requires CARGO_REGISTRY_TOKEN to be set)
 	@echo "Publishing the package to Cargo registry..."
-	@cargo publish --token $(CARGO_REGISTRY_TOKEN)
+	@if [ -z "$(CARGO_REGISTRY_TOKEN)" ]; then \
+	   echo "Error: CARGO_REGISTRY_TOKEN is not set."; \
+	   exit 1; \
+	fi
+	@cargo publish -p issundb --token $(CARGO_REGISTRY_TOKEN)
 
 ########################################################################################
 ## Python binding targets
@@ -159,9 +165,6 @@ publish: ## Publish the package to crates.io (requires CARGO_REGISTRY_TOKEN to b
 .PHONY: develop-py
 develop-py: ## Build issundb-py and install it into the active Python environment
 	@echo "Building and installing issundb-py..."
-	@# Drop maturin's prior output so a re-run cannot hardlink and re-patch a stale
-	@# copy: re-patching zeroes the shared inode (including cargo's target/debug
-	@# copy), which cargo's fingerprint then treats as current.
 	@rm -rf target/maturin
 	@# Maturin fails when CONDA_PREFIX and VIRTUAL_ENV are both set; clear the former.
 	@(cd $(PY_DIR) && unset CONDA_PREFIX && maturin develop)
@@ -169,16 +172,9 @@ develop-py: ## Build issundb-py and install it into the active Python environmen
 .PHONY: wheel-py
 wheel-py: ## Build the issundb-py wheel for the current platform
 	@echo "Building the issundb-py wheel..."
-	@# Sync the dev group (patchelf) without installing the project; auditwheel
-	@# repair needs patchelf on PATH to copy libgomp into the wheel and patch the
-	@# rpath, and only the dev-group binary is available.
 	@(cd $(PY_DIR) && $(PY_MNGR) sync --group dev --no-install-project)
-	@# Drop maturin's prior output so it cannot hardlink and re-patch a stale copy.
 	@rm -rf target/maturin
 	@# Maturin fails when CONDA_PREFIX and VIRTUAL_ENV are both set; clear the former.
-	@# Run through uv so the dev-group patchelf is on PATH. "repair" (the maturin
-	@# default) bundles the external libgomp for the host platform; "check" only
-	@# verifies compliance and errors when a library needs copying.
 	@(cd $(PY_DIR) && unset CONDA_PREFIX && $(PY_MNGR) run --no-sync maturin build --release --out $(WHEEL_DIR) --auditwheel repair)
 
 .PHONY: wheel-py-manylinux
@@ -189,25 +185,16 @@ wheel-py-manylinux: ## Build the manylinux issundb-py wheel using Zig
 .PHONY: test-py
 test-py: ## Build issundb-py and run the Python binding tests
 	@echo "Syncing Python test dependencies..."
-	@# Sync the dev group (pytest) without letting uv install the project itself:
-	@# uv would register issundb as an editable install, which cannot resolve the
-	@# compiled PyO3 extension. Maturin places the working extension instead.
 	@(cd $(PY_DIR) && $(PY_MNGR) sync --group dev --no-install-project)
 	@echo "Building and installing issundb-py..."
-	@# Drop maturin's prior output so it cannot hardlink and re-patch a stale copy:
-	@# re-patching an existing artifact zeroes the shared inode (including cargo's
-	@# target/debug copy), which cargo's fingerprint then treats as current.
 	@rm -rf target/maturin
 	@# Maturin fails when CONDA_PREFIX and VIRTUAL_ENV are both set; clear the former.
-	@# Run maturin through uv so the dev-group patchelf is on PATH; without it the
-	@# libgomp rpath step fails and leaves a corrupt extension.
 	@(cd $(PY_DIR) && unset CONDA_PREFIX && $(PY_MNGR) run --no-sync maturin develop)
 	@echo "Running Python binding tests..."
-	@# --no-sync keeps uv from replacing the maturin-installed extension on run.
 	@(cd $(PY_DIR) && $(PY_MNGR) run --no-sync pytest)
 
 .PHONY: publish-py
-publish-py: wheel-py-manylinux ## Publish the issundb-py wheel to PyPI (requires PYPI_TOKEN to be set)
+publish-py: wheel-py-manylinux ## Publish the issundb-py wheel to PyPI (needs PYPI_TOKEN to be set)
 	@echo "Publishing issundb-py to PyPI..."
 	@if [ -z "$(WHEEL_FILE)" ]; then \
 	   echo "Error: no wheel file found in $(PY_DIR)/$(WHEEL_DIR). Run 'make wheel-py-manylinux' first."; \
@@ -229,7 +216,7 @@ mcp: ## Launch the MCP server over stdio (pass MCP_PATH=<dir> to set the databas
 
 .PHONY: mcp-http
 mcp-http: ## Launch the MCP server over Streamable HTTP (MCP_PATH=<dir> db path, MCP_BIND=<addr> bind address)
-	@echo "Starting IssunDB MCP server over HTTP at $(or $(MCP_BIND),127.0.0.1:8000) (database: $(or $(MCP_PATH),./issundb-data))..."
+	@echo "Starting IssunDB MCP server over HTTP at $(or $(MCP_BIND),127.0.0.1:8000) (database: $(or $(MCP_PATH),./issundb-data))..." >&2
 	@RUST_BACKTRACE=$(RUST_BACKTRACE) cargo run -p issundb-mcp -- --db-path $(or $(MCP_PATH),./issundb-data)\
  	--transport http --bind $(or $(MCP_BIND),127.0.0.1:8000)
 
@@ -326,7 +313,7 @@ fix-lint: ## Fix the linter warnings
 .PHONY: run-examples
 run-examples: ## Run all examples in crates/issundb-examples one by one
 	@echo "Running all examples..."
-	@for example in crates/issundb-examples/*.rs; do \
+	@for example in crates/issundb-examples/examples/*.rs; do \
 	   example_name=$$(basename $$example .rs); \
 	   echo "Running example: $$example_name"; \
 	   cargo run -p issundb-examples --example $$example_name; \
@@ -356,7 +343,7 @@ check-module-deps: ## Verify crate boundary rules: lower-level crates must not i
 	   src_dir="crates/$$crate/src"; \
 	   if [ ! -d "$$src_dir" ]; then continue; fi; \
 	   for forbidden in $${FORBIDDEN[$$crate]}; do \
-	      VIOLATIONS=$$(grep -r "use $$forbidden" "$$src_dir/" 2>/dev/null || true); \
+	      VIOLATIONS=$$(grep -rE "(use |extern crate |::)$$forbidden" "$$src_dir/" 2>/dev/null || true); \
 	      if [ -n "$$VIOLATIONS" ]; then \
 	         echo "ERROR: $$crate has forbidden dependency on $$forbidden:"; \
 	         echo "$$VIOLATIONS" | sed 's/^/  /'; \
