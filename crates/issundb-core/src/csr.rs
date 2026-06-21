@@ -169,6 +169,10 @@ pub struct GraphDelta {
     pub added_nodes: Vec<NodeId>,
     pub updated_nodes: Vec<NodeId>,
     pub added_edges: Vec<(NodeId, NodeId)>,
+    /// Edge ids of the edges added in this transaction, parallel in spirit to
+    /// `added_edges`. The edge property column cache drains this to patch the
+    /// new edges in without a full rebuild.
+    pub added_edge_ids: Vec<crate::schema::EdgeId>,
     pub removed_edges: Vec<(NodeId, NodeId)>,
     pub force_full: bool,
 }

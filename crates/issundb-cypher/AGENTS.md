@@ -125,6 +125,35 @@ the two new bindings are paid per output row.
 - **`HasLabel` filters**: always route through the existing bulk-GraphBLAS path; `execute_filter_over_expand` is not called for `HasLabel`
   expressions.
 
+## Vectorized Aggregate and Columnar Fast Path
+
+`exec/vectorized.rs` is an alternative executor for read queries whose optimized physical plan is a linear chain (a scan, then zero or more single-hop
+expands) topped by a projection, an aggregation, or an aggregation feeding projections and an optional sort. `recognize` inspects the optimized
+`PhysicalOperator` tree and returns a `VecPipeline` when the shape qualifies; `execute` runs it, and any unrecognized plan falls through to the row
+pipeline in `exec/read.rs`. The fast path is a performance choice only: declining it must never change results, and the `DISABLE_FOR_TEST`
+thread-local forces the row path so tests can compare the two.
+
+The `VecRoot` variants escalate in generality:
+
+- `Project`: the root is a RETURN of single-property reads.
+- `Aggregate`: every group key and aggregate input is a single-property read on a chain node variable, folded through dense group codes and bulk
+  column gathers.
+- `AggregateGeneral`: group keys or aggregate inputs are general scalar expressions (CASE, arithmetic, comparisons, IS NULL, function calls) over
+  chain node and relationship variables, including edge properties. It binds each row's node and edge ids and folds through the shared `evaluate_expr`
+  and `AggState`, so its semantics match the row pipeline exactly. `agg_expr_eligible` gates which expressions qualify; anything it declines stays on
+  the row pipeline, so correctness never depends on the gate.
+
+Both aggregate roots read properties from the in-memory columnar store (see "In-Memory Property Columns" in `issundb-core/AGENTS.md`): one bulk gather
+of every referenced `(variable, property)` column per query rather than a point read per row. Every vectorized shape must be covered by a differential
+test that asserts byte-identical columns and records against the row pipeline (`assert_matches_row_path` and the `*_matches_row_path` tests in
+`exec/vectorized.rs`); add one whenever you widen `recognize`.
+
+**Group-key identity invariant** (binds both executors): grouping by a bare node or edge variable (`Expr::Prop(var, "")`) keys on the element id, not
+its materialized property bag, and the group row keeps the `Node` or `Edge` binding rather than a materialized `Scalar`. The row pipeline's
+`aggregate_all` fold and the vectorized aggregate both depend on this. Serializing a whole node to a JSON object per input row to build the group key
+is an O(rows x properties) cliff (it regressed RE24 by roughly 5x), and re-materializing the entity as a `Scalar` forces downstream property reads off
+the columnar fast path. Do not reduce either fold back to `evaluate_expr(...).to_string()` for a node or edge group key.
+
 ## Executor Mutation Safety
 
 CREATE, SET, DELETE, and MERGE all mutate the graph:

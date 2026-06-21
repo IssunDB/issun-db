@@ -21,7 +21,8 @@ Priorities, in order:
   the public facade, and the binding crates (`issundb-rest`, `issundb-mcp`, `issundb-py`) consume only the
   `issundb` facade and its extension crates. Do not import across those boundaries in the wrong direction.
 - Keep all mutable state inside `Graph` and `Storage`; do not introduce module-level `static mut` or `lazy_static` globals for runtime state.
-- Writes are serialized via the `parking_lot::ReentrantMutex<()>` write lock on `Graph`; LMDB enforces the same constraint at the storage level. Do not bypass
+- Writes are serialized via the `parking_lot::ReentrantMutex<()>` write lock on `Graph`; LMDB enforces the same constraint at the storage level. Do
+  not bypass
   either.
 - Add comments only when they clarify a non-obvious storage invariant, an LMDB lifetime constraint, or a GraphBLAS semiring choice.
 - Maintain the permissive license boundary of the workspace (MIT or Apache-2.0). Do not add dependencies or statically link libraries with copyleft,
@@ -319,7 +320,8 @@ retrieve functions are free functions, not methods on `Graph`, to preserve the c
 
 - `retrieve(graph: &Graph, q: &[f32], k: usize, hops: u8) -> Result<Subgraph, RetrievalError>`
 - `retrieve_with(graph: &Graph, q: &[f32], opts: &RetrieveOptions) -> Result<Subgraph, RetrievalError>`
-- `retrieve_hybrid(graph: &Graph, q: &[f32], text_query: &str, opts: &HybridRetrieveOptions) -> Result<Subgraph, RetrievalError>`: fuses vector and text search seed relevance scores before running expansion.
+- `retrieve_hybrid(graph: &Graph, q: &[f32], text_query: &str, opts: &HybridRetrieveOptions) -> Result<Subgraph, RetrievalError>`: fuses vector and
+  text search seed relevance scores before running expansion.
 - `Subgraph`: `nodes: Vec<NodeId>`, `edges: Vec<EdgeId>`, `scores: HashMap<NodeId, f32>`
 - `RetrieveOptions`: `k`, `hops`, `max_distance`, `max_nodes`
 - `HybridRetrieveOptions`: `vector_k`, `text_k`, `text_label`, `text_property`, `hops`, `max_distance`, `max_nodes`, `vector_label`, `fusion`
@@ -332,7 +334,8 @@ outside `issundb`.
 
 - `query(cypher: &str) -> Result<QueryResult, CypherError>`,
   `query_with_params(cypher: &str, params: &HashMap<String, serde_json::Value>) -> Result<QueryResult, CypherError>`,
-  `query_with_procedures(cypher: &str, params: &HashMap<String, serde_json::Value>, registry: &ProcedureRegistry) -> Result<QueryResult, CypherError>`, and
+  `query_with_procedures(cypher: &str, params: &HashMap<String, serde_json::Value>, registry: &ProcedureRegistry) -> Result<QueryResult, CypherError>`,
+  and
   `explain(cypher: &str) -> Result<String, CypherError>`
 - `QueryResult`: `columns: Vec<String>`, `records: Vec<Record>`
 - `Record`: `values: Vec<serde_json::Value>`

@@ -50,7 +50,7 @@
 
 use std::collections::HashMap;
 
-use issundb_core::{Graph, NodeId};
+use issundb_core::{EdgeId, Graph, NodeId};
 use serde_json::Value;
 
 use crate::ast::{AggFn, BinaryOperator, Expr, ReturnClause, SortItem};
@@ -232,15 +232,38 @@ fn vec_stage(expression: &FilterExpr) -> Option<VecStage<'_>> {
     }
 }
 
+type ProjLayer<'a> = (&'a [(Expr, Option<String>)], bool);
+
 enum VecRoot<'a> {
     /// The plan root is the final RETURN projection of single-property reads.
     Project { items: &'a [(Expr, Option<String>)] },
     /// An aggregation feeds the projection (and the optional sort above it).
+    /// Every group key and aggregate input is a single-property read on a chain
+    /// node variable, so the executor folds through dense group codes and bulk
+    /// column gathers.
     Aggregate {
         group_by: &'a [(Expr, Option<String>)],
         aggregations: &'a [(AggFn, Expr, String)],
         project_items: &'a [(Expr, Option<String>)],
         project_is_barrier: bool,
+        sort_items: Option<&'a [SortItem]>,
+    },
+    /// Like [`VecRoot::Aggregate`], but the group keys or aggregate inputs are
+    /// general scalar expressions (CASE, arithmetic, comparisons, IS NULL) over
+    /// chain node and relationship variables, including edge properties. The
+    /// executor binds each row's node and edge ids and folds through the shared
+    /// `evaluate_expr` and `AggState`, so its semantics match the row pipeline
+    /// exactly while reading every property from the in-memory columns.
+    ///
+    /// `projections` holds every `Project` layer sitting above the aggregate,
+    /// innermost (closest to the aggregate) first. A WITH-aggregate followed by
+    /// a RETURN projection stacks two layers; an aggregate in RETURN has one.
+    /// Each layer is `(items, is_barrier)` and runs through the row pipeline's
+    /// `project_rows`, in order.
+    AggregateGeneral {
+        group_by: &'a [(Expr, Option<String>)],
+        aggregations: &'a [(AggFn, Expr, String)],
+        projections: Vec<ProjLayer<'a>>,
         sort_items: Option<&'a [SortItem]>,
     },
 }
@@ -258,6 +281,93 @@ enum AggIn {
 /// chain column.
 fn col_of(chain_vars: &[&str], var: &str) -> Option<usize> {
     chain_vars.iter().position(|v| *v == var)
+}
+
+/// True when `expr` is a scalar expression the general columnar aggregate path
+/// can evaluate from per-row node and edge bindings: every property or label
+/// variable it names is a chain node variable or a chain relationship variable,
+/// and it contains no aggregate or variable-introducing construct (which would
+/// need bindings beyond the chain's node and edge ids). Anything else declines
+/// so the row pipeline runs unchanged; correctness never depends on this gate.
+fn agg_expr_eligible(expr: &Expr, chain_vars: &[&str], rel_vars: &[&str]) -> bool {
+    let var_ok = |v: &str| chain_vars.contains(&v) || rel_vars.contains(&v);
+    match expr {
+        // Single-property reads only; a whole-variable read or a label test
+        // would need the full entity, which the bulk gather does not
+        // materialize.
+        Expr::Prop(var, prop) => !prop.is_empty() && var_ok(var),
+        Expr::Literal(_) | Expr::Param(_) => true,
+        Expr::BinaryOp { left, right, .. } => {
+            agg_expr_eligible(left, chain_vars, rel_vars)
+                && agg_expr_eligible(right, chain_vars, rel_vars)
+        }
+        Expr::IsNull(e) | Expr::IsNotNull(e) | Expr::Not(e) => {
+            agg_expr_eligible(e, chain_vars, rel_vars)
+        }
+        Expr::Case {
+            subject,
+            arms,
+            else_expr,
+        } => {
+            subject
+                .as_ref()
+                .is_none_or(|e| agg_expr_eligible(e, chain_vars, rel_vars))
+                && arms.iter().all(|a| {
+                    agg_expr_eligible(&a.when, chain_vars, rel_vars)
+                        && agg_expr_eligible(&a.then, chain_vars, rel_vars)
+                })
+                && else_expr
+                    .as_ref()
+                    .is_none_or(|e| agg_expr_eligible(e, chain_vars, rel_vars))
+        }
+        Expr::FunctionCall { args, .. } => args
+            .iter()
+            .all(|a| agg_expr_eligible(a, chain_vars, rel_vars)),
+        // Aggregates, comprehensions, quantifiers, reduce, subscript, slice,
+        // and bare `count(*)` are out of scope here.
+        _ => false,
+    }
+}
+
+/// Collect every `(variable, property)` read in `expr` into `out`, recursing
+/// through the expression forms `agg_expr_eligible` admits. Whole-variable
+/// reads (empty property) are skipped; eligibility already rejects them, so the
+/// general aggregate only ever needs scalar property values.
+fn collect_props<'a>(expr: &'a Expr, out: &mut Vec<(&'a str, &'a str)>) {
+    match expr {
+        Expr::Prop(var, prop) if !prop.is_empty() => {
+            if !out.contains(&(var.as_str(), prop.as_str())) {
+                out.push((var.as_str(), prop.as_str()));
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            collect_props(left, out);
+            collect_props(right, out);
+        }
+        Expr::IsNull(e) | Expr::IsNotNull(e) | Expr::Not(e) => collect_props(e, out),
+        Expr::Case {
+            subject,
+            arms,
+            else_expr,
+        } => {
+            if let Some(s) = subject {
+                collect_props(s, out);
+            }
+            for a in arms {
+                collect_props(&a.when, out);
+                collect_props(&a.then, out);
+            }
+            if let Some(e) = else_expr {
+                collect_props(e, out);
+            }
+        }
+        Expr::FunctionCall { args, .. } => {
+            for a in args {
+                collect_props(a, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// A single-property read on a chain node variable, the only expression form
@@ -375,12 +485,32 @@ fn recognize(plan: &PhysicalOperator) -> Option<VecPipeline<'_>> {
     else {
         return None;
     };
-    let (root, chain_top) = match input.as_ref() {
-        PhysicalOperator::Aggregate {
-            input: agg_input,
-            group_by,
-            aggregations,
-        } => (
+    // Peel the stack of `Project` layers above the (optional) aggregate. A
+    // WITH-aggregate followed by a RETURN projection stacks two layers; an
+    // aggregate in RETURN, or a plain projection, has one.
+    let mut proj_stack: Vec<ProjLayer<'_>> = vec![(items.as_slice(), *is_barrier)];
+    let mut stacked = input.as_ref();
+    while let PhysicalOperator::Project {
+        input: inner,
+        items: inner_items,
+        is_barrier: inner_barrier,
+    } = stacked
+    {
+        proj_stack.push((inner_items.as_slice(), *inner_barrier));
+        stacked = inner.as_ref();
+    }
+
+    let (root, chain_top) = match (proj_stack.len(), stacked) {
+        // Single projection directly over an aggregate: the existing fast/general
+        // aggregate decision applies (made below once the chain is known).
+        (
+            1,
+            PhysicalOperator::Aggregate {
+                input: agg_input,
+                group_by,
+                aggregations,
+            },
+        ) => (
             VecRoot::Aggregate {
                 group_by,
                 aggregations,
@@ -390,7 +520,33 @@ fn recognize(plan: &PhysicalOperator) -> Option<VecPipeline<'_>> {
             },
             agg_input.as_ref(),
         ),
-        other => {
+        // Two or more projections over an aggregate (WITH-aggregate then a
+        // RETURN projection): always the general path, applying every layer in
+        // order. Eligibility of the group keys and aggregate inputs is checked
+        // once the chain variables are known.
+        (
+            _,
+            PhysicalOperator::Aggregate {
+                input: agg_input,
+                group_by,
+                aggregations,
+            },
+        ) => {
+            // Innermost (closest to the aggregate) first.
+            proj_stack.reverse();
+            (
+                VecRoot::AggregateGeneral {
+                    group_by,
+                    aggregations,
+                    projections: proj_stack,
+                    sort_items,
+                },
+                agg_input.as_ref(),
+            )
+        }
+        // No aggregate beneath. Only a single projection is a recognizable
+        // plain-projection root; a stack with no aggregate is declined.
+        (1, other) => {
             // Sort keys over a plain projection evaluate against the
             // projected row; a barrier project drops the pipeline variables,
             // so the bulk gather could diverge from the fallback lookups.
@@ -399,6 +555,7 @@ fn recognize(plan: &PhysicalOperator) -> Option<VecPipeline<'_>> {
             }
             (VecRoot::Project { items }, other)
         }
+        _ => return None,
     };
 
     // Walk the linear chain top-down, alternating a filter region with one
@@ -535,6 +692,7 @@ fn recognize(plan: &PhysicalOperator) -> Option<VecPipeline<'_>> {
     // Per-root expression eligibility.
     let mut project_sort = None;
     let mut collapse = None;
+    let mut general_agg = false;
     match &root {
         VecRoot::Project { items } => {
             for (expr, _) in items.iter() {
@@ -572,25 +730,49 @@ fn recognize(plan: &PhysicalOperator) -> Option<VecPipeline<'_>> {
             if limited_distinct {
                 return None;
             }
-            for (expr, _) in group_by.iter() {
-                prop_read(expr, &chain_vars)?;
-            }
-            for (agg_fn, inner, _) in aggregations.iter() {
+            // Decide between the fast path (every group key and aggregate
+            // input is a single-property read on a chain node variable, folded
+            // through dense group codes and bulk gathers) and the general path
+            // (arbitrary scalar expressions over chain node and relationship
+            // variables, including edge properties, folded per row through the
+            // shared evaluator). Anything the general path also cannot evaluate
+            // declines to the row pipeline.
+            let group_simple = group_by
+                .iter()
+                .all(|(e, _)| prop_read(e, &chain_vars).is_some());
+            let aggs_simple = aggregations.iter().all(|(agg_fn, inner, _)| {
                 let count_like = match inner {
                     Expr::CountStar => matches!(agg_fn, AggFn::Count { .. }),
                     // A whole bound variable is never null here, so a
-                    // non-distinct count over it is a row count. Any other
-                    // aggregate over a whole variable needs the row value.
+                    // non-distinct count over it is a row count.
                     Expr::Prop(var, prop) if prop.is_empty() => {
                         matches!(agg_fn, AggFn::Count { distinct: false })
-                            && (col_of(&chain_vars, var).is_some()
-                                || rel_vars.contains(&var.as_str()))
+                            && col_of(&chain_vars, var).is_some()
                     }
                     _ => false,
                 };
-                if !count_like && prop_read(inner, &chain_vars).is_none() {
-                    return None;
+                count_like || prop_read(inner, &chain_vars).is_some()
+            });
+
+            if !(group_simple && aggs_simple) {
+                // General path: every referenced variable must be a chain node
+                // or relationship variable so each row's value is computable
+                // from the per-row bindings.
+                for (e, _) in group_by.iter() {
+                    if !agg_expr_eligible(e, &chain_vars, &rel_vars) {
+                        return None;
+                    }
                 }
+                for (agg_fn, inner, _) in aggregations.iter() {
+                    if matches!(inner, Expr::CountStar) {
+                        if !matches!(agg_fn, AggFn::Count { .. }) {
+                            return None;
+                        }
+                    } else if !agg_expr_eligible(inner, &chain_vars, &rel_vars) {
+                        return None;
+                    }
+                }
+                general_agg = true;
             }
             // The projection and sort above the aggregate run through the
             // regular operators, so their expressions need no eligibility.
@@ -602,7 +784,7 @@ fn recognize(plan: &PhysicalOperator) -> Option<VecPipeline<'_>> {
             // every terminal row. The final region's filters must read only the
             // terminal variable, so a neighbor's qualification is independent of
             // the pre-row it extends.
-            if !expands.is_empty() && aggregations.len() == 1 {
+            if !general_agg && !expands.is_empty() && aggregations.len() == 1 {
                 let (agg_fn, inner, _) = &aggregations[0];
                 let terminal = chain_vars[chain_vars.len() - 1];
                 let tc = match inner {
@@ -630,7 +812,53 @@ fn recognize(plan: &PhysicalOperator) -> Option<VecPipeline<'_>> {
                 }
             }
         }
+        // A multi-projection aggregate (WITH-aggregate then RETURN projection)
+        // built directly above. The fast path never handled this shape, so it
+        // is always general; validate that every group key and aggregate input
+        // is evaluable from the per-row node and edge bindings.
+        VecRoot::AggregateGeneral {
+            group_by,
+            aggregations,
+            ..
+        } => {
+            for (e, _) in group_by.iter() {
+                if !agg_expr_eligible(e, &chain_vars, &rel_vars) {
+                    return None;
+                }
+            }
+            for (agg_fn, inner, _) in aggregations.iter() {
+                if matches!(inner, Expr::CountStar) {
+                    if !matches!(agg_fn, AggFn::Count { .. }) {
+                        return None;
+                    }
+                } else if !agg_expr_eligible(inner, &chain_vars, &rel_vars) {
+                    return None;
+                }
+            }
+        }
     }
+
+    // Promote a general-expression aggregate to its own root so the executor
+    // takes the per-row evaluator path instead of the dense-code fast path.
+    let root = if general_agg {
+        match root {
+            VecRoot::Aggregate {
+                group_by,
+                aggregations,
+                project_items,
+                project_is_barrier,
+                sort_items,
+            } => VecRoot::AggregateGeneral {
+                group_by,
+                aggregations,
+                projections: vec![(project_items, project_is_barrier)],
+                sort_items,
+            },
+            other => other,
+        }
+    } else {
+        root
+    };
 
     Some(VecPipeline {
         leaf,
@@ -658,6 +886,24 @@ fn props_table(graph: &Graph, ids: &[NodeId], props: &[&str]) -> Result<Vec<Vec<
         })
 }
 
+/// Edge counterpart of [`props_table`]: bulk row-major gather of edge `props`
+/// for each edge id in `ids`, through the in-memory edge property columns.
+fn edge_props_table(
+    graph: &Graph,
+    ids: &[EdgeId],
+    props: &[&str],
+) -> Result<Vec<Vec<Value>>, String> {
+    if props.is_empty() {
+        return Ok(Vec::new());
+    }
+    graph
+        .edge_props_json_table(ids, props)
+        .map_err(|e| match e {
+            issundb_core::Error::EdgeNotFound(id) => format!("edge not found: {}", id),
+            other => other.to_string(),
+        })
+}
+
 /// Single-property gather as one flat column, avoiding the row-major table's
 /// per-row vector allocation.
 fn prop_column(graph: &Graph, ids: &[NodeId], prop: &str) -> Result<Vec<Value>, String> {
@@ -673,6 +919,11 @@ fn prop_column(graph: &Graph, ids: &[NodeId], prop: &str) -> Result<Vec<Value>, 
 /// row's bindings survive or drop together.
 struct IdCols {
     cols: Vec<Vec<NodeId>>,
+    /// One edge-id column per materialized hop, in hop order, populated only
+    /// when the pipeline needs relationship bindings (the general aggregate
+    /// path). Empty otherwise. Fanned out and compacted in lockstep with
+    /// `cols`, so `edge_cols[h][i]` is the edge id of hop `h` for row `i`.
+    edge_cols: Vec<Vec<EdgeId>>,
 }
 
 impl IdCols {
@@ -686,9 +937,9 @@ impl IdCols {
     }
 
     /// Order-preserving compaction by a per-row keep mask, applied to every
-    /// column.
+    /// node and edge column in lockstep.
     fn compact(&mut self, mask: &[bool]) {
-        for col in &mut self.cols {
+        for col in self.cols.iter_mut().chain(self.edge_cols.iter_mut()) {
             let mut w = 0;
             for (i, keep) in mask.iter().enumerate() {
                 if *keep {
@@ -1091,8 +1342,13 @@ pub(super) fn try_execute_vectorized(
             None => return Ok(None),
         },
     };
+    // The general aggregate path binds each row's relationship variables, so
+    // the expansion must carry an edge-id column per hop; every other root
+    // ignores edge identity and skips the extra columns.
+    let track_edges = matches!(p.root, VecRoot::AggregateGeneral { .. });
     let mut cols = IdCols {
         cols: vec![leaf_ids],
+        edge_cols: Vec::new(),
     };
 
     // 2. Apply the leaf-level stages, then each hop followed by that hop's
@@ -1114,23 +1370,39 @@ pub(super) fn try_execute_vectorized(
         distinct.sort_unstable();
         distinct.dedup();
         let transitions = expand_multi_type(graph, &distinct, x.rel_type, x.is_incoming)?;
-        let mut per_src: ahash::AHashMap<NodeId, Vec<NodeId>> = ahash::AHashMap::new();
-        for (s, _e, d) in transitions {
-            per_src.entry(s).or_default().push(d);
+        let mut per_src: ahash::AHashMap<NodeId, Vec<(EdgeId, NodeId)>> = ahash::AHashMap::new();
+        for (s, e, d) in transitions {
+            per_src.entry(s).or_default().push((e, d));
         }
         let n = cols.len();
         let mut new_cols: Vec<Vec<NodeId>> = vec![Vec::new(); width + 1];
+        // When tracking edges, carry the prior hops' edge columns plus one new
+        // column for this hop, fanned out in lockstep with the node columns.
+        let mut new_edge_cols: Vec<Vec<EdgeId>> = if track_edges {
+            (0..=k).map(|_| Vec::new()).collect()
+        } else {
+            Vec::new()
+        };
         for i in 0..n {
             if let Some(neighbors) = per_src.get(&cols.cols[width - 1][i]) {
-                for &d in neighbors {
+                for &(e, d) in neighbors {
                     for (new_col, old_col) in new_cols.iter_mut().zip(&cols.cols) {
                         new_col.push(old_col[i]);
                     }
                     new_cols[width].push(d);
+                    if track_edges {
+                        for (h, old_edge_col) in cols.edge_cols.iter().enumerate() {
+                            new_edge_cols[h].push(old_edge_col[i]);
+                        }
+                        new_edge_cols[k].push(e);
+                    }
                 }
             }
         }
-        cols = IdCols { cols: new_cols };
+        cols = IdCols {
+            cols: new_cols,
+            edge_cols: new_edge_cols,
+        };
         for stage in &p.stages[k + 1] {
             apply_stage(graph, stage, params, schema, &p.chain_vars, &mut cols)?;
         }
@@ -1142,7 +1414,10 @@ pub(super) fn try_execute_vectorized(
     }
 
     let n = cols.len();
-    let id_cols = cols.cols;
+    let IdCols {
+        cols: id_cols,
+        edge_cols,
+    } = cols;
 
     match p.root {
         VecRoot::Project { items } => {
@@ -1384,6 +1659,137 @@ pub(super) fn try_execute_vectorized(
             }
             Ok(Some(records))
         }
+        VecRoot::AggregateGeneral {
+            group_by,
+            aggregations,
+            projections,
+            sort_items,
+        } => {
+            use std::collections::BTreeMap;
+            // Bulk-gather every referenced property once per variable (one
+            // dense-index pass over the node or edge columns), then fold per
+            // row exactly as the row pipeline's `aggregate_all` does: same
+            // group key, same group order (a `BTreeMap` over the serialized
+            // key), same aggregate states, and same finalize. Each row binds
+            // its variables to scalar objects built from the pre-gathered
+            // cells, so `evaluate_expr` resolves `var.prop` with no per-access
+            // graph lookup, while its expression semantics stay identical.
+            let mut node_props: Vec<Vec<&str>> = vec![Vec::new(); p.chain_vars.len()];
+            let mut edge_props: Vec<Vec<&str>> = vec![Vec::new(); p.expands.len()];
+            let mut refs: Vec<(&str, &str)> = Vec::new();
+            for (e, _) in group_by.iter() {
+                collect_props(e, &mut refs);
+            }
+            for (_, inner, _) in aggregations.iter() {
+                collect_props(inner, &mut refs);
+            }
+            for (var, prop) in refs {
+                if let Some(c) = col_of(&p.chain_vars, var) {
+                    node_props[c].push(prop);
+                } else if let Some(h) = p.expands.iter().position(|ex| ex.rel_var == var) {
+                    edge_props[h].push(prop);
+                }
+            }
+            let node_tables: Vec<Vec<Vec<Value>>> = (0..id_cols.len())
+                .map(|c| props_table(graph, &id_cols[c], &node_props[c]))
+                .collect::<Result<_, _>>()?;
+            let edge_tables: Vec<Vec<Vec<Value>>> = (0..edge_cols.len())
+                .map(|h| edge_props_table(graph, &edge_cols[h], &edge_props[h]))
+                .collect::<Result<_, _>>()?;
+
+            // Bind one row's variables to scalar objects of their gathered
+            // properties (cells moved out, since each row is consumed once).
+            let bind_row = |i: usize,
+                            node_tables: &mut Vec<Vec<Vec<Value>>>,
+                            edge_tables: &mut Vec<Vec<Vec<Value>>>|
+             -> SlotRow {
+                let mut row = SlotRow::empty(schema.clone());
+                for (c, var) in p.chain_vars.iter().enumerate() {
+                    if node_props[c].is_empty() {
+                        continue;
+                    }
+                    let mut m = serde_json::Map::with_capacity(node_props[c].len());
+                    for (j, prop) in node_props[c].iter().enumerate() {
+                        m.insert(prop.to_string(), std::mem::take(&mut node_tables[c][i][j]));
+                    }
+                    row.bind_local(var, GraphBinding::Scalar(Value::Object(m)));
+                }
+                for (h, ex) in p.expands.iter().enumerate() {
+                    if edge_props[h].is_empty() {
+                        continue;
+                    }
+                    let mut m = serde_json::Map::with_capacity(edge_props[h].len());
+                    for (j, prop) in edge_props[h].iter().enumerate() {
+                        m.insert(prop.to_string(), std::mem::take(&mut edge_tables[h][i][j]));
+                    }
+                    row.bind_local(ex.rel_var, GraphBinding::Scalar(Value::Object(m)));
+                }
+                row
+            };
+
+            let mut node_tables = node_tables;
+            let mut edge_tables = edge_tables;
+            let mut groups: BTreeMap<String, (SlotRow, Vec<AggState>)> = BTreeMap::new();
+            if group_by.is_empty() {
+                let states = aggregations.iter().map(|_| AggState::new()).collect();
+                groups.insert(String::new(), (SlotRow::empty(schema.clone()), states));
+            }
+            for i in 0..n {
+                let row = bind_row(i, &mut node_tables, &mut edge_tables);
+
+                let mut key_parts = Vec::with_capacity(group_by.len());
+                let mut gb_row = SlotRow::empty(schema.clone());
+                for (expr, alias) in group_by.iter() {
+                    let val = evaluate_expr(graph, &row, expr, params)?;
+                    let col = group_by_column_name(expr, alias);
+                    key_parts.push(val.to_string());
+                    gb_row.bind_local(&col, GraphBinding::Scalar(val));
+                }
+                let group_key = key_parts.join("\x00");
+                let entry = groups.entry(group_key).or_insert_with(|| {
+                    let states = aggregations.iter().map(|_| AggState::new()).collect();
+                    (gb_row, states)
+                });
+                for (k, (agg_fn, inner, _)) in aggregations.iter().enumerate() {
+                    let state = &mut entry.1[k];
+                    if matches!(agg_fn, AggFn::Count { .. }) && matches!(inner, Expr::CountStar) {
+                        state.fold_count_star();
+                    } else {
+                        let val = evaluate_expr(graph, &row, inner, params)?;
+                        state.fold(agg_fn, val);
+                    }
+                }
+            }
+
+            let mut agg_rows = Vec::with_capacity(groups.len());
+            for (_key, (mut gb_row, states)) in groups {
+                for (k, (agg_fn, _inner, col)) in aggregations.iter().enumerate() {
+                    let val = states[k].finalize(graph, agg_fn, params)?;
+                    gb_row.bind_local(col, GraphBinding::Scalar(val));
+                }
+                agg_rows.push(gb_row);
+            }
+
+            // Apply each projection layer in order (innermost first), exactly
+            // as the stacked `Project` operators run in the row pipeline.
+            let mut rows = agg_rows;
+            for (items, is_barrier) in &projections {
+                rows = project_rows(graph, rows, items, *is_barrier, params)?;
+            }
+            let bound = p.limit.map(|(skip, count)| skip.saturating_add(count));
+            let rows = match sort_items {
+                Some(items) => sort_all(graph, rows, items, bound, params),
+                None => rows,
+            };
+            let mut records = rows_to_records(graph, &return_clause.items, rows)?;
+            if let Some((skip, count)) = p.limit {
+                if skip > 0 {
+                    records.drain(..skip.min(records.len()));
+                }
+                records.truncate(count);
+            }
+            Ok(Some(records))
+        }
     }
 }
 
@@ -1445,6 +1851,7 @@ fn execute_collapsed_count(
     distinct_neighbors.dedup();
     let mut mini = IdCols {
         cols: vec![distinct_neighbors],
+        edge_cols: Vec::new(),
     };
     let term_only_vars = [terminal];
     if let Some(level) = p.stages.last() {
@@ -1690,6 +2097,118 @@ mod tests {
         }
     }
 
+    /// A two-hop "at-bat" graph with edge properties on both hops, shaped like
+    /// the benchmark's platoon-advantage query: `(:Player)-[:BATTED]->(:Event)
+    /// <-[:PITCHED]-(:Player)`. Batter and pitcher edges carry handedness and
+    /// stat counters; the middle event carries a run marker.
+    fn edge_prop_fixture() -> (TempDir, Graph) {
+        let dir = TempDir::new().unwrap();
+        let g = Graph::open(dir.path(), 1).unwrap();
+        let players: Vec<_> = (0..6)
+            .map(|i| {
+                let hand = if i % 2 == 0 { "L" } else { "R" };
+                g.add_node("Player", &json!({ "name": format!("p{i}"), "hand": hand }))
+                    .unwrap()
+            })
+            .collect();
+        for ev in 0..40usize {
+            let run = if ev % 3 == 0 {
+                Some(ev as i64 % 4)
+            } else {
+                None
+            };
+            let event = g
+                .add_node("Event", &json!({ "run_b": run, "idx": ev as i64 }))
+                .unwrap();
+            let batter = players[ev % players.len()];
+            let pitcher = players[(ev * 2 + 1) % players.len()];
+            let bhand = if ev % 2 == 0 { "L" } else { "R" };
+            let phand = if ev % 3 == 0 { "L" } else { "R" };
+            g.add_edge(
+                batter,
+                event,
+                "BATTED",
+                &json!({ "bathand": bhand, "pa": 1, "hr": ev as i64 % 5, "ab": (ev as i64) % 2 }),
+            )
+            .unwrap();
+            g.add_edge(
+                pitcher,
+                event,
+                "PITCHED",
+                &json!({ "pithand": phand, "pitches": ev as i64 % 7 }),
+            )
+            .unwrap();
+        }
+        (dir, g)
+    }
+
+    #[test]
+    fn general_aggregate_over_edge_props_is_recognized() {
+        let (_dir, g) = edge_prop_fixture();
+        let plan = optimized_plan(
+            &g,
+            "MATCH (:Player)-[be:BATTED]->(e:Event)<-[pe:PITCHED]-(:Player) \
+             WITH CASE WHEN be.bathand <> pe.pithand THEN 'adv' ELSE 'dis' END AS m, \
+                  SUM(be.pa) AS pa, SUM(be.hr) AS hr, \
+                  SUM(CASE WHEN e.run_b IS NOT NULL THEN 1 ELSE 0 END) AS runs \
+             RETURN m, pa, hr, runs ORDER BY m",
+        );
+        assert!(
+            matches!(
+                recognize(&plan),
+                Some(VecPipeline {
+                    root: VecRoot::AggregateGeneral { .. },
+                    ..
+                })
+            ),
+            "expected a general aggregate root, got: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn general_aggregate_edge_props_matches_row_path() {
+        let (_dir, g) = edge_prop_fixture();
+        // Group key is a CASE over two edge properties; aggregate inputs mix a
+        // CASE over a node property with bare edge-property sums. This is the
+        // shape that previously fell to the row pipeline.
+        assert_matches_row_path(
+            &g,
+            "MATCH (:Player)-[be:BATTED]->(e:Event)<-[pe:PITCHED]-(:Player) \
+             WITH CASE WHEN be.bathand <> pe.pithand THEN 'Batter Adv' ELSE 'Pitcher Adv' END AS matchup, \
+                  SUM(be.pa) AS pa, \
+                  SUM(CASE WHEN e.run_b IS NOT NULL THEN 1 ELSE 0 END) AS runs, \
+                  SUM(be.hr) AS hr \
+             RETURN matchup, pa, runs, \
+                    ROUND(toFloat(runs) / (CASE WHEN pa = 0 THEN null ELSE pa END), 3) AS rpa \
+             ORDER BY matchup",
+        );
+    }
+
+    #[test]
+    fn general_aggregate_edge_prop_grouping_matches_row_path() {
+        let (_dir, g) = edge_prop_fixture();
+        // Group directly by an edge property, aggregate another edge property,
+        // and also count a node-property non-null.
+        assert_matches_row_path(
+            &g,
+            "MATCH (:Player)-[be:BATTED]->(e:Event)<-[pe:PITCHED]-(:Player) \
+             WITH be.bathand AS bh, pe.pithand AS ph, \
+                  SUM(be.hr) AS hr, count(e.run_b) AS scored \
+             RETURN bh, ph, hr, scored ORDER BY bh, ph",
+        );
+    }
+
+    #[test]
+    fn general_aggregate_no_group_key_matches_row_path() {
+        let (_dir, g) = edge_prop_fixture();
+        assert_matches_row_path(
+            &g,
+            "MATCH (:Player)-[be:BATTED]->(e:Event)<-[pe:PITCHED]-(:Player) \
+             RETURN SUM(be.pa + be.hr) AS total, \
+                    SUM(CASE WHEN be.bathand = pe.pithand THEN 1 ELSE 0 END) AS same_hand",
+        );
+    }
+
     #[test]
     fn recognizes_projection_and_aggregate_roots() {
         let (_dir, g) = fixture();
@@ -1829,6 +2348,45 @@ mod tests {
         ] {
             assert_matches_row_path(&g, cypher);
         }
+    }
+
+    #[test]
+    fn group_by_node_identity_matches_group_by_unique_property() {
+        let (_dir, g) = fixture();
+        let params = std::collections::HashMap::new();
+        // Grouping by the node variable keys on node identity, so it must
+        // produce the same groups as grouping by a property unique to each
+        // node, and the node must stay usable for a downstream property read
+        // (`b.name`) and an `ORDER BY` over it.
+        let by_node = row_path_execute(
+            &g,
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) \
+             WITH b, count(*) AS n RETURN b.name AS name, n ORDER BY name",
+            &params,
+        )
+        .unwrap();
+        let by_name = row_path_execute(
+            &g,
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) \
+             WITH b.name AS name, count(*) AS n RETURN name, n ORDER BY name",
+            &params,
+        )
+        .unwrap();
+        let node_rows: Vec<_> = by_node.records.iter().map(|r| &r.values).collect();
+        let name_rows: Vec<_> = by_name.records.iter().map(|r| &r.values).collect();
+        assert_eq!(
+            node_rows, name_rows,
+            "node grouping vs unique-property grouping"
+        );
+        assert_eq!(
+            node_rows,
+            vec![
+                &vec![json!("ada"), json!(1)],
+                &vec![json!("bob"), json!(3)],
+                &vec![json!("cal"), json!(1)],
+            ],
+            "concrete grouped counts"
+        );
     }
 
     #[test]
@@ -2074,7 +2632,10 @@ mod tests {
         }
         let srcs = g.nodes_by_label("Person").unwrap();
         let n = srcs.len();
-        let cols = IdCols { cols: vec![srcs] };
+        let cols = IdCols {
+            cols: vec![srcs],
+            edge_cols: Vec::new(),
+        };
         let chain_vars: [&str; 1] = ["p"];
         let schema = std::sync::Arc::new(SlotSchema::empty());
         let params = HashMap::new();

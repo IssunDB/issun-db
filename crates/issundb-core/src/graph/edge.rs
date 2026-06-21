@@ -19,6 +19,7 @@ impl Graph {
         let edge_id = self.add_edge_impl(&mut wtxn, src, dst, etype, props)?;
         wtxn.commit()?;
         self.csr_cache.record_added_edge(src, dst);
+        self.edge_columns.record_touched(edge_id);
         self.maybe_spawn_rebuild();
         Ok(edge_id)
     }
@@ -91,6 +92,7 @@ impl Graph {
             .edges
             .put(&mut wtxn, &id, &crate::storage::props::encode(&new_record)?)?;
         wtxn.commit()?;
+        self.edge_columns.record_touched(id);
         Ok(())
     }
 
@@ -120,6 +122,8 @@ impl Graph {
         wtxn.commit()?;
         if let Some((src, dst)) = endpoints {
             self.csr_cache.record_removed_edge(src, dst);
+            // The deletion reshuffles the dense edge mapping; force a rebuild.
+            self.edge_columns.record_force_full();
         }
         self.maybe_spawn_rebuild();
         Ok(())

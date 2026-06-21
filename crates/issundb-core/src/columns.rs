@@ -17,8 +17,94 @@ use ahash::AHashMap;
 use serde_json::Value;
 
 use crate::error::Error;
-use crate::schema::{NodeId, NodeRecord};
+use crate::schema::{EdgeId, EdgeRecord, NodeId, NodeRecord};
 use crate::storage::{lmdb::Storage, props};
+
+/// Abstracts which LMDB sub-database a column set is built from, so the same
+/// columnar machinery serves both node and edge properties. A source knows how
+/// to enumerate every entity's decoded properties, re-read one entity, and name
+/// the not-found error for its entity kind.
+pub(crate) trait ColumnSource {
+    /// The entity id type (a `u64` for both nodes and edges).
+    type Id: Copy + Eq + std::hash::Hash;
+
+    /// Decode every entity's user properties as JSON, in storage iteration
+    /// order. Each item is `(id, props_json)`.
+    fn scan_all(storage: &Storage) -> Result<Vec<(Self::Id, Value)>, Error>;
+
+    /// Re-read one entity's user properties as JSON; `None` if it no longer
+    /// exists (deleted between commit and refresh).
+    fn fetch_one(storage: &Storage, id: Self::Id) -> Result<Option<Value>, Error>;
+
+    /// The not-found error for this entity kind.
+    fn not_found(id: Self::Id) -> Error;
+}
+
+/// Builds node property columns from the `nodes` sub-database.
+pub(crate) struct NodeSource;
+
+impl ColumnSource for NodeSource {
+    type Id = NodeId;
+
+    fn scan_all(storage: &Storage) -> Result<Vec<(NodeId, Value)>, Error> {
+        let rtxn = storage.env.read_txn()?;
+        let mut out = Vec::new();
+        for entry in storage.nodes.iter(&rtxn)? {
+            let (id, bytes) = entry?;
+            let rec: NodeRecord = props::decode(bytes)?;
+            out.push((id, props::decode(&rec.props)?));
+        }
+        Ok(out)
+    }
+
+    fn fetch_one(storage: &Storage, id: NodeId) -> Result<Option<Value>, Error> {
+        let rtxn = storage.env.read_txn()?;
+        match storage.nodes.get(&rtxn, &id)? {
+            Some(bytes) => {
+                let rec: NodeRecord = props::decode(bytes)?;
+                Ok(Some(props::decode(&rec.props)?))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn not_found(id: NodeId) -> Error {
+        Error::NodeNotFound(id)
+    }
+}
+
+/// Builds edge property columns from the `edges` sub-database.
+pub(crate) struct EdgeSource;
+
+impl ColumnSource for EdgeSource {
+    type Id = EdgeId;
+
+    fn scan_all(storage: &Storage) -> Result<Vec<(EdgeId, Value)>, Error> {
+        let rtxn = storage.env.read_txn()?;
+        let mut out = Vec::new();
+        for entry in storage.edges.iter(&rtxn)? {
+            let (id, bytes) = entry?;
+            let rec: EdgeRecord = props::decode(bytes)?;
+            out.push((id, props::decode(&rec.props)?));
+        }
+        Ok(out)
+    }
+
+    fn fetch_one(storage: &Storage, id: EdgeId) -> Result<Option<Value>, Error> {
+        let rtxn = storage.env.read_txn()?;
+        match storage.edges.get(&rtxn, &id)? {
+            Some(bytes) => {
+                let rec: EdgeRecord = props::decode(bytes)?;
+                Ok(Some(props::decode(&rec.props)?))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn not_found(id: EdgeId) -> Error {
+        Error::EdgeNotFound(id)
+    }
+}
 
 /// One typed column over dense node indices.
 pub(crate) enum PropColumn {
@@ -252,10 +338,11 @@ impl PropStats {
     }
 }
 
-/// The materialized column set with its own dense node mapping.
-pub(crate) struct PropColumns {
-    pub(crate) id_to_dense: AHashMap<NodeId, u32>,
-    pub(crate) dense_to_id: Vec<NodeId>,
+/// The materialized column set with its own dense entity mapping. Generic over
+/// the [`ColumnSource`] that supplies the entities (nodes or edges).
+pub(crate) struct PropColumns<S: ColumnSource> {
+    pub(crate) id_to_dense: AHashMap<S::Id, u32>,
+    pub(crate) dense_to_id: Vec<S::Id>,
     pub(crate) cols: AHashMap<String, PropColumn>,
     /// Per-property stats, computed on first access through [`prop_stats`]
     /// and invalidated wholesale by [`patch`] (a patch clears the touched
@@ -265,27 +352,20 @@ pub(crate) struct PropColumns {
     stats: AHashMap<String, Option<PropStats>>,
 }
 
-impl PropColumns {
+impl<S: ColumnSource> PropColumns<S> {
     /// Build columns for every property name present, from one full scan.
     fn build(storage: &Storage) -> Result<Self, Error> {
-        let rtxn = storage.env.read_txn()?;
-        let mut dense_to_id = Vec::new();
-        let mut decoded: Vec<Value> = Vec::new();
-        for entry in storage.nodes.iter(&rtxn)? {
-            let (id, bytes) = entry?;
-            let rec: NodeRecord = props::decode(bytes)?;
-            dense_to_id.push(id);
-            decoded.push(props::decode(&rec.props)?);
+        let items = S::scan_all(storage)?;
+        let n = items.len();
+        let mut dense_to_id = Vec::with_capacity(n);
+        let mut id_to_dense: AHashMap<S::Id, u32> = AHashMap::with_capacity(n);
+        for (i, (id, _)) in items.iter().enumerate() {
+            dense_to_id.push(*id);
+            id_to_dense.insert(*id, i as u32);
         }
-        let n = dense_to_id.len();
-        let id_to_dense: AHashMap<NodeId, u32> = dense_to_id
-            .iter()
-            .enumerate()
-            .map(|(i, &id)| (id, i as u32))
-            .collect();
 
         let mut values: AHashMap<String, Vec<Option<Value>>> = AHashMap::new();
-        for (dense, json) in decoded.into_iter().enumerate() {
+        for (dense, (_, json)) in items.into_iter().enumerate() {
             if let Value::Object(map) = json {
                 for (k, v) in map {
                     let col = values.entry(k).or_insert_with(|| vec![None; n]);
@@ -323,16 +403,13 @@ impl PropColumns {
     /// node is an error, matching the per-row executor path.
     pub(crate) fn props_table(
         &self,
-        ids: &[NodeId],
+        ids: &[S::Id],
         props: &[&str],
     ) -> Result<Vec<Vec<Value>>, Error> {
         let cols: Vec<Option<&PropColumn>> = props.iter().map(|p| self.cols.get(*p)).collect();
         let mut out = Vec::with_capacity(ids.len());
         for &id in ids {
-            let dense = *self
-                .id_to_dense
-                .get(&id)
-                .ok_or_else(|| Error::NodeNotFound(id))? as usize;
+            let dense = *self.id_to_dense.get(&id).ok_or_else(|| S::not_found(id))? as usize;
             out.push(
                 cols.iter()
                     .map(|c| c.and_then(|c| c.get_json_opt(dense)).unwrap_or(Value::Null))
@@ -348,14 +425,11 @@ impl PropColumns {
     /// allocation per id. Same semantics: a missing property (or a property
     /// name with no column) reads as `Value::Null`; a missing node is an
     /// error.
-    pub(crate) fn prop_column(&self, ids: &[NodeId], prop: &str) -> Result<Vec<Value>, Error> {
+    pub(crate) fn prop_column(&self, ids: &[S::Id], prop: &str) -> Result<Vec<Value>, Error> {
         let col = self.cols.get(prop);
         let mut out = Vec::with_capacity(ids.len());
         for &id in ids {
-            let dense = *self
-                .id_to_dense
-                .get(&id)
-                .ok_or_else(|| Error::NodeNotFound(id))? as usize;
+            let dense = *self.id_to_dense.get(&id).ok_or_else(|| S::not_found(id))? as usize;
             out.push(
                 col.and_then(|c| c.get_json_opt(dense))
                     .unwrap_or(Value::Null),
@@ -377,7 +451,7 @@ impl PropColumns {
     /// array index); no `Value` is built per row.
     pub(crate) fn group_codes(
         &self,
-        ids: &[NodeId],
+        ids: &[S::Id],
         prop: &str,
     ) -> Result<(Vec<u32>, Vec<Value>), Error> {
         let mut codes = Vec::with_capacity(ids.len());
@@ -387,7 +461,7 @@ impl PropColumns {
             // No such column: every (existing) id is one null group.
             for &id in ids {
                 if !self.id_to_dense.contains_key(&id) {
-                    return Err(Error::NodeNotFound(id));
+                    return Err(S::not_found(id));
                 }
             }
             if !ids.is_empty() {
@@ -410,11 +484,8 @@ impl PropColumns {
             PropColumn::Int(v) => {
                 let mut seen: AHashMap<i64, u32> = AHashMap::new();
                 for &id in ids {
-                    let dense = *self
-                        .id_to_dense
-                        .get(&id)
-                        .ok_or_else(|| Error::NodeNotFound(id))?
-                        as usize;
+                    let dense =
+                        *self.id_to_dense.get(&id).ok_or_else(|| S::not_found(id))? as usize;
                     codes.push(match v[dense] {
                         None => intern_null(&mut reps),
                         Some(n) => *seen.entry(n).or_insert_with(|| {
@@ -430,11 +501,8 @@ impl PropColumns {
                 // identity is serialization identity.
                 let mut seen: AHashMap<u64, u32> = AHashMap::new();
                 for &id in ids {
-                    let dense = *self
-                        .id_to_dense
-                        .get(&id)
-                        .ok_or_else(|| Error::NodeNotFound(id))?
-                        as usize;
+                    let dense =
+                        *self.id_to_dense.get(&id).ok_or_else(|| S::not_found(id))? as usize;
                     codes.push(match v[dense] {
                         None => intern_null(&mut reps),
                         Some(f) => *seen.entry(f.to_bits()).or_insert_with(|| {
@@ -447,11 +515,8 @@ impl PropColumns {
             PropColumn::Bool(v) => {
                 let mut seen: [Option<u32>; 2] = [None, None];
                 for &id in ids {
-                    let dense = *self
-                        .id_to_dense
-                        .get(&id)
-                        .ok_or_else(|| Error::NodeNotFound(id))?
-                        as usize;
+                    let dense =
+                        *self.id_to_dense.get(&id).ok_or_else(|| S::not_found(id))? as usize;
                     codes.push(match v[dense] {
                         None => intern_null(&mut reps),
                         Some(b) => *seen[b as usize].get_or_insert_with(|| {
@@ -466,11 +531,8 @@ impl PropColumns {
                 // per-row work is two array reads.
                 let mut dict_code: Vec<u32> = vec![u32::MAX; dict.len()];
                 for &id in ids {
-                    let dense = *self
-                        .id_to_dense
-                        .get(&id)
-                        .ok_or_else(|| Error::NodeNotFound(id))?
-                        as usize;
+                    let dense =
+                        *self.id_to_dense.get(&id).ok_or_else(|| S::not_found(id))? as usize;
                     codes.push(match idx[dense] {
                         STR_NULL => intern_null(&mut reps),
                         i => {
@@ -488,11 +550,8 @@ impl PropColumns {
                 // identity the executor's string-keyed fold uses.
                 let mut seen: AHashMap<String, u32> = AHashMap::new();
                 for &id in ids {
-                    let dense = *self
-                        .id_to_dense
-                        .get(&id)
-                        .ok_or_else(|| Error::NodeNotFound(id))?
-                        as usize;
+                    let dense =
+                        *self.id_to_dense.get(&id).ok_or_else(|| S::not_found(id))? as usize;
                     codes.push(match &v[dense] {
                         None => intern_null(&mut reps),
                         Some(val) => *seen.entry(val.to_string()).or_insert_with(|| {
@@ -508,23 +567,20 @@ impl PropColumns {
 
     /// Re-read `touched` node records and patch their slots in place. New
     /// nodes extend the dense mapping; new property names start a new column.
-    fn patch(&mut self, storage: &Storage, touched: &[NodeId]) -> Result<(), Error> {
+    fn patch(&mut self, storage: &Storage, touched: &[S::Id]) -> Result<(), Error> {
         // A patch clears the touched rows in every column before re-setting
         // the present properties, so every cached distribution may be stale,
         // including ones whose property the new records no longer carry.
         if !touched.is_empty() {
             self.stats.clear();
         }
-        let rtxn = storage.env.read_txn()?;
         for &id in touched {
-            let bytes = match storage.nodes.get(&rtxn, &id)? {
-                Some(b) => b,
+            let json = match S::fetch_one(storage, id)? {
+                Some(j) => j,
                 // Deleted between commit and refresh; deletion also sets
                 // force_full, so this patch run's result is discarded anyway.
                 None => continue,
             };
-            let rec: NodeRecord = props::decode(bytes)?;
-            let json: Value = props::decode(&rec.props)?;
             let dense = match self.id_to_dense.get(&id) {
                 Some(&d) => d as usize,
                 None => {
@@ -609,38 +665,56 @@ fn compute_prop_stats(col: &PropColumn) -> Option<PropStats> {
     })
 }
 
-/// Pending node mutations the columns have not absorbed yet.
-#[derive(Default)]
-struct ColumnsDelta {
-    touched: Vec<NodeId>,
+/// Pending entity mutations the columns have not absorbed yet.
+struct ColumnsDelta<Id> {
+    touched: Vec<Id>,
     force_full: bool,
 }
 
-/// Thread-safe lazy holder for [`PropColumns`], fed post-commit by the write
-/// path and refreshed on read access.
-#[derive(Default)]
-pub(crate) struct ColumnsCache {
-    columns: parking_lot::RwLock<Option<PropColumns>>,
-    pending: parking_lot::Mutex<ColumnsDelta>,
+impl<Id> Default for ColumnsDelta<Id> {
+    fn default() -> Self {
+        Self {
+            touched: Vec::new(),
+            force_full: false,
+        }
+    }
 }
 
-impl ColumnsCache {
-    /// Record an added or updated node. Called post-commit.
-    pub(crate) fn record_touched(&self, id: NodeId) {
+/// Thread-safe lazy holder for [`PropColumns`], fed post-commit by the write
+/// path and refreshed on read access. Generic over the [`ColumnSource`] so one
+/// instance serves nodes and another serves edges.
+pub(crate) struct ColumnsCache<S: ColumnSource> {
+    columns: parking_lot::RwLock<Option<PropColumns<S>>>,
+    pending: parking_lot::Mutex<ColumnsDelta<S::Id>>,
+}
+
+impl<S: ColumnSource> Default for ColumnsCache<S> {
+    fn default() -> Self {
+        Self {
+            columns: parking_lot::RwLock::new(None),
+            pending: parking_lot::Mutex::new(ColumnsDelta::default()),
+        }
+    }
+}
+
+impl<S: ColumnSource> ColumnsCache<S> {
+    /// Record an added or updated entity. Called post-commit.
+    pub(crate) fn record_touched(&self, id: S::Id) {
         let mut p = self.pending.lock();
         if !p.force_full {
             p.touched.push(id);
         }
     }
 
-    pub(crate) fn record_touched_many(&self, ids: &[NodeId]) {
+    pub(crate) fn record_touched_many(&self, ids: &[S::Id]) {
         let mut p = self.pending.lock();
         if !p.force_full {
             p.touched.extend_from_slice(ids);
         }
     }
 
-    /// Record a node deletion. Called post-commit.
+    /// Record a deletion (which reshuffles the dense mapping). Called
+    /// post-commit.
     pub(crate) fn record_force_full(&self) {
         let mut p = self.pending.lock();
         p.force_full = true;
@@ -652,7 +726,7 @@ impl ColumnsCache {
     pub(crate) fn with_fresh<T>(
         &self,
         storage: &Storage,
-        f: impl FnOnce(&PropColumns) -> T,
+        f: impl FnOnce(&PropColumns<S>) -> T,
     ) -> Result<T, Error> {
         loop {
             {
@@ -682,7 +756,7 @@ impl ColumnsCache {
     pub(crate) fn with_fresh_mut<T>(
         &self,
         storage: &Storage,
-        f: impl FnOnce(&mut PropColumns) -> T,
+        f: impl FnOnce(&mut PropColumns<S>) -> T,
     ) -> Result<T, Error> {
         let mut guard = self.columns.write();
         loop {
@@ -1061,5 +1135,110 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!((sel - 1.0).abs() < 1e-9, "got {sel}");
+    }
+
+    // ------------------------------------------------------------------
+    // Edge property columns
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn edge_typed_values_round_trip_and_missing_semantics() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("N", &()).unwrap();
+        let b = g.add_node("N", &()).unwrap();
+        let e = g
+            .add_edge(
+                a,
+                b,
+                "E",
+                &json!({ "i": 7, "s": "hit", "f": 1.5, "b": true }),
+            )
+            .unwrap();
+
+        assert_eq!(g.edge_prop_json(e, "i").unwrap(), Some(json!(7)));
+        assert_eq!(g.edge_prop_json(e, "s").unwrap(), Some(json!("hit")));
+        assert_eq!(g.edge_prop_json(e, "f").unwrap(), Some(json!(1.5)));
+        assert_eq!(g.edge_prop_json(e, "b").unwrap(), Some(json!(true)));
+        // Missing property is null; nonexistent edge is None.
+        assert_eq!(
+            g.edge_prop_json(e, "nope").unwrap(),
+            Some(serde_json::Value::Null)
+        );
+        assert_eq!(g.edge_prop_json(e + 999, "i").unwrap(), None);
+    }
+
+    #[test]
+    fn edge_table_and_column_gather_in_input_order() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("N", &()).unwrap();
+        let b = g.add_node("N", &()).unwrap();
+        let e1 = g.add_edge(a, b, "E", &json!({ "pa": 1, "hr": 1 })).unwrap();
+        let e2 = g.add_edge(a, b, "E", &json!({ "pa": 1 })).unwrap();
+
+        let table = g
+            .edge_props_json_table(&[e2, e1, e2], &["pa", "hr"])
+            .unwrap();
+        assert_eq!(
+            table,
+            vec![
+                vec![json!(1), serde_json::Value::Null],
+                vec![json!(1), json!(1)],
+                vec![json!(1), serde_json::Value::Null],
+            ]
+        );
+        let col = g.edge_prop_json_column(&[e2, e1], "hr").unwrap();
+        assert_eq!(col, vec![serde_json::Value::Null, json!(1)]);
+        // A nonexistent edge is an error, like the node gather.
+        assert!(g.edge_props_json_table(&[e1 + 999], &["pa"]).is_err());
+    }
+
+    #[test]
+    fn edge_group_codes_match_value_identity() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("N", &()).unwrap();
+        let b = g.add_node("N", &()).unwrap();
+        let e1 = g.add_edge(a, b, "E", &json!({ "hand": "L" })).unwrap();
+        let e2 = g.add_edge(a, b, "E", &json!({ "hand": "R" })).unwrap();
+        let e3 = g.add_edge(a, b, "E", &json!({ "hand": "L" })).unwrap();
+
+        let (codes, reps) = g.edge_prop_group_codes(&[e1, e2, e3], "hand").unwrap();
+        assert_eq!(codes[0], codes[2]);
+        assert_ne!(codes[0], codes[1]);
+        assert_eq!(reps[codes[0] as usize], json!("L"));
+        assert_eq!(reps[codes[1] as usize], json!("R"));
+    }
+
+    #[test]
+    fn edge_update_is_visible_and_delete_forces_rebuild() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("N", &()).unwrap();
+        let b = g.add_node("N", &()).unwrap();
+        let e1 = g.add_edge(a, b, "E", &json!({ "w": 1 })).unwrap();
+        let e2 = g.add_edge(a, b, "E", &json!({ "w": 2 })).unwrap();
+        assert_eq!(g.edge_prop_json(e1, "w").unwrap(), Some(json!(1)));
+
+        g.update_edge(e1, &json!({ "w": 10 })).unwrap();
+        assert_eq!(g.edge_prop_json(e1, "w").unwrap(), Some(json!(10)));
+
+        g.delete_edge(e1).unwrap();
+        // The surviving edge is still readable after the forced rebuild.
+        assert_eq!(g.edge_prop_json(e2, "w").unwrap(), Some(json!(2)));
+        assert_eq!(g.edge_prop_json(e1, "w").unwrap(), None);
+    }
+
+    #[test]
+    fn edge_columns_built_in_batch_transaction_are_visible() {
+        let (_dir, g) = open_tmp();
+        let (a, b) = g
+            .update(|txn| {
+                let a = txn.add_node("N", &())?;
+                let b = txn.add_node("N", &())?;
+                Ok((a, b))
+            })
+            .unwrap();
+        let e = g
+            .update(|txn| txn.add_edge(a, b, "E", &json!({ "k": 42 })))
+            .unwrap();
+        assert_eq!(g.edge_prop_json(e, "k").unwrap(), Some(json!(42)));
     }
 }
