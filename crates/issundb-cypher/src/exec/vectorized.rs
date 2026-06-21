@@ -232,6 +232,8 @@ fn vec_stage(expression: &FilterExpr) -> Option<VecStage<'_>> {
     }
 }
 
+type ProjLayer<'a> = (&'a [(Expr, Option<String>)], bool);
+
 enum VecRoot<'a> {
     /// The plan root is the final RETURN projection of single-property reads.
     Project { items: &'a [(Expr, Option<String>)] },
@@ -261,7 +263,7 @@ enum VecRoot<'a> {
     AggregateGeneral {
         group_by: &'a [(Expr, Option<String>)],
         aggregations: &'a [(AggFn, Expr, String)],
-        projections: Vec<(&'a [(Expr, Option<String>)], bool)>,
+        projections: Vec<ProjLayer<'a>>,
         sort_items: Option<&'a [SortItem]>,
     },
 }
@@ -486,8 +488,7 @@ fn recognize(plan: &PhysicalOperator) -> Option<VecPipeline<'_>> {
     // Peel the stack of `Project` layers above the (optional) aggregate. A
     // WITH-aggregate followed by a RETURN projection stacks two layers; an
     // aggregate in RETURN, or a plain projection, has one.
-    let mut proj_stack: Vec<(&[(Expr, Option<String>)], bool)> =
-        vec![(items.as_slice(), *is_barrier)];
+    let mut proj_stack: Vec<ProjLayer<'_>> = vec![(items.as_slice(), *is_barrier)];
     let mut stacked = input.as_ref();
     while let PhysicalOperator::Project {
         input: inner,
@@ -895,10 +896,12 @@ fn edge_props_table(
     if props.is_empty() {
         return Ok(Vec::new());
     }
-    graph.edge_props_json_table(ids, props).map_err(|e| match e {
-        issundb_core::Error::EdgeNotFound(id) => format!("edge not found: {}", id),
-        other => other.to_string(),
-    })
+    graph
+        .edge_props_json_table(ids, props)
+        .map_err(|e| match e {
+            issundb_core::Error::EdgeNotFound(id) => format!("edge not found: {}", id),
+            other => other.to_string(),
+        })
 }
 
 /// Single-property gather as one flat column, avoiding the row-major table's
@@ -1696,7 +1699,10 @@ pub(super) fn try_execute_vectorized(
 
             // Bind one row's variables to scalar objects of their gathered
             // properties (cells moved out, since each row is consumed once).
-            let bind_row = |i: usize, node_tables: &mut Vec<Vec<Vec<Value>>>, edge_tables: &mut Vec<Vec<Vec<Value>>>| -> SlotRow {
+            let bind_row = |i: usize,
+                            node_tables: &mut Vec<Vec<Vec<Value>>>,
+                            edge_tables: &mut Vec<Vec<Vec<Value>>>|
+             -> SlotRow {
                 let mut row = SlotRow::empty(schema.clone());
                 for (c, var) in p.chain_vars.iter().enumerate() {
                     if node_props[c].is_empty() {
@@ -2106,12 +2112,13 @@ mod tests {
             })
             .collect();
         for ev in 0..40usize {
-            let run = if ev % 3 == 0 { Some(ev as i64 % 4) } else { None };
+            let run = if ev % 3 == 0 {
+                Some(ev as i64 % 4)
+            } else {
+                None
+            };
             let event = g
-                .add_node(
-                    "Event",
-                    &json!({ "run_b": run, "idx": ev as i64 }),
-                )
+                .add_node("Event", &json!({ "run_b": run, "idx": ev as i64 }))
                 .unwrap();
             let batter = players[ev % players.len()];
             let pitcher = players[(ev * 2 + 1) % players.len()];
@@ -2367,7 +2374,10 @@ mod tests {
         .unwrap();
         let node_rows: Vec<_> = by_node.records.iter().map(|r| &r.values).collect();
         let name_rows: Vec<_> = by_name.records.iter().map(|r| &r.values).collect();
-        assert_eq!(node_rows, name_rows, "node grouping vs unique-property grouping");
+        assert_eq!(
+            node_rows, name_rows,
+            "node grouping vs unique-property grouping"
+        );
         assert_eq!(
             node_rows,
             vec![

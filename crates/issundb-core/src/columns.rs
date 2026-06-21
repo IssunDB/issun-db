@@ -409,10 +409,7 @@ impl<S: ColumnSource> PropColumns<S> {
         let cols: Vec<Option<&PropColumn>> = props.iter().map(|p| self.cols.get(*p)).collect();
         let mut out = Vec::with_capacity(ids.len());
         for &id in ids {
-            let dense = *self
-                .id_to_dense
-                .get(&id)
-                .ok_or_else(|| S::not_found(id))? as usize;
+            let dense = *self.id_to_dense.get(&id).ok_or_else(|| S::not_found(id))? as usize;
             out.push(
                 cols.iter()
                     .map(|c| c.and_then(|c| c.get_json_opt(dense)).unwrap_or(Value::Null))
@@ -432,10 +429,7 @@ impl<S: ColumnSource> PropColumns<S> {
         let col = self.cols.get(prop);
         let mut out = Vec::with_capacity(ids.len());
         for &id in ids {
-            let dense = *self
-                .id_to_dense
-                .get(&id)
-                .ok_or_else(|| S::not_found(id))? as usize;
+            let dense = *self.id_to_dense.get(&id).ok_or_else(|| S::not_found(id))? as usize;
             out.push(
                 col.and_then(|c| c.get_json_opt(dense))
                     .unwrap_or(Value::Null),
@@ -490,11 +484,8 @@ impl<S: ColumnSource> PropColumns<S> {
             PropColumn::Int(v) => {
                 let mut seen: AHashMap<i64, u32> = AHashMap::new();
                 for &id in ids {
-                    let dense = *self
-                        .id_to_dense
-                        .get(&id)
-                        .ok_or_else(|| S::not_found(id))?
-                        as usize;
+                    let dense =
+                        *self.id_to_dense.get(&id).ok_or_else(|| S::not_found(id))? as usize;
                     codes.push(match v[dense] {
                         None => intern_null(&mut reps),
                         Some(n) => *seen.entry(n).or_insert_with(|| {
@@ -510,11 +501,8 @@ impl<S: ColumnSource> PropColumns<S> {
                 // identity is serialization identity.
                 let mut seen: AHashMap<u64, u32> = AHashMap::new();
                 for &id in ids {
-                    let dense = *self
-                        .id_to_dense
-                        .get(&id)
-                        .ok_or_else(|| S::not_found(id))?
-                        as usize;
+                    let dense =
+                        *self.id_to_dense.get(&id).ok_or_else(|| S::not_found(id))? as usize;
                     codes.push(match v[dense] {
                         None => intern_null(&mut reps),
                         Some(f) => *seen.entry(f.to_bits()).or_insert_with(|| {
@@ -527,11 +515,8 @@ impl<S: ColumnSource> PropColumns<S> {
             PropColumn::Bool(v) => {
                 let mut seen: [Option<u32>; 2] = [None, None];
                 for &id in ids {
-                    let dense = *self
-                        .id_to_dense
-                        .get(&id)
-                        .ok_or_else(|| S::not_found(id))?
-                        as usize;
+                    let dense =
+                        *self.id_to_dense.get(&id).ok_or_else(|| S::not_found(id))? as usize;
                     codes.push(match v[dense] {
                         None => intern_null(&mut reps),
                         Some(b) => *seen[b as usize].get_or_insert_with(|| {
@@ -546,11 +531,8 @@ impl<S: ColumnSource> PropColumns<S> {
                 // per-row work is two array reads.
                 let mut dict_code: Vec<u32> = vec![u32::MAX; dict.len()];
                 for &id in ids {
-                    let dense = *self
-                        .id_to_dense
-                        .get(&id)
-                        .ok_or_else(|| S::not_found(id))?
-                        as usize;
+                    let dense =
+                        *self.id_to_dense.get(&id).ok_or_else(|| S::not_found(id))? as usize;
                     codes.push(match idx[dense] {
                         STR_NULL => intern_null(&mut reps),
                         i => {
@@ -568,11 +550,8 @@ impl<S: ColumnSource> PropColumns<S> {
                 // identity the executor's string-keyed fold uses.
                 let mut seen: AHashMap<String, u32> = AHashMap::new();
                 for &id in ids {
-                    let dense = *self
-                        .id_to_dense
-                        .get(&id)
-                        .ok_or_else(|| S::not_found(id))?
-                        as usize;
+                    let dense =
+                        *self.id_to_dense.get(&id).ok_or_else(|| S::not_found(id))? as usize;
                     codes.push(match &v[dense] {
                         None => intern_null(&mut reps),
                         Some(val) => *seen.entry(val.to_string()).or_insert_with(|| {
@@ -1168,7 +1147,12 @@ mod tests {
         let a = g.add_node("N", &()).unwrap();
         let b = g.add_node("N", &()).unwrap();
         let e = g
-            .add_edge(a, b, "E", &json!({ "i": 7, "s": "hit", "f": 1.5, "b": true }))
+            .add_edge(
+                a,
+                b,
+                "E",
+                &json!({ "i": 7, "s": "hit", "f": 1.5, "b": true }),
+            )
             .unwrap();
 
         assert_eq!(g.edge_prop_json(e, "i").unwrap(), Some(json!(7)));
@@ -1176,7 +1160,10 @@ mod tests {
         assert_eq!(g.edge_prop_json(e, "f").unwrap(), Some(json!(1.5)));
         assert_eq!(g.edge_prop_json(e, "b").unwrap(), Some(json!(true)));
         // Missing property is null; nonexistent edge is None.
-        assert_eq!(g.edge_prop_json(e, "nope").unwrap(), Some(serde_json::Value::Null));
+        assert_eq!(
+            g.edge_prop_json(e, "nope").unwrap(),
+            Some(serde_json::Value::Null)
+        );
         assert_eq!(g.edge_prop_json(e + 999, "i").unwrap(), None);
     }
 
