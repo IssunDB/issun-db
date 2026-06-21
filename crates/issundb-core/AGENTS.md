@@ -82,24 +82,17 @@ via `arc_swap::ArcSwap`. `MatrixSet` (in `matrices.rs`) holds the GraphBLAS spar
 `columns.rs` holds a typed, in-memory columnar view of scalar properties used as the hot read path for property gathers and aggregations.
 It is derived from LMDB, like the CSR snapshot, and follows the same write-LMDB-first rule.
 
-- `PropColumns<S: ColumnSource>` stores one typed column per property (Int,
-  Float, Bool, dict-encoded Str, or a JSON fallback) over a dense `id -> index`
-  map. `NodeSource` and `EdgeSource` implement `ColumnSource`, so nodes and edges
-  share one generic store; `Graph` holds `prop_columns: ColumnsCache<NodeSource>`
-  and `edge_columns: ColumnsCache<EdgeSource>`.
-- `ColumnsCache<S>` builds lazily on first access from one full `scan_all`, so
-  the first property read of a process pays an O(records) build (visible as a
-  slow first query). After that it is kept fresh by post-commit deltas: writers
-  call `record_touched`/`record_force_full`, and `with_fresh` patches touched ids
-  via `fetch_one` or rebuilds on `force_full` before serving a read.
-- Read it only through `with_fresh`/`with_fresh_mut`. Prefer the bulk forms
-  (`Graph::node_props_json_table`, `node_prop_json_column`, `node_prop_group_codes`,
-  and the `edge_*` equivalents): they refresh once and gather a whole column,
-  versus `node_prop_json`, which refreshes per call. The Cypher vectorized
-  aggregate path depends on the bulk forms (see `issundb-cypher/AGENTS.md`).
-- This store is a cache, never the source of truth. Any new write path that
-  changes a scalar property must record a delta against both `prop_columns` and
-  `edge_columns` as applicable, the same way it updates `node_prop_idx`.
+- `PropColumns<S: ColumnSource>` stores one typed column per property (Int, Float, Bool, dict-encoded Str, or a JSON fallback) over a dense
+  `id -> index` map. `NodeSource` and `EdgeSource` implement `ColumnSource`, so nodes and edges share one generic store; `Graph` holds
+  `prop_columns: ColumnsCache<NodeSource>` and `edge_columns: ColumnsCache<EdgeSource>`.
+- `ColumnsCache<S>` builds lazily on first access from one full `scan_all`, so the first property read of a process pays an O(records) build (visible
+  as a slow first query). After that it is kept fresh by post-commit deltas: writers call `record_touched`/`record_force_full`, and `with_fresh`
+  patches touched ids via `fetch_one` or rebuilds on `force_full` before serving a read.
+- Read it only through `with_fresh`/`with_fresh_mut`. Prefer the bulk forms(`Graph::node_props_json_table`, `node_prop_json_column`,
+  `node_prop_group_codes`, and the `edge_*` equivalents): they refresh once and gather a whole column, versus `node_prop_json`, which refreshes per
+  call. The Cypher vectorized aggregate path depends on the bulk forms (see `issundb-cypher/AGENTS.md`).
+- This store is a cache, never the source of truth. Any new write path that changes a scalar property must record a delta against both `prop_columns`
+  and `edge_columns` as applicable, the same way it updates `node_prop_idx`.
 
 ## GraphBLAS Semiring Choices
 
