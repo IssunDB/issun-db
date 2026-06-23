@@ -1,16 +1,12 @@
-//! Minimal safe wrapper over the SuiteSparse:GraphBLAS operations that IssunDB uses.
+//! A minimal safe wrapper over the SuiteSparse:GraphBLAS operations that IssunDB uses.
 //!
-//! This crate intentionally exposes only the small slice of GraphBLAS the engine
-//! needs: typed sparse matrices and vectors over `i32`, `f32`, and `f64`; building
+//! This crate intentionally exposes only a subset of GraphBLAS APIs that are needed.
+//! These are mainly typed sparse matrices and vectors over `i32`, `f32`, and `f64`; building
 //! them from element triples; matrix-by-vector multiply (`GrB_mxv`) over a fixed set
 //! of predefined semirings; element-wise vector addition (`GrB_Vector_eWiseAdd_Monoid`)
 //! over a fixed set of predefined monoids; and the descriptor flags those operations
 //! use. Everything maps directly onto predefined `GrB_*` objects, so no semiring,
 //! monoid, or binary-operator construction is needed.
-//!
-//! Built over `issundb-graphblas-sys`, the in-house raw FFI to the Apache-2.0
-//! SuiteSparse:GraphBLAS C library (PIC, dynamic OpenMP), so this wrapper links
-//! into the binding `cdylib`s.
 
 use std::marker::PhantomData;
 use std::os::raw::c_int;
