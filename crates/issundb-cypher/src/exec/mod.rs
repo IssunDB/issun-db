@@ -361,6 +361,85 @@ mod tests {
         graph.add_node("Person", &props).unwrap()
     }
 
+    /// A typed hop between two labeled endpoints that the data schema never
+    /// connects is pruned to a zero-row plan: the query returns no rows (and a
+    /// grouping-free `count` returns 0), and `EXPLAIN` shows the pruning `Limit`.
+    /// A satisfiable pattern over the same graph is untouched and returns rows.
+    #[test]
+    fn type_inference_prunes_unsatisfiable_pattern() {
+        let (_dir, graph) = setup_graph();
+        // Cities KNOW only other cities; people KNOW only other people. The
+        // schema therefore contains City-KNOWS->City and Person-KNOWS->Person,
+        // but never City-KNOWS->Person.
+        let london = graph
+            .add_node("City", &serde_json::json!({"n": "London"}))
+            .unwrap();
+        let paris = graph
+            .add_node("City", &serde_json::json!({"n": "Paris"}))
+            .unwrap();
+        let alice = insert_person(&graph, "Alice", 30, "London");
+        let bob = insert_person(&graph, "Bob", 25, "Paris");
+        graph
+            .add_edge(london, paris, "KNOWS", &serde_json::json!({}))
+            .unwrap();
+        graph
+            .add_edge(alice, bob, "KNOWS", &serde_json::json!({}))
+            .unwrap();
+        graph.rebuild_csr().unwrap();
+
+        let params = HashMap::new();
+
+        // Unsatisfiable: no City KNOWS a Person.
+        let res = execute(
+            &graph,
+            "MATCH (a:City)-[:KNOWS]->(b:Person) RETURN b.n AS n",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(
+            res.records.len(),
+            0,
+            "unsatisfiable pattern returns no rows"
+        );
+
+        // The grouping-free count over the same impossible pattern is 0, in one row.
+        let res = execute(
+            &graph,
+            "MATCH (a:City)-[:KNOWS]->(b:Person) RETURN count(*) AS c",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(res.records.len(), 1);
+        assert_eq!(res.records[0].values[0].as_i64().unwrap(), 0);
+
+        // The plan carries the pruning zero-row Limit.
+        let plan = explain(
+            &graph,
+            "MATCH (a:City)-[:KNOWS]->(b:Person) RETURN b.n AS n",
+        )
+        .unwrap();
+        assert!(
+            plan.contains("count=0"),
+            "expected a zero-row Limit in the pruned plan, got:\n{plan}"
+        );
+
+        // Satisfiable over the same graph: City-KNOWS->City exists, so the
+        // pattern is not pruned and returns the real row.
+        let res = execute(
+            &graph,
+            "MATCH (a:City)-[:KNOWS]->(b:City) RETURN b.n AS n",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(res.records.len(), 1);
+        assert_eq!(res.records[0].values[0].as_str().unwrap(), "Paris");
+        let plan = explain(&graph, "MATCH (a:City)-[:KNOWS]->(b:City) RETURN b.n AS n").unwrap();
+        assert!(
+            !plan.contains("count=0"),
+            "satisfiable pattern must not be pruned, got:\n{plan}"
+        );
+    }
+
     /// `ORDER BY vector_dist(n, $q) LIMIT k` over a labeled scan lowers to the
     /// `VectorTopK` index search, and returns the same ranking the exact row
     /// pipeline would (here, ascending L2 from the origin).

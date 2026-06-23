@@ -32,8 +32,16 @@ use crate::{
 
 use super::Graph;
 
-/// Per-`(label, type)` edge frequencies in both directions, tagged with the
-/// committed-write generation they were built at.
+/// The data graph schema as edge frequencies, tagged with the committed-write
+/// generation the table reflects.
+///
+/// `out_by_src_label` and `in_by_dst_label` are the per-source-label and
+/// per-destination-label typed edge counts (the marginals) that back the
+/// expand-ratio cardinality estimate. `triples` is the realized schema graph:
+/// for each directed `(src_label, type, dst_label)` actually present in the
+/// data, the count of edges matching it. The set of `triples` keys is the
+/// schema connectivity that drives type inference; the counts refine the
+/// cardinality estimate when both endpoint labels are known.
 pub(crate) struct EdgeFanout {
     /// The `csr_cache` write generation this table reflects.
     generation: u64,
@@ -41,6 +49,11 @@ pub(crate) struct EdgeFanout {
     out_by_src_label: AHashMap<(LabelId, TypeId), u64>,
     /// Count of edges of a type whose target node carries a label.
     in_by_dst_label: AHashMap<(LabelId, TypeId), u64>,
+    /// Count of edges matching a realized `(src_label, type, dst_label)` schema
+    /// triple. A multi-label endpoint contributes one triple per label it
+    /// carries, so an edge between an `m`-label source and an `n`-label target
+    /// contributes to `m * n` triples.
+    triples: AHashMap<(LabelId, TypeId, LabelId), u64>,
 }
 
 impl EdgeFanout {
@@ -62,17 +75,27 @@ impl EdgeFanout {
 
         let mut out_by_src_label: AHashMap<(LabelId, TypeId), u64> = AHashMap::new();
         let mut in_by_dst_label: AHashMap<(LabelId, TypeId), u64> = AHashMap::new();
+        let mut triples: AHashMap<(LabelId, TypeId, LabelId), u64> = AHashMap::new();
         for result in storage.edges.iter(&rtxn)? {
             let (_edge_id, bytes) = result?;
             let rec: EdgeRecord = props::decode(bytes)?;
-            if let Some(labels) = node_labels.get(&rec.src) {
+            let src_labels = node_labels.get(&rec.src);
+            let dst_labels = node_labels.get(&rec.dst);
+            if let Some(labels) = src_labels {
                 for &label in labels {
                     *out_by_src_label.entry((label, rec.edge_type)).or_insert(0) += 1;
                 }
             }
-            if let Some(labels) = node_labels.get(&rec.dst) {
+            if let Some(labels) = dst_labels {
                 for &label in labels {
                     *in_by_dst_label.entry((label, rec.edge_type)).or_insert(0) += 1;
+                }
+            }
+            if let (Some(srcs), Some(dsts)) = (src_labels, dst_labels) {
+                for &s in srcs {
+                    for &d in dsts {
+                        *triples.entry((s, rec.edge_type, d)).or_insert(0) += 1;
+                    }
                 }
             }
         }
@@ -81,11 +104,46 @@ impl EdgeFanout {
             generation,
             out_by_src_label,
             in_by_dst_label,
+            triples,
         })
     }
 }
 
 impl Graph {
+    /// Resolve label and type names to their ids, returning `None` when either
+    /// is unknown to the registry (the caller then cannot decide on the schema).
+    fn resolve_label_type(
+        &self,
+        label: &str,
+        rel_type: &str,
+    ) -> Result<Option<(LabelId, TypeId)>, Error> {
+        let rtxn = self.storage.env.read_txn()?;
+        let label_id = match get_label(&self.storage, &rtxn, label)? {
+            Some(id) => id,
+            None => return Ok(None),
+        };
+        let type_id = match get_type(&self.storage, &rtxn, rel_type)? {
+            Some(id) => id,
+            None => return Ok(None),
+        };
+        Ok(Some((label_id, type_id)))
+    }
+
+    /// Run `f` against the cached schema table, rebuilding it first when
+    /// committed writes have advanced past the cached generation.
+    fn with_fanout<T>(&self, f: impl FnOnce(&EdgeFanout) -> T) -> Result<T, Error> {
+        let generation = self.csr_cache.current_gen();
+        let mut guard = self.edge_fanout.lock();
+        let stale = guard
+            .as_ref()
+            .map(|t| t.generation != generation)
+            .unwrap_or(true);
+        if stale {
+            *guard = Some(EdgeFanout::build(&self.storage, generation)?);
+        }
+        Ok(f(guard.as_ref().expect("schema table was just populated")))
+    }
+
     /// Estimated average fan-out for expanding edges of `rel_type` from a node
     /// carrying `src_label`: the per-source-label typed out-degree, or the typed
     /// in-degree when `incoming` is true.
@@ -103,43 +161,101 @@ impl Graph {
         rel_type: &str,
         incoming: bool,
     ) -> Result<Option<f64>, Error> {
-        let (label_id, type_id) = {
-            let rtxn = self.storage.env.read_txn()?;
-            let label_id = match get_label(&self.storage, &rtxn, src_label)? {
-                Some(id) => id,
-                None => return Ok(None),
-            };
-            let type_id = match get_type(&self.storage, &rtxn, rel_type)? {
-                Some(id) => id,
-                None => return Ok(None),
-            };
-            (label_id, type_id)
+        let (label_id, type_id) = match self.resolve_label_type(src_label, rel_type)? {
+            Some(ids) => ids,
+            None => return Ok(None),
         };
-
         let node_count = self.node_count_by_label(src_label)?;
         if node_count == 0 {
             return Ok(None);
         }
+        self.with_fanout(|table| {
+            let map = if incoming {
+                &table.in_by_dst_label
+            } else {
+                &table.out_by_src_label
+            };
+            match map.get(&(label_id, type_id)).copied() {
+                Some(edges) if edges > 0 => Some(edges as f64 / node_count as f64),
+                _ => None,
+            }
+        })
+    }
 
-        let generation = self.csr_cache.current_gen();
-        let mut guard = self.edge_fanout.lock();
-        let stale = guard
-            .as_ref()
-            .map(|f| f.generation != generation)
-            .unwrap_or(true);
-        if stale {
-            *guard = Some(EdgeFanout::build(&self.storage, generation)?);
-        }
-        let table = guard.as_ref().expect("fanout table was just populated");
-        let map = if incoming {
-            &table.in_by_dst_label
-        } else {
-            &table.out_by_src_label
+    /// Destination-label-aware fan-out: the average number of `dst_label`
+    /// neighbors reached by expanding edges of `rel_type` from a node carrying
+    /// `src_label` (or the symmetric in-direction when `incoming`).
+    ///
+    /// This sharpens [`Graph::estimate_expand_fanout`] when the expansion target
+    /// also carries a label, dividing the realized `(src_label, type, dst_label)`
+    /// triple count by the `src_label` node count instead of the type marginal.
+    /// Returns `None` (fall back to the marginal or the global average) when a
+    /// label or type is unknown, the source label has no nodes, or no such
+    /// triple exists.
+    pub fn estimate_expand_fanout_to(
+        &self,
+        src_label: &str,
+        rel_type: &str,
+        dst_label: &str,
+        incoming: bool,
+    ) -> Result<Option<f64>, Error> {
+        let (src_id, type_id) = match self.resolve_label_type(src_label, rel_type)? {
+            Some(ids) => ids,
+            None => return Ok(None),
         };
-        match map.get(&(label_id, type_id)).copied() {
-            Some(edges) if edges > 0 => Ok(Some(edges as f64 / node_count as f64)),
-            _ => Ok(None),
+        let dst_id = {
+            let rtxn = self.storage.env.read_txn()?;
+            match get_label(&self.storage, &rtxn, dst_label)? {
+                Some(id) => id,
+                None => return Ok(None),
+            }
+        };
+        let node_count = self.node_count_by_label(src_label)?;
+        if node_count == 0 {
+            return Ok(None);
         }
+        // An outgoing expand traverses `src --type--> dst`; an incoming expand
+        // from a `src_label` node reaches a `dst_label` node along the reversed
+        // edge `dst --type--> src`, so the triple key swaps its endpoints.
+        let key = if incoming {
+            (dst_id, type_id, src_id)
+        } else {
+            (src_id, type_id, dst_id)
+        };
+        self.with_fanout(|table| match table.triples.get(&key).copied() {
+            Some(edges) if edges > 0 => Some(edges as f64 / node_count as f64),
+            _ => None,
+        })
+    }
+
+    /// Whether the data schema contains any directed edge `src_label --rel_type-->
+    /// dst_label`. Returns `Some(false)` when the labels and type are all known
+    /// but no such edge exists (the directed pattern is unsatisfiable), and
+    /// `None` when any of the three names is unknown to the registry, so the
+    /// caller cannot decide.
+    ///
+    /// The underlying schema table reflects all committed writes (it is rebuilt
+    /// when the write generation advances), so a `Some(false)` is authoritative
+    /// for committed state. Callers that prune work on this answer must guard
+    /// against uncommitted same-statement writes, which the table cannot see.
+    pub fn schema_has_edge(
+        &self,
+        src_label: &str,
+        rel_type: &str,
+        dst_label: &str,
+    ) -> Result<Option<bool>, Error> {
+        let (src_id, type_id) = match self.resolve_label_type(src_label, rel_type)? {
+            Some(ids) => ids,
+            None => return Ok(None),
+        };
+        let dst_id = {
+            let rtxn = self.storage.env.read_txn()?;
+            match get_label(&self.storage, &rtxn, dst_label)? {
+                Some(id) => id,
+                None => return Ok(None),
+            }
+        };
+        self.with_fanout(|table| Some(table.triples.contains_key(&(src_id, type_id, dst_id))))
     }
 }
 
@@ -235,6 +351,93 @@ mod tests {
                 .estimate_expand_fanout("Person", "KNOWS", false)
                 .unwrap(),
             Some(1.0)
+        );
+    }
+
+    #[test]
+    fn schema_has_edge_reflects_realized_triples() {
+        let (_dir, graph) = open_graph();
+        let p0 = graph.add_node("Person", &json!({})).unwrap();
+        let p1 = graph.add_node("Person", &json!({})).unwrap();
+        let c0 = graph.add_node("City", &json!({})).unwrap();
+
+        // Person KNOWS Person, and Person LIVES_IN City. No City ever has an
+        // outgoing KNOWS, and no Person LIVES_IN a Person.
+        graph.add_edge(p0, p1, "KNOWS", &json!({})).unwrap();
+        graph.add_edge(p0, c0, "LIVES_IN", &json!({})).unwrap();
+
+        assert_eq!(
+            graph.schema_has_edge("Person", "KNOWS", "Person").unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            graph.schema_has_edge("Person", "LIVES_IN", "City").unwrap(),
+            Some(true)
+        );
+        // Realized in neither the data nor the schema: a provably empty pattern.
+        assert_eq!(
+            graph.schema_has_edge("City", "KNOWS", "Person").unwrap(),
+            Some(false)
+        );
+        assert_eq!(
+            graph
+                .schema_has_edge("Person", "LIVES_IN", "Person")
+                .unwrap(),
+            Some(false)
+        );
+        // Unknown label or type yields an undecidable answer, never a false prune.
+        assert_eq!(
+            graph.schema_has_edge("Ghost", "KNOWS", "Person").unwrap(),
+            None
+        );
+        assert_eq!(
+            graph.schema_has_edge("Person", "GHOST", "Person").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn expand_fanout_to_uses_destination_label() {
+        let (_dir, graph) = open_graph();
+        // p0 KNOWS one Person and two Cities. The marginal KNOWS fan-out mixes
+        // both targets; the destination-aware fan-out separates them.
+        let p0 = graph.add_node("Person", &json!({})).unwrap();
+        let p1 = graph.add_node("Person", &json!({})).unwrap();
+        let c0 = graph.add_node("City", &json!({})).unwrap();
+        let c1 = graph.add_node("City", &json!({})).unwrap();
+        graph.add_edge(p0, p1, "KNOWS", &json!({})).unwrap();
+        graph.add_edge(p0, c0, "KNOWS", &json!({})).unwrap();
+        graph.add_edge(p0, c1, "KNOWS", &json!({})).unwrap();
+
+        // Two Person nodes (p0, p1); the marginal KNOWS fan-out is 3 edges / 2.
+        assert_eq!(
+            graph
+                .estimate_expand_fanout("Person", "KNOWS", false)
+                .unwrap(),
+            Some(1.5)
+        );
+        // Of those edges, one targets a Person and two target a City, each over
+        // the same two Person sources.
+        assert_eq!(
+            graph
+                .estimate_expand_fanout_to("Person", "KNOWS", "Person", false)
+                .unwrap(),
+            Some(0.5)
+        );
+        assert_eq!(
+            graph
+                .estimate_expand_fanout_to("Person", "KNOWS", "City", false)
+                .unwrap(),
+            Some(1.0)
+        );
+        // A schema-absent destination falls back rather than reporting zero.
+        let p2 = graph.add_node("Robot", &json!({})).unwrap();
+        let _ = p2;
+        assert_eq!(
+            graph
+                .estimate_expand_fanout_to("Person", "KNOWS", "Robot", false)
+                .unwrap(),
+            None
         );
     }
 }

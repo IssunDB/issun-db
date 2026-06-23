@@ -12,7 +12,22 @@ impl Optimizer {
     /// Optimize a `PhysicalOperator` plan by standardizing operator sequences,
     /// extracting filter predicates, and pushing them down to the lowest possible nodes.
     pub fn optimize(op: PhysicalOperator, stats: Option<&dyn StatsProvider>) -> PhysicalOperator {
-        let (stripped_op, raw_filters) = Self::extract_filters(op, stats);
+        // Schema-based pruning may only run on a fully read-only query: a write
+        // anywhere in the plan can create the very edge a pattern matches, which
+        // the committed-state schema cannot see. The flag is decided once over
+        // the whole tree and threaded through the opaque recursive optimize
+        // calls (barrier `Project`, `WritePart`) so a write subtree never lets a
+        // recursively optimized read sub-plan prune itself.
+        let allow_prune = !Self::plan_has_write(&op);
+        Self::optimize_impl(op, stats, allow_prune)
+    }
+
+    fn optimize_impl(
+        op: PhysicalOperator,
+        stats: Option<&dyn StatsProvider>,
+        allow_prune: bool,
+    ) -> PhysicalOperator {
+        let (stripped_op, raw_filters) = Self::extract_filters(op, stats, allow_prune);
         // Split top-level AND conjunctions so each conjunct pushes down to its
         // own lowest binder: `a.id = 1 AND b.age > 30` as a whole references
         // both endpoints and would stay above the Expand, while its conjuncts
@@ -73,6 +88,16 @@ impl Optimizer {
         // the grouped-degree kernel. Runs after the path-count rewrite, which
         // claims the grouping-free counts; only grouped aggregates remain here.
         result = rewrite_grouped_degree(result);
+        // Type inference: when the data schema contains no edge matching a typed
+        // hop between two labeled endpoints, that hop (and so the whole pattern)
+        // is unsatisfiable, so it is replaced with a zero-row operator that never
+        // touches storage. Runs last, after the plan shape is settled, and only
+        // on read-only plans: the committed-state schema cannot see edges that a
+        // write part of the same statement would create, so pruning a plan with
+        // writes could drop rows the query should return.
+        if allow_prune {
+            result = Self::prune_unsatisfiable(result, stats);
+        }
         result
     }
 
@@ -101,10 +126,12 @@ impl Optimizer {
     fn extract_filters(
         op: PhysicalOperator,
         stats: Option<&dyn StatsProvider>,
+        allow_prune: bool,
     ) -> (PhysicalOperator, Vec<FilterExpr>) {
         match op {
             PhysicalOperator::Filter { input, expression } => {
-                let (inner_op, mut inner_filters) = Self::extract_filters(*input, stats);
+                let (inner_op, mut inner_filters) =
+                    Self::extract_filters(*input, stats, allow_prune);
                 inner_filters.push(expression);
                 (inner_op, inner_filters)
             }
@@ -114,7 +141,7 @@ impl Optimizer {
                 expr,
                 variable,
             } => {
-                let (inner_op, inner_filters) = Self::extract_filters(*input, stats);
+                let (inner_op, inner_filters) = Self::extract_filters(*input, stats, allow_prune);
                 (
                     PhysicalOperator::Unwind {
                         input: Box::new(inner_op),
@@ -186,7 +213,7 @@ impl Optimizer {
                 unique_rels,
                 needs_path,
             } => {
-                let (inner_op, inner_filters) = Self::extract_filters(*input, stats);
+                let (inner_op, inner_filters) = Self::extract_filters(*input, stats, allow_prune);
                 (
                     PhysicalOperator::Expand {
                         input: Box::new(inner_op),
@@ -216,7 +243,7 @@ impl Optimizer {
                     // filters would re-place them above the barrier, where the variables
                     // they reference are no longer in scope. Treat barrier projects as
                     // opaque: do not extract filters from inside them, but optimize their subplan.
-                    let optimized_input = Self::optimize(*input, stats);
+                    let optimized_input = Self::optimize_impl(*input, stats, allow_prune);
                     (
                         PhysicalOperator::Project {
                             input: Box::new(optimized_input),
@@ -226,7 +253,8 @@ impl Optimizer {
                         Vec::new(),
                     )
                 } else {
-                    let (inner_op, inner_filters) = Self::extract_filters(*input, stats);
+                    let (inner_op, inner_filters) =
+                        Self::extract_filters(*input, stats, allow_prune);
                     (
                         PhysicalOperator::Project {
                             input: Box::new(inner_op),
@@ -238,8 +266,8 @@ impl Optimizer {
                 }
             }
             PhysicalOperator::HashJoin { left, right } => {
-                let (left_op, mut left_filters) = Self::extract_filters(*left, stats);
-                let (right_op, right_filters) = Self::extract_filters(*right, stats);
+                let (left_op, mut left_filters) = Self::extract_filters(*left, stats, allow_prune);
+                let (right_op, right_filters) = Self::extract_filters(*right, stats, allow_prune);
                 left_filters.extend(right_filters);
                 (
                     PhysicalOperator::HashJoin {
@@ -256,7 +284,7 @@ impl Optimizer {
                 group_by,
                 aggregations,
             } => {
-                let (inner, filters) = Self::extract_filters(*input, stats);
+                let (inner, filters) = Self::extract_filters(*input, stats, allow_prune);
                 (
                     PhysicalOperator::Aggregate {
                         input: Box::new(inner),
@@ -267,7 +295,7 @@ impl Optimizer {
                 )
             }
             PhysicalOperator::Sort { input, items } => {
-                let (inner, filters) = Self::extract_filters(*input, stats);
+                let (inner, filters) = Self::extract_filters(*input, stats, allow_prune);
                 (
                     PhysicalOperator::Sort {
                         input: Box::new(inner),
@@ -277,7 +305,7 @@ impl Optimizer {
                 )
             }
             PhysicalOperator::Limit { input, skip, count } => {
-                let (inner, filters) = Self::extract_filters(*input, stats);
+                let (inner, filters) = Self::extract_filters(*input, stats, allow_prune);
                 (
                     PhysicalOperator::Limit {
                         input: Box::new(inner),
@@ -301,7 +329,7 @@ impl Optimizer {
                 Vec::new(),
             ),
             PhysicalOperator::Distinct { input, keys } => {
-                let (inner, inner_filters) = Self::extract_filters(*input, stats);
+                let (inner, inner_filters) = Self::extract_filters(*input, stats, allow_prune);
                 (
                     PhysicalOperator::Distinct {
                         input: Box::new(inner),
@@ -313,7 +341,7 @@ impl Optimizer {
             // WritePart operators are opaque: do not extract filters from inside them,
             // but recursively optimize their input subplans.
             PhysicalOperator::WritePart { input, part } => {
-                let optimized_input = Self::optimize(*input, stats);
+                let optimized_input = Self::optimize_impl(*input, stats, allow_prune);
                 (
                     PhysicalOperator::WritePart {
                         input: Box::new(optimized_input),
@@ -346,7 +374,7 @@ impl Optimizer {
                 closing_is_undirected,
                 closing_unique_rels,
             } => {
-                let (inner_op, inner_filters) = Self::extract_filters(*input, stats);
+                let (inner_op, inner_filters) = Self::extract_filters(*input, stats, allow_prune);
                 (
                     PhysicalOperator::MultiwayJoin {
                         input: Box::new(inner_op),
@@ -609,8 +637,16 @@ impl Optimizer {
             // plan choice only changes when statistics actually exist.
             PhysicalOperator::Filter { input, expression } => {
                 let child_weight = Self::plan_weight(input, stats);
+                // A `HasLabel` filter directly over an `Expand` carries real
+                // selectivity on a skewed schema (the fraction of the source
+                // label's typed neighbors that carry the target label), which the
+                // generic selectivity estimator does not model. Prefer it, then
+                // fall back to the property-histogram estimate, then to 1.0.
                 let selectivity = stats
-                    .and_then(|s| s.estimate_filter_selectivity(expression))
+                    .and_then(|s| {
+                        Self::haslabel_selectivity(expression, input, s)
+                            .or_else(|| s.estimate_filter_selectivity(expression))
+                    })
                     .unwrap_or(1.0);
                 ((child_weight as f64 * selectivity).ceil() as usize).max(1)
             }
@@ -672,6 +708,387 @@ impl Optimizer {
                 Self::scan_label_of(left, var).or_else(|| Self::scan_label_of(right, var))
             }
             _ => None,
+        }
+    }
+
+    /// Selectivity of a `HasLabel(dst, label)` filter sitting directly over the
+    /// `Expand` that binds `dst`: the fraction of the source label's `rel_type`
+    /// neighbors that carry `label`, from the destination-aware expand ratio.
+    /// `None` when the shape does not match or no per-label estimate exists, so
+    /// the caller falls back to the generic estimate.
+    fn haslabel_selectivity(
+        expr: &FilterExpr,
+        input: &PhysicalOperator,
+        stats: &dyn StatsProvider,
+    ) -> Option<f64> {
+        let (var, label) = match expr {
+            FilterExpr::HasLabel(var, label) => (var, label),
+            _ => return None,
+        };
+        let (src_var, rel_type, dst_var, is_incoming) = match input {
+            PhysicalOperator::Expand {
+                src_var,
+                rel_type: Some(rel_type),
+                dst_var,
+                is_incoming,
+                ..
+            } => (src_var, rel_type, dst_var, *is_incoming),
+            _ => return None,
+        };
+        if dst_var != var {
+            return None;
+        }
+        let src_label = Self::scan_label_of(input, src_var)?;
+        let total = stats.expand_fanout(src_label, rel_type, is_incoming)?;
+        if total <= 0.0 {
+            return None;
+        }
+        // A schema-absent destination contributes zero matching neighbors.
+        let to = stats
+            .expand_fanout_to(src_label, rel_type, label, is_incoming)
+            .unwrap_or(0.0);
+        Some((to / total).clamp(0.0, 1.0))
+    }
+
+    /// Type inference: replace each typed `Expand` between two labeled endpoints
+    /// that the data schema does not connect with a zero-row operator, so a
+    /// provably empty pattern never scans storage.
+    ///
+    /// Guarded on two fronts so it can only ever drop rows that the query could
+    /// not have produced: it runs only when statistics are present and the plan
+    /// has no write part (a write could create the very edge being matched,
+    /// which the committed-state schema cannot see), and it prunes a hop only on
+    /// a definitive `Some(false)` from [`StatsProvider::schema_has_edge`], never
+    /// on the undecidable `None`.
+    fn prune_unsatisfiable(
+        op: PhysicalOperator,
+        stats: Option<&dyn StatsProvider>,
+    ) -> PhysicalOperator {
+        let stats = match stats {
+            Some(s) => s,
+            None => return op,
+        };
+        // The caller (`optimize`) only reaches here when `allow_prune` holds,
+        // which it computes from `plan_has_write` over the whole query, so this
+        // plan is read-only and a hop can be pruned on committed-schema evidence
+        // without risking an edge a same-statement write would create.
+        //
+        // Collect every variable's declared label constraints once over the whole
+        // tree: a destination label often arrives as a `HasLabel` filter above
+        // the `Expand` that binds it, so a single bottom-up scan is needed before
+        // any hop can be judged.
+        let mut labels: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        Self::collect_label_constraints(&op, &mut labels);
+        Self::rewrite_unsatisfiable(op, &labels, stats)
+    }
+
+    /// True when any operator in the plan performs a write (`CREATE`, `MERGE`,
+    /// `SET`, `DELETE`), so schema-based pruning must be skipped.
+    fn plan_has_write(op: &PhysicalOperator) -> bool {
+        match op {
+            PhysicalOperator::WritePart { .. } => true,
+            PhysicalOperator::SingleRow
+            | PhysicalOperator::LabelScan { .. }
+            | PhysicalOperator::NodeByIdSeek { .. }
+            | PhysicalOperator::NodeIndexScan { .. }
+            | PhysicalOperator::NodeRangeScan { .. }
+            | PhysicalOperator::VectorTopK { .. }
+            | PhysicalOperator::TriangleCount { .. }
+            | PhysicalOperator::PathCount { .. }
+            | PhysicalOperator::GroupedDegree { .. } => false,
+            PhysicalOperator::Unwind { input, .. }
+            | PhysicalOperator::Expand { input, .. }
+            | PhysicalOperator::Filter { input, .. }
+            | PhysicalOperator::Project { input, .. }
+            | PhysicalOperator::Aggregate { input, .. }
+            | PhysicalOperator::Sort { input, .. }
+            | PhysicalOperator::Limit { input, .. }
+            | PhysicalOperator::OptionalMatch { input, .. }
+            | PhysicalOperator::Distinct { input, .. }
+            | PhysicalOperator::ProcedureCall { input, .. }
+            | PhysicalOperator::MultiwayJoin { input, .. } => Self::plan_has_write(input),
+            PhysicalOperator::HashJoin { left, right } => {
+                Self::plan_has_write(left) || Self::plan_has_write(right)
+            }
+        }
+    }
+
+    /// Record the label constraints each node variable carries, from labeled
+    /// scans and from `HasLabel` filters. A variable can accumulate several
+    /// labels (a multi-label pattern such as `(n:A:B)`); all are kept.
+    fn collect_label_constraints(
+        op: &PhysicalOperator,
+        out: &mut std::collections::HashMap<String, Vec<String>>,
+    ) {
+        let add = |var: &str, label: &str, out: &mut std::collections::HashMap<_, Vec<String>>| {
+            let entry: &mut Vec<String> = out.entry(var.to_string()).or_default();
+            if !entry.iter().any(|l| l == label) {
+                entry.push(label.to_string());
+            }
+        };
+        match op {
+            PhysicalOperator::LabelScan {
+                variable,
+                label: Some(label),
+            }
+            | PhysicalOperator::NodeByIdSeek {
+                variable,
+                label: Some(label),
+                ..
+            } => add(variable, label, out),
+            PhysicalOperator::NodeIndexScan {
+                variable, label, ..
+            }
+            | PhysicalOperator::NodeRangeScan {
+                variable, label, ..
+            } => add(variable, label, out),
+            PhysicalOperator::Filter {
+                input,
+                expression: FilterExpr::HasLabel(var, label),
+            } => {
+                add(var, label, out);
+                Self::collect_label_constraints(input, out);
+            }
+            PhysicalOperator::Unwind { input, .. }
+            | PhysicalOperator::Expand { input, .. }
+            | PhysicalOperator::Filter { input, .. }
+            | PhysicalOperator::Project { input, .. }
+            | PhysicalOperator::Aggregate { input, .. }
+            | PhysicalOperator::Sort { input, .. }
+            | PhysicalOperator::Limit { input, .. }
+            | PhysicalOperator::OptionalMatch { input, .. }
+            | PhysicalOperator::Distinct { input, .. }
+            | PhysicalOperator::WritePart { input, .. }
+            | PhysicalOperator::ProcedureCall { input, .. }
+            | PhysicalOperator::MultiwayJoin { input, .. } => {
+                Self::collect_label_constraints(input, out)
+            }
+            PhysicalOperator::HashJoin { left, right } => {
+                Self::collect_label_constraints(left, out);
+                Self::collect_label_constraints(right, out);
+            }
+            PhysicalOperator::LabelScan { .. }
+            | PhysicalOperator::NodeByIdSeek { .. }
+            | PhysicalOperator::SingleRow
+            | PhysicalOperator::VectorTopK { .. }
+            | PhysicalOperator::TriangleCount { .. }
+            | PhysicalOperator::PathCount { .. }
+            | PhysicalOperator::GroupedDegree { .. } => {}
+        }
+    }
+
+    /// Walk the plan and wrap each unsatisfiable typed `Expand` in a zero-row
+    /// `Limit`. The `Expand` (and its scan subtree) is preserved below the
+    /// `Limit` so the slot schema is unchanged, but `Limit { count: 0 }` returns
+    /// immediately without ever pulling it.
+    fn rewrite_unsatisfiable(
+        op: PhysicalOperator,
+        labels: &std::collections::HashMap<String, Vec<String>>,
+        stats: &dyn StatsProvider,
+    ) -> PhysicalOperator {
+        // Rewrite children first so a nested impossible hop is still caught.
+        let op = Self::map_inputs(op, |child| {
+            Self::rewrite_unsatisfiable(child, labels, stats)
+        });
+        if let PhysicalOperator::Expand {
+            src_var,
+            rel_type: Some(rel_type),
+            dst_var,
+            is_incoming,
+            is_undirected,
+            ..
+        } = &op
+        {
+            let empty_src = Vec::new();
+            let empty_dst = Vec::new();
+            let src_labels = labels.get(src_var).unwrap_or(&empty_src);
+            let dst_labels = labels.get(dst_var).unwrap_or(&empty_dst);
+            if Self::hop_is_impossible(
+                stats,
+                src_labels,
+                rel_type,
+                dst_labels,
+                *is_incoming,
+                *is_undirected,
+            ) {
+                return PhysicalOperator::Limit {
+                    input: Box::new(op),
+                    skip: 0,
+                    count: 0,
+                };
+            }
+        }
+        op
+    }
+
+    /// Whether a typed hop between the two endpoint label sets is provably
+    /// unsatisfiable on the committed schema. Both endpoints must be labeled; an
+    /// unlabeled endpoint leaves the hop unconstrained, so no prune is possible.
+    fn hop_is_impossible(
+        stats: &dyn StatsProvider,
+        src_labels: &[String],
+        rel_type: &str,
+        dst_labels: &[String],
+        is_incoming: bool,
+        is_undirected: bool,
+    ) -> bool {
+        if src_labels.is_empty() || dst_labels.is_empty() {
+            return false;
+        }
+        // An orientation `from --rel--> to` is impossible when any single
+        // (from-label, to-label) pair is definitively absent from the schema:
+        // a matching node must carry every one of its labels, so if even one of
+        // them never originates (or receives) the edge, no node can match.
+        let orientation_impossible = |from: &[String], to: &[String]| -> bool {
+            for f in from {
+                for t in to {
+                    if stats.schema_has_edge(f, rel_type, t) == Some(false) {
+                        return true;
+                    }
+                }
+            }
+            false
+        };
+        if is_undirected {
+            // Either orientation could satisfy the pattern, so it is impossible
+            // only when both are.
+            orientation_impossible(src_labels, dst_labels)
+                && orientation_impossible(dst_labels, src_labels)
+        } else if is_incoming {
+            // The edge runs dst --rel--> src.
+            orientation_impossible(dst_labels, src_labels)
+        } else {
+            orientation_impossible(src_labels, dst_labels)
+        }
+    }
+
+    /// Apply `f` to every direct child sub-plan of `op`, rebuilding `op` with
+    /// the mapped children and leaving leaves unchanged.
+    fn map_inputs(
+        op: PhysicalOperator,
+        mut f: impl FnMut(PhysicalOperator) -> PhysicalOperator,
+    ) -> PhysicalOperator {
+        use PhysicalOperator::*;
+        match op {
+            Unwind {
+                input,
+                expr,
+                variable,
+            } => Unwind {
+                input: Box::new(f(*input)),
+                expr,
+                variable,
+            },
+            Expand {
+                input,
+                src_var,
+                rel_var,
+                dst_var,
+                rel_type,
+                is_incoming,
+                is_undirected,
+                min_hops,
+                max_hops,
+                unique_rels,
+                needs_path,
+            } => Expand {
+                input: Box::new(f(*input)),
+                src_var,
+                rel_var,
+                dst_var,
+                rel_type,
+                is_incoming,
+                is_undirected,
+                min_hops,
+                max_hops,
+                unique_rels,
+                needs_path,
+            },
+            Filter { input, expression } => Filter {
+                input: Box::new(f(*input)),
+                expression,
+            },
+            Project {
+                input,
+                items,
+                is_barrier,
+            } => Project {
+                input: Box::new(f(*input)),
+                items,
+                is_barrier,
+            },
+            Aggregate {
+                input,
+                group_by,
+                aggregations,
+            } => Aggregate {
+                input: Box::new(f(*input)),
+                group_by,
+                aggregations,
+            },
+            Sort { input, items } => Sort {
+                input: Box::new(f(*input)),
+                items,
+            },
+            Limit { input, skip, count } => Limit {
+                input: Box::new(f(*input)),
+                skip,
+                count,
+            },
+            OptionalMatch { input, null_vars } => OptionalMatch {
+                input: Box::new(f(*input)),
+                null_vars,
+            },
+            Distinct { input, keys } => Distinct {
+                input: Box::new(f(*input)),
+                keys,
+            },
+            WritePart { input, part } => WritePart {
+                input: Box::new(f(*input)),
+                part,
+            },
+            ProcedureCall {
+                input,
+                output_vars,
+                rows,
+            } => ProcedureCall {
+                input: Box::new(f(*input)),
+                output_vars,
+                rows,
+            },
+            MultiwayJoin {
+                input,
+                closing_src_var,
+                closing_dst_var,
+                closing_rel_type,
+                closing_rel_var,
+                closing_is_incoming,
+                closing_is_undirected,
+                closing_unique_rels,
+            } => MultiwayJoin {
+                input: Box::new(f(*input)),
+                closing_src_var,
+                closing_dst_var,
+                closing_rel_type,
+                closing_rel_var,
+                closing_is_incoming,
+                closing_is_undirected,
+                closing_unique_rels,
+            },
+            HashJoin { left, right } => HashJoin {
+                left: Box::new(f(*left)),
+                right: Box::new(f(*right)),
+            },
+            leaf @ (SingleRow
+            | LabelScan { .. }
+            | NodeByIdSeek { .. }
+            | NodeIndexScan { .. }
+            | NodeRangeScan { .. }
+            | VectorTopK { .. }
+            | TriangleCount { .. }
+            | PathCount { .. }
+            | GroupedDegree { .. }) => leaf,
         }
     }
 
@@ -4017,6 +4434,87 @@ mod tests {
         // node_count_by_label None -> scan weight 1; global ratio 52000/2000 = 26.
         let unknown = Optimizer::plan_weight(&expand("Gadget"), Some(&stats));
         assert_eq!(unknown, 26);
+    }
+
+    /// The type-inference pass wraps an `Expand` between two labeled endpoints
+    /// the schema does not connect in a zero-row `Limit`, but leaves a connected
+    /// pattern alone and never prunes a plan that writes (the committed schema
+    /// cannot see an edge the write would create).
+    #[test]
+    fn prune_unsatisfiable_pass_gating() {
+        struct SchemaStats;
+        impl StatsProvider for SchemaStats {
+            fn node_count_by_label(&self, _l: &str) -> Option<u64> {
+                Some(10)
+            }
+            fn edge_count_by_type(&self, _t: &str) -> Option<u64> {
+                Some(10)
+            }
+            // Everything connects except City -KNOWS-> Person.
+            fn schema_has_edge(&self, s: &str, t: &str, d: &str) -> Option<bool> {
+                Some(!(t == "KNOWS" && s == "City" && d == "Person"))
+            }
+        }
+
+        // Project <- Filter(HasLabel b Person) <- Expand(a:City -KNOWS-> b) <- LabelScan(a:City)
+        let impossible = || PhysicalOperator::Filter {
+            input: Box::new(PhysicalOperator::Expand {
+                input: Box::new(PhysicalOperator::LabelScan {
+                    variable: "a".to_string(),
+                    label: Some("City".to_string()),
+                }),
+                src_var: "a".to_string(),
+                rel_var: "r".to_string(),
+                dst_var: "b".to_string(),
+                rel_type: Some("KNOWS".to_string()),
+                is_incoming: false,
+                is_undirected: false,
+                min_hops: 1,
+                max_hops: 1,
+                unique_rels: vec![],
+                needs_path: false,
+            }),
+            expression: FilterExpr::HasLabel("b".to_string(), "Person".to_string()),
+        };
+        let read_plan = PhysicalOperator::Project {
+            input: Box::new(impossible()),
+            items: vec![(Expr::Prop("b".to_string(), String::new()), None)],
+            is_barrier: false,
+        };
+
+        let optimized = Optimizer::optimize(read_plan, Some(&SchemaStats));
+        let plan_text = crate::plan::physical::format_physical_plan(&optimized, 0);
+        assert!(
+            plan_text.contains("count=0"),
+            "impossible hop should be pruned, got:\n{plan_text}"
+        );
+
+        // The same impossible pattern under a write part must NOT be pruned.
+        let writing_plan = PhysicalOperator::WritePart {
+            input: Box::new(impossible()),
+            part: crate::ast::QueryPart::Create { patterns: vec![] },
+        };
+        let optimized = Optimizer::optimize(writing_plan, Some(&SchemaStats));
+        let plan_text = crate::plan::physical::format_physical_plan(&optimized, 0);
+        assert!(
+            !plan_text.contains("count=0"),
+            "a plan with writes must not be pruned, got:\n{plan_text}"
+        );
+
+        // Without statistics, nothing is pruned.
+        let optimized = Optimizer::optimize(
+            PhysicalOperator::Project {
+                input: Box::new(impossible()),
+                items: vec![(Expr::Prop("b".to_string(), String::new()), None)],
+                is_barrier: false,
+            },
+            None,
+        );
+        let plan_text = crate::plan::physical::format_physical_plan(&optimized, 0);
+        assert!(
+            !plan_text.contains("count=0"),
+            "no stats means no prune, got:\n{plan_text}"
+        );
     }
 
     struct MockStats {

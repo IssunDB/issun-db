@@ -28,6 +28,29 @@ pub trait StatsProvider {
         None
     }
 
+    /// Destination-label-aware refinement of [`StatsProvider::expand_fanout`]:
+    /// the average number of `dst_label` neighbors reached when expanding
+    /// `rel_type` from a `src_label` node. `None` when no per-triple estimate is
+    /// available.
+    fn expand_fanout_to(
+        &self,
+        _src_label: &str,
+        _rel_type: &str,
+        _dst_label: &str,
+        _incoming: bool,
+    ) -> Option<f64> {
+        None
+    }
+
+    /// Whether the data schema contains any directed edge `src_label
+    /// --rel_type--> dst_label`. `Some(false)` means the directed pattern is
+    /// provably unsatisfiable on committed data; `None` means undecidable
+    /// (an unknown label or type, or no statistics), so the caller must not
+    /// prune.
+    fn schema_has_edge(&self, _src_label: &str, _rel_type: &str, _dst_label: &str) -> Option<bool> {
+        None
+    }
+
     /// Check if a node property index exists.
     fn has_node_property_index(&self, _label: &str, _property: &str) -> bool {
         false
@@ -54,6 +77,24 @@ impl StatsProvider for Graph {
 
     fn expand_fanout(&self, src_label: &str, rel_type: &str, incoming: bool) -> Option<f64> {
         self.estimate_expand_fanout(src_label, rel_type, incoming)
+            .ok()
+            .flatten()
+    }
+
+    fn expand_fanout_to(
+        &self,
+        src_label: &str,
+        rel_type: &str,
+        dst_label: &str,
+        incoming: bool,
+    ) -> Option<f64> {
+        self.estimate_expand_fanout_to(src_label, rel_type, dst_label, incoming)
+            .ok()
+            .flatten()
+    }
+
+    fn schema_has_edge(&self, src_label: &str, rel_type: &str, dst_label: &str) -> Option<bool> {
+        self.schema_has_edge(src_label, rel_type, dst_label)
             .ok()
             .flatten()
     }

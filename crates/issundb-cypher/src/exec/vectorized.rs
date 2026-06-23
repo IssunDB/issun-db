@@ -2075,8 +2075,17 @@ mod tests {
         params: &std::collections::HashMap<String, serde_json::Value>,
     ) {
         let plan = optimized_plan(graph, cypher);
+        // Schema-based type inference can prune a pattern with no matching edges
+        // (such as `(:P)-[:T]->(:P)` over a random graph that produced no such
+        // edge) to a zero-row `Limit`, which is intentionally not vectorized.
+        // None of these queries use `LIMIT 0`, so a `count=0` Limit marks a
+        // pruned plan; in that case both executors run the same empty plan and
+        // the row comparison below still holds, so only the eligibility check is
+        // relaxed.
+        let pruned_empty =
+            crate::plan::physical::format_physical_plan(&plan, 0).contains("count=0");
         assert!(
-            recognize(&plan).is_some(),
+            pruned_empty || recognize(&plan).is_some(),
             "expected a vectorized-eligible plan for: {cypher}\n{plan:?}"
         );
         let fast = execute(graph, cypher, params);

@@ -68,8 +68,10 @@ Do not invent modules that do not yet exist when answering questions, but do pla
     - `src/graph/node.rs`: node CRUD (`add_node`, `get_node`, `update_node`, `delete_node`).
     - `src/graph/edge.rs`: edge CRUD and adjacency (`add_edge`, `get_edge`, `delete_edge`, `out_neighbors`, `in_neighbors`, `node_has_relationships`).
     - `src/graph/index.rs`: label and type indexes, property indexes, constraints, and property scan methods.
-    - `src/graph/stats.rs`: high-order cardinality statistics for the optimizer. Owns the `(label, type)` edge-frequency table behind
-      `estimate_expand_fanout` (the per-source-label expand ratio), recomputed by one full scan and cached against the committed-write generation.
+    - `src/graph/stats.rs`: high-order cardinality statistics and the data-graph schema for the optimizer. Owns the `(label, type)` edge-frequency
+      table behind `estimate_expand_fanout` (the per-source-label expand ratio) and the realized `(src_label, type, dst_label)` triples behind
+      `estimate_expand_fanout_to` and `schema_has_edge` (type inference), recomputed by one full scan and cached against the committed-write
+      generation.
     - `src/graph/fts_mod.rs`: full-text search index lifecycle and FTS storage primitives.
     - `src/graph/vector.rs`: vector byte storage helpers.
     - `src/graph/algo.rs`: public algorithm dispatch methods and internal traversal helpers.
@@ -271,7 +273,15 @@ The read-path and statistics methods carry non-obvious semantics:
   ratio" that sharpens the optimizer's `Expand` plan weight over the global `edges_of_type / total_nodes` average on a skewed schema. `None` when
   the label or type is unknown or no such edges exist, so the planner falls back to the global average. Backed by a `(label, type)` frequency table
   recomputed by one full scan and cached against the committed-write generation, so it refreshes only when writes advance past the cached value;
-  the estimate only weights plan choices, so a stale or absent value never affects correctness)
+  the estimate only weights plan choices, so a stale or absent value never affects correctness. The same scan also records the realized
+  `(src_label, type, dst_label)` schema triples that back the two methods below)
+- `estimate_expand_fanout_to(src_label: &str, rel_type: &str, dst_label: &str, incoming: bool) -> Result<Option<f64>, Error>`
+  (destination-label-aware refinement of `estimate_expand_fanout`: the realized `(src_label, type, dst_label)` triple count divided by the
+  `src_label` node count, the average number of `dst_label` neighbors per `src_label` node. `None` when a label or type is unknown or the triple
+  is absent; sharpens the plan weight of a `HasLabel` filter over an `Expand`)
+- `schema_has_edge(src_label: &str, rel_type: &str, dst_label: &str) -> Result<Option<bool>, Error>` (whether the committed data schema contains
+  any directed edge `src_label --rel_type--> dst_label`. `Some(false)` means the directed pattern is provably unsatisfiable; `None` when any name
+  is unknown to the registry. Backs the optimizer's type-inference pass, which prunes a provably empty pattern to a zero-row plan)
 - `label_filter(nodes: &[NodeId], label: &str) -> Result<Vec<NodeId>, Error>` (subset of `nodes` carrying `label`, via one `label_idx` point
   lookup per candidate)
 - `set_thread_count(n: i32) -> Result<(), Error>`: sets the thread count for GraphBLAS matrix computations, overriding the `ISSUNDB_NUM_THREADS`
@@ -368,6 +378,11 @@ index-resolved node-id allow-sets (`PathCountSpec::vertex_allow`), so a filtered
 `RETURN DISTINCT` plans a `Distinct` operator between the final `Project` and `Sort`, keyed on the projected columns, so deduplication
 happens before `ORDER BY` and `SKIP`/`LIMIT`; `WITH DISTINCT` keeps full-row deduplication behind its barrier project, and only
 `RETURN DISTINCT *` deduplicates records after projection in the executor.
+A final type-inference pass (`prune_unsatisfiable`) consults the data schema (`Graph::schema_has_edge`): when a typed hop between two labeled
+endpoints has no realized `(src_label, type, dst_label)` triple, the pattern is provably empty, so that `Expand` is wrapped in a `Limit` with
+`count` zero that returns immediately without scanning. It runs only on read-only plans (a write part could create the matched edge, which the
+committed-state schema cannot see) and prunes only on a definitive negative, so it never drops rows the query should return. A `HasLabel` filter
+over an `Expand` also draws its plan-weight selectivity from the schema triples (`estimate_expand_fanout_to`).
 
 ### `issundb_rest`
 
