@@ -30,7 +30,7 @@ digraph IssunDBArchitecture {
  // GraphBLAS foundation: raw FFI and safe wrapper.
  // ---------------------------------------------------------------
     subgraph cluster_graphblas {
-    label = "GraphBLAS Wapper"
+    label = "GraphBLAS Wrapper"
     fontname = "Helvetica,Arial,sans-serif"
     fontsize = 14
     style = "rounded"
