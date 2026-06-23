@@ -19,7 +19,7 @@ const GRAPHBLAS_URL: &str =
 const GRAPHBLAS_SHA256: &str = "a3c4de775f47d9b448d0f548234a6c321c45f9f6a54e32c9e3a41b28df55cd0a";
 
 /// These are macros that their definitions confuse bindgen (they expand to floating-point
-/// classification constants); ignore them so binding generation won't fail.
+/// classification constants); ignore them so binding generation doesn't fail.
 #[derive(Debug)]
 struct IgnoreMacros(HashSet<String>);
 
@@ -76,7 +76,7 @@ fn main() {
 
     // Apple Clang does not ship an OpenMP runtime, so `find_package(OpenMP)`
     // fails unless pointed at the Homebrew (or MacPorts) `libomp`. Without these
-    // hints GraphBLAS silently builds single-threaded and the `-lomp` link line
+    // hints, GraphBLAS silently builds single-threaded, and the `-lomp` link line
     // below has no library to resolve. Locate the prefix once and reuse it for
     // both the cmake hints and the link search path.
     let macos_libomp = (target_os == "macos").then(find_libomp_prefix).flatten();
@@ -91,8 +91,8 @@ fn main() {
 
     let dst = cfg.build();
 
-    // The install tree puts the static library under `lib` (Debian/Ubuntu) or
-    // `lib64` (Fedora-like); search both.
+    // The installation tree puts the static library under `lib` (Debian/Ubuntu) or
+    // `lib64` (Fedora-like), so search both paths.
     println!("cargo:rustc-link-search=native={}/lib", dst.display());
     println!("cargo:rustc-link-search=native={}/lib64", dst.display());
     // GraphBLAS names the static library `graphblas` everywhere except MSVC,
