@@ -2,6 +2,7 @@ use super::expr::*;
 use super::factorize::{FactorizedRecordGroup, filter_refs_in_expr};
 use super::row::{Bindings, SlotRow, SlotSchema};
 use super::*;
+use issundb_vector::VectorGraphExt;
 
 /// Expand from a set of source nodes, handling pipe-separated OR relationship types.
 ///
@@ -4032,7 +4033,73 @@ pub(super) fn eval_leaf(
             }
             Ok(out)
         }
+        PhysicalOperator::VectorTopK {
+            variable,
+            label,
+            query,
+            k,
+            prop_filters,
+        } => {
+            // Resolve the query vector and any pushed-down equality filters once,
+            // with no row context: the recognizer guarantees these expressions
+            // reference no bound variable.
+            let q = match resolve_query_vector(graph, query, params)? {
+                Some(v) => v,
+                // A null query vector (a null parameter) matches nothing.
+                None => return Ok(vec![]),
+            };
+            let properties = if prop_filters.is_empty() {
+                None
+            } else {
+                let mut m = std::collections::HashMap::with_capacity(prop_filters.len());
+                for (prop, value_expr) in prop_filters {
+                    let v = evaluate_expr(graph, &PathMap::new(), value_expr, params)?;
+                    m.insert(prop.clone(), v);
+                }
+                Some(m)
+            };
+            let opts = issundb_vector::VectorSearchOptions {
+                k: *k,
+                label: label.clone(),
+                properties,
+                rescore_factor: None,
+            };
+            let hits = graph
+                .vector_search_with(&q, &opts)
+                .map_err(|e| e.to_string())?;
+            let mut out = Vec::with_capacity(hits.len());
+            for hit in hits {
+                let mut path = SlotRow::empty(schema.clone());
+                path.bind_local(variable, GraphBinding::Node(hit.node));
+                out.push(path);
+            }
+            Ok(out)
+        }
         other => Err(format!("eval_leaf called on non-leaf operator: {other:?}")),
+    }
+}
+
+/// Resolve a `VectorTopK` query expression to an `f32` vector with no row
+/// context. Returns `None` when the expression evaluates to null (a null
+/// parameter). Errors when it is not a numeric vector.
+fn resolve_query_vector(
+    graph: &Graph,
+    query: &Expr,
+    params: &HashMap<String, serde_json::Value>,
+) -> Result<Option<Vec<f32>>, String> {
+    match evaluate_expr(graph, &PathMap::new(), query, params)? {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::Array(items) => {
+            let mut v = Vec::with_capacity(items.len());
+            for item in items {
+                let f = item
+                    .as_f64()
+                    .ok_or_else(|| "vector query elements must be numbers".to_string())?;
+                v.push(f as f32);
+            }
+            Ok(Some(v))
+        }
+        _ => Err("vector query must be a numeric vector".into()),
     }
 }
 

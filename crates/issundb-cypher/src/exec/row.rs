@@ -94,7 +94,8 @@ impl SlotSchema {
             LabelScan { variable, .. }
             | NodeByIdSeek { variable, .. }
             | NodeIndexScan { variable, .. }
-            | NodeRangeScan { variable, .. } => self.bind(variable),
+            | NodeRangeScan { variable, .. }
+            | VectorTopK { variable, .. } => self.bind(variable),
             Expand {
                 input,
                 src_var,

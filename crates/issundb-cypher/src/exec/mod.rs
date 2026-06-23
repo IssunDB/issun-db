@@ -361,6 +361,229 @@ mod tests {
         graph.add_node("Person", &props).unwrap()
     }
 
+    /// `ORDER BY vector_dist(n, $q) LIMIT k` over a labeled scan lowers to the
+    /// `VectorTopK` index search, and returns the same ranking the exact row
+    /// pipeline would (here, ascending L2 from the origin).
+    #[test]
+    fn vector_topk_lowers_and_matches_exact() {
+        use issundb_vector::{
+            VectorGraphExt, VectorIndexOptions, VectorMetric, VectorQuantization,
+        };
+        let (_dir, graph) = setup_graph();
+        graph
+            .configure_vector_index(VectorIndexOptions {
+                metric: VectorMetric::L2,
+                quantization: VectorQuantization::Float32,
+            })
+            .unwrap();
+        // Five docs at increasing distance from the origin.
+        let coords = [
+            (10, [0.0_f32, 0.0]),
+            (20, [1.0, 0.0]),
+            (30, [2.0, 0.0]),
+            (40, [3.0, 0.0]),
+            (50, [4.0, 0.0]),
+        ];
+        for (id, v) in coords {
+            let n = graph
+                .add_node("Doc", &serde_json::json!({"id": id}))
+                .unwrap();
+            graph.upsert_vector(n, &v).unwrap();
+        }
+        graph.rebuild_csr().unwrap();
+
+        let mut params = HashMap::new();
+        params.insert("q".to_string(), serde_json::json!([0.0, 0.0]));
+
+        let q = "MATCH (n:Doc) RETURN n.id AS id ORDER BY vector_dist(n, $q) LIMIT 3";
+
+        // The plan must use the index search, not a full sort.
+        let plan = explain(&graph, q).unwrap();
+        assert!(
+            plan.contains("VectorTopK"),
+            "expected VectorTopK in plan, got:\n{plan}"
+        );
+
+        let res = execute(&graph, q, &params).unwrap();
+        let ids: Vec<i64> = res
+            .records
+            .iter()
+            .map(|r| r.values[0].as_i64().unwrap())
+            .collect();
+        assert_eq!(ids, vec![10, 20, 30]);
+
+        // SKIP applies after the index ranking: skip the 2 nearest, take 2.
+        let res = execute(
+            &graph,
+            "MATCH (n:Doc) RETURN n.id AS id ORDER BY vector_dist(n, $q) SKIP 2 LIMIT 2",
+            &params,
+        )
+        .unwrap();
+        let ids: Vec<i64> = res
+            .records
+            .iter()
+            .map(|r| r.values[0].as_i64().unwrap())
+            .collect();
+        assert_eq!(ids, vec![30, 40]);
+    }
+
+    /// A `WHERE` equality predicate over the ranked variable is pushed into the
+    /// index traversal as a pre-filter, so the top-k is taken among only the matching nodes.
+    /// The nearer non-matching nodes are skipped, not returned and then discarded.
+    #[test]
+    fn vector_topk_pushes_down_equality_prefilter() {
+        use issundb_vector::{
+            VectorGraphExt, VectorIndexOptions, VectorMetric, VectorQuantization,
+        };
+        let (_dir, graph) = setup_graph();
+        graph
+            .configure_vector_index(VectorIndexOptions {
+                metric: VectorMetric::L2,
+                quantization: VectorQuantization::Float32,
+            })
+            .unwrap();
+        // The two nodes nearest the origin are French; the English ones are
+        // farther. A pre-filtered top-2 must return the English ones.
+        let rows = [
+            (1, "fr", [0.0_f32, 0.0]),
+            (2, "fr", [1.0, 0.0]),
+            (3, "en", [2.0, 0.0]),
+            (4, "en", [3.0, 0.0]),
+            (5, "en", [9.0, 0.0]),
+        ];
+        for (id, lang, v) in rows {
+            let n = graph
+                .add_node("Doc", &serde_json::json!({"id": id, "lang": lang}))
+                .unwrap();
+            graph.upsert_vector(n, &v).unwrap();
+        }
+        graph.rebuild_csr().unwrap();
+
+        let mut params = HashMap::new();
+        params.insert("q".to_string(), serde_json::json!([0.0, 0.0]));
+
+        let q = "MATCH (n:Doc) WHERE n.lang = 'en' RETURN n.id AS id \
+                 ORDER BY vector_dist(n, $q) LIMIT 2";
+        let plan = explain(&graph, q).unwrap();
+        assert!(
+            plan.contains("VectorTopK") && plan.contains("n.lang = "),
+            "expected VectorTopK with pushed-down lang filter, got:\n{plan}"
+        );
+        let res = execute(&graph, q, &params).unwrap();
+        let ids: Vec<i64> = res
+            .records
+            .iter()
+            .map(|r| r.values[0].as_i64().unwrap())
+            .collect();
+        assert_eq!(ids, vec![3, 4]);
+    }
+
+    /// Descending order is not index-accelerable, so the plan keeps the row
+    /// pipeline (`Sort`) and still returns the farthest-first ranking.
+    #[test]
+    fn vector_topk_descending_falls_back_to_sort() {
+        use issundb_vector::{
+            VectorGraphExt, VectorIndexOptions, VectorMetric, VectorQuantization,
+        };
+        let (_dir, graph) = setup_graph();
+        graph
+            .configure_vector_index(VectorIndexOptions {
+                metric: VectorMetric::L2,
+                quantization: VectorQuantization::Float32,
+            })
+            .unwrap();
+        for (id, v) in [(1, [0.0_f32, 0.0]), (2, [5.0, 0.0])] {
+            let n = graph
+                .add_node("Doc", &serde_json::json!({"id": id}))
+                .unwrap();
+            graph.upsert_vector(n, &v).unwrap();
+        }
+        graph.rebuild_csr().unwrap();
+
+        let mut params = HashMap::new();
+        params.insert("q".to_string(), serde_json::json!([0.0, 0.0]));
+
+        let q = "MATCH (n:Doc) RETURN n.id AS id ORDER BY vector_dist(n, $q) DESC LIMIT 2";
+        let plan = explain(&graph, q).unwrap();
+        assert!(
+            !plan.contains("VectorTopK"),
+            "descending order must not lower to VectorTopK:\n{plan}"
+        );
+        let res = execute(&graph, q, &params).unwrap();
+        let ids: Vec<i64> = res
+            .records
+            .iter()
+            .map(|r| r.values[0].as_i64().unwrap())
+            .collect();
+        assert_eq!(ids, vec![2, 1]);
+    }
+
+    /// `vector_dist(a, b)` computes the distance under the graph's configured
+    /// metric. Either argument may be a node (its stored embedding is resolved)
+    /// or a numeric vector. A node with no embedding yields `null`.
+    #[test]
+    fn vector_dist_scalar_function() {
+        use issundb_vector::{
+            VectorGraphExt, VectorIndexOptions, VectorMetric, VectorQuantization,
+        };
+        let (_dir, graph) = setup_graph();
+        graph
+            .configure_vector_index(VectorIndexOptions {
+                metric: VectorMetric::L2,
+                quantization: VectorQuantization::Float32,
+            })
+            .unwrap();
+        let a = graph
+            .add_node("Doc", &serde_json::json!({"id": 1}))
+            .unwrap();
+        let b = graph
+            .add_node("Doc", &serde_json::json!({"id": 2}))
+            .unwrap();
+        // A third node with no embedding.
+        graph
+            .add_node("Doc", &serde_json::json!({"id": 3}))
+            .unwrap();
+        graph.upsert_vector(a, &[0.0, 0.0]).unwrap();
+        graph.upsert_vector(b, &[3.0, 4.0]).unwrap();
+        // c has no embedding.
+        graph.rebuild_csr().unwrap();
+
+        let mut params = HashMap::new();
+        params.insert("q".to_string(), serde_json::json!([0.0, 0.0]));
+
+        // Explicit two-vector form: squared L2 between (0,0) and (3,4) is 25.
+        let res = execute(
+            &graph,
+            "RETURN vector_dist([0.0, 0.0], [3.0, 4.0]) AS d",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(res.records[0].values[0].as_f64().unwrap(), 25.0);
+
+        // Node-vs-query-vector form, ordered ascending by distance: a (0) before b (25).
+        let res = execute(
+            &graph,
+            "MATCH (n:Doc) WHERE n.id <> 3 RETURN n.id AS id ORDER BY vector_dist(n, $q)",
+            &params,
+        )
+        .unwrap();
+        let ids: Vec<i64> = res
+            .records
+            .iter()
+            .map(|r| r.values[0].as_i64().unwrap())
+            .collect();
+        assert_eq!(ids, vec![1, 2]);
+
+        // A node without an embedding yields null.
+        let res = execute(
+            &graph,
+            "MATCH (n:Doc) WHERE n.id = 3 RETURN vector_dist(n, $q) AS d",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(res.records[0].values[0], serde_json::Value::Null);
+    }
+
     /// Run `setup` then `query`, returning the single scalar value of the one expected row.
     fn agg_scalar(setup: &[&str], query: &str) -> serde_json::Value {
         let params = HashMap::new();

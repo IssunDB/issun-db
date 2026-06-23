@@ -41,6 +41,13 @@ impl Optimizer {
                 expression: filter_expr,
             };
         }
+        // Replace a `vector_dist` top-k sort over a labeled scan with one HNSW
+        // index search, pushing any equality `WHERE` predicates over the scan
+        // variable into the index traversal. Runs before index-scan rewriting so
+        // the pre-filters are still `Filter` nodes over the `LabelScan` (not yet
+        // turned into a `NodeIndexScan`); an unrecognized shape falls back to the
+        // exact row-pipeline evaluation.
+        result = rewrite_vector_topk(result);
         result = Self::optimize_index_scans(result, stats);
         // Convert a natural inner `HashJoin` whose one side merely re-scans a
         // variable the other side already binds into a linear "expand into"
@@ -357,7 +364,8 @@ impl Optimizer {
             // A leaf produced after this pass; nothing to extract.
             t @ PhysicalOperator::TriangleCount { .. }
             | t @ PhysicalOperator::PathCount { .. }
-            | t @ PhysicalOperator::GroupedDegree { .. } => (t, Vec::new()),
+            | t @ PhysicalOperator::GroupedDegree { .. }
+            | t @ PhysicalOperator::VectorTopK { .. } => (t, Vec::new()),
         }
     }
 
@@ -521,7 +529,8 @@ impl Optimizer {
             },
             t @ PhysicalOperator::TriangleCount { .. }
             | t @ PhysicalOperator::PathCount { .. }
-            | t @ PhysicalOperator::GroupedDegree { .. } => t,
+            | t @ PhysicalOperator::GroupedDegree { .. }
+            | t @ PhysicalOperator::VectorTopK { .. } => t,
         }
     }
 
@@ -605,6 +614,8 @@ impl Optimizer {
             PhysicalOperator::TriangleCount { .. } | PhysicalOperator::PathCount { .. } => 1,
             // One kernel pass over adjacency producing one row per group.
             PhysicalOperator::GroupedDegree { .. } => 1,
+            // One index search producing at most `k` rows.
+            PhysicalOperator::VectorTopK { .. } => 1,
             // MultiwayJoin is cheaper than a regular Expand because the closing check is O(1)
             // per row after a single bulk expansion. Weight as the input cost.
             PhysicalOperator::MultiwayJoin { input, .. } => Self::plan_weight(input, stats),
@@ -1107,7 +1118,8 @@ impl Optimizer {
             // A leaf produced after this pass; no children to push into.
             t @ PhysicalOperator::TriangleCount { .. }
             | t @ PhysicalOperator::PathCount { .. }
-            | t @ PhysicalOperator::GroupedDegree { .. } => t,
+            | t @ PhysicalOperator::GroupedDegree { .. }
+            | t @ PhysicalOperator::VectorTopK { .. } => t,
         }
     }
 
@@ -1138,6 +1150,9 @@ impl Optimizer {
                 vars.insert(variable.clone());
             }
             PhysicalOperator::NodeRangeScan { variable, .. } => {
+                vars.insert(variable.clone());
+            }
+            PhysicalOperator::VectorTopK { variable, .. } => {
                 vars.insert(variable.clone());
             }
             PhysicalOperator::Expand {
@@ -2970,6 +2985,170 @@ fn rewrite_path_count(op: PhysicalOperator) -> PhysicalOperator {
             expression,
         },
         other => other,
+    }
+}
+
+/// Replace a `Limit` over a `Sort` whose single ascending key is
+/// `vector_dist(var, query)` over a bare `LabelScan(var)` with the leaf
+/// `VectorTopK` operator, which answers the query with one HNSW index search
+/// instead of scanning every node and computing a distance per row. The `Sort`
+/// is dropped (the operator emits in ranked order) and the enclosing `Limit`
+/// still applies `skip`. Any other shape is left untouched, so the row pipeline
+/// (which evaluates `vector_dist` exactly) remains the correctness fallback.
+fn rewrite_vector_topk(op: PhysicalOperator) -> PhysicalOperator {
+    if let Some(t) = try_vector_topk(&op) {
+        return t;
+    }
+    match op {
+        PhysicalOperator::Project {
+            input,
+            items,
+            is_barrier,
+        } => PhysicalOperator::Project {
+            input: Box::new(rewrite_vector_topk(*input)),
+            items,
+            is_barrier,
+        },
+        PhysicalOperator::Limit { input, skip, count } => PhysicalOperator::Limit {
+            input: Box::new(rewrite_vector_topk(*input)),
+            skip,
+            count,
+        },
+        PhysicalOperator::WritePart { input, part } => PhysicalOperator::WritePart {
+            input: Box::new(rewrite_vector_topk(*input)),
+            part,
+        },
+        other => other,
+    }
+}
+
+/// Recognize the `VectorTopK` shape rooted at a `Limit`. Returns the rewritten
+/// operator, or `None` when the shape does not match exactly.
+fn try_vector_topk(op: &PhysicalOperator) -> Option<PhysicalOperator> {
+    let PhysicalOperator::Limit { input, skip, count } = op else {
+        return None;
+    };
+    let PhysicalOperator::Sort {
+        input: sort_input,
+        items,
+    } = input.as_ref()
+    else {
+        return None;
+    };
+    // Exactly one ascending key, and it must be `vector_dist(var, query)`.
+    if items.len() != 1 || !items[0].ascending {
+        return None;
+    }
+    let (var, query) = match_vector_dist(&items[0].expr)?;
+    // The query vector must be a constant (a parameter or a literal vector), so
+    // it can be evaluated once with no row context.
+    if !query_is_constant(query) {
+        return None;
+    }
+    // Below the (optional) projection, the source must be a labeled scan of the
+    // same variable the sort key ranks, optionally wrapped in equality `Filter`
+    // predicates over that variable. The projection is re-applied above the
+    // index search, where it maps the ranked nodes to the output columns; the
+    // equality predicates become pushed-down pre-filters on the index traversal.
+    let (project, mut scan) = match sort_input.as_ref() {
+        PhysicalOperator::Project {
+            input,
+            items,
+            is_barrier,
+        } => (Some((items.clone(), *is_barrier)), input.as_ref()),
+        other => (None, other),
+    };
+    // Collect the equality-filter chain. Any non-equality or cross-variable
+    // predicate cannot be expressed as an index pre-filter, so the whole shape
+    // falls back rather than silently dropping a predicate (which would break
+    // top-k semantics by returning unfiltered neighbors).
+    let mut prop_filters: Vec<(String, Expr)> = Vec::new();
+    while let PhysicalOperator::Filter { input, expression } = scan {
+        let (prop, value) = pushable_eq(expression, &var)?;
+        prop_filters.push((prop, value));
+        scan = input.as_ref();
+    }
+    let PhysicalOperator::LabelScan { variable, label } = scan else {
+        return None;
+    };
+    if variable != &var {
+        return None;
+    }
+
+    let topk = PhysicalOperator::VectorTopK {
+        variable: variable.clone(),
+        label: label.clone(),
+        query: query.clone(),
+        k: skip.saturating_add(*count),
+        prop_filters,
+    };
+    let inner = match project {
+        Some((items, is_barrier)) => PhysicalOperator::Project {
+            input: Box::new(topk),
+            items,
+            is_barrier,
+        },
+        None => topk,
+    };
+    Some(PhysicalOperator::Limit {
+        input: Box::new(inner),
+        skip: *skip,
+        count: *count,
+    })
+}
+
+/// Match `vector_dist(var, query)` where exactly one argument is a bare variable
+/// reference (`Expr::Prop(var, "")`). Returns the variable name and a reference
+/// to the other (query) argument. The distance metrics are symmetric, so the
+/// argument order does not matter.
+fn match_vector_dist(expr: &Expr) -> Option<(String, &Expr)> {
+    let Expr::FunctionCall { name, args } = expr else {
+        return None;
+    };
+    if !name.eq_ignore_ascii_case("vector_dist") || args.len() != 2 {
+        return None;
+    }
+    match (&args[0], &args[1]) {
+        (Expr::Prop(var, p), q) if p.is_empty() => Some((var.clone(), q)),
+        (q, Expr::Prop(var, p)) if p.is_empty() => Some((var.clone(), q)),
+        _ => None,
+    }
+}
+
+/// Match an equality predicate of the form `var.prop = const` (or its mirror),
+/// returning the property name and the constant value expression. Used to push
+/// `WHERE` equality filters over the ranked variable into the index traversal.
+fn pushable_eq(f: &FilterExpr, var: &str) -> Option<(String, Expr)> {
+    let (l, r) = match f {
+        FilterExpr::Eq(l, r) => (l, r),
+        FilterExpr::Expr(Expr::BinaryOp {
+            op: BinaryOperator::Eq,
+            left,
+            right,
+        }) => (left.as_ref(), right.as_ref()),
+        _ => return None,
+    };
+    let pick = |a: &Expr, b: &Expr| -> Option<(String, Expr)> {
+        if let Expr::Prop(v, p) = a {
+            if v == var && !p.is_empty() && query_is_constant(b) {
+                return Some((p.clone(), b.clone()));
+            }
+        }
+        None
+    };
+    pick(l, r).or_else(|| pick(r, l))
+}
+
+/// A query vector is constant when it is a parameter or a literal-element vector
+/// (`[1.0, 2.0]`, parsed as the internal `__list__` call), so it references no
+/// bound variable and can be evaluated once before the search.
+fn query_is_constant(expr: &Expr) -> bool {
+    match expr {
+        Expr::Param(_) | Expr::Literal(_) => true,
+        Expr::FunctionCall { name, args } if name == "__list__" => {
+            args.iter().all(query_is_constant)
+        }
+        _ => false,
     }
 }
 

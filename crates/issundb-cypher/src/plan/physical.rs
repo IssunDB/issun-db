@@ -231,6 +231,34 @@ pub enum PhysicalOperator {
         /// Output column the count is bound to.
         output: String,
     },
+    /// Approximate k-nearest-neighbor scan over the HNSW vector index, binding
+    /// `variable` to the `k` nodes nearest to `query` in ascending distance
+    /// order under the graph's configured metric.
+    ///
+    /// Emitted by the optimizer when a `Limit` over a `Sort` whose single
+    /// ascending key is `vector_dist(variable, query)` sits over a bare
+    /// `LabelScan(variable)` (optionally with pushed-down property-equality
+    /// filters). It replaces the scan-plus-sort with one index search, so the
+    /// engine never computes a distance for every node. The `Sort` is dropped
+    /// because the operator emits in ranked order; the enclosing `Limit`
+    /// applies `skip`. `query` is evaluated once against empty bindings, so it
+    /// must not reference any bound variable. Any unrecognized shape (descending
+    /// order, a non-constant query, a non-`vector_dist` key) keeps the row
+    /// pipeline, so correctness never depends on this rewrite.
+    VectorTopK {
+        /// Node variable bound to each ranked result.
+        variable: String,
+        /// Label every result must carry, if the scan was labeled.
+        label: Option<String>,
+        /// The query-vector expression, evaluated once with no row context.
+        query: Expr,
+        /// Number of nearest neighbors to fetch (`skip + count` of the `Limit`).
+        k: usize,
+        /// Equality pre-filters on the result variable's properties, pushed down
+        /// into the index traversal. Each entry is `(property, value_expr)` and
+        /// the value expression is evaluated once with no row context.
+        prop_filters: Vec<(String, Expr)>,
+    },
 }
 
 /// Comparison operator of a per-vertex property predicate pushed into the
@@ -716,6 +744,28 @@ pub fn format_physical_plan(op: &PhysicalOperator, depth: usize) -> String {
             buf.push_str(&format!(
                 "{pad}GroupedDegree {arrow} group=[{}] {counted} AS {output}\n",
                 keys.join(", ")
+            ));
+        }
+        PhysicalOperator::VectorTopK {
+            variable,
+            label,
+            query,
+            k,
+            prop_filters,
+        } => {
+            let lbl = label.as_deref().unwrap_or("*");
+            let filters = if prop_filters.is_empty() {
+                String::new()
+            } else {
+                let parts: Vec<String> = prop_filters
+                    .iter()
+                    .map(|(p, v)| format!("{variable}.{p} = {}", fmt_expr(v)))
+                    .collect();
+                format!(" {{{}}}", parts.join(", "))
+            };
+            buf.push_str(&format!(
+                "{pad}VectorTopK {variable}:{lbl}{filters} order=vector_dist({variable}, {}) k={k}\n",
+                fmt_expr(query)
             ));
         }
     }

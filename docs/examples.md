@@ -27,6 +27,27 @@ fn run_vector_search(graph: &Graph) -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+## Vector Search in Cypher
+
+Vector distance is also available inside Cypher through the `vector_dist` function, so nearest-neighbor
+ranking can be expressed declaratively alongside graph patterns. The first argument is a node (its stored
+embedding is resolved) or a numeric vector, and the second is the query vector; the distance uses the
+graph's configured metric.
+
+```cypher
+MATCH (p:Document)
+WHERE p.language = 'English'
+RETURN p.title
+ORDER BY vector_dist(p, $query_vector)
+LIMIT 10
+```
+
+When the query is an ascending `ORDER BY vector_dist(node, query)` with a `LIMIT` over a labeled scan, the
+planner answers it with a single HNSW index search instead of computing a distance for every node, and it
+pushes any equality `WHERE` predicate over the scanned variable (such as `p.language = 'English'`) into the
+index traversal as a pre-filter. Any other shape (for example descending order or a non-constant query
+vector) falls back to exact evaluation over the row pipeline, so results are always correct.
+
 ## Full-Text Search Example
 
 Create a text index on specific node properties to support unstructured text queries:

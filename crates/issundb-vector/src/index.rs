@@ -367,6 +367,17 @@ pub trait VectorGraphExt {
         q: &[f32],
         opts: &VectorSearchOptions,
     ) -> Result<Vec<Hit>, VectorError>;
+
+    /// Return the full-precision embedding stored for `n`, or `None` when the
+    /// node has no embedding. This is a point lookup against LMDB and does not
+    /// build or consult the in-memory HNSW index.
+    fn node_vector(&self, n: NodeId) -> Result<Option<Vec<f32>>, VectorError>;
+
+    /// Distance between two vectors under this graph's configured metric
+    /// (default Cosine). The convention matches `vector_search`: squared L2 for
+    /// `L2` and `1 - dot` for `Dot`. Returns `DimensionMismatch` when the two
+    /// vectors differ in length.
+    fn vector_distance(&self, a: &[f32], b: &[f32]) -> Result<f32, VectorError>;
 }
 
 /// Key type used to store the persistent HNSW cache in `Graph::extensions`.
@@ -548,6 +559,25 @@ impl VectorGraphExt for Graph {
 
         final_hits.truncate(opts.k);
         Ok(final_hits)
+    }
+
+    fn node_vector(&self, n: NodeId) -> Result<Option<Vec<f32>>, VectorError> {
+        let bytes = self.view(|txn| txn.get_vector_bytes(n))?;
+        match bytes {
+            Some(b) => Ok(Some(decode_vector(&b)?)),
+            None => Ok(None),
+        }
+    }
+
+    fn vector_distance(&self, a: &[f32], b: &[f32]) -> Result<f32, VectorError> {
+        if a.len() != b.len() {
+            return Err(VectorError::DimensionMismatch {
+                expected: a.len(),
+                got: b.len(),
+            });
+        }
+        let metric = load_config(self)?.unwrap_or_default().metric;
+        Ok(exact_distance(a, b, metric))
     }
 }
 

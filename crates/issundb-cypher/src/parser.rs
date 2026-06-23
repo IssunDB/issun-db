@@ -3449,6 +3449,7 @@ fn is_known_function(name: &str) -> bool {
             | "nodes"
             | "relationships"
             | "rels"
+            | "vector_dist"
     )
 }
 
