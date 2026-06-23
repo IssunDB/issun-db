@@ -30,7 +30,7 @@ digraph IssunDBArchitecture {
  // GraphBLAS foundation: raw FFI and safe wrapper.
  // ---------------------------------------------------------------
     subgraph cluster_graphblas {
-    label = "GraphBLAS Wapper"
+    label = "GraphBLAS Wrapper"
     fontname = "Helvetica,Arial,sans-serif"
     fontsize = 14
     style = "rounded"
@@ -129,6 +129,7 @@ digraph IssunDBArchitecture {
     retrieval -> text
     cypher -> core [lhead = cluster_core]
     cypher -> text
+    cypher -> vector
 
     // Facade composes the extensions and core.
     facade -> core [ltail = cluster_facade, lhead = cluster_core]

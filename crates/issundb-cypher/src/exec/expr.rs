@@ -4,6 +4,7 @@ use chrono::{
     Datelike, Duration, NaiveDate, NaiveDateTime, NaiveTime, Offset, TimeZone, Timelike, Weekday,
 };
 use chrono_tz::Tz;
+use issundb_vector::VectorGraphExt;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
@@ -973,6 +974,41 @@ pub(super) fn eval_arithmetic(
 }
 
 /// Evaluate a built-in function call.
+/// Resolve a `vector_dist` argument to an embedding. A node value resolves to
+/// its stored embedding (`None` when the node has none), a JSON array resolves
+/// to its numeric elements, and `null` resolves to `None`. Any other value is
+/// an error. Returning `None` lets the caller propagate Cypher null semantics.
+fn resolve_vector_arg<B: Bindings>(
+    graph: &Graph,
+    path: &B,
+    expr: &Expr,
+    params: &HashMap<String, serde_json::Value>,
+) -> Result<Option<Vec<f32>>, String> {
+    match evaluate_expr(graph, path, expr, params)? {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::Array(items) => {
+            let mut v = Vec::with_capacity(items.len());
+            for item in items {
+                let f = item
+                    .as_f64()
+                    .ok_or_else(|| "vector_dist() vector elements must be numbers".to_string())?;
+                v.push(f as f32);
+            }
+            Ok(Some(v))
+        }
+        serde_json::Value::Object(map)
+            if map.get("__type__").and_then(|t| t.as_str()) == Some("__Node__") =>
+        {
+            let id = map
+                .get("id")
+                .and_then(|v| v.as_u64())
+                .ok_or_else(|| "vector_dist() node has no id".to_string())?;
+            graph.node_vector(id).map_err(|e| e.to_string())
+        }
+        _ => Err("vector_dist() argument must be a node or a numeric vector".into()),
+    }
+}
+
 pub(super) fn eval_function_call<B: Bindings>(
     graph: &Graph,
     path: &B,
@@ -1045,6 +1081,22 @@ pub(super) fn eval_function_call<B: Bindings>(
                 i += 2;
             }
             Ok(serde_json::Value::Object(map))
+        }
+        "vector_dist" => {
+            if args.len() != 2 {
+                return Err("vector_dist() requires exactly 2 arguments".into());
+            }
+            let a = resolve_vector_arg(graph, path, &args[0], params)?;
+            let b = resolve_vector_arg(graph, path, &args[1], params)?;
+            // A null operand (a null input or a node with no embedding) yields null,
+            // matching Cypher's null propagation for scalar functions.
+            match (a, b) {
+                (Some(va), Some(vb)) => {
+                    let d = graph.vector_distance(&va, &vb).map_err(|e| e.to_string())?;
+                    Ok(serde_json::Value::from(d as f64))
+                }
+                _ => Ok(serde_json::Value::Null),
+            }
         }
         "range" => {
             if args.len() < 2 || args.len() > 3 {

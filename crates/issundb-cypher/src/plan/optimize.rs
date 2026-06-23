@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::ast::{AggFn, BinaryOperator, Expr, Literal};
 use crate::plan::logical::FilterExpr;
@@ -12,7 +12,31 @@ impl Optimizer {
     /// Optimize a `PhysicalOperator` plan by standardizing operator sequences,
     /// extracting filter predicates, and pushing them down to the lowest possible nodes.
     pub fn optimize(op: PhysicalOperator, stats: Option<&dyn StatsProvider>) -> PhysicalOperator {
-        let (stripped_op, raw_filters) = Self::extract_filters(op, stats);
+        // Schema-based pruning may only run on a fully read-only query: a write
+        // anywhere in the plan can create the very edge a pattern matches, which
+        // the committed-state schema cannot see. The flag is decided once over
+        // the whole tree and threaded through the opaque recursive optimize
+        // calls (barrier `Project`, `WritePart`) so a write subtree never lets a
+        // recursively optimized read sub-plan prune itself.
+        let allow_prune = !Self::plan_has_write(&op);
+        Self::optimize_impl(op, stats, allow_prune)
+    }
+
+    fn optimize_impl(
+        op: PhysicalOperator,
+        stats: Option<&dyn StatsProvider>,
+        allow_prune: bool,
+    ) -> PhysicalOperator {
+        // Collect each variable's declared label constraints from the original
+        // tree before `extract_filters` strips the `HasLabel` filters that carry
+        // an intermediate hop endpoint's label. Reordering runs on the
+        // filter-free spine, where only scan variables still carry a label, so
+        // this map is how `plan_weight` recovers the per-source-label expand
+        // ratio for a hop whose source is a labeled intermediate variable rather
+        // than a scanned one (multi-hop fan-out chaining).
+        let mut labels: HashMap<String, Vec<String>> = HashMap::new();
+        Self::collect_label_constraints(&op, &mut labels);
+        let (stripped_op, raw_filters) = Self::extract_filters(op, stats, allow_prune);
         // Split top-level AND conjunctions so each conjunct pushes down to its
         // own lowest binder: `a.id = 1 AND b.age > 30` as a whole references
         // both endpoints and would stay above the Expand, while its conjuncts
@@ -25,7 +49,7 @@ impl Optimizer {
         // evaluated per row. Only provably-true forms are removed; false or
         // unknown predicates are preserved for normal evaluation.
         filters.retain(|f| !Self::is_trivially_true(f));
-        let reordered_op = Self::reorder_operators(stripped_op, stats);
+        let reordered_op = Self::reorder_operators(stripped_op, stats, &labels);
         // Choose the lowest-cardinality endpoint as the traversal start, reversing a
         // linear single-hop Expand chain when its far endpoint is cheaper to scan.
         // Runs on the filter-free spine so the chain is contiguous; the HasLabel
@@ -41,6 +65,13 @@ impl Optimizer {
                 expression: filter_expr,
             };
         }
+        // Replace a `vector_dist` top-k sort over a labeled scan with one HNSW
+        // index search, pushing any equality `WHERE` predicates over the scan
+        // variable into the index traversal. Runs before index-scan rewriting so
+        // the pre-filters are still `Filter` nodes over the `LabelScan` (not yet
+        // turned into a `NodeIndexScan`); an unrecognized shape falls back to the
+        // exact row-pipeline evaluation.
+        result = rewrite_vector_topk(result);
         result = Self::optimize_index_scans(result, stats);
         // Convert a natural inner `HashJoin` whose one side merely re-scans a
         // variable the other side already binds into a linear "expand into"
@@ -66,6 +97,16 @@ impl Optimizer {
         // the grouped-degree kernel. Runs after the path-count rewrite, which
         // claims the grouping-free counts; only grouped aggregates remain here.
         result = rewrite_grouped_degree(result);
+        // Type inference: when the data schema contains no edge matching a typed
+        // hop between two labeled endpoints, that hop (and so the whole pattern)
+        // is unsatisfiable, so it is replaced with a zero-row operator that never
+        // touches storage. Runs last, after the plan shape is settled, and only
+        // on read-only plans: the committed-state schema cannot see edges that a
+        // write part of the same statement would create, so pruning a plan with
+        // writes could drop rows the query should return.
+        if allow_prune {
+            result = Self::prune_unsatisfiable(result, stats);
+        }
         result
     }
 
@@ -94,10 +135,12 @@ impl Optimizer {
     fn extract_filters(
         op: PhysicalOperator,
         stats: Option<&dyn StatsProvider>,
+        allow_prune: bool,
     ) -> (PhysicalOperator, Vec<FilterExpr>) {
         match op {
             PhysicalOperator::Filter { input, expression } => {
-                let (inner_op, mut inner_filters) = Self::extract_filters(*input, stats);
+                let (inner_op, mut inner_filters) =
+                    Self::extract_filters(*input, stats, allow_prune);
                 inner_filters.push(expression);
                 (inner_op, inner_filters)
             }
@@ -107,7 +150,7 @@ impl Optimizer {
                 expr,
                 variable,
             } => {
-                let (inner_op, inner_filters) = Self::extract_filters(*input, stats);
+                let (inner_op, inner_filters) = Self::extract_filters(*input, stats, allow_prune);
                 (
                     PhysicalOperator::Unwind {
                         input: Box::new(inner_op),
@@ -179,7 +222,7 @@ impl Optimizer {
                 unique_rels,
                 needs_path,
             } => {
-                let (inner_op, inner_filters) = Self::extract_filters(*input, stats);
+                let (inner_op, inner_filters) = Self::extract_filters(*input, stats, allow_prune);
                 (
                     PhysicalOperator::Expand {
                         input: Box::new(inner_op),
@@ -209,7 +252,7 @@ impl Optimizer {
                     // filters would re-place them above the barrier, where the variables
                     // they reference are no longer in scope. Treat barrier projects as
                     // opaque: do not extract filters from inside them, but optimize their subplan.
-                    let optimized_input = Self::optimize(*input, stats);
+                    let optimized_input = Self::optimize_impl(*input, stats, allow_prune);
                     (
                         PhysicalOperator::Project {
                             input: Box::new(optimized_input),
@@ -219,7 +262,8 @@ impl Optimizer {
                         Vec::new(),
                     )
                 } else {
-                    let (inner_op, inner_filters) = Self::extract_filters(*input, stats);
+                    let (inner_op, inner_filters) =
+                        Self::extract_filters(*input, stats, allow_prune);
                     (
                         PhysicalOperator::Project {
                             input: Box::new(inner_op),
@@ -231,8 +275,8 @@ impl Optimizer {
                 }
             }
             PhysicalOperator::HashJoin { left, right } => {
-                let (left_op, mut left_filters) = Self::extract_filters(*left, stats);
-                let (right_op, right_filters) = Self::extract_filters(*right, stats);
+                let (left_op, mut left_filters) = Self::extract_filters(*left, stats, allow_prune);
+                let (right_op, right_filters) = Self::extract_filters(*right, stats, allow_prune);
                 left_filters.extend(right_filters);
                 (
                     PhysicalOperator::HashJoin {
@@ -249,7 +293,7 @@ impl Optimizer {
                 group_by,
                 aggregations,
             } => {
-                let (inner, filters) = Self::extract_filters(*input, stats);
+                let (inner, filters) = Self::extract_filters(*input, stats, allow_prune);
                 (
                     PhysicalOperator::Aggregate {
                         input: Box::new(inner),
@@ -260,7 +304,7 @@ impl Optimizer {
                 )
             }
             PhysicalOperator::Sort { input, items } => {
-                let (inner, filters) = Self::extract_filters(*input, stats);
+                let (inner, filters) = Self::extract_filters(*input, stats, allow_prune);
                 (
                     PhysicalOperator::Sort {
                         input: Box::new(inner),
@@ -270,7 +314,7 @@ impl Optimizer {
                 )
             }
             PhysicalOperator::Limit { input, skip, count } => {
-                let (inner, filters) = Self::extract_filters(*input, stats);
+                let (inner, filters) = Self::extract_filters(*input, stats, allow_prune);
                 (
                     PhysicalOperator::Limit {
                         input: Box::new(inner),
@@ -294,7 +338,7 @@ impl Optimizer {
                 Vec::new(),
             ),
             PhysicalOperator::Distinct { input, keys } => {
-                let (inner, inner_filters) = Self::extract_filters(*input, stats);
+                let (inner, inner_filters) = Self::extract_filters(*input, stats, allow_prune);
                 (
                     PhysicalOperator::Distinct {
                         input: Box::new(inner),
@@ -306,7 +350,7 @@ impl Optimizer {
             // WritePart operators are opaque: do not extract filters from inside them,
             // but recursively optimize their input subplans.
             PhysicalOperator::WritePart { input, part } => {
-                let optimized_input = Self::optimize(*input, stats);
+                let optimized_input = Self::optimize_impl(*input, stats, allow_prune);
                 (
                     PhysicalOperator::WritePart {
                         input: Box::new(optimized_input),
@@ -339,7 +383,7 @@ impl Optimizer {
                 closing_is_undirected,
                 closing_unique_rels,
             } => {
-                let (inner_op, inner_filters) = Self::extract_filters(*input, stats);
+                let (inner_op, inner_filters) = Self::extract_filters(*input, stats, allow_prune);
                 (
                     PhysicalOperator::MultiwayJoin {
                         input: Box::new(inner_op),
@@ -357,7 +401,8 @@ impl Optimizer {
             // A leaf produced after this pass; nothing to extract.
             t @ PhysicalOperator::TriangleCount { .. }
             | t @ PhysicalOperator::PathCount { .. }
-            | t @ PhysicalOperator::GroupedDegree { .. } => (t, Vec::new()),
+            | t @ PhysicalOperator::GroupedDegree { .. }
+            | t @ PhysicalOperator::VectorTopK { .. } => (t, Vec::new()),
         }
     }
 
@@ -365,16 +410,17 @@ impl Optimizer {
     fn reorder_operators(
         op: PhysicalOperator,
         stats: Option<&dyn StatsProvider>,
+        labels: &HashMap<String, Vec<String>>,
     ) -> PhysicalOperator {
         match op {
             PhysicalOperator::HashJoin { left, right } => {
-                let opt_left = Self::reorder_operators(*left, stats);
-                let opt_right = Self::reorder_operators(*right, stats);
+                let opt_left = Self::reorder_operators(*left, stats, labels);
+                let opt_right = Self::reorder_operators(*right, stats, labels);
 
                 // Standardize join branch order by placing the heavier branch on the left,
                 // which guarantees consistent physical structure regardless of Cypher MATCH clause order.
-                let left_weight = Self::plan_weight(&opt_left, stats);
-                let right_weight = Self::plan_weight(&opt_right, stats);
+                let left_weight = Self::plan_weight_env(&opt_left, stats, labels);
+                let right_weight = Self::plan_weight_env(&opt_right, stats, labels);
 
                 if left_weight >= right_weight {
                     PhysicalOperator::HashJoin {
@@ -401,7 +447,7 @@ impl Optimizer {
                 unique_rels,
                 needs_path,
             } => PhysicalOperator::Expand {
-                input: Box::new(Self::reorder_operators(*input, stats)),
+                input: Box::new(Self::reorder_operators(*input, stats, labels)),
                 src_var,
                 rel_var,
                 dst_var,
@@ -416,7 +462,7 @@ impl Optimizer {
             // Filter nodes inside opaque barrier-Project subtrees are not stripped by
             // `extract_filters`.  Pass them through so that reordering does not panic.
             PhysicalOperator::Filter { input, expression } => PhysicalOperator::Filter {
-                input: Box::new(Self::reorder_operators(*input, stats)),
+                input: Box::new(Self::reorder_operators(*input, stats, labels)),
                 expression,
             },
             PhysicalOperator::Project {
@@ -435,7 +481,7 @@ impl Optimizer {
                     }
                 } else {
                     PhysicalOperator::Project {
-                        input: Box::new(Self::reorder_operators(*input, stats)),
+                        input: Box::new(Self::reorder_operators(*input, stats, labels)),
                         items,
                         is_barrier,
                     }
@@ -447,7 +493,7 @@ impl Optimizer {
                 expr,
                 variable,
             } => PhysicalOperator::Unwind {
-                input: Box::new(Self::reorder_operators(*input, stats)),
+                input: Box::new(Self::reorder_operators(*input, stats, labels)),
                 expr,
                 variable,
             },
@@ -463,28 +509,28 @@ impl Optimizer {
                 group_by,
                 aggregations,
             } => PhysicalOperator::Aggregate {
-                input: Box::new(Self::reorder_operators(*input, stats)),
+                input: Box::new(Self::reorder_operators(*input, stats, labels)),
                 group_by,
                 aggregations,
             },
             PhysicalOperator::Sort { input, items } => PhysicalOperator::Sort {
-                input: Box::new(Self::reorder_operators(*input, stats)),
+                input: Box::new(Self::reorder_operators(*input, stats, labels)),
                 items,
             },
             PhysicalOperator::Limit { input, skip, count } => PhysicalOperator::Limit {
-                input: Box::new(Self::reorder_operators(*input, stats)),
+                input: Box::new(Self::reorder_operators(*input, stats, labels)),
                 skip,
                 count,
             },
             PhysicalOperator::OptionalMatch { input, null_vars } => {
                 PhysicalOperator::OptionalMatch {
-                    input: Box::new(Self::reorder_operators(*input, stats)),
+                    input: Box::new(Self::reorder_operators(*input, stats, labels)),
                     null_vars,
                 }
             }
             PhysicalOperator::Distinct { input, keys } => PhysicalOperator::Distinct {
                 keys,
-                input: Box::new(Self::reorder_operators(*input, stats)),
+                input: Box::new(Self::reorder_operators(*input, stats, labels)),
             },
             // WritePart is opaque: do not descend into it for reordering.
             PhysicalOperator::WritePart { input, part } => {
@@ -510,7 +556,7 @@ impl Optimizer {
                 closing_is_undirected,
                 closing_unique_rels,
             } => PhysicalOperator::MultiwayJoin {
-                input: Box::new(Self::reorder_operators(*input, stats)),
+                input: Box::new(Self::reorder_operators(*input, stats, labels)),
                 closing_src_var,
                 closing_dst_var,
                 closing_rel_type,
@@ -521,15 +567,36 @@ impl Optimizer {
             },
             t @ PhysicalOperator::TriangleCount { .. }
             | t @ PhysicalOperator::PathCount { .. }
-            | t @ PhysicalOperator::GroupedDegree { .. } => t,
+            | t @ PhysicalOperator::GroupedDegree { .. }
+            | t @ PhysicalOperator::VectorTopK { .. } => t,
         }
     }
 
-    /// Compute plan complexity/weight to assist with operator reordering.
+    /// Compute plan complexity/weight to assist with operator reordering, with
+    /// no external label environment. Multi-hop chaining can still apply at any
+    /// hop whose source label is visible in the plan spine (a scanned variable).
+    /// Used by the optimizer tests, which construct plans directly without the
+    /// label map the full pipeline threads through.
+    #[cfg(test)]
     fn plan_weight(op: &PhysicalOperator, stats: Option<&dyn StatsProvider>) -> usize {
+        Self::plan_weight_env(op, stats, &HashMap::new())
+    }
+
+    /// Compute plan complexity/weight, consulting `labels` for the declared
+    /// label of a variable that no longer carries one in the filter-free spine
+    /// (a labeled intermediate hop endpoint whose `HasLabel` filter was stripped
+    /// before reordering). This is what lets the per-source-label expand ratio
+    /// chain across hops rather than apply only to the first.
+    fn plan_weight_env(
+        op: &PhysicalOperator,
+        stats: Option<&dyn StatsProvider>,
+        labels: &HashMap<String, Vec<String>>,
+    ) -> usize {
         match op {
             PhysicalOperator::SingleRow => 1,
-            PhysicalOperator::Unwind { input, .. } => 1 + Self::plan_weight(input, stats),
+            PhysicalOperator::Unwind { input, .. } => {
+                1 + Self::plan_weight_env(input, stats, labels)
+            }
             // A primary-key seek touches at most one node: the cheapest scan.
             PhysicalOperator::NodeByIdSeek { .. } => 1,
             PhysicalOperator::NodeIndexScan { .. } => 2,
@@ -546,27 +613,43 @@ impl Optimizer {
                 }
             }
             PhysicalOperator::Expand {
-                input, rel_type, ..
+                input,
+                src_var,
+                rel_type,
+                is_incoming,
+                ..
             } => {
-                let input_weight = Self::plan_weight(input, stats);
-                // `rel_weight` is the average fan-out per input row: the number of
-                // edges of this type divided by the node count. The previous model
-                // used the total typed edge count as the multiplier, which treated
-                // every input row as expanding to *every* edge of the type. That
-                // inflated chained multi-hop expands (input * edges * edges * ...)
-                // until they saturated `usize`, collapsing the cost space so plan
-                // ordering became arbitrary. Average fan-out keeps the estimate in
-                // a realistic range so ordering stays meaningful across hops.
+                let input_weight = Self::plan_weight_env(input, stats, labels);
+                // `rel_weight` is the average fan-out per input row. When the
+                // source variable traces to a labeled scan, prefer the
+                // per-source-label typed fan-out (the high-order "expand ratio"):
+                // edges of this type incident to that label divided by that
+                // label's node count. This is sharper than the global
+                // `edges_of_type / total_nodes` ratio on a skewed schema where
+                // one label expands heavily and another not at all.
+                //
+                // The global ratio is the fallback. It already avoids the prior
+                // total-edge multiplier, which treated every input row as
+                // expanding to *every* edge of the type and inflated chained
+                // multi-hop expands until they saturated `usize`, collapsing the
+                // cost space so plan ordering became arbitrary.
                 let rel_weight = if let Some(rtype) = rel_type {
                     match stats {
                         Some(s) => {
-                            let edges = s.edge_count_by_type(rtype).unwrap_or(0);
-                            match s.total_node_count() {
-                                Some(nodes) if nodes > 0 => {
-                                    ((edges as f64 / nodes as f64).ceil() as usize).max(1)
+                            let typed = Self::label_of_var(input, src_var, labels)
+                                .and_then(|lbl| s.expand_fanout(lbl, rtype, *is_incoming));
+                            match typed {
+                                Some(fanout) => (fanout.ceil() as usize).max(1),
+                                None => {
+                                    let edges = s.edge_count_by_type(rtype).unwrap_or(0);
+                                    match s.total_node_count() {
+                                        Some(nodes) if nodes > 0 => {
+                                            ((edges as f64 / nodes as f64).ceil() as usize).max(1)
+                                        }
+                                        // No node-count estimate: keep the prior typed default.
+                                        _ => 10,
+                                    }
                                 }
-                                // No node-count estimate: keep the prior typed default.
-                                _ => 10,
                             }
                         }
                         None => 10,
@@ -583,15 +666,24 @@ impl Optimizer {
             // fallback is 1.0 (a transparent filter, the prior behavior), so
             // plan choice only changes when statistics actually exist.
             PhysicalOperator::Filter { input, expression } => {
-                let child_weight = Self::plan_weight(input, stats);
+                let child_weight = Self::plan_weight_env(input, stats, labels);
+                // A `HasLabel` filter directly over an `Expand` carries real
+                // selectivity on a skewed schema (the fraction of the source
+                // label's typed neighbors that carry the target label), which the
+                // generic selectivity estimator does not model. Prefer it, then
+                // fall back to the property-histogram estimate, then to 1.0.
                 let selectivity = stats
-                    .and_then(|s| s.estimate_filter_selectivity(expression))
+                    .and_then(|s| {
+                        Self::haslabel_selectivity(expression, input, s, labels)
+                            .or_else(|| s.estimate_filter_selectivity(expression))
+                    })
                     .unwrap_or(1.0);
                 ((child_weight as f64 * selectivity).ceil() as usize).max(1)
             }
-            PhysicalOperator::Project { input, .. } => Self::plan_weight(input, stats),
+            PhysicalOperator::Project { input, .. } => Self::plan_weight_env(input, stats, labels),
             PhysicalOperator::HashJoin { left, right } => {
-                Self::plan_weight(left, stats).saturating_mul(Self::plan_weight(right, stats))
+                Self::plan_weight_env(left, stats, labels)
+                    .saturating_mul(Self::plan_weight_env(right, stats, labels))
             }
             // These operators sit above the core traversal tree; weight them as their child.
             PhysicalOperator::Aggregate { input, .. }
@@ -600,14 +692,521 @@ impl Optimizer {
             | PhysicalOperator::OptionalMatch { input, .. }
             | PhysicalOperator::Distinct { input, .. }
             | PhysicalOperator::WritePart { input, .. }
-            | PhysicalOperator::ProcedureCall { input, .. } => Self::plan_weight(input, stats),
+            | PhysicalOperator::ProcedureCall { input, .. } => {
+                Self::plan_weight_env(input, stats, labels)
+            }
             // A single kernel call producing one row.
             PhysicalOperator::TriangleCount { .. } | PhysicalOperator::PathCount { .. } => 1,
             // One kernel pass over adjacency producing one row per group.
             PhysicalOperator::GroupedDegree { .. } => 1,
-            // MultiwayJoin is cheaper than a regular Expand because the closing check is O(1)
-            // per row after a single bulk expansion. Weight as the input cost.
-            PhysicalOperator::MultiwayJoin { input, .. } => Self::plan_weight(input, stats),
+            // One index search producing at most `k` rows.
+            PhysicalOperator::VectorTopK { .. } => 1,
+            // MultiwayJoin closes a cycle: it bulk-expands the open path (the
+            // input) and keeps only rows whose endpoints carry the closing edge.
+            // Its result cardinality is the input weight scaled by the closing
+            // edge's per-pair probability, the cyclic-pattern cardinality factor,
+            // so a selective triangle reads as cheap when it feeds a larger plan.
+            // No statistics, or unlabeled endpoints, leaves the input unscaled.
+            PhysicalOperator::MultiwayJoin {
+                input,
+                closing_src_var,
+                closing_dst_var,
+                closing_rel_type,
+                closing_is_incoming,
+                ..
+            } => {
+                let input_weight = Self::plan_weight_env(input, stats, labels);
+                let selectivity = stats
+                    .and_then(|s| {
+                        Self::closing_selectivity(
+                            input,
+                            closing_src_var,
+                            closing_dst_var,
+                            closing_rel_type,
+                            *closing_is_incoming,
+                            s,
+                            labels,
+                        )
+                    })
+                    .unwrap_or(1.0);
+                ((input_weight as f64 * selectivity).ceil() as usize).max(1)
+            }
+        }
+    }
+
+    /// Find the label a node variable is scanned under by walking the plan
+    /// subtree to the operator that binds it. Returns `None` when the variable
+    /// is bound by an unlabeled scan or produced by an expansion (so it never
+    /// traces to a single scan label), in which case the caller has no
+    /// per-source-label fan-out to apply.
+    fn scan_label_of<'a>(op: &'a PhysicalOperator, var: &str) -> Option<&'a str> {
+        match op {
+            PhysicalOperator::LabelScan { variable, label } if variable == var => label.as_deref(),
+            PhysicalOperator::NodeByIdSeek {
+                variable, label, ..
+            } if variable == var => label.as_deref(),
+            PhysicalOperator::NodeIndexScan {
+                variable, label, ..
+            } if variable == var => Some(label),
+            PhysicalOperator::NodeRangeScan {
+                variable, label, ..
+            } if variable == var => Some(label),
+            // Recurse through single-input operators that preserve the binding.
+            PhysicalOperator::Filter { input, .. }
+            | PhysicalOperator::Project { input, .. }
+            | PhysicalOperator::Expand { input, .. }
+            | PhysicalOperator::Unwind { input, .. }
+            | PhysicalOperator::Aggregate { input, .. }
+            | PhysicalOperator::Sort { input, .. }
+            | PhysicalOperator::Limit { input, .. }
+            | PhysicalOperator::OptionalMatch { input, .. }
+            | PhysicalOperator::Distinct { input, .. }
+            | PhysicalOperator::WritePart { input, .. }
+            | PhysicalOperator::ProcedureCall { input, .. }
+            | PhysicalOperator::MultiwayJoin { input, .. } => Self::scan_label_of(input, var),
+            PhysicalOperator::HashJoin { left, right } => {
+                Self::scan_label_of(left, var).or_else(|| Self::scan_label_of(right, var))
+            }
+            _ => None,
+        }
+    }
+
+    /// Find the label a node variable carries for fan-out estimation, preferring
+    /// a binding visible in the plan spine (a scanned variable) and falling back
+    /// to a constraint collected from the original tree before its `HasLabel`
+    /// filter was stripped for reordering. The fallback is what lets multi-hop
+    /// chaining apply a per-source-label expand ratio at a hop whose source is a
+    /// labeled intermediate variable (the destination of a prior hop), not just
+    /// at the first hop off a scan. Returns the first declared label; a
+    /// multi-label variable contributes one representative label to the estimate,
+    /// which only weights plan choice.
+    fn label_of_var<'a>(
+        op: &'a PhysicalOperator,
+        var: &str,
+        labels: &'a HashMap<String, Vec<String>>,
+    ) -> Option<&'a str> {
+        Self::scan_label_of(op, var).or_else(|| {
+            labels
+                .get(var)
+                .and_then(|ls| ls.first())
+                .map(String::as_str)
+        })
+    }
+
+    /// Selectivity of a `HasLabel(dst, label)` filter sitting directly over the
+    /// `Expand` that binds `dst`: the fraction of the source label's `rel_type`
+    /// neighbors that carry `label`, from the destination-aware expand ratio.
+    /// `None` when the shape does not match or no per-label estimate exists, so
+    /// the caller falls back to the generic estimate.
+    fn haslabel_selectivity(
+        expr: &FilterExpr,
+        input: &PhysicalOperator,
+        stats: &dyn StatsProvider,
+        labels: &HashMap<String, Vec<String>>,
+    ) -> Option<f64> {
+        let (var, label) = match expr {
+            FilterExpr::HasLabel(var, label) => (var, label),
+            _ => return None,
+        };
+        let (src_var, rel_type, dst_var, is_incoming) = match input {
+            PhysicalOperator::Expand {
+                src_var,
+                rel_type: Some(rel_type),
+                dst_var,
+                is_incoming,
+                ..
+            } => (src_var, rel_type, dst_var, *is_incoming),
+            _ => return None,
+        };
+        if dst_var != var {
+            return None;
+        }
+        let src_label = Self::label_of_var(input, src_var, labels)?;
+        let total = stats.expand_fanout(src_label, rel_type, is_incoming)?;
+        if total <= 0.0 {
+            return None;
+        }
+        // A schema-absent destination contributes zero matching neighbors.
+        let to = stats
+            .expand_fanout_to(src_label, rel_type, label, is_incoming)
+            .unwrap_or(0.0);
+        Some((to / total).clamp(0.0, 1.0))
+    }
+
+    /// Selectivity of a `MultiwayJoin`'s closing edge: the per-pair probability
+    /// that the closing relationship runs between its two already-bound
+    /// endpoints. This is the cyclic-pattern (triangle and longer-cycle)
+    /// cardinality factor. The open path the join closes over expands to
+    /// `input_weight` rows, but only the fraction carrying the closing edge are
+    /// real cycles, so a triangle is far more selective than its open path.
+    ///
+    /// It is composed from the existing schema frequencies rather than a motif
+    /// census: the destination-aware expand ratio `expand_fanout_to` gives the
+    /// average number of closing-destination neighbors per closing-source node
+    /// (`triples / N_src`), and dividing by the destination node count yields the
+    /// per-pair density `triples / (N_src * N_dst)`. `None` when either endpoint
+    /// lacks a resolvable label, the closing edge is untyped, or no per-triple
+    /// estimate exists, so the caller leaves the input weight unscaled.
+    fn closing_selectivity(
+        input: &PhysicalOperator,
+        closing_src_var: &str,
+        closing_dst_var: &str,
+        closing_rel_type: &Option<String>,
+        closing_is_incoming: bool,
+        stats: &dyn StatsProvider,
+        labels: &HashMap<String, Vec<String>>,
+    ) -> Option<f64> {
+        let rel_type = closing_rel_type.as_deref()?;
+        let src_label = Self::label_of_var(input, closing_src_var, labels)?;
+        let dst_label = Self::label_of_var(input, closing_dst_var, labels)?;
+        let dst_count = stats.node_count_by_label(dst_label)?;
+        if dst_count == 0 {
+            return None;
+        }
+        let fanout_to =
+            stats.expand_fanout_to(src_label, rel_type, dst_label, closing_is_incoming)?;
+        Some((fanout_to / dst_count as f64).clamp(0.0, 1.0))
+    }
+
+    /// Type inference: replace each typed `Expand` between two labeled endpoints
+    /// that the data schema does not connect with a zero-row operator, so a
+    /// provably empty pattern never scans storage.
+    ///
+    /// Guarded on two fronts so it can only ever drop rows that the query could
+    /// not have produced: it runs only when statistics are present and the plan
+    /// has no write part (a write could create the very edge being matched,
+    /// which the committed-state schema cannot see), and it prunes a hop only on
+    /// a definitive `Some(false)` from [`StatsProvider::schema_has_edge`], never
+    /// on the undecidable `None`.
+    fn prune_unsatisfiable(
+        op: PhysicalOperator,
+        stats: Option<&dyn StatsProvider>,
+    ) -> PhysicalOperator {
+        let stats = match stats {
+            Some(s) => s,
+            None => return op,
+        };
+        // The caller (`optimize`) only reaches here when `allow_prune` holds,
+        // which it computes from `plan_has_write` over the whole query, so this
+        // plan is read-only and a hop can be pruned on committed-schema evidence
+        // without risking an edge a same-statement write would create.
+        //
+        // Collect every variable's declared label constraints once over the whole
+        // tree: a destination label often arrives as a `HasLabel` filter above
+        // the `Expand` that binds it, so a single bottom-up scan is needed before
+        // any hop can be judged.
+        let mut labels: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        Self::collect_label_constraints(&op, &mut labels);
+        Self::rewrite_unsatisfiable(op, &labels, stats)
+    }
+
+    /// True when any operator in the plan performs a write (`CREATE`, `MERGE`,
+    /// `SET`, `DELETE`), so schema-based pruning must be skipped.
+    fn plan_has_write(op: &PhysicalOperator) -> bool {
+        match op {
+            PhysicalOperator::WritePart { .. } => true,
+            PhysicalOperator::SingleRow
+            | PhysicalOperator::LabelScan { .. }
+            | PhysicalOperator::NodeByIdSeek { .. }
+            | PhysicalOperator::NodeIndexScan { .. }
+            | PhysicalOperator::NodeRangeScan { .. }
+            | PhysicalOperator::VectorTopK { .. }
+            | PhysicalOperator::TriangleCount { .. }
+            | PhysicalOperator::PathCount { .. }
+            | PhysicalOperator::GroupedDegree { .. } => false,
+            PhysicalOperator::Unwind { input, .. }
+            | PhysicalOperator::Expand { input, .. }
+            | PhysicalOperator::Filter { input, .. }
+            | PhysicalOperator::Project { input, .. }
+            | PhysicalOperator::Aggregate { input, .. }
+            | PhysicalOperator::Sort { input, .. }
+            | PhysicalOperator::Limit { input, .. }
+            | PhysicalOperator::OptionalMatch { input, .. }
+            | PhysicalOperator::Distinct { input, .. }
+            | PhysicalOperator::ProcedureCall { input, .. }
+            | PhysicalOperator::MultiwayJoin { input, .. } => Self::plan_has_write(input),
+            PhysicalOperator::HashJoin { left, right } => {
+                Self::plan_has_write(left) || Self::plan_has_write(right)
+            }
+        }
+    }
+
+    /// Record the label constraints each node variable carries, from labeled
+    /// scans and from `HasLabel` filters. A variable can accumulate several
+    /// labels (a multi-label pattern such as `(n:A:B)`); all are kept.
+    fn collect_label_constraints(
+        op: &PhysicalOperator,
+        out: &mut std::collections::HashMap<String, Vec<String>>,
+    ) {
+        let add = |var: &str, label: &str, out: &mut std::collections::HashMap<_, Vec<String>>| {
+            let entry: &mut Vec<String> = out.entry(var.to_string()).or_default();
+            if !entry.iter().any(|l| l == label) {
+                entry.push(label.to_string());
+            }
+        };
+        match op {
+            PhysicalOperator::LabelScan {
+                variable,
+                label: Some(label),
+            }
+            | PhysicalOperator::NodeByIdSeek {
+                variable,
+                label: Some(label),
+                ..
+            } => add(variable, label, out),
+            PhysicalOperator::NodeIndexScan {
+                variable, label, ..
+            }
+            | PhysicalOperator::NodeRangeScan {
+                variable, label, ..
+            } => add(variable, label, out),
+            PhysicalOperator::Filter {
+                input,
+                expression: FilterExpr::HasLabel(var, label),
+            } => {
+                add(var, label, out);
+                Self::collect_label_constraints(input, out);
+            }
+            PhysicalOperator::Unwind { input, .. }
+            | PhysicalOperator::Expand { input, .. }
+            | PhysicalOperator::Filter { input, .. }
+            | PhysicalOperator::Project { input, .. }
+            | PhysicalOperator::Aggregate { input, .. }
+            | PhysicalOperator::Sort { input, .. }
+            | PhysicalOperator::Limit { input, .. }
+            | PhysicalOperator::OptionalMatch { input, .. }
+            | PhysicalOperator::Distinct { input, .. }
+            | PhysicalOperator::WritePart { input, .. }
+            | PhysicalOperator::ProcedureCall { input, .. }
+            | PhysicalOperator::MultiwayJoin { input, .. } => {
+                Self::collect_label_constraints(input, out)
+            }
+            PhysicalOperator::HashJoin { left, right } => {
+                Self::collect_label_constraints(left, out);
+                Self::collect_label_constraints(right, out);
+            }
+            PhysicalOperator::LabelScan { .. }
+            | PhysicalOperator::NodeByIdSeek { .. }
+            | PhysicalOperator::SingleRow
+            | PhysicalOperator::VectorTopK { .. }
+            | PhysicalOperator::TriangleCount { .. }
+            | PhysicalOperator::PathCount { .. }
+            | PhysicalOperator::GroupedDegree { .. } => {}
+        }
+    }
+
+    /// Walk the plan and wrap each unsatisfiable typed `Expand` in a zero-row
+    /// `Limit`. The `Expand` (and its scan subtree) is preserved below the
+    /// `Limit` so the slot schema is unchanged, but `Limit { count: 0 }` returns
+    /// immediately without ever pulling it.
+    fn rewrite_unsatisfiable(
+        op: PhysicalOperator,
+        labels: &std::collections::HashMap<String, Vec<String>>,
+        stats: &dyn StatsProvider,
+    ) -> PhysicalOperator {
+        // Rewrite children first so a nested impossible hop is still caught.
+        let op = Self::map_inputs(op, |child| {
+            Self::rewrite_unsatisfiable(child, labels, stats)
+        });
+        if let PhysicalOperator::Expand {
+            src_var,
+            rel_type: Some(rel_type),
+            dst_var,
+            is_incoming,
+            is_undirected,
+            ..
+        } = &op
+        {
+            let empty_src = Vec::new();
+            let empty_dst = Vec::new();
+            let src_labels = labels.get(src_var).unwrap_or(&empty_src);
+            let dst_labels = labels.get(dst_var).unwrap_or(&empty_dst);
+            if Self::hop_is_impossible(
+                stats,
+                src_labels,
+                rel_type,
+                dst_labels,
+                *is_incoming,
+                *is_undirected,
+            ) {
+                return PhysicalOperator::Limit {
+                    input: Box::new(op),
+                    skip: 0,
+                    count: 0,
+                };
+            }
+        }
+        op
+    }
+
+    /// Whether a typed hop between the two endpoint label sets is provably
+    /// unsatisfiable on the committed schema. Both endpoints must be labeled; an
+    /// unlabeled endpoint leaves the hop unconstrained, so no prune is possible.
+    fn hop_is_impossible(
+        stats: &dyn StatsProvider,
+        src_labels: &[String],
+        rel_type: &str,
+        dst_labels: &[String],
+        is_incoming: bool,
+        is_undirected: bool,
+    ) -> bool {
+        if src_labels.is_empty() || dst_labels.is_empty() {
+            return false;
+        }
+        // An orientation `from --rel--> to` is impossible when any single
+        // (from-label, to-label) pair is definitively absent from the schema:
+        // a matching node must carry every one of its labels, so if even one of
+        // them never originates (or receives) the edge, no node can match.
+        let orientation_impossible = |from: &[String], to: &[String]| -> bool {
+            for f in from {
+                for t in to {
+                    if stats.schema_has_edge(f, rel_type, t) == Some(false) {
+                        return true;
+                    }
+                }
+            }
+            false
+        };
+        if is_undirected {
+            // Either orientation could satisfy the pattern, so it is impossible
+            // only when both are.
+            orientation_impossible(src_labels, dst_labels)
+                && orientation_impossible(dst_labels, src_labels)
+        } else if is_incoming {
+            // The edge runs dst --rel--> src.
+            orientation_impossible(dst_labels, src_labels)
+        } else {
+            orientation_impossible(src_labels, dst_labels)
+        }
+    }
+
+    /// Apply `f` to every direct child sub-plan of `op`, rebuilding `op` with
+    /// the mapped children and leaving leaves unchanged.
+    fn map_inputs(
+        op: PhysicalOperator,
+        mut f: impl FnMut(PhysicalOperator) -> PhysicalOperator,
+    ) -> PhysicalOperator {
+        use PhysicalOperator::*;
+        match op {
+            Unwind {
+                input,
+                expr,
+                variable,
+            } => Unwind {
+                input: Box::new(f(*input)),
+                expr,
+                variable,
+            },
+            Expand {
+                input,
+                src_var,
+                rel_var,
+                dst_var,
+                rel_type,
+                is_incoming,
+                is_undirected,
+                min_hops,
+                max_hops,
+                unique_rels,
+                needs_path,
+            } => Expand {
+                input: Box::new(f(*input)),
+                src_var,
+                rel_var,
+                dst_var,
+                rel_type,
+                is_incoming,
+                is_undirected,
+                min_hops,
+                max_hops,
+                unique_rels,
+                needs_path,
+            },
+            Filter { input, expression } => Filter {
+                input: Box::new(f(*input)),
+                expression,
+            },
+            Project {
+                input,
+                items,
+                is_barrier,
+            } => Project {
+                input: Box::new(f(*input)),
+                items,
+                is_barrier,
+            },
+            Aggregate {
+                input,
+                group_by,
+                aggregations,
+            } => Aggregate {
+                input: Box::new(f(*input)),
+                group_by,
+                aggregations,
+            },
+            Sort { input, items } => Sort {
+                input: Box::new(f(*input)),
+                items,
+            },
+            Limit { input, skip, count } => Limit {
+                input: Box::new(f(*input)),
+                skip,
+                count,
+            },
+            OptionalMatch { input, null_vars } => OptionalMatch {
+                input: Box::new(f(*input)),
+                null_vars,
+            },
+            Distinct { input, keys } => Distinct {
+                input: Box::new(f(*input)),
+                keys,
+            },
+            WritePart { input, part } => WritePart {
+                input: Box::new(f(*input)),
+                part,
+            },
+            ProcedureCall {
+                input,
+                output_vars,
+                rows,
+            } => ProcedureCall {
+                input: Box::new(f(*input)),
+                output_vars,
+                rows,
+            },
+            MultiwayJoin {
+                input,
+                closing_src_var,
+                closing_dst_var,
+                closing_rel_type,
+                closing_rel_var,
+                closing_is_incoming,
+                closing_is_undirected,
+                closing_unique_rels,
+            } => MultiwayJoin {
+                input: Box::new(f(*input)),
+                closing_src_var,
+                closing_dst_var,
+                closing_rel_type,
+                closing_rel_var,
+                closing_is_incoming,
+                closing_is_undirected,
+                closing_unique_rels,
+            },
+            HashJoin { left, right } => HashJoin {
+                left: Box::new(f(*left)),
+                right: Box::new(f(*right)),
+            },
+            leaf @ (SingleRow
+            | LabelScan { .. }
+            | NodeByIdSeek { .. }
+            | NodeIndexScan { .. }
+            | NodeRangeScan { .. }
+            | VectorTopK { .. }
+            | TriangleCount { .. }
+            | PathCount { .. }
+            | GroupedDegree { .. }) => leaf,
         }
     }
 
@@ -1107,7 +1706,8 @@ impl Optimizer {
             // A leaf produced after this pass; no children to push into.
             t @ PhysicalOperator::TriangleCount { .. }
             | t @ PhysicalOperator::PathCount { .. }
-            | t @ PhysicalOperator::GroupedDegree { .. } => t,
+            | t @ PhysicalOperator::GroupedDegree { .. }
+            | t @ PhysicalOperator::VectorTopK { .. } => t,
         }
     }
 
@@ -1138,6 +1738,9 @@ impl Optimizer {
                 vars.insert(variable.clone());
             }
             PhysicalOperator::NodeRangeScan { variable, .. } => {
+                vars.insert(variable.clone());
+            }
+            PhysicalOperator::VectorTopK { variable, .. } => {
                 vars.insert(variable.clone());
             }
             PhysicalOperator::Expand {
@@ -2973,6 +3576,170 @@ fn rewrite_path_count(op: PhysicalOperator) -> PhysicalOperator {
     }
 }
 
+/// Replace a `Limit` over a `Sort` whose single ascending key is
+/// `vector_dist(var, query)` over a bare `LabelScan(var)` with the leaf
+/// `VectorTopK` operator, which answers the query with one HNSW index search
+/// instead of scanning every node and computing a distance per row. The `Sort`
+/// is dropped (the operator emits in ranked order) and the enclosing `Limit`
+/// still applies `skip`. Any other shape is left untouched, so the row pipeline
+/// (which evaluates `vector_dist` exactly) remains the correctness fallback.
+fn rewrite_vector_topk(op: PhysicalOperator) -> PhysicalOperator {
+    if let Some(t) = try_vector_topk(&op) {
+        return t;
+    }
+    match op {
+        PhysicalOperator::Project {
+            input,
+            items,
+            is_barrier,
+        } => PhysicalOperator::Project {
+            input: Box::new(rewrite_vector_topk(*input)),
+            items,
+            is_barrier,
+        },
+        PhysicalOperator::Limit { input, skip, count } => PhysicalOperator::Limit {
+            input: Box::new(rewrite_vector_topk(*input)),
+            skip,
+            count,
+        },
+        PhysicalOperator::WritePart { input, part } => PhysicalOperator::WritePart {
+            input: Box::new(rewrite_vector_topk(*input)),
+            part,
+        },
+        other => other,
+    }
+}
+
+/// Recognize the `VectorTopK` shape rooted at a `Limit`. Returns the rewritten
+/// operator, or `None` when the shape does not match exactly.
+fn try_vector_topk(op: &PhysicalOperator) -> Option<PhysicalOperator> {
+    let PhysicalOperator::Limit { input, skip, count } = op else {
+        return None;
+    };
+    let PhysicalOperator::Sort {
+        input: sort_input,
+        items,
+    } = input.as_ref()
+    else {
+        return None;
+    };
+    // Exactly one ascending key, and it must be `vector_dist(var, query)`.
+    if items.len() != 1 || !items[0].ascending {
+        return None;
+    }
+    let (var, query) = match_vector_dist(&items[0].expr)?;
+    // The query vector must be a constant (a parameter or a literal vector), so
+    // it can be evaluated once with no row context.
+    if !query_is_constant(query) {
+        return None;
+    }
+    // Below the (optional) projection, the source must be a labeled scan of the
+    // same variable the sort key ranks, optionally wrapped in equality `Filter`
+    // predicates over that variable. The projection is re-applied above the
+    // index search, where it maps the ranked nodes to the output columns; the
+    // equality predicates become pushed-down pre-filters on the index traversal.
+    let (project, mut scan) = match sort_input.as_ref() {
+        PhysicalOperator::Project {
+            input,
+            items,
+            is_barrier,
+        } => (Some((items.clone(), *is_barrier)), input.as_ref()),
+        other => (None, other),
+    };
+    // Collect the equality-filter chain. Any non-equality or cross-variable
+    // predicate cannot be expressed as an index pre-filter, so the whole shape
+    // falls back rather than silently dropping a predicate (which would break
+    // top-k semantics by returning unfiltered neighbors).
+    let mut prop_filters: Vec<(String, Expr)> = Vec::new();
+    while let PhysicalOperator::Filter { input, expression } = scan {
+        let (prop, value) = pushable_eq(expression, &var)?;
+        prop_filters.push((prop, value));
+        scan = input.as_ref();
+    }
+    let PhysicalOperator::LabelScan { variable, label } = scan else {
+        return None;
+    };
+    if variable != &var {
+        return None;
+    }
+
+    let topk = PhysicalOperator::VectorTopK {
+        variable: variable.clone(),
+        label: label.clone(),
+        query: query.clone(),
+        k: skip.saturating_add(*count),
+        prop_filters,
+    };
+    let inner = match project {
+        Some((items, is_barrier)) => PhysicalOperator::Project {
+            input: Box::new(topk),
+            items,
+            is_barrier,
+        },
+        None => topk,
+    };
+    Some(PhysicalOperator::Limit {
+        input: Box::new(inner),
+        skip: *skip,
+        count: *count,
+    })
+}
+
+/// Match `vector_dist(var, query)` where exactly one argument is a bare variable
+/// reference (`Expr::Prop(var, "")`). Returns the variable name and a reference
+/// to the other (query) argument. The distance metrics are symmetric, so the
+/// argument order does not matter.
+fn match_vector_dist(expr: &Expr) -> Option<(String, &Expr)> {
+    let Expr::FunctionCall { name, args } = expr else {
+        return None;
+    };
+    if !name.eq_ignore_ascii_case("vector_dist") || args.len() != 2 {
+        return None;
+    }
+    match (&args[0], &args[1]) {
+        (Expr::Prop(var, p), q) if p.is_empty() => Some((var.clone(), q)),
+        (q, Expr::Prop(var, p)) if p.is_empty() => Some((var.clone(), q)),
+        _ => None,
+    }
+}
+
+/// Match an equality predicate of the form `var.prop = const` (or its mirror),
+/// returning the property name and the constant value expression. Used to push
+/// `WHERE` equality filters over the ranked variable into the index traversal.
+fn pushable_eq(f: &FilterExpr, var: &str) -> Option<(String, Expr)> {
+    let (l, r) = match f {
+        FilterExpr::Eq(l, r) => (l, r),
+        FilterExpr::Expr(Expr::BinaryOp {
+            op: BinaryOperator::Eq,
+            left,
+            right,
+        }) => (left.as_ref(), right.as_ref()),
+        _ => return None,
+    };
+    let pick = |a: &Expr, b: &Expr| -> Option<(String, Expr)> {
+        if let Expr::Prop(v, p) = a {
+            if v == var && !p.is_empty() && query_is_constant(b) {
+                return Some((p.clone(), b.clone()));
+            }
+        }
+        None
+    };
+    pick(l, r).or_else(|| pick(r, l))
+}
+
+/// A query vector is constant when it is a parameter or a literal-element vector
+/// (`[1.0, 2.0]`, parsed as the internal `__list__` call), so it references no
+/// bound variable and can be evaluated once before the search.
+fn query_is_constant(expr: &Expr) -> bool {
+    match expr {
+        Expr::Param(_) | Expr::Literal(_) => true,
+        Expr::FunctionCall { name, args } if name == "__list__" => {
+            args.iter().all(query_is_constant)
+        }
+        _ => false,
+    }
+}
+
 /// Replace an `Aggregate` whose group keys are all single-property reads on one
 /// endpoint of a single directed hop, carrying one non-distinct `count` over
 /// the other endpoint, with the leaf `GroupedDegree` operator. The executor
@@ -3715,6 +4482,303 @@ mod tests {
         let w = Optimizer::plan_weight(&three_hop, Some(&stats));
         assert_eq!(w, 1000 * 5 * 5 * 5);
         assert!(w < usize::MAX, "multi-hop estimate must not saturate");
+    }
+
+    #[test]
+    fn test_expand_weight_prefers_per_source_label_fanout() {
+        // On a skewed schema the per-source-label fan-out differs by label even
+        // for the same relationship type. The global ratio cannot distinguish
+        // them; the typed estimate can. A Person expands KNOWS at fan-out 50, a
+        // City at fan-out 2, while the global average is some single value.
+        struct SkewStats;
+        impl StatsProvider for SkewStats {
+            fn node_count_by_label(&self, label: &str) -> Option<u64> {
+                match label {
+                    "Person" => Some(1000),
+                    "City" => Some(1000),
+                    _ => None,
+                }
+            }
+            fn edge_count_by_type(&self, etype: &str) -> Option<u64> {
+                (etype == "KNOWS").then_some(52_000)
+            }
+            fn total_node_count(&self) -> Option<u64> {
+                Some(2000)
+            }
+            fn expand_fanout(
+                &self,
+                src_label: &str,
+                rel_type: &str,
+                incoming: bool,
+            ) -> Option<f64> {
+                if rel_type != "KNOWS" || incoming {
+                    return None;
+                }
+                match src_label {
+                    "Person" => Some(50.0),
+                    "City" => Some(2.0),
+                    _ => None,
+                }
+            }
+        }
+        let stats = SkewStats;
+
+        let expand = |label: &str| PhysicalOperator::Expand {
+            input: Box::new(PhysicalOperator::LabelScan {
+                variable: "a".to_string(),
+                label: Some(label.to_string()),
+            }),
+            src_var: "a".to_string(),
+            rel_var: "r".to_string(),
+            dst_var: "b".to_string(),
+            rel_type: Some("KNOWS".to_string()),
+            is_incoming: false,
+            is_undirected: false,
+            min_hops: 1,
+            max_hops: 1,
+            unique_rels: vec![],
+            needs_path: false,
+        };
+
+        // Both scans weigh 1000 (their node count). The typed fan-out makes the
+        // Person expand 25x heavier than the City expand, which the global ratio
+        // (52000 / 2000 = 26 for both) could never express.
+        let person = Optimizer::plan_weight(&expand("Person"), Some(&stats));
+        let city = Optimizer::plan_weight(&expand("City"), Some(&stats));
+        assert_eq!(person, 1000 * 50);
+        assert_eq!(city, 1000 * 2);
+
+        // Without a per-label estimate (unknown label), the global ratio applies.
+        // node_count_by_label None -> scan weight 1; global ratio 52000/2000 = 26.
+        let unknown = Optimizer::plan_weight(&expand("Gadget"), Some(&stats));
+        assert_eq!(unknown, 26);
+    }
+
+    #[test]
+    fn test_multi_hop_chaining_applies_fanout_past_first_hop() {
+        // A two-hop chain `(a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c)`. The
+        // first hop's source `a` carries its label on the scan; the second hop's
+        // source `b` is an intermediate variable whose `:Person` label arrives as
+        // a `HasLabel` filter that reordering has already stripped. Multi-hop
+        // chaining recovers `b`'s label from the collected-constraints map so the
+        // per-source-label expand ratio applies at the second hop too, rather
+        // than falling back to the coarser global average.
+        struct ChainStats;
+        impl StatsProvider for ChainStats {
+            fn node_count_by_label(&self, label: &str) -> Option<u64> {
+                (label == "Person").then_some(1000)
+            }
+            fn edge_count_by_type(&self, etype: &str) -> Option<u64> {
+                // A global ratio of 10 000 / 1000 = 10, far above the true
+                // per-Person KNOWS fan-out of 3, so the two models disagree.
+                (etype == "KNOWS").then_some(10_000)
+            }
+            fn total_node_count(&self) -> Option<u64> {
+                Some(1000)
+            }
+            fn expand_fanout(
+                &self,
+                src_label: &str,
+                rel_type: &str,
+                incoming: bool,
+            ) -> Option<f64> {
+                (src_label == "Person" && rel_type == "KNOWS" && !incoming).then_some(3.0)
+            }
+        }
+        let stats = ChainStats;
+
+        // The filter-free spine reordering sees: each hop's intermediate label is
+        // not on the spine, only `a`'s scan label is.
+        let chain = PhysicalOperator::Expand {
+            input: Box::new(PhysicalOperator::Expand {
+                input: Box::new(PhysicalOperator::LabelScan {
+                    variable: "a".to_string(),
+                    label: Some("Person".to_string()),
+                }),
+                src_var: "a".to_string(),
+                rel_var: "r1".to_string(),
+                dst_var: "b".to_string(),
+                rel_type: Some("KNOWS".to_string()),
+                is_incoming: false,
+                is_undirected: false,
+                min_hops: 1,
+                max_hops: 1,
+                unique_rels: vec![],
+                needs_path: false,
+            }),
+            src_var: "b".to_string(),
+            rel_var: "r2".to_string(),
+            dst_var: "c".to_string(),
+            rel_type: Some("KNOWS".to_string()),
+            is_incoming: false,
+            is_undirected: false,
+            min_hops: 1,
+            max_hops: 1,
+            unique_rels: vec![],
+            needs_path: false,
+        };
+
+        // Without a label environment, only the first hop applies the typed
+        // fan-out (3); the second hop's source `b` has no spine label, so it falls
+        // back to the global ratio (10): 1000 * 3 * 10 = 30 000.
+        assert_eq!(Optimizer::plan_weight(&chain, Some(&stats)), 1000 * 3 * 10);
+
+        // With `b` declared `Person` in the constraint map (as `collect_label_
+        // constraints` records from the original `HasLabel` filter), both hops
+        // apply the typed fan-out (3): 1000 * 3 * 3 = 9000.
+        let mut labels: HashMap<String, Vec<String>> = HashMap::new();
+        labels.insert("a".to_string(), vec!["Person".to_string()]);
+        labels.insert("b".to_string(), vec!["Person".to_string()]);
+        labels.insert("c".to_string(), vec!["Person".to_string()]);
+        assert_eq!(
+            Optimizer::plan_weight_env(&chain, Some(&stats), &labels),
+            1000 * 3 * 3
+        );
+    }
+
+    #[test]
+    fn test_multiway_join_weight_uses_closing_selectivity() {
+        // A `MultiwayJoin` closes a cycle over an open path. Its result is the
+        // open path's cardinality scaled by the closing edge's per-pair
+        // probability, composed from the triple frequency and the endpoint node
+        // counts: a triangle is far more selective than the path it closes.
+        struct CycleStats;
+        impl StatsProvider for CycleStats {
+            fn node_count_by_label(&self, label: &str) -> Option<u64> {
+                match label {
+                    "Path" => Some(1000),  // drives the open-path input weight
+                    "Person" => Some(100), // the closing endpoints
+                    _ => None,
+                }
+            }
+            fn edge_count_by_type(&self, _etype: &str) -> Option<u64> {
+                None
+            }
+            fn expand_fanout_to(
+                &self,
+                src_label: &str,
+                rel_type: &str,
+                dst_label: &str,
+                incoming: bool,
+            ) -> Option<f64> {
+                // Five Person neighbors per Person via CO_AUTHOR; over 100 Person
+                // nodes that is a per-pair density of 0.05.
+                (src_label == "Person"
+                    && rel_type == "CO_AUTHOR"
+                    && dst_label == "Person"
+                    && !incoming)
+                    .then_some(5.0)
+            }
+        }
+        let stats = CycleStats;
+
+        // The open path binds the closing endpoints `a` and `c`; its weight is
+        // the `Path` scan's node count (1000).
+        let join = PhysicalOperator::MultiwayJoin {
+            input: Box::new(PhysicalOperator::LabelScan {
+                variable: "x".to_string(),
+                label: Some("Path".to_string()),
+            }),
+            closing_src_var: "c".to_string(),
+            closing_dst_var: "a".to_string(),
+            closing_rel_type: Some("CO_AUTHOR".to_string()),
+            closing_rel_var: "rc".to_string(),
+            closing_is_incoming: false,
+            closing_is_undirected: false,
+            closing_unique_rels: vec![],
+        };
+
+        // Without endpoint labels in scope, the closing selectivity is unknown,
+        // so the input weight passes through unscaled.
+        assert_eq!(Optimizer::plan_weight(&join, Some(&stats)), 1000);
+
+        // With `a` and `c` declared `Person`, the closing density 0.05 scales the
+        // open path: 1000 * 0.05 = 50.
+        let mut labels: HashMap<String, Vec<String>> = HashMap::new();
+        labels.insert("a".to_string(), vec!["Person".to_string()]);
+        labels.insert("c".to_string(), vec!["Person".to_string()]);
+        assert_eq!(Optimizer::plan_weight_env(&join, Some(&stats), &labels), 50);
+    }
+
+    /// The type-inference pass wraps an `Expand` between two labeled endpoints
+    /// the schema does not connect in a zero-row `Limit`, but leaves a connected
+    /// pattern alone and never prunes a plan that writes (the committed schema
+    /// cannot see an edge the write would create).
+    #[test]
+    fn prune_unsatisfiable_pass_gating() {
+        struct SchemaStats;
+        impl StatsProvider for SchemaStats {
+            fn node_count_by_label(&self, _l: &str) -> Option<u64> {
+                Some(10)
+            }
+            fn edge_count_by_type(&self, _t: &str) -> Option<u64> {
+                Some(10)
+            }
+            // Everything connects except City -KNOWS-> Person.
+            fn schema_has_edge(&self, s: &str, t: &str, d: &str) -> Option<bool> {
+                Some(!(t == "KNOWS" && s == "City" && d == "Person"))
+            }
+        }
+
+        // Project <- Filter(HasLabel b Person) <- Expand(a:City -KNOWS-> b) <- LabelScan(a:City)
+        let impossible = || PhysicalOperator::Filter {
+            input: Box::new(PhysicalOperator::Expand {
+                input: Box::new(PhysicalOperator::LabelScan {
+                    variable: "a".to_string(),
+                    label: Some("City".to_string()),
+                }),
+                src_var: "a".to_string(),
+                rel_var: "r".to_string(),
+                dst_var: "b".to_string(),
+                rel_type: Some("KNOWS".to_string()),
+                is_incoming: false,
+                is_undirected: false,
+                min_hops: 1,
+                max_hops: 1,
+                unique_rels: vec![],
+                needs_path: false,
+            }),
+            expression: FilterExpr::HasLabel("b".to_string(), "Person".to_string()),
+        };
+        let read_plan = PhysicalOperator::Project {
+            input: Box::new(impossible()),
+            items: vec![(Expr::Prop("b".to_string(), String::new()), None)],
+            is_barrier: false,
+        };
+
+        let optimized = Optimizer::optimize(read_plan, Some(&SchemaStats));
+        let plan_text = crate::plan::physical::format_physical_plan(&optimized, 0);
+        assert!(
+            plan_text.contains("count=0"),
+            "impossible hop should be pruned, got:\n{plan_text}"
+        );
+
+        // The same impossible pattern under a write part must NOT be pruned.
+        let writing_plan = PhysicalOperator::WritePart {
+            input: Box::new(impossible()),
+            part: crate::ast::QueryPart::Create { patterns: vec![] },
+        };
+        let optimized = Optimizer::optimize(writing_plan, Some(&SchemaStats));
+        let plan_text = crate::plan::physical::format_physical_plan(&optimized, 0);
+        assert!(
+            !plan_text.contains("count=0"),
+            "a plan with writes must not be pruned, got:\n{plan_text}"
+        );
+
+        // Without statistics, nothing is pruned.
+        let optimized = Optimizer::optimize(
+            PhysicalOperator::Project {
+                input: Box::new(impossible()),
+                items: vec![(Expr::Prop("b".to_string(), String::new()), None)],
+                is_barrier: false,
+            },
+            None,
+        );
+        let plan_text = crate::plan::physical::format_physical_plan(&optimized, 0);
+        assert!(
+            !plan_text.contains("count=0"),
+            "no stats means no prune, got:\n{plan_text}"
+        );
     }
 
     struct MockStats {

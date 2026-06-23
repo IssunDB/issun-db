@@ -6,7 +6,7 @@
 [![Examples](https://img.shields.io/badge/examples-view-ffd343?style=flat&labelColor=282c34&logo=python)](https://github.com/IssunDB/issun-db/tree/main/crates/issundb-py/examples)
 [![License: MIT](https://img.shields.io/badge/license-MIT-ffd343?style=flat&labelColor=282c34&logo=open-source-initiative)](https://github.com/IssunDB/issun-db/blob/main/LICENSE-MIT)
 
-This directory contains the Python bindings for [IssunDB](https://github.com/IssunDB/issun-db).
+The Python bindings for [IssunDB](https://github.com/IssunDB/issun-db).
 
 ### Installation
 

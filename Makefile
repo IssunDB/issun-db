@@ -302,7 +302,7 @@ docs-serve: ## Serve the MkDocs documentation locally
 .PHONY: figs
 figs: ## Generate the figures in the assets directory
 	@echo "Generating figures..."
-	@$(SHELL) $(ASSET_DIR)/diagrams/make_figures.sh $(ASSET_DIR)/diagrams
+	@$(SHELL) $(ASSET_DIR)/make_figures.sh $(ASSET_DIR)
 
 .PHONY: fix-lint
 fix-lint: ## Fix the linter warnings

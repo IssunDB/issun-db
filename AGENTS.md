@@ -68,6 +68,10 @@ Do not invent modules that do not yet exist when answering questions, but do pla
     - `src/graph/node.rs`: node CRUD (`add_node`, `get_node`, `update_node`, `delete_node`).
     - `src/graph/edge.rs`: edge CRUD and adjacency (`add_edge`, `get_edge`, `delete_edge`, `out_neighbors`, `in_neighbors`, `node_has_relationships`).
     - `src/graph/index.rs`: label and type indexes, property indexes, constraints, and property scan methods.
+    - `src/graph/stats.rs`: high-order cardinality statistics and the data-graph schema for the optimizer. Owns the `(label, type)` edge-frequency
+      table behind `estimate_expand_fanout` (the per-source-label expand ratio) and the realized `(src_label, type, dst_label)` triples behind
+      `estimate_expand_fanout_to` and `schema_has_edge` (type inference), recomputed by one full scan and cached against the committed-write
+      generation.
     - `src/graph/fts_mod.rs`: full-text search index lifecycle and FTS storage primitives.
     - `src/graph/vector.rs`: vector byte storage helpers.
     - `src/graph/algo.rs`: public algorithm dispatch methods and internal traversal helpers.
@@ -128,9 +132,13 @@ Do not invent modules that do not yet exist when answering questions, but do pla
   materialization.
 - `crates/issundb/`: public facade. Re-exports the deliberate public surface from `issundb-core`, `issundb-vector`, `issundb-text`,
   `issundb-retrieval`, and `issundb-cypher`. Do not re-export internal storage types like `Storage`.
-    - `benches/`: Criterion query optimizer benchmark, and two profiling drivers that load a persistent graph once and rerun a query so a profiler
-      observes query execution without load noise: `profile_triangle` (Zipf-skewed graph, cyclic triangle-count query) and `profile_query` (uniform
-      graph with the comparison harness's Person/KNOWS schema, arbitrary query via `PROFILE_QUERY`).
+    - `benches/`: Criterion query optimizer benchmark (`query_optimizer`), a skewed-schema optimizer benchmark (`skewed_schema`), and two
+      profiling drivers that load a persistent graph once and rerun a query so a profiler observes query execution without load noise:
+      `profile_triangle` (Zipf-skewed graph, cyclic triangle-count query) and `profile_query` (uniform graph with the comparison harness's
+      Person/KNOWS schema, arbitrary query via `PROFILE_QUERY`). `skewed_schema` builds a graph where labels sharing a relationship type have
+      different fan-out and some `(src_label, type, dst_label)` triples never occur, so it exercises the schema-aware passes: the headline
+      `type_inference` group contrasts a provably-empty typed hop (pruned to a zero-row plan) against the same shape over a realizable hop, and
+      the `expand_ratio` and `multi_hop` groups guard the latency of join-ordering- and chaining-sensitive queries.
 - `crates/issundb-cli/`: interactive REPL binary. Uses only the `issundb` public facade for manual exploration and demos.
 - `crates/issundb-rest/`: Axum-based HTTP REST API server. Exposes the data plane and retrieval over HTTP: node and edge CRUD, Cypher query
   execution, query plan explanation, vector upsert and search, full-text search, and hybrid retrieval. Index administration and host operations
@@ -143,8 +151,8 @@ Do not invent modules that do not yet exist when answering questions, but do pla
 - `crates/issundb-py/`: Python bindings via PyO3. Exposes the `IssunDB` class with node and edge CRUD, Cypher query and explain, vector upsert
   and search, vector index configuration, full-text search and index administration, hybrid retrieval, GraphBLAS thread-count control, and
   backup and restore methods. Depends only on `issundb`.
-- `crates/issundb-examples/`: standalone example programs (`quickstart.rs`, `hybrid_retrieval_quickstart.rs`, `neo4j_migration.rs`, and
-  `load_ldbc.rs`). Depends only on `issundb`.
+- `crates/issundb-examples/`: standalone example programs (`quickstart.rs`, `hybrid_retrieval_quickstart.rs`, `neo4j_migration.rs`,
+  `load_ldbc.rs`, `graph_analytics.rs`, and `concurrent_ops.rs`). These examples depend only on `issundb`.
 - `crates/issundb-core/benches/`: Criterion storage, Pokec dataset, Wikipedia PageRank, and write throughput benchmarks.
 - `crates/issundb-cypher/benches/`: Criterion Cypher parsing, execution, LSQB Q1–Q9 queries, and OLTP transactional read benchmarks.
 - `crates/issundb-vector/benches/`: Criterion vector search benchmarks.
@@ -264,6 +272,20 @@ The read-path and statistics methods carry non-obvious semantics:
 - `estimate_equality_selectivity(prop: &str, val: &serde_json::Value) -> Result<Option<f64>, Error>` (estimated fraction of non-null values
   equal to `val`: exact for the property's most common values, histogram-estimated otherwise; both estimates feed the optimizer's
   selectivity-aware `Filter` plan weight)
+- `estimate_expand_fanout(src_label: &str, rel_type: &str, incoming: bool) -> Result<Option<f64>, Error>` (per-source-label typed degree: the
+  count of `rel_type` edges incident to `src_label` nodes in the given direction, divided by the `src_label` node count; the high-order "expand
+  ratio" that sharpens the optimizer's `Expand` plan weight over the global `edges_of_type / total_nodes` average on a skewed schema. `None` when
+  the label or type is unknown or no such edges exist, so the planner falls back to the global average. Backed by a `(label, type)` frequency table
+  recomputed by one full scan and cached against the committed-write generation, so it refreshes only when writes advance past the cached value;
+  the estimate only weights plan choices, so a stale or absent value never affects correctness. The same scan also records the realized
+  `(src_label, type, dst_label)` schema triples that back the two methods below)
+- `estimate_expand_fanout_to(src_label: &str, rel_type: &str, dst_label: &str, incoming: bool) -> Result<Option<f64>, Error>`
+  (destination-label-aware refinement of `estimate_expand_fanout`: the realized `(src_label, type, dst_label)` triple count divided by the
+  `src_label` node count, the average number of `dst_label` neighbors per `src_label` node. `None` when a label or type is unknown or the triple
+  is absent; sharpens the plan weight of a `HasLabel` filter over an `Expand`)
+- `schema_has_edge(src_label: &str, rel_type: &str, dst_label: &str) -> Result<Option<bool>, Error>` (whether the committed data schema contains
+  any directed edge `src_label --rel_type--> dst_label`. `Some(false)` means the directed pattern is provably unsatisfiable; `None` when any name
+  is unknown to the registry. Backs the optimizer's type-inference pass, which prunes a provably empty pattern to a zero-row plan)
 - `label_filter(nodes: &[NodeId], label: &str) -> Result<Vec<NodeId>, Error>` (subset of `nodes` carrying `label`, via one `label_idx` point
   lookup per candidate)
 - `set_thread_count(n: i32) -> Result<(), Error>`: sets the thread count for GraphBLAS matrix computations, overriding the `ISSUNDB_NUM_THREADS`
@@ -360,6 +382,19 @@ index-resolved node-id allow-sets (`PathCountSpec::vertex_allow`), so a filtered
 `RETURN DISTINCT` plans a `Distinct` operator between the final `Project` and `Sort`, keyed on the projected columns, so deduplication
 happens before `ORDER BY` and `SKIP`/`LIMIT`; `WITH DISTINCT` keeps full-row deduplication behind its barrier project, and only
 `RETURN DISTINCT *` deduplicates records after projection in the executor.
+A final type-inference pass (`prune_unsatisfiable`) consults the data schema (`Graph::schema_has_edge`): when a typed hop between two labeled
+endpoints has no realized `(src_label, type, dst_label)` triple, the pattern is provably empty, so that `Expand` is wrapped in a `Limit` with
+`count` zero that returns immediately without scanning. It runs only on read-only plans (a write part could create the matched edge, which the
+committed-state schema cannot see) and prunes only on a definitive negative, so it never drops rows the query should return. A `HasLabel` filter
+over an `Expand` also draws its plan-weight selectivity from the schema triples (`estimate_expand_fanout_to`).
+The plan-weight cost model applies these high-order statistics at every hop, not just the first. Reordering runs on the filter-free spine, where
+only scanned variables still carry a label, so the optimizer first collects each variable's label constraints from the pre-strip tree
+(`collect_label_constraints`) and threads that map through `plan_weight`; `label_of_var` then recovers the label of a labeled intermediate hop
+endpoint whose `HasLabel` filter was stripped, so a multi-hop chain applies the per-source-label expand ratio at each hop (the GOpt Eq. 1 chained
+fan-out) rather than falling back to the global average past the first. A cyclic pattern closed by a `MultiwayJoin` is weighted by its closing
+edge's per-pair probability (`closing_selectivity`), composed from the realized triple frequency and the endpoint node counts
+(`triples / (N_src * N_dst)`), so a selective triangle reads as cheap when it feeds a larger plan; this is the k=3 cardinality factor derived
+from the existing edge frequencies, not a motif census.
 
 ### `issundb_rest`
 

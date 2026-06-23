@@ -6,7 +6,7 @@ so callers serialize with `json.dumps` on the way in and `json.loads` on the way
 out.
 """
 
-from typing import List, Optional
+from typing import List, Optional, Union
 
 
 class IssunDB:
@@ -29,11 +29,12 @@ class IssunDB:
         """
         ...
 
-    def add_node(self, label: str, props: str) -> int:
-        """Insert a node with ``label`` and JSON-encoded ``props``.
+    def add_node(self, labels: Union[str, List[str]], props: str) -> int:
+        """Insert a node with ``labels`` and JSON-encoded ``props``.
 
         Args:
-            label: The node label.
+            labels: A single label string, or a list of label strings for a
+                multi-label node.
             props: A JSON object string holding the node properties.
 
         Returns:
