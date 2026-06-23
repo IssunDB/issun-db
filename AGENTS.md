@@ -151,8 +151,8 @@ Do not invent modules that do not yet exist when answering questions, but do pla
 - `crates/issundb-py/`: Python bindings via PyO3. Exposes the `IssunDB` class with node and edge CRUD, Cypher query and explain, vector upsert
   and search, vector index configuration, full-text search and index administration, hybrid retrieval, GraphBLAS thread-count control, and
   backup and restore methods. Depends only on `issundb`.
-- `crates/issundb-examples/`: standalone example programs (`quickstart.rs`, `hybrid_retrieval_quickstart.rs`, `neo4j_migration.rs`, and
-  `load_ldbc.rs`). Depends only on `issundb`.
+- `crates/issundb-examples/`: standalone example programs (`quickstart.rs`, `hybrid_retrieval_quickstart.rs`, `neo4j_migration.rs`,
+  `load_ldbc.rs`, `graph_analytics.rs`, and `concurrent_ops.rs`). These examples depend only on `issundb`.
 - `crates/issundb-core/benches/`: Criterion storage, Pokec dataset, Wikipedia PageRank, and write throughput benchmarks.
 - `crates/issundb-cypher/benches/`: Criterion Cypher parsing, execution, LSQB Q1–Q9 queries, and OLTP transactional read benchmarks.
 - `crates/issundb-vector/benches/`: Criterion vector search benchmarks.
