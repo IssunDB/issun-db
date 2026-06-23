@@ -91,44 +91,50 @@
 <!-- retrieval -->
 <g id="node6" class="node">
 <title>retrieval</title>
-<polygon fill="#d9f99d" stroke="#4d7c0f" stroke-width="1.4" points="974,-303 850,-303 850,-267 974,-267 974,-303"/>
-<text text-anchor="middle" x="912" y="-281.3" font-family="Helvetica,Arial,sans-serif" font-size="14.00">issundb&#45;retrieval</text>
+<polygon fill="#d9f99d" stroke="#4d7c0f" stroke-width="1.4" points="974,-375 850,-375 850,-339 974,-339 974,-375"/>
+<text text-anchor="middle" x="912" y="-353.3" font-family="Helvetica,Arial,sans-serif" font-size="14.00">issundb&#45;retrieval</text>
 </g>
 <!-- retrieval&#45;&gt;core -->
 <g id="edge5" class="edge">
 <title>retrieval&#45;&gt;core</title>
-<path fill="none" stroke="#475569" stroke-width="1.2" d="M877.6,-303.04C868.41,-308.45 858.61,-314.64 850,-321 811.79,-349.22 815.3,-375.84 771,-393 718.07,-413.5 654.41,-402.62 605.82,-387.62"/>
-<polygon fill="#475569" stroke="#475569" stroke-width="1.2" points="606.59,-384.2 596,-384.47 604.45,-390.86 606.59,-384.2"/>
+<path fill="none" stroke="#475569" stroke-width="1.2" d="M893.65,-375.26C869.08,-399.65 821.48,-441.69 771,-458 716.87,-475.49 696.15,-478.29 643,-458 621.94,-449.96 602.32,-435.99 585.54,-420.96"/>
+<polygon fill="#475569" stroke="#475569" stroke-width="1.2" points="587.74,-418.23 578.03,-414 582.98,-423.37 587.74,-418.23"/>
 </g>
 <!-- retrieval&#45;&gt;vector -->
 <g id="edge6" class="edge">
 <title>retrieval&#45;&gt;vector</title>
-<path fill="none" stroke="#475569" stroke-width="1.2" d="M849.84,-285C828.14,-285 803.64,-285 781.6,-285"/>
-<polygon fill="#475569" stroke="#475569" stroke-width="1.2" points="781.32,-281.5 771.32,-285 781.32,-288.5 781.32,-281.5"/>
+<path fill="none" stroke="#475569" stroke-width="1.2" d="M862.04,-338.92C835.5,-329.12 802.52,-316.95 774.61,-306.64"/>
+<polygon fill="#475569" stroke="#475569" stroke-width="1.2" points="775.57,-303.26 764.98,-303.08 773.14,-309.83 775.57,-303.26"/>
 </g>
 <!-- retrieval&#45;&gt;text -->
 <g id="edge7" class="edge">
 <title>retrieval&#45;&gt;text</title>
-<path fill="none" stroke="#475569" stroke-width="1.2" d="M862.04,-303.08C835.1,-313.02 801.51,-325.43 773.34,-335.83"/>
-<polygon fill="#475569" stroke="#475569" stroke-width="1.2" points="771.8,-332.67 763.63,-339.41 774.22,-339.23 771.8,-332.67"/>
+<path fill="none" stroke="#475569" stroke-width="1.2" d="M849.84,-357C825.5,-357 797.64,-357 773.66,-357"/>
+<polygon fill="#475569" stroke="#475569" stroke-width="1.2" points="773.65,-353.5 763.65,-357 773.65,-360.5 773.65,-353.5"/>
 </g>
 <!-- cypher -->
 <g id="node7" class="node">
 <title>cypher</title>
-<polygon fill="#d9f99d" stroke="#4d7c0f" stroke-width="1.4" points="970,-375 854,-375 854,-339 970,-339 970,-375"/>
-<text text-anchor="middle" x="912" y="-353.3" font-family="Helvetica,Arial,sans-serif" font-size="14.00">issundb&#45;cypher</text>
+<polygon fill="#d9f99d" stroke="#4d7c0f" stroke-width="1.4" points="970,-303 854,-303 854,-267 970,-267 970,-303"/>
+<text text-anchor="middle" x="912" y="-281.3" font-family="Helvetica,Arial,sans-serif" font-size="14.00">issundb&#45;cypher</text>
 </g>
 <!-- cypher&#45;&gt;core -->
 <g id="edge8" class="edge">
 <title>cypher&#45;&gt;core</title>
-<path fill="none" stroke="#475569" stroke-width="1.2" d="M893.65,-375.26C869.08,-399.65 821.48,-441.69 771,-458 716.87,-475.49 696.15,-478.29 643,-458 621.94,-449.96 602.32,-435.99 585.54,-420.96"/>
-<polygon fill="#475569" stroke="#475569" stroke-width="1.2" points="587.74,-418.23 578.03,-414 582.98,-423.37 587.74,-418.23"/>
+<path fill="none" stroke="#475569" stroke-width="1.2" d="M877.6,-303.04C868.41,-308.45 858.61,-314.64 850,-321 811.79,-349.22 815.3,-375.84 771,-393 718.07,-413.5 654.41,-402.62 605.82,-387.62"/>
+<polygon fill="#475569" stroke="#475569" stroke-width="1.2" points="606.59,-384.2 596,-384.47 604.45,-390.86 606.59,-384.2"/>
+</g>
+<!-- cypher&#45;&gt;vector -->
+<g id="edge10" class="edge">
+<title>cypher&#45;&gt;vector</title>
+<path fill="none" stroke="#475569" stroke-width="1.2" d="M853.81,-285C831.1,-285 804.85,-285 781.39,-285"/>
+<polygon fill="#475569" stroke="#475569" stroke-width="1.2" points="781.17,-281.5 771.17,-285 781.17,-288.5 781.17,-281.5"/>
 </g>
 <!-- cypher&#45;&gt;text -->
 <g id="edge9" class="edge">
 <title>cypher&#45;&gt;text</title>
-<path fill="none" stroke="#475569" stroke-width="1.2" d="M853.81,-357C828.62,-357 799.08,-357 773.82,-357"/>
-<polygon fill="#475569" stroke="#475569" stroke-width="1.2" points="773.65,-353.5 763.65,-357 773.65,-360.5 773.65,-353.5"/>
+<path fill="none" stroke="#475569" stroke-width="1.2" d="M862.04,-303.08C835.1,-313.02 801.51,-325.43 773.34,-335.83"/>
+<polygon fill="#475569" stroke="#475569" stroke-width="1.2" points="771.8,-332.67 763.63,-339.41 774.22,-339.23 771.8,-332.67"/>
 </g>
 <!-- facade -->
 <g id="node8" class="node">
@@ -137,13 +143,13 @@
 <text text-anchor="middle" x="912" y="-182.3" font-family="Helvetica,Arial,sans-serif" font-size="14.00">issundb</text>
 </g>
 <!-- facade&#45;&gt;core -->
-<g id="edge10" class="edge">
+<g id="edge11" class="edge">
 <title>facade&#45;&gt;core</title>
 <path fill="none" stroke="#475569" stroke-width="1.2" d="M860.5,-187.88C804.27,-191.86 712.2,-204.19 643,-242 610.39,-259.82 581.22,-290.08 560.68,-315.09"/>
 <polygon fill="#475569" stroke="#475569" stroke-width="1.2" points="557.86,-313.01 554.33,-323 563.32,-317.4 557.86,-313.01"/>
 </g>
 <!-- facade&#45;&gt;vector -->
-<g id="edge11" class="edge">
+<g id="edge12" class="edge">
 <title>facade&#45;&gt;vector</title>
 <path fill="none" stroke="#475569" stroke-width="1.2" d="M860.5,-211.64C839.6,-222.25 814.9,-234.79 791.89,-246.47"/>
 <polygon fill="#475569" stroke="#475569" stroke-width="1.2" points="790.3,-243.35 782.97,-251 793.47,-249.6 790.3,-243.35"/>
@@ -155,7 +161,7 @@
 <text text-anchor="middle" x="1120" y="-326.3" font-family="Helvetica,Arial,sans-serif" font-size="14.00">issundb&#45;cli</text>
 </g>
 <!-- cli&#45;&gt;facade -->
-<g id="edge12" class="edge">
+<g id="edge13" class="edge">
 <title>cli&#45;&gt;facade</title>
 <path fill="none" stroke="#475569" stroke-width="1.2" d="M1037,-294C1011.73,-275.78 1013.17,-262.83 990,-242 984.21,-236.8 977.95,-231.62 971.59,-226.62"/>
 <polygon fill="#475569" stroke="#475569" stroke-width="1.2" points="973.56,-223.72 963.5,-220.41 969.3,-229.28 973.56,-223.72"/>
@@ -167,7 +173,7 @@
 <text text-anchor="middle" x="1120" y="-254.3" font-family="Helvetica,Arial,sans-serif" font-size="14.00">issundb&#45;rest</text>
 </g>
 <!-- rest&#45;&gt;facade -->
-<g id="edge13" class="edge">
+<g id="edge14" class="edge">
 <title>rest&#45;&gt;facade</title>
 <path fill="none" stroke="#475569" stroke-width="1.2" d="M1037,-229.34C1015.61,-221.86 992.96,-213.95 972.95,-206.95"/>
 <polygon fill="#475569" stroke="#475569" stroke-width="1.2" points="974.09,-203.64 963.5,-203.65 971.78,-210.25 974.09,-203.64"/>
@@ -179,7 +185,7 @@
 <text text-anchor="middle" x="1120" y="-182.3" font-family="Helvetica,Arial,sans-serif" font-size="14.00">issundb&#45;mcp</text>
 </g>
 <!-- mcp&#45;&gt;facade -->
-<g id="edge14" class="edge">
+<g id="edge15" class="edge">
 <title>mcp&#45;&gt;facade</title>
 <path fill="none" stroke="#475569" stroke-width="1.2" d="M1037,-186C1015.82,-186 993.4,-186 973.53,-186"/>
 <polygon fill="#475569" stroke="#475569" stroke-width="1.2" points="973.5,-182.5 963.5,-186 973.5,-189.5 973.5,-182.5"/>
@@ -191,7 +197,7 @@
 <text text-anchor="middle" x="1120" y="-110.3" font-family="Helvetica,Arial,sans-serif" font-size="14.00">issundb&#45;py</text>
 </g>
 <!-- py_bind&#45;&gt;facade -->
-<g id="edge15" class="edge">
+<g id="edge16" class="edge">
 <title>py_bind&#45;&gt;facade</title>
 <path fill="none" stroke="#475569" stroke-width="1.2" d="M1037,-142.66C1015.75,-150.09 993.25,-157.95 973.34,-164.91"/>
 <polygon fill="#475569" stroke="#475569" stroke-width="1.2" points="971.78,-161.75 963.5,-168.35 974.09,-168.36 971.78,-161.75"/>
@@ -203,7 +209,7 @@
 <text text-anchor="middle" x="1120" y="-38.3" font-family="Helvetica,Arial,sans-serif" font-size="14.00">issundb&#45;examples</text>
 </g>
 <!-- examples&#45;&gt;facade -->
-<g id="edge16" class="edge">
+<g id="edge17" class="edge">
 <title>examples&#45;&gt;facade</title>
 <path fill="none" stroke="#475569" stroke-width="1.2" d="M1037,-78C1006.87,-97.1 976.61,-123.29 953.53,-145.09"/>
 <polygon fill="#475569" stroke="#475569" stroke-width="1.2" points="951.11,-142.56 946.3,-152 955.94,-147.62 951.11,-142.56"/>
