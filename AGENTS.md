@@ -132,9 +132,13 @@ Do not invent modules that do not yet exist when answering questions, but do pla
   materialization.
 - `crates/issundb/`: public facade. Re-exports the deliberate public surface from `issundb-core`, `issundb-vector`, `issundb-text`,
   `issundb-retrieval`, and `issundb-cypher`. Do not re-export internal storage types like `Storage`.
-    - `benches/`: Criterion query optimizer benchmark, and two profiling drivers that load a persistent graph once and rerun a query so a profiler
-      observes query execution without load noise: `profile_triangle` (Zipf-skewed graph, cyclic triangle-count query) and `profile_query` (uniform
-      graph with the comparison harness's Person/KNOWS schema, arbitrary query via `PROFILE_QUERY`).
+    - `benches/`: Criterion query optimizer benchmark (`query_optimizer`), a skewed-schema optimizer benchmark (`skewed_schema`), and two
+      profiling drivers that load a persistent graph once and rerun a query so a profiler observes query execution without load noise:
+      `profile_triangle` (Zipf-skewed graph, cyclic triangle-count query) and `profile_query` (uniform graph with the comparison harness's
+      Person/KNOWS schema, arbitrary query via `PROFILE_QUERY`). `skewed_schema` builds a graph where labels sharing a relationship type have
+      different fan-out and some `(src_label, type, dst_label)` triples never occur, so it exercises the schema-aware passes: the headline
+      `type_inference` group contrasts a provably-empty typed hop (pruned to a zero-row plan) against the same shape over a realizable hop, and
+      the `expand_ratio` and `multi_hop` groups guard the latency of join-ordering- and chaining-sensitive queries.
 - `crates/issundb-cli/`: interactive REPL binary. Uses only the `issundb` public facade for manual exploration and demos.
 - `crates/issundb-rest/`: Axum-based HTTP REST API server. Exposes the data plane and retrieval over HTTP: node and edge CRUD, Cypher query
   execution, query plan explanation, vector upsert and search, full-text search, and hybrid retrieval. Index administration and host operations
@@ -383,6 +387,14 @@ endpoints has no realized `(src_label, type, dst_label)` triple, the pattern is 
 `count` zero that returns immediately without scanning. It runs only on read-only plans (a write part could create the matched edge, which the
 committed-state schema cannot see) and prunes only on a definitive negative, so it never drops rows the query should return. A `HasLabel` filter
 over an `Expand` also draws its plan-weight selectivity from the schema triples (`estimate_expand_fanout_to`).
+The plan-weight cost model applies these high-order statistics at every hop, not just the first. Reordering runs on the filter-free spine, where
+only scanned variables still carry a label, so the optimizer first collects each variable's label constraints from the pre-strip tree
+(`collect_label_constraints`) and threads that map through `plan_weight`; `label_of_var` then recovers the label of a labeled intermediate hop
+endpoint whose `HasLabel` filter was stripped, so a multi-hop chain applies the per-source-label expand ratio at each hop (the GOpt Eq. 1 chained
+fan-out) rather than falling back to the global average past the first. A cyclic pattern closed by a `MultiwayJoin` is weighted by its closing
+edge's per-pair probability (`closing_selectivity`), composed from the realized triple frequency and the endpoint node counts
+(`triples / (N_src * N_dst)`), so a selective triangle reads as cheap when it feeds a larger plan; this is the k=3 cardinality factor derived
+from the existing edge frequencies, not a motif census.
 
 ### `issundb_rest`
 

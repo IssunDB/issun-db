@@ -35,6 +35,10 @@ name = "query_optimizer"
 harness = false
 
 [[bench]]
+name = "skewed_schema"
+harness = false
+
+[[bench]]
 name = "profile_query"
 harness = false
 

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::ast::{AggFn, BinaryOperator, Expr, Literal};
 use crate::plan::logical::FilterExpr;
@@ -27,6 +27,15 @@ impl Optimizer {
         stats: Option<&dyn StatsProvider>,
         allow_prune: bool,
     ) -> PhysicalOperator {
+        // Collect each variable's declared label constraints from the original
+        // tree before `extract_filters` strips the `HasLabel` filters that carry
+        // an intermediate hop endpoint's label. Reordering runs on the
+        // filter-free spine, where only scan variables still carry a label, so
+        // this map is how `plan_weight` recovers the per-source-label expand
+        // ratio for a hop whose source is a labeled intermediate variable rather
+        // than a scanned one (multi-hop fan-out chaining).
+        let mut labels: HashMap<String, Vec<String>> = HashMap::new();
+        Self::collect_label_constraints(&op, &mut labels);
         let (stripped_op, raw_filters) = Self::extract_filters(op, stats, allow_prune);
         // Split top-level AND conjunctions so each conjunct pushes down to its
         // own lowest binder: `a.id = 1 AND b.age > 30` as a whole references
@@ -40,7 +49,7 @@ impl Optimizer {
         // evaluated per row. Only provably-true forms are removed; false or
         // unknown predicates are preserved for normal evaluation.
         filters.retain(|f| !Self::is_trivially_true(f));
-        let reordered_op = Self::reorder_operators(stripped_op, stats);
+        let reordered_op = Self::reorder_operators(stripped_op, stats, &labels);
         // Choose the lowest-cardinality endpoint as the traversal start, reversing a
         // linear single-hop Expand chain when its far endpoint is cheaper to scan.
         // Runs on the filter-free spine so the chain is contiguous; the HasLabel
@@ -401,16 +410,17 @@ impl Optimizer {
     fn reorder_operators(
         op: PhysicalOperator,
         stats: Option<&dyn StatsProvider>,
+        labels: &HashMap<String, Vec<String>>,
     ) -> PhysicalOperator {
         match op {
             PhysicalOperator::HashJoin { left, right } => {
-                let opt_left = Self::reorder_operators(*left, stats);
-                let opt_right = Self::reorder_operators(*right, stats);
+                let opt_left = Self::reorder_operators(*left, stats, labels);
+                let opt_right = Self::reorder_operators(*right, stats, labels);
 
                 // Standardize join branch order by placing the heavier branch on the left,
                 // which guarantees consistent physical structure regardless of Cypher MATCH clause order.
-                let left_weight = Self::plan_weight(&opt_left, stats);
-                let right_weight = Self::plan_weight(&opt_right, stats);
+                let left_weight = Self::plan_weight_env(&opt_left, stats, labels);
+                let right_weight = Self::plan_weight_env(&opt_right, stats, labels);
 
                 if left_weight >= right_weight {
                     PhysicalOperator::HashJoin {
@@ -437,7 +447,7 @@ impl Optimizer {
                 unique_rels,
                 needs_path,
             } => PhysicalOperator::Expand {
-                input: Box::new(Self::reorder_operators(*input, stats)),
+                input: Box::new(Self::reorder_operators(*input, stats, labels)),
                 src_var,
                 rel_var,
                 dst_var,
@@ -452,7 +462,7 @@ impl Optimizer {
             // Filter nodes inside opaque barrier-Project subtrees are not stripped by
             // `extract_filters`.  Pass them through so that reordering does not panic.
             PhysicalOperator::Filter { input, expression } => PhysicalOperator::Filter {
-                input: Box::new(Self::reorder_operators(*input, stats)),
+                input: Box::new(Self::reorder_operators(*input, stats, labels)),
                 expression,
             },
             PhysicalOperator::Project {
@@ -471,7 +481,7 @@ impl Optimizer {
                     }
                 } else {
                     PhysicalOperator::Project {
-                        input: Box::new(Self::reorder_operators(*input, stats)),
+                        input: Box::new(Self::reorder_operators(*input, stats, labels)),
                         items,
                         is_barrier,
                     }
@@ -483,7 +493,7 @@ impl Optimizer {
                 expr,
                 variable,
             } => PhysicalOperator::Unwind {
-                input: Box::new(Self::reorder_operators(*input, stats)),
+                input: Box::new(Self::reorder_operators(*input, stats, labels)),
                 expr,
                 variable,
             },
@@ -499,28 +509,28 @@ impl Optimizer {
                 group_by,
                 aggregations,
             } => PhysicalOperator::Aggregate {
-                input: Box::new(Self::reorder_operators(*input, stats)),
+                input: Box::new(Self::reorder_operators(*input, stats, labels)),
                 group_by,
                 aggregations,
             },
             PhysicalOperator::Sort { input, items } => PhysicalOperator::Sort {
-                input: Box::new(Self::reorder_operators(*input, stats)),
+                input: Box::new(Self::reorder_operators(*input, stats, labels)),
                 items,
             },
             PhysicalOperator::Limit { input, skip, count } => PhysicalOperator::Limit {
-                input: Box::new(Self::reorder_operators(*input, stats)),
+                input: Box::new(Self::reorder_operators(*input, stats, labels)),
                 skip,
                 count,
             },
             PhysicalOperator::OptionalMatch { input, null_vars } => {
                 PhysicalOperator::OptionalMatch {
-                    input: Box::new(Self::reorder_operators(*input, stats)),
+                    input: Box::new(Self::reorder_operators(*input, stats, labels)),
                     null_vars,
                 }
             }
             PhysicalOperator::Distinct { input, keys } => PhysicalOperator::Distinct {
                 keys,
-                input: Box::new(Self::reorder_operators(*input, stats)),
+                input: Box::new(Self::reorder_operators(*input, stats, labels)),
             },
             // WritePart is opaque: do not descend into it for reordering.
             PhysicalOperator::WritePart { input, part } => {
@@ -546,7 +556,7 @@ impl Optimizer {
                 closing_is_undirected,
                 closing_unique_rels,
             } => PhysicalOperator::MultiwayJoin {
-                input: Box::new(Self::reorder_operators(*input, stats)),
+                input: Box::new(Self::reorder_operators(*input, stats, labels)),
                 closing_src_var,
                 closing_dst_var,
                 closing_rel_type,
@@ -562,11 +572,31 @@ impl Optimizer {
         }
     }
 
-    /// Compute plan complexity/weight to assist with operator reordering.
+    /// Compute plan complexity/weight to assist with operator reordering, with
+    /// no external label environment. Multi-hop chaining can still apply at any
+    /// hop whose source label is visible in the plan spine (a scanned variable).
+    /// Used by the optimizer tests, which construct plans directly without the
+    /// label map the full pipeline threads through.
+    #[cfg(test)]
     fn plan_weight(op: &PhysicalOperator, stats: Option<&dyn StatsProvider>) -> usize {
+        Self::plan_weight_env(op, stats, &HashMap::new())
+    }
+
+    /// Compute plan complexity/weight, consulting `labels` for the declared
+    /// label of a variable that no longer carries one in the filter-free spine
+    /// (a labeled intermediate hop endpoint whose `HasLabel` filter was stripped
+    /// before reordering). This is what lets the per-source-label expand ratio
+    /// chain across hops rather than apply only to the first.
+    fn plan_weight_env(
+        op: &PhysicalOperator,
+        stats: Option<&dyn StatsProvider>,
+        labels: &HashMap<String, Vec<String>>,
+    ) -> usize {
         match op {
             PhysicalOperator::SingleRow => 1,
-            PhysicalOperator::Unwind { input, .. } => 1 + Self::plan_weight(input, stats),
+            PhysicalOperator::Unwind { input, .. } => {
+                1 + Self::plan_weight_env(input, stats, labels)
+            }
             // A primary-key seek touches at most one node: the cheapest scan.
             PhysicalOperator::NodeByIdSeek { .. } => 1,
             PhysicalOperator::NodeIndexScan { .. } => 2,
@@ -589,7 +619,7 @@ impl Optimizer {
                 is_incoming,
                 ..
             } => {
-                let input_weight = Self::plan_weight(input, stats);
+                let input_weight = Self::plan_weight_env(input, stats, labels);
                 // `rel_weight` is the average fan-out per input row. When the
                 // source variable traces to a labeled scan, prefer the
                 // per-source-label typed fan-out (the high-order "expand ratio"):
@@ -606,7 +636,7 @@ impl Optimizer {
                 let rel_weight = if let Some(rtype) = rel_type {
                     match stats {
                         Some(s) => {
-                            let typed = Self::scan_label_of(input, src_var)
+                            let typed = Self::label_of_var(input, src_var, labels)
                                 .and_then(|lbl| s.expand_fanout(lbl, rtype, *is_incoming));
                             match typed {
                                 Some(fanout) => (fanout.ceil() as usize).max(1),
@@ -636,7 +666,7 @@ impl Optimizer {
             // fallback is 1.0 (a transparent filter, the prior behavior), so
             // plan choice only changes when statistics actually exist.
             PhysicalOperator::Filter { input, expression } => {
-                let child_weight = Self::plan_weight(input, stats);
+                let child_weight = Self::plan_weight_env(input, stats, labels);
                 // A `HasLabel` filter directly over an `Expand` carries real
                 // selectivity on a skewed schema (the fraction of the source
                 // label's typed neighbors that carry the target label), which the
@@ -644,15 +674,16 @@ impl Optimizer {
                 // fall back to the property-histogram estimate, then to 1.0.
                 let selectivity = stats
                     .and_then(|s| {
-                        Self::haslabel_selectivity(expression, input, s)
+                        Self::haslabel_selectivity(expression, input, s, labels)
                             .or_else(|| s.estimate_filter_selectivity(expression))
                     })
                     .unwrap_or(1.0);
                 ((child_weight as f64 * selectivity).ceil() as usize).max(1)
             }
-            PhysicalOperator::Project { input, .. } => Self::plan_weight(input, stats),
+            PhysicalOperator::Project { input, .. } => Self::plan_weight_env(input, stats, labels),
             PhysicalOperator::HashJoin { left, right } => {
-                Self::plan_weight(left, stats).saturating_mul(Self::plan_weight(right, stats))
+                Self::plan_weight_env(left, stats, labels)
+                    .saturating_mul(Self::plan_weight_env(right, stats, labels))
             }
             // These operators sit above the core traversal tree; weight them as their child.
             PhysicalOperator::Aggregate { input, .. }
@@ -661,16 +692,45 @@ impl Optimizer {
             | PhysicalOperator::OptionalMatch { input, .. }
             | PhysicalOperator::Distinct { input, .. }
             | PhysicalOperator::WritePart { input, .. }
-            | PhysicalOperator::ProcedureCall { input, .. } => Self::plan_weight(input, stats),
+            | PhysicalOperator::ProcedureCall { input, .. } => {
+                Self::plan_weight_env(input, stats, labels)
+            }
             // A single kernel call producing one row.
             PhysicalOperator::TriangleCount { .. } | PhysicalOperator::PathCount { .. } => 1,
             // One kernel pass over adjacency producing one row per group.
             PhysicalOperator::GroupedDegree { .. } => 1,
             // One index search producing at most `k` rows.
             PhysicalOperator::VectorTopK { .. } => 1,
-            // MultiwayJoin is cheaper than a regular Expand because the closing check is O(1)
-            // per row after a single bulk expansion. Weight as the input cost.
-            PhysicalOperator::MultiwayJoin { input, .. } => Self::plan_weight(input, stats),
+            // MultiwayJoin closes a cycle: it bulk-expands the open path (the
+            // input) and keeps only rows whose endpoints carry the closing edge.
+            // Its result cardinality is the input weight scaled by the closing
+            // edge's per-pair probability, the cyclic-pattern cardinality factor,
+            // so a selective triangle reads as cheap when it feeds a larger plan.
+            // No statistics, or unlabeled endpoints, leaves the input unscaled.
+            PhysicalOperator::MultiwayJoin {
+                input,
+                closing_src_var,
+                closing_dst_var,
+                closing_rel_type,
+                closing_is_incoming,
+                ..
+            } => {
+                let input_weight = Self::plan_weight_env(input, stats, labels);
+                let selectivity = stats
+                    .and_then(|s| {
+                        Self::closing_selectivity(
+                            input,
+                            closing_src_var,
+                            closing_dst_var,
+                            closing_rel_type,
+                            *closing_is_incoming,
+                            s,
+                            labels,
+                        )
+                    })
+                    .unwrap_or(1.0);
+                ((input_weight as f64 * selectivity).ceil() as usize).max(1)
+            }
         }
     }
 
@@ -711,6 +771,28 @@ impl Optimizer {
         }
     }
 
+    /// Find the label a node variable carries for fan-out estimation, preferring
+    /// a binding visible in the plan spine (a scanned variable) and falling back
+    /// to a constraint collected from the original tree before its `HasLabel`
+    /// filter was stripped for reordering. The fallback is what lets multi-hop
+    /// chaining apply a per-source-label expand ratio at a hop whose source is a
+    /// labeled intermediate variable (the destination of a prior hop), not just
+    /// at the first hop off a scan. Returns the first declared label; a
+    /// multi-label variable contributes one representative label to the estimate,
+    /// which only weights plan choice.
+    fn label_of_var<'a>(
+        op: &'a PhysicalOperator,
+        var: &str,
+        labels: &'a HashMap<String, Vec<String>>,
+    ) -> Option<&'a str> {
+        Self::scan_label_of(op, var).or_else(|| {
+            labels
+                .get(var)
+                .and_then(|ls| ls.first())
+                .map(String::as_str)
+        })
+    }
+
     /// Selectivity of a `HasLabel(dst, label)` filter sitting directly over the
     /// `Expand` that binds `dst`: the fraction of the source label's `rel_type`
     /// neighbors that carry `label`, from the destination-aware expand ratio.
@@ -720,6 +802,7 @@ impl Optimizer {
         expr: &FilterExpr,
         input: &PhysicalOperator,
         stats: &dyn StatsProvider,
+        labels: &HashMap<String, Vec<String>>,
     ) -> Option<f64> {
         let (var, label) = match expr {
             FilterExpr::HasLabel(var, label) => (var, label),
@@ -738,7 +821,7 @@ impl Optimizer {
         if dst_var != var {
             return None;
         }
-        let src_label = Self::scan_label_of(input, src_var)?;
+        let src_label = Self::label_of_var(input, src_var, labels)?;
         let total = stats.expand_fanout(src_label, rel_type, is_incoming)?;
         if total <= 0.0 {
             return None;
@@ -748,6 +831,41 @@ impl Optimizer {
             .expand_fanout_to(src_label, rel_type, label, is_incoming)
             .unwrap_or(0.0);
         Some((to / total).clamp(0.0, 1.0))
+    }
+
+    /// Selectivity of a `MultiwayJoin`'s closing edge: the per-pair probability
+    /// that the closing relationship runs between its two already-bound
+    /// endpoints. This is the cyclic-pattern (triangle and longer-cycle)
+    /// cardinality factor. The open path the join closes over expands to
+    /// `input_weight` rows, but only the fraction carrying the closing edge are
+    /// real cycles, so a triangle is far more selective than its open path.
+    ///
+    /// It is composed from the existing schema frequencies rather than a motif
+    /// census: the destination-aware expand ratio `expand_fanout_to` gives the
+    /// average number of closing-destination neighbors per closing-source node
+    /// (`triples / N_src`), and dividing by the destination node count yields the
+    /// per-pair density `triples / (N_src * N_dst)`. `None` when either endpoint
+    /// lacks a resolvable label, the closing edge is untyped, or no per-triple
+    /// estimate exists, so the caller leaves the input weight unscaled.
+    fn closing_selectivity(
+        input: &PhysicalOperator,
+        closing_src_var: &str,
+        closing_dst_var: &str,
+        closing_rel_type: &Option<String>,
+        closing_is_incoming: bool,
+        stats: &dyn StatsProvider,
+        labels: &HashMap<String, Vec<String>>,
+    ) -> Option<f64> {
+        let rel_type = closing_rel_type.as_deref()?;
+        let src_label = Self::label_of_var(input, closing_src_var, labels)?;
+        let dst_label = Self::label_of_var(input, closing_dst_var, labels)?;
+        let dst_count = stats.node_count_by_label(dst_label)?;
+        if dst_count == 0 {
+            return None;
+        }
+        let fanout_to =
+            stats.expand_fanout_to(src_label, rel_type, dst_label, closing_is_incoming)?;
+        Some((fanout_to / dst_count as f64).clamp(0.0, 1.0))
     }
 
     /// Type inference: replace each typed `Expand` between two labeled endpoints
@@ -4434,6 +4552,152 @@ mod tests {
         // node_count_by_label None -> scan weight 1; global ratio 52000/2000 = 26.
         let unknown = Optimizer::plan_weight(&expand("Gadget"), Some(&stats));
         assert_eq!(unknown, 26);
+    }
+
+    #[test]
+    fn test_multi_hop_chaining_applies_fanout_past_first_hop() {
+        // A two-hop chain `(a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c)`. The
+        // first hop's source `a` carries its label on the scan; the second hop's
+        // source `b` is an intermediate variable whose `:Person` label arrives as
+        // a `HasLabel` filter that reordering has already stripped. Multi-hop
+        // chaining recovers `b`'s label from the collected-constraints map so the
+        // per-source-label expand ratio applies at the second hop too, rather
+        // than falling back to the coarser global average.
+        struct ChainStats;
+        impl StatsProvider for ChainStats {
+            fn node_count_by_label(&self, label: &str) -> Option<u64> {
+                (label == "Person").then_some(1000)
+            }
+            fn edge_count_by_type(&self, etype: &str) -> Option<u64> {
+                // A global ratio of 10 000 / 1000 = 10, far above the true
+                // per-Person KNOWS fan-out of 3, so the two models disagree.
+                (etype == "KNOWS").then_some(10_000)
+            }
+            fn total_node_count(&self) -> Option<u64> {
+                Some(1000)
+            }
+            fn expand_fanout(
+                &self,
+                src_label: &str,
+                rel_type: &str,
+                incoming: bool,
+            ) -> Option<f64> {
+                (src_label == "Person" && rel_type == "KNOWS" && !incoming).then_some(3.0)
+            }
+        }
+        let stats = ChainStats;
+
+        // The filter-free spine reordering sees: each hop's intermediate label is
+        // not on the spine, only `a`'s scan label is.
+        let chain = PhysicalOperator::Expand {
+            input: Box::new(PhysicalOperator::Expand {
+                input: Box::new(PhysicalOperator::LabelScan {
+                    variable: "a".to_string(),
+                    label: Some("Person".to_string()),
+                }),
+                src_var: "a".to_string(),
+                rel_var: "r1".to_string(),
+                dst_var: "b".to_string(),
+                rel_type: Some("KNOWS".to_string()),
+                is_incoming: false,
+                is_undirected: false,
+                min_hops: 1,
+                max_hops: 1,
+                unique_rels: vec![],
+                needs_path: false,
+            }),
+            src_var: "b".to_string(),
+            rel_var: "r2".to_string(),
+            dst_var: "c".to_string(),
+            rel_type: Some("KNOWS".to_string()),
+            is_incoming: false,
+            is_undirected: false,
+            min_hops: 1,
+            max_hops: 1,
+            unique_rels: vec![],
+            needs_path: false,
+        };
+
+        // Without a label environment, only the first hop applies the typed
+        // fan-out (3); the second hop's source `b` has no spine label, so it falls
+        // back to the global ratio (10): 1000 * 3 * 10 = 30 000.
+        assert_eq!(Optimizer::plan_weight(&chain, Some(&stats)), 1000 * 3 * 10);
+
+        // With `b` declared `Person` in the constraint map (as `collect_label_
+        // constraints` records from the original `HasLabel` filter), both hops
+        // apply the typed fan-out (3): 1000 * 3 * 3 = 9000.
+        let mut labels: HashMap<String, Vec<String>> = HashMap::new();
+        labels.insert("a".to_string(), vec!["Person".to_string()]);
+        labels.insert("b".to_string(), vec!["Person".to_string()]);
+        labels.insert("c".to_string(), vec!["Person".to_string()]);
+        assert_eq!(
+            Optimizer::plan_weight_env(&chain, Some(&stats), &labels),
+            1000 * 3 * 3
+        );
+    }
+
+    #[test]
+    fn test_multiway_join_weight_uses_closing_selectivity() {
+        // A `MultiwayJoin` closes a cycle over an open path. Its result is the
+        // open path's cardinality scaled by the closing edge's per-pair
+        // probability, composed from the triple frequency and the endpoint node
+        // counts: a triangle is far more selective than the path it closes.
+        struct CycleStats;
+        impl StatsProvider for CycleStats {
+            fn node_count_by_label(&self, label: &str) -> Option<u64> {
+                match label {
+                    "Path" => Some(1000),  // drives the open-path input weight
+                    "Person" => Some(100), // the closing endpoints
+                    _ => None,
+                }
+            }
+            fn edge_count_by_type(&self, _etype: &str) -> Option<u64> {
+                None
+            }
+            fn expand_fanout_to(
+                &self,
+                src_label: &str,
+                rel_type: &str,
+                dst_label: &str,
+                incoming: bool,
+            ) -> Option<f64> {
+                // Five Person neighbors per Person via CO_AUTHOR; over 100 Person
+                // nodes that is a per-pair density of 0.05.
+                (src_label == "Person"
+                    && rel_type == "CO_AUTHOR"
+                    && dst_label == "Person"
+                    && !incoming)
+                    .then_some(5.0)
+            }
+        }
+        let stats = CycleStats;
+
+        // The open path binds the closing endpoints `a` and `c`; its weight is
+        // the `Path` scan's node count (1000).
+        let join = PhysicalOperator::MultiwayJoin {
+            input: Box::new(PhysicalOperator::LabelScan {
+                variable: "x".to_string(),
+                label: Some("Path".to_string()),
+            }),
+            closing_src_var: "c".to_string(),
+            closing_dst_var: "a".to_string(),
+            closing_rel_type: Some("CO_AUTHOR".to_string()),
+            closing_rel_var: "rc".to_string(),
+            closing_is_incoming: false,
+            closing_is_undirected: false,
+            closing_unique_rels: vec![],
+        };
+
+        // Without endpoint labels in scope, the closing selectivity is unknown,
+        // so the input weight passes through unscaled.
+        assert_eq!(Optimizer::plan_weight(&join, Some(&stats)), 1000);
+
+        // With `a` and `c` declared `Person`, the closing density 0.05 scales the
+        // open path: 1000 * 0.05 = 50.
+        let mut labels: HashMap<String, Vec<String>> = HashMap::new();
+        labels.insert("a".to_string(), vec!["Person".to_string()]);
+        labels.insert("c".to_string(), vec!["Person".to_string()]);
+        assert_eq!(Optimizer::plan_weight_env(&join, Some(&stats), &labels), 50);
     }
 
     /// The type-inference pass wraps an `Expand` between two labeled endpoints

@@ -134,14 +134,19 @@ impl Graph {
     fn with_fanout<T>(&self, f: impl FnOnce(&EdgeFanout) -> T) -> Result<T, Error> {
         let generation = self.csr_cache.current_gen();
         let mut guard = self.edge_fanout.lock();
-        let stale = guard
-            .as_ref()
-            .map(|t| t.generation != generation)
-            .unwrap_or(true);
-        if stale {
-            *guard = Some(EdgeFanout::build(&self.storage, generation)?);
+        let fresh = guard.as_ref().is_some_and(|t| t.generation == generation);
+        if fresh {
+            if let Some(table) = guard.as_ref() {
+                return Ok(f(table));
+            }
         }
-        Ok(f(guard.as_ref().expect("schema table was just populated")))
+        // Stale or absent: rebuild, run the closure against the new table, then
+        // cache it. Computing the result before storing keeps the helper
+        // panic-free (no `expect` on the just-populated guard).
+        let table = EdgeFanout::build(&self.storage, generation)?;
+        let result = f(&table);
+        *guard = Some(table);
+        Ok(result)
     }
 
     /// Estimated average fan-out for expanding edges of `rel_type` from a node
