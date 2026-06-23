@@ -68,6 +68,8 @@ Do not invent modules that do not yet exist when answering questions, but do pla
     - `src/graph/node.rs`: node CRUD (`add_node`, `get_node`, `update_node`, `delete_node`).
     - `src/graph/edge.rs`: edge CRUD and adjacency (`add_edge`, `get_edge`, `delete_edge`, `out_neighbors`, `in_neighbors`, `node_has_relationships`).
     - `src/graph/index.rs`: label and type indexes, property indexes, constraints, and property scan methods.
+    - `src/graph/stats.rs`: high-order cardinality statistics for the optimizer. Owns the `(label, type)` edge-frequency table behind
+      `estimate_expand_fanout` (the per-source-label expand ratio), recomputed by one full scan and cached against the committed-write generation.
     - `src/graph/fts_mod.rs`: full-text search index lifecycle and FTS storage primitives.
     - `src/graph/vector.rs`: vector byte storage helpers.
     - `src/graph/algo.rs`: public algorithm dispatch methods and internal traversal helpers.
@@ -264,6 +266,12 @@ The read-path and statistics methods carry non-obvious semantics:
 - `estimate_equality_selectivity(prop: &str, val: &serde_json::Value) -> Result<Option<f64>, Error>` (estimated fraction of non-null values
   equal to `val`: exact for the property's most common values, histogram-estimated otherwise; both estimates feed the optimizer's
   selectivity-aware `Filter` plan weight)
+- `estimate_expand_fanout(src_label: &str, rel_type: &str, incoming: bool) -> Result<Option<f64>, Error>` (per-source-label typed degree: the
+  count of `rel_type` edges incident to `src_label` nodes in the given direction, divided by the `src_label` node count; the high-order "expand
+  ratio" that sharpens the optimizer's `Expand` plan weight over the global `edges_of_type / total_nodes` average on a skewed schema. `None` when
+  the label or type is unknown or no such edges exist, so the planner falls back to the global average. Backed by a `(label, type)` frequency table
+  recomputed by one full scan and cached against the committed-write generation, so it refreshes only when writes advance past the cached value;
+  the estimate only weights plan choices, so a stale or absent value never affects correctness)
 - `label_filter(nodes: &[NodeId], label: &str) -> Result<Vec<NodeId>, Error>` (subset of `nodes` carrying `label`, via one `label_idx` point
   lookup per candidate)
 - `set_thread_count(n: i32) -> Result<(), Error>`: sets the thread count for GraphBLAS matrix computations, overriding the `ISSUNDB_NUM_THREADS`

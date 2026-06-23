@@ -17,6 +17,17 @@ pub trait StatsProvider {
         None
     }
 
+    /// Estimated average fan-out for expanding edges of `rel_type` from a node
+    /// carrying `src_label`, traversing outgoing edges (or incoming when
+    /// `incoming` is true). This is the per-source-label typed degree, which is
+    /// more precise than the global `edges_of_type / total_nodes` ratio on a
+    /// skewed schema where different labels have different out-degrees. Returns
+    /// `None` when no per-label estimate is available, so the planner falls back
+    /// to the global average fan-out.
+    fn expand_fanout(&self, _src_label: &str, _rel_type: &str, _incoming: bool) -> Option<f64> {
+        None
+    }
+
     /// Check if a node property index exists.
     fn has_node_property_index(&self, _label: &str, _property: &str) -> bool {
         false
@@ -39,6 +50,12 @@ impl StatsProvider for Graph {
 
     fn total_node_count(&self) -> Option<u64> {
         self.node_count_hint().ok()
+    }
+
+    fn expand_fanout(&self, src_label: &str, rel_type: &str, incoming: bool) -> Option<f64> {
+        self.estimate_expand_fanout(src_label, rel_type, incoming)
+            .ok()
+            .flatten()
     }
 
     fn has_node_property_index(&self, label: &str, property: &str) -> bool {

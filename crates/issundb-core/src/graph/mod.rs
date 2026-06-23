@@ -38,6 +38,7 @@ pub mod fts_mod;
 pub mod graphblas;
 pub mod index;
 pub mod node;
+pub mod stats;
 pub mod txn;
 pub mod vector;
 
@@ -359,6 +360,10 @@ pub struct Graph {
     pub(super) matrices: Arc<parking_lot::RwLock<Option<MatrixSet>>>,
     pub(super) prop_columns: Arc<crate::columns::ColumnsCache<crate::columns::NodeSource>>,
     pub(super) edge_columns: Arc<crate::columns::ColumnsCache<crate::columns::EdgeSource>>,
+    /// Per-`(label, type)` edge frequencies backing the optimizer's per-source-label
+    /// expand-ratio estimate, recomputed lazily when committed writes advance past
+    /// the cached generation. See [`crate::graph::stats`].
+    pub(super) edge_fanout: Arc<parking_lot::Mutex<Option<crate::graph::stats::EdgeFanout>>>,
     pub(super) n_threads: Arc<std::sync::atomic::AtomicI32>,
     /// Type-erased extension cache. Higher-level crates attach caches (e.g. the
     /// HNSW vector index) to a Graph without creating a circular dependency,
@@ -405,6 +410,7 @@ impl Graph {
             matrices,
             prop_columns: Arc::new(crate::columns::ColumnsCache::default()),
             edge_columns: Arc::new(crate::columns::ColumnsCache::default()),
+            edge_fanout: Arc::new(parking_lot::Mutex::new(None)),
             n_threads: Arc::new(std::sync::atomic::AtomicI32::new(0)),
             extensions: Arc::new(parking_lot::Mutex::new(AHashMap::new())),
         })

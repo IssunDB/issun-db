@@ -555,27 +555,43 @@ impl Optimizer {
                 }
             }
             PhysicalOperator::Expand {
-                input, rel_type, ..
+                input,
+                src_var,
+                rel_type,
+                is_incoming,
+                ..
             } => {
                 let input_weight = Self::plan_weight(input, stats);
-                // `rel_weight` is the average fan-out per input row: the number of
-                // edges of this type divided by the node count. The previous model
-                // used the total typed edge count as the multiplier, which treated
-                // every input row as expanding to *every* edge of the type. That
-                // inflated chained multi-hop expands (input * edges * edges * ...)
-                // until they saturated `usize`, collapsing the cost space so plan
-                // ordering became arbitrary. Average fan-out keeps the estimate in
-                // a realistic range so ordering stays meaningful across hops.
+                // `rel_weight` is the average fan-out per input row. When the
+                // source variable traces to a labeled scan, prefer the
+                // per-source-label typed fan-out (the high-order "expand ratio"):
+                // edges of this type incident to that label divided by that
+                // label's node count. This is sharper than the global
+                // `edges_of_type / total_nodes` ratio on a skewed schema where
+                // one label expands heavily and another not at all.
+                //
+                // The global ratio is the fallback. It already avoids the prior
+                // total-edge multiplier, which treated every input row as
+                // expanding to *every* edge of the type and inflated chained
+                // multi-hop expands until they saturated `usize`, collapsing the
+                // cost space so plan ordering became arbitrary.
                 let rel_weight = if let Some(rtype) = rel_type {
                     match stats {
                         Some(s) => {
-                            let edges = s.edge_count_by_type(rtype).unwrap_or(0);
-                            match s.total_node_count() {
-                                Some(nodes) if nodes > 0 => {
-                                    ((edges as f64 / nodes as f64).ceil() as usize).max(1)
+                            let typed = Self::scan_label_of(input, src_var)
+                                .and_then(|lbl| s.expand_fanout(lbl, rtype, *is_incoming));
+                            match typed {
+                                Some(fanout) => (fanout.ceil() as usize).max(1),
+                                None => {
+                                    let edges = s.edge_count_by_type(rtype).unwrap_or(0);
+                                    match s.total_node_count() {
+                                        Some(nodes) if nodes > 0 => {
+                                            ((edges as f64 / nodes as f64).ceil() as usize).max(1)
+                                        }
+                                        // No node-count estimate: keep the prior typed default.
+                                        _ => 10,
+                                    }
                                 }
-                                // No node-count estimate: keep the prior typed default.
-                                _ => 10,
                             }
                         }
                         None => 10,
@@ -619,6 +635,43 @@ impl Optimizer {
             // MultiwayJoin is cheaper than a regular Expand because the closing check is O(1)
             // per row after a single bulk expansion. Weight as the input cost.
             PhysicalOperator::MultiwayJoin { input, .. } => Self::plan_weight(input, stats),
+        }
+    }
+
+    /// Find the label a node variable is scanned under by walking the plan
+    /// subtree to the operator that binds it. Returns `None` when the variable
+    /// is bound by an unlabeled scan or produced by an expansion (so it never
+    /// traces to a single scan label), in which case the caller has no
+    /// per-source-label fan-out to apply.
+    fn scan_label_of<'a>(op: &'a PhysicalOperator, var: &str) -> Option<&'a str> {
+        match op {
+            PhysicalOperator::LabelScan { variable, label } if variable == var => label.as_deref(),
+            PhysicalOperator::NodeByIdSeek {
+                variable, label, ..
+            } if variable == var => label.as_deref(),
+            PhysicalOperator::NodeIndexScan {
+                variable, label, ..
+            } if variable == var => Some(label),
+            PhysicalOperator::NodeRangeScan {
+                variable, label, ..
+            } if variable == var => Some(label),
+            // Recurse through single-input operators that preserve the binding.
+            PhysicalOperator::Filter { input, .. }
+            | PhysicalOperator::Project { input, .. }
+            | PhysicalOperator::Expand { input, .. }
+            | PhysicalOperator::Unwind { input, .. }
+            | PhysicalOperator::Aggregate { input, .. }
+            | PhysicalOperator::Sort { input, .. }
+            | PhysicalOperator::Limit { input, .. }
+            | PhysicalOperator::OptionalMatch { input, .. }
+            | PhysicalOperator::Distinct { input, .. }
+            | PhysicalOperator::WritePart { input, .. }
+            | PhysicalOperator::ProcedureCall { input, .. }
+            | PhysicalOperator::MultiwayJoin { input, .. } => Self::scan_label_of(input, var),
+            PhysicalOperator::HashJoin { left, right } => {
+                Self::scan_label_of(left, var).or_else(|| Self::scan_label_of(right, var))
+            }
+            _ => None,
         }
     }
 
@@ -3894,6 +3947,76 @@ mod tests {
         let w = Optimizer::plan_weight(&three_hop, Some(&stats));
         assert_eq!(w, 1000 * 5 * 5 * 5);
         assert!(w < usize::MAX, "multi-hop estimate must not saturate");
+    }
+
+    #[test]
+    fn test_expand_weight_prefers_per_source_label_fanout() {
+        // On a skewed schema the per-source-label fan-out differs by label even
+        // for the same relationship type. The global ratio cannot distinguish
+        // them; the typed estimate can. A Person expands KNOWS at fan-out 50, a
+        // City at fan-out 2, while the global average is some single value.
+        struct SkewStats;
+        impl StatsProvider for SkewStats {
+            fn node_count_by_label(&self, label: &str) -> Option<u64> {
+                match label {
+                    "Person" => Some(1000),
+                    "City" => Some(1000),
+                    _ => None,
+                }
+            }
+            fn edge_count_by_type(&self, etype: &str) -> Option<u64> {
+                (etype == "KNOWS").then_some(52_000)
+            }
+            fn total_node_count(&self) -> Option<u64> {
+                Some(2000)
+            }
+            fn expand_fanout(
+                &self,
+                src_label: &str,
+                rel_type: &str,
+                incoming: bool,
+            ) -> Option<f64> {
+                if rel_type != "KNOWS" || incoming {
+                    return None;
+                }
+                match src_label {
+                    "Person" => Some(50.0),
+                    "City" => Some(2.0),
+                    _ => None,
+                }
+            }
+        }
+        let stats = SkewStats;
+
+        let expand = |label: &str| PhysicalOperator::Expand {
+            input: Box::new(PhysicalOperator::LabelScan {
+                variable: "a".to_string(),
+                label: Some(label.to_string()),
+            }),
+            src_var: "a".to_string(),
+            rel_var: "r".to_string(),
+            dst_var: "b".to_string(),
+            rel_type: Some("KNOWS".to_string()),
+            is_incoming: false,
+            is_undirected: false,
+            min_hops: 1,
+            max_hops: 1,
+            unique_rels: vec![],
+            needs_path: false,
+        };
+
+        // Both scans weigh 1000 (their node count). The typed fan-out makes the
+        // Person expand 25x heavier than the City expand, which the global ratio
+        // (52000 / 2000 = 26 for both) could never express.
+        let person = Optimizer::plan_weight(&expand("Person"), Some(&stats));
+        let city = Optimizer::plan_weight(&expand("City"), Some(&stats));
+        assert_eq!(person, 1000 * 50);
+        assert_eq!(city, 1000 * 2);
+
+        // Without a per-label estimate (unknown label), the global ratio applies.
+        // node_count_by_label None -> scan weight 1; global ratio 52000/2000 = 26.
+        let unknown = Optimizer::plan_weight(&expand("Gadget"), Some(&stats));
+        assert_eq!(unknown, 26);
     }
 
     struct MockStats {
