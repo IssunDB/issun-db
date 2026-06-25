@@ -83,6 +83,10 @@ enum ReplCommand {
         map_size_gb: Option<usize>,
     },
 
+    /// Close the open database without exiting the CLI (e.g., `:close`)
+    #[command(name = ":close")]
+    Close,
+
     /// Execute a script file line by line (e.g., `:run ./import.cypher`)
     #[command(name = ":run")]
     Run {
@@ -501,6 +505,7 @@ enum ReplCommand {
 const HELP_TEXT: &str = r#"
 Database Control
   :open <path> [map_size_gb]           Open or reopen a database at the given path (e.g., :open ./issundb-data 2)
+  :close                               Close the open database without exiting the CLI (e.g., :close)
   :threads <count>                     Set the thread count for GraphBLAS computations (e.g., :threads 4)
 
 Scripting and Parameters
@@ -758,6 +763,7 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
     let needs_db = !matches!(
         cmd,
         ReplCommand::Open { .. }
+            | ReplCommand::Close
             | ReplCommand::Run { .. }
             | ReplCommand::Params
             | ReplCommand::Set { .. }
@@ -792,6 +798,15 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
                         eprintln!("{}", format!("error: {}", e).red());
                     }
                 }
+            }
+        }
+        ReplCommand::Close => {
+            // Dropping the Graph closes the LMDB environment. The prompt falls
+            // back to the "(no db)" state until the next :open.
+            if state.graph.take().is_some() {
+                eprintln!("{}", "closed".green());
+            } else {
+                eprintln!("no database open");
             }
         }
         ReplCommand::Open { path, map_size_gb } => {
@@ -2041,6 +2056,13 @@ mod tests {
             &format!(":restore {} {}", snap.display(), restored.display())
         ));
         assert!(restored.exists());
+
+        // 4h. Close releases the open database without exiting; a second close
+        // is a no-op against the now-empty state.
+        assert!(state.graph.is_some());
+        assert!(handle(&mut state, ":close"));
+        assert!(state.graph.is_none());
+        assert!(handle(&mut state, ":close"));
 
         // 5. Quit command should return false
         assert!(!handle(&mut state, "quit"));
