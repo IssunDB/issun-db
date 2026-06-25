@@ -19,7 +19,38 @@ use rustyline::hint::Hinter;
 use rustyline::history::FileHistory;
 use rustyline::validate::Validator;
 use rustyline::{Context, Editor, Helper};
+use std::cell::Cell;
 use std::str::FromStr;
+
+// ---------------------------------------------------------------------------
+// Error tracking
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    /// Set whenever a command reports an error, so a `:run` script (and the
+    /// `--script` batch launch) can fail fast on the first failing command.
+    /// Informational and success messages do not touch it.
+    static COMMAND_ERRORED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Record that the current command failed.
+fn note_command_error() {
+    COMMAND_ERRORED.with(|e| e.set(true));
+}
+
+/// Read and reset the command-error flag.
+fn take_command_error() -> bool {
+    COMMAND_ERRORED.with(|e| e.replace(false))
+}
+
+/// Like `eprintln!`, but also flags the current command as failed. Use it for
+/// error output; keep plain `eprintln!` for informational and success messages.
+macro_rules! cli_eprintln {
+    ($($arg:tt)*) => {{
+        note_command_error();
+        eprintln!($($arg)*);
+    }};
+}
 
 // ---------------------------------------------------------------------------
 // History file location
@@ -90,7 +121,8 @@ struct Cli {
 
     /// Execute a script file then exit, instead of starting the interactive
     /// prompt (e.g., `--script ./setup.txt`). Lines may mix meta, data, and
-    /// Cypher, exactly like `:run`; the `:!` shell escape is rejected.
+    /// Cypher, exactly like `:run`; the `:!` shell escape is rejected. Execution
+    /// stops at the first failing command, and the process exits non-zero.
     #[arg(long, short = 'f')]
     script: Option<String>,
 }
@@ -114,7 +146,8 @@ enum ReplCommand {
     /// Execute a script file line by line (e.g., `:run ./script.txt`). Each line
     /// runs through the same dispatcher as the prompt, so a script may mix meta
     /// commands, data commands, and Cypher; blank lines and `//` or `--` comments
-    /// are skipped. The `:!` shell escape is rejected inside a script.
+    /// are skipped. Execution stops at the first failing command. The `:!` shell
+    /// escape is rejected inside a script.
     #[command(name = ":run")]
     Run {
         /// Path to the script file
@@ -547,7 +580,7 @@ Database Control
   :threads <count>                     Set the thread count for GraphBLAS computations (e.g., :threads 4)
 
 Scripting and Parameters
-  :run <file>                          Execute a script file line by line; lines may mix meta, data, and Cypher (e.g., :run ./setup.txt)
+  :run <file>                          Execute a script file line by line, stopping at the first failing command (e.g., :run ./setup.txt)
   :! / :shell <command>                Run a shell command (e.g., :! ls -l ./data); note that it's disabled inside :run scripts
   :save <file>                         Save the output of the next query to a file (e.g., :save ./output.txt)
   :params                              List all current query parameters
@@ -693,8 +726,11 @@ fn main() {
 
     // Batch mode: run the script then exit without starting the prompt. The
     // script may `:open` its own database, so a launch path is not required.
+    // Exit non-zero if any command in the script failed.
     if let Some(script) = cli.script.as_deref() {
-        run_script(&mut state, script);
+        if !run_script(&mut state, script) {
+            std::process::exit(1);
+        }
         return;
     }
 
@@ -892,7 +928,18 @@ fn handle(state: &mut State, line: &str) -> bool {
             }
         }
         Err(e) => {
-            // Print Clap's parsed errors/help.
+            // Print Clap's parsed errors/help. A help or version display is not
+            // a failure, but a genuine parse error (unknown command or bad
+            // arguments) is, so a script can fail fast on it.
+            use clap::error::ErrorKind;
+            if !matches!(
+                e.kind(),
+                ErrorKind::DisplayHelp
+                    | ErrorKind::DisplayVersion
+                    | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+            ) {
+                note_command_error();
+            }
             let _ = e.print();
         }
     }
@@ -922,7 +969,7 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
     );
 
     if needs_db && state.graph.is_none() {
-        eprintln!("no database open; use :open <path>");
+        cli_eprintln!("no database open; use :open <path>");
         return true;
     }
 
@@ -941,7 +988,7 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
                         println!("{}", format!("thread count set to: {}", count).green());
                     }
                     Err(e) => {
-                        eprintln!("{}", format!("error: {}", e).red());
+                        cli_eprintln!("{}", format!("error: {}", e).red());
                     }
                 }
             }
@@ -963,11 +1010,15 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
                     state.graph = Some(g);
                     state.db_path = Some(path);
                 }
-                Err(e) => eprintln!("{}", format!("error: {e}").red()),
+                Err(e) => cli_eprintln!("{}", format!("error: {e}").red()),
             }
         }
         ReplCommand::Run { file } => {
-            run_script(state, &file);
+            // Propagate a nested script failure so an enclosing `:run` (or the
+            // `--script` launch) also fails fast.
+            if !run_script(state, &file) {
+                note_command_error();
+            }
         }
         ReplCommand::Shell { args } => {
             run_shell(state, &args);
@@ -1004,7 +1055,7 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
                 let cypher_str = cypher.join(" ");
                 match g.explain(&cypher_str) {
                     Ok(plan) => print!("{plan}"),
-                    Err(e) => eprintln!("error: {e}"),
+                    Err(e) => cli_eprintln!("error: {e}"),
                 }
             }
         }
@@ -1012,7 +1063,7 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
             if let Some(g) = &state.graph {
                 match g.backup(&file) {
                     Ok(_) => eprintln!("backup written to {}", file.display()),
-                    Err(e) => eprintln!("backup failed: {e}"),
+                    Err(e) => cli_eprintln!("backup failed: {e}"),
                 }
             }
         }
@@ -1020,7 +1071,7 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
             if let Some(g) = &state.graph {
                 match g.backup_compact(&file) {
                     Ok(_) => eprintln!("compact backup written to {}", file.display()),
-                    Err(e) => eprintln!("backup failed: {e}"),
+                    Err(e) => cli_eprintln!("backup failed: {e}"),
                 }
             }
         }
@@ -1034,7 +1085,7 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
                     dst.display(),
                     dst.display()
                 ),
-                Err(e) => eprintln!("restore failed: {e}"),
+                Err(e) => cli_eprintln!("restore failed: {e}"),
             }
         }
         ReplCommand::ImportNodes { file, label } => {
@@ -1055,7 +1106,7 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
         ReplCommand::AddNode { label, props } => {
             if let Some(g) = &state.graph {
                 match parse_props(&props) {
-                    Err(e) => eprintln!("invalid props: {e}"),
+                    Err(e) => cli_eprintln!("invalid props: {e}"),
                     Ok(parsed_props) => {
                         // A colon-separated label string creates a multi-label node,
                         // matching the Cypher `(n:A:B)` convention.
@@ -1067,7 +1118,7 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
                         };
                         match result {
                             Ok(id) => println!("{id}"),
-                            Err(e) => eprintln!("error: {e}"),
+                            Err(e) => cli_eprintln!("error: {e}"),
                         }
                     }
                 }
@@ -1084,17 +1135,17 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
                         println!("label={label} props={}", decode_props(&r.props));
                     }
                     Ok(None) => eprintln!("node {id} not found"),
-                    Err(e) => eprintln!("error: {e}"),
+                    Err(e) => cli_eprintln!("error: {e}"),
                 }
             }
         }
         ReplCommand::UpdateNode { id, props } => {
             if let Some(g) = &state.graph {
                 match parse_props(&props) {
-                    Err(e) => eprintln!("invalid props: {e}"),
+                    Err(e) => cli_eprintln!("invalid props: {e}"),
                     Ok(parsed_props) => match g.update_node(NodeId::from(id), &parsed_props) {
                         Ok(()) => println!("ok"),
-                        Err(e) => eprintln!("error: {e}"),
+                        Err(e) => cli_eprintln!("error: {e}"),
                     },
                 }
             }
@@ -1105,10 +1156,10 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
                 match g.get_node(node_id) {
                     Ok(Some(_)) => match g.delete_node(node_id) {
                         Ok(()) => println!("ok"),
-                        Err(e) => eprintln!("error: {e}"),
+                        Err(e) => cli_eprintln!("error: {e}"),
                     },
                     Ok(None) => eprintln!("node {id} not found"),
-                    Err(e) => eprintln!("error: {e}"),
+                    Err(e) => cli_eprintln!("error: {e}"),
                 }
             }
         }
@@ -1116,7 +1167,7 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
             if let Some(g) = &state.graph {
                 match g.add_label(NodeId::from(id), &label) {
                     Ok(()) => println!("ok"),
-                    Err(e) => eprintln!("error: {e}"),
+                    Err(e) => cli_eprintln!("error: {e}"),
                 }
             }
         }
@@ -1124,7 +1175,7 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
             if let Some(g) = &state.graph {
                 match g.remove_label(NodeId::from(id), &label) {
                     Ok(()) => println!("ok"),
-                    Err(e) => eprintln!("error: {e}"),
+                    Err(e) => cli_eprintln!("error: {e}"),
                 }
             }
         }
@@ -1136,7 +1187,7 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
         } => {
             if let Some(g) = &state.graph {
                 match parse_props(&props) {
-                    Err(e) => eprintln!("invalid props: {e}"),
+                    Err(e) => cli_eprintln!("invalid props: {e}"),
                     Ok(parsed_props) => {
                         match g.add_edge(
                             NodeId::from(src),
@@ -1145,7 +1196,7 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
                             &parsed_props,
                         ) {
                             Ok(id) => println!("{id}"),
-                            Err(e) => eprintln!("error: {e}"),
+                            Err(e) => cli_eprintln!("error: {e}"),
                         }
                     }
                 }
@@ -1168,17 +1219,17 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
                         );
                     }
                     Ok(None) => eprintln!("edge {id} not found"),
-                    Err(e) => eprintln!("error: {e}"),
+                    Err(e) => cli_eprintln!("error: {e}"),
                 }
             }
         }
         ReplCommand::UpdateEdge { id, props } => {
             if let Some(g) = &state.graph {
                 match parse_props(&props) {
-                    Err(e) => eprintln!("invalid props: {e}"),
+                    Err(e) => cli_eprintln!("invalid props: {e}"),
                     Ok(parsed_props) => match g.update_edge(EdgeId::from(id), &parsed_props) {
                         Ok(()) => println!("ok"),
-                        Err(e) => eprintln!("error: {e}"),
+                        Err(e) => cli_eprintln!("error: {e}"),
                     },
                 }
             }
@@ -1189,10 +1240,10 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
                 match g.get_edge(edge_id) {
                     Ok(Some(_)) => match g.delete_edge(edge_id) {
                         Ok(()) => println!("ok"),
-                        Err(e) => eprintln!("error: {e}"),
+                        Err(e) => cli_eprintln!("error: {e}"),
                     },
                     Ok(None) => eprintln!("edge {id} not found"),
-                    Err(e) => eprintln!("error: {e}"),
+                    Err(e) => cli_eprintln!("error: {e}"),
                 }
             }
         }
@@ -1212,7 +1263,7 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
                             println!("  node={} edge={} type={etype}", ne.node, ne.edge);
                         }
                     }
-                    Err(e) => eprintln!("error: {e}"),
+                    Err(e) => cli_eprintln!("error: {e}"),
                 }
             }
         }
@@ -1232,7 +1283,7 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
                             println!("  node={} edge={} type={etype}", ne.node, ne.edge);
                         }
                     }
-                    Err(e) => eprintln!("error: {e}"),
+                    Err(e) => cli_eprintln!("error: {e}"),
                 }
             }
         }
@@ -1249,7 +1300,7 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
                             }
                         }
                     }
-                    Err(e) => eprintln!("error: {e}"),
+                    Err(e) => cli_eprintln!("error: {e}"),
                 }
             }
         }
@@ -1266,7 +1317,7 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
                             }
                         }
                     }
-                    Err(e) => eprintln!("error: {e}"),
+                    Err(e) => cli_eprintln!("error: {e}"),
                 }
             }
         }
@@ -1274,7 +1325,7 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
             if let Some(g) = &state.graph {
                 match gather_stats(g, state.db_path.as_deref(), state.map_size_gb) {
                     Ok(stats) => print_stats(&stats),
-                    Err(e) => eprintln!("error: {e}"),
+                    Err(e) => cli_eprintln!("error: {e}"),
                 }
             }
         }
@@ -1287,7 +1338,7 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
                             println!("  {x}");
                         }
                     }
-                    Err(e) => eprintln!("error: {e}"),
+                    Err(e) => cli_eprintln!("error: {e}"),
                 }
             }
         }
@@ -1300,7 +1351,7 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
                             println!("  {x}");
                         }
                     }
-                    Err(e) => eprintln!("error: {e}"),
+                    Err(e) => cli_eprintln!("error: {e}"),
                 }
             }
         }
@@ -1315,7 +1366,7 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
                             .join(" -> ")
                     ),
                     Ok(None) => println!("no path"),
-                    Err(e) => eprintln!("error: {e}"),
+                    Err(e) => cli_eprintln!("error: {e}"),
                 }
             }
         }
@@ -1332,7 +1383,7 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
                             .join(" -> ")
                     ),
                     Ok(None) => println!("no path"),
-                    Err(e) => eprintln!("error: {e}"),
+                    Err(e) => cli_eprintln!("error: {e}"),
                 }
             }
         }
@@ -1349,7 +1400,7 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
                             println!("  ... ({} total)", sorted.len());
                         }
                     }
-                    Err(e) => eprintln!("error: {e}"),
+                    Err(e) => cli_eprintln!("error: {e}"),
                 }
             }
         }
@@ -1360,7 +1411,7 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
                         let n_comps = map.values().collect::<std::collections::HashSet<_>>().len();
                         println!("{} node(s) in {n_comps} component(s)", map.len());
                     }
-                    Err(e) => eprintln!("error: {e}"),
+                    Err(e) => cli_eprintln!("error: {e}"),
                 }
             }
         }
@@ -1383,7 +1434,7 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
                             println!("  ... ({} total)", sorted.len());
                         }
                     }
-                    Err(e) => eprintln!("error: {e}"),
+                    Err(e) => cli_eprintln!("error: {e}"),
                 }
             }
         }
@@ -1392,7 +1443,7 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
             if let Some(g) = &state.graph {
                 match g.rebuild_csr() {
                     Ok(()) => println!("ok"),
-                    Err(e) => eprintln!("error: {e}"),
+                    Err(e) => cli_eprintln!("error: {e}"),
                 }
             }
         }
@@ -1400,7 +1451,7 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
             if let Some(g) = &state.graph {
                 match g.upsert_vector(NodeId::from(id), &values) {
                     Ok(()) => println!("ok"),
-                    Err(e) => eprintln!("error: {e}"),
+                    Err(e) => cli_eprintln!("error: {e}"),
                 }
             }
         }
@@ -1408,7 +1459,7 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
             if let Some(g) = &state.graph {
                 match g.remove_vector(NodeId::from(id)) {
                     Ok(()) => println!("ok"),
-                    Err(e) => eprintln!("error: {e}"),
+                    Err(e) => cli_eprintln!("error: {e}"),
                 }
             }
         }
@@ -1424,7 +1475,7 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
                     None => None,
                     Some(Ok(map)) => Some(map),
                     Some(Err(e)) => {
-                        eprintln!("invalid props: {e}");
+                        cli_eprintln!("invalid props: {e}");
                         return true;
                     }
                 };
@@ -1436,7 +1487,7 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
                 };
                 match g.vector_search_with(&query, &opts) {
                     Ok(hits) => print_hits(&hits),
-                    Err(e) => eprintln!("error: {e}"),
+                    Err(e) => cli_eprintln!("error: {e}"),
                 }
             }
         }
@@ -1484,7 +1535,7 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
                             println!("  seed node={n} score={score:.6}");
                         }
                     }
-                    Err(e) => eprintln!("error: {e}"),
+                    Err(e) => cli_eprintln!("error: {e}"),
                 }
             }
         }
@@ -1505,7 +1556,7 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
                 };
                 match res {
                     Ok(()) => println!("ok"),
-                    Err(e) => eprintln!("error: {e}"),
+                    Err(e) => cli_eprintln!("error: {e}"),
                 }
             }
         }
@@ -1521,12 +1572,12 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
                         let lbl = label.as_deref().unwrap_or("");
                         let prop = property.as_deref().unwrap_or("");
                         if lbl.is_empty() || prop.is_empty() {
-                            eprintln!("label and property are required for create");
+                            cli_eprintln!("label and property are required for create");
                         } else {
                             let language = Language::from_str(&lang).unwrap_or_default();
                             match g.create_text_index_with_language(lbl, prop, language) {
                                 Ok(()) => println!("ok"),
-                                Err(e) => eprintln!("error: {e}"),
+                                Err(e) => cli_eprintln!("error: {e}"),
                             }
                         }
                     }
@@ -1534,11 +1585,11 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
                         let lbl = label.as_deref().unwrap_or("");
                         let prop = property.as_deref().unwrap_or("");
                         if lbl.is_empty() || prop.is_empty() {
-                            eprintln!("label and property are required for drop");
+                            cli_eprintln!("label and property are required for drop");
                         } else {
                             match g.drop_text_index(lbl, prop) {
                                 Ok(()) => println!("ok"),
-                                Err(e) => eprintln!("error: {e}"),
+                                Err(e) => cli_eprintln!("error: {e}"),
                             }
                         }
                     }
@@ -1546,11 +1597,11 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
                         let lbl = label.as_deref().unwrap_or("");
                         let prop = property.as_deref().unwrap_or("");
                         if lbl.is_empty() || prop.is_empty() {
-                            eprintln!("label and property are required for has");
+                            cli_eprintln!("label and property are required for has");
                         } else {
                             match g.has_text_index(lbl, prop) {
                                 Ok(exists) => println!("{}", exists),
-                                Err(e) => eprintln!("error: {e}"),
+                                Err(e) => cli_eprintln!("error: {e}"),
                             }
                         }
                     }
@@ -1564,7 +1615,7 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
                                 }
                             }
                         }
-                        Err(e) => eprintln!("error: {e}"),
+                        Err(e) => cli_eprintln!("error: {e}"),
                     },
                     _ => {}
                 }
@@ -1593,7 +1644,7 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
                             }
                         }
                     }
-                    Err(e) => eprintln!("{}", format!("error: {e}").red()),
+                    Err(e) => cli_eprintln!("{}", format!("error: {e}").red()),
                 }
             }
         }
@@ -1605,12 +1656,14 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
 // Script execution
 // ---------------------------------------------------------------------------
 
-fn run_script(state: &mut State, path: &str) {
+/// Execute a script file line by line, stopping at the first failing command.
+/// Returns `true` if the whole script ran without an error, `false` otherwise.
+fn run_script(state: &mut State, path: &str) -> bool {
     let content = match fs::read_to_string(path) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("cannot read {path}: {e}");
-            return;
+            cli_eprintln!("cannot read {path}: {e}");
+            return false;
         }
     };
 
@@ -1618,17 +1671,32 @@ fn run_script(state: &mut State, path: &str) {
     // Save and restore the flag so a nested `:run` does not clear it early.
     let was_in_script = state.in_script;
     state.in_script = true;
+    let mut ok = true;
     for (lineno, line) in content.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() || line.starts_with("//") || line.starts_with("--") {
             continue;
         }
         println!("[{}:{}] {line}", path, lineno + 1);
-        if !handle(state, line) {
+        // Clear the per-command flag, run the line, then check whether it
+        // reported an error. The first failing command stops the script.
+        let _ = take_command_error();
+        let cont = handle(state, line);
+        if take_command_error() {
+            cli_eprintln!(
+                "script aborted at {}:{} after a failing command",
+                path,
+                lineno + 1
+            );
+            ok = false;
+            break;
+        }
+        if !cont {
             break;
         }
     }
     state.in_script = was_in_script;
+    ok
 }
 
 // ---------------------------------------------------------------------------
@@ -1639,14 +1707,14 @@ fn run_shell(state: &State, args: &[String]) {
     // A checked-in script must not silently shell out on someone else's machine,
     // so the escape is interactive-only.
     if state.in_script {
-        eprintln!(
+        cli_eprintln!(
             "{}",
             "the :! shell escape is disabled inside :run scripts".red()
         );
         return;
     }
     if args.is_empty() {
-        eprintln!("usage: :! <command> [args...]");
+        cli_eprintln!("usage: :! <command> [args...]");
         return;
     }
     // Run through the user's shell so pipes, globs, and quoting behave as typed.
@@ -1659,13 +1727,13 @@ fn run_shell(state: &State, args: &[String]) {
     {
         Ok(status) if status.success() => {}
         Ok(status) => match status.code() {
-            Some(code) => eprintln!(
+            Some(code) => cli_eprintln!(
                 "{}",
                 format!("shell command exited with status {code}").red()
             ),
-            None => eprintln!("{}", "shell command terminated by signal".red()),
+            None => cli_eprintln!("{}", "shell command terminated by signal".red()),
         },
-        Err(e) => eprintln!("{}", format!("failed to run shell command: {e}").red()),
+        Err(e) => cli_eprintln!("{}", format!("failed to run shell command: {e}").red()),
     }
 }
 
@@ -1677,7 +1745,7 @@ fn run_cypher(state: &mut State, cypher: &str) {
     let g = match state.graph.as_ref() {
         Some(g) => g,
         None => {
-            eprintln!("no database open");
+            cli_eprintln!("no database open");
             return;
         }
     };
@@ -1690,19 +1758,19 @@ fn run_cypher(state: &mut State, cypher: &str) {
     };
 
     match result {
-        Err(e) => eprintln!("{}", format!("error: {e}").red()),
+        Err(e) => cli_eprintln!("{}", format!("error: {e}").red()),
         Ok(qr) => {
             let output = format_query_result(&qr);
             if let Some(ref save) = save_path {
                 match fs::File::create(save) {
                     Ok(mut f) => {
                         if let Err(e) = f.write_all(output.as_bytes()) {
-                            eprintln!("write error: {e}");
+                            cli_eprintln!("write error: {e}");
                         } else {
                             eprintln!("saved to {}", save.display());
                         }
                     }
-                    Err(e) => eprintln!("cannot create {}: {e}", save.display()),
+                    Err(e) => cli_eprintln!("cannot create {}: {e}", save.display()),
                 }
             } else {
                 print!("{output}");
@@ -2102,14 +2170,14 @@ fn cmd_import_nodes(state: &mut State, path: &str, label: &str) {
     let g = match state.graph.as_ref() {
         Some(g) => g,
         None => {
-            eprintln!("no database open");
+            cli_eprintln!("no database open");
             return;
         }
     };
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("cannot read {path}: {e}");
+            cli_eprintln!("cannot read {path}: {e}");
             return;
         }
     };
@@ -2118,14 +2186,14 @@ fn cmd_import_nodes(state: &mut State, path: &str, label: &str) {
     let header_line = match lines.next() {
         Some(h) => h,
         None => {
-            eprintln!("CSV file is empty");
+            cli_eprintln!("CSV file is empty");
             return;
         }
     };
 
     let headers = parse_csv_line(header_line);
     if headers.is_empty() {
-        eprintln!("CSV has no columns");
+        cli_eprintln!("CSV has no columns");
         return;
     }
 
@@ -2154,7 +2222,7 @@ fn cmd_import_nodes(state: &mut State, path: &str, label: &str) {
         }) {
             Ok(_) => inserted += chunk.len() as u64,
             Err(e) => {
-                eprintln!("node batch insert failed: {e}");
+                cli_eprintln!("node batch insert failed: {e}");
                 return;
             }
         }
@@ -2193,7 +2261,7 @@ fn cmd_import_edges(state: &mut State, path: &str, src_label: &str, dst_label: &
     let g = match state.graph.as_ref() {
         Some(g) => g,
         None => {
-            eprintln!("no database open");
+            cli_eprintln!("no database open");
             return;
         }
     };
@@ -2201,7 +2269,7 @@ fn cmd_import_edges(state: &mut State, path: &str, src_label: &str, dst_label: &
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("cannot read {path}: {e}");
+            cli_eprintln!("cannot read {path}: {e}");
             return;
         }
     };
@@ -2209,7 +2277,7 @@ fn cmd_import_edges(state: &mut State, path: &str, src_label: &str, dst_label: &
     // First non-empty line is the header (e.g. `src_id,dst_id`).
     let mut lines = content.lines().filter(|l| !l.trim().is_empty());
     if lines.next().is_none() {
-        eprintln!("CSV file is empty");
+        cli_eprintln!("CSV file is empty");
         return;
     }
 
@@ -2248,7 +2316,7 @@ fn cmd_import_edges(state: &mut State, path: &str, src_label: &str, dst_label: &
         }) {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("edge resolution failed: {e}");
+                cli_eprintln!("edge resolution failed: {e}");
                 return;
             }
         };
@@ -2262,7 +2330,7 @@ fn cmd_import_edges(state: &mut State, path: &str, src_label: &str, dst_label: &
         }) {
             Ok(_) => inserted += resolved.len() as u64,
             Err(e) => {
-                eprintln!("edge batch insert failed: {e}");
+                cli_eprintln!("edge batch insert failed: {e}");
                 return;
             }
         }
@@ -2714,6 +2782,52 @@ mod tests {
             &format!(":! touch {}", marker.display())
         ));
         assert!(marker.exists());
+    }
+
+    #[test]
+    fn script_run_succeeds_when_all_commands_ok() {
+        let temp = TempDir::new().unwrap();
+        let script = temp.path().join("ok.txt");
+        std::fs::write(
+            &script,
+            format!(
+                ":open {}\nadd-node Person {{\"name\": \"Alice\"}}\nMATCH (n) RETURN count(n)\n",
+                temp.path().join("db").display()
+            ),
+        )
+        .unwrap();
+
+        let mut state = State::new(None, None, 1);
+        assert!(run_script(&mut state, script.to_str().unwrap()));
+    }
+
+    #[test]
+    fn script_run_stops_at_first_failing_command() {
+        let temp = TempDir::new().unwrap();
+        let script = temp.path().join("bad.txt");
+        // A bad command sits between two good ones; the trailing one must not run.
+        std::fs::write(
+            &script,
+            format!(
+                ":open {}\nadd-node Person {{\"name\": \"Alice\"}}\nbogus-command 1 2\nadd-node Person {{\"name\": \"Carol\"}}\n",
+                temp.path().join("db").display()
+            ),
+        )
+        .unwrap();
+
+        let mut state = State::new(None, None, 1);
+        assert!(!run_script(&mut state, script.to_str().unwrap()));
+
+        // The command after the failure never executed, so only Alice exists.
+        let g = state.graph.as_ref().unwrap();
+        let people = g.view(|txn| txn.nodes_by_label("Person")).unwrap();
+        assert_eq!(people.len(), 1);
+    }
+
+    #[test]
+    fn script_run_fails_on_missing_file() {
+        let mut state = State::new(None, None, 1);
+        assert!(!run_script(&mut state, "/no/such/script.txt"));
     }
 
     #[test]
