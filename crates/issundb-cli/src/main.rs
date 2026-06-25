@@ -50,6 +50,9 @@ struct State {
     /// Map size from the launch flag; the `:open` default when the positional
     /// map size is omitted.
     map_size_gb: usize,
+    /// True while a `:run` script is executing, so the `:!` shell escape can
+    /// refuse to run from inside a script file.
+    in_script: bool,
 }
 
 impl State {
@@ -60,6 +63,7 @@ impl State {
             params: HashMap::new(),
             save_path: None,
             map_size_gb,
+            in_script: false,
         }
     }
 }
@@ -101,11 +105,23 @@ enum ReplCommand {
     #[command(name = ":close")]
     Close,
 
-    /// Execute a script file line by line (e.g., `:run ./import.cypher`)
+    /// Execute a script file line by line (e.g., `:run ./script.txt`). Each line
+    /// runs through the same dispatcher as the prompt, so a script may mix meta
+    /// commands, data commands, and Cypher; blank lines and `//` or `--` comments
+    /// are skipped. The `:!` shell escape is rejected inside a script.
     #[command(name = ":run")]
     Run {
         /// Path to the script file
         file: String,
+    },
+
+    /// Run a shell command (e.g., `:! ls -l ./data`). Disabled inside `:run`
+    /// scripts.
+    #[command(name = ":!", alias = ":shell")]
+    Shell {
+        /// The shell command and its arguments
+        #[arg(num_args = 1.., allow_hyphen_values = true)]
+        args: Vec<String>,
     },
 
     /// Save the output of the next query to a file (e.g., `:save ./output.txt`)
@@ -525,7 +541,8 @@ Database Control
   :threads <count>                     Set the thread count for GraphBLAS computations (e.g., :threads 4)
 
 Scripting and Parameters
-  :run <file>                          Execute a script file line by line (e.g., :run ./import.cypher)
+  :run <file>                          Execute a script file line by line; lines may mix meta, data, and Cypher (e.g., :run ./setup.txt)
+  :! / :shell <command>                Run a shell command (e.g., :! ls -l ./data); note that it's disabled inside :run scripts
   :save <file>                         Save the output of the next query to a file (e.g., :save ./output.txt)
   :params                              List all current query parameters
   :set <name> <value>                  Set a query parameter (e.g., :set limit 10 or :set person {"name": "Alice"})
@@ -556,7 +573,7 @@ Query and Mutations
   in <id>                              Get incoming neighbors of a node (e.g., in 1)
   label <label>                        Find nodes carrying a specific label (e.g., label Person)
   etype <type>                         Find edges of a specific type (e.g., etype KNOWS)
-  stats                                Display database and graph statistics: sizes, counts, indexes
+  stats                                Show database and graph statistics like sizes, counts, indexes, etc.
 
 Graph Algorithms
   bfs <id> <hops>                      Run breadth-first expansion traversal (e.g., bfs 1 2)
@@ -880,6 +897,7 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
         ReplCommand::Open { .. }
             | ReplCommand::Close
             | ReplCommand::Run { .. }
+            | ReplCommand::Shell { .. }
             | ReplCommand::Params
             | ReplCommand::Set { .. }
             | ReplCommand::Unset { .. }
@@ -937,6 +955,9 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
         }
         ReplCommand::Run { file } => {
             run_script(state, &file);
+        }
+        ReplCommand::Shell { args } => {
+            run_shell(state, &args);
         }
         ReplCommand::Save { file } => {
             state.save_path = Some(file.clone());
@@ -1580,6 +1601,10 @@ fn run_script(state: &mut State, path: &str) {
         }
     };
 
+    // Mark the script scope so a `:!` shell escape inside the file is rejected.
+    // Save and restore the flag so a nested `:run` does not clear it early.
+    let was_in_script = state.in_script;
+    state.in_script = true;
     for (lineno, line) in content.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() || line.starts_with("//") || line.starts_with("--") {
@@ -1589,6 +1614,45 @@ fn run_script(state: &mut State, path: &str) {
         if !handle(state, line) {
             break;
         }
+    }
+    state.in_script = was_in_script;
+}
+
+// ---------------------------------------------------------------------------
+// Shell escape
+// ---------------------------------------------------------------------------
+
+fn run_shell(state: &State, args: &[String]) {
+    // A checked-in script must not silently shell out on someone else's machine,
+    // so the escape is interactive-only.
+    if state.in_script {
+        eprintln!(
+            "{}",
+            "the :! shell escape is disabled inside :run scripts".red()
+        );
+        return;
+    }
+    if args.is_empty() {
+        eprintln!("usage: :! <command> [args...]");
+        return;
+    }
+    // Run through the user's shell so pipes, globs, and quoting behave as typed.
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+    let command = args.join(" ");
+    match std::process::Command::new(&shell)
+        .arg("-c")
+        .arg(&command)
+        .status()
+    {
+        Ok(status) if status.success() => {}
+        Ok(status) => match status.code() {
+            Some(code) => eprintln!(
+                "{}",
+                format!("shell command exited with status {code}").red()
+            ),
+            None => eprintln!("{}", "shell command terminated by signal".red()),
+        },
+        Err(e) => eprintln!("{}", format!("failed to run shell command: {e}").red()),
     }
 }
 
@@ -2623,5 +2687,36 @@ mod tests {
             .view(|txn| txn.nodes_by_property("Library", "Id", PropValue::Str("numpy".to_owned())))
             .unwrap();
         assert_eq!(by_name.len(), 1);
+    }
+
+    #[test]
+    fn shell_escape_runs_interactively() {
+        let temp = TempDir::new().unwrap();
+        let marker = temp.path().join("ran");
+        let mut state = State::new(None, None, 1);
+
+        // At the interactive prompt the escape runs the command.
+        assert!(handle(
+            &mut state,
+            &format!(":! touch {}", marker.display())
+        ));
+        assert!(marker.exists());
+    }
+
+    #[test]
+    fn shell_escape_is_rejected_inside_a_script() {
+        let temp = TempDir::new().unwrap();
+        let marker = temp.path().join("ran");
+        let script = temp.path().join("setup.txt");
+        std::fs::write(&script, format!(":! touch {}\n", marker.display())).unwrap();
+
+        let mut state = State::new(None, None, 1);
+        assert!(handle(&mut state, &format!(":run {}", script.display())));
+
+        // The script line is parsed and dispatched, but the escape refuses to run
+        // from inside a script, so the command never executes.
+        assert!(!marker.exists());
+        // The flag is cleared once the script finishes.
+        assert!(!state.in_script);
     }
 }
