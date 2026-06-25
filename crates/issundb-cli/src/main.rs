@@ -1,4 +1,9 @@
-use std::{collections::HashMap, fs, io::Write, path::PathBuf};
+use std::{
+    collections::HashMap,
+    fs,
+    io::Write,
+    path::{Path, PathBuf},
+};
 
 use clap::{CommandFactory, Parser};
 use colored::Colorize;
@@ -36,6 +41,9 @@ fn dirs_home() -> Option<PathBuf> {
 
 struct State {
     graph: Option<Graph>,
+    /// Directory of the open database, tracked so `stats` can report on-disk
+    /// size. Set on `:open`, cleared on `:close`.
+    db_path: Option<PathBuf>,
     params: HashMap<String, serde_json::Value>,
     /// Path to capture the next query output into, then cleared.
     save_path: Option<PathBuf>,
@@ -45,9 +53,10 @@ struct State {
 }
 
 impl State {
-    fn new(graph: Option<Graph>, map_size_gb: usize) -> Self {
+    fn new(graph: Option<Graph>, db_path: Option<PathBuf>, map_size_gb: usize) -> Self {
         Self {
             graph,
+            db_path,
             params: HashMap::new(),
             save_path: None,
             map_size_gb,
@@ -316,7 +325,9 @@ enum ReplCommand {
         etype: String,
     },
 
-    /// Display node and edge count statistics (e.g., `stats`)
+    /// Display database and graph statistics: on-disk size, node and edge
+    /// counts, per-label and per-type breakdowns, indexes, constraints, text
+    /// indexes, and vector count (e.g., `stats`)
     #[command(name = "stats")]
     Stats,
 
@@ -545,7 +556,7 @@ Query and Mutations
   in <id>                              Get incoming neighbors of a node (e.g., in 1)
   label <label>                        Find nodes carrying a specific label (e.g., label Person)
   etype <type>                         Find edges of a specific type (e.g., etype KNOWS)
-  stats                                Display node and edge count statistics (e.g., stats)
+  stats                                Display database and graph statistics: sizes, counts, indexes
 
 Graph Algorithms
   bfs <id> <hops>                      Run breadth-first expansion traversal (e.g., bfs 1 2)
@@ -637,21 +648,25 @@ fn print_help() {
 
 fn main() {
     let cli = Cli::parse();
-    let graph = cli
+    let opened = cli
         .db_path
         .as_ref()
         .and_then(|p| match Graph::open(p, cli.map_size_gb) {
             Ok(g) => {
                 eprintln!("{}", format!("opened: {}", p.display()).green());
-                Some(g)
+                Some((g, p.clone()))
             }
             Err(e) => {
                 eprintln!("{}", format!("error opening {}: {e}", p.display()).red());
                 None
             }
         });
+    let (graph, db_path) = match opened {
+        Some((g, p)) => (Some(g), Some(p)),
+        None => (None, None),
+    };
 
-    let mut state = State::new(graph, cli.map_size_gb);
+    let mut state = State::new(graph, db_path, cli.map_size_gb);
 
     let mut rl: Editor<ReplHelper, FileHistory> = match Editor::new() {
         Ok(r) => r,
@@ -904,6 +919,7 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
             // Dropping the Graph closes the LMDB environment. The prompt falls
             // back to the "(no db)" state until the next :open.
             if state.graph.take().is_some() {
+                state.db_path = None;
                 eprintln!("{}", "closed".green());
             } else {
                 eprintln!("no database open");
@@ -914,6 +930,7 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
                 Ok(g) => {
                     eprintln!("{}", format!("opened: {}", path.display()).green());
                     state.graph = Some(g);
+                    state.db_path = Some(path);
                 }
                 Err(e) => eprintln!("{}", format!("error: {e}").red()),
             }
@@ -1221,9 +1238,10 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
         }
         ReplCommand::Stats => {
             if let Some(g) = &state.graph {
-                let nodes = g.all_nodes().map(|v| v.len()).unwrap_or(0);
-                println!("nodes : {nodes}");
-                println!("(use `etype <type>` or `label <label>` for detailed counts)");
+                match gather_stats(g, state.db_path.as_deref(), state.map_size_gb) {
+                    Ok(stats) => print_stats(&stats),
+                    Err(e) => eprintln!("error: {e}"),
+                }
             }
         }
         ReplCommand::Bfs { id, hops } => {
@@ -1643,6 +1661,202 @@ fn format_query_result(qr: &issundb::QueryResult) -> String {
     );
     let _ = writeln!(out, "{}", footer.dimmed());
     out
+}
+
+// ---------------------------------------------------------------------------
+// Database statistics
+// ---------------------------------------------------------------------------
+
+/// A snapshot of database and graph metadata gathered for the `stats` command.
+struct GraphStats {
+    /// Exact live node count (a full node scan).
+    node_count: usize,
+    /// Exact live edge count, summed over every relationship type.
+    edge_count: u64,
+    /// `(label, live node count)` for every label in the registry, including
+    /// labels with zero live nodes.
+    labels: Vec<(String, u64)>,
+    /// `(relationship type, live edge count)` for every type in the registry.
+    rel_types: Vec<(String, u64)>,
+    /// `(label, property, flags)` node indexes and constraints.
+    node_indexes: Vec<(String, String, u8)>,
+    /// `(type, property, flags)` edge indexes and constraints.
+    edge_indexes: Vec<(String, String, u8)>,
+    /// `(label, property, language)` full-text indexes.
+    text_indexes: Vec<(String, String, String)>,
+    /// Number of persisted vector embeddings.
+    vector_count: usize,
+    /// Total size of the LMDB files on disk, when the path is known.
+    on_disk_bytes: Option<u64>,
+    /// Configured LMDB map size in gigabytes.
+    map_size_gb: usize,
+}
+
+/// Gathers database and graph statistics through the public facade.
+///
+/// The label and type registries allocate dense, monotonic `u32` ids from 0 and
+/// never reuse them, so probing ids upward until the first unallocated id
+/// enumerates every label and type ever created. This is the only registry
+/// enumeration the facade exposes.
+fn gather_stats(
+    g: &Graph,
+    db_path: Option<&Path>,
+    map_size_gb: usize,
+) -> Result<GraphStats, issundb::Error> {
+    let node_count = g.all_nodes()?.len();
+
+    let mut labels = Vec::new();
+    let mut label_id: u32 = 0;
+    while let Some(name) = g.label_name(label_id)? {
+        let count = g.node_count_by_label(&name)?;
+        labels.push((name, count));
+        label_id += 1;
+    }
+
+    let mut rel_types = Vec::new();
+    let mut edge_count: u64 = 0;
+    let mut type_id: u32 = 0;
+    while let Some(name) = g.type_name(type_id)? {
+        let count = g.edge_count_by_type(&name)?;
+        edge_count += count;
+        rel_types.push((name, count));
+        type_id += 1;
+    }
+
+    let node_indexes = g.list_node_indexes_and_constraints()?;
+    let edge_indexes = g.list_edge_indexes_and_constraints()?;
+
+    // The text-index listing has its own error type; treat a failure as "none"
+    // rather than aborting the whole report.
+    let text_indexes = g
+        .list_text_indexes()
+        .map(|v| {
+            v.into_iter()
+                .map(|(label, prop, lang)| (label, prop, format!("{lang:?}").to_lowercase()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let vector_count = g.vector_bytes()?.len();
+    let on_disk_bytes = db_path.and_then(dir_size);
+
+    Ok(GraphStats {
+        node_count,
+        edge_count,
+        labels,
+        rel_types,
+        node_indexes,
+        edge_indexes,
+        text_indexes,
+        vector_count,
+        on_disk_bytes,
+        map_size_gb,
+    })
+}
+
+/// Names the index kind for a node or edge index flag byte: `0x01` is a unique
+/// constraint, `0x02` a required (existence) constraint, anything else a plain
+/// property index.
+fn index_kind(flags: u8) -> &'static str {
+    match flags {
+        0x01 => "unique",
+        0x02 => "required",
+        _ => "index",
+    }
+}
+
+/// Sum of the file sizes directly inside an LMDB directory (`data.mdb` and
+/// `lock.mdb`). Returns `None` when the directory cannot be read. Not recursive:
+/// an LMDB environment keeps its files flat in the directory.
+fn dir_size(dir: &Path) -> Option<u64> {
+    let mut total = 0u64;
+    for entry in fs::read_dir(dir).ok()? {
+        let Ok(entry) = entry else { continue };
+        if let Ok(meta) = entry.metadata() {
+            if meta.is_file() {
+                total += meta.len();
+            }
+        }
+    }
+    Some(total)
+}
+
+/// Formats a byte count with a binary unit suffix (KiB, MiB, ...).
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
+    let mut size = bytes as f64;
+    let mut unit = 0;
+    while size >= 1024.0 && unit < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{size:.1} {}", UNITS[unit])
+    }
+}
+
+/// Prints the gathered statistics as aligned, sectioned tables.
+fn print_stats(s: &GraphStats) {
+    let kv = |key: &str, val: &str| println!("  {key:<20}{val}");
+
+    println!("{}", "Database".cyan().bold());
+    if let Some(bytes) = s.on_disk_bytes {
+        kv("on-disk size", &human_bytes(bytes));
+    }
+    kv("map size", &format!("{} GiB", s.map_size_gb));
+
+    println!("{}", "Graph".cyan().bold());
+    kv("nodes", &s.node_count.to_string());
+    kv("edges", &s.edge_count.to_string());
+    kv("labels", &s.labels.len().to_string());
+    kv("relationship types", &s.rel_types.len().to_string());
+    kv("vectors", &s.vector_count.to_string());
+
+    if !s.labels.is_empty() {
+        println!("{}", "Labels".cyan().bold());
+        print_named_counts(&s.labels);
+    }
+    if !s.rel_types.is_empty() {
+        println!("{}", "Relationship Types".cyan().bold());
+        print_named_counts(&s.rel_types);
+    }
+
+    println!("{}", "Indexes & Constraints".cyan().bold());
+    if s.node_indexes.is_empty() && s.edge_indexes.is_empty() {
+        println!("  (none)");
+    } else {
+        for (label, prop, flags) in &s.node_indexes {
+            println!(
+                "  node  {:<28}{}",
+                format!("{label}.{prop}"),
+                index_kind(*flags)
+            );
+        }
+        for (etype, prop, flags) in &s.edge_indexes {
+            println!(
+                "  edge  {:<28}{}",
+                format!("{etype}.{prop}"),
+                index_kind(*flags)
+            );
+        }
+    }
+
+    if !s.text_indexes.is_empty() {
+        println!("{}", "Text Indexes".cyan().bold());
+        for (label, prop, lang) in &s.text_indexes {
+            println!("  {:<28}{}", format!("{label}.{prop}"), lang);
+        }
+    }
+}
+
+/// Prints `(name, count)` rows with the name column padded to the widest name.
+fn print_named_counts(rows: &[(String, u64)]) {
+    let width = rows.iter().map(|(n, _)| n.len()).max().unwrap_or(0).max(8) + 2;
+    for (name, count) in rows {
+        println!("  {name:<width$}{count}");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2083,6 +2297,66 @@ mod tests {
     }
 
     #[test]
+    fn stats_gather_reports_counts_labels_types_indexes_and_vectors() {
+        use serde_json::json;
+        let dir = TempDir::new().unwrap();
+        let g = Graph::open(dir.path(), 1).unwrap();
+
+        let a = g.add_node("Person", &json!({"name": "Alice"})).unwrap();
+        // A multi-label node: counted under both Person and Admin per the label
+        // scans, but only once in the exact total.
+        let b = g
+            .add_node_multi(&["Person", "Admin"], &json!({"name": "Bob"}))
+            .unwrap();
+        let c = g.add_node("City", &json!({"name": "Paris"})).unwrap();
+        g.add_edge(a, b, "KNOWS", &json!({})).unwrap();
+        g.add_edge(a, c, "LIVES_IN", &json!({})).unwrap();
+        g.create_node_unique_constraint("Person", "email").unwrap();
+        g.upsert_vector(a, &[0.1, 0.2, 0.3]).unwrap();
+
+        let stats = gather_stats(&g, Some(dir.path()), 1).unwrap();
+
+        // Exact totals, independent of multi-labeling (sum of label counts is 4).
+        assert_eq!(stats.node_count, 3);
+        assert_eq!(stats.edge_count, 2);
+
+        // Per-label breakdown: Bob counts under both Person and Admin.
+        assert!(stats.labels.iter().any(|(n, c)| n == "Person" && *c == 2));
+        assert!(stats.labels.iter().any(|(n, c)| n == "Admin" && *c == 1));
+        assert!(stats.labels.iter().any(|(n, c)| n == "City" && *c == 1));
+
+        // Per-type edge breakdown.
+        assert!(stats.rel_types.iter().any(|(n, c)| n == "KNOWS" && *c == 1));
+        assert!(
+            stats
+                .rel_types
+                .iter()
+                .any(|(n, c)| n == "LIVES_IN" && *c == 1)
+        );
+
+        // The unique constraint surfaces with the unique flag (0x01).
+        assert!(
+            stats
+                .node_indexes
+                .iter()
+                .any(|(l, p, f)| l == "Person" && p == "email" && *f == 0x01)
+        );
+
+        assert_eq!(stats.vector_count, 1);
+        assert!(stats.on_disk_bytes.unwrap_or(0) > 0);
+    }
+
+    #[test]
+    fn human_bytes_uses_binary_units() {
+        assert_eq!(human_bytes(512), "512 B");
+        assert_eq!(human_bytes(1024), "1.0 KiB");
+        assert_eq!(human_bytes(1024 * 1024), "1.0 MiB");
+        assert_eq!(index_kind(0x01), "unique");
+        assert_eq!(index_kind(0x02), "required");
+        assert_eq!(index_kind(0x00), "index");
+    }
+
+    #[test]
     fn test_split_cmd() {
         assert_eq!(split_cmd("  quit  "), ("quit", ""));
         assert_eq!(split_cmd(" :open   /tmp/db  "), (":open", "/tmp/db"));
@@ -2173,7 +2447,7 @@ mod tests {
     #[test]
     fn test_repl_commands_handle() {
         let temp = TempDir::new().unwrap();
-        let mut state = State::new(None, 1);
+        let mut state = State::new(None, None, 1);
 
         // 1. Open database via REPL command
         let open_cmd = format!(":open {}", temp.path().display());
@@ -2259,7 +2533,7 @@ mod tests {
     #[test]
     fn test_import_edges_resolves_domain_keys() {
         let temp = TempDir::new().unwrap();
-        let mut state = State::new(None, 1);
+        let mut state = State::new(None, None, 1);
         assert!(handle(
             &mut state,
             &format!(":open {}", temp.path().display())
@@ -2311,7 +2585,7 @@ mod tests {
     #[test]
     fn test_import_nodes_loads_csv_columns_as_properties() {
         let temp = TempDir::new().unwrap();
-        let mut state = State::new(None, 1);
+        let mut state = State::new(None, None, 1);
         assert!(handle(
             &mut state,
             &format!(":open {}", temp.path().display())
