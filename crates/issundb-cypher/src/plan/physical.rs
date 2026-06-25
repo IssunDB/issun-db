@@ -34,6 +34,23 @@ pub enum PhysicalOperator {
         property: String,
         value: Expr,
     },
+    /// Correlated index seek (index nested-loop join): for each row produced by
+    /// `input`, evaluate `key` and seek the node(s) bound to `variable` whose
+    /// `property` equals that value (or, when `property` is `None`, whose internal
+    /// id equals it), keeping the input row's bindings. `label` scopes a property
+    /// seek to one label and is re-checked on an id seek.
+    ///
+    /// Emitted by the optimizer for a correlated equality such as
+    /// `UNWIND $ids AS x MATCH (n:User) WHERE n.Id = x`, replacing a full label
+    /// scan joined to the outer rows (which builds a hash table over every
+    /// candidate node) with one index lookup per outer row.
+    CorrelatedIndexSeek {
+        input: Box<PhysicalOperator>,
+        variable: String,
+        label: Option<String>,
+        property: Option<String>,
+        key: Expr,
+    },
     /// Scan nodes using a property range index: binds `variable` to nodes where `property` falls
     /// within [`lo`, `hi`] (inclusive/exclusive per the flags). At least one bound must be `Some`.
     NodeRangeScan {
@@ -435,6 +452,26 @@ pub fn format_physical_plan(op: &PhysicalOperator, depth: usize) -> String {
                 property,
                 fmt_expr(value)
             ));
+        }
+        PhysicalOperator::CorrelatedIndexSeek {
+            input,
+            variable,
+            label,
+            property,
+            key,
+        } => {
+            let lbl = label.as_deref().unwrap_or("*");
+            let target = match property {
+                Some(prop) => format!("{variable}:{lbl}.{prop}"),
+                None => format!("id({variable}:{lbl})"),
+            };
+            buf.push_str(&format!(
+                "{}CorrelatedIndexSeek {} = {}\n",
+                pad,
+                target,
+                fmt_expr(key)
+            ));
+            buf.push_str(&format_physical_plan(input, depth + 1));
         }
         PhysicalOperator::Expand {
             input,

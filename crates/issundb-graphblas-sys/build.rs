@@ -1,5 +1,5 @@
-// A build script panics on a misconfigured environment (missing submodule,
-// failed cmake, unwritable OUT_DIR); `unwrap`/`expect` are the idiomatic way to
+// Note that a build script panics on a misconfigured environment (like missing Git submodules,
+// failed Cmake runs, and unwritable OUT_DIR); `unwrap`/`expect` are the idiomatic way to
 // surface those as build failures, so the workspace bans on them do not apply.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -7,17 +7,19 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Pinned GraphBLAS release, used when the `external/GraphBLAS` submodule is not
-/// present (a crate consumed from crates.io carries no submodule, because
-/// `cargo package` never descends into submodules). The tarball is fetched and
-/// checksum-verified at build time. The version tracks the submodule pin.
+/// We are using pinned GraphBLAS release. It's used when the `external/GraphBLAS` submodule is not
+/// present (a crate consumed from crates.io can't include a Git submodule, because
+/// `cargo package` never goes into submodules). To solve this, we fetched the tarbal release
+/// of GraphBLAS implementation from GitHub and checksum-verified at build time.
+/// Note that the version tag of the downloaded tarbal matches the version of code that
+/// is pinned in the submodule.
 const GRAPHBLAS_VERSION: &str = "10.3.1";
 const GRAPHBLAS_URL: &str =
     "https://github.com/DrTimothyAldenDavis/GraphBLAS/archive/refs/tags/v10.3.1.tar.gz";
 const GRAPHBLAS_SHA256: &str = "a3c4de775f47d9b448d0f548234a6c321c45f9f6a54e32c9e3a41b28df55cd0a";
 
 /// These are macros that their definitions confuse bindgen (they expand to floating-point
-/// classification constants); ignore them so binding generation succeeds.
+/// classification constants); ignore them so binding generation doesn't fail.
 #[derive(Debug)]
 struct IgnoreMacros(HashSet<String>);
 
@@ -74,7 +76,7 @@ fn main() {
 
     // Apple Clang does not ship an OpenMP runtime, so `find_package(OpenMP)`
     // fails unless pointed at the Homebrew (or MacPorts) `libomp`. Without these
-    // hints GraphBLAS silently builds single-threaded and the `-lomp` link line
+    // hints, GraphBLAS silently builds single-threaded, and the `-lomp` link line
     // below has no library to resolve. Locate the prefix once and reuse it for
     // both the cmake hints and the link search path.
     let macos_libomp = (target_os == "macos").then(find_libomp_prefix).flatten();
@@ -89,8 +91,8 @@ fn main() {
 
     let dst = cfg.build();
 
-    // The install tree puts the static library under `lib` (Debian/Ubuntu) or
-    // `lib64` (Fedora-like); search both.
+    // The installation tree puts the static library under `lib` (Debian/Ubuntu) or
+    // `lib64` (Fedora-like), so search both paths.
     println!("cargo:rustc-link-search=native={}/lib", dst.display());
     println!("cargo:rustc-link-search=native={}/lib64", dst.display());
     // GraphBLAS names the static library `graphblas` everywhere except MSVC,

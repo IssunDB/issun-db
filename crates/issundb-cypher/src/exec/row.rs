@@ -116,6 +116,12 @@ impl SlotSchema {
                     self.bind(&format!("_path_{dst_var}"));
                 }
             }
+            CorrelatedIndexSeek {
+                input, variable, ..
+            } => {
+                self.collect(input);
+                self.bind(variable);
+            }
             Filter { input, .. } => self.collect(input),
             Project { input, items, .. } => {
                 self.collect(input);

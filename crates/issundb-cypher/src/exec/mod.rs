@@ -29,6 +29,13 @@ use write::{
     execute_set_and_return,
 };
 
+/// Stack size for the dedicated thread that executes a deeply nested query.
+/// Expression evaluation recurses with the source nesting depth, so this must
+/// comfortably exceed the deepest accepted nesting (`MAX_NESTING_COST_KB`) at the
+/// executor's per-level frame cost. The address space is reserved lazily, so only
+/// pages a given query actually touches cost memory.
+const EXEC_THREAD_STACK: usize = 256 * 1024 * 1024;
+
 /// The tabular result of a Cypher query execution.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct QueryResult {
@@ -106,7 +113,31 @@ pub fn execute_with_procedures(
     params: &HashMap<String, serde_json::Value>,
     registry: &crate::procedure::ProcedureRegistry,
 ) -> Result<QueryResult, CypherError> {
-    let stmt = parser::parse(cypher)?;
+    let (stmt, exec_needs_large_stack) = parser::parse_with_exec_depth(cypher)?;
+
+    // Expression evaluation recurses with the source nesting depth, so a deeply
+    // nested literal (the parser admits these, since the parse itself runs on a
+    // large-stack thread) would overflow a small worker stack at execution. When
+    // the parser flags such depth, run the whole statement on a large-stack
+    // thread. The statement clock is thread-local, so it is installed inside the
+    // worker, not on the caller. Shallow queries (the common case) execute inline.
+    if exec_needs_large_stack {
+        return std::thread::scope(|scope| {
+            let handle = std::thread::Builder::new()
+                .stack_size(EXEC_THREAD_STACK)
+                .spawn_scoped(scope, || {
+                    let _clock = expr::StatementClock::install();
+                    execute_statement(graph, &stmt, params, registry)
+                })
+                .map_err(|e| {
+                    CypherError::Execution(format!("failed to spawn execution thread: {e}"))
+                })?;
+            handle
+                .join()
+                .map_err(|_| CypherError::Execution("execution thread panicked".to_string()))?
+        });
+    }
+
     // Freeze a single wall-clock instant for the whole statement so that all current-time
     // functions (date(), datetime(), and the like) within this query observe the same time.
     let _clock = expr::StatementClock::install();
@@ -3810,5 +3841,233 @@ mod tests {
                 serde_json::json!(2020)
             ]
         );
+    }
+
+    // --- Correlated index seek (index nested-loop join) ---
+
+    fn add_user(graph: &Graph, id: i64) -> issundb_core::NodeId {
+        graph
+            .add_node(
+                "User",
+                &serde_json::json!({"Id": id, "name": format!("u{id}")}),
+            )
+            .unwrap()
+    }
+
+    /// A `WHERE n.Id = x` whose key `x` is bound by an enclosing `UNWIND` lowers
+    /// to a `CorrelatedIndexSeek` instead of a full label scan hashed against the
+    /// outer rows, and returns the matching nodes.
+    #[test]
+    fn correlated_unwind_key_lowers_to_index_seek() {
+        let (_dir, graph) = setup_graph();
+        for id in 1..=50 {
+            add_user(&graph, id);
+        }
+
+        let q = "UNWIND [3, 7, 42] AS x MATCH (n:User) WHERE n.Id = x RETURN n.Id AS id";
+        let plan = explain(&graph, q).unwrap();
+        assert!(
+            plan.contains("CorrelatedIndexSeek"),
+            "expected a correlated seek, got:\n{plan}"
+        );
+        assert!(
+            !plan.contains("HashJoin"),
+            "the hash join should be gone, got:\n{plan}"
+        );
+
+        let res = execute(&graph, q, &HashMap::new()).unwrap();
+        let mut ids: Vec<i64> = res
+            .records
+            .iter()
+            .map(|r| r.values[0].as_i64().unwrap())
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![3, 7, 42]);
+    }
+
+    /// The seek result matches the row-pipeline (hash-join) result, including the
+    /// multiplicity when the outer list repeats a key and when several nodes share
+    /// a key value.
+    #[test]
+    fn correlated_seek_matches_unfiltered_semantics() {
+        let (_dir, graph) = setup_graph();
+        add_user(&graph, 1);
+        add_user(&graph, 2);
+        // A second node with Id = 2: a key lookup must return both.
+        graph
+            .add_node("User", &serde_json::json!({"Id": 2, "name": "dup"}))
+            .unwrap();
+
+        // Key 2 appears twice in the list and matches two nodes => four rows.
+        let q = "UNWIND [2, 2, 1] AS x MATCH (n:User) WHERE n.Id = x RETURN n.name AS name";
+        let res = execute(&graph, q, &HashMap::new()).unwrap();
+        assert_eq!(res.records.len(), 5);
+        let names: Vec<String> = res
+            .records
+            .iter()
+            .map(|r| r.values[0].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(names.iter().filter(|n| n.as_str() == "u1").count(), 1);
+        assert_eq!(
+            names
+                .iter()
+                .filter(|n| n.as_str() == "u2" || n.as_str() == "dup")
+                .count(),
+            4
+        );
+    }
+
+    /// A correlated key supplied through a query parameter list also lowers to the
+    /// seek.
+    #[test]
+    fn correlated_param_keys_lower_to_index_seek() {
+        let (_dir, graph) = setup_graph();
+        for id in 1..=20 {
+            add_user(&graph, id);
+        }
+        let mut params = HashMap::new();
+        params.insert("ids".to_string(), serde_json::json!([4, 11]));
+
+        let q = "UNWIND $ids AS x MATCH (n:User) WHERE n.Id = x RETURN n.Id AS id";
+        assert!(explain(&graph, q).unwrap().contains("CorrelatedIndexSeek"));
+
+        let res = execute(&graph, q, &params).unwrap();
+        let mut ids: Vec<i64> = res
+            .records
+            .iter()
+            .map(|r| r.values[0].as_i64().unwrap())
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![4, 11]);
+    }
+
+    /// A correlated `id(n) = x` lowers to an id-based correlated seek (no property
+    /// index needed) and returns the addressed nodes.
+    #[test]
+    fn correlated_id_key_lowers_to_seek() {
+        let (_dir, graph) = setup_graph();
+        let a = add_user(&graph, 100);
+        let _b = add_user(&graph, 200);
+        let c = add_user(&graph, 300);
+
+        let q = format!("UNWIND [{a}, {c}] AS x MATCH (n:User) WHERE id(n) = x RETURN n.Id AS id");
+        let plan = explain(&graph, &q).unwrap();
+        assert!(
+            plan.contains("CorrelatedIndexSeek"),
+            "expected an id seek, got:\n{plan}"
+        );
+
+        let res = execute(&graph, &q, &HashMap::new()).unwrap();
+        let mut ids: Vec<i64> = res
+            .records
+            .iter()
+            .map(|r| r.values[0].as_i64().unwrap())
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![100, 300]);
+    }
+
+    /// A constant key is unaffected: it still lowers to a plain `NodeIndexScan`,
+    /// not a correlated seek.
+    #[test]
+    fn constant_key_still_uses_plain_index_scan() {
+        let (_dir, graph) = setup_graph();
+        add_user(&graph, 9);
+        let plan = explain(&graph, "MATCH (n:User) WHERE n.Id = 9 RETURN n").unwrap();
+        assert!(plan.contains("NodeIndexScan"), "got:\n{plan}");
+        assert!(!plan.contains("CorrelatedIndexSeek"), "got:\n{plan}");
+    }
+
+    /// A query string deep enough to overflow the stack is rejected by the parser
+    /// guard, so `execute` returns an error rather than aborting the process.
+    #[test]
+    fn deeply_nested_query_errors_instead_of_aborting() {
+        let (_dir, graph) = setup_graph();
+        let deep = std::iter::repeat("RETURN 1 AS x")
+            .take(5000)
+            .collect::<Vec<_>>()
+            .join(" UNION ALL ");
+        assert!(execute(&graph, &deep, &HashMap::new()).is_err());
+    }
+
+    /// A query shallow enough to execute inline (cost at or below
+    /// `SMALL_STACK_EXEC_BUDGET_KB`) must complete on a small worker stack, not
+    /// overflow. This pins the inline-execution regime: if a future change pushes
+    /// the inline threshold past what the executor can handle on a small stack,
+    /// this test aborts and flags the regression. Deeper queries are covered by
+    /// `deeply_nested_literal_executes_via_large_stack`.
+    #[test]
+    fn near_budget_queries_run_on_a_small_stack() {
+        // A nested-list expression and an operator chain, both within the
+        // inline-execution budget so they stay on the caller stack.
+        let mut list = String::from("1");
+        for _ in 0..12 {
+            list = format!("[{}]", list);
+        }
+        let and = std::iter::repeat("1 = 1")
+            .take(20)
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        let queries = vec![format!("RETURN {list} AS x"), format!("RETURN {and} AS x")];
+
+        let handle = std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || {
+                // Consume some stack first to mimic a real handler call chain.
+                let pad = [0u8; 256 * 1024];
+                std::hint::black_box(&pad);
+                let dir = TempDir::new().unwrap();
+                let graph = Graph::open(dir.path(), 1).unwrap();
+                for q in &queries {
+                    // Parsing and execution must complete without overflowing.
+                    let _ = execute(&graph, q, &HashMap::new());
+                }
+            })
+            .unwrap();
+        handle.join().unwrap();
+    }
+
+    /// A deeply nested literal exceeds the inline-execution budget, so the
+    /// executor moves it to a large-stack thread. Run from a small worker stack
+    /// (the shape a server request handler has), it must execute to completion
+    /// and return the correct nested value, not overflow and abort the process.
+    /// This is the regression for the openCypher TCK deep-nested-literal
+    /// scenarios, which the recursion guard would otherwise reject outright.
+    #[test]
+    fn deeply_nested_literal_executes_via_large_stack() {
+        let depth = 40usize;
+        let list = format!("{}1{}", "[".repeat(depth), "]".repeat(depth));
+        let mut map = String::from("1");
+        for _ in 0..depth {
+            map = format!("{{a: {map}}}");
+        }
+
+        let handle = std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || {
+                let pad = [0u8; 256 * 1024];
+                std::hint::black_box(&pad);
+                let dir = TempDir::new().unwrap();
+                let graph = Graph::open(dir.path(), 1).unwrap();
+
+                let res = execute(&graph, &format!("RETURN {list} AS x"), &HashMap::new())
+                    .expect("deep list must execute");
+                // Unwrap the 40 nested arrays down to the innermost integer.
+                let mut v = &res.records[0].values[0];
+                for _ in 0..depth {
+                    v = &v.as_array().expect("nested array")[0];
+                }
+                assert_eq!(v.as_i64(), Some(1));
+
+                let res = execute(&graph, &format!("RETURN {map} AS x"), &HashMap::new())
+                    .expect("deep map must execute");
+                let mut v = &res.records[0].values[0];
+                for _ in 0..depth {
+                    v = &v.as_object().expect("nested object")["a"];
+                }
+                assert_eq!(v.as_i64(), Some(1));
+            })
+            .unwrap();
+        handle.join().unwrap();
     }
 }

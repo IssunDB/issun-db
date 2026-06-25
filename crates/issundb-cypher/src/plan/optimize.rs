@@ -8,6 +8,19 @@ use crate::plan::stats::StatsProvider;
 /// An optimizer that applies relational algebra optimization passes to physical plans.
 pub struct Optimizer;
 
+/// The parameters of a recognized correlated index seek (`rewrite_correlated_seek`).
+struct CorrelatedSeek {
+    /// True when the join's left side is the bare `LabelScan` the seek replaces,
+    /// so the right side is the driver (and vice versa).
+    scan_is_left: bool,
+    variable: String,
+    label: Option<String>,
+    /// `Some(property)` for a property-index seek, `None` for an `id(var)` seek.
+    property: Option<String>,
+    /// The correlated key expression, evaluated against each driver row.
+    key: Expr,
+}
+
 impl Optimizer {
     /// Optimize a `PhysicalOperator` plan by standardizing operator sequences,
     /// extracting filter predicates, and pushing them down to the lowest possible nodes.
@@ -73,6 +86,14 @@ impl Optimizer {
         // exact row-pipeline evaluation.
         result = rewrite_vector_topk(result);
         result = Self::optimize_index_scans(result, stats);
+        // Replace a correlated equality over a cross join (the shape a
+        // parameterized or `UNWIND`-driven key lookup produces) with an index
+        // nested-loop seek: one index lookup per outer row instead of a full
+        // label scan hashed against the outer rows. Runs after index-scan
+        // optimization so the index the seek needs is already known, and the
+        // scan side is still a bare `LabelScan` (the correlated filter sits above
+        // the join, so it was not rewritten into a `NodeIndexScan`).
+        result = Self::rewrite_correlated_seek(result, stats);
         // Convert a natural inner `HashJoin` whose one side merely re-scans a
         // variable the other side already binds into a linear "expand into"
         // chain. Runs after index-scan optimization so the driver side keeps
@@ -398,10 +419,12 @@ impl Optimizer {
                     inner_filters,
                 )
             }
-            // A leaf produced after this pass; nothing to extract.
+            // Already-optimized opaque nodes (only reachable inside a barrier
+            // subtree that was optimized as a whole); nothing to extract.
             t @ PhysicalOperator::TriangleCount { .. }
             | t @ PhysicalOperator::PathCount { .. }
             | t @ PhysicalOperator::GroupedDegree { .. }
+            | t @ PhysicalOperator::CorrelatedIndexSeek { .. }
             | t @ PhysicalOperator::VectorTopK { .. } => (t, Vec::new()),
         }
     }
@@ -568,6 +591,7 @@ impl Optimizer {
             t @ PhysicalOperator::TriangleCount { .. }
             | t @ PhysicalOperator::PathCount { .. }
             | t @ PhysicalOperator::GroupedDegree { .. }
+            | t @ PhysicalOperator::CorrelatedIndexSeek { .. }
             | t @ PhysicalOperator::VectorTopK { .. } => t,
         }
     }
@@ -599,6 +623,10 @@ impl Optimizer {
             }
             // A primary-key seek touches at most one node: the cheapest scan.
             PhysicalOperator::NodeByIdSeek { .. } => 1,
+            // An index seek per outer row: roughly one matched node per input row.
+            PhysicalOperator::CorrelatedIndexSeek { input, .. } => {
+                Self::plan_weight_env(input, stats, labels)
+            }
             PhysicalOperator::NodeIndexScan { .. } => 2,
             PhysicalOperator::NodeRangeScan { .. } => 3,
             PhysicalOperator::LabelScan { label, .. } => {
@@ -925,6 +953,7 @@ impl Optimizer {
             | PhysicalOperator::OptionalMatch { input, .. }
             | PhysicalOperator::Distinct { input, .. }
             | PhysicalOperator::ProcedureCall { input, .. }
+            | PhysicalOperator::CorrelatedIndexSeek { input, .. }
             | PhysicalOperator::MultiwayJoin { input, .. } => Self::plan_has_write(input),
             PhysicalOperator::HashJoin { left, right } => {
                 Self::plan_has_write(left) || Self::plan_has_write(right)
@@ -968,6 +997,15 @@ impl Optimizer {
                 add(var, label, out);
                 Self::collect_label_constraints(input, out);
             }
+            PhysicalOperator::CorrelatedIndexSeek {
+                input,
+                variable,
+                label: Some(label),
+                ..
+            } => {
+                add(variable, label, out);
+                Self::collect_label_constraints(input, out);
+            }
             PhysicalOperator::Unwind { input, .. }
             | PhysicalOperator::Expand { input, .. }
             | PhysicalOperator::Filter { input, .. }
@@ -979,6 +1017,7 @@ impl Optimizer {
             | PhysicalOperator::Distinct { input, .. }
             | PhysicalOperator::WritePart { input, .. }
             | PhysicalOperator::ProcedureCall { input, .. }
+            | PhysicalOperator::CorrelatedIndexSeek { input, .. }
             | PhysicalOperator::MultiwayJoin { input, .. } => {
                 Self::collect_label_constraints(input, out)
             }
@@ -1197,6 +1236,19 @@ impl Optimizer {
             HashJoin { left, right } => HashJoin {
                 left: Box::new(f(*left)),
                 right: Box::new(f(*right)),
+            },
+            CorrelatedIndexSeek {
+                input,
+                variable,
+                label,
+                property,
+                key,
+            } => CorrelatedIndexSeek {
+                input: Box::new(f(*input)),
+                variable,
+                label,
+                property,
+                key,
             },
             leaf @ (SingleRow
             | LabelScan { .. }
@@ -1707,6 +1759,7 @@ impl Optimizer {
             t @ PhysicalOperator::TriangleCount { .. }
             | t @ PhysicalOperator::PathCount { .. }
             | t @ PhysicalOperator::GroupedDegree { .. }
+            | t @ PhysicalOperator::CorrelatedIndexSeek { .. }
             | t @ PhysicalOperator::VectorTopK { .. } => t,
         }
     }
@@ -1741,6 +1794,12 @@ impl Optimizer {
                 vars.insert(variable.clone());
             }
             PhysicalOperator::VectorTopK { variable, .. } => {
+                vars.insert(variable.clone());
+            }
+            PhysicalOperator::CorrelatedIndexSeek {
+                input, variable, ..
+            } => {
+                Self::collect_bound_vars(input, vars);
                 vars.insert(variable.clone());
             }
             PhysicalOperator::Expand {
@@ -2802,6 +2861,152 @@ impl Optimizer {
             FilterExpr::Ne(Expr::Literal(a), Expr::Literal(b)) => a != b,
             _ => false,
         }
+    }
+
+    /// Recursively rewrite a correlated equality over a cross join into a
+    /// `CorrelatedIndexSeek`. See the call site in `optimize_impl` for the target
+    /// shape. The rewrite is applied bottom-up; an unrecognized shape is left
+    /// unchanged, so correctness never depends on it firing.
+    fn rewrite_correlated_seek(
+        op: PhysicalOperator,
+        stats: Option<&dyn StatsProvider>,
+    ) -> PhysicalOperator {
+        let op = Self::map_inputs(op, |child| Self::rewrite_correlated_seek(child, stats));
+
+        let PhysicalOperator::Filter { input, expression } = op else {
+            return op;
+        };
+        match *input {
+            PhysicalOperator::HashJoin { left, right } => {
+                match Self::correlated_seek_decision(&expression, &left, &right, stats) {
+                    Some(d) => {
+                        // The driver is whichever side does not provide the seek
+                        // variable; the scan side is discarded (the seek replaces
+                        // it).
+                        let driver = if d.scan_is_left { right } else { left };
+                        PhysicalOperator::CorrelatedIndexSeek {
+                            input: driver,
+                            variable: d.variable,
+                            label: d.label,
+                            property: d.property,
+                            key: d.key,
+                        }
+                    }
+                    None => PhysicalOperator::Filter {
+                        input: Box::new(PhysicalOperator::HashJoin { left, right }),
+                        expression,
+                    },
+                }
+            }
+            other => PhysicalOperator::Filter {
+                input: Box::new(other),
+                expression,
+            },
+        }
+    }
+
+    /// Decide whether a `Filter` over `HashJoin(left, right)` is a correlated
+    /// index seek and, if so, return its parameters. The equality must compare a
+    /// `var.prop` (or `id(var)`) on one side against an expression that references
+    /// only variables bound by the join's other side, where `var` is bound by a
+    /// bare `LabelScan` on one join side. A property seek additionally requires a
+    /// known label with an index.
+    fn correlated_seek_decision(
+        expression: &FilterExpr,
+        left: &PhysicalOperator,
+        right: &PhysicalOperator,
+        stats: Option<&dyn StatsProvider>,
+    ) -> Option<CorrelatedSeek> {
+        // Normalize to an equality's two operands.
+        let (l, r) = match expression {
+            FilterExpr::Eq(l, r) => (l, r),
+            FilterExpr::Expr(Expr::BinaryOp {
+                op: BinaryOperator::Eq,
+                left,
+                right,
+            }) => (left.as_ref(), right.as_ref()),
+            _ => return None,
+        };
+
+        // `id(var)` extracted from a function-call expression.
+        let id_of = |e: &Expr| -> Option<String> {
+            if let Expr::FunctionCall { name, args } = e {
+                if name == "id" && args.len() == 1 {
+                    if let Expr::Prop(v, p) = &args[0] {
+                        if p.is_empty() {
+                            return Some(v.clone());
+                        }
+                    }
+                }
+            }
+            None
+        };
+
+        // The label on a bare `LabelScan` for `var`, if `side` is exactly that.
+        let scan_label = |side: &PhysicalOperator, var: &str| -> Option<Option<String>> {
+            if let PhysicalOperator::LabelScan { variable, label } = side {
+                if variable == var {
+                    return Some(label.clone());
+                }
+            }
+            None
+        };
+
+        // `target` is the seek operand (`var.prop` or `id(var)`); `key` is the
+        // correlated operand evaluated per outer row.
+        let try_orient = |target: &Expr, key: &Expr| -> Option<CorrelatedSeek> {
+            let (var, property) = if let Expr::Prop(v, p) = target {
+                if p.is_empty() {
+                    return None; // a bare variable, not a property access
+                }
+                (v.clone(), Some(p.clone()))
+            } else if let Some(v) = id_of(target) {
+                (v, None)
+            } else {
+                return None;
+            };
+
+            // The key must be constant per outer row: it cannot reference the
+            // seek variable, and every variable it does reference must be bound
+            // by the driver (the other join side).
+            let mut key_vars = HashSet::new();
+            Self::collect_expr_vars(key, &mut key_vars);
+            if key_vars.contains(&var) {
+                return None;
+            }
+
+            let (scan_is_left, label) = if let Some(lbl) = scan_label(left, &var) {
+                (true, lbl)
+            } else if let Some(lbl) = scan_label(right, &var) {
+                (false, lbl)
+            } else {
+                return None;
+            };
+            let driver = if scan_is_left { right } else { left };
+            let driver_bound = Self::bound_vars(driver);
+            if !key_vars.iter().all(|v| driver_bound.contains(v)) {
+                return None;
+            }
+
+            // A property seek needs a known label whose property is indexed; an
+            // id seek needs neither.
+            if let Some(prop) = &property {
+                let lbl = label.as_ref()?;
+                if !stats?.has_node_property_index(lbl, prop) {
+                    return None;
+                }
+            }
+
+            Some(CorrelatedSeek {
+                scan_is_left,
+                variable: var,
+                label,
+                property,
+                key: key.clone(),
+            })
+        };
+
+        try_orient(l, r).or_else(|| try_orient(r, l))
     }
 
     /// When one side of an equality is `id(var)` and the other is a literal or
