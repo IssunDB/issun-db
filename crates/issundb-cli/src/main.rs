@@ -1,14 +1,19 @@
 use std::{collections::HashMap, fs, io::Write, path::PathBuf};
 
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use colored::Colorize;
 use issundb::{
     DegreeDirection, EdgeId, FusionStrategy, Graph, GraphQueryExt, Hit, HybridRetrieveOptions,
     Language, NodeId, PropValue, TextGraphExt, TextIndexExt, TextSearchOptions, VectorGraphExt,
     VectorIndexOptions, VectorMetric, VectorQuantization, VectorSearchOptions, retrieve_hybrid,
 };
-use rustyline::DefaultEditor;
+use rustyline::completion::{Completer, FilenameCompleter, Pair};
 use rustyline::error::ReadlineError;
+use rustyline::highlight::Highlighter;
+use rustyline::hint::Hinter;
+use rustyline::history::FileHistory;
+use rustyline::validate::Validator;
+use rustyline::{Context, Editor, Helper};
 use std::str::FromStr;
 
 // ---------------------------------------------------------------------------
@@ -648,13 +653,14 @@ fn main() {
 
     let mut state = State::new(graph, cli.map_size_gb);
 
-    let mut rl = match DefaultEditor::new() {
+    let mut rl: Editor<ReplHelper, FileHistory> = match Editor::new() {
         Ok(r) => r,
         Err(e) => {
             eprintln!("readline init failed: {e}");
             return;
         }
     };
+    rl.set_helper(Some(ReplHelper::new()));
 
     // Load persistent history.
     if let Some(ref hp) = history_path() {
@@ -699,6 +705,108 @@ fn main() {
 }
 
 // ---------------------------------------------------------------------------
+// Tab completion
+// ---------------------------------------------------------------------------
+
+/// Cypher clause keywords the REPL recognizes as a leading token, routing the
+/// whole line to the query path without a `query`/`cypher` prefix. Shared by the
+/// dispatcher and the completer so both stay in sync.
+const CYPHER_KEYWORDS: &[&str] = &[
+    "MATCH", "CREATE", "MERGE", "WITH", "RETURN", "DELETE", "DETACH", "SET", "UNWIND", "CALL",
+    "OPTIONAL", "WHERE", "FOREACH", "EXPORT", "IMPORT",
+];
+
+/// REPL commands whose arguments are filesystem paths, for which the completer
+/// delegates to `FilenameCompleter`.
+const FILE_ARG_COMMANDS: &[&str] = &[
+    ":run",
+    ":save",
+    ":backup",
+    ":backup-compact",
+    ":restore",
+    ":import-nodes",
+    ":import-edges",
+];
+
+/// rustyline helper providing tab completion for the REPL: command names and
+/// Cypher keywords in the first token, filesystem paths in the arguments of the
+/// path-taking commands. Hinting, highlighting, and validation are left at their
+/// trait defaults.
+struct ReplHelper {
+    filename: FilenameCompleter,
+    /// All completable first-token words, sorted and deduplicated: every Clap
+    /// command name (`:open`, `add-node`, `help`, `quit`, ...) plus the Cypher
+    /// leading keywords. Sourced from the Clap command tree so it cannot drift.
+    commands: Vec<String>,
+}
+
+impl ReplHelper {
+    fn new() -> Self {
+        let mut commands: Vec<String> = ReplCommand::command()
+            .get_subcommands()
+            .map(|c| c.get_name().to_string())
+            .collect();
+        commands.extend(CYPHER_KEYWORDS.iter().map(|k| (*k).to_string()));
+        commands.sort();
+        commands.dedup();
+        Self {
+            filename: FilenameCompleter::new(),
+            commands,
+        }
+    }
+}
+
+impl Completer for ReplHelper {
+    type Candidate = Pair;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        ctx: &Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<Pair>)> {
+        let head = &line[..pos];
+        // Start byte of the word under the cursor. Whitespace is ASCII, so the
+        // byte index after it is a valid char boundary.
+        let word_start = head.rfind(char::is_whitespace).map(|i| i + 1).unwrap_or(0);
+        let word = &head[word_start..];
+        let is_first_token = head[..word_start].trim().is_empty();
+
+        if is_first_token {
+            let needle = word.to_ascii_uppercase();
+            let candidates = self
+                .commands
+                .iter()
+                .filter(|name| name.to_ascii_uppercase().starts_with(&needle))
+                .map(|name| Pair {
+                    display: name.clone(),
+                    replacement: name.clone(),
+                })
+                .collect();
+            return Ok((word_start, candidates));
+        }
+
+        // Argument position: complete filesystem paths for the path commands.
+        let cmd = head.split_whitespace().next().unwrap_or("");
+        if FILE_ARG_COMMANDS.contains(&cmd) {
+            return self.filename.complete(line, pos, ctx);
+        }
+
+        Ok((pos, Vec::new()))
+    }
+}
+
+impl Hinter for ReplHelper {
+    type Hint = String;
+}
+
+impl Highlighter for ReplHelper {}
+
+impl Validator for ReplHelper {}
+
+impl Helper for ReplHelper {}
+
+// ---------------------------------------------------------------------------
 // Top-level command dispatch
 // ---------------------------------------------------------------------------
 
@@ -711,25 +819,7 @@ fn handle(state: &mut State, line: &str) -> bool {
     // Cypher shorthand: check if the first token is a known Cypher keyword.
     let (cmd_token, _) = split_cmd(line_trimmed);
     let upper = cmd_token.to_uppercase();
-    let is_cypher_kw = matches!(
-        upper.as_str(),
-        "MATCH"
-            | "CREATE"
-            | "MERGE"
-            | "WITH"
-            | "RETURN"
-            | "DELETE"
-            | "DETACH"
-            | "SET"
-            | "UNWIND"
-            | "CALL"
-            | "OPTIONAL"
-            | "WHERE"
-            | "FOREACH"
-            | "EXPORT"
-            | "IMPORT"
-    );
-    if is_cypher_kw {
+    if CYPHER_KEYWORDS.contains(&upper.as_str()) {
         run_cypher(state, line_trimmed);
         return true;
     }
@@ -1890,6 +1980,66 @@ fn cmd_import_edges(state: &mut State, path: &str, src_label: &str, dst_label: &
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// Run the completer over `line` with the cursor at the end and return the
+    /// word-start offset plus the replacement strings.
+    fn complete_at_end(helper: &ReplHelper, line: &str) -> (usize, Vec<String>) {
+        let hist = rustyline::history::DefaultHistory::new();
+        let ctx = Context::new(&hist);
+        let (start, pairs) = helper.complete(line, line.len(), &ctx).expect("completion");
+        (start, pairs.into_iter().map(|p| p.replacement).collect())
+    }
+
+    #[test]
+    fn completer_completes_command_names_and_cypher_keywords() {
+        let helper = ReplHelper::new();
+
+        // Colon meta-command prefix.
+        let (start, cands) = complete_at_end(&helper, ":ru");
+        assert_eq!(start, 0);
+        assert!(cands.contains(&":run".to_string()));
+
+        // Bare data command.
+        let (_, cands) = complete_at_end(&helper, "add-n");
+        assert!(cands.contains(&"add-node".to_string()));
+
+        // Cypher keyword, matched case-insensitively but offered uppercase.
+        let (_, cands) = complete_at_end(&helper, "ma");
+        assert!(cands.contains(&"MATCH".to_string()));
+
+        // help and quit are real Clap subcommands, so they complete too.
+        let (_, cands) = complete_at_end(&helper, "qu");
+        assert!(cands.contains(&"quit".to_string()));
+    }
+
+    #[test]
+    fn completer_offset_skips_leading_whitespace() {
+        let helper = ReplHelper::new();
+        let (start, cands) = complete_at_end(&helper, "   :op");
+        assert_eq!(start, 3);
+        assert!(cands.contains(&":open".to_string()));
+    }
+
+    #[test]
+    fn completer_does_not_offer_commands_in_argument_position() {
+        let helper = ReplHelper::new();
+        // A non-path command's argument gets no command-name candidates.
+        let (_, cands) = complete_at_end(&helper, "get-node 1");
+        assert!(cands.is_empty());
+    }
+
+    #[test]
+    fn completer_keyword_list_matches_dispatcher() {
+        // The completer and the Cypher shorthand in `handle` share CYPHER_KEYWORDS,
+        // so every keyword the dispatcher routes is also a completion candidate.
+        let helper = ReplHelper::new();
+        for kw in CYPHER_KEYWORDS {
+            assert!(
+                helper.commands.iter().any(|c| c == kw),
+                "{kw} missing from completion candidates"
+            );
+        }
+    }
 
     #[test]
     fn test_split_cmd() {
