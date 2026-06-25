@@ -2308,6 +2308,18 @@ enum RowStream {
         variable: String,
         buf: std::collections::VecDeque<SlotRow>,
     },
+    /// Correlated index seek (index nested-loop join): for each input row, seek
+    /// the node(s) bound to `variable` whose `property` (or internal id, when
+    /// `property` is `None`) equals `key` evaluated against that row, keeping the
+    /// input row's bindings. One input row can match several nodes, so the overflow is buffered.
+    CorrelatedIndexSeek {
+        input: Box<RowStream>,
+        variable: String,
+        label: Option<String>,
+        property: Option<String>,
+        key: Expr,
+        buf: std::collections::VecDeque<SlotRow>,
+    },
     /// A resolved `CALL`: the N:M cross of each input row with the procedure's
     /// output rows, with an overflow buffer.
     ProcedureCall {
@@ -2589,6 +2601,20 @@ fn build_stream_with_sip(
             input: Box::new(build_stream_with_sip(input, sip)),
             expr: expr.clone(),
             variable: variable.clone(),
+            buf: std::collections::VecDeque::new(),
+        },
+        PhysicalOperator::CorrelatedIndexSeek {
+            input,
+            variable,
+            label,
+            property,
+            key,
+        } => RowStream::CorrelatedIndexSeek {
+            input: Box::new(build_stream_with_sip(input, sip)),
+            variable: variable.clone(),
+            label: label.clone(),
+            property: property.clone(),
+            key: key.clone(),
             buf: std::collections::VecDeque::new(),
         },
         PhysicalOperator::ProcedureCall {
@@ -3018,6 +3044,85 @@ impl RowStream {
                         let mut new_path = path.clone();
                         new_path.bind_local(variable, GraphBinding::Scalar(list_val));
                         buf.push_back(new_path);
+                    }
+                }
+            },
+            RowStream::CorrelatedIndexSeek {
+                input,
+                variable,
+                label,
+                property,
+                key,
+                buf,
+            } => loop {
+                if !buf.is_empty() {
+                    let take = buf.len().min(STREAM_BATCH);
+                    return Ok(buf.drain(..take).collect());
+                }
+                let batch = input.next_batch(graph, params, schema)?;
+                if batch.is_empty() {
+                    return Ok(vec![]);
+                }
+                for path in batch {
+                    let key_val = evaluate_expr(graph, &path, key, params)?;
+                    // A null key matches nothing: `prop = null` / `id(n) = null`
+                    // is never TRUE.
+                    if key_val.is_null() {
+                        continue;
+                    }
+                    match property {
+                        Some(prop) => {
+                            let Some(prop_val) = json_to_prop_value(&key_val) else {
+                                // A non-scalar key cannot equal an indexed scalar.
+                                continue;
+                            };
+                            let label = label.as_deref().unwrap_or_default();
+                            let candidates = graph
+                                .nodes_by_property(label, prop, prop_val)
+                                .map_err(|e| e.to_string())?;
+                            for (cand, actual_val) in index_verify_values(graph, &candidates, prop)
+                            {
+                                if json_vals_are_equal(&actual_val, &key_val) {
+                                    let mut new_path = path.clone();
+                                    new_path.bind_local(variable, GraphBinding::Node(cand));
+                                    buf.push_back(new_path);
+                                }
+                            }
+                        }
+                        None => {
+                            // `id(n) = key`: fetch the single node directly and
+                            // re-check the label the seek replaced.
+                            let Some(nid) = key_val.as_u64().map(|n| n as NodeId) else {
+                                continue;
+                            };
+                            let matched = graph
+                                .view(|txn| {
+                                    let Some(record) = txn.get_node(nid)? else {
+                                        return Ok(false);
+                                    };
+                                    match label {
+                                        Some(lbl) => {
+                                            let mut found = false;
+                                            for lid in &record.labels {
+                                                if txn.label_name(*lid)?.as_deref()
+                                                    == Some(lbl.as_str())
+                                                {
+                                                    found = true;
+                                                    break;
+                                                }
+                                            }
+                                            Ok(found)
+                                        }
+                                        None => Ok(true),
+                                    }
+                                })
+                                .map_err(|e| e.to_string())?;
+                            if matched {
+                                let mut new_path = path.clone();
+                                new_path.bind_local(variable, GraphBinding::Node(nid));
+                                buf.push_back(new_path);
+                            }
+                        }
                     }
                 }
             },

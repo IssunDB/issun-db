@@ -3811,4 +3811,187 @@ mod tests {
             ]
         );
     }
+
+    // --- Correlated index seek (index nested-loop join) ---
+
+    fn add_user(graph: &Graph, id: i64) -> issundb_core::NodeId {
+        graph
+            .add_node(
+                "User",
+                &serde_json::json!({"Id": id, "name": format!("u{id}")}),
+            )
+            .unwrap()
+    }
+
+    /// A `WHERE n.Id = x` whose key `x` is bound by an enclosing `UNWIND` lowers
+    /// to a `CorrelatedIndexSeek` instead of a full label scan hashed against the
+    /// outer rows, and returns the matching nodes.
+    #[test]
+    fn correlated_unwind_key_lowers_to_index_seek() {
+        let (_dir, graph) = setup_graph();
+        for id in 1..=50 {
+            add_user(&graph, id);
+        }
+
+        let q = "UNWIND [3, 7, 42] AS x MATCH (n:User) WHERE n.Id = x RETURN n.Id AS id";
+        let plan = explain(&graph, q).unwrap();
+        assert!(
+            plan.contains("CorrelatedIndexSeek"),
+            "expected a correlated seek, got:\n{plan}"
+        );
+        assert!(
+            !plan.contains("HashJoin"),
+            "the hash join should be gone, got:\n{plan}"
+        );
+
+        let res = execute(&graph, q, &HashMap::new()).unwrap();
+        let mut ids: Vec<i64> = res
+            .records
+            .iter()
+            .map(|r| r.values[0].as_i64().unwrap())
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![3, 7, 42]);
+    }
+
+    /// The seek result matches the row-pipeline (hash-join) result, including the
+    /// multiplicity when the outer list repeats a key and when several nodes share
+    /// a key value.
+    #[test]
+    fn correlated_seek_matches_unfiltered_semantics() {
+        let (_dir, graph) = setup_graph();
+        add_user(&graph, 1);
+        add_user(&graph, 2);
+        // A second node with Id = 2: a key lookup must return both.
+        graph
+            .add_node("User", &serde_json::json!({"Id": 2, "name": "dup"}))
+            .unwrap();
+
+        // Key 2 appears twice in the list and matches two nodes => four rows.
+        let q = "UNWIND [2, 2, 1] AS x MATCH (n:User) WHERE n.Id = x RETURN n.name AS name";
+        let res = execute(&graph, q, &HashMap::new()).unwrap();
+        assert_eq!(res.records.len(), 5);
+        let names: Vec<String> = res
+            .records
+            .iter()
+            .map(|r| r.values[0].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(names.iter().filter(|n| n.as_str() == "u1").count(), 1);
+        assert_eq!(
+            names
+                .iter()
+                .filter(|n| n.as_str() == "u2" || n.as_str() == "dup")
+                .count(),
+            4
+        );
+    }
+
+    /// A correlated key supplied through a query parameter list also lowers to the
+    /// seek.
+    #[test]
+    fn correlated_param_keys_lower_to_index_seek() {
+        let (_dir, graph) = setup_graph();
+        for id in 1..=20 {
+            add_user(&graph, id);
+        }
+        let mut params = HashMap::new();
+        params.insert("ids".to_string(), serde_json::json!([4, 11]));
+
+        let q = "UNWIND $ids AS x MATCH (n:User) WHERE n.Id = x RETURN n.Id AS id";
+        assert!(explain(&graph, q).unwrap().contains("CorrelatedIndexSeek"));
+
+        let res = execute(&graph, q, &params).unwrap();
+        let mut ids: Vec<i64> = res
+            .records
+            .iter()
+            .map(|r| r.values[0].as_i64().unwrap())
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![4, 11]);
+    }
+
+    /// A correlated `id(n) = x` lowers to an id-based correlated seek (no property
+    /// index needed) and returns the addressed nodes.
+    #[test]
+    fn correlated_id_key_lowers_to_seek() {
+        let (_dir, graph) = setup_graph();
+        let a = add_user(&graph, 100);
+        let _b = add_user(&graph, 200);
+        let c = add_user(&graph, 300);
+
+        let q = format!("UNWIND [{a}, {c}] AS x MATCH (n:User) WHERE id(n) = x RETURN n.Id AS id");
+        let plan = explain(&graph, &q).unwrap();
+        assert!(
+            plan.contains("CorrelatedIndexSeek"),
+            "expected an id seek, got:\n{plan}"
+        );
+
+        let res = execute(&graph, &q, &HashMap::new()).unwrap();
+        let mut ids: Vec<i64> = res
+            .records
+            .iter()
+            .map(|r| r.values[0].as_i64().unwrap())
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![100, 300]);
+    }
+
+    /// A constant key is unaffected: it still lowers to a plain `NodeIndexScan`,
+    /// not a correlated seek.
+    #[test]
+    fn constant_key_still_uses_plain_index_scan() {
+        let (_dir, graph) = setup_graph();
+        add_user(&graph, 9);
+        let plan = explain(&graph, "MATCH (n:User) WHERE n.Id = 9 RETURN n").unwrap();
+        assert!(plan.contains("NodeIndexScan"), "got:\n{plan}");
+        assert!(!plan.contains("CorrelatedIndexSeek"), "got:\n{plan}");
+    }
+
+    /// A query string deep enough to overflow the stack is rejected by the parser
+    /// guard, so `execute` returns an error rather than aborting the process.
+    #[test]
+    fn deeply_nested_query_errors_instead_of_aborting() {
+        let (_dir, graph) = setup_graph();
+        let deep = std::iter::repeat("RETURN 1 AS x")
+            .take(5000)
+            .collect::<Vec<_>>()
+            .join(" UNION ALL ");
+        assert!(execute(&graph, &deep, &HashMap::new()).is_err());
+    }
+
+    /// The parser guard's budget keeps an accepted query's recursion (parse,
+    /// plan, optimize, and execute) within a small worker-thread stack. Running
+    /// the deepest accepted shapes on a 2 MiB stack must complete, not overflow.
+    /// If a future change loosens the budget past what the executor can handle on
+    /// a small stack, this test aborts and flags the regression.
+    #[test]
+    fn near_budget_queries_run_on_a_small_stack() {
+        // A nested-list expression close to the bracket budget, plus a long
+        // operator chain close to the operator budget. Both pass the guard.
+        let mut list = String::from("1");
+        for _ in 0..12 {
+            list = format!("[{}]", list);
+        }
+        let and = std::iter::repeat("1 = 1")
+            .take(20)
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        let queries = vec![format!("RETURN {list} AS x"), format!("RETURN {and} AS x")];
+
+        let handle = std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || {
+                // Consume some stack first to mimic a real handler call chain.
+                let pad = [0u8; 256 * 1024];
+                std::hint::black_box(&pad);
+                let dir = TempDir::new().unwrap();
+                let graph = Graph::open(dir.path(), 1).unwrap();
+                for q in &queries {
+                    // Parsing and execution must complete without overflowing.
+                    let _ = execute(&graph, q, &HashMap::new());
+                }
+            })
+            .unwrap();
+        handle.join().unwrap();
+    }
 }

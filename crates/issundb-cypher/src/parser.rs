@@ -5170,6 +5170,194 @@ fn check_pattern_value_conflict(
     Ok(())
 }
 
+// ─── Recursion-depth guard ──────────────────────────────────────────────────
+
+// The parser is a recursive-descent combinator parser (built with `chumsky`),
+// and several constructs recurse with the nesting depth of the source: bracketed
+// sub-expressions `( [ {`, `CASE`/`END`, `UNION` chains, `FOREACH` bodies, and
+// chained binary or unary operators. Every later pass over the resulting AST
+// recurses the same way: validation, planning, optimization, execution
+// (`evaluate_expr`), and `Drop`. Without a guard a deeply nested query string
+// overflows the stack and aborts the whole process with SIGABRT rather than
+// returning an error.
+//
+// The guard rejects over-deep input before any AST is built, which bounds the
+// parser and every later pass at once. The cost of one nesting level differs by
+// an order of magnitude between constructs and between the parser (large
+// monomorphized combinator frames) and the executor (ordinary frames). The two
+// thresholds that matter, both measured on an unoptimized build, are:
+//
+// - The parser itself: one level of bracket or `CASE` nesting costs roughly
+//   200 KiB of stack, so on a small (for example 2 MiB) worker-thread stack the
+//   parser overflows below ten levels. To keep realistic nesting parseable, deep
+//   inputs parse on a dedicated large-stack thread; only trivially shallow
+//   queries, the common case, parse on the caller stack.
+// - The downstream passes on the caller stack: nested-bracket evaluation costs
+//   roughly 60 KiB per level (overflows near depth 36 on a 2 MiB stack), an
+//   operator chain roughly 17 KiB per level (overflows near depth 123), and
+//   `CASE`/`UNION` nesting is lighter still. This is the binding constraint,
+//   because the executor runs on the caller stack, not the parse thread.
+//
+// The downstream constraint is enforced as a weighted budget: each open nesting
+// level adds its per-level stack cost, and the deepest weighted path must stay
+// within a budget sized to leave headroom on a 2 MiB stack. A single combined
+// budget is required because the constructs can nest inside one another and their
+// frames add up on one call path. The scan is a single iterative pass over the
+// tokens with no recursion of its own.
+
+/// Per-level downstream stack cost (KiB), each padded above the measured value.
+const BRACKET_COST_KB: usize = 70;
+const CASE_COST_KB: usize = 14;
+const OP_COST_KB: usize = 21;
+const UNION_COST_KB: usize = 14;
+/// Maximum weighted downstream nesting cost (KiB). Sized to leave headroom for
+/// the caller's own frames on a 2 MiB worker-thread stack.
+const MAX_NESTING_COST_KB: usize = 1000;
+
+/// Parse stays on the caller stack only when bracket and `CASE` nesting (the
+/// parser's costly frames) and the operator and `UNION` depth are all small
+/// enough to be safe even on a 2 MiB stack.
+const INLINE_BRACKET_CASE_DEPTH: usize = 2;
+const INLINE_OP_DEPTH: usize = 48;
+const INLINE_UNION_DEPTH: usize = 16;
+/// Stack size for the dedicated parse thread used for deeper inputs. Large enough
+/// for any input within `MAX_NESTING_COST_KB`; the address space is reserved
+/// lazily, so only pages actually touched by a given parse cost memory.
+const PARSE_THREAD_STACK: usize = 128 * 1024 * 1024;
+
+/// A token is an operator (it makes the expression parser recurse on an operand)
+/// when it is one of these keywords.
+fn is_operator_keyword(name: &str) -> bool {
+    matches!(
+        name.to_ascii_uppercase().as_str(),
+        "AND" | "OR" | "XOR" | "NOT" | "IN" | "IS" | "CONTAINS" | "STARTS" | "ENDS"
+    )
+}
+
+/// Worst-case nesting measured from the token stream.
+#[derive(Default)]
+struct Nesting {
+    /// Deepest weighted downstream stack cost on a single call path (KiB).
+    cost_kb: usize,
+    /// Deepest simultaneous bracket plus `CASE` nesting.
+    bracket_case: usize,
+    /// Deepest operator-chain depth.
+    op: usize,
+    /// Deepest `UNION` nesting within a pipeline segment.
+    union: usize,
+}
+
+/// One open nesting level on the scan's explicit stack.
+struct Frame {
+    /// Stack cost contributed by opening this level (bracket or `CASE`).
+    base_kb: usize,
+    /// Operators chained directly inside this level.
+    op_run: usize,
+}
+
+/// Compute worst-case nesting from the token stream. The scan is iterative: it
+/// maintains an explicit stack of open levels instead of recursing.
+fn scan_nesting(tokens: &[(Tok, SimpleSpan)]) -> Nesting {
+    // The first frame is the implicit top level (no opening bracket).
+    let mut frames: Vec<Frame> = vec![Frame {
+        base_kb: 0,
+        op_run: 0,
+    }];
+    let mut cost_kb: usize = 0;
+    let mut union_depth: usize = 0;
+    let mut op_total: usize = 0;
+    let mut out = Nesting::default();
+
+    for (tok, _) in tokens {
+        match tok {
+            Tok::LParen | Tok::LBrack | Tok::LBrace => {
+                frames.push(Frame {
+                    base_kb: BRACKET_COST_KB,
+                    op_run: 0,
+                });
+                cost_kb += BRACKET_COST_KB;
+            }
+            Tok::RParen | Tok::RBrack | Tok::RBrace => {
+                close_frame(&mut frames, &mut cost_kb, &mut op_total)
+            }
+            Tok::Comma => {
+                // A new list element or argument restarts the operator chain at
+                // this level.
+                if let Some(top) = frames.last_mut() {
+                    cost_kb -= top.op_run * OP_COST_KB;
+                    op_total -= top.op_run;
+                    top.op_run = 0;
+                }
+            }
+            Tok::Semi => {
+                // Pipeline statements parse iteratively, so each segment starts
+                // from a clean stack.
+                frames.truncate(1);
+                frames[0].op_run = 0;
+                cost_kb = 0;
+                op_total = 0;
+                union_depth = 0;
+            }
+            Tok::Eq
+            | Tok::Ne
+            | Tok::Lt
+            | Tok::Gt
+            | Tok::Le
+            | Tok::Ge
+            | Tok::RegexEq
+            | Tok::Plus
+            | Tok::Minus
+            | Tok::Star
+            | Tok::Slash
+            | Tok::Percent
+            | Tok::Caret => add_operator(&mut frames, &mut cost_kb, &mut op_total),
+            Tok::Ident(name) => {
+                if name.eq_ignore_ascii_case("CASE") {
+                    frames.push(Frame {
+                        base_kb: CASE_COST_KB,
+                        op_run: 0,
+                    });
+                    cost_kb += CASE_COST_KB;
+                } else if name.eq_ignore_ascii_case("END") {
+                    close_frame(&mut frames, &mut cost_kb, &mut op_total);
+                } else if name.eq_ignore_ascii_case("UNION") {
+                    union_depth += 1;
+                    cost_kb += UNION_COST_KB;
+                } else if is_operator_keyword(name) {
+                    add_operator(&mut frames, &mut cost_kb, &mut op_total);
+                }
+            }
+            _ => {}
+        }
+        out.cost_kb = out.cost_kb.max(cost_kb);
+        out.bracket_case = out.bracket_case.max(frames.len() - 1);
+        out.op = out.op.max(op_total);
+        out.union = out.union.max(union_depth);
+    }
+
+    out
+}
+
+/// Record one operator chained inside the innermost open level.
+fn add_operator(frames: &mut [Frame], cost_kb: &mut usize, op_total: &mut usize) {
+    if let Some(f) = frames.last_mut() {
+        f.op_run += 1;
+    }
+    *cost_kb += OP_COST_KB;
+    *op_total += 1;
+}
+
+/// Pop the innermost open level, deducting its contribution. The top-level frame
+/// is never popped; an unbalanced closer is left for the real parser to report.
+fn close_frame(frames: &mut Vec<Frame>, cost_kb: &mut usize, op_total: &mut usize) {
+    if frames.len() > 1 {
+        if let Some(f) = frames.pop() {
+            *cost_kb -= f.base_kb + f.op_run * OP_COST_KB;
+            *op_total -= f.op_run;
+        }
+    }
+}
+
 // ─── Public entry point ───────────────────────────────────────────────────────
 
 /// Parse a Cypher query string into a `Statement` AST.
@@ -5183,24 +5371,54 @@ pub fn parse(cypher: &str) -> Result<Statement, CypherError> {
         CypherError::Parse(msg)
     })?;
 
-    let eoi = SimpleSpan::from(cypher.len()..cypher.len());
-    let stream = tokens.as_slice().split_token_span(eoi);
+    let nesting = scan_nesting(&tokens);
+    if nesting.cost_kb > MAX_NESTING_COST_KB {
+        return Err(CypherError::Parse(
+            "SyntaxError: query is too deeply nested; reduce nesting of brackets, \
+             CASE expressions, UNION clauses, or chained operators"
+                .to_string(),
+        ));
+    }
 
-    let statement = pipeline_parser(cypher)
-        .parse(stream)
-        .into_result()
-        .map_err(|errs| {
-            let msg = errs
-                .into_iter()
-                .map(|e| format!("{:?}", e))
-                .collect::<Vec<_>>()
-                .join("; ");
-            CypherError::Parse(msg)
-        })?;
+    // Parsing and validation recurse with the source nesting depth. Run them on a
+    // large-stack thread once the input is deep enough that the caller stack may
+    // be too small.
+    let run = || -> Result<Statement, CypherError> {
+        let eoi = SimpleSpan::from(cypher.len()..cypher.len());
+        let stream = tokens.as_slice().split_token_span(eoi);
 
-    validate_statement(&statement).map_err(CypherError::Parse)?;
+        let statement = pipeline_parser(cypher)
+            .parse(stream)
+            .into_result()
+            .map_err(|errs| {
+                let msg = errs
+                    .into_iter()
+                    .map(|e| format!("{:?}", e))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                CypherError::Parse(msg)
+            })?;
 
-    Ok(statement)
+        validate_statement(&statement).map_err(CypherError::Parse)?;
+        Ok(statement)
+    };
+
+    let inline = nesting.bracket_case <= INLINE_BRACKET_CASE_DEPTH
+        && nesting.op <= INLINE_OP_DEPTH
+        && nesting.union <= INLINE_UNION_DEPTH;
+    if inline {
+        run()
+    } else {
+        std::thread::scope(|scope| {
+            let handle = std::thread::Builder::new()
+                .stack_size(PARSE_THREAD_STACK)
+                .spawn_scoped(scope, run)
+                .map_err(|e| CypherError::Parse(format!("failed to spawn parse thread: {e}")))?;
+            handle
+                .join()
+                .map_err(|_| CypherError::Parse("parse thread panicked".to_string()))?
+        })
+    }
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -5660,5 +5878,94 @@ mod tests {
         } else {
             panic!("Expected Statement::ImportDatabase");
         }
+    }
+
+    // --- Recursion-depth guard ---
+
+    /// A query string with thousands of nested levels must return a parse error,
+    /// not overflow the stack and abort the process. Each variant exercises a
+    /// distinct recursion path in the parser (`UNION`, brackets, `CASE`,
+    /// chained operators, map literals, and `FOREACH` bodies).
+    #[test]
+    fn deeply_nested_queries_are_rejected_not_aborted() {
+        let union = std::iter::repeat("RETURN 1 AS x")
+            .take(5000)
+            .collect::<Vec<_>>()
+            .join(" UNION ALL ");
+        assert!(parse(&union).is_err());
+
+        let mut list = String::from("1");
+        for _ in 0..5000 {
+            list = format!("[{}]", list);
+        }
+        assert!(parse(&format!("RETURN {list} AS x")).is_err());
+
+        let mut case = String::from("1");
+        for _ in 0..5000 {
+            case = format!("CASE WHEN true THEN {case} ELSE 0 END");
+        }
+        assert!(parse(&format!("RETURN {case} AS x")).is_err());
+
+        let and = std::iter::repeat("m.x = 1")
+            .take(5000)
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        assert!(parse(&format!("MATCH (m) WHERE {and} RETURN m")).is_err());
+
+        let mut map = String::from("1");
+        for _ in 0..5000 {
+            map = format!("{{a: {map}}}");
+        }
+        assert!(parse(&format!("RETURN {map} AS x")).is_err());
+
+        let mut foreach = String::from("FOREACH (x IN [1] | CREATE (n))");
+        for _ in 0..5000 {
+            foreach = format!("FOREACH (y IN [1] | {foreach})");
+        }
+        assert!(parse(&foreach).is_err());
+    }
+
+    /// Ordinary queries, including ones with shallow nesting and several `AND`ed
+    /// predicates, parse unaffected by the guard.
+    #[test]
+    fn ordinary_queries_parse_under_the_guard() {
+        assert!(parse("MATCH (n:User) WHERE n.Id = 9028 RETURN n").is_ok());
+        assert!(parse("UNWIND [1, 2, 3] AS x MATCH (n:User) WHERE n.Id = x RETURN n").is_ok());
+        assert!(
+            parse(
+                "MATCH (a)-[r:KNOWS]->(b) \
+                 WHERE a.age > 21 AND b.city = 'X' AND a.x = 1 AND a.y = 2 \
+                 RETURN a.name, b.name"
+            )
+            .is_ok()
+        );
+        assert!(parse("RETURN {a: {b: {c: 1}}} AS m").is_ok());
+        assert!(parse("RETURN CASE WHEN true THEN 1 ELSE 2 END AS x").is_ok());
+        assert!(parse("RETURN 1 AS x UNION ALL RETURN 2 AS x UNION ALL RETURN 3 AS x").is_ok());
+    }
+
+    /// `scan_nesting` charges each construct and unwinds it on close, so its cost
+    /// reflects the deepest single path, not the total token count.
+    #[test]
+    fn scan_nesting_tracks_depth_not_breadth() {
+        let lex = |q: &str| lexer().parse(q).into_result().unwrap();
+
+        // A flat, wide query stays cheap: each bracket pair opens and closes.
+        let wide = scan_nesting(&lex("RETURN [1, 2, 3, 4, 5], [6, 7], [8, 9, 10] AS x"));
+        assert_eq!(wide.bracket_case, 1);
+
+        // Three nested brackets reach depth three.
+        let deep = scan_nesting(&lex("RETURN [[[1]]] AS x"));
+        assert_eq!(deep.bracket_case, 3);
+
+        // Commas reset the operator chain, so sibling sums do not accumulate.
+        let ops = scan_nesting(&lex("RETURN 1 + 2 + 3, 4 + 5 AS x"));
+        assert_eq!(ops.op, 2);
+
+        // A `UNION` chain is counted per segment.
+        let unions = scan_nesting(&lex(
+            "RETURN 1 AS x UNION RETURN 2 AS x UNION RETURN 3 AS x",
+        ));
+        assert_eq!(unions.union, 2);
     }
 }
