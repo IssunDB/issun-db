@@ -145,9 +145,9 @@ enum ReplCommand {
     },
 
     /// Bulk-import nodes from a CSV file whose columns become node properties
-    /// (e.g., `:import-nodes ./users.csv User`). The first row is the header and
-    /// every remaining row is one node of the given label. Rows are inserted in
-    /// batched transactions.
+    /// (e.g., `:import-nodes ./people.csv Person`). The first row is the header
+    /// and every remaining row is one node of the given label. Rows are inserted
+    /// in batched transactions.
     #[command(name = ":import-nodes")]
     ImportNodes {
         /// Path to the CSV file (header row plus one node per row)
@@ -157,7 +157,7 @@ enum ReplCommand {
     },
 
     /// Bulk-import edges from a two-column CSV of source/destination domain keys
-    /// (e.g., `:import-edges ./edges.csv User Kernel AUTHORED_KERNEL`). Each key is
+    /// (e.g., `:import-edges ./knows.csv Person Person KNOWS`). Each key is
     /// resolved to a node by its auto-indexed `Id` property and edges are inserted
     /// in batched transactions.
     #[command(name = ":import-edges")]
@@ -403,7 +403,7 @@ enum ReplCommand {
         /// Restrict results to nodes carrying this label
         #[arg(long)]
         label: Option<String>,
-        /// JSON object of property key-value filters (e.g., `--props {"team":"blue"}`)
+        /// JSON object of property key-value filters (e.g., `--props {"name":"Alice"}`)
         #[arg(long)]
         props: Option<String>,
         /// Optional rescore factor for quantized indexes
@@ -519,8 +519,8 @@ Backup and Import
   :backup <file>                       Write a hot backup snapshot of the database (e.g., :backup ./backup.db)
   :backup-compact <file>               Write a compacted backup snapshot of the database (e.g., :backup-compact ./compact.db)
   :restore <snapshot> <dst>            Restore a snapshot into a new database directory (e.g., :restore ./snap.db ./restored)
-  :import-nodes <file> <label>         Bulk-import nodes from a CSV whose columns become properties (e.g., :import-nodes ./users.csv User)
-  :import-edges <file> <src> <dst> <type>  Bulk-import edges from a 2-column CSV of domain keys (e.g., :import-edges ./e.csv User Kernel AUTHORED_KERNEL)
+  :import-nodes <file> <label>         Bulk-import nodes from a CSV whose columns become properties (e.g., :import-nodes ./people.csv Person)
+  :import-edges <file> <src> <dst> <type>  Bulk-import edges from a 2-column CSV of domain keys (e.g., :import-edges ./knows.csv Person Person KNOWS)
   rebuild-csr                          Rebuild the CSR snapshot cache
 
 Query and Mutations
@@ -1774,10 +1774,10 @@ fn cmd_import_nodes(state: &mut State, path: &str, label: &str) {
 
 /// Resolve a domain key to a node id via the always-on scalar auto-index on
 /// `Id`. The key is matched as an integer when it parses as one, otherwise as a
-/// string. This mirrors how `:import-csv` stores values, so integer-keyed nodes
-/// (e.g. `User`, `Kernel`) and string-keyed nodes (e.g. `Library`) both resolve.
-/// A unique `Id` yields exactly one match; the first is taken if several exist.
-/// Returns `None` when no node carries that `(label, Id)`.
+/// string. This mirrors how `:import-nodes` stores values, so both integer-keyed
+/// and string-keyed nodes resolve. A unique `Id` yields exactly one match; the
+/// first is taken if several exist. Returns `None` when no node carries that
+/// `(label, Id)`.
 fn resolve_node_by_id(
     txn: &issundb::ReadTxn,
     label: &str,
@@ -1818,7 +1818,7 @@ fn cmd_import_edges(state: &mut State, path: &str, src_label: &str, dst_label: &
         }
     };
 
-    // First non-empty line is the header (e.g. `from_user_id,to_kernel_id`).
+    // First non-empty line is the header (e.g. `src_id,dst_id`).
     let mut lines = content.lines().filter(|l| !l.trim().is_empty());
     if lines.next().is_none() {
         eprintln!("CSV file is empty");
