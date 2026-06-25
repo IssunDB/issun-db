@@ -1787,10 +1787,7 @@ fn resolve_node_by_id(
         Ok(i) => PropValue::Int(i),
         Err(_) => PropValue::Str(key.to_owned()),
     };
-    Ok(txn
-        .nodes_by_property(label, "Id", val)?
-        .into_iter()
-        .next())
+    Ok(txn.nodes_by_property(label, "Id", val)?.into_iter().next())
 }
 
 /// Bulk-import edges from a two-column CSV of source/destination domain keys.
