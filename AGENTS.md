@@ -93,7 +93,9 @@ Do not invent modules that do not yet exist when answering questions, but do pla
     - `src/parser.rs`: Cypher parser built with the `chumsky` parser-combinator library (with a Pratt parser for operator-precedence expressions) for
       MATCH (including inline relationship property maps and multi-label node patterns
       such as `(n:A:B)`), WHERE, RETURN, CREATE, SET (property and label assignment), REMOVE (label and property), and DELETE/DETACH DELETE over
-      arbitrary expression targets.
+      arbitrary expression targets. An iterative token-stream scan (`scan_nesting`) rejects pathologically deep input (nested brackets, `CASE`,
+      `UNION` chains, or chained operators) with a parse error before any AST is built, so a deeply nested query cannot overflow the stack and abort
+      the process; an input within the budget but past a shallow inline depth parses on a dedicated large-stack thread.
     - `src/ast.rs`: AST node types.
     - `src/plan/`: logical planner, physical planner, optimizer, and statistics helpers.
     - `src/exec/mod.rs`: public entry points (`execute`, `explain`), shared type definitions, and tests.
@@ -368,7 +370,12 @@ Untyped expansion uses GraphBLAS SpMV; typed expansion reads the CSR snapshot in
 and the source set is small so a write-then-expand workload never pays a rebuild. The optimizer splits top-level `AND` conjunctions in WHERE so
 each conjunct pushes down to its own lowest binder, and rewrites an equality or range filter over a labeled scan into `NodeIndexScan` or
 `NodeRangeScan` when the property has a declared index; the rewrite recurses through every single-input operator (including `Aggregate`, `Sort`,
-`Limit`, and `Distinct`) and treats a split conjunct's expression form like the structured comparison forms. A natural inner `HashJoin` whose one
+`Limit`, and `Distinct`) and treats a split conjunct's expression form like the structured comparison forms. A correlated equality whose key is
+bound at runtime (the shape a `UNWIND`- or parameter-driven key lookup produces, which the literal-only index-scan rewrite cannot lower) is
+rewritten from a `Filter` over a `HashJoin` into a `CorrelatedIndexSeek` (`rewrite_correlated_seek`): an index nested-loop join that runs one
+property-index or `id` seek per outer row instead of hashing a full label scan against the outer rows, removing the hash-table memory blowup on a
+large label. It fires only when one join side is a bare `LabelScan` for the seek variable and the key references only variables bound by the other
+side. A natural inner `HashJoin` whose one
 side merely re-scans a variable the other already binds (the shape a multi-`MATCH` sharing a pivot produces) is rewritten into a linear
 "expand into" chain (`rewrite_join_to_expand`), grafting the redundant-scan side's `Filter`/`Expand` chain onto the driver so the full re-scan is
 eliminated and the columnar path and closing-join rewrite can both exploit the chain; it fires only when the two sides share exactly the one rooted
