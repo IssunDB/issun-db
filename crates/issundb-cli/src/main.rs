@@ -716,16 +716,20 @@ const CYPHER_KEYWORDS: &[&str] = &[
     "OPTIONAL", "WHERE", "FOREACH", "EXPORT", "IMPORT",
 ];
 
-/// REPL commands whose arguments are filesystem paths, for which the completer
-/// delegates to `FilenameCompleter`.
-const FILE_ARG_COMMANDS: &[&str] = &[
-    ":run",
-    ":save",
-    ":backup",
-    ":backup-compact",
-    ":restore",
-    ":import-nodes",
-    ":import-edges",
+/// REPL commands that take filesystem-path arguments, paired with the 1-based
+/// argument positions (counting from the first word after the command) that are
+/// paths. The completer delegates only those positions to `FilenameCompleter`;
+/// the remaining arguments (labels, relationship types) get no completion so the
+/// filesystem is not offered where a name is expected. For example,
+/// `:import-nodes <file> <label>` lists only position 1 as a path.
+const FILE_ARG_COMMANDS: &[(&str, &[usize])] = &[
+    (":run", &[1]),
+    (":save", &[1]),
+    (":backup", &[1]),
+    (":backup-compact", &[1]),
+    (":restore", &[1, 2]),
+    (":import-nodes", &[1]),
+    (":import-edges", &[1]),
 ];
 
 /// rustyline helper providing tab completion for the REPL: command names and
@@ -786,10 +790,16 @@ impl Completer for ReplHelper {
             return Ok((word_start, candidates));
         }
 
-        // Argument position: complete filesystem paths for the path commands.
+        // Argument position: complete filesystem paths only for the path-typed
+        // argument positions of the path commands. The 1-based index of the word
+        // under the cursor is the count of tokens preceding it (the command is
+        // index 0, so the first argument is index 1).
         let cmd = head.split_whitespace().next().unwrap_or("");
-        if FILE_ARG_COMMANDS.contains(&cmd) {
-            return self.filename.complete(line, pos, ctx);
+        let arg_index = head[..word_start].split_whitespace().count();
+        if let Some((_, paths)) = FILE_ARG_COMMANDS.iter().find(|(name, _)| *name == cmd) {
+            if paths.contains(&arg_index) {
+                return self.filename.complete(line, pos, ctx);
+            }
         }
 
         Ok((pos, Vec::new()))
@@ -2025,6 +2035,37 @@ mod tests {
         let helper = ReplHelper::new();
         // A non-path command's argument gets no command-name candidates.
         let (_, cands) = complete_at_end(&helper, "get-node 1");
+        assert!(cands.is_empty());
+    }
+
+    #[test]
+    fn completer_path_argument_completes_filenames() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("nodes.csv"), "Id\n").unwrap();
+        let helper = ReplHelper::new();
+        // Position 1 of :import-nodes is the CSV path, so filenames complete.
+        let line = format!(":import-nodes {}/no", dir.path().display());
+        let (_, cands) = complete_at_end(&helper, &line);
+        assert!(
+            cands.iter().any(|c| c.contains("nodes.csv")),
+            "expected a filename candidate, got {cands:?}"
+        );
+    }
+
+    #[test]
+    fn completer_label_argument_is_not_path_completed() {
+        let helper = ReplHelper::new();
+        // Position 2 of :import-nodes is the label, not a path, so the filesystem
+        // is not offered there.
+        let (_, cands) = complete_at_end(&helper, ":import-nodes people.csv Per");
+        assert!(
+            cands.is_empty(),
+            "label argument should not complete to files"
+        );
+
+        // The relationship-type and label arguments of :import-edges (positions
+        // 2 through 4) are likewise not path-completed.
+        let (_, cands) = complete_at_end(&helper, ":import-edges e.csv Person Person KNO");
         assert!(cands.is_empty());
     }
 
