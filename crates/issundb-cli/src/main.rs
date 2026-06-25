@@ -87,6 +87,12 @@ struct Cli {
     /// LMDB memory map size in gigabytes (defaults to 1).
     #[arg(long, default_value_t = 1)]
     map_size_gb: usize,
+
+    /// Execute a script file then exit, instead of starting the interactive
+    /// prompt (e.g., `--script ./setup.txt`). Lines may mix meta, data, and
+    /// Cypher, exactly like `:run`; the `:!` shell escape is rejected.
+    #[arg(long, short = 'f')]
+    script: Option<String>,
 }
 
 #[derive(Parser, Debug)]
@@ -684,6 +690,13 @@ fn main() {
     };
 
     let mut state = State::new(graph, db_path, cli.map_size_gb);
+
+    // Batch mode: run the script then exit without starting the prompt. The
+    // script may `:open` its own database, so a launch path is not required.
+    if let Some(script) = cli.script.as_deref() {
+        run_script(&mut state, script);
+        return;
+    }
 
     let mut rl: Editor<ReplHelper, FileHistory> = match Editor::new() {
         Ok(r) => r,
