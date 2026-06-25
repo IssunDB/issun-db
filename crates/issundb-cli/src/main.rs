@@ -4,7 +4,7 @@ use clap::Parser;
 use colored::Colorize;
 use issundb::{
     DegreeDirection, EdgeId, FusionStrategy, Graph, GraphQueryExt, Hit, HybridRetrieveOptions,
-    Language, NodeId, TextGraphExt, TextIndexExt, TextSearchOptions, VectorGraphExt,
+    Language, NodeId, PropValue, TextGraphExt, TextIndexExt, TextSearchOptions, VectorGraphExt,
     VectorIndexOptions, VectorMetric, VectorQuantization, VectorSearchOptions, retrieve_hybrid,
 };
 use rustyline::DefaultEditor;
@@ -152,6 +152,22 @@ enum ReplCommand {
     ImportCsv {
         /// Path to the CSV file
         file: String,
+    },
+
+    /// Bulk-import edges from a two-column CSV of source/destination domain keys
+    /// (e.g., `:import-edges ./edges.csv User Kernel AUTHORED_KERNEL`). Each key is
+    /// resolved to a node by its auto-indexed `Id` property and edges are inserted
+    /// in batched transactions.
+    #[command(name = ":import-edges")]
+    ImportEdges {
+        /// Path to the two-column CSV file (src_key,dst_key)
+        file: String,
+        /// Label of the source nodes (matched on their `Id` property)
+        src_label: String,
+        /// Label of the destination nodes (matched on their `Id` property)
+        dst_label: String,
+        /// Relationship type for the created edges
+        etype: String,
     },
 
     /// Rebuild the CSR snapshot cache (e.g., `rebuild-csr`)
@@ -502,6 +518,7 @@ Backup and Import
   :restore <snapshot> <dst>            Restore a snapshot into a new database directory (e.g., :restore ./snap.db ./restored)
   :import-jsonl <file>                 Import nodes from a JSONL file (e.g., :import-jsonl ./nodes.jsonl)
   :import-csv <file>                   Import nodes from a CSV file (e.g., :import-csv ./nodes.csv)
+  :import-edges <file> <src> <dst> <type>  Bulk-import edges from a 2-column CSV of domain keys (e.g., :import-edges ./e.csv User Kernel AUTHORED_KERNEL)
   rebuild-csr                          Rebuild the CSR snapshot cache
 
 Query and Mutations
@@ -862,6 +879,14 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
         }
         ReplCommand::ImportCsv { file } => {
             cmd_import_csv(state, &file);
+        }
+        ReplCommand::ImportEdges {
+            file,
+            src_label,
+            dst_label,
+            etype,
+        } => {
+            cmd_import_edges(state, &file, &src_label, &dst_label, &etype);
         }
         ReplCommand::Query { cypher } => {
             let cypher_str = cypher.join(" ");
@@ -1781,6 +1806,119 @@ fn cmd_import_csv(state: &mut State, path: &str) {
     }
 }
 
+/// Resolve a domain key to a node id via the always-on scalar auto-index on
+/// `Id`. The key is matched as an integer when it parses as one, otherwise as a
+/// string. This mirrors how `:import-csv` stores values, so integer-keyed nodes
+/// (e.g. `User`, `Kernel`) and string-keyed nodes (e.g. `Library`) both resolve.
+/// A unique `Id` yields exactly one match; the first is taken if several exist.
+/// Returns `None` when no node carries that `(label, Id)`.
+fn resolve_node_by_id(
+    txn: &issundb::ReadTxn,
+    label: &str,
+    key: &str,
+) -> Result<Option<NodeId>, issundb::Error> {
+    let val = match key.parse::<i64>() {
+        Ok(i) => PropValue::Int(i),
+        Err(_) => PropValue::Str(key.to_owned()),
+    };
+    Ok(txn
+        .nodes_by_property(label, "Id", val)?
+        .into_iter()
+        .next())
+}
+
+/// Bulk-import edges from a two-column CSV of source/destination domain keys.
+///
+/// Each data row is `src_key,dst_key`. Both keys are resolved to node ids by
+/// their auto-indexed `Id` property; `src_label` and `dst_label` scope the
+/// lookup so keys that collide across labels stay distinct. Edges of type
+/// `etype` are inserted in fixed-size batches, each its own write transaction.
+/// This bypasses the Cypher planner entirely (no `UNWIND`, `LabelScan`, or
+/// `HashJoin`) and keeps memory bounded regardless of file size.
+fn cmd_import_edges(state: &mut State, path: &str, src_label: &str, dst_label: &str, etype: &str) {
+    let g = match state.graph.as_ref() {
+        Some(g) => g,
+        None => {
+            eprintln!("no database open");
+            return;
+        }
+    };
+
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("cannot read {path}: {e}");
+            return;
+        }
+    };
+
+    // First non-empty line is the header (e.g. `from_user_id,to_kernel_id`).
+    let mut lines = content.lines().filter(|l| !l.trim().is_empty());
+    if lines.next().is_none() {
+        eprintln!("CSV file is empty");
+        return;
+    }
+
+    // Collect the two key columns up front as raw strings (resolution decides
+    // int-vs-string per key). A row missing either non-empty key is malformed.
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    let mut malformed: u64 = 0;
+    for line in lines {
+        let cols = parse_csv_line(line);
+        let src = cols.first().map(|s| s.trim()).filter(|s| !s.is_empty());
+        let dst = cols.get(1).map(|s| s.trim()).filter(|s| !s.is_empty());
+        match (src, dst) {
+            (Some(s), Some(d)) => pairs.push((s.to_owned(), d.to_owned())),
+            _ => malformed += 1,
+        }
+    }
+
+    const BATCH: usize = 50_000;
+    let empty = serde_json::Value::Object(serde_json::Map::new());
+    let mut inserted: u64 = 0;
+    let mut unresolved: u64 = 0;
+
+    for chunk in pairs.chunks(BATCH) {
+        // One read view resolves the whole chunk, then one write txn inserts it.
+        let resolved: Vec<(NodeId, NodeId)> = match g.view(|txn| {
+            let mut out = Vec::with_capacity(chunk.len());
+            for (src_key, dst_key) in chunk {
+                if let (Some(s), Some(d)) = (
+                    resolve_node_by_id(txn, src_label, src_key)?,
+                    resolve_node_by_id(txn, dst_label, dst_key)?,
+                ) {
+                    out.push((s, d));
+                }
+            }
+            Ok(out)
+        }) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("edge resolution failed: {e}");
+                return;
+            }
+        };
+        unresolved += (chunk.len() - resolved.len()) as u64;
+
+        match g.update(|txn| {
+            for (s, d) in &resolved {
+                txn.add_edge(*s, *d, etype, &empty)?;
+            }
+            Ok(())
+        }) {
+            Ok(_) => inserted += resolved.len() as u64,
+            Err(e) => {
+                eprintln!("edge batch insert failed: {e}");
+                return;
+            }
+        }
+    }
+
+    eprintln!(
+        "imported {inserted} {etype} edges from {path} ({unresolved} unresolved endpoint(s), {malformed} malformed row(s))"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1955,5 +2093,57 @@ mod tests {
 
         // 5. Quit command should return false
         assert!(!handle(&mut state, "quit"));
+    }
+
+    #[test]
+    fn test_import_edges_resolves_domain_keys() {
+        let temp = TempDir::new().unwrap();
+        let mut state = State::new(None, 1);
+        assert!(handle(
+            &mut state,
+            &format!(":open {}", temp.path().display())
+        ));
+
+        // Nodes keyed by a domain `Id` that differs from their internal id.
+        assert!(handle(&mut state, "add-node User {\"Id\": 10}"));
+        assert!(handle(&mut state, "add-node User {\"Id\": 20}"));
+        assert!(handle(&mut state, "add-node Kernel {\"Id\": 100}"));
+        assert!(handle(&mut state, "add-node Kernel {\"Id\": 200}"));
+
+        // CSV of domain keys: two valid rows plus one with an unresolvable dst.
+        let csv = temp.path().join("edges.csv");
+        std::fs::write(&csv, "from_user_id,to_kernel_id\n10,100\n20,200\n10,999\n").unwrap();
+
+        assert!(handle(
+            &mut state,
+            &format!(
+                ":import-edges {} User Kernel AUTHORED_KERNEL",
+                csv.display()
+            )
+        ));
+
+        // Exactly the two resolvable edges should exist; the 999 dst is dropped.
+        let g = state.graph.as_ref().unwrap();
+        let count = g
+            .view(|txn| txn.edge_count_by_type("AUTHORED_KERNEL"))
+            .unwrap();
+        assert_eq!(count, 2);
+
+        // String-keyed endpoints (e.g. Library nodes keyed by name) resolve too.
+        assert!(handle(&mut state, "add-node Library {\"Id\": \"numpy\"}"));
+        let lib_csv = temp.path().join("imports.csv");
+        std::fs::write(
+            &lib_csv,
+            "from_kernel_version_id,to_library_id\n100,numpy\n200,pandas\n",
+        )
+        .unwrap();
+        assert!(handle(
+            &mut state,
+            &format!(":import-edges {} Kernel Library IMPORTS", lib_csv.display())
+        ));
+        let g = state.graph.as_ref().unwrap();
+        let imports = g.view(|txn| txn.edge_count_by_type("IMPORTS")).unwrap();
+        // Only (Kernel 100 -> Library "numpy") resolves; "pandas" has no node.
+        assert_eq!(imports, 1);
     }
 }
