@@ -93,9 +93,14 @@ Do not invent modules that do not yet exist when answering questions, but do pla
     - `src/parser.rs`: Cypher parser built with the `chumsky` parser-combinator library (with a Pratt parser for operator-precedence expressions) for
       MATCH (including inline relationship property maps and multi-label node patterns
       such as `(n:A:B)`), WHERE, RETURN, CREATE, SET (property and label assignment), REMOVE (label and property), and DELETE/DETACH DELETE over
-      arbitrary expression targets. An iterative token-stream scan (`scan_nesting`) rejects pathologically deep input (nested brackets, `CASE`,
-      `UNION` chains, or chained operators) with a parse error before any AST is built, so a deeply nested query cannot overflow the stack and abort
-      the process; an input within the budget but past a shallow inline depth parses on a dedicated large-stack thread.
+      arbitrary expression targets. An iterative token-stream scan (`scan_nesting`) computes a weighted nesting cost (nested brackets, `CASE`,
+      `UNION` chains, and chained operators, with relationship-pattern dashes excluded by resetting the operator run at each clause boundary so a
+      flat multi-clause query does not read as deep) and rejects only genuinely pathological input (thousands of levels) with a parse error before
+      any AST is built. Realistic deep input is kept safe instead by running the work on large stacks: a deep parse runs on a dedicated large-stack
+      thread, and a query whose nesting exceeds `SMALL_STACK_EXEC_BUDGET_KB` has its execution dispatched to a large-stack thread by
+      `execute_with_procedures` (the statement clock is thread-local, so it is installed inside that worker), so a deeply nested literal evaluates
+      to completion rather than overflowing a small worker stack and aborting the process. Shallow queries, the common case, parse and execute
+      inline on the caller stack.
     - `src/ast.rs`: AST node types.
     - `src/plan/`: logical planner, physical planner, optimizer, and statistics helpers.
     - `src/exec/mod.rs`: public entry points (`execute`, `explain`), shared type definitions, and tests.

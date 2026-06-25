@@ -5181,38 +5181,41 @@ fn check_pattern_value_conflict(
 // overflows the stack and aborts the whole process with SIGABRT rather than
 // returning an error.
 //
-// The guard rejects over-deep input before any AST is built, which bounds the
-// parser and every later pass at once. The cost of one nesting level differs by
-// an order of magnitude between constructs and between the parser (large
-// monomorphized combinator frames) and the executor (ordinary frames). The two
-// thresholds that matter, both measured on an unoptimized build, are:
+// The guard rejects truly pathological input (thousands of levels) before any
+// AST is built, which bounds the parser and every later pass at once. It is not
+// the mechanism that keeps realistic deep input safe: that is handled by running
+// both the deep parse and the deep execution on dedicated large-stack threads
+// (see `PARSE_THREAD_STACK` here and the executor's large-stack dispatch). The
+// weighted budget is therefore sized to the large stacks those threads provide,
+// not to a small worker stack.
 //
-// - The parser itself: one level of bracket or `CASE` nesting costs roughly
-//   200 KiB of stack, so on a small (for example 2 MiB) worker-thread stack the
-//   parser overflows below ten levels. To keep realistic nesting parseable, deep
-//   inputs parse on a dedicated large-stack thread; only trivially shallow
-//   queries, the common case, parse on the caller stack.
-// - The downstream passes on the caller stack: nested-bracket evaluation costs
-//   roughly 60 KiB per level (overflows near depth 36 on a 2 MiB stack), an
-//   operator chain roughly 17 KiB per level (overflows near depth 123), and
-//   `CASE`/`UNION` nesting is lighter still. This is the binding constraint,
-//   because the executor runs on the caller stack, not the parse thread.
+// The cost of one nesting level is weighted per construct: each open level adds
+// its per-level stack cost, and the deepest weighted path must stay within the
+// budget. A single combined budget is required because the constructs can nest
+// inside one another and their frames add up on one call path. The scan is a
+// single iterative pass over the tokens with no recursion of its own.
 //
-// The downstream constraint is enforced as a weighted budget: each open nesting
-// level adds its per-level stack cost, and the deepest weighted path must stay
-// within a budget sized to leave headroom on a 2 MiB stack. A single combined
-// budget is required because the constructs can nest inside one another and their
-// frames add up on one call path. The scan is a single iterative pass over the
-// tokens with no recursion of its own.
+// A separate, smaller threshold (`SMALL_STACK_EXEC_BUDGET_KB`) decides whether a
+// query's execution must move to a large-stack thread: shallow queries (the
+// common case) execute inline on the caller stack, and only deeper ones pay the
+// thread hop.
 
-/// Per-level downstream stack cost (KiB), each padded above the measured value.
+/// Per-level stack cost (KiB), each padded above the measured value.
 const BRACKET_COST_KB: usize = 70;
 const CASE_COST_KB: usize = 14;
 const OP_COST_KB: usize = 21;
 const UNION_COST_KB: usize = 14;
-/// Maximum weighted downstream nesting cost (KiB). Sized to leave headroom for
-/// the caller's own frames on a 2 MiB worker-thread stack.
-const MAX_NESTING_COST_KB: usize = 1000;
+/// Maximum weighted nesting cost (KiB) accepted at all. Sized so realistic deep
+/// input (for example a 40-deep nested literal) parses and executes on the
+/// large-stack threads, while genuinely pathological input (thousands of levels)
+/// that would overflow even those is still rejected up front.
+const MAX_NESTING_COST_KB: usize = 12_000;
+
+/// Weighted nesting cost (KiB) up to which a query executes inline on the
+/// caller stack. Above it, execution moves to a large-stack thread, because
+/// expression evaluation recurses with the nesting depth and a deeply nested
+/// literal would otherwise overflow a small (for example 2 MiB) worker stack.
+pub(crate) const SMALL_STACK_EXEC_BUDGET_KB: usize = 1000;
 
 /// Parse stays on the caller stack only when bracket and `CASE` nesting (the
 /// parser's costly frames) and the operator and `UNION` depth are all small
@@ -5223,7 +5226,7 @@ const INLINE_UNION_DEPTH: usize = 16;
 /// Stack size for the dedicated parse thread used for deeper inputs. Large enough
 /// for any input within `MAX_NESTING_COST_KB`; the address space is reserved
 /// lazily, so only pages actually touched by a given parse cost memory.
-const PARSE_THREAD_STACK: usize = 128 * 1024 * 1024;
+const PARSE_THREAD_STACK: usize = 256 * 1024 * 1024;
 
 /// A token is an operator (it makes the expression parser recurse on an operand)
 /// when it is one of these keywords.
@@ -5231,6 +5234,35 @@ fn is_operator_keyword(name: &str) -> bool {
     matches!(
         name.to_ascii_uppercase().as_str(),
         "AND" | "OR" | "XOR" | "NOT" | "IN" | "IS" | "CONTAINS" | "STARTS" | "ENDS"
+    )
+}
+
+/// A keyword that begins a clause, and therefore a fresh expression context. The
+/// operator chain accumulated in the previous clause ends here, so it no longer
+/// contributes to the deepest call path. A genuine deep operator chain lives
+/// inside a single expression and contains none of these, so resetting at a
+/// clause boundary never hides one.
+fn is_clause_keyword(name: &str) -> bool {
+    matches!(
+        name.to_ascii_uppercase().as_str(),
+        "MATCH"
+            | "OPTIONAL"
+            | "CREATE"
+            | "MERGE"
+            | "DELETE"
+            | "DETACH"
+            | "SET"
+            | "REMOVE"
+            | "RETURN"
+            | "WITH"
+            | "WHERE"
+            | "UNWIND"
+            | "CALL"
+            | "YIELD"
+            | "FOREACH"
+            | "ORDER"
+            | "SKIP"
+            | "LIMIT"
     )
 }
 
@@ -5283,11 +5315,7 @@ fn scan_nesting(tokens: &[(Tok, SimpleSpan)]) -> Nesting {
             Tok::Comma => {
                 // A new list element or argument restarts the operator chain at
                 // this level.
-                if let Some(top) = frames.last_mut() {
-                    cost_kb -= top.op_run * OP_COST_KB;
-                    op_total -= top.op_run;
-                    top.op_run = 0;
-                }
+                reset_operator_run(&mut frames, &mut cost_kb, &mut op_total);
             }
             Tok::Semi => {
                 // Pipeline statements parse iteratively, so each segment starts
@@ -5325,6 +5353,13 @@ fn scan_nesting(tokens: &[(Tok, SimpleSpan)]) -> Nesting {
                     cost_kb += UNION_COST_KB;
                 } else if is_operator_keyword(name) {
                     add_operator(&mut frames, &mut cost_kb, &mut op_total);
+                } else if is_clause_keyword(name) {
+                    // A clause boundary ends the previous clause's operator chain.
+                    // A relationship pattern's leading dash (`-[:T]->`) lexes as a
+                    // subtraction operator, so without this reset a flat query with
+                    // many sibling clauses (each holding pattern dashes) would
+                    // accumulate operator cost across breadth and read as deep.
+                    reset_operator_run(&mut frames, &mut cost_kb, &mut op_total);
                 }
             }
             _ => {}
@@ -5347,6 +5382,18 @@ fn add_operator(frames: &mut [Frame], cost_kb: &mut usize, op_total: &mut usize)
     *op_total += 1;
 }
 
+/// End the operator chain accumulated directly inside the innermost open level,
+/// deducting its stack-cost contribution. A comma (a new list element or
+/// argument) and a clause keyword (a fresh expression context) both terminate
+/// the current chain, so it no longer counts toward the deepest call path.
+fn reset_operator_run(frames: &mut [Frame], cost_kb: &mut usize, op_total: &mut usize) {
+    if let Some(top) = frames.last_mut() {
+        *cost_kb -= top.op_run * OP_COST_KB;
+        *op_total -= top.op_run;
+        top.op_run = 0;
+    }
+}
+
 /// Pop the innermost open level, deducting its contribution. The top-level frame
 /// is never popped; an unbalanced closer is left for the real parser to report.
 fn close_frame(frames: &mut Vec<Frame>, cost_kb: &mut usize, op_total: &mut usize) {
@@ -5362,6 +5409,15 @@ fn close_frame(frames: &mut Vec<Frame>, cost_kb: &mut usize, op_total: &mut usiz
 
 /// Parse a Cypher query string into a `Statement` AST.
 pub fn parse(cypher: &str) -> Result<Statement, CypherError> {
+    parse_with_exec_depth(cypher).map(|(stmt, _)| stmt)
+}
+
+/// Parse a Cypher query string, also reporting whether its expression nesting is
+/// deep enough that execution must run on a large-stack thread. Evaluation
+/// recurses with the nesting depth, so a deeply nested literal would overflow a
+/// small worker stack; the executor uses this flag to move such a query off the
+/// caller stack. The flag is `false` for the common shallow case.
+pub(crate) fn parse_with_exec_depth(cypher: &str) -> Result<(Statement, bool), CypherError> {
     let tokens = lexer().parse(cypher).into_result().map_err(|errs| {
         let msg = errs
             .into_iter()
@@ -5406,8 +5462,8 @@ pub fn parse(cypher: &str) -> Result<Statement, CypherError> {
     let inline = nesting.bracket_case <= INLINE_BRACKET_CASE_DEPTH
         && nesting.op <= INLINE_OP_DEPTH
         && nesting.union <= INLINE_UNION_DEPTH;
-    if inline {
-        run()
+    let stmt = if inline {
+        run()?
     } else {
         std::thread::scope(|scope| {
             let handle = std::thread::Builder::new()
@@ -5417,8 +5473,11 @@ pub fn parse(cypher: &str) -> Result<Statement, CypherError> {
             handle
                 .join()
                 .map_err(|_| CypherError::Parse("parse thread panicked".to_string()))?
-        })
-    }
+        })?
+    };
+
+    let exec_needs_large_stack = nesting.cost_kb > SMALL_STACK_EXEC_BUDGET_KB;
+    Ok((stmt, exec_needs_large_stack))
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -5967,5 +6026,54 @@ mod tests {
             "RETURN 1 AS x UNION RETURN 2 AS x UNION RETURN 3 AS x",
         ));
         assert_eq!(unions.union, 2);
+    }
+
+    /// A flat query with many sibling clauses must not read as deeply nested. A
+    /// relationship pattern's leading dash (`-[:T]->`) lexes as a subtraction
+    /// operator, so without a clause-boundary reset the operator cost summed
+    /// across every clause. Regression for the openCypher TCK
+    /// `Create4 [2] Many CREATE clauses` scenario, which the guard wrongly
+    /// rejected as too deeply nested.
+    #[test]
+    fn many_flat_clauses_with_pattern_dashes_parse() {
+        let lex = |q: &str| lexer().parse(q).into_result().unwrap();
+
+        let mut q = String::from("CREATE (hf:School {name: 'X'})\n");
+        for i in 0..80 {
+            q.push_str(&format!(
+                "CREATE (hf)-[:STAFF]->(t{i}:Teacher {{name: 'N{i}'}})\n"
+            ));
+        }
+        // The pattern dashes do not accumulate across clauses.
+        let nesting = scan_nesting(&lex(&q));
+        assert!(
+            nesting.op <= 1,
+            "operator depth {} must not grow with the clause count",
+            nesting.op
+        );
+        assert!(parse(&q).is_ok(), "a flat many-clause query must parse");
+    }
+
+    /// The clause-boundary reset ends only the previous clause's operator chain.
+    /// A genuine deep chain within one expression contains no clause keyword, so
+    /// it still registers its full depth, and one long enough to exceed the
+    /// budget is still rejected.
+    #[test]
+    fn clause_reset_does_not_hide_a_deep_single_chain() {
+        let lex = |q: &str| lexer().parse(q).into_result().unwrap();
+
+        // A chain whose weighted operator cost exceeds the maximum budget.
+        let n = MAX_NESTING_COST_KB / OP_COST_KB + 50;
+        let chain = std::iter::repeat("1")
+            .take(n + 1)
+            .collect::<Vec<_>>()
+            .join(" - ");
+        let nesting = scan_nesting(&lex(&format!("RETURN {chain} AS x")));
+        assert!(
+            nesting.op >= n,
+            "a long single-clause operator chain must still register depth, got {}",
+            nesting.op
+        );
+        assert!(parse(&format!("RETURN {chain} AS x")).is_err());
     }
 }

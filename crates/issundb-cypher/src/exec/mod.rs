@@ -29,6 +29,13 @@ use write::{
     execute_set_and_return,
 };
 
+/// Stack size for the dedicated thread that executes a deeply nested query.
+/// Expression evaluation recurses with the source nesting depth, so this must
+/// comfortably exceed the deepest accepted nesting (`MAX_NESTING_COST_KB`) at the
+/// executor's per-level frame cost. The address space is reserved lazily, so only
+/// pages a given query actually touches cost memory.
+const EXEC_THREAD_STACK: usize = 256 * 1024 * 1024;
+
 /// The tabular result of a Cypher query execution.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct QueryResult {
@@ -106,7 +113,31 @@ pub fn execute_with_procedures(
     params: &HashMap<String, serde_json::Value>,
     registry: &crate::procedure::ProcedureRegistry,
 ) -> Result<QueryResult, CypherError> {
-    let stmt = parser::parse(cypher)?;
+    let (stmt, exec_needs_large_stack) = parser::parse_with_exec_depth(cypher)?;
+
+    // Expression evaluation recurses with the source nesting depth, so a deeply
+    // nested literal (the parser admits these, since the parse itself runs on a
+    // large-stack thread) would overflow a small worker stack at execution. When
+    // the parser flags such depth, run the whole statement on a large-stack
+    // thread. The statement clock is thread-local, so it is installed inside the
+    // worker, not on the caller. Shallow queries (the common case) execute inline.
+    if exec_needs_large_stack {
+        return std::thread::scope(|scope| {
+            let handle = std::thread::Builder::new()
+                .stack_size(EXEC_THREAD_STACK)
+                .spawn_scoped(scope, || {
+                    let _clock = expr::StatementClock::install();
+                    execute_statement(graph, &stmt, params, registry)
+                })
+                .map_err(|e| {
+                    CypherError::Execution(format!("failed to spawn execution thread: {e}"))
+                })?;
+            handle
+                .join()
+                .map_err(|_| CypherError::Execution("execution thread panicked".to_string()))?
+        });
+    }
+
     // Freeze a single wall-clock instant for the whole statement so that all current-time
     // functions (date(), datetime(), and the like) within this query observe the same time.
     let _clock = expr::StatementClock::install();
@@ -3959,15 +3990,16 @@ mod tests {
         assert!(execute(&graph, &deep, &HashMap::new()).is_err());
     }
 
-    /// The parser guard's budget keeps an accepted query's recursion (parse,
-    /// plan, optimize, and execute) within a small worker-thread stack. Running
-    /// the deepest accepted shapes on a 2 MiB stack must complete, not overflow.
-    /// If a future change loosens the budget past what the executor can handle on
-    /// a small stack, this test aborts and flags the regression.
+    /// A query shallow enough to execute inline (cost at or below
+    /// `SMALL_STACK_EXEC_BUDGET_KB`) must complete on a small worker stack, not
+    /// overflow. This pins the inline-execution regime: if a future change pushes
+    /// the inline threshold past what the executor can handle on a small stack,
+    /// this test aborts and flags the regression. Deeper queries are covered by
+    /// `deeply_nested_literal_executes_via_large_stack`.
     #[test]
     fn near_budget_queries_run_on_a_small_stack() {
-        // A nested-list expression close to the bracket budget, plus a long
-        // operator chain close to the operator budget. Both pass the guard.
+        // A nested-list expression and an operator chain, both within the
+        // inline-execution budget so they stay on the caller stack.
         let mut list = String::from("1");
         for _ in 0..12 {
             list = format!("[{}]", list);
@@ -3990,6 +4022,50 @@ mod tests {
                     // Parsing and execution must complete without overflowing.
                     let _ = execute(&graph, q, &HashMap::new());
                 }
+            })
+            .unwrap();
+        handle.join().unwrap();
+    }
+
+    /// A deeply nested literal exceeds the inline-execution budget, so the
+    /// executor moves it to a large-stack thread. Run from a small worker stack
+    /// (the shape a server request handler has), it must execute to completion
+    /// and return the correct nested value, not overflow and abort the process.
+    /// This is the regression for the openCypher TCK deep-nested-literal
+    /// scenarios, which the recursion guard would otherwise reject outright.
+    #[test]
+    fn deeply_nested_literal_executes_via_large_stack() {
+        let depth = 40usize;
+        let list = format!("{}1{}", "[".repeat(depth), "]".repeat(depth));
+        let mut map = String::from("1");
+        for _ in 0..depth {
+            map = format!("{{a: {map}}}");
+        }
+
+        let handle = std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || {
+                let pad = [0u8; 256 * 1024];
+                std::hint::black_box(&pad);
+                let dir = TempDir::new().unwrap();
+                let graph = Graph::open(dir.path(), 1).unwrap();
+
+                let res = execute(&graph, &format!("RETURN {list} AS x"), &HashMap::new())
+                    .expect("deep list must execute");
+                // Unwrap the 40 nested arrays down to the innermost integer.
+                let mut v = &res.records[0].values[0];
+                for _ in 0..depth {
+                    v = &v.as_array().expect("nested array")[0];
+                }
+                assert_eq!(v.as_i64(), Some(1));
+
+                let res = execute(&graph, &format!("RETURN {map} AS x"), &HashMap::new())
+                    .expect("deep map must execute");
+                let mut v = &res.records[0].values[0];
+                for _ in 0..depth {
+                    v = &v.as_object().expect("nested object")["a"];
+                }
+                assert_eq!(v.as_i64(), Some(1));
             })
             .unwrap();
         handle.join().unwrap();
