@@ -25,18 +25,26 @@ trap cleanup EXIT
 
 DB_PATH="$TEMP_DIR/db"
 IMPORT_CYPHER="$TEMP_DIR/import.cypher"
-NODES_JSONL="$TEMP_DIR/nodes.jsonl"
 NODES_CSV="$TEMP_DIR/nodes.csv"
+EDGES_CSV="$TEMP_DIR/edges.csv"
 OUTPUT_TXT="$TEMP_DIR/output.txt"
 BACKUP_DB="$TEMP_DIR/backup.db"
 COMPACT_DB="$TEMP_DIR/compact.db"
 
-# Create mock data files
+# Create mock data files.
+# Node CSV: header row plus one node per row; the `:import-nodes` label is an
+# argument, so the `Id` column becomes the auto-indexed domain key.
 echo "MATCH (n) RETURN n" > "$IMPORT_CYPHER"
-echo '{"label": "Person", "props": {"name": "Eve"}}' > "$NODES_JSONL"
 cat <<EOF > "$NODES_CSV"
-label,name
-Person,Grace
+Id,name
+p1,Grace
+p2,Heidi
+EOF
+# Edge CSV: header row plus two columns of source/destination `Id` keys, which
+# import-edges resolves against the imported nodes' auto-indexed `Id` property.
+cat <<EOF > "$EDGES_CSV"
+src_id,dst_id
+p1,p2
 EOF
 
 echo "Running end-to-end CLI integration test..."
@@ -87,8 +95,8 @@ query MATCH (n) RETURN n
 :backup-compact $COMPACT_DB
 EXPORT DATABASE '$TEMP_DIR/db_export' WITH {format: 'parquet'}
 IMPORT DATABASE '$TEMP_DIR/db_export'
-:import-jsonl $NODES_JSONL
-:import-csv $NODES_CSV
+:import-nodes $NODES_CSV Person
+:import-edges $EDGES_CSV Person Person KNOWS
 rebuild-csr
 delete-edge 0
 delete-node 0
