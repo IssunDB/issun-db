@@ -140,18 +140,16 @@ enum ReplCommand {
         dst: PathBuf,
     },
 
-    /// Import nodes from a JSONL file (e.g., `:import-jsonl ./nodes.jsonl`)
-    #[command(name = ":import-jsonl")]
-    ImportJsonl {
-        /// Path to the JSONL file
+    /// Bulk-import nodes from a CSV file whose columns become node properties
+    /// (e.g., `:import-nodes ./users.csv User`). The first row is the header and
+    /// every remaining row is one node of the given label. Rows are inserted in
+    /// batched transactions.
+    #[command(name = ":import-nodes")]
+    ImportNodes {
+        /// Path to the CSV file (header row plus one node per row)
         file: String,
-    },
-
-    /// Import nodes from a CSV file (e.g., `:import-csv ./nodes.csv`)
-    #[command(name = ":import-csv")]
-    ImportCsv {
-        /// Path to the CSV file
-        file: String,
+        /// Label applied to every imported node
+        label: String,
     },
 
     /// Bulk-import edges from a two-column CSV of source/destination domain keys
@@ -516,8 +514,7 @@ Backup and Import
   :backup <file>                       Write a hot backup snapshot of the database (e.g., :backup ./backup.db)
   :backup-compact <file>               Write a compacted backup snapshot of the database (e.g., :backup-compact ./compact.db)
   :restore <snapshot> <dst>            Restore a snapshot into a new database directory (e.g., :restore ./snap.db ./restored)
-  :import-jsonl <file>                 Import nodes from a JSONL file (e.g., :import-jsonl ./nodes.jsonl)
-  :import-csv <file>                   Import nodes from a CSV file (e.g., :import-csv ./nodes.csv)
+  :import-nodes <file> <label>         Bulk-import nodes from a CSV whose columns become properties (e.g., :import-nodes ./users.csv User)
   :import-edges <file> <src> <dst> <type>  Bulk-import edges from a 2-column CSV of domain keys (e.g., :import-edges ./e.csv User Kernel AUTHORED_KERNEL)
   rebuild-csr                          Rebuild the CSR snapshot cache
 
@@ -874,11 +871,8 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
                 Err(e) => eprintln!("restore failed: {e}"),
             }
         }
-        ReplCommand::ImportJsonl { file } => {
-            cmd_import_jsonl(state, &file);
-        }
-        ReplCommand::ImportCsv { file } => {
-            cmd_import_csv(state, &file);
+        ReplCommand::ImportNodes { file, label } => {
+            cmd_import_nodes(state, &file, &label);
         }
         ReplCommand::ImportEdges {
             file,
@@ -1645,67 +1639,6 @@ fn colorize_prompt(
 // Batch import helpers
 // ---------------------------------------------------------------------------
 
-fn cmd_import_jsonl(state: &mut State, path: &str) {
-    let g = match state.graph.as_ref() {
-        Some(g) => g,
-        None => {
-            eprintln!("no database open");
-            return;
-        }
-    };
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("cannot read {path}: {e}");
-            return;
-        }
-    };
-
-    let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
-    let total = lines.len();
-    let mut errors = 0usize;
-
-    // Parse all lines first to fail fast on malformed input.
-    let mut entries: Vec<(String, serde_json::Value)> = Vec::with_capacity(total);
-    for (i, line) in lines.iter().enumerate() {
-        match serde_json::from_str::<serde_json::Value>(line) {
-            Ok(v) => {
-                let label = v
-                    .get("label")
-                    .and_then(|l| l.as_str())
-                    .unwrap_or("Node")
-                    .to_owned();
-                let props = v
-                    .get("props")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Object(Default::default()));
-                entries.push((label, props));
-            }
-            Err(e) => {
-                eprintln!("line {}: parse error: {e}", i + 1);
-                errors += 1;
-            }
-        }
-    }
-
-    if errors > 0 {
-        eprintln!("import aborted: {errors} parse error(s) found");
-        return;
-    }
-
-    // Batch-insert in one write transaction.
-    let ok = entries.len();
-    match g.update(|txn| {
-        for (label, props) in &entries {
-            txn.add_node(label, props)?;
-        }
-        Ok(())
-    }) {
-        Ok(_) => eprintln!("imported {ok}/{total} nodes"),
-        Err(e) => eprintln!("import failed: {e}"),
-    }
-}
-
 fn parse_csv_line(s: &str) -> Vec<String> {
     let mut cols = Vec::new();
     let mut current = String::new();
@@ -1731,7 +1664,35 @@ fn parse_csv_line(s: &str) -> Vec<String> {
     cols
 }
 
-fn cmd_import_csv(state: &mut State, path: &str) {
+/// Infer a JSON value from a raw CSV cell. Empty cells become null, integers and
+/// floats become numbers, `true`/`false` become booleans, and anything else
+/// stays a string. The `Id` column relies on this so integer keys index as
+/// integers and name keys index as strings.
+fn csv_cell_to_value(val_str: &str) -> serde_json::Value {
+    if val_str.is_empty() {
+        serde_json::Value::Null
+    } else if let Ok(n) = val_str.parse::<i64>() {
+        serde_json::Value::Number(n.into())
+    } else if let Ok(f) = val_str.parse::<f64>() {
+        serde_json::json!(f)
+    } else if val_str.eq_ignore_ascii_case("true") {
+        serde_json::Value::Bool(true)
+    } else if val_str.eq_ignore_ascii_case("false") {
+        serde_json::Value::Bool(false)
+    } else {
+        serde_json::Value::String(val_str.to_owned())
+    }
+}
+
+/// Bulk-import nodes from a CSV file whose columns become node properties.
+///
+/// The first non-empty line is the header and supplies the property names; each
+/// remaining row is one node carrying `label`. Cell values are typed by
+/// [`csv_cell_to_value`]. Nodes are inserted in fixed-size batches, each its own
+/// write transaction, mirroring `:import-edges` so memory stays bounded
+/// regardless of file size. The label is a command argument, so the CSV does not
+/// carry a leading label column.
+fn cmd_import_nodes(state: &mut State, path: &str, label: &str) {
     let g = match state.graph.as_ref() {
         Some(g) => g,
         None => {
@@ -1762,48 +1723,38 @@ fn cmd_import_csv(state: &mut State, path: &str) {
         return;
     }
 
-    // First column contains the node label; remaining columns become properties.
-    let prop_headers = &headers[1..];
-    let mut entries: Vec<(String, serde_json::Value)> = Vec::new();
-
+    // Every column is a property; the label comes from the command argument.
+    let mut entries: Vec<serde_json::Value> = Vec::new();
     for line in lines {
         let cols = parse_csv_line(line);
-        let label = cols
-            .first()
-            .map(|s| s.as_str())
-            .unwrap_or("Node")
-            .to_owned();
         let mut props = serde_json::Map::new();
-        for (j, header) in prop_headers.iter().enumerate() {
-            let val_str = cols.get(j + 1).map(|s| s.as_str()).unwrap_or("");
-            let val = if val_str.is_empty() {
-                serde_json::Value::Null
-            } else if let Ok(n) = val_str.parse::<i64>() {
-                serde_json::Value::Number(n.into())
-            } else if let Ok(f) = val_str.parse::<f64>() {
-                serde_json::json!(f)
-            } else if val_str.eq_ignore_ascii_case("true") {
-                serde_json::Value::Bool(true)
-            } else if val_str.eq_ignore_ascii_case("false") {
-                serde_json::Value::Bool(false)
-            } else {
-                serde_json::Value::String(val_str.to_owned())
-            };
-            props.insert(header.to_owned(), val);
+        for (j, header) in headers.iter().enumerate() {
+            let val_str = cols.get(j).map(|s| s.as_str()).unwrap_or("");
+            props.insert(header.to_owned(), csv_cell_to_value(val_str));
         }
-        entries.push((label, serde_json::Value::Object(props)));
+        entries.push(serde_json::Value::Object(props));
     }
 
+    const BATCH: usize = 50_000;
     let total = entries.len();
-    match g.update(|txn| {
-        for (label, props) in &entries {
-            txn.add_node(label, props)?;
+    let mut inserted: u64 = 0;
+
+    for chunk in entries.chunks(BATCH) {
+        match g.update(|txn| {
+            for props in chunk {
+                txn.add_node(label, props)?;
+            }
+            Ok(())
+        }) {
+            Ok(_) => inserted += chunk.len() as u64,
+            Err(e) => {
+                eprintln!("node batch insert failed: {e}");
+                return;
+            }
         }
-        Ok(())
-    }) {
-        Ok(_) => eprintln!("imported {total} nodes from {path}"),
-        Err(e) => eprintln!("import failed: {e}"),
     }
+
+    eprintln!("imported {inserted}/{total} {label} nodes from {path}");
 }
 
 /// Resolve a domain key to a node id via the always-on scalar auto-index on
@@ -2145,5 +2096,48 @@ mod tests {
         let imports = g.view(|txn| txn.edge_count_by_type("IMPORTS")).unwrap();
         // Only (Kernel 100 -> Library "numpy") resolves; "pandas" has no node.
         assert_eq!(imports, 1);
+    }
+
+    #[test]
+    fn test_import_nodes_loads_csv_columns_as_properties() {
+        let temp = TempDir::new().unwrap();
+        let mut state = State::new(None, 1);
+        assert!(handle(
+            &mut state,
+            &format!(":open {}", temp.path().display())
+        ));
+
+        // Header columns become properties; the label is the command argument,
+        // so there is no leading label column.
+        let csv = temp.path().join("users.csv");
+        std::fs::write(&csv, "Id,name\n10,Alice\n20,Bob\n").unwrap();
+        assert!(handle(
+            &mut state,
+            &format!(":import-nodes {} User", csv.display())
+        ));
+
+        let g = state.graph.as_ref().unwrap();
+        let users = g.view(|txn| txn.nodes_by_label("User")).unwrap();
+        assert_eq!(users.len(), 2);
+
+        // Imported nodes resolve through the same auto-index the edge importer
+        // uses, with the integer `Id` typed as an integer.
+        let by_id = g
+            .view(|txn| txn.nodes_by_property("User", "Id", PropValue::Int(10)))
+            .unwrap();
+        assert_eq!(by_id.len(), 1);
+
+        // String-keyed nodes (e.g. Library) type their `Id` as a string.
+        let lib_csv = temp.path().join("libs.csv");
+        std::fs::write(&lib_csv, "Id\nnumpy\npandas\n").unwrap();
+        assert!(handle(
+            &mut state,
+            &format!(":import-nodes {} Library", lib_csv.display())
+        ));
+        let g = state.graph.as_ref().unwrap();
+        let by_name = g
+            .view(|txn| txn.nodes_by_property("Library", "Id", PropValue::Str("numpy".to_owned())))
+            .unwrap();
+        assert_eq!(by_name.len(), 1);
     }
 }
