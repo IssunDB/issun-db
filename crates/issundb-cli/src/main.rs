@@ -915,6 +915,30 @@ fn handle(state: &mut State, line: &str) -> bool {
         return true;
     }
 
+    // The `query`, `cypher`, and `:explain` commands carry a raw Cypher body.
+    // Route it verbatim instead of through tokenize_line, which strips the
+    // quotes that delimit Cypher string literals (so `query RETURN 'x'` keeps
+    // its literal rather than degrading to the bare variable `x`).
+    match classify_raw_cypher(line_trimmed) {
+        Some(RawCypher::Query(body)) => {
+            if body.is_empty() {
+                cli_eprintln!("usage: query <cypher>");
+            } else {
+                run_cypher(state, body);
+            }
+            return true;
+        }
+        Some(RawCypher::Explain(body)) => {
+            if body.is_empty() {
+                cli_eprintln!("usage: :explain <cypher>");
+            } else {
+                run_explain(state, body);
+            }
+            return true;
+        }
+        None => {}
+    }
+
     let tokens = tokenize_line(line_trimmed);
     if tokens.len() == 1 && (tokens[0] == "help" || tokens[0] == "-h" || tokens[0] == "--help") {
         print_help();
@@ -1741,6 +1765,20 @@ fn run_shell(state: &State, args: &[String]) {
 // Cypher execution
 // ---------------------------------------------------------------------------
 
+fn run_explain(state: &mut State, cypher: &str) {
+    let g = match state.graph.as_ref() {
+        Some(g) => g,
+        None => {
+            cli_eprintln!("no database open");
+            return;
+        }
+    };
+    match g.explain(cypher) {
+        Ok(plan) => print!("{plan}"),
+        Err(e) => cli_eprintln!("error: {e}"),
+    }
+}
+
 fn run_cypher(state: &mut State, cypher: &str) {
     let g = match state.graph.as_ref() {
         Some(g) => g,
@@ -2013,6 +2051,25 @@ fn split_cmd(s: &str) -> (&str, &str) {
     match s.find(' ') {
         None => (s, ""),
         Some(i) => (s[..i].trim(), s[i + 1..].trim()),
+    }
+}
+
+/// A REPL command whose argument is a raw Cypher body that must reach the
+/// engine verbatim, with its string-literal quotes intact.
+enum RawCypher<'a> {
+    Query(&'a str),
+    Explain(&'a str),
+}
+
+/// Classify a line that carries a raw Cypher body (`query`, its `cypher` alias,
+/// or `:explain`) and return the verbatim body. Returns `None` for any other
+/// command, which is then tokenized and parsed by clap as before.
+fn classify_raw_cypher(line: &str) -> Option<RawCypher<'_>> {
+    let (cmd, rest) = split_cmd(line);
+    match cmd {
+        "query" | "cypher" => Some(RawCypher::Query(rest)),
+        ":explain" => Some(RawCypher::Explain(rest)),
+        _ => None,
     }
 }
 
@@ -2509,6 +2566,32 @@ mod tests {
             split_cmd("cypher match (n) return n"),
             ("cypher", "match (n) return n")
         );
+    }
+
+    #[test]
+    fn classify_raw_cypher_preserves_quoted_literals() {
+        // A single-quoted string literal must survive verbatim, where
+        // tokenize_line would have stripped the quotes into a bare variable.
+        match classify_raw_cypher("query RETURN 'hello world' AS x") {
+            Some(RawCypher::Query(body)) => assert_eq!(body, "RETURN 'hello world' AS x"),
+            _ => panic!("expected a Query body"),
+        }
+        // The `cypher` alias behaves identically, including double quotes.
+        match classify_raw_cypher("cypher MATCH (n) WHERE n.p = \"a b\" RETURN n") {
+            Some(RawCypher::Query(body)) => {
+                assert_eq!(body, "MATCH (n) WHERE n.p = \"a b\" RETURN n")
+            }
+            _ => panic!("expected a Query body"),
+        }
+        // `:explain` carries the same raw body, quotes intact.
+        match classify_raw_cypher(":explain MATCH (n) WHERE n.p CONTAINS 'z' RETURN n") {
+            Some(RawCypher::Explain(body)) => {
+                assert_eq!(body, "MATCH (n) WHERE n.p CONTAINS 'z' RETURN n")
+            }
+            _ => panic!("expected an Explain body"),
+        }
+        // Any other command is left for clap to tokenize and parse.
+        assert!(classify_raw_cypher("add-node Person {\"name\": \"Alice\"}").is_none());
     }
 
     #[test]
