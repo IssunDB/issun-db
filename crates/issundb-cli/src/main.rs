@@ -505,7 +505,7 @@ enum ReplCommand {
 const HELP_TEXT: &str = r#"
 Database Control
   :open <path> [map_size_gb]           Open or reopen a database at the given path (e.g., :open ./issundb-data 2)
-  :close                               Close the open database without exiting the CLI (e.g., :close)
+  :close                               Close the open database without exiting the CLI
   :threads <count>                     Set the thread count for GraphBLAS computations (e.g., :threads 4)
 
 Scripting and Parameters
