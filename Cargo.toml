@@ -58,6 +58,7 @@ deepsize = { version = "0.2", features = ["derive"] }
 parquet = "59.0.0"
 arrow-array = "59.0.0"
 arrow-schema = "59.0.0"
+terminal_size = "0.4"
 
 [profile.release]
 strip = "debuginfo"

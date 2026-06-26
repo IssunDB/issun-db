@@ -641,7 +641,49 @@ System
   quit / exit                          Exit the CLI
 "#;
 
+/// Detected terminal width in columns, or a sane default when output is not a
+/// terminal (for example when the help is piped to a pager or file).
+fn terminal_columns() -> usize {
+    terminal_size::terminal_size()
+        .map(|(w, _)| w.0 as usize)
+        .filter(|w| *w > 0)
+        .unwrap_or(100)
+}
+
+/// Greedily word-wrap `text` into lines no wider than `width` columns. A single
+/// word longer than `width` is left on its own line rather than split mid-word.
+/// Always returns at least one line, empty when `text` has no words.
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        if current.is_empty() {
+            current.push_str(word);
+        } else if current.len() + 1 + word.len() <= width {
+            current.push(' ');
+            current.push_str(word);
+        } else {
+            lines.push(std::mem::take(&mut current));
+            current.push_str(word);
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
 fn print_help() {
+    // The syntax occupies a fixed left column; descriptions wrap in the
+    // remaining width with a hanging indent so continuation lines stay aligned.
+    let syntax_limit = 39;
+    let columns = terminal_columns();
+    let desc_width = columns.saturating_sub(syntax_limit).max(20);
+
     for line in HELP_TEXT.lines() {
         if line.trim().is_empty() {
             println!();
@@ -650,53 +692,56 @@ fn print_help() {
         let leading_spaces = line.len() - line.trim_start().len();
         if leading_spaces == 0 {
             println!("{}", line.bold().blue());
-        } else {
-            let syntax_limit = 39;
-            if line.len() < syntax_limit {
-                let trimmed = line.trim();
-                let (cmd, args) = if let Some(idx) = trimmed.find(['<', '[']) {
-                    let (c, a) = trimmed.split_at(idx);
-                    let cmd_trimmed = c.trim_end();
-                    let spaces_count = c.len() - cmd_trimmed.len();
-                    (cmd_trimmed, format!("{}{}", " ".repeat(spaces_count), a))
-                } else {
-                    (trimmed, "".to_owned())
-                };
-                let colored_cmd = if cmd.starts_with(':') {
-                    cmd.cyan()
-                } else {
-                    cmd.green()
-                };
-                println!("{}{}{}", " ".repeat(leading_spaces), colored_cmd, args);
+        } else if line.len() < syntax_limit {
+            let trimmed = line.trim();
+            let (cmd, args) = if let Some(idx) = trimmed.find(['<', '[']) {
+                let (c, a) = trimmed.split_at(idx);
+                let cmd_trimmed = c.trim_end();
+                let spaces_count = c.len() - cmd_trimmed.len();
+                (cmd_trimmed, format!("{}{}", " ".repeat(spaces_count), a))
             } else {
-                let (syntax, desc) = line.split_at(syntax_limit);
-                let trimmed_syntax = syntax.trim();
-                let (cmd, args) = if let Some(idx) = trimmed_syntax.find(['<', '[']) {
-                    let (c, a) = trimmed_syntax.split_at(idx);
-                    let cmd_trimmed = c.trim_end();
-                    let spaces_count = c.len() - cmd_trimmed.len();
-                    (cmd_trimmed, format!("{}{}", " ".repeat(spaces_count), a))
-                } else {
-                    (trimmed_syntax, "".to_owned())
-                };
-                let colored_cmd = if cmd.starts_with(':') {
-                    cmd.cyan()
-                } else {
-                    cmd.green()
-                };
+                (trimmed, "".to_owned())
+            };
+            let colored_cmd = if cmd.starts_with(':') {
+                cmd.cyan()
+            } else {
+                cmd.green()
+            };
+            println!("{}{}{}", " ".repeat(leading_spaces), colored_cmd, args);
+        } else {
+            let (syntax, desc) = line.split_at(syntax_limit);
+            let trimmed_syntax = syntax.trim();
+            let (cmd, args) = if let Some(idx) = trimmed_syntax.find(['<', '[']) {
+                let (c, a) = trimmed_syntax.split_at(idx);
+                let cmd_trimmed = c.trim_end();
+                let spaces_count = c.len() - cmd_trimmed.len();
+                (cmd_trimmed, format!("{}{}", " ".repeat(spaces_count), a))
+            } else {
+                (trimmed_syntax, "".to_owned())
+            };
+            let colored_cmd = if cmd.starts_with(':') {
+                cmd.cyan()
+            } else {
+                cmd.green()
+            };
 
-                let uncolored_len = cmd.len() + args.len();
-                let target_len = syntax.len() - leading_spaces;
-                let padding = target_len.saturating_sub(uncolored_len);
+            let uncolored_len = cmd.len() + args.len();
+            let target_len = syntax.len() - leading_spaces;
+            let padding = target_len.saturating_sub(uncolored_len);
 
-                print!(
-                    "{}{}{}{}",
-                    " ".repeat(leading_spaces),
-                    colored_cmd,
-                    args,
-                    " ".repeat(padding)
-                );
-                println!("{}", desc.dimmed());
+            // First wrapped line sits beside the syntax; later lines hang under
+            // the description column at `syntax_limit`.
+            let wrapped = wrap_text(desc.trim(), desc_width);
+            print!(
+                "{}{}{}{}",
+                " ".repeat(leading_spaces),
+                colored_cmd,
+                args,
+                " ".repeat(padding)
+            );
+            println!("{}", wrapped[0].dimmed());
+            for cont in &wrapped[1..] {
+                println!("{}{}", " ".repeat(syntax_limit), cont.dimmed());
             }
         }
     }
@@ -3215,6 +3260,23 @@ mod tests {
             .view(|txn| txn.edge_count_by_type("AUTHORED_KERNEL"))
             .unwrap();
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn wrap_text_respects_width_and_hangs_long_words() {
+        // Greedy fill: words pack until the next would exceed the width.
+        let lines = wrap_text("the quick brown fox jumps", 10);
+        assert_eq!(lines, vec!["the quick", "brown fox", "jumps"]);
+        for line in &lines {
+            assert!(line.len() <= 10);
+        }
+
+        // A word longer than the width is left whole on its own line.
+        let lines = wrap_text("short superlongunbreakableword end", 8);
+        assert_eq!(lines, vec!["short", "superlongunbreakableword", "end"]);
+
+        // Empty input still yields one (empty) line so indexing [0] is safe.
+        assert_eq!(wrap_text("", 10), vec![String::new()]);
     }
 
     #[test]

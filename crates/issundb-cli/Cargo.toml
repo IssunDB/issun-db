@@ -25,6 +25,7 @@ clap = { version = "4", features = ["derive", "env"] }
 parquet = { workspace = true }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
+terminal_size = { workspace = true }
 
 [dev-dependencies]
 tempfile.workspace = true
