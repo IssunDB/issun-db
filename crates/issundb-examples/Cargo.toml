@@ -37,5 +37,9 @@ name = "graph_analytics"
 path = "graph_analytics.rs"
 
 [[example]]
+name = "gds_cypher"
+path = "gds_cypher.rs"
+
+[[example]]
 name = "concurrent_ops"
 path = "concurrent_ops.rs"

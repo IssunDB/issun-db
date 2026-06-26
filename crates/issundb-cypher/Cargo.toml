@@ -14,6 +14,7 @@ rust-version.workspace = true
 issundb-core.workspace = true
 issundb-text.workspace = true
 issundb-vector.workspace = true
+issundb-retrieval.workspace = true
 ahash.workspace = true
 tracing.workspace = true
 thiserror.workspace = true

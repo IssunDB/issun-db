@@ -1508,7 +1508,7 @@ checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
 
 [[package]]
 name = "issundb"
-version = "0.1.0-alpha.12"
+version = "0.1.0-alpha.13"
 dependencies = [
  "criterion",
  "gherkin",
@@ -1526,20 +1526,24 @@ dependencies = [
 
 [[package]]
 name = "issundb-cli"
-version = "0.1.0-alpha.12"
+version = "0.1.0-alpha.13"
 dependencies = [
+ "arrow-array",
+ "arrow-schema",
  "clap",
  "colored",
  "issundb",
+ "parquet",
  "rmp-serde",
  "rustyline",
  "serde_json",
  "tempfile",
+ "terminal_size",
 ]
 
 [[package]]
 name = "issundb-core"
-version = "0.1.0-alpha.12"
+version = "0.1.0-alpha.13"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -1564,7 +1568,7 @@ dependencies = [
 
 [[package]]
 name = "issundb-cypher"
-version = "0.1.0-alpha.12"
+version = "0.1.0-alpha.13"
 dependencies = [
  "ahash",
  "arrow-array",
@@ -1574,6 +1578,7 @@ dependencies = [
  "chumsky",
  "criterion",
  "issundb-core",
+ "issundb-retrieval",
  "issundb-text",
  "issundb-vector",
  "parquet",
@@ -1589,7 +1594,7 @@ dependencies = [
 
 [[package]]
 name = "issundb-examples"
-version = "0.1.0-alpha.12"
+version = "0.1.0-alpha.13"
 dependencies = [
  "issundb",
  "rmp-serde",
@@ -1599,7 +1604,7 @@ dependencies = [
 
 [[package]]
 name = "issundb-graphblas"
-version = "0.1.0-alpha.12"
+version = "0.1.0-alpha.13"
 dependencies = [
  "issundb-graphblas-sys",
  "thiserror 2.0.18",
@@ -1607,7 +1612,7 @@ dependencies = [
 
 [[package]]
 name = "issundb-graphblas-sys"
-version = "0.1.0-alpha.12"
+version = "0.1.0-alpha.13"
 dependencies = [
  "bindgen",
  "cmake",
@@ -1616,7 +1621,7 @@ dependencies = [
 
 [[package]]
 name = "issundb-mcp"
-version = "0.1.0-alpha.12"
+version = "0.1.0-alpha.13"
 dependencies = [
  "anyhow",
  "axum",
@@ -1634,7 +1639,7 @@ dependencies = [
 
 [[package]]
 name = "issundb-py"
-version = "0.1.0-alpha.12"
+version = "0.1.0-alpha.13"
 dependencies = [
  "issundb",
  "pyo3",
@@ -1644,7 +1649,7 @@ dependencies = [
 
 [[package]]
 name = "issundb-rest"
-version = "0.1.0-alpha.12"
+version = "0.1.0-alpha.13"
 dependencies = [
  "anyhow",
  "axum",
@@ -1665,7 +1670,7 @@ dependencies = [
 
 [[package]]
 name = "issundb-retrieval"
-version = "0.1.0-alpha.12"
+version = "0.1.0-alpha.13"
 dependencies = [
  "ahash",
  "arrow-array",
@@ -1681,7 +1686,7 @@ dependencies = [
 
 [[package]]
 name = "issundb-text"
-version = "0.1.0-alpha.12"
+version = "0.1.0-alpha.13"
 dependencies = [
  "arrow-array",
  "criterion",
@@ -1696,7 +1701,7 @@ dependencies = [
 
 [[package]]
 name = "issundb-vector"
-version = "0.1.0-alpha.12"
+version = "0.1.0-alpha.13"
 dependencies = [
  "arrow-array",
  "criterion",
@@ -3003,6 +3008,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06794f8f6c5c898b3275aebefa6b8a1cb24cd2c6c79397ab15774837a0bc5755"
 dependencies = [
  "winapi-util",
+]
+
+[[package]]
+name = "terminal_size"
+version = "0.4.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "230a1b821ccbd75b185820a1f1ff7b14d21da1e442e22c0863ea5f08771a8874"
+dependencies = [
+ "rustix",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

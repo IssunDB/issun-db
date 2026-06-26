@@ -1,6 +1,6 @@
 # Code Examples
 
-This page provides practical examples demonstrating vector search, full-text search, Cypher query execution, and GraphBLAS algorithm execution.
+This page provides practical examples demonstrating vector search, full-text search, Cypher query execution, GraphBLAS algorithm execution, and the graph data science procedures and functions exposed through Cypher.
 
 ## Vector Search Example
 
@@ -148,4 +148,68 @@ fn run_algorithms(graph: &Graph) -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+```
+
+## Graph Data Science in Cypher
+
+The analytics, pathfinding, and retrieval algorithms are also reachable from Cypher, so a query author can run them and feed the results into ordinary `MATCH`, `WHERE`, and `RETURN` clauses without dropping to the Rust API. There are two surfaces: built-in `CALL issundb.*` procedures and the `issundb.distance.*` and `issundb.similarity.*` scalar functions. A runnable end-to-end tour lives in `crates/issundb-examples/gds_cypher.rs` (`cargo run -p issundb-examples --example gds_cypher`).
+
+### Built-in Procedures
+
+Every procedure runs the algorithm against the live graph and yields one row per result. A procedure's `YIELD` columns are bound for the rest of the query, so `nodeId` joins back to the matched nodes through `id()`.
+
+| Procedure | Optional configuration | Yields |
+| --- | --- | --- |
+| `issundb.pageRank` | `{iterations, damping}` | `nodeId, score` |
+| `issundb.betweenness` | none | `nodeId, score` |
+| `issundb.harmonic` | none | `nodeId, score` |
+| `issundb.degree` | `{direction: 'IN'|'OUT'|'BOTH'}` | `nodeId, score` |
+| `issundb.connectedComponents` (alias `issundb.wcc`) | none | `nodeId, componentId` |
+| `issundb.stronglyConnectedComponents` (alias `issundb.scc`) | none | `nodeId, componentId` |
+| `issundb.labelPropagation` | `{maxIterations}` | `nodeId, communityId` |
+| `issundb.communities` | `{maxIterations, topPerCommunity}` | `communityId, nodeId, rank` |
+| `issundb.shortestPath` | requires `(srcId, dstId)` | `index, nodeId` |
+| `issundb.dijkstra` | requires `(srcId, dstId)` | `index, nodeId, totalWeight` |
+| `issundb.triangleCount` | `{relTypes, labels}` | `count` |
+| `issundb.retrieve.vector` | requires `queryVector`, then `{k, hops, maxDistance, maxNodes}` | `nodeId, distance` |
+| `issundb.retrieve.hybrid` | requires `queryVector, queryText`, then `{vectorK, textK, hops, maxDistance, maxNodes, textLabel, textProperty, vectorLabel, fusion}` | `nodeId, score` |
+
+PageRank, ranked and joined back to node names:
+
+```cypher
+CALL issundb.pageRank({iterations: 20, damping: 0.85}) YIELD nodeId, score
+MATCH (p:Person) WHERE id(p) = nodeId
+RETURN p.name AS name, score
+ORDER BY score DESC
+```
+
+GraphRAG retrieval seeds on the nearest embeddings, fuses in full-text hits, and expands the requested number of hops. Seed nodes carry a score, and expansion-only nodes carry a null score:
+
+```cypher
+CALL issundb.retrieve.hybrid([0.20, 0.85], 'machine learning',
+  {vectorK: 2, textK: 2, textLabel: 'Person', textProperty: 'bio', hops: 1})
+  YIELD nodeId, score
+MATCH (p:Person) WHERE id(p) = nodeId
+RETURN p.name AS name, score
+ORDER BY score IS NULL, score DESC
+```
+
+### Comparison Functions
+
+Four scalar functions compare two values pairwise. Vector measures are distances (lower is more similar), and set measures are similarities (higher is more similar). A vector argument is either a numeric list or a node, in which case its stored embedding is resolved.
+
+| Function | Operates on | Returns |
+| --- | --- | --- |
+| `issundb.distance.cosine(a, b)` | vectors | cosine distance, in `[0, 2]` |
+| `issundb.distance.euclidean(a, b)` | vectors | Euclidean (L2) distance, in `[0, ∞)` |
+| `issundb.similarity.jaccard(a, b)` | sets (lists) | Jaccard similarity, in `[0, 1]` |
+| `issundb.similarity.overlap(a, b)` | sets (lists) | overlap coefficient, in `[0, 1]` |
+
+Each measure has a single canonical form, so the opposite direction is a short inline expression rather than a separate function: cosine similarity is `1 - issundb.distance.cosine(a, b)`, Euclidean similarity is `1.0 / (1.0 + issundb.distance.euclidean(a, b))`, and a set distance is `1 - issundb.similarity.jaccard(a, b)`. A null operand, or a vector length mismatch, yields null.
+
+```cypher
+MATCH (a:Person {name: 'Alice'}), (e:Person {name: 'Erin'})
+RETURN issundb.distance.cosine(a, e) AS cosineDistance,
+       1 - issundb.distance.cosine(a, e) AS cosineSimilarity,
+       issundb.similarity.jaccard(a.skills, e.skills) AS skillJaccard
 ```

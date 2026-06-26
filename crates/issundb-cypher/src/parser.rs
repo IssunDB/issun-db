@@ -626,10 +626,17 @@ pub(crate) fn expr_parser<'a>() -> impl Parser<'a, ParserInput<'a>, Expr, Parser
             .then_ignore(sym(Tok::RParen))
             .map(|(name, args)| Expr::FunctionCall { name, args });
 
-        // Namespace-qualified function calls: date.truncate(...), duration.between(...), etc.
+        // Namespace-qualified function calls: date.truncate(...), duration.between(...), and
+        // deeper-namespaced built-ins such as issundb.distance.cosine(...). The name is a
+        // dot-separated chain of two or more segments.
         let dotted_fn_call = identifier()
-            .then_ignore(sym(Tok::Dot))
-            .then(identifier())
+            .then(
+                sym(Tok::Dot)
+                    .ignore_then(identifier())
+                    .repeated()
+                    .at_least(1)
+                    .collect::<Vec<String>>(),
+            )
             .then_ignore(sym(Tok::LParen))
             .then(
                 expr.clone()
@@ -638,9 +645,13 @@ pub(crate) fn expr_parser<'a>() -> impl Parser<'a, ParserInput<'a>, Expr, Parser
                     .collect::<Vec<Expr>>(),
             )
             .then_ignore(sym(Tok::RParen))
-            .map(|((namespace, func), args)| Expr::FunctionCall {
-                name: format!("{}.{}", namespace, func),
-                args,
+            .map(|((head, rest), args)| {
+                let mut name = head;
+                for segment in rest {
+                    name.push('.');
+                    name.push_str(&segment);
+                }
+                Expr::FunctionCall { name, args }
             });
 
         // filter(var IN list WHERE predicate) -> list comprehension without transform
@@ -3450,6 +3461,10 @@ fn is_known_function(name: &str) -> bool {
             | "relationships"
             | "rels"
             | "vector_dist"
+            | "issundb.distance.cosine"
+            | "issundb.distance.euclidean"
+            | "issundb.similarity.jaccard"
+            | "issundb.similarity.overlap"
     )
 }
 

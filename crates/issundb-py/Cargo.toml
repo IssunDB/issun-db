@@ -10,9 +10,13 @@ homepage.workspace = true
 rust-version.workspace = true
 publish = false
 
+# The lib must be named `issundb` because that is the Python import name
+# (the `#[pymodule]` and maturin `module-name`). Only a `cdylib` is needed: the wheel
+# consumes it and no Rust crate links this one. Emitting an `rlib` would collide
+# with the `issundb` facade crate's `libissundb.rlib` output.
 [lib]
 name = "issundb"
-crate-type = ["cdylib", "rlib"]
+crate-type = ["cdylib"]
 doc = false
 
 [features]
