@@ -1739,8 +1739,192 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
 // Script execution
 // ---------------------------------------------------------------------------
 
-/// Execute a script file line by line, stopping at the first failing command.
-/// Returns `true` if the whole script ran without an error, `false` otherwise.
+/// One logical statement extracted from a script file, paired with the 1-based
+/// line where it begins (for error reporting).
+struct ScriptStmt {
+    line: usize,
+    text: String,
+}
+
+/// The Clap subcommand names, used to recognize a command line during script
+/// segmentation so a bare Cypher statement does not swallow a following command.
+fn command_names() -> Vec<String> {
+    ReplCommand::command()
+        .get_subcommands()
+        .map(|c| c.get_name().to_string())
+        .collect()
+}
+
+/// Whether `line` begins a bare Cypher statement: its first token is a Cypher
+/// clause keyword. These statements may span physical lines and are terminated
+/// by `;`. The `query`, `cypher`, and `:explain` prefixed forms are not bare
+/// Cypher; they stay single-line and route through `handle` as before.
+fn is_bare_cypher_start(line: &str) -> bool {
+    match line.split_whitespace().next() {
+        Some(tok) => CYPHER_KEYWORDS.contains(&tok.to_ascii_uppercase().as_str()),
+        None => false,
+    }
+}
+
+/// Whether `line` begins a meta or data command rather than a Cypher
+/// continuation. A command can never continue a Cypher statement, so during
+/// bare-Cypher accumulation such a line ends the current statement.
+fn is_command_line(line: &str, command_names: &[&str]) -> bool {
+    match line.split_whitespace().next() {
+        Some(tok) => tok.starts_with(':') || command_names.contains(&tok),
+        None => false,
+    }
+}
+
+/// Find the byte index of the first `;` in `s` that is at top level: not inside
+/// a single-, double-, or backtick-quoted span, and not inside a `//` line
+/// comment or a `/* */` block comment. Returns `None` when there is no such
+/// terminator. Used to split a Cypher buffer into statements without mistaking a
+/// `;` inside a string literal or comment for a terminator.
+fn find_top_level_semicolon(s: &str) -> Option<usize> {
+    #[derive(PartialEq)]
+    enum St {
+        Normal,
+        Single,
+        Double,
+        Backtick,
+        LineComment,
+        BlockComment,
+    }
+    let bytes = s.as_bytes();
+    let mut st = St::Normal;
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        match st {
+            St::Normal => match c {
+                b'\'' => st = St::Single,
+                b'"' => st = St::Double,
+                b'`' => st = St::Backtick,
+                b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'/' => {
+                    st = St::LineComment;
+                    i += 1;
+                }
+                b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
+                    st = St::BlockComment;
+                    i += 1;
+                }
+                b';' => return Some(i),
+                _ => {}
+            },
+            // A backslash escapes the next byte inside a string literal.
+            St::Single => match c {
+                b'\\' => i += 1,
+                b'\'' => st = St::Normal,
+                _ => {}
+            },
+            St::Double => match c {
+                b'\\' => i += 1,
+                b'"' => st = St::Normal,
+                _ => {}
+            },
+            St::Backtick => {
+                if c == b'`' {
+                    st = St::Normal;
+                }
+            }
+            St::LineComment => {
+                if c == b'\n' {
+                    st = St::Normal;
+                }
+            }
+            St::BlockComment => {
+                if c == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                    st = St::Normal;
+                    i += 1;
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Segment script `content` into logical statements. Blank lines and `//` or
+/// `--` comment lines at a statement boundary are skipped. A meta, data, or
+/// `query`/`cypher`/`:explain` line is one single-line statement. A bare Cypher
+/// statement accumulates across physical lines until a `;` terminator, a blank
+/// or comment line, the start of a command, or end of file, and one buffer may
+/// hold several `;`-separated statements. Newlines inside a statement are
+/// preserved so the Cypher parser sees the original layout. Pure and free of
+/// side effects so the segmentation can be unit tested without a graph.
+fn segment_script(content: &str, command_names: &[&str]) -> Vec<ScriptStmt> {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i].trim();
+        if line.is_empty() || line.starts_with("//") || line.starts_with("--") {
+            i += 1;
+            continue;
+        }
+
+        if !is_bare_cypher_start(line) {
+            // Meta, data, or prefixed-Cypher command: one physical line.
+            out.push(ScriptStmt {
+                line: i + 1,
+                text: line.to_string(),
+            });
+            i += 1;
+            continue;
+        }
+
+        // Bare Cypher: accumulate continuation lines, then split on `;`.
+        let start = i + 1;
+        let mut buf = line.to_string();
+        i += 1;
+        while i < lines.len() {
+            let next = lines[i].trim();
+            if next.is_empty()
+                || next.starts_with("//")
+                || next.starts_with("--")
+                || is_command_line(next, command_names)
+            {
+                break;
+            }
+            buf.push('\n');
+            buf.push_str(next);
+            i += 1;
+        }
+
+        let mut rest = buf.as_str();
+        loop {
+            match find_top_level_semicolon(rest) {
+                Some(idx) => {
+                    let stmt = rest[..idx].trim();
+                    if !stmt.is_empty() {
+                        out.push(ScriptStmt {
+                            line: start,
+                            text: stmt.to_string(),
+                        });
+                    }
+                    rest = &rest[idx + 1..];
+                }
+                None => {
+                    let stmt = rest.trim();
+                    if !stmt.is_empty() {
+                        out.push(ScriptStmt {
+                            line: start,
+                            text: stmt.to_string(),
+                        });
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Execute a script file statement by statement, stopping at the first failing
+/// command. A bare Cypher statement may span multiple lines and is terminated by
+/// `;`; meta and data commands stay single-line. Returns `true` if the whole
+/// script ran without an error, `false` otherwise.
 fn run_script(state: &mut State, path: &str) -> bool {
     let content = match fs::read_to_string(path) {
         Ok(c) => c,
@@ -1750,26 +1934,29 @@ fn run_script(state: &mut State, path: &str) -> bool {
         }
     };
 
+    let names = command_names();
+    let names_ref: Vec<&str> = names.iter().map(String::as_str).collect();
+    let stmts = segment_script(&content, &names_ref);
+
     // Mark the script scope so a `:!` shell escape inside the file is rejected.
     // Save and restore the flag so a nested `:run` does not clear it early.
     let was_in_script = state.in_script;
     state.in_script = true;
     let mut ok = true;
-    for (lineno, line) in content.lines().enumerate() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with("//") || line.starts_with("--") {
-            continue;
-        }
-        println!("[{}:{}] {line}", path, lineno + 1);
-        // Clear the per-command flag, run the line, then check whether it
+    for stmt in stmts {
+        // Echo with internal whitespace collapsed so a multi-line statement
+        // stays on one marker line.
+        let echo = stmt.text.split_whitespace().collect::<Vec<_>>().join(" ");
+        println!("[{}:{}] {echo}", path, stmt.line);
+        // Clear the per-command flag, run the statement, then check whether it
         // reported an error. The first failing command stops the script.
         let _ = take_command_error();
-        let cont = handle(state, line);
+        let cont = handle(state, &stmt.text);
         if take_command_error() {
             cli_eprintln!(
                 "script aborted at {}:{} after a failing command",
                 path,
-                lineno + 1
+                stmt.line
             );
             ok = false;
             break;
@@ -2723,6 +2910,102 @@ mod tests {
         let ctx = Context::new(&hist);
         let (start, pairs) = helper.complete(line, line.len(), &ctx).expect("completion");
         (start, pairs.into_iter().map(|p| p.replacement).collect())
+    }
+
+    /// Segment with the real command-name set and return just the statement
+    /// texts, dropping the line numbers.
+    fn segment_texts(content: &str) -> Vec<String> {
+        let names = command_names();
+        let names_ref: Vec<&str> = names.iter().map(String::as_str).collect();
+        segment_script(content, &names_ref)
+            .into_iter()
+            .map(|s| s.text)
+            .collect()
+    }
+
+    #[test]
+    fn top_level_semicolon_skips_strings_and_comments() {
+        assert_eq!(find_top_level_semicolon("a;b"), Some(1));
+        assert_eq!(find_top_level_semicolon("'a;b'"), None);
+        assert_eq!(find_top_level_semicolon("\"a;b\""), None);
+        assert_eq!(find_top_level_semicolon("`a;b`"), None);
+        assert_eq!(find_top_level_semicolon("// a;b"), None);
+        // An escaped quote does not close the string, so the `;` after the real
+        // closing quote is the top-level terminator.
+        assert_eq!(find_top_level_semicolon("'a\\'b';c"), Some(6));
+        // After a block comment closes, the next `;` is top level.
+        assert_eq!(find_top_level_semicolon("/* ; */ ;"), Some(8));
+    }
+
+    #[test]
+    fn segment_joins_multiline_cypher_statement() {
+        let script = "MATCH (n:Person)\nWHERE n.age > 30\nRETURN n.name;\n";
+        let stmts = segment_texts(script);
+        assert_eq!(stmts.len(), 1);
+        assert_eq!(stmts[0], "MATCH (n:Person)\nWHERE n.age > 30\nRETURN n.name");
+    }
+
+    #[test]
+    fn segment_keeps_semicolon_inside_string_literal() {
+        let stmts = segment_texts("CREATE (n {note: 'a;b'}) RETURN n;\n");
+        assert_eq!(stmts.len(), 1);
+        assert_eq!(stmts[0], "CREATE (n {note: 'a;b'}) RETURN n");
+    }
+
+    #[test]
+    fn segment_keeps_semicolon_inside_line_comment() {
+        let stmts = segment_texts("MATCH (n) // ; not a terminator\nRETURN n;\n");
+        assert_eq!(stmts.len(), 1);
+        assert_eq!(stmts[0], "MATCH (n) // ; not a terminator\nRETURN n");
+    }
+
+    #[test]
+    fn segment_splits_two_statements_on_one_line() {
+        let stmts = segment_texts("MATCH (n) RETURN n; MATCH (m) RETURN m;\n");
+        assert_eq!(
+            stmts,
+            vec!["MATCH (n) RETURN n", "MATCH (m) RETURN m"]
+        );
+    }
+
+    #[test]
+    fn segment_keeps_meta_and_data_commands_single_line() {
+        let stmts = segment_texts(":open ./db\nadd-node Person {\"name\":\"Alice\"}\n");
+        assert_eq!(
+            stmts,
+            vec![":open ./db", "add-node Person {\"name\":\"Alice\"}"]
+        );
+    }
+
+    #[test]
+    fn segment_blank_line_separates_semicolonless_cypher() {
+        // Backward compatibility: a blank line ends a `;`-less Cypher statement.
+        let stmts = segment_texts("MATCH (n) RETURN n\n\nMATCH (m) RETURN m\n");
+        assert_eq!(stmts, vec!["MATCH (n) RETURN n", "MATCH (m) RETURN m"]);
+    }
+
+    #[test]
+    fn segment_command_after_cypher_flushes_without_semicolon() {
+        // A command line cannot continue Cypher, so it ends the prior statement
+        // even with no `;`.
+        let stmts = segment_texts("MATCH (n) RETURN n\n:close\n");
+        assert_eq!(stmts, vec!["MATCH (n) RETURN n", ":close"]);
+    }
+
+    #[test]
+    fn segment_single_cypher_without_semicolon_at_eof() {
+        let stmts = segment_texts("MATCH (n) RETURN n");
+        assert_eq!(stmts, vec!["MATCH (n) RETURN n"]);
+    }
+
+    #[test]
+    fn segment_prefixed_query_stays_single_line() {
+        // `query`/`cypher` are explicit one-liner forms, not multiline Cypher.
+        let stmts = segment_texts("query MATCH (n) RETURN n\nquery MATCH (m) RETURN m\n");
+        assert_eq!(
+            stmts,
+            vec!["query MATCH (n) RETURN n", "query MATCH (m) RETURN m"]
+        );
     }
 
     #[test]
