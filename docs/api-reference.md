@@ -173,6 +173,49 @@ Import the `GraphQueryExt` trait to run declarative graph queries.
 
 ---
 
+## Cypher Built-in Procedures
+
+A set of graph data science procedures runs through the same `query` entry point with `CALL issundb.<name>(...)`. A procedure's `YIELD` columns bind for the rest of the query, so `nodeId` joins back to nodes through `id(n)`. A runnable tour is in `crates/issundb-examples/gds_cypher.rs`. See [Graph Data Science in Cypher](examples.md#graph-data-science-in-cypher) for worked queries.
+
+### Analytics and Communities
+
+- `CALL issundb.pageRank({iterations, damping})` yields `(nodeId, score)`. The configuration map is optional.
+- `CALL issundb.betweenness()` and `CALL issundb.harmonic()` yield `(nodeId, score)`. Both take no arguments.
+- `CALL issundb.degree({direction})` yields `(nodeId, score)`, where `direction` is `'IN'`, `'OUT'`, or `'BOTH'` (the default).
+- `CALL issundb.connectedComponents()` (alias `issundb.wcc`) and `CALL issundb.stronglyConnectedComponents()` (alias `issundb.scc`) yield `(nodeId, componentId)`.
+- `CALL issundb.labelPropagation({maxIterations})` yields `(nodeId, communityId)`.
+- `CALL issundb.communities({maxIterations, topPerCommunity})` yields `(communityId, nodeId, rank)`, partitioning by label propagation and ranking each community by PageRank.
+
+### Pathfinding
+
+- `CALL issundb.shortestPath(srcId, dstId)` yields `(index, nodeId)` for the hop sequence, or no rows when the target is unreachable.
+- `CALL issundb.dijkstra(srcId, dstId)` yields `(index, nodeId, totalWeight)`, using the first present of the `weight`, `cost`, `capacity`, or `cap` edge property as the edge weight.
+- `CALL issundb.triangleCount({relTypes, labels})` yields a single `(count)` row for the directed triangle pattern. The configuration map and each of its fields are optional.
+
+### GraphRAG Retrieval
+
+- `CALL issundb.retrieve.vector(queryVector, {k, hops, maxDistance, maxNodes})` yields `(nodeId, distance)`. Seed nodes carry a distance; nodes reached only by expansion carry a null distance.
+- `CALL issundb.retrieve.hybrid(queryVector, queryText, {vectorK, textK, hops, maxDistance, maxNodes, textLabel, textProperty, vectorLabel, fusion})` yields `(nodeId, score)`, fusing vector and full-text relevance before expansion. The `fusion` field is the string `'rrf'`, or a map `{rrfK}` or `{vectorWeight, textWeight}`.
+
+For both retrieval procedures the leading vector and text arguments are required and the configuration map is optional.
+
+---
+
+## Cypher Functions
+
+These scalar functions are available inside any expression position.
+
+- `vector_dist(node_or_vector, query_vector)`  
+  Distance between a node's stored embedding (or a numeric vector) and a query vector, under the graph's configured vector index metric. An ascending `ORDER BY vector_dist(node, query)` with a `LIMIT` over a labeled scan is answered by a single HNSW index search.
+- `issundb.distance.cosine(a, b)` and `issundb.distance.euclidean(a, b)`  
+  Cosine distance (in `[0, 2]`) and Euclidean (L2) distance (in `[0, ∞)`) between two vectors. Each argument is a numeric list or a node, in which case its stored embedding is resolved.
+- `issundb.similarity.jaccard(a, b)` and `issundb.similarity.overlap(a, b)`  
+  Jaccard similarity and overlap coefficient (both in `[0, 1]`) between two lists treated as sets.
+
+Each measure has a single canonical form, so the opposite direction is a short inline expression: cosine similarity is `1 - issundb.distance.cosine(a, b)`, Euclidean similarity is `1.0 / (1.0 + issundb.distance.euclidean(a, b))`, and a set distance is `1 - issundb.similarity.jaccard(a, b)`. A null operand, or a vector length mismatch, yields null.
+
+---
+
 ## Cypher DDL Reference
 
 Schema statements run through the same `query` entry point as data statements. A DDL statement targets either nodes of a label, written `(n:Label)`,

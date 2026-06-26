@@ -130,6 +130,7 @@ digraph IssunDBArchitecture {
     cypher -> core [lhead = cluster_core]
     cypher -> text
     cypher -> vector
+    cypher -> retrieval
 
     // Facade composes the extensions and core.
     facade -> core [ltail = cluster_facade, lhead = cluster_core]
