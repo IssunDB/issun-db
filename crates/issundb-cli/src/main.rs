@@ -213,25 +213,29 @@ enum ReplCommand {
         dst: PathBuf,
     },
 
-    /// Bulk-import nodes from a CSV file whose columns become node properties
-    /// (e.g., `:import-nodes ./people.csv Person`). The first row is the header
-    /// and every remaining row is one node of the given label. Rows are inserted
-    /// in batched transactions.
+    /// Bulk-import nodes from a CSV or Parquet file whose columns become node
+    /// properties (e.g., `:import-nodes ./people.csv Person`). A `.parquet` file
+    /// extension selects the Parquet reader; any other extension is read as CSV
+    /// where the first row is the header. Each remaining row, or each Parquet
+    /// row, is one node of the given label. Rows are inserted in batched
+    /// transactions.
     #[command(name = ":import-nodes")]
     ImportNodes {
-        /// Path to the CSV file (header row plus one node per row)
+        /// Path to the CSV or Parquet file (one node per row)
         file: String,
         /// Label applied to every imported node
         label: String,
     },
 
-    /// Bulk-import edges from a two-column CSV of source/destination domain keys
-    /// (e.g., `:import-edges ./knows.csv Person Person KNOWS`). Each key is
-    /// resolved to a node by its auto-indexed `Id` property and edges are inserted
-    /// in batched transactions.
+    /// Bulk-import edges from a two-column CSV or Parquet file of
+    /// source/destination domain keys (e.g., `:import-edges ./knows.csv Person
+    /// Person KNOWS`). A `.parquet` file extension selects the Parquet reader,
+    /// whose first two columns are the source and destination keys; any other
+    /// extension is read as CSV. Each key is resolved to a node by its
+    /// auto-indexed `Id` property and edges are inserted in batched transactions.
     #[command(name = ":import-edges")]
     ImportEdges {
-        /// Path to the two-column CSV file (src_key,dst_key)
+        /// Path to the two-column CSV or Parquet file (src_key, dst_key)
         file: String,
         /// Label of the source nodes (matched on their `Id` property)
         src_label: String,
@@ -591,8 +595,8 @@ Backup and Import
   :backup <file>                       Write a hot backup snapshot of the database (e.g., :backup ./backup.db)
   :backup-compact <file>               Write a compacted backup snapshot of the database (e.g., :backup-compact ./compact.db)
   :restore <snapshot> <dst>            Restore a snapshot into a new database directory (e.g., :restore ./snap.db ./restored)
-  :import-nodes <file> <label>         Bulk-import nodes from a CSV whose columns become properties (e.g., :import-nodes ./people.csv Person)
-  :import-edges <file> <src> <dst> <type>  Bulk-import edges from a 2-column CSV of domain keys (e.g., :import-edges ./knows.csv Person Person KNOWS)
+  :import-nodes <file> <label>         Bulk-import nodes from a CSV or Parquet file whose columns become properties (e.g., :import-nodes ./people.parquet Person)
+  :import-edges <file> <src> <dst> <type>  Bulk-import edges from a 2-column CSV or Parquet file of domain keys (e.g., :import-edges ./knows.parquet Person Person KNOWS)
   rebuild-csr                          Rebuild the CSR snapshot cache
 
 Query and Mutations
@@ -2215,14 +2219,27 @@ fn csv_cell_to_value(val_str: &str) -> serde_json::Value {
     }
 }
 
-/// Bulk-import nodes from a CSV file whose columns become node properties.
+/// Whether `path` should be read as Parquet, decided by a case-insensitive
+/// `.parquet` file extension. Any other extension is treated as CSV.
+fn is_parquet_path(path: &str) -> bool {
+    std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("parquet"))
+        .unwrap_or(false)
+}
+
+/// Bulk-import nodes from a CSV or Parquet file whose columns become node
+/// properties.
 ///
-/// The first non-empty line is the header and supplies the property names; each
-/// remaining row is one node carrying `label`. Cell values are typed by
-/// [`csv_cell_to_value`]. Nodes are inserted in fixed-size batches, each its own
-/// write transaction, mirroring `:import-edges` so memory stays bounded
-/// regardless of file size. The label is a command argument, so the CSV does not
-/// carry a leading label column.
+/// A `.parquet` extension selects the Parquet reader, whose columns become
+/// properties typed by their Arrow schema; any other extension is read as CSV
+/// where the first non-empty line is the header that supplies the property
+/// names and CSV cell values are typed by [`csv_cell_to_value`]. Either way each
+/// row is one node carrying `label`, and nodes are inserted in fixed-size
+/// batches, each its own write transaction, mirroring `:import-edges` so memory
+/// stays bounded regardless of file size. The label is a command argument, so
+/// neither format carries a leading label column.
 fn cmd_import_nodes(state: &mut State, path: &str, label: &str) {
     let g = match state.graph.as_ref() {
         Some(g) => g,
@@ -2231,40 +2248,52 @@ fn cmd_import_nodes(state: &mut State, path: &str, label: &str) {
             return;
         }
     };
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(e) => {
-            cli_eprintln!("cannot read {path}: {e}");
+
+    let entries: Vec<serde_json::Value> = if is_parquet_path(path) {
+        match read_parquet_entries(path) {
+            Ok(maps) => maps.into_iter().map(serde_json::Value::Object).collect(),
+            Err(e) => {
+                cli_eprintln!("cannot read {path}: {e}");
+                return;
+            }
+        }
+    } else {
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(e) => {
+                cli_eprintln!("cannot read {path}: {e}");
+                return;
+            }
+        };
+
+        let mut lines = content.lines().filter(|l| !l.trim().is_empty());
+        let header_line = match lines.next() {
+            Some(h) => h,
+            None => {
+                cli_eprintln!("CSV file is empty");
+                return;
+            }
+        };
+
+        let headers = parse_csv_line(header_line);
+        if headers.is_empty() {
+            cli_eprintln!("CSV has no columns");
             return;
         }
-    };
 
-    let mut lines = content.lines().filter(|l| !l.trim().is_empty());
-    let header_line = match lines.next() {
-        Some(h) => h,
-        None => {
-            cli_eprintln!("CSV file is empty");
-            return;
+        // Every column is a property; the label comes from the command argument.
+        let mut entries: Vec<serde_json::Value> = Vec::new();
+        for line in lines {
+            let cols = parse_csv_line(line);
+            let mut props = serde_json::Map::new();
+            for (j, header) in headers.iter().enumerate() {
+                let val_str = cols.get(j).map(|s| s.as_str()).unwrap_or("");
+                props.insert(header.to_owned(), csv_cell_to_value(val_str));
+            }
+            entries.push(serde_json::Value::Object(props));
         }
+        entries
     };
-
-    let headers = parse_csv_line(header_line);
-    if headers.is_empty() {
-        cli_eprintln!("CSV has no columns");
-        return;
-    }
-
-    // Every column is a property; the label comes from the command argument.
-    let mut entries: Vec<serde_json::Value> = Vec::new();
-    for line in lines {
-        let cols = parse_csv_line(line);
-        let mut props = serde_json::Map::new();
-        for (j, header) in headers.iter().enumerate() {
-            let val_str = cols.get(j).map(|s| s.as_str()).unwrap_or("");
-            props.insert(header.to_owned(), csv_cell_to_value(val_str));
-        }
-        entries.push(serde_json::Value::Object(props));
-    }
 
     const BATCH: usize = 50_000;
     let total = entries.len();
@@ -2306,10 +2335,12 @@ fn resolve_node_by_id(
     Ok(txn.nodes_by_property(label, "Id", val)?.into_iter().next())
 }
 
-/// Bulk-import edges from a two-column CSV of source/destination domain keys.
+/// Bulk-import edges from a two-column CSV or Parquet file of source and
+/// destination domain keys.
 ///
-/// Each data row is `src_key,dst_key`. Both keys are resolved to node ids by
-/// their auto-indexed `Id` property; `src_label` and `dst_label` scope the
+/// Each data row is `src_key, dst_key`: for CSV the first two columns, for
+/// Parquet the first two columns by position. Both keys are resolved to node ids
+/// by their auto-indexed `Id` property; `src_label` and `dst_label` scope the
 /// lookup so keys that collide across labels stay distinct. Edges of type
 /// `etype` are inserted in fixed-size batches, each its own write transaction.
 /// This bypasses the Cypher planner entirely (no `UNWIND`, `LabelScan`, or
@@ -2323,34 +2354,45 @@ fn cmd_import_edges(state: &mut State, path: &str, src_label: &str, dst_label: &
         }
     };
 
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(e) => {
-            cli_eprintln!("cannot read {path}: {e}");
-            return;
-        }
-    };
-
-    // First non-empty line is the header (e.g. `src_id,dst_id`).
-    let mut lines = content.lines().filter(|l| !l.trim().is_empty());
-    if lines.next().is_none() {
-        cli_eprintln!("CSV file is empty");
-        return;
-    }
-
     // Collect the two key columns up front as raw strings (resolution decides
     // int-vs-string per key). A row missing either non-empty key is malformed.
-    let mut pairs: Vec<(String, String)> = Vec::new();
-    let mut malformed: u64 = 0;
-    for line in lines {
-        let cols = parse_csv_line(line);
-        let src = cols.first().map(|s| s.trim()).filter(|s| !s.is_empty());
-        let dst = cols.get(1).map(|s| s.trim()).filter(|s| !s.is_empty());
-        match (src, dst) {
-            (Some(s), Some(d)) => pairs.push((s.to_owned(), d.to_owned())),
-            _ => malformed += 1,
+    let (pairs, malformed): (Vec<(String, String)>, u64) = if is_parquet_path(path) {
+        match read_parquet_edge_pairs(path) {
+            Ok(r) => r,
+            Err(e) => {
+                cli_eprintln!("cannot read {path}: {e}");
+                return;
+            }
         }
-    }
+    } else {
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(e) => {
+                cli_eprintln!("cannot read {path}: {e}");
+                return;
+            }
+        };
+
+        // First non-empty line is the header (e.g. `src_id,dst_id`).
+        let mut lines = content.lines().filter(|l| !l.trim().is_empty());
+        if lines.next().is_none() {
+            cli_eprintln!("CSV file is empty");
+            return;
+        }
+
+        let mut pairs: Vec<(String, String)> = Vec::new();
+        let mut malformed: u64 = 0;
+        for line in lines {
+            let cols = parse_csv_line(line);
+            let src = cols.first().map(|s| s.trim()).filter(|s| !s.is_empty());
+            let dst = cols.get(1).map(|s| s.trim()).filter(|s| !s.is_empty());
+            match (src, dst) {
+                (Some(s), Some(d)) => pairs.push((s.to_owned(), d.to_owned())),
+                _ => malformed += 1,
+            }
+        }
+        (pairs, malformed)
+    };
 
     const BATCH: usize = 50_000;
     let empty = serde_json::Value::Object(serde_json::Map::new());
@@ -2396,6 +2438,218 @@ fn cmd_import_edges(state: &mut State, path: &str, src_label: &str, dst_label: &
     eprintln!(
         "imported {inserted} {etype} edges from {path} ({unresolved} unresolved endpoint(s), {malformed} malformed row(s))"
     );
+}
+
+/// Read every row of a Parquet file into one property map per row, each column
+/// becoming a property keyed by its name. The Arrow value to JSON mapping
+/// mirrors the engine's `COPY ... FROM '*.parquet'` path so Parquet imports and
+/// the `COPY` statement agree on typing. A `props` column holding a nested
+/// object is flattened into the row, matching `COPY` so an exported file
+/// round-trips.
+fn read_parquet_entries(
+    path: &str,
+) -> Result<Vec<serde_json::Map<String, serde_json::Value>>, String> {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        .map_err(|e| format!("not a valid Parquet file: {e}"))?;
+    let reader = builder
+        .build()
+        .map_err(|e| format!("failed to read Parquet file: {e}"))?;
+
+    let mut entries = Vec::new();
+    for batch_res in reader {
+        let batch = batch_res.map_err(|e| format!("failed to read record batch: {e}"))?;
+        let schema = batch.schema();
+        for row in 0..batch.num_rows() {
+            let mut obj = serde_json::Map::new();
+            for col in 0..batch.num_columns() {
+                let name = schema.field(col).name();
+                let val = arrow_to_json_value(batch.column(col), row)?;
+                obj.insert(name.clone(), val);
+            }
+            if let Some(props_val) = obj.get("props") {
+                if let Some(props_obj) = props_val.as_object() {
+                    let props_obj = props_obj.clone();
+                    obj.remove("props");
+                    for (k, v) in props_obj {
+                        obj.insert(k, v);
+                    }
+                }
+            }
+            entries.push(obj);
+        }
+    }
+    Ok(entries)
+}
+
+/// Read source and destination domain keys from the first two columns of a
+/// Parquet file, mirroring the positional two-column convention of the CSV edge
+/// import. Returns the resolvable `(src_key, dst_key)` string pairs plus the
+/// count of rows missing either key. Values are stringified by
+/// [`value_to_key_string`] so `resolve_node_by_id` can match them as integers or
+/// strings.
+fn read_parquet_edge_pairs(path: &str) -> Result<(Vec<(String, String)>, u64), String> {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        .map_err(|e| format!("not a valid Parquet file: {e}"))?;
+    let reader = builder
+        .build()
+        .map_err(|e| format!("failed to read Parquet file: {e}"))?;
+
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    let mut malformed: u64 = 0;
+    for batch_res in reader {
+        let batch = batch_res.map_err(|e| format!("failed to read record batch: {e}"))?;
+        if batch.num_columns() < 2 {
+            return Err(
+                "Parquet file must have at least two columns (src_key, dst_key)".to_owned(),
+            );
+        }
+        let src_col = batch.column(0);
+        let dst_col = batch.column(1);
+        for row in 0..batch.num_rows() {
+            let src = value_to_key_string(&arrow_to_json_value(src_col, row)?);
+            let dst = value_to_key_string(&arrow_to_json_value(dst_col, row)?);
+            match (src, dst) {
+                (Some(s), Some(d)) => pairs.push((s, d)),
+                _ => malformed += 1,
+            }
+        }
+    }
+    Ok((pairs, malformed))
+}
+
+/// Convert a JSON value into a domain-key string for edge endpoint resolution,
+/// or `None` when the value cannot be a key. A number is rendered without a
+/// fractional part when it is integral so an `Id` stored as an integer matches.
+/// A blank or whitespace-only string is treated as absent.
+fn value_to_key_string(val: &serde_json::Value) -> Option<String> {
+    match val {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_owned())
+            }
+        }
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        serde_json::Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
+/// Convert one cell of an Arrow array to a JSON value, mirroring the engine's
+/// `COPY` reader so Parquet imports type values the same way. A string that
+/// looks like a JSON array or object is parsed; an unsupported Arrow type maps
+/// to null.
+fn arrow_to_json_value(
+    array: &arrow_array::ArrayRef,
+    row: usize,
+) -> Result<serde_json::Value, String> {
+    use arrow_array::cast::AsArray;
+    use arrow_schema::DataType;
+    use serde_json::Value;
+
+    if array.is_null(row) {
+        return Ok(Value::Null);
+    }
+
+    let parse_strish = |s: &str| -> Value {
+        if (s.starts_with('[') && s.ends_with(']')) || (s.starts_with('{') && s.ends_with('}')) {
+            serde_json::from_str(s).unwrap_or_else(|_| Value::String(s.to_owned()))
+        } else {
+            Value::String(s.to_owned())
+        }
+    };
+
+    match array.data_type() {
+        DataType::Boolean => Ok(Value::Bool(array.as_boolean().value(row))),
+        DataType::Int8 => Ok(Value::Number(
+            array
+                .as_primitive::<arrow_array::types::Int8Type>()
+                .value(row)
+                .into(),
+        )),
+        DataType::Int16 => Ok(Value::Number(
+            array
+                .as_primitive::<arrow_array::types::Int16Type>()
+                .value(row)
+                .into(),
+        )),
+        DataType::Int32 => Ok(Value::Number(
+            array
+                .as_primitive::<arrow_array::types::Int32Type>()
+                .value(row)
+                .into(),
+        )),
+        DataType::Int64 => Ok(Value::Number(
+            array
+                .as_primitive::<arrow_array::types::Int64Type>()
+                .value(row)
+                .into(),
+        )),
+        DataType::UInt8 => Ok(Value::Number(
+            array
+                .as_primitive::<arrow_array::types::UInt8Type>()
+                .value(row)
+                .into(),
+        )),
+        DataType::UInt16 => Ok(Value::Number(
+            array
+                .as_primitive::<arrow_array::types::UInt16Type>()
+                .value(row)
+                .into(),
+        )),
+        DataType::UInt32 => Ok(Value::Number(
+            array
+                .as_primitive::<arrow_array::types::UInt32Type>()
+                .value(row)
+                .into(),
+        )),
+        DataType::UInt64 => Ok(Value::Number(
+            array
+                .as_primitive::<arrow_array::types::UInt64Type>()
+                .value(row)
+                .into(),
+        )),
+        DataType::Float32 => {
+            let v = array
+                .as_primitive::<arrow_array::types::Float32Type>()
+                .value(row);
+            Ok(serde_json::Number::from_f64(v as f64).map_or(Value::Null, Value::Number))
+        }
+        DataType::Float64 => {
+            let v = array
+                .as_primitive::<arrow_array::types::Float64Type>()
+                .value(row);
+            Ok(serde_json::Number::from_f64(v).map_or(Value::Null, Value::Number))
+        }
+        DataType::Utf8 => Ok(parse_strish(array.as_string::<i32>().value(row))),
+        DataType::LargeUtf8 => Ok(parse_strish(array.as_string::<i64>().value(row))),
+        DataType::List(_) => {
+            let value_arr = array.as_list::<i32>().value(row);
+            let mut vals = Vec::with_capacity(value_arr.len());
+            for i in 0..value_arr.len() {
+                vals.push(arrow_to_json_value(&value_arr, i)?);
+            }
+            Ok(Value::Array(vals))
+        }
+        DataType::LargeList(_) => {
+            let value_arr = array.as_list::<i64>().value(row);
+            let mut vals = Vec::with_capacity(value_arr.len());
+            for i in 0..value_arr.len() {
+                vals.push(arrow_to_json_value(&value_arr, i)?);
+            }
+            Ok(Value::Array(vals))
+        }
+        _ => Ok(Value::Null),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2851,6 +3105,116 @@ mod tests {
             .view(|txn| txn.nodes_by_property("Library", "Id", PropValue::Str("numpy".to_owned())))
             .unwrap();
         assert_eq!(by_name.len(), 1);
+    }
+
+    /// Write `batch` to `path` as a single-row-group Parquet file for the import
+    /// tests.
+    fn write_parquet(path: &std::path::Path, batch: &arrow_array::RecordBatch) {
+        use parquet::arrow::arrow_writer::ArrowWriter;
+        let file = std::fs::File::create(path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, batch.schema(), None).unwrap();
+        writer.write(batch).unwrap();
+        writer.close().unwrap();
+    }
+
+    #[test]
+    fn test_import_nodes_loads_parquet_columns_as_properties() {
+        use arrow_array::{Int64Array, RecordBatch, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+        use std::sync::Arc;
+
+        let temp = TempDir::new().unwrap();
+        let mut state = State::new(None, None, 1);
+        assert!(handle(
+            &mut state,
+            &format!(":open {}", temp.path().display())
+        ));
+
+        // A Parquet file with a typed integer `Id` column and a string column.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("Id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![10i64, 20])),
+                Arc::new(StringArray::from(vec!["Alice", "Bob"])),
+            ],
+        )
+        .unwrap();
+        let pq = temp.path().join("users.parquet");
+        write_parquet(&pq, &batch);
+
+        assert!(handle(
+            &mut state,
+            &format!(":import-nodes {} User", pq.display())
+        ));
+
+        let g = state.graph.as_ref().unwrap();
+        let users = g.view(|txn| txn.nodes_by_label("User")).unwrap();
+        assert_eq!(users.len(), 2);
+
+        // The Parquet integer column types the `Id` as an integer, so the same
+        // auto-index lookup the edge importer relies on resolves it.
+        let by_id = g
+            .view(|txn| txn.nodes_by_property("User", "Id", PropValue::Int(10)))
+            .unwrap();
+        assert_eq!(by_id.len(), 1);
+
+        // The string column is stored verbatim as a string property.
+        let g = state.graph.as_ref().unwrap();
+        let by_name = g
+            .view(|txn| txn.nodes_by_property("User", "name", PropValue::Str("Bob".to_owned())))
+            .unwrap();
+        assert_eq!(by_name.len(), 1);
+    }
+
+    #[test]
+    fn test_import_edges_resolves_parquet_domain_keys() {
+        use arrow_array::{Int64Array, RecordBatch};
+        use arrow_schema::{DataType, Field, Schema};
+        use std::sync::Arc;
+
+        let temp = TempDir::new().unwrap();
+        let mut state = State::new(None, None, 1);
+        assert!(handle(
+            &mut state,
+            &format!(":open {}", temp.path().display())
+        ));
+
+        assert!(handle(&mut state, "add-node User {\"Id\": 10}"));
+        assert!(handle(&mut state, "add-node User {\"Id\": 20}"));
+        assert!(handle(&mut state, "add-node Kernel {\"Id\": 100}"));
+        assert!(handle(&mut state, "add-node Kernel {\"Id\": 200}"));
+
+        // The first two columns are the source and destination keys by position;
+        // the third row's dst (999) has no node and is dropped.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("from_user_id", DataType::Int64, false),
+            Field::new("to_kernel_id", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![10i64, 20, 10])),
+                Arc::new(Int64Array::from(vec![100i64, 200, 999])),
+            ],
+        )
+        .unwrap();
+        let pq = temp.path().join("edges.parquet");
+        write_parquet(&pq, &batch);
+
+        assert!(handle(
+            &mut state,
+            &format!(":import-edges {} User Kernel AUTHORED_KERNEL", pq.display())
+        ));
+
+        let g = state.graph.as_ref().unwrap();
+        let count = g
+            .view(|txn| txn.edge_count_by_type("AUTHORED_KERNEL"))
+            .unwrap();
+        assert_eq!(count, 2);
     }
 
     #[test]
