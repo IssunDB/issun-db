@@ -110,8 +110,10 @@ impl State {
     about = "IssunDB command-line interface"
 )]
 struct Cli {
-    /// Path to the database directory. Defaults to the ISSUNDB_DB_PATH
-    /// environment variable when set (the container image sets it to /data).
+    /// Path to the database directory.
+    ///
+    /// Defaults to the ISSUNDB_DB_PATH environment variable when set (the
+    /// container image sets it to /data).
     #[arg(env = "ISSUNDB_DB_PATH")]
     db_path: Option<PathBuf>,
 
@@ -120,9 +122,11 @@ struct Cli {
     map_size_gb: usize,
 
     /// Execute a script file then exit, instead of starting the interactive
-    /// prompt (e.g., `--script ./setup.txt`). Lines may mix meta, data, and
-    /// Cypher, exactly like `:run`; the `:!` shell escape is rejected. Execution
-    /// stops at the first failing command, and the process exits non-zero.
+    /// prompt (e.g., `--script ./setup.txt`).
+    ///
+    /// Lines may mix meta, data, and Cypher, exactly like `:run`; the `:!` shell
+    /// escape is rejected. Execution stops at the first failing command, and the
+    /// process exits non-zero.
     #[arg(long, short = 'f')]
     script: Option<String>,
 }
