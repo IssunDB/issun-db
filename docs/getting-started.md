@@ -1,32 +1,32 @@
 # Getting Started
 
-This guide provides instructions to help you build, configure, and query IssunDB.
+This guide covers compiling, configuring, and querying IssunDB. It explains prerequisites, building the engine from source, and using the command-line interface (CLI) to interact with the database.
 
 ## Prerequisites
 
-To compile the database and its native dependencies, ensure you have Rust 1.85.0 or later installed on your system, along with the following:
+Compiling IssunDB and its native dependencies requires Rust 1.85.0 or later, along with the following system tools:
 
-- Build Tools: CMake and a C/C++ compiler (Clang or GCC) to build the SuiteSparse:GraphBLAS static library.
-- FFI Bindings: `libclang`, which `bindgen` uses to build raw GraphBLAS wrappers.
-- OpenMP Runtime: Resolves to `libgomp` (bundled with GCC) on Linux, `libomp` on macOS (`brew install libomp`), and `vcomp` (part of the MSVC
+- **Build Tools**: CMake and a C/C++ compiler (such as Clang or GCC) to compile the SuiteSparse:GraphBLAS static library.
+- **FFI Bindings**: `libclang`, which `bindgen` uses to build the raw GraphBLAS wrappers.
+- **OpenMP Runtime**: This resolves to `libgomp` (bundled with GCC) on Linux, `libomp` on macOS (`brew install libomp`), and `vcomp` (part of the MSVC
   runtime) on Windows.
 
 ## Build from Source
 
-You can build the workspace (including the core storage engine, query layer, and interactive CLI) by running:
+To clone the repository and compile the workspace components (including the storage engine, query layer, and CLI), execute the following commands:
 
 ```bash
 # Clone the repository (with Git submodules included)
 git clone --recursive https://github.com/IssunDB/issun-db.git
 cd issun-db
 
-# Build release binaries (this can take a while first time)
+# Build release binaries (this can take a while the first time)
 make build
 ```
 
 ## Basic CLI Usage
 
-Launch the interactive REPL binary to manage and query your database manually:
+After building the binaries, run the interactive REPL to manage and query the database directly:
 
 ```bash
 # Launch the CLI (with the default database location)
@@ -38,26 +38,27 @@ make repl REPL_PATH=/path/to/my-db
 
 ### Interactive REPL Meta Commands
 
-These commands manage database sessions, backups, parameters, and bulk imports:
+The REPL supports meta commands (prefixed with `:`) to manage the session, take backups, and import files:
 
-| Command           | Usage                                        | Description                                           |
-|-------------------|----------------------------------------------|-------------------------------------------------------|
-| `:open`           | `:open /path/to/db [map_size_gb]`            | Open or reopen a database at the specified directory; the map size defaults to the launch `--map-size-gb` value. |
-| `:run`            | `:run /path/to/script.cypher`                | Execute a file line by line.                          |
-| `:save`           | `:save /path/to/output.txt`                  | Direct the output of the next query to a file.        |
-| `:params`         | `:params`                                    | List all current query parameters.                    |
-| `:set`            | `:set limit 10`                              | Set a query parameter value (JSON or string).         |
-| `:unset`          | `:unset limit`                               | Remove a query parameter.                             |
-| `:backup`         | `:backup /path/to/backup.db`                 | Write a hot backup snapshot of the database.          |
-| `:backup-compact` | `:backup-compact /path/to/backup.db`         | Write a compacted backup snapshot.                    |
-| `:restore`        | `:restore /path/to/snapshot.db /path/to/dst` | Restore a snapshot into a new database directory.     |
-| `:import-jsonl`   | `:import-jsonl /path/to/data.jsonl`          | Import nodes from a JSONL file.                       |
-| `:import-csv`     | `:import-csv /path/to/data.csv`              | Import nodes from a CSV file.                         |
-| `:explain`        | `:explain MATCH (n) RETURN n`                | Explain the physical plan of a Cypher query.          |
+| Command           | Usage                                           | Description                                                                                                               |
+|-------------------|-------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------|
+| `:open`           | `:open /path/to/db [map_size_gb]`               | Open or reopen a database at the specified directory; the map size defaults to the launch `--map-size-gb` value.          |
+| `:close`          | `:close`                                        | Close the open database without exiting the CLI.                                                                          |
+| `:run`            | `:run /path/to/script.cypher`                   | Execute a script file; meta and data commands are one line each, and a Cypher statement may span lines and ends with `;`. |
+| `:save`           | `:save /path/to/output.txt`                     | Direct the output of the next query to a file.                                                                            |
+| `:params`         | `:params`                                       | List all current query parameters.                                                                                        |
+| `:set`            | `:set limit 10`                                 | Set a query parameter value (JSON or string).                                                                             |
+| `:unset`          | `:unset limit`                                  | Remove a query parameter.                                                                                                 |
+| `:backup`         | `:backup /path/to/backup.db`                    | Write a hot backup snapshot of the database.                                                                              |
+| `:backup-compact` | `:backup-compact /path/to/backup.db`            | Write a compacted backup snapshot.                                                                                        |
+| `:restore`        | `:restore /path/to/snapshot.db /path/to/dst`    | Restore a snapshot into a new database directory.                                                                         |
+| `:import-nodes`   | `:import-nodes /path/to/nodes.csv Label`        | Bulk-import nodes from a CSV or Parquet file whose columns become properties.                                             |
+| `:import-edges`   | `:import-edges /path/to/edges.csv Src Dst Type` | Bulk-import edges from a two-column CSV or Parquet file of domain keys.                                                   |
+| `:explain`        | `:explain MATCH (n) RETURN n`                   | Explain the physical plan of a Cypher query.                                                                              |
 
 ### Graph Shell Commands
 
-These subcommands perform direct graph operations, algorithm executions, vector search configuration, and full-text search indexing:
+The REPL also supports direct operations and queries to manipulate nodes and edges, or execute graph algorithms:
 
 | Command               | Description                                                                                        |
 |-----------------------|----------------------------------------------------------------------------------------------------|
@@ -92,35 +93,35 @@ These subcommands perform direct graph operations, algorithm executions, vector 
 | `configure-vec`       | Configure vector index metric and quantization (e.g., `configure-vec cosine int8`).                |
 | `text-index`          | Configure and manage full-text indexes (e.g., `text-index create Book title`).                     |
 | `text-search`         | Query the BM25 full-text search index (e.g., `text-search "query" Book summary 5`).                |
-| `threads`             | Set the GraphBLAS thread count, with 0 restoring the default (e.g., `threads 4`).                  |
+| `:threads`            | Set the GraphBLAS thread count, with 0 restoring the default (e.g., `:threads 4`).                 |
 
 ---
 
 ## Embed in a Rust Project
 
-To use the database in your own Rust application, add the `issundb` facade and `serde_json` dependencies to your `Cargo.toml` file:
+To use IssunDB as an embedded database in a Rust project, add the `issundb` library and `serde_json` to the dependencies in `Cargo.toml`:
 
 ```toml
 [dependencies]
-issundb = "version" # Like "0.1.0" or "0.1.0-alpha.4"
+issundb = "0.1.0"   # Or specify the exact version we are targeting
 serde_json = "1.0"   # Used to construct property maps
 ```
 
-Or
+Alternatively, point to a local workspace path:
 
 ```toml
 [dependencies]
 issundb = { path = "../path/to/crates/issundb" }
 ```
 
-You can then open a database environment, execute transactions, and run queries through the Rust API:
+The following example demonstrates opening the database environment, inserting nodes and edges, and handling errors:
 
 ```rust
 use std::path::Path;
 use issundb::Graph;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Open the graph database with a memory map size limit (in GB)
+    // Open the graph database with a memory map size limit of 10 GB
     let graph = Graph::open(Path::new("./data"), 10)?;
 
     // Insert nodes and edges via the API
@@ -132,3 +133,5 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+Running this code opens the database environment, populates the graph, and prints a success message.

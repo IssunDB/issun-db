@@ -124,9 +124,10 @@ struct Cli {
     /// Execute a script file then exit, instead of starting the interactive
     /// prompt (e.g., `--script ./setup.txt`).
     ///
-    /// Lines may mix meta, data, and Cypher, exactly like `:run`; the `:!` shell
-    /// escape is rejected. Execution stops at the first failing command, and the
-    /// process exits non-zero.
+    /// The file may mix meta, data, and Cypher, exactly like `:run`; a bare
+    /// Cypher statement may span multiple lines and is terminated by `;`. The
+    /// `:!` shell escape is rejected. Execution stops at the first failing
+    /// command, and the process exits non-zero.
     #[arg(long, short = 'f')]
     script: Option<String>,
 }
@@ -147,11 +148,13 @@ enum ReplCommand {
     #[command(name = ":close")]
     Close,
 
-    /// Execute a script file line by line (e.g., `:run ./script.txt`). Each line
-    /// runs through the same dispatcher as the prompt, so a script may mix meta
-    /// commands, data commands, and Cypher; blank lines and `//` or `--` comments
-    /// are skipped. Execution stops at the first failing command. The `:!` shell
-    /// escape is rejected inside a script.
+    /// Execute a script file (e.g., `:run ./script.txt`). Statements run through
+    /// the same dispatcher as the prompt, so a script may mix meta commands, data
+    /// commands, and Cypher. A meta or data command is one line; a bare Cypher
+    /// statement may span multiple lines and is terminated by `;` (a blank line,
+    /// a following command, or end of file also ends one). Blank lines and `//`
+    /// or `--` comment lines are skipped. Execution stops at the first failing
+    /// command. The `:!` shell escape is rejected inside a script.
     #[command(name = ":run")]
     Run {
         /// Path to the script file
@@ -588,7 +591,7 @@ Database Control
   :threads <count>                     Set the thread count for GraphBLAS computations (e.g., :threads 4)
 
 Scripting and Parameters
-  :run <file>                          Execute a script file line by line, stopping at the first failing command (e.g., :run ./setup.txt)
+  :run <file>                          Execute a script file (multi-line Cypher statements end with ;), stopping at the first failing command (e.g., :run ./setup.txt)
   :! / :shell <command>                Run a shell command (e.g., :! ls -l ./data); note that it's disabled inside :run scripts
   :save <file>                         Save the output of the next query to a file (e.g., :save ./output.txt)
   :params                              List all current query parameters
@@ -2942,7 +2945,10 @@ mod tests {
         let script = "MATCH (n:Person)\nWHERE n.age > 30\nRETURN n.name;\n";
         let stmts = segment_texts(script);
         assert_eq!(stmts.len(), 1);
-        assert_eq!(stmts[0], "MATCH (n:Person)\nWHERE n.age > 30\nRETURN n.name");
+        assert_eq!(
+            stmts[0],
+            "MATCH (n:Person)\nWHERE n.age > 30\nRETURN n.name"
+        );
     }
 
     #[test]
@@ -2962,10 +2968,7 @@ mod tests {
     #[test]
     fn segment_splits_two_statements_on_one_line() {
         let stmts = segment_texts("MATCH (n) RETURN n; MATCH (m) RETURN m;\n");
-        assert_eq!(
-            stmts,
-            vec!["MATCH (n) RETURN n", "MATCH (m) RETURN m"]
-        );
+        assert_eq!(stmts, vec!["MATCH (n) RETURN n", "MATCH (m) RETURN m"]);
     }
 
     #[test]

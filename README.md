@@ -19,20 +19,19 @@ An embedded graph database for AI applications and graph analytics
 
 ---
 
-IssunDB is a fast embedded graph database, written in Rust.
-It can be embedded in Rust applications without the need for a server, and can be used for a wide range of applications such as building
-GraphRAG pipelines and querying knowledge graphs.
+IssunDB is an embedded graph database written in Rust.
+It can be embedded in Rust applications without a separate server, and is designed for applications such as GraphRAG pipelines and knowledge graphs.
 
 **You can download the latest binaries (for IssunDB CLI, MCP and HTTP servers) from [here](https://github.com/IssunDB/issun-db/releases).**
 
 ### Key Features
 
-* Rust graph engine built with ACID, property graph model, and Cypher query language support
-* Fast graph traversal and analytics using sparse matrix operations
-* Fast vectorized query execution with multi-core parallelism and serializable transactions
-* Built-in vector, text, and hybrid search and retrieval
-* Provides a wide range of APIs, including native Rust, Python bindings, CLI, HTTP (REST), and MCP
-* Fully cross-platform; supports Linux, macOS, and Windows
+* ACID transactions, property graph model, and Cypher query support
+* Graph traversal and analytics using sparse matrix operations
+* Vectorized query execution with multi-core parallel processing
+* Vector, full-text, and hybrid search
+* APIs for Rust, Python, CLI, HTTP REST, and MCP
+* Support for Linux, macOS, and Windows
 
 > [!IMPORTANT]
 > This project is still in early development, so bugs and breaking changes are expected.
@@ -53,7 +52,7 @@ serde_json = "1.0"
 > [!NOTE]
 > IssunDB needs Rust 1.85.0 or newer.
 
-Here is a basic example showing how to open a database, insert nodes, establish relationships, and query the graph using Cypher:
+The following example opens a database, inserts nodes, creates relationships, and queries the graph using Cypher:
 
 ```rust
 use std::path::Path;
@@ -134,11 +133,11 @@ The Rust API documentation is available on [docs.rs/issundb](https://docs.rs/iss
 
 #### Rust Examples
 
-Check out the [issundb-examples](crates/issundb-examples) crate for more examples using IssunDB using the Rust API.
+Refer to the [issundb-examples](crates/issundb-examples) crate for Rust API examples.
 
 #### Python Examples
 
-See the [issundb-py/examples](crates/issundb-py/examples) directory for example usage of the Python API.
+Refer to the [issundb-py/examples](crates/issundb-py/examples) directory for Python API examples.
 
 ---
 

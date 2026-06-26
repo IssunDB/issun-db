@@ -1,22 +1,20 @@
 # Hybrid Retrieval
 
-IssunDB supports hybrid retrieval pipelines designed for GraphRAG (Retrieval-Augmented Generation) applications.
-These pipelines combine vector similarity search, full-text search, and multi-source graph traversal to construct relevant context subgraphs.
+This guide covers hybrid retrieval pipelines for GraphRAG (Retrieval-Augmented Generation) applications. These pipelines combine vector similarity search, full-text search, and multi-source graph traversal to construct relevant context subgraphs.
 
 ## Retrieval Concepts
 
-A hybrid retrieval workflow follows three sequential steps:
+The hybrid retrieval workflow consists of three sequential steps:
 
-1. Seed selection: Query inputs (vector embeddings, text queries, or both) identify initial "seed" nodes using vector indexes and full-text indexes.
-2. Score fusion: Relevance scores from different index hits are combined into a single ranking using a configurable fusion strategy.
-3. Graph traversal: A multi-source Breadth-First Search (BFS) expands outward from the top-ranked seed nodes to gather neighboring nodes and edges,
-   materializing a self-contained subgraph.
+1. **Seed Selection**: Query inputs (vector embeddings, text queries, or both) are evaluated against vector and full-text indexes to identify initial seed nodes.
+2. **Score Fusion**: Relevance scores from different index hits are combined into a single ranking using a configurable fusion strategy.
+3. **Graph Traversal**: A multi-source Breadth-First Search (BFS) starts from the top-ranked seed nodes and expands outward to gather neighboring nodes and edges, materializing the final subgraph.
 
 ---
 
 ## Retrieval Interfaces
 
-Import the retrieval functions and types from the facade:
+To use these retrieval functions and types in Rust, import them from the public library:
 
 ```rust
 use issundb::{retrieve, retrieve_with, retrieve_hybrid};
@@ -25,14 +23,16 @@ use issundb::{RetrieveOptions, HybridRetrieveOptions, FusionStrategy, Subgraph};
 
 ### Vector Search with Expansion
 
-For queries using only vector embeddings, use `retrieve` or `retrieve_with`:
+For queries using only vector embeddings, call `retrieve` or `retrieve_with`:
 
 - `retrieve(graph: &Graph, q: &[f32], k: usize, hops: u8) -> Result<Subgraph, RetrievalError>`  
   Performs a vector search to find `k` seed nodes, then runs a BFS traversal up to `hops` depth to build the result subgraph.
 - `retrieve_with(graph: &Graph, q: &[f32], opts: &RetrieveOptions) -> Result<Subgraph, RetrievalError>`  
-  Allows finer control over seed selection and traversal limits.
+  Provides control over seed selection and traversal limits.
 
 #### RetrieveOptions Structure
+
+The `RetrieveOptions` struct contains the following fields:
 
 ```rust
 pub struct RetrieveOptions {
@@ -52,9 +52,11 @@ pub struct RetrieveOptions {
 To combine vector search and full-text search with graph expansion, use `retrieve_hybrid`:
 
 - `retrieve_hybrid(graph: &Graph, q: &[f32], text_query: &str, opts: &HybridRetrieveOptions) -> Result<Subgraph, RetrievalError>`  
-  Identifies seeds from both index types, fuses the ranks, and expands the neighborhood using GraphBLAS operations.
+  Identifies seeds from both index types, fuses their ranks, and expands the neighborhood using GraphBLAS operations.
 
 #### HybridRetrieveOptions Structure
+
+The `HybridRetrieveOptions` struct contains the following fields:
 
 ```rust
 pub struct HybridRetrieveOptions {
@@ -83,12 +85,14 @@ pub struct HybridRetrieveOptions {
 
 ## Score Fusion Strategies
 
-Relevance scores from different sources are merged using one of the following strategies:
+Relevance scores from different sources are merged using one of two strategies:
 
-* Reciprocal Rank Fusion (RRF): Merges ranked lists using the reciprocal of the rank: `score = Σ 1 / (k + rank)`. This is the default strategy and is
-  effective when relevance scores have different scales.
-* Weighted Linear Combination: Combines raw relevance scores linearly: `score = α * vector_score + β * text_score`. Use this when you want to
-  prioritize one index over another.
+* **Reciprocal Rank Fusion (RRF)**: Merges ranked lists using the reciprocal of each item's rank: `score = Σ 1 / (k + rank)`. This is the default
+  strategy and is highly effective when relevance scores have different scales.
+* **Weighted Linear Combination**: Combines raw relevance scores linearly: `score = α * vector_score + β * text_score`. We can use this when we want
+  to prioritize one index type over another.
+
+The `FusionStrategy` enum contains the following variants:
 
 ```rust
 pub enum FusionStrategy {
@@ -106,7 +110,7 @@ pub enum FusionStrategy {
 
 ## Integration Example
 
-Below is a self-contained example demonstrating how to configure and execute a hybrid retrieval query in Rust:
+The following example demonstrates how to configure and execute a hybrid retrieval query in a Rust application:
 
 ```rust
 use std::path::Path;
@@ -131,10 +135,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }))?;
     graph.upsert_vector(id2, &[0.8, 0.2, 0.1])?;
 
-    // Create an edge establishing a relationship
+    // Connect the nodes with an edge
     graph.add_edge(id1, id2, "REFERENCES", &serde_json::json!({}))?;
 
-    // Configure hybrid retrieval options
+    // Configure the hybrid retrieval options
     let opts = HybridRetrieveOptions {
         vector_k: 5,
         text_k: 5,
@@ -144,7 +148,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..Default::default()
     };
 
-    // Run hybrid retrieval (query vector and query text)
+    // Run the hybrid retrieval query
     let query_vector = vec![0.15, 0.75, 0.35];
     let subgraph = retrieve_hybrid(&graph, &query_vector, "transactional storage", &opts)?;
 
