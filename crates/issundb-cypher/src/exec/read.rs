@@ -388,9 +388,14 @@ pub(super) fn resolve_call_parts(
                 // reuse the registry's YIELD and validation logic via
                 // `resolve_against`.
                 let rc = match crate::builtin_procs::build(graph, name, &arg_values)? {
+                    // A built-in consumes and validates its own arguments inside
+                    // `build` (synthesizing its rows from them), so the table-filter
+                    // step in `resolve_against` runs against no inputs: pass `&[]`,
+                    // not `arg_values`. This also matches the parameterless built-in
+                    // forms, whose arguments are always empty here.
                     Some(proc) => crate::procedure::resolve_against(
                         &proc,
-                        &arg_values,
+                        &[],
                         *implicit_args,
                         !standalone,
                         yields,

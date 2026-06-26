@@ -1578,6 +1578,7 @@ dependencies = [
  "chumsky",
  "criterion",
  "issundb-core",
+ "issundb-retrieval",
  "issundb-text",
  "issundb-vector",
  "parquet",
