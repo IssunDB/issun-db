@@ -683,6 +683,7 @@ fn print_help() {
     let syntax_limit = 39;
     let columns = terminal_columns();
     let desc_width = columns.saturating_sub(syntax_limit).max(20);
+    let hang = " ".repeat(syntax_limit);
 
     for line in HELP_TEXT.lines() {
         if line.trim().is_empty() {
@@ -692,56 +693,61 @@ fn print_help() {
         let leading_spaces = line.len() - line.trim_start().len();
         if leading_spaces == 0 {
             println!("{}", line.bold().blue());
-        } else if line.len() < syntax_limit {
-            let trimmed = line.trim();
-            let (cmd, args) = if let Some(idx) = trimmed.find(['<', '[']) {
-                let (c, a) = trimmed.split_at(idx);
-                let cmd_trimmed = c.trim_end();
-                let spaces_count = c.len() - cmd_trimmed.len();
-                (cmd_trimmed, format!("{}{}", " ".repeat(spaces_count), a))
-            } else {
-                (trimmed, "".to_owned())
-            };
-            let colored_cmd = if cmd.starts_with(':') {
-                cmd.cyan()
-            } else {
-                cmd.green()
-            };
-            println!("{}{}{}", " ".repeat(leading_spaces), colored_cmd, args);
+            continue;
+        }
+
+        // Descriptions are aligned to `syntax_limit` in the source. Split there,
+        // but never mid-token: if the boundary lands inside a word (a syntax
+        // that overruns the column, like `:import-edges`), advance to the next
+        // space so the full syntax stays intact.
+        let bytes = line.as_bytes();
+        let mut split = syntax_limit.min(line.len());
+        if split > 0 && split < line.len() && bytes[split - 1] != b' ' && bytes[split] != b' ' {
+            while split < line.len() && bytes[split] != b' ' {
+                split += 1;
+            }
+        }
+        let (syntax, desc) = line.split_at(split);
+        let desc = desc.trim();
+
+        let trimmed_syntax = syntax.trim();
+        let (cmd, args) = if let Some(idx) = trimmed_syntax.find(['<', '[']) {
+            let (c, a) = trimmed_syntax.split_at(idx);
+            let cmd_trimmed = c.trim_end();
+            let gap = c.len() - cmd_trimmed.len();
+            (cmd_trimmed, format!("{}{}", " ".repeat(gap), a))
         } else {
-            let (syntax, desc) = line.split_at(syntax_limit);
-            let trimmed_syntax = syntax.trim();
-            let (cmd, args) = if let Some(idx) = trimmed_syntax.find(['<', '[']) {
-                let (c, a) = trimmed_syntax.split_at(idx);
-                let cmd_trimmed = c.trim_end();
-                let spaces_count = c.len() - cmd_trimmed.len();
-                (cmd_trimmed, format!("{}{}", " ".repeat(spaces_count), a))
-            } else {
-                (trimmed_syntax, "".to_owned())
-            };
-            let colored_cmd = if cmd.starts_with(':') {
-                cmd.cyan()
-            } else {
-                cmd.green()
-            };
+            (trimmed_syntax, String::new())
+        };
+        let colored_cmd = if cmd.starts_with(':') {
+            cmd.cyan()
+        } else {
+            cmd.green()
+        };
 
-            let uncolored_len = cmd.len() + args.len();
-            let target_len = syntax.len() - leading_spaces;
-            let padding = target_len.saturating_sub(uncolored_len);
+        let indent = " ".repeat(leading_spaces);
+        let syntax_visible = leading_spaces + cmd.len() + args.len();
 
-            // First wrapped line sits beside the syntax; later lines hang under
-            // the description column at `syntax_limit`.
-            let wrapped = wrap_text(desc.trim(), desc_width);
-            print!(
-                "{}{}{}{}",
-                " ".repeat(leading_spaces),
-                colored_cmd,
-                args,
-                " ".repeat(padding)
-            );
+        if desc.is_empty() {
+            println!("{}{}{}", indent, colored_cmd, args);
+            continue;
+        }
+
+        let wrapped = wrap_text(desc, desc_width);
+        if syntax_visible < syntax_limit {
+            // Description fits beside the syntax; later lines hang at the column.
+            let padding = syntax_limit - syntax_visible;
+            print!("{}{}{}{}", indent, colored_cmd, args, " ".repeat(padding));
             println!("{}", wrapped[0].dimmed());
             for cont in &wrapped[1..] {
-                println!("{}{}", " ".repeat(syntax_limit), cont.dimmed());
+                println!("{}{}", hang, cont.dimmed());
+            }
+        } else {
+            // Syntax reaches or overruns the column: put it on its own line and
+            // hang the whole wrapped description under the description column.
+            println!("{}{}{}", indent, colored_cmd, args);
+            for cont in &wrapped {
+                println!("{}{}", hang, cont.dimmed());
             }
         }
     }
