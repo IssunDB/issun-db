@@ -694,10 +694,12 @@ mod tests {
         assert_eq!(res.records[0].values[0], serde_json::Value::Null);
     }
 
-    /// The canonical pairwise comparison functions: vector measures as distances
-    /// (`distance.cosine`, `distance.euclidean`), set measures as similarities
-    /// (`similarity.jaccard`, `similarity.overlap`). The opposite direction is a
-    /// trivial inline expression rather than a separate function. Null propagates.
+    /// The canonical pairwise comparison functions, namespaced under `issundb.`:
+    /// vector measures as distances (`issundb.distance.cosine`,
+    /// `issundb.distance.euclidean`), set measures as similarities
+    /// (`issundb.similarity.jaccard`, `issundb.similarity.overlap`). The opposite
+    /// direction is a trivial inline expression rather than a separate function.
+    /// Null propagates.
     #[test]
     fn comparison_scalar_functions() {
         let params = HashMap::new();
@@ -716,56 +718,56 @@ mod tests {
 
         // Cosine distance: 0.0 for parallel, 1.0 for orthogonal.
         near(
-            scalar("RETURN distance.cosine([1.0, 0.0], [2.0, 0.0]) AS s"),
+            scalar("RETURN issundb.distance.cosine([1.0, 0.0], [2.0, 0.0]) AS s"),
             0.0,
         );
         near(
-            scalar("RETURN distance.cosine([1.0, 0.0], [0.0, 1.0]) AS s"),
+            scalar("RETURN issundb.distance.cosine([1.0, 0.0], [0.0, 1.0]) AS s"),
             1.0,
         );
 
         // Euclidean distance between (0,0) and (3,4) is 5.
         near(
-            scalar("RETURN distance.euclidean([0.0, 0.0], [3.0, 4.0]) AS s"),
+            scalar("RETURN issundb.distance.euclidean([0.0, 0.0], [3.0, 4.0]) AS s"),
             5.0,
         );
 
         // Jaccard of {1,2,3} and {2,3,4}: intersection 2, union 4 => 0.5.
         near(
-            scalar("RETURN similarity.jaccard([1, 2, 3], [2, 3, 4]) AS s"),
+            scalar("RETURN issundb.similarity.jaccard([1, 2, 3], [2, 3, 4]) AS s"),
             0.5,
         );
 
         // Overlap of {1,2} and {1,2,3,4}: intersection 2 over min size 2 => 1.0.
         near(
-            scalar("RETURN similarity.overlap([1, 2], [1, 2, 3, 4]) AS s"),
+            scalar("RETURN issundb.similarity.overlap([1, 2], [1, 2, 3, 4]) AS s"),
             1.0,
         );
 
         // The opposite direction is a one-liner, not a separate function.
-        // Cosine similarity = 1 - distance.cosine (1.0 for parallel vectors).
+        // Cosine similarity = 1 - issundb.distance.cosine (1.0 for parallel vectors).
         near(
-            scalar("RETURN 1 - distance.cosine([1.0, 0.0], [2.0, 0.0]) AS s"),
+            scalar("RETURN 1 - issundb.distance.cosine([1.0, 0.0], [2.0, 0.0]) AS s"),
             1.0,
         );
         // Euclidean similarity = 1 / (1 + distance): 1 / (1 + 5) = 1/6.
         near(
-            scalar("RETURN 1.0 / (1.0 + distance.euclidean([0.0, 0.0], [3.0, 4.0])) AS s"),
+            scalar("RETURN 1.0 / (1.0 + issundb.distance.euclidean([0.0, 0.0], [3.0, 4.0])) AS s"),
             1.0 / 6.0,
         );
         // Jaccard distance = 1 - similarity = 0.5.
         near(
-            scalar("RETURN 1 - similarity.jaccard([1, 2, 3], [2, 3, 4]) AS s"),
+            scalar("RETURN 1 - issundb.similarity.jaccard([1, 2, 3], [2, 3, 4]) AS s"),
             0.5,
         );
 
         // A null operand propagates to null; a length mismatch yields null.
         assert_eq!(
-            scalar("RETURN similarity.jaccard(null, [1, 2]) AS s"),
+            scalar("RETURN issundb.similarity.jaccard(null, [1, 2]) AS s"),
             serde_json::Value::Null
         );
         assert_eq!(
-            scalar("RETURN distance.cosine([1.0], [1.0, 2.0]) AS s"),
+            scalar("RETURN issundb.distance.cosine([1.0], [1.0, 2.0]) AS s"),
             serde_json::Value::Null
         );
     }

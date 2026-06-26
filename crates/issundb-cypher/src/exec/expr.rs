@@ -1230,32 +1230,32 @@ pub(super) fn eval_function_call<B: Bindings>(
                 _ => Ok(serde_json::Value::Null),
             }
         }
-        // Pairwise comparison functions (the parser allows a single dot in a
-        // function name). Each measure has one canonical form, in the namespace
-        // matching its natural direction: vector measures are distances (lower is
-        // more similar), set measures are similarities (higher is more similar).
-        // The opposite direction is a trivial inline expression and is
+        // Pairwise comparison functions, namespaced under `issundb.` so the source
+        // of the built-in is explicit. Each measure has one canonical form, in the
+        // namespace matching its natural direction: vector measures are distances
+        // (lower is more similar), set measures are similarities (higher is more
+        // similar). The opposite direction is a trivial inline expression and is
         // deliberately not duplicated:
-        //   cosine similarity    = 1 - distance.cosine(a, b)
-        //   euclidean similarity = 1 / (1 + distance.euclidean(a, b))
-        //   jaccard/overlap dist = 1 - similarity.X(a, b)
+        //   cosine similarity    = 1 - issundb.distance.cosine(a, b)
+        //   euclidean similarity = 1 / (1 + issundb.distance.euclidean(a, b))
+        //   jaccard/overlap dist = 1 - issundb.similarity.X(a, b)
         // Vector arguments may be a list literal, a parameter, or a node embedding;
         // unlike `vector_dist`, these use a fixed metric independent of the graph's
         // configured vector index metric. A null operand, or a length mismatch,
         // yields null.
-        "distance.cosine" => {
+        "issundb.distance.cosine" => {
             // Cosine distance is 1 - cosine similarity, in [0, 2].
             eval_vector_metric(graph, path, name, args, params, cosine_similarity, |s| {
                 1.0 - s
             })
         }
-        "distance.euclidean" => {
+        "issundb.distance.euclidean" => {
             eval_vector_metric(graph, path, name, args, params, euclidean_distance, |d| d)
         }
-        "similarity.jaccard" => {
+        "issundb.similarity.jaccard" => {
             eval_set_metric(graph, path, name, args, params, jaccard_similarity, |s| s)
         }
-        "similarity.overlap" => {
+        "issundb.similarity.overlap" => {
             eval_set_metric(graph, path, name, args, params, overlap_similarity, |s| s)
         }
         "range" => {
