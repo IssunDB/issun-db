@@ -30,12 +30,13 @@
 //! therefore declares no inputs and carries only output rows.
 
 use crate::procedure::{CypherType, Procedure};
-use issundb_core::{DegreeDirection, Graph, NodeId};
+use issundb_core::{DegreeDirection, Graph, NodeId, TriangleCountSpec};
 use issundb_retrieval::{
     FusionStrategy, HybridRetrieveOptions, RetrieveOptions, Subgraph, retrieve_hybrid,
     retrieve_with,
 };
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 
 /// Default PageRank iteration count for the unparameterized procedure form.
 const PAGE_RANK_ITERATIONS: u32 = 20;
@@ -56,43 +57,58 @@ pub fn build(graph: &Graph, name: &str, args: &[Value]) -> Result<Option<Procedu
     if let Some(proc) = build_retrieval(graph, name, args)? {
         return Ok(Some(proc));
     }
+    if let Some(proc) = build_pathfinding(graph, name, args)? {
+        return Ok(Some(proc));
+    }
+    if let Some(proc) = build_communities(graph, name, args)? {
+        return Ok(Some(proc));
+    }
     build_algorithm(graph, name, args)
 }
 
-/// Build a parameterless analytics or community-algorithm procedure. Every
-/// produced row is `(nodeId, value)`, sorted by node id for deterministic output.
+/// Build an analytics or community-algorithm procedure that yields one
+/// `(nodeId, value)` row per node, sorted by node id for deterministic output.
+///
+/// `pageRank`, `degree`, and `labelPropagation` accept one optional configuration
+/// map; the remaining forms take no arguments. `wcc` and `scc` are aliases for the
+/// weakly and strongly connected-components procedures.
 fn build_algorithm(graph: &Graph, name: &str, args: &[Value]) -> Result<Option<Procedure>, String> {
-    let known = matches!(
+    let parameterized = matches!(
         name,
-        "issundb.pageRank"
-            | "issundb.betweenness"
-            | "issundb.harmonic"
-            | "issundb.degree"
-            | "issundb.connectedComponents"
-            | "issundb.stronglyConnectedComponents"
-            | "issundb.labelPropagation"
+        "issundb.pageRank" | "issundb.degree" | "issundb.labelPropagation"
     );
-    if !known {
+    let parameterless = matches!(
+        name,
+        "issundb.betweenness"
+            | "issundb.harmonic"
+            | "issundb.connectedComponents"
+            | "issundb.wcc"
+            | "issundb.stronglyConnectedComponents"
+            | "issundb.scc"
+    );
+    if !parameterized && !parameterless {
         return Ok(None);
     }
-    // Reject arguments before running the algorithm: the built-in forms are
-    // unparameterized, so there is no point computing a result just to fail
-    // argument validation afterwards.
-    if !args.is_empty() {
-        return Err(format!(
-            "SyntaxError(InvalidNumberOfArguments): procedure `{}` takes 0 argument(s) but {} given",
-            name,
-            args.len()
-        ));
-    }
-
-    let to_err = |e: issundb_core::Error| format!("ProcedureCallFailed: {e}");
+    // Parameterized forms accept one optional configuration map; parameterless
+    // forms reject any argument.
+    let cfg = if parameterized {
+        if args.len() > 1 {
+            return Err(arg_count_err(name, "0 or 1", args.len()));
+        }
+        args.first()
+    } else {
+        if !args.is_empty() {
+            return Err(arg_count_err(name, "0", args.len()));
+        }
+        None
+    };
 
     let (value_col, rows): (&str, Vec<Vec<Value>>) = match name {
         "issundb.pageRank" => {
-            let scores = graph
-                .page_rank(PAGE_RANK_ITERATIONS, PAGE_RANK_DAMPING)
-                .map_err(to_err)?;
+            let iterations =
+                cfg_usize(name, cfg, "iterations", PAGE_RANK_ITERATIONS as usize)? as u32;
+            let damping = cfg_f32(name, cfg, "damping", PAGE_RANK_DAMPING)?;
+            let scores = graph.page_rank(iterations, damping).map_err(proc_err)?;
             (
                 "score",
                 float_rows(scores.into_iter().map(|(n, s)| (n, s as f64))),
@@ -100,44 +116,55 @@ fn build_algorithm(graph: &Graph, name: &str, args: &[Value]) -> Result<Option<P
         }
         "issundb.betweenness" => (
             "score",
-            float_rows(graph.betweenness_centrality().map_err(to_err)?.into_iter()),
-        ),
-        "issundb.harmonic" => (
-            "score",
-            float_rows(graph.harmonic_centrality().map_err(to_err)?.into_iter()),
-        ),
-        "issundb.degree" => (
-            "score",
-            int_rows(
+            float_rows(
                 graph
-                    .degree_centrality(DegreeDirection::Both)
-                    .map_err(to_err)?
+                    .betweenness_centrality()
+                    .map_err(proc_err)?
                     .into_iter(),
             ),
         ),
-        "issundb.connectedComponents" => (
-            "componentId",
-            int_rows(graph.connected_components().map_err(to_err)?.into_iter()),
+        "issundb.harmonic" => (
+            "score",
+            float_rows(graph.harmonic_centrality().map_err(proc_err)?.into_iter()),
         ),
-        "issundb.stronglyConnectedComponents" => (
+        "issundb.degree" => {
+            let direction = parse_degree_direction(name, cfg)?;
+            (
+                "score",
+                int_rows(
+                    graph
+                        .degree_centrality(direction)
+                        .map_err(proc_err)?
+                        .into_iter(),
+                ),
+            )
+        }
+        "issundb.connectedComponents" | "issundb.wcc" => (
+            "componentId",
+            int_rows(graph.connected_components().map_err(proc_err)?.into_iter()),
+        ),
+        "issundb.stronglyConnectedComponents" | "issundb.scc" => (
             "componentId",
             int_rows(
                 graph
                     .strongly_connected_components()
-                    .map_err(to_err)?
+                    .map_err(proc_err)?
                     .into_iter(),
             ),
         ),
-        "issundb.labelPropagation" => (
-            "communityId",
-            int_rows(
-                graph
-                    .label_propagation(LABEL_PROP_ITERATIONS)
-                    .map_err(to_err)?
-                    .into_iter(),
-            ),
-        ),
-        _ => unreachable!("name was checked against the built-in set above"),
+        "issundb.labelPropagation" => {
+            let max_iterations = cfg_usize(name, cfg, "maxIterations", LABEL_PROP_ITERATIONS)?;
+            (
+                "communityId",
+                int_rows(
+                    graph
+                        .label_propagation(max_iterations)
+                        .map_err(proc_err)?
+                        .into_iter(),
+                ),
+            )
+        }
+        _ => unreachable!("name was checked against the built-in sets above"),
     };
 
     let value_type = if value_col == "score" {
@@ -155,6 +182,22 @@ fn build_algorithm(graph: &Graph, name: &str, args: &[Value]) -> Result<Option<P
         ],
         rows,
     }))
+}
+
+/// Parse the `direction` configuration field for `issundb.degree`: `IN`, `OUT`,
+/// or `BOTH` (case-insensitive), defaulting to `BOTH`.
+fn parse_degree_direction(proc: &str, cfg: Option<&Value>) -> Result<DegreeDirection, String> {
+    match cfg_opt_string(proc, cfg, "direction")? {
+        None => Ok(DegreeDirection::Both),
+        Some(s) => match s.to_ascii_uppercase().as_str() {
+            "IN" => Ok(DegreeDirection::In),
+            "OUT" => Ok(DegreeDirection::Out),
+            "BOTH" => Ok(DegreeDirection::Both),
+            _ => Err(format!(
+                "ProcedureCallFailed: procedure `{proc}` direction must be `IN`, `OUT`, or `BOTH`"
+            )),
+        },
+    }
 }
 
 /// Materialize `(nodeId, score)` rows for a float-valued algorithm result,
@@ -437,6 +480,240 @@ fn cfg_type_err(proc: &str, key: &str, expected: &str) -> String {
     )
 }
 
+/// Map an `issundb-core` error into the standard procedure-failure string. A free
+/// function (not a closure) so it is `Copy` and usable across several `map_err`
+/// calls in one procedure body.
+fn proc_err(e: issundb_core::Error) -> String {
+    format!("ProcedureCallFailed: {e}")
+}
+
+/// Build a pathfinding or pattern-count procedure (`issundb.shortestPath`,
+/// `issundb.dijkstra`, or `issundb.triangleCount`), or `Ok(None)` when `name` is
+/// not one. Paths yield one ordered `(index, nodeId[, totalWeight])` row per node;
+/// an absent path yields no rows.
+fn build_pathfinding(
+    graph: &Graph,
+    name: &str,
+    args: &[Value],
+) -> Result<Option<Procedure>, String> {
+    match name {
+        "issundb.shortestPath" => Ok(Some(build_shortest_path(graph, args)?)),
+        "issundb.dijkstra" => Ok(Some(build_dijkstra(graph, args)?)),
+        "issundb.triangleCount" => Ok(Some(build_triangle_count(graph, args)?)),
+        _ => Ok(None),
+    }
+}
+
+/// `issundb.shortestPath(sourceId, targetId)`. Yields `(index, nodeId)` along an
+/// unweighted shortest path; no rows when the target is unreachable.
+fn build_shortest_path(graph: &Graph, args: &[Value]) -> Result<Procedure, String> {
+    let name = "issundb.shortestPath";
+    if args.len() != 2 {
+        return Err(arg_count_err(name, "2", args.len()));
+    }
+    let src = parse_node_id(name, &args[0])?;
+    let dst = parse_node_id(name, &args[1])?;
+    let rows = match graph.shortest_path(src, dst).map_err(proc_err)? {
+        Some(nodes) => nodes
+            .into_iter()
+            .enumerate()
+            .map(|(i, n)| vec![json!(i as u64), json!(n)])
+            .collect(),
+        None => Vec::new(),
+    };
+    Ok(Procedure {
+        name: name.to_string(),
+        inputs: vec![],
+        outputs: vec![
+            ("index".to_string(), CypherType::Integer),
+            ("nodeId".to_string(), CypherType::Integer),
+        ],
+        rows,
+    })
+}
+
+/// `issundb.dijkstra(sourceId, targetId)`. Yields `(index, nodeId, totalWeight)`
+/// along the least-weight path, where edge weight is the first present of the
+/// `weight`, `cost`, `capacity`, or `cap` property (default `1.0`); `totalWeight`
+/// is the whole-path weight, repeated on every row. No rows when unreachable.
+fn build_dijkstra(graph: &Graph, args: &[Value]) -> Result<Procedure, String> {
+    let name = "issundb.dijkstra";
+    if args.len() != 2 {
+        return Err(arg_count_err(name, "2", args.len()));
+    }
+    let src = parse_node_id(name, &args[0])?;
+    let dst = parse_node_id(name, &args[1])?;
+    let rows = match graph.shortest_path_dijkstra(src, dst).map_err(proc_err)? {
+        Some(path) => {
+            let total = path.total_weight;
+            path.nodes
+                .into_iter()
+                .enumerate()
+                .map(|(i, n)| vec![json!(i as u64), json!(n), json!(total)])
+                .collect()
+        }
+        None => Vec::new(),
+    };
+    Ok(Procedure {
+        name: name.to_string(),
+        inputs: vec![],
+        outputs: vec![
+            ("index".to_string(), CypherType::Integer),
+            ("nodeId".to_string(), CypherType::Integer),
+            ("totalWeight".to_string(), CypherType::Float),
+        ],
+        rows,
+    })
+}
+
+/// `issundb.triangleCount([{relTypes, labels}])`. Yields a single `(count)` row:
+/// the number of directed triangle cycles `(a)->(b)->(c)->(a)`, optionally
+/// constrained by per-hop relationship types and per-variable labels (each a list
+/// of up to three strings, with `null` entries left unconstrained).
+fn build_triangle_count(graph: &Graph, args: &[Value]) -> Result<Procedure, String> {
+    let name = "issundb.triangleCount";
+    if args.len() > 1 {
+        return Err(arg_count_err(name, "0 or 1", args.len()));
+    }
+    let cfg = args.first();
+    // The spec borrows `&str`, so the owned strings must outlive the call.
+    let rel_owned = parse_str_triple(name, cfg, "relTypes")?;
+    let label_owned = parse_str_triple(name, cfg, "labels")?;
+    let spec = TriangleCountSpec {
+        rel_types: [
+            rel_owned[0].as_deref(),
+            rel_owned[1].as_deref(),
+            rel_owned[2].as_deref(),
+        ],
+        labels: [
+            label_owned[0].as_deref(),
+            label_owned[1].as_deref(),
+            label_owned[2].as_deref(),
+        ],
+    };
+    let count = graph.count_triangle_cycles(&spec).map_err(proc_err)?;
+    Ok(Procedure {
+        name: name.to_string(),
+        inputs: vec![],
+        outputs: vec![("count".to_string(), CypherType::Integer)],
+        rows: vec![vec![json!(count)]],
+    })
+}
+
+/// `issundb.communities([{maxIterations, topPerCommunity}])`. Partitions the graph
+/// with label propagation, then ranks each community's members by PageRank
+/// (descending, node id breaking ties), yielding `(communityId, nodeId, rank)`
+/// with a one-based `rank`. `topPerCommunity` caps the members emitted per
+/// community. This is the building block global-GraphRAG search needs to pick
+/// representative nodes per community; the community summaries themselves are an
+/// application concern, not a database one.
+fn build_communities(
+    graph: &Graph,
+    name: &str,
+    args: &[Value],
+) -> Result<Option<Procedure>, String> {
+    if name != "issundb.communities" {
+        return Ok(None);
+    }
+    if args.len() > 1 {
+        return Err(arg_count_err(name, "0 or 1", args.len()));
+    }
+    let cfg = args.first();
+    let max_iterations = cfg_usize(name, cfg, "maxIterations", LABEL_PROP_ITERATIONS)?;
+    let top = cfg_opt_usize(name, cfg, "topPerCommunity")?;
+
+    let communities = graph.label_propagation(max_iterations).map_err(proc_err)?;
+    let ranks = graph
+        .page_rank(PAGE_RANK_ITERATIONS, PAGE_RANK_DAMPING)
+        .map_err(proc_err)?;
+
+    // Group nodes by community (BTreeMap for a deterministic community order).
+    let mut by_community: BTreeMap<u64, Vec<(NodeId, f32)>> = BTreeMap::new();
+    for (node, community) in communities {
+        let score = ranks.get(&node).copied().unwrap_or(0.0);
+        by_community
+            .entry(community)
+            .or_default()
+            .push((node, score));
+    }
+
+    let mut rows: Vec<Vec<Value>> = Vec::new();
+    for (community, mut members) in by_community {
+        members.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.0.cmp(&b.0))
+        });
+        for (i, (node, _score)) in members.iter().enumerate() {
+            if top.is_some_and(|t| i >= t) {
+                break;
+            }
+            rows.push(vec![json!(community), json!(node), json!(i as u64 + 1)]);
+        }
+    }
+
+    Ok(Some(Procedure {
+        name: name.to_string(),
+        inputs: vec![],
+        outputs: vec![
+            ("communityId".to_string(), CypherType::Integer),
+            ("nodeId".to_string(), CypherType::Integer),
+            ("rank".to_string(), CypherType::Integer),
+        ],
+        rows,
+    }))
+}
+
+/// Parse a node-id argument: a non-negative integer.
+fn parse_node_id(proc: &str, v: &Value) -> Result<NodeId, String> {
+    match v {
+        Value::Number(n) => n.as_u64().map(|u| u as NodeId).ok_or_else(|| {
+            format!(
+                "ProcedureCallFailed: procedure `{proc}` node id must be a non-negative integer"
+            )
+        }),
+        _ => Err(format!(
+            "ProcedureCallFailed: procedure `{proc}` node id must be an integer"
+        )),
+    }
+}
+
+/// Parse a configuration field holding a list of up to three strings (with `null`
+/// entries permitted and left unconstrained) into a fixed triple of owned strings.
+fn parse_str_triple(
+    proc: &str,
+    cfg: Option<&Value>,
+    key: &str,
+) -> Result<[Option<String>; 3], String> {
+    let mut out: [Option<String>; 3] = [None, None, None];
+    match cfg_field(proc, cfg, key)? {
+        None => Ok(out),
+        Some(Value::Array(items)) => {
+            if items.len() > 3 {
+                return Err(format!(
+                    "ProcedureCallFailed: procedure `{proc}` `{key}` accepts at most 3 entries"
+                ));
+            }
+            for (i, item) in items.iter().enumerate() {
+                match item {
+                    Value::Null => {}
+                    Value::String(s) => out[i] = Some(s.clone()),
+                    _ => {
+                        return Err(format!(
+                            "ProcedureCallFailed: procedure `{proc}` `{key}` entries must be \
+                             strings or null"
+                        ));
+                    }
+                }
+            }
+            Ok(out)
+        }
+        Some(_) => Err(format!(
+            "ProcedureCallFailed: procedure `{proc}` `{key}` must be a list of strings"
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::exec::execute;
@@ -672,5 +949,220 @@ mod tests {
         for r in &res.records {
             assert!(r.values[0].is_string());
         }
+    }
+
+    // --- parameterized algorithm procedures ---
+
+    #[test]
+    fn page_rank_accepts_config_map() {
+        let (_d, g) = triangle();
+        let params = HashMap::new();
+        let res = execute(
+            &g,
+            "CALL issundb.pageRank({iterations: 5, damping: 0.9}) \
+             YIELD nodeId, score RETURN count(*) AS c",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(res.records[0].values[0], json!(3));
+    }
+
+    #[test]
+    fn degree_accepts_direction_config() {
+        let (_d, g) = triangle();
+        let params = HashMap::new();
+        // Each node in a directed triangle has out-degree 1.
+        let res = execute(
+            &g,
+            "CALL issundb.degree({direction: 'OUT'}) \
+             YIELD nodeId, score RETURN nodeId, score ORDER BY nodeId",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(res.records.len(), 3);
+        for r in &res.records {
+            assert_eq!(r.values[1], json!(1));
+        }
+    }
+
+    #[test]
+    fn degree_rejects_invalid_direction() {
+        let (_d, g) = triangle();
+        let params = HashMap::new();
+        assert!(execute(&g, "CALL issundb.degree({direction: 'SIDEWAYS'})", &params).is_err());
+    }
+
+    #[test]
+    fn wcc_and_scc_aliases_resolve() {
+        let (_d, g) = triangle();
+        let params = HashMap::new();
+        for q in [
+            "CALL issundb.wcc() YIELD nodeId, componentId RETURN count(*) AS c",
+            "CALL issundb.scc() YIELD nodeId, componentId RETURN count(*) AS c",
+        ] {
+            let res = execute(&g, q, &params).unwrap();
+            assert_eq!(res.records[0].values[0], json!(3));
+        }
+    }
+
+    #[test]
+    fn parameterless_procedure_still_rejects_arguments() {
+        let (_d, g) = triangle();
+        let params = HashMap::new();
+        assert!(execute(&g, "CALL issundb.betweenness(1)", &params).is_err());
+    }
+
+    // --- pathfinding and pattern-count procedures ---
+
+    /// A directed weighted chain `n0 -> n1 -> n2 -> n3`, returning the node ids.
+    fn weighted_chain() -> (TempDir, Graph, [i64; 4]) {
+        let dir = TempDir::new().unwrap();
+        let g = Graph::open(dir.path(), 1).unwrap();
+        let n: Vec<_> = (0..4)
+            .map(|_| g.add_node("N", &json!({})).unwrap())
+            .collect();
+        g.add_edge(n[0], n[1], "E", &json!({"weight": 1.0}))
+            .unwrap();
+        g.add_edge(n[1], n[2], "E", &json!({"weight": 2.0}))
+            .unwrap();
+        g.add_edge(n[2], n[3], "E", &json!({"weight": 3.0}))
+            .unwrap();
+        g.rebuild_csr().unwrap();
+        (dir, g, [n[0] as i64, n[1] as i64, n[2] as i64, n[3] as i64])
+    }
+
+    #[test]
+    fn shortest_path_yields_ordered_nodes() {
+        let (_d, g, ids) = weighted_chain();
+        let params = HashMap::new();
+        let q = format!(
+            "CALL issundb.shortestPath({}, {}) YIELD index, nodeId RETURN index, nodeId ORDER BY index",
+            ids[0], ids[3]
+        );
+        let res = execute(&g, &q, &params).unwrap();
+        assert_eq!(res.columns, vec!["index".to_string(), "nodeId".to_string()]);
+        let path: Vec<i64> = res
+            .records
+            .iter()
+            .map(|r| r.values[1].as_i64().unwrap())
+            .collect();
+        assert_eq!(path, vec![ids[0], ids[1], ids[2], ids[3]]);
+    }
+
+    #[test]
+    fn shortest_path_unreachable_yields_no_rows() {
+        let (_d, g, ids) = weighted_chain();
+        let params = HashMap::new();
+        // The chain is directed, so there is no path from the last node back.
+        let q = format!(
+            "CALL issundb.shortestPath({}, {}) YIELD nodeId RETURN count(*) AS c",
+            ids[3], ids[0]
+        );
+        let res = execute(&g, &q, &params).unwrap();
+        assert_eq!(res.records[0].values[0], json!(0));
+    }
+
+    #[test]
+    fn dijkstra_yields_total_weight() {
+        let (_d, g, ids) = weighted_chain();
+        let params = HashMap::new();
+        let q = format!(
+            "CALL issundb.dijkstra({}, {}) YIELD index, nodeId, totalWeight \
+             RETURN index, nodeId, totalWeight ORDER BY index",
+            ids[0], ids[3]
+        );
+        let res = execute(&g, &q, &params).unwrap();
+        assert_eq!(res.records.len(), 4);
+        // Total weight 1 + 2 + 3 = 6, repeated on each row.
+        for r in &res.records {
+            assert!((r.values[2].as_f64().unwrap() - 6.0).abs() < 1e-6);
+        }
+        // Rows are ordered along the path.
+        let path: Vec<i64> = res
+            .records
+            .iter()
+            .map(|r| r.values[1].as_i64().unwrap())
+            .collect();
+        assert_eq!(path, vec![ids[0], ids[1], ids[2], ids[3]]);
+    }
+
+    #[test]
+    fn triangle_count_counts_the_cycle() {
+        let (_d, g) = triangle();
+        let params = HashMap::new();
+        let res = execute(
+            &g,
+            "CALL issundb.triangleCount() YIELD count RETURN count",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(res.columns, vec!["count".to_string()]);
+        // The directed triangle a->b->c->a yields 3 cyclic assignments (one per
+        // rotation of the start vertex).
+        assert_eq!(res.records[0].values[0], json!(3));
+    }
+
+    #[test]
+    fn triangle_count_with_type_filter_is_accepted() {
+        let (_d, g) = triangle();
+        let params = HashMap::new();
+        let res = execute(
+            &g,
+            "CALL issundb.triangleCount({relTypes: ['T', 'T', 'T'], labels: ['N', 'N', 'N']}) \
+             YIELD count RETURN count",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(res.records[0].values[0], json!(3));
+    }
+
+    // --- communities (global-GraphRAG building block) ---
+
+    #[test]
+    fn communities_yields_ranked_members_per_community() {
+        let (_d, g) = triangle();
+        let params = HashMap::new();
+        let res = execute(
+            &g,
+            "CALL issundb.communities() YIELD communityId, nodeId, rank \
+             RETURN communityId, nodeId, rank ORDER BY communityId, rank",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(
+            res.columns,
+            vec![
+                "communityId".to_string(),
+                "nodeId".to_string(),
+                "rank".to_string()
+            ]
+        );
+        // One row per node, and ranks within a community start at 1.
+        assert_eq!(res.records.len(), 3);
+        assert!(
+            res.records
+                .iter()
+                .all(|r| r.values[2].as_u64().unwrap() >= 1)
+        );
+    }
+
+    #[test]
+    fn communities_top_per_community_caps_members() {
+        let (_d, g) = triangle();
+        let params = HashMap::new();
+        // The directed triangle is one strongly connected community under label
+        // propagation, so topPerCommunity=1 keeps a single representative.
+        let res = execute(
+            &g,
+            "CALL issundb.communities({topPerCommunity: 1}) YIELD nodeId, rank \
+             RETURN count(*) AS c",
+            &params,
+        )
+        .unwrap();
+        let count = res.records[0].values[0].as_u64().unwrap();
+        assert!(
+            count >= 1 && count <= 3,
+            "expected 1..=3 representatives, got {count}"
+        );
     }
 }

@@ -3450,6 +3450,10 @@ fn is_known_function(name: &str) -> bool {
             | "relationships"
             | "rels"
             | "vector_dist"
+            | "distance.cosine"
+            | "distance.euclidean"
+            | "similarity.jaccard"
+            | "similarity.overlap"
     )
 }
 

@@ -1009,6 +1009,138 @@ fn resolve_vector_arg<B: Bindings>(
     }
 }
 
+/// Cosine similarity of two equal-length numeric vectors, in the range `[-1, 1]`
+/// (higher is more similar). `None` on a length mismatch, an empty vector, or a
+/// zero-magnitude vector (an undefined cosine).
+fn cosine_similarity(a: &[f32], b: &[f32]) -> Option<f64> {
+    if a.len() != b.len() || a.is_empty() {
+        return None;
+    }
+    let (mut dot, mut na, mut nb) = (0.0f64, 0.0f64, 0.0f64);
+    for (x, y) in a.iter().zip(b.iter()) {
+        let (x, y) = (*x as f64, *y as f64);
+        dot += x * y;
+        na += x * x;
+        nb += y * y;
+    }
+    if na == 0.0 || nb == 0.0 {
+        return None;
+    }
+    Some(dot / (na.sqrt() * nb.sqrt()))
+}
+
+/// Euclidean (L2) distance between two equal-length numeric vectors (lower is more
+/// similar). `None` on a length mismatch.
+fn euclidean_distance(a: &[f32], b: &[f32]) -> Option<f64> {
+    if a.len() != b.len() {
+        return None;
+    }
+    let sum: f64 = a
+        .iter()
+        .zip(b.iter())
+        .map(|(x, y)| {
+            let d = *x as f64 - *y as f64;
+            d * d
+        })
+        .sum();
+    Some(sum.sqrt())
+}
+
+/// Interpret a JSON value as a set: the deduplicated elements of a list. `None`
+/// for any non-list value (so a null operand propagates to a null result).
+/// `serde_json::Value` is not `Eq` (floats), so membership uses linear `PartialEq`
+/// comparison rather than a hash set.
+fn value_as_set(v: &serde_json::Value) -> Option<Vec<serde_json::Value>> {
+    match v {
+        serde_json::Value::Array(items) => {
+            let mut set: Vec<serde_json::Value> = Vec::new();
+            for it in items {
+                if !set.contains(it) {
+                    set.push(it.clone());
+                }
+            }
+            Some(set)
+        }
+        _ => None,
+    }
+}
+
+/// Jaccard similarity of two sets: intersection over union, in `[0, 1]` (higher is
+/// more similar). A degenerate empty union yields `0.0`.
+fn jaccard_similarity(a: &[serde_json::Value], b: &[serde_json::Value]) -> f64 {
+    let inter = a.iter().filter(|x| b.contains(x)).count();
+    let union = a.len() + b.len() - inter;
+    if union == 0 {
+        0.0
+    } else {
+        inter as f64 / union as f64
+    }
+}
+
+/// Overlap (Szymkiewicz–Simpson) similarity of two sets: intersection over the
+/// smaller set, in `[0, 1]` (higher is more similar). A degenerate empty set
+/// yields `0.0`.
+fn overlap_similarity(a: &[serde_json::Value], b: &[serde_json::Value]) -> f64 {
+    let inter = a.iter().filter(|x| b.contains(x)).count();
+    let denom = a.len().min(b.len());
+    if denom == 0 {
+        0.0
+    } else {
+        inter as f64 / denom as f64
+    }
+}
+
+/// Evaluate a pairwise vector metric over two vector arguments (each a list
+/// literal, a parameter, or a node embedding). A null operand, or a `metric`
+/// returning `None` (length mismatch or undefined), yields null. `transform` maps
+/// the raw metric to the reported value: identity for the natural form, or a
+/// complement such as `1.0 - s` for the opposite-direction form.
+fn eval_vector_metric<B: Bindings>(
+    graph: &Graph,
+    path: &B,
+    name: &str,
+    args: &[Expr],
+    params: &HashMap<String, serde_json::Value>,
+    metric: impl Fn(&[f32], &[f32]) -> Option<f64>,
+    transform: impl Fn(f64) -> f64,
+) -> Result<serde_json::Value, String> {
+    if args.len() != 2 {
+        return Err(format!("{name}() requires exactly 2 arguments"));
+    }
+    let a = resolve_vector_arg(graph, path, &args[0], params)?;
+    let b = resolve_vector_arg(graph, path, &args[1], params)?;
+    Ok(match (a, b) {
+        (Some(va), Some(vb)) => match metric(&va, &vb) {
+            Some(m) => serde_json::Value::from(transform(m)),
+            None => serde_json::Value::Null,
+        },
+        _ => serde_json::Value::Null,
+    })
+}
+
+/// Evaluate a pairwise set metric over two list arguments treated as sets. A null
+/// (non-list) operand yields null. `sim` computes the similarity from the two
+/// deduplicated sets; `transform` maps it to the reported value.
+fn eval_set_metric<B: Bindings>(
+    graph: &Graph,
+    path: &B,
+    name: &str,
+    args: &[Expr],
+    params: &HashMap<String, serde_json::Value>,
+    sim: impl Fn(&[serde_json::Value], &[serde_json::Value]) -> f64,
+    transform: impl Fn(f64) -> f64,
+) -> Result<serde_json::Value, String> {
+    if args.len() != 2 {
+        return Err(format!("{name}() requires exactly 2 arguments"));
+    }
+    let a = evaluate_expr(graph, path, &args[0], params)?;
+    let b = evaluate_expr(graph, path, &args[1], params)?;
+    Ok(match (value_as_set(&a), value_as_set(&b)) {
+        (Some(sa), Some(sb)) => serde_json::Value::from(transform(sim(&sa, &sb))),
+        _ => serde_json::Value::Null,
+    })
+}
+
 pub(super) fn eval_function_call<B: Bindings>(
     graph: &Graph,
     path: &B,
@@ -1097,6 +1229,34 @@ pub(super) fn eval_function_call<B: Bindings>(
                 }
                 _ => Ok(serde_json::Value::Null),
             }
+        }
+        // Pairwise comparison functions (the parser allows a single dot in a
+        // function name). Each measure has one canonical form, in the namespace
+        // matching its natural direction: vector measures are distances (lower is
+        // more similar), set measures are similarities (higher is more similar).
+        // The opposite direction is a trivial inline expression and is
+        // deliberately not duplicated:
+        //   cosine similarity    = 1 - distance.cosine(a, b)
+        //   euclidean similarity = 1 / (1 + distance.euclidean(a, b))
+        //   jaccard/overlap dist = 1 - similarity.X(a, b)
+        // Vector arguments may be a list literal, a parameter, or a node embedding;
+        // unlike `vector_dist`, these use a fixed metric independent of the graph's
+        // configured vector index metric. A null operand, or a length mismatch,
+        // yields null.
+        "distance.cosine" => {
+            // Cosine distance is 1 - cosine similarity, in [0, 2].
+            eval_vector_metric(graph, path, name, args, params, cosine_similarity, |s| {
+                1.0 - s
+            })
+        }
+        "distance.euclidean" => {
+            eval_vector_metric(graph, path, name, args, params, euclidean_distance, |d| d)
+        }
+        "similarity.jaccard" => {
+            eval_set_metric(graph, path, name, args, params, jaccard_similarity, |s| s)
+        }
+        "similarity.overlap" => {
+            eval_set_metric(graph, path, name, args, params, overlap_similarity, |s| s)
         }
         "range" => {
             if args.len() < 2 || args.len() > 3 {
