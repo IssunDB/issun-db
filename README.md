@@ -139,6 +139,11 @@ Refer to the [issundb-examples](crates/issundb-examples) crate for Rust API exam
 
 Refer to the [issundb-py/examples](crates/issundb-py/examples) directory for Python API examples.
 
+#### Knowlege Graph Demo
+
+[![asciicast](https://asciinema.org/a/L1iTAtQeVeCe6jiX.svg)](https://asciinema.org/a/L1iTAtQeVeCe6jiX)
+
+
 ---
 
 ### Contributing
