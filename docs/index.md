@@ -6,16 +6,18 @@ GraphRAG pipelines and querying knowledge graphs.
 
 ## Key Features
 
-* Rust graph engine built with ACID, property graph model, and Cypher query language support
-* Fast graph traversal and analytics using sparse matrix operations
-* Fast vectorized query execution with multi-core query parallelism and serializable transactions
-* Built-in vector, text, and hybrid search and retrieval
-* Provides a wide range of APIs, including native Rust, Python bindings, CLI, HTTP (REST), and MCP
-* Fully cross-platform; supports Linux, macOS, and Windows
+Key features of IssunDB:
+
+* **ACID Transactions**: A graph engine with full support for transactional safety and declarative Cypher queries.
+* **Fast Graph Analytics**: High-performance traversals and graph algorithms using sparse matrix operations.
+* **Vectorized Execution**: Multi-core parallel execution and serializable transactions.
+* **Multi-Index Retrieval**: Hybrid search combining vector search, full-text keyword ranking, and neighborhood expansion.
+* **Rich Developer Tooling**: Native Rust APIs, Python bindings, interactive CLI, HTTP REST server, and MCP.
+* **Cross-Platform Support**: Compatibility with Linux, macOS, and Windows.
 
 ## Architecture Overview
 
-The database is built as a set of modular crates:
+The database is designed as a set of modular crates, establishing clear boundaries between storage, queries, and indexes:
 
 | Crate               | Purpose                                                                     |
 |---------------------|-----------------------------------------------------------------------------|
@@ -24,7 +26,7 @@ The database is built as a set of modular crates:
 | `issundb-text`      | Tokenizer implementation, inverted indexes, and BM25 text search scoring.   |
 | `issundb-retrieval` | Multi-source hybrid retrieval, rank fusion, and graph traversal.            |
 | `issundb-cypher`    | Cypher query parser, AST definitions, planners, and executors.              |
-| `issundb`           | Public facade (the API) of IssunDB that provides a unified API for use.     |
+| `issundb`           | The primary library crate providing a unified public API.                   |
 | `issundb-cli`       | An interactive CLI for IssunDB.                                             |
 | `issundb-rest`      | An HTTP server that exposes IssunDB's functionalities over REST API.        |
 | `issundb-mcp`       | MCP server implementation for IssunDB.                                      |
@@ -41,3 +43,4 @@ The database is built as a set of modular crates:
 - [API Reference](api-reference.md): Public Rust API reference, types, and Cypher DDL syntax.
 - [Hybrid Retrieval](hybrid-retrieval.md): Concept overview and implementation guide for GraphRAG pipelines.
 - [Integrations](integrations.md): Exposing IssunDB over HTTP REST and the MCP.
+- [Python Integration](python.md): Working with IssunDB directly from Python.

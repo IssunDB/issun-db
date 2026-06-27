@@ -1,17 +1,16 @@
 # Integrations
 
-IssunDB provides integration servers to expose graph operations, vector search, and Cypher execution to external applications and client tools.
+IssunDB provides integration servers to expose graph operations, vector search, and Cypher query execution to external applications and client tools. This document describes how to configure and run these services.
 
 ---
 
 ## HTTP REST API
 
-The `issundb-rest` crate provides an HTTP REST server built on Axum. It serves versioned endpoints for node/edge CRUD, text and vector searches,
-and query execution.
+The `issundb-rest` crate provides an HTTP REST server built on Axum. It serves versioned endpoints for node/edge CRUD operations, text and vector searches, and query execution.
 
 ### Start the REST Server
 
-Run the REST server using `cargo`:
+Launch the REST server via `cargo` using the following command:
 
 ```bash
 cargo run -p issundb-rest -- --db-path /path/to/db-dir [--host 127.0.0.1] [--port 7474]
@@ -23,7 +22,7 @@ All data and query endpoints are prefixed with `/v1`.
 
 #### Node Operations
 
-* Create node: `POST /v1/nodes`
+* **Create Node**: `POST /v1/nodes`
     * Request body:
       ```json
       {
@@ -32,25 +31,25 @@ All data and query endpoints are prefixed with `/v1`.
       }
       ```
     * Response: Returns the generated `NodeId` wrapped in a JSON object, e.g., `{"id": 1}`.
-* Get node: `GET /v1/nodes/:id`
+* **Get Node**: `GET /v1/nodes/:id`
     * Response: A JSON object containing the node's unique ID, labels, and properties.
-* Update node: `PUT /v1/nodes/:id`
+* **Update Node**: `PUT /v1/nodes/:id`
     * Request body:
       ```json
       {
         "props": { "name": "Bob", "age": 32 }
       }
       ```
-* Delete node: `DELETE /v1/nodes/:id`
+* **Delete Node**: `DELETE /v1/nodes/:id`
     * Response: `204 No Content` on successful removal.
-* Add label: `POST /v1/nodes/:id/labels/:label`
-    * Response: `204 No Content`; `404 Not Found` when the node does not exist.
-* Remove label: `DELETE /v1/nodes/:id/labels/:label`
-    * Response: `204 No Content`; removal is idempotent.
+* **Add Label**: `POST /v1/nodes/:id/labels/:label`
+    * Response: `204 No Content`; returns `404 Not Found` when the node does not exist.
+* **Remove Label**: `DELETE /v1/nodes/:id/labels/:label`
+    * Response: `204 No Content` (label removal is idempotent).
 
 #### Edge Operations
 
-* Create edge: `POST /v1/edges`
+* **Create Edge**: `POST /v1/edges`
     * Request body:
       ```json
       {
@@ -61,22 +60,22 @@ All data and query endpoints are prefixed with `/v1`.
       }
       ```
     * Response: Returns the generated `EdgeId` wrapped in a JSON object, e.g., `{"id": 1}`.
-* Get edge: `GET /v1/edges/:id`
+* **Get Edge**: `GET /v1/edges/:id`
     * Response: A JSON object containing the edge's unique ID, source/destination node IDs, type, and properties.
-* Update edge: `PUT /v1/edges/:id`
+* **Update Edge**: `PUT /v1/edges/:id`
     * Request body:
       ```json
       {
         "props": { "since": 2021 }
       }
       ```
-    * Response: `204 No Content`; `404 Not Found` when the edge does not exist.
-* Delete edge: `DELETE /v1/edges/:id`
+    * Response: `204 No Content`; returns `404 Not Found` when the edge does not exist.
+* **Delete Edge**: `DELETE /v1/edges/:id`
     * Response: `204 No Content` upon successful removal.
 
 #### Search and Query Operations
 
-* Cypher query: `POST /v1/query`
+* **Cypher Query**: `POST /v1/query`
     * Request body:
       ```json
       {
@@ -84,8 +83,8 @@ All data and query endpoints are prefixed with `/v1`.
         "params": { "min_age": 25 }
       }
       ```
-    * Response: Returns a results table containing records and projected column names.
-* Explain plan: `POST /v1/explain`
+    * Response: Returns a results table containing the records and projected column names.
+* **Explain Plan**: `POST /v1/explain`
     * Request body:
       ```json
       {
@@ -93,7 +92,7 @@ All data and query endpoints are prefixed with `/v1`.
       }
       ```
     * Response: An indented, human-readable execution plan tree.
-* Full-text search: `POST /v1/search/text`
+* **Full-Text Search**: `POST /v1/search/text`
     * Request body:
       ```json
       {
@@ -103,7 +102,7 @@ All data and query endpoints are prefixed with `/v1`.
         "limit": 10
       }
       ```
-* Vector search: `POST /v1/search/vector`
+* **Vector Search**: `POST /v1/search/vector`
     * Request body:
       ```json
       {
@@ -115,22 +114,18 @@ All data and query endpoints are prefixed with `/v1`.
 
 #### API Reference (OpenAPI)
 
-The server publishes a machine-readable OpenAPI 3.1 document generated from the route handlers, so it always matches the live API. Use it to
-generate typed clients or to browse the full request and response schemas, including the routes not enumerated above (`POST /v1/vectors`,
-`DELETE /v1/vectors/:id`, and `POST /v1/retrieve`).
+The server automatically publishes a machine-readable OpenAPI 3.1 document generated from the route handlers to match the live API. This document can be used to generate typed clients or browse request and response schemas, including routes such as `POST /v1/vectors`, `DELETE /v1/vectors/:id`, and `POST /v1/retrieve`.
 
-* OpenAPI document: `GET /v1/openapi.json`
-* Interactive Scalar UI: `GET /v1/docs`
+* **OpenAPI Document**: `GET /v1/openapi.json`
+* **Interactive Scalar UI**: `GET /v1/docs`
 
-The Scalar UI loads its front-end assets from a CDN, so the documentation page needs outbound network access to render; the
-`GET /v1/openapi.json` document itself is fully self-contained and works offline.
+The Scalar UI loads its front-end assets from a CDN, meaning the documentation page needs outbound network access to render; the `GET /v1/openapi.json` document itself is fully self-contained and works offline.
 
 ---
 
 ## Model Context Protocol (MCP) Server
 
-The `issundb-mcp` crate implements a Model Context Protocol (MCP) server. It exposes database actions, search features, and query execution as
-standard MCP tools that LLM clients (such as Cursor, Claude Desktop, or custom agent frameworks) can invoke.
+The `issundb-mcp` crate implements a Model Context Protocol (MCP) server. It exposes database actions, search features, and query execution as standard MCP tools for LLM clients (such as Cursor, Claude Desktop, or custom agent frameworks).
 
 ### Start the MCP Server
 
@@ -138,7 +133,7 @@ The server supports two transport protocols:
 
 #### Stdio Transport (Default)
 
-Standard for local client integrations where the LLM application launches the server as a background subprocess.
+This is standard for local client integrations where the LLM application launches the server as a background subprocess.
 
 ```bash
 cargo run -p issundb-mcp -- --db-path /path/to/db-dir --transport stdio
@@ -146,7 +141,7 @@ cargo run -p issundb-mcp -- --db-path /path/to/db-dir --transport stdio
 
 #### Streamable HTTP Transport
 
-For remote connections, using streamable HTTP.
+For remote connections, we can serve over streamable HTTP:
 
 ```bash
 cargo run -p issundb-mcp -- --db-path /path/to/db-dir --transport http --bind 127.0.0.1:8000
@@ -156,17 +151,17 @@ cargo run -p issundb-mcp -- --db-path /path/to/db-dir --transport http --bind 12
 
 The server registers the following tools with the connecting client:
 
-1. `get_node`: Fetch a node by ID; returning its labels and properties.
-2. `get_edge`: Fetch an edge by ID; returning its endpoints, type, and properties.
-3. `cypher_query`: Execute a Cypher query with optional parameter bindings. Use CREATE, SET, REMOVE, DELETE, and MERGE to mutate the graph.
+1. `get_node`: Fetch a node by ID, returning its labels and properties.
+2. `get_edge`: Fetch an edge by ID, returning its endpoints, type, and properties.
+3. `cypher_query`: Execute a Cypher query with optional parameter bindings. `CREATE`, `SET`, `REMOVE`, `DELETE`, and `MERGE` statements can be used to mutate the graph.
 4. `explain`: Return the physical query plan for a Cypher query as an indented tree.
 5. `text_search`: Full-text search over indexed node properties; returns ranked hits.
-6. `vector_search`: Nearest-neighbor vector search; returns the $k$ closest nodes by distance (with optional label and property filtering).
-7. `retrieve_hybrid`: Execute a hybrid retrieval query that combines vector/semantic search, full-text keyword search, and relationship expansion.
+6. `vector_search`: Nearest-neighbor vector search; returns the $k$ closest nodes by distance (supporting label and property filtering).
+7. `retrieve_hybrid`: Run a hybrid retrieval query that combines vector/semantic search, full-text keyword search, and relationship expansion.
 
 ### Client Configurations
 
-To connect an LLM client (like Claude Code) to the IssunDB MCP server, you can use the following configurations:
+To connect an LLM client to the IssunDB MCP server, use the following configurations:
 
 #### Streamable HTTP
 
@@ -180,7 +175,7 @@ To connect an LLM client (like Claude Code) to the IssunDB MCP server, you can u
 }
 ```
 
-Note that `issundb-mcp-server-host:8000` must be the actual host (or ip) and port of the MCP server.
+Note that `issundb-mcp-server-host:8000` must be replaced with the actual host (or IP) and port of the MCP server.
 
 #### Stdio
 
