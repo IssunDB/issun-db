@@ -952,7 +952,7 @@ dependencies = [
 
 [[package]]
 name = "issundb"
-version = "0.1.0-alpha.13"
+version = "0.1.0-alpha.14"
 dependencies = [
  "issundb-core",
  "issundb-cypher",
@@ -964,7 +964,7 @@ dependencies = [
 
 [[package]]
 name = "issundb-core"
-version = "0.1.0-alpha.13"
+version = "0.1.0-alpha.14"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -985,7 +985,7 @@ dependencies = [
 
 [[package]]
 name = "issundb-cypher"
-version = "0.1.0-alpha.13"
+version = "0.1.0-alpha.14"
 dependencies = [
  "ahash",
  "arrow-array",
@@ -994,6 +994,7 @@ dependencies = [
  "chrono-tz",
  "chumsky",
  "issundb-core",
+ "issundb-retrieval",
  "issundb-text",
  "issundb-vector",
  "parquet",
@@ -1007,7 +1008,7 @@ dependencies = [
 
 [[package]]
 name = "issundb-graphblas"
-version = "0.1.0-alpha.13"
+version = "0.1.0-alpha.14"
 dependencies = [
  "issundb-graphblas-sys",
  "thiserror",
@@ -1015,7 +1016,7 @@ dependencies = [
 
 [[package]]
 name = "issundb-graphblas-sys"
-version = "0.1.0-alpha.13"
+version = "0.1.0-alpha.14"
 dependencies = [
  "bindgen",
  "cmake",
@@ -1024,7 +1025,7 @@ dependencies = [
 
 [[package]]
 name = "issundb-retrieval"
-version = "0.1.0-alpha.13"
+version = "0.1.0-alpha.14"
 dependencies = [
  "ahash",
  "issundb-core",
@@ -1035,7 +1036,7 @@ dependencies = [
 
 [[package]]
 name = "issundb-text"
-version = "0.1.0-alpha.13"
+version = "0.1.0-alpha.14"
 dependencies = [
  "issundb-core",
  "roaring",
@@ -1044,7 +1045,7 @@ dependencies = [
 
 [[package]]
 name = "issundb-vector"
-version = "0.1.0-alpha.13"
+version = "0.1.0-alpha.14"
 dependencies = [
  "issundb-core",
  "parking_lot",

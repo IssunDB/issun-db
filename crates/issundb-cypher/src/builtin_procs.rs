@@ -1161,7 +1161,7 @@ mod tests {
         .unwrap();
         let count = res.records[0].values[0].as_u64().unwrap();
         assert!(
-            count >= 1 && count <= 3,
+            (1..=3).contains(&count),
             "expected 1..=3 representatives, got {count}"
         );
     }

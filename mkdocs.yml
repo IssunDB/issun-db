@@ -49,6 +49,7 @@ nav:
   - API Reference: api-reference.md
   - Hybrid Retrieval: hybrid-retrieval.md
   - Integrations: integrations.md
+  - Python Integration: python.md
 
 markdown_extensions:
   - pymdownx.highlight:

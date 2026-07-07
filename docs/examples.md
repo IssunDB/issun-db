@@ -1,10 +1,10 @@
 # Code Examples
 
-This page provides practical examples demonstrating vector search, full-text search, Cypher query execution, GraphBLAS algorithm execution, and the graph data science procedures and functions exposed through Cypher.
+This page provides code examples for performing vector search, full-text keyword search, Cypher queries, running script files via the CLI, and executing GraphBLAS-backed graph algorithms in Rust and Cypher.
 
 ## Vector Search Example
 
-You can insert vector embeddings for nodes and perform $k$-nearest-neighbor search:
+The following Rust example demonstrates inserting vector embeddings for nodes and performing $k$-nearest-neighbor similarity searches:
 
 ```rust
 use issundb::{Graph, VectorGraphExt};
@@ -16,7 +16,7 @@ fn run_vector_search(graph: &Graph) -> Result<(), Box<dyn std::error::Error>> {
     // Upsert a 3-dimensional vector embedding for the node
     graph.upsert_vector(doc_node, &[0.1, 0.9, 0.4])?;
 
-    // Perform vector similarity search
+    // Perform a vector similarity search to find matching nodes
     let query_vector = vec![0.15, 0.85, 0.35];
     let hits = graph.vector_search(&query_vector, 5)?;
 
@@ -29,10 +29,7 @@ fn run_vector_search(graph: &Graph) -> Result<(), Box<dyn std::error::Error>> {
 
 ## Vector Search in Cypher
 
-Vector distance is also available inside Cypher through the `vector_dist` function, so nearest-neighbor
-ranking can be expressed declaratively alongside graph patterns. The first argument is a node (its stored
-embedding is resolved) or a numeric vector, and the second is the query vector; the distance uses the
-graph's configured metric.
+Vector similarity searches can be performed directly inside Cypher queries using the `vector_dist` function. This allows nearest-neighbor ranking to be expressed declaratively alongside graph patterns. The first argument is either a node variable (whose stored embedding is resolved) or a numeric vector, and the second is the query vector. The distance is computed using the metric configured for the graph:
 
 ```cypher
 MATCH (p:Document)
@@ -42,31 +39,27 @@ ORDER BY vector_dist(p, $query_vector)
 LIMIT 10
 ```
 
-When the query is an ascending `ORDER BY vector_dist(node, query)` with a `LIMIT` over a labeled scan, the
-planner answers it with a single HNSW index search instead of computing a distance for every node, and it
-pushes any equality `WHERE` predicate over the scanned variable (such as `p.language = 'English'`) into the
-index traversal as a pre-filter. Any other shape (for example descending order or a non-constant query
-vector) falls back to exact evaluation over the row pipeline, so results are always correct.
+When a query uses an ascending `ORDER BY vector_dist(node, query)` with a `LIMIT` over a labeled scan, the query planner uses a single HNSW index search instead of calculating distances for every node. It also pushes equality `WHERE` predicates (such as `p.language = 'English'`) into the index traversal as a pre-filter. Other query forms (such as descending order or a non-constant query vector) fall back to exact evaluation over the row pipeline.
 
 ## Full-Text Search Example
 
-Create a text index on specific node properties to support unstructured text queries:
+The following Rust example demonstrates configuring and querying a full-text search index on specific node properties:
 
 ```rust
 use issundb::{Graph, TextIndexExt, TextGraphExt, TextSearchOptions};
 use serde_json::json;
 
 fn run_text_search(graph: &Graph) -> Result<(), Box<dyn std::error::Error>> {
-    // Create full-text search index
+    // Create a full-text search index on the 'summary' property of 'Book' nodes
     graph.create_text_index("Book", "summary")?;
 
-    // Add nodes with indexed properties
+    // Add a node with the indexed property
     graph.add_node("Book", &json!({
         "title": "Programming in Rust",
         "summary": "An introduction to Rust, systems programming, and memory safety."
     }))?;
 
-    // Query the full-text search index
+    // Query the full-text index
     let opts = TextSearchOptions::default();
     let hits = graph.text_search("memory safety", &opts)?;
 
@@ -79,14 +72,14 @@ fn run_text_search(graph: &Graph) -> Result<(), Box<dyn std::error::Error>> {
 
 ## Cypher Query Execution Example
 
-Execute Cypher queries against your graph to create, match, and filter nodes and relationships:
+Cypher queries can be executed against the graph to create, match, and filter nodes and relationships. The following example demonstrates performing a read-write transaction to populate the graph, followed by a parameterized read-only query:
 
 ```rust
 use std::collections::HashMap;
 use issundb::{Graph, GraphQueryExt};
 
 fn run_cypher(graph: &Graph) -> Result<(), Box<dyn std::error::Error>> {
-    // Execute a read-write transaction to populate nodes and edges
+    // Run a query to populate nodes and edges in the graph
     let cypher = "
         CREATE (p1:Person {name: 'Alice', age: 30})
         CREATE (p2:Person {name: 'Bob', age: 25})
@@ -94,7 +87,7 @@ fn run_cypher(graph: &Graph) -> Result<(), Box<dyn std::error::Error>> {
     ";
     graph.query(cypher)?;
 
-    // Execute a read-only parameterized query
+    // Run a parameterized query to retrieve friendship details
     let query = "
         MATCH (a:Person)-[:FRIEND]->(b:Person)
         WHERE a.age > $min_age
@@ -111,27 +104,55 @@ fn run_cypher(graph: &Graph) -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+## Running a Cypher Script with the CLI
+
+The CLI supports running script files containing meta commands, comments, and Cypher statements. A script can be executed inside the REPL using the `:run` command, or at launch using the `--script` (or `-f`) flag. For example, write the following to `setup.cypher`:
+
+```cypher
+// setup.cypher: open a database, seed it, and query it
+:open ./issundb-data
+
+CREATE (a:Person {name: 'Alice', age: 40})
+CREATE (b:Person {name: 'Bob', age: 25})
+CREATE (a)-[:FRIEND]->(b);
+
+MATCH (p:Person)
+WHERE p.age > 30
+RETURN p.name;
+```
+
+Now the script can be executed using one of the following methods:
+
+```bash
+# Method 1: Inside the interactive REPL
+issundb> :run ./setup.cypher
+
+# Method 2: Batch mode from the terminal (exits with a non-zero status on failure)
+issundb-cli --script ./setup.cypher
+```
+
+When writing scripts, remember that a semicolon inside a string literal or comment is not treated as a statement terminator, so values like
+`{name: 'a;b'}` are safe. If two Cypher statements are written with no semicolon and no blank line between them, the CLI will read them as a single
+statement, so it is a good idea to separate distinct statements with a semicolon. The `query`, `cypher`, and `:explain` forms always stay single-line.
+
 ## GraphBLAS Algorithms Example
 
-Use GraphBLAS bindings for path-finding and centrality algorithms:
+The following example demonstrates running GraphBLAS-backed pathfinding and centrality algorithms. These algorithms run on the in-memory CSR snapshot and automatically refresh the snapshot on demand, removing the need to call `rebuild_csr()` manually after inserting data:
 
 ```rust
 use issundb::{Graph, NodeId};
 use serde_json::json;
 
 fn run_algorithms(graph: &Graph) -> Result<(), Box<dyn std::error::Error>> {
-    // Populate a sample path
+    // Build a sample path to query
     let n1 = graph.add_node("Station", &json!({ "name": "Station A" }))?;
     let n2 = graph.add_node("Station", &json!({ "name": "Station B" }))?;
     let n3 = graph.add_node("Station", &json!({ "name": "Station C" }))?;
 
-    // Add weighted edges for path-finding (weight property is 'cost')
+    // Add weighted edges where the weight property is called 'cost'
     graph.add_edge(n1, n2, "CONNECTS", &json!({ "cost": 5 }))?;
     graph.add_edge(n2, n3, "CONNECTS", &json!({ "cost": 10 }))?;
     graph.add_edge(n1, n3, "CONNECTS", &json!({ "cost": 20 }))?;
-
-    // The algorithms refresh the in-memory CSR snapshot on demand, so no
-    // explicit rebuild call is needed after the writes above.
 
     // 1. Dijkstra Shortest Path: Finds the cheapest path using the 'cost' property
     let path = graph.shortest_path_top_k(n1, n3, 1, "cost")?;
@@ -152,29 +173,33 @@ fn run_algorithms(graph: &Graph) -> Result<(), Box<dyn std::error::Error>> {
 
 ## Graph Data Science in Cypher
 
-The analytics, pathfinding, and retrieval algorithms are also reachable from Cypher, so a query author can run them and feed the results into ordinary `MATCH`, `WHERE`, and `RETURN` clauses without dropping to the Rust API. There are two surfaces: built-in `CALL issundb.*` procedures and the `issundb.distance.*` and `issundb.similarity.*` scalar functions. A runnable end-to-end tour lives in `crates/issundb-examples/gds_cypher.rs` (`cargo run -p issundb-examples --example gds_cypher`).
+We can also invoke these analytics, pathfinding, and retrieval algorithms directly inside Cypher queries! This allows feeding algorithm results
+directly into `MATCH`, `WHERE`, and `RETURN` clauses. There are two surfaces: built-in `CALL issundb.*` procedures and the `issundb.distance.*` and
+`issundb.similarity.*` scalar functions. We can find a complete, runnable tour in the `gds_cypher.rs` example program (
+`cargo run -p issundb-examples --example gds_cypher`).
 
 ### Built-in Procedures
 
-Every procedure runs the algorithm against the live graph and yields one row per result. A procedure's `YIELD` columns are bound for the rest of the query, so `nodeId` joins back to the matched nodes through `id()`.
+Every procedure runs the algorithm against the live graph and yields one row per result. A procedure's `YIELD` columns are bound for the rest of the
+query, so `nodeId` joins back to the matched nodes through `id()`.
 
-| Procedure | Optional configuration | Yields |
-| --- | --- | --- |
-| `issundb.pageRank` | `{iterations, damping}` | `nodeId, score` |
-| `issundb.betweenness` | none | `nodeId, score` |
-| `issundb.harmonic` | none | `nodeId, score` |
-| `issundb.degree` | `{direction: 'IN'|'OUT'|'BOTH'}` | `nodeId, score` |
-| `issundb.connectedComponents` (alias `issundb.wcc`) | none | `nodeId, componentId` |
-| `issundb.stronglyConnectedComponents` (alias `issundb.scc`) | none | `nodeId, componentId` |
-| `issundb.labelPropagation` | `{maxIterations}` | `nodeId, communityId` |
-| `issundb.communities` | `{maxIterations, topPerCommunity}` | `communityId, nodeId, rank` |
-| `issundb.shortestPath` | requires `(srcId, dstId)` | `index, nodeId` |
-| `issundb.dijkstra` | requires `(srcId, dstId)` | `index, nodeId, totalWeight` |
-| `issundb.triangleCount` | `{relTypes, labels}` | `count` |
-| `issundb.retrieve.vector` | requires `queryVector`, then `{k, hops, maxDistance, maxNodes}` | `nodeId, distance` |
-| `issundb.retrieve.hybrid` | requires `queryVector, queryText`, then `{vectorK, textK, hops, maxDistance, maxNodes, textLabel, textProperty, vectorLabel, fusion}` | `nodeId, score` |
+| Procedure                                                   | Optional configuration                                                                                                                | Yields                       |
+|-------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------|------------------------------|
+| `issundb.pageRank`                                          | `{iterations, damping}`                                                                                                               | `nodeId, score`              |
+| `issundb.betweenness`                                       | none                                                                                                                                  | `nodeId, score`              |
+| `issundb.harmonic`                                          | none                                                                                                                                  | `nodeId, score`              |
+| `issundb.degree`                                            | `{direction: 'IN'                                                                                                                     | 'OUT'                        |'BOTH'}` | `nodeId, score` |
+| `issundb.connectedComponents` (alias `issundb.wcc`)         | none                                                                                                                                  | `nodeId, componentId`        |
+| `issundb.stronglyConnectedComponents` (alias `issundb.scc`) | none                                                                                                                                  | `nodeId, componentId`        |
+| `issundb.labelPropagation`                                  | `{maxIterations}`                                                                                                                     | `nodeId, communityId`        |
+| `issundb.communities`                                       | `{maxIterations, topPerCommunity}`                                                                                                    | `communityId, nodeId, rank`  |
+| `issundb.shortestPath`                                      | requires `(srcId, dstId)`                                                                                                             | `index, nodeId`              |
+| `issundb.dijkstra`                                          | requires `(srcId, dstId)`                                                                                                             | `index, nodeId, totalWeight` |
+| `issundb.triangleCount`                                     | `{relTypes, labels}`                                                                                                                  | `count`                      |
+| `issundb.retrieve.vector`                                   | requires `queryVector`, then `{k, hops, maxDistance, maxNodes}`                                                                       | `nodeId, distance`           |
+| `issundb.retrieve.hybrid`                                   | requires `queryVector, queryText`, then `{vectorK, textK, hops, maxDistance, maxNodes, textLabel, textProperty, vectorLabel, fusion}` | `nodeId, score`              |
 
-PageRank, ranked and joined back to node names:
+The following Cypher query calculates PageRank scores and returns node names:
 
 ```cypher
 CALL issundb.pageRank({iterations: 20, damping: 0.85}) YIELD nodeId, score
@@ -183,7 +208,7 @@ RETURN p.name AS name, score
 ORDER BY score DESC
 ```
 
-GraphRAG retrieval seeds on the nearest embeddings, fuses in full-text hits, and expands the requested number of hops. Seed nodes carry a score, and expansion-only nodes carry a null score:
+Vector and text hits can be fused before expanding the graph neighborhood during GraphRAG retrieval:
 
 ```cypher
 CALL issundb.retrieve.hybrid([0.20, 0.85], 'machine learning',
@@ -196,16 +221,19 @@ ORDER BY score IS NULL, score DESC
 
 ### Comparison Functions
 
-Four scalar functions compare two values pairwise. Vector measures are distances (lower is more similar), and set measures are similarities (higher is more similar). A vector argument is either a numeric list or a node, in which case its stored embedding is resolved.
+Four scalar functions compare two values pairwise. Vector measures are distances (lower is more similar), and set measures are similarities (higher is
+more similar). A vector argument is either a numeric list or a node, in which case its stored embedding is resolved.
 
-| Function | Operates on | Returns |
-| --- | --- | --- |
-| `issundb.distance.cosine(a, b)` | vectors | cosine distance, in `[0, 2]` |
-| `issundb.distance.euclidean(a, b)` | vectors | Euclidean (L2) distance, in `[0, ∞)` |
-| `issundb.similarity.jaccard(a, b)` | sets (lists) | Jaccard similarity, in `[0, 1]` |
-| `issundb.similarity.overlap(a, b)` | sets (lists) | overlap coefficient, in `[0, 1]` |
+| Function                           | Operates on  | Returns                              |
+|------------------------------------|--------------|--------------------------------------|
+| `issundb.distance.cosine(a, b)`    | vectors      | cosine distance, in `[0, 2]`         |
+| `issundb.distance.euclidean(a, b)` | vectors      | Euclidean (L2) distance, in `[0, ∞)` |
+| `issundb.similarity.jaccard(a, b)` | sets (lists) | Jaccard similarity, in `[0, 1]`      |
+| `issundb.similarity.overlap(a, b)` | sets (lists) | overlap coefficient, in `[0, 1]`     |
 
-Each measure has a single canonical form, so the opposite direction is a short inline expression rather than a separate function: cosine similarity is `1 - issundb.distance.cosine(a, b)`, Euclidean similarity is `1.0 / (1.0 + issundb.distance.euclidean(a, b))`, and a set distance is `1 - issundb.similarity.jaccard(a, b)`. A null operand, or a vector length mismatch, yields null.
+Each measure has a single canonical form, so the opposite direction is a short inline expression rather than a separate function: cosine similarity is
+`1 - issundb.distance.cosine(a, b)`, Euclidean similarity is `1.0 / (1.0 + issundb.distance.euclidean(a, b))`, and a set distance is
+`1 - issundb.similarity.jaccard(a, b)`. A null operand, or a vector length mismatch, yields null.
 
 ```cypher
 MATCH (a:Person {name: 'Alice'}), (e:Person {name: 'Erin'})
