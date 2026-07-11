@@ -58,8 +58,8 @@ use crate::plan::{FilterExpr, PhysicalOperator};
 
 use super::expr::{cypher_eq, evaluate_expr, is_nan, json_cmp};
 use super::read::{
-    AggState, eval_leaf, expand_multi_type, group_by_column_name, json_cmp_total, project_rows,
-    projected_key, rows_to_records, sort_all, unpack_sentinels,
+    AggState, canonical_cell_key, eval_leaf, expand_multi_type, group_by_column_name,
+    json_cmp_total, project_rows, projected_key, rows_to_records, sort_all, unpack_sentinels,
 };
 use super::row::{Bindings, SlotRow, SlotSchema};
 use super::{GraphBinding, Record};
@@ -1466,9 +1466,10 @@ pub(super) fn try_execute_vectorized(
                     use std::fmt::Write as _;
                     let mut key = String::new();
                     for &(col, j) in &item_cols {
-                        // `{:?}` escapes string content, so the separator
-                        // cannot collide with a cell.
-                        let _ = write!(key, "{:?}\x00", tables[col][i][j]);
+                        // Canonical cell keys match the row pipeline's dedup
+                        // (`1` and `1.0` are equal) and never contain the raw
+                        // separator (strings serialize with escaped controls).
+                        let _ = write!(key, "{}\x00", canonical_cell_key(&tables[col][i][j]));
                     }
                     if seen.insert(key) {
                         survivors.push(i);
@@ -1548,6 +1549,9 @@ pub(super) fn try_execute_vectorized(
                     },
                 )?);
             }
+            // Merge codes whose representatives are canonically equal so grouping
+            // matches the row pipeline's numeric equivalence.
+            let group_codes = canonicalize_group_codes(group_codes);
             // Aggregate inputs gathered per chain column; `AggIn::Cell(col, j)`
             // indexes the j-th gathered property of that column.
             let mut col_props: Vec<Vec<&str>> = vec![Vec::new(); ncols];
@@ -1629,7 +1633,7 @@ pub(super) fn try_execute_vectorized(
                 let mut gb = SlotRow::empty(schema.clone());
                 for (k, col) in group_cols.iter().enumerate() {
                     let rep = &group_codes[k].1[codes[k] as usize];
-                    key_parts.push(rep.to_string());
+                    key_parts.push(canonical_cell_key(rep));
                     gb.bind_local(col, GraphBinding::Scalar(rep.clone()));
                 }
                 for (k, (agg_fn, _, col)) in aggregations.iter().enumerate() {
@@ -1742,7 +1746,7 @@ pub(super) fn try_execute_vectorized(
                 for (expr, alias) in group_by.iter() {
                     let val = evaluate_expr(graph, &row, expr, params)?;
                     let col = group_by_column_name(expr, alias);
-                    key_parts.push(val.to_string());
+                    key_parts.push(canonical_cell_key(&val));
                     gb_row.bind_local(&col, GraphBinding::Scalar(val));
                 }
                 let group_key = key_parts.join("\x00");
@@ -1807,6 +1811,41 @@ pub(super) fn try_execute_vectorized(
 /// does. Parallel edges are counted per transition, so the cardinality matches a
 /// full materialization.
 #[allow(clippy::too_many_arguments)]
+/// Remap group codes so representatives equal under canonical numeric
+/// equivalence (`1` and `1.0`, `0.0` and `-0.0`) share one code, keeping the
+/// first-occurrence representative. The code-based grouping otherwise keys on
+/// exact value identity, which would split a group the row pipeline merges;
+/// remapping keeps the two paths consistent. The common case (no merge) returns
+/// the input columns unchanged.
+fn canonicalize_group_codes(
+    group_codes: Vec<(Vec<u32>, Vec<Value>)>,
+) -> Vec<(Vec<u32>, Vec<Value>)> {
+    group_codes
+        .into_iter()
+        .map(|(codes, reps)| {
+            let mut key_to_new: ahash::AHashMap<String, u32> =
+                ahash::AHashMap::with_capacity(reps.len());
+            let mut new_reps: Vec<Value> = Vec::with_capacity(reps.len());
+            let mut old_to_new: Vec<u32> = Vec::with_capacity(reps.len());
+            for rep in &reps {
+                let new = *key_to_new
+                    .entry(canonical_cell_key(rep))
+                    .or_insert_with(|| {
+                        new_reps.push(rep.clone());
+                        (new_reps.len() - 1) as u32
+                    });
+                old_to_new.push(new);
+            }
+            if new_reps.len() == reps.len() {
+                (codes, reps)
+            } else {
+                let new_codes = codes.into_iter().map(|c| old_to_new[c as usize]).collect();
+                (new_codes, new_reps)
+            }
+        })
+        .collect()
+}
+
 fn execute_collapsed_count(
     graph: &Graph,
     p: &VecPipeline<'_>,
@@ -1911,6 +1950,9 @@ fn execute_collapsed_count(
                 .map_err(|e| e.to_string())?,
         );
     }
+    // Merge codes whose representatives are canonically equal so grouping matches
+    // the row pipeline's numeric equivalence (`1` == `1.0`).
+    let group_codes = canonicalize_group_codes(group_codes);
     let mut strides = vec![1u64; group_by.len()];
     {
         let mut acc: u64 = 1;
@@ -1968,7 +2010,7 @@ fn execute_collapsed_count(
         let mut key_parts = Vec::with_capacity(group_cols.len());
         for (k, col) in group_cols.iter().enumerate() {
             let rep = &group_codes[k].1[codes[k] as usize];
-            key_parts.push(rep.to_string());
+            key_parts.push(canonical_cell_key(rep));
             gb.bind_local(col, GraphBinding::Scalar(rep.clone()));
         }
         gb.bind_local(out_name, GraphBinding::Scalar(serde_json::Value::from(cnt)));

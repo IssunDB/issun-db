@@ -93,6 +93,14 @@ impl Graph {
             .put(&mut wtxn, &id, &crate::storage::props::encode(&new_record)?)?;
         wtxn.commit()?;
         self.edge_columns.record_touched(id);
+        // A property change can alter an edge's weight (`weight`/`cost`/
+        // `capacity`/`cap`), which the CSR snapshot and the derived weight and
+        // PageRank matrices bake in. Those matrices have no incremental
+        // maintenance, so advance the write generation to mark them stale; the
+        // next `ensure_csr_fresh` then rebuilds before a weighted algorithm reads
+        // them. Without this, `shortest_path_dijkstra` and friends serve the
+        // pre-update weight (or, with a changed edge, no path at all).
+        self.maybe_spawn_rebuild();
         Ok(())
     }
 

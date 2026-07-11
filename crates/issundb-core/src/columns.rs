@@ -1241,4 +1241,26 @@ mod tests {
             .unwrap();
         assert_eq!(g.edge_prop_json(e, "k").unwrap(), Some(json!(42)));
     }
+
+    /// Deleting a node cascades to its incident edges, so those edges must drop
+    /// out of the edge property columns too. Without the forced rebuild a deleted
+    /// edge stays readable through `edge_prop_json`.
+    #[test]
+    fn delete_node_cascade_invalidates_edge_columns() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("N", &()).unwrap();
+        let b = g.add_node("N", &()).unwrap();
+        let e = g.add_edge(a, b, "E", &json!({ "w": 7 })).unwrap();
+        // Materialize the edge columns.
+        assert_eq!(g.edge_prop_json(e, "w").unwrap(), Some(json!(7)));
+
+        // Deleting a cascades the deletion of edge e.
+        g.delete_node(a).unwrap();
+        assert!(g.get_edge(e).unwrap().is_none(), "edge is gone from LMDB");
+        assert_eq!(
+            g.edge_prop_json(e, "w").unwrap(),
+            None,
+            "a cascade-deleted edge must not remain readable via the columns"
+        );
+    }
 }

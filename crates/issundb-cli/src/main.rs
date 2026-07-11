@@ -2783,7 +2783,27 @@ fn value_to_key_string(val: &serde_json::Value) -> Option<String> {
                 Some(trimmed.to_owned())
             }
         }
-        serde_json::Value::Number(n) => Some(n.to_string()),
+        serde_json::Value::Number(n) => {
+            // Render an integral number without a fractional part so a key that
+            // arrives as a float (a Parquet Float column holding `100.0`) matches
+            // a node `Id` stored as the integer `100`. `resolve_node_by_id`
+            // parses the key back with `i64::parse`, so "100.0" would fall through
+            // to a string lookup and never resolve. A genuine non-integer keeps
+            // its decimal form.
+            if let Some(i) = n.as_i64() {
+                Some(i.to_string())
+            } else if let Some(u) = n.as_u64() {
+                Some(u.to_string())
+            } else if let Some(f) = n.as_f64() {
+                if f.fract() == 0.0 && (i64::MIN as f64..=i64::MAX as f64).contains(&f) {
+                    Some((f as i64).to_string())
+                } else {
+                    Some(n.to_string())
+                }
+            } else {
+                Some(n.to_string())
+            }
+        }
         serde_json::Value::Bool(b) => Some(b.to_string()),
         _ => None,
     }
@@ -3265,6 +3285,22 @@ mod tests {
             serde_json::json!({"name": "Alice"})
         );
         assert!(parse_props("invalid-json").is_err());
+    }
+
+    #[test]
+    fn value_to_key_string_renders_integral_floats_without_fraction() {
+        use serde_json::json;
+        // An integral float (a Parquet Float `Id` column) renders like the
+        // integer so `resolve_node_by_id` parses it and matches an integer `Id`.
+        assert_eq!(value_to_key_string(&json!(100.0)).as_deref(), Some("100"));
+        assert_eq!(value_to_key_string(&json!(100)).as_deref(), Some("100"));
+        assert_eq!(value_to_key_string(&json!(-5.0)).as_deref(), Some("-5"));
+        // A genuine non-integer keeps its decimal.
+        assert_eq!(value_to_key_string(&json!(1.5)).as_deref(), Some("1.5"));
+        // Strings pass through trimmed; blanks and null are absent.
+        assert_eq!(value_to_key_string(&json!(" x ")).as_deref(), Some("x"));
+        assert_eq!(value_to_key_string(&json!("   ")), None);
+        assert_eq!(value_to_key_string(&json!(null)), None);
     }
 
     #[test]

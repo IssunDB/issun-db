@@ -525,6 +525,23 @@ impl VectorGraphExt for Graph {
             arc.0.search(q, fetch_k)?
         };
 
+        // Drop "ghost" hits: a node deleted through the core graph API stays in
+        // the in-memory HNSW index, because core deletion cannot reach this
+        // vector-crate extension. Filter out hits whose node no longer exists,
+        // in one read transaction, before rescore and the `opts.k` truncation so
+        // the caller still gets live nearest neighbors. The filtered-search path
+        // above already excludes these via its label and property predicate; this
+        // covers the unfiltered path and the quantized rescore.
+        let hits: Vec<Hit> = self.view(|txn| {
+            let mut live = Vec::with_capacity(hits.len());
+            for hit in hits {
+                if txn.get_node(hit.node)?.is_some() {
+                    live.push(hit);
+                }
+            }
+            Ok(live)
+        })?;
+
         let mut final_hits = if rescore_factor > 1 && !hits.is_empty() {
             // One read transaction covers every stored-vector lookup. A hit
             // whose stored bytes are absent keeps its approximate distance,
@@ -783,6 +800,31 @@ mod tests {
         let (_dir, graph) = open_tmp();
         let hits = graph.vector_search(&[1.0f32, 0.0, 0.0], 5).unwrap();
         assert!(hits.is_empty());
+    }
+
+    /// A node deleted through the core graph API lingers in the in-memory HNSW
+    /// index, but `vector_search` must not return it as a "ghost" hit.
+    #[test]
+    fn vector_search_excludes_deleted_nodes() {
+        let (_dir, graph) = open_tmp();
+        let a = graph.add_node("N", &json!({})).unwrap();
+        let b = graph.add_node("N", &json!({})).unwrap();
+        graph.upsert_vector(a, &[1.0f32, 0.0, 0.0]).unwrap();
+        graph.upsert_vector(b, &[0.0f32, 1.0, 0.0]).unwrap();
+
+        // Delete the closest node through the core API (not `remove_vector`), so
+        // its embedding stays in the HNSW index.
+        graph.delete_node(a).unwrap();
+
+        let hits = graph.vector_search(&[1.0f32, 0.0, 0.0], 5).unwrap();
+        assert!(
+            hits.iter().all(|h| h.node != a),
+            "deleted node must not appear in vector_search results"
+        );
+        assert!(
+            hits.iter().any(|h| h.node == b),
+            "the surviving node is still searchable"
+        );
     }
 
     #[test]

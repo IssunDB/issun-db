@@ -113,10 +113,11 @@ impl Graph {
                                     self.storage.node_prop_idx.prefix_iter(wtxn, &prefix)?
                                 {
                                     let (key, _) = entry?;
-                                    if key.len() >= 8 {
-                                        let mut node_id_bytes = [0u8; 8];
-                                        node_id_bytes.copy_from_slice(&key[key.len() - 8..]);
-                                        let found_node_id = u64::from_be_bytes(node_id_bytes);
+                                    // Only an exact encoded-value match is a real
+                                    // conflict; a prefix-only match is a distinct
+                                    // string value (see `exact_prop_index_id`).
+                                    if let Some(found_node_id) = exact_prop_index_id(key, &encoded)
+                                    {
                                         if found_node_id != node_id {
                                             return Err(Error::UniqueConstraintViolation(
                                                 label_name.to_string(),
@@ -382,9 +383,13 @@ impl Graph {
         self.delete_node_impl(&mut wtxn, id)?;
         wtxn.commit()?;
         // A node deletion reshuffles the sorted dense-index mapping, so the next
-        // matrix refresh must rebuild fully rather than patch incrementally.
+        // matrix refresh must rebuild fully rather than patch incrementally. The
+        // deletion also cascades to every incident edge, so the edge property
+        // columns must rebuild too; without this a deleted edge stays readable
+        // through `edge_prop_json` and the vectorized executor's edge reads.
         self.csr_cache.mark_force_full();
         self.prop_columns.record_force_full();
+        self.edge_columns.record_force_full();
         self.maybe_spawn_rebuild();
         Ok(())
     }

@@ -210,6 +210,17 @@ pub struct CsrCache {
     write_gen: AtomicU64,
     /// The `write_gen` value the currently installed snapshot reflects.
     snapshot_gen: AtomicU64,
+    /// The `write_gen` value the currently materialized `MatrixSet` reflects.
+    ///
+    /// The weight and PageRank matrices have no incremental maintenance: a
+    /// snapshot-only refresh (`install_snapshot`) and an in-place adjacency delta
+    /// (`MatrixSet::apply_delta`) both leave them untouched. So a fresh
+    /// `snapshot_gen` does not imply fresh matrices. Only a full rebuild
+    /// (`install`/`install_full`, which re-run `MatrixSet::materialize`) advances
+    /// this counter; weighted consumers gate on it via `matrices_stale`. The
+    /// invariant `matrices_gen <= snapshot_gen <= write_gen` always holds, so
+    /// `matrices_stale` subsumes `snapshot_is_stale`.
+    matrices_gen: AtomicU64,
 }
 
 impl CsrCache {
@@ -222,6 +233,7 @@ impl CsrCache {
             pending: parking_lot::Mutex::new(GraphDelta::default()),
             write_gen: AtomicU64::new(0),
             snapshot_gen: AtomicU64::new(0),
+            matrices_gen: AtomicU64::new(0),
         }
     }
 
@@ -236,6 +248,15 @@ impl CsrCache {
     /// hybrid consumer must rebuild before reading it.
     pub fn snapshot_is_stale(&self) -> bool {
         self.write_gen.load(Ordering::Acquire) != self.snapshot_gen.load(Ordering::Acquire)
+    }
+
+    /// True when the materialized `MatrixSet` lags committed writes, so a
+    /// consumer of the weight or PageRank matrices must rebuild before reading
+    /// them. Strictly weaker than fresh matrices being current: it also catches
+    /// the case where a snapshot-only refresh or an adjacency-only delta advanced
+    /// the snapshot while leaving the weighted matrices behind.
+    pub fn matrices_are_stale(&self) -> bool {
+        self.write_gen.load(Ordering::Acquire) != self.matrices_gen.load(Ordering::Acquire)
     }
 
     /// Record a newly inserted node. Called post-commit under the write lock.
@@ -327,8 +348,11 @@ impl CsrCache {
         // `built_gen` was captured before the build, so the snapshot reflects at
         // least that generation. Writes that landed during the build keep
         // `write_gen` ahead, leaving the snapshot correctly stale until the next
-        // pass.
+        // pass. This is a full rebuild (the caller re-ran `MatrixSet::materialize`
+        // before installing), so the weighted matrices are fresh at `built_gen`
+        // too.
         self.snapshot_gen.store(built_gen, Ordering::Release);
+        self.matrices_gen.store(built_gen, Ordering::Release);
         let claimed = self.claimed.swap(0, Ordering::AcqRel);
         let prev = self.dirty.fetch_sub(claimed, Ordering::AcqRel);
         let remaining = prev.saturating_sub(claimed);
@@ -357,6 +381,9 @@ impl CsrCache {
     pub fn install_full(&self, snap: CsrSnapshot, built_gen: u64) {
         self.snapshot.store(Arc::new(snap));
         self.snapshot_gen.store(built_gen, Ordering::Release);
+        // A full synchronous rebuild also re-materialized the `MatrixSet`, so the
+        // weighted matrices are fresh at `built_gen`.
+        self.matrices_gen.store(built_gen, Ordering::Release);
         self.dirty.store(0, Ordering::Release);
         self.claimed.store(0, Ordering::Release);
         self.rebuilding.store(false, Ordering::Release);

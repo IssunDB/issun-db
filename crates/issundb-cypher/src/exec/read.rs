@@ -863,13 +863,64 @@ pub(super) fn rows_to_records(
     Ok(records)
 }
 
-/// Apply RETURN DISTINCT deduplication in place, keyed by the serialized row.
+/// Canonical grouping and DISTINCT key for one value, following openCypher
+/// equivalence: numbers compare by value, so an integer and an integer-valued
+/// float (for example `1` and `1.0`, or `0.0` and `-0.0`) share a key, while a
+/// non-integer float keeps its own. Non-numbers use their JSON serialization.
+/// Only the key is canonicalized; callers keep the original value as the emitted
+/// group representative, so `RETURN n.x, count(*)` still returns `1.0` when that
+/// was the input. Type-tag prefixes (`N`/`F`/`J`) keep a number from colliding
+/// with a string that happens to serialize the same.
+pub(super) fn canonical_cell_key(v: &serde_json::Value) -> String {
+    if let serde_json::Value::Number(n) = v {
+        if let Some(i) = n.as_i64() {
+            return format!("N{i}");
+        }
+        if let Some(u) = n.as_u64() {
+            return format!("N{u}");
+        }
+        if let Some(f) = n.as_f64() {
+            if f == 0.0 {
+                return "N0".to_string();
+            }
+            if f.fract() == 0.0 && (i64::MIN as f64..=i64::MAX as f64).contains(&f) {
+                return format!("N{}", f as i64);
+            }
+            return format!("F{f}");
+        }
+    }
+    format!("J{v}")
+}
+
+/// Canonical DISTINCT key for a whole row, cell by cell (see
+/// [`canonical_cell_key`]). Used wherever a full projected row is deduplicated so
+/// numeric equivalence matches the grouping path.
+pub(super) fn canonical_row_key(values: &[serde_json::Value]) -> String {
+    let mut out = String::new();
+    for v in values {
+        out.push('\x01');
+        out.push_str(&canonical_cell_key(v));
+    }
+    out
+}
+
+/// Canonical DISTINCT key for one binding: node and edge identity by id, scalars
+/// by [`canonical_cell_key`] so `1` and `1.0` deduplicate as equal. The `@`
+/// prefixes keep a node or edge id from colliding with a numeric scalar key.
+pub(super) fn canonical_binding_key(b: Option<&GraphBinding>) -> String {
+    match b {
+        Some(GraphBinding::Node(id)) => format!("@n{id}"),
+        Some(GraphBinding::Edge(id)) => format!("@e{id}"),
+        Some(GraphBinding::Scalar(v)) => canonical_cell_key(v),
+        None => "@_".to_string(),
+    }
+}
+
+/// Apply RETURN DISTINCT deduplication in place, keyed by the canonical row (so
+/// `1` and `1.0` deduplicate as equal, matching openCypher equivalence).
 pub(super) fn dedup_records(records: &mut Vec<Record>) {
     let mut seen = std::collections::HashSet::new();
-    records.retain(|r| {
-        let key = serde_json::to_string(&r.values).unwrap_or_default();
-        seen.insert(key)
-    });
+    records.retain(|r| seen.insert(canonical_row_key(&r.values)));
 }
 
 /// Convert a `FilterExpr` to the `WhereClause` representation used by `evaluate_where`.
@@ -2962,10 +3013,11 @@ impl RowStream {
                     .filter(|path| {
                         let key = match keys {
                             // Keyed dedup: only the selected bindings (the
-                            // RETURN DISTINCT projection) form the key.
+                            // RETURN DISTINCT projection) form the key. Canonical
+                            // keys make `1` and `1.0` deduplicate as equal.
                             Some(keys) => keys
                                 .iter()
-                                .map(|k| format!("{:?}", path.get_binding(k)))
+                                .map(|k| canonical_binding_key(path.get_binding(k)))
                                 .collect::<Vec<_>>()
                                 .join("|"),
                             // Full-row dedup: `bound_entries` iterates slots in
@@ -2973,7 +3025,7 @@ impl RowStream {
                             // deterministic.
                             None => path
                                 .bound_entries()
-                                .map(|(k, v)| format!("{}={:?}", k, v))
+                                .map(|(k, v)| format!("{}={}", k, canonical_binding_key(Some(v))))
                                 .collect::<Vec<_>>()
                                 .join("|"),
                         };
@@ -3266,7 +3318,7 @@ impl AggState {
             AggFn::Count { distinct } => {
                 if val != serde_json::Value::Null {
                     if *distinct {
-                        if self.distinct_seen.insert(val.to_string()) {
+                        if self.distinct_seen.insert(canonical_cell_key(&val)) {
                             self.count += 1;
                         }
                     } else {
@@ -3276,7 +3328,7 @@ impl AggState {
             }
             AggFn::Sum { distinct } => {
                 if val != serde_json::Value::Null {
-                    if *distinct && !self.distinct_seen.insert(val.to_string()) {
+                    if *distinct && !self.distinct_seen.insert(canonical_cell_key(&val)) {
                         // already seen, skip
                     } else if let Some(n) = val.as_f64() {
                         if val.as_i64().is_none() {
@@ -3288,7 +3340,7 @@ impl AggState {
             }
             AggFn::Avg { distinct } => {
                 if val != serde_json::Value::Null {
-                    if *distinct && !self.distinct_seen.insert(val.to_string()) {
+                    if *distinct && !self.distinct_seen.insert(canonical_cell_key(&val)) {
                         // already seen, skip
                     } else if let Some(n) = val.as_f64() {
                         self.sum += n;
@@ -3326,7 +3378,7 @@ impl AggState {
             }
             AggFn::Collect { distinct } => {
                 if val != serde_json::Value::Null {
-                    if *distinct && !self.distinct_seen.insert(val.to_string()) {
+                    if *distinct && !self.distinct_seen.insert(canonical_cell_key(&val)) {
                         // already seen, skip
                     } else {
                         self.collect.push(val);
@@ -3537,7 +3589,7 @@ fn aggregate_all(
                 }
             }
             let val = evaluate_expr(graph, &path, expr, params)?;
-            key_parts.push(val.to_string());
+            key_parts.push(canonical_cell_key(&val));
             gb_path.bind_local(&col, GraphBinding::Scalar(val));
         }
         let group_key = key_parts.join("\x00");
@@ -4122,7 +4174,7 @@ pub(super) fn eval_leaf(
                 let row = &table[i];
                 let mut key_parts = Vec::with_capacity(col_names.len());
                 for val in row {
-                    key_parts.push(val.to_string());
+                    key_parts.push(canonical_cell_key(&val));
                 }
                 let key = key_parts.join("\x00");
                 match groups.get_mut(&key) {

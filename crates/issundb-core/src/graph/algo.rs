@@ -657,12 +657,20 @@ impl Graph {
     /// snapshot and all matrices. Gated by the write generation, so it catches
     /// edge-only drift, not just node-count changes.
     pub(crate) fn ensure_csr_fresh(&self) -> Result<(), Error> {
-        if self.matrices.read().is_none() || self.csr_cache.snapshot_is_stale() {
+        // Gate on the matrices generation, not the snapshot generation. The
+        // weight and PageRank matrices have no incremental maintenance, so a
+        // snapshot-only refresh (`ensure_snapshot_fresh`) or an adjacency-only
+        // delta apply can advance `snapshot_gen` while leaving those matrices
+        // stale. `matrices_are_stale` catches both cases, and because
+        // `matrices_gen <= snapshot_gen` it also covers a stale snapshot; a full
+        // `rebuild_csr` re-materializes every matrix. Without this, a weighted
+        // algorithm (Dijkstra, PageRank, spanning forest) reads pre-write weights
+        // after a bulk typed expansion or an `update_edge`.
+        if self.matrices.read().is_none() || self.csr_cache.matrices_are_stale() {
             self.rebuild_csr()?;
         } else {
-            // A snapshot-only refresh (`ensure_snapshot_fresh`) leaves the
-            // structural delta pending, so a fresh snapshot generation does
-            // not imply fresh matrices; drain the delta into them.
+            // Matrices already reflect the current write generation; drain any
+            // residual adjacency delta to keep the shared invariant.
             self.ensure_matrix_view()?;
         }
         Ok(())
@@ -1816,5 +1824,90 @@ mod triangle_cycle_count_tests {
                 .unwrap(),
             0
         );
+    }
+
+    /// Changing an edge's weight through `update_edge` must be reflected by the
+    /// next weighted shortest path. The weight and PageRank matrices have no
+    /// incremental maintenance, so `update_edge` must advance the write
+    /// generation to force a rebuild; otherwise the stale matrix serves the old
+    /// weight, or (with a changed weight the reconstruction can no longer match)
+    /// no path at all.
+    #[test]
+    fn update_edge_weight_refreshes_dijkstra() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("N", &json!({})).unwrap();
+        let b = g.add_node("N", &json!({})).unwrap();
+        let c = g.add_node("N", &json!({})).unwrap();
+        // Direct a->b costs 1; the detour a->c->b costs 10.
+        let direct = g.add_edge(a, b, "R", &json!({ "weight": 1.0 })).unwrap();
+        g.add_edge(a, c, "R", &json!({ "weight": 5.0 })).unwrap();
+        g.add_edge(c, b, "R", &json!({ "weight": 5.0 })).unwrap();
+        g.rebuild_csr().unwrap();
+        assert_eq!(
+            g.shortest_path_dijkstra(a, b)
+                .unwrap()
+                .unwrap()
+                .total_weight,
+            1.0
+        );
+
+        // Make the direct edge expensive: the detour is now the shortest path.
+        g.update_edge(direct, &json!({ "weight": 100.0 })).unwrap();
+        let p = g
+            .shortest_path_dijkstra(a, b)
+            .unwrap()
+            .expect("a path a->b still exists after update_edge");
+        assert_eq!(p.total_weight, 10.0, "update_edge weight must be honored");
+        assert_eq!(p.nodes, vec![a, c, b]);
+    }
+
+    /// Two parallel edges between the same pair must take the cheaper weight, not
+    /// the sum, and must still yield a path (a summed weight matches no real edge
+    /// and breaks path reconstruction).
+    #[test]
+    fn dijkstra_parallel_edges_use_min_weight() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("N", &json!({})).unwrap();
+        let b = g.add_node("N", &json!({})).unwrap();
+        g.add_edge(a, b, "R", &json!({ "weight": 2.0 })).unwrap();
+        g.add_edge(a, b, "R", &json!({ "weight": 3.0 })).unwrap();
+        g.rebuild_csr().unwrap();
+
+        let p = g
+            .shortest_path_dijkstra(a, b)
+            .unwrap()
+            .expect("parallel edges must still yield a path");
+        assert_eq!(p.total_weight, 2.0, "parallel edges take the min weight");
+    }
+
+    /// PageRank must not depend on whether a prior bulk typed expansion advanced
+    /// the snapshot generation without re-materializing the PageRank matrix.
+    #[test]
+    fn page_rank_fresh_after_snapshot_only_refresh() {
+        let (_dir, g) = open_tmp();
+        let mut nodes = Vec::new();
+        for _ in 0..70 {
+            nodes.push(g.add_node("N", &json!({})).unwrap());
+        }
+        g.rebuild_csr().unwrap();
+        for w in nodes.windows(2) {
+            g.add_edge(w[0], w[1], "R", &json!({})).unwrap();
+        }
+        // A bulk typed expansion over >64 sources advances the snapshot only,
+        // leaving the pending delta for the (matrix-free) snapshot refresh.
+        let _ = g.expand_spmv_graphblas(&nodes, Some("R"), false).unwrap();
+        let incremental = g.page_rank(20, 0.85).unwrap();
+
+        g.rebuild_csr().unwrap();
+        let full = g.page_rank(20, 0.85).unwrap();
+
+        for n in &nodes {
+            assert!(
+                (incremental[n] - full[n]).abs() < 1e-6,
+                "page_rank for {n} diverges after a snapshot-only refresh: {} vs {}",
+                incremental[n],
+                full[n]
+            );
+        }
     }
 }

@@ -289,6 +289,30 @@ pub(super) fn edge_prop_index_key(
     key
 }
 
+/// Returns the trailing 8-byte id from a property-index key, but only when the
+/// key's encoded-value segment equals `encoded` exactly.
+///
+/// A property-index key is `(prefix u32, prop_key_id u32, encoded_val, id u64)`,
+/// so the value segment is `key[8 .. len - 8]`. A prefix scan on
+/// `(prefix, prop_key_id, encoded)` also matches keys whose value merely *starts*
+/// with `encoded`: for the NUL-terminated string encoding, a stored `"a\0"`
+/// (encoded `04 61 00 00`) is matched by a lookup for `"a"` (encoded `04 61 00`),
+/// because a small id has leading zero bytes. Requiring the value segment to
+/// equal `encoded` exactly rejects those collisions so equality lookups and
+/// unique-constraint checks never conflate distinct string values. Fixed-width
+/// encodings (numbers, bools, null) are already exact, so this never rejects a
+/// genuine match. Returns `None` when the key is too short or the value differs.
+pub(super) fn exact_prop_index_id(key: &[u8], encoded: &[u8]) -> Option<NodeId> {
+    if key.len() < 8 + 8 {
+        return None;
+    }
+    if &key[8..key.len() - 8] != encoded {
+        return None;
+    }
+    let id_bytes: [u8; 8] = key[key.len() - 8..].try_into().ok()?;
+    Some(u64::from_be_bytes(id_bytes))
+}
+
 /// Builds a composite key `(label_id, prop_key_id, term)` for FTS postings.
 pub(super) fn fts_postings_key(label_id: LabelId, prop_key_id: PropKeyId, term: &str) -> Vec<u8> {
     let mut key = Vec::with_capacity(8 + term.len());

@@ -193,10 +193,11 @@ impl Graph {
                                     self.storage.edge_prop_idx.prefix_iter(wtxn, &prefix)?
                                 {
                                     let (key, _) = entry?;
-                                    if key.len() >= 8 {
-                                        let mut edge_id_bytes = [0u8; 8];
-                                        edge_id_bytes.copy_from_slice(&key[key.len() - 8..]);
-                                        let found_edge_id = u64::from_be_bytes(edge_id_bytes);
+                                    // Only an exact encoded-value match conflicts;
+                                    // a prefix-only match is a distinct string
+                                    // value (see `exact_prop_index_id`).
+                                    if let Some(found_edge_id) = exact_prop_index_id(key, &encoded)
+                                    {
                                         if found_edge_id != edge_id {
                                             return Err(Error::UniqueConstraintViolation(
                                                 etype.to_string(),
@@ -733,10 +734,12 @@ impl Graph {
         let mut result = Vec::new();
         for entry in self.storage.node_prop_idx.prefix_iter(rtxn, &prefix)? {
             let (key, _) = entry?;
-            if key.len() >= 8 {
-                let mut node_id_bytes = [0u8; 8];
-                node_id_bytes.copy_from_slice(&key[key.len() - 8..]);
-                result.push(u64::from_be_bytes(node_id_bytes));
+            // A prefix match on the encoded value is not enough: the
+            // NUL-terminated string encoding lets a lookup for "a" prefix-match a
+            // stored "a\0", so require the value segment to equal `encoded`
+            // exactly.
+            if let Some(node_id) = exact_prop_index_id(key, &encoded) {
+                result.push(node_id);
             }
         }
         Ok(result)
@@ -964,10 +967,11 @@ impl Graph {
         let mut result = Vec::new();
         for entry in self.storage.edge_prop_idx.prefix_iter(rtxn, &prefix)? {
             let (key, _) = entry?;
-            if key.len() >= 8 {
-                let mut edge_id_bytes = [0u8; 8];
-                edge_id_bytes.copy_from_slice(&key[key.len() - 8..]);
-                result.push(u64::from_be_bytes(edge_id_bytes));
+            // Require an exact encoded-value match, not just a prefix, so a
+            // stored "a\0" is not returned for a lookup of "a" (see
+            // `exact_prop_index_id`).
+            if let Some(edge_id) = exact_prop_index_id(key, &encoded) {
+                result.push(edge_id);
             }
         }
         Ok(result)
@@ -1144,6 +1148,108 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let g = Graph::open(dir.path(), 1).unwrap();
         (dir, g)
+    }
+
+    /// A string equality lookup must match the exact value, not merely a prefix.
+    /// The NUL-terminated string encoding plus leading-zero ids would otherwise
+    /// let a lookup for "a" also return a node whose value is "a\0".
+    #[test]
+    fn string_equality_lookup_is_exact_across_nul_boundary() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("L", &json!({ "k": "a" })).unwrap();
+        let a_nul = g.add_node("L", &json!({ "k": "a\u{0}" })).unwrap();
+
+        assert_eq!(
+            g.nodes_by_property("L", "k", PropValue::Str("a".to_string()))
+                .unwrap(),
+            vec![a],
+            "lookup of \"a\" must not return \"a\\0\""
+        );
+        assert_eq!(
+            g.nodes_by_property("L", "k", PropValue::Str("a\u{0}".to_string()))
+                .unwrap(),
+            vec![a_nul],
+            "lookup of \"a\\0\" must not return \"a\""
+        );
+    }
+
+    /// The edge equality lookup has the same exactness requirement. Edge
+    /// properties are indexed only under an explicit edge index, so create one
+    /// before inserting the edges.
+    #[test]
+    fn edge_string_equality_lookup_is_exact_across_nul_boundary() {
+        let (_dir, g) = open_tmp();
+        g.create_edge_property_index("R", "k").unwrap();
+        let a = g.add_node("N", &json!({})).unwrap();
+        let b = g.add_node("N", &json!({})).unwrap();
+        let e = g.add_edge(a, b, "R", &json!({ "k": "a" })).unwrap();
+        let _e_nul = g.add_edge(a, b, "R", &json!({ "k": "a\u{0}" })).unwrap();
+
+        assert_eq!(
+            g.edges_by_property("R", "k", PropValue::Str("a".to_string()))
+                .unwrap(),
+            vec![e],
+            "edge lookup of \"a\" must not return \"a\\0\""
+        );
+    }
+
+    /// Distinct string values that share a NUL-boundary relationship must not
+    /// trigger a spurious unique-constraint violation.
+    #[test]
+    fn unique_constraint_distinguishes_nul_boundary_strings() {
+        let (_dir, g) = open_tmp();
+        g.create_node_unique_constraint("L", "k").unwrap();
+        g.add_node("L", &json!({ "k": "a" })).unwrap();
+        // "a\0" is a distinct value, so this insert must succeed.
+        let res = g.add_node("L", &json!({ "k": "a\u{0}" }));
+        assert!(
+            res.is_ok(),
+            "\"a\\0\" is distinct from \"a\" and must not violate unique(L.k)"
+        );
+        // A genuine duplicate still fails.
+        assert!(
+            g.add_node("L", &json!({ "k": "a" })).is_err(),
+            "a true duplicate must still be rejected"
+        );
+    }
+
+    /// A string range must place a NUL-suffixed value on the correct side of the
+    /// bound: Cypher orders "a" < "a\0" < "ab" (a prefix is smaller), and the
+    /// order-preserving encoding reproduces that, so ranges stay exact across the
+    /// NUL boundary without any re-verification.
+    #[test]
+    fn string_range_respects_nul_boundary() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("L", &json!({ "k": "a" })).unwrap();
+        let a_nul = g.add_node("L", &json!({ "k": "a\u{0}" })).unwrap();
+        let ab = g.add_node("L", &json!({ "k": "ab" })).unwrap();
+
+        // k >= "a\0" excludes "a", includes "a\0" and "ab".
+        let mut hits = g
+            .nodes_by_property_range(
+                "L",
+                "k",
+                Some(PropValue::Str("a\u{0}".into())),
+                true,
+                None,
+                false,
+            )
+            .unwrap();
+        hits.sort_unstable();
+        assert_eq!(hits, vec![a_nul, ab]);
+
+        // k <= "a" includes only "a".
+        let hits = g
+            .nodes_by_property_range("L", "k", None, false, Some(PropValue::Str("a".into())), true)
+            .unwrap();
+        assert_eq!(hits, vec![a]);
+
+        // k > "a" (exclusive) excludes "a", includes "a\0" and "ab".
+        let mut hits = g
+            .nodes_by_property_range("L", "k", Some(PropValue::Str("a".into())), false, None, false)
+            .unwrap();
+        hits.sort_unstable();
+        assert_eq!(hits, vec![a_nul, ab]);
     }
 
     /// Dropping an explicit property index must leave the always-on auto-index

@@ -920,26 +920,37 @@ pub(super) fn eval_arithmetic(
     match (lv, rv) {
         (serde_json::Value::Number(ln), serde_json::Value::Number(rn)) => {
             if let (Some(li), Some(ri)) = (ln.as_i64(), rn.as_i64()) {
+                // Both operands are integers, so integer arithmetic applies. On
+                // overflow openCypher raises an error rather than silently
+                // widening to floating point (which would lose precision and
+                // change the value's type), so surface it instead of falling
+                // through to the float path below.
+                let overflow = || format!("ArithmeticError: integer overflow in {li} {op} {ri}");
                 let result = match op {
-                    '+' => li.checked_add(ri).map(serde_json::Value::from),
-                    '-' => li.checked_sub(ri).map(serde_json::Value::from),
-                    '*' => li.checked_mul(ri).map(serde_json::Value::from),
+                    '+' => Some(li.checked_add(ri).ok_or_else(overflow)?),
+                    '-' => Some(li.checked_sub(ri).ok_or_else(overflow)?),
+                    '*' => Some(li.checked_mul(ri).ok_or_else(overflow)?),
                     '/' => {
                         if ri == 0 {
                             return Ok(serde_json::Value::Null);
                         }
-                        li.checked_div(ri).map(serde_json::Value::from)
+                        // `checked_div` is `None` only for `i64::MIN / -1`, a true
+                        // overflow.
+                        Some(li.checked_div(ri).ok_or_else(overflow)?)
                     }
                     '%' => {
                         if ri == 0 {
                             return Ok(serde_json::Value::Null);
                         }
-                        li.checked_rem(ri).map(serde_json::Value::from)
+                        // `i64::MIN % -1` is mathematically 0 (no overflow of the
+                        // remainder itself); `wrapping_rem` yields that, matching
+                        // Neo4j, and is exact for every other divisor.
+                        Some(li.wrapping_rem(ri))
                     }
                     _ => None,
                 };
                 if let Some(v) = result {
-                    return Ok(v);
+                    return Ok(serde_json::Value::from(v));
                 }
             }
             if let (Some(lf), Some(rf)) = (ln.as_f64(), rn.as_f64()) {

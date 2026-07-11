@@ -56,7 +56,12 @@ impl MatrixSet {
 
         let mut adj_elements: Vec<(usize, usize, i32)> = Vec::new();
         let mut adj_t_elements: Vec<(usize, usize, i32)> = Vec::new();
-        let mut weight_elements: Vec<(usize, usize, f64)> = Vec::new();
+        // Accumulate the weight of each i→j pair as the minimum over parallel
+        // edges: the weight matrix models the cheapest connection, so summing
+        // parallel edges would invent a weight no real edge has, inflating
+        // shortest-path costs and breaking path reconstruction (which looks for a
+        // real edge matching the matrix weight).
+        let mut weight_map: HashMap<(usize, usize), f64> = HashMap::new();
         // Accumulate PageRank weights in a map so that parallel edges i→j
         // sum their contributions rather than keeping only the first.
         let mut pr_map: HashMap<(usize, usize), f32> = HashMap::new();
@@ -69,7 +74,11 @@ impl MatrixSet {
                 let col = csr.col_idx[k] as usize;
                 adj_elements.push((i, col, 1i32));
                 adj_t_elements.push((col, i, 1i32));
-                weight_elements.push((i, col, csr.edge_weight[k]));
+                let w = csr.edge_weight[k];
+                weight_map
+                    .entry((i, col))
+                    .and_modify(|m| *m = m.min(w))
+                    .or_insert(w);
                 if out_deg > 0.0 {
                     // M[col][i] = 1/out_deg(i) so that M * r gives incoming rank.
                     *pr_map.entry((col, i)).or_insert(0.0) += 1.0f32 / out_deg;
@@ -77,13 +86,19 @@ impl MatrixSet {
             }
         }
 
+        let weight_elements: Vec<(usize, usize, f64)> = weight_map
+            .into_iter()
+            .map(|((r, c), v)| (r, c, v))
+            .collect();
         let pr_elements: Vec<(usize, usize, f32)> =
             pr_map.into_iter().map(|((r, c), v)| (r, c, v)).collect();
 
         let gb = |e: issundb_graphblas::GraphblasError| Error::GraphBLAS(e.to_string());
 
         // First-wins union for the boolean adjacency matrices; Plus to sum the
-        // contributions of parallel edges in the PageRank and weight matrices.
+        // per-edge transition contributions of parallel edges in the PageRank
+        // matrix. The weight and PageRank triples are already deduplicated by
+        // coordinate above, so their reducer never actually combines values.
         let adjacency = Matrix::<i32>::from_triples(
             context.clone(),
             n_nodes,
@@ -113,7 +128,7 @@ impl MatrixSet {
             n_nodes,
             n_nodes,
             &weight_elements,
-            Reducer::Plus,
+            Reducer::First,
         )
         .map_err(gb)?;
 
