@@ -1240,13 +1240,27 @@ mod tests {
 
         // k <= "a" includes only "a".
         let hits = g
-            .nodes_by_property_range("L", "k", None, false, Some(PropValue::Str("a".into())), true)
+            .nodes_by_property_range(
+                "L",
+                "k",
+                None,
+                false,
+                Some(PropValue::Str("a".into())),
+                true,
+            )
             .unwrap();
         assert_eq!(hits, vec![a]);
 
         // k > "a" (exclusive) excludes "a", includes "a\0" and "ab".
         let mut hits = g
-            .nodes_by_property_range("L", "k", Some(PropValue::Str("a".into())), false, None, false)
+            .nodes_by_property_range(
+                "L",
+                "k",
+                Some(PropValue::Str("a".into())),
+                false,
+                None,
+                false,
+            )
             .unwrap();
         hits.sort_unstable();
         assert_eq!(hits, vec![a_nul, ab]);

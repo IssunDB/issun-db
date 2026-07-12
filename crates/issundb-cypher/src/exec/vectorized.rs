@@ -2148,6 +2148,58 @@ mod tests {
         }
     }
 
+    /// A group-by over a property that mixes integer and float representations of
+    /// the same value (`1` and `1.0`) must form one group under openCypher
+    /// numeric equivalence, and the vectorized fast path must agree with the row
+    /// pipeline.
+    #[test]
+    fn mixed_int_float_group_merges_and_matches_row_path() {
+        let dir = TempDir::new().unwrap();
+        let g = Graph::open(dir.path(), 1).unwrap();
+        // Group by the source property, which mixes integer and float
+        // representations of the same value.
+        let a1 = g.add_node("A", &json!({ "v": 1 })).unwrap(); // integer 1
+        let a2 = g.add_node("A", &json!({ "v": 1.0 })).unwrap(); // float 1.0
+        let a3 = g.add_node("A", &json!({ "v": 2 })).unwrap();
+        let b = g.add_node("B", &json!({})).unwrap();
+        for a in [a1, a2, a3] {
+            g.add_edge(a, b, "R", &json!({})).unwrap();
+        }
+
+        let cypher = "MATCH (a:A)-[:R]->(b:B) RETURN a.v AS v, count(*) AS c ORDER BY v";
+        assert_matches_row_path(&g, cypher);
+
+        // 1 and 1.0 collapse into a single group of two.
+        let res = execute(&g, cypher, &std::collections::HashMap::new()).unwrap();
+        assert_eq!(res.records.len(), 2, "1 and 1.0 must form one group");
+        assert_eq!(res.records[0].values[1], json!(2), "the merged group has 2");
+    }
+
+    /// `count(DISTINCT ...)` and `collect(DISTINCT ...)` treat `1` and `1.0` as
+    /// one value (row pipeline, driven through `UNWIND`).
+    #[test]
+    fn distinct_aggregation_treats_int_and_float_as_equal() {
+        let dir = TempDir::new().unwrap();
+        let g = Graph::open(dir.path(), 1).unwrap();
+        let params = std::collections::HashMap::new();
+
+        let res = execute(
+            &g,
+            "UNWIND [1, 1.0, 2, 2.0, 2] AS x RETURN count(DISTINCT x) AS c",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(
+            res.records[0].values[0],
+            json!(2),
+            "{{1,1.0}} and {{2,2.0}}"
+        );
+
+        // RETURN DISTINCT collapses 1 and 1.0 to a single row.
+        let res = execute(&g, "UNWIND [1, 1.0, 2] AS x RETURN DISTINCT x", &params).unwrap();
+        assert_eq!(res.records.len(), 2, "1 and 1.0 are one distinct value");
+    }
+
     /// A two-hop "at-bat" graph with edge properties on both hops, shaped like
     /// the benchmark's platoon-advantage query: `(:Player)-[:BATTED]->(:Event)
     /// <-[:PITCHED]-(:Player)`. Batter and pitcher edges carry handedness and

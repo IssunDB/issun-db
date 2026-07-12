@@ -4882,3 +4882,51 @@ pub(super) fn json_cmp(l: &serde_json::Value, r: &serde_json::Value) -> Option<s
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod arithmetic_tests {
+    use super::eval_arithmetic;
+    use serde_json::json;
+
+    #[test]
+    fn integer_overflow_errors_instead_of_promoting_to_float() {
+        // i64::MAX + 1 overflows: openCypher raises rather than widening to f64.
+        let err = eval_arithmetic(&json!(i64::MAX), &json!(1), '+').unwrap_err();
+        assert!(err.contains("overflow"), "got: {err}");
+        assert!(eval_arithmetic(&json!(i64::MAX), &json!(2), '*').is_err());
+        assert!(eval_arithmetic(&json!(i64::MIN), &json!(1), '-').is_err());
+        // i64::MIN / -1 overflows too.
+        assert!(eval_arithmetic(&json!(i64::MIN), &json!(-1), '/').is_err());
+
+        // A float operand still uses float arithmetic (no error, widens).
+        assert_eq!(
+            eval_arithmetic(&json!(i64::MAX), &json!(1.0), '+').unwrap(),
+            json!(i64::MAX as f64 + 1.0)
+        );
+
+        // Normal integer arithmetic is unaffected and stays integer-typed.
+        assert_eq!(
+            eval_arithmetic(&json!(2), &json!(3), '+').unwrap(),
+            json!(5)
+        );
+        assert_eq!(
+            eval_arithmetic(&json!(10), &json!(3), '/').unwrap(),
+            json!(3)
+        );
+
+        // Division/modulo by zero stay null (not an error).
+        assert_eq!(
+            eval_arithmetic(&json!(1), &json!(0), '/').unwrap(),
+            json!(null)
+        );
+        assert_eq!(
+            eval_arithmetic(&json!(1), &json!(0), '%').unwrap(),
+            json!(null)
+        );
+        // i64::MIN % -1 is mathematically 0 (the remainder does not overflow).
+        assert_eq!(
+            eval_arithmetic(&json!(i64::MIN), &json!(-1), '%').unwrap(),
+            json!(0)
+        );
+    }
+}

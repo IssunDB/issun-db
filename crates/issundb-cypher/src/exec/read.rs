@@ -4174,7 +4174,7 @@ pub(super) fn eval_leaf(
                 let row = &table[i];
                 let mut key_parts = Vec::with_capacity(col_names.len());
                 for val in row {
-                    key_parts.push(canonical_cell_key(&val));
+                    key_parts.push(canonical_cell_key(val));
                 }
                 let key = key_parts.join("\x00");
                 match groups.get_mut(&key) {
