@@ -700,12 +700,11 @@ mod tests {
         );
     }
 
-    // Regression: collect_bound_vars for Expand unconditionally reported
-    // rel_var as bound even for variable-length paths, causing the optimizer
-    // to place filters referencing rel_var above the Expand where it is absent
-    // from the PathMap, producing "unbound variable" errors at runtime.
+    // A variable-length relationship variable binds to the list of relationships
+    // along each trail, so querying only dst_var still works and a scalar
+    // property access on the list variable is a type error, not a wrong result.
     #[test]
-    fn variable_length_where_on_rel_var_errors_cleanly() {
+    fn variable_length_rel_var_binds_relationship_list() {
         let (_dir, g) = open_tmp();
         let a = g.add_node("Person", &json!({ "name": "Alice" })).unwrap();
         let b = g.add_node("Person", &json!({ "name": "Bob" })).unwrap();
@@ -724,8 +723,8 @@ mod tests {
         assert_eq!(res.records.len(), 1);
         assert_eq!(res.records[0].values[0], json!("Bob"));
 
-        // Referencing rel_var in a variable-length WHERE must produce a clear error,
-        // not a silent wrong result. (rel_var is undefined for multi-hop paths.)
+        // A scalar property access on the list variable is a type error: `r` is a
+        // list of relationships, not a single relationship.
         let err = execute(
             &g,
             "MATCH (a:Person)-[r*1..2]->(b:Person) WHERE r.since = 2020 RETURN b.name AS name",
@@ -733,8 +732,156 @@ mod tests {
         );
         assert!(
             err.is_err(),
-            "filter on rel_var in variable-length path should error"
+            "scalar property access on a variable-length list variable should error"
         );
+    }
+
+    // `RETURN r` on a variable-length pattern yields the list of relationship
+    // objects that make up each trail, one list per emitted row.
+    #[test]
+    fn variable_length_return_rel_list() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("Person", &json!({ "name": "Alice" })).unwrap();
+        let b = g.add_node("Person", &json!({ "name": "Bob" })).unwrap();
+        let c = g.add_node("Person", &json!({ "name": "Carol" })).unwrap();
+        let e1 = g
+            .add_edge(a, b, "KNOWS", &json!({ "since": 2020 }))
+            .unwrap();
+        let e2 = g
+            .add_edge(b, c, "KNOWS", &json!({ "since": 2021 }))
+            .unwrap();
+        g.rebuild_csr().unwrap();
+
+        let params = HashMap::new();
+        // The single trail Alice -> Bob -> Carol has two relationships.
+        let res = execute(
+            &g,
+            "MATCH (a:Person {name: 'Alice'})-[r:KNOWS*2]->(c:Person) RETURN r, size(r) AS n",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(res.records.len(), 1);
+        let list = res.records[0].values[0]
+            .as_array()
+            .expect("r must be a list");
+        assert_eq!(list.len(), 2, "two hops means two relationships");
+        // Each element is a relationship object carrying its edge id.
+        let ids: Vec<i64> = list
+            .iter()
+            .map(|v| v.get("id").and_then(|i| i.as_i64()).expect("edge id"))
+            .collect();
+        assert_eq!(ids, vec![e1 as i64, e2 as i64]);
+        // size(r) reports the hop count.
+        assert_eq!(res.records[0].values[1], json!(2));
+
+        // A WHERE predicate over the list variable is now bound and placeable
+        // above the Expand: this used to be an unbound-variable error.
+        let filtered = execute(
+            &g,
+            "MATCH (a:Person {name: 'Alice'})-[r:KNOWS*1..2]->(c:Person) WHERE size(r) = 2 RETURN c.name AS name",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(filtered.records.len(), 1);
+        assert_eq!(filtered.records[0].values[0], json!("Carol"));
+    }
+
+    // Relationship uniqueness spans a variable-length list and a sibling single
+    // hop in the same pattern: a relationship in the list may not be reused by a
+    // later hop.
+    #[test]
+    fn variable_length_rel_list_participates_in_uniqueness() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("Person", &json!({ "name": "Alice" })).unwrap();
+        let b = g.add_node("Person", &json!({ "name": "Bob" })).unwrap();
+        // A single edge a -> b. `(a)-[r*1..2]->(b)-[s]->(c)` cannot close because
+        // the only edge into the s hop is the one already used by r.
+        g.add_edge(a, b, "KNOWS", &json!({})).unwrap();
+        g.rebuild_csr().unwrap();
+
+        let params = HashMap::new();
+        let res = execute(
+            &g,
+            "MATCH (a:Person {name: 'Alice'})-[r*1..2]->(b)<-[s]-(c) RETURN c.name AS name",
+            &params,
+        )
+        .unwrap();
+        // Only trail: r = [a->b], then s must be a distinct edge into b. The sole
+        // in-edge of b is a->b, already in r, so no row survives uniqueness.
+        assert!(
+            res.records.is_empty(),
+            "sibling hop must not reuse a relationship already in the list"
+        );
+    }
+
+    // Full openCypher fidelity: any `*` range makes the relationship variable a
+    // list, even `*1` and `*1..1`, which collapse to `min == max == 1` bounds yet
+    // must still bind a length-one list (not a single relationship like `[r]`).
+    #[test]
+    fn single_hop_star_range_binds_length_one_list() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("Person", &json!({ "name": "Alice" })).unwrap();
+        let b = g.add_node("Person", &json!({ "name": "Bob" })).unwrap();
+        let e = g
+            .add_edge(a, b, "KNOWS", &json!({ "since": 2020 }))
+            .unwrap();
+        g.rebuild_csr().unwrap();
+        let params = HashMap::new();
+
+        // `[r]` (no range) binds a single relationship object, not a list.
+        let plain = execute(
+            &g,
+            "MATCH (a:Person {name: 'Alice'})-[r:KNOWS]->(b) RETURN r",
+            &params,
+        )
+        .unwrap();
+        assert!(
+            plain.records[0].values[0].is_object(),
+            "a plain [r] hop binds a single relationship, not a list"
+        );
+
+        // `[r*1]` and `[r*1..1]` each bind a length-one list of relationships.
+        for pattern in ["-[r:KNOWS*1]->", "-[r:KNOWS*1..1]->"] {
+            let q =
+                format!("MATCH (a:Person {{name: 'Alice'}}){pattern}(b) RETURN r, size(r) AS n");
+            let res = execute(&g, &q, &params).unwrap();
+            assert_eq!(res.records.len(), 1, "{pattern}");
+            let list = res.records[0].values[0]
+                .as_array()
+                .unwrap_or_else(|| panic!("{pattern}: r must be a list"));
+            assert_eq!(list.len(), 1, "{pattern}: length-one list");
+            assert_eq!(
+                list[0].get("id").and_then(|i| i.as_i64()),
+                Some(e as i64),
+                "{pattern}"
+            );
+            assert_eq!(
+                res.records[0].values[1],
+                json!(1),
+                "{pattern}: size(r) == 1"
+            );
+        }
+
+        // A grouping-free `count(*)` over `*1` counts trails (one per edge); the
+        // optimizer's metadata-count and kernel paths must stay correct for the
+        // var-length single hop.
+        let counted = execute(
+            &g,
+            "MATCH (a:Person {name: 'Alice'})-[:KNOWS*1]->(b) RETURN count(*) AS n",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(counted.records[0].values[0], json!(1));
+
+        // An anonymous `*1` (no relationship variable) still traverses the hop.
+        let anon = execute(
+            &g,
+            "MATCH (a:Person {name: 'Alice'})-[*1]->(b) RETURN b.name AS name",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(anon.records.len(), 1);
+        assert_eq!(anon.records[0].values[0], json!("Bob"));
     }
 
     // Proposal B: the factorized Filter-over-Expand path must produce the same

@@ -592,6 +592,7 @@ fn recognize(plan: &PhysicalOperator) -> Option<VecPipeline<'_>> {
                 max_hops: 1,
                 unique_rels,
                 needs_path: false,
+                is_var_length: false,
             } => {
                 // A self-referencing hop `(a)-->(a)` needs the pre-bound target
                 // guard the row pipeline applies; decline it here.

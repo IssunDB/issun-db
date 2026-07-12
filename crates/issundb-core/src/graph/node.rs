@@ -100,35 +100,24 @@ impl Graph {
 
                 if let Some(val) = prop_val {
                     if val != &serde_json::Value::Null {
+                        // Unique constraint check runs for every non-null value,
+                        // including a string too long to index (absent from
+                        // `node_prop_idx`), which falls back to a label scan so the
+                        // constraint still holds. Excludes this node by id so a
+                        // re-index of an unchanged value does not conflict with itself.
+                        if flags == 0x01 {
+                            self.check_node_property_unique(
+                                wtxn,
+                                label_id,
+                                label_name,
+                                prop_key_id,
+                                &prop_name,
+                                val,
+                                node_id,
+                            )?;
+                        }
+
                         if let Some(encoded) = encode_property_value(val) {
-                            // Unique constraint check; excludes this node by id so a
-                            // re-index of an unchanged value does not conflict with itself.
-                            if flags == 0x01 {
-                                let mut prefix = Vec::with_capacity(4 + 4 + encoded.len());
-                                prefix.extend_from_slice(&label_id.to_be_bytes());
-                                prefix.extend_from_slice(&prop_key_id.to_be_bytes());
-                                prefix.extend_from_slice(&encoded);
-
-                                for entry in
-                                    self.storage.node_prop_idx.prefix_iter(wtxn, &prefix)?
-                                {
-                                    let (key, _) = entry?;
-                                    // Only an exact encoded-value match is a real
-                                    // conflict; a prefix-only match is a distinct
-                                    // string value (see `exact_prop_index_id`).
-                                    if let Some(found_node_id) = exact_prop_index_id(key, &encoded)
-                                    {
-                                        if found_node_id != node_id {
-                                            return Err(Error::UniqueConstraintViolation(
-                                                label_name.to_string(),
-                                                prop_name.to_string(),
-                                                val.to_string(),
-                                            ));
-                                        }
-                                    }
-                                }
-                            }
-
                             let idx_key =
                                 node_prop_index_key(label_id, prop_key_id, &encoded, node_id);
                             self.storage.node_prop_idx.put(wtxn, &idx_key, &())?;
@@ -156,6 +145,64 @@ impl Graph {
         // FTS indexing hook for this label.
         self.index_node_fts(wtxn, node_id, label_id, props_json)?;
 
+        Ok(())
+    }
+
+    /// Enforce a unique constraint for one node property value, excluding the
+    /// node itself. An index-encodable value is checked via `node_prop_idx`
+    /// (exact encoded-value match, so `30` and `30.0` conflict, matching the
+    /// range and equality lookups); a value too long to index falls back to a
+    /// label scan comparing stored values, so the constraint holds for long
+    /// strings that never reach the index.
+    #[allow(clippy::too_many_arguments)]
+    fn check_node_property_unique(
+        &self,
+        wtxn: &heed::RwTxn,
+        label_id: LabelId,
+        label_name: &str,
+        prop_key_id: PropKeyId,
+        prop_name: &str,
+        val: &serde_json::Value,
+        node_id: NodeId,
+    ) -> Result<(), Error> {
+        let violation = || {
+            Error::UniqueConstraintViolation(
+                label_name.to_string(),
+                prop_name.to_string(),
+                val.to_string(),
+            )
+        };
+        if let Some(encoded) = encode_property_value(val) {
+            let mut prefix = Vec::with_capacity(4 + 4 + encoded.len());
+            prefix.extend_from_slice(&label_id.to_be_bytes());
+            prefix.extend_from_slice(&prop_key_id.to_be_bytes());
+            prefix.extend_from_slice(&encoded);
+            for entry in self.storage.node_prop_idx.prefix_iter(wtxn, &prefix)? {
+                let (key, _) = entry?;
+                // Only an exact encoded-value match is a real conflict; a
+                // prefix-only match is a distinct string value (the NUL-terminated
+                // string encoding lets "a" prefix-match a stored "a\0").
+                if let Some(found_node_id) = exact_prop_index_id(key, &encoded) {
+                    if found_node_id != node_id {
+                        return Err(violation());
+                    }
+                }
+            }
+        } else {
+            // Too long to index: compare the stored value on every other node
+            // carrying this label.
+            for other in self.nodes_by_label_impl(wtxn, label_name)? {
+                if other == node_id {
+                    continue;
+                }
+                if let Some(record) = self.get_node_impl(wtxn, other)? {
+                    let props: serde_json::Value = props::decode(&record.props)?;
+                    if props.get(prop_name) == Some(val) {
+                        return Err(violation());
+                    }
+                }
+            }
+        }
         Ok(())
     }
 

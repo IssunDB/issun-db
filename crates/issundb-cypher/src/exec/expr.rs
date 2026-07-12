@@ -680,6 +680,24 @@ pub(super) fn evaluate_expr<B: Bindings>(
                         ))
                     }
                 }
+                GraphBinding::EdgeList(ids) => {
+                    if prop.is_empty() {
+                        // Whole-variable reference: the list of relationship
+                        // objects along the variable-length trail.
+                        let mut arr = Vec::with_capacity(ids.len());
+                        for &eid in ids {
+                            arr.push(super::read::get_edge_representation(graph, eid)?);
+                        }
+                        Ok(serde_json::Value::Array(arr))
+                    } else {
+                        // A variable-length relationship variable is a list, so a
+                        // scalar property access is a type error.
+                        Err(format!(
+                            "TypeError: property access '{}' on a list of relationships",
+                            prop
+                        ))
+                    }
+                }
             }
         }
     }
@@ -1596,7 +1614,12 @@ pub(super) fn eval_function_call<B: Bindings>(
             match val {
                 serde_json::Value::Number(n) => {
                     if let Some(i) = n.as_i64() {
-                        Ok(i.abs().into())
+                        // `i64::MIN.abs()` overflows (panics in debug, wraps in
+                        // release); openCypher raises on arithmetic overflow.
+                        let a = i.checked_abs().ok_or_else(|| {
+                            format!("ArithmeticError: integer overflow in abs({i})")
+                        })?;
+                        Ok(a.into())
                     } else if let Some(f) = n.as_f64() {
                         Ok(serde_json::Number::from_f64(f.abs())
                             .map(serde_json::Value::Number)

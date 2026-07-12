@@ -55,6 +55,13 @@ pub enum LogicalOperator {
         /// Building those objects costs three record decodes per row, so plain
         /// patterns skip them entirely.
         needs_path: bool,
+        /// True when the pattern used a `*` range (`[r*]`, `[r*1..3]`, `[r*2]`,
+        /// even `[r*1..1]`), so `rel_var` binds the list of relationships along
+        /// the trail rather than a single relationship. A plain `[r]` hop (no
+        /// range) is false and binds a single relationship. This distinguishes
+        /// `[r*1..1]` (a length-one list) from `[r]` (one relationship), which
+        /// otherwise share the same `min_hops == max_hops == 1` bounds.
+        is_var_length: bool,
     },
     /// Filter records based on expressions/WHERE predicates.
     Filter {
@@ -708,6 +715,7 @@ impl LogicalPlanner {
                 max_hops,
                 unique_rels: prior_rel_vars.clone(),
                 needs_path: pattern.path_variable.is_some(),
+                is_var_length: rel_pat.range.is_some(),
             };
             prior_rel_vars.push(rel_var.clone());
 

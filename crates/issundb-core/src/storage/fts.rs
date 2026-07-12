@@ -283,6 +283,12 @@ pub fn fold_ascii(text: &str) -> String {
 ///
 /// Diacritics are folded to their ASCII base before segmentation so that
 /// "café" and "cafe" produce the same stem.
+/// Maximum byte length of an indexable FTS term. A term is embedded in the
+/// postings key after an 8-byte `(label_id, prop_key_id)` prefix, so it must
+/// stay well under LMDB's 511-byte key limit. Conservative, matching the
+/// property index's `MAX_INDEXED_STRING_LEN`.
+pub(crate) const MAX_FTS_TERM_LEN: usize = 480;
+
 pub fn tokenize(text: &str, lang: Language) -> HashMap<String, u32> {
     let folded = fold_ascii(text);
     let mut terms = HashMap::new();
@@ -294,6 +300,15 @@ pub fn tokenize(text: &str, lang: Language) -> HashMap<String, u32> {
         let lower = word.to_lowercase();
         if !stop_words.contains(&lower.as_str()) {
             let stemmed = stemmer.stem(&lower);
+            // A term is embedded in the FTS postings key (after the 8-byte
+            // label/prop prefix), so an over-long token would exceed LMDB's
+            // 511-byte key limit and abort the whole write. Skip it, matching how
+            // the property index declines over-long values: the containing node is
+            // still inserted, and because both indexing and querying tokenize
+            // through here, a skipped term is simply not searchable (consistent).
+            if stemmed.len() > MAX_FTS_TERM_LEN {
+                continue;
+            }
             *terms.entry(stemmed.into_owned()).or_insert(0) += 1;
         }
     }

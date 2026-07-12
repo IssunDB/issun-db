@@ -385,8 +385,12 @@ struct VectorIndexCache(VectorIndex);
 
 impl VectorGraphExt for Graph {
     fn configure_vector_index(&self, opts: VectorIndexOptions) -> Result<(), VectorError> {
-        let current = load_config(self)?;
-        if current == Some(opts) {
+        // Compare against the EFFECTIVE config: when nothing is persisted the
+        // active configuration is the lazily built default, so re-applying that
+        // default (or any already-active config) is a no-op, as documented, not
+        // an `AlreadyConfigured` error.
+        let effective = load_config(self)?.unwrap_or_default();
+        if effective == opts {
             return Ok(());
         }
         // The HNSW graph is built per-metric. Changing the metric or
@@ -394,7 +398,7 @@ impl VectorGraphExt for Graph {
         // the next cold-start rebuild, so refuse it while vectors are present.
         if !self.vector_bytes()?.is_empty() {
             return Err(VectorError::AlreadyConfigured {
-                existing: format!("{:?}", current.unwrap_or_default()),
+                existing: format!("{effective:?}"),
                 requested: format!("{opts:?}"),
             });
         }
@@ -408,11 +412,15 @@ impl VectorGraphExt for Graph {
     }
 
     fn reindex_vector_index(&self, opts: VectorIndexOptions) -> Result<(), VectorError> {
-        // Persist the new configuration, rebuild the index from the stored raw
-        // embeddings, then swap the cache atomically. The build runs before the
-        // swap so a mid-rebuild failure leaves the previous cache in place.
-        self.put_vector_config(&encode_config(opts))?;
+        // Rebuild the index from the stored raw embeddings FIRST, then persist
+        // the new configuration and swap the cache. Building before persisting
+        // means a mid-rebuild failure leaves BOTH the previous cache and the
+        // previous persisted config in place, so the next cold-start rebuild does
+        // not silently reinterpret embeddings under a metric the failed operation
+        // never finished applying. `build_index` takes `opts` explicitly, so it
+        // does not depend on the persisted config.
         let rebuilt = build_index(self, opts)?;
+        self.put_vector_config(&encode_config(opts))?;
         self.set_extension(Arc::new(VectorIndexCache(rebuilt)));
         Ok(())
     }
@@ -520,27 +528,37 @@ impl VectorGraphExt for Graph {
             if let Some(e) = pred_err.into_inner() {
                 return Err(e);
             }
+            // The label and property predicate fails for a node deleted through
+            // the core API (it is gone from `label_idx` and the property columns),
+            // so `search_filtered` has already skipped those "ghost" hits and kept
+            // expanding, returning live matches only.
             results
         } else {
-            arc.0.search(q, fetch_k)?
-        };
-
-        // Drop "ghost" hits: a node deleted through the core graph API stays in
-        // the in-memory HNSW index, because core deletion cannot reach this
-        // vector-crate extension. Filter out hits whose node no longer exists,
-        // in one read transaction, before rescore and the `opts.k` truncation so
-        // the caller still gets live nearest neighbors. The filtered-search path
-        // above already excludes these via its label and property predicate; this
-        // covers the unfiltered path and the quantized rescore.
-        let hits: Vec<Hit> = self.view(|txn| {
-            let mut live = Vec::with_capacity(hits.len());
-            for hit in hits {
-                if txn.get_node(hit.node)?.is_some() {
-                    live.push(hit);
+            // Unfiltered: a node deleted through the core graph API stays in the
+            // in-memory HNSW index, because core deletion cannot reach this
+            // vector-crate extension. Over-fetch and drop those "ghost" hits,
+            // growing the fetch window until `fetch_k` live hits remain (or the
+            // index is exhausted). A fixed `fetch_k` would truncate the result
+            // below `opts.k` when enough top-ranked nodes had been deleted.
+            let mut want = fetch_k.max(1);
+            loop {
+                let raw = arc.0.search(q, want)?;
+                let raw_len = raw.len();
+                let live: Vec<Hit> = self.view(|txn| {
+                    let mut live = Vec::with_capacity(raw_len);
+                    for hit in raw {
+                        if txn.get_node(hit.node)?.is_some() {
+                            live.push(hit);
+                        }
+                    }
+                    Ok(live)
+                })?;
+                if live.len() >= fetch_k || raw_len < want {
+                    break live;
                 }
+                want = want.saturating_mul(2);
             }
-            Ok(live)
-        })?;
+        };
 
         let mut final_hits = if rescore_factor > 1 && !hits.is_empty() {
             // One read transaction covers every stored-vector lookup. A hit
@@ -825,6 +843,70 @@ mod tests {
             hits.iter().any(|h| h.node == b),
             "the surviving node is still searchable"
         );
+    }
+
+    /// When enough top-ranked nodes are deleted (ghosts) on the default
+    /// Float32 path, `vector_search` must still return `k` live hits by
+    /// over-fetching past the ghosts, not truncate below `k`.
+    #[test]
+    fn vector_search_returns_k_live_hits_despite_deleted_top_ranked() {
+        let (_dir, graph) = open_tmp();
+        let close = [
+            graph.add_node("N", &json!({})).unwrap(),
+            graph.add_node("N", &json!({})).unwrap(),
+            graph.add_node("N", &json!({})).unwrap(),
+        ];
+        graph.upsert_vector(close[0], &[1.0f32, 0.0]).unwrap();
+        graph.upsert_vector(close[1], &[1.0f32, 0.1]).unwrap();
+        graph.upsert_vector(close[2], &[1.0f32, 0.2]).unwrap();
+        let far = [
+            graph.add_node("N", &json!({})).unwrap(),
+            graph.add_node("N", &json!({})).unwrap(),
+            graph.add_node("N", &json!({})).unwrap(),
+        ];
+        graph.upsert_vector(far[0], &[1.0f32, 1.0]).unwrap();
+        graph.upsert_vector(far[1], &[0.5f32, 1.0]).unwrap();
+        graph.upsert_vector(far[2], &[0.0f32, 1.0]).unwrap();
+
+        // Delete the three closest through the core API (leaving them as ghosts
+        // in the HNSW index), so a fixed `fetch_k == k` would drop all results.
+        for n in close {
+            graph.delete_node(n).unwrap();
+        }
+
+        let hits = graph.vector_search(&[1.0f32, 0.0], 3).unwrap();
+        assert_eq!(
+            hits.len(),
+            3,
+            "must backfill past deleted nodes to return k live hits"
+        );
+        assert!(
+            hits.iter().all(|h| far.contains(&h.node)),
+            "only the live (far) nodes are returned"
+        );
+    }
+
+    /// Re-applying the effective default configuration on a graph that has
+    /// vectors but no explicitly persisted config is a documented no-op, not an
+    /// `AlreadyConfigured` error.
+    #[test]
+    fn configure_default_after_upsert_is_noop() {
+        let (_dir, graph) = open_tmp();
+        let a = graph.add_node("N", &json!({})).unwrap();
+        graph.upsert_vector(a, &[1.0f32, 0.0]).unwrap();
+        // No prior configure_vector_index call; the active config is the lazily
+        // built default. Re-applying that default must succeed.
+        assert!(
+            graph
+                .configure_vector_index(VectorIndexOptions::default())
+                .is_ok()
+        );
+        // Requesting a DIFFERENT config while vectors exist is still refused.
+        let other = VectorIndexOptions {
+            metric: VectorMetric::L2,
+            ..VectorIndexOptions::default()
+        };
+        assert!(graph.configure_vector_index(other).is_err());
     }
 
     #[test]

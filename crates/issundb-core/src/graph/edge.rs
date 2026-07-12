@@ -32,6 +32,19 @@ impl Graph {
         etype: &str,
         props: &impl Serialize,
     ) -> Result<EdgeId, Error> {
+        // Both endpoints must already exist. Writing adjacency for a nonexistent
+        // node id would leave a dangling `in_adj`/`out_adj` entry that a
+        // later-allocated node would silently inherit, breaking adjacency
+        // consistency. Reads see writes earlier in this same transaction, so a
+        // node created before the edge in one `update` batch is visible. This
+        // check runs before any write, so a rejected edge leaves no partial state.
+        if self.storage.nodes.get(wtxn, &src)?.is_none() {
+            return Err(Error::NodeNotFound(src));
+        }
+        if self.storage.nodes.get(wtxn, &dst)?.is_none() {
+            return Err(Error::NodeNotFound(dst));
+        }
+
         let type_id = get_or_create_type(&self.storage, wtxn, etype)?;
         let edge_id = alloc_edge_id(&self.storage, wtxn)?;
         let encoded_props = props::encode(props)?;
@@ -251,6 +264,31 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let g = Graph::open(dir.path(), 1).unwrap();
         (dir, g)
+    }
+
+    /// `add_edge` must reject an endpoint that does not exist, so a
+    /// later-allocated node cannot inherit dangling adjacency. A committed node
+    /// created earlier in the graph is a valid endpoint.
+    #[test]
+    fn add_edge_rejects_nonexistent_endpoint() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("N", &()).unwrap();
+        // dst 999 has never been allocated.
+        assert!(matches!(
+            g.add_edge(a, 999, "R", &()),
+            Err(Error::NodeNotFound(999))
+        ));
+        // src 999 likewise.
+        assert!(matches!(
+            g.add_edge(999, a, "R", &()),
+            Err(Error::NodeNotFound(999))
+        ));
+        // No dangling adjacency was written for the phantom id: a node allocated
+        // afterward has no inherited relationships.
+        let b = g.add_node("N", &()).unwrap();
+        assert!(!g.node_has_relationships(b).unwrap());
+        // A valid edge between existing nodes still works.
+        assert!(g.add_edge(a, b, "R", &()).is_ok());
     }
 
     /// After a CSR rebuild captures a node into the snapshot, adding an edge to

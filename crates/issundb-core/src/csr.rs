@@ -203,6 +203,15 @@ pub struct CsrCache {
     /// serialize on the `Graph` write lock, so contention here is only between a
     /// writer recording a mutation and the refresh path draining it.
     pending: parking_lot::Mutex<GraphDelta>,
+    /// Serializes every cache-maintenance operation (incremental delta apply,
+    /// snapshot-only refresh, and full rebuild, foreground or background) against
+    /// each other. Writers do not take it (they only record the delta and bump
+    /// `write_gen`), and idle reads skip it via a lock-free pre-check, so it is
+    /// contended only when maintenance is actually needed. Holding it across a
+    /// full rebuild is what keeps an incremental drain from racing a background
+    /// rebuild that would otherwise discard the drained write, and keeps two
+    /// rebuilds from running concurrently.
+    pub(crate) maintenance: parking_lot::Mutex<()>,
     /// Monotonic count of committed structural writes. Bumped on every write,
     /// independent of the `pending` delta (which the incremental matrix-refresh
     /// path drains). The CSR snapshot records the value it was built at in
@@ -231,6 +240,7 @@ impl CsrCache {
             rebuilding: AtomicBool::new(false),
             claimed: AtomicU64::new(0),
             pending: parking_lot::Mutex::new(GraphDelta::default()),
+            maintenance: parking_lot::Mutex::new(()),
             write_gen: AtomicU64::new(0),
             snapshot_gen: AtomicU64::new(0),
             matrices_gen: AtomicU64::new(0),

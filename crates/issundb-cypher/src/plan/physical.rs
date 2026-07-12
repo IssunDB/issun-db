@@ -85,6 +85,12 @@ pub enum PhysicalOperator {
         /// and the fused-chain fast path (which skips path objects) must not
         /// apply.
         needs_path: bool,
+        /// True when the pattern used a `*` range, so `rel_var` binds the list of
+        /// relationships along the trail (even for `[r*1..1]`). The single-hop
+        /// fast paths apply only to plain `[r]` hops (`is_var_length == false`);
+        /// a variable-length hop runs through the general expansion so it can
+        /// bind an `EdgeList`.
+        is_var_length: bool,
     },
     /// Filter records based on expressions/WHERE predicates.
     Filter {
@@ -333,6 +339,7 @@ impl PhysicalPlanner {
                 max_hops,
                 unique_rels,
                 needs_path,
+                is_var_length,
             } => PhysicalOperator::Expand {
                 input: Box::new(Self::plan(input)),
                 src_var: src_var.clone(),
@@ -345,6 +352,7 @@ impl PhysicalPlanner {
                 max_hops: *max_hops,
                 unique_rels: unique_rels.clone(),
                 needs_path: *needs_path,
+                is_var_length: *is_var_length,
             },
             LogicalOperator::Filter { input, expression } => PhysicalOperator::Filter {
                 input: Box::new(Self::plan(input)),
@@ -482,10 +490,11 @@ pub fn format_physical_plan(op: &PhysicalOperator, depth: usize) -> String {
             is_incoming,
             min_hops,
             max_hops,
+            is_var_length,
             ..
         } => {
             let rtype = rel_type.as_deref().unwrap_or("*");
-            let range = if *min_hops == 1 && *max_hops == 1 {
+            let range = if *min_hops == 1 && *max_hops == 1 && !*is_var_length {
                 String::new()
             } else if *max_hops == usize::MAX {
                 format!("*{}..", min_hops)
