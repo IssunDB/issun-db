@@ -241,6 +241,11 @@ fn collect_delete_targets(
             match path.get(var) {
                 Some(GraphBinding::Node(id)) => return Ok(vec![GraphBinding::Node(*id)]),
                 Some(GraphBinding::Edge(id)) => return Ok(vec![GraphBinding::Edge(*id)]),
+                // A variable-length relationship variable is a list; deleting it
+                // deletes each relationship in the trail.
+                Some(GraphBinding::EdgeList(ids)) => {
+                    return Ok(ids.iter().map(|id| GraphBinding::Edge(*id)).collect());
+                }
                 Some(GraphBinding::Scalar(v)) => return value_to_delete_targets(v),
                 None => return Err(format!("unbound variable: {}", var)),
             }
@@ -394,9 +399,12 @@ pub(super) fn execute_delete_and_return(
                 distinct: false,
             },
             parts: Vec::new(),
-            order_by: stmt.order_by.clone(),
-            skip: stmt.skip.clone(),
-            limit: stmt.limit.clone(),
+            // DELETE affects every matched element; ORDER BY, SKIP, and LIMIT
+            // restrict only the RETURN projection (computed above in `return_query`),
+            // not the set of rows fed to `delete_over_paths`.
+            order_by: None,
+            skip: None,
+            limit: None,
         };
         let logical = LogicalPlanner::plan(&binding_query).map_err(|e| e.to_string())?;
         let physical = PhysicalPlanner::plan(&logical);
@@ -666,6 +674,12 @@ fn resolve_set_target(path: &PathMap, variable: &str) -> Result<SetTarget, Strin
     match path.get(variable) {
         Some(GraphBinding::Node(id)) => Ok(SetTarget::Node(*id)),
         Some(GraphBinding::Edge(id)) => Ok(SetTarget::Edge(*id)),
+        // A variable-length relationship variable is a list, not a single graph
+        // element, so it cannot be a SET/REMOVE target.
+        Some(GraphBinding::EdgeList(_)) => Err(format!(
+            "SET/REMOVE on a list of relationships '{}' is not supported",
+            variable
+        )),
         Some(GraphBinding::Scalar(val)) => {
             if val.is_null() {
                 return Ok(SetTarget::Skip);

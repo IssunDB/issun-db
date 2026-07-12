@@ -289,6 +289,63 @@ pub(super) fn edge_prop_index_key(
     key
 }
 
+/// Returns the trailing 8-byte id from a property-index key, but only when the
+/// key's encoded-value segment equals `encoded` exactly.
+///
+/// A property-index key is `(prefix u32, prop_key_id u32, encoded_val, id u64)`,
+/// so the value segment is `key[8 .. len - 8]`. A prefix scan on
+/// `(prefix, prop_key_id, encoded)` also matches keys whose value merely *starts*
+/// with `encoded`: for the NUL-terminated string encoding, a stored `"a\0"`
+/// (encoded `04 61 00 00`) is matched by a lookup for `"a"` (encoded `04 61 00`),
+/// because a small id has leading zero bytes. Requiring the value segment to
+/// equal `encoded` exactly rejects those collisions so equality lookups and
+/// unique-constraint checks never conflate distinct string values. Fixed-width
+/// encodings (numbers, bools, null) are already exact, so this never rejects a
+/// genuine match. Returns `None` when the key is too short or the value differs.
+pub(super) fn exact_prop_index_id(key: &[u8], encoded: &[u8]) -> Option<NodeId> {
+    if key.len() < 8 + 8 {
+        return None;
+    }
+    if &key[8..key.len() - 8] != encoded {
+        return None;
+    }
+    let id_bytes: [u8; 8] = key[key.len() - 8..].try_into().ok()?;
+    Some(u64::from_be_bytes(id_bytes))
+}
+
+/// Whether a stored string lies within the range `[lo, hi]` (or the open
+/// variants), using byte-wise comparison, which is the same order the
+/// order-preserving index encoding reproduces (`"a" < "a\0" < "ab"`). A `None`
+/// bound is unbounded on that side. Backs the string-range label-scan fallback
+/// for values too long to index.
+pub(super) fn str_in_range(
+    s: &str,
+    lo: Option<&str>,
+    lo_inclusive: bool,
+    hi: Option<&str>,
+    hi_inclusive: bool,
+) -> bool {
+    if let Some(lo) = lo {
+        if lo_inclusive {
+            if s < lo {
+                return false;
+            }
+        } else if s <= lo {
+            return false;
+        }
+    }
+    if let Some(hi) = hi {
+        if hi_inclusive {
+            if s > hi {
+                return false;
+            }
+        } else if s >= hi {
+            return false;
+        }
+    }
+    true
+}
+
 /// Builds a composite key `(label_id, prop_key_id, term)` for FTS postings.
 pub(super) fn fts_postings_key(label_id: LabelId, prop_key_id: PropKeyId, term: &str) -> Vec<u8> {
     let mut key = Vec::with_capacity(8 + term.len());
@@ -708,6 +765,18 @@ impl Graph {
     /// has been crossed.
     #[instrument(skip(self))]
     pub fn rebuild_csr(&self) -> Result<(), Error> {
+        // Serialize against every other maintenance path (incremental applies,
+        // snapshot-only refreshes, and the background rebuild) so no two run
+        // concurrently and an incremental drain cannot race this install.
+        let _maint = self.csr_cache.maintenance.lock();
+        self.rebuild_csr_locked()
+    }
+
+    /// Full CSR-snapshot and matrix rebuild from LMDB. The caller must already
+    /// hold `csr_cache.maintenance`; the public [`Graph::rebuild_csr`] acquires
+    /// it. Kept separate so the freshness gates, which already hold the lock, do
+    /// not deadlock on the non-reentrant mutex.
+    pub(super) fn rebuild_csr_locked(&self) -> Result<(), Error> {
         // Capture the generation before reading LMDB so writes that land during
         // the build leave the snapshot conservatively stale.
         let built_gen = self.csr_cache.current_gen();
@@ -720,7 +789,12 @@ impl Graph {
             &snap,
             self.n_threads.load(std::sync::atomic::Ordering::Acquire),
         )?;
-        *self.matrices.write() = Some(m);
+        // Install the matrices and the snapshot together under the matrices write
+        // lock so a reader holding `matrices.read()` never observes a matrix from
+        // one generation paired with a snapshot from another (the snapshot store
+        // inside `install_full` cannot interleave with a held read guard).
+        let mut guard = self.matrices.write();
+        *guard = Some(m);
         self.csr_cache.install_full(snap, built_gen);
         Ok(())
     }

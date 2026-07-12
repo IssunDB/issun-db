@@ -778,12 +778,36 @@ pub(crate) fn expr_parser<'a>() -> impl Parser<'a, ParserInput<'a>, Expr, Parser
             .repeated(),
             |expr, op| match op {
                 PostfixOp::LabelCheck(label) => {
-                    // Extract the variable name from a bare identifier expression.
+                    // `n:A` requires label A; a chained `n:A:B` requires BOTH, so
+                    // fold each additional label into an AND of `HasLabel` checks
+                    // on the same variable. The variable is recovered from a bare
+                    // identifier (`n:A`) or from the accumulated `HasLabel`/`And`
+                    // (`n:A:B`).
                     let variable = match &expr {
-                        Expr::Prop(var, empty) if empty.is_empty() => var.clone(),
-                        _ => return expr, // non-identifier: ignore the colon (shouldn't happen)
+                        Expr::Prop(var, empty) if empty.is_empty() => Some(var.clone()),
+                        Expr::HasLabel { variable, .. } => Some(variable.clone()),
+                        Expr::BinaryOp {
+                            op: BinaryOperator::And,
+                            right,
+                            ..
+                        } => match right.as_ref() {
+                            Expr::HasLabel { variable, .. } => Some(variable.clone()),
+                            _ => None,
+                        },
+                        _ => None,
                     };
-                    Expr::HasLabel { variable, label }
+                    let Some(variable) = variable else {
+                        return expr; // non-identifier: ignore the colon (shouldn't happen)
+                    };
+                    let check = Expr::HasLabel { variable, label };
+                    match expr {
+                        Expr::Prop(_, ref empty) if empty.is_empty() => check,
+                        _ => Expr::BinaryOp {
+                            op: BinaryOperator::And,
+                            left: Box::new(expr),
+                            right: Box::new(check),
+                        },
+                    }
                 }
                 PostfixOp::Dot(prop) => match expr {
                     Expr::Prop(var, ref empty) if empty.is_empty() => {
@@ -5110,6 +5134,12 @@ fn validate_value_var_conflicts(stmt: &Statement) -> Result<(), String> {
                     for p in patterns {
                         check_pattern_value_conflict(p, &value_vars)?;
                         collect_pattern_bound_vars(p, &mut element_vars);
+                    }
+                }
+                QueryPart::Merge { merges } => {
+                    for m in merges {
+                        check_pattern_value_conflict(&m.pattern, &value_vars)?;
+                        collect_pattern_bound_vars(&m.pattern, &mut element_vars);
                     }
                 }
                 QueryPart::With { items, .. } => {

@@ -193,10 +193,11 @@ impl Graph {
                                     self.storage.edge_prop_idx.prefix_iter(wtxn, &prefix)?
                                 {
                                     let (key, _) = entry?;
-                                    if key.len() >= 8 {
-                                        let mut edge_id_bytes = [0u8; 8];
-                                        edge_id_bytes.copy_from_slice(&key[key.len() - 8..]);
-                                        let found_edge_id = u64::from_be_bytes(edge_id_bytes);
+                                    // Only an exact encoded-value match conflicts;
+                                    // a prefix-only match is a distinct string
+                                    // value (see `exact_prop_index_id`).
+                                    if let Some(found_edge_id) = exact_prop_index_id(key, &encoded)
+                                    {
                                         if found_edge_id != edge_id {
                                             return Err(Error::UniqueConstraintViolation(
                                                 etype.to_string(),
@@ -409,7 +410,13 @@ impl Graph {
         }
 
         let node_ids = self.nodes_by_label_impl(wtxn, label)?;
-        let mut seen_values = ahash::AHashSet::new();
+        // Dedup on the same notion of value identity the insert-time check uses:
+        // an encodable value by its order-preserving encoding (so `30` and `30.0`
+        // collide, as they do at insert time), a value too long to index by a
+        // tagged copy of its exact JSON form (the `0xFF` tag cannot collide with
+        // an encoded value's type tag). Without this the backfill accepted data
+        // that a later insert would reject, creating an unenforceable constraint.
+        let mut seen_values: ahash::AHashSet<Vec<u8>> = ahash::AHashSet::new();
 
         for node_id in &node_ids {
             let record = self
@@ -426,12 +433,19 @@ impl Graph {
             }
 
             if let Some(val) = prop_val {
-                if flags == 0x01 && !seen_values.insert(val.clone()) {
-                    return Err(Error::UniqueConstraintViolation(
-                        label.to_string(),
-                        property.to_string(),
-                        val.to_string(),
-                    ));
+                if flags == 0x01 && val != &serde_json::Value::Null {
+                    let key = encode_property_value(val).unwrap_or_else(|| {
+                        let mut k = vec![0xFF];
+                        k.extend_from_slice(val.to_string().as_bytes());
+                        k
+                    });
+                    if !seen_values.insert(key) {
+                        return Err(Error::UniqueConstraintViolation(
+                            label.to_string(),
+                            property.to_string(),
+                            val.to_string(),
+                        ));
+                    }
                 }
             }
         }
@@ -733,10 +747,12 @@ impl Graph {
         let mut result = Vec::new();
         for entry in self.storage.node_prop_idx.prefix_iter(rtxn, &prefix)? {
             let (key, _) = entry?;
-            if key.len() >= 8 {
-                let mut node_id_bytes = [0u8; 8];
-                node_id_bytes.copy_from_slice(&key[key.len() - 8..]);
-                result.push(u64::from_be_bytes(node_id_bytes));
+            // A prefix match on the encoded value is not enough: the
+            // NUL-terminated string encoding lets a lookup for "a" prefix-match a
+            // stored "a\0", so require the value segment to equal `encoded`
+            // exactly.
+            if let Some(node_id) = exact_prop_index_id(key, &encoded) {
+                result.push(node_id);
             }
         }
         Ok(result)
@@ -760,6 +776,56 @@ impl Graph {
                     result.push(id);
                 }
             }
+        }
+        Ok(result)
+    }
+
+    /// Range lookup fallback for a node string property whose values may exceed
+    /// the index encoding limit. Scans the label and compares stored string
+    /// values directly, in ascending ID order. A non-string bound excludes every
+    /// string value (a string never compares to a numeric or boolean bound under
+    /// openCypher), so it yields an empty result. Non-string stored values are
+    /// skipped for the same reason.
+    #[allow(clippy::too_many_arguments)]
+    fn scan_label_for_property_str_range(
+        &self,
+        rtxn: &heed::RoTxn,
+        label: &str,
+        property: &str,
+        min_val: Option<PropValue>,
+        min_inclusive: bool,
+        max_val: Option<PropValue>,
+        max_inclusive: bool,
+    ) -> Result<Vec<NodeId>, Error> {
+        let lo = match min_val {
+            Some(PropValue::Str(s)) => Some(s),
+            None => None,
+            Some(_) => return Ok(Vec::new()),
+        };
+        let hi = match max_val {
+            Some(PropValue::Str(s)) => Some(s),
+            None => None,
+            Some(_) => return Ok(Vec::new()),
+        };
+        let mut result = Vec::new();
+        for id in self.nodes_by_label_impl(rtxn, label)? {
+            let Some(record) = self.get_node_impl(rtxn, id)? else {
+                continue;
+            };
+            let props: serde_json::Value = props::decode(&record.props)?;
+            let Some(serde_json::Value::String(s)) = props.get(property) else {
+                continue;
+            };
+            if !str_in_range(
+                s,
+                lo.as_deref(),
+                min_inclusive,
+                hi.as_deref(),
+                max_inclusive,
+            ) {
+                continue;
+            }
+            result.push(id);
         }
         Ok(result)
     }
@@ -806,6 +872,27 @@ impl Graph {
             }
             None => return Ok(Vec::new()),
         };
+
+        // A string value longer than `MAX_INDEXED_STRING_LEN` is absent from
+        // `node_prop_idx`, so an index-only scan would silently drop it. A string
+        // bound admits only string values (a string never compares to a numeric
+        // or boolean bound under openCypher three-valued logic), some of which
+        // may be unindexed, so fall back to a full label scan that compares the
+        // stored string directly. Numeric and boolean bounds keep the index fast
+        // path because those values are always index-encodable. This mirrors the
+        // equality fallback in `nodes_by_property_impl`.
+        if matches!(min_val, Some(PropValue::Str(_))) || matches!(max_val, Some(PropValue::Str(_)))
+        {
+            return self.scan_label_for_property_str_range(
+                rtxn,
+                label,
+                property,
+                min_val,
+                min_inclusive,
+                max_val,
+                max_inclusive,
+            );
+        }
 
         let prop_key = format!("prop_key:{property}");
         let prop_key_id = match self.storage.meta.get(rtxn, &prop_key)? {
@@ -964,10 +1051,11 @@ impl Graph {
         let mut result = Vec::new();
         for entry in self.storage.edge_prop_idx.prefix_iter(rtxn, &prefix)? {
             let (key, _) = entry?;
-            if key.len() >= 8 {
-                let mut edge_id_bytes = [0u8; 8];
-                edge_id_bytes.copy_from_slice(&key[key.len() - 8..]);
-                result.push(u64::from_be_bytes(edge_id_bytes));
+            // Require an exact encoded-value match, not just a prefix, so a
+            // stored "a\0" is not returned for a lookup of "a" (see
+            // `exact_prop_index_id`).
+            if let Some(edge_id) = exact_prop_index_id(key, &encoded) {
+                result.push(edge_id);
             }
         }
         Ok(result)
@@ -995,6 +1083,44 @@ impl Graph {
         Ok(result)
     }
 
+    /// Range lookup fallback for an edge string property whose values may exceed
+    /// the index encoding limit. Both bounds are inclusive, matching
+    /// `edges_by_property_range_impl`. See `scan_label_for_property_str_range`.
+    fn scan_type_for_property_str_range(
+        &self,
+        rtxn: &heed::RoTxn,
+        etype: &str,
+        property: &str,
+        min_val: Option<PropValue>,
+        max_val: Option<PropValue>,
+    ) -> Result<Vec<EdgeId>, Error> {
+        let lo = match min_val {
+            Some(PropValue::Str(s)) => Some(s),
+            None => None,
+            Some(_) => return Ok(Vec::new()),
+        };
+        let hi = match max_val {
+            Some(PropValue::Str(s)) => Some(s),
+            None => None,
+            Some(_) => return Ok(Vec::new()),
+        };
+        let mut result = Vec::new();
+        for id in self.edges_by_type_impl(rtxn, etype)? {
+            let Some(record) = self.get_edge_impl(rtxn, id)? else {
+                continue;
+            };
+            let props: serde_json::Value = props::decode(&record.props)?;
+            let Some(serde_json::Value::String(s)) = props.get(property) else {
+                continue;
+            };
+            if !str_in_range(s, lo.as_deref(), true, hi.as_deref(), true) {
+                continue;
+            }
+            result.push(id);
+        }
+        Ok(result)
+    }
+
     pub fn edges_by_property_range(
         &self,
         etype: &str,
@@ -1014,6 +1140,15 @@ impl Graph {
         min_val: Option<PropValue>,
         max_val: Option<PropValue>,
     ) -> Result<Vec<EdgeId>, Error> {
+        // See `nodes_by_property_range_impl`: a string value too long to index is
+        // absent from `edge_prop_idx`, so a string bound falls back to a full type
+        // scan that compares stored strings directly. The bounds are inclusive on
+        // both sides, matching this method's index comparison below.
+        if matches!(min_val, Some(PropValue::Str(_))) || matches!(max_val, Some(PropValue::Str(_)))
+        {
+            return self.scan_type_for_property_str_range(rtxn, etype, property, min_val, max_val);
+        }
+
         let type_key = format!("type:{etype}");
         let type_id = match self.storage.meta.get(rtxn, &type_key)? {
             Some(b) => {
@@ -1144,6 +1279,197 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let g = Graph::open(dir.path(), 1).unwrap();
         (dir, g)
+    }
+
+    /// A string equality lookup must match the exact value, not merely a prefix.
+    /// The NUL-terminated string encoding plus leading-zero ids would otherwise
+    /// let a lookup for "a" also return a node whose value is "a\0".
+    #[test]
+    fn string_equality_lookup_is_exact_across_nul_boundary() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("L", &json!({ "k": "a" })).unwrap();
+        let a_nul = g.add_node("L", &json!({ "k": "a\u{0}" })).unwrap();
+
+        assert_eq!(
+            g.nodes_by_property("L", "k", PropValue::Str("a".to_string()))
+                .unwrap(),
+            vec![a],
+            "lookup of \"a\" must not return \"a\\0\""
+        );
+        assert_eq!(
+            g.nodes_by_property("L", "k", PropValue::Str("a\u{0}".to_string()))
+                .unwrap(),
+            vec![a_nul],
+            "lookup of \"a\\0\" must not return \"a\""
+        );
+    }
+
+    /// The edge equality lookup has the same exactness requirement. Edge
+    /// properties are indexed only under an explicit edge index, so create one
+    /// before inserting the edges.
+    #[test]
+    fn edge_string_equality_lookup_is_exact_across_nul_boundary() {
+        let (_dir, g) = open_tmp();
+        g.create_edge_property_index("R", "k").unwrap();
+        let a = g.add_node("N", &json!({})).unwrap();
+        let b = g.add_node("N", &json!({})).unwrap();
+        let e = g.add_edge(a, b, "R", &json!({ "k": "a" })).unwrap();
+        let _e_nul = g.add_edge(a, b, "R", &json!({ "k": "a\u{0}" })).unwrap();
+
+        assert_eq!(
+            g.edges_by_property("R", "k", PropValue::Str("a".to_string()))
+                .unwrap(),
+            vec![e],
+            "edge lookup of \"a\" must not return \"a\\0\""
+        );
+    }
+
+    /// A unique constraint treats numerically equal values (`30` and `30.0`) as
+    /// duplicates consistently at both constraint-creation (backfill) and
+    /// insert time, matching openCypher value equality.
+    #[test]
+    fn unique_constraint_treats_int_and_float_as_equal() {
+        // Insert-time: constraint first, then a numerically-equal insert fails.
+        let (_dir, g) = open_tmp();
+        g.create_node_unique_constraint("L", "k").unwrap();
+        g.add_node("L", &json!({ "k": 30 })).unwrap();
+        assert!(
+            g.add_node("L", &json!({ "k": 30.0 })).is_err(),
+            "30.0 duplicates the existing 30 under numeric equality"
+        );
+
+        // Backfill: creating the constraint over pre-existing {30, 30.0} fails,
+        // rather than succeeding into a constraint the insert path would reject.
+        let (_dir2, g2) = open_tmp();
+        g2.add_node("L", &json!({ "k": 30 })).unwrap();
+        g2.add_node("L", &json!({ "k": 30.0 })).unwrap();
+        assert!(g2.create_node_unique_constraint("L", "k").is_err());
+    }
+
+    /// A unique constraint is enforced for string values too long to index, at
+    /// both insert time and constraint creation.
+    #[test]
+    fn unique_constraint_enforced_for_over_long_strings() {
+        let long_a = format!("A{}", "x".repeat(600));
+        let long_b = format!("B{}", "y".repeat(600));
+
+        // Insert-time: the second identical long value is rejected; a different
+        // long value is accepted.
+        let (_dir, g) = open_tmp();
+        g.create_node_unique_constraint("L", "k").unwrap();
+        g.add_node("L", &json!({ "k": long_a })).unwrap();
+        assert!(
+            g.add_node("L", &json!({ "k": long_a })).is_err(),
+            "a duplicate over-long value must be rejected"
+        );
+        assert!(g.add_node("L", &json!({ "k": long_b })).is_ok());
+
+        // Backfill: pre-existing duplicate long values block constraint creation.
+        let (_dir2, g2) = open_tmp();
+        g2.add_node("L", &json!({ "k": long_a })).unwrap();
+        g2.add_node("L", &json!({ "k": long_a })).unwrap();
+        assert!(g2.create_node_unique_constraint("L", "k").is_err());
+    }
+
+    /// Distinct string values that share a NUL-boundary relationship must not
+    /// trigger a spurious unique-constraint violation.
+    #[test]
+    fn unique_constraint_distinguishes_nul_boundary_strings() {
+        let (_dir, g) = open_tmp();
+        g.create_node_unique_constraint("L", "k").unwrap();
+        g.add_node("L", &json!({ "k": "a" })).unwrap();
+        // "a\0" is a distinct value, so this insert must succeed.
+        let res = g.add_node("L", &json!({ "k": "a\u{0}" }));
+        assert!(
+            res.is_ok(),
+            "\"a\\0\" is distinct from \"a\" and must not violate unique(L.k)"
+        );
+        // A genuine duplicate still fails.
+        assert!(
+            g.add_node("L", &json!({ "k": "a" })).is_err(),
+            "a true duplicate must still be rejected"
+        );
+    }
+
+    /// A string property value too long to index (over `MAX_INDEXED_STRING_LEN`)
+    /// must still be returned by a range scan: the range path falls back to a
+    /// label scan for string bounds, mirroring the equality fallback.
+    #[test]
+    fn string_range_returns_over_long_value() {
+        let (_dir, g) = open_tmp();
+        let short = g.add_node("L", &json!({ "k": "Nectarine" })).unwrap();
+        let long_val = format!("Z{}", "x".repeat(600));
+        let long = g.add_node("L", &json!({ "k": long_val })).unwrap();
+        g.add_node("L", &json!({ "k": "Apple" })).unwrap();
+
+        // k > "M" (exclusive lower bound) includes "Nectarine" and the long "Z...".
+        let mut hits = g
+            .nodes_by_property_range(
+                "L",
+                "k",
+                Some(PropValue::Str("M".into())),
+                false,
+                None,
+                false,
+            )
+            .unwrap();
+        hits.sort_unstable();
+        let mut expected = vec![short, long];
+        expected.sort_unstable();
+        assert_eq!(hits, expected, "the over-long value must not be dropped");
+    }
+
+    /// A string range must place a NUL-suffixed value on the correct side of the
+    /// bound: Cypher orders "a" < "a\0" < "ab" (a prefix is smaller), and the
+    /// order-preserving encoding reproduces that, so ranges stay exact across the
+    /// NUL boundary without any re-verification.
+    #[test]
+    fn string_range_respects_nul_boundary() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("L", &json!({ "k": "a" })).unwrap();
+        let a_nul = g.add_node("L", &json!({ "k": "a\u{0}" })).unwrap();
+        let ab = g.add_node("L", &json!({ "k": "ab" })).unwrap();
+
+        // k >= "a\0" excludes "a", includes "a\0" and "ab".
+        let mut hits = g
+            .nodes_by_property_range(
+                "L",
+                "k",
+                Some(PropValue::Str("a\u{0}".into())),
+                true,
+                None,
+                false,
+            )
+            .unwrap();
+        hits.sort_unstable();
+        assert_eq!(hits, vec![a_nul, ab]);
+
+        // k <= "a" includes only "a".
+        let hits = g
+            .nodes_by_property_range(
+                "L",
+                "k",
+                None,
+                false,
+                Some(PropValue::Str("a".into())),
+                true,
+            )
+            .unwrap();
+        assert_eq!(hits, vec![a]);
+
+        // k > "a" (exclusive) excludes "a", includes "a\0" and "ab".
+        let mut hits = g
+            .nodes_by_property_range(
+                "L",
+                "k",
+                Some(PropValue::Str("a".into())),
+                false,
+                None,
+                false,
+            )
+            .unwrap();
+        hits.sort_unstable();
+        assert_eq!(hits, vec![a_nul, ab]);
     }
 
     /// Dropping an explicit property index must leave the always-on auto-index

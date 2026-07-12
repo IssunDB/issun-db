@@ -59,6 +59,11 @@ pub struct Record {
 enum GraphBinding {
     Node(NodeId),
     Edge(EdgeId),
+    /// The ordered list of relationships traversed by a variable-length pattern
+    /// (`(a)-[r*1..3]->(b)`), in trail order. A single (non-variable-length) hop
+    /// binds `Edge`; the list form keeps relationship identity so cross-hop
+    /// relationship uniqueness can recognize its members.
+    EdgeList(Vec<EdgeId>),
     Scalar(serde_json::Value),
 }
 
@@ -72,6 +77,10 @@ impl std::hash::Hash for GraphBinding {
             GraphBinding::Edge(id) => {
                 1.hash(state);
                 id.hash(state);
+            }
+            GraphBinding::EdgeList(ids) => {
+                3.hash(state);
+                ids.hash(state);
             }
             GraphBinding::Scalar(val) => {
                 2.hash(state);
@@ -229,11 +238,10 @@ fn execute_union(
     records.extend(right_result.records);
 
     if !stmt.all {
+        // Deduplicate on the canonical row key so UNION treats `1` and `1.0` as
+        // equal, matching RETURN DISTINCT, count(DISTINCT), and grouping.
         let mut seen: HashSet<String> = HashSet::new();
-        records.retain(|r| {
-            let key = serde_json::to_string(&r.values).unwrap_or_default();
-            seen.insert(key)
-        });
+        records.retain(|r| seen.insert(read::canonical_row_key(&r.values)));
     }
 
     Ok(QueryResult { columns, records })
@@ -390,6 +398,282 @@ mod tests {
     fn insert_person(graph: &Graph, name: &str, age: i64, city: &str) -> issundb_core::NodeId {
         let props = serde_json::json!({"name": name, "age": age, "city": city});
         graph.add_node("Person", &props).unwrap()
+    }
+
+    /// An unwound variable used as a graph element raises VariableTypeConflict.
+    /// CREATE already enforced this; MERGE must be consistent rather than
+    /// silently mishandling the value binding (which anchored the pattern on the
+    /// wrong node or created duplicates).
+    #[test]
+    fn merge_on_unwound_variable_raises_type_conflict() {
+        let (_dir, graph) = setup_graph();
+        graph
+            .add_node("Person", &serde_json::json!({"n": "A"}))
+            .unwrap();
+        let create = execute(
+            &graph,
+            "MATCH (a:Person) WITH collect(a) AS ps UNWIND ps AS p CREATE (p)-[:KNOWS]->(:Tag)",
+            &HashMap::new(),
+        );
+        assert!(
+            create.is_err(),
+            "CREATE rejects an unwound var used as a node"
+        );
+        let merge = execute(
+            &graph,
+            "MATCH (a:Person) WITH collect(a) AS ps UNWIND ps AS p MERGE (p)-[:KNOWS]->(:Tag)",
+            &HashMap::new(),
+        );
+        assert!(
+            merge.is_err(),
+            "MERGE must reject it too, not silently misbehave"
+        );
+        // A node passed straight through WITH stays a graph element and is usable.
+        let ok = execute(
+            &graph,
+            "MATCH (a:Person) WITH a MERGE (a)-[:KNOWS]->(:Tag) RETURN a",
+            &HashMap::new(),
+        );
+        assert!(
+            ok.is_ok(),
+            "a node passed through WITH must stay usable in MERGE: {ok:?}"
+        );
+    }
+
+    /// `WHERE n:A:B` requires BOTH labels; a node carrying only `A` must not
+    /// match. Regression for the parser dropping every label after the first.
+    #[test]
+    fn where_multi_label_requires_all_labels() {
+        let (_dir, graph) = setup_graph();
+        graph
+            .add_node("A", &serde_json::json!({"n": "only_a"}))
+            .unwrap();
+        graph
+            .add_node_multi(&["A", "B"], &serde_json::json!({"n": "both"}))
+            .unwrap();
+        let res = execute(
+            &graph,
+            "MATCH (n) WHERE n:A:B RETURN n.n AS n",
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(res.records.len(), 1, "only the A:B node matches");
+        assert_eq!(res.records[0].values[0], serde_json::json!("both"));
+    }
+
+    /// `sum()` over integers stays exact past 2^53 rather than rounding in f64.
+    #[test]
+    fn sum_of_integers_is_exact_past_two_pow_53() {
+        let (_dir, graph) = setup_graph();
+        let res = execute(
+            &graph,
+            "UNWIND [9007199254740992, 1] AS x RETURN sum(x) AS s",
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            res.records[0].values[0],
+            serde_json::json!(9007199254740993i64)
+        );
+        // A float input still yields a float sum.
+        let res = execute(
+            &graph,
+            "UNWIND [1, 2.5] AS x RETURN sum(x) AS s",
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(res.records[0].values[0], serde_json::json!(3.5));
+    }
+
+    /// `abs(i64::MIN)` overflows; it must raise rather than panic or wrap.
+    #[test]
+    fn abs_of_i64_min_errors() {
+        let (_dir, graph) = setup_graph();
+        let res = execute(
+            &graph,
+            "RETURN abs(-9223372036854775808) AS a",
+            &HashMap::new(),
+        );
+        assert!(
+            res.is_err(),
+            "abs(i64::MIN) overflows and must error: {res:?}"
+        );
+    }
+
+    /// `DELETE ... RETURN ... SKIP/LIMIT` must delete every matched element;
+    /// SKIP, LIMIT, and ORDER BY restrict only the returned rows.
+    #[test]
+    fn delete_return_skip_still_deletes_all_matched() {
+        let (_dir, graph) = setup_graph();
+        for _ in 0..10 {
+            graph.add_node("N", &serde_json::json!({})).unwrap();
+        }
+        let res = execute(
+            &graph,
+            "MATCH (n:N) DELETE n RETURN n SKIP 2",
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(res.records.len(), 8, "SKIP 2 returns 8 of the 10 rows");
+        let remaining =
+            execute(&graph, "MATCH (n:N) RETURN count(n) AS c", &HashMap::new()).unwrap();
+        assert_eq!(
+            remaining.records[0].values[0],
+            serde_json::json!(0),
+            "all 10 deleted"
+        );
+    }
+
+    /// A range predicate over a string property must return a node whose value
+    /// is too long to index (over 480 bytes): the `NodeRangeScan` must fall back
+    /// so the value is not silently dropped.
+    #[test]
+    fn string_range_returns_unindexed_long_value() {
+        let (_dir, graph) = setup_graph();
+        for t in ["Apple", "Banana", "Nectarine", "Orange"] {
+            graph
+                .add_node("Post", &serde_json::json!({"title": t}))
+                .unwrap();
+        }
+        let long_title = format!("Z{}", "x".repeat(600));
+        graph
+            .add_node("Post", &serde_json::json!({"title": long_title}))
+            .unwrap();
+        let res = execute(
+            &graph,
+            "MATCH (p:Post) WHERE p.title > 'M' RETURN p.title AS t",
+            &HashMap::new(),
+        )
+        .unwrap();
+        let titles: Vec<&str> = res
+            .records
+            .iter()
+            .filter_map(|r| r.values[0].as_str())
+            .collect();
+        assert_eq!(
+            titles.len(),
+            3,
+            "Nectarine, Orange, and the long Z... value"
+        );
+        assert!(
+            titles.iter().any(|t| t.starts_with('Z')),
+            "long value must be present"
+        );
+    }
+
+    /// A variable-length typed hop between two labeled endpoints must not be
+    /// pruned by the direct-edge schema check: a 2-hop path exists through an
+    /// intermediate node even though no direct `A --R--> B` edge does. Regression
+    /// for the pruner discarding `min_hops`/`max_hops`.
+    #[test]
+    fn varlen_hop_not_pruned_by_direct_edge_schema() {
+        let (_dir, graph) = setup_graph();
+        let a = graph.add_node("A", &serde_json::json!({})).unwrap();
+        let x = graph.add_node("X", &serde_json::json!({})).unwrap();
+        let b = graph.add_node("B", &serde_json::json!({})).unwrap();
+        graph.add_edge(a, x, "R", &serde_json::json!({})).unwrap();
+        graph.add_edge(x, b, "R", &serde_json::json!({})).unwrap();
+        let res = execute(
+            &graph,
+            "MATCH (a:A)-[:R*2]->(b:B) RETURN a, b",
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            res.records.len(),
+            1,
+            "the reachable 2-hop path must not be pruned"
+        );
+        // A genuine single-hop dead end is still pruned: no direct A --R--> B edge.
+        let res = execute(
+            &graph,
+            "MATCH (a:A)-[:R]->(b:B) RETURN a, b",
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(res.records.len(), 0, "no direct A-[:R]->B edge exists");
+    }
+
+    /// `null = null` is `NULL` under three-valued logic, so it filters every row;
+    /// the optimizer must not fold it to a trivially-true (dropped) predicate.
+    /// `1 <> 1.0` is likewise false because `1 = 1.0`.
+    #[test]
+    fn null_and_numeric_literal_comparisons_are_not_wrongly_folded() {
+        let (_dir, graph) = setup_graph();
+        insert_person(&graph, "Alice", 30, "London");
+        insert_person(&graph, "Bob", 25, "Paris");
+        let n = execute(
+            &graph,
+            "MATCH (n:Person) WHERE null = null RETURN n",
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(n.records.len(), 0, "null = null is NULL, so no rows pass");
+        let n = execute(
+            &graph,
+            "MATCH (n:Person) WHERE 1 <> 1.0 RETURN n",
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(n.records.len(), 0, "1 <> 1.0 is false, so no rows pass");
+        // A genuinely-true literal predicate is still dropped and returns all rows.
+        let n = execute(
+            &graph,
+            "MATCH (n:Person) WHERE 1 = 1 RETURN n",
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(n.records.len(), 2);
+    }
+
+    /// UNION (distinct) treats `1` and `1.0` as one value under openCypher
+    /// numeric equivalence, matching RETURN DISTINCT and count(DISTINCT).
+    #[test]
+    fn union_deduplicates_by_numeric_equivalence() {
+        let (_dir, graph) = setup_graph();
+        let res = execute(
+            &graph,
+            "RETURN 1 AS x UNION RETURN 1.0 AS x",
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(res.records.len(), 1, "1 and 1.0 are one value");
+        // UNION ALL keeps both.
+        let res = execute(
+            &graph,
+            "RETURN 1 AS x UNION ALL RETURN 1.0 AS x",
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(res.records.len(), 2);
+    }
+
+    /// `RETURN DISTINCT *` deduplicates node columns by identity, not by their
+    /// property values, so two distinct nodes with identical properties stay two
+    /// rows (matching `RETURN DISTINCT n`).
+    #[test]
+    fn distinct_star_keys_nodes_by_identity() {
+        let (_dir, graph) = setup_graph();
+        graph
+            .add_node("P", &serde_json::json!({"name": "Alice"}))
+            .unwrap();
+        graph
+            .add_node("P", &serde_json::json!({"name": "Alice"}))
+            .unwrap();
+        let star = execute(&graph, "MATCH (n:P) RETURN DISTINCT *", &HashMap::new()).unwrap();
+        assert_eq!(
+            star.records.len(),
+            2,
+            "two distinct nodes, equal props, stay two rows"
+        );
+        // A scalar column still deduplicates by value.
+        let scalar = execute(
+            &graph,
+            "MATCH (n:P) RETURN DISTINCT n.name",
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(scalar.records.len(), 1);
     }
 
     /// A typed hop between two labeled endpoints that the data schema never

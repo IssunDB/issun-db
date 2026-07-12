@@ -270,11 +270,9 @@ async fn create_then_get_edge_round_trip() {
 }
 
 #[tokio::test]
-async fn create_edge_with_missing_endpoint_currently_succeeds() {
-    // NOTE: `Graph::add_edge` does not validate that its endpoints exist, so the
-    // handler's `NodeNotFound` -> 400 arm is unreachable and a dangling edge is
-    // created. This test pins the current behavior; if endpoint validation is
-    // added to the core, switch this assertion to `BAD_REQUEST`.
+async fn create_edge_with_missing_endpoint_is_bad_request() {
+    // `Graph::add_edge` validates that its endpoints exist and returns
+    // `NodeNotFound` for a dangling edge, which the handler maps to 400.
     let (graph, _dir) = fresh_graph();
     let src = create_node(&graph, "Person", json!({})).await;
 
@@ -286,8 +284,8 @@ async fn create_edge_with_missing_endpoint_currently_succeeds() {
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "create_edge body: {body}");
-    assert!(body["id"].as_u64().is_some());
+    assert_eq!(status, StatusCode::BAD_REQUEST, "create_edge body: {body}");
+    assert!(body["error"].as_str().is_some());
 }
 
 #[tokio::test]

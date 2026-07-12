@@ -44,11 +44,16 @@ pub trait Scorer: Send + Sync {
     /// and query term frequency `qtf`.
     fn score(&self, tf: f32, doc_len: f32, avgdl: f32, idf: f32, qtf: f32) -> f32;
 
-    /// Loose upper bound on `score(tf, *, *, idf, 1.0)` for WAND pruning.
+    /// Upper bound on `score(tf, *, *, idf, 1.0)` for WAND pruning, where
+    /// `max_tf` is the largest term frequency this term attains in any document
+    /// of its posting list.
     ///
-    /// Must be `>=` the maximum possible `score` value for a single term in
-    /// any document. A tighter bound means more aggressive pruning.
-    fn upper_bound(&self, idf: f32) -> f32;
+    /// Must be `>=` the maximum possible `score` value for a single term in any
+    /// document (WAND correctness depends on this; an under-estimate silently
+    /// drops true top-k results). A scorer whose per-term score saturates in
+    /// `tf` (such as BM25) may ignore `max_tf`; a scorer unbounded in `tf` (such
+    /// as TF-IDF) must use it. A tighter bound means more aggressive pruning.
+    fn upper_bound(&self, idf: f32, max_tf: u32) -> f32;
 }
 
 /// BM25 (Okapi BM25) relevance scorer with default parameters k1 = 1.2, b = 0.75.
@@ -78,9 +83,10 @@ impl Scorer for Bm25Scorer {
         qtf * idf * (numerator / denominator)
     }
 
-    fn upper_bound(&self, idf: f32) -> f32 {
-        // As tf → ∞ the BM25 saturation factor converges to (k1 + 1).
-        // This is the tightest possible upper bound for a single query-term contribution.
+    fn upper_bound(&self, idf: f32, _max_tf: u32) -> f32 {
+        // As tf → ∞ the BM25 saturation factor converges to (k1 + 1). This is
+        // the tightest possible upper bound for a single query-term contribution
+        // and holds for any tf, so `max_tf` is not needed.
         idf * (self.k1 + 1.0)
     }
 }
@@ -98,9 +104,12 @@ impl Scorer for TfIdfScorer {
         qtf * tf.sqrt() * idf
     }
 
-    fn upper_bound(&self, idf: f32) -> f32 {
-        // Loose bound: assumes at most 100 term occurrences per document.
-        idf * (100.0_f32).sqrt()
+    fn upper_bound(&self, idf: f32, max_tf: u32) -> f32 {
+        // `score = qtf * sqrt(tf) * idf` is unbounded in tf (no saturation), so
+        // a fixed bound is unsound: a term repeating more than the assumed cap
+        // would exceed it and be pruned from the true top-k. Bound with the
+        // term's actual maximum frequency, which is exact for `qtf == 1`.
+        idf * (max_tf as f32).sqrt()
     }
 }
 
@@ -509,7 +518,8 @@ impl TextGraphExt for Graph {
                 }
                 let n_term = postings.len() as f32;
                 let idf = scorer.idf(n_docs_f, n_term);
-                let ub = scorer.upper_bound(idf) * qtf as f32;
+                let max_tf = postings.iter().map(|(_, tf)| *tf).max().unwrap_or(0);
+                let ub = scorer.upper_bound(idf, max_tf) * qtf as f32;
                 cursors.push(PostingCursor::new(postings, idf, ub, qtf as f32));
             }
 
@@ -620,6 +630,39 @@ mod tests {
     use proptest::prelude::*;
     use serde_json::json;
     use tempfile::TempDir;
+
+    /// A token too long to fit in an LMDB key must be skipped during FTS
+    /// indexing, not abort the whole `add_node` write. The node is still
+    /// inserted, its short tokens stay searchable, and the over-long token is
+    /// simply not searchable (consistent, since querying tokenizes identically).
+    #[test]
+    fn over_long_token_does_not_abort_node_insert() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TempDir::new()?;
+        let graph = Graph::open(temp.path(), 1)?;
+        graph.create_node_text_index("Doc", "body")?;
+
+        let long_token = "z".repeat(600);
+        let text = format!("hello {long_token} world");
+        // The insert must succeed despite the 600-char token.
+        let n = graph.add_node("Doc", &json!({ "body": text }))?;
+        assert!(graph.get_node(n)?.is_some(), "node must be inserted");
+
+        let opts = TextSearchOptions {
+            label: Some("Doc".to_string()),
+            property: Some("body".to_string()),
+            limit: 5,
+            ..Default::default()
+        };
+        // A normal token is searchable.
+        let hits = graph.text_search("hello", &opts)?;
+        assert!(
+            hits.iter().any(|h| h.node == n),
+            "short token stays searchable"
+        );
+        // The over-long token was skipped, so it finds nothing (no crash).
+        assert!(graph.text_search(&long_token, &opts)?.is_empty());
+        Ok(())
+    }
 
     #[test]
     fn test_fts_e2e_indexing_and_scoring() -> Result<(), Box<dyn std::error::Error>> {
@@ -764,13 +807,35 @@ mod tests {
     fn test_bm25_scorer_upper_bound_is_tight() {
         let scorer = Bm25Scorer::default();
         let idf = scorer.idf(100.0, 10.0);
-        let ub = scorer.upper_bound(idf);
+        // BM25 saturates in tf, so its bound ignores max_tf and holds for any tf.
+        let ub = scorer.upper_bound(idf, 1000);
         // Score with very high tf and very low doc_len should approach the upper bound.
         let high_tf_score = scorer.score(1000.0, 1.0, 100.0, idf, 1.0);
         assert!(
             high_tf_score <= ub + 1e-4,
             "upper_bound must be >= any achievable score: ub={ub}, score={high_tf_score}"
         );
+    }
+
+    /// The TF-IDF bound must dominate the achievable score at the term's maximum
+    /// frequency, including `tf > 100`. WAND correctness depends on it; the old
+    /// fixed `sqrt(100)` bound was exceeded once a term repeated over 100 times,
+    /// silently dropping that document from the top-k.
+    #[test]
+    fn test_tfidf_scorer_upper_bound_is_sound() {
+        let scorer = TfIdfScorer;
+        let idf = scorer.idf(100.0, 10.0);
+        for max_tf in [1u32, 5, 100, 400, 10_000] {
+            let ub = scorer.upper_bound(idf, max_tf);
+            let score = scorer.score(max_tf as f32, 1.0, 100.0, idf, 1.0);
+            assert!(
+                score <= ub + 1e-4,
+                "unsound TF-IDF bound: max_tf={max_tf} ub={ub} score={score}"
+            );
+        }
+        // Premise check: at tf=400 the score exceeds the old fixed sqrt(100) bound.
+        let big = scorer.score(400.0, 1.0, 100.0, idf, 1.0);
+        assert!(big > idf * (100.0_f32).sqrt());
     }
 
     #[test]
@@ -994,7 +1059,8 @@ mod tests {
             let cursors: Vec<PostingCursor> = term_data
                 .iter()
                 .map(|(postings, idf, qtf)| {
-                    let ub = scorer.upper_bound(*idf) * *qtf;
+                    let max_tf = postings.iter().map(|(_, tf)| *tf).max().unwrap_or(0);
+                    let ub = scorer.upper_bound(*idf, max_tf) * *qtf;
                     PostingCursor::new(postings.clone(), *idf, ub, *qtf)
                 })
                 .collect();

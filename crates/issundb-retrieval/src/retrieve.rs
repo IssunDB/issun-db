@@ -119,8 +119,9 @@ pub fn retrieve_with(
 /// Strategy for fusing vector and text relevance scores.
 #[derive(Debug, Clone)]
 pub enum FusionStrategy {
-    /// Reciprocal Rank Fusion: score = Σ 1 / (k + rank).
-    /// `k` is a smoothing constant; default 60.
+    /// Reciprocal Rank Fusion: score = Σ 1 / (k + rank + 1), summed over the
+    /// modalities that ranked the item, where `rank` is 0-based. `k` is a
+    /// smoothing constant; default 60.
     Rrf { k: u32 },
     /// Weighted linear combination: score = α·vector_score + β·text_score.
     WeightedSum {
@@ -262,7 +263,18 @@ pub fn retrieve_hybrid(
         fused.insert(*node, score);
     }
 
-    let seeds: Vec<NodeId> = fused.keys().copied().collect();
+    // Seed the expansion from the highest-scored fused hits first: the
+    // multi-source BFS keeps only the first `max_nodes` seeds, so an arbitrary
+    // `AHashMap` iteration order would drop top-scored seeds nondeterministically.
+    // Sort by fused score descending, breaking ties by node id for a stable,
+    // reproducible seed set.
+    let mut ranked: Vec<(NodeId, f32)> = fused.iter().map(|(n, s)| (*n, *s)).collect();
+    ranked.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    });
+    let seeds: Vec<NodeId> = ranked.into_iter().map(|(n, _)| n).collect();
 
     if seeds.is_empty() {
         return Ok(Subgraph {
@@ -803,6 +815,41 @@ mod tests {
         .unwrap();
         assert_eq!(sub.nodes.len(), 1);
         assert_eq!(sub.nodes[0], a);
+    }
+
+    /// `retrieve_hybrid` must keep the highest-scored seeds when `max_nodes`
+    /// caps the result, not an arbitrary subset. Regression for score-blind,
+    /// nondeterministic seed truncation.
+    #[test]
+    fn hybrid_retrieve_keeps_top_scored_seeds_under_max_nodes() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("N", &json!({})).unwrap();
+        let b = g.add_node("N", &json!({})).unwrap();
+        let c = g.add_node("N", &json!({})).unwrap();
+        let d = g.add_node("N", &json!({})).unwrap();
+        g.upsert_vector(a, &[1.0f32, 0.0, 0.0]).unwrap(); // closest to the query
+        g.upsert_vector(b, &[0.9f32, 0.1, 0.0]).unwrap(); // second closest
+        g.upsert_vector(c, &[0.2f32, 1.0, 0.0]).unwrap(); // far
+        g.upsert_vector(d, &[0.0f32, 0.0, 1.0]).unwrap(); // far
+        g.rebuild_csr().unwrap();
+
+        let opts = HybridRetrieveOptions {
+            vector_k: 4,
+            text_k: 0,
+            hops: 0,
+            max_distance: 2.0, // admit all four as seeds so truncation is exercised
+            max_nodes: Some(2),
+            ..Default::default()
+        };
+        let sub = retrieve_hybrid(&g, &[1.0f32, 0.0, 0.0], "", &opts).unwrap();
+        let mut nodes = sub.nodes.clone();
+        nodes.sort_unstable();
+        let mut expected = vec![a, b];
+        expected.sort_unstable();
+        assert_eq!(
+            nodes, expected,
+            "the two highest-scored seeds must survive the max_nodes cap"
+        );
     }
 
     #[test]

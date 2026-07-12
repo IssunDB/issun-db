@@ -260,9 +260,28 @@ pub(super) fn execute_read_query(
     };
 
     // 4. Read each projected value directly from the row by its canonical key.
-    let mut records = if is_return_star {
+    //
+    // For RETURN DISTINCT *, deduplicate by binding identity (node and edge id,
+    // or canonical scalar value) rather than by the materialized property
+    // values: two distinct nodes that happen to carry equal properties must
+    // remain distinct rows, matching `RETURN DISTINCT n`. Every other DISTINCT
+    // projection deduplicates inside the plan (a Distinct operator below Sort
+    // and Limit), so the limit caps distinct rows.
+    let records = if is_return_star {
+        let distinct = query.return_clause.distinct;
+        let mut seen = std::collections::HashSet::new();
         let mut star_records = Vec::with_capacity(resolved_paths.len());
         for path in resolved_paths {
+            if distinct {
+                let mut row_key = String::new();
+                for key in &columns {
+                    row_key.push('\x01');
+                    row_key.push_str(&canonical_binding_key(path.get_binding(key)));
+                }
+                if !seen.insert(row_key) {
+                    continue;
+                }
+            }
             let mut values = Vec::with_capacity(columns.len());
             for key in &columns {
                 values.push(binding_to_value(graph, path.get_binding(key))?);
@@ -273,13 +292,6 @@ pub(super) fn execute_read_query(
     } else {
         rows_to_records(graph, &query.return_clause.items, resolved_paths)?
     };
-
-    // 5. Apply RETURN DISTINCT deduplication for RETURN *. Every other
-    // DISTINCT projection deduplicates inside the plan (a Distinct operator
-    // below Sort and Limit), so the limit caps distinct rows.
-    if query.return_clause.distinct && is_return_star {
-        dedup_records(&mut records);
-    }
 
     Ok(QueryResult { columns, records })
 }
@@ -837,6 +849,15 @@ pub(super) fn binding_to_value(
                 .ok_or_else(|| format!("edge not found: {}", id))?;
             rmp_serde::from_slice(&record.props).map_err(|e| e.to_string())
         }
+        // A variable-length relationship variable surfaces as the list of
+        // relationship objects along the trail, matching `relationships(p)`.
+        Some(GraphBinding::EdgeList(ids)) => {
+            let mut arr = Vec::with_capacity(ids.len());
+            for &eid in ids {
+                arr.push(get_edge_representation(graph, eid)?);
+            }
+            Ok(serde_json::Value::Array(arr))
+        }
     }
 }
 
@@ -863,13 +884,72 @@ pub(super) fn rows_to_records(
     Ok(records)
 }
 
-/// Apply RETURN DISTINCT deduplication in place, keyed by the serialized row.
+/// Canonical grouping and DISTINCT key for one value, following openCypher
+/// equivalence: numbers compare by value, so an integer and an integer-valued
+/// float (for example `1` and `1.0`, or `0.0` and `-0.0`) share a key, while a
+/// non-integer float keeps its own. Non-numbers use their JSON serialization.
+/// Only the key is canonicalized; callers keep the original value as the emitted
+/// group representative, so `RETURN n.x, count(*)` still returns `1.0` when that
+/// was the input. Type-tag prefixes (`N`/`F`/`J`) keep a number from colliding
+/// with a string that happens to serialize the same.
+pub(super) fn canonical_cell_key(v: &serde_json::Value) -> String {
+    if let serde_json::Value::Number(n) = v {
+        if let Some(i) = n.as_i64() {
+            return format!("N{i}");
+        }
+        if let Some(u) = n.as_u64() {
+            return format!("N{u}");
+        }
+        if let Some(f) = n.as_f64() {
+            if f == 0.0 {
+                return "N0".to_string();
+            }
+            if f.fract() == 0.0 && (i64::MIN as f64..=i64::MAX as f64).contains(&f) {
+                return format!("N{}", f as i64);
+            }
+            return format!("F{f}");
+        }
+    }
+    format!("J{v}")
+}
+
+/// Canonical DISTINCT key for a whole row, cell by cell (see
+/// [`canonical_cell_key`]). Used wherever a full projected row is deduplicated so
+/// numeric equivalence matches the grouping path.
+pub(super) fn canonical_row_key(values: &[serde_json::Value]) -> String {
+    let mut out = String::new();
+    for v in values {
+        out.push('\x01');
+        out.push_str(&canonical_cell_key(v));
+    }
+    out
+}
+
+/// Canonical DISTINCT key for one binding: node and edge identity by id, scalars
+/// by [`canonical_cell_key`] so `1` and `1.0` deduplicate as equal. The `@`
+/// prefixes keep a node or edge id from colliding with a numeric scalar key.
+pub(super) fn canonical_binding_key(b: Option<&GraphBinding>) -> String {
+    match b {
+        Some(GraphBinding::Node(id)) => format!("@n{id}"),
+        Some(GraphBinding::Edge(id)) => format!("@e{id}"),
+        Some(GraphBinding::EdgeList(ids)) => {
+            let mut key = String::from("@el");
+            for id in ids {
+                key.push('_');
+                key.push_str(&id.to_string());
+            }
+            key
+        }
+        Some(GraphBinding::Scalar(v)) => canonical_cell_key(v),
+        None => "@_".to_string(),
+    }
+}
+
+/// Apply RETURN DISTINCT deduplication in place, keyed by the canonical row (so
+/// `1` and `1.0` deduplicate as equal, matching openCypher equivalence).
 pub(super) fn dedup_records(records: &mut Vec<Record>) {
     let mut seen = std::collections::HashSet::new();
-    records.retain(|r| {
-        let key = serde_json::to_string(&r.values).unwrap_or_default();
-        seen.insert(key)
-    });
+    records.retain(|r| seen.insert(canonical_row_key(&r.values)));
 }
 
 /// Convert a `FilterExpr` to the `WhereClause` representation used by `evaluate_where`.
@@ -895,7 +975,13 @@ fn filter_expr_to_where_clause(expression: &FilterExpr) -> WhereClause {
 fn edge_bound_to_sibling_rel(path: &SlotRow, unique_rels: &[String], eid: EdgeId) -> bool {
     unique_rels
         .iter()
-        .any(|v| matches!(path.get_binding(v.as_str()), Some(GraphBinding::Edge(e)) if *e == eid))
+        .any(|v| match path.get_binding(v.as_str()) {
+            Some(GraphBinding::Edge(e)) => *e == eid,
+            // A sibling variable-length hop binds a list; the whole list counts as
+            // used relationships for uniqueness.
+            Some(GraphBinding::EdgeList(ids)) => ids.contains(&eid),
+            _ => false,
+        })
 }
 
 /// Bulk-expand a batch of pre-expansion rows and apply a `Filter` predicate that
@@ -1091,7 +1177,10 @@ fn get_node_representation(graph: &Graph, nid: NodeId) -> Result<serde_json::Val
     Ok(serde_json::Value::Object(node_obj))
 }
 
-fn get_edge_representation(graph: &Graph, eid: EdgeId) -> Result<serde_json::Value, String> {
+pub(super) fn get_edge_representation(
+    graph: &Graph,
+    eid: EdgeId,
+) -> Result<serde_json::Value, String> {
     let record = graph
         .get_edge(eid)
         .map_err(|e| e.to_string())?
@@ -1223,6 +1312,10 @@ fn expand_from_paths(
     max_hops: usize,
     unique_rels: &[String],
     needs_path: bool,
+    // True when the pattern used a `*` range: `rel_var` then binds the list of
+    // relationships along the trail (an `EdgeList`), even for a single hop
+    // (`[r*1..1]`). A plain `[r]` hop is false and binds a single `Edge`.
+    is_var_length: bool,
 ) -> Result<Vec<SlotRow>, String> {
     let mut next_paths = Vec::new();
 
@@ -1284,7 +1377,13 @@ fn expand_from_paths(
                         }
                     }
                     let mut new_path = (*shared).clone();
-                    new_path.bind_local(rel_var, GraphBinding::Edge(eid));
+                    // A `*` range binds `rel_var` to a single-element list even
+                    // for one hop (`[r*1..1]`); a plain `[r]` binds one edge.
+                    if is_var_length {
+                        new_path.bind_local(rel_var, GraphBinding::EdgeList(vec![eid]));
+                    } else {
+                        new_path.bind_local(rel_var, GraphBinding::Edge(eid));
+                    }
                     new_path.bind_local(dst_var, GraphBinding::Node(dst_node));
 
                     // Build and insert the Path object only when the pattern binds a
@@ -1321,10 +1420,16 @@ fn expand_from_paths(
             // check because trails are short; termination on unbounded ranges
             // follows from the finite edge set emptying the queue.
             let mut queue = vec![(src_node, initial_traversed.clone(), Vec::<EdgeId>::new())];
-            let mut completed_paths: Vec<(NodeId, Vec<serde_json::Value>)> = Vec::new();
+            // Each completed trail carries its terminal node, the optional
+            // path-element list, and the ordered edge ids traversed. The edge ids
+            // bind the relationship variable (`(a)-[r*1..3]->(b)` binds `r` to the
+            // list of relationships), so they are tracked even when `needs_path`
+            // is false.
+            let mut completed_paths: Vec<(NodeId, Vec<serde_json::Value>, Vec<EdgeId>)> =
+                Vec::new();
 
             if min_hops == 0 {
-                completed_paths.push((src_node, initial_traversed));
+                completed_paths.push((src_node, initial_traversed, Vec::new()));
             }
 
             for hop in 1..=max_hops {
@@ -1351,7 +1456,11 @@ fn expand_from_paths(
                         }
 
                         if hop >= min_hops {
-                            completed_paths.push((neigh_node, next_traversed.clone()));
+                            completed_paths.push((
+                                neigh_node,
+                                next_traversed.clone(),
+                                next_used.clone(),
+                            ));
                         }
                         next_queue.push((neigh_node, next_traversed, next_used));
                     }
@@ -1362,7 +1471,7 @@ fn expand_from_paths(
                 }
             }
 
-            for (neigh_node, path_elements) in completed_paths {
+            for (neigh_node, path_elements, trail_edges) in completed_paths {
                 // Closing-hop guard: a pre-bound dst must match.
                 if path
                     .get_binding(dst_var)
@@ -1372,6 +1481,8 @@ fn expand_from_paths(
                 }
                 let mut new_path = path.clone();
                 new_path.bind_local(dst_var, GraphBinding::Node(neigh_node));
+                // Bind the relationship variable to the trail's relationship list.
+                new_path.bind_local(rel_var, GraphBinding::EdgeList(trail_edges));
 
                 // Build the Path object only when the pattern binds a path variable.
                 if needs_path {
@@ -1490,6 +1601,7 @@ pub(super) fn eval_pattern_comprehension(
             max_hops,
             &prior_rel_vars,
             pattern.path_variable.is_some(),
+            rel.range.is_some(),
         )?;
         prior_rel_vars.push(rel_var.clone());
         current_paths = filter_paths_by_node(
@@ -1641,18 +1753,26 @@ fn build_sip(common_vars: &[String], build_rows: &[SlotRow]) -> HashMap<String, 
 fn build_hash_table(
     common_vars: &[String],
     build_rows: Vec<SlotRow>,
-) -> HashMap<Vec<GraphBinding>, Vec<SlotRow>> {
-    let mut hash_table: HashMap<Vec<GraphBinding>, Vec<SlotRow>> = HashMap::new();
+) -> HashMap<Vec<String>, Vec<SlotRow>> {
+    let mut hash_table: HashMap<Vec<String>, Vec<SlotRow>> = HashMap::new();
     for op in build_rows {
-        let key: Option<Vec<GraphBinding>> = common_vars
-            .iter()
-            .map(|v| op.get_binding(v).cloned())
-            .collect();
-        if let Some(key) = key {
+        if let Some(key) = join_key(common_vars, &op) {
             hash_table.entry(key).or_default().push(op);
         }
     }
     hash_table
+}
+
+/// The equi-join key for one row: the canonical binding key (see
+/// [`canonical_binding_key`]) of each common variable, so numeric equivalence
+/// (`1` and `1.0`) matches on the join key just as it does for grouping and
+/// DISTINCT. Returns `None` when any common variable is unbound, so a row that
+/// cannot join is dropped.
+fn join_key(common_vars: &[String], row: &SlotRow) -> Option<Vec<String>> {
+    common_vars
+        .iter()
+        .map(|v| row.get_binding(v).map(|b| canonical_binding_key(Some(b))))
+        .collect()
 }
 
 /// Fill any `null_vars` not already present in `path` with `null`. Used for the
@@ -1671,7 +1791,7 @@ fn null_fill(path: &mut SlotRow, null_vars: &[String]) {
 enum JoinProbeData {
     Equi {
         common_vars: Vec<String>,
-        hash_table: HashMap<Vec<GraphBinding>, Vec<SlotRow>>,
+        hash_table: HashMap<Vec<String>, Vec<SlotRow>>,
     },
     Cartesian {
         build_rows: Vec<SlotRow>,
@@ -1697,12 +1817,8 @@ fn hash_join_rows(
                 common_vars,
                 hash_table,
             } => {
-                let key: Option<Vec<GraphBinding>> = common_vars
-                    .iter()
-                    .map(|v| rp.get_binding(v).cloned())
-                    .collect();
                 // A row missing a common var cannot join; drop it.
-                if let Some(key) = key {
+                if let Some(key) = join_key(common_vars, &rp) {
                     if let Some(matches) = hash_table.get(&key) {
                         for op in matches {
                             let mut merged = rp.clone();
@@ -2214,6 +2330,9 @@ enum RowStream {
         /// True only when the pattern binds a path variable; the expansion then
         /// materializes a `_path_*` object per emitted row.
         needs_path: bool,
+        /// True when the pattern used a `*` range, so `rel_var` binds the list of
+        /// relationships along the trail rather than a single relationship.
+        is_var_length: bool,
         /// Holds expansion output beyond `STREAM_BATCH`: one input row can fan
         /// out to many neighbors, so the overflow is buffered and served on
         /// later pulls before the next input batch is fetched.
@@ -2423,6 +2542,7 @@ fn build_stream_with_sip(
                 unique_rels,
                 // The factorized path never builds `_path_*` objects.
                 needs_path: false,
+                is_var_length: false,
             } = input.as_ref()
             {
                 if !matches!(expression, FilterExpr::HasLabel(..)) {
@@ -2456,12 +2576,18 @@ fn build_stream_with_sip(
             max_hops,
             unique_rels,
             needs_path,
+            is_var_length,
         } => {
             // Fused-chain fast path: collapse a maximal linear chain of single-hop
             // directed Expands, mirroring the materializing `Expand` arm. The fused
             // chain never builds `_path_*` objects, so hops of a named-path pattern
             // are excluded.
-            if *min_hops == 1 && *max_hops == 1 && !*is_undirected && !*needs_path {
+            if *min_hops == 1
+                && *max_hops == 1
+                && !*is_var_length
+                && !*is_undirected
+                && !*needs_path
+            {
                 let mut hops = vec![OwnedChainHop {
                     src_var: src_var.clone(),
                     rel_var: rel_var.clone(),
@@ -2484,6 +2610,7 @@ fn build_stream_with_sip(
                     max_hops: 1,
                     unique_rels: inner_unique_rels,
                     needs_path: false,
+                    is_var_length: false,
                 } = base
                 {
                     if bottom_src != inner_dst_var {
@@ -2522,6 +2649,7 @@ fn build_stream_with_sip(
                 max_hops: *max_hops,
                 unique_rels: unique_rels.clone(),
                 needs_path: *needs_path,
+                is_var_length: *is_var_length,
                 buf: std::collections::VecDeque::new(),
             }
         }
@@ -2761,6 +2889,7 @@ impl RowStream {
                 max_hops,
                 unique_rels,
                 needs_path,
+                is_var_length,
                 buf,
             } => loop {
                 if !buf.is_empty() {
@@ -2784,6 +2913,7 @@ impl RowStream {
                     *max_hops,
                     unique_rels,
                     *needs_path,
+                    *is_var_length,
                 )?;
                 buf.extend(expanded);
             },
@@ -2962,10 +3092,11 @@ impl RowStream {
                     .filter(|path| {
                         let key = match keys {
                             // Keyed dedup: only the selected bindings (the
-                            // RETURN DISTINCT projection) form the key.
+                            // RETURN DISTINCT projection) form the key. Canonical
+                            // keys make `1` and `1.0` deduplicate as equal.
                             Some(keys) => keys
                                 .iter()
-                                .map(|k| format!("{:?}", path.get_binding(k)))
+                                .map(|k| canonical_binding_key(path.get_binding(k)))
                                 .collect::<Vec<_>>()
                                 .join("|"),
                             // Full-row dedup: `bound_entries` iterates slots in
@@ -2973,7 +3104,7 @@ impl RowStream {
                             // deterministic.
                             None => path
                                 .bound_entries()
-                                .map(|(k, v)| format!("{}={:?}", k, v))
+                                .map(|(k, v)| format!("{}={}", k, canonical_binding_key(Some(v))))
                                 .collect::<Vec<_>>()
                                 .join("|"),
                         };
@@ -3229,8 +3360,14 @@ impl RowStream {
 pub(super) struct AggState {
     count: i64,
     sum: f64,
-    /// True once a non-integer value has been summed. `sum()` over only
-    /// integers returns an integer, matching openCypher numeric typing.
+    /// Integer running total for `sum()`, used while every summed value is an
+    /// integer. Accumulating in `i64` rather than `f64` keeps sums of integers
+    /// exact past 2^53; the accumulator promotes to `sum` (f64) on the first
+    /// float input or on `i64` overflow.
+    sum_int: i64,
+    /// True once a non-integer value has been summed (or the integer accumulator
+    /// overflowed). `sum()` over only integers returns an integer, matching
+    /// openCypher numeric typing.
     sum_is_float: bool,
     min: Option<serde_json::Value>,
     max: Option<serde_json::Value>,
@@ -3245,6 +3382,7 @@ impl AggState {
         Self {
             count: 0,
             sum: 0.0,
+            sum_int: 0,
             sum_is_float: false,
             min: None,
             max: None,
@@ -3266,7 +3404,7 @@ impl AggState {
             AggFn::Count { distinct } => {
                 if val != serde_json::Value::Null {
                     if *distinct {
-                        if self.distinct_seen.insert(val.to_string()) {
+                        if self.distinct_seen.insert(canonical_cell_key(&val)) {
                             self.count += 1;
                         }
                     } else {
@@ -3276,19 +3414,31 @@ impl AggState {
             }
             AggFn::Sum { distinct } => {
                 if val != serde_json::Value::Null {
-                    if *distinct && !self.distinct_seen.insert(val.to_string()) {
+                    if *distinct && !self.distinct_seen.insert(canonical_cell_key(&val)) {
                         // already seen, skip
-                    } else if let Some(n) = val.as_f64() {
-                        if val.as_i64().is_none() {
+                    } else if let Some(i) = val.as_i64() {
+                        if self.sum_is_float {
+                            self.sum += i as f64;
+                        } else if let Some(s) = self.sum_int.checked_add(i) {
+                            self.sum_int = s;
+                        } else {
+                            // Integer total overflowed i64: fall back to float.
+                            self.sum = self.sum_int as f64 + i as f64;
                             self.sum_is_float = true;
                         }
-                        self.sum += n;
+                    } else if let Some(f) = val.as_f64() {
+                        if !self.sum_is_float {
+                            // First float input: fold the exact integer total in.
+                            self.sum = self.sum_int as f64;
+                            self.sum_is_float = true;
+                        }
+                        self.sum += f;
                     }
                 }
             }
             AggFn::Avg { distinct } => {
                 if val != serde_json::Value::Null {
-                    if *distinct && !self.distinct_seen.insert(val.to_string()) {
+                    if *distinct && !self.distinct_seen.insert(canonical_cell_key(&val)) {
                         // already seen, skip
                     } else if let Some(n) = val.as_f64() {
                         self.sum += n;
@@ -3326,7 +3476,7 @@ impl AggState {
             }
             AggFn::Collect { distinct } => {
                 if val != serde_json::Value::Null {
-                    if *distinct && !self.distinct_seen.insert(val.to_string()) {
+                    if *distinct && !self.distinct_seen.insert(canonical_cell_key(&val)) {
                         // already seen, skip
                     } else {
                         self.collect.push(val);
@@ -3357,13 +3507,11 @@ impl AggState {
         Ok(match agg_fn {
             AggFn::Count { .. } => serde_json::Value::Number(state.count.into()),
             AggFn::Sum { .. } => {
-                // Preserve integer typing: a sum over only integer inputs
-                // is an integer, as in openCypher.
-                if !state.sum_is_float
-                    && state.sum.fract() == 0.0
-                    && state.sum.abs() < i64::MAX as f64
-                {
-                    serde_json::Value::Number((state.sum as i64).into())
+                // Preserve integer typing: a sum over only integer inputs is an
+                // integer, as in openCypher, and stays exact via the `i64`
+                // accumulator (no 2^53 float rounding).
+                if !state.sum_is_float {
+                    serde_json::Value::Number(state.sum_int.into())
                 } else {
                     serde_json::Number::from_f64(state.sum)
                         .map(serde_json::Value::Number)
@@ -3537,7 +3685,7 @@ fn aggregate_all(
                 }
             }
             let val = evaluate_expr(graph, &path, expr, params)?;
-            key_parts.push(val.to_string());
+            key_parts.push(canonical_cell_key(&val));
             gb_path.bind_local(&col, GraphBinding::Scalar(val));
         }
         let group_key = key_parts.join("\x00");
@@ -4122,7 +4270,7 @@ pub(super) fn eval_leaf(
                 let row = &table[i];
                 let mut key_parts = Vec::with_capacity(col_names.len());
                 for val in row {
-                    key_parts.push(val.to_string());
+                    key_parts.push(canonical_cell_key(val));
                 }
                 let key = key_parts.join("\x00");
                 match groups.get_mut(&key) {

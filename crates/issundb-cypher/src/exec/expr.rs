@@ -680,6 +680,24 @@ pub(super) fn evaluate_expr<B: Bindings>(
                         ))
                     }
                 }
+                GraphBinding::EdgeList(ids) => {
+                    if prop.is_empty() {
+                        // Whole-variable reference: the list of relationship
+                        // objects along the variable-length trail.
+                        let mut arr = Vec::with_capacity(ids.len());
+                        for &eid in ids {
+                            arr.push(super::read::get_edge_representation(graph, eid)?);
+                        }
+                        Ok(serde_json::Value::Array(arr))
+                    } else {
+                        // A variable-length relationship variable is a list, so a
+                        // scalar property access is a type error.
+                        Err(format!(
+                            "TypeError: property access '{}' on a list of relationships",
+                            prop
+                        ))
+                    }
+                }
             }
         }
     }
@@ -920,26 +938,37 @@ pub(super) fn eval_arithmetic(
     match (lv, rv) {
         (serde_json::Value::Number(ln), serde_json::Value::Number(rn)) => {
             if let (Some(li), Some(ri)) = (ln.as_i64(), rn.as_i64()) {
+                // Both operands are integers, so integer arithmetic applies. On
+                // overflow openCypher raises an error rather than silently
+                // widening to floating point (which would lose precision and
+                // change the value's type), so surface it instead of falling
+                // through to the float path below.
+                let overflow = || format!("ArithmeticError: integer overflow in {li} {op} {ri}");
                 let result = match op {
-                    '+' => li.checked_add(ri).map(serde_json::Value::from),
-                    '-' => li.checked_sub(ri).map(serde_json::Value::from),
-                    '*' => li.checked_mul(ri).map(serde_json::Value::from),
+                    '+' => Some(li.checked_add(ri).ok_or_else(overflow)?),
+                    '-' => Some(li.checked_sub(ri).ok_or_else(overflow)?),
+                    '*' => Some(li.checked_mul(ri).ok_or_else(overflow)?),
                     '/' => {
                         if ri == 0 {
                             return Ok(serde_json::Value::Null);
                         }
-                        li.checked_div(ri).map(serde_json::Value::from)
+                        // `checked_div` is `None` only for `i64::MIN / -1`, a true
+                        // overflow.
+                        Some(li.checked_div(ri).ok_or_else(overflow)?)
                     }
                     '%' => {
                         if ri == 0 {
                             return Ok(serde_json::Value::Null);
                         }
-                        li.checked_rem(ri).map(serde_json::Value::from)
+                        // `i64::MIN % -1` is mathematically 0 (no overflow of the
+                        // remainder itself); `wrapping_rem` yields that, matching
+                        // Neo4j, and is exact for every other divisor.
+                        Some(li.wrapping_rem(ri))
                     }
                     _ => None,
                 };
                 if let Some(v) = result {
-                    return Ok(v);
+                    return Ok(serde_json::Value::from(v));
                 }
             }
             if let (Some(lf), Some(rf)) = (ln.as_f64(), rn.as_f64()) {
@@ -1585,7 +1614,12 @@ pub(super) fn eval_function_call<B: Bindings>(
             match val {
                 serde_json::Value::Number(n) => {
                     if let Some(i) = n.as_i64() {
-                        Ok(i.abs().into())
+                        // `i64::MIN.abs()` overflows (panics in debug, wraps in
+                        // release); openCypher raises on arithmetic overflow.
+                        let a = i.checked_abs().ok_or_else(|| {
+                            format!("ArithmeticError: integer overflow in abs({i})")
+                        })?;
+                        Ok(a.into())
                     } else if let Some(f) = n.as_f64() {
                         Ok(serde_json::Number::from_f64(f.abs())
                             .map(serde_json::Value::Number)
@@ -4869,5 +4903,53 @@ pub(super) fn json_cmp(l: &serde_json::Value, r: &serde_json::Value) -> Option<s
             }
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod arithmetic_tests {
+    use super::eval_arithmetic;
+    use serde_json::json;
+
+    #[test]
+    fn integer_overflow_errors_instead_of_promoting_to_float() {
+        // i64::MAX + 1 overflows: openCypher raises rather than widening to f64.
+        let err = eval_arithmetic(&json!(i64::MAX), &json!(1), '+').unwrap_err();
+        assert!(err.contains("overflow"), "got: {err}");
+        assert!(eval_arithmetic(&json!(i64::MAX), &json!(2), '*').is_err());
+        assert!(eval_arithmetic(&json!(i64::MIN), &json!(1), '-').is_err());
+        // i64::MIN / -1 overflows too.
+        assert!(eval_arithmetic(&json!(i64::MIN), &json!(-1), '/').is_err());
+
+        // A float operand still uses float arithmetic (no error, widens).
+        assert_eq!(
+            eval_arithmetic(&json!(i64::MAX), &json!(1.0), '+').unwrap(),
+            json!(i64::MAX as f64 + 1.0)
+        );
+
+        // Normal integer arithmetic is unaffected and stays integer-typed.
+        assert_eq!(
+            eval_arithmetic(&json!(2), &json!(3), '+').unwrap(),
+            json!(5)
+        );
+        assert_eq!(
+            eval_arithmetic(&json!(10), &json!(3), '/').unwrap(),
+            json!(3)
+        );
+
+        // Division/modulo by zero stay null (not an error).
+        assert_eq!(
+            eval_arithmetic(&json!(1), &json!(0), '/').unwrap(),
+            json!(null)
+        );
+        assert_eq!(
+            eval_arithmetic(&json!(1), &json!(0), '%').unwrap(),
+            json!(null)
+        );
+        // i64::MIN % -1 is mathematically 0 (the remainder does not overflow).
+        assert_eq!(
+            eval_arithmetic(&json!(i64::MIN), &json!(-1), '%').unwrap(),
+            json!(0)
+        );
     }
 }

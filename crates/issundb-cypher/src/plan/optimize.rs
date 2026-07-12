@@ -242,6 +242,7 @@ impl Optimizer {
                 max_hops,
                 unique_rels,
                 needs_path,
+                is_var_length,
             } => {
                 let (inner_op, inner_filters) = Self::extract_filters(*input, stats, allow_prune);
                 (
@@ -257,6 +258,7 @@ impl Optimizer {
                         max_hops,
                         unique_rels,
                         needs_path,
+                        is_var_length,
                     },
                     inner_filters,
                 )
@@ -469,6 +471,7 @@ impl Optimizer {
                 max_hops,
                 unique_rels,
                 needs_path,
+                is_var_length,
             } => PhysicalOperator::Expand {
                 input: Box::new(Self::reorder_operators(*input, stats, labels)),
                 src_var,
@@ -481,6 +484,7 @@ impl Optimizer {
                 max_hops,
                 unique_rels,
                 needs_path,
+                is_var_length,
             },
             // Filter nodes inside opaque barrier-Project subtrees are not stripped by
             // `extract_filters`.  Pass them through so that reordering does not panic.
@@ -1054,21 +1058,31 @@ impl Optimizer {
             dst_var,
             is_incoming,
             is_undirected,
+            min_hops,
+            max_hops,
             ..
         } = &op
         {
+            // `schema_has_edge` only knows about directly realized triples, so the
+            // prune is sound only for a single fixed hop. A variable-length hop
+            // (`min_hops != 1` or `max_hops != 1`) can reach `dst` through
+            // intermediate nodes even when no direct `src --rel--> dst` edge
+            // exists, so it must never be pruned on the direct-edge schema.
+            let single_hop = *min_hops == 1 && *max_hops == 1;
             let empty_src = Vec::new();
             let empty_dst = Vec::new();
             let src_labels = labels.get(src_var).unwrap_or(&empty_src);
             let dst_labels = labels.get(dst_var).unwrap_or(&empty_dst);
-            if Self::hop_is_impossible(
-                stats,
-                src_labels,
-                rel_type,
-                dst_labels,
-                *is_incoming,
-                *is_undirected,
-            ) {
+            if single_hop
+                && Self::hop_is_impossible(
+                    stats,
+                    src_labels,
+                    rel_type,
+                    dst_labels,
+                    *is_incoming,
+                    *is_undirected,
+                )
+            {
                 return PhysicalOperator::Limit {
                     input: Box::new(op),
                     skip: 0,
@@ -1149,6 +1163,7 @@ impl Optimizer {
                 max_hops,
                 unique_rels,
                 needs_path,
+                is_var_length,
             } => Expand {
                 input: Box::new(f(*input)),
                 src_var,
@@ -1161,6 +1176,7 @@ impl Optimizer {
                 max_hops,
                 unique_rels,
                 needs_path,
+                is_var_length,
             },
             Filter { input, expression } => Filter {
                 input: Box::new(f(*input)),
@@ -1393,6 +1409,7 @@ impl Optimizer {
                 max_hops,
                 unique_rels,
                 needs_path,
+                is_var_length,
             } => {
                 let child_bound = Self::bound_vars(&input);
 
@@ -1423,6 +1440,7 @@ impl Optimizer {
                     max_hops,
                     unique_rels,
                     needs_path,
+                    is_var_length,
                 };
 
                 let bound = Self::bound_vars(&current_node);
@@ -1806,18 +1824,14 @@ impl Optimizer {
                 input,
                 rel_var,
                 dst_var,
-                min_hops,
-                max_hops,
                 ..
             } => {
                 Self::collect_bound_vars(input, vars);
-                // rel_var is only bound for single-hop patterns (min=max=1).
-                // Variable-length BFS (any other range) does not insert rel_var
-                // into the PathMap, so the optimizer must not treat it as bound
-                // or it will misplace filters that reference it.
-                if *min_hops == 1 && *max_hops == 1 {
-                    vars.insert(rel_var.clone());
-                }
+                // A single hop binds `rel_var` to one relationship; a
+                // variable-length hop binds it to the list of relationships along
+                // the trail. Either way the variable is bound after the Expand, so
+                // filters that reference it may sit above the operator.
+                vars.insert(rel_var.clone());
                 vars.insert(dst_var.clone());
             }
             PhysicalOperator::Filter { input, .. } => {
@@ -2511,6 +2525,7 @@ impl Optimizer {
                 max_hops,
                 unique_rels,
                 needs_path,
+                is_var_length,
             } => PhysicalOperator::Expand {
                 input: Box::new(Self::optimize_index_scans(*input, stats)),
                 src_var,
@@ -2523,6 +2538,7 @@ impl Optimizer {
                 max_hops,
                 unique_rels,
                 needs_path,
+                is_var_length,
             },
             PhysicalOperator::Project {
                 input,
@@ -2807,6 +2823,7 @@ impl Optimizer {
                 max_hops: 1,
                 unique_rels: prior_rels.clone(),
                 needs_path: hop.needs_path,
+                is_var_length: false,
             };
             prior_rels.push(hop.rel_var.clone());
         }
@@ -2857,8 +2874,39 @@ impl Optimizer {
     fn is_trivially_true(f: &FilterExpr) -> bool {
         match f {
             FilterExpr::Expr(Expr::Literal(Literal::Bool(true))) => true,
-            FilterExpr::Eq(Expr::Literal(a), Expr::Literal(b)) => a == b,
-            FilterExpr::Ne(Expr::Literal(a), Expr::Literal(b)) => a != b,
+            // A comparison involving NULL evaluates to NULL under openCypher
+            // three-valued logic (the row is filtered out), so it is never
+            // trivially true and the predicate must be kept. A non-null `Eq` is
+            // trivially true only when the two literals are the same value; the
+            // structural `==` is sufficient because equal non-null literals are
+            // also Cypher-equal (unequal structural forms such as `1` and `1.0`
+            // are simply not folded, which is safe).
+            FilterExpr::Eq(Expr::Literal(a), Expr::Literal(b)) => {
+                !matches!(a, Literal::Null) && !matches!(b, Literal::Null) && a == b
+            }
+            // `Ne` needs value-aware inequality: `1 <> 1.0` is false even though
+            // the literals differ structurally, so a raw `a != b` would wrongly
+            // drop the predicate.
+            FilterExpr::Ne(Expr::Literal(a), Expr::Literal(b)) => {
+                Self::literals_definitely_unequal(a, b)
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether two literals are definitely unequal under openCypher value
+    /// equality, so a `<>` between them is unconditionally true. Conservative:
+    /// any comparison with NULL, a list, or two operands of unrelated kinds
+    /// returns false (the predicate is kept and evaluated at runtime).
+    fn literals_definitely_unequal(a: &Literal, b: &Literal) -> bool {
+        match (a, b) {
+            (Literal::Int(x), Literal::Int(y)) => x != y,
+            (Literal::Float(x), Literal::Float(y)) => x != y,
+            (Literal::Int(x), Literal::Float(y)) | (Literal::Float(y), Literal::Int(x)) => {
+                (*x as f64) != *y
+            }
+            (Literal::Str(x), Literal::Str(y)) => x != y,
+            (Literal::Bool(x), Literal::Bool(y)) => x != y,
             _ => false,
         }
     }
@@ -3226,6 +3274,7 @@ fn rewrite_join_to_expand(op: PhysicalOperator) -> PhysicalOperator {
             max_hops,
             unique_rels,
             needs_path,
+            is_var_length,
         } => PhysicalOperator::Expand {
             input: Box::new(rewrite_join_to_expand(*input)),
             src_var,
@@ -3238,6 +3287,7 @@ fn rewrite_join_to_expand(op: PhysicalOperator) -> PhysicalOperator {
             max_hops,
             unique_rels,
             needs_path,
+            is_var_length,
         },
         PhysicalOperator::Unwind {
             input,
@@ -3339,6 +3389,7 @@ fn graft_chain_onto(
             max_hops,
             unique_rels,
             needs_path,
+            is_var_length,
         } => PhysicalOperator::Expand {
             input: Box::new(graft_chain_onto(*input, driver, v, label)),
             src_var,
@@ -3351,6 +3402,7 @@ fn graft_chain_onto(
             max_hops,
             unique_rels,
             needs_path,
+            is_var_length,
         },
         PhysicalOperator::LabelScan { .. } => match label {
             Some(l) => PhysicalOperator::Filter {
@@ -3379,12 +3431,18 @@ fn rewrite_closing_expands(op: PhysicalOperator) -> PhysicalOperator {
             max_hops,
             unique_rels,
             needs_path,
+            is_var_length,
         } => {
             let new_input = rewrite_closing_expands(*input);
             let input_bound = Optimizer::bound_vars(&new_input);
             // A closing join never extends `_path_*` objects, so a pattern that
             // binds a path variable keeps its plain Expand.
-            if min_hops == 1 && max_hops == 1 && !needs_path && input_bound.contains(&dst_var) {
+            if min_hops == 1
+                && max_hops == 1
+                && !is_var_length
+                && !needs_path
+                && input_bound.contains(&dst_var)
+            {
                 PhysicalOperator::MultiwayJoin {
                     input: Box::new(new_input),
                     closing_src_var: src_var,
@@ -3408,6 +3466,7 @@ fn rewrite_closing_expands(op: PhysicalOperator) -> PhysicalOperator {
                     max_hops,
                     unique_rels,
                     needs_path,
+                    is_var_length,
                 }
             }
         }
@@ -3605,6 +3664,7 @@ fn try_triangle_count(op: &PhysicalOperator) -> Option<PhysicalOperator> {
         max_hops: 1,
         unique_rels: unique2,
         needs_path: false,
+        is_var_length: false,
     } = exp2_op
     else {
         return None;
@@ -3623,6 +3683,7 @@ fn try_triangle_count(op: &PhysicalOperator) -> Option<PhysicalOperator> {
         max_hops: 1,
         unique_rels: unique1,
         needs_path: false,
+        is_var_length: false,
     } = exp1_op
     else {
         return None;
@@ -3715,6 +3776,7 @@ fn match_forward_expand(op: &PhysicalOperator) -> Option<ForwardExpand<'_>> {
         max_hops: 1,
         unique_rels,
         needs_path: false,
+        is_var_length: false,
     } = op
     {
         Some((
@@ -4622,6 +4684,7 @@ mod tests {
             max_hops: 1,
             unique_rels: vec![],
             needs_path: false,
+            is_var_length: false,
         };
 
         let join_plan = PhysicalOperator::HashJoin {
@@ -4675,6 +4738,7 @@ mod tests {
             max_hops: 1,
             unique_rels: vec![],
             needs_path: false,
+            is_var_length: false,
         };
 
         // Average fan-out = ceil(5000 / 1000) = 5; input weight (Person) = 1000.
@@ -4743,6 +4807,7 @@ mod tests {
             max_hops: 1,
             unique_rels: vec![],
             needs_path: false,
+            is_var_length: false,
         };
 
         // Both scans weigh 1000 (their node count). The typed fan-out makes the
@@ -4810,6 +4875,7 @@ mod tests {
                 max_hops: 1,
                 unique_rels: vec![],
                 needs_path: false,
+                is_var_length: false,
             }),
             src_var: "b".to_string(),
             rel_var: "r2".to_string(),
@@ -4821,6 +4887,7 @@ mod tests {
             max_hops: 1,
             unique_rels: vec![],
             needs_path: false,
+            is_var_length: false,
         };
 
         // Without a label environment, only the first hop applies the typed
@@ -4942,6 +5009,7 @@ mod tests {
                 max_hops: 1,
                 unique_rels: vec![],
                 needs_path: false,
+                is_var_length: false,
             }),
             expression: FilterExpr::HasLabel("b".to_string(), "Person".to_string()),
         };
@@ -5141,6 +5209,7 @@ mod tests {
                     max_hops: 1,
                     unique_rels: vec![],
                     needs_path: false,
+                    is_var_length: false,
                 }),
                 src_var: "b".to_string(),
                 rel_var: "r2".to_string(),
@@ -5152,6 +5221,7 @@ mod tests {
                 max_hops: 1,
                 unique_rels: vec![],
                 needs_path: false,
+                is_var_length: false,
             }),
             src_var: "c".to_string(),
             rel_var: "r3".to_string(),
@@ -5164,6 +5234,7 @@ mod tests {
             max_hops: 1,
             unique_rels: vec![],
             needs_path: false,
+            is_var_length: false,
         };
 
         let rewritten = rewrite_closing_expands(plan);
@@ -5205,6 +5276,7 @@ mod tests {
                 max_hops: 1,
                 unique_rels: vec![],
                 needs_path: false,
+                is_var_length: false,
             }),
             src_var: "b".to_string(),
             rel_var: "r2".to_string(),
@@ -5216,6 +5288,7 @@ mod tests {
             max_hops: 1,
             unique_rels: vec![],
             needs_path: false,
+            is_var_length: false,
         };
 
         let rewritten = rewrite_closing_expands(plan);
@@ -5249,6 +5322,7 @@ mod tests {
                 max_hops: 1,
                 unique_rels: vec![],
                 needs_path: false,
+                is_var_length: false,
             }),
             src_var: "a".to_string(),
             rel_var: "r".to_string(),
@@ -5261,6 +5335,7 @@ mod tests {
             max_hops: 1,
             unique_rels: vec![],
             needs_path: false,
+            is_var_length: false,
         };
 
         let rewritten = rewrite_closing_expands(plan);
@@ -5875,6 +5950,7 @@ mod tests {
             max_hops: 1,
             unique_rels: vec![],
             needs_path: false,
+            is_var_length: false,
         }
     }
 
