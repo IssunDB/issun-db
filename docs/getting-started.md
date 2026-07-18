@@ -6,9 +6,9 @@ This guide covers compiling, configuring, and querying IssunDB. It explains prer
 
 Compiling IssunDB and its native dependencies requires Rust 1.85.0 or later, along with the following system tools:
 
-- **Build Tools**: CMake and a C/C++ compiler (such as Clang or GCC) to compile the SuiteSparse:GraphBLAS static library.
-- **FFI Bindings**: `libclang`, which `bindgen` uses to build the raw GraphBLAS wrappers.
-- **OpenMP Runtime**: This resolves to `libgomp` (bundled with GCC) on Linux, `libomp` on macOS (`brew install libomp`), and `vcomp` (part of the MSVC
+- Build Tools: CMake and a C/C++ compiler (such as Clang or GCC) to compile the SuiteSparse:GraphBLAS static library.
+- FFI Bindings: `libclang`, which `bindgen` uses to build the raw GraphBLAS wrappers.
+- OpenMP Runtime: This resolves to `libgomp` (bundled with GCC) on Linux, `libomp` on macOS (`brew install libomp`), and `vcomp` (part of the MSVC
   runtime) on Windows.
 
 ## Build from Source
@@ -34,6 +34,14 @@ make repl
 
 # Launch with a custom database directory
 make repl REPL_PATH=/path/to/my-db
+```
+
+The built binary can also be invoked directly.
+The database directory is a positional argument that falls back to the `ISSUNDB_DB_PATH` environment variable, `--map-size-gb` sets the LMDB map size (default 1), and `--script` (short form `-f`) executes a script file in batch mode instead of starting the prompt:
+
+```bash
+target/release/issundb-cli /path/to/my-db --map-size-gb 4
+target/release/issundb-cli -f ./setup.cypher
 ```
 
 ### Interactive REPL Meta Commands

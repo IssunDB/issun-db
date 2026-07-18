@@ -159,7 +159,7 @@ Here is a quick reference of the methods available on the `IssunDB` class:
 * `upsert_vector(id: int, vector: List[float]) -> None`: Associates an embedding vector with a node.
 * `remove_vector(id: int) -> None`: Removes the embedding for a node.
 * `vector_search(vector: List[float], k: int, label: Optional[str] = None, properties: Optional[str] = None, rescore_factor: Optional[int] = None) -> str`: Performs nearest-neighbor vector search with optional label and property filters.
-* `create_text_index(label: str, property: str, language: Optional[str] = None) -> None`: Creates a full-text search index.
+* `create_text_index(label: str, property: str, language: Optional[str] = None) -> None`: Creates a full-text search index. The language controls stemming and stop words and accepts `"english"` (the default), `"spanish"`, `"french"`, `"german"`, `"italian"`, or `"portuguese"`, case-insensitively; an unknown language raises an error.
 * `drop_text_index(label: str, property: str) -> None`: Removes a full-text search index.
 * `has_text_index(label: str, property: str) -> bool`: Checks whether a full-text search index exists for a label and property.
 * `list_text_indexes() -> str`: Returns a JSON list of active full-text search indexes.

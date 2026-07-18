@@ -36,6 +36,7 @@ The database is designed as a set of modular crates, establishing clear boundari
 
 - [Getting Started](getting-started.md): Installation, build instructions, basic CLI usage, and usage in Rust projects.
 - [Code Examples](examples.md): Practical code examples for vector search, text search, and Cypher query execution.
+- [Cypher Support](cypher.md): The supported Cypher clauses, patterns, expressions, and functions, plus known deviations.
 - [API Reference](api-reference.md): Public Rust API reference, types, and Cypher DDL syntax.
 - [Hybrid Retrieval](hybrid-retrieval.md): Concept overview and implementation guide for GraphRAG pipelines.
 - [Integrations](integrations.md): Exposing IssunDB over HTTP REST and MCP.

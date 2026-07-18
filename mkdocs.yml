@@ -46,6 +46,7 @@ nav:
   - Home: index.md
   - Getting Started: getting-started.md
   - Examples: examples.md
+  - Cypher Support: cypher.md
   - API Reference: api-reference.md
   - Hybrid Retrieval: hybrid-retrieval.md
   - Integrations: integrations.md

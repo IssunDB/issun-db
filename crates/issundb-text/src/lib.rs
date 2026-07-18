@@ -148,8 +148,10 @@ pub struct TextSearchOptions {
     pub limit: usize,
     /// Relevance scorer. When `None`, the default [`Bm25Scorer`] is used.
     pub scorer: Option<Arc<dyn Scorer>>,
-    /// Boolean candidate filtering. When `None`, `BooleanMode::And` is used for
-    /// multi-term queries, consistent with most full-text search engines.
+    /// Boolean candidate filtering. `Some(BooleanMode::And)` restricts results
+    /// to documents containing every query term. When `None` (the default) or
+    /// `Some(BooleanMode::Or)`, any document matching at least one term is
+    /// ranked; no hard term-presence filter is applied.
     pub boolean_mode: Option<BooleanMode>,
 }
 

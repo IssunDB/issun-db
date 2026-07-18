@@ -2,6 +2,20 @@
 
 This page provides code examples for performing vector search, full-text keyword search, Cypher queries, running script files via the CLI, and executing GraphBLAS-backed graph algorithms in Rust and Cypher.
 
+## Example Programs
+
+The `crates/issundb-examples` crate contains complete, runnable programs; run one with `cargo run -p issundb-examples --example <name>`:
+
+| Example                       | Description                                                                                                            |
+|-------------------------------|------------------------------------------------------------------------------------------------------------------------|
+| `quickstart`                  | Opening a database, inserting nodes and edges, and executing a Cypher query.                                           |
+| `hybrid_retrieval_quickstart` | An end-to-end GraphRAG flow: nodes and edges, a full-text index, vector upserts, hybrid retrieval, and a Cypher query. |
+| `graph_analytics`             | Graph algorithms including PageRank, degree centrality, weighted shortest paths, label propagation, and components.   |
+| `gds_cypher`                  | The graph data science surface in Cypher: `CALL issundb.*` procedures and the comparison functions.                    |
+| `load_ldbc`                   | Loading a social network graph and running analytics over it.                                                          |
+| `neo4j_migration`             | Migrating sample data from a Neo4j-style JSON export into IssunDB.                                                     |
+| `concurrent_ops`              | Concurrent reads and writes over a shared `Graph` handle, demonstrating snapshot isolation for readers.               |
+
 ## Vector Search Example
 
 The following Rust example demonstrates inserting vector embeddings for nodes and performing k-nearest-neighbor similarity searches:

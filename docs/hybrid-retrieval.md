@@ -6,9 +6,9 @@ This guide covers hybrid retrieval pipelines for GraphRAG (Retrieval-Augmented G
 
 The hybrid retrieval workflow consists of three sequential steps:
 
-1. **Seed Selection**: Query inputs (vector embeddings, text queries, or both) are evaluated against vector and full-text indexes to identify initial seed nodes.
-2. **Score Fusion**: Relevance scores from different index hits are combined into a single ranking using a configurable fusion strategy.
-3. **Graph Traversal**: A multi-source Breadth-First Search (BFS) starts from the top-ranked seed nodes and expands outward to gather neighboring nodes and edges, materializing the final subgraph.
+1. Seed Selection: Query inputs (vector embeddings, text queries, or both) are evaluated against vector and full-text indexes to identify initial seed nodes.
+2. Score Fusion: Relevance scores from different index hits are combined into a single ranking using a configurable fusion strategy.
+3. Graph Traversal: A multi-source Breadth-First Search (BFS) starts from the top-ranked seed nodes and expands outward to gather neighboring nodes and edges, materializing the final subgraph.
 
 ---
 
@@ -87,9 +87,9 @@ pub struct HybridRetrieveOptions {
 
 Relevance scores from different sources are merged using one of two strategies:
 
-* **Reciprocal Rank Fusion (RRF)**: Merges ranked lists using the reciprocal of each item's rank: `score = Σ 1 / (k + rank)`. This is the default
+* Reciprocal Rank Fusion (RRF): Merges ranked lists using the reciprocal of each item's rank: `score = Σ 1 / (k + rank)`. This is the default
   strategy; because it uses ranks rather than raw scores, it needs no normalization when relevance scores have different scales.
-* **Weighted Linear Combination**: Combines raw relevance scores linearly: `score = α * vector_score + β * text_score`. Use this to prioritize one
+* Weighted Linear Combination: Combines raw relevance scores linearly: `score = α * vector_score + β * text_score`. Use this to prioritize one
   index type over the other.
 
 The `FusionStrategy` enum contains the following variants:
