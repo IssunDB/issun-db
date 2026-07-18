@@ -92,7 +92,7 @@ Pathfinding, network centrality, and connectivity algorithms are executed using 
 - `shortest_path_dijkstra(src: NodeId, dst: NodeId) -> Result<Option<WeightedPath>, Error>`  
   Finds the shortest weighted path between two nodes using Dijkstra's algorithm.
 - `shortest_path_top_k(src: NodeId, dst: NodeId, k: usize, weight_property: &str) -> Result<Vec<WeightedPath>, Error>`  
-  Finds the top-$k$ shortest weighted paths using Yen's algorithm.
+  Finds the top-k shortest weighted paths using Yen's algorithm.
 - `all_paths(src: NodeId, dst: NodeId) -> Result<Vec<Vec<NodeId>>, Error>`  
   Returns all simple paths between the source and destination nodes.
 - `all_shortest_paths(src: NodeId, dst: NodeId) -> Result<Vec<Vec<NodeId>>, Error>`  
@@ -143,9 +143,9 @@ The `VectorGraphExt` trait extends the graph with vector embedding storage and s
 - `VectorGraphExt::remove_vector(n: NodeId) -> Result<(), VectorError>`  
   Removes the embedding for a node from both the index and storage.
 - `VectorGraphExt::vector_search(q: &[f32], k: usize) -> Result<Vec<Hit>, VectorError>`  
-  Retrieves the top-$k$ nearest neighbor nodes matching the query vector.
+  Retrieves the top-k nearest neighbor nodes matching the query vector.
 - `VectorGraphExt::vector_search_with(q: &[f32], opts: &VectorSearchOptions) -> Result<Vec<Hit>, VectorError>`  
-  Retrieves the top-$k$ nearest neighbor nodes satisfying label and property filters.
+  Retrieves the top-k nearest neighbor nodes satisfying label and property filters.
 - `VectorGraphExt::node_vector(n: NodeId) -> Result<Option<Vec<f32>>, VectorError>`  
   Returns the full-precision embedding stored for a node, or `None` if the node has no embedding. This performs an LMDB point lookup and does not build or consult the in-memory HNSW index.
 - `VectorGraphExt::vector_distance(a: &[f32], b: &[f32]) -> Result<f32, VectorError>`  
@@ -207,7 +207,7 @@ Graph data science procedures can be executed through the query interface using 
 ### Analytics and Communities
 
 - `CALL issundb.pageRank({iterations, damping})` yields `(nodeId, score)`. The configuration map is optional.
-- `CALL issundb.betweenness()` and `CALL issundb.harmonic()` yields `(nodeId, score)`. Both take no arguments.
+- `CALL issundb.betweenness()` and `CALL issundb.harmonic()` yield `(nodeId, score)`. Both take no arguments.
 - `CALL issundb.degree({direction})` yields `(nodeId, score)`, where `direction` is `'IN'`, `'OUT'`, or `'BOTH'` (the default).
 - `CALL issundb.connectedComponents()` (alias `issundb.wcc`) and `CALL issundb.stronglyConnectedComponents()` (alias `issundb.scc`) yield `(nodeId, componentId)`.
 - `CALL issundb.labelPropagation({maxIterations})` yields `(nodeId, communityId)`.

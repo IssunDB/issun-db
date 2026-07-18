@@ -4,7 +4,7 @@ This page provides code examples for performing vector search, full-text keyword
 
 ## Vector Search Example
 
-The following Rust example demonstrates inserting vector embeddings for nodes and performing $k$-nearest-neighbor similarity searches:
+The following Rust example demonstrates inserting vector embeddings for nodes and performing k-nearest-neighbor similarity searches:
 
 ```rust
 use issundb::{Graph, VectorGraphExt};
@@ -173,9 +173,9 @@ fn run_algorithms(graph: &Graph) -> Result<(), Box<dyn std::error::Error>> {
 
 ## Graph Data Science in Cypher
 
-We can also invoke these analytics, pathfinding, and retrieval algorithms directly inside Cypher queries! This allows feeding algorithm results
-directly into `MATCH`, `WHERE`, and `RETURN` clauses. There are two surfaces: built-in `CALL issundb.*` procedures and the `issundb.distance.*` and
-`issundb.similarity.*` scalar functions. We can find a complete, runnable tour in the `gds_cypher.rs` example program (
+These analytics, pathfinding, and retrieval algorithms can also be invoked directly inside Cypher queries, feeding algorithm results directly into
+`MATCH`, `WHERE`, and `RETURN` clauses. There are two surfaces: built-in `CALL issundb.*` procedures and the `issundb.distance.*` and
+`issundb.similarity.*` scalar functions. The `gds_cypher.rs` example program is a complete, runnable tour (
 `cargo run -p issundb-examples --example gds_cypher`).
 
 ### Built-in Procedures
@@ -188,7 +188,7 @@ query, so `nodeId` joins back to the matched nodes through `id()`.
 | `issundb.pageRank`                                          | `{iterations, damping}`                                                                                                               | `nodeId, score`              |
 | `issundb.betweenness`                                       | none                                                                                                                                  | `nodeId, score`              |
 | `issundb.harmonic`                                          | none                                                                                                                                  | `nodeId, score`              |
-| `issundb.degree`                                            | `{direction: 'IN'                                                                                                                     | 'OUT'                        |'BOTH'}` | `nodeId, score` |
+| `issundb.degree`                                            | `{direction}` with `'IN'`, `'OUT'`, or `'BOTH'`                                                                                       | `nodeId, score`              |
 | `issundb.connectedComponents` (alias `issundb.wcc`)         | none                                                                                                                                  | `nodeId, componentId`        |
 | `issundb.stronglyConnectedComponents` (alias `issundb.scc`) | none                                                                                                                                  | `nodeId, componentId`        |
 | `issundb.labelPropagation`                                  | `{maxIterations}`                                                                                                                     | `nodeId, communityId`        |

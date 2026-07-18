@@ -1,6 +1,6 @@
 # IssunDB
 
-IssunDB is a fast embedded graph database, written in Rust.
+IssunDB is an embedded graph database, written in Rust.
 It can be embedded in Rust applications without the need for a server, and can be used for a wide range of applications such as building
 GraphRAG pipelines and querying knowledge graphs.
 
@@ -9,10 +9,10 @@ GraphRAG pipelines and querying knowledge graphs.
 Key features of IssunDB:
 
 * **ACID Transactions**: A graph engine with full support for transactional safety and declarative Cypher queries.
-* **Fast Graph Analytics**: High-performance traversals and graph algorithms using sparse matrix operations.
-* **Vectorized Execution**: Multi-core parallel execution and serializable transactions.
+* **Graph Analytics**: Traversals and graph algorithms executed as sparse matrix operations.
+* **Vectorized Execution**: A columnar fast path that executes projections and aggregations column at a time.
 * **Multi-Index Retrieval**: Hybrid search combining vector search, full-text keyword ranking, and neighborhood expansion.
-* **Rich Developer Tooling**: Native Rust APIs, Python bindings, interactive CLI, HTTP REST server, and MCP.
+* **Developer Tooling**: Native Rust APIs, Python bindings, interactive CLI, HTTP REST server, and MCP.
 * **Cross-Platform Support**: Compatibility with Linux, macOS, and Windows.
 
 ## Architecture Overview
@@ -42,5 +42,5 @@ The database is designed as a set of modular crates, establishing clear boundari
 - [Code Examples](examples.md): Practical code examples for vector search, text search, and Cypher query execution.
 - [API Reference](api-reference.md): Public Rust API reference, types, and Cypher DDL syntax.
 - [Hybrid Retrieval](hybrid-retrieval.md): Concept overview and implementation guide for GraphRAG pipelines.
-- [Integrations](integrations.md): Exposing IssunDB over HTTP REST and the MCP.
+- [Integrations](integrations.md): Exposing IssunDB over HTTP REST and MCP.
 - [Python Integration](python.md): Working with IssunDB directly from Python.

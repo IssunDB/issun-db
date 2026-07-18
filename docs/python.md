@@ -14,7 +14,7 @@ pip install issundb
 
 ### Build from Source
 
-To compile the bindings locally from the repository root, build and install the package using `uv` and `maturin`:
+To compile the bindings locally from the repository root, build and install the package using `maturin`:
 
 ```bash
 # Maturin compiles the native extension and installs it in the environment
@@ -28,7 +28,7 @@ maturin develop --manifest-path crates/issundb-py/Cargo.toml
 
 The following example demonstrates opening a database, populating it with nodes and edges, and executing a Cypher query:
 
-Properties are passed across the bindings as JSON strings, so we serialize them using `json.dumps` when writing data and deserialize them using `json.loads` when reading results:
+Properties are passed across the bindings as JSON strings. Serialize them using `json.dumps` when writing data, and deserialize them using `json.loads` when reading results:
 
 ```python
 import json
@@ -73,9 +73,9 @@ from issundb import IssunDB
 db = IssunDB("./data")
 
 # 1. Configure the vector index metric and quantization
-# Supported metrics: "cosine", "l2", "ip"
-# Supported quantization: "f32", "f16", "i8"
-db.configure_vector_index(metric="cosine", quantization="f32")
+# Supported metrics: "cosine", "l2", "dot" (alias "ip")
+# Supported quantization: "float32", "float16", "int8"
+db.configure_vector_index(metric="cosine", quantization="float32")
 
 # 2. Add a document node
 doc_props = json.dumps({"title": "Rust Guide", "content": "Database concepts."})
@@ -117,7 +117,7 @@ inception_props = json.dumps({
 })
 inception_id = db.add_node("Movie", inception_props)
 
-# 3. Query our full-text index using keywords
+# 3. Query the full-text index using keywords
 results_str = db.text_search("secrets dream", label="Movie", property="description", limit=5)
 results = json.loads(results_str)
 
@@ -153,18 +153,18 @@ Here is a quick reference of the methods available on the `IssunDB` class:
 
 ### Querying and Search
 
-* `query(cypher: str) -> str`: Executes a Cypher query and returns the results as a JSON-encoded string.
+* `query(cypher: str, params: Optional[str] = None) -> str`: Executes a Cypher query, optionally with JSON-encoded parameters, and returns the results as a JSON-encoded string.
 * `explain(cypher: str) -> str`: Returns the indented execution plan tree of a Cypher query.
-* `configure_vector_index(metric: str, quantization: str) -> None`: Sets vector index configurations.
-* `reindex_vector_index(metric: str, quantization: str) -> None`: Rebuilds the vector index under a new configuration.
+* `configure_vector_index(metric: str, quantization: str = "float32", reindex: bool = False) -> None`: Sets the vector index metric and quantization; pass `reindex=True` to rebuild a populated index under the new configuration.
 * `upsert_vector(id: int, vector: List[float]) -> None`: Associates an embedding vector with a node.
 * `remove_vector(id: int) -> None`: Removes the embedding for a node.
-* `vector_search(vector: List[float], k: int, label: Optional[str] = None, properties: Optional[str] = None) -> str`: Performs nearest-neighbor vector search.
+* `vector_search(vector: List[float], k: int, label: Optional[str] = None, properties: Optional[str] = None, rescore_factor: Optional[int] = None) -> str`: Performs nearest-neighbor vector search with optional label and property filters.
 * `create_text_index(label: str, property: str, language: Optional[str] = None) -> None`: Creates a full-text search index.
 * `drop_text_index(label: str, property: str) -> None`: Removes a full-text search index.
+* `has_text_index(label: str, property: str) -> bool`: Checks whether a full-text search index exists for a label and property.
 * `list_text_indexes() -> str`: Returns a JSON list of active full-text search indexes.
 * `text_search(query: str, label: Optional[str] = None, property: Optional[str] = None, limit: int = 10) -> str`: Performs keyword text search.
-* `retrieve_hybrid(vector: List[float], text_query: str, options: str) -> str`: Runs a hybrid search and neighborhood expansion, returning a JSON-encoded Subgraph.
+* `retrieve_hybrid(vector: Optional[List[float]] = None, text_query: Optional[str] = None, vector_k: int = 10, text_k: int = 10, text_label: Optional[str] = None, text_property: Optional[str] = None, vector_label: Optional[str] = None, hops: int = 2, max_distance: Optional[float] = None, max_nodes: Optional[int] = None, fusion_strategy: str = "rrf", rrf_k: int = 60, vector_weight: float = 0.5, text_weight: float = 0.5) -> str`: Runs a hybrid search and neighborhood expansion, returning a JSON-encoded subgraph.
 
 ### Maintenance and Backups
 

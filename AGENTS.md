@@ -181,9 +181,7 @@ modules according to this map.
     - Typed bulk expansion calls `ensure_snapshot_fresh`, which rebuilds only the snapshot (no GraphBLAS materialization); for a small source set over
       a stale snapshot it skips the gate and reads per-source LMDB adjacency.
       The background rebuild after `REBUILD_THRESHOLD` writes is a compaction safety net, not the freshness path; callers needing a guaranteed fresh
-      CSR
-      view still call `rebuild_csr`. Point adjacency lookups (`out_neighbors`, `in_neighbors`, `all_neighbors`) read the `out_adj` and `in_adj` stores
-      directly through the transaction, never the snapshot, so they always reflect committed and in-transaction writes.
+      CSR view still call `rebuild_csr`. Point adjacency lookups (`out_neighbors`, `in_neighbors`, `all_neighbors`) read the `out_adj` and `in_adj` stores directly through the transaction, never the snapshot, so they always reflect committed and in-transaction writes.
 - `Storage::open` is the only entry point for LMDB. Do not call `heed::EnvOpenOptions` from outside `crates/issundb-core/src/storage/lmdb.rs`.
 - Heavy dependencies are tracked in the workspace `Cargo.toml`. `usearch` and `chumsky` are active, non-optional dependencies. GraphBLAS is reached
   through the in-house permissive crates `issundb-graphblas` and `issundb-graphblas-sys`. Building requires the submodule

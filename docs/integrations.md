@@ -141,7 +141,7 @@ cargo run -p issundb-mcp -- --db-path /path/to/db-dir --transport stdio
 
 #### Streamable HTTP Transport
 
-For remote connections, we can serve over streamable HTTP:
+For remote connections, serve over streamable HTTP:
 
 ```bash
 cargo run -p issundb-mcp -- --db-path /path/to/db-dir --transport http --bind 127.0.0.1:8000
@@ -156,7 +156,7 @@ The server registers the following tools with the connecting client:
 3. `cypher_query`: Execute a Cypher query with optional parameter bindings. `CREATE`, `SET`, `REMOVE`, `DELETE`, and `MERGE` statements can be used to mutate the graph.
 4. `explain`: Return the physical query plan for a Cypher query as an indented tree.
 5. `text_search`: Full-text search over indexed node properties; returns ranked hits.
-6. `vector_search`: Nearest-neighbor vector search; returns the $k$ closest nodes by distance (supporting label and property filtering).
+6. `vector_search`: Nearest-neighbor vector search; returns the k closest nodes by distance (supporting label and property filtering).
 7. `retrieve_hybrid`: Run a hybrid retrieval query that combines vector/semantic search, full-text keyword search, and relationship expansion.
 
 ### Client Configurations

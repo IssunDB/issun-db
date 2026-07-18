@@ -45,6 +45,7 @@ The REPL supports meta commands (prefixed with `:`) to manage the session, take 
 | `:open`           | `:open /path/to/db [map_size_gb]`               | Open or reopen a database at the specified directory; the map size defaults to the launch `--map-size-gb` value.          |
 | `:close`          | `:close`                                        | Close the open database without exiting the CLI.                                                                          |
 | `:run`            | `:run /path/to/script.cypher`                   | Execute a script file; meta and data commands are one line each, and a Cypher statement may span lines and ends with `;`. |
+| `:!`              | `:! ls -la`                                     | Run a shell command from the REPL (alias `:shell`); rejected inside a script file.                                        |
 | `:save`           | `:save /path/to/output.txt`                     | Direct the output of the next query to a file.                                                                            |
 | `:params`         | `:params`                                       | List all current query parameters.                                                                                        |
 | `:set`            | `:set limit 10`                                 | Set a query parameter value (JSON or string).                                                                             |
@@ -88,7 +89,7 @@ The REPL also supports direct operations and queries to manipulate nodes and edg
 | `rebuild-csr`         | Rebuild the in-memory CSR snapshot cache.                                                          |
 | `upsert-vec`          | Attach/upsert a vector embedding on a node (e.g., `upsert-vec 1 0.1 0.2 0.3`).                     |
 | `remove-vec`          | Remove the vector embedding from a node (e.g., `remove-vec 1`).                                    |
-| `vsearch`             | Query the vector index for $k$-nearest neighbors (e.g., `vsearch 5 0.1 0.2 0.3`).                  |
+| `vsearch`             | Query the vector index for k-nearest neighbors (e.g., `vsearch 5 0.1 0.2 0.3`).                    |
 | `retrieve`            | Execute hybrid retrieval over vector and text indexes (e.g., `retrieve 5 2 0.1 0.2 --text query`). |
 | `configure-vec`       | Configure vector index metric and quantization (e.g., `configure-vec cosine int8`).                |
 | `text-index`          | Configure and manage full-text indexes (e.g., `text-index create Book title`).                     |
@@ -103,8 +104,8 @@ To use IssunDB as an embedded database in a Rust project, add the `issundb` libr
 
 ```toml
 [dependencies]
-issundb = "0.1.0"   # Or specify the exact version we are targeting
-serde_json = "1.0"   # Used to construct property maps
+issundb = "0.1.0-alpha.15"   # Match the version published on crates.io
+serde_json = "1.0"           # Used to construct property maps
 ```
 
 Alternatively, point to a local workspace path:
