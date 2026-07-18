@@ -131,9 +131,9 @@ Pathfinding, network centrality, and connectivity algorithms are executed using 
 ### Traversal and Paths
 
 - `bfs(start: NodeId, hops: u8) -> Result<Vec<NodeId>, Error>`  
-  Runs a Breadth-First Search traversal outward from the start node up to the specified depth.
+  Runs a breadth-first search traversal outward from the start node up to the specified depth.
 - `dfs(start: NodeId, hops: u8) -> Result<Vec<NodeId>, Error>`  
-  Runs a Depth-First Search traversal from the start node up to the specified depth.
+  Runs a depth-first search traversal from the start node up to the specified depth.
 - `shortest_path(src: NodeId, dst: NodeId) -> Result<Option<Vec<NodeId>>, Error>`  
   Finds the shortest unweighted path between two nodes in the graph.
 - `shortest_path_dijkstra(src: NodeId, dst: NodeId) -> Result<Option<WeightedPath>, Error>`  
@@ -204,7 +204,7 @@ The index is configured through `VectorIndexOptions`, which holds a `VectorMetri
 
 ---
 
-## Full-Text Search Extensions
+## Full-text Search Extensions
 
 The `TextIndexExt` and `TextGraphExt` traits enable creating, configuring, and querying full-text search indexes on node properties.
 

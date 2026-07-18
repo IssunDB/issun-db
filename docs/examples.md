@@ -55,7 +55,7 @@ LIMIT 10
 
 When a query uses an ascending `ORDER BY vector_dist(node, query)` with a `LIMIT` over a labeled scan, the query planner uses a single HNSW index search instead of calculating distances for every node. It also pushes equality `WHERE` predicates (such as `p.language = 'English'`) into the index traversal as a pre-filter. Other query forms (such as descending order or a non-constant query vector) fall back to exact evaluation over the row pipeline.
 
-## Full-Text Search Example
+## Full-text Search Example
 
 The following Rust example demonstrates configuring and querying a full-text search index on specific node properties:
 

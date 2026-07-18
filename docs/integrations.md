@@ -24,7 +24,7 @@ All data and query endpoints are prefixed with `/v1`.
 
 #### Node Operations
 
-* Create Node: `POST /v1/nodes`
+* Create node: `POST /v1/nodes`
     * Request body:
       ```json
       {
@@ -33,25 +33,25 @@ All data and query endpoints are prefixed with `/v1`.
       }
       ```
     * Response: Returns the generated `NodeId` wrapped in a JSON object, e.g., `{"id": 1}`.
-* Get Node: `GET /v1/nodes/:id`
+* Get node: `GET /v1/nodes/:id`
     * Response: A JSON object containing the node's unique ID, labels, and properties.
-* Update Node: `PUT /v1/nodes/:id`
+* Update node: `PUT /v1/nodes/:id`
     * Request body:
       ```json
       {
         "props": { "name": "Bob", "age": 32 }
       }
       ```
-* Delete Node: `DELETE /v1/nodes/:id`
+* Delete node: `DELETE /v1/nodes/:id`
     * Response: `204 No Content` on successful removal.
-* Add Label: `POST /v1/nodes/:id/labels/:label`
+* Add label: `POST /v1/nodes/:id/labels/:label`
     * Response: `204 No Content`; returns `404 Not Found` when the node does not exist.
-* Remove Label: `DELETE /v1/nodes/:id/labels/:label`
+* Remove label: `DELETE /v1/nodes/:id/labels/:label`
     * Response: `204 No Content` (label removal is idempotent).
 
 #### Edge Operations
 
-* Create Edge: `POST /v1/edges`
+* Create edge: `POST /v1/edges`
     * Request body:
       ```json
       {
@@ -62,9 +62,9 @@ All data and query endpoints are prefixed with `/v1`.
       }
       ```
     * Response: Returns the generated `EdgeId` wrapped in a JSON object, e.g., `{"id": 1}`.
-* Get Edge: `GET /v1/edges/:id`
+* Get edge: `GET /v1/edges/:id`
     * Response: A JSON object containing the edge's unique ID, source/destination node IDs, type, and properties.
-* Update Edge: `PUT /v1/edges/:id`
+* Update edge: `PUT /v1/edges/:id`
     * Request body:
       ```json
       {
@@ -72,12 +72,12 @@ All data and query endpoints are prefixed with `/v1`.
       }
       ```
     * Response: `204 No Content`; returns `404 Not Found` when the edge does not exist.
-* Delete Edge: `DELETE /v1/edges/:id`
+* Delete edge: `DELETE /v1/edges/:id`
     * Response: `204 No Content` upon successful removal.
 
 #### Search and Query Operations
 
-* Cypher Query: `POST /v1/query`
+* Cypher query: `POST /v1/query`
     * Request body:
       ```json
       {
@@ -86,7 +86,7 @@ All data and query endpoints are prefixed with `/v1`.
       }
       ```
     * Response: Returns a results table containing the records and projected column names.
-* Explain Plan: `POST /v1/explain`
+* Explain plan: `POST /v1/explain`
     * Request body:
       ```json
       {
@@ -94,7 +94,7 @@ All data and query endpoints are prefixed with `/v1`.
       }
       ```
     * Response: An indented, human-readable execution plan tree.
-* Full-Text Search: `POST /v1/search/text`
+* Full-text search: `POST /v1/search/text`
     * Request body:
       ```json
       {
@@ -104,7 +104,7 @@ All data and query endpoints are prefixed with `/v1`.
         "limit": 10
       }
       ```
-* Vector Search: `POST /v1/search/vector`
+* Vector search: `POST /v1/search/vector`
     * Request body:
       ```json
       {
@@ -116,7 +116,7 @@ All data and query endpoints are prefixed with `/v1`.
 
 #### Vector and Retrieval Operations
 
-* Upsert Vector: `POST /v1/vectors`
+* Upsert vector: `POST /v1/vectors`
     * Request body:
       ```json
       {
@@ -125,9 +125,9 @@ All data and query endpoints are prefixed with `/v1`.
       }
       ```
     * Response: Returns the node ID wrapped in a JSON object; an empty vector returns `400 Bad Request`.
-* Delete Vector: `DELETE /v1/vectors/:id`
+* Delete vector: `DELETE /v1/vectors/:id`
     * Response: `204 No Content`; removes the embedding from the index and storage.
-* Hybrid Retrieval: `POST /v1/retrieve`
+* Hybrid retrieval: `POST /v1/retrieve`
     * Request body (all fields are optional; provide a vector, a text query, or both to produce seed nodes):
       ```json
       {
@@ -158,7 +158,7 @@ All data and query endpoints are prefixed with `/v1`.
 
 The server automatically publishes a machine-readable OpenAPI 3.1 document generated from the route handlers to match the live API. This document can be used to generate typed clients or browse request and response schemas.
 
-* OpenAPI Document: `GET /v1/openapi.json`
+* OpenAPI document: `GET /v1/openapi.json`
 * Interactive Scalar UI: `GET /v1/docs`
 
 The Scalar UI loads its front-end assets from a CDN, meaning the documentation page needs outbound network access to render; the `GET /v1/openapi.json` document itself is fully self-contained and works offline.

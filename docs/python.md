@@ -97,7 +97,7 @@ for hit in results:
 
 ---
 
-## Full-Text Search
+## Full-text Search
 
 BM25 full-text indexes can be configured and queried to search unstructured text fields:
 

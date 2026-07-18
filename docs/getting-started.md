@@ -6,9 +6,9 @@ This guide covers compiling, configuring, and querying IssunDB. It explains prer
 
 Compiling IssunDB and its native dependencies requires Rust 1.85.0 or later, along with the following system tools:
 
-- Build Tools: CMake and a C/C++ compiler (such as Clang or GCC) to compile the SuiteSparse:GraphBLAS static library.
-- FFI Bindings: `libclang`, which `bindgen` uses to build the raw GraphBLAS wrappers.
-- OpenMP Runtime: This resolves to `libgomp` (bundled with GCC) on Linux, `libomp` on macOS (`brew install libomp`), and `vcomp` (part of the MSVC
+- Build tools: CMake and a C/C++ compiler (such as Clang or GCC) to compile the SuiteSparse:GraphBLAS static library.
+- FFI bindings: `libclang`, which `bindgen` uses to build the raw GraphBLAS wrappers.
+- OpenMP runtime: This resolves to `libgomp` (bundled with GCC) on Linux, `libomp` on macOS (`brew install libomp`), and `vcomp` (part of the MSVC
   runtime) on Windows.
 
 ## Build from Source
@@ -87,8 +87,8 @@ The REPL also supports direct operations and queries to manipulate nodes and edg
 | `label`               | Find nodes carrying a specific label (e.g., `label Person`).                                       |
 | `etype`               | Find relationships of a specific type (e.g., `etype KNOWS`).                                       |
 | `stats`               | Display node and relationship count statistics.                                                    |
-| `bfs`                 | Run a Breadth-First Search traversal (e.g., `bfs 1 3`).                                            |
-| `dfs`                 | Run a Depth-First Search traversal (e.g., `dfs 1 3`).                                              |
+| `bfs`                 | Run a breadth-first search traversal (e.g., `bfs 1 3`).                                            |
+| `dfs`                 | Run a depth-first search traversal (e.g., `dfs 1 3`).                                              |
 | `path`                | Find the shortest unweighted path between two nodes (e.g., `path 1 2`).                            |
 | `wpath`               | Find the shortest weighted path between two nodes (e.g., `wpath 1 2`).                             |
 | `pagerank`            | Compute PageRank centrality scores (e.g., `pagerank 20 0.85`).                                     |
