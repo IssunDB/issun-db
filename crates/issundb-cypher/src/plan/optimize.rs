@@ -128,6 +128,12 @@ impl Optimizer {
         if allow_prune {
             result = Self::prune_unsatisfiable(result, stats);
         }
+        // Fuse each directed `MultiwayJoin` with the directed single-hop
+        // `Expand` that binds its closing-source variable, so the executor
+        // intersects the two adjacency lists per row instead of materializing
+        // every middle-hop neighbor first. Runs last: the count-lowering and
+        // pruning passes above match the unfused `MultiwayJoin` shape.
+        result = rewrite_expand_intersect(result);
         result
     }
 
@@ -427,6 +433,7 @@ impl Optimizer {
             | t @ PhysicalOperator::PathCount { .. }
             | t @ PhysicalOperator::GroupedDegree { .. }
             | t @ PhysicalOperator::CorrelatedIndexSeek { .. }
+            | t @ PhysicalOperator::ExpandIntersect { .. }
             | t @ PhysicalOperator::VectorTopK { .. } => (t, Vec::new()),
         }
     }
@@ -596,6 +603,7 @@ impl Optimizer {
             | t @ PhysicalOperator::PathCount { .. }
             | t @ PhysicalOperator::GroupedDegree { .. }
             | t @ PhysicalOperator::CorrelatedIndexSeek { .. }
+            | t @ PhysicalOperator::ExpandIntersect { .. }
             | t @ PhysicalOperator::VectorTopK { .. } => t,
         }
     }
@@ -762,6 +770,12 @@ impl Optimizer {
                     })
                     .unwrap_or(1.0);
                 ((input_weight as f64 * selectivity).ceil() as usize).max(1)
+            }
+            // ExpandIntersect is created after reordering, so it is only seen
+            // here inside a re-optimized barrier subtree. Its output is the
+            // closing-edge matches, bounded by the input: weight as the input.
+            PhysicalOperator::ExpandIntersect { input, .. } => {
+                Self::plan_weight_env(input, stats, labels)
             }
         }
     }
@@ -958,7 +972,8 @@ impl Optimizer {
             | PhysicalOperator::Distinct { input, .. }
             | PhysicalOperator::ProcedureCall { input, .. }
             | PhysicalOperator::CorrelatedIndexSeek { input, .. }
-            | PhysicalOperator::MultiwayJoin { input, .. } => Self::plan_has_write(input),
+            | PhysicalOperator::MultiwayJoin { input, .. }
+            | PhysicalOperator::ExpandIntersect { input, .. } => Self::plan_has_write(input),
             PhysicalOperator::HashJoin { left, right } => {
                 Self::plan_has_write(left) || Self::plan_has_write(right)
             }
@@ -1022,7 +1037,8 @@ impl Optimizer {
             | PhysicalOperator::WritePart { input, .. }
             | PhysicalOperator::ProcedureCall { input, .. }
             | PhysicalOperator::CorrelatedIndexSeek { input, .. }
-            | PhysicalOperator::MultiwayJoin { input, .. } => {
+            | PhysicalOperator::MultiwayJoin { input, .. }
+            | PhysicalOperator::ExpandIntersect { input, .. } => {
                 Self::collect_label_constraints(input, out)
             }
             PhysicalOperator::HashJoin { left, right } => {
@@ -1247,6 +1263,33 @@ impl Optimizer {
                 closing_rel_var,
                 closing_is_incoming,
                 closing_is_undirected,
+                closing_unique_rels,
+            },
+            ExpandIntersect {
+                input,
+                src_var,
+                rel_var,
+                dst_var,
+                rel_type,
+                is_incoming,
+                unique_rels,
+                closing_dst_var,
+                closing_rel_type,
+                closing_rel_var,
+                closing_is_incoming,
+                closing_unique_rels,
+            } => ExpandIntersect {
+                input: Box::new(f(*input)),
+                src_var,
+                rel_var,
+                dst_var,
+                rel_type,
+                is_incoming,
+                unique_rels,
+                closing_dst_var,
+                closing_rel_type,
+                closing_rel_var,
+                closing_is_incoming,
                 closing_unique_rels,
             },
             HashJoin { left, right } => HashJoin {
@@ -1778,6 +1821,7 @@ impl Optimizer {
             | t @ PhysicalOperator::PathCount { .. }
             | t @ PhysicalOperator::GroupedDegree { .. }
             | t @ PhysicalOperator::CorrelatedIndexSeek { .. }
+            | t @ PhysicalOperator::ExpandIntersect { .. }
             | t @ PhysicalOperator::VectorTopK { .. } => t,
         }
     }
@@ -1833,6 +1877,18 @@ impl Optimizer {
                 // filters that reference it may sit above the operator.
                 vars.insert(rel_var.clone());
                 vars.insert(dst_var.clone());
+            }
+            PhysicalOperator::ExpandIntersect {
+                input,
+                rel_var,
+                dst_var,
+                closing_rel_var,
+                ..
+            } => {
+                Self::collect_bound_vars(input, vars);
+                vars.insert(rel_var.clone());
+                vars.insert(dst_var.clone());
+                vars.insert(closing_rel_var.clone());
             }
             PhysicalOperator::Filter { input, .. } => {
                 Self::collect_bound_vars(input, vars);
@@ -3547,6 +3603,100 @@ fn rewrite_closing_expands(op: PhysicalOperator) -> PhysicalOperator {
             closing_unique_rels,
         },
         leaf => leaf,
+    }
+}
+
+/// Fuse a directed `MultiwayJoin` with the directed single-hop `Expand` that
+/// binds its closing-source variable into one `ExpandIntersect` operator.
+///
+/// The unfused pair materializes one row per middle-hop neighbor and then
+/// probes the closing edge per row, so the intermediate row count is the open
+/// path count (the wedge blowup on a skewed graph). The fused operator
+/// intersects the middle-hop adjacency of the source with the closing-hop
+/// adjacency of the already-bound endpoint per input row, iterating the
+/// smaller list, so its work is the intersection bound instead.
+///
+/// Any run of `Filter` operators between the join and the expand is hoisted
+/// above the fused operator: a filter there references only variables that
+/// stay bound, and both it and the closing probe only drop rows, so the
+/// result multiset is unchanged. The rewrite requires a directed closing hop
+/// and a directed, single-hop, non-path-binding expand whose destination is
+/// the closing-source variable; every other shape keeps its `MultiwayJoin`,
+/// so correctness never depends on the fusion.
+fn rewrite_expand_intersect(op: PhysicalOperator) -> PhysicalOperator {
+    let op = Optimizer::map_inputs(op, rewrite_expand_intersect);
+    match op {
+        PhysicalOperator::MultiwayJoin {
+            input,
+            closing_src_var,
+            closing_dst_var,
+            closing_rel_type,
+            closing_rel_var,
+            closing_is_incoming,
+            closing_is_undirected: false,
+            closing_unique_rels,
+        } => {
+            let mut filters = Vec::new();
+            let mut cur = *input;
+            while let PhysicalOperator::Filter { input, expression } = cur {
+                filters.push(expression);
+                cur = *input;
+            }
+            let rebuild = |node: PhysicalOperator, filters: Vec<FilterExpr>| {
+                filters
+                    .into_iter()
+                    .rev()
+                    .fold(node, |input, expression| PhysicalOperator::Filter {
+                        input: Box::new(input),
+                        expression,
+                    })
+            };
+            match cur {
+                PhysicalOperator::Expand {
+                    input: mid_input,
+                    src_var,
+                    rel_var,
+                    dst_var,
+                    rel_type,
+                    is_incoming,
+                    is_undirected: false,
+                    min_hops: 1,
+                    max_hops: 1,
+                    unique_rels,
+                    needs_path: false,
+                    is_var_length: false,
+                } if dst_var == closing_src_var
+                    && Optimizer::bound_vars(&mid_input).contains(&closing_dst_var) =>
+                {
+                    let fused = PhysicalOperator::ExpandIntersect {
+                        input: mid_input,
+                        src_var,
+                        rel_var,
+                        dst_var,
+                        rel_type,
+                        is_incoming,
+                        unique_rels,
+                        closing_dst_var,
+                        closing_rel_type,
+                        closing_rel_var,
+                        closing_is_incoming,
+                        closing_unique_rels,
+                    };
+                    rebuild(fused, filters)
+                }
+                other => PhysicalOperator::MultiwayJoin {
+                    input: Box::new(rebuild(other, filters)),
+                    closing_src_var,
+                    closing_dst_var,
+                    closing_rel_type,
+                    closing_rel_var,
+                    closing_is_incoming,
+                    closing_is_undirected: false,
+                    closing_unique_rels,
+                },
+            }
+        }
+        other => other,
     }
 }
 

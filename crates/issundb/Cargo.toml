@@ -45,3 +45,7 @@ harness = false
 [[bench]]
 name = "profile_triangle"
 harness = false
+
+[[bench]]
+name = "cyclic_enumeration"
+harness = false

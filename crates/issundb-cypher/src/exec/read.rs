@@ -2078,6 +2078,130 @@ fn multiway_join_rows(
     Ok(next_paths)
 }
 
+/// Close an `ExpandIntersect` over one batch of child rows: the fused final
+/// hop and closing probe of a cyclic pattern. The middle-hop adjacency is
+/// bulk-expanded once per distinct `src_var` node and the closing-hop
+/// adjacency once per distinct `closing_dst_var` node; each row then iterates
+/// the smaller of its two neighbor maps and probes the other, so the per-row
+/// work is the intersection bound `min(deg(src), deg(closing_dst))` rather
+/// than the full middle-hop fanout the unfused plan would materialize.
+#[allow(clippy::too_many_arguments)]
+fn expand_intersect_rows(
+    graph: &Graph,
+    child_paths: Vec<SlotRow>,
+    src_var: &str,
+    rel_var: &str,
+    dst_var: &str,
+    rel_type: Option<&str>,
+    is_incoming: bool,
+    unique_rels: &[String],
+    closing_dst_var: &str,
+    closing_rel_type: Option<&str>,
+    closing_rel_var: &str,
+    closing_is_incoming: bool,
+    closing_unique_rels: &[String],
+) -> Result<Vec<SlotRow>, String> {
+    if child_paths.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let collect_nodes = |var: &str| {
+        let mut nodes: Vec<NodeId> = child_paths
+            .iter()
+            .filter_map(|p| match p.get_binding(var) {
+                Some(GraphBinding::Node(n)) => Some(*n),
+                _ => None,
+            })
+            .collect();
+        nodes.sort_unstable();
+        nodes.dedup();
+        nodes
+    };
+    let src_nodes = collect_nodes(src_var);
+    let close_nodes = collect_nodes(closing_dst_var);
+
+    // Adjacency keyed node -> (neighbor -> edges). Parallel edges between the
+    // same pair are distinct matches, so the values are lists.
+    let build_map = |transitions: Vec<(NodeId, EdgeId, NodeId)>| {
+        let mut map: ahash::AHashMap<NodeId, ahash::AHashMap<NodeId, Vec<EdgeId>>> =
+            ahash::AHashMap::new();
+        for (src, eid, dst) in transitions {
+            map.entry(src)
+                .or_default()
+                .entry(dst)
+                .or_default()
+                .push(eid);
+        }
+        map
+    };
+    let mid_map = build_map(expand_multi_type(graph, &src_nodes, rel_type, is_incoming)?);
+    // The closing hop is traversed from the bound endpoint, so the direction
+    // flips: an edge the pattern writes as leaving `dst_var`
+    // (`closing_is_incoming` false) is incoming at `closing_dst_var`.
+    let close_map = build_map(expand_multi_type(
+        graph,
+        &close_nodes,
+        closing_rel_type,
+        !closing_is_incoming,
+    )?);
+
+    // The middle edge is chosen in the same emission as the closing edge, so a
+    // uniqueness constraint between the two cannot be checked against the row.
+    let closing_must_differ_from_mid = closing_unique_rels.iter().any(|r| r == rel_var);
+
+    let mut next_paths = Vec::new();
+    for path in child_paths {
+        let src = match path.get_binding(src_var) {
+            Some(GraphBinding::Node(n)) => *n,
+            _ => continue,
+        };
+        let closing_dst = match path.get_binding(closing_dst_var) {
+            Some(GraphBinding::Node(n)) => *n,
+            _ => continue,
+        };
+        let (Some(mids), Some(closes)) = (mid_map.get(&src), close_map.get(&closing_dst)) else {
+            continue;
+        };
+        // Iterate the smaller neighbor map and probe the other: the run-time
+        // cover choice that keeps the per-row work at the intersection bound.
+        let mids_outer = mids.len() <= closes.len();
+        let (outer, inner) = if mids_outer {
+            (mids, closes)
+        } else {
+            (closes, mids)
+        };
+        for (candidate, outer_edges) in outer {
+            let Some(inner_edges) = inner.get(candidate) else {
+                continue;
+            };
+            let (mid_edges, close_edges) = if mids_outer {
+                (outer_edges, inner_edges)
+            } else {
+                (inner_edges, outer_edges)
+            };
+            for &mid_eid in mid_edges {
+                if edge_bound_to_sibling_rel(&path, unique_rels, mid_eid) {
+                    continue;
+                }
+                for &close_eid in close_edges {
+                    if closing_must_differ_from_mid && close_eid == mid_eid {
+                        continue;
+                    }
+                    if edge_bound_to_sibling_rel(&path, closing_unique_rels, close_eid) {
+                        continue;
+                    }
+                    let mut new_path = path.clone();
+                    new_path.bind_local(dst_var, GraphBinding::Node(*candidate));
+                    new_path.bind_local(rel_var, GraphBinding::Edge(mid_eid));
+                    new_path.bind_local(closing_rel_var, GraphBinding::Edge(close_eid));
+                    next_paths.push(new_path);
+                }
+            }
+        }
+    }
+    Ok(next_paths)
+}
+
 /// One hop of a fused linear expand chain. `src_var` is the node the hop starts
 /// from (bound by the base or an earlier hop), and the hop binds `rel_var` to the
 /// traversed edge and `dst_var` to the reached node.
@@ -2470,6 +2594,24 @@ enum RowStream {
         closing_unique_rels: Vec<String>,
         buf: std::collections::VecDeque<SlotRow>,
     },
+    /// The fused closing intersection whose input streams. Each input batch is
+    /// closed via `expand_intersect_rows`, so an upstream `LIMIT` stops the
+    /// input scan/expansion early.
+    ExpandIntersect {
+        input: Box<RowStream>,
+        src_var: String,
+        rel_var: String,
+        dst_var: String,
+        rel_type: Option<String>,
+        is_incoming: bool,
+        unique_rels: Vec<String>,
+        closing_dst_var: String,
+        closing_rel_type: Option<String>,
+        closing_rel_var: String,
+        closing_is_incoming: bool,
+        closing_unique_rels: Vec<String>,
+        buf: std::collections::VecDeque<SlotRow>,
+    },
     /// Fused linear chain of single-hop directed Expands: the streaming form of
     /// the `execute_expand_chain_n` fast path. Each input batch is threaded
     /// through all hops at once; overflow beyond `STREAM_BATCH` is buffered.
@@ -2771,6 +2913,34 @@ fn build_stream_with_sip(
             closing_rel_var: closing_rel_var.clone(),
             closing_is_incoming: *closing_is_incoming,
             closing_is_undirected: *closing_is_undirected,
+            closing_unique_rels: closing_unique_rels.clone(),
+            buf: std::collections::VecDeque::new(),
+        },
+        PhysicalOperator::ExpandIntersect {
+            input,
+            src_var,
+            rel_var,
+            dst_var,
+            rel_type,
+            is_incoming,
+            unique_rels,
+            closing_dst_var,
+            closing_rel_type,
+            closing_rel_var,
+            closing_is_incoming,
+            closing_unique_rels,
+        } => RowStream::ExpandIntersect {
+            input: Box::new(build_stream_with_sip(input, sip)),
+            src_var: src_var.clone(),
+            rel_var: rel_var.clone(),
+            dst_var: dst_var.clone(),
+            rel_type: rel_type.clone(),
+            is_incoming: *is_incoming,
+            unique_rels: unique_rels.clone(),
+            closing_dst_var: closing_dst_var.clone(),
+            closing_rel_type: closing_rel_type.clone(),
+            closing_rel_var: closing_rel_var.clone(),
+            closing_is_incoming: *closing_is_incoming,
             closing_unique_rels: closing_unique_rels.clone(),
             buf: std::collections::VecDeque::new(),
         },
@@ -3097,6 +3267,46 @@ impl RowStream {
                     closing_rel_var,
                     *closing_is_incoming,
                     *closing_is_undirected,
+                    closing_unique_rels,
+                )?;
+                buf.extend(rows);
+            },
+            RowStream::ExpandIntersect {
+                input,
+                src_var,
+                rel_var,
+                dst_var,
+                rel_type,
+                is_incoming,
+                unique_rels,
+                closing_dst_var,
+                closing_rel_type,
+                closing_rel_var,
+                closing_is_incoming,
+                closing_unique_rels,
+                buf,
+            } => loop {
+                if !buf.is_empty() {
+                    let take = buf.len().min(STREAM_BATCH);
+                    return Ok(buf.drain(..take).collect());
+                }
+                let batch = input.next_batch(graph, params, schema)?;
+                if batch.is_empty() {
+                    return Ok(vec![]);
+                }
+                let rows = expand_intersect_rows(
+                    graph,
+                    batch,
+                    src_var,
+                    rel_var,
+                    dst_var,
+                    rel_type.as_deref(),
+                    *is_incoming,
+                    unique_rels,
+                    closing_dst_var,
+                    closing_rel_type.as_deref(),
+                    closing_rel_var,
+                    *closing_is_incoming,
                     closing_unique_rels,
                 )?;
                 buf.extend(rows);
@@ -4882,12 +5092,215 @@ mod stream_join_tests {
     #[test]
     fn streaming_directed_multiway_join_matches_materialized() {
         let (_dir, graph) = triangle_graph();
+        // A directed closing hop over a directed final expand fuses into the
+        // closing intersection; the streamed result must still match.
         assert_streaming_matches(
             &graph,
             "MATCH (a:N)-[:R]->(b)-[:R]->(c)-[:R]->(a) \
              RETURN a.name AS a, b.name AS b, c.name AS c",
-            "MultiwayJoin",
+            "ExpandIntersect",
         );
+    }
+
+    fn plan_display(graph: &Graph, cypher: &str) -> String {
+        format_physical_plan(&optimized_plan(graph, cypher), 0)
+    }
+
+    /// Exact result multiset for the fused closing intersection, hand-computed
+    /// on a fixture with a parallel middle edge and an open wedge. Each
+    /// rotation of the triangle traverses the doubled `y -> z` edge in a
+    /// different hop position (chain, middle, and closing), so every rotation
+    /// emits twice and the wedge emits nothing.
+    #[test]
+    fn expand_intersect_triangle_rows_exact() {
+        let (_dir, graph) = setup();
+        exec(
+            &graph,
+            "CREATE (x:N {name: 'x'}), (y:N {name: 'y'}), (z:N {name: 'z'}), \
+             (u:N {name: 'u'}), (v:N {name: 'v'}), (w:N {name: 'w'}) \
+             CREATE (x)-[:R]->(y), (y)-[:R]->(z), (y)-[:R]->(z), (z)-[:R]->(x) \
+             CREATE (u)-[:R]->(v), (v)-[:R]->(w)",
+        );
+        graph.rebuild_csr().unwrap();
+        let cypher = "MATCH (a:N)-[:R]->(b)-[:R]->(c)-[:R]->(a) \
+                      RETURN a.name AS a, b.name AS b, c.name AS c";
+        assert!(
+            plan_display(&graph, cypher).contains("ExpandIntersect"),
+            "triangle plan did not fuse:\n{}",
+            plan_display(&graph, cypher)
+        );
+        let rows = run_rows(&graph, cypher);
+        let expected: Vec<Row> = [
+            ["x", "y", "z"],
+            ["x", "y", "z"],
+            ["y", "z", "x"],
+            ["y", "z", "x"],
+            ["z", "x", "y"],
+            ["z", "x", "y"],
+        ]
+        .iter()
+        .map(|r| r.iter().map(|s| serde_json::json!(s)).collect())
+        .collect();
+        assert_eq!(sorted_rows(&rows), sorted_rows(&expected));
+    }
+
+    /// Relationship uniqueness inside the fused operator: a 2-cycle pattern
+    /// binds both of its edges there, so they must be distinct. A single
+    /// self-loop offers only one edge and must not match; a reciprocal pair
+    /// matches in both rotations, and the two bound edges are never the same.
+    #[test]
+    fn expand_intersect_two_cycle_uniqueness() {
+        let (_dir, graph) = setup();
+        exec(
+            &graph,
+            "CREATE (s:N {name: 's'}), (p:N {name: 'p'}), (q:N {name: 'q'}) \
+             CREATE (s)-[:R]->(s), (p)-[:R]->(q), (q)-[:R]->(p)",
+        );
+        graph.rebuild_csr().unwrap();
+        let cypher = "MATCH (a:N)-[:R]->(b)-[:R]->(a) RETURN a.name AS a, b.name AS b";
+        assert!(
+            plan_display(&graph, cypher).contains("ExpandIntersect"),
+            "2-cycle plan did not fuse:\n{}",
+            plan_display(&graph, cypher)
+        );
+        let rows = run_rows(&graph, cypher);
+        let expected: Vec<Row> = [["p", "q"], ["q", "p"]]
+            .iter()
+            .map(|r| r.iter().map(|s| serde_json::json!(s)).collect())
+            .collect();
+        assert_eq!(sorted_rows(&rows), sorted_rows(&expected));
+
+        // Both edge variables bind real, distinct relationships.
+        let ids = run_rows(
+            &graph,
+            "MATCH (a:N)-[r1:R]->(b)-[r2:R]->(a) RETURN id(r1) = id(r2) AS same",
+        );
+        assert_eq!(ids.len(), 2);
+        assert!(ids.iter().all(|r| r[0] == serde_json::json!(false)));
+    }
+
+    /// Both hop directions route through the fusion: a closing hop written
+    /// `(c)<-[:R]-(a)` closes with an edge from the bound node, and a middle
+    /// hop written `(b)<-[:R]-(c)` expands over incoming adjacency.
+    #[test]
+    fn expand_intersect_incoming_hops_exact() {
+        let (_dir, graph) = setup();
+        exec(
+            &graph,
+            "CREATE (x:N {name: 'x'}), (y:N {name: 'y'}), (z:N {name: 'z'}) \
+             CREATE (x)-[:R]->(y), (x)-[:R]->(z), (y)-[:R]->(z)",
+        );
+        graph.rebuild_csr().unwrap();
+
+        // Needs x -> y, y -> z, and x -> z: only (x, y, z).
+        let closing_incoming = "MATCH (a:N)-[:R]->(b)-[:R]->(c)<-[:R]-(a) \
+                                RETURN a.name AS a, b.name AS b, c.name AS c";
+        assert!(
+            plan_display(&graph, closing_incoming).contains("ExpandIntersect"),
+            "closing-incoming plan did not fuse:\n{}",
+            plan_display(&graph, closing_incoming)
+        );
+        let rows = run_rows(&graph, closing_incoming);
+        let expected: Vec<Row> = vec![vec![
+            serde_json::json!("x"),
+            serde_json::json!("y"),
+            serde_json::json!("z"),
+        ]];
+        assert_eq!(sorted_rows(&rows), sorted_rows(&expected));
+
+        // Needs a -> b, c -> b, and c -> a: only (y, z, x).
+        let middle_incoming = "MATCH (a:N)-[:R]->(b)<-[:R]-(c)-[:R]->(a) \
+                               RETURN a.name AS a, b.name AS b, c.name AS c";
+        assert!(
+            plan_display(&graph, middle_incoming).contains("ExpandIntersect"),
+            "middle-incoming plan did not fuse:\n{}",
+            plan_display(&graph, middle_incoming)
+        );
+        let rows = run_rows(&graph, middle_incoming);
+        let expected: Vec<Row> = vec![vec![
+            serde_json::json!("y"),
+            serde_json::json!("z"),
+            serde_json::json!("x"),
+        ]];
+        assert_eq!(sorted_rows(&rows), sorted_rows(&expected));
+    }
+
+    /// A label filter between the closing join and the middle hop is hoisted
+    /// above the fused operator, not lost: only the triangle whose middle
+    /// destination carries the label survives.
+    #[test]
+    fn expand_intersect_hoists_dst_label_filter() {
+        let (_dir, graph) = setup();
+        exec(
+            &graph,
+            "CREATE (x:N {name: 'x'}), (y:N {name: 'y'}), (z:N:Q {name: 'z'}), \
+             (u:N {name: 'u'}), (v:N {name: 'v'}), (w:N {name: 'w'}) \
+             CREATE (x)-[:R]->(y), (y)-[:R]->(z), (z)-[:R]->(x) \
+             CREATE (u)-[:R]->(v), (v)-[:R]->(w), (w)-[:R]->(u)",
+        );
+        graph.rebuild_csr().unwrap();
+        let cypher = "MATCH (a:N)-[:R]->(b)-[:R]->(c:Q)-[:R]->(a) \
+                      RETURN a.name AS a, b.name AS b, c.name AS c";
+        assert!(
+            plan_display(&graph, cypher).contains("ExpandIntersect"),
+            "labeled triangle plan did not fuse:\n{}",
+            plan_display(&graph, cypher)
+        );
+        let rows = run_rows(&graph, cypher);
+        let expected: Vec<Row> = vec![vec![
+            serde_json::json!("x"),
+            serde_json::json!("y"),
+            serde_json::json!("z"),
+        ]];
+        assert_eq!(sorted_rows(&rows), sorted_rows(&expected));
+    }
+
+    /// Shapes the fusion must not claim: an undirected closing hop keeps the
+    /// dual-direction `MultiwayJoin`, and a named-path pattern keeps its plain
+    /// closing expand.
+    #[test]
+    fn expand_intersect_fallback_shapes() {
+        let (_dir, graph) = triangle_graph();
+        let undirected = plan_display(
+            &graph,
+            "MATCH (a:N)-[:R]->(b)-[:R]->(c)-[:R]-(a) \
+             RETURN a.name AS a, b.name AS b, c.name AS c",
+        );
+        assert!(
+            undirected.contains("MultiwayJoin") && !undirected.contains("ExpandIntersect"),
+            "undirected closing hop must keep MultiwayJoin:\n{undirected}"
+        );
+        let named_path = plan_display(
+            &graph,
+            "MATCH p = (a:N)-[:R]->(b)-[:R]->(c)-[:R]->(a) RETURN length(p) AS l",
+        );
+        assert!(
+            !named_path.contains("ExpandIntersect"),
+            "named-path pattern must not fuse:\n{named_path}"
+        );
+    }
+
+    /// A middle hop whose destination is constrained by an earlier pattern
+    /// part must keep that constraint: `c` is pinned to `q` by the `S` hop,
+    /// and `q` is in no triangle, so the result is empty. The planner meets
+    /// the two parts at a `HashJoin` on `c`, so the fused operator's subtree
+    /// binds `c` fresh; a fusion over a pre-bound `dst_var` would instead
+    /// rebind it freely and emit the `x, y, z` triangle.
+    #[test]
+    fn expand_intersect_prebound_dst_constraint() {
+        let (_dir, graph) = setup();
+        exec(
+            &graph,
+            "CREATE (m:M {name: 'm'}), (x:N {name: 'x'}), (y:N {name: 'y'}), \
+             (z:N {name: 'z'}), (q:N {name: 'q'}) \
+             CREATE (x)-[:R]->(y), (y)-[:R]->(z), (z)-[:R]->(x) \
+             CREATE (m)-[:S]->(q)",
+        );
+        graph.rebuild_csr().unwrap();
+        let cypher = "MATCH (m:M)-[:S]->(c), (a:N)-[:R]->(b)-[:R]->(c)-[:R]->(a) \
+                      RETURN a.name AS a, b.name AS b, c.name AS c";
+        let rows = run_rows(&graph, cypher);
+        assert!(rows.is_empty(), "expected no rows, got {rows:?}");
     }
 
     #[test]
@@ -5156,10 +5569,11 @@ mod triangle_count_exec_tests {
         );
         assert_eq!(count_result(&graph, KERNEL_Q), 3);
 
-        // The forced row path keeps the MultiwayJoin pipeline and agrees.
+        // The forced row path keeps the row pipeline (its closing join fuses
+        // into the closing intersection) and agrees.
         let row_plan = plan_text(&graph, ROW_Q);
         assert!(
-            !row_plan.contains("TriangleCount") && row_plan.contains("MultiwayJoin"),
+            !row_plan.contains("TriangleCount") && row_plan.contains("ExpandIntersect"),
             "forcing predicate failed to disable the rewrite:\n{row_plan}"
         );
         assert_eq!(count_result(&graph, ROW_Q), 3);

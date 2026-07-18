@@ -122,6 +122,20 @@ impl SlotSchema {
                 self.collect(input);
                 self.bind(variable);
             }
+            ExpandIntersect {
+                input,
+                src_var,
+                rel_var,
+                dst_var,
+                closing_rel_var,
+                ..
+            } => {
+                self.collect(input);
+                self.bind(src_var);
+                self.bind(rel_var);
+                self.bind(dst_var);
+                self.bind(closing_rel_var);
+            }
             Filter { input, .. } => self.collect(input),
             Project { input, items, .. } => {
                 self.collect(input);

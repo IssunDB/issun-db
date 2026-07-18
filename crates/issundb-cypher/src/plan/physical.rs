@@ -181,6 +181,46 @@ pub enum PhysicalOperator {
         /// relationship uniqueness).
         closing_unique_rels: Vec<String>,
     },
+    /// Fused final hop and closing probe of a cyclic pattern: the directed
+    /// single hop `src_var -[rel_var]- dst_var` and the closing edge
+    /// `dst_var -[closing_rel_var]- closing_dst_var` evaluated together.
+    ///
+    /// Emitted by the optimizer when a directed `MultiwayJoin` sits directly
+    /// on the directed single-hop `Expand` that binds its closing-source
+    /// variable. Instead of materializing one row per middle-hop neighbor and
+    /// probing the closing edge afterwards (which enumerates every open path,
+    /// the wedge blowup on a skewed graph), the executor intersects the two
+    /// adjacency lists per input row, iterating the smaller list and probing
+    /// the other, so the work per row is the intersection bound
+    /// `min(deg(src_var), deg(closing_dst_var))`.
+    ExpandIntersect {
+        input: Box<PhysicalOperator>,
+        /// Node the middle hop starts from (bound by the input).
+        src_var: String,
+        /// Variable bound to the middle hop's edge.
+        rel_var: String,
+        /// Newly bound node both hops constrain.
+        dst_var: String,
+        /// Relationship type of the middle hop; `None` matches any type.
+        rel_type: Option<String>,
+        /// Direction of the middle hop: `true` = incoming to `src_var`.
+        is_incoming: bool,
+        /// Sibling relationship variables the middle edge must differ from
+        /// (openCypher relationship uniqueness); all bound in the input row.
+        unique_rels: Vec<String>,
+        /// Already-bound node the closing edge connects `dst_var` to.
+        closing_dst_var: String,
+        /// Relationship type of the closing edge; `None` matches any type.
+        closing_rel_type: Option<String>,
+        /// Variable to bind the closing edge's `EdgeId`.
+        closing_rel_var: String,
+        /// Direction of the closing edge: `true` = incoming to `dst_var`.
+        closing_is_incoming: bool,
+        /// Sibling relationship variables the closing edge must differ from.
+        /// An entry equal to `rel_var` refers to the middle edge chosen in the
+        /// same emission, not to a row binding.
+        closing_unique_rels: Vec<String>,
+    },
     /// Whole-pattern count of the directed triangle cycle
     /// `(a)-[t1]->(b)-[t2]->(c)-[t3]->(a)`, evaluated by the core
     /// sorted-intersect kernel without materializing any rows.
@@ -681,6 +721,30 @@ pub fn format_physical_plan(op: &PhysicalOperator, depth: usize) -> String {
             buf.push_str(&format!(
                 "{}MultiwayJoin ({}{dir}[{closing_rel_var}:{rel}]{dir}{closing_dst_var})\n",
                 pad, closing_src_var
+            ));
+            buf.push_str(&format_physical_plan(input, depth + 1));
+        }
+        PhysicalOperator::ExpandIntersect {
+            input,
+            src_var,
+            rel_var,
+            dst_var,
+            rel_type,
+            is_incoming,
+            closing_dst_var,
+            closing_rel_type,
+            closing_rel_var,
+            closing_is_incoming,
+            ..
+        } => {
+            let arrows = |incoming: bool| if incoming { ("<-", "-") } else { ("-", "->") };
+            let (ml, mr) = arrows(*is_incoming);
+            let (cl, cr) = arrows(*closing_is_incoming);
+            let mid = rel_type.as_deref().unwrap_or("*");
+            let close = closing_rel_type.as_deref().unwrap_or("*");
+            buf.push_str(&format!(
+                "{}ExpandIntersect ({src_var}{ml}[{rel_var}:{mid}]{mr}{dst_var}{cl}[{closing_rel_var}:{close}]{cr}{closing_dst_var})\n",
+                pad
             ));
             buf.push_str(&format_physical_plan(input, depth + 1));
         }
