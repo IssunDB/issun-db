@@ -995,6 +995,14 @@ pub(super) fn eval_arithmetic(
         (serde_json::Value::String(ls), serde_json::Value::String(rs)) if op == '+' => {
             Ok(serde_json::Value::String(format!("{}{}", ls, rs)))
         }
+        // openCypher `+` type table: STRING + INTEGER/FLOAT (either order)
+        // concatenates with the number's string form.
+        (serde_json::Value::String(ls), serde_json::Value::Number(rn)) if op == '+' => {
+            Ok(serde_json::Value::String(format!("{}{}", ls, rn)))
+        }
+        (serde_json::Value::Number(ln), serde_json::Value::String(rs)) if op == '+' => {
+            Ok(serde_json::Value::String(format!("{}{}", ln, rs)))
+        }
         (lv, rv) => Err(format!(
             "TypeError: cannot apply '{}' to {} and {}",
             op, lv, rv
@@ -4951,5 +4959,27 @@ mod arithmetic_tests {
             eval_arithmetic(&json!(i64::MIN), &json!(-1), '%').unwrap(),
             json!(0)
         );
+    }
+
+    /// openCypher defines `+` between a string and a number as concatenation
+    /// with the number's string form, in both operand orders.
+    #[test]
+    fn string_number_concatenation() {
+        assert_eq!(
+            eval_arithmetic(&json!("Age: "), &json!(30), '+').unwrap(),
+            json!("Age: 30")
+        );
+        assert_eq!(
+            eval_arithmetic(&json!(1), &json!("2"), '+').unwrap(),
+            json!("12")
+        );
+        assert_eq!(
+            eval_arithmetic(&json!("x"), &json!(1.5), '+').unwrap(),
+            json!("x1.5")
+        );
+        // Other operators on a string and a number stay errors.
+        assert!(eval_arithmetic(&json!("x"), &json!(1), '-').is_err());
+        // A boolean never concatenates with a string.
+        assert!(eval_arithmetic(&json!("x"), &json!(true), '+').is_err());
     }
 }

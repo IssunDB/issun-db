@@ -91,18 +91,92 @@ fn validate_skip_limit_param(
     Ok(())
 }
 
+/// Substitute runtime values into every non-literal SKIP/LIMIT expression of
+/// the query (the final clause and each WITH clause), validating them first.
+/// The `Limit` operator stores a fixed count computed at plan time, so a
+/// parameter (`SKIP $s`) or a constant expression (`LIMIT toInteger(rand()*9)`,
+/// allowed by openCypher for any expression that does not depend on variables)
+/// must become a literal before planning; without the substitution the planner
+/// would silently treat it as 0. An expression that references a variable
+/// fails here with an evaluation error, matching the openCypher requirement
+/// that SKIP/LIMIT be variable-free. Returns `None` when every SKIP/LIMIT is
+/// already a literal, so the common case avoids the clone.
+fn resolve_skip_limit_params(
+    graph: &Graph,
+    query: &Query,
+    params: &HashMap<String, serde_json::Value>,
+) -> Result<Option<Query>, String> {
+    fn resolve(
+        graph: &Graph,
+        slot: &mut Option<Expr>,
+        keyword: &str,
+        params: &HashMap<String, serde_json::Value>,
+        changed: &mut bool,
+    ) -> Result<(), String> {
+        let Some(expr) = slot else {
+            return Ok(());
+        };
+        // Literals keep their plan-time validation (`validate_skip_limit`).
+        if matches!(expr, Expr::Literal(_)) {
+            return Ok(());
+        }
+        validate_skip_limit_param(expr, keyword, params)?;
+        // Evaluate against an empty binding context: a parameter resolves to
+        // its value, any other constant expression to its result, and an
+        // expression that references a variable fails.
+        let value = evaluate_expr(graph, &super::PathMap::new(), expr, params)?;
+        let n = match &value {
+            serde_json::Value::Number(num) => match num.as_i64() {
+                Some(i) => i,
+                // An integral float (e.g. a parameter passed as `3.0`) is
+                // accepted, matching `validate_skip_limit_param`.
+                None => match num.as_f64() {
+                    Some(f) if f.fract() == 0.0 => f as i64,
+                    _ => {
+                        return Err(format!(
+                            "SyntaxError: {keyword} value must be an integer, not a float"
+                        ));
+                    }
+                },
+            },
+            v => {
+                return Err(format!(
+                    "SyntaxError: {keyword} requires an integer, got {v}"
+                ));
+            }
+        };
+        if n < 0 {
+            return Err(format!(
+                "SyntaxError: {keyword} value must not be negative (got {n})"
+            ));
+        }
+        *slot = Some(Expr::Literal(crate::ast::Literal::Int(n)));
+        *changed = true;
+        Ok(())
+    }
+
+    let mut resolved = query.clone();
+    let mut changed = false;
+    resolve(graph, &mut resolved.skip, "SKIP", params, &mut changed)?;
+    resolve(graph, &mut resolved.limit, "LIMIT", params, &mut changed)?;
+    for part in &mut resolved.parts {
+        if let QueryPart::With { skip, limit, .. } = part {
+            resolve(graph, skip, "SKIP", params, &mut changed)?;
+            resolve(graph, limit, "LIMIT", params, &mut changed)?;
+        }
+    }
+    Ok(changed.then_some(resolved))
+}
+
 pub(super) fn execute_read_query(
     graph: &Graph,
     query: &Query,
     params: &HashMap<String, serde_json::Value>,
 ) -> Result<QueryResult, String> {
-    // Validate parameter-based SKIP/LIMIT at runtime before planning.
-    if let Some(ref skip_expr) = query.skip {
-        validate_skip_limit_param(skip_expr, "SKIP", params)?;
-    }
-    if let Some(ref limit_expr) = query.limit {
-        validate_skip_limit_param(limit_expr, "LIMIT", params)?;
-    }
+    // Validate non-literal SKIP/LIMIT expressions at runtime and substitute
+    // their values before planning.
+    let resolved_query = resolve_skip_limit_params(graph, query, params)?;
+    let query = resolved_query.as_ref().unwrap_or(query);
 
     // 1. Compile query AST into an optimized physical plan
     let logical = LogicalPlanner::plan(query).map_err(|e| e.to_string())?;
@@ -269,9 +343,32 @@ pub(super) fn execute_read_query(
     // and Limit), so the limit caps distinct rows.
     let records = if is_return_star {
         let distinct = query.return_clause.distinct;
+        // For DISTINCT the planner leaves SKIP/LIMIT out of the plan (dedup
+        // happens here, after projection, and openCypher windows distinct
+        // rows), so apply them after deduplication. The expressions are
+        // literal non-negative integers by this point: the planner validated
+        // them and `resolve_skip_limit_params` substituted any parameter.
+        let window_literal = |expr: &Option<Expr>, default: usize| match expr {
+            Some(Expr::Literal(crate::ast::Literal::Int(n))) => (*n).max(0) as usize,
+            _ => default,
+        };
+        let skip_n = if distinct {
+            window_literal(&query.skip, 0)
+        } else {
+            0
+        };
+        let limit_n = if distinct {
+            window_literal(&query.limit, usize::MAX)
+        } else {
+            usize::MAX
+        };
+        let mut skipped = 0usize;
         let mut seen = std::collections::HashSet::new();
         let mut star_records = Vec::with_capacity(resolved_paths.len());
         for path in resolved_paths {
+            if star_records.len() >= limit_n {
+                break;
+            }
             if distinct {
                 let mut row_key = String::new();
                 for key in &columns {
@@ -279,6 +376,10 @@ pub(super) fn execute_read_query(
                     row_key.push_str(&canonical_binding_key(path.get_binding(key)));
                 }
                 if !seen.insert(row_key) {
+                    continue;
+                }
+                if skipped < skip_n {
+                    skipped += 1;
                     continue;
                 }
             }

@@ -483,7 +483,15 @@ impl VectorGraphExt for Graph {
             opts.k
         };
 
-        let hits = if opts.label.is_some() || opts.properties.is_some() {
+        // An empty property map with no label is a vacuous filter set: the
+        // predicate below would accept every candidate, including nodes
+        // deleted through the core API that linger in the HNSW index (the
+        // filtered path relies on its label and property lookups to reject
+        // those ghosts). Route it to the unfiltered path, which drops ghosts
+        // via its liveness backfill.
+        let has_filters =
+            opts.label.is_some() || opts.properties.as_ref().is_some_and(|m| !m.is_empty());
+        let hits = if has_filters {
             // Evaluate the label and property filters during the HNSW traversal via
             // a predicate, so the search keeps expanding until it has `opts.k`
             // matching neighbors instead of post-filtering a fixed over-fetch, which
@@ -838,6 +846,38 @@ mod tests {
         assert!(
             hits.iter().all(|h| h.node != a),
             "deleted node must not appear in vector_search results"
+        );
+        assert!(
+            hits.iter().any(|h| h.node == b),
+            "the surviving node is still searchable"
+        );
+    }
+
+    /// A vacuous filter set (no label, empty property map) must not return
+    /// core-deleted ghosts either: the predicate-filtered path cannot rely on
+    /// its label and property lookups to reject deleted nodes when there are
+    /// no lookups to make. Reachable from the REST and MCP surfaces as
+    /// `"properties": {}` with no label.
+    #[test]
+    fn vector_search_with_empty_filters_excludes_deleted_nodes() {
+        let (_dir, graph) = open_tmp();
+        let a = graph.add_node("N", &json!({})).unwrap();
+        let b = graph.add_node("N", &json!({})).unwrap();
+        graph.upsert_vector(a, &[1.0f32, 0.0, 0.0]).unwrap();
+        graph.upsert_vector(b, &[0.0f32, 1.0, 0.0]).unwrap();
+        graph.delete_node(a).unwrap();
+
+        let opts = VectorSearchOptions {
+            k: 5,
+            properties: Some(std::collections::HashMap::new()),
+            ..Default::default()
+        };
+        let hits = graph
+            .vector_search_with(&[1.0f32, 0.0, 0.0], &opts)
+            .unwrap();
+        assert!(
+            hits.iter().all(|h| h.node != a),
+            "deleted node must not appear under an empty filter set"
         );
         assert!(
             hits.iter().any(|h| h.node == b),

@@ -1240,6 +1240,142 @@ mod tests {
         assert_eq!(count.records[0].values[0], serde_json::json!(1));
     }
 
+    /// A MERGE match must not reuse one relationship for two hops of the
+    /// pattern (openCypher relationship uniqueness). With a single :R
+    /// self-loop, the two-hop pattern has no valid match (it would need two
+    /// distinct edges), so MERGE must create a fresh chain instead of
+    /// reporting a spurious match.
+    #[test]
+    fn merge_match_respects_relationship_uniqueness() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+        execute(&graph, "CREATE (a:A)-[:R]->(a)", &params).unwrap();
+        graph.rebuild_csr().unwrap();
+        execute(&graph, "MATCH (a:A) MERGE (a)-[:R]->(a)-[:R]->(a)", &params).unwrap();
+        graph.rebuild_csr().unwrap();
+        let count = execute(&graph, "MATCH ()-[r:R]->() RETURN count(r) AS c", &params).unwrap();
+        assert_eq!(
+            count.records[0].values[0],
+            serde_json::json!(3),
+            "MERGE must have created a fresh two-hop chain"
+        );
+    }
+
+    /// SKIP and LIMIT accept query parameters: `LIMIT $lim` limits by the
+    /// parameter's value rather than silently planning a zero-row limit, on
+    /// both the final RETURN and a WITH clause.
+    #[test]
+    fn parameterized_skip_and_limit_apply() {
+        let (_dir, graph) = setup_graph();
+        execute(
+            &graph,
+            "UNWIND [1, 2, 3, 4, 5] AS x CREATE (:N {v: x})",
+            &HashMap::new(),
+        )
+        .unwrap();
+        graph.rebuild_csr().unwrap();
+        let mut params = HashMap::new();
+        params.insert("lim".to_string(), serde_json::json!(3));
+        params.insert("s".to_string(), serde_json::json!(2));
+
+        let res = execute(
+            &graph,
+            "MATCH (n:N) RETURN n.v AS v ORDER BY v LIMIT $lim",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(res.records.len(), 3, "LIMIT $lim must limit to 3 rows");
+
+        let res = execute(
+            &graph,
+            "MATCH (n:N) RETURN n.v AS v ORDER BY v SKIP $s LIMIT $lim",
+            &params,
+        )
+        .unwrap();
+        let vals: Vec<_> = res.records.iter().map(|r| r.values[0].clone()).collect();
+        assert_eq!(
+            vals,
+            vec![
+                serde_json::json!(3),
+                serde_json::json!(4),
+                serde_json::json!(5)
+            ],
+            "SKIP $s must skip the first 2 rows"
+        );
+
+        let res = execute(
+            &graph,
+            "MATCH (n:N) WITH n ORDER BY n.v SKIP $s LIMIT $lim RETURN n.v AS v",
+            &params,
+        )
+        .unwrap();
+        let vals: Vec<_> = res.records.iter().map(|r| r.values[0].clone()).collect();
+        assert_eq!(
+            vals,
+            vec![
+                serde_json::json!(3),
+                serde_json::json!(4),
+                serde_json::json!(5)
+            ],
+            "WITH-clause SKIP/LIMIT must honor parameters"
+        );
+    }
+
+    /// `RETURN DISTINCT *` must deduplicate before SKIP and LIMIT, matching
+    /// every other DISTINCT projection: the window applies to distinct rows,
+    /// not to the raw stream.
+    #[test]
+    fn return_distinct_star_dedups_before_skip_and_limit() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+
+        let res = execute(
+            &graph,
+            "UNWIND [1, 1, 2, 2, 3] AS x RETURN DISTINCT * LIMIT 2",
+            &params,
+        )
+        .unwrap();
+        let vals: Vec<_> = res.records.iter().map(|r| r.values[0].clone()).collect();
+        assert_eq!(
+            vals,
+            vec![serde_json::json!(1), serde_json::json!(2)],
+            "LIMIT applies to the deduplicated rows"
+        );
+
+        let res = execute(
+            &graph,
+            "UNWIND [1, 1, 2, 2, 3] AS x RETURN DISTINCT * SKIP 1",
+            &params,
+        )
+        .unwrap();
+        let vals: Vec<_> = res.records.iter().map(|r| r.values[0].clone()).collect();
+        assert_eq!(
+            vals,
+            vec![serde_json::json!(2), serde_json::json!(3)],
+            "SKIP applies to the deduplicated rows"
+        );
+    }
+
+    /// A WITH-clause SKIP or LIMIT is validated like the final clause: a
+    /// negative or non-integer value is a syntax error, not a silent zero.
+    #[test]
+    fn with_clause_skip_limit_is_validated() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+        assert!(
+            execute(&graph, "MATCH (n) WITH n LIMIT -5 RETURN n", &params).is_err(),
+            "negative WITH LIMIT must be rejected"
+        );
+        assert!(
+            execute(&graph, "MATCH (n) WITH n LIMIT 1.5 RETURN n", &params).is_err(),
+            "float WITH LIMIT must be rejected"
+        );
+        assert!(
+            execute(&graph, "MATCH (n) WITH n SKIP -1 RETURN n", &params).is_err(),
+            "negative WITH SKIP must be rejected"
+        );
+    }
+
     /// ON MATCH SET runs when the pattern already exists; ON CREATE SET does not.
     #[test]
     fn merge_on_match_runs_for_existing() {

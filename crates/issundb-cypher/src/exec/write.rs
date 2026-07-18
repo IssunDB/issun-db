@@ -975,15 +975,18 @@ fn merge_match(
             _ => candidate_nodes(graph, &pattern.node.labels, &seed_props)?,
         };
 
-    // Each partial carries the pattern bindings accumulated so far and the
-    // current chain endpoint.
-    let mut partials: Vec<(super::PathMap, NodeId)> = Vec::new();
+    // Each partial carries the pattern bindings accumulated so far, the
+    // current chain endpoint, and the edge ids already consumed by earlier
+    // hops: openCypher relationship uniqueness forbids one relationship from
+    // satisfying two hops of the same pattern, so a match that would reuse an
+    // edge is not a match (and MERGE must create instead).
+    let mut partials: Vec<(super::PathMap, NodeId, Vec<EdgeId>)> = Vec::new();
     for nid in seed_candidates {
         let mut pm = super::PathMap::new();
         if let Some(v) = &pattern.node.variable {
             pm.insert(v.clone(), GraphBinding::Node(nid));
         }
-        partials.push((pm, nid));
+        partials.push((pm, nid, Vec::new()));
     }
 
     for (rel_pat, node_pat) in &pattern.rels {
@@ -992,8 +995,8 @@ fn merge_match(
             .as_deref()
             .map(|t| t.split('|').collect())
             .unwrap_or_default();
-        let mut next: Vec<(super::PathMap, NodeId)> = Vec::new();
-        for (pm, cur) in &partials {
+        let mut next: Vec<(super::PathMap, NodeId, Vec<EdgeId>)> = Vec::new();
+        for (pm, cur, used_edges) in &partials {
             let mut combined = ctx.clone();
             for (k, v) in pm {
                 combined.insert(k.clone(), v.clone());
@@ -1017,6 +1020,9 @@ fn merge_match(
 
             let neighbors = graph.all_neighbors(*cur).map_err(|e| e.to_string())?;
             for n in neighbors {
+                if used_edges.contains(&n.edge) {
+                    continue;
+                }
                 // Direction filter: undirected accepts both, otherwise the edge
                 // orientation must match the pattern.
                 if !rel_pat.is_undirected {
@@ -1049,13 +1055,15 @@ fn merge_match(
                 if let Some(tv) = &node_pat.variable {
                     npm.insert(tv.clone(), GraphBinding::Node(n.node));
                 }
-                next.push((npm, n.node));
+                let mut nused = used_edges.clone();
+                nused.push(n.edge);
+                next.push((npm, n.node, nused));
             }
         }
         partials = next;
     }
 
-    Ok(partials.into_iter().map(|(pm, _)| pm).collect())
+    Ok(partials.into_iter().map(|(pm, _, _)| pm).collect())
 }
 
 /// Match-or-create a MERGE pattern within the given context. Returns one binding

@@ -509,6 +509,11 @@ impl TextGraphExt for Graph {
                 if postings.is_empty() {
                     continue;
                 }
+                // IDF reflects the term's global document frequency, so it is
+                // taken before the boolean pre-filter: the AND intersection is
+                // a subset of every term's postings, and deriving IDF from it
+                // would weight rare and common query terms identically.
+                let n_term = postings.len() as f32;
                 // Apply boolean pre-filter if requested.
                 if let Some(ref filter) = candidate_filter {
                     postings.retain(|(id, _)| filter.contains(*id));
@@ -516,7 +521,6 @@ impl TextGraphExt for Graph {
                         continue;
                     }
                 }
-                let n_term = postings.len() as f32;
                 let idf = scorer.idf(n_docs_f, n_term);
                 let max_tf = postings.iter().map(|(_, tf)| *tf).max().unwrap_or(0);
                 let ub = scorer.upper_bound(idf, max_tf) * qtf as f32;
@@ -661,6 +665,52 @@ mod tests {
         );
         // The over-long token was skipped, so it finds nothing (no crash).
         assert!(graph.text_search(&long_token, &opts)?.is_empty());
+        Ok(())
+    }
+
+    /// Boolean AND mode must compute each term's IDF from its global document
+    /// frequency, not from the size of the AND intersection. Two documents
+    /// match both terms with mirrored term frequencies and equal lengths, so
+    /// their BM25 scores differ only through the IDF weights: the document
+    /// loaded with the rare term must strictly outrank the one loaded with the
+    /// common term. If both terms wrongly share the intersection-derived IDF,
+    /// the two scores are exactly equal.
+    #[test]
+    fn and_mode_idf_uses_global_document_frequency() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TempDir::new()?;
+        let graph = Graph::open(temp.path(), 1)?;
+        graph.create_node_text_index("Doc", "body")?;
+
+        // Loaded with the common term.
+        let common_heavy = graph.add_node("Doc", &json!({ "body": "zyx qqq qqq qqq" }))?;
+        // Loaded with the rare term.
+        let rare_heavy = graph.add_node("Doc", &json!({ "body": "zyx zyx zyx qqq" }))?;
+        // Fillers make "qqq" common while "zyx" stays rare.
+        for i in 0..8 {
+            graph.add_node("Doc", &json!({ "body": format!("qqq filler{i}") }))?;
+        }
+
+        let opts = TextSearchOptions {
+            label: Some("Doc".to_string()),
+            property: Some("body".to_string()),
+            limit: 5,
+            boolean_mode: Some(BooleanMode::And),
+            ..Default::default()
+        };
+        let hits = graph.text_search("zyx qqq", &opts)?;
+        let score_of = |id| {
+            hits.iter()
+                .find(|h| h.node == id)
+                .map(|h| h.score)
+                .unwrap_or_else(|| panic!("node {id} missing from AND results"))
+        };
+        assert!(
+            score_of(rare_heavy) > score_of(common_heavy),
+            "the rare-term-heavy document must outrank the common-term-heavy one \
+             (rare {} vs common {})",
+            score_of(rare_heavy),
+            score_of(common_heavy)
+        );
         Ok(())
     }
 

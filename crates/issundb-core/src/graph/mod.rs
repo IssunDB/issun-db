@@ -204,6 +204,19 @@ pub(super) fn encode_property_value(val: &serde_json::Value) -> Option<Vec<u8>> 
     }
 }
 
+/// Comparable-type family of an encoded property value's leading type tag.
+/// Booleans span two tags (`0x01` false, `0x02` true) but form one comparable
+/// family; every other tag is its own family. Range scans compare only values
+/// within the bound's family, because under openCypher a value of one type
+/// never satisfies a range bound of another (a string is not comparable to a
+/// numeric bound), even though the tagged encoding orders them globally.
+pub(super) fn encoded_tag_family(tag: u8) -> u8 {
+    match tag {
+        0x02 => 0x01,
+        t => t,
+    }
+}
+
 /// Decodes a sortable byte representation back into a JSON property value.
 #[allow(dead_code)]
 pub(super) fn decode_property_value(bytes: &[u8]) -> Option<serde_json::Value> {

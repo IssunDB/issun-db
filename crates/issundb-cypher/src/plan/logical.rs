@@ -382,7 +382,16 @@ impl LogicalPlanner {
                             };
                         }
 
-                        // Apply optional SKIP / LIMIT attached to the WITH clause.
+                        // Apply optional SKIP / LIMIT attached to the WITH
+                        // clause, validated like the final clause so a
+                        // negative or non-integer value is a syntax error
+                        // rather than a silent zero.
+                        if let Some(skip_expr) = skip.as_ref() {
+                            validate_skip_limit(skip_expr, "SKIP")?;
+                        }
+                        if let Some(limit_expr) = limit.as_ref() {
+                            validate_skip_limit(limit_expr, "LIMIT")?;
+                        }
                         let skip_n = skip.as_ref().map(literal_usize).unwrap_or(0);
                         let limit_n = limit.as_ref().map(literal_usize).unwrap_or(usize::MAX);
                         if skip.is_some() || limit.is_some() {
@@ -632,7 +641,13 @@ impl LogicalPlanner {
             .as_ref()
             .map(literal_usize)
             .unwrap_or(usize::MAX);
-        if query.skip.is_some() || query.limit.is_some() {
+        // `RETURN DISTINCT *` deduplicates in the executor after projection
+        // (the star's columns are unknown at plan time), so its SKIP/LIMIT is
+        // not planned here: openCypher applies DISTINCT before SKIP and
+        // LIMIT, and a plan-level Limit would truncate the pre-dedup stream.
+        // The executor applies the validated SKIP/LIMIT after its dedup.
+        let executor_windows = is_return_star && query.return_clause.distinct;
+        if (query.skip.is_some() || query.limit.is_some()) && !executor_windows {
             plan = LogicalOperator::Limit {
                 input: Box::new(plan),
                 skip: skip_n,
