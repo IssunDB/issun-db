@@ -1218,8 +1218,18 @@ fn relationship_pattern<'a>(
                 ))),
         )
         .map(
-            |((is_incoming, _), ((((variable, rel_type), range), properties), is_minus_suffix))| {
-                let is_undirected = !is_incoming && is_minus_suffix;
+            |(
+                (has_left_arrow, _),
+                ((((variable, rel_type), range), properties), is_minus_suffix),
+            )| {
+                // Four prefix/suffix combinations: `<-[..]-` is incoming,
+                // `-[..]->` is outgoing, `-[..]-` is undirected, and the
+                // both-arrows form `<-[..]->` matches either direction, which
+                // is the undirected semantics (CREATE and MERGE then reject
+                // it, since a created relationship must be directed).
+                let both_arrows = has_left_arrow && !is_minus_suffix;
+                let is_incoming = has_left_arrow && is_minus_suffix;
+                let is_undirected = (!has_left_arrow && is_minus_suffix) || both_arrows;
                 RelationshipPattern {
                     variable,
                     rel_type,
@@ -4333,12 +4343,13 @@ fn validate_create_patterns(
     bound: &mut std::collections::HashSet<String>,
 ) -> Result<(), String> {
     let snapshot = bound.clone();
+    let mut seen_in_clause = std::collections::HashSet::new();
     for p in patterns {
         let has_rels = !p.rels.is_empty();
-        check_create_node(&p.node, &snapshot, has_rels)?;
+        check_create_node(&p.node, &snapshot, &mut seen_in_clause, has_rels)?;
         for (rel, target) in &p.rels {
             check_create_rel(rel, &snapshot)?;
-            check_create_node(target, &snapshot, true)?;
+            check_create_node(target, &snapshot, &mut seen_in_clause, true)?;
         }
     }
     for p in patterns {
@@ -4349,16 +4360,25 @@ fn validate_create_patterns(
 
 /// A created node may reuse an already-bound variable only as a bare relationship
 /// endpoint: it must carry no labels or properties, and the surrounding pattern
-/// must contain at least one relationship.
+/// must contain at least one relationship. Node patterns are also invariant
+/// within one clause: a variable re-occurring later in the same CREATE or
+/// MERGE clause (`seen_in_clause`) must not add a label or property predicate,
+/// though unlike a previously bound variable it may stand alone.
 fn check_create_node(
     node: &NodePattern,
     bound: &std::collections::HashSet<String>,
+    seen_in_clause: &mut std::collections::HashSet<String>,
     pattern_has_rels: bool,
 ) -> Result<(), String> {
     if let Some(ref v) = node.variable {
-        if bound.contains(v)
-            && (!node.labels.is_empty() || node.properties.is_some() || !pattern_has_rels)
-        {
+        let redeclares = !node.labels.is_empty() || node.properties.is_some();
+        if bound.contains(v) && (redeclares || !pattern_has_rels) {
+            return Err(format!(
+                "SyntaxError(VariableAlreadyBound): variable '{}' is already bound",
+                v
+            ));
+        }
+        if !seen_in_clause.insert(v.clone()) && redeclares {
             return Err(format!(
                 "SyntaxError(VariableAlreadyBound): variable '{}' is already bound",
                 v
@@ -4559,15 +4579,16 @@ fn check_merge_pattern(
     bound: &mut std::collections::HashSet<String>,
 ) -> Result<(), String> {
     let snapshot = bound.clone();
+    let mut seen_in_clause = std::collections::HashSet::new();
     let has_rels = !p.rels.is_empty();
     // A bound node may appear only as a bare relationship endpoint; the rule is
     // identical to CREATE.
-    check_create_node(&p.node, &snapshot, has_rels)?;
+    check_create_node(&p.node, &snapshot, &mut seen_in_clause, has_rels)?;
     check_merge_null_props(&p.node.properties)?;
     for (rel, target) in &p.rels {
         check_merge_rel(rel, &snapshot)?;
         check_merge_null_props(&rel.properties)?;
-        check_create_node(target, &snapshot, true)?;
+        check_create_node(target, &snapshot, &mut seen_in_clause, true)?;
         check_merge_null_props(&target.properties)?;
     }
     collect_pattern_bound_vars(p, bound);

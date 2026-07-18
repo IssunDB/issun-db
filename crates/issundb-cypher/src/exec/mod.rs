@@ -1413,6 +1413,45 @@ mod tests {
         assert!(parser::parse("MATCH (a) MERGE (a)").is_err());
     }
 
+    /// Node patterns are invariant within one clause: a variable re-occurring
+    /// in the same CREATE (or MERGE) clause must not add a label or property
+    /// predicate (TCK Create1 [15], [16]).
+    #[test]
+    fn create_same_clause_label_redeclaration_is_rejected() {
+        assert!(parser::parse("CREATE (n:Foo)-[:T1]->(), (n:Bar)-[:T2]->()").is_err());
+        assert!(parser::parse("CREATE ()<-[:T2]-(n:Foo), (n:Bar)<-[:T1]-()").is_err());
+        assert!(parser::parse("CREATE (n:Foo)-[:T]->(n:Bar)").is_err());
+        assert!(parser::parse("MERGE (n:Foo)-[:T]->(n:Bar)").is_err());
+        // A bare re-occurrence stays legal.
+        assert!(parser::parse("CREATE (n:Foo)-[:T1]->(), (n)-[:T2]->()").is_ok());
+        assert!(parser::parse("CREATE (n:Foo)-[:T]->(n)").is_ok());
+    }
+
+    /// A relationship pattern with arrows in both directions is equivalent to
+    /// an undirected pattern, so CREATE rejects it (a created relationship
+    /// must be directed; TCK Create2 [20]).
+    #[test]
+    fn create_relationship_with_two_directions_is_rejected() {
+        assert!(parser::parse("CREATE (a)<-[:FOO]->(b)").is_err());
+    }
+
+    /// In MATCH, a both-arrows relationship matches either direction, exactly
+    /// like an undirected pattern.
+    #[test]
+    fn match_relationship_with_two_directions_is_undirected() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+        execute(&graph, "CREATE (:A {v: 1})-[:R]->(:B {v: 2})", &params).unwrap();
+        graph.rebuild_csr().unwrap();
+        let res = execute(&graph, "MATCH (a:A)<-[:R]->(b) RETURN b.v AS v", &params).unwrap();
+        assert_eq!(
+            res.records.len(),
+            1,
+            "both-arrows must match the outgoing edge like an undirected pattern"
+        );
+        assert_eq!(res.records[0].values[0], serde_json::json!(2));
+    }
+
     /// An undefined variable in an ON MATCH SET action is rejected.
     #[test]
     fn merge_undefined_variable_in_on_clause_is_rejected() {
@@ -2063,6 +2102,23 @@ mod tests {
         // A genuine chained comparison (no parentheses) must still desugar correctly.
         assert_eq!(scalar(&graph, "1 < 2 < 3"), serde_json::json!(true));
         assert_eq!(scalar(&graph, "1 < 2 < 1"), serde_json::json!(false));
+    }
+
+    /// Longer chained comparisons desugar to pairwise conjuncts over each
+    /// adjacent operand pair, with mixed operators and three-valued null
+    /// propagation across the chain.
+    #[test]
+    fn long_chained_comparisons_desugar_pairwise() {
+        let (_dir, graph) = setup_graph();
+        assert_eq!(scalar(&graph, "1 < 2 <= 2 < 4"), serde_json::json!(true));
+        assert_eq!(scalar(&graph, "1 < 2 <= 2 < 2"), serde_json::json!(false));
+        assert_eq!(scalar(&graph, "4 > 3 >= 3 > 1"), serde_json::json!(true));
+        assert_eq!(scalar(&graph, "1 < 2 = 2 < 3"), serde_json::json!(true));
+        // A false early conjunct decides the chain even when a later operand
+        // is null; a null conjunct otherwise propagates.
+        assert_eq!(scalar(&graph, "2 < 1 < null"), serde_json::json!(false));
+        assert_eq!(scalar(&graph, "1 < 2 < null"), serde_json::json!(null));
+        assert_eq!(scalar(&graph, "1 < null < 3"), serde_json::json!(null));
     }
 
     #[test]

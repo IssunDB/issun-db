@@ -737,6 +737,54 @@ fn eval_and(lv: &serde_json::Value, rv: &serde_json::Value) -> Result<serde_json
     Ok(serde_json::Value::Bool(true))
 }
 
+/// Compare two evaluated values under a comparison operator with openCypher
+/// three-valued semantics: null propagation, NaN ordering, and incomparable
+/// types yielding null.
+fn compare_values(
+    lv: &serde_json::Value,
+    rv: &serde_json::Value,
+    op: &BinaryOperator,
+) -> Result<serde_json::Value, String> {
+    if lv == &serde_json::Value::Null || rv == &serde_json::Value::Null {
+        return Ok(serde_json::Value::Null);
+    }
+    match op {
+        // Equality: NaN != NaN (IEEE 754). List equality propagates null when
+        // any element in either list is null (openCypher three-valued logic).
+        BinaryOperator::Eq => Ok(cypher_eq(lv, rv)),
+        BinaryOperator::Ne => match cypher_eq(lv, rv) {
+            serde_json::Value::Bool(b) => Ok(serde_json::Value::Bool(!b)),
+            serde_json::Value::Null => Ok(serde_json::Value::Null),
+            _ => unreachable!(),
+        },
+        // Ordered comparisons: return null for incompatible types; for NaN vs
+        // number return false; for NaN vs non-number return null (openCypher
+        // spec).
+        BinaryOperator::Lt | BinaryOperator::Gt | BinaryOperator::Le | BinaryOperator::Ge => {
+            if is_nan(lv) || is_nan(rv) {
+                let other = if is_nan(lv) { rv } else { lv };
+                return Ok(if other.is_number() || is_nan(other) {
+                    serde_json::Value::Bool(false)
+                } else {
+                    serde_json::Value::Null
+                });
+            }
+            // When json_cmp returns None, the types are incompatible → null.
+            match json_cmp(lv, rv) {
+                None => Ok(serde_json::Value::Null),
+                Some(c) => Ok(serde_json::Value::Bool(match op {
+                    BinaryOperator::Lt => c == std::cmp::Ordering::Less,
+                    BinaryOperator::Gt => c == std::cmp::Ordering::Greater,
+                    BinaryOperator::Le => c != std::cmp::Ordering::Greater,
+                    BinaryOperator::Ge => c != std::cmp::Ordering::Less,
+                    _ => unreachable!(),
+                })),
+            }
+        }
+        _ => Err(format!("not a comparison operator: {op:?}")),
+    }
+}
+
 /// Evaluate a binary operation with three-valued null propagation.
 pub(super) fn eval_binary_op<B: Bindings>(
     graph: &Graph,
@@ -747,17 +795,43 @@ pub(super) fn eval_binary_op<B: Bindings>(
     params: &HashMap<String, serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
     if is_comparison_op(op) {
-        if let Expr::BinaryOp {
-            op: op_left,
-            left: left_left,
-            right: right_left,
-        } = left
+        // A left-nested run of comparisons (`a < b < c`, parsed
+        // left-associatively) desugars to pairwise comparisons joined by AND.
+        // The operands are collected first and each is evaluated exactly
+        // once: a middle operand is shared by two adjacent comparisons, and
+        // re-evaluating a non-deterministic expression such as `rand()`
+        // could make the conjunction inconsistent.
+        let mut ops = vec![op];
+        let mut rights = vec![right];
+        let mut head = left;
+        while let Expr::BinaryOp {
+            op: inner_op,
+            left: inner_left,
+            right: inner_right,
+        } = head
         {
-            if is_comparison_op(op_left) {
-                let res_left = eval_binary_op(graph, path, op_left, left_left, right_left, params)?;
-                let res_right = eval_binary_op(graph, path, op, right_left, right, params)?;
-                return eval_and(&res_left, &res_right);
+            if !is_comparison_op(inner_op) {
+                break;
             }
+            ops.push(inner_op);
+            rights.push(inner_right);
+            head = inner_left;
+        }
+        if ops.len() > 1 {
+            // Evaluate operands left to right: the chain head, then each
+            // right-hand operand from innermost to outermost.
+            let mut values = Vec::with_capacity(ops.len() + 1);
+            values.push(evaluate_expr(graph, path, head, params)?);
+            for expr in rights.iter().rev() {
+                values.push(evaluate_expr(graph, path, expr, params)?);
+            }
+            let ops: Vec<&BinaryOperator> = ops.into_iter().rev().collect();
+            let mut acc = compare_values(&values[0], &values[1], ops[0])?;
+            for (i, cmp_op) in ops.iter().enumerate().skip(1) {
+                let next = compare_values(&values[i], &values[i + 1], cmp_op)?;
+                acc = eval_and(&acc, &next)?;
+            }
+            return Ok(acc);
         }
     }
     match op {
@@ -839,45 +913,7 @@ pub(super) fn eval_binary_op<B: Bindings>(
                 return Ok(serde_json::Value::Null);
             }
             match op {
-                // Equality: NaN != NaN (IEEE 754).  List equality propagates null when
-                // any element in either list is null (openCypher three-valued logic).
-                BinaryOperator::Eq => Ok(cypher_eq(&lv, &rv)),
-                BinaryOperator::Ne => {
-                    let eq = cypher_eq(&lv, &rv);
-                    match eq {
-                        serde_json::Value::Bool(b) => Ok(serde_json::Value::Bool(!b)),
-                        serde_json::Value::Null => Ok(serde_json::Value::Null),
-                        _ => unreachable!(),
-                    }
-                }
-                // Ordered comparisons: return null for incompatible types; for NaN vs
-                // number return false; for NaN vs non-number return null (openCypher spec).
-                BinaryOperator::Lt
-                | BinaryOperator::Gt
-                | BinaryOperator::Le
-                | BinaryOperator::Ge => {
-                    // NaN handling
-                    if is_nan(&lv) || is_nan(&rv) {
-                        let other = if is_nan(&lv) { &rv } else { &lv };
-                        return Ok(if other.is_number() || is_nan(other) {
-                            serde_json::Value::Bool(false)
-                        } else {
-                            serde_json::Value::Null
-                        });
-                    }
-                    let c = json_cmp(&lv, &rv);
-                    // When json_cmp returns None, the types are incompatible → null.
-                    match c {
-                        None => Ok(serde_json::Value::Null),
-                        Some(c) => Ok(serde_json::Value::Bool(match op {
-                            BinaryOperator::Lt => c == std::cmp::Ordering::Less,
-                            BinaryOperator::Gt => c == std::cmp::Ordering::Greater,
-                            BinaryOperator::Le => c != std::cmp::Ordering::Greater,
-                            BinaryOperator::Ge => c != std::cmp::Ordering::Less,
-                            _ => unreachable!(),
-                        })),
-                    }
-                }
+                cmp if is_comparison_op(cmp) => compare_values(&lv, &rv, cmp),
                 BinaryOperator::Add => eval_arithmetic(&lv, &rv, '+'),
                 BinaryOperator::Sub => eval_arithmetic(&lv, &rv, '-'),
                 BinaryOperator::Mul => eval_arithmetic(&lv, &rv, '*'),
@@ -893,7 +929,9 @@ pub(super) fn eval_binary_op<B: Bindings>(
                     }
                     _ => Ok(serde_json::Value::Null),
                 },
-                BinaryOperator::And | BinaryOperator::Or | BinaryOperator::Xor => unreachable!(),
+                // And/Or/Xor are handled above; every comparison operator is
+                // consumed by the `is_comparison_op` guard arm.
+                _ => unreachable!(),
             }
         }
     }
