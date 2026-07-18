@@ -1,19 +1,15 @@
 # IssunDB
 
 IssunDB is an embedded graph database, written in Rust.
-It can be embedded in Rust applications without the need for a server, and can be used for a wide range of applications such as building
-GraphRAG pipelines and querying knowledge graphs.
 
 ## Key Features
 
-Key features of IssunDB:
-
-* **ACID Transactions**: A graph engine with full support for transactional safety and declarative Cypher queries.
-* **Graph Analytics**: Traversals and graph algorithms executed as sparse matrix operations.
-* **Vectorized Execution**: A columnar fast path that executes projections and aggregations column at a time.
-* **Multi-Index Retrieval**: Hybrid search combining vector search, full-text keyword ranking, and neighborhood expansion.
-* **Developer Tooling**: Native Rust APIs, Python bindings, interactive CLI, HTTP REST server, and MCP.
-* **Cross-Platform Support**: Compatibility with Linux, macOS, and Windows.
+* ACID transactions, property graph model, and Cypher query support
+* Graph traversal and analytics using sparse matrix operations
+* Vectorized query execution with multi-core parallel processing
+* Vector, full-text, and hybrid search
+* APIs for Rust, Python, CLI, HTTP REST, and MCP
+* Support for Linux, macOS, and Windows
 
 ## Architecture Overview
 
