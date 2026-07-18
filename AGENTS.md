@@ -408,10 +408,14 @@ concerns driven through the CLI or the Python and REST surfaces. Keep this surfa
 Python bindings via PyO3. Exposes a single `IssunDB` class. The `extension-module` feature must be enabled for the Python extension to compile.
 Depends only on `issundb`.
 
-Methods: `add_node` (accepts a single label string or a list of label strings), `get_node`, `update_node`, `delete_node`, `add_edge`, `get_edge`,
-`delete_edge`, `query`, `explain`, `upsert_vector`, `vector_search` (with optional `label` and JSON-object `properties` filters),
-`configure_vector_index`, `text_search`, `create_text_index` (with optional `language`), `drop_text_index`, `list_text_indexes`, `retrieve_hybrid`,
-`set_thread_count`, `backup`, `backup_compact`, and `restore`.
+Methods: `add_node` (accepts a single label string or a list of label strings), `get_node`, `update_node`, `delete_node`, `add_label`,
+`remove_label`, `add_edge`, `get_edge`, `update_edge`, `delete_edge`, `query`, `explain`, `upsert_vector`, `remove_vector`, `vector_search` (with
+optional `label` and JSON-object `properties` filters), `configure_vector_index`, `text_search`, `create_text_index` (with optional `language`),
+`drop_text_index`, `list_text_indexes`, `has_text_index`, `retrieve_hybrid`, `set_thread_count`, `backup`, `backup_compact`, and `restore`.
+
+Every method releases the GIL around the native engine call, so a long-running query, backup, or reindex does not stall other Python threads.
+Keep that invariant when adding a method: extract arguments to owned Rust values first, run the engine call and JSON serialization inside
+`Python::detach`, and never touch a Python object in the released section.
 
 ### `issundb_core::Storage`
 
