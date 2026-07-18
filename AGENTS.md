@@ -192,7 +192,7 @@ modules according to this map.
 - `Storage::open` is the only entry point for LMDB. Do not call `heed::EnvOpenOptions` from outside `crates/issundb-core/src/storage/lmdb.rs`.
 - Heavy dependencies are tracked in the workspace `Cargo.toml`. `usearch` and `chumsky` are active, non-optional dependencies. GraphBLAS is reached
   through the in-house permissive crates `issundb-graphblas` and `issundb-graphblas-sys`. Building requires the submodule
-  (`git submodule update --init external/GraphBLAS`) plus cmake and clang.
+  (`git submodule update --init external/GraphBLAS`) plus CMake and Clang.
 - Async is not used in the core engine. LMDB and GraphBLAS are synchronous. `tokio` is an optional dependency for server mode only; do not add
   `.await` inside `issundb-core`.
 - GraphBLAS initializes a process-global context and OpenMP thread pool on first use (`GrB_init`) and never finalizes it. Under `cargo nextest`
@@ -369,7 +369,7 @@ control, and backup/restore are intentionally absent: provisioning and host oper
 
 The API is self-describing: the OpenAPI 3.1 document is generated from the handler annotations (`#[utoipa::path]`) and the request and response
 `ToSchema` derives, served as JSON at `GET /v1/openapi.json` with a Scalar UI at `GET /v1/docs`. The generator crates are `utoipa` and
-`utoipa-scalar` (both MIT or Apache-2.0), pinned to the axum 0.7 line. Because the handlers build their JSON bodies inline with `json!`, the
+`utoipa-scalar` (both MIT or Apache-2.0), pinned to the Axum 0.7 line. Because the handlers build their JSON bodies inline with `json!`, the
 documentation-only response structs (`NodeResponse`, `EdgeResponse`, `IdResponse`, `QueryResponse`, `ExplainResponse`, `RetrieveResponse`,
 `HealthResponse`, and `ErrorResponse`) describe the response shapes and must be kept in sync with those literals. The Cypher result is documented as
 columns plus row-major records of arbitrary JSON.

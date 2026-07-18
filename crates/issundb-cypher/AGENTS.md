@@ -143,7 +143,7 @@ The `VecRoot` variants escalate in generality:
   and `AggState`, so its semantics match the row pipeline exactly. `agg_expr_eligible` gates which expressions qualify; anything it declines stays on
   the row pipeline, so correctness never depends on the gate.
 
-Both aggregate roots read properties from the in-memory columnar store (see "In-Memory Property Columns" in `issundb-core/AGENTS.md`): one bulk gather
+Both aggregate roots read properties from the in-memory columnar store (see "In-memory Property Columns" in `issundb-core/AGENTS.md`): one bulk gather
 of every referenced `(variable, property)` column per query rather than a point read per row. Every vectorized shape must be covered by a differential
 test that asserts byte-identical columns and records against the row pipeline (`assert_matches_row_path` and the `*_matches_row_path` tests in
 `exec/vectorized.rs`); add one whenever you widen `recognize`.

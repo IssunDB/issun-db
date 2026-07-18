@@ -36,7 +36,7 @@ These invariants must hold after every successful write transaction:
 - Do not hold a `RwTxn` open while calling any method that might open another `RwTxn`; LMDB on Linux does not support nested write transactions.
 - Do not store transactions, cursors, or database handles with lifetimes tied to the transaction in `struct` fields or `Arc`.
 
-## Write-Lock Contract
+## Write-lock Contract
 
 All mutations to the graph go through the `Graph` API. Inside `Graph`:
 
@@ -77,7 +77,7 @@ via `arc_swap::ArcSwap`. `MatrixSet` (in `matrices.rs`) holds the GraphBLAS spar
 - `MatrixSet` is rebuilt from the CSR snapshot by `MatrixSet::materialize`. Rebuild both the CSR and the matrix set together; do not update one
   without the other.
 
-## In-Memory Property Columns
+## In-memory Property Columns
 
 `columns.rs` holds a typed, in-memory columnar view of scalar properties used as the hot read path for property gathers and aggregations.
 It is derived from LMDB, like the CSR snapshot, and follows the same write-LMDB-first rule.
@@ -107,7 +107,7 @@ Use the correct GraphBLAS semiring for each algorithm:
 
 When adding a new graph algorithm, document the semiring choice in a comment above the operation.
 
-## The 12 LMDB Sub-Databases
+## The 12 LMDB Sub-databases
 
 All sub-databases are opened once by `Storage::open` in `storage/lmdb.rs`:
 
