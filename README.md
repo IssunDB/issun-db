@@ -30,7 +30,7 @@ It can be embedded in Rust applications without a separate server, and is design
 * Graph traversal and analytics using sparse matrix operations
 * Vectorized query execution with multi-core parallel processing
 * Vector, full-text, and hybrid search
-* APIs for Rust, Python, CLI, HTTP REST, and MCP
+* APIs for Rust, Python, CLI, HTTP (REST), and MCP
 * Support for Linux, macOS, and Windows
 
 > [!IMPORTANT]
