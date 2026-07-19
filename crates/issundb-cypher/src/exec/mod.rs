@@ -1148,6 +1148,31 @@ mod tests {
         assert_eq!(res.records[0].values[0], serde_json::json!(2));
     }
 
+    /// A DELETE statement that fails on a still-connected node must leave the
+    /// graph untouched: the relationships listed in the same clause must not
+    /// stay deleted after the error (statement atomicity).
+    #[test]
+    fn failed_delete_leaves_graph_unchanged() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+        execute(&graph, "CREATE (a:A)-[:R]->(b:B), (b)-[:S]->(:C)", &params).unwrap();
+        graph.rebuild_csr().unwrap();
+        // b still has the S relationship, so the statement must error.
+        let res = execute(&graph, "MATCH (a:A)-[r:R]->(b:B) DELETE r, b", &params);
+        assert!(res.is_err(), "expected DeleteConnectedNode error");
+        assert!(res.unwrap_err().to_string().contains("DeleteConnectedNode"));
+        // The R edge deleted earlier in the same statement must be back.
+        let r_count = execute(
+            &graph,
+            "MATCH (:A)-[r:R]->(:B) RETURN count(r) AS c",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(r_count.records[0].values[0], serde_json::json!(1));
+        let nodes = execute(&graph, "MATCH (n) RETURN count(n) AS c", &params).unwrap();
+        assert_eq!(nodes.records[0].values[0], serde_json::json!(3));
+    }
+
     /// Property access on a node reached through an expression reads user
     /// properties, not the wrapper's internal id.
     #[test]
@@ -1240,6 +1265,142 @@ mod tests {
         assert_eq!(count.records[0].values[0], serde_json::json!(1));
     }
 
+    /// A MERGE match must not reuse one relationship for two hops of the
+    /// pattern (openCypher relationship uniqueness). With a single :R
+    /// self-loop, the two-hop pattern has no valid match (it would need two
+    /// distinct edges), so MERGE must create a fresh chain instead of
+    /// reporting a spurious match.
+    #[test]
+    fn merge_match_respects_relationship_uniqueness() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+        execute(&graph, "CREATE (a:A)-[:R]->(a)", &params).unwrap();
+        graph.rebuild_csr().unwrap();
+        execute(&graph, "MATCH (a:A) MERGE (a)-[:R]->(a)-[:R]->(a)", &params).unwrap();
+        graph.rebuild_csr().unwrap();
+        let count = execute(&graph, "MATCH ()-[r:R]->() RETURN count(r) AS c", &params).unwrap();
+        assert_eq!(
+            count.records[0].values[0],
+            serde_json::json!(3),
+            "MERGE must have created a fresh two-hop chain"
+        );
+    }
+
+    /// SKIP and LIMIT accept query parameters: `LIMIT $lim` limits by the
+    /// parameter's value rather than silently planning a zero-row limit, on
+    /// both the final RETURN and a WITH clause.
+    #[test]
+    fn parameterized_skip_and_limit_apply() {
+        let (_dir, graph) = setup_graph();
+        execute(
+            &graph,
+            "UNWIND [1, 2, 3, 4, 5] AS x CREATE (:N {v: x})",
+            &HashMap::new(),
+        )
+        .unwrap();
+        graph.rebuild_csr().unwrap();
+        let mut params = HashMap::new();
+        params.insert("lim".to_string(), serde_json::json!(3));
+        params.insert("s".to_string(), serde_json::json!(2));
+
+        let res = execute(
+            &graph,
+            "MATCH (n:N) RETURN n.v AS v ORDER BY v LIMIT $lim",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(res.records.len(), 3, "LIMIT $lim must limit to 3 rows");
+
+        let res = execute(
+            &graph,
+            "MATCH (n:N) RETURN n.v AS v ORDER BY v SKIP $s LIMIT $lim",
+            &params,
+        )
+        .unwrap();
+        let vals: Vec<_> = res.records.iter().map(|r| r.values[0].clone()).collect();
+        assert_eq!(
+            vals,
+            vec![
+                serde_json::json!(3),
+                serde_json::json!(4),
+                serde_json::json!(5)
+            ],
+            "SKIP $s must skip the first 2 rows"
+        );
+
+        let res = execute(
+            &graph,
+            "MATCH (n:N) WITH n ORDER BY n.v SKIP $s LIMIT $lim RETURN n.v AS v",
+            &params,
+        )
+        .unwrap();
+        let vals: Vec<_> = res.records.iter().map(|r| r.values[0].clone()).collect();
+        assert_eq!(
+            vals,
+            vec![
+                serde_json::json!(3),
+                serde_json::json!(4),
+                serde_json::json!(5)
+            ],
+            "WITH-clause SKIP/LIMIT must honor parameters"
+        );
+    }
+
+    /// `RETURN DISTINCT *` must deduplicate before SKIP and LIMIT, matching
+    /// every other DISTINCT projection: the window applies to distinct rows,
+    /// not to the raw stream.
+    #[test]
+    fn return_distinct_star_dedups_before_skip_and_limit() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+
+        let res = execute(
+            &graph,
+            "UNWIND [1, 1, 2, 2, 3] AS x RETURN DISTINCT * LIMIT 2",
+            &params,
+        )
+        .unwrap();
+        let vals: Vec<_> = res.records.iter().map(|r| r.values[0].clone()).collect();
+        assert_eq!(
+            vals,
+            vec![serde_json::json!(1), serde_json::json!(2)],
+            "LIMIT applies to the deduplicated rows"
+        );
+
+        let res = execute(
+            &graph,
+            "UNWIND [1, 1, 2, 2, 3] AS x RETURN DISTINCT * SKIP 1",
+            &params,
+        )
+        .unwrap();
+        let vals: Vec<_> = res.records.iter().map(|r| r.values[0].clone()).collect();
+        assert_eq!(
+            vals,
+            vec![serde_json::json!(2), serde_json::json!(3)],
+            "SKIP applies to the deduplicated rows"
+        );
+    }
+
+    /// A WITH-clause SKIP or LIMIT is validated like the final clause: a
+    /// negative or non-integer value is a syntax error, not a silent zero.
+    #[test]
+    fn with_clause_skip_limit_is_validated() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+        assert!(
+            execute(&graph, "MATCH (n) WITH n LIMIT -5 RETURN n", &params).is_err(),
+            "negative WITH LIMIT must be rejected"
+        );
+        assert!(
+            execute(&graph, "MATCH (n) WITH n LIMIT 1.5 RETURN n", &params).is_err(),
+            "float WITH LIMIT must be rejected"
+        );
+        assert!(
+            execute(&graph, "MATCH (n) WITH n SKIP -1 RETURN n", &params).is_err(),
+            "negative WITH SKIP must be rejected"
+        );
+    }
+
     /// ON MATCH SET runs when the pattern already exists; ON CREATE SET does not.
     #[test]
     fn merge_on_match_runs_for_existing() {
@@ -1275,6 +1436,45 @@ mod tests {
     #[test]
     fn merge_already_bound_node_is_rejected() {
         assert!(parser::parse("MATCH (a) MERGE (a)").is_err());
+    }
+
+    /// Node patterns are invariant within one clause: a variable re-occurring
+    /// in the same CREATE (or MERGE) clause must not add a label or property
+    /// predicate (TCK Create1 [15], [16]).
+    #[test]
+    fn create_same_clause_label_redeclaration_is_rejected() {
+        assert!(parser::parse("CREATE (n:Foo)-[:T1]->(), (n:Bar)-[:T2]->()").is_err());
+        assert!(parser::parse("CREATE ()<-[:T2]-(n:Foo), (n:Bar)<-[:T1]-()").is_err());
+        assert!(parser::parse("CREATE (n:Foo)-[:T]->(n:Bar)").is_err());
+        assert!(parser::parse("MERGE (n:Foo)-[:T]->(n:Bar)").is_err());
+        // A bare re-occurrence stays legal.
+        assert!(parser::parse("CREATE (n:Foo)-[:T1]->(), (n)-[:T2]->()").is_ok());
+        assert!(parser::parse("CREATE (n:Foo)-[:T]->(n)").is_ok());
+    }
+
+    /// A relationship pattern with arrows in both directions is equivalent to
+    /// an undirected pattern, so CREATE rejects it (a created relationship
+    /// must be directed; TCK Create2 [20]).
+    #[test]
+    fn create_relationship_with_two_directions_is_rejected() {
+        assert!(parser::parse("CREATE (a)<-[:FOO]->(b)").is_err());
+    }
+
+    /// In MATCH, a both-arrows relationship matches either direction, exactly
+    /// like an undirected pattern.
+    #[test]
+    fn match_relationship_with_two_directions_is_undirected() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+        execute(&graph, "CREATE (:A {v: 1})-[:R]->(:B {v: 2})", &params).unwrap();
+        graph.rebuild_csr().unwrap();
+        let res = execute(&graph, "MATCH (a:A)<-[:R]->(b) RETURN b.v AS v", &params).unwrap();
+        assert_eq!(
+            res.records.len(),
+            1,
+            "both-arrows must match the outgoing edge like an undirected pattern"
+        );
+        assert_eq!(res.records[0].values[0], serde_json::json!(2));
     }
 
     /// An undefined variable in an ON MATCH SET action is rejected.
@@ -1927,6 +2127,23 @@ mod tests {
         // A genuine chained comparison (no parentheses) must still desugar correctly.
         assert_eq!(scalar(&graph, "1 < 2 < 3"), serde_json::json!(true));
         assert_eq!(scalar(&graph, "1 < 2 < 1"), serde_json::json!(false));
+    }
+
+    /// Longer chained comparisons desugar to pairwise conjuncts over each
+    /// adjacent operand pair, with mixed operators and three-valued null
+    /// propagation across the chain.
+    #[test]
+    fn long_chained_comparisons_desugar_pairwise() {
+        let (_dir, graph) = setup_graph();
+        assert_eq!(scalar(&graph, "1 < 2 <= 2 < 4"), serde_json::json!(true));
+        assert_eq!(scalar(&graph, "1 < 2 <= 2 < 2"), serde_json::json!(false));
+        assert_eq!(scalar(&graph, "4 > 3 >= 3 > 1"), serde_json::json!(true));
+        assert_eq!(scalar(&graph, "1 < 2 = 2 < 3"), serde_json::json!(true));
+        // A false early conjunct decides the chain even when a later operand
+        // is null; a null conjunct otherwise propagates.
+        assert_eq!(scalar(&graph, "2 < 1 < null"), serde_json::json!(false));
+        assert_eq!(scalar(&graph, "1 < 2 < null"), serde_json::json!(null));
+        assert_eq!(scalar(&graph, "1 < null < 3"), serde_json::json!(null));
     }
 
     #[test]
@@ -3733,6 +3950,553 @@ mod tests {
         assert_eq!(ages, vec![20, 30, 40]);
     }
 
+    /// `RETURN *` projects only user-named variables; anonymous pattern
+    /// elements bound under planner-generated names stay internal.
+    #[test]
+    fn return_star_excludes_internal_columns() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+        execute(&graph, "CREATE (:SA)-[:T]->(:SB)", &params).unwrap();
+        graph.rebuild_csr().unwrap();
+        let res = execute(&graph, "MATCH (a)-->(b) RETURN *", &params).unwrap();
+        assert_eq!(res.columns, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    /// `stDev(DISTINCT ...)` deduplicates its inputs before folding.
+    #[test]
+    fn stdev_distinct_deduplicates() {
+        let v = agg_scalar(&[], "UNWIND [1, 1, 2] AS x RETURN stDev(DISTINCT x) AS s");
+        let got = v.as_f64().unwrap();
+        // stDev of [1, 2] is sqrt(0.5) ~ 0.7071; of [1, 1, 2] it is ~0.5774.
+        assert!((got - 0.7071).abs() < 1e-3, "got {got}");
+    }
+
+    /// A pattern comprehension enforces the anchor node's label and the
+    /// relationship's inline property map.
+    #[test]
+    fn pattern_comprehension_checks_anchor_and_rel_props() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+        execute(
+            &graph,
+            "CREATE (:Animal {nm: 'n'})-[:T {w: 2}]->(:PB)",
+            &params,
+        )
+        .unwrap();
+        graph.rebuild_csr().unwrap();
+        let res = execute(
+            &graph,
+            "MATCH (n:Animal) RETURN size([(n:Person)-->(b) | b]) AS anchor, \
+             size([(n)-[:T {w: 1}]->(b) | b]) AS wrong_w, \
+             size([(n)-[:T {w: 2}]->(b) | b]) AS right_w",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(res.records[0].values[0], serde_json::json!(0));
+        assert_eq!(res.records[0].values[1], serde_json::json!(0));
+        assert_eq!(res.records[0].values[2], serde_json::json!(1));
+    }
+
+    /// A null ORDER BY key sorts as null; it must not fall back to a
+    /// same-named projected alias holding an unrelated value.
+    #[test]
+    fn null_sort_key_does_not_borrow_alias_column() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+        execute(
+            &graph,
+            "CREATE (:SK {age: 30, nickname: 'zed'}), (:SK {nickname: 'abc'})",
+            &params,
+        )
+        .unwrap();
+        let res = execute(
+            &graph,
+            "MATCH (n:SK) RETURN n.nickname AS age ORDER BY n.age",
+            &params,
+        )
+        .unwrap();
+        // The node with age 30 sorts first; the ageless node sorts as null
+        // (last, ascending), even though its alias column holds "abc".
+        let names: Vec<_> = res.records.iter().map(|r| r.values[0].clone()).collect();
+        assert_eq!(
+            names,
+            vec![serde_json::json!("zed"), serde_json::json!("abc")]
+        );
+    }
+
+    /// MERGE with a runtime-null property value is an error, not a filter
+    /// with the key silently dropped (which would match every candidate).
+    #[test]
+    fn merge_with_null_property_value_is_error() {
+        let (_dir, graph) = setup_graph();
+        let params = HashMap::new();
+        execute(
+            &graph,
+            "CREATE (:MP {name: 'a'}), (:MP {name: 'b'})",
+            &params,
+        )
+        .unwrap();
+        let mut with_null = HashMap::new();
+        with_null.insert("x".to_string(), serde_json::Value::Null);
+        let res = execute(
+            &graph,
+            "MERGE (n:MP {name: $x}) ON MATCH SET n.hit = true",
+            &with_null,
+        );
+        assert!(res.is_err(), "null merge property must error");
+        // Nothing was matched or mutated.
+        let res = execute(
+            &graph,
+            "MATCH (n:MP) WHERE n.hit = true RETURN count(n) AS c",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(res.records[0].values[0], serde_json::json!(0));
+    }
+
+    /// MERGE inline properties use Cypher value equality: a float literal
+    /// matches an integer-stored value of the same number.
+    #[test]
+    fn merge_numeric_equality_matches_across_int_and_float() {
+        let (_dir, graph) = setup_graph();
+        let params = HashMap::new();
+        execute(&graph, "CREATE (:MQ {x: 30})", &params).unwrap();
+        execute(&graph, "MERGE (n:MQ {x: 30.0})", &params).unwrap();
+        let res = execute(&graph, "MATCH (n:MQ) RETURN count(n) AS c", &params).unwrap();
+        assert_eq!(res.records[0].values[0], serde_json::json!(1));
+    }
+
+    /// The FOREACH loop variable is usable in the body: as a property value
+    /// in CREATE, in SET, and through a nested FOREACH's list expression.
+    #[test]
+    fn foreach_loop_variable_usable_in_body() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+        execute(
+            &graph,
+            "FOREACH (x IN [1, 2, 3] | CREATE (:F {num: x}))",
+            &params,
+        )
+        .unwrap();
+        let res = execute(
+            &graph,
+            "MATCH (f:F) RETURN count(f) AS c, sum(f.num) AS s",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(res.records[0].values[0], serde_json::json!(3));
+        assert_eq!(res.records[0].values[1], serde_json::json!(6));
+
+        // Arithmetic over the loop variable in the created properties.
+        execute(
+            &graph,
+            "FOREACH (x IN [10, 20] | CREATE (:G {num: x + 1}))",
+            &params,
+        )
+        .unwrap();
+        let res = execute(
+            &graph,
+            "MATCH (g:G) RETURN count(g) AS c, sum(g.num) AS s",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(res.records[0].values[0], serde_json::json!(2));
+        assert_eq!(res.records[0].values[1], serde_json::json!(32));
+    }
+
+    /// Null in, null out for optional arguments: a null substring length or
+    /// round precision must not silently read as zero.
+    #[test]
+    fn null_optional_arguments_propagate() {
+        let v = agg_scalar(&[], "RETURN substring('hello', 1, null) AS r");
+        assert_eq!(v, serde_json::json!(null));
+        let v = agg_scalar(&[], "RETURN round(1.234, null) AS r");
+        assert_eq!(v, serde_json::json!(null));
+    }
+
+    /// NaN flows through arithmetic, abs(), and toString(), and math functions
+    /// whose float result is NaN produce it rather than null.
+    #[test]
+    fn nan_propagates_through_arithmetic_and_functions() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+        let one = |q: &str| execute(&graph, q, &params).unwrap().records[0].values[0].clone();
+        // 0.0/0.0 is NaN; adding to it stays NaN and prints as 'NaN'.
+        assert_eq!(
+            one("RETURN toString(0.0/0.0 + 1.0) AS r"),
+            serde_json::json!("NaN")
+        );
+        assert_eq!(
+            one("RETURN toString(abs(0.0/0.0)) AS r"),
+            serde_json::json!("NaN")
+        );
+        assert_eq!(
+            one("RETURN toString(sqrt(-1.0)) AS r"),
+            serde_json::json!("NaN")
+        );
+        // NaN is not equal to anything, including itself.
+        assert_eq!(
+            one("RETURN 0.0/0.0 = 0.0/0.0 AS r"),
+            serde_json::json!(false)
+        );
+        // Concatenation absorbs NaN instead of propagating it: a list appends
+        // the NaN element, and a string appends its string form.
+        assert_eq!(
+            one("RETURN size([1, 2] + (0.0/0.0)) AS r"),
+            serde_json::json!(3)
+        );
+        assert_eq!(
+            one("RETURN 'a' + (0.0/0.0) AS r"),
+            serde_json::json!("aNaN")
+        );
+        assert_eq!(
+            one("RETURN (0.0/0.0) + 'b' AS r"),
+            serde_json::json!("NaNb")
+        );
+    }
+
+    /// Two DateTimes denoting the same instant in different zones are equal,
+    /// and equality agrees with the ordering operators on the same pair.
+    #[test]
+    fn datetime_equality_compares_instants() {
+        let v = agg_scalar(
+            &[],
+            "RETURN datetime('2015-06-24T11:50:35Z') = datetime('2015-06-24T12:50:35+01:00') AS r",
+        );
+        assert_eq!(v, serde_json::json!(true));
+        let v = agg_scalar(
+            &[],
+            "RETURN datetime('2015-06-24T11:50:35Z') <> datetime('2015-06-24T12:50:35+01:00') AS r",
+        );
+        assert_eq!(v, serde_json::json!(false));
+    }
+
+    /// An out-of-range time component map is an error, not a silent midnight.
+    #[test]
+    fn out_of_range_time_component_is_error() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+        assert!(execute(&graph, "RETURN time({hour: 25}) AS r", &params).is_err());
+        assert!(
+            execute(
+                &graph,
+                "RETURN localtime({hour: 10, minute: 70}) AS r",
+                &params
+            )
+            .is_err()
+        );
+        // The datetime and localdatetime component-map paths apply the same
+        // check instead of clamping the time to midnight.
+        assert!(
+            execute(
+                &graph,
+                "RETURN datetime({year: 2020, month: 1, day: 1, hour: 25}) AS r",
+                &params
+            )
+            .is_err()
+        );
+        assert!(
+            execute(
+                &graph,
+                "RETURN localdatetime({year: 2020, month: 1, day: 1, minute: 70}) AS r",
+                &params
+            )
+            .is_err()
+        );
+        // An out-of-range field override on a selector errors too.
+        assert!(
+            execute(
+                &graph,
+                "WITH datetime('2020-01-01T10:00:00Z') AS d RETURN datetime({datetime: d, hour: 25}) AS r",
+                &params
+            )
+            .is_err()
+        );
+        // In-range component maps still construct.
+        assert!(
+            execute(
+                &graph,
+                "RETURN datetime({year: 2020, month: 1, day: 1, hour: 23, minute: 59}) AS r",
+                &params
+            )
+            .is_ok()
+        );
+    }
+
+    /// The null predicate applies to the whole additive expression, so
+    /// `1 + null IS NULL` is true rather than a type error.
+    #[test]
+    fn is_null_over_arithmetic_evaluates() {
+        let v = agg_scalar(&[], "RETURN 1 + null IS NULL AS x");
+        assert_eq!(v, serde_json::json!(true));
+        let v = agg_scalar(&[], "RETURN 1 + 2 IS NOT NULL AS x");
+        assert_eq!(v, serde_json::json!(true));
+    }
+
+    /// A trailing WHERE on WITH (the openCypher clause order) filters after
+    /// ORDER BY, SKIP, and LIMIT apply, unlike the lenient WHERE-first order,
+    /// which filters before them.
+    #[test]
+    fn with_trailing_where_filters_after_limit() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+        execute(
+            &graph,
+            "CREATE (:P {age: 10}), (:P {age: 20}), (:P {age: 30}), (:P {age: 40})",
+            &params,
+        )
+        .unwrap();
+        let res = execute(
+            &graph,
+            "MATCH (n:P) WITH n ORDER BY n.age LIMIT 3 WHERE n.age > 15 RETURN n.age ORDER BY n.age",
+            &params,
+        )
+        .unwrap();
+        let ages: Vec<_> = res.records.iter().map(|r| r.values[0].clone()).collect();
+        assert_eq!(ages, vec![serde_json::json!(20), serde_json::json!(30)]);
+        // WHERE-first filters before the limit, so three rows survive.
+        let res = execute(
+            &graph,
+            "MATCH (n:P) WITH n WHERE n.age > 15 ORDER BY n.age LIMIT 3 RETURN n.age ORDER BY n.age",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(res.records.len(), 3);
+    }
+
+    /// `RETURN *, item` and `WITH *, item` expand the star and append the
+    /// explicit items.
+    #[test]
+    fn star_with_additional_items_executes() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+        execute(&graph, "CREATE (:P {v: 1})", &params).unwrap();
+        let res = execute(&graph, "MATCH (n:P) RETURN *, n.v + 1 AS w", &params).unwrap();
+        assert_eq!(res.columns, vec!["n".to_string(), "w".to_string()]);
+        assert_eq!(res.records[0].values[1], serde_json::json!(2));
+        let res = execute(
+            &graph,
+            "MATCH (n:P) WITH *, n.v AS v RETURN n.v + v AS s",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(res.records[0].values[0], serde_json::json!(2));
+    }
+
+    /// A `*0..n` hop in a pattern comprehension matches at length zero even
+    /// when the relationship carries an inline property map; the map is
+    /// vacuously true over the empty edge list.
+    #[test]
+    fn pattern_comprehension_zero_length_hop_with_rel_props() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+        execute(
+            &graph,
+            "CREATE (:A {n: 1})-[:T {w: 2}]->(:B {n: 2})",
+            &params,
+        )
+        .unwrap();
+        let res = execute(
+            &graph,
+            "MATCH (a:A) RETURN size([(a)-[:T*0..1 {w: 2}]->(b) | b]) AS s",
+            &params,
+        )
+        .unwrap();
+        // Two elements: the zero-length match (b = a) and the one-hop match.
+        assert_eq!(res.records[0].values[0], serde_json::json!(2));
+    }
+
+    /// `range()` near `i64::MAX` completes instead of overflowing.
+    #[test]
+    fn range_at_i64_max_does_not_overflow() {
+        let v = agg_scalar(
+            &[],
+            "RETURN size(range(9223372036854775806, 9223372036854775807)) AS s",
+        );
+        assert_eq!(v, serde_json::json!(2));
+    }
+
+    /// id(), keys(), and label predicates resolve a node that arrives as a
+    /// value (through a path accessor or UNWIND) like a direct binding.
+    #[test]
+    fn wrapped_node_values_resolve_in_id_keys_and_label_predicate() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+        execute(
+            &graph,
+            "CREATE (:WN {name: 'x'})-[:R]->(:WN {name: 'y'})",
+            &params,
+        )
+        .unwrap();
+        graph.rebuild_csr().unwrap();
+        let res = execute(
+            &graph,
+            "MATCH p = (a:WN {name: 'x'})-[:R]->(b) \
+             RETURN id(nodes(p)[0]) AS i, keys(nodes(p)[0]) AS k",
+            &params,
+        )
+        .unwrap();
+        assert!(res.records[0].values[0].is_number(), "id() must resolve");
+        assert_eq!(res.records[0].values[1], serde_json::json!(["name"]));
+
+        let res = execute(
+            &graph,
+            "MATCH (n:WN {name: 'x'}) UNWIND [n] AS x \
+             RETURN x:WN AS has, id(x) AS i",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(res.records[0].values[0], serde_json::json!(true));
+        assert!(res.records[0].values[1].is_number());
+    }
+
+    /// A variable name re-declared after a WITH is a fresh variable: its label
+    /// in the second MATCH must not merge with the first declaration's label
+    /// when the schema-based prune judges the second hop.
+    #[test]
+    fn prune_does_not_leak_labels_across_with_scope() {
+        let (_dir, graph) = setup_graph();
+        let params = HashMap::new();
+        execute(&graph, "CREATE (:AA {name: 'a'})", &params).unwrap();
+        execute(&graph, "CREATE (:BB)-[:RR]->(:CC)", &params).unwrap();
+        graph.rebuild_csr().unwrap();
+        // `a` is re-declared: first :AA, then :BB. The (BB)-[:RR]->(CC) hop is
+        // satisfiable; merging would test (AA, RR, CC), which is absent.
+        let rows = run(
+            &graph,
+            "MATCH (a:AA) WITH a.name AS name \
+             MATCH (a:BB)-[:RR]->(x:CC) RETURN name, count(x) AS c",
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][1], serde_json::json!(1));
+    }
+
+    /// A label inside an OPTIONAL MATCH is not a mandatory constraint on the
+    /// shared variable: the mandatory pattern must not be pruned against it.
+    #[test]
+    fn prune_ignores_optional_match_labels() {
+        let (_dir, graph) = setup_graph();
+        let params = HashMap::new();
+        // A :DD node with an SS edge to a :CC2 node; DD never has an RR2 edge,
+        // and no (:AA2, SS, CC2) triple exists, so merging the optional's :AA2
+        // onto `n` would prune the mandatory SS hop.
+        execute(&graph, "CREATE (:DD)-[:SS]->(:CC2)", &params).unwrap();
+        execute(&graph, "CREATE (:AA2)-[:RR2]->(:EE)", &params).unwrap();
+        graph.rebuild_csr().unwrap();
+        let rows = run(
+            &graph,
+            "MATCH (n)-[:SS]->(z:CC2) OPTIONAL MATCH (n:AA2)-[:RR2]->(m) \
+             RETURN count(z) AS c",
+        );
+        assert_eq!(rows[0][0], serde_json::json!(1));
+    }
+
+    /// A `*1..1` hop binds its relationship variable to a one-element list,
+    /// and that must survive the scan-selection pass reversing the chain
+    /// toward the rarer endpoint (100 sources vs 2 destinations here).
+    #[test]
+    fn var_length_one_hop_binds_list_through_reversed_chain() {
+        let (_dir, graph) = setup_graph();
+        let params = HashMap::new();
+        execute(
+            &graph,
+            "UNWIND range(1, 100) AS i CREATE (:VA {i: i})",
+            &params,
+        )
+        .unwrap();
+        execute(&graph, "CREATE (:VB {i: 1}), (:VB {i: 2})", &params).unwrap();
+        execute(
+            &graph,
+            "MATCH (a:VA {i: 1}), (b:VB {i: 1}) CREATE (a)-[:TT]->(b)",
+            &params,
+        )
+        .unwrap();
+        graph.rebuild_csr().unwrap();
+        let rows = run(&graph, "MATCH (a:VA)-[r*1..1]->(b:VB) RETURN r");
+        assert_eq!(rows.len(), 1);
+        assert!(
+            rows[0][0].is_array(),
+            "r must bind a one-element relationship list, got {:?}",
+            rows[0][0]
+        );
+    }
+
+    /// A predicate after a `WITH ... ORDER BY ... LIMIT k` boundary applies to
+    /// the k chosen rows; the optimizer must not push it below the LIMIT,
+    /// where it would choose k different rows.
+    #[test]
+    fn filter_after_with_limit_applies_to_chosen_rows() {
+        let (_dir, graph) = setup_graph();
+        for age in 1..=10i64 {
+            graph
+                .add_node("A", &serde_json::json!({"age": age * 10}))
+                .unwrap();
+        }
+        let rows = run(
+            &graph,
+            "MATCH (n:A) WITH n ORDER BY n.age LIMIT 5 \
+             WITH n WHERE n.age > 30 RETURN n.age AS age ORDER BY age",
+        );
+        let ages: Vec<i64> = rows.iter().map(|r| r[0].as_i64().unwrap()).collect();
+        assert_eq!(ages, vec![40, 50]);
+    }
+
+    /// Two bounds on the same side must intersect, not overwrite: the second
+    /// (looser) conjunct must not widen the scan range. The tighter bound wins
+    /// whichever order the conjuncts arrive in.
+    #[test]
+    fn range_scan_same_side_bounds_intersect() {
+        let (_dir, graph) = setup_graph();
+        for age in [10i64, 20, 30, 40, 50] {
+            graph
+                .add_node("Person", &serde_json::json!({"age": age}))
+                .unwrap();
+        }
+        let rows = run(
+            &graph,
+            "MATCH (n:Person) WHERE n.age <= 30 AND n.age < 50 RETURN n.age AS age",
+        );
+        let mut ages: Vec<i64> = rows.iter().map(|r| r[0].as_i64().unwrap()).collect();
+        ages.sort_unstable();
+        assert_eq!(ages, vec![10, 20, 30]);
+
+        let rows = run(
+            &graph,
+            "MATCH (n:Person) WHERE n.age < 50 AND n.age <= 30 RETURN n.age AS age",
+        );
+        let mut ages: Vec<i64> = rows.iter().map(|r| r[0].as_i64().unwrap()).collect();
+        ages.sort_unstable();
+        assert_eq!(ages, vec![10, 20, 30]);
+
+        // Same-side lower bounds.
+        let rows = run(
+            &graph,
+            "MATCH (n:Person) WHERE n.age >= 30 AND n.age > 10 RETURN n.age AS age",
+        );
+        let mut ages: Vec<i64> = rows.iter().map(|r| r[0].as_i64().unwrap()).collect();
+        ages.sort_unstable();
+        assert_eq!(ages, vec![30, 40, 50]);
+    }
+
+    /// A comparison written with the property on the right (`25 < n.age`) is a
+    /// lower bound and must not be dropped when it meets an existing scan.
+    #[test]
+    fn range_scan_prop_on_right_not_dropped() {
+        let (_dir, graph) = setup_graph();
+        for age in [10i64, 20, 30, 40, 50] {
+            graph
+                .add_node("Person", &serde_json::json!({"age": age}))
+                .unwrap();
+        }
+        let rows = run(
+            &graph,
+            "MATCH (n:Person) WHERE n.age < 45 AND 25 < n.age RETURN n.age AS age",
+        );
+        let mut ages: Vec<i64> = rows.iter().map(|r| r[0].as_i64().unwrap()).collect();
+        ages.sort_unstable();
+        assert_eq!(ages, vec![30, 40]);
+    }
+
     #[test]
     fn null_equality_with_declared_index_returns_no_rows() {
         // `prop = null` is never TRUE. With a declared index the equality
@@ -4063,7 +4827,7 @@ mod tests {
         {
             let mut file = std::fs::File::create(&jsonl_path).unwrap();
             writeln!(file, "{{\"name\": \"David\", \"age\": 25}}").unwrap();
-            writeln!(file, "{{\"props\": {{\"name\": \"Eve\", \"age\": 35}}}}").unwrap();
+            writeln!(file, "{{\"name\": \"Eve\", \"age\": 35}}").unwrap();
         }
 
         let query_jsonl = format!("COPY Person FROM '{}'", jsonl_path.display());
@@ -4203,6 +4967,123 @@ mod tests {
                 serde_json::json!(2020)
             ]
         );
+    }
+
+    /// Round-trip fidelity for the adversarial cases: node properties named
+    /// `from`/`to` (must not classify the node file as edges), edge properties
+    /// named `type`/`from`, string-typed "true"/"123"/"" values, and a
+    /// mixed-type property column. One test per format.
+    fn roundtrip_fixture() -> (tempfile::TempDir, Graph) {
+        let (dir, graph) = setup_graph();
+        let params = HashMap::new();
+        execute(
+            &graph,
+            "CREATE (:Flight {from: 1, to: 2, s: 'true', t: '123', e: ''})",
+            &params,
+        )
+        .unwrap();
+        execute(
+            &graph,
+            "CREATE (:Mixed {v: true}), (:Mixed {v: 5})",
+            &params,
+        )
+        .unwrap();
+        execute(
+            &graph,
+            "MATCH (f:Flight), (m:Mixed {v: 5}) \
+             CREATE (f)-[:R {type: 'x', from: 7, keep: 1}]->(m)",
+            &params,
+        )
+        .unwrap();
+        (dir, graph)
+    }
+
+    fn assert_roundtrip(format: &str) {
+        let params = HashMap::new();
+        let (tempdir, graph) = roundtrip_fixture();
+        let export_dir = tempdir.path().join(format!("rt_{format}"));
+        execute(
+            &graph,
+            &format!(
+                "EXPORT DATABASE '{}' WITH {{format: '{format}'}}",
+                export_dir.display()
+            ),
+            &params,
+        )
+        .unwrap();
+        let (_dir2, graph2) = setup_graph();
+        execute(
+            &graph2,
+            &format!("IMPORT DATABASE '{}'", export_dir.display()),
+            &params,
+        )
+        .unwrap();
+
+        // The Flight node survives as a node with its from/to properties.
+        let res = execute(
+            &graph2,
+            "MATCH (f:Flight) RETURN f.from, f.to, f.s, f.t, f.e",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(res.records.len(), 1, "{format}: Flight node lost");
+        assert_eq!(
+            res.records[0].values,
+            vec![
+                serde_json::json!(1),
+                serde_json::json!(2),
+                serde_json::json!("true"),
+                serde_json::json!("123"),
+                serde_json::json!(""),
+            ],
+            "{format}: Flight properties diverged"
+        );
+
+        // The mixed-type property keeps both the boolean and the integer.
+        let res = execute(
+            &graph2,
+            "MATCH (m:Mixed) RETURN m.v ORDER BY toString(m.v)",
+            &params,
+        )
+        .unwrap();
+        let vals: Vec<_> = res.records.iter().map(|r| r.values[0].clone()).collect();
+        assert!(
+            vals.contains(&serde_json::json!(true)) && vals.contains(&serde_json::json!(5)),
+            "{format}: mixed column coerced, got {vals:?}"
+        );
+
+        // The edge keeps its reserved-name properties.
+        let res = execute(
+            &graph2,
+            "MATCH ()-[r:R]->() RETURN r.type, r.from, r.keep",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(res.records.len(), 1, "{format}: R edge lost");
+        assert_eq!(
+            res.records[0].values,
+            vec![
+                serde_json::json!("x"),
+                serde_json::json!(7),
+                serde_json::json!(1),
+            ],
+            "{format}: edge properties diverged"
+        );
+    }
+
+    #[test]
+    fn export_import_roundtrip_jsonl() {
+        assert_roundtrip("jsonl");
+    }
+
+    #[test]
+    fn export_import_roundtrip_csv() {
+        assert_roundtrip("csv");
+    }
+
+    #[test]
+    fn export_import_roundtrip_parquet() {
+        assert_roundtrip("parquet");
     }
 
     // --- Correlated index seek (index nested-loop join) ---
@@ -4346,7 +5227,7 @@ mod tests {
     fn deeply_nested_query_errors_instead_of_aborting() {
         let (_dir, graph) = setup_graph();
         let deep = std::iter::repeat("RETURN 1 AS x")
-            .take(5000)
+            .take(10_000)
             .collect::<Vec<_>>()
             .join(" UNION ALL ");
         assert!(execute(&graph, &deep, &HashMap::new()).is_err());

@@ -16,6 +16,25 @@ The `Graph` struct coordinates all transactional graph storage, retrieval, and i
   Executes a read-write transaction inside a closure.
 - `Graph::set_thread_count(&self, n: i32) -> Result<(), Error>`  
   Sets the thread count for GraphBLAS matrix computations, overriding the `ISSUNDB_NUM_THREADS` environment variable. Set to `0` to restore default behavior.
+- `Graph::backup(&self, destination: &Path) -> Result<(), Error>`  
+  Writes a hot backup snapshot of the database environment to the destination file while the graph stays open.
+- `Graph::backup_compact(&self, destination: &Path) -> Result<(), Error>`  
+  Writes a compacted backup snapshot, reclaiming free pages during the copy.
+- `Graph::restore(snapshot_file: &Path, dst_dir: &Path) -> Result<(), Error>`  
+  Restores a backup snapshot into a new database directory. This is an associated function; call it before opening the restored graph.
+- `Graph::rebuild_csr(&self) -> Result<(), Error>`  
+  Rebuilds the in-memory CSR snapshot immediately instead of waiting for the on-demand refresh; useful before a burst of algorithm calls.
+
+### Transactions and Concurrency
+
+IssunDB uses a single-writer, multi-reader model.
+Writes are serialized through an internal write lock and one LMDB write transaction at a time; every mutation method (and every write Cypher query) commits atomically. Reads execute against MVCC snapshots and never block writers or one another, so read-heavy workloads scale across threads over one shared `Graph`.
+
+- `Graph::view(f)` runs the closure inside a read-only transaction (`ReadTxn`); every read observes one consistent snapshot.
+- `Graph::update(f)` runs the closure inside a read-write transaction (`WriteTxn`); the transaction commits when the closure returns `Ok` and aborts, leaving the database unchanged, when it returns `Err`.
+- `ReadTxn` and `WriteTxn` expose the same node, edge, adjacency, and lookup methods as `Graph`, so multi-step logic can run atomically inside one closure.
+
+The `map_size_gb` argument to `Graph::open` sets the maximum size of the LMDB memory map, which bounds the database size. The map is created sparsely, so a generous value costs no disk space up front; a write that would exceed the map fails with a storage error, and the database must be reopened with a larger value to grow it.
 
 ### Node Management CRUD
 
@@ -75,6 +94,34 @@ The `Graph` struct coordinates all transactional graph storage, retrieval, and i
 - `edge_count_by_type(etype: &str) -> Result<u64, Error>`  
   Returns the count of edges of the specified type.
 
+### Property Lookups
+
+Property values are represented by the `PropValue` enum with the variants `Bool`, `Int`, `Float`, and `Str`. Numeric lookups treat `30` and `30.0` as equal, and a range bound only matches values of its own type family (a string value never satisfies a numeric bound).
+
+- `nodes_by_property(label: &str, property: &str, val: PropValue) -> Result<Vec<NodeId>, Error>`  
+  Returns the nodes carrying the label whose property equals the value. Node properties are indexed automatically, so no DDL is required.
+- `nodes_by_property_range(label: &str, property: &str, min_val: Option<PropValue>, min_inclusive: bool, max_val: Option<PropValue>, max_inclusive: bool) -> Result<Vec<NodeId>, Error>`  
+  Returns the nodes whose property value falls inside the range; either bound may be absent.
+- `edges_by_property(etype: &str, property: &str, val: PropValue) -> Result<Vec<EdgeId>, Error>`  
+  Returns the edges of the type whose property equals the value. Edge properties are indexed only while a relationship property index exists, so create one first.
+- `edges_by_property_range(etype: &str, property: &str, min_val: Option<PropValue>, max_val: Option<PropValue>) -> Result<Vec<EdgeId>, Error>`  
+  Range form of the edge lookup; both bounds are inclusive.
+
+### Index and Constraint Management
+
+These methods are the Rust equivalents of the Cypher DDL statements in the [Cypher DDL Reference](#cypher-ddl-reference); each creation method validates the existing data first and fails if any element already violates the constraint.
+
+- `create_node_property_index(label: &str, property: &str) -> Result<(), Error>` and `drop_node_property_index(...)`  
+  Declares (or removes) a node property index. Because every scalar node property is auto-indexed, the declaration mainly matters as the anchor for constraints.
+- `create_node_unique_constraint(label: &str, property: &str) -> Result<(), Error>` and `drop_node_unique_constraint(...)`  
+  Requires the property value to be unique across all nodes with the label; explicit nulls never conflict.
+- `create_node_required_constraint(label: &str, property: &str) -> Result<(), Error>` and `drop_node_required_constraint(...)`  
+  Requires the property to be present and non-null on every node with the label.
+- `create_edge_property_index`, `create_edge_unique_constraint`, and `create_edge_required_constraint` (with matching `drop_*` methods)  
+  The relationship counterparts, keyed by relationship type instead of label.
+- `list_node_indexes_and_constraints() -> Result<Vec<(String, String, u8)>, Error>` and `list_edge_indexes_and_constraints() -> ...`  
+  Lists the declared indexes and constraints as `(label_or_type, property, kind)` tuples, where the kind byte is `0x00` for an index, `0x01` for a unique constraint, and `0x02` for a required constraint.
+
 ---
 
 ## GraphBLAS Algorithms
@@ -84,15 +131,15 @@ Pathfinding, network centrality, and connectivity algorithms are executed using 
 ### Traversal and Paths
 
 - `bfs(start: NodeId, hops: u8) -> Result<Vec<NodeId>, Error>`  
-  Runs a Breadth-First Search traversal outward from the start node up to the specified depth.
+  Runs a breadth-first search traversal outward from the start node up to the specified depth.
 - `dfs(start: NodeId, hops: u8) -> Result<Vec<NodeId>, Error>`  
-  Runs a Depth-First Search traversal from the start node up to the specified depth.
+  Runs a depth-first search traversal from the start node up to the specified depth.
 - `shortest_path(src: NodeId, dst: NodeId) -> Result<Option<Vec<NodeId>>, Error>`  
   Finds the shortest unweighted path between two nodes in the graph.
 - `shortest_path_dijkstra(src: NodeId, dst: NodeId) -> Result<Option<WeightedPath>, Error>`  
   Finds the shortest weighted path between two nodes using Dijkstra's algorithm.
 - `shortest_path_top_k(src: NodeId, dst: NodeId, k: usize, weight_property: &str) -> Result<Vec<WeightedPath>, Error>`  
-  Finds the top-$k$ shortest weighted paths using Yen's algorithm.
+  Finds the top-k shortest weighted paths using Yen's algorithm.
 - `all_paths(src: NodeId, dst: NodeId) -> Result<Vec<Vec<NodeId>>, Error>`  
   Returns all simple paths between the source and destination nodes.
 - `all_shortest_paths(src: NodeId, dst: NodeId) -> Result<Vec<Vec<NodeId>>, Error>`  
@@ -132,7 +179,11 @@ Pathfinding, network centrality, and connectivity algorithms are executed using 
 
 ## Vector Search Extensions
 
-The `VectorGraphExt` trait extends the graph with vector embedding storage and similarity search capability:
+The `VectorGraphExt` trait extends the graph with vector embedding storage and similarity search capability.
+
+The index is configured through `VectorIndexOptions`, which holds a `VectorMetric` (`Cosine`, the default, `L2`, or `Dot`) and a `VectorQuantization` (`Float32`, the default, `Float16`, or `Int8`). The configuration is persisted inside the database, so reopening rebuilds the index with the same settings. Configure the index before the first upsert: changing the metric or quantization once vectors exist returns `VectorError::AlreadyConfigured`, and `reindex_vector_index` is the explicit way to change settings afterward.
+
+`VectorSearchOptions` carries `k`, an optional exact-label filter (`label`), optional property equality filters (`properties`), and `rescore_factor`. On a quantized index a search fetches `k * rescore_factor` candidates (default factor 2) and re-ranks them by exact distance against the full-precision vectors in storage; pass `Some(1)` to disable the rescore. A `Float32` index never rescores by default.
 
 - `VectorGraphExt::configure_vector_index(opts: VectorIndexOptions) -> Result<(), VectorError>`  
   Configures the metric and quantization parameters for the graph's vector index.
@@ -143,9 +194,9 @@ The `VectorGraphExt` trait extends the graph with vector embedding storage and s
 - `VectorGraphExt::remove_vector(n: NodeId) -> Result<(), VectorError>`  
   Removes the embedding for a node from both the index and storage.
 - `VectorGraphExt::vector_search(q: &[f32], k: usize) -> Result<Vec<Hit>, VectorError>`  
-  Retrieves the top-$k$ nearest neighbor nodes matching the query vector.
+  Retrieves the top-k nearest neighbor nodes matching the query vector.
 - `VectorGraphExt::vector_search_with(q: &[f32], opts: &VectorSearchOptions) -> Result<Vec<Hit>, VectorError>`  
-  Retrieves the top-$k$ nearest neighbor nodes satisfying label and property filters.
+  Retrieves the top-k nearest neighbor nodes satisfying label and property filters.
 - `VectorGraphExt::node_vector(n: NodeId) -> Result<Option<Vec<f32>>, VectorError>`  
   Returns the full-precision embedding stored for a node, or `None` if the node has no embedding. This performs an LMDB point lookup and does not build or consult the in-memory HNSW index.
 - `VectorGraphExt::vector_distance(a: &[f32], b: &[f32]) -> Result<f32, VectorError>`  
@@ -153,9 +204,13 @@ The `VectorGraphExt` trait extends the graph with vector embedding storage and s
 
 ---
 
-## Full-Text Search Extensions
+## Full-text Search Extensions
 
-The `TextIndexExt` and `TextGraphExt` traits enable creating, configuring, and querying full-text search indexes on node properties:
+The `TextIndexExt` and `TextGraphExt` traits enable creating, configuring, and querying full-text search indexes on node properties.
+
+`TextSearchOptions` controls a search: `label` and `property` narrow it to one index (when `None`, every active index is searched and per-node scores are summed), `limit` caps the result count (default 10), `scorer` replaces the default BM25 scorer, and `boolean_mode` selects candidate filtering. `BooleanMode::And` restricts results to documents containing every query term; `BooleanMode::Or` and the default `None` rank any document matching at least one term.
+
+Stemming and stop words are language-aware. `create_text_index` uses English; `create_text_index_with_language` accepts a `Language` value: `English`, `Spanish`, `French`, `German`, `Italian`, or `Portuguese`.
 
 - `TextIndexExt::create_text_index(label: &str, property: &str) -> Result<(), TextError>`  
   Creates a full-text search index on a specific node property.
@@ -198,6 +253,14 @@ The `GraphQueryExt` trait provides methods to execute Cypher queries against the
 - `explain(cypher: &str) -> Result<String, CypherError>`  
   Compiles and optimizes the physical query plan, returning it as an indented, human-readable tree.
 
+The supported query language surface is documented on the [Cypher Support](cypher.md) page.
+
+### Query Results and Errors
+
+A query returns a `QueryResult` with `columns: Vec<String>` and `records: Vec<Record>`; each `Record` holds `values: Vec<serde_json::Value>` aligned row-major with the columns. Nodes and relationships project as JSON objects, and missing values project as JSON null.
+
+Each layer has one error type, and all of them implement `std::error::Error`: `Error` for storage and domain failures (including the `NodeNotFound` and `EdgeNotFound` variants), `CypherError` for parse, plan, and execution failures, `VectorError` for vector index failures (including `AlreadyConfigured` and `DimensionMismatch`), `TextError` for full-text index failures, and `RetrievalError` for hybrid retrieval failures.
+
 ---
 
 ## Cypher Built-in Procedures
@@ -207,7 +270,7 @@ Graph data science procedures can be executed through the query interface using 
 ### Analytics and Communities
 
 - `CALL issundb.pageRank({iterations, damping})` yields `(nodeId, score)`. The configuration map is optional.
-- `CALL issundb.betweenness()` and `CALL issundb.harmonic()` yields `(nodeId, score)`. Both take no arguments.
+- `CALL issundb.betweenness()` and `CALL issundb.harmonic()` yield `(nodeId, score)`. Both take no arguments.
 - `CALL issundb.degree({direction})` yields `(nodeId, score)`, where `direction` is `'IN'`, `'OUT'`, or `'BOTH'` (the default).
 - `CALL issundb.connectedComponents()` (alias `issundb.wcc`) and `CALL issundb.stronglyConnectedComponents()` (alias `issundb.scc`) yield `(nodeId, componentId)`.
 - `CALL issundb.labelPropagation({maxIterations})` yields `(nodeId, communityId)`.

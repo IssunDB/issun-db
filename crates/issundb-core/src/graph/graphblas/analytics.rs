@@ -4,8 +4,11 @@ impl Graph {
     /// PageRank via iterative SpMV over the column-stochastic matrix.
     ///
     /// Each iteration computes `raw = M * rank` using PlusTimes, then applies the
-    /// damping formula `rank[i] = d * raw[i] + (1 - d) / n` in Rust. Dangling
-    /// nodes (no incoming edges) receive only the teleportation term.
+    /// damping formula `rank[i] = d * raw[i] + (1 - d) / n` in Rust. A node with
+    /// no incoming edges receives only the teleportation term. The rank mass of
+    /// dangling nodes (no outgoing edges) is not redistributed, so ranks do not
+    /// sum to 1; this is a deliberate simplification shared by the non-GraphBLAS
+    /// implementation.
     #[doc(hidden)]
     pub fn page_rank_graphblas(
         &self,

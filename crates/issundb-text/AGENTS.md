@@ -79,7 +79,7 @@ Consequences:
 
 Never apply `And` pre-filtering when `boolean_mode` is `None`; that would silently change the default retrieval semantics.
 
-## Batch Doc-Length Loading
+## Batch Doc-length Loading
 
 Doc lengths are stored in `fts_docs` keyed by `(LabelId, PropKeyId, NodeId)`. Loading them one call per `(NodeId, term)` pair causes redundant LMDB
 reads when multiple terms share candidate documents.

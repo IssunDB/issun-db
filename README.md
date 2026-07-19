@@ -45,7 +45,7 @@ To use IssunDB in your Rust project, add the dependency to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-issundb = "0.1.0-alpha.14"
+issundb = "0.1.0-alpha.15"
 serde_json = "1.0"
 ```
 
@@ -139,7 +139,7 @@ Refer to the [issundb-examples](crates/issundb-examples) crate for Rust API exam
 
 Refer to the [issundb-py/examples](crates/issundb-py/examples) directory for Python API examples.
 
-#### Knowlege Graph Demo
+#### Knowledge Graph Demo
 
 [![asciicast](https://asciinema.org/a/L1iTAtQeVeCe6jiX.svg)](https://asciinema.org/a/L1iTAtQeVeCe6jiX)
 

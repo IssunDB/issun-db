@@ -1,5 +1,12 @@
 //! Python `IssunDB` class. The module is gated behind the `extension-module`
 //! feature by `lib.rs`, so this file carries no feature attribute of its own.
+//!
+//! Every method releases the GIL around the native engine call
+//! (`Python::detach`), so a long-running query, backup, or reindex does not
+//! stall other Python threads and a pending `KeyboardInterrupt` is delivered
+//! as soon as the call returns. Arguments are extracted to owned Rust values
+//! before the release and results are serialized to JSON strings inside it,
+//! so the released section never touches a Python object.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -41,88 +48,85 @@ impl PyGraph {
     /// Open or create an IssunDB graph at `path`, specifying optional LMDB map size in GB.
     #[new]
     #[pyo3(signature = (path, map_size_gb=None))]
-    fn new(path: &str, map_size_gb: Option<usize>) -> PyResult<Self> {
+    fn new(py: Python<'_>, path: &str, map_size_gb: Option<usize>) -> PyResult<Self> {
         let size = map_size_gb.unwrap_or(1);
-        let graph = Graph::open(Path::new(path), size)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        let graph = py
+            .detach(|| Graph::open(Path::new(path), size))
+            .map_err(rt)?;
         Ok(Self { graph })
     }
 
     /// Insert a node with one or more labels and JSON-encoded `props`. Returns the
     /// new node ID. `labels` accepts either a single label string or a list of
     /// label strings (multi-label node).
-    fn add_node(&self, labels: &Bound<'_, PyAny>, props: &str) -> PyResult<u64> {
+    fn add_node(&self, py: Python<'_>, labels: &Bound<'_, PyAny>, props: &str) -> PyResult<u64> {
         let value = parse_json(props)?;
         if let Ok(single) = labels.extract::<String>() {
-            self.graph.add_node(&single, &value).map_err(rt)
+            py.detach(|| self.graph.add_node(&single, &value))
+                .map_err(rt)
         } else {
             let multi: Vec<String> = labels
                 .extract()
                 .map_err(|_| val("labels must be a string or a list of strings"))?;
-            let refs: Vec<&str> = multi.iter().map(String::as_str).collect();
-            self.graph.add_node_multi(&refs, &value).map_err(rt)
+            py.detach(|| {
+                let refs: Vec<&str> = multi.iter().map(String::as_str).collect();
+                self.graph.add_node_multi(&refs, &value)
+            })
+            .map_err(rt)
         }
     }
 
     /// Return the JSON-encoded properties of node `id`, or `None` if the node does not exist.
-    fn get_node(&self, id: u64) -> PyResult<Option<String>> {
-        let record = self
-            .graph
-            .get_node(id)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-        match record {
+    fn get_node(&self, py: Python<'_>, id: u64) -> PyResult<Option<String>> {
+        py.detach(|| match self.graph.get_node(id).map_err(rt)? {
             None => Ok(None),
             Some(r) => {
-                let value: serde_json::Value = rmp_serde::from_slice(&r.props)
-                    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-                let json = serde_json::to_string(&value)
-                    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-                Ok(Some(json))
+                let value: serde_json::Value = rmp_serde::from_slice(&r.props).map_err(rt)?;
+                Ok(Some(serde_json::to_string(&value).map_err(rt)?))
             }
-        }
+        })
     }
 
     /// Replace the properties of node `id` with JSON-encoded `props`.
-    fn update_node(&self, id: u64, props: &str) -> PyResult<()> {
-        let value: serde_json::Value = serde_json::from_str(props)
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-        self.graph
-            .update_node(id, &value)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    fn update_node(&self, py: Python<'_>, id: u64, props: &str) -> PyResult<()> {
+        let value = parse_json(props)?;
+        py.detach(|| self.graph.update_node(id, &value)).map_err(rt)
     }
 
     /// Delete node `id` and all of its incident edges.
-    fn delete_node(&self, id: u64) -> PyResult<()> {
-        self.graph
-            .delete_node(id)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    fn delete_node(&self, py: Python<'_>, id: u64) -> PyResult<()> {
+        py.detach(|| self.graph.delete_node(id)).map_err(rt)
     }
 
     /// Add a label to node `id`. No-op if it already has it.
-    fn add_label(&self, id: u64, label: &str) -> PyResult<()> {
-        self.graph
-            .add_label(id, label)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    fn add_label(&self, py: Python<'_>, id: u64, label: &str) -> PyResult<()> {
+        py.detach(|| self.graph.add_label(id, label)).map_err(rt)
     }
 
     /// Remove a label from node `id`. No-op if missing.
-    fn remove_label(&self, id: u64, label: &str) -> PyResult<()> {
-        self.graph
-            .remove_label(id, label)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    fn remove_label(&self, py: Python<'_>, id: u64, label: &str) -> PyResult<()> {
+        py.detach(|| self.graph.remove_label(id, label)).map_err(rt)
     }
 
     /// Insert a directed edge from `src` to `dst` with edge type `etype` and JSON-encoded `props`.
     /// Returns the new edge ID.
-    fn add_edge(&self, src: u64, dst: u64, etype: &str, props: &str) -> PyResult<u64> {
+    fn add_edge(
+        &self,
+        py: Python<'_>,
+        src: u64,
+        dst: u64,
+        etype: &str,
+        props: &str,
+    ) -> PyResult<u64> {
         let value = parse_json(props)?;
-        self.graph.add_edge(src, dst, etype, &value).map_err(rt)
+        py.detach(|| self.graph.add_edge(src, dst, etype, &value))
+            .map_err(rt)
     }
 
     /// Return edge `id` as a JSON string `{"src", "dst", "type", "props"}`, or
     /// `None` if the edge does not exist.
-    fn get_edge(&self, id: u64) -> PyResult<Option<String>> {
-        match self.graph.get_edge(id).map_err(rt)? {
+    fn get_edge(&self, py: Python<'_>, id: u64) -> PyResult<Option<String>> {
+        py.detach(|| match self.graph.get_edge(id).map_err(rt)? {
             None => Ok(None),
             Some(record) => {
                 let edge_type = self
@@ -139,49 +143,49 @@ impl PyGraph {
                 });
                 Ok(Some(value.to_string()))
             }
-        }
+        })
     }
 
     /// Replace the properties of edge `id` with JSON-encoded `props`.
-    fn update_edge(&self, id: u64, props: &str) -> PyResult<()> {
-        let value: serde_json::Value = serde_json::from_str(props)
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-        self.graph
-            .update_edge(id, &value)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    fn update_edge(&self, py: Python<'_>, id: u64, props: &str) -> PyResult<()> {
+        let value = parse_json(props)?;
+        py.detach(|| self.graph.update_edge(id, &value)).map_err(rt)
     }
 
     /// Delete edge `id`.
-    fn delete_edge(&self, id: u64) -> PyResult<()> {
-        self.graph.delete_edge(id).map_err(rt)
+    fn delete_edge(&self, py: Python<'_>, id: u64) -> PyResult<()> {
+        py.detach(|| self.graph.delete_edge(id)).map_err(rt)
     }
 
     /// Execute a Cypher query with optional JSON-encoded parameter bindings and return the result as a JSON string.
     ///
     /// The returned object has the shape `{"columns": [...], "records": [[...]]}`.
     #[pyo3(signature = (cypher, params=None))]
-    fn query(&self, cypher: &str, params: Option<String>) -> PyResult<String> {
-        let result = match params {
-            None => self.graph.query(cypher).map_err(rt)?,
-            Some(s) => {
-                let map: HashMap<String, serde_json::Value> = serde_json::from_str(&s)
-                    .map_err(|e| val(format!("parameters must be a JSON object: {e}")))?;
-                self.graph.query_with_params(cypher, &map).map_err(rt)?
-            }
+    fn query(&self, py: Python<'_>, cypher: &str, params: Option<String>) -> PyResult<String> {
+        let params: Option<HashMap<String, serde_json::Value>> = match params {
+            None => None,
+            Some(s) => Some(
+                serde_json::from_str(&s)
+                    .map_err(|e| val(format!("parameters must be a JSON object: {e}")))?,
+            ),
         };
-        serde_json::to_string(&result).map_err(rt)
+        py.detach(|| {
+            let result = match &params {
+                None => self.graph.query(cypher).map_err(rt)?,
+                Some(map) => self.graph.query_with_params(cypher, map).map_err(rt)?,
+            };
+            serde_json::to_string(&result).map_err(rt)
+        })
     }
 
     /// Compile `cypher`, optimize the physical plan, and return it as a human-readable tree.
-    fn explain(&self, cypher: &str) -> PyResult<String> {
-        self.graph
-            .explain(cypher)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    fn explain(&self, py: Python<'_>, cypher: &str) -> PyResult<String> {
+        py.detach(|| self.graph.explain(cypher)).map_err(rt)
     }
 
     /// Index or update the float32 embedding for node `id`.
-    fn upsert_vector(&self, id: u64, vec: Vec<f32>) -> PyResult<()> {
-        self.graph.upsert_vector(id, &vec).map_err(rt)
+    fn upsert_vector(&self, py: Python<'_>, id: u64, vec: Vec<f32>) -> PyResult<()> {
+        py.detach(|| self.graph.upsert_vector(id, &vec)).map_err(rt)
     }
 
     /// Return the `k` nearest neighbors to `vec` as a JSON array of
@@ -193,6 +197,7 @@ impl PyGraph {
     #[pyo3(signature = (vec, k, label=None, properties=None, rescore_factor=None))]
     fn vector_search(
         &self,
+        py: Python<'_>,
         vec: Vec<f32>,
         k: usize,
         label: Option<String>,
@@ -213,12 +218,14 @@ impl PyGraph {
             properties,
             rescore_factor,
         };
-        let hits = self.graph.vector_search_with(&vec, &opts).map_err(rt)?;
-        let json_hits: Vec<serde_json::Value> = hits
-            .into_iter()
-            .map(|h| serde_json::json!({ "node": h.node, "distance": h.distance }))
-            .collect();
-        serde_json::to_string(&json_hits).map_err(rt)
+        py.detach(|| {
+            let hits = self.graph.vector_search_with(&vec, &opts).map_err(rt)?;
+            let json_hits: Vec<serde_json::Value> = hits
+                .into_iter()
+                .map(|h| serde_json::json!({ "node": h.node, "distance": h.distance }))
+                .collect();
+            serde_json::to_string(&json_hits).map_err(rt)
+        })
     }
 
     /// Configure or rebuild the vector index metric and quantization.
@@ -229,6 +236,7 @@ impl PyGraph {
     #[pyo3(signature = (metric, quantization="float32", reindex=false))]
     fn configure_vector_index(
         &self,
+        py: Python<'_>,
         metric: &str,
         quantization: &str,
         reindex: bool,
@@ -237,11 +245,14 @@ impl PyGraph {
             metric: VectorMetric::from_str(metric).map_err(val)?,
             quantization: VectorQuantization::from_str(quantization).map_err(val)?,
         };
-        if reindex {
-            self.graph.reindex_vector_index(opts).map_err(rt)
-        } else {
-            self.graph.configure_vector_index(opts).map_err(rt)
-        }
+        py.detach(|| {
+            if reindex {
+                self.graph.reindex_vector_index(opts)
+            } else {
+                self.graph.configure_vector_index(opts)
+            }
+        })
+        .map_err(rt)
     }
 
     /// Full-text search over indexed node properties.
@@ -251,6 +262,7 @@ impl PyGraph {
     #[pyo3(signature = (query, label=None, property=None, limit=10))]
     fn text_search(
         &self,
+        py: Python<'_>,
         query: &str,
         label: Option<String>,
         property: Option<String>,
@@ -262,21 +274,19 @@ impl PyGraph {
             limit,
             ..Default::default()
         };
-        let hits = self
-            .graph
-            .text_search(query, &opts)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-        let json_hits: Vec<serde_json::Value> = hits
-            .into_iter()
-            .map(|h| {
-                serde_json::json!({
-                    "node": h.node,
-                    "score": h.score,
+        py.detach(|| {
+            let hits = self.graph.text_search(query, &opts).map_err(rt)?;
+            let json_hits: Vec<serde_json::Value> = hits
+                .into_iter()
+                .map(|h| {
+                    serde_json::json!({
+                        "node": h.node,
+                        "score": h.score,
+                    })
                 })
-            })
-            .collect();
-        serde_json::to_string(&json_hits)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+                .collect();
+            serde_json::to_string(&json_hits).map_err(rt)
+        })
     }
 
     /// Create a full-text index on `property` for nodes with `label`.
@@ -286,41 +296,47 @@ impl PyGraph {
     #[pyo3(signature = (label, property, language=None))]
     fn create_text_index(
         &self,
+        py: Python<'_>,
         label: &str,
         property: &str,
         language: Option<String>,
     ) -> PyResult<()> {
         let lang = Language::from_str(language.as_deref().unwrap_or("english")).map_err(val)?;
-        self.graph
-            .create_text_index_with_language(label, property, lang)
-            .map_err(rt)
+        py.detach(|| {
+            self.graph
+                .create_text_index_with_language(label, property, lang)
+        })
+        .map_err(rt)
     }
 
     /// Drop the full-text index on `property` for nodes with `label`.
-    fn drop_text_index(&self, label: &str, property: &str) -> PyResult<()> {
-        self.graph.drop_text_index(label, property).map_err(rt)
+    fn drop_text_index(&self, py: Python<'_>, label: &str, property: &str) -> PyResult<()> {
+        py.detach(|| self.graph.drop_text_index(label, property))
+            .map_err(rt)
     }
 
     /// List all active full-text indexes as a JSON array of
     /// `{"label", "property", "language"}`.
-    fn list_text_indexes(&self) -> PyResult<String> {
-        let indexes = self.graph.list_text_indexes().map_err(rt)?;
-        let list: Vec<serde_json::Value> = indexes
-            .into_iter()
-            .map(|(label, property, language)| {
-                serde_json::json!({
-                    "label": label,
-                    "property": property,
-                    "language": format!("{language:?}").to_lowercase(),
+    fn list_text_indexes(&self, py: Python<'_>) -> PyResult<String> {
+        py.detach(|| {
+            let indexes = self.graph.list_text_indexes().map_err(rt)?;
+            let list: Vec<serde_json::Value> = indexes
+                .into_iter()
+                .map(|(label, property, language)| {
+                    serde_json::json!({
+                        "label": label,
+                        "property": property,
+                        "language": format!("{language:?}").to_lowercase(),
+                    })
                 })
-            })
-            .collect();
-        serde_json::to_string(&list).map_err(rt)
+                .collect();
+            serde_json::to_string(&list).map_err(rt)
+        })
     }
 
     /// Set the GraphBLAS thread count (0 restores default behavior).
-    fn set_thread_count(&self, count: i32) -> PyResult<()> {
-        self.graph.set_thread_count(count).map_err(rt)
+    fn set_thread_count(&self, py: Python<'_>, count: i32) -> PyResult<()> {
+        py.detach(|| self.graph.set_thread_count(count)).map_err(rt)
     }
 
     /// Execute a hybrid retrieval (GraphRAG) query combining vector search, text
@@ -347,6 +363,7 @@ impl PyGraph {
     #[allow(clippy::too_many_arguments)]
     fn retrieve_hybrid(
         &self,
+        py: Python<'_>,
         vector: Option<Vec<f32>>,
         text_query: Option<String>,
         vector_k: usize,
@@ -383,50 +400,50 @@ impl PyGraph {
         };
         let vector = vector.unwrap_or_default();
         let text_query = text_query.unwrap_or_default();
-        let subgraph = retrieve_hybrid(&self.graph, &vector, &text_query, &opts).map_err(rt)?;
-        let scores: HashMap<String, f32> = subgraph
-            .scores
-            .into_iter()
-            .map(|(node, score)| (node.to_string(), score))
-            .collect();
-        let value = serde_json::json!({
-            "nodes": subgraph.nodes,
-            "edges": subgraph.edges,
-            "scores": scores,
-        });
-        serde_json::to_string(&value).map_err(rt)
+        py.detach(|| {
+            let subgraph = retrieve_hybrid(&self.graph, &vector, &text_query, &opts).map_err(rt)?;
+            let scores: HashMap<String, f32> = subgraph
+                .scores
+                .into_iter()
+                .map(|(node, score)| (node.to_string(), score))
+                .collect();
+            let value = serde_json::json!({
+                "nodes": subgraph.nodes,
+                "edges": subgraph.edges,
+                "scores": scores,
+            });
+            serde_json::to_string(&value).map_err(rt)
+        })
     }
 
     /// Write a hot backup of the database to `path`.
-    fn backup(&self, path: &str) -> PyResult<()> {
-        self.graph
-            .backup(Path::new(path))
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    fn backup(&self, py: Python<'_>, path: &str) -> PyResult<()> {
+        py.detach(|| self.graph.backup(Path::new(path))).map_err(rt)
     }
 
     /// Write a compacted hot backup of the database to `path`.
-    fn backup_compact(&self, path: &str) -> PyResult<()> {
-        self.graph
-            .backup_compact(Path::new(path))
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    fn backup_compact(&self, py: Python<'_>, path: &str) -> PyResult<()> {
+        py.detach(|| self.graph.backup_compact(Path::new(path)))
+            .map_err(rt)
     }
 
     /// Remove the indexed vector for node `id`.
-    fn remove_vector(&self, id: u64) -> PyResult<()> {
-        self.graph.remove_vector(id).map_err(rt)
+    fn remove_vector(&self, py: Python<'_>, id: u64) -> PyResult<()> {
+        py.detach(|| self.graph.remove_vector(id)).map_err(rt)
     }
 
     /// Check if a full-text index exists on `property` for nodes with `label`.
-    fn has_text_index(&self, label: &str, property: &str) -> PyResult<bool> {
-        self.graph.has_text_index(label, property).map_err(rt)
+    fn has_text_index(&self, py: Python<'_>, label: &str, property: &str) -> PyResult<bool> {
+        py.detach(|| self.graph.has_text_index(label, property))
+            .map_err(rt)
     }
 
     /// Restore a snapshot file at `snapshot` into a new database directory at `dst`.
     ///
     /// After restoration, open the database with `IssunDB(dst)`.
     #[staticmethod]
-    fn restore(snapshot: &str, dst: &str) -> PyResult<()> {
-        Graph::restore(Path::new(snapshot), Path::new(dst))
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    fn restore(py: Python<'_>, snapshot: &str, dst: &str) -> PyResult<()> {
+        py.detach(|| Graph::restore(Path::new(snapshot), Path::new(dst)))
+            .map_err(rt)
     }
 }

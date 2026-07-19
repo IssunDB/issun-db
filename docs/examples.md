@@ -2,9 +2,23 @@
 
 This page provides code examples for performing vector search, full-text keyword search, Cypher queries, running script files via the CLI, and executing GraphBLAS-backed graph algorithms in Rust and Cypher.
 
+## Example Programs
+
+The `crates/issundb-examples` crate contains complete, runnable programs; run one with `cargo run -p issundb-examples --example <name>`:
+
+| Example                       | Description                                                                                                            |
+|-------------------------------|------------------------------------------------------------------------------------------------------------------------|
+| `quickstart`                  | Opening a database, inserting nodes and edges, and executing a Cypher query.                                           |
+| `hybrid_retrieval_quickstart` | An end-to-end GraphRAG flow: nodes and edges, a full-text index, vector upserts, hybrid retrieval, and a Cypher query. |
+| `graph_analytics`             | Graph algorithms including PageRank, degree centrality, weighted shortest paths, label propagation, and components.   |
+| `gds_cypher`                  | The graph data science surface in Cypher: `CALL issundb.*` procedures and the comparison functions.                    |
+| `load_ldbc`                   | Loading a social network graph and running analytics over it.                                                          |
+| `neo4j_migration`             | Migrating sample data from a Neo4j-style JSON export into IssunDB.                                                     |
+| `concurrent_ops`              | Concurrent reads and writes over a shared `Graph` handle, demonstrating snapshot isolation for readers.               |
+
 ## Vector Search Example
 
-The following Rust example demonstrates inserting vector embeddings for nodes and performing $k$-nearest-neighbor similarity searches:
+The following Rust example demonstrates inserting vector embeddings for nodes and performing k-nearest-neighbor similarity searches:
 
 ```rust
 use issundb::{Graph, VectorGraphExt};
@@ -41,7 +55,7 @@ LIMIT 10
 
 When a query uses an ascending `ORDER BY vector_dist(node, query)` with a `LIMIT` over a labeled scan, the query planner uses a single HNSW index search instead of calculating distances for every node. It also pushes equality `WHERE` predicates (such as `p.language = 'English'`) into the index traversal as a pre-filter. Other query forms (such as descending order or a non-constant query vector) fall back to exact evaluation over the row pipeline.
 
-## Full-Text Search Example
+## Full-text Search Example
 
 The following Rust example demonstrates configuring and querying a full-text search index on specific node properties:
 
@@ -173,9 +187,9 @@ fn run_algorithms(graph: &Graph) -> Result<(), Box<dyn std::error::Error>> {
 
 ## Graph Data Science in Cypher
 
-We can also invoke these analytics, pathfinding, and retrieval algorithms directly inside Cypher queries! This allows feeding algorithm results
-directly into `MATCH`, `WHERE`, and `RETURN` clauses. There are two surfaces: built-in `CALL issundb.*` procedures and the `issundb.distance.*` and
-`issundb.similarity.*` scalar functions. We can find a complete, runnable tour in the `gds_cypher.rs` example program (
+These analytics, pathfinding, and retrieval algorithms can also be invoked directly inside Cypher queries, feeding algorithm results directly into
+`MATCH`, `WHERE`, and `RETURN` clauses. There are two surfaces: built-in `CALL issundb.*` procedures and the `issundb.distance.*` and
+`issundb.similarity.*` scalar functions. The `gds_cypher.rs` example program is a complete, runnable tour (
 `cargo run -p issundb-examples --example gds_cypher`).
 
 ### Built-in Procedures
@@ -188,7 +202,7 @@ query, so `nodeId` joins back to the matched nodes through `id()`.
 | `issundb.pageRank`                                          | `{iterations, damping}`                                                                                                               | `nodeId, score`              |
 | `issundb.betweenness`                                       | none                                                                                                                                  | `nodeId, score`              |
 | `issundb.harmonic`                                          | none                                                                                                                                  | `nodeId, score`              |
-| `issundb.degree`                                            | `{direction: 'IN'                                                                                                                     | 'OUT'                        |'BOTH'}` | `nodeId, score` |
+| `issundb.degree`                                            | `{direction}` with `'IN'`, `'OUT'`, or `'BOTH'`                                                                                       | `nodeId, score`              |
 | `issundb.connectedComponents` (alias `issundb.wcc`)         | none                                                                                                                                  | `nodeId, componentId`        |
 | `issundb.stronglyConnectedComponents` (alias `issundb.scc`) | none                                                                                                                                  | `nodeId, componentId`        |
 | `issundb.labelPropagation`                                  | `{maxIterations}`                                                                                                                     | `nodeId, communityId`        |

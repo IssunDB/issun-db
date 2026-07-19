@@ -1,6 +1,7 @@
 """Tests for Cypher query execution and plan explanation."""
 
 import json
+import threading
 
 import pytest
 
@@ -37,6 +38,25 @@ def test_explain_returns_plan_text(db):
 def test_query_rejects_invalid_cypher(db):
     with pytest.raises(RuntimeError):
         db.query("MATCH (n RETURN n")
+
+
+def test_concurrent_queries_from_threads(db):
+    """Queries release the GIL, so worker threads run them concurrently and
+    each thread sees the full committed result."""
+    for name in ("Ada", "Bob", "Cy"):
+        db.add_node("Person", json.dumps({"name": name}))
+    results = []
+
+    def worker():
+        result = json.loads(db.query("MATCH (n:Person) RETURN count(n) AS c"))
+        results.append(rows(result)[0][0])
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert results == [3] * 8
 
 
 def test_query_with_params(db):

@@ -52,7 +52,7 @@ The usearch `Index` does not auto-grow its internal capacity. Follow these rules
 - usearch `search` returns at most `min(k, index.size())` results. Clamp `k` to `index.size()` before searching to avoid requesting more results than
   the index holds.
 
-## The Cold-Start Pattern in `get_or_init_cache`
+## The Cold-start Pattern in `get_or_init_cache`
 
 `get_or_init_cache` builds the in-memory HNSW index from LMDB on first use:
 

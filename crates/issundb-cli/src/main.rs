@@ -1090,6 +1090,20 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
             }
         }
         ReplCommand::Open { path, map_size_gb } => {
+            // Reopening the currently open path requires dropping the live
+            // environment first: LMDB refuses a second in-process open of the
+            // same directory. Closing first means a failed reopen leaves no
+            // database open, which the error message reports. Opening a
+            // different path keeps the current database on failure.
+            let canon = |p: &Path| fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+            let reopening = state
+                .db_path
+                .as_deref()
+                .is_some_and(|cur| canon(cur) == canon(&path));
+            if reopening {
+                state.graph = None;
+                state.db_path = None;
+            }
             match Graph::open(&path, map_size_gb.unwrap_or(state.map_size_gb)) {
                 Ok(g) => {
                     eprintln!("{}", format!("opened: {}", path.display()).green());
@@ -2047,7 +2061,8 @@ fn run_cypher(state: &mut State, cypher: &str) {
     match result {
         Err(e) => cli_eprintln!("{}", format!("error: {e}").red()),
         Ok(qr) => {
-            let output = format_query_result(&qr);
+            // A saved file must stay plain text; only terminal output is styled.
+            let output = format_query_result(&qr, save_path.is_none());
             if let Some(ref save) = save_path {
                 match fs::File::create(save) {
                     Ok(mut f) => {
@@ -2066,7 +2081,10 @@ fn run_cypher(state: &mut State, cypher: &str) {
     }
 }
 
-fn format_query_result(qr: &issundb::QueryResult) -> String {
+/// Render a query result as a tab-separated table. With `color` false the
+/// output is plain text with no ANSI escapes, for `:save` files; terminal
+/// output passes true and still honors the global color detection.
+fn format_query_result(qr: &issundb::QueryResult, color: bool) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
 
@@ -2078,8 +2096,13 @@ fn format_query_result(qr: &issundb::QueryResult) -> String {
     // Header.
     let header = qr.columns.join("\t");
     let divider = "-".repeat(header.len().max(40));
-    let _ = writeln!(out, "{}", header.cyan().bold());
-    let _ = writeln!(out, "{}", divider.dimmed());
+    if color {
+        let _ = writeln!(out, "{}", header.cyan().bold());
+        let _ = writeln!(out, "{}", divider.dimmed());
+    } else {
+        let _ = writeln!(out, "{header}");
+        let _ = writeln!(out, "{divider}");
+    }
 
     for rec in &qr.records {
         let row: Vec<String> = rec.values.iter().map(|v| v.to_string()).collect();
@@ -2091,7 +2114,11 @@ fn format_query_result(qr: &issundb::QueryResult) -> String {
         qr.records.len(),
         if qr.records.len() == 1 { "" } else { "s" }
     );
-    let _ = writeln!(out, "{}", footer.dimmed());
+    if color {
+        let _ = writeln!(out, "{}", footer.dimmed());
+    } else {
+        let _ = writeln!(out, "{footer}");
+    }
     out
 }
 
@@ -2474,16 +2501,21 @@ fn is_parquet_path(path: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Rows per import write transaction. One buffered batch is the only
+/// per-import allocation that scales with the input, so memory stays bounded
+/// regardless of file size.
+const IMPORT_BATCH: usize = 50_000;
+
 /// Bulk-import nodes from a CSV or Parquet file whose columns become node
 /// properties.
 ///
 /// A `.parquet` extension selects the Parquet reader, whose columns become
 /// properties typed by their Arrow schema; any other extension is read as CSV
 /// where the first non-empty line is the header that supplies the property
-/// names and CSV cell values are typed by [`csv_cell_to_value`]. Either way each
-/// row is one node carrying `label`, and nodes are inserted in fixed-size
-/// batches, each its own write transaction, mirroring `:import-edges` so memory
-/// stays bounded regardless of file size. The label is a command argument, so
+/// names and CSV cell values are typed by [`csv_cell_to_value`]. Either way
+/// each row is one node carrying `label`. Rows stream from the file into
+/// batches of [`IMPORT_BATCH`], each inserted in its own write transaction,
+/// so memory holds at most one batch. The label is a command argument, so
 /// neither format carries a leading label column.
 fn cmd_import_nodes(state: &mut State, path: &str, label: &str) {
     let g = match state.graph.as_ref() {
@@ -2493,73 +2525,97 @@ fn cmd_import_nodes(state: &mut State, path: &str, label: &str) {
             return;
         }
     };
+    match import_nodes_stream(g, path, label, IMPORT_BATCH) {
+        Ok(inserted) => eprintln!("imported {inserted} {label} nodes from {path}"),
+        Err(e) => cli_eprintln!("{e}"),
+    }
+}
 
-    let entries: Vec<serde_json::Value> = if is_parquet_path(path) {
-        match read_parquet_entries(path) {
-            Ok(maps) => maps.into_iter().map(serde_json::Value::Object).collect(),
-            Err(e) => {
-                cli_eprintln!("cannot read {path}: {e}");
-                return;
-            }
+/// Insert one batch of node property maps in a single write transaction and
+/// clear the buffer.
+fn insert_node_batch(
+    g: &Graph,
+    label: &str,
+    buf: &mut Vec<serde_json::Value>,
+    inserted: &mut u64,
+) -> Result<(), String> {
+    if buf.is_empty() {
+        return Ok(());
+    }
+    g.update(|txn| {
+        for props in buf.iter() {
+            txn.add_node(label, props)?;
         }
-    } else {
-        let content = match std::fs::read_to_string(path) {
-            Ok(c) => c,
-            Err(e) => {
-                cli_eprintln!("cannot read {path}: {e}");
-                return;
-            }
-        };
+        Ok(())
+    })
+    .map_err(|e| format!("node batch insert failed: {e}"))?;
+    *inserted += buf.len() as u64;
+    buf.clear();
+    Ok(())
+}
 
-        let mut lines = content.lines().filter(|l| !l.trim().is_empty());
-        let header_line = match lines.next() {
-            Some(h) => h,
-            None => {
-                cli_eprintln!("CSV file is empty");
-                return;
-            }
-        };
-
-        let headers = parse_csv_line(header_line);
-        if headers.is_empty() {
-            cli_eprintln!("CSV has no columns");
-            return;
-        }
-
-        // Every column is a property; the label comes from the command argument.
-        let mut entries: Vec<serde_json::Value> = Vec::new();
-        for line in lines {
-            let cols = parse_csv_line(line);
-            let mut props = serde_json::Map::new();
-            for (j, header) in headers.iter().enumerate() {
-                let val_str = cols.get(j).map(|s| s.as_str()).unwrap_or("");
-                props.insert(header.to_owned(), csv_cell_to_value(val_str));
-            }
-            entries.push(serde_json::Value::Object(props));
-        }
-        entries
-    };
-
-    const BATCH: usize = 50_000;
-    let total = entries.len();
+/// Streaming body of `:import-nodes`: rows are read one at a time and flushed
+/// every `batch_size` rows, so at most one batch is in memory. Returns the
+/// inserted row count. `batch_size` is a parameter so tests can exercise the
+/// batch boundary cheaply.
+fn import_nodes_stream(
+    g: &Graph,
+    path: &str,
+    label: &str,
+    batch_size: usize,
+) -> Result<u64, String> {
+    let batch_size = batch_size.max(1);
+    let mut buf: Vec<serde_json::Value> = Vec::new();
     let mut inserted: u64 = 0;
 
-    for chunk in entries.chunks(BATCH) {
-        match g.update(|txn| {
-            for props in chunk {
-                txn.add_node(label, props)?;
+    if is_parquet_path(path) {
+        stream_parquet_entries(path, |obj| {
+            buf.push(serde_json::Value::Object(obj));
+            if buf.len() >= batch_size {
+                insert_node_batch(g, label, &mut buf, &mut inserted)?;
             }
             Ok(())
-        }) {
-            Ok(_) => inserted += chunk.len() as u64,
-            Err(e) => {
-                cli_eprintln!("node batch insert failed: {e}");
-                return;
+        })?;
+    } else {
+        use std::io::BufRead;
+        let file = std::fs::File::open(path).map_err(|e| format!("cannot read {path}: {e}"))?;
+        let mut headers: Option<Vec<String>> = None;
+        for line in std::io::BufReader::new(file).lines() {
+            let line = line.map_err(|e| format!("cannot read {path}: {e}"))?;
+            if line.trim().is_empty() {
+                continue;
             }
+            match &headers {
+                None => {
+                    // Every column is a property; the label comes from the
+                    // command argument.
+                    let h = parse_csv_line(&line);
+                    if h.is_empty() {
+                        return Err("CSV has no columns".to_owned());
+                    }
+                    headers = Some(h);
+                }
+                Some(hs) => {
+                    let cols = parse_csv_line(&line);
+                    let mut props = serde_json::Map::new();
+                    for (j, header) in hs.iter().enumerate() {
+                        let val_str = cols.get(j).map(|s| s.as_str()).unwrap_or("");
+                        props.insert(header.to_owned(), csv_cell_to_value(val_str));
+                    }
+                    buf.push(serde_json::Value::Object(props));
+                    if buf.len() >= batch_size {
+                        insert_node_batch(g, label, &mut buf, &mut inserted)?;
+                    }
+                }
+            }
+        }
+        if headers.is_none() {
+            return Err("CSV file is empty".to_owned());
         }
     }
 
-    eprintln!("imported {inserted}/{total} {label} nodes from {path}");
+    insert_node_batch(g, label, &mut buf, &mut inserted)?;
+    Ok(inserted)
 }
 
 /// Resolve a domain key to a node id via the always-on scalar auto-index on
@@ -2580,16 +2636,25 @@ fn resolve_node_by_id(
     Ok(txn.nodes_by_property(label, "Id", val)?.into_iter().next())
 }
 
+/// Counters accumulated by a streaming edge import.
+#[derive(Default)]
+struct EdgeImportReport {
+    inserted: u64,
+    unresolved: u64,
+    malformed: u64,
+}
+
 /// Bulk-import edges from a two-column CSV or Parquet file of source and
 /// destination domain keys.
 ///
 /// Each data row is `src_key, dst_key`: for CSV the first two columns, for
-/// Parquet the first two columns by position. Both keys are resolved to node ids
-/// by their auto-indexed `Id` property; `src_label` and `dst_label` scope the
-/// lookup so keys that collide across labels stay distinct. Edges of type
-/// `etype` are inserted in fixed-size batches, each its own write transaction.
-/// This bypasses the Cypher planner entirely (no `UNWIND`, `LabelScan`, or
-/// `HashJoin`) and keeps memory bounded regardless of file size.
+/// Parquet the first two columns by position. Both keys are resolved to node
+/// ids by their auto-indexed `Id` property; `src_label` and `dst_label` scope
+/// the lookup so keys that collide across labels stay distinct. Key pairs
+/// stream from the file into batches of [`IMPORT_BATCH`]; each batch is
+/// resolved in one read view and inserted in one write transaction, so memory
+/// holds at most one batch. This bypasses the Cypher planner entirely (no
+/// `UNWIND`, `LabelScan`, or `HashJoin`).
 fn cmd_import_edges(state: &mut State, path: &str, src_label: &str, dst_label: &str, etype: &str) {
     let g = match state.graph.as_ref() {
         Some(g) => g,
@@ -2598,57 +2663,33 @@ fn cmd_import_edges(state: &mut State, path: &str, src_label: &str, dst_label: &
             return;
         }
     };
+    match import_edges_stream(g, path, src_label, dst_label, etype, IMPORT_BATCH) {
+        Ok(report) => eprintln!(
+            "imported {} {etype} edges from {path} ({} unresolved endpoint(s), {} malformed row(s))",
+            report.inserted, report.unresolved, report.malformed
+        ),
+        Err(e) => cli_eprintln!("{e}"),
+    }
+}
 
-    // Collect the two key columns up front as raw strings (resolution decides
-    // int-vs-string per key). A row missing either non-empty key is malformed.
-    let (pairs, malformed): (Vec<(String, String)>, u64) = if is_parquet_path(path) {
-        match read_parquet_edge_pairs(path) {
-            Ok(r) => r,
-            Err(e) => {
-                cli_eprintln!("cannot read {path}: {e}");
-                return;
-            }
-        }
-    } else {
-        let content = match std::fs::read_to_string(path) {
-            Ok(c) => c,
-            Err(e) => {
-                cli_eprintln!("cannot read {path}: {e}");
-                return;
-            }
-        };
-
-        // First non-empty line is the header (e.g. `src_id,dst_id`).
-        let mut lines = content.lines().filter(|l| !l.trim().is_empty());
-        if lines.next().is_none() {
-            cli_eprintln!("CSV file is empty");
-            return;
-        }
-
-        let mut pairs: Vec<(String, String)> = Vec::new();
-        let mut malformed: u64 = 0;
-        for line in lines {
-            let cols = parse_csv_line(line);
-            let src = cols.first().map(|s| s.trim()).filter(|s| !s.is_empty());
-            let dst = cols.get(1).map(|s| s.trim()).filter(|s| !s.is_empty());
-            match (src, dst) {
-                (Some(s), Some(d)) => pairs.push((s.to_owned(), d.to_owned())),
-                _ => malformed += 1,
-            }
-        }
-        (pairs, malformed)
-    };
-
-    const BATCH: usize = 50_000;
-    let empty = serde_json::Value::Object(serde_json::Map::new());
-    let mut inserted: u64 = 0;
-    let mut unresolved: u64 = 0;
-
-    for chunk in pairs.chunks(BATCH) {
-        // One read view resolves the whole chunk, then one write txn inserts it.
-        let resolved: Vec<(NodeId, NodeId)> = match g.view(|txn| {
-            let mut out = Vec::with_capacity(chunk.len());
-            for (src_key, dst_key) in chunk {
+/// Resolve one batch of key pairs in a single read view, insert the resolved
+/// edges in a single write transaction, and clear the buffer. A row missing
+/// either endpoint counts as unresolved and is dropped.
+fn insert_edge_batch(
+    g: &Graph,
+    src_label: &str,
+    dst_label: &str,
+    etype: &str,
+    buf: &mut Vec<(String, String)>,
+    report: &mut EdgeImportReport,
+) -> Result<(), String> {
+    if buf.is_empty() {
+        return Ok(());
+    }
+    let resolved: Vec<(NodeId, NodeId)> = g
+        .view(|txn| {
+            let mut out = Vec::with_capacity(buf.len());
+            for (src_key, dst_key) in buf.iter() {
                 if let (Some(s), Some(d)) = (
                     resolve_node_by_id(txn, src_label, src_key)?,
                     resolve_node_by_id(txn, dst_label, dst_key)?,
@@ -2657,53 +2698,103 @@ fn cmd_import_edges(state: &mut State, path: &str, src_label: &str, dst_label: &
                 }
             }
             Ok(out)
-        }) {
-            Ok(v) => v,
-            Err(e) => {
-                cli_eprintln!("edge resolution failed: {e}");
-                return;
-            }
-        };
-        unresolved += (chunk.len() - resolved.len()) as u64;
+        })
+        .map_err(|e| format!("edge resolution failed: {e}"))?;
+    report.unresolved += (buf.len() - resolved.len()) as u64;
 
-        match g.update(|txn| {
-            for (s, d) in &resolved {
-                txn.add_edge(*s, *d, etype, &empty)?;
+    let empty = serde_json::Value::Object(serde_json::Map::new());
+    g.update(|txn| {
+        for (s, d) in &resolved {
+            txn.add_edge(*s, *d, etype, &empty)?;
+        }
+        Ok(())
+    })
+    .map_err(|e| format!("edge batch insert failed: {e}"))?;
+    report.inserted += resolved.len() as u64;
+    buf.clear();
+    Ok(())
+}
+
+/// Streaming body of `:import-edges`: key pairs are read one at a time and
+/// flushed every `batch_size` pairs, so at most one batch is in memory.
+/// `batch_size` is a parameter so tests can exercise the batch boundary
+/// cheaply.
+fn import_edges_stream(
+    g: &Graph,
+    path: &str,
+    src_label: &str,
+    dst_label: &str,
+    etype: &str,
+    batch_size: usize,
+) -> Result<EdgeImportReport, String> {
+    let batch_size = batch_size.max(1);
+    let mut buf: Vec<(String, String)> = Vec::new();
+    let mut report = EdgeImportReport::default();
+
+    if is_parquet_path(path) {
+        report.malformed = stream_parquet_edge_pairs(path, |src, dst| {
+            buf.push((src, dst));
+            if buf.len() >= batch_size {
+                insert_edge_batch(g, src_label, dst_label, etype, &mut buf, &mut report)?;
             }
             Ok(())
-        }) {
-            Ok(_) => inserted += resolved.len() as u64,
-            Err(e) => {
-                cli_eprintln!("edge batch insert failed: {e}");
-                return;
+        })?;
+    } else {
+        use std::io::BufRead;
+        let file = std::fs::File::open(path).map_err(|e| format!("cannot read {path}: {e}"))?;
+        // First non-empty line is the header (e.g. `src_id,dst_id`). A data row
+        // missing either non-empty key is malformed.
+        let mut saw_header = false;
+        for line in std::io::BufReader::new(file).lines() {
+            let line = line.map_err(|e| format!("cannot read {path}: {e}"))?;
+            if line.trim().is_empty() {
+                continue;
             }
+            if !saw_header {
+                saw_header = true;
+                continue;
+            }
+            let cols = parse_csv_line(&line);
+            let src = cols.first().map(|s| s.trim()).filter(|s| !s.is_empty());
+            let dst = cols.get(1).map(|s| s.trim()).filter(|s| !s.is_empty());
+            match (src, dst) {
+                (Some(s), Some(d)) => {
+                    buf.push((s.to_owned(), d.to_owned()));
+                    if buf.len() >= batch_size {
+                        insert_edge_batch(g, src_label, dst_label, etype, &mut buf, &mut report)?;
+                    }
+                }
+                _ => report.malformed += 1,
+            }
+        }
+        if !saw_header {
+            return Err("CSV file is empty".to_owned());
         }
     }
 
-    eprintln!(
-        "imported {inserted} {etype} edges from {path} ({unresolved} unresolved endpoint(s), {malformed} malformed row(s))"
-    );
+    insert_edge_batch(g, src_label, dst_label, etype, &mut buf, &mut report)?;
+    Ok(report)
 }
 
-/// Read every row of a Parquet file into one property map per row, each column
-/// becoming a property keyed by its name. The Arrow value to JSON mapping
-/// mirrors the engine's `COPY ... FROM '*.parquet'` path so Parquet imports and
-/// the `COPY` statement agree on typing. A `props` column holding a nested
-/// object is flattened into the row, matching `COPY` so an exported file
-/// round-trips.
-fn read_parquet_entries(
+/// Stream every row of a Parquet file as one property map per row, each column
+/// becoming a property keyed by its name, calling `f` per row so the whole
+/// file is never held in memory. The Arrow value to JSON mapping mirrors the
+/// engine's `COPY ... FROM '*.parquet'` path so Parquet imports and the `COPY`
+/// statement agree on typing. A `props` column holding a nested object is
+/// flattened into the row, matching `COPY` so an exported file round-trips.
+fn stream_parquet_entries(
     path: &str,
-) -> Result<Vec<serde_json::Map<String, serde_json::Value>>, String> {
+    mut f: impl FnMut(serde_json::Map<String, serde_json::Value>) -> Result<(), String>,
+) -> Result<(), String> {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
-    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let file = std::fs::File::open(path).map_err(|e| format!("cannot read {path}: {e}"))?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)
         .map_err(|e| format!("not a valid Parquet file: {e}"))?;
     let reader = builder
         .build()
         .map_err(|e| format!("failed to read Parquet file: {e}"))?;
 
-    let mut entries = Vec::new();
     for batch_res in reader {
         let batch = batch_res.map_err(|e| format!("failed to read record batch: {e}"))?;
         let schema = batch.schema();
@@ -2723,29 +2814,30 @@ fn read_parquet_entries(
                     }
                 }
             }
-            entries.push(obj);
+            f(obj)?;
         }
     }
-    Ok(entries)
+    Ok(())
 }
 
-/// Read source and destination domain keys from the first two columns of a
-/// Parquet file, mirroring the positional two-column convention of the CSV edge
-/// import. Returns the resolvable `(src_key, dst_key)` string pairs plus the
-/// count of rows missing either key. Values are stringified by
-/// [`value_to_key_string`] so `resolve_node_by_id` can match them as integers or
-/// strings.
-fn read_parquet_edge_pairs(path: &str) -> Result<(Vec<(String, String)>, u64), String> {
+/// Stream source and destination domain keys from the first two columns of a
+/// Parquet file, mirroring the positional two-column convention of the CSV
+/// edge import, calling `f` per resolvable pair. Returns the count of rows
+/// missing either key. Values are stringified by [`value_to_key_string`] so
+/// `resolve_node_by_id` can match them as integers or strings.
+fn stream_parquet_edge_pairs(
+    path: &str,
+    mut f: impl FnMut(String, String) -> Result<(), String>,
+) -> Result<u64, String> {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
-    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let file = std::fs::File::open(path).map_err(|e| format!("cannot read {path}: {e}"))?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)
         .map_err(|e| format!("not a valid Parquet file: {e}"))?;
     let reader = builder
         .build()
         .map_err(|e| format!("failed to read Parquet file: {e}"))?;
 
-    let mut pairs: Vec<(String, String)> = Vec::new();
     let mut malformed: u64 = 0;
     for batch_res in reader {
         let batch = batch_res.map_err(|e| format!("failed to read record batch: {e}"))?;
@@ -2760,12 +2852,12 @@ fn read_parquet_edge_pairs(path: &str) -> Result<(Vec<(String, String)>, u64), S
             let src = value_to_key_string(&arrow_to_json_value(src_col, row)?);
             let dst = value_to_key_string(&arrow_to_json_value(dst_col, row)?);
             match (src, dst) {
-                (Some(s), Some(d)) => pairs.push((s, d)),
+                (Some(s), Some(d)) => f(s, d)?,
                 _ => malformed += 1,
             }
         }
     }
-    Ok((pairs, malformed))
+    Ok(malformed)
 }
 
 /// Convert a JSON value into a domain-key string for edge endpoint resolution,
@@ -3387,6 +3479,80 @@ mod tests {
 
         // 5. Quit command should return false
         assert!(!handle(&mut state, "quit"));
+    }
+
+    /// `:open` on the already-open path must drop the live environment first;
+    /// LMDB refuses a second in-process open of the same directory. The data
+    /// persists across the reopen.
+    #[test]
+    fn reopen_same_path_replaces_environment() {
+        let temp = TempDir::new().unwrap();
+        let mut state = State::new(None, None, 1);
+        let open_cmd = format!(":open {}", temp.path().display());
+        assert!(handle(&mut state, &open_cmd));
+        assert!(handle(&mut state, "add-node Person {\"name\": \"Alice\"}"));
+
+        let _ = take_command_error();
+        assert!(handle(&mut state, &open_cmd));
+        assert!(!take_command_error(), "reopen reported an error");
+        assert!(state.graph.is_some());
+
+        let g = state.graph.as_ref().unwrap();
+        let people = g.view(|txn| txn.nodes_by_label("Person")).unwrap();
+        assert_eq!(people.len(), 1);
+    }
+
+    /// The `:save` file path renders plain text even when terminal coloring is
+    /// forced on, so a saved file never contains ANSI escape sequences.
+    #[test]
+    fn saved_query_output_has_no_ansi_escapes() {
+        let qr = issundb::QueryResult {
+            columns: vec!["name".to_owned()],
+            records: vec![issundb::Record {
+                values: vec![serde_json::json!("Alice")],
+            }],
+        };
+        colored::control::set_override(true);
+        let plain = format_query_result(&qr, false);
+        let styled = format_query_result(&qr, true);
+        colored::control::unset_override();
+        assert!(
+            !plain.contains('\u{1b}'),
+            "plain output contains ANSI escapes:\n{plain:?}"
+        );
+        assert!(plain.contains("name") && plain.contains("(1 row)"));
+        assert!(
+            styled.contains('\u{1b}'),
+            "styled output lost its coloring under a forced override"
+        );
+    }
+
+    /// Streaming imports flush at the batch boundary: with a batch size of 2,
+    /// five node rows and three edge rows cross the boundary and every row
+    /// still lands exactly once.
+    #[test]
+    fn import_streams_flush_across_batch_boundary() {
+        let temp = TempDir::new().unwrap();
+        let g = Graph::open(temp.path(), 1).unwrap();
+
+        let nodes_csv = temp.path().join("users.csv");
+        std::fs::write(&nodes_csv, "Id\n1\n2\n3\n4\n5\n").unwrap();
+        let inserted = import_nodes_stream(&g, nodes_csv.to_str().unwrap(), "User", 2).unwrap();
+        assert_eq!(inserted, 5);
+        let users = g.view(|txn| txn.nodes_by_label("User")).unwrap();
+        assert_eq!(users.len(), 5);
+
+        // Three resolvable pairs plus one unresolvable and one malformed row.
+        let edges_csv = temp.path().join("knows.csv");
+        std::fs::write(&edges_csv, "src,dst\n1,2\n2,3\n3,4\n4,999\n5,\n").unwrap();
+        let report =
+            import_edges_stream(&g, edges_csv.to_str().unwrap(), "User", "User", "KNOWS", 2)
+                .unwrap();
+        assert_eq!(report.inserted, 3);
+        assert_eq!(report.unresolved, 1);
+        assert_eq!(report.malformed, 1);
+        let count = g.view(|txn| txn.edge_count_by_type("KNOWS")).unwrap();
+        assert_eq!(count, 3);
     }
 
     #[test]

@@ -164,30 +164,36 @@ impl IssunMcp {
     }
 
     #[tool(description = "Fetch a node by id; returning its labels and properties.")]
-    fn get_node(
+    async fn get_node(
         &self,
         Parameters(args): Parameters<NodeIdArgs>,
     ) -> Result<CallToolResult, McpError> {
-        match self.graph.get_node(args.id).map_err(internal)? {
+        // Every tool runs its synchronous graph work on the blocking pool: a
+        // long query on the async runtime would stall the transport's worker
+        // threads (the REST layer does the same via `spawn_blocking`).
+        let graph = self.graph.clone();
+        tokio::task::spawn_blocking(move || match graph.get_node(args.id).map_err(internal)? {
             Some(record) => {
-                let labels = self.graph.node_labels(args.id).map_err(internal)?;
+                let labels = graph.node_labels(args.id).map_err(internal)?;
                 let label = labels.first().cloned().unwrap_or_default();
                 let props: Value = rmp_serde::from_slice(&record.props).map_err(internal)?;
                 ok_json(json!({ "id": args.id, "label": label, "labels": labels, "props": props }))
             }
             None => Err(invalid(format!("node {} not found", args.id))),
-        }
+        })
+        .await
+        .map_err(internal)?
     }
 
     #[tool(description = "Fetch an edge by id; returning its endpoints, type, and properties.")]
-    fn get_edge(
+    async fn get_edge(
         &self,
         Parameters(args): Parameters<EdgeIdArgs>,
     ) -> Result<CallToolResult, McpError> {
-        match self.graph.get_edge(args.id).map_err(internal)? {
+        let graph = self.graph.clone();
+        tokio::task::spawn_blocking(move || match graph.get_edge(args.id).map_err(internal)? {
             Some(record) => {
-                let edge_type = self
-                    .graph
+                let edge_type = graph
                     .type_name(record.edge_type)
                     .map_err(internal)?
                     .unwrap_or_default();
@@ -201,86 +207,104 @@ impl IssunMcp {
                 }))
             }
             None => Err(invalid(format!("edge {} not found", args.id))),
-        }
+        })
+        .await
+        .map_err(internal)?
     }
 
     #[tool(
         description = "Execute a Cypher query with optional parameters; returns columns and records. Use CREATE, SET, REMOVE, DELETE, and MERGE to mutate the graph."
     )]
-    fn cypher_query(
+    async fn cypher_query(
         &self,
         Parameters(args): Parameters<CypherArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let result = self
-            .graph
-            .query_with_params(&args.query, &args.params)
-            .map_err(invalid)?;
-        let records: Vec<Vec<Value>> = result.records.iter().map(|r| r.values.clone()).collect();
-        ok_json(json!({ "columns": result.columns, "records": records }))
+        let graph = self.graph.clone();
+        tokio::task::spawn_blocking(move || {
+            let result = graph
+                .query_with_params(&args.query, &args.params)
+                .map_err(invalid)?;
+            let records: Vec<Vec<Value>> =
+                result.records.iter().map(|r| r.values.clone()).collect();
+            ok_json(json!({ "columns": result.columns, "records": records }))
+        })
+        .await
+        .map_err(internal)?
     }
 
     #[tool(description = "Return the physical query plan for a Cypher query as an indented tree.")]
-    fn explain(
+    async fn explain(
         &self,
         Parameters(args): Parameters<ExplainArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let plan = self.graph.explain(&args.query).map_err(invalid)?;
-        ok_json(json!({ "plan": plan }))
+        let graph = self.graph.clone();
+        tokio::task::spawn_blocking(move || {
+            let plan = graph.explain(&args.query).map_err(invalid)?;
+            ok_json(json!({ "plan": plan }))
+        })
+        .await
+        .map_err(internal)?
     }
 
     #[tool(description = "Full-text search over indexed node properties; returns ranked hits.")]
-    fn text_search(
+    async fn text_search(
         &self,
         Parameters(args): Parameters<TextSearchArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let opts = TextSearchOptions {
-            label: args.label,
-            property: args.property,
-            limit: args.limit,
-            ..Default::default()
-        };
-        let hits = self
-            .graph
-            .text_search(&args.query, &opts)
-            .map_err(internal)?;
-        let response: Vec<Value> = hits
-            .iter()
-            .map(|h| json!({ "node": h.node, "score": h.score }))
-            .collect();
-        ok_json(json!(response))
+        let graph = self.graph.clone();
+        tokio::task::spawn_blocking(move || {
+            let opts = TextSearchOptions {
+                label: args.label,
+                property: args.property,
+                limit: args.limit,
+                ..Default::default()
+            };
+            let hits = graph.text_search(&args.query, &opts).map_err(internal)?;
+            let response: Vec<Value> = hits
+                .iter()
+                .map(|h| json!({ "node": h.node, "score": h.score }))
+                .collect();
+            ok_json(json!(response))
+        })
+        .await
+        .map_err(internal)?
     }
 
     #[tool(
         description = "Nearest-neighbor vector search; returns the k closest nodes by distance (with optional label and property filtering)."
     )]
-    fn vector_search(
+    async fn vector_search(
         &self,
         Parameters(args): Parameters<VectorSearchArgs>,
     ) -> Result<CallToolResult, McpError> {
         if args.vector.is_empty() {
             return Err(invalid("vector must not be empty"));
         }
-        let opts = VectorSearchOptions {
-            k: args.k,
-            label: args.label,
-            properties: args.properties,
-            rescore_factor: args.rescore_factor,
-        };
-        let hits = self
-            .graph
-            .vector_search_with(&args.vector, &opts)
-            .map_err(internal)?;
-        let response: Vec<Value> = hits
-            .iter()
-            .map(|h| json!({ "node": h.node, "distance": h.distance }))
-            .collect();
-        ok_json(json!(response))
+        let graph = self.graph.clone();
+        tokio::task::spawn_blocking(move || {
+            let opts = VectorSearchOptions {
+                k: args.k,
+                label: args.label,
+                properties: args.properties,
+                rescore_factor: args.rescore_factor,
+            };
+            let hits = graph
+                .vector_search_with(&args.vector, &opts)
+                .map_err(internal)?;
+            let response: Vec<Value> = hits
+                .iter()
+                .map(|h| json!({ "node": h.node, "distance": h.distance }))
+                .collect();
+            ok_json(json!(response))
+        })
+        .await
+        .map_err(internal)?
     }
 
     #[tool(
         description = "Execute a hybrid retrieval query that combines vector/semantic search, full-text keyword search, and relationship expansion."
     )]
-    fn retrieve_hybrid(
+    async fn retrieve_hybrid(
         &self,
         Parameters(args): Parameters<HybridRetrieveArgs>,
     ) -> Result<CallToolResult, McpError> {
@@ -316,14 +340,19 @@ impl IssunMcp {
             fusion,
         };
 
-        let subgraph =
-            retrieve_hybrid(&self.graph, &vector, &text_query, &opts).map_err(internal)?;
+        let graph = self.graph.clone();
+        tokio::task::spawn_blocking(move || {
+            let subgraph =
+                retrieve_hybrid(&graph, &vector, &text_query, &opts).map_err(internal)?;
 
-        ok_json(json!({
-            "nodes": subgraph.nodes,
-            "edges": subgraph.edges,
-            "scores": subgraph.scores,
-        }))
+            ok_json(json!({
+                "nodes": subgraph.nodes,
+                "edges": subgraph.edges,
+                "scores": subgraph.scores,
+            }))
+        })
+        .await
+        .map_err(internal)?
     }
 }
 
@@ -395,12 +424,13 @@ mod tests {
             .expect("seed person")
     }
 
-    #[test]
-    fn get_node_round_trips_label_and_props() {
+    #[tokio::test]
+    async fn get_node_round_trips_label_and_props() {
         let (mcp, _dir) = fresh();
         let id = seed_person(&mcp, "Ada");
         let result = mcp
             .get_node(Parameters(NodeIdArgs { id }))
+            .await
             .expect("get_node");
         let value = body(result);
         assert_eq!(value["id"].as_u64(), Some(id));
@@ -409,17 +439,18 @@ mod tests {
         assert_eq!(value["props"]["name"], "Ada");
     }
 
-    #[test]
-    fn get_node_missing_is_invalid_params() {
+    #[tokio::test]
+    async fn get_node_missing_is_invalid_params() {
         let (mcp, _dir) = fresh();
         let err = mcp
             .get_node(Parameters(NodeIdArgs { id: 999 }))
+            .await
             .expect_err("missing node");
         assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
     }
 
-    #[test]
-    fn get_edge_round_trips_endpoints_and_type() {
+    #[tokio::test]
+    async fn get_edge_round_trips_endpoints_and_type() {
         let (mcp, _dir) = fresh();
         let a = seed_person(&mcp, "Ada");
         let b = seed_person(&mcp, "Grace");
@@ -429,6 +460,7 @@ mod tests {
             .expect("add edge");
         let value = body(
             mcp.get_edge(Parameters(EdgeIdArgs { id: edge_id }))
+                .await
                 .expect("get_edge"),
         );
         assert_eq!(value["src"].as_u64(), Some(a));
@@ -437,17 +469,18 @@ mod tests {
         assert_eq!(value["props"]["since"], 2020);
     }
 
-    #[test]
-    fn get_edge_missing_is_invalid_params() {
+    #[tokio::test]
+    async fn get_edge_missing_is_invalid_params() {
         let (mcp, _dir) = fresh();
         let err = mcp
             .get_edge(Parameters(EdgeIdArgs { id: 999 }))
+            .await
             .expect_err("missing edge");
         assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
     }
 
-    #[test]
-    fn cypher_query_returns_columns_and_records() {
+    #[tokio::test]
+    async fn cypher_query_returns_columns_and_records() {
         let (mcp, _dir) = fresh();
         seed_person(&mcp, "Ada");
         let result = mcp
@@ -455,14 +488,15 @@ mod tests {
                 query: "MATCH (n:Person) RETURN n.name AS name".to_string(),
                 params: HashMap::new(),
             }))
+            .await
             .expect("cypher_query");
         let value = body(result);
         assert_eq!(value["columns"], json!(["name"]));
         assert_eq!(value["records"], json!([["Ada"]]));
     }
 
-    #[test]
-    fn cypher_query_honors_params() {
+    #[tokio::test]
+    async fn cypher_query_honors_params() {
         let (mcp, _dir) = fresh();
         seed_person(&mcp, "Ada");
         seed_person(&mcp, "Grace");
@@ -473,12 +507,13 @@ mod tests {
                 query: "MATCH (n:Person) WHERE n.name = $who RETURN n.name AS name".to_string(),
                 params,
             }))
+            .await
             .expect("cypher_query");
         assert_eq!(body(result)["records"], json!([["Grace"]]));
     }
 
-    #[test]
-    fn cypher_query_mutates_via_create_and_delete() {
+    #[tokio::test]
+    async fn cypher_query_mutates_via_create_and_delete() {
         // The aggressive MCP surface has no typed write tools; mutation must work
         // through Cypher. Create a node, confirm it, then delete it.
         let (mcp, _dir) = fresh();
@@ -486,12 +521,14 @@ mod tests {
             query: "CREATE (n:Person {name: 'Ada'})".to_string(),
             params: HashMap::new(),
         }))
+        .await
         .expect("create");
         let after_create = body(
             mcp.cypher_query(Parameters(CypherArgs {
                 query: "MATCH (n:Person) RETURN n.name AS name".to_string(),
                 params: HashMap::new(),
             }))
+            .await
             .expect("match"),
         );
         assert_eq!(after_create["records"], json!([["Ada"]]));
@@ -500,53 +537,58 @@ mod tests {
             query: "MATCH (n:Person {name: 'Ada'}) DELETE n".to_string(),
             params: HashMap::new(),
         }))
+        .await
         .expect("delete");
         let after_delete = body(
             mcp.cypher_query(Parameters(CypherArgs {
                 query: "MATCH (n:Person) RETURN n.name AS name".to_string(),
                 params: HashMap::new(),
             }))
+            .await
             .expect("match"),
         );
         assert_eq!(after_delete["records"], json!([]));
     }
 
-    #[test]
-    fn cypher_query_invalid_is_invalid_params() {
+    #[tokio::test]
+    async fn cypher_query_invalid_is_invalid_params() {
         let (mcp, _dir) = fresh();
         let err = mcp
             .cypher_query(Parameters(CypherArgs {
                 query: "MATCH (n RETURN".to_string(),
                 params: HashMap::new(),
             }))
+            .await
             .expect_err("parse error");
         assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
     }
 
-    #[test]
-    fn explain_returns_plan() {
+    #[tokio::test]
+    async fn explain_returns_plan() {
         let (mcp, _dir) = fresh();
         let result = mcp
             .explain(Parameters(ExplainArgs {
                 query: "MATCH (n:Person) RETURN n".to_string(),
             }))
+            .await
             .expect("explain");
         assert!(body(result)["plan"].as_str().is_some_and(|p| !p.is_empty()));
     }
 
-    #[test]
-    fn explain_invalid_is_invalid_params() {
+    #[tokio::test]
+    async fn explain_invalid_is_invalid_params() {
         let (mcp, _dir) = fresh();
         let err = mcp
             .explain(Parameters(ExplainArgs {
                 query: "MATCH (n RETURN".to_string(),
             }))
+            .await
             .expect_err("parse error");
         assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
     }
 
-    #[test]
-    fn text_search_returns_ranked_hits() {
+    #[tokio::test]
+    async fn text_search_returns_ranked_hits() {
         let (mcp, _dir) = fresh();
         mcp.graph
             .create_text_index("Doc", "body")
@@ -562,14 +604,15 @@ mod tests {
                 property: Some("body".to_string()),
                 limit: 10,
             }))
+            .await
             .expect("text_search");
         let hits = body(result);
         assert_eq!(hits.as_array().map(|a| a.len()), Some(1));
         assert_eq!(hits[0]["node"].as_u64(), Some(id));
     }
 
-    #[test]
-    fn vector_search_returns_nearest_node() {
+    #[tokio::test]
+    async fn vector_search_returns_nearest_node() {
         let (mcp, _dir) = fresh();
         let a = seed_person(&mcp, "Ada");
         let b = seed_person(&mcp, "Grace");
@@ -587,14 +630,15 @@ mod tests {
                 properties: None,
                 rescore_factor: None,
             }))
+            .await
             .expect("vector_search");
         let hits = body(result);
         assert_eq!(hits.as_array().map(|a| a.len()), Some(1));
         assert_eq!(hits[0]["node"].as_u64(), Some(a));
     }
 
-    #[test]
-    fn vector_search_empty_vector_is_invalid_params() {
+    #[tokio::test]
+    async fn vector_search_empty_vector_is_invalid_params() {
         let (mcp, _dir) = fresh();
         let err = mcp
             .vector_search(Parameters(VectorSearchArgs {
@@ -604,12 +648,13 @@ mod tests {
                 properties: None,
                 rescore_factor: None,
             }))
+            .await
             .expect_err("empty vector");
         assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
     }
 
-    #[test]
-    fn vector_search_with_property_filter_succeeds() {
+    #[tokio::test]
+    async fn vector_search_with_property_filter_succeeds() {
         let (mcp, _dir) = fresh();
         let a = seed_person(&mcp, "Ada");
         let b = seed_person(&mcp, "Grace");
@@ -632,14 +677,15 @@ mod tests {
                 properties: Some(filters),
                 rescore_factor: None,
             }))
+            .await
             .expect("vector_search with filter");
         let hits = body(result);
         assert_eq!(hits.as_array().map(|a| a.len()), Some(1));
         assert_eq!(hits[0]["node"].as_u64(), Some(b));
     }
 
-    #[test]
-    fn retrieve_hybrid_succeeds() {
+    #[tokio::test]
+    async fn retrieve_hybrid_succeeds() {
         let (mcp, _dir) = fresh();
         mcp.graph
             .create_text_index("Person", "name")
@@ -666,6 +712,7 @@ mod tests {
                 vector_weight: None,
                 text_weight: None,
             }))
+            .await
             .expect("retrieve_hybrid");
 
         let value = body(result);

@@ -181,39 +181,85 @@ impl Graph {
 
                 if let Some(val) = prop_val {
                     if val != &serde_json::Value::Null {
+                        // 2. Unique constraint check. Runs for every non-null
+                        // value, including a string too long to index (absent
+                        // from `edge_prop_idx`), which falls back to a type
+                        // scan so the constraint still holds.
+                        if flags == 0x01 {
+                            self.check_edge_property_unique(
+                                wtxn,
+                                type_id,
+                                etype,
+                                prop_key_id,
+                                &prop_name,
+                                val,
+                                edge_id,
+                            )?;
+                        }
+
+                        // 3. Write index entry
                         if let Some(encoded) = encode_property_value(val) {
-                            // 2. Unique constraint check
-                            if flags == 0x01 {
-                                let mut prefix = Vec::with_capacity(4 + 4 + encoded.len());
-                                prefix.extend_from_slice(&type_id.to_be_bytes());
-                                prefix.extend_from_slice(&prop_key_id.to_be_bytes());
-                                prefix.extend_from_slice(&encoded);
-
-                                for entry in
-                                    self.storage.edge_prop_idx.prefix_iter(wtxn, &prefix)?
-                                {
-                                    let (key, _) = entry?;
-                                    // Only an exact encoded-value match conflicts;
-                                    // a prefix-only match is a distinct string
-                                    // value (see `exact_prop_index_id`).
-                                    if let Some(found_edge_id) = exact_prop_index_id(key, &encoded)
-                                    {
-                                        if found_edge_id != edge_id {
-                                            return Err(Error::UniqueConstraintViolation(
-                                                etype.to_string(),
-                                                prop_name.to_string(),
-                                                val.to_string(),
-                                            ));
-                                        }
-                                    }
-                                }
-                            }
-
-                            // 3. Write index entry
                             let idx_key =
                                 edge_prop_index_key(type_id, prop_key_id, &encoded, edge_id);
                             self.storage.edge_prop_idx.put(wtxn, &idx_key, &())?;
                         }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Enforce a unique constraint for one edge property value, excluding the
+    /// edge itself. An index-encodable value is checked via `edge_prop_idx`
+    /// (exact encoded-value match, so `30` and `30.0` conflict); a value too
+    /// long to index falls back to a type scan comparing stored values, so the
+    /// constraint holds for long strings that never reach the index. Mirrors
+    /// `check_node_property_unique`.
+    #[allow(clippy::too_many_arguments)]
+    fn check_edge_property_unique(
+        &self,
+        wtxn: &heed::RwTxn,
+        type_id: TypeId,
+        etype: &str,
+        prop_key_id: PropKeyId,
+        prop_name: &str,
+        val: &serde_json::Value,
+        edge_id: EdgeId,
+    ) -> Result<(), Error> {
+        let violation = || {
+            Error::UniqueConstraintViolation(
+                etype.to_string(),
+                prop_name.to_string(),
+                val.to_string(),
+            )
+        };
+        if let Some(encoded) = encode_property_value(val) {
+            let mut prefix = Vec::with_capacity(4 + 4 + encoded.len());
+            prefix.extend_from_slice(&type_id.to_be_bytes());
+            prefix.extend_from_slice(&prop_key_id.to_be_bytes());
+            prefix.extend_from_slice(&encoded);
+            for entry in self.storage.edge_prop_idx.prefix_iter(wtxn, &prefix)? {
+                let (key, _) = entry?;
+                // Only an exact encoded-value match conflicts; a prefix-only
+                // match is a distinct string value (see `exact_prop_index_id`).
+                if let Some(found_edge_id) = exact_prop_index_id(key, &encoded) {
+                    if found_edge_id != edge_id {
+                        return Err(violation());
+                    }
+                }
+            }
+        } else {
+            // Too long to index: compare the stored value on every other edge
+            // of this type.
+            for other in self.edges_by_type_impl(wtxn, etype)? {
+                if other == edge_id {
+                    continue;
+                }
+                if let Some(record) = self.get_edge_impl(wtxn, other)? {
+                    let props: serde_json::Value = props::decode(&record.props)?;
+                    if props.get(prop_name) == Some(val) {
+                        return Err(violation());
                     }
                 }
             }
@@ -584,7 +630,12 @@ impl Graph {
         }
 
         let edge_ids = self.edges_by_type_impl(wtxn, etype)?;
-        let mut seen_values = ahash::AHashSet::new();
+        // Dedup on the same notion of value identity the insert-time check uses
+        // (see `create_node_index_impl`): an encodable value by its
+        // order-preserving encoding (so `30` and `30.0` collide, as they do at
+        // insert time), a value too long to index by a tagged copy of its exact
+        // JSON form. Explicit nulls never conflict, matching the insert path.
+        let mut seen_values: ahash::AHashSet<Vec<u8>> = ahash::AHashSet::new();
 
         for edge_id in &edge_ids {
             let record = self
@@ -601,12 +652,19 @@ impl Graph {
             }
 
             if let Some(val) = prop_val {
-                if flags == 0x01 && !seen_values.insert(val.clone()) {
-                    return Err(Error::UniqueConstraintViolation(
-                        etype.to_string(),
-                        property.to_string(),
-                        val.to_string(),
-                    ));
+                if flags == 0x01 && val != &serde_json::Value::Null {
+                    let key = encode_property_value(val).unwrap_or_else(|| {
+                        let mut k = vec![0xFF];
+                        k.extend_from_slice(val.to_string().as_bytes());
+                        k
+                    });
+                    if !seen_values.insert(key) {
+                        return Err(Error::UniqueConstraintViolation(
+                            etype.to_string(),
+                            property.to_string(),
+                            val.to_string(),
+                        ));
+                    }
                 }
             }
         }
@@ -918,12 +976,30 @@ impl Graph {
             .as_ref()
             .and_then(encode_property_value);
 
+        // A one-sided bound must not admit values of another type family that
+        // merely sort past it in the tagged encoding (see `encoded_tag_family`).
+        let bound_family = match (&min_encoded, &max_encoded) {
+            (Some(lo), Some(hi)) => {
+                if encoded_tag_family(lo[0]) != encoded_tag_family(hi[0]) {
+                    return Ok(Vec::new());
+                }
+                Some(encoded_tag_family(lo[0]))
+            }
+            (Some(e), None) | (None, Some(e)) => Some(encoded_tag_family(e[0])),
+            (None, None) => None,
+        };
+
         let mut result = Vec::new();
         for entry in self.storage.node_prop_idx.prefix_iter(rtxn, &prefix)? {
             let (key, _) = entry?;
             if key.len() >= prefix.len() + 8 {
                 let val_bytes = &key[prefix.len()..key.len() - 8];
 
+                if let Some(family) = bound_family {
+                    if val_bytes.is_empty() || encoded_tag_family(val_bytes[0]) != family {
+                        continue;
+                    }
+                }
                 if let Some(ref min_enc) = min_encoded {
                     if min_inclusive {
                         if val_bytes < min_enc.as_slice() {
@@ -1184,12 +1260,30 @@ impl Graph {
             .as_ref()
             .and_then(encode_property_value);
 
+        // See `nodes_by_property_range_impl`: a one-sided bound must not admit
+        // values of another type family that merely sort past it.
+        let bound_family = match (&min_encoded, &max_encoded) {
+            (Some(lo), Some(hi)) => {
+                if encoded_tag_family(lo[0]) != encoded_tag_family(hi[0]) {
+                    return Ok(Vec::new());
+                }
+                Some(encoded_tag_family(lo[0]))
+            }
+            (Some(e), None) | (None, Some(e)) => Some(encoded_tag_family(e[0])),
+            (None, None) => None,
+        };
+
         let mut result = Vec::new();
         for entry in self.storage.edge_prop_idx.prefix_iter(rtxn, &prefix)? {
             let (key, _) = entry?;
             if key.len() >= prefix.len() + 8 {
                 let val_bytes = &key[prefix.len()..key.len() - 8];
 
+                if let Some(family) = bound_family {
+                    if val_bytes.is_empty() || encoded_tag_family(val_bytes[0]) != family {
+                        continue;
+                    }
+                }
                 if let Some(ref min_enc) = min_encoded {
                     if val_bytes < min_enc.as_slice() {
                         continue;
@@ -1369,6 +1463,119 @@ mod tests {
         g2.add_node("L", &json!({ "k": long_a })).unwrap();
         g2.add_node("L", &json!({ "k": long_a })).unwrap();
         assert!(g2.create_node_unique_constraint("L", "k").is_err());
+    }
+
+    /// The edge unique-constraint backfill must use the same value identity as
+    /// the insert-time check: `30` and `30.0` are duplicates under numeric
+    /// equality, at constraint creation as well as at insert time.
+    #[test]
+    fn edge_unique_constraint_treats_int_and_float_as_equal() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("N", &json!({})).unwrap();
+        let b = g.add_node("N", &json!({})).unwrap();
+        g.add_edge(a, b, "R", &json!({ "k": 30 })).unwrap();
+        g.add_edge(a, b, "R", &json!({ "k": 30.0 })).unwrap();
+        assert!(
+            g.create_edge_unique_constraint("R", "k").is_err(),
+            "30 and 30.0 duplicate each other under numeric equality"
+        );
+    }
+
+    /// Explicit null values never conflict under a unique constraint, so the
+    /// edge backfill must not reject a pre-existing pair of nulls that the
+    /// insert-time check would have allowed.
+    #[test]
+    fn edge_unique_constraint_backfill_allows_multiple_nulls() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("N", &json!({})).unwrap();
+        let b = g.add_node("N", &json!({})).unwrap();
+        g.add_edge(a, b, "R", &json!({ "k": null })).unwrap();
+        g.add_edge(a, b, "R", &json!({ "k": null })).unwrap();
+        assert!(
+            g.create_edge_unique_constraint("R", "k").is_ok(),
+            "explicit nulls must not count as duplicates"
+        );
+    }
+
+    /// An edge unique constraint is enforced for string values too long to
+    /// index, falling back to a type scan, mirroring the node path.
+    #[test]
+    fn edge_unique_constraint_enforced_for_over_long_strings() {
+        let long_a = format!("A{}", "x".repeat(600));
+        let long_b = format!("B{}", "y".repeat(600));
+
+        let (_dir, g) = open_tmp();
+        g.create_edge_unique_constraint("R", "k").unwrap();
+        let a = g.add_node("N", &json!({})).unwrap();
+        let b = g.add_node("N", &json!({})).unwrap();
+        g.add_edge(a, b, "R", &json!({ "k": long_a.clone() }))
+            .unwrap();
+        assert!(
+            g.add_edge(a, b, "R", &json!({ "k": long_a })).is_err(),
+            "a duplicate over-long value must be rejected"
+        );
+        assert!(g.add_edge(a, b, "R", &json!({ "k": long_b })).is_ok());
+    }
+
+    /// A one-sided numeric range must not return values of other JSON types
+    /// that happen to sort past the bound in the tagged encoding: a string is
+    /// never comparable to a numeric bound under openCypher, and neither is a
+    /// boolean or a null.
+    #[test]
+    fn numeric_range_excludes_other_value_types() {
+        let (_dir, g) = open_tmp();
+        let n_int = g.add_node("L", &json!({ "age": 30 })).unwrap();
+        g.add_node("L", &json!({ "age": "old" })).unwrap();
+        g.add_node("L", &json!({ "age": true })).unwrap();
+
+        let lo = g
+            .nodes_by_property_range("L", "age", Some(PropValue::Int(20)), true, None, false)
+            .unwrap();
+        assert_eq!(
+            lo,
+            vec![n_int],
+            "a lower-bound-only numeric range must exclude string values"
+        );
+
+        let hi = g
+            .nodes_by_property_range("L", "age", None, false, Some(PropValue::Int(40)), true)
+            .unwrap();
+        assert_eq!(
+            hi,
+            vec![n_int],
+            "an upper-bound-only numeric range must exclude boolean values"
+        );
+    }
+
+    /// The edge range scan has the same type-family requirement as the node
+    /// range scan.
+    #[test]
+    fn edge_numeric_range_excludes_other_value_types() {
+        let (_dir, g) = open_tmp();
+        g.create_edge_property_index("R", "w").unwrap();
+        let a = g.add_node("N", &json!({})).unwrap();
+        let b = g.add_node("N", &json!({})).unwrap();
+        let e_int = g.add_edge(a, b, "R", &json!({ "w": 5 })).unwrap();
+        g.add_edge(a, b, "R", &json!({ "w": "heavy" })).unwrap();
+        g.add_edge(a, b, "R", &json!({ "w": true })).unwrap();
+
+        let lo = g
+            .edges_by_property_range("R", "w", Some(PropValue::Int(1)), None)
+            .unwrap();
+        assert_eq!(
+            lo,
+            vec![e_int],
+            "a lower-bound-only numeric range must exclude string values"
+        );
+
+        let hi = g
+            .edges_by_property_range("R", "w", None, Some(PropValue::Int(10)))
+            .unwrap();
+        assert_eq!(
+            hi,
+            vec![e_int],
+            "an upper-bound-only numeric range must exclude boolean values"
+        );
     }
 
     /// Distinct string values that share a NUL-boundary relationship must not

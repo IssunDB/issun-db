@@ -247,6 +247,7 @@ impl LogicalPlanner {
                     QueryPart::With {
                         items,
                         where_clause,
+                        where_after,
                         order_by,
                         skip,
                         limit,
@@ -382,7 +383,16 @@ impl LogicalPlanner {
                             };
                         }
 
-                        // Apply optional SKIP / LIMIT attached to the WITH clause.
+                        // Apply optional SKIP / LIMIT attached to the WITH
+                        // clause, validated like the final clause so a
+                        // negative or non-integer value is a syntax error
+                        // rather than a silent zero.
+                        if let Some(skip_expr) = skip.as_ref() {
+                            validate_skip_limit(skip_expr, "SKIP")?;
+                        }
+                        if let Some(limit_expr) = limit.as_ref() {
+                            validate_skip_limit(limit_expr, "LIMIT")?;
+                        }
                         let skip_n = skip.as_ref().map(literal_usize).unwrap_or(0);
                         let limit_n = limit.as_ref().map(literal_usize).unwrap_or(usize::MAX);
                         if skip.is_some() || limit.is_some() {
@@ -390,6 +400,17 @@ impl LogicalPlanner {
                                 input: Box::new(p),
                                 skip: skip_n,
                                 count: limit_n,
+                            };
+                        }
+
+                        // A WHERE in the openCypher position (after ORDER BY,
+                        // SKIP, and LIMIT) filters the rows those sub-clauses
+                        // produced. The row is already narrowed to the WITH
+                        // aliases, matching the trailing WHERE's scope.
+                        if let Some(wc) = where_after {
+                            p = LogicalOperator::Filter {
+                                input: Box::new(p),
+                                expression: where_clause_to_filter_expr(wc),
                             };
                         }
 
@@ -632,7 +653,13 @@ impl LogicalPlanner {
             .as_ref()
             .map(literal_usize)
             .unwrap_or(usize::MAX);
-        if query.skip.is_some() || query.limit.is_some() {
+        // `RETURN DISTINCT *` deduplicates in the executor after projection
+        // (the star's columns are unknown at plan time), so its SKIP/LIMIT is
+        // not planned here: openCypher applies DISTINCT before SKIP and
+        // LIMIT, and a plan-level Limit would truncate the pre-dedup stream.
+        // The executor applies the validated SKIP/LIMIT after its dedup.
+        let executor_windows = is_return_star && query.return_clause.distinct;
+        if (query.skip.is_some() || query.limit.is_some()) && !executor_windows {
             plan = LogicalOperator::Limit {
                 input: Box::new(plan),
                 skip: skip_n,
@@ -788,6 +815,19 @@ impl LogicalPlanner {
 type GroupByItem = (Expr, Option<String>);
 /// Aggregation spec: `(function, inner expression, output column name)`.
 type AggItem = (AggFn, Expr, String);
+
+/// Convert a parsed WHERE clause into a plan filter expression.
+fn where_clause_to_filter_expr(wc: &WhereClause) -> FilterExpr {
+    match wc {
+        WhereClause::Eq(l, r) => FilterExpr::Eq(l.clone(), r.clone()),
+        WhereClause::Ne(l, r) => FilterExpr::Ne(l.clone(), r.clone()),
+        WhereClause::Lt(l, r) => FilterExpr::Lt(l.clone(), r.clone()),
+        WhereClause::Gt(l, r) => FilterExpr::Gt(l.clone(), r.clone()),
+        WhereClause::Le(l, r) => FilterExpr::Le(l.clone(), r.clone()),
+        WhereClause::Ge(l, r) => FilterExpr::Ge(l.clone(), r.clone()),
+        WhereClause::Expr(e) => FilterExpr::Expr(e.clone()),
+    }
+}
 
 /// Classify RETURN items into group-by keys (non-aggregate) and aggregation specs.
 ///

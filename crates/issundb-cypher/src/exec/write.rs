@@ -348,31 +348,49 @@ pub(super) fn delete_over_paths(
         }
     }
 
-    // Relationships first: idempotent, and clears edges that connect nodes also
-    // being deleted in the same clause.
-    for eid in &edges {
-        graph.delete_edge(*eid).map_err(|e| e.to_string())?;
-    }
-
-    for nid in nodes {
-        if detach {
-            for ne in graph.out_neighbors(nid).map_err(|e| e.to_string())? {
-                graph.delete_edge(ne.edge).map_err(|e| e.to_string())?;
+    // All deletions run inside one write transaction so a failing statement
+    // (a still-connected node without DETACH) has no effect: the transaction
+    // aborts and the relationships deleted earlier in the same clause come
+    // back. The constraint failure rides an `InvalidArgument` so the abort
+    // path triggers; it is unwrapped back to the openCypher message below.
+    // Relationships first: clears edges that connect nodes also being deleted
+    // in the same clause.
+    graph
+        .update(|txn| {
+            for eid in &edges {
+                txn.delete_edge(*eid)?;
             }
-            for ne in graph.in_neighbors(nid).map_err(|e| e.to_string())? {
-                graph.delete_edge(ne.edge).map_err(|e| e.to_string())?;
+            for nid in &nodes {
+                if detach {
+                    for ne in txn.out_neighbors(*nid)? {
+                        txn.delete_edge(ne.edge)?;
+                    }
+                    for ne in txn.in_neighbors(*nid)? {
+                        txn.delete_edge(ne.edge)?;
+                    }
+                } else if !txn.out_neighbors(*nid)?.is_empty()
+                    || !txn.in_neighbors(*nid)?.is_empty()
+                {
+                    return Err(issundb_core::Error::InvalidArgument(
+                        DELETE_CONNECTED_NODE_MSG.to_string(),
+                    ));
+                }
+                txn.delete_node(*nid)?;
             }
-        } else if graph
-            .node_has_relationships(nid)
-            .map_err(|e| e.to_string())?
-        {
-            return Err("ConstraintVerificationFailed: DeleteConnectedNode: Cannot delete node, because it still has relationships. To delete this node, you must first delete its relationships.".to_string());
-        }
-        graph.delete_node(nid).map_err(|e| e.to_string())?;
-    }
-
-    Ok(())
+            Ok(())
+        })
+        .map_err(|e| match e {
+            issundb_core::Error::InvalidArgument(msg)
+                if msg.starts_with("ConstraintVerificationFailed") =>
+            {
+                msg
+            }
+            other => other.to_string(),
+        })
 }
+
+/// openCypher error for deleting a node that still has relationships.
+const DELETE_CONNECTED_NODE_MSG: &str = "ConstraintVerificationFailed: DeleteConnectedNode: Cannot delete node, because it still has relationships. To delete this node, you must first delete its relationships.";
 
 pub(super) fn execute_delete_and_return(
     graph: &Graph,
@@ -599,10 +617,21 @@ pub(super) fn execute_foreach(
         other => vec![other],
     };
 
+    // The body statements reference the loop variable as a plain variable,
+    // but the body executors evaluate expressions against fresh rows that do
+    // not bind it. Rewrite the body once, replacing every loop-variable
+    // reference with a parameter access, and carry the element value in the
+    // per-iteration parameter map under the same name.
+    let body: Vec<crate::ast::Statement> = stmt
+        .body
+        .iter()
+        .map(|s| subst_loop_var_stmt(s, &stmt.variable))
+        .collect();
+
     for element in items {
         let mut inner_params = params.clone();
         inner_params.insert(stmt.variable.clone(), element);
-        for body_stmt in &stmt.body {
+        for body_stmt in &body {
             execute_foreach_body(graph, body_stmt, &inner_params)?;
         }
     }
@@ -611,6 +640,318 @@ pub(super) fn execute_foreach(
         columns: vec![],
         records: vec![],
     })
+}
+
+/// Replace every reference to the FOREACH loop variable in `expr` with a
+/// parameter access of the same name: a bare `x` becomes `$x`, and `x.prop`
+/// becomes `$x["prop"]`. Scoping constructs that rebind the name (a
+/// quantifier, list comprehension, or reduce over the same variable) shadow
+/// the substitution inside their body. `HasLabel` and pattern-bound variables
+/// are graph-element positions the loop value cannot occupy; they are left
+/// for the executor's normal unbound/type errors.
+fn subst_loop_var_expr(expr: &Expr, var: &str) -> Expr {
+    use crate::ast::Expr as E;
+    let sub = |e: &Expr| subst_loop_var_expr(e, var);
+    let sub_box = |e: &Expr| Box::new(subst_loop_var_expr(e, var));
+    match expr {
+        E::Prop(v, p) if v == var => {
+            if p.is_empty() {
+                E::Param(var.to_string())
+            } else {
+                E::Subscript {
+                    expr: Box::new(E::Param(var.to_string())),
+                    index: Box::new(E::Literal(crate::ast::Literal::Str(p.clone()))),
+                }
+            }
+        }
+        E::Prop(..) | E::Literal(_) | E::Param(_) | E::CountStar | E::HasLabel { .. } => {
+            expr.clone()
+        }
+        E::Agg(f, inner) => E::Agg(f.clone(), sub_box(inner)),
+        E::Quantifier {
+            kind,
+            variable,
+            list,
+            predicate,
+        } => E::Quantifier {
+            kind: kind.clone(),
+            variable: variable.clone(),
+            list: sub_box(list),
+            predicate: if variable == var {
+                predicate.clone()
+            } else {
+                sub_box(predicate)
+            },
+        },
+        E::FunctionCall { name, args } => E::FunctionCall {
+            name: name.clone(),
+            args: args.iter().map(sub).collect(),
+        },
+        E::BinaryOp { op, left, right } => E::BinaryOp {
+            op: op.clone(),
+            left: sub_box(left),
+            right: sub_box(right),
+        },
+        E::IsNull(inner) => E::IsNull(sub_box(inner)),
+        E::IsNotNull(inner) => E::IsNotNull(sub_box(inner)),
+        E::Not(inner) => E::Not(sub_box(inner)),
+        E::Case {
+            subject,
+            arms,
+            else_expr,
+        } => E::Case {
+            subject: subject.as_ref().map(|s| sub_box(s)),
+            arms: arms
+                .iter()
+                .map(|a| crate::ast::CaseArm {
+                    when: sub(&a.when),
+                    then: sub(&a.then),
+                })
+                .collect(),
+            else_expr: else_expr.as_ref().map(|e| sub_box(e)),
+        },
+        E::Subscript { expr, index } => E::Subscript {
+            expr: sub_box(expr),
+            index: sub_box(index),
+        },
+        E::Slice { expr, start, end } => E::Slice {
+            expr: sub_box(expr),
+            start: start.as_ref().map(|s| sub_box(s)),
+            end: end.as_ref().map(|e| sub_box(e)),
+        },
+        E::ListComprehension {
+            variable,
+            list,
+            predicate,
+            transform,
+        } => {
+            let shadowed = variable == var;
+            E::ListComprehension {
+                variable: variable.clone(),
+                list: sub_box(list),
+                predicate: predicate
+                    .as_ref()
+                    .map(|p| if shadowed { p.clone() } else { sub_box(p) }),
+                transform: transform
+                    .as_ref()
+                    .map(|t| if shadowed { t.clone() } else { sub_box(t) }),
+            }
+        }
+        E::PatternComprehension {
+            pattern,
+            predicate,
+            transform,
+        } => E::PatternComprehension {
+            pattern: Box::new(subst_loop_var_pattern(pattern, var)),
+            predicate: predicate.as_ref().map(|p| sub_box(p)),
+            transform: sub_box(transform),
+        },
+        E::Reduce {
+            accumulator,
+            initial,
+            variable,
+            list,
+            expression,
+        } => {
+            let shadowed = variable == var || accumulator == var;
+            E::Reduce {
+                accumulator: accumulator.clone(),
+                initial: sub_box(initial),
+                variable: variable.clone(),
+                list: sub_box(list),
+                expression: if shadowed {
+                    expression.clone()
+                } else {
+                    sub_box(expression)
+                },
+            }
+        }
+    }
+}
+
+/// Substitute the loop variable inside a pattern's inline property maps.
+fn subst_loop_var_pattern(pattern: &crate::ast::Pattern, var: &str) -> crate::ast::Pattern {
+    let sub_props = |props: &Option<HashMap<String, Expr>>| {
+        props.as_ref().map(|m| {
+            m.iter()
+                .map(|(k, e)| (k.clone(), subst_loop_var_expr(e, var)))
+                .collect()
+        })
+    };
+    let mut out = pattern.clone();
+    out.node.properties = sub_props(&pattern.node.properties);
+    for (i, (rel, target)) in pattern.rels.iter().enumerate() {
+        out.rels[i].0.properties = sub_props(&rel.properties);
+        out.rels[i].1.properties = sub_props(&target.properties);
+    }
+    out
+}
+
+/// Substitute the loop variable inside one SET item's value expression.
+fn subst_loop_var_set_item(item: &SetItem, var: &str) -> SetItem {
+    match item {
+        SetItem::Property {
+            variable,
+            property,
+            expr,
+        } => SetItem::Property {
+            variable: variable.clone(),
+            property: property.clone(),
+            expr: subst_loop_var_expr(expr, var),
+        },
+        other => other.clone(),
+    }
+}
+
+/// Substitute the loop variable through a FOREACH body statement. Only the
+/// statement forms `execute_foreach_body` accepts need coverage; anything
+/// else passes through unchanged and fails there with its normal error.
+fn subst_loop_var_stmt(stmt: &crate::ast::Statement, var: &str) -> crate::ast::Statement {
+    use crate::ast::Statement as S;
+    let sub_where = |w: &Option<WhereClause>| -> Option<WhereClause> {
+        w.as_ref().map(|w| match w {
+            WhereClause::Eq(l, r) => {
+                WhereClause::Eq(subst_loop_var_expr(l, var), subst_loop_var_expr(r, var))
+            }
+            WhereClause::Ne(l, r) => {
+                WhereClause::Ne(subst_loop_var_expr(l, var), subst_loop_var_expr(r, var))
+            }
+            WhereClause::Lt(l, r) => {
+                WhereClause::Lt(subst_loop_var_expr(l, var), subst_loop_var_expr(r, var))
+            }
+            WhereClause::Gt(l, r) => {
+                WhereClause::Gt(subst_loop_var_expr(l, var), subst_loop_var_expr(r, var))
+            }
+            WhereClause::Le(l, r) => {
+                WhereClause::Le(subst_loop_var_expr(l, var), subst_loop_var_expr(r, var))
+            }
+            WhereClause::Ge(l, r) => {
+                WhereClause::Ge(subst_loop_var_expr(l, var), subst_loop_var_expr(r, var))
+            }
+            WhereClause::Expr(e) => WhereClause::Expr(subst_loop_var_expr(e, var)),
+        })
+    };
+    let sub_matches = |mcs: &[crate::ast::MatchClause]| -> Vec<crate::ast::MatchClause> {
+        mcs.iter()
+            .map(|mc| crate::ast::MatchClause {
+                pattern: subst_loop_var_pattern(&mc.pattern, var),
+            })
+            .collect()
+    };
+    match stmt {
+        S::Create(c) => S::Create(crate::ast::CreateStatement {
+            patterns: c
+                .patterns
+                .iter()
+                .map(|p| subst_loop_var_pattern(p, var))
+                .collect(),
+        }),
+        S::Set(s) => S::Set(crate::ast::SetStatement {
+            match_clauses: sub_matches(&s.match_clauses),
+            where_clause: sub_where(&s.where_clause),
+            set_items: s
+                .set_items
+                .iter()
+                .map(|i| subst_loop_var_set_item(i, var))
+                .collect(),
+        }),
+        S::Delete(d) => S::Delete(crate::ast::DeleteStatement {
+            match_clauses: sub_matches(&d.match_clauses),
+            where_clause: sub_where(&d.where_clause),
+            targets: d
+                .targets
+                .iter()
+                .map(|t| subst_loop_var_expr(t, var))
+                .collect(),
+            detach: d.detach,
+        }),
+        S::Merge(m) => S::Merge(crate::ast::MergeStatement {
+            pattern: subst_loop_var_pattern(&m.pattern, var),
+            on_create_set: m
+                .on_create_set
+                .iter()
+                .map(|i| subst_loop_var_set_item(i, var))
+                .collect(),
+            on_match_set: m
+                .on_match_set
+                .iter()
+                .map(|i| subst_loop_var_set_item(i, var))
+                .collect(),
+        }),
+        // A standalone body clause (e.g. a bare CREATE) parses as a write-only
+        // pipeline query; substitute through its clauses.
+        S::Query(q) => {
+            let mut q = q.clone();
+            q.match_clauses = sub_matches(&q.match_clauses);
+            q.where_clause = sub_where(&q.where_clause);
+            for part in &mut q.parts {
+                match part {
+                    QueryPart::Match {
+                        match_clauses,
+                        where_clause,
+                    }
+                    | QueryPart::OptionalMatch {
+                        match_clauses,
+                        where_clause,
+                    } => {
+                        *match_clauses = sub_matches(match_clauses);
+                        *where_clause = sub_where(where_clause);
+                    }
+                    QueryPart::Create { patterns } => {
+                        *patterns = patterns
+                            .iter()
+                            .map(|p| subst_loop_var_pattern(p, var))
+                            .collect();
+                    }
+                    QueryPart::Merge { merges } => {
+                        for m in merges.iter_mut() {
+                            m.pattern = subst_loop_var_pattern(&m.pattern, var);
+                            m.on_create_set = m
+                                .on_create_set
+                                .iter()
+                                .map(|i| subst_loop_var_set_item(i, var))
+                                .collect();
+                            m.on_match_set = m
+                                .on_match_set
+                                .iter()
+                                .map(|i| subst_loop_var_set_item(i, var))
+                                .collect();
+                        }
+                    }
+                    QueryPart::Set { items } => {
+                        *items = items
+                            .iter()
+                            .map(|i| subst_loop_var_set_item(i, var))
+                            .collect();
+                    }
+                    QueryPart::Delete { targets, .. } => {
+                        *targets = targets
+                            .iter()
+                            .map(|t| subst_loop_var_expr(t, var))
+                            .collect();
+                    }
+                    QueryPart::Unwind { expr, variable } if variable != var => {
+                        *expr = subst_loop_var_expr(expr, var);
+                    }
+                    _ => {}
+                }
+            }
+            S::Query(q)
+        }
+        S::Foreach(f) if f.variable != *var => S::Foreach(ForeachStatement {
+            variable: f.variable.clone(),
+            list: subst_loop_var_expr(&f.list, var),
+            body: f.body.iter().map(|s| subst_loop_var_stmt(s, var)).collect(),
+        }),
+        // An inner FOREACH over the same name shadows the outer variable in
+        // its body; only its list expression sees the outer binding.
+        S::Foreach(f) => S::Foreach(ForeachStatement {
+            variable: f.variable.clone(),
+            list: subst_loop_var_expr(&f.list, var),
+            body: f.body.clone(),
+        }),
+        other => other.clone(),
+    }
 }
 
 fn execute_foreach_body(
@@ -905,9 +1246,37 @@ fn props_subset_match(filter: &serde_json::Value, actual: &serde_json::Value) ->
     let (Some(filter_obj), Some(actual_obj)) = (filter.as_object(), actual.as_object()) else {
         return filter.as_object().map(|o| o.is_empty()).unwrap_or(true);
     };
-    filter_obj
-        .iter()
-        .all(|(k, v)| actual_obj.get(k).is_some_and(|a| a == v))
+    // Cypher value equality, not structural JSON equality: an integer-stored
+    // property matches a float literal of the same value (30 = 30.0), so
+    // `MERGE (n {x: 30.0})` finds a node created with `{x: 30}`.
+    filter_obj.iter().all(|(k, v)| {
+        actual_obj
+            .get(k)
+            .is_some_and(|a| super::expr::cypher_eq(a, v) == serde_json::Value::Bool(true))
+    })
+}
+
+/// Evaluate a MERGE pattern's inline property map. Unlike CREATE, where a
+/// null property value simply is not stored, MERGE cannot match on null: the
+/// filter key would vanish and the pattern would match every candidate, so
+/// openCypher requires an error instead.
+fn eval_merge_properties(
+    graph: &Graph,
+    props: &HashMap<String, crate::ast::Expr>,
+    path: &PathMap,
+    params: &HashMap<String, serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let mut obj = serde_json::Map::new();
+    for (k, v) in props {
+        let val = evaluate_expr(graph, path, v, params)?;
+        if val == serde_json::Value::Null {
+            return Err(format!(
+                "SemanticError(InvalidArgumentValue): cannot merge using null property value for '{k}'"
+            ));
+        }
+        obj.insert(k.clone(), val);
+    }
+    Ok(serde_json::Value::Object(obj))
 }
 
 /// True when a node carries all of the required labels.
@@ -966,7 +1335,7 @@ fn merge_match(
 ) -> Result<Vec<super::PathMap>, String> {
     // Seed candidates for the first node in the chain.
     let seed_props = match &pattern.node.properties {
-        Some(p) => eval_properties(graph, p, ctx, params)?,
+        Some(p) => eval_merge_properties(graph, p, ctx, params)?,
         None => serde_json::Value::Object(serde_json::Map::new()),
     };
     let seed_candidates: Vec<NodeId> =
@@ -975,15 +1344,18 @@ fn merge_match(
             _ => candidate_nodes(graph, &pattern.node.labels, &seed_props)?,
         };
 
-    // Each partial carries the pattern bindings accumulated so far and the
-    // current chain endpoint.
-    let mut partials: Vec<(super::PathMap, NodeId)> = Vec::new();
+    // Each partial carries the pattern bindings accumulated so far, the
+    // current chain endpoint, and the edge ids already consumed by earlier
+    // hops: openCypher relationship uniqueness forbids one relationship from
+    // satisfying two hops of the same pattern, so a match that would reuse an
+    // edge is not a match (and MERGE must create instead).
+    let mut partials: Vec<(super::PathMap, NodeId, Vec<EdgeId>)> = Vec::new();
     for nid in seed_candidates {
         let mut pm = super::PathMap::new();
         if let Some(v) = &pattern.node.variable {
             pm.insert(v.clone(), GraphBinding::Node(nid));
         }
-        partials.push((pm, nid));
+        partials.push((pm, nid, Vec::new()));
     }
 
     for (rel_pat, node_pat) in &pattern.rels {
@@ -992,18 +1364,18 @@ fn merge_match(
             .as_deref()
             .map(|t| t.split('|').collect())
             .unwrap_or_default();
-        let mut next: Vec<(super::PathMap, NodeId)> = Vec::new();
-        for (pm, cur) in &partials {
+        let mut next: Vec<(super::PathMap, NodeId, Vec<EdgeId>)> = Vec::new();
+        for (pm, cur, used_edges) in &partials {
             let mut combined = ctx.clone();
             for (k, v) in pm {
                 combined.insert(k.clone(), v.clone());
             }
             let rel_props = match &rel_pat.properties {
-                Some(p) => eval_properties(graph, p, &combined, params)?,
+                Some(p) => eval_merge_properties(graph, p, &combined, params)?,
                 None => serde_json::Value::Object(serde_json::Map::new()),
             };
             let tgt_props = match &node_pat.properties {
-                Some(p) => eval_properties(graph, p, &combined, params)?,
+                Some(p) => eval_merge_properties(graph, p, &combined, params)?,
                 None => serde_json::Value::Object(serde_json::Map::new()),
             };
             let bound_target = node_pat
@@ -1017,6 +1389,9 @@ fn merge_match(
 
             let neighbors = graph.all_neighbors(*cur).map_err(|e| e.to_string())?;
             for n in neighbors {
+                if used_edges.contains(&n.edge) {
+                    continue;
+                }
                 // Direction filter: undirected accepts both, otherwise the edge
                 // orientation must match the pattern.
                 if !rel_pat.is_undirected {
@@ -1049,13 +1424,15 @@ fn merge_match(
                 if let Some(tv) = &node_pat.variable {
                     npm.insert(tv.clone(), GraphBinding::Node(n.node));
                 }
-                next.push((npm, n.node));
+                let mut nused = used_edges.clone();
+                nused.push(n.edge);
+                next.push((npm, n.node, nused));
             }
         }
         partials = next;
     }
 
-    Ok(partials.into_iter().map(|(pm, _)| pm).collect())
+    Ok(partials.into_iter().map(|(pm, _, _)| pm).collect())
 }
 
 /// Match-or-create a MERGE pattern within the given context. Returns one binding

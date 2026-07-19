@@ -92,21 +92,14 @@ pub(super) fn execute_copy_internal(
             let val: Value = serde_json::from_str(&line)
                 .map_err(|e| format!("JSON parse error on line {}: {}", i + 1, e))?;
 
-            let mut obj = val
+            // Rows are flat: metadata under the underscore-prefixed keys and
+            // user properties at the top level, exactly as EXPORT writes them.
+            // A user property named `props` is an ordinary property, so no
+            // nested-object flattening happens here.
+            let obj = val
                 .as_object()
                 .ok_or_else(|| format!("line {}: JSONL row must be a JSON object", i + 1))?
                 .clone();
-
-            if let Some(props_val) = obj.get("props") {
-                if let Some(props_obj) = props_val.as_object() {
-                    let props_obj = props_obj.clone();
-                    obj.remove("props");
-                    for (k, v) in props_obj {
-                        obj.insert(k, v);
-                    }
-                }
-            }
-
             entries.push(obj);
         }
     } else {
@@ -131,15 +124,31 @@ pub(super) fn execute_copy_internal(
             if line.trim().is_empty() {
                 continue;
             }
-            let cols = parse_csv_line(&line, delimiter);
+            let cols = parse_csv_line_quoted(&line, delimiter);
             if headers.is_empty() {
                 headers = (0..cols.len()).map(|idx| format!("col{}", idx)).collect();
             }
 
             let mut props = serde_json::Map::new();
             for (j, header) in headers.iter().enumerate() {
-                let val_str = cols.get(j).map(|s| s.as_str()).unwrap_or("");
-                let val = if val_str.is_empty() {
+                let (val_str, quoted) = cols
+                    .get(j)
+                    .map(|(s, q)| (s.as_str(), *q))
+                    .unwrap_or(("", false));
+                // A quoted cell was a string on export: it imports verbatim
+                // (the string "true" stays a string, "" stays an empty
+                // string), except quoted JSON text, the export form of a list
+                // or map. An unquoted cell is null or a scalar to infer.
+                let val = if quoted {
+                    if (val_str.starts_with('[') && val_str.ends_with(']'))
+                        || (val_str.starts_with('{') && val_str.ends_with('}'))
+                    {
+                        serde_json::from_str(val_str)
+                            .unwrap_or_else(|_| Value::String(val_str.to_owned()))
+                    } else {
+                        Value::String(val_str.to_owned())
+                    }
+                } else if val_str.is_empty() {
                     Value::Null
                 } else if let Ok(n) = val_str.parse::<i64>() {
                     Value::Number(n.into())
@@ -155,6 +164,7 @@ pub(super) fn execute_copy_internal(
                     serde_json::from_str(val_str)
                         .unwrap_or_else(|_| Value::String(val_str.to_owned()))
                 } else {
+                    // An unquoted bare word in a hand-authored file.
                     Value::String(val_str.to_owned())
                 };
                 props.insert(header.clone(), val);
@@ -168,15 +178,13 @@ pub(super) fn execute_copy_internal(
         return Ok(0);
     }
 
-    // 3. Determine if it is a relationship import
+    // 3. Determine if it is a relationship import. Only the underscore-prefixed
+    // metadata keys classify: a node whose user properties happen to be named
+    // `from` and `to` must import as a node, not as an edge file.
     let is_relationship = if inferred_format == "csv" {
-        (headers_found.contains(&"_from".to_string())
-            || headers_found.contains(&"from".to_string()))
-            && (headers_found.contains(&"_to".to_string())
-                || headers_found.contains(&"to".to_string()))
+        headers_found.contains(&"_from".to_string()) && headers_found.contains(&"_to".to_string())
     } else if let Some(first) = entries.first() {
-        (first.contains_key("_from") || first.contains_key("from"))
-            && (first.contains_key("_to") || first.contains_key("to"))
+        first.contains_key("_from") && first.contains_key("_to")
     } else {
         false
     };
@@ -187,36 +195,26 @@ pub(super) fn execute_copy_internal(
                 for obj in &entries {
                     let from_raw = obj
                         .get("_from")
-                        .or_else(|| obj.get("from"))
                         .and_then(|v| v.as_u64())
                         .ok_or_else(|| custom_err("missing or invalid _from ID"))?;
 
                     let to_raw = obj
                         .get("_to")
-                        .or_else(|| obj.get("to"))
                         .and_then(|v| v.as_u64())
                         .ok_or_else(|| custom_err("missing or invalid _to ID"))?;
 
                     let from_id = *id_map.get(&from_raw).unwrap_or(&from_raw);
                     let to_id = *id_map.get(&to_raw).unwrap_or(&to_raw);
 
-                    let etype_val = obj
-                        .get("_type")
-                        .or_else(|| obj.get("_etype"))
-                        .or_else(|| obj.get("type"));
+                    let etype_val = obj.get("_type").or_else(|| obj.get("_etype"));
 
                     let etype = etype_val.and_then(|v| v.as_str()).unwrap_or(&stmt.target);
 
+                    // Only the prefixed metadata keys are stripped; a user
+                    // property named `type`, `from`, or `to` survives.
                     let mut props_filtered = serde_json::Map::new();
                     for (k, v) in obj {
-                        if k != "_from"
-                            && k != "from"
-                            && k != "_to"
-                            && k != "to"
-                            && k != "_type"
-                            && k != "_etype"
-                            && k != "type"
-                        {
+                        if k != "_from" && k != "_to" && k != "_type" && k != "_etype" {
                             props_filtered.insert(k.clone(), v.clone());
                         }
                     }
@@ -231,13 +229,13 @@ pub(super) fn execute_copy_internal(
         graph
             .update(|txn| {
                 for obj in &entries {
-                    let old_id = obj
-                        .get("_id")
-                        .or_else(|| obj.get("id"))
-                        .and_then(|v| v.as_u64());
+                    let old_id = obj.get("_id").and_then(|v| v.as_u64());
 
+                    // Labels come only from the prefixed metadata key. A
+                    // present-but-empty `_labels` (a zero-label node's export)
+                    // imports as zero labels, not as the COPY target label.
                     let labels = if let Some(labels_val) =
-                        obj.get("_labels").or_else(|| obj.get("labels"))
+                        obj.get("_labels").or_else(|| obj.get("_label"))
                     {
                         if let Some(arr) = labels_val.as_array() {
                             arr.iter().filter_map(|v| v.as_str()).collect::<Vec<&str>>()
@@ -246,20 +244,17 @@ pub(super) fn execute_copy_internal(
                                 .filter(|s| !s.is_empty())
                                 .collect::<Vec<&str>>()
                         } else {
-                            vec![stmt.target.as_str()]
+                            Vec::new()
                         }
                     } else {
                         vec![stmt.target.as_str()]
                     };
 
+                    // Only the prefixed metadata keys are stripped; a user
+                    // property named `labels`, `label`, or `id` survives.
                     let mut props_filtered = serde_json::Map::new();
                     for (k, v) in obj {
-                        if k != "_id"
-                            && k != "_labels"
-                            && k != "labels"
-                            && k != "_label"
-                            && k != "label"
-                        {
+                        if k != "_id" && k != "_labels" && k != "_label" {
                             props_filtered.insert(k.clone(), v.clone());
                         }
                     }
@@ -799,9 +794,21 @@ pub(super) fn execute_import_db(
 }
 
 fn parse_csv_line(s: &str, delimiter: char) -> Vec<String> {
+    parse_csv_line_quoted(s, delimiter)
+        .into_iter()
+        .map(|(v, _)| v)
+        .collect()
+}
+
+/// Split one CSV line into `(cell, was_quoted)` pairs. Quotedness carries the
+/// type distinction on import: a quoted cell was a string on export (its text
+/// imports verbatim, whitespace included), while an unquoted cell is a
+/// non-string scalar subject to inference.
+fn parse_csv_line_quoted(s: &str, delimiter: char) -> Vec<(String, bool)> {
     let mut cols = Vec::new();
     let mut current = String::new();
     let mut in_quotes = false;
+    let mut was_quoted = false;
     let mut chars = s.chars().peekable();
 
     while let Some(c) = chars.next() {
@@ -811,15 +818,26 @@ fn parse_csv_line(s: &str, delimiter: char) -> Vec<String> {
                 current.push('"');
             } else {
                 in_quotes = !in_quotes;
+                was_quoted = true;
             }
         } else if c == delimiter && !in_quotes {
-            cols.push(current.trim().to_owned());
-            current.clear();
+            let cell = if was_quoted {
+                std::mem::take(&mut current)
+            } else {
+                std::mem::take(&mut current).trim().to_owned()
+            };
+            cols.push((cell, was_quoted));
+            was_quoted = false;
         } else {
             current.push(c);
         }
     }
-    cols.push(current.trim().to_owned());
+    let cell = if was_quoted {
+        current
+    } else {
+        current.trim().to_owned()
+    };
+    cols.push((cell, was_quoted));
     cols
 }
 
@@ -828,28 +846,37 @@ fn format_csv_cell(val: &Value) -> String {
         Value::Null => "".to_string(),
         Value::Bool(b) => b.to_string(),
         Value::Number(n) => n.to_string(),
+        // Strings are always quoted so import can tell the string "true"
+        // apart from the boolean true (and "" apart from null). Lists and
+        // maps are quoted JSON text.
         Value::String(s) => escape_csv_string(s),
         Value::Array(_) | Value::Object(_) => escape_csv_string(&val.to_string()),
     }
 }
 
 fn escape_csv_string(s: &str) -> String {
-    if s.contains(',') || s.contains('"') || s.contains('\n') || s.contains('\r') {
-        let escaped = s.replace('"', "\"\"");
-        format!("\"{}\"", escaped)
-    } else {
-        s.to_string()
-    }
+    format!("\"{}\"", s.replace('"', "\"\""))
 }
 
 fn custom_err(msg: &str) -> issundb_core::Error {
     issundb_core::Error::Io(std::io::Error::new(std::io::ErrorKind::Other, msg))
 }
 
+/// The Arrow column type chosen for one property, plus whether the column
+/// stores JSON-encoded text (the lossless fallback for mixed-type and
+/// complex-valued properties) instead of native values.
+struct ColumnType {
+    dtype: arrow_schema::DataType,
+    json: bool,
+}
+
+/// Field metadata key marking a column as JSON-encoded text.
+const PARQUET_JSON_META: &str = "issundb:json";
+
 fn determine_column_types(
     entries: &[serde_json::Map<String, Value>],
     keys: &BTreeSet<String>,
-) -> HashMap<String, arrow_schema::DataType> {
+) -> HashMap<String, ColumnType> {
     let mut types = HashMap::new();
     for k in keys {
         let mut has_bool = false;
@@ -876,18 +903,27 @@ fn determine_column_types(
             }
         }
 
-        let dtype = if has_complex || has_string {
-            arrow_schema::DataType::Utf8
+        // A column whose non-null values are all one primitive kind keeps a
+        // native Arrow type. Anything else (lists, maps, or a mix of kinds)
+        // is stored as JSON text and flagged in the field metadata, so import
+        // restores every value exactly instead of coercing (a boolean in a
+        // numeric column must not come back as 0).
+        let kinds = [has_bool, has_int, has_float, has_string]
+            .iter()
+            .filter(|b| **b)
+            .count();
+        let (dtype, json) = if has_complex || kinds > 1 {
+            (arrow_schema::DataType::Utf8, true)
         } else if has_float {
-            arrow_schema::DataType::Float64
+            (arrow_schema::DataType::Float64, false)
         } else if has_int {
-            arrow_schema::DataType::Int64
+            (arrow_schema::DataType::Int64, false)
         } else if has_bool {
-            arrow_schema::DataType::Boolean
+            (arrow_schema::DataType::Boolean, false)
         } else {
-            arrow_schema::DataType::Utf8
+            (arrow_schema::DataType::Utf8, false)
         };
-        types.insert(k.clone(), dtype);
+        types.insert(k.clone(), ColumnType { dtype, json });
     }
     types
 }
@@ -895,7 +931,7 @@ fn determine_column_types(
 fn build_record_batch(
     entries: &[serde_json::Map<String, Value>],
     prop_keys: &BTreeSet<String>,
-    col_types: &HashMap<String, arrow_schema::DataType>,
+    col_types: &HashMap<String, ColumnType>,
     is_relationship: bool,
 ) -> Result<arrow_array::RecordBatch, String> {
     use arrow_array::builder::{
@@ -995,11 +1031,34 @@ fn build_record_batch(
     }
 
     for k in prop_keys {
-        let dtype = col_types
+        let col = col_types
             .get(k)
-            .ok_or_else(|| format!("missing type for column {}", k))?
-            .clone();
-        fields.push(Field::new(k, dtype.clone(), true));
+            .ok_or_else(|| format!("missing type for column {}", k))?;
+        let dtype = col.dtype.clone();
+        let mut field = Field::new(k, dtype.clone(), true);
+        if col.json {
+            field = field.with_metadata(std::collections::HashMap::from([(
+                PARQUET_JSON_META.to_string(),
+                "true".to_string(),
+            )]));
+        }
+        fields.push(field);
+
+        // A JSON column serializes every value, strings included, so the cell
+        // text is unambiguous on import ("5" the string vs 5 the number).
+        if col.json {
+            let mut builder = StringBuilder::new();
+            for obj in entries {
+                match obj.get(k) {
+                    None | Some(Value::Null) => builder.append_null(),
+                    Some(val) => {
+                        builder.append_value(serde_json::to_string(val).map_err(|e| e.to_string())?)
+                    }
+                }
+            }
+            arrays.push(Arc::new(builder.finish()));
+            continue;
+        }
 
         match dtype {
             arrow_schema::DataType::Boolean => {
@@ -1109,22 +1168,26 @@ fn read_parquet_entries(path: &Path) -> Result<Vec<serde_json::Map<String, Value
         for row in 0..num_rows {
             let mut obj = serde_json::Map::new();
             for col in 0..num_cols {
-                let col_name = schema.field(col).name();
+                let field = schema.field(col);
                 let array = batch.column(col);
-                let val = arrow_to_json_value(array, row)?;
-                obj.insert(col_name.clone(), val);
-            }
-
-            if let Some(props_val) = obj.get("props") {
-                if let Some(props_obj) = props_val.as_object() {
-                    let props_obj = props_obj.clone();
-                    obj.remove("props");
-                    for (k, v) in props_obj {
-                        obj.insert(k, v);
+                // A column flagged as JSON text (mixed-type or complex values
+                // on export) decodes each cell back to its exact value.
+                let val = if field.metadata().get(PARQUET_JSON_META).map(String::as_str)
+                    == Some("true")
+                {
+                    use arrow_array::cast::AsArray;
+                    if array.is_null(row) {
+                        Value::Null
+                    } else {
+                        let text = array.as_string::<i32>().value(row);
+                        serde_json::from_str(text)
+                            .unwrap_or_else(|_| Value::String(text.to_owned()))
                     }
-                }
+                } else {
+                    arrow_to_json_value(array, row)?
+                };
+                obj.insert(field.name().clone(), val);
             }
-
             entries.push(obj);
         }
     }
@@ -1192,29 +1255,15 @@ fn arrow_to_json_value(array: &arrow_array::ArrayRef, row: usize) -> Result<Valu
                 Ok(Value::Null)
             }
         }
+        // A plain string column imports verbatim: complex values live in
+        // JSON-flagged columns, so no content sniffing happens here.
         DataType::Utf8 => {
             let arr = array.as_string::<i32>();
-            let val_str = arr.value(row);
-            if (val_str.starts_with('[') && val_str.ends_with(']'))
-                || (val_str.starts_with('{') && val_str.ends_with('}'))
-            {
-                Ok(serde_json::from_str(val_str)
-                    .unwrap_or_else(|_| Value::String(val_str.to_owned())))
-            } else {
-                Ok(Value::String(val_str.to_owned()))
-            }
+            Ok(Value::String(arr.value(row).to_owned()))
         }
         DataType::LargeUtf8 => {
             let arr = array.as_string::<i64>();
-            let val_str = arr.value(row);
-            if (val_str.starts_with('[') && val_str.ends_with(']'))
-                || (val_str.starts_with('{') && val_str.ends_with('}'))
-            {
-                Ok(serde_json::from_str(val_str)
-                    .unwrap_or_else(|_| Value::String(val_str.to_owned())))
-            } else {
-                Ok(Value::String(val_str.to_owned()))
-            }
+            Ok(Value::String(arr.value(row).to_owned()))
         }
         DataType::List(_) => {
             let list_arr = array.as_list::<i32>();

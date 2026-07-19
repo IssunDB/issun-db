@@ -84,6 +84,10 @@ pub enum QueryPart {
     With {
         items: Vec<ReturnItem>,
         where_clause: Option<WhereClause>,
+        /// A WHERE written after ORDER BY, SKIP, and LIMIT (the openCypher
+        /// clause order). It filters after those sub-clauses apply, unlike
+        /// `where_clause`, which filters before them.
+        where_after: Option<WhereClause>,
         /// Optional ORDER BY on the WITH clause output.
         order_by: Option<OrderBy>,
         /// Optional SKIP on the WITH clause output.

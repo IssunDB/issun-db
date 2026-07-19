@@ -45,6 +45,12 @@ Quick examples:
 - Prefer noun phrases for checklist items over imperative verbs. Write "temp directory teardown" not "tear down the temp directory".
 - Headings in Markdown files must be in title case: "Build from Source" not "Build from source". Minor words (a, an, the, and, but, or, for, in, on,
   at, to, by, of) stay lowercase unless they are the first word.
+- Do not bold the lead-in of a list item. Write "Vector and set similarity: ..." not "**Vector and set similarity**: ...".
+- Use sentence case for the lead-in of a list item. Write "Seed selection: ..." not "Seed Selection: ...". Proper nouns keep their capitals.
+- Capitalize only the first part of a hyphenated compound: "Full-text Search" in a heading, "Breadth-first" at the start of a sentence, and
+  "breadth-first search" elsewhere. Never write "Breadth-First".
+- Start each sentence with a capital letter, capitalize proper nouns (Rust, Cypher, LMDB, GraphBLAS), and leave common nouns lowercase in the middle
+  of a sentence.
 - Write correct and complete sentences.
 - Avoid made-up words, abbreviations, and colons in the middle of sentences.
 
@@ -181,13 +187,12 @@ modules according to this map.
     - Typed bulk expansion calls `ensure_snapshot_fresh`, which rebuilds only the snapshot (no GraphBLAS materialization); for a small source set over
       a stale snapshot it skips the gate and reads per-source LMDB adjacency.
       The background rebuild after `REBUILD_THRESHOLD` writes is a compaction safety net, not the freshness path; callers needing a guaranteed fresh
-      CSR
-      view still call `rebuild_csr`. Point adjacency lookups (`out_neighbors`, `in_neighbors`, `all_neighbors`) read the `out_adj` and `in_adj` stores
-      directly through the transaction, never the snapshot, so they always reflect committed and in-transaction writes.
+      CSR view still call `rebuild_csr`. Point adjacency lookups (`out_neighbors`, `in_neighbors`, `all_neighbors`) read the `out_adj` and `in_adj`
+      stores directly through the transaction, never the snapshot, so they always reflect committed and in-transaction writes.
 - `Storage::open` is the only entry point for LMDB. Do not call `heed::EnvOpenOptions` from outside `crates/issundb-core/src/storage/lmdb.rs`.
 - Heavy dependencies are tracked in the workspace `Cargo.toml`. `usearch` and `chumsky` are active, non-optional dependencies. GraphBLAS is reached
   through the in-house permissive crates `issundb-graphblas` and `issundb-graphblas-sys`. Building requires the submodule
-  (`git submodule update --init external/GraphBLAS`) plus cmake and clang.
+  (`git submodule update --init external/GraphBLAS`) plus CMake and Clang.
 - Async is not used in the core engine. LMDB and GraphBLAS are synchronous. `tokio` is an optional dependency for server mode only; do not add
   `.await` inside `issundb-core`.
 - GraphBLAS initializes a process-global context and OpenMP thread pool on first use (`GrB_init`) and never finalizes it. Under `cargo nextest`
@@ -364,7 +369,7 @@ control, and backup/restore are intentionally absent: provisioning and host oper
 
 The API is self-describing: the OpenAPI 3.1 document is generated from the handler annotations (`#[utoipa::path]`) and the request and response
 `ToSchema` derives, served as JSON at `GET /v1/openapi.json` with a Scalar UI at `GET /v1/docs`. The generator crates are `utoipa` and
-`utoipa-scalar` (both MIT or Apache-2.0), pinned to the axum 0.7 line. Because the handlers build their JSON bodies inline with `json!`, the
+`utoipa-scalar` (both MIT or Apache-2.0), pinned to the Axum 0.7 line. Because the handlers build their JSON bodies inline with `json!`, the
 documentation-only response structs (`NodeResponse`, `EdgeResponse`, `IdResponse`, `QueryResponse`, `ExplainResponse`, `RetrieveResponse`,
 `HealthResponse`, and `ErrorResponse`) describe the response shapes and must be kept in sync with those literals. The Cypher result is documented as
 columns plus row-major records of arbitrary JSON.
@@ -403,10 +408,14 @@ concerns driven through the CLI or the Python and REST surfaces. Keep this surfa
 Python bindings via PyO3. Exposes a single `IssunDB` class. The `extension-module` feature must be enabled for the Python extension to compile.
 Depends only on `issundb`.
 
-Methods: `add_node` (accepts a single label string or a list of label strings), `get_node`, `update_node`, `delete_node`, `add_edge`, `get_edge`,
-`delete_edge`, `query`, `explain`, `upsert_vector`, `vector_search` (with optional `label` and JSON-object `properties` filters),
-`configure_vector_index`, `text_search`, `create_text_index` (with optional `language`), `drop_text_index`, `list_text_indexes`, `retrieve_hybrid`,
-`set_thread_count`, `backup`, `backup_compact`, and `restore`.
+Methods: `add_node` (accepts a single label string or a list of label strings), `get_node`, `update_node`, `delete_node`, `add_label`,
+`remove_label`, `add_edge`, `get_edge`, `update_edge`, `delete_edge`, `query`, `explain`, `upsert_vector`, `remove_vector`, `vector_search` (with
+optional `label` and JSON-object `properties` filters), `configure_vector_index`, `text_search`, `create_text_index` (with optional `language`),
+`drop_text_index`, `list_text_indexes`, `has_text_index`, `retrieve_hybrid`, `set_thread_count`, `backup`, `backup_compact`, and `restore`.
+
+Every method releases the GIL around the native engine call, so a long-running query, backup, or reindex does not stall other Python threads.
+Keep that invariant when adding a method: extract arguments to owned Rust values first, run the engine call and JSON serialization inside
+`Python::detach`, and never touch a Python object in the released section.
 
 ### `issundb_core::Storage`
 
