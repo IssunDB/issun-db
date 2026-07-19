@@ -1,6 +1,6 @@
 # IssunDB
 
-IssunDB is an embedded graph database, written in Rust.
+IssunDB is an embedded graph database in Rust.
 
 ## Key Features
 

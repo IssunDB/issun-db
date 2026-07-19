@@ -4790,8 +4790,22 @@ mod tests {
             csv_path.display()
         );
         let res_csv = execute(&graph, &query_csv, &params).unwrap();
-        assert_eq!(res_csv.columns, vec!["nodes_imported".to_string()]);
-        assert_eq!(res_csv.records[0].values[0], serde_json::json!(3));
+        assert_eq!(
+            res_csv.columns,
+            vec![
+                "target".to_string(),
+                "kind".to_string(),
+                "count".to_string()
+            ]
+        );
+        assert_eq!(
+            res_csv.records[0].values,
+            vec![
+                serde_json::json!("Person"),
+                serde_json::json!("nodes"),
+                serde_json::json!(3)
+            ]
+        );
 
         // Query and verify CSV nodes
         let query_verify_csv = "MATCH (n:Person) RETURN n.name, n.age, n.active ORDER BY n.name";
@@ -4832,7 +4846,7 @@ mod tests {
 
         let query_jsonl = format!("COPY Person FROM '{}'", jsonl_path.display());
         let res_jsonl = execute(&graph, &query_jsonl, &params).unwrap();
-        assert_eq!(res_jsonl.records[0].values[0], serde_json::json!(2));
+        assert_eq!(res_jsonl.records[0].values[2], serde_json::json!(2));
 
         // Query and verify JSONL nodes
         let query_verify_jsonl = "MATCH (n:Person) WHERE n.name = 'David' OR n.name = 'Eve' RETURN n.name, n.age ORDER BY n.name";
@@ -4865,7 +4879,7 @@ mod tests {
 
         let query = format!("COPY Person FROM '{}'", jsonl_path.display());
         let res = execute(&graph, &query, &params).unwrap();
-        assert_eq!(res.records[0].values[0], serde_json::json!(2));
+        assert_eq!(res.records[0].values[2], serde_json::json!(2));
 
         let res_id = execute(
             &graph,
@@ -4889,6 +4903,205 @@ mod tests {
             res_both.records[0].values,
             vec![serde_json::json!("Bob"), serde_json::Value::Null]
         );
+    }
+
+    /// COPY reports what it did: the target, whether the file classified as
+    /// nodes or relationships, and the row count.
+    #[test]
+    fn test_copy_reports_target_kind_and_count() {
+        use std::io::Write;
+        let (tempdir, graph) = setup_graph();
+        let params = HashMap::new();
+
+        let nodes_path = tempdir.path().join("people.jsonl");
+        {
+            let mut file = std::fs::File::create(&nodes_path).unwrap();
+            writeln!(file, "{{\"_id\": 0, \"name\": \"Alice\"}}").unwrap();
+            writeln!(file, "{{\"_id\": 1, \"name\": \"Bob\"}}").unwrap();
+        }
+        let res = execute(
+            &graph,
+            &format!("COPY Person FROM '{}'", nodes_path.display()),
+            &params,
+        )
+        .unwrap();
+        assert_eq!(
+            res.columns,
+            vec![
+                "target".to_string(),
+                "kind".to_string(),
+                "count".to_string()
+            ]
+        );
+        assert_eq!(
+            res.records[0].values,
+            vec![
+                serde_json::json!("Person"),
+                serde_json::json!("nodes"),
+                serde_json::json!(2)
+            ]
+        );
+
+        // A standalone edge COPY has no id map, so the file must reference
+        // the real node ids. Look them up first.
+        let ids = execute(
+            &graph,
+            "MATCH (p:Person) RETURN id(p) ORDER BY id(p)",
+            &params,
+        )
+        .unwrap();
+        let a = ids.records[0].values[0].as_u64().unwrap();
+        let b = ids.records[1].values[0].as_u64().unwrap();
+
+        let edges_path = tempdir.path().join("knows.jsonl");
+        {
+            let mut file = std::fs::File::create(&edges_path).unwrap();
+            writeln!(file, "{{\"_from\": {a}, \"_to\": {b}}}").unwrap();
+        }
+        let res = execute(
+            &graph,
+            &format!("COPY KNOWS FROM '{}'", edges_path.display()),
+            &params,
+        )
+        .unwrap();
+        assert_eq!(
+            res.records[0].values,
+            vec![
+                serde_json::json!("KNOWS"),
+                serde_json::json!("relationships"),
+                serde_json::json!(1)
+            ]
+        );
+    }
+
+    /// IMPORT DATABASE reports one row per COPY statement in copy.cypher, so
+    /// a file that ingests zero rows or classifies unexpectedly is visible.
+    #[test]
+    fn test_import_database_reports_per_file_counts() {
+        use std::io::Write;
+        let (tempdir, graph) = setup_graph();
+        let params = HashMap::new();
+
+        let import_dir = tempdir.path().join("import_counts");
+        std::fs::create_dir(&import_dir).unwrap();
+        {
+            let mut file = std::fs::File::create(import_dir.join("Person.jsonl")).unwrap();
+            writeln!(file, "{{\"_id\": 0, \"name\": \"A\"}}").unwrap();
+            writeln!(file, "{{\"_id\": 1, \"name\": \"B\"}}").unwrap();
+            writeln!(file, "{{\"_id\": 2, \"name\": \"C\"}}").unwrap();
+        }
+        {
+            let mut file = std::fs::File::create(import_dir.join("FOLLOWS.jsonl")).unwrap();
+            writeln!(file, "{{\"_from\": 0, \"_to\": 1}}").unwrap();
+            writeln!(file, "{{\"_from\": 0, \"_to\": 2}}").unwrap();
+        }
+        std::fs::write(
+            import_dir.join("copy.cypher"),
+            "COPY Person FROM 'Person.jsonl';\nCOPY FOLLOWS FROM 'FOLLOWS.jsonl';\n",
+        )
+        .unwrap();
+
+        let res = execute(
+            &graph,
+            &format!("IMPORT DATABASE '{}'", import_dir.display()),
+            &params,
+        )
+        .unwrap();
+        assert_eq!(
+            res.columns,
+            vec![
+                "target".to_string(),
+                "kind".to_string(),
+                "count".to_string()
+            ]
+        );
+        assert_eq!(res.records.len(), 2);
+        assert_eq!(
+            res.records[0].values,
+            vec![
+                serde_json::json!("Person"),
+                serde_json::json!("nodes"),
+                serde_json::json!(3)
+            ]
+        );
+        assert_eq!(
+            res.records[1].values,
+            vec![
+                serde_json::json!("FOLLOWS"),
+                serde_json::json!("relationships"),
+                serde_json::json!(2)
+            ]
+        );
+
+        let count = execute(
+            &graph,
+            "MATCH ()-[:FOLLOWS]->() RETURN count(*) AS num",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(count.records[0].values[0], serde_json::json!(2));
+    }
+
+    /// A file whose rows carry bare `from` and `to` keys and no node metadata
+    /// is a pre-rename edge file, not a node file; importing it as nodes
+    /// would silently produce zero edges, so it must error with a migration
+    /// hint instead.
+    #[test]
+    fn test_legacy_edge_endpoint_keys_are_rejected() {
+        use std::io::Write;
+        let (tempdir, graph) = setup_graph();
+        let params = HashMap::new();
+
+        let jsonl_path = tempdir.path().join("follows_legacy.jsonl");
+        {
+            let mut file = std::fs::File::create(&jsonl_path).unwrap();
+            writeln!(file, "{{\"from\": 0, \"to\": 1}}").unwrap();
+        }
+        let err = execute(
+            &graph,
+            &format!("COPY FOLLOWS FROM '{}'", jsonl_path.display()),
+            &params,
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("_from") && msg.contains("_to"),
+            "error should point at the underscore keys, got: {msg}"
+        );
+
+        // The same shape as a CSV file is rejected too.
+        let csv_path = tempdir.path().join("follows_legacy.csv");
+        {
+            let mut file = std::fs::File::create(&csv_path).unwrap();
+            writeln!(file, "from,to").unwrap();
+            writeln!(file, "0,1").unwrap();
+        }
+        let err = execute(
+            &graph,
+            &format!("COPY FOLLOWS FROM '{}'", csv_path.display()),
+            &params,
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("_from"));
+
+        // A node row with `from`/`to` user properties imports fine as long
+        // as it carries node metadata.
+        let ok_path = tempdir.path().join("flights.jsonl");
+        {
+            let mut file = std::fs::File::create(&ok_path).unwrap();
+            writeln!(
+                file,
+                "{{\"_labels\": [\"Flight\"], \"from\": 1, \"to\": 2}}"
+            )
+            .unwrap();
+        }
+        let res = execute(
+            &graph,
+            &format!("COPY Flight FROM '{}'", ok_path.display()),
+            &params,
+        )
+        .unwrap();
+        assert_eq!(res.records[0].values[2], serde_json::json!(1));
     }
 
     #[test]
@@ -4930,9 +5143,14 @@ mod tests {
         let import_query = format!("IMPORT DATABASE '{}'", export_dir.display());
         let res_import = execute(&graph2, &import_query, &params).unwrap();
         assert_eq!(
-            res_import.records[0].values[0],
-            serde_json::Value::Bool(true)
+            res_import.columns,
+            vec![
+                "target".to_string(),
+                "kind".to_string(),
+                "count".to_string()
+            ]
         );
+        assert_eq!(res_import.records.len(), 2);
 
         // Verify the imported nodes and properties
         let verify_query = "MATCH (n:Person) RETURN n.name, n.age, n.active ORDER BY n.name";

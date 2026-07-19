@@ -69,7 +69,7 @@ The temporal constructors `date`, `time`, `localtime`, `datetime`, `localdatetim
 
 - Built-in graph data science procedures run through `CALL issundb.<name>(...)`; the full list is in the [Cypher Built-in Procedures](api-reference.md#cypher-built-in-procedures) reference, and custom procedures can be registered through `query_with_procedures`.
 - Index and constraint DDL (`CREATE INDEX`, `DROP INDEX`, `CREATE CONSTRAINT`, and `DROP CONSTRAINT`) is covered by the [Cypher DDL Reference](api-reference.md#cypher-ddl-reference).
-- Bulk data administration statements are also available: `COPY <Label> FROM '<file>' [WITH ...]` bulk-imports nodes from a file, `EXPORT DATABASE '<path>' [WITH ...]` writes the database contents out, and `IMPORT DATABASE '<path>'` loads a previous export.
+- Bulk data administration statements are also available: `COPY <Label> FROM '<file>' [WITH ...]` bulk-imports nodes or relationships from a file, `EXPORT DATABASE '<path>' [WITH ...]` writes the database contents out, and `IMPORT DATABASE '<path>'` loads a previous export. A file classifies as a relationship import when its rows carry the `_from` and `_to` endpoint keys; rows with bare `from` and `to` keys and no node metadata key (`_id` or `_labels`) are rejected with a migration hint rather than silently imported as nodes. Both `COPY` and `IMPORT DATABASE` return one row per imported file with the columns `target`, `kind` (`nodes` or `relationships`), and `count`.
 
 ## Unsupported Constructs
 

@@ -1,6 +1,7 @@
 # Getting Started
 
-This guide covers compiling, configuring, and querying IssunDB. It explains prerequisites, building the engine from source, and using the command-line interface (CLI) to interact with the database.
+This guide covers compiling, configuring, and querying IssunDB.
+It explains prerequisites, building the engine from source, and using the command-line interface (CLI) to interact with the database.
 
 ## Prerequisites
 
@@ -8,8 +9,7 @@ Compiling IssunDB and its native dependencies requires Rust 1.85.0 or later, alo
 
 - Build tools: CMake and a C/C++ compiler (such as Clang or GCC) to compile the SuiteSparse:GraphBLAS static library.
 - FFI bindings: `libclang`, which `bindgen` uses to build the raw GraphBLAS wrappers.
-- OpenMP runtime: This resolves to `libgomp` (bundled with GCC) on Linux, `libomp` on macOS (`brew install libomp`), and `vcomp` (part of the MSVC
-  runtime) on Windows.
+- OpenMP runtime: This resolves to `libgomp` (bundled with GCC) on Linux, `libomp` on macOS (`brew install libomp`), and `vcomp` (usually part of the MSVC runtime) on Windows.
 
 ## Build from Source
 
