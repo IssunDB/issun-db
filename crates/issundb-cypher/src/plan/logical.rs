@@ -247,6 +247,7 @@ impl LogicalPlanner {
                     QueryPart::With {
                         items,
                         where_clause,
+                        where_after,
                         order_by,
                         skip,
                         limit,
@@ -399,6 +400,17 @@ impl LogicalPlanner {
                                 input: Box::new(p),
                                 skip: skip_n,
                                 count: limit_n,
+                            };
+                        }
+
+                        // A WHERE in the openCypher position (after ORDER BY,
+                        // SKIP, and LIMIT) filters the rows those sub-clauses
+                        // produced. The row is already narrowed to the WITH
+                        // aliases, matching the trailing WHERE's scope.
+                        if let Some(wc) = where_after {
+                            p = LogicalOperator::Filter {
+                                input: Box::new(p),
+                                expression: where_clause_to_filter_expr(wc),
                             };
                         }
 
@@ -803,6 +815,19 @@ impl LogicalPlanner {
 type GroupByItem = (Expr, Option<String>);
 /// Aggregation spec: `(function, inner expression, output column name)`.
 type AggItem = (AggFn, Expr, String);
+
+/// Convert a parsed WHERE clause into a plan filter expression.
+fn where_clause_to_filter_expr(wc: &WhereClause) -> FilterExpr {
+    match wc {
+        WhereClause::Eq(l, r) => FilterExpr::Eq(l.clone(), r.clone()),
+        WhereClause::Ne(l, r) => FilterExpr::Ne(l.clone(), r.clone()),
+        WhereClause::Lt(l, r) => FilterExpr::Lt(l.clone(), r.clone()),
+        WhereClause::Gt(l, r) => FilterExpr::Gt(l.clone(), r.clone()),
+        WhereClause::Le(l, r) => FilterExpr::Le(l.clone(), r.clone()),
+        WhereClause::Ge(l, r) => FilterExpr::Ge(l.clone(), r.clone()),
+        WhereClause::Expr(e) => FilterExpr::Expr(e.clone()),
+    }
+}
 
 /// Classify RETURN items into group-by keys (non-aggregate) and aggregation specs.
 ///

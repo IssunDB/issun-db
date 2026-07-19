@@ -5,3 +5,5 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 4298c2a8c59583f966f8d044a931dd37c277a13db04002d230a3de4e02694967 # shrinks to nodes = [(0, 0, 0)], edges = []
+cc 561ad1bec1df9b05e8d46d44bd9422500841d88e6ab70f3f9a49310309caa2aa # shrinks to people = [(true, [1], [0])], target = 1
+cc 13c267581718891a6398f168a8f4cca99d23f4197967754ff01d0fed79c8bcec # shrinks to nodes = [(0, 0, 0)], edges = []

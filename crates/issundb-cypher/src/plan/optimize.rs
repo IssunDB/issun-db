@@ -8,6 +8,16 @@ use crate::plan::stats::StatsProvider;
 /// An optimizer that applies relational algebra optimization passes to physical plans.
 pub struct Optimizer;
 
+/// A filter awaiting placement during pushdown, tagged with how many `Limit`
+/// operators stood between its original position and the optimization-scope
+/// root. The filter may descend back through exactly that many `Limit`s:
+/// crossing more would move it below a row-selection boundary it originally
+/// applied after, changing which rows the LIMIT keeps.
+struct PendingFilter {
+    expr: FilterExpr,
+    limits_crossable: usize,
+}
+
 /// The parameters of a recognized correlated index seek (`rewrite_correlated_seek`).
 struct CorrelatedSeek {
     /// True when the join's left side is the bare `LabelScan` the seek replaces,
@@ -53,21 +63,27 @@ impl Optimizer {
         // Split top-level AND conjunctions so each conjunct pushes down to its
         // own lowest binder: `a.id = 1 AND b.age > 30` as a whole references
         // both endpoints and would stay above the Expand, while its conjuncts
-        // reach the scan and the expansion respectively.
-        let mut filters = Vec::with_capacity(raw_filters.len());
+        // reach the scan and the expansion respectively. Each conjunct keeps
+        // its parent's Limit-crossing budget.
+        let mut filters: Vec<PendingFilter> = Vec::with_capacity(raw_filters.len());
         for filter in raw_filters {
-            Self::split_conjuncts(filter, &mut filters);
+            let mut parts = Vec::new();
+            Self::split_conjuncts(filter.expr, &mut parts);
+            filters.extend(parts.into_iter().map(|expr| PendingFilter {
+                expr,
+                limits_crossable: filter.limits_crossable,
+            }));
         }
         // Drop statically-true predicates so they are neither pushed down nor
         // evaluated per row. Only provably-true forms are removed; false or
         // unknown predicates are preserved for normal evaluation.
-        filters.retain(|f| !Self::is_trivially_true(f));
+        filters.retain(|f| !Self::is_trivially_true(&f.expr));
         let reordered_op = Self::reorder_operators(stripped_op, stats, &labels);
         // Choose the lowest-cardinality endpoint as the traversal start, reversing a
         // linear single-hop Expand chain when its far endpoint is cheaper to scan.
         // Runs on the filter-free spine so the chain is contiguous; the HasLabel
         // predicates needed to estimate endpoint cardinality live in `filters`.
-        let scan_selected = Self::select_scan_node(reordered_op, &mut filters, stats);
+        let scan_selected = Self::select_scan_node(reordered_op, &mut filters, stats, 0);
         let mut result = Self::push_down_filters(scan_selected, &mut filters);
         // Any filter whose referenced variables are not bound by any operator in the
         // tree cannot be pushed down. Wrap them above the root so no predicate is
@@ -75,7 +91,7 @@ impl Optimizer {
         for filter_expr in filters {
             result = PhysicalOperator::Filter {
                 input: Box::new(result),
-                expression: filter_expr,
+                expression: filter_expr.expr,
             };
         }
         // Replace a `vector_dist` top-k sort over a labeled scan with one HNSW
@@ -163,12 +179,15 @@ impl Optimizer {
         op: PhysicalOperator,
         stats: Option<&dyn StatsProvider>,
         allow_prune: bool,
-    ) -> (PhysicalOperator, Vec<FilterExpr>) {
+    ) -> (PhysicalOperator, Vec<PendingFilter>) {
         match op {
             PhysicalOperator::Filter { input, expression } => {
                 let (inner_op, mut inner_filters) =
                     Self::extract_filters(*input, stats, allow_prune);
-                inner_filters.push(expression);
+                inner_filters.push(PendingFilter {
+                    expr: expression,
+                    limits_crossable: 0,
+                });
                 (inner_op, inner_filters)
             }
             PhysicalOperator::SingleRow => (PhysicalOperator::SingleRow, Vec::new()),
@@ -343,7 +362,12 @@ impl Optimizer {
                 )
             }
             PhysicalOperator::Limit { input, skip, count } => {
-                let (inner, filters) = Self::extract_filters(*input, stats, allow_prune);
+                let (inner, mut filters) = Self::extract_filters(*input, stats, allow_prune);
+                // These filters originated below this LIMIT, so they may cross
+                // it again on the way back down during pushdown.
+                for f in &mut filters {
+                    f.limits_crossable += 1;
+                }
                 (
                     PhysicalOperator::Limit {
                         input: Box::new(inner),
@@ -937,14 +961,103 @@ impl Optimizer {
         // plan is read-only and a hop can be pruned on committed-schema evidence
         // without risking an edge a same-statement write would create.
         //
-        // Collect every variable's declared label constraints once over the whole
-        // tree: a destination label often arrives as a `HasLabel` filter above
-        // the `Expand` that binds it, so a single bottom-up scan is needed before
-        // any hop can be judged.
+        // Collect every variable's declared label constraints once over this
+        // optimization scope: a destination label often arrives as a `HasLabel`
+        // filter above the `Expand` that binds it, so a single bottom-up scan is
+        // needed before any hop can be judged. Unlike the cost-model collection,
+        // the prune-time collection stops at scope boundaries: a barrier Project
+        // starts a fresh variable scope (a re-declared name after WITH is a
+        // different variable), and a label inside an OPTIONAL MATCH is not a
+        // mandatory constraint on the shared variable. Merging either would
+        // prune satisfiable patterns.
         let mut labels: std::collections::HashMap<String, Vec<String>> =
             std::collections::HashMap::new();
-        Self::collect_label_constraints(&op, &mut labels);
+        Self::collect_prune_label_constraints(&op, &mut labels);
         Self::rewrite_unsatisfiable(op, &labels, stats)
+    }
+
+    /// Scope-limited variant of `collect_label_constraints` for pruning: does
+    /// not descend into barrier `Project` subtrees (their own optimize pass
+    /// prunes them against their own scope's labels) or into `OptionalMatch`
+    /// subtrees (whose labels are not mandatory for shared variables).
+    fn collect_prune_label_constraints(
+        op: &PhysicalOperator,
+        out: &mut std::collections::HashMap<String, Vec<String>>,
+    ) {
+        match op {
+            PhysicalOperator::Project {
+                is_barrier: true, ..
+            }
+            | PhysicalOperator::OptionalMatch { .. } => {}
+            PhysicalOperator::Filter {
+                input,
+                expression: FilterExpr::HasLabel(var, label),
+            } => {
+                let entry: &mut Vec<String> = out.entry(var.clone()).or_default();
+                if !entry.iter().any(|l| l == label) {
+                    entry.push(label.clone());
+                }
+                Self::collect_prune_label_constraints(input, out);
+            }
+            PhysicalOperator::LabelScan {
+                variable,
+                label: Some(label),
+            }
+            | PhysicalOperator::NodeByIdSeek {
+                variable,
+                label: Some(label),
+                ..
+            }
+            | PhysicalOperator::NodeIndexScan {
+                variable, label, ..
+            }
+            | PhysicalOperator::NodeRangeScan {
+                variable, label, ..
+            } => {
+                let entry: &mut Vec<String> = out.entry(variable.clone()).or_default();
+                if !entry.iter().any(|l| l == label) {
+                    entry.push(label.clone());
+                }
+            }
+            PhysicalOperator::CorrelatedIndexSeek {
+                input,
+                variable,
+                label: Some(label),
+                ..
+            } => {
+                let entry: &mut Vec<String> = out.entry(variable.clone()).or_default();
+                if !entry.iter().any(|l| l == label) {
+                    entry.push(label.clone());
+                }
+                Self::collect_prune_label_constraints(input, out);
+            }
+            PhysicalOperator::Unwind { input, .. }
+            | PhysicalOperator::Expand { input, .. }
+            | PhysicalOperator::Filter { input, .. }
+            | PhysicalOperator::Project { input, .. }
+            | PhysicalOperator::Aggregate { input, .. }
+            | PhysicalOperator::Sort { input, .. }
+            | PhysicalOperator::Limit { input, .. }
+            | PhysicalOperator::Distinct { input, .. }
+            | PhysicalOperator::WritePart { input, .. }
+            | PhysicalOperator::ProcedureCall { input, .. }
+            | PhysicalOperator::CorrelatedIndexSeek { input, .. }
+            | PhysicalOperator::MultiwayJoin { input, .. }
+            | PhysicalOperator::ExpandIntersect { input, .. } => {
+                Self::collect_prune_label_constraints(input, out)
+            }
+            PhysicalOperator::HashJoin { left, right } => {
+                Self::collect_prune_label_constraints(left, out);
+                Self::collect_prune_label_constraints(right, out);
+            }
+            PhysicalOperator::LabelScan { .. }
+            | PhysicalOperator::NodeByIdSeek { .. }
+            | PhysicalOperator::SingleRow
+            | PhysicalOperator::VectorTopK { .. }
+            | PhysicalOperator::TriangleCount { .. }
+            | PhysicalOperator::PathCount { .. }
+            | PhysicalOperator::GroupedDegree { .. } => {}
+        }
     }
 
     /// True when any operator in the plan performs a write (`CREATE`, `MERGE`,
@@ -1064,7 +1177,23 @@ impl Optimizer {
         labels: &std::collections::HashMap<String, Vec<String>>,
         stats: &dyn StatsProvider,
     ) -> PhysicalOperator {
+        // A barrier Project subtree is a separately optimized scope whose own
+        // prune pass already ran against its own labels; judging its hops with
+        // this scope's labels would leak constraints across a WITH boundary.
+        if matches!(
+            op,
+            PhysicalOperator::Project {
+                is_barrier: true,
+                ..
+            }
+        ) {
+            return op;
+        }
         // Rewrite children first so a nested impossible hop is still caught.
+        // Descending into an OptionalMatch is sound because `labels` holds only
+        // mandatory constraints (the scope-limited collection skips optional
+        // subtrees): if a shared variable's mandatory labels make an optional
+        // hop impossible, the optional pattern indeed never matches.
         let op = Self::map_inputs(op, |child| {
             Self::rewrite_unsatisfiable(child, labels, stats)
         });
@@ -1322,7 +1451,10 @@ impl Optimizer {
     }
 
     /// Push collected filters down the plan tree to the lowest possible nodes where they can be evaluated.
-    fn push_down_filters(op: PhysicalOperator, pending: &mut Vec<FilterExpr>) -> PhysicalOperator {
+    fn push_down_filters(
+        op: PhysicalOperator,
+        pending: &mut Vec<PendingFilter>,
+    ) -> PhysicalOperator {
         match op {
             PhysicalOperator::NodeRangeScan {
                 variable,
@@ -1345,12 +1477,12 @@ impl Optimizer {
                 let bound = Self::bound_vars(&current_node);
                 let mut i = 0;
                 while i < pending.len() {
-                    let ref_vars = Self::referenced_vars(&pending[i]);
+                    let ref_vars = Self::referenced_vars(&pending[i].expr);
                     if ref_vars.is_subset(&bound) {
                         let filter_expr = pending.remove(i);
                         current_node = PhysicalOperator::Filter {
                             input: Box::new(current_node),
-                            expression: filter_expr,
+                            expression: filter_expr.expr,
                         };
                     } else {
                         i += 1;
@@ -1375,12 +1507,12 @@ impl Optimizer {
 
                 let mut i = 0;
                 while i < pending.len() {
-                    let ref_vars = Self::referenced_vars(&pending[i]);
+                    let ref_vars = Self::referenced_vars(&pending[i].expr);
                     if ref_vars.is_subset(&bound) {
                         let filter_expr = pending.remove(i);
                         current_node = PhysicalOperator::Filter {
                             input: Box::new(current_node),
-                            expression: filter_expr,
+                            expression: filter_expr.expr,
                         };
                     } else {
                         i += 1;
@@ -1402,12 +1534,12 @@ impl Optimizer {
                 let bound = Self::bound_vars(&current_node);
                 let mut i = 0;
                 while i < pending.len() {
-                    let ref_vars = Self::referenced_vars(&pending[i]);
+                    let ref_vars = Self::referenced_vars(&pending[i].expr);
                     if ref_vars.is_subset(&bound) {
                         let filter_expr = pending.remove(i);
                         current_node = PhysicalOperator::Filter {
                             input: Box::new(current_node),
-                            expression: filter_expr,
+                            expression: filter_expr.expr,
                         };
                     } else {
                         i += 1;
@@ -1426,12 +1558,12 @@ impl Optimizer {
                 // Push down all filters whose referenced variables are fully bound by this scan.
                 let mut i = 0;
                 while i < pending.len() {
-                    let ref_vars = Self::referenced_vars(&pending[i]);
+                    let ref_vars = Self::referenced_vars(&pending[i].expr);
                     if ref_vars.is_subset(&bound) {
                         let filter_expr = pending.remove(i);
                         current_node = PhysicalOperator::Filter {
                             input: Box::new(current_node),
-                            expression: filter_expr,
+                            expression: filter_expr.expr,
                         };
                     } else {
                         i += 1;
@@ -1460,7 +1592,7 @@ impl Optimizer {
                 let mut remaining_pending = Vec::new();
 
                 for filter in pending.drain(..) {
-                    let ref_vars = Self::referenced_vars(&filter);
+                    let ref_vars = Self::referenced_vars(&filter.expr);
                     if ref_vars.is_subset(&child_bound) {
                         child_pending.push(filter);
                     } else {
@@ -1490,12 +1622,12 @@ impl Optimizer {
 
                 let mut i = 0;
                 while i < remaining_pending.len() {
-                    let ref_vars = Self::referenced_vars(&remaining_pending[i]);
+                    let ref_vars = Self::referenced_vars(&remaining_pending[i].expr);
                     if ref_vars.is_subset(&bound) {
                         let filter_expr = remaining_pending.remove(i);
                         current_node = PhysicalOperator::Filter {
                             input: Box::new(current_node),
-                            expression: filter_expr,
+                            expression: filter_expr.expr,
                         };
                     } else {
                         i += 1;
@@ -1514,7 +1646,7 @@ impl Optimizer {
                 let mut remaining_pending = Vec::new();
 
                 for filter in pending.drain(..) {
-                    let ref_vars = Self::referenced_vars(&filter);
+                    let ref_vars = Self::referenced_vars(&filter.expr);
                     if ref_vars.is_subset(&left_bound) {
                         left_pending.push(filter);
                     } else if ref_vars.is_subset(&right_bound) {
@@ -1539,12 +1671,12 @@ impl Optimizer {
 
                 let mut i = 0;
                 while i < remaining_pending.len() {
-                    let ref_vars = Self::referenced_vars(&remaining_pending[i]);
+                    let ref_vars = Self::referenced_vars(&remaining_pending[i].expr);
                     if ref_vars.is_subset(&bound) {
                         let filter_expr = remaining_pending.remove(i);
                         current_node = PhysicalOperator::Filter {
                             input: Box::new(current_node),
-                            expression: filter_expr,
+                            expression: filter_expr.expr,
                         };
                     } else {
                         i += 1;
@@ -1577,12 +1709,12 @@ impl Optimizer {
                     let bound = Self::bound_vars(&current_node);
                     let mut i = 0;
                     while i < pending.len() {
-                        let ref_vars = Self::referenced_vars(&pending[i]);
+                        let ref_vars = Self::referenced_vars(&pending[i].expr);
                         if ref_vars.is_subset(&bound) {
                             let filter_expr = pending.remove(i);
                             current_node = PhysicalOperator::Filter {
                                 input: Box::new(current_node),
-                                expression: filter_expr,
+                                expression: filter_expr.expr,
                             };
                         } else {
                             i += 1;
@@ -1597,7 +1729,7 @@ impl Optimizer {
                     let mut remaining_pending = Vec::new();
 
                     for filter in pending.drain(..) {
-                        let ref_vars = Self::referenced_vars(&filter);
+                        let ref_vars = Self::referenced_vars(&filter.expr);
                         if ref_vars.is_subset(&child_bound) {
                             child_pending.push(filter);
                         } else {
@@ -1618,12 +1750,12 @@ impl Optimizer {
 
                     let mut i = 0;
                     while i < remaining_pending.len() {
-                        let ref_vars = Self::referenced_vars(&remaining_pending[i]);
+                        let ref_vars = Self::referenced_vars(&remaining_pending[i].expr);
                         if ref_vars.is_subset(&bound) {
                             let filter_expr = remaining_pending.remove(i);
                             current_node = PhysicalOperator::Filter {
                                 input: Box::new(current_node),
-                                expression: filter_expr,
+                                expression: filter_expr.expr,
                             };
                         } else {
                             i += 1;
@@ -1640,12 +1772,12 @@ impl Optimizer {
 
                 let mut i = 0;
                 while i < pending.len() {
-                    let ref_vars = Self::referenced_vars(&pending[i]);
+                    let ref_vars = Self::referenced_vars(&pending[i].expr);
                     if ref_vars.is_subset(&bound) {
                         let filter_expr = pending.remove(i);
                         current_node = PhysicalOperator::Filter {
                             input: Box::new(current_node),
-                            expression: filter_expr,
+                            expression: filter_expr.expr,
                         };
                     } else {
                         i += 1;
@@ -1664,7 +1796,7 @@ impl Optimizer {
                 let mut remaining_pending = Vec::new();
 
                 for filter in pending.drain(..) {
-                    let ref_vars = Self::referenced_vars(&filter);
+                    let ref_vars = Self::referenced_vars(&filter.expr);
                     if ref_vars.is_subset(&child_bound) {
                         child_pending.push(filter);
                     } else {
@@ -1685,12 +1817,12 @@ impl Optimizer {
 
                 let mut i = 0;
                 while i < remaining_pending.len() {
-                    let ref_vars = Self::referenced_vars(&remaining_pending[i]);
+                    let ref_vars = Self::referenced_vars(&remaining_pending[i].expr);
                     if ref_vars.is_subset(&bound) {
                         let filter_expr = remaining_pending.remove(i);
                         current_node = PhysicalOperator::Filter {
                             input: Box::new(current_node),
-                            expression: filter_expr,
+                            expression: filter_expr.expr,
                         };
                     } else {
                         i += 1;
@@ -1725,7 +1857,29 @@ impl Optimizer {
                 }
             }
             PhysicalOperator::Limit { input, skip, count } => {
-                let optimized = Self::push_down_filters(*input, pending);
+                // A LIMIT is a row-selection boundary: a filter may descend
+                // through it only if it originated below one (its
+                // `limits_crossable` budget, set during extraction). An outer
+                // filter applies to the k rows the LIMIT chose, so letting it
+                // cross would choose k different rows; it stays pending for
+                // the caller to attach above this node.
+                let mut crossers = Vec::new();
+                let mut stayers = Vec::new();
+                for mut f in pending.drain(..) {
+                    if f.limits_crossable > 0 {
+                        f.limits_crossable -= 1;
+                        crossers.push(f);
+                    } else {
+                        stayers.push(f);
+                    }
+                }
+                let optimized = Self::push_down_filters(*input, &mut crossers);
+                // Whatever the subtree could not place surfaces back above.
+                for mut f in crossers {
+                    f.limits_crossable += 1;
+                    stayers.push(f);
+                }
+                *pending = stayers;
                 PhysicalOperator::Limit {
                     input: Box::new(optimized),
                     skip,
@@ -1776,7 +1930,7 @@ impl Optimizer {
                 let mut remaining_pending = Vec::new();
 
                 for filter in pending.drain(..) {
-                    let ref_vars = Self::referenced_vars(&filter);
+                    let ref_vars = Self::referenced_vars(&filter.expr);
                     if ref_vars.is_subset(&child_bound) {
                         child_pending.push(filter);
                     } else {
@@ -1801,12 +1955,12 @@ impl Optimizer {
                 let bound = Self::bound_vars(&current_node);
                 let mut i = 0;
                 while i < remaining_pending.len() {
-                    let ref_vars = Self::referenced_vars(&remaining_pending[i]);
+                    let ref_vars = Self::referenced_vars(&remaining_pending[i].expr);
                     if ref_vars.is_subset(&bound) {
                         let filter_expr = remaining_pending.remove(i);
                         current_node = PhysicalOperator::Filter {
                             input: Box::new(current_node),
-                            expression: filter_expr,
+                            expression: filter_expr.expr,
                         };
                     } else {
                         i += 1;
@@ -2466,76 +2620,54 @@ impl Optimizer {
                                 }
                                 None
                             };
-                            match probe {
+                            // Normalize the conjunct to (is_lower_bound, value,
+                            // inclusive) with the property on the left: a
+                            // prop-on-right comparison flips sides (`c < n.p`
+                            // is a lower bound).
+                            let bound = match probe {
                                 FilterExpr::Lt(l, r) => {
-                                    if let Some((val, prop_on_left)) = try_same_prop(l, r) {
-                                        return PhysicalOperator::NodeRangeScan {
-                                            variable,
-                                            label,
-                                            property,
-                                            lo,
-                                            lo_inclusive,
-                                            hi: if prop_on_left { Some(val) } else { hi },
-                                            hi_inclusive: if prop_on_left {
-                                                false
-                                            } else {
-                                                hi_inclusive
-                                            },
-                                        };
-                                    }
+                                    try_same_prop(l, r).map(|(v, pl)| (!pl, v, false))
                                 }
                                 FilterExpr::Le(l, r) => {
-                                    if let Some((val, prop_on_left)) = try_same_prop(l, r) {
-                                        return PhysicalOperator::NodeRangeScan {
-                                            variable,
-                                            label,
-                                            property,
-                                            lo,
-                                            lo_inclusive,
-                                            hi: if prop_on_left { Some(val) } else { hi },
-                                            hi_inclusive: if prop_on_left {
-                                                true
-                                            } else {
-                                                hi_inclusive
-                                            },
-                                        };
-                                    }
+                                    try_same_prop(l, r).map(|(v, pl)| (!pl, v, true))
                                 }
                                 FilterExpr::Gt(l, r) => {
-                                    if let Some((val, prop_on_left)) = try_same_prop(l, r) {
-                                        return PhysicalOperator::NodeRangeScan {
-                                            variable,
-                                            label,
-                                            property,
-                                            lo: if prop_on_left { Some(val) } else { lo },
-                                            lo_inclusive: if prop_on_left {
-                                                false
-                                            } else {
-                                                lo_inclusive
-                                            },
-                                            hi,
-                                            hi_inclusive,
-                                        };
-                                    }
+                                    try_same_prop(l, r).map(|(v, pl)| (pl, v, false))
                                 }
                                 FilterExpr::Ge(l, r) => {
-                                    if let Some((val, prop_on_left)) = try_same_prop(l, r) {
-                                        return PhysicalOperator::NodeRangeScan {
-                                            variable,
-                                            label,
-                                            property,
-                                            lo: if prop_on_left { Some(val) } else { lo },
-                                            lo_inclusive: if prop_on_left {
-                                                true
-                                            } else {
-                                                lo_inclusive
-                                            },
-                                            hi,
-                                            hi_inclusive,
-                                        };
-                                    }
+                                    try_same_prop(l, r).map(|(v, pl)| (pl, v, true))
                                 }
-                                _ => {}
+                                _ => None,
+                            };
+                            // Merge only into an unbounded side. A second bound
+                            // on an already-bounded side cannot be compared at
+                            // plan time (parameters), so it stays behind the
+                            // scan as the wrapped-back post-filter below;
+                            // overwriting could widen the range and return
+                            // rows that fail the tighter predicate.
+                            if let Some((is_lower, val, inclusive)) = bound {
+                                if is_lower && lo.is_none() {
+                                    return PhysicalOperator::NodeRangeScan {
+                                        variable,
+                                        label,
+                                        property,
+                                        lo: Some(val),
+                                        lo_inclusive: inclusive,
+                                        hi,
+                                        hi_inclusive,
+                                    };
+                                }
+                                if !is_lower && hi.is_none() {
+                                    return PhysicalOperator::NodeRangeScan {
+                                        variable,
+                                        label,
+                                        property,
+                                        lo,
+                                        lo_inclusive,
+                                        hi: Some(val),
+                                        hi_inclusive: inclusive,
+                                    };
+                                }
                             }
                         }
                     }
@@ -2690,20 +2822,21 @@ impl Optimizer {
     /// predicates are not extracted and so still interrupt the spine).
     fn select_scan_node(
         op: PhysicalOperator,
-        filters: &mut Vec<FilterExpr>,
+        filters: &mut Vec<PendingFilter>,
         stats: Option<&dyn StatsProvider>,
+        limit_depth: usize,
     ) -> PhysicalOperator {
         match op {
             PhysicalOperator::HashJoin { left, right } => PhysicalOperator::HashJoin {
-                left: Box::new(Self::select_scan_node(*left, filters, stats)),
-                right: Box::new(Self::select_scan_node(*right, filters, stats)),
+                left: Box::new(Self::select_scan_node(*left, filters, stats, limit_depth)),
+                right: Box::new(Self::select_scan_node(*right, filters, stats, limit_depth)),
             },
             PhysicalOperator::Project {
                 input,
                 items,
                 is_barrier,
             } if !is_barrier => PhysicalOperator::Project {
-                input: Box::new(Self::select_scan_node(*input, filters, stats)),
+                input: Box::new(Self::select_scan_node(*input, filters, stats, limit_depth)),
                 items,
                 is_barrier,
             },
@@ -2712,24 +2845,33 @@ impl Optimizer {
                 group_by,
                 aggregations,
             } => PhysicalOperator::Aggregate {
-                input: Box::new(Self::select_scan_node(*input, filters, stats)),
+                input: Box::new(Self::select_scan_node(*input, filters, stats, limit_depth)),
                 group_by,
                 aggregations,
             },
             PhysicalOperator::Sort { input, items } => PhysicalOperator::Sort {
-                input: Box::new(Self::select_scan_node(*input, filters, stats)),
+                input: Box::new(Self::select_scan_node(*input, filters, stats, limit_depth)),
                 items,
             },
             PhysicalOperator::Limit { input, skip, count } => PhysicalOperator::Limit {
-                input: Box::new(Self::select_scan_node(*input, filters, stats)),
+                // Descending past a LIMIT: filters synthesized below it must
+                // carry one more crossing so pushdown lets them back down.
+                input: Box::new(Self::select_scan_node(
+                    *input,
+                    filters,
+                    stats,
+                    limit_depth + 1,
+                )),
                 skip,
                 count,
             },
             PhysicalOperator::Distinct { input, keys } => PhysicalOperator::Distinct {
                 keys,
-                input: Box::new(Self::select_scan_node(*input, filters, stats)),
+                input: Box::new(Self::select_scan_node(*input, filters, stats, limit_depth)),
             },
-            op @ PhysicalOperator::Expand { .. } => Self::try_reverse_chain(op, filters, stats),
+            op @ PhysicalOperator::Expand { .. } => {
+                Self::try_reverse_chain(op, filters, stats, limit_depth)
+            }
             // Barrier projects, OptionalMatch, WritePart, Unwind, and leaf scans are
             // left untouched: their spines either are not contiguous (filters remain
             // inside) or contain no reversible chain.
@@ -2742,8 +2884,9 @@ impl Optimizer {
     /// original `op` unchanged when reversal does not apply or would not help.
     fn try_reverse_chain(
         op: PhysicalOperator,
-        filters: &mut Vec<FilterExpr>,
+        filters: &mut Vec<PendingFilter>,
         stats: Option<&dyn StatsProvider>,
+        limit_depth: usize,
     ) -> PhysicalOperator {
         struct Hop {
             src: String,
@@ -2772,10 +2915,14 @@ impl Optimizer {
                     min_hops,
                     max_hops,
                     needs_path,
+                    is_var_length,
                     ..
                 } => {
-                    if *min_hops != 1 || *max_hops != 1 {
-                        return op; // variable-length hops are not reversed here
+                    // A var-length hop is not reversed even at `*1..1`: its
+                    // relationship variable binds a list, and the rebuilt hop
+                    // below would degrade it to a single relationship.
+                    if *min_hops != 1 || *max_hops != 1 || *is_var_length {
+                        return op;
                     }
                     hops.push(Hop {
                         src: src_var.clone(),
@@ -2826,7 +2973,7 @@ impl Optimizer {
 
         // The far endpoint is the top hop's destination.
         let terminal_var = hops[0].dst.clone();
-        let term_lbl = match filters.iter().find_map(|f| match f {
+        let term_lbl = match filters.iter().find_map(|f| match &f.expr {
             FilterExpr::HasLabel(v, l) if *v == terminal_var => Some(l.clone()),
             _ => None,
         }) {
@@ -2886,10 +3033,15 @@ impl Optimizer {
 
         // The far endpoint's label is now carried by the scan; drop its HasLabel
         // predicate and re-add the original start label so it is still enforced.
+        // The new filter is born at this Limit depth, so pushdown lets it back
+        // down to the reversed chain.
         filters.retain(
-            |f| !matches!(f, FilterExpr::HasLabel(v, l) if *v == terminal_var && *l == term_lbl),
+            |f| !matches!(&f.expr, FilterExpr::HasLabel(v, l) if *v == terminal_var && *l == term_lbl),
         );
-        filters.push(FilterExpr::HasLabel(start_var, start_lbl));
+        filters.push(PendingFilter {
+            expr: FilterExpr::HasLabel(start_var, start_lbl),
+            limits_crossable: limit_depth,
+        });
         tree
     }
 
@@ -2898,12 +3050,12 @@ impl Optimizer {
     fn has_indexed_eq(
         var: &str,
         label: &str,
-        filters: &[FilterExpr],
+        filters: &[PendingFilter],
         stats: Option<&dyn StatsProvider>,
     ) -> bool {
         let Some(s) = stats else { return false };
         filters.iter().any(|f| {
-            let FilterExpr::Eq(l, r) = f else {
+            let FilterExpr::Eq(l, r) = &f.expr else {
                 return false;
             };
             let prop = match (l, r) {

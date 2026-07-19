@@ -822,6 +822,12 @@ fn recognize(plan: &PhysicalOperator) -> Option<VecPipeline<'_>> {
             aggregations,
             ..
         } => {
+            // Like the plain aggregate root: the operators above the fold have
+            // no dedup-before-limit step, so a `RETURN DISTINCT ... LIMIT`
+            // shape would truncate before deduplicating. Decline it.
+            if limited_distinct {
+                return None;
+            }
             for (e, _) in group_by.iter() {
                 if !agg_expr_eligible(e, &chain_vars, &rel_vars) {
                     return None;
@@ -2620,6 +2626,28 @@ mod tests {
         ] {
             assert_matches_row_path(&g, cypher);
         }
+    }
+
+    /// A `RETURN DISTINCT ... ORDER BY ... LIMIT` above a WITH-aggregate must
+    /// deduplicate before the limit binds; the multi-projection aggregate root
+    /// declines the shape so the row pipeline's Distinct-before-Sort runs.
+    #[test]
+    fn with_aggregate_distinct_limit_declines_and_dedups_first() {
+        let dir = TempDir::new().unwrap();
+        let g = Graph::open(dir.path(), 1).unwrap();
+        // Group sizes by city are {a: 1, b: 1, c: 2}, so the distinct counts
+        // are [1, 2]; a limit applied before the dedup would take the two
+        // 1-sized groups and collapse them to the single row [1].
+        for city in ["a", "b", "c", "c"] {
+            g.add_node("Person", &json!({"city": city})).unwrap();
+        }
+        let cypher = "MATCH (p:Person) WITH p.city AS city, count(*) AS n \
+                      RETURN DISTINCT n ORDER BY n LIMIT 2";
+        let plan = optimized_plan(&g, cypher);
+        assert!(recognize(&plan).is_none(), "must not vectorize: {cypher}");
+        let result = execute(&g, cypher, &HashMap::new()).unwrap();
+        let values: Vec<_> = result.records.iter().map(|r| r.values[0].clone()).collect();
+        assert_eq!(values, vec![json!(1), json!(2)]);
     }
 
     #[test]

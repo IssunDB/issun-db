@@ -557,6 +557,19 @@ pub(super) fn evaluate_expr<B: Bindings>(
             Some(GraphBinding::Scalar(serde_json::Value::Null)) | None => {
                 Ok(serde_json::Value::Null)
             }
+            // A node rebound as a value (UNWIND, a projected expression)
+            // arrives in its JSON wrapper form; resolve it to the stored node
+            // and check its labels like the direct binding above.
+            Some(GraphBinding::Scalar(v)) => {
+                if let Some((true, id)) = wrapped_graph_id(v) {
+                    if let Ok(node_labels) = graph.node_labels(id) {
+                        return Ok(serde_json::Value::Bool(
+                            node_labels.iter().any(|l| l == label),
+                        ));
+                    }
+                }
+                Ok(serde_json::Value::Bool(false))
+            }
             _ => Ok(serde_json::Value::Bool(false)),
         },
         Expr::Prop(var, prop) => {
@@ -923,9 +936,7 @@ pub(super) fn eval_binary_op<B: Bindings>(
                     (serde_json::Value::Number(base), serde_json::Value::Number(exp)) => {
                         let b = base.as_f64().unwrap_or(0.0);
                         let e = exp.as_f64().unwrap_or(0.0);
-                        Ok(serde_json::Number::from_f64(b.powf(e))
-                            .map(serde_json::Value::Number)
-                            .unwrap_or(serde_json::Value::Null))
+                        Ok(float_result(b.powf(e)))
                     }
                     _ => Ok(serde_json::Value::Null),
                 },
@@ -944,6 +955,18 @@ pub(super) fn eval_arithmetic(
 ) -> Result<serde_json::Value, String> {
     // List concatenation with +
     if op == '+' {
+        match (lv, rv) {
+            // String + NaN concatenates the float's string form, so the NaN
+            // sentinel must not short-circuit before this arm; likewise a NaN
+            // element appends to a list like any other value.
+            (serde_json::Value::String(ls), v) if is_nan(v) => {
+                return Ok(serde_json::Value::String(format!("{}NaN", ls)));
+            }
+            (v, serde_json::Value::String(rs)) if is_nan(v) => {
+                return Ok(serde_json::Value::String(format!("NaN{}", rs)));
+            }
+            _ => {}
+        }
         match (lv, rv) {
             (serde_json::Value::Array(a), serde_json::Value::Array(b)) => {
                 let mut result = a.clone();
@@ -964,6 +987,14 @@ pub(super) fn eval_arithmetic(
             }
             _ => {}
         }
+    }
+
+    // NaN propagates through every remaining arithmetic operator (IEEE 754);
+    // without this the sentinel object would fall through to the type-error
+    // arm. This sits below the `+` concatenation arms because list and string
+    // concatenation absorb a NaN operand instead of propagating it.
+    if is_nan(lv) || is_nan(rv) {
+        return Ok(nan_value());
     }
 
     // Temporal arithmetic: Date/LocalDateTime/DateTime ± Duration, Duration ± Duration.
@@ -1024,9 +1055,7 @@ pub(super) fn eval_arithmetic(
                 if result.is_nan() {
                     return Ok(nan_value());
                 }
-                return Ok(serde_json::Number::from_f64(result)
-                    .map(serde_json::Value::Number)
-                    .unwrap_or(serde_json::Value::Null));
+                return Ok(float_result(result));
             }
             Ok(serde_json::Value::Null)
         }
@@ -1365,17 +1394,26 @@ pub(super) fn eval_function_call<B: Bindings>(
             };
 
             let mut result = Vec::new();
+            // Checked stepping: near `i64::MAX` (or `MIN` with a negative
+            // step) the next value overflows, which also means it is past the
+            // end bound, so the range is complete.
             if step > 0 {
                 let mut v = start;
                 while v <= end {
                     result.push(serde_json::Value::Number(v.into()));
-                    v += step;
+                    match v.checked_add(step) {
+                        Some(next) => v = next,
+                        None => break,
+                    }
                 }
             } else {
                 let mut v = start;
                 while v >= end {
                     result.push(serde_json::Value::Number(v.into()));
-                    v += step;
+                    match v.checked_add(step) {
+                        Some(next) => v = next,
+                        None => break,
+                    }
                 }
             }
             Ok(serde_json::Value::Array(result))
@@ -1442,6 +1480,13 @@ pub(super) fn eval_function_call<B: Bindings>(
                         _ => {}
                     }
                 }
+            }
+            // A node or relationship reached through an expression (a path
+            // accessor, UNWIND, or a projected value) arrives in its JSON
+            // wrapper form; resolve its id like the direct binding above.
+            let val = evaluate_expr(graph, path, &args[0], params)?;
+            if let Some((_, id)) = wrapped_graph_id(&val) {
+                return Ok(serde_json::Value::Number(id.into()));
             }
             Ok(serde_json::Value::Null)
         }
@@ -1510,10 +1555,7 @@ pub(super) fn eval_function_call<B: Bindings>(
                 .as_f64()
                 .ok_or_else(|| "degrees() argument must be a number".to_string())?;
             let deg = rad * 180.0 / std::f64::consts::PI;
-            Ok(serde_json::Value::Number(
-                serde_json::Number::from_f64(deg)
-                    .ok_or_else(|| "degrees() result overflow".to_string())?,
-            ))
+            Ok(float_result(deg))
         }
         "radians" => {
             if args.len() != 1 {
@@ -1576,6 +1618,7 @@ pub(super) fn eval_function_call<B: Bindings>(
             match val {
                 serde_json::Value::String(s) => Ok(serde_json::Value::String(s)),
                 serde_json::Value::Null => Ok(serde_json::Value::Null),
+                v if is_nan(&v) => Ok(serde_json::Value::String("NaN".to_string())),
                 serde_json::Value::Bool(b) => Ok(serde_json::Value::String(b.to_string())),
                 serde_json::Value::Number(n) => Ok(serde_json::Value::String(n.to_string())),
                 // Temporal values are stored as objects carrying their canonical ISO string
@@ -1633,17 +1676,11 @@ pub(super) fn eval_function_call<B: Bindings>(
             }
             let val = evaluate_expr(graph, path, &args[0], params)?;
             match val {
-                serde_json::Value::Number(n) => {
-                    Ok(serde_json::Number::from_f64(n.as_f64().unwrap_or(0.0))
-                        .map(serde_json::Value::Number)
-                        .unwrap_or(serde_json::Value::Null))
-                }
+                serde_json::Value::Number(n) => Ok(float_result(n.as_f64().unwrap_or(0.0))),
                 serde_json::Value::String(s) => {
                     // Try parsing the string as a float.
                     if let Ok(f) = s.trim().parse::<f64>() {
-                        Ok(serde_json::Number::from_f64(f)
-                            .map(serde_json::Value::Number)
-                            .unwrap_or(serde_json::Value::Null))
+                        Ok(float_result(f))
                     } else {
                         Ok(serde_json::Value::Null)
                     }
@@ -1667,14 +1704,13 @@ pub(super) fn eval_function_call<B: Bindings>(
                         })?;
                         Ok(a.into())
                     } else if let Some(f) = n.as_f64() {
-                        Ok(serde_json::Number::from_f64(f.abs())
-                            .map(serde_json::Value::Number)
-                            .unwrap_or(serde_json::Value::Null))
+                        Ok(float_result(f.abs()))
                     } else {
                         Ok(serde_json::Value::Null)
                     }
                 }
                 serde_json::Value::Null => Ok(serde_json::Value::Null),
+                v if is_nan(&v) => Ok(nan_value()),
                 _ => Err("abs() requires a numeric argument".into()),
             }
         }
@@ -1717,6 +1753,16 @@ pub(super) fn eval_function_call<B: Bindings>(
 
             match val {
                 serde_json::Value::Object(map) => {
+                    // A node or relationship in its JSON wrapper form lists
+                    // its property keys, not the wrapper's internal keys.
+                    let map = match map.get("__type__").and_then(|t| t.as_str()) {
+                        Some("__Node__") | Some("__Edge__") => map
+                            .get("properties")
+                            .and_then(|p| p.as_object())
+                            .cloned()
+                            .unwrap_or_default(),
+                        _ => map,
+                    };
                     let mut keys: Vec<serde_json::Value> = map
                         .keys()
                         .map(|k| serde_json::Value::String(k.clone()))
@@ -1876,11 +1922,10 @@ pub(super) fn eval_function_call<B: Bindings>(
             match val {
                 serde_json::Value::Number(n) => {
                     let f = n.as_f64().unwrap_or(0.0);
-                    Ok(serde_json::Number::from_f64(f.sqrt())
-                        .map(serde_json::Value::Number)
-                        .unwrap_or(serde_json::Value::Null))
+                    Ok(float_result(f.sqrt()))
                 }
                 serde_json::Value::Null => Ok(serde_json::Value::Null),
+                v if is_nan(&v) => Ok(nan_value()),
                 _ => Err("sqrt() requires a numeric argument".into()),
             }
         }
@@ -1892,11 +1937,10 @@ pub(super) fn eval_function_call<B: Bindings>(
             match val {
                 serde_json::Value::Number(n) => {
                     let f = n.as_f64().unwrap_or(0.0).floor();
-                    Ok(serde_json::Number::from_f64(f)
-                        .map(serde_json::Value::Number)
-                        .unwrap_or(serde_json::Value::Null))
+                    Ok(float_result(f))
                 }
                 serde_json::Value::Null => Ok(serde_json::Value::Null),
+                v if is_nan(&v) => Ok(nan_value()),
                 _ => Err("floor() requires a numeric argument".into()),
             }
         }
@@ -1908,11 +1952,10 @@ pub(super) fn eval_function_call<B: Bindings>(
             match val {
                 serde_json::Value::Number(n) => {
                     let f = n.as_f64().unwrap_or(0.0).ceil();
-                    Ok(serde_json::Number::from_f64(f)
-                        .map(serde_json::Value::Number)
-                        .unwrap_or(serde_json::Value::Null))
+                    Ok(float_result(f))
                 }
                 serde_json::Value::Null => Ok(serde_json::Value::Null),
+                v if is_nan(&v) => Ok(nan_value()),
                 _ => Err("ceil() requires a numeric argument".into()),
             }
         }
@@ -1926,17 +1969,20 @@ pub(super) fn eval_function_call<B: Bindings>(
                     let f = n.as_f64().unwrap_or(0.0);
                     let precision = if args.len() == 2 {
                         let pv = evaluate_expr(graph, path, &args[1], params)?;
+                        // Null in, null out: a null precision must not read as 0.
+                        if pv == serde_json::Value::Null {
+                            return Ok(serde_json::Value::Null);
+                        }
                         pv.as_i64().unwrap_or(0) as u32
                     } else {
                         0
                     };
                     let factor = 10f64.powi(precision as i32);
                     let rounded = (f * factor).round() / factor;
-                    Ok(serde_json::Number::from_f64(rounded)
-                        .map(serde_json::Value::Number)
-                        .unwrap_or(serde_json::Value::Null))
+                    Ok(float_result(rounded))
                 }
                 serde_json::Value::Null => Ok(serde_json::Value::Null),
+                v if is_nan(&v) => Ok(nan_value()),
                 _ => Err("round() requires a numeric argument".into()),
             }
         }
@@ -1958,6 +2004,7 @@ pub(super) fn eval_function_call<B: Bindings>(
                     Ok(serde_json::Value::Number(s.into()))
                 }
                 serde_json::Value::Null => Ok(serde_json::Value::Null),
+                v if is_nan(&v) => Ok(nan_value()),
                 _ => Err("sign() requires a numeric argument".into()),
             }
         }
@@ -1969,11 +2016,10 @@ pub(super) fn eval_function_call<B: Bindings>(
             match val {
                 serde_json::Value::Number(n) => {
                     let f = n.as_f64().unwrap_or(0.0).ln();
-                    Ok(serde_json::Number::from_f64(f)
-                        .map(serde_json::Value::Number)
-                        .unwrap_or(serde_json::Value::Null))
+                    Ok(float_result(f))
                 }
                 serde_json::Value::Null => Ok(serde_json::Value::Null),
+                v if is_nan(&v) => Ok(nan_value()),
                 _ => Err("log() requires a numeric argument".into()),
             }
         }
@@ -1985,11 +2031,10 @@ pub(super) fn eval_function_call<B: Bindings>(
             match val {
                 serde_json::Value::Number(n) => {
                     let f = n.as_f64().unwrap_or(0.0).log10();
-                    Ok(serde_json::Number::from_f64(f)
-                        .map(serde_json::Value::Number)
-                        .unwrap_or(serde_json::Value::Null))
+                    Ok(float_result(f))
                 }
                 serde_json::Value::Null => Ok(serde_json::Value::Null),
+                v if is_nan(&v) => Ok(nan_value()),
                 _ => Err("log10() requires a numeric argument".into()),
             }
         }
@@ -2001,11 +2046,10 @@ pub(super) fn eval_function_call<B: Bindings>(
             match val {
                 serde_json::Value::Number(n) => {
                     let f = n.as_f64().unwrap_or(0.0).exp();
-                    Ok(serde_json::Number::from_f64(f)
-                        .map(serde_json::Value::Number)
-                        .unwrap_or(serde_json::Value::Null))
+                    Ok(float_result(f))
                 }
                 serde_json::Value::Null => Ok(serde_json::Value::Null),
+                v if is_nan(&v) => Ok(nan_value()),
                 _ => Err("exp() requires a numeric argument".into()),
             }
         }
@@ -2026,9 +2070,7 @@ pub(super) fn eval_function_call<B: Bindings>(
                         "atan" => f.atan(),
                         _ => unreachable!(),
                     };
-                    Ok(serde_json::Number::from_f64(result)
-                        .map(serde_json::Value::Number)
-                        .unwrap_or(serde_json::Value::Null))
+                    Ok(float_result(result))
                 }
                 serde_json::Value::Null => Ok(serde_json::Value::Null),
                 _ => Err(format!("{}() requires a numeric argument", name)),
@@ -2046,19 +2088,13 @@ pub(super) fn eval_function_call<B: Bindings>(
                         .as_f64()
                         .unwrap_or(0.0)
                         .atan2(x_n.as_f64().unwrap_or(0.0));
-                    Ok(serde_json::Number::from_f64(result)
-                        .map(serde_json::Value::Number)
-                        .unwrap_or(serde_json::Value::Null))
+                    Ok(float_result(result))
                 }
                 _ => Ok(serde_json::Value::Null),
             }
         }
-        "pi" => Ok(serde_json::Number::from_f64(std::f64::consts::PI)
-            .map(serde_json::Value::Number)
-            .unwrap_or(serde_json::Value::Null)),
-        "e" => Ok(serde_json::Number::from_f64(std::f64::consts::E)
-            .map(serde_json::Value::Number)
-            .unwrap_or(serde_json::Value::Null)),
+        "pi" => Ok(float_result(std::f64::consts::PI)),
+        "e" => Ok(float_result(std::f64::consts::E)),
         "rand" => {
             // Returns a random float in [0.0, 1.0).
             use std::cell::Cell;
@@ -2084,9 +2120,7 @@ pub(super) fn eval_function_call<B: Bindings>(
             count.hash(&mut h);
             let bits = h.finish();
             let f = (bits as f64) / (u64::MAX as f64);
-            Ok(serde_json::Number::from_f64(f)
-                .map(serde_json::Value::Number)
-                .unwrap_or(serde_json::Value::Null))
+            Ok(float_result(f))
         }
         "max" if args.len() > 1 => {
             // max(a, b, ...) as a function call (not aggregation)
@@ -2208,6 +2242,10 @@ pub(super) fn eval_function_call<B: Bindings>(
                     let chars: Vec<char> = s.chars().collect();
                     let end = if args.len() == 3 {
                         let len_v = evaluate_expr(graph, path, &args[2], params)?;
+                        // Null in, null out: a null length must not read as 0.
+                        if len_v == serde_json::Value::Null {
+                            return Ok(serde_json::Value::Null);
+                        }
                         let len = len_v.as_i64().unwrap_or(0).max(0) as usize;
                         (start + len).min(chars.len())
                     } else {
@@ -3160,7 +3198,7 @@ fn select_time_from_map(
         // No selector: the map's own fields are the source. A stored temporal object carries a
         // numeric `offset`; fall back to `timezone` for a bare component map.
         _ => (
-            obj_to_naive_time(map),
+            obj_to_naive_time_checked(map)?,
             map.get("offset")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string())
@@ -3519,9 +3557,15 @@ fn select_datetime_from_map(
         Some(d) => apply_date_overrides(d, map)?,
         None => naive_date_from_map(map)?,
     };
-    // The default-zero base lets the override helper build a time from direct components when no
-    // selector supplied one.
-    let time = apply_time_field_overrides(base_time.unwrap_or_default(), Some(map));
+    // An out-of-range user component (`datetime({..., hour: 25})`) must error rather than
+    // clamp to midnight, matching the checked `time()` path.
+    let time = match base_time {
+        Some(t) => {
+            validate_time_override_ranges(map)?;
+            apply_time_field_overrides(t, Some(map))
+        }
+        None => obj_to_naive_time_checked(map)?,
+    };
     // A timezone override on a zoned source preserves the instant: shift the wall clock by the
     // difference between the source and target offsets, which can roll the date. On a local
     // source the override attaches without shifting. With no override the source zone carries.
@@ -3594,6 +3638,29 @@ fn make_datetime(arg: serde_json::Value) -> Result<serde_json::Value, String> {
             other
         )),
     }
+}
+
+/// Like `obj_to_naive_time`, but rejects out-of-range components instead of
+/// clamping to midnight. Used for bare user component maps (`time({hour: 25})`
+/// must error); a stored temporal object is always valid.
+fn obj_to_naive_time_checked(
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> Result<NaiveTime, String> {
+    let get_i64 = |k: &str| -> i64 { obj.get(k).and_then(|v| v.as_i64()).unwrap_or(0) };
+    let (h, m, s) = (get_i64("hour"), get_i64("minute"), get_i64("second"));
+    let total_ns =
+        get_i64("nanosecond") + get_i64("microsecond") * 1_000 + get_i64("millisecond") * 1_000_000;
+    if !(0..24).contains(&h)
+        || !(0..60).contains(&m)
+        || !(0..60).contains(&s)
+        || !(0..1_000_000_000).contains(&total_ns)
+    {
+        return Err(format!(
+            "InvalidArgumentValue: time component out of range: hour {h}, minute {m}, second {s}, nanosecond {total_ns}"
+        ));
+    }
+    NaiveTime::from_hms_nano_opt(h as u32, m as u32, s as u32, total_ns as u32)
+        .ok_or_else(|| "InvalidArgumentValue: invalid time components".to_string())
 }
 
 fn obj_to_naive_time(obj: &serde_json::Map<String, serde_json::Value>) -> NaiveTime {
@@ -4598,6 +4665,29 @@ fn truncate_time(t: NaiveTime, unit: &str) -> NaiveTime {
 
 /// Applies time-field overrides from a truncate map to a time. A sub-second override
 /// (`millisecond`, `microsecond`, or `nanosecond`) replaces the whole sub-second component.
+/// Reject an out-of-range time-field override (`hour: 25`) instead of letting
+/// `apply_time_field_overrides` silently fall back to the base time.
+fn validate_time_override_ranges(
+    map: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), String> {
+    let check = |k: &str, range: std::ops::Range<i64>| -> Result<(), String> {
+        if let Some(v) = map.get(k).and_then(|v| v.as_i64()) {
+            if !range.contains(&v) {
+                return Err(format!(
+                    "InvalidArgumentValue: {k} component out of range: {v}"
+                ));
+            }
+        }
+        Ok(())
+    };
+    check("hour", 0..24)?;
+    check("minute", 0..60)?;
+    check("second", 0..60)?;
+    check("millisecond", 0..1_000)?;
+    check("microsecond", 0..1_000_000)?;
+    check("nanosecond", 0..1_000_000_000)
+}
+
 fn apply_time_field_overrides(
     t: NaiveTime,
     ov: Option<&serde_json::Map<String, serde_json::Value>>,
@@ -4803,15 +4893,39 @@ pub(super) fn literal_to_value(l: &Literal) -> serde_json::Value {
     match l {
         Literal::Str(s) => serde_json::Value::String(s.clone()),
         Literal::Int(i) => serde_json::Value::Number((*i).into()),
-        Literal::Float(f) => serde_json::Number::from_f64(*f)
-            .map(serde_json::Value::Number)
-            .unwrap_or(serde_json::Value::Null),
+        Literal::Float(f) => float_result(*f),
         Literal::Bool(b) => serde_json::Value::Bool(*b),
         Literal::Null => serde_json::Value::Null,
         Literal::List(items) => {
             serde_json::Value::Array(items.iter().map(literal_to_value).collect())
         }
     }
+}
+
+/// Convert an f64 computation result to a JSON value: NaN becomes the
+/// sentinel object (JSON numbers cannot hold it), and infinities, which the
+/// sentinel does not cover, become null.
+pub(super) fn float_result(f: f64) -> serde_json::Value {
+    if f.is_nan() {
+        return nan_value();
+    }
+    serde_json::Number::from_f64(f)
+        .map(serde_json::Value::Number)
+        .unwrap_or(serde_json::Value::Null)
+}
+
+/// Extract the id of a node or relationship value in its JSON wrapper form
+/// (`{"__type__": "__Node__"|"__Edge__", "id": ...}`), the representation a
+/// projected expression, UNWIND, or path accessor produces. Returns
+/// `(is_node, id)`.
+pub(super) fn wrapped_graph_id(v: &serde_json::Value) -> Option<(bool, u64)> {
+    let m = v.as_object()?;
+    let is_node = match m.get("__type__").and_then(|t| t.as_str()) {
+        Some("__Node__") => true,
+        Some("__Edge__") => false,
+        _ => return None,
+    };
+    Some((is_node, m.get("id")?.as_u64()?))
 }
 
 /// Sentinel JSON object used to represent IEEE 754 NaN.
@@ -4878,6 +4992,22 @@ pub(super) fn cypher_eq(lv: &serde_json::Value, rv: &serde_json::Value) -> serde
                 serde_json::Value::Bool(true)
             }
         } else {
+            // Temporal values denoting the same instant are equal even when
+            // written in different zones. The UTC-normalized `__sort_key__`
+            // is the instant identity the ordering already uses, so equality
+            // must use it too, or `=` and `<=`/`>=` would disagree on the
+            // same pair. Non-temporal wrappers (nodes, edges, paths) carry no
+            // sort key and keep structural equality.
+            let ltype = lm.get("__type__").and_then(|t| t.as_str());
+            let rtype = rm.get("__type__").and_then(|t| t.as_str());
+            if ltype == rtype {
+                if let (Some(lk), Some(rk)) = (
+                    lm.get("__sort_key__").and_then(|k| k.as_str()),
+                    rm.get("__sort_key__").and_then(|k| k.as_str()),
+                ) {
+                    return serde_json::Value::Bool(lk == rk);
+                }
+            }
             serde_json::Value::Bool(lv == rv)
         }
     } else if let (serde_json::Value::Number(n1), serde_json::Value::Number(n2)) = (lv, rv) {

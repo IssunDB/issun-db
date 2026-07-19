@@ -261,10 +261,18 @@ pub(super) fn execute_read_query(
 
     // 3. Derive column names. For RETURN *, use all keys from the first resolved path.
     let columns: Vec<String> = if is_return_star {
-        // Collect and sort keys from the first path for deterministic column ordering.
+        // Collect and sort keys from the first path for deterministic column
+        // ordering, excluding planner-generated bindings (`_rel_N_M` for an
+        // anonymous relationship, `_path_*` path objects, and the like):
+        // RETURN * projects only user-named variables.
         let mut keys: Vec<String> = resolved_paths
             .first()
-            .map(|p| p.bound_entries().map(|(k, _)| k.to_string()).collect())
+            .map(|p| {
+                p.bound_entries()
+                    .map(|(k, _)| k.to_string())
+                    .filter(|k| !is_internal_var(k))
+                    .collect()
+            })
             .unwrap_or_else(|| {
                 let mut scope = std::collections::HashSet::new();
                 for part in &query.parts {
@@ -1630,6 +1638,41 @@ fn expand_from_paths(
 /// bound, plus the optional path variable bound to the matched path. Matches that fail
 /// the optional `WHERE` predicate are dropped. An anchor that is not bound to a node
 /// yields an empty list rather than an error.
+/// True when a variable name is a planner- or executor-generated binding that
+/// must never surface as a `RETURN *` column: anonymous pattern elements
+/// (`_rel_N_M`, `_target_*`, `_seed_*`), path accumulators (`_path_*`),
+/// synthesized aggregate outputs (`_ret_agg_*`), and pattern-comprehension
+/// locals (`__pc_*`).
+pub(super) fn is_internal_var(name: &str) -> bool {
+    name.starts_with("_rel_")
+        || name.starts_with("_target_")
+        || name.starts_with("_seed_")
+        || name.starts_with("_path_")
+        || name.starts_with("_ret_agg_")
+        || name.starts_with("__pc_")
+}
+
+/// True when the edge's stored properties satisfy every expected key-value
+/// pair under Cypher value equality.
+fn edge_matches_props(
+    graph: &Graph,
+    eid: EdgeId,
+    expected: &serde_json::Map<String, serde_json::Value>,
+) -> Result<bool, String> {
+    let Some(record) = graph.get_edge(eid).map_err(|e| e.to_string())? else {
+        return Ok(false);
+    };
+    let props: serde_json::Value =
+        rmp_serde::from_slice(&record.props).map_err(|e| e.to_string())?;
+    let empty = serde_json::Map::new();
+    let props = props.as_object().unwrap_or(&empty);
+    Ok(expected.iter().all(|(k, v)| {
+        props
+            .get(k)
+            .is_some_and(|a| super::expr::cypher_eq(a, v) == serde_json::Value::Bool(true))
+    }))
+}
+
 pub(super) fn eval_pattern_comprehension(
     graph: &Graph,
     outer: &PathMap,
@@ -1667,7 +1710,17 @@ pub(super) fn eval_pattern_comprehension(
         _ => return Ok(serde_json::Value::Array(Vec::new())),
     }
 
-    let mut current_paths = vec![seed];
+    // The anchor node's own label and inline property constraints restrict
+    // the comprehension exactly like a target node's: an anchor that fails
+    // them contributes no elements.
+    let mut current_paths = filter_paths_by_node(
+        graph,
+        vec![seed],
+        &anchor_var,
+        &pattern.node.labels,
+        &pattern.node.properties,
+        params,
+    )?;
     let mut src_var = anchor_var.clone();
     let mut last_dst_var = anchor_var;
     let mut anon = 0usize;
@@ -1705,6 +1758,39 @@ pub(super) fn eval_pattern_comprehension(
             rel.range.is_some(),
         )?;
         prior_rel_vars.push(rel_var.clone());
+        // An inline relationship property map restricts which edges match,
+        // exactly like a target node's inline map. Every traversed edge of a
+        // var-length hop must match.
+        if let Some(props) = &rel.properties {
+            if !props.is_empty() {
+                let mut kept = Vec::with_capacity(current_paths.len());
+                for path in current_paths {
+                    let mut expected = serde_json::Map::new();
+                    for (k, e) in props {
+                        expected.insert(k.clone(), evaluate_expr(graph, &path, e, params)?);
+                    }
+                    // A zero-length `*0..n` match binds an empty edge list, on
+                    // which the property map is vacuously true; only a missing
+                    // or non-edge binding fails the filter outright.
+                    let edges: Option<Vec<EdgeId>> = match path.get_binding(&rel_var) {
+                        Some(GraphBinding::Edge(eid)) => Some(vec![*eid]),
+                        Some(GraphBinding::EdgeList(list)) => Some(list.clone()),
+                        _ => None,
+                    };
+                    let mut all_match = edges.is_some();
+                    for eid in edges.iter().flatten() {
+                        if !edge_matches_props(graph, *eid, &expected)? {
+                            all_match = false;
+                            break;
+                        }
+                    }
+                    if all_match {
+                        kept.push(path);
+                    }
+                }
+                current_paths = kept;
+            }
+        }
         current_paths = filter_paths_by_node(
             graph,
             current_paths,
@@ -3794,9 +3880,11 @@ impl AggState {
                     }
                 }
             }
-            AggFn::StDev { .. } | AggFn::StDevP { .. } => {
+            AggFn::StDev { distinct } | AggFn::StDevP { distinct } => {
                 if let Some(n) = val.as_f64() {
-                    self.values.push(n);
+                    if !*distinct || self.distinct_seen.insert(canonical_cell_key(&val)) {
+                        self.values.push(n);
+                    }
                 }
             }
             AggFn::PercentileDisc { .. } | AggFn::PercentileCont { .. } => {
@@ -4770,14 +4858,15 @@ pub(super) fn evaluate_sort_key<B: Bindings>(
     expr: &Expr,
     params: &HashMap<String, serde_json::Value>,
 ) -> serde_json::Value {
-    // Fast path: expression evaluates directly.
+    // Fast path: the expression evaluates against the row. A successful null
+    // (a bound node missing the property) is the sort key; falling through
+    // would let an unrelated same-named projected alias hijack the ordering.
     if let Ok(val) = evaluate_expr(graph, path, expr, params) {
-        if val != serde_json::Value::Null {
-            return val;
-        }
+        return val;
     }
 
-    // Fallback: look up the projected column name.
+    // Fallback for rows where the expression's variables are no longer bound
+    // (post-projection): look up the projected column name.
     let col_name = match expr {
         Expr::Prop(var, prop) if prop.is_empty() => var.clone(),
         Expr::Prop(var, prop) => format!("{}.{}", var, prop),

@@ -1,9 +1,14 @@
 use crate::ast::*;
 use crate::error::CypherError;
 use chumsky::input::MappedInput;
-use chumsky::pratt::{infix, left, prefix};
+use chumsky::pratt::{infix, left, postfix, prefix};
 use chumsky::prelude::*;
 use std::collections::HashMap;
+
+/// Sentinel variable emitted for a label predicate whose left side is not a
+/// variable (`n.prop:Label`). The expression fold cannot fail, so statement
+/// validation detects this name and reports the targeted syntax error.
+const INVALID_LABEL_CHECK_VAR: &str = "  invalid label predicate  ";
 
 // ─── Token ────────────────────────────────────────────────────────────────────
 
@@ -293,10 +298,27 @@ pub(crate) fn lexer<'src>()
         just(']').to(Tok::RBrack),
     ));
 
-    // Line comments
-    let comment = just("//")
+    // Comments: line (`// ...`) and block (`/* ... */`). Comments and
+    // whitespace interleave freely between tokens, so one combined padding
+    // parser consumes both in any order; separate whitespace and comment
+    // padding layers would each require the other to be absent at its seam.
+    let line_comment = just("//")
         .then(any().and_is(just('\n').not()).repeated())
         .ignored();
+    let block_comment = just("/*")
+        .then(any().and_is(just("*/").not()).repeated())
+        .then(just("*/"))
+        .ignored();
+    let padding = choice((
+        any()
+            .filter(|c: &char| c.is_whitespace())
+            .repeated()
+            .at_least(1)
+            .ignored(),
+        line_comment,
+        block_comment,
+    ))
+    .repeated();
 
     let token = choice((
         hex_int,
@@ -314,8 +336,7 @@ pub(crate) fn lexer<'src>()
 
     token
         .map_with(|tok, extra| (tok, extra.span()))
-        .padded_by(comment.repeated())
-        .padded()
+        .padded_by(padding)
         .repeated()
         .collect()
 }
@@ -392,8 +413,6 @@ pub(crate) fn expr_parser<'a>() -> impl Parser<'a, ParserInput<'a>, Expr, Parser
             start: Option<Expr>,
             end: Option<Expr>,
         },
-        IsNull,
-        IsNotNull,
         /// `n:Label` label predicate in a WHERE expression.
         LabelCheck(String),
     }
@@ -729,7 +748,7 @@ pub(crate) fn expr_parser<'a>() -> impl Parser<'a, ParserInput<'a>, Expr, Parser
         ));
 
         // Postfix operations (chained left-associatively):
-        let postfix = atom_choices.foldl(
+        let postfixed_atom = atom_choices.foldl(
             choice((
                 // .property
                 sym(Tok::Dot).ignore_then(identifier()).map(PostfixOp::Dot),
@@ -761,13 +780,6 @@ pub(crate) fn expr_parser<'a>() -> impl Parser<'a, ParserInput<'a>, Expr, Parser
                         SubscriptOrSlice::Slice { start, end } => PostfixOp::Slice { start, end },
                         SubscriptOrSlice::Subscript(idx) => PostfixOp::Subscript(idx),
                     }),
-                // IS NULL / IS NOT NULL
-                keyword("IS").ignore_then(choice((
-                    keyword("NOT")
-                        .ignore_then(keyword("NULL"))
-                        .to(PostfixOp::IsNotNull),
-                    keyword("NULL").to(PostfixOp::IsNull),
-                ))),
                 // n:Label: label predicate usable in WHERE expressions.
 
                 // Only applies when the left operand is a bare identifier (Prop(name, "")).
@@ -797,7 +809,19 @@ pub(crate) fn expr_parser<'a>() -> impl Parser<'a, ParserInput<'a>, Expr, Parser
                         _ => None,
                     };
                     let Some(variable) = variable else {
-                        return expr; // non-identifier: ignore the colon (shouldn't happen)
+                        // A label predicate on a non-variable (`n.prop:Label`,
+                        // `1:Foo`) has no HasLabel form. Folding here cannot
+                        // fail, so emit a sentinel variable that statement
+                        // validation rejects with a targeted message instead
+                        // of silently dropping the predicate.
+                        return Expr::BinaryOp {
+                            op: BinaryOperator::And,
+                            left: Box::new(expr),
+                            right: Box::new(Expr::HasLabel {
+                                variable: INVALID_LABEL_CHECK_VAR.to_string(),
+                                label,
+                            }),
+                        };
                     };
                     let check = Expr::HasLabel { variable, label };
                     match expr {
@@ -827,8 +851,6 @@ pub(crate) fn expr_parser<'a>() -> impl Parser<'a, ParserInput<'a>, Expr, Parser
                     start: start.map(Box::new),
                     end: end.map(Box::new),
                 },
-                PostfixOp::IsNull => Expr::IsNull(Box::new(expr)),
-                PostfixOp::IsNotNull => Expr::IsNotNull(Box::new(expr)),
             },
         );
 
@@ -860,7 +882,7 @@ pub(crate) fn expr_parser<'a>() -> impl Parser<'a, ParserInput<'a>, Expr, Parser
         //  18: ^  (left-assoc)
         //  19: unary -  (prefix; binds tighter than ^, so -3^2 = (-3)^2 = 9)
 
-        let pratt = postfix.pratt((
+        let pratt = postfixed_atom.pratt((
             // Unary minus at 19, one above ^ (18): chumsky's prefix(P) lets infix(left(P))
             // bind into its operand, so unary minus must sit ABOVE ^ for openCypher's
             // "numeric unary negative takes precedence over exponentiation" (-3^2 = 9).
@@ -916,42 +938,46 @@ pub(crate) fn expr_parser<'a>() -> impl Parser<'a, ParserInput<'a>, Expr, Parser
                 right: Box::new(r),
             }),
             // Comparisons at 14; IN/CONTAINS/STARTS_WITH/ENDS_WITH at 15 (tighter).
-            infix(left(14), sym(Tok::Eq), |l, _, r, _| Expr::BinaryOp {
-                op: BinaryOperator::Eq,
-                left: Box::new(l),
-                right: Box::new(r),
-            }),
+            infix(
+                left(14),
+                choice((
+                    sym(Tok::Eq).to(BinaryOperator::Eq),
+                    sym(Tok::Ne).to(BinaryOperator::Ne),
+                    sym(Tok::Le).to(BinaryOperator::Le),
+                    sym(Tok::Ge).to(BinaryOperator::Ge),
+                    sym(Tok::Lt).to(BinaryOperator::Lt),
+                    sym(Tok::Gt).to(BinaryOperator::Gt),
+                )),
+                |l, op, r, _| Expr::BinaryOp {
+                    op,
+                    left: Box::new(l),
+                    right: Box::new(r),
+                },
+            ),
             infix(left(14), sym(Tok::RegexEq), |l, _, r, _| {
                 Expr::FunctionCall {
                     name: "__regex__".to_string(),
                     args: vec![l, r],
                 }
             }),
-            infix(left(14), sym(Tok::Ne), |l, _, r, _| Expr::BinaryOp {
-                op: BinaryOperator::Ne,
-                left: Box::new(l),
-                right: Box::new(r),
-            }),
-            infix(left(14), sym(Tok::Lt), |l, _, r, _| Expr::BinaryOp {
-                op: BinaryOperator::Lt,
-                left: Box::new(l),
-                right: Box::new(r),
-            }),
-            infix(left(14), sym(Tok::Gt), |l, _, r, _| Expr::BinaryOp {
-                op: BinaryOperator::Gt,
-                left: Box::new(l),
-                right: Box::new(r),
-            }),
-            infix(left(14), sym(Tok::Le), |l, _, r, _| Expr::BinaryOp {
-                op: BinaryOperator::Le,
-                left: Box::new(l),
-                right: Box::new(r),
-            }),
-            infix(left(14), sym(Tok::Ge), |l, _, r, _| Expr::BinaryOp {
-                op: BinaryOperator::Ge,
-                left: Box::new(l),
-                right: Box::new(r),
-            }),
+            // IS [NOT] NULL: the openCypher null predicate sits at the same
+            // level as the string and list predicates (15), applying to the
+            // whole add-or-subtract expression on its left, so `a + b IS NULL`
+            // reads `(a + b) IS NULL` and `a = b IS NULL` reads
+            // `a = (b IS NULL)`.
+            postfix(
+                15,
+                keyword("IS")
+                    .ignore_then(keyword("NOT").or_not().map(|n| n.is_some()))
+                    .then_ignore(keyword("NULL")),
+                |x, negated, _| {
+                    if negated {
+                        Expr::IsNotNull(Box::new(x))
+                    } else {
+                        Expr::IsNull(Box::new(x))
+                    }
+                },
+            ),
             // Membership and string-matching operators (level 15, tighter than comparisons 14).
             // x IN list
             infix(left(15), keyword("IN"), |l, _, r, _| Expr::FunctionCall {
@@ -1105,8 +1131,10 @@ fn node_pattern<'a>(
 
 /// Parses edge hop ranges: `*1..3` or `*..5` or `*2` or bare `*`
 fn rel_range<'a>() -> impl Parser<'a, ParserInput<'a>, RelRange, ParserError<'a>> + Clone {
+    // Reject a bound outside u32 with a parse error instead of truncating it
+    // (a wrapped `*4294967296` would silently read as a zero-hop range).
     let int_u32 = any().filter_map(|tok| match tok {
-        Tok::Integer(n) => Some(n as u32),
+        Tok::Integer(n) => u32::try_from(n).ok(),
         _ => None,
     });
 
@@ -1290,17 +1318,8 @@ fn return_clause(
                 .or_not()
                 .map(|d| d.unwrap_or(false)),
         )
-        .then(choice((
-            // `RETURN *`: return all bound variables.
-            sym(Tok::Star).to(vec![ReturnItem {
-                expr: Expr::FunctionCall {
-                    name: "__star__".to_string(),
-                    args: vec![],
-                },
-                alias: None,
-                source_text: None,
-            }]),
-            return_item()
+        .then({
+            let item_list = return_item()
                 .map_with(move |mut item, e| {
                     // The default column name is the verbatim source of the
                     // expression; only relevant when the item has no `AS` alias.
@@ -1314,8 +1333,27 @@ fn return_clause(
                 })
                 .separated_by(sym(Tok::Comma))
                 .at_least(1)
-                .collect::<Vec<_>>(),
-        )))
+                .collect::<Vec<_>>();
+            choice((
+                // `RETURN *` returns all bound variables; `RETURN *, item, ...`
+                // appends explicit items after the expansion.
+                sym(Tok::Star)
+                    .ignore_then(sym(Tok::Comma).ignore_then(item_list.clone()).or_not())
+                    .map(|rest| {
+                        let mut items = vec![ReturnItem {
+                            expr: Expr::FunctionCall {
+                                name: "__star__".to_string(),
+                                args: vec![],
+                            },
+                            alias: None,
+                            source_text: None,
+                        }];
+                        items.extend(rest.unwrap_or_default());
+                        items
+                    }),
+                item_list,
+            ))
+        })
         .map(|(distinct, items)| ReturnClause { items, distinct })
 }
 
@@ -1374,9 +1412,14 @@ fn order_by_clause<'a>() -> impl Parser<'a, ParserInput<'a>, OrderBy, ParserErro
         .ignore_then(
             expr_parser()
                 .then(
-                    choice((keyword("ASC").to(true), keyword("DESC").to(false)))
-                        .or_not()
-                        .map(|d| d.unwrap_or(true)),
+                    choice((
+                        keyword("ASCENDING").to(true),
+                        keyword("ASC").to(true),
+                        keyword("DESCENDING").to(false),
+                        keyword("DESC").to(false),
+                    ))
+                    .or_not()
+                    .map(|d| d.unwrap_or(true)),
                 )
                 .map(|(expr, ascending)| SortItem { expr, ascending })
                 .separated_by(sym(Tok::Comma))
@@ -1525,32 +1568,50 @@ fn query_part<'a>() -> impl Parser<'a, ParserInput<'a>, QueryPart, ParserError<'
                     .or_not()
                     .map(|d| d.unwrap_or(false)),
             )
-            .then(choice((
-                sym(Tok::Star).to(vec![ReturnItem {
-                    expr: Expr::FunctionCall {
-                        name: "__star__".to_string(),
-                        args: vec![],
-                    },
-                    alias: None,
-                    source_text: None,
-                }]),
-                return_item()
+            .then({
+                let item_list = return_item()
                     .separated_by(sym(Tok::Comma))
                     .at_least(1)
-                    .collect::<Vec<_>>(),
-            )))
+                    .collect::<Vec<_>>();
+                choice((
+                    // `WITH *` carries all bound variables; `WITH *, item, ...`
+                    // appends explicit items after the expansion.
+                    sym(Tok::Star)
+                        .ignore_then(sym(Tok::Comma).ignore_then(item_list.clone()).or_not())
+                        .map(|rest| {
+                            let mut items = vec![ReturnItem {
+                                expr: Expr::FunctionCall {
+                                    name: "__star__".to_string(),
+                                    args: vec![],
+                                },
+                                alias: None,
+                                source_text: None,
+                            }];
+                            items.extend(rest.unwrap_or_default());
+                            items
+                        }),
+                    item_list,
+                ))
+            })
             .then(where_clause().or_not())
             .then(order_by_clause().or_not())
             .then(keyword("SKIP").ignore_then(expr_parser()).or_not())
             .then(keyword("LIMIT").ignore_then(expr_parser()).or_not())
+            // The openCypher clause order puts WHERE after ORDER BY, SKIP,
+            // and LIMIT, where it filters after they apply; the pre-ORDER
+            // position is kept for leniency and filters before them.
+            .then(where_clause().or_not())
             .map(
-                |(((((distinct, items), where_clause), order_by), skip), limit)| QueryPart::With {
-                    items,
-                    where_clause,
-                    order_by,
-                    skip,
-                    limit,
-                    distinct,
+                |((((((distinct, items), where_clause), order_by), skip), limit), where_after)| {
+                    QueryPart::With {
+                        items,
+                        where_clause,
+                        where_after,
+                        order_by,
+                        skip,
+                        limit,
+                        distinct,
+                    }
                 },
             ),
         keyword("UNWIND")
@@ -3849,6 +3910,12 @@ fn validate_expr_vars(
     let mut vars = std::collections::HashSet::new();
     collect_expr_vars(expr, &mut vars);
     for v in vars {
+        if v == INVALID_LABEL_CHECK_VAR {
+            return Err(
+                "SyntaxError: a label predicate (':Label') requires a variable on its left side"
+                    .to_string(),
+            );
+        }
         if !active.contains(&v) {
             return Err(format!(
                 "SyntaxError(UndefinedVariable): variable '{}' is not in scope",
@@ -3884,6 +3951,12 @@ fn validate_where_vars(
     let mut vars = std::collections::HashSet::new();
     collect_where_vars(w, &mut vars);
     for v in vars {
+        if v == INVALID_LABEL_CHECK_VAR {
+            return Err(
+                "SyntaxError: a label predicate (':Label') requires a variable on its left side"
+                    .to_string(),
+            );
+        }
         if !active.contains(&v) {
             return Err(format!(
                 "SyntaxError(UndefinedVariable): variable '{}' is not in scope",
@@ -4198,6 +4271,96 @@ fn validate_statement_undefined_vars_impl(
     Ok(())
 }
 
+/// Whether a projection item is the `*` sentinel.
+fn is_star_item(item: &ReturnItem) -> bool {
+    matches!(&item.expr, Expr::FunctionCall { name, .. } if name == "__star__")
+}
+
+/// Expand a `*` projection combined with explicit items (`RETURN *, expr` or
+/// `WITH *, expr`) into one item per in-scope user variable, in sorted order.
+/// A lone `*` keeps its sentinel form, which the planner and executor handle
+/// directly. Scope is derived syntactically from the clauses, mirroring the
+/// executor's fallback scope computation.
+fn expand_star_items(stmt: &mut Statement) {
+    match stmt {
+        Statement::Query(q) => expand_star_in_query(q),
+        Statement::Union(u) => {
+            expand_star_items(&mut u.left);
+            expand_star_items(&mut u.right);
+        }
+        _ => {}
+    }
+}
+
+fn expand_star_list(items: &mut Vec<ReturnItem>, scope: &std::collections::HashSet<String>) {
+    if items.len() < 2 || !items.iter().any(is_star_item) {
+        return;
+    }
+    let mut vars: Vec<&String> = scope.iter().collect();
+    vars.sort();
+    let mut out = Vec::with_capacity(items.len() + vars.len());
+    for item in items.drain(..) {
+        if is_star_item(&item) {
+            out.extend(vars.iter().map(|v| ReturnItem {
+                expr: Expr::Prop((*v).clone(), String::new()),
+                alias: None,
+                source_text: Some((*v).clone()),
+            }));
+        } else {
+            out.push(item);
+        }
+    }
+    *items = out;
+}
+
+fn expand_star_in_query(q: &mut Query) {
+    let mut scope: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for mc in &q.match_clauses {
+        collect_pattern_bound_vars(&mc.pattern, &mut scope);
+    }
+    for part in q.parts.iter_mut() {
+        match part {
+            QueryPart::Match { match_clauses, .. }
+            | QueryPart::OptionalMatch { match_clauses, .. } => {
+                for mc in match_clauses.iter() {
+                    collect_pattern_bound_vars(&mc.pattern, &mut scope);
+                }
+            }
+            QueryPart::Unwind { variable, .. } => {
+                scope.insert(variable.clone());
+            }
+            QueryPart::Create { patterns } => {
+                for p in patterns.iter() {
+                    collect_pattern_bound_vars(p, &mut scope);
+                }
+            }
+            QueryPart::Merge { merges } => {
+                for m in merges.iter() {
+                    collect_pattern_bound_vars(&m.pattern, &mut scope);
+                }
+            }
+            QueryPart::With { items, .. } => {
+                expand_star_list(items, &scope);
+                let mut next: std::collections::HashSet<String> = std::collections::HashSet::new();
+                for item in items.iter() {
+                    if is_star_item(item) {
+                        next.extend(scope.iter().cloned());
+                    } else if let Some(alias) = &item.alias {
+                        next.insert(alias.clone());
+                    } else if let Expr::Prop(v, p) = &item.expr {
+                        if p.is_empty() {
+                            next.insert(v.clone());
+                        }
+                    }
+                }
+                scope = next;
+            }
+            _ => {}
+        }
+    }
+    expand_star_list(&mut q.return_clause.items, &scope);
+}
+
 fn validate_statement_undefined_vars(stmt: &Statement) -> Result<(), String> {
     let mut active = std::collections::HashSet::new();
     validate_statement_undefined_vars_impl(stmt, &mut active)
@@ -4257,8 +4420,15 @@ fn validate_statement(stmt: &Statement) -> Result<(), String> {
             validate_match_clause_variables(&rr.match_clauses)?;
         }
         Statement::Foreach(f) => {
+            // Do not re-run the full validation on the body: the
+            // undefined-variable pass already checked it with the loop
+            // variable in scope, and re-validating from a fresh scope would
+            // reject that variable. The create/merge/delete validators and
+            // the expression checks recurse into the body through their own
+            // `Foreach` arms; only the two without such arms run here.
             for s in &f.body {
-                validate_statement(s)?;
+                validate_projection_semantics(s)?;
+                validate_value_var_conflicts(s)?;
             }
         }
         Statement::Pipeline(stmts) => {
@@ -5271,11 +5441,14 @@ const BRACKET_COST_KB: usize = 70;
 const CASE_COST_KB: usize = 14;
 const OP_COST_KB: usize = 21;
 const UNION_COST_KB: usize = 14;
-/// Maximum weighted nesting cost (KiB) accepted at all. Sized so realistic deep
-/// input (for example a 40-deep nested literal) parses and executes on the
-/// large-stack threads, while genuinely pathological input (thousands of levels)
-/// that would overflow even those is still rejected up front.
-const MAX_NESTING_COST_KB: usize = 12_000;
+/// Maximum weighted nesting cost (KiB) accepted at all. Sized against the
+/// 256 MiB parse and execution threads with better than 2x headroom (the
+/// per-level weights are themselves padded above measured cost), so realistic
+/// deep or machine-generated wide input (for example a WHERE with hundreds of
+/// flat AND conjuncts, which evaluates down a left-deep tree) parses and
+/// executes, while genuinely pathological input that would overflow even the
+/// large stacks is still rejected up front.
+const MAX_NESTING_COST_KB: usize = 100_000;
 
 /// Weighted nesting cost (KiB) up to which a query executes inline on the
 /// caller stack. Above it, execution moves to a large-stack thread, because
@@ -5351,6 +5524,11 @@ struct Frame {
     base_kb: usize,
     /// Operators chained directly inside this level.
     op_run: usize,
+    /// Whether this level was opened by a `CASE` keyword. An `END` closes
+    /// only a `CASE` level; treating every `end` identifier as a closer
+    /// would let a deep query interleaved with `end` (a common property
+    /// name) scan as shallow and overflow the real parser's stack.
+    is_case: bool,
 }
 
 /// Compute worst-case nesting from the token stream. The scan is iterative: it
@@ -5360,11 +5538,15 @@ fn scan_nesting(tokens: &[(Tok, SimpleSpan)]) -> Nesting {
     let mut frames: Vec<Frame> = vec![Frame {
         base_kb: 0,
         op_run: 0,
+        is_case: false,
     }];
     let mut cost_kb: usize = 0;
     let mut union_depth: usize = 0;
     let mut op_total: usize = 0;
     let mut out = Nesting::default();
+    // A `Dot`-preceded identifier is a property access, never a `CASE`,
+    // `END`, `UNION`, or operator keyword.
+    let mut prev_was_dot = false;
 
     for (tok, _) in tokens {
         match tok {
@@ -5372,6 +5554,7 @@ fn scan_nesting(tokens: &[(Tok, SimpleSpan)]) -> Nesting {
                 frames.push(Frame {
                     base_kb: BRACKET_COST_KB,
                     op_run: 0,
+                    is_case: false,
                 });
                 cost_kb += BRACKET_COST_KB;
             }
@@ -5406,14 +5589,23 @@ fn scan_nesting(tokens: &[(Tok, SimpleSpan)]) -> Nesting {
             | Tok::Percent
             | Tok::Caret => add_operator(&mut frames, &mut cost_kb, &mut op_total),
             Tok::Ident(name) => {
-                if name.eq_ignore_ascii_case("CASE") {
+                if prev_was_dot {
+                    // Property access: the name is data, not a keyword.
+                } else if name.eq_ignore_ascii_case("CASE") {
                     frames.push(Frame {
                         base_kb: CASE_COST_KB,
                         op_run: 0,
+                        is_case: true,
                     });
                     cost_kb += CASE_COST_KB;
                 } else if name.eq_ignore_ascii_case("END") {
-                    close_frame(&mut frames, &mut cost_kb, &mut op_total);
+                    // Close only an open CASE level: `end` is also a common
+                    // variable and property name. Ignoring a stray `end`
+                    // leaves any enclosing frame open, which can only
+                    // overcount depth, never undercount it.
+                    if frames.last().is_some_and(|f| f.is_case) {
+                        close_frame(&mut frames, &mut cost_kb, &mut op_total);
+                    }
                 } else if name.eq_ignore_ascii_case("UNION") {
                     union_depth += 1;
                     cost_kb += UNION_COST_KB;
@@ -5430,6 +5622,7 @@ fn scan_nesting(tokens: &[(Tok, SimpleSpan)]) -> Nesting {
             }
             _ => {}
         }
+        prev_was_dot = matches!(tok, Tok::Dot);
         out.cost_kb = out.cost_kb.max(cost_kb);
         out.bracket_case = out.bracket_case.max(frames.len() - 1);
         out.op = out.op.max(op_total);
@@ -5509,7 +5702,7 @@ pub(crate) fn parse_with_exec_depth(cypher: &str) -> Result<(Statement, bool), C
         let eoi = SimpleSpan::from(cypher.len()..cypher.len());
         let stream = tokens.as_slice().split_token_span(eoi);
 
-        let statement = pipeline_parser(cypher)
+        let mut statement = pipeline_parser(cypher)
             .parse(stream)
             .into_result()
             .map_err(|errs| {
@@ -5521,6 +5714,7 @@ pub(crate) fn parse_with_exec_depth(cypher: &str) -> Result<(Statement, bool), C
                 CypherError::Parse(msg)
             })?;
 
+        expand_star_items(&mut statement);
         validate_statement(&statement).map_err(CypherError::Parse)?;
         Ok(statement)
     };
@@ -6014,7 +6208,7 @@ mod tests {
     #[test]
     fn deeply_nested_queries_are_rejected_not_aborted() {
         let union = std::iter::repeat("RETURN 1 AS x")
-            .take(5000)
+            .take(10_000)
             .collect::<Vec<_>>()
             .join(" UNION ALL ");
         assert!(parse(&union).is_err());
@@ -6026,7 +6220,7 @@ mod tests {
         assert!(parse(&format!("RETURN {list} AS x")).is_err());
 
         let mut case = String::from("1");
-        for _ in 0..5000 {
+        for _ in 0..10_000 {
             case = format!("CASE WHEN true THEN {case} ELSE 0 END");
         }
         assert!(parse(&format!("RETURN {case} AS x")).is_err());
@@ -6067,6 +6261,133 @@ mod tests {
         assert!(parse("RETURN {a: {b: {c: 1}}} AS m").is_ok());
         assert!(parse("RETURN CASE WHEN true THEN 1 ELSE 2 END AS x").is_ok());
         assert!(parse("RETURN 1 AS x UNION ALL RETURN 2 AS x UNION ALL RETURN 3 AS x").is_ok());
+    }
+
+    /// Comments lex anywhere whitespace can appear: leading, trailing, between
+    /// clauses, and the block form inside an expression.
+    #[test]
+    fn comments_are_ignored_everywhere() {
+        assert!(parse("RETURN 1 AS x // trailing").is_ok());
+        assert!(parse("// leading\nRETURN 1 AS x").is_ok());
+        assert!(parse("MATCH (n) // comment\nRETURN n").is_ok());
+        assert!(parse("RETURN /* block */ 1 AS x").is_ok());
+        assert!(parse("RETURN 1 AS x /* trailing block */").is_ok());
+        assert!(parse("RETURN 1 // one\n// two\n AS x").is_ok());
+        // An unterminated block comment is a lex error, not silent consumption.
+        assert!(parse("RETURN /* open 1 AS x").is_err());
+    }
+
+    /// A flat chain of several hundred operators is wide, not pathologically
+    /// deep; the nesting guard accepts it.
+    #[test]
+    fn flat_operator_chains_parse() {
+        let and = std::iter::repeat("m.x = 1")
+            .take(600)
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        assert!(parse(&format!("MATCH (m) WHERE {and} RETURN m")).is_ok());
+        let sum = std::iter::repeat("1")
+            .take(1000)
+            .collect::<Vec<_>>()
+            .join(" + ");
+        assert!(parse(&format!("RETURN {sum} AS s")).is_ok());
+    }
+
+    /// A deep bracket nest interleaved with the identifier `end` (a common
+    /// property name) must not fool the depth scan into parsing inline on a
+    /// small caller stack; this input aborted the process before the scan
+    /// tracked `CASE` frames explicitly.
+    #[test]
+    fn end_property_does_not_defeat_the_depth_scan() {
+        let mut inner = String::from("1");
+        for _ in 0..500 {
+            inner = format!("[x.end, {inner}]");
+        }
+        let result = parse(&format!("WITH 1 AS x RETURN {inner} AS r"));
+        assert!(result.is_ok(), "deep end-interleaved query should parse");
+    }
+
+    /// `IS [NOT] NULL` applies to the whole add-or-subtract expression on its
+    /// left, not just the nearest atom.
+    #[test]
+    fn is_null_binds_looser_than_additive_operators() {
+        let stmt = parse("RETURN 1 + null IS NULL AS x").unwrap();
+        let Statement::Query(q) = stmt else {
+            panic!("expected query");
+        };
+        assert!(
+            matches!(
+                &q.return_clause.items[0].expr,
+                Expr::IsNull(inner)
+                    if matches!(inner.as_ref(), Expr::BinaryOp { op: BinaryOperator::Add, .. })
+            ),
+            "expected IsNull(Add(..)), got {:?}",
+            q.return_clause.items[0].expr
+        );
+        assert!(parse("MATCH (n) WHERE n.a + n.b IS NOT NULL RETURN n").is_ok());
+    }
+
+    /// A label predicate requires a variable on its left side; on any other
+    /// expression it is a syntax error, not a silently dropped filter.
+    #[test]
+    fn label_predicate_on_non_variable_is_an_error() {
+        assert!(parse("MATCH (n) WHERE n.prop:Label RETURN n").is_err());
+        assert!(parse("RETURN 1:Foo AS x").is_err());
+        assert!(parse("MATCH (n) WHERE n:Label RETURN n").is_ok());
+        assert!(parse("MATCH (n) WHERE n:A:B RETURN n").is_ok());
+    }
+
+    /// WITH accepts the openCypher clause order (WHERE after ORDER BY, SKIP,
+    /// and LIMIT) as well as the lenient WHERE-first order.
+    #[test]
+    fn with_accepts_standard_clause_order() {
+        assert!(parse("MATCH (n) WITH n ORDER BY n.x LIMIT 5 WHERE n.x > 0 RETURN n").is_ok());
+        assert!(parse("MATCH (n) WITH n ORDER BY n.x WHERE n.x > 0 RETURN n").is_ok());
+        assert!(parse("MATCH (n) WITH n WHERE n.x > 0 ORDER BY n.x LIMIT 5 RETURN n").is_ok());
+    }
+
+    /// The long sort-direction forms are accepted alongside ASC and DESC.
+    #[test]
+    fn order_by_long_direction_forms() {
+        let stmt = parse("MATCH (n) RETURN n ORDER BY n.x DESCENDING, n.y ASCENDING").unwrap();
+        let Statement::Query(q) = stmt else {
+            panic!("expected query");
+        };
+        let items = &q.order_by.as_ref().unwrap().items;
+        assert!(!items[0].ascending);
+        assert!(items[1].ascending);
+    }
+
+    /// A var-length hop bound outside u32 is a parse error, not a silently
+    /// wrapped zero-hop range.
+    #[test]
+    fn var_length_bound_out_of_u32_range_is_rejected() {
+        assert!(parse("MATCH (a)-[*4294967296]->(b) RETURN a").is_err());
+        assert!(parse("MATCH (a)-[*2..4294967296]->(b) RETURN a").is_err());
+        assert!(parse("MATCH (a)-[*2..3]->(b) RETURN a").is_ok());
+    }
+
+    /// `RETURN *, item` expands the star to the in-scope variables and appends
+    /// the explicit items; same for WITH.
+    #[test]
+    fn star_with_additional_items_expands() {
+        let stmt = parse("MATCH (n)-[r:T]->(m) RETURN *, n.x AS y").unwrap();
+        let Statement::Query(q) = stmt else {
+            panic!("expected query");
+        };
+        let aliases: Vec<String> = q
+            .return_clause
+            .items
+            .iter()
+            .map(|i| {
+                i.alias
+                    .clone()
+                    .or_else(|| i.source_text.clone())
+                    .unwrap_or_default()
+            })
+            .collect();
+        assert_eq!(aliases, vec!["m", "n", "r", "y"]);
+        assert!(parse("MATCH (n) WITH *, n.x AS y RETURN n, y").is_ok());
     }
 
     /// `scan_nesting` charges each construct and unwinds it on close, so its cost
