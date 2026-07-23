@@ -224,8 +224,9 @@ Stemming and stop words are language-aware. `create_text_index` uses English; `c
 - `TextIndexExt::list_text_indexes() -> Result<Vec<(String, String, Language)>, TextError>`  
   Lists all active full-text search indexes in the database.
 - `TextGraphExt::text_search(query: &str, opts: &TextSearchOptions) -> Result<Vec<TextHit>, TextError>`  
-  Queries indexed text fields and ranks matching nodes using BM25 scoring. A request that cannot match anything errors instead of returning an empty
-  list: an empty query, a label or property filter naming no active index, or a graph with no text indexes at all.
+  Queries indexed text fields and ranks matching nodes using BM25 scoring. Each `TextHit` carries `node`, `score`, and the `label` and `property` of
+  the text index that contributed the hit's largest partial score. A request that cannot match anything errors instead of returning an empty list:
+  an empty query, a label or property filter naming no active index, or a graph with no text indexes at all.
 
 ---
 

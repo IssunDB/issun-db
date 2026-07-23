@@ -1562,6 +1562,28 @@ mod tests {
         assert_eq!(res.columns, vec!["total".to_string()]);
     }
 
+    /// Integer division and modulo by zero raise a runtime error, matching
+    /// Neo4j; returning null would let the mistake propagate silently through
+    /// downstream aggregates. Float division by zero keeps its IEEE 754
+    /// result (NaN here, since 0.0 / 0.0 is the sentinel-visible case).
+    #[test]
+    fn integer_division_by_zero_is_a_runtime_error() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+
+        for q in ["RETURN 1 / 0 AS boom", "RETURN 1 % 0 AS boom"] {
+            let err = execute(&graph, q, &params).unwrap_err();
+            assert!(
+                matches!(err, CypherError::Math(_)),
+                "{q} must raise a math error, got {err:?}"
+            );
+        }
+
+        // The float path is unchanged: NaN, not an error.
+        let res = execute(&graph, "RETURN 0.0 / 0.0 AS nan_val", &params).unwrap();
+        assert_eq!(res.records.len(), 1);
+    }
+
     #[test]
     fn call_procedure_standalone_and_in_query() {
         use crate::procedure::{CypherType, Procedure, ProcedureRegistry};

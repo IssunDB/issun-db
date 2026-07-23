@@ -1018,8 +1018,11 @@ pub(super) fn eval_arithmetic(
                     '-' => Some(li.checked_sub(ri).ok_or_else(overflow)?),
                     '*' => Some(li.checked_mul(ri).ok_or_else(overflow)?),
                     '/' => {
+                        // Integer division by zero raises, matching Neo4j; a
+                        // null result would flow silently through downstream
+                        // aggregates. Float division by zero below stays IEEE 754.
                         if ri == 0 {
-                            return Ok(serde_json::Value::Null);
+                            return Err(format!("ArithmeticError: division by zero in {li} / 0"));
                         }
                         // `checked_div` is `None` only for `i64::MIN / -1`, a true
                         // overflow.
@@ -1027,7 +1030,7 @@ pub(super) fn eval_arithmetic(
                     }
                     '%' => {
                         if ri == 0 {
-                            return Ok(serde_json::Value::Null);
+                            return Err(format!("ArithmeticError: division by zero in {li} % 0"));
                         }
                         // `i64::MIN % -1` is mathematically 0 (no overflow of the
                         // remainder itself); `wrapping_rem` yields that, matching
@@ -5113,15 +5116,11 @@ mod arithmetic_tests {
             json!(3)
         );
 
-        // Division/modulo by zero stay null (not an error).
-        assert_eq!(
-            eval_arithmetic(&json!(1), &json!(0), '/').unwrap(),
-            json!(null)
-        );
-        assert_eq!(
-            eval_arithmetic(&json!(1), &json!(0), '%').unwrap(),
-            json!(null)
-        );
+        // Integer division/modulo by zero raise, matching Neo4j.
+        let err = eval_arithmetic(&json!(1), &json!(0), '/').unwrap_err();
+        assert!(err.contains("division by zero"), "got: {err}");
+        let err = eval_arithmetic(&json!(1), &json!(0), '%').unwrap_err();
+        assert!(err.contains("division by zero"), "got: {err}");
         // i64::MIN % -1 is mathematically 0 (the remainder does not overflow).
         assert_eq!(
             eval_arithmetic(&json!(i64::MIN), &json!(-1), '%').unwrap(),

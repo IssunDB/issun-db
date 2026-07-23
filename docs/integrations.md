@@ -204,12 +204,15 @@ TLS and authentication are the reverse proxy's job; the server itself binds with
 
 The server registers the following tools with the connecting client:
 
-1. `get_node`: Fetch a node by ID, returning its labels and properties.
-2. `get_edge`: Fetch an edge by ID, returning its endpoints, type, and properties.
+1. `get_node`: Fetch a node by ID, returning its labels and properties. String property values longer than `max_property_chars` (default 2000) are
+   truncated with an explicit marker; a `properties` list selects specific properties, and a cap of 0 disables truncation.
+2. `get_edge`: Fetch an edge by ID, returning its endpoints, type, and properties, bounded the same way as `get_node`.
 3. `cypher_query`: Execute a Cypher query with optional parameter bindings. `CREATE`, `SET`, `REMOVE`, `DELETE`, and `MERGE` statements can be used to mutate the graph.
 4. `explain`: Return the physical query plan for a Cypher query as an indented tree.
-5. `text_search`: Full-text search over indexed node properties; returns ranked hits.
-6. `vector_search`: Nearest-neighbor vector search; returns the k closest nodes by distance (supporting label and property filtering).
+5. `text_search`: Full-text search over indexed node properties. Each ranked hit carries the node id, the score, the matched label and property, and
+   a bounded excerpt of the matched value.
+6. `vector_search`: Nearest-neighbor vector search; returns the k closest nodes by distance (supporting label and property filtering). Each hit
+   carries the node id, the distance, and the node's labels.
 7. `retrieve_hybrid`: Run a hybrid retrieval query that combines vector/semantic search, full-text keyword search, and relationship expansion. At
    least one of `text_query` or `vector` is required, and the result carries a `truncated` flag that is true when the `max_nodes` cap cut off seeds
    or expansion.

@@ -1745,7 +1745,10 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
                             println!("(no results)");
                         } else {
                             for h in &hits {
-                                println!("  node={} score={:.6}", h.node, h.score);
+                                println!(
+                                    "  node={} score={:.6} matched={}.{}",
+                                    h.node, h.score, h.label, h.property
+                                );
                             }
                         }
                     }

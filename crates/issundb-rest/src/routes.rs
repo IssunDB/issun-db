@@ -688,6 +688,10 @@ pub async fn explain_query(
 struct TextHitResponse {
     node: u64,
     score: f32,
+    /// Label of the text index that matched this hit.
+    label: String,
+    /// Property of the text index that matched this hit.
+    property: String,
 }
 
 /// Full-text search over indexed node properties, ranked by relevance.
@@ -714,10 +718,12 @@ pub async fn search_text(
         match graph.text_search(&body.query, &opts) {
             Ok(hits) => {
                 let response: Vec<TextHitResponse> = hits
-                    .iter()
+                    .into_iter()
                     .map(|h| TextHitResponse {
                         node: h.node,
                         score: h.score,
+                        label: h.label,
+                        property: h.property,
                     })
                     .collect();
                 (StatusCode::OK, Json(json!(response))).into_response()

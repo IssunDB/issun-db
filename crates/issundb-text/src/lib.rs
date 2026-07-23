@@ -29,10 +29,18 @@ pub enum TextError {
 }
 
 /// A single ranked full-text search result.
+///
+/// `label` and `property` name the text index that contributed the hit's
+/// largest partial score, so a caller can tell which indexed field matched
+/// (and read it) without a follow-up lookup. With one active index they are
+/// simply that index; with several, scores sum across indexes and the
+/// strongest contributor is reported.
 #[derive(Debug, Clone)]
 pub struct TextHit {
     pub node: NodeId,
     pub score: f32,
+    pub label: String,
+    pub property: String,
 }
 
 // ------------------------------------------------------------------
@@ -498,10 +506,12 @@ impl TextGraphExt for Graph {
         // top-k is taken after the merge. A single active index needs no sum, so
         // it keeps the WAND top-k fast path.
         let multi_index = active_indices.len() > 1;
-        let mut scores: HashMap<NodeId, f32> = HashMap::new();
+        // Per node: summed score, largest per-index partial score, and the
+        // position in `active_indices` of the index that produced it.
+        let mut scores: HashMap<NodeId, (f32, f32, usize)> = HashMap::new();
 
-        for (label, property, lang) in active_indices {
-            let stats = match self.fts_stats(&label, &property)? {
+        for (index_pos, (label, property, lang)) in active_indices.iter().enumerate() {
+            let stats = match self.fts_stats(label, property)? {
                 Some(s) => s,
                 None => continue,
             };
@@ -511,7 +521,7 @@ impl TextGraphExt for Graph {
             }
             let avgdl = (sum_dl as f32) / (n_docs as f32);
 
-            let query_terms = self.tokenize_text(query, lang);
+            let query_terms = self.tokenize_text(query, *lang);
             if query_terms.is_empty() {
                 continue;
             }
@@ -524,8 +534,8 @@ impl TextGraphExt for Graph {
                 if opts.boolean_mode == Some(BooleanMode::And) && query_terms.len() > 1 {
                     Some(boolean_candidate_set(
                         self,
-                        &label,
-                        &property,
+                        label,
+                        property,
                         &query_terms,
                         BooleanMode::And, // already guarded by Some(BooleanMode::And) above
                     )?)
@@ -538,7 +548,7 @@ impl TextGraphExt for Graph {
             let mut cursors: Vec<PostingCursor> = Vec::with_capacity(query_terms.len());
 
             for (term, &qtf) in &query_terms {
-                let mut postings = self.fts_postings(&label, &property, term)?;
+                let mut postings = self.fts_postings(label, property, term)?;
                 if postings.is_empty() {
                     continue;
                 }
@@ -578,7 +588,7 @@ impl TextGraphExt for Graph {
 
             let mut doc_lengths: HashMap<NodeId, u32> = HashMap::with_capacity(candidate_ids.len());
             for id in candidate_ids {
-                if let Some(len) = self.fts_doc_len(&label, &property, id)? {
+                if let Some(len) = self.fts_doc_len(label, property, id)? {
                     doc_lengths.insert(id, len);
                 }
             }
@@ -591,13 +601,26 @@ impl TextGraphExt for Graph {
             let index_k = if multi_index { usize::MAX } else { opts.limit };
             let top_k = wand_top_k(cursors, index_k, scorer, &doc_lengths, avgdl);
             for (node_id, score) in top_k {
-                *scores.entry(node_id).or_insert(0.0) += score;
+                let entry = scores.entry(node_id).or_insert((0.0, f32::NEG_INFINITY, 0));
+                entry.0 += score;
+                if score > entry.1 {
+                    entry.1 = score;
+                    entry.2 = index_pos;
+                }
             }
         }
 
         let mut hits: Vec<TextHit> = scores
             .into_iter()
-            .map(|(node, score)| TextHit { node, score })
+            .map(|(node, (score, _, index_pos))| {
+                let (label, property, _) = &active_indices[index_pos];
+                TextHit {
+                    node,
+                    score,
+                    label: label.clone(),
+                    property: property.clone(),
+                }
+            })
             .collect();
 
         hits.sort_by(|a, b| {
@@ -698,6 +721,28 @@ mod tests {
         );
         // The over-long token was skipped, so it finds nothing (no crash).
         assert!(graph.text_search(&long_token, &opts)?.is_empty());
+        Ok(())
+    }
+
+    /// Each hit names the text index that matched it, so a caller can read
+    /// the matched field without a follow-up lookup. With two active indexes,
+    /// a node matching only through one reports that one.
+    #[test]
+    fn text_hits_carry_the_matched_index() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TempDir::new()?;
+        let graph = Graph::open(temp.path(), 1)?;
+        graph.create_node_text_index("Doc", "title")?;
+        graph.create_node_text_index("Doc", "body")?;
+        let n = graph.add_node(
+            "Doc",
+            &json!({ "title": "storage engine", "body": "cassava leaf disease" }),
+        )?;
+
+        let hits = graph.text_search("cassava", &TextSearchOptions::default())?;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].node, n);
+        assert_eq!(hits[0].label, "Doc");
+        assert_eq!(hits[0].property, "body");
         Ok(())
     }
 

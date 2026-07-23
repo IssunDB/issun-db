@@ -282,6 +282,8 @@ impl PyGraph {
                     serde_json::json!({
                         "node": h.node,
                         "score": h.score,
+                        "label": h.label,
+                        "property": h.property,
                     })
                 })
                 .collect();

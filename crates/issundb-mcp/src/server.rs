@@ -51,6 +51,75 @@ fn invalid(e: impl std::fmt::Display) -> McpError {
     McpError::invalid_params(e.to_string(), None)
 }
 
+/// Longest string value returned inside a search hit before truncation.
+const HIT_VALUE_MAX_CHARS: usize = 200;
+
+/// Bound a string property value for inclusion in a search hit, marking the
+/// cut explicitly so an agent never mistakes a truncated value for the full
+/// text. Non-string values pass through untouched.
+fn hit_value_snippet(value: Value) -> Value {
+    match value {
+        Value::String(s) => Value::String(truncate_marked(&s, HIT_VALUE_MAX_CHARS)),
+        other => other,
+    }
+}
+
+/// Default character cap per string property value in `get_node` and
+/// `get_edge` responses. A Competition or ForumMessage node can carry tens of
+/// kilobytes of markdown, which would flood an agent's context on every
+/// lookup.
+const DEFAULT_PROP_MAX_CHARS: usize = 2000;
+
+/// Bound a property map for an agent-facing response: keep only the requested
+/// keys (all when `keep` is `None`) and truncate string values to `max_chars`
+/// characters with an explicit marker. `max_chars` of 0 disables truncation.
+fn bound_props(props: Value, keep: Option<&[String]>, max_chars: usize) -> Value {
+    match props {
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .filter(|(k, _)| keep.is_none_or(|names| names.iter().any(|n| n == k)))
+                .map(|(k, v)| (k, bound_value(v, max_chars)))
+                .collect(),
+        ),
+        other => bound_value(other, max_chars),
+    }
+}
+
+/// Truncate every string inside `v` (recursively through arrays and objects)
+/// to `max_chars` characters with an explicit marker.
+fn bound_value(v: Value, max_chars: usize) -> Value {
+    if max_chars == 0 {
+        return v;
+    }
+    match v {
+        Value::String(s) => Value::String(truncate_marked(&s, max_chars)),
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .map(|item| bound_value(item, max_chars))
+                .collect(),
+        ),
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .map(|(k, item)| (k, bound_value(item, max_chars)))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+/// Truncate `s` to `max_chars` characters on a character boundary, appending
+/// an explicit marker with the original length.
+fn truncate_marked(s: &str, max_chars: usize) -> String {
+    match s.char_indices().nth(max_chars) {
+        None => s.to_string(),
+        Some((byte_pos, _)) => {
+            let total = s.chars().count();
+            format!("{}… [truncated, {} chars total]", &s[..byte_pos], total)
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tool argument types
 // ---------------------------------------------------------------------------
@@ -59,12 +128,30 @@ fn invalid(e: impl std::fmt::Display) -> McpError {
 pub struct NodeIdArgs {
     /// Node identifier.
     pub id: u64,
+    /// Optional list of property names to return; other properties are left
+    /// out of the response. Omit to return every property.
+    #[serde(default)]
+    pub properties: Option<Vec<String>>,
+    /// Character cap per string property value (default 2000). A longer value
+    /// is cut on a character boundary and carries an explicit truncation
+    /// marker with its full length. Pass 0 to disable the cap.
+    #[serde(default)]
+    pub max_property_chars: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct EdgeIdArgs {
     /// Edge identifier.
     pub id: u64,
+    /// Optional list of property names to return; other properties are left
+    /// out of the response. Omit to return every property.
+    #[serde(default)]
+    pub properties: Option<Vec<String>>,
+    /// Character cap per string property value (default 2000). A longer value
+    /// is cut on a character boundary and carries an explicit truncation
+    /// marker with its full length. Pass 0 to disable the cap.
+    #[serde(default)]
+    pub max_property_chars: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -164,7 +251,9 @@ impl IssunMcp {
         }
     }
 
-    #[tool(description = "Fetch a node by id; returning its labels and properties.")]
+    #[tool(
+        description = "Fetch a node by id; returning its labels and properties. String property values longer than max_property_chars (default 2000) are truncated with an explicit marker; pass a properties list to select specific properties, or max_property_chars 0 for full values."
+    )]
     async fn get_node(
         &self,
         Parameters(args): Parameters<NodeIdArgs>,
@@ -178,6 +267,11 @@ impl IssunMcp {
                 let labels = graph.node_labels(args.id).map_err(internal)?;
                 let label = labels.first().cloned().unwrap_or_default();
                 let props: Value = rmp_serde::from_slice(&record.props).map_err(internal)?;
+                let props = bound_props(
+                    props,
+                    args.properties.as_deref(),
+                    args.max_property_chars.unwrap_or(DEFAULT_PROP_MAX_CHARS),
+                );
                 ok_json(json!({ "id": args.id, "label": label, "labels": labels, "props": props }))
             }
             None => Err(invalid(format!("node {} not found", args.id))),
@@ -186,7 +280,9 @@ impl IssunMcp {
         .map_err(internal)?
     }
 
-    #[tool(description = "Fetch an edge by id; returning its endpoints, type, and properties.")]
+    #[tool(
+        description = "Fetch an edge by id; returning its endpoints, type, and properties. String property values are bounded the same way as get_node."
+    )]
     async fn get_edge(
         &self,
         Parameters(args): Parameters<EdgeIdArgs>,
@@ -199,6 +295,11 @@ impl IssunMcp {
                     .map_err(internal)?
                     .unwrap_or_default();
                 let props: Value = rmp_serde::from_slice(&record.props).map_err(internal)?;
+                let props = bound_props(
+                    props,
+                    args.properties.as_deref(),
+                    args.max_property_chars.unwrap_or(DEFAULT_PROP_MAX_CHARS),
+                );
                 ok_json(json!({
                     "id": args.id,
                     "src": record.src,
@@ -247,7 +348,9 @@ impl IssunMcp {
         .map_err(internal)?
     }
 
-    #[tool(description = "Full-text search over indexed node properties; returns ranked hits.")]
+    #[tool(
+        description = "Full-text search over indexed node properties. Each ranked hit carries the node id, the score, the matched label and property, and a bounded excerpt of the matched value."
+    )]
     async fn text_search(
         &self,
         Parameters(args): Parameters<TextSearchArgs>,
@@ -267,10 +370,24 @@ impl IssunMcp {
                 TextError::Core(err) => internal(err),
                 other => invalid(other),
             })?;
-            let response: Vec<Value> = hits
-                .iter()
-                .map(|h| json!({ "node": h.node, "score": h.score }))
-                .collect();
+            // Each hit carries the matched index and a bounded excerpt of the
+            // matched value, so the hit is meaningful without a follow-up
+            // get_node round trip.
+            let mut response: Vec<Value> = Vec::with_capacity(hits.len());
+            for h in &hits {
+                let value = graph
+                    .node_prop_json(h.node, &h.property)
+                    .map_err(internal)?
+                    .map(hit_value_snippet)
+                    .unwrap_or(Value::Null);
+                response.push(json!({
+                    "node": h.node,
+                    "score": h.score,
+                    "label": h.label,
+                    "property": h.property,
+                    "value": value,
+                }));
+            }
             ok_json(json!(response))
         })
         .await
@@ -278,7 +395,7 @@ impl IssunMcp {
     }
 
     #[tool(
-        description = "Nearest-neighbor vector search; returns the k closest nodes by distance (with optional label and property filtering)."
+        description = "Nearest-neighbor vector search; returns the k closest nodes by distance (with optional label and property filtering). Each hit carries the node id, the distance, and the node's labels."
     )]
     async fn vector_search(
         &self,
@@ -303,10 +420,15 @@ impl IssunMcp {
                     }
                     other => internal(other),
                 })?;
-            let response: Vec<Value> = hits
-                .iter()
-                .map(|h| json!({ "node": h.node, "distance": h.distance }))
-                .collect();
+            let mut response: Vec<Value> = Vec::with_capacity(hits.len());
+            for h in &hits {
+                let labels = graph.node_labels(h.node).map_err(internal)?;
+                response.push(json!({
+                    "node": h.node,
+                    "distance": h.distance,
+                    "labels": labels,
+                }));
+            }
             ok_json(json!(response))
         })
         .await
@@ -402,7 +524,9 @@ impl ServerHandler for IssunMcp {
                 "IssunDB graph database. Tools: get_node, get_edge, cypher_query, explain, \
                  text_search, vector_search, and retrieve_hybrid. Mutate the graph by sending \
                  CREATE, SET, REMOVE, DELETE, or MERGE through cypher_query; there are no \
-                 separate write, index-administration, or backup tools."
+                 separate write, index-administration, or backup tools. Property comparisons \
+                 in Cypher are strictly typed: c.Id = \"13836\" does not match an integer \
+                 property, use c.Id = 13836. Integer division by zero raises an error."
                     .to_string(),
             ),
         }
@@ -450,12 +574,30 @@ mod tests {
             .expect("seed person")
     }
 
+    /// `get_node` arguments with the default property handling.
+    fn node_args(id: u64) -> NodeIdArgs {
+        NodeIdArgs {
+            id,
+            properties: None,
+            max_property_chars: None,
+        }
+    }
+
+    /// `get_edge` arguments with the default property handling.
+    fn edge_args(id: u64) -> EdgeIdArgs {
+        EdgeIdArgs {
+            id,
+            properties: None,
+            max_property_chars: None,
+        }
+    }
+
     #[tokio::test]
     async fn get_node_round_trips_label_and_props() {
         let (mcp, _dir) = fresh();
         let id = seed_person(&mcp, "Ada");
         let result = mcp
-            .get_node(Parameters(NodeIdArgs { id }))
+            .get_node(Parameters(node_args(id)))
             .await
             .expect("get_node");
         let value = body(result);
@@ -469,7 +611,7 @@ mod tests {
     async fn get_node_missing_is_invalid_params() {
         let (mcp, _dir) = fresh();
         let err = mcp
-            .get_node(Parameters(NodeIdArgs { id: 999 }))
+            .get_node(Parameters(node_args(999)))
             .await
             .expect_err("missing node");
         assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
@@ -485,7 +627,7 @@ mod tests {
             .add_edge(a, b, "KNOWS", &json!({ "since": 2020 }))
             .expect("add edge");
         let value = body(
-            mcp.get_edge(Parameters(EdgeIdArgs { id: edge_id }))
+            mcp.get_edge(Parameters(edge_args(edge_id)))
                 .await
                 .expect("get_edge"),
         );
@@ -499,7 +641,7 @@ mod tests {
     async fn get_edge_missing_is_invalid_params() {
         let (mcp, _dir) = fresh();
         let err = mcp
-            .get_edge(Parameters(EdgeIdArgs { id: 999 }))
+            .get_edge(Parameters(edge_args(999)))
             .await
             .expect_err("missing edge");
         assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
@@ -635,6 +777,99 @@ mod tests {
         let hits = body(result);
         assert_eq!(hits.as_array().map(|a| a.len()), Some(1));
         assert_eq!(hits[0]["node"].as_u64(), Some(id));
+        // The hit is meaningful without a follow-up get_node call.
+        assert_eq!(hits[0]["label"], "Doc");
+        assert_eq!(hits[0]["property"], "body");
+        assert_eq!(hits[0]["value"], "the quick brown fox");
+    }
+
+    #[tokio::test]
+    async fn text_search_hit_value_is_truncated_with_marker() {
+        let (mcp, _dir) = fresh();
+        mcp.graph
+            .create_text_index("Doc", "body")
+            .expect("create index");
+        let long_body = format!("needle {}", "x".repeat(2000));
+        mcp.graph
+            .add_node("Doc", &json!({ "body": long_body }))
+            .expect("add doc");
+        let result = mcp
+            .text_search(Parameters(TextSearchArgs {
+                query: "needle".to_string(),
+                label: None,
+                property: None,
+                limit: 10,
+            }))
+            .await
+            .expect("text_search");
+        let hits = body(result);
+        let value = hits[0]["value"].as_str().expect("string value");
+        assert!(value.contains("[truncated,"), "got: {value}");
+        assert!(
+            value.chars().count() < 300,
+            "snippet must stay bounded, got {} chars",
+            value.chars().count()
+        );
+    }
+
+    #[tokio::test]
+    async fn get_node_truncates_long_string_properties_by_default() {
+        let (mcp, _dir) = fresh();
+        let long_text = "y".repeat(5000);
+        let id = mcp
+            .graph
+            .add_node("Doc", &json!({ "overview": long_text, "size": 7 }))
+            .expect("add doc");
+
+        let value = body(
+            mcp.get_node(Parameters(node_args(id)))
+                .await
+                .expect("get_node"),
+        );
+        let overview = value["props"]["overview"].as_str().expect("string");
+        assert!(
+            overview.contains("[truncated, 5000 chars total]"),
+            "got: {overview}"
+        );
+        assert!(overview.chars().count() < 2100, "cap must hold");
+        // Non-string values pass through untouched.
+        assert_eq!(value["props"]["size"], 7);
+
+        // An explicit cap of 0 returns the full value.
+        let value = body(
+            mcp.get_node(Parameters(NodeIdArgs {
+                id,
+                properties: None,
+                max_property_chars: Some(0),
+            }))
+            .await
+            .expect("get_node uncapped"),
+        );
+        assert_eq!(
+            value["props"]["overview"].as_str().map(str::len),
+            Some(5000)
+        );
+    }
+
+    #[tokio::test]
+    async fn get_node_selects_requested_properties() {
+        let (mcp, _dir) = fresh();
+        let id = mcp
+            .graph
+            .add_node("Doc", &json!({ "title": "t", "body": "b", "extra": 1 }))
+            .expect("add doc");
+        let value = body(
+            mcp.get_node(Parameters(NodeIdArgs {
+                id,
+                properties: Some(vec!["title".to_string()]),
+                max_property_chars: None,
+            }))
+            .await
+            .expect("get_node"),
+        );
+        let props = value["props"].as_object().expect("props object");
+        assert_eq!(props.len(), 1);
+        assert_eq!(props["title"], "t");
     }
 
     #[tokio::test]
@@ -661,6 +896,7 @@ mod tests {
         let hits = body(result);
         assert_eq!(hits.as_array().map(|a| a.len()), Some(1));
         assert_eq!(hits[0]["node"].as_u64(), Some(a));
+        assert_eq!(hits[0]["labels"], json!(["Person"]));
     }
 
     #[tokio::test]

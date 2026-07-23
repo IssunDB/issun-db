@@ -80,6 +80,6 @@ The temporal constructors `date`, `time`, `localtime`, `datetime`, `localdatetim
 
 ## Known Deviations
 
-- Integer division or modulo by zero returns null; Neo4j raises an arithmetic exception. Float division by zero follows IEEE 754 and produces NaN or infinity.
+- Integer division or modulo by zero raises an arithmetic error, matching Neo4j. Float division by zero follows IEEE 754 and produces NaN or infinity.
 - Temporal years are limited to roughly the range -262143 to 262143, narrower than the openCypher specification admits.
 - The openCypher TCK subset run (`make test-conformance`) tracks the remaining known gaps; failures there are documented deviations rather than silent wrong results.

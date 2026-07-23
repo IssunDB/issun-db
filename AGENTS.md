@@ -298,6 +298,8 @@ Full-text search crate. Owns tokenization, inverted index storage, ranking, and 
 `issundb-vector`, `issundb-retrieval`, `issundb-cypher`, bindings, or CLI crates.
 
 - `TextGraphExt::text_search(query, opts) -> Result<Vec<TextHit>, TextError>`
+- `TextHit` carries `node`, `score`, and the `label` and `property` of the text index that contributed the hit's largest partial score, so a caller
+  can read the matched field without a follow-up lookup.
 - `text_search` errors instead of returning a silent empty list when the request cannot match anything: an empty query (`EmptyQuery`), a label or
   property filter naming no active index (`LabelNotIndexed`, `PropertyNotIndexed`, or `IndexNotFound` for a pair), or a graph with no text indexes at
   all (`NoIndexes`).
@@ -407,7 +409,10 @@ HTTP 403.
 The tool surface is deliberately curated for an LLM agent: reads, queries, and retrieval only. Tools: `get_node`, `get_edge`, `cypher_query`,
 `explain`, `text_search`, `vector_search`, and `retrieve_hybrid`. There are no typed mutation tools: graph mutations are expressed as Cypher (
 `CREATE`,
-`SET`, `REMOVE`, `DELETE`, `MERGE`) through `cypher_query`. Index administration, vector loading, thread control, and backup/restore are operator
+`SET`, `REMOVE`, `DELETE`, `MERGE`) through `cypher_query`. The responses are bounded and self-describing for an agent consumer: `get_node` and
+`get_edge` truncate string property values at `max_property_chars` (default 2000) with an explicit marker and accept a `properties` selection list,
+`text_search` hits carry the matched label, property, and a bounded value excerpt, `vector_search` hits carry the node's labels, and
+`retrieve_hybrid` reports `truncated` when the `max_nodes` cap cut off expansion. Index administration, vector loading, thread control, and backup/restore are operator
 concerns driven through the CLI or the Python and REST surfaces. Keep this surface minimal: every additional tool dilutes the agent's tool selection.
 
 ### `issundb_py`
