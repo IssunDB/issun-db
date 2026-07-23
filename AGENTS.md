@@ -414,6 +414,10 @@ The tool surface is deliberately curated for an LLM agent: reads, queries, and r
 `text_search` hits carry the matched label, property, and a bounded value excerpt, `vector_search` hits carry the node's labels, and
 `retrieve_hybrid` reports `truncated` when the `max_nodes` cap cut off expansion. Index administration, vector loading, thread control, and backup/restore are operator
 concerns driven through the CLI or the Python and REST surfaces. Keep this surface minimal: every additional tool dilutes the agent's tool selection.
+`get_node` and `get_edge` take the internal engine id, the same value Cypher's `id(n)`/`id(r)` returns, never a domain property such as `Id`: the two
+live in separate numbering spaces and can collide, so passing a domain identifier straight to `get_node` silently returns the wrong,
+differently-labeled entity instead of erroring. The tool descriptions, argument docs, and server instructions all say this; resolve a domain
+identifier first with `MATCH (n:Label) WHERE n.Id = x RETURN id(n)`.
 
 ### `issundb_py`
 

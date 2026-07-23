@@ -126,7 +126,11 @@ fn truncate_marked(s: &str, max_chars: usize) -> String {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct NodeIdArgs {
-    /// Node identifier.
+    /// The internal engine node identifier, the same value Cypher's id(n)
+    /// returns and get_node's own response echoes back as "id". This is NOT a
+    /// domain property such as a node's Id field; those live in a separate
+    /// numbering space and collide with internal ids. To look up a node by a
+    /// domain property, run MATCH (n:Label) WHERE n.Id = x RETURN id(n) first.
     pub id: u64,
     /// Optional list of property names to return; other properties are left
     /// out of the response. Omit to return every property.
@@ -141,7 +145,10 @@ pub struct NodeIdArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct EdgeIdArgs {
-    /// Edge identifier.
+    /// The internal engine edge identifier, the same value Cypher's id(r)
+    /// returns and get_edge's own response echoes back as "id". This is NOT a
+    /// domain property; those live in a separate numbering space and collide
+    /// with internal ids.
     pub id: u64,
     /// Optional list of property names to return; other properties are left
     /// out of the response. Omit to return every property.
@@ -252,7 +259,7 @@ impl IssunMcp {
     }
 
     #[tool(
-        description = "Fetch a node by id; returning its labels and properties. String property values longer than max_property_chars (default 2000) are truncated with an explicit marker; pass a properties list to select specific properties, or max_property_chars 0 for full values."
+        description = "Fetch a node by its internal engine id (Cypher's id(n), not a domain property such as Id); returning its labels and properties. String property values longer than max_property_chars (default 2000) are truncated with an explicit marker; pass a properties list to select specific properties, or max_property_chars 0 for full values."
     )]
     async fn get_node(
         &self,
@@ -281,7 +288,7 @@ impl IssunMcp {
     }
 
     #[tool(
-        description = "Fetch an edge by id; returning its endpoints, type, and properties. String property values are bounded the same way as get_node."
+        description = "Fetch an edge by its internal engine id (Cypher's id(r), not a domain property); returning its endpoints, type, and properties. String property values are bounded the same way as get_node."
     )]
     async fn get_edge(
         &self,
@@ -526,7 +533,12 @@ impl ServerHandler for IssunMcp {
                  CREATE, SET, REMOVE, DELETE, or MERGE through cypher_query; there are no \
                  separate write, index-administration, or backup tools. Property comparisons \
                  in Cypher are strictly typed: c.Id = \"13836\" does not match an integer \
-                 property, use c.Id = 13836. Integer division by zero raises an error."
+                 property, use c.Id = 13836. Integer division by zero raises an error. \
+                 get_node and get_edge take the internal engine id (Cypher's id(n)/id(r)), \
+                 never a domain property like Id: the two live in separate numbering spaces \
+                 and can collide, so passing a domain Id straight to get_node can silently \
+                 return the wrong, differently-labeled entity. Resolve a domain identifier \
+                 first with MATCH (n:Label) WHERE n.Id = x RETURN id(n)."
                     .to_string(),
             ),
         }
