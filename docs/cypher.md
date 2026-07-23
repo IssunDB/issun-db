@@ -75,11 +75,16 @@ The temporal constructors `date`, `time`, `localtime`, `datetime`, `localdatetim
 
 - `SET n = {map}` and `SET n += {map}`: assign properties individually with `SET n.prop = value`.
 - `CALL { ... }` subqueries and `EXISTS { ... }` subqueries: `CALL` is procedure invocation only, and `exists()` is a scalar null check.
+- `shortestPath(...)` and `allShortestPaths(...)` pattern functions: use the `shortest_path` and `all_shortest_paths` methods on the `Graph` API instead.
 - Map projections (`n{.name, .age}`).
 - `MANDATORY MATCH`.
 
 ## Known Deviations
 
-- Integer division or modulo by zero raises an arithmetic error, matching Neo4j. Float division by zero follows IEEE 754 and produces NaN or infinity.
+- Integer division or modulo by zero raises an arithmetic error, matching Neo4j. Float division by zero follows IEEE 754: `0.0/0.0` is NaN and a
+  nonzero numerator over a zero denominator is +/-Infinity. Neither has a JSON number representation, so both are returned as a tagged sentinel
+  object (`{"__type__": "__NaN__"}`, `{"__type__": "__Infinity__"}`, or `{"__type__": "__-Infinity__"}`) rather than as a number or as `null`.
+- `=~` matches the entire string, per the openCypher spec: a bare pattern with no `^`/`$` (for example `=~ 'chris'`) matches only the exact string
+  `"chris"`, not any string that merely contains it.
 - Temporal years are limited to roughly the range -262143 to 262143, narrower than the openCypher specification admits.
 - The openCypher TCK subset run (`make test-conformance`) tracks the remaining known gaps; failures there are documented deviations rather than silent wrong results.

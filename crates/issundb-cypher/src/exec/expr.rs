@@ -1048,16 +1048,14 @@ pub(super) fn eval_arithmetic(
                     '+' => lf + rf,
                     '-' => lf - rf,
                     '*' => lf * rf,
-                    // Float division/modulo by zero → NaN (IEEE 754), not null.
+                    // Float division/modulo by zero follows IEEE 754: 0.0/0.0
+                    // is NaN, a nonzero numerator over a zero denominator is
+                    // +/-Infinity. `float_result` turns both into a sentinel,
+                    // since neither has a `serde_json::Number` representation.
                     '/' => lf / rf,
                     '%' => lf % rf,
                     _ => return Ok(serde_json::Value::Null),
                 };
-                // f64::NAN and f64::INFINITY cannot be stored in serde_json::Number;
-                // represent NaN as a sentinel object.
-                if result.is_nan() {
-                    return Ok(nan_value());
-                }
                 return Ok(float_result(result));
             }
             Ok(serde_json::Value::Null)
@@ -1914,7 +1912,13 @@ pub(super) fn eval_function_call<B: Bindings>(
             }
             let text = left.as_str().unwrap_or("");
             let pattern = right.as_str().unwrap_or("");
-            let re = regex::Regex::new(pattern).map_err(|e| format!("invalid regex: {e}"))?;
+            // openCypher =~ matches the entire string, not an unanchored
+            // substring; `regex::Regex::is_match` searches anywhere in the
+            // haystack by default, so the pattern must be anchored. `\A`/`\z`
+            // anchor to the true start/end regardless of multiline mode,
+            // unlike `^`/`$`.
+            let anchored = format!(r"\A(?:{pattern})\z");
+            let re = regex::Regex::new(&anchored).map_err(|e| format!("invalid regex: {e}"))?;
             Ok(serde_json::Value::Bool(re.is_match(text)))
         }
         "sqrt" => {
@@ -4905,12 +4909,16 @@ pub(super) fn literal_to_value(l: &Literal) -> serde_json::Value {
     }
 }
 
-/// Convert an f64 computation result to a JSON value: NaN becomes the
-/// sentinel object (JSON numbers cannot hold it), and infinities, which the
-/// sentinel does not cover, become null.
+/// Convert an f64 computation result to a JSON value: NaN and the two
+/// infinities become distinct sentinel objects, since none of the three has a
+/// `serde_json::Number` representation. Collapsing an infinity to `null`
+/// would make it indistinguishable from a genuinely missing value.
 pub(super) fn float_result(f: f64) -> serde_json::Value {
     if f.is_nan() {
         return nan_value();
+    }
+    if f.is_infinite() {
+        return infinity_value(f.is_sign_negative());
     }
     serde_json::Number::from_f64(f)
         .map(serde_json::Value::Number)
@@ -4946,6 +4954,24 @@ pub(super) fn is_nan(v: &serde_json::Value) -> bool {
         .and_then(|m| m.get("__type__"))
         .and_then(|t| t.as_str())
         .is_some_and(|s| s == "__NaN__")
+}
+
+/// Sentinel JSON object used to represent IEEE 754 positive or negative
+/// infinity (mirrors `nan_value`).
+pub(super) fn infinity_value(negative: bool) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    m.insert(
+        "__type__".to_string(),
+        serde_json::Value::String(
+            if negative {
+                "__-Infinity__"
+            } else {
+                "__Infinity__"
+            }
+            .to_string(),
+        ),
+    );
+    serde_json::Value::Object(m)
 }
 
 pub(super) fn cypher_eq(lv: &serde_json::Value, rv: &serde_json::Value) -> serde_json::Value {

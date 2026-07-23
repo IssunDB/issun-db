@@ -1584,6 +1584,33 @@ mod tests {
         assert_eq!(res.records.len(), 1);
     }
 
+    /// Float division by zero that yields +/-Infinity must not serialize as
+    /// JSON null: that would be indistinguishable from a genuinely missing
+    /// value. It gets a distinct sentinel, mirroring how NaN (right next to
+    /// it, `0.0 / 0.0`) is already represented.
+    #[test]
+    fn float_division_by_zero_infinity_is_not_null() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+
+        let res = execute(&graph, "RETURN 1.0 / 0.0 AS v", &params).unwrap();
+        let v = &res.records[0].values[0];
+        assert_ne!(*v, serde_json::Value::Null, "got: {v:?}");
+        assert_eq!(v["__type__"], "__Infinity__", "got: {v:?}");
+
+        let res = execute(&graph, "RETURN -1.0 / 0.0 AS v", &params).unwrap();
+        let v = &res.records[0].values[0];
+        assert_ne!(*v, serde_json::Value::Null, "got: {v:?}");
+        assert_eq!(v["__type__"], "__-Infinity__", "got: {v:?}");
+
+        // The two signs must not collide with each other or with NaN.
+        let pos = execute(&graph, "RETURN 1.0 / 0.0 AS v", &params).unwrap();
+        let neg = execute(&graph, "RETURN -1.0 / 0.0 AS v", &params).unwrap();
+        let nan = execute(&graph, "RETURN 0.0 / 0.0 AS v", &params).unwrap();
+        assert_ne!(pos.records[0].values[0], neg.records[0].values[0]);
+        assert_ne!(pos.records[0].values[0], nan.records[0].values[0]);
+    }
+
     #[test]
     fn call_procedure_standalone_and_in_query() {
         use crate::procedure::{CypherType, Procedure, ProcedureRegistry};
@@ -3777,6 +3804,26 @@ mod tests {
         .unwrap();
         assert_eq!(result.records.len(), 1);
         assert_eq!(result.records[0].values[0].as_str().unwrap(), "Alice");
+    }
+
+    /// `=~` matches the entire string per the openCypher spec, not an
+    /// unanchored substring; a bare pattern with no `^`/`$` must not match a
+    /// value that merely contains it somewhere.
+    #[test]
+    fn regex_match_is_anchored_to_the_whole_string() {
+        let (_dir, graph) = setup_graph();
+        let params = HashMap::new();
+        execute(&graph, "CREATE (n:Person {name: 'chris'})", &params).unwrap();
+        execute(&graph, "CREATE (n:Person {name: 'brotherchris'})", &params).unwrap();
+
+        let result = execute(
+            &graph,
+            "MATCH (n:Person) WHERE n.name =~ 'chris' RETURN n.name AS name",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(result.records.len(), 1);
+        assert_eq!(result.records[0].values[0].as_str().unwrap(), "chris");
     }
 
     // --- Feature 8: Statistical Aggregation Functions ---

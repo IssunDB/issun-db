@@ -264,7 +264,7 @@ The supported query language surface is documented on the [Cypher Support](cyphe
 
 ### Query Results and Errors
 
-A query returns a `QueryResult` with `columns: Vec<String>` and `records: Vec<Record>`; each `Record` holds `values: Vec<serde_json::Value>` aligned row-major with the columns. Nodes and relationships project as JSON objects, and missing values project as JSON null.
+A query returns a `QueryResult` with `columns: Vec<String>` and `records: Vec<Record>`; each `Record` holds `values: Vec<serde_json::Value>` aligned row-major with the columns. Nodes and relationships project as JSON objects, and missing values project as JSON null. NaN and the two infinities have no JSON number representation, so a float result never collapses them to `null` (indistinguishable from a missing value); each projects as a tagged sentinel object instead: `{"__type__": "__NaN__"}`, `{"__type__": "__Infinity__"}`, or `{"__type__": "__-Infinity__"}`.
 
 Each layer has one error type, and all of them implement `std::error::Error`: `Error` for storage and domain failures (including the `NodeNotFound` and `EdgeNotFound` variants), `CypherError` for parse, plan, and execution failures, `VectorError` for vector index failures (including `AlreadyConfigured` and `DimensionMismatch`), `TextError` for full-text index failures, and `RetrievalError` for hybrid retrieval failures.
 

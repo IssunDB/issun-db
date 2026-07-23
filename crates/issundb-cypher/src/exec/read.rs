@@ -3912,19 +3912,14 @@ impl AggState {
                 if !state.sum_is_float {
                     serde_json::Value::Number(state.sum_int.into())
                 } else {
-                    serde_json::Number::from_f64(state.sum)
-                        .map(serde_json::Value::Number)
-                        .unwrap_or(serde_json::Value::Null)
+                    float_result(state.sum)
                 }
             }
             AggFn::Avg { .. } => {
                 if state.count == 0 {
                     serde_json::Value::Null
                 } else {
-                    let avg = state.sum / state.count as f64;
-                    serde_json::Number::from_f64(avg)
-                        .map(serde_json::Value::Number)
-                        .unwrap_or(serde_json::Value::Null)
+                    float_result(state.sum / state.count as f64)
                 }
             }
             AggFn::Min { .. } => state.min.clone().unwrap_or(serde_json::Value::Null),
@@ -3941,9 +3936,7 @@ impl AggState {
                     let mean = state.values.iter().sum::<f64>() / n as f64;
                     let variance = state.values.iter().map(|x| (x - mean).powi(2)).sum::<f64>()
                         / (n - 1) as f64;
-                    serde_json::Number::from_f64(variance.sqrt())
-                        .map(serde_json::Value::Number)
-                        .unwrap_or(serde_json::Value::Null)
+                    float_result(variance.sqrt())
                 }
             }
             AggFn::StDevP { .. } => {
@@ -3957,9 +3950,7 @@ impl AggState {
                     let mean = state.values.iter().sum::<f64>() / n as f64;
                     let variance =
                         state.values.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n as f64;
-                    serde_json::Number::from_f64(variance.sqrt())
-                        .map(serde_json::Value::Number)
-                        .unwrap_or(serde_json::Value::Null)
+                    float_result(variance.sqrt())
                 }
             }
             AggFn::PercentileDisc { percentile } => {
@@ -3981,9 +3972,7 @@ impl AggState {
                     let idx = ((percentile * n as f64).ceil() as usize)
                         .saturating_sub(1)
                         .min(n - 1);
-                    serde_json::Number::from_f64(sorted[idx])
-                        .map(serde_json::Value::Number)
-                        .unwrap_or(serde_json::Value::Null)
+                    float_result(sorted[idx])
                 }
             }
             AggFn::PercentileCont { percentile } => {
@@ -4007,9 +3996,7 @@ impl AggState {
                     let upper = rank.ceil() as usize;
                     let frac = rank - lower as f64;
                     let val = sorted[lower] + frac * (sorted[upper.min(n - 1)] - sorted[lower]);
-                    serde_json::Number::from_f64(val)
-                        .map(serde_json::Value::Number)
-                        .unwrap_or(serde_json::Value::Null)
+                    float_result(val)
                 }
             }
         })
