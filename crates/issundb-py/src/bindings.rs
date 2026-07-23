@@ -13,9 +13,9 @@ use std::path::Path;
 use std::str::FromStr;
 
 use issundb::{
-    FusionStrategy, Graph, GraphQueryExt, HybridRetrieveOptions, Language, TextGraphExt,
-    TextIndexExt, TextSearchOptions, VectorGraphExt, VectorIndexOptions, VectorMetric,
-    VectorQuantization, VectorSearchOptions, retrieve_hybrid,
+    FusionStrategy, Graph, GraphQueryExt, HybridRetrieveOptions, Language, RetrievalError,
+    TextGraphExt, TextIndexExt, TextSearchOptions, VectorGraphExt, VectorIndexOptions,
+    VectorMetric, VectorQuantization, VectorSearchOptions, retrieve_hybrid,
 };
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -401,7 +401,11 @@ impl PyGraph {
         let vector = vector.unwrap_or_default();
         let text_query = text_query.unwrap_or_default();
         py.detach(|| {
-            let subgraph = retrieve_hybrid(&self.graph, &vector, &text_query, &opts).map_err(rt)?;
+            let subgraph =
+                retrieve_hybrid(&self.graph, &vector, &text_query, &opts).map_err(|e| match e {
+                    e @ RetrievalError::NoQuery => val(e),
+                    other => rt(other),
+                })?;
             let scores: HashMap<String, f32> = subgraph
                 .scores
                 .into_iter()
@@ -411,6 +415,7 @@ impl PyGraph {
                 "nodes": subgraph.nodes,
                 "edges": subgraph.edges,
                 "scores": scores,
+                "truncated": subgraph.truncated,
             });
             serde_json::to_string(&value).map_err(rt)
         })

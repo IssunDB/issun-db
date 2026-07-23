@@ -194,9 +194,10 @@ The index is configured through `VectorIndexOptions`, which holds a `VectorMetri
 - `VectorGraphExt::remove_vector(n: NodeId) -> Result<(), VectorError>`  
   Removes the embedding for a node from both the index and storage.
 - `VectorGraphExt::vector_search(q: &[f32], k: usize) -> Result<Vec<Hit>, VectorError>`  
-  Retrieves the top-k nearest neighbor nodes matching the query vector.
+  Retrieves the top-k nearest neighbor nodes matching the query vector. Searching a graph with no stored embeddings returns
+  `VectorError::EmptyIndex` rather than an empty hit list.
 - `VectorGraphExt::vector_search_with(q: &[f32], opts: &VectorSearchOptions) -> Result<Vec<Hit>, VectorError>`  
-  Retrieves the top-k nearest neighbor nodes satisfying label and property filters.
+  Retrieves the top-k nearest neighbor nodes satisfying label and property filters. Errors like `vector_search` on a graph with no embeddings.
 - `VectorGraphExt::node_vector(n: NodeId) -> Result<Option<Vec<f32>>, VectorError>`  
   Returns the full-precision embedding stored for a node, or `None` if the node has no embedding. This performs an LMDB point lookup and does not build or consult the in-memory HNSW index.
 - `VectorGraphExt::vector_distance(a: &[f32], b: &[f32]) -> Result<f32, VectorError>`  
@@ -223,7 +224,8 @@ Stemming and stop words are language-aware. `create_text_index` uses English; `c
 - `TextIndexExt::list_text_indexes() -> Result<Vec<(String, String, Language)>, TextError>`  
   Lists all active full-text search indexes in the database.
 - `TextGraphExt::text_search(query: &str, opts: &TextSearchOptions) -> Result<Vec<TextHit>, TextError>`  
-  Queries indexed text fields and ranks matching nodes using BM25 scoring.
+  Queries indexed text fields and ranks matching nodes using BM25 scoring. A request that cannot match anything errors instead of returning an empty
+  list: an empty query, a label or property filter naming no active index, or a graph with no text indexes at all.
 
 ---
 
@@ -236,7 +238,11 @@ Hybrid retrieval functions combine vector search and full-text keyword search wi
 - `retrieve_with(graph: &Graph, q: &[f32], opts: &RetrieveOptions) -> Result<Subgraph, RetrievalError>`  
   Runs a vector search to find seeds with fine-grained control over distance and traversal limits.
 - `retrieve_hybrid(graph: &Graph, q: &[f32], text_query: &str, opts: &HybridRetrieveOptions) -> Result<Subgraph, RetrievalError>`  
-  Merges seed nodes from vector and full-text keyword searches, fuses their scores, and performs a GraphBLAS multi-source expansion.
+  Merges seed nodes from vector and full-text keyword searches, fuses their scores, and performs a GraphBLAS multi-source expansion. When neither
+  search would run (both inputs empty or both k values zero) it returns `RetrievalError::NoQuery`.
+
+The returned `Subgraph` carries `nodes`, `edges`, `scores`, and `truncated`. The `truncated` flag is true when the `max_nodes` cap cut off seeds or
+expansion, so missing edges in a capped result do not mean the returned nodes are unconnected.
 
 ---
 

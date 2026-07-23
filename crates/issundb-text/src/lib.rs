@@ -14,6 +14,18 @@ pub enum TextError {
 
     #[error("index not found for label {label} and property {property}")]
     IndexNotFound { label: String, property: String },
+
+    #[error("no text index found for label {label}")]
+    LabelNotIndexed { label: String },
+
+    #[error("no text index found for property {property}")]
+    PropertyNotIndexed { property: String },
+
+    #[error("no text indexes exist in this graph")]
+    NoIndexes,
+
+    #[error("text query must not be empty")]
+    EmptyQuery,
 }
 
 /// A single ranked full-text search result.
@@ -419,6 +431,10 @@ impl TextGraphExt for Graph {
         query: &str,
         opts: &TextSearchOptions,
     ) -> Result<Vec<TextHit>, TextError> {
+        if query.trim().is_empty() {
+            return Err(TextError::EmptyQuery);
+        }
+
         let bm25_default = Bm25Scorer::default();
         let scorer: &dyn Scorer = opts
             .scorer
@@ -455,6 +471,21 @@ impl TextGraphExt for Graph {
                 if matches_label && matches_prop {
                     active_indices.push((label, property, lang));
                 }
+            }
+            // A filter that matches no active index is an error, not an empty
+            // result: a typo in the label or property would otherwise be
+            // indistinguishable from "no documents matched". This mirrors the
+            // label-plus-property branch above, which errors on an unknown pair.
+            if active_indices.is_empty() {
+                return Err(match (&opts.label, &opts.property) {
+                    (Some(label), _) => TextError::LabelNotIndexed {
+                        label: label.clone(),
+                    },
+                    (None, Some(property)) => TextError::PropertyNotIndexed {
+                        property: property.clone(),
+                    },
+                    (None, None) => TextError::NoIndexes,
+                });
             }
         }
 
@@ -667,6 +698,73 @@ mod tests {
         );
         // The over-long token was skipped, so it finds nothing (no crash).
         assert!(graph.text_search(&long_token, &opts)?.is_empty());
+        Ok(())
+    }
+
+    /// Silent-empty guards: a filter naming no active index, a graph with no
+    /// text indexes, and an empty query string all error instead of returning
+    /// an empty hit list an agent would read as "nothing matched".
+    #[test]
+    fn text_search_unknown_label_filter_is_an_error() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TempDir::new()?;
+        let graph = Graph::open(temp.path(), 1)?;
+        graph.create_node_text_index("Doc", "body")?;
+        graph.add_node("Doc", &json!({ "body": "cassava leaf disease" }))?;
+
+        let opts = TextSearchOptions {
+            label: Some("NoSuchLabel".to_string()),
+            limit: 5,
+            ..Default::default()
+        };
+        let err = graph.text_search("cassava", &opts).unwrap_err();
+        assert!(
+            matches!(err, TextError::LabelNotIndexed { ref label } if label == "NoSuchLabel"),
+            "got {err:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn text_search_unknown_property_filter_is_an_error() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TempDir::new()?;
+        let graph = Graph::open(temp.path(), 1)?;
+        graph.create_node_text_index("Doc", "body")?;
+
+        let opts = TextSearchOptions {
+            property: Some("nope".to_string()),
+            limit: 5,
+            ..Default::default()
+        };
+        let err = graph.text_search("cassava", &opts).unwrap_err();
+        assert!(
+            matches!(err, TextError::PropertyNotIndexed { ref property } if property == "nope"),
+            "got {err:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn text_search_without_any_index_is_an_error() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TempDir::new()?;
+        let graph = Graph::open(temp.path(), 1)?;
+        let err = graph
+            .text_search("cassava", &TextSearchOptions::default())
+            .unwrap_err();
+        assert!(matches!(err, TextError::NoIndexes), "got {err:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn text_search_empty_query_is_an_error() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TempDir::new()?;
+        let graph = Graph::open(temp.path(), 1)?;
+        graph.create_node_text_index("Doc", "body")?;
+        for query in ["", "   "] {
+            let err = graph
+                .text_search(query, &TextSearchOptions::default())
+                .unwrap_err();
+            assert!(matches!(err, TextError::EmptyQuery), "got {err:?}");
+        }
         Ok(())
     }
 

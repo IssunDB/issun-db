@@ -284,6 +284,8 @@ Vector search crate. Owns vector index abstractions, vector metadata, vector sto
   index from the persisted embeddings. The stored vectors are raw, metric-agnostic f32, so they re-index under any metric; this is O(n) and is an
   administrative operation, not a concurrent one.
 - `VectorGraphExt::upsert_vector(n, v) -> Result<(), VectorError>`
+- Searching a graph with no stored embeddings returns `VectorError::EmptyIndex` rather than an empty hit list, so a caller can distinguish "no
+  semantic matches" from "there is nothing to search". The Cypher `VectorTopK` operator maps that error to zero rows, keeping MATCH semantics.
 - `VectorGraphExt::remove_vector(n) -> Result<(), VectorError>`: removes the embedding from both memory and storage.
 - `VectorGraphExt::vector_search(q, k) -> Result<Vec<Hit>, VectorError>`
 - `VectorGraphExt::vector_search_with(q, opts) -> Result<Vec<Hit>, VectorError>`: adds an exact-label filter and property equality filters (both
@@ -296,6 +298,9 @@ Full-text search crate. Owns tokenization, inverted index storage, ranking, and 
 `issundb-vector`, `issundb-retrieval`, `issundb-cypher`, bindings, or CLI crates.
 
 - `TextGraphExt::text_search(query, opts) -> Result<Vec<TextHit>, TextError>`
+- `text_search` errors instead of returning a silent empty list when the request cannot match anything: an empty query (`EmptyQuery`), a label or
+  property filter naming no active index (`LabelNotIndexed`, `PropertyNotIndexed`, or `IndexNotFound` for a pair), or a graph with no text indexes at
+  all (`NoIndexes`).
 - `TextIndexExt::create_text_index(label, property) -> Result<(), TextError>`
 - `TextIndexExt::create_text_index_with_language(label, property, lang) -> Result<(), TextError>`
 - `TextIndexExt::drop_text_index(label, property) -> Result<(), TextError>`
@@ -310,8 +315,10 @@ retrieve functions are free functions, not methods on `Graph`, to preserve the c
 - `retrieve(graph, q, k, hops) -> Result<Subgraph, RetrievalError>`
 - `retrieve_with(graph, q, opts) -> Result<Subgraph, RetrievalError>`
 - `retrieve_hybrid(graph, q, text_query, opts) -> Result<Subgraph, RetrievalError>`: fuses vector and text search seed relevance scores before running
-  expansion.
-- `Subgraph`: `nodes: Vec<NodeId>`, `edges: Vec<EdgeId>`, `scores: HashMap<NodeId, f32>`
+  expansion. When neither modality would run (both inputs empty or both k values zero) it returns `RetrievalError::NoQuery` instead of a silently
+  empty subgraph.
+- `Subgraph`: `nodes: Vec<NodeId>`, `edges: Vec<EdgeId>`, `scores: HashMap<NodeId, f32>`, and `truncated: bool` (true when the `max_nodes` cap cut
+  off seeds or expansion, so a capped result is distinguishable from a complete one)
 - `RetrieveOptions`: `k`, `hops`, `max_distance`, `max_nodes`
 - `HybridRetrieveOptions`: `vector_k`, `text_k`, `text_label`, `text_property`, `hops`, `max_distance`, `max_nodes`, `vector_label`, `fusion`
 - `FusionStrategy`: reciprocal rank fusion (`Rrf { k }`) or linear combination (`WeightedSum { vector_weight, text_weight }`)

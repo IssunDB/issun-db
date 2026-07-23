@@ -8,8 +8,9 @@ use axum::{
     routing::{delete, get, post, put},
 };
 use issundb::{
-    CypherError, FusionStrategy, Graph, GraphQueryExt, HybridRetrieveOptions, TextGraphExt,
-    TextSearchOptions, VectorGraphExt, VectorSearchOptions, retrieve_hybrid,
+    CypherError, FusionStrategy, Graph, GraphQueryExt, HybridRetrieveOptions, RetrievalError,
+    TextError, TextGraphExt, TextSearchOptions, VectorError, VectorGraphExt, VectorSearchOptions,
+    retrieve_hybrid,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -304,6 +305,9 @@ pub struct RetrieveResponse {
     pub edges: Vec<u64>,
     /// Fused relevance score per node id.
     pub scores: HashMap<u64, f32>,
+    /// True when the max_nodes cap cut off seeds or expansion, so missing
+    /// edges do not mean the returned nodes are unconnected.
+    pub truncated: bool,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -692,6 +696,7 @@ struct TextHitResponse {
     request_body = TextSearchBody,
     responses(
         (status = 200, description = "Ranked text hits", body = [TextHitResponse]),
+        (status = 400, description = "Empty query, or a label or property filter matching no text index", body = ErrorResponse),
         (status = 500, description = "Storage error", body = ErrorResponse),
     ),
 )]
@@ -717,7 +722,10 @@ pub async fn search_text(
                     .collect();
                 (StatusCode::OK, Json(json!(response))).into_response()
             }
-            Err(e) => internal(e).into_response(),
+            // Every non-storage text error (unknown label or property filter,
+            // no indexes, empty query) is a problem with the request.
+            Err(TextError::Core(e)) => internal(e).into_response(),
+            Err(e) => bad_request(e).into_response(),
         }
     }))
     .await
@@ -735,7 +743,7 @@ struct VectorHitResponse {
     request_body = VectorSearchBody,
     responses(
         (status = 200, description = "Nearest neighbors by distance", body = [VectorHitResponse]),
-        (status = 400, description = "Empty query vector", body = ErrorResponse),
+        (status = 400, description = "Empty query vector, dimension mismatch, or no stored embeddings", body = ErrorResponse),
         (status = 500, description = "Storage error", body = ErrorResponse),
     ),
 )]
@@ -763,6 +771,9 @@ pub async fn search_vector(
                     })
                     .collect();
                 (StatusCode::OK, Json(json!(response))).into_response()
+            }
+            Err(e @ (VectorError::EmptyIndex | VectorError::DimensionMismatch { .. })) => {
+                bad_request(e).into_response()
             }
             Err(e) => internal(e).into_response(),
         }
@@ -811,7 +822,7 @@ pub async fn upsert_vector(
     request_body = HybridRetrieveBody,
     responses(
         (status = 200, description = "Induced subgraph with fused scores", body = RetrieveResponse),
-        (status = 400, description = "Invalid fusion strategy", body = ErrorResponse),
+        (status = 400, description = "Invalid fusion strategy, no query input, or an invalid search filter", body = ErrorResponse),
         (status = 500, description = "Storage error", body = ErrorResponse),
     ),
 )]
@@ -844,9 +855,16 @@ pub async fn retrieve(
                     "nodes": subgraph.nodes,
                     "edges": subgraph.edges,
                     "scores": subgraph.scores,
+                    "truncated": subgraph.truncated,
                 })),
             )
                 .into_response(),
+            Err(e @ RetrievalError::NoQuery) => bad_request(e).into_response(),
+            Err(RetrievalError::Vector(
+                e @ (VectorError::EmptyIndex | VectorError::DimensionMismatch { .. }),
+            )) => bad_request(e).into_response(),
+            Err(RetrievalError::Text(TextError::Core(e))) => internal(e).into_response(),
+            Err(RetrievalError::Text(e)) => bad_request(e).into_response(),
             Err(e) => internal(e).into_response(),
         }
     }))

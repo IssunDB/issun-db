@@ -1624,10 +1624,15 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
                 match retrieve_hybrid(g, &query, &text_query, &opts) {
                     Ok(sub) => {
                         println!(
-                            "{} node(s), {} edge(s), {} seed(s)",
+                            "{} node(s), {} edge(s), {} seed(s){}",
                             sub.nodes.len(),
                             sub.edges.len(),
-                            sub.scores.len()
+                            sub.scores.len(),
+                            if sub.truncated {
+                                " (truncated by the node cap)"
+                            } else {
+                                ""
+                            }
                         );
                         let mut seeds: Vec<_> = sub.scores.iter().collect();
                         seeds.sort_unstable_by(|a, b| b.1.total_cmp(a.1));

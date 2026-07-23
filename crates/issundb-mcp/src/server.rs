@@ -1,8 +1,9 @@
 use std::{collections::HashMap, sync::Arc};
 
 use issundb::{
-    FusionStrategy, Graph, GraphQueryExt, HybridRetrieveOptions, TextGraphExt, TextSearchOptions,
-    VectorGraphExt, VectorSearchOptions, retrieve_hybrid,
+    FusionStrategy, Graph, GraphQueryExt, HybridRetrieveOptions, RetrievalError, TextError,
+    TextGraphExt, TextSearchOptions, VectorError, VectorGraphExt, VectorSearchOptions,
+    retrieve_hybrid,
 };
 use rmcp::{
     ErrorData as McpError, ServerHandler,
@@ -259,7 +260,13 @@ impl IssunMcp {
                 limit: args.limit,
                 ..Default::default()
             };
-            let hits = graph.text_search(&args.query, &opts).map_err(internal)?;
+            // Every non-storage text error (unknown label or property filter,
+            // no indexes, empty query) is a problem with the request, not the
+            // server, so it surfaces as invalid params.
+            let hits = graph.text_search(&args.query, &opts).map_err(|e| match e {
+                TextError::Core(err) => internal(err),
+                other => invalid(other),
+            })?;
             let response: Vec<Value> = hits
                 .iter()
                 .map(|h| json!({ "node": h.node, "score": h.score }))
@@ -290,7 +297,12 @@ impl IssunMcp {
             };
             let hits = graph
                 .vector_search_with(&args.vector, &opts)
-                .map_err(internal)?;
+                .map_err(|e| match e {
+                    e @ (VectorError::EmptyIndex | VectorError::DimensionMismatch { .. }) => {
+                        invalid(e)
+                    }
+                    other => internal(other),
+                })?;
             let response: Vec<Value> = hits
                 .iter()
                 .map(|h| json!({ "node": h.node, "distance": h.distance }))
@@ -302,7 +314,7 @@ impl IssunMcp {
     }
 
     #[tool(
-        description = "Execute a hybrid retrieval query that combines vector/semantic search, full-text keyword search, and relationship expansion."
+        description = "Execute a hybrid retrieval query that combines vector/semantic search, full-text keyword search, and relationship expansion. At least one of text_query or vector is required. The truncated flag in the result is true when the max_nodes cap cut off seeds or expansion, so missing edges do not mean the nodes are unconnected."
     )]
     async fn retrieve_hybrid(
         &self,
@@ -343,12 +355,26 @@ impl IssunMcp {
         let graph = self.graph.clone();
         tokio::task::spawn_blocking(move || {
             let subgraph =
-                retrieve_hybrid(&graph, &vector, &text_query, &opts).map_err(internal)?;
+                retrieve_hybrid(&graph, &vector, &text_query, &opts).map_err(|e| match e {
+                    e @ RetrievalError::NoQuery => invalid(e),
+                    RetrievalError::Vector(err) => match err {
+                        e @ (VectorError::EmptyIndex | VectorError::DimensionMismatch { .. }) => {
+                            invalid(e)
+                        }
+                        other => internal(other),
+                    },
+                    RetrievalError::Text(err) => match err {
+                        TextError::Core(err) => internal(err),
+                        other => invalid(other),
+                    },
+                    other => internal(other),
+                })?;
 
             ok_json(json!({
                 "nodes": subgraph.nodes,
                 "edges": subgraph.edges,
                 "scores": subgraph.scores,
+                "truncated": subgraph.truncated,
             }))
         })
         .await

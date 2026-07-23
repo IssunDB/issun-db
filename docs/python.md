@@ -164,7 +164,7 @@ Here is a quick reference of the methods available on the `IssunDB` class:
 * `has_text_index(label: str, property: str) -> bool`: Checks whether a full-text search index exists for a label and property.
 * `list_text_indexes() -> str`: Returns a JSON list of active full-text search indexes.
 * `text_search(query: str, label: Optional[str] = None, property: Optional[str] = None, limit: int = 10) -> str`: Performs keyword text search.
-* `retrieve_hybrid(vector: Optional[List[float]] = None, text_query: Optional[str] = None, vector_k: int = 10, text_k: int = 10, text_label: Optional[str] = None, text_property: Optional[str] = None, vector_label: Optional[str] = None, hops: int = 2, max_distance: Optional[float] = None, max_nodes: Optional[int] = None, fusion_strategy: str = "rrf", rrf_k: int = 60, vector_weight: float = 0.5, text_weight: float = 0.5) -> str`: Runs a hybrid search and neighborhood expansion, returning a JSON-encoded subgraph.
+* `retrieve_hybrid(vector: Optional[List[float]] = None, text_query: Optional[str] = None, vector_k: int = 10, text_k: int = 10, text_label: Optional[str] = None, text_property: Optional[str] = None, vector_label: Optional[str] = None, hops: int = 2, max_distance: Optional[float] = None, max_nodes: Optional[int] = None, fusion_strategy: str = "rrf", rrf_k: int = 60, vector_weight: float = 0.5, text_weight: float = 0.5) -> str`: Runs a hybrid search and neighborhood expansion, returning a JSON-encoded subgraph with `nodes`, `edges`, `scores`, and a `truncated` flag that is true when `max_nodes` cut off seeds or expansion. Raises `ValueError` when neither `vector` nor `text_query` is given.
 
 ### Maintenance and Backups
 

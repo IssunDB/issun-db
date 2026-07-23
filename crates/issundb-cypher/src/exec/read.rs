@@ -4721,9 +4721,13 @@ pub(super) fn eval_leaf(
                 properties,
                 rescore_factor: None,
             };
-            let hits = graph
-                .vector_search_with(&q, &opts)
-                .map_err(|e| e.to_string())?;
+            // An empty vector index yields zero rows under Cypher MATCH
+            // semantics; the hard error is for the imperative search surfaces.
+            let hits = match graph.vector_search_with(&q, &opts) {
+                Ok(hits) => hits,
+                Err(issundb_vector::VectorError::EmptyIndex) => Vec::new(),
+                Err(e) => return Err(e.to_string()),
+            };
             let mut out = Vec::with_capacity(hits.len());
             for hit in hits {
                 let mut path = SlotRow::empty(schema.clone());

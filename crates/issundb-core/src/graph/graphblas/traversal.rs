@@ -86,14 +86,18 @@ impl Graph {
     /// Multi-source BFS via repeated SpMV over the combined adjacency using the MinPlus semiring.
     ///
     /// The `max_nodes` cap is applied both during seed seeding and during SpMV
-    /// expansion so that the returned slice never exceeds the cap.
+    /// expansion so that the returned slice never exceeds the cap. The second
+    /// element of the returned pair is true when the cap cut off seeds or
+    /// frontier nodes that were still reachable, so a capped result is
+    /// distinguishable from an exhaustively explored one. Exhausting `hops`
+    /// with frontier remaining is the requested depth, not truncation.
     #[doc(hidden)]
     pub fn bfs_multi_source_graphblas(
         &self,
         seeds: &[NodeId],
         hops: u8,
         max_nodes: Option<usize>,
-    ) -> Result<Vec<NodeId>, Error> {
+    ) -> Result<(Vec<NodeId>, bool), Error> {
         use issundb_graphblas::{Descriptor, Monoid, Semiring, Vector, ewise_add, mxv};
 
         self.ensure_matrix_view()?;
@@ -101,33 +105,40 @@ impl Graph {
         let guard = self.matrices.read();
         let m = match guard.as_ref() {
             Some(m) => m,
-            None => return Ok(vec![]),
+            None => return Ok((vec![], false)),
         };
         let n = m.n_nodes;
         if seeds.is_empty() || n == 0 {
-            return Ok(vec![]);
+            return Ok((vec![], false));
         }
 
         // level[d] = BFS hop count to dense node d; absent = not yet reached.
         let mut level = Vector::<i32>::new(m.context.clone(), n)
             .map_err(|e| Error::GraphBLAS(e.to_string()))?;
 
-        // Seed the level vector.
-        let mut seeds_added: usize = 0;
+        // Seed the level vector. Duplicate seeds count once, so the cap and the
+        // truncation flag reflect distinct nodes.
+        let mut truncated = false;
+        let mut seeded: std::collections::HashSet<usize> = std::collections::HashSet::new();
         for &start in seeds {
-            if max_nodes.is_some_and(|max| seeds_added >= max) {
-                break;
-            }
             if let Some(&d) = m.id_to_dense.get(&start) {
+                let d = d as usize;
+                if seeded.contains(&d) {
+                    continue;
+                }
+                if max_nodes.is_some_and(|max| seeded.len() >= max) {
+                    truncated = true;
+                    break;
+                }
                 level
-                    .set(d as usize, 0)
+                    .set(d, 0)
                     .map_err(|e| Error::GraphBLAS(e.to_string()))?;
-                seeds_added += 1;
+                seeded.insert(d);
             }
         }
 
-        if seeds_added == 0 {
-            return Ok(vec![]);
+        if seeded.is_empty() {
+            return Ok((vec![], false));
         }
 
         // Transpose A so product[j] = min_i(A[i][j] + level[i]) = min incoming hop + 1.
@@ -159,9 +170,11 @@ impl Graph {
 
             if let Some(max) = max_nodes {
                 if current_count >= max {
+                    truncated = true;
                     break;
                 }
                 if current_count + next_count > max {
+                    truncated = true;
                     let allowed = max - current_count;
                     let next_indices: Vec<usize> = next
                         .indices()
@@ -193,10 +206,11 @@ impl Graph {
         let dense_indices: Vec<usize> = level
             .indices()
             .map_err(|e| Error::GraphBLAS(e.to_string()))?;
-        Ok(dense_indices
+        let nodes = dense_indices
             .into_iter()
             .filter_map(|d| m.dense_to_id.get(d).copied())
-            .collect())
+            .collect();
+        Ok((nodes, truncated))
     }
 
     /// Expand relationships for a set of source nodes using GraphBLAS SpMV.

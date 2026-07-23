@@ -210,7 +210,9 @@ The server registers the following tools with the connecting client:
 4. `explain`: Return the physical query plan for a Cypher query as an indented tree.
 5. `text_search`: Full-text search over indexed node properties; returns ranked hits.
 6. `vector_search`: Nearest-neighbor vector search; returns the k closest nodes by distance (supporting label and property filtering).
-7. `retrieve_hybrid`: Run a hybrid retrieval query that combines vector/semantic search, full-text keyword search, and relationship expansion.
+7. `retrieve_hybrid`: Run a hybrid retrieval query that combines vector/semantic search, full-text keyword search, and relationship expansion. At
+   least one of `text_query` or `vector` is required, and the result carries a `truncated` flag that is true when the `max_nodes` cap cut off seeds
+   or expansion.
 
 ### Client Configurations
 
