@@ -59,6 +59,7 @@ pub(super) fn execute_copy(
         .map_err(|e| format!("failed to rebuild CSR after import: {}", e))?;
 
     Ok(QueryResult {
+        statement_count: 1,
         columns: copy_result_columns(),
         records: vec![outcome.to_record(&stmt.target)],
     })
@@ -760,6 +761,7 @@ pub(super) fn execute_export_db(
     }
 
     Ok(QueryResult {
+        statement_count: 1,
         columns: vec!["exported".to_string()],
         records: vec![Record {
             values: vec![Value::Bool(true)],
@@ -862,6 +864,7 @@ pub(super) fn execute_import_db(
     // One row per COPY statement, so a file that ingested zero rows or
     // classified unexpectedly is visible to the caller.
     Ok(QueryResult {
+        statement_count: 1,
         columns: copy_result_columns(),
         records,
     })

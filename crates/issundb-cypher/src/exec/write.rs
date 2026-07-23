@@ -49,6 +49,7 @@ pub(super) fn execute_create(
         shared_bindings.extend(created);
     }
     Ok(QueryResult {
+        statement_count: 1,
         columns: vec![],
         records: vec![],
     })
@@ -108,6 +109,7 @@ pub(super) fn execute_create_and_return(
     }
 
     Ok(QueryResult {
+        statement_count: 1,
         columns,
         records: result_records,
     })
@@ -179,6 +181,7 @@ pub(super) fn execute_set(
     }
 
     Ok(QueryResult {
+        statement_count: 1,
         columns: vec![],
         records: vec![],
     })
@@ -217,6 +220,7 @@ pub(super) fn execute_delete(
     delete_over_paths(graph, &bound_paths, &delete.targets, delete.detach, params)?;
 
     Ok(QueryResult {
+        statement_count: 1,
         columns: vec![],
         records: vec![],
     })
@@ -461,6 +465,7 @@ pub(super) fn execute_merge_inner(
     let empty = super::PathMap::new();
     execute_merge_internal_with_context(graph, stmt, &empty, params)?;
     Ok(QueryResult {
+        statement_count: 1,
         columns: vec![],
         records: vec![],
     })
@@ -571,6 +576,7 @@ pub(super) fn execute_remove(
     }
 
     Ok(QueryResult {
+        statement_count: 1,
         columns: vec![],
         records: vec![],
     })
@@ -637,6 +643,7 @@ pub(super) fn execute_foreach(
     }
 
     Ok(QueryResult {
+        statement_count: 1,
         columns: vec![],
         records: vec![],
     })

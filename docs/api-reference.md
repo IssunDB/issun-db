@@ -266,6 +266,8 @@ The supported query language surface is documented on the [Cypher Support](cyphe
 
 A query returns a `QueryResult` with `columns: Vec<String>` and `records: Vec<Record>`; each `Record` holds `values: Vec<serde_json::Value>` aligned row-major with the columns. Nodes and relationships project as JSON objects, and missing values project as JSON null. NaN and the two infinities have no JSON number representation, so a float result never collapses them to `null` (indistinguishable from a missing value); each projects as a tagged sentinel object instead: `{"__type__": "__NaN__"}`, `{"__type__": "__Infinity__"}`, or `{"__type__": "__-Infinity__"}`.
 
+A query string may contain several semicolon-separated top-level statements in one call (for example `CREATE (n:Person {name: 'Ada'}) RETURN n.name; MATCH (m) WHERE id(m) = 0 RETURN m.name`), which is useful for a CREATE that a later statement in the same call needs to reference. Every statement runs, but `columns`/`records` reflect only the last one: `QueryResult` carries a `statement_count: usize` field (always 1 outside this case) so a caller can tell a multi-statement query apart from an ordinary single-statement one instead of silently reading the final statement's result as if it were the whole query.
+
 Each layer has one error type, and all of them implement `std::error::Error`: `Error` for storage and domain failures (including the `NodeNotFound` and `EdgeNotFound` variants), `CypherError` for parse, plan, and execution failures, `VectorError` for vector index failures (including `AlreadyConfigured` and `DimensionMismatch`), `TextError` for full-text index failures, and `RetrievalError` for hybrid retrieval failures.
 
 ---

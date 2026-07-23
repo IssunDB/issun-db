@@ -44,7 +44,9 @@ Queries compose as pipelines: a sequence of clauses such as `MATCH ... WITH ... 
 - Arithmetic: `+`, `-`, `*`, `/`, `%`, `^`, and unary minus. Integer overflow raises an error rather than silently widening to float.
 - String predicates: `STARTS WITH`, `ENDS WITH`, `CONTAINS`, and regular expression matching with `=~`, each with a `NOT` form.
 - Comparisons: `=`, `<>`, `<`, `>`, `<=`, `>=`, including chained comparisons (`1 < x < 10`).
-- `IS NULL` and `IS NOT NULL`, three-valued `AND`, `OR`, `XOR`, and `NOT`, and membership with `IN`.
+- `IS NULL` and `IS NOT NULL`, three-valued `AND`, `OR`, `XOR`, and `NOT`, and membership with `IN`. `AND` and `OR` short-circuit: `false AND x` and
+  `true OR x` never evaluate `x`, so a guard clause such as `x <> 0 AND y / x > 1` protects against a runtime error on the right side (`XOR` cannot
+  short-circuit, since both operands always determine its result).
 - `CASE` in both the simple (`CASE x WHEN ...`) and searched (`CASE WHEN ...`) forms, with an optional `ELSE`.
 - List comprehensions (`[x IN list WHERE pred | expr]`), pattern comprehensions (`[p = (a)-[r]->(b) WHERE pred | expr]`), the quantifiers `all`, `any`, `none`, and `single`, and `reduce(acc = init, x IN list | expr)`.
 - Label predicates in expression position: `n:Label` and `n:A:B` evaluate to booleans.

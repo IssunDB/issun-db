@@ -322,7 +322,7 @@ impl IssunMcp {
     }
 
     #[tool(
-        description = "Execute a Cypher query with optional parameters; returns columns and records. Use CREATE, SET, REMOVE, DELETE, and MERGE to mutate the graph."
+        description = "Execute a Cypher query with optional parameters; returns columns and records. Use CREATE, SET, REMOVE, DELETE, and MERGE to mutate the graph. A semicolon-separated query runs every statement, but columns/records reflect only the last one; statement_count says how many actually ran, so more than 1 means earlier statements' own results were not returned here."
     )]
     async fn cypher_query(
         &self,
@@ -335,7 +335,11 @@ impl IssunMcp {
                 .map_err(invalid)?;
             let records: Vec<Vec<Value>> =
                 result.records.iter().map(|r| r.values.clone()).collect();
-            ok_json(json!({ "columns": result.columns, "records": records }))
+            ok_json(json!({
+                "columns": result.columns,
+                "records": records,
+                "statement_count": result.statement_count,
+            }))
         })
         .await
         .map_err(internal)?

@@ -41,6 +41,13 @@ const EXEC_THREAD_STACK: usize = 256 * 1024 * 1024;
 pub struct QueryResult {
     pub columns: Vec<String>,
     pub records: Vec<Record>,
+    /// Number of semicolon-separated top-level statements the query string
+    /// contained. Always 1 except for a `Statement::Pipeline` (several
+    /// statements sent in one call): every statement in a pipeline runs, but
+    /// `columns`/`records` reflect only the last one, so a caller can use
+    /// this to notice a multi-statement query rather than silently reading
+    /// only the final statement's result as if it were the whole query.
+    pub statement_count: usize,
 }
 
 /// An individual row in the query result table.
@@ -244,7 +251,11 @@ fn execute_union(
         records.retain(|r| seen.insert(read::canonical_row_key(&r.values)));
     }
 
-    Ok(QueryResult { columns, records })
+    Ok(QueryResult {
+        columns,
+        records,
+        statement_count: 1,
+    })
 }
 
 /// Classify query execution errors into structured CypherError variants.
@@ -281,6 +292,7 @@ fn execute_pipeline(
     let mut last = QueryResult {
         columns: vec![],
         records: vec![],
+        statement_count: 1,
     };
 
     for stmt in stmts {
@@ -302,6 +314,7 @@ fn execute_pipeline(
                 last = QueryResult {
                     columns: vec![],
                     records: vec![],
+                    statement_count: 1,
                 };
             }
             other => {
@@ -310,6 +323,11 @@ fn execute_pipeline(
         }
     }
 
+    // Every statement in the pipeline ran (a CREATE's writes are not
+    // speculative), but `columns`/`records` reflect only the last one; report
+    // the true count so a caller does not mistake this for a single-statement
+    // result and silently miss the other statements' outcomes.
+    last.statement_count = stmts.len();
     Ok(last)
 }
 
@@ -1609,6 +1627,101 @@ mod tests {
         let nan = execute(&graph, "RETURN 0.0 / 0.0 AS v", &params).unwrap();
         assert_ne!(pos.records[0].values[0], neg.records[0].values[0]);
         assert_ne!(pos.records[0].values[0], nan.records[0].values[0]);
+    }
+
+    /// `AND`/`OR` short-circuit: the determining operand's value alone
+    /// decides the result, so the other operand is never evaluated, and a
+    /// runtime error on that side (e.g. division by zero) never surfaces.
+    /// This is what lets a guard clause like `x <> 0 AND y/x > 1` actually
+    /// protect against a division error on rows where `x` is zero.
+    #[test]
+    fn and_or_short_circuit_and_do_not_evaluate_the_other_side() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+
+        let res = execute(&graph, "RETURN false AND (1 / 0) AS v", &params).unwrap();
+        assert_eq!(res.records[0].values[0], serde_json::Value::Bool(false));
+
+        let res = execute(&graph, "RETURN true OR (1 / 0) AS v", &params).unwrap();
+        assert_eq!(res.records[0].values[0], serde_json::Value::Bool(true));
+
+        // The non-short-circuiting sides still evaluate the other operand and
+        // still raise: `true AND (1/0)` and `false OR (1/0)` both need the
+        // right side's value to determine the result.
+        for q in [
+            "RETURN true AND (1 / 0) AS v",
+            "RETURN false OR (1 / 0) AS v",
+        ] {
+            let err = execute(&graph, q, &params).unwrap_err();
+            assert!(
+                matches!(err, CypherError::Math(_)),
+                "{q} must still raise, got {err:?}"
+            );
+        }
+    }
+
+    /// A guard clause protects against a division error exactly the way an
+    /// agent porting SQL/Neo4j-style filters would expect.
+    #[test]
+    fn guard_clause_protects_against_division_by_zero() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+        for (x, y) in [(0i64, 10i64), (2, 10)] {
+            graph
+                .add_node("Num", &serde_json::json!({"x": x, "y": y}))
+                .unwrap();
+        }
+        let res = execute(
+            &graph,
+            "MATCH (n:Num) WHERE n.x <> 0 AND n.y / n.x > 1 RETURN n.x AS x",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(res.records.len(), 1);
+        assert_eq!(res.records[0].values[0], serde_json::json!(2));
+    }
+
+    /// A single statement reports `statement_count: 1`, the common case every
+    /// pre-existing caller relies on implicitly.
+    #[test]
+    fn single_statement_reports_statement_count_one() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+        let res = execute(&graph, "RETURN 1 AS v", &params).unwrap();
+        assert_eq!(res.statement_count, 1);
+    }
+
+    /// A semicolon-separated pipeline runs every statement (the first
+    /// statement's CREATE is visible to a later MATCH within the same
+    /// pipeline call), but `columns`/`records` reflect only the last
+    /// statement. `statement_count` makes that explicit instead of a caller
+    /// silently mistaking the final statement's result for the whole query,
+    /// or assuming the earlier statements were skipped.
+    #[test]
+    fn pipeline_runs_every_statement_but_reports_only_the_last_result() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+
+        let res = execute(
+            &graph,
+            "CREATE (n:PipelineProbe {v: 1}) RETURN n.v; RETURN 'second statement' AS v",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(res.statement_count, 2);
+        assert_eq!(
+            res.records[0].values[0],
+            serde_json::json!("second statement")
+        );
+
+        // The CREATE from the first statement was not skipped.
+        let check = execute(
+            &graph,
+            "MATCH (n:PipelineProbe) RETURN count(n) AS c",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(check.records[0].values[0], serde_json::json!(1));
     }
 
     #[test]

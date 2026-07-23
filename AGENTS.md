@@ -333,7 +333,11 @@ outside `issundb`.
 - `query(cypher) -> Result<QueryResult, CypherError>`, `query_with_params(cypher, params) -> ...`,
   `query_with_procedures(cypher, params, registry) -> ...` (resolves `CALL` clauses against a custom procedure registry), and
   `explain(cypher) -> Result<String, CypherError>`
-- `QueryResult`: `columns: Vec<String>`, `records: Vec<Record>`; `Record`: `values: Vec<serde_json::Value>`
+- `QueryResult`: `columns: Vec<String>`, `records: Vec<Record>`, `statement_count: usize`; `Record`: `values: Vec<serde_json::Value>`. A
+  semicolon-separated query (`Statement::Pipeline`) runs every top-level statement, but `columns`/`records` reflect only the last one;
+  `statement_count` (always 1 otherwise) lets a caller notice a multi-statement query instead of silently reading the final statement's result as if
+  it were the whole query. `AND`/`OR` short-circuit (`false AND x`/`true OR x` never evaluate `x`), so a guard clause protects against a runtime
+  error such as division by zero on the side that is never evaluated.
 
 The executor resolves patterns through the physical plan. Untyped expansion uses GraphBLAS SpMV; typed expansion reads the CSR snapshot in bulk behind
 `ensure_snapshot_fresh`, falling back to per-source LMDB point reads when the snapshot is stale and the source set is small. Key optimizer behaviors,

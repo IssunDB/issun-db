@@ -209,7 +209,7 @@ The server registers the following tools with the connecting client:
    specific properties, and a cap of 0 disables truncation.
 2. `get_edge`: Fetch an edge by its internal engine id (Cypher's `id(r)`, not a domain property), returning its endpoints, type, and properties,
    bounded the same way as `get_node`.
-3. `cypher_query`: Execute a Cypher query with optional parameter bindings. `CREATE`, `SET`, `REMOVE`, `DELETE`, and `MERGE` statements can be used to mutate the graph.
+3. `cypher_query`: Execute a Cypher query with optional parameter bindings. `CREATE`, `SET`, `REMOVE`, `DELETE`, and `MERGE` statements can be used to mutate the graph. A semicolon-separated query runs every statement, but the returned `columns`/`records` reflect only the last one; `statement_count` says how many actually ran, so a value above 1 means the earlier statements' own results were not returned.
 4. `explain`: Return the physical query plan for a Cypher query as an indented tree.
 5. `text_search`: Full-text search over indexed node properties. Each ranked hit carries the node id, the score, the matched label and property, and
    a bounded excerpt of the matched value.

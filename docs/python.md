@@ -153,7 +153,7 @@ Here is a quick reference of the methods available on the `IssunDB` class:
 
 ### Querying and Search
 
-* `query(cypher: str, params: Optional[str] = None) -> str`: Executes a Cypher query, optionally with JSON-encoded parameters, and returns the results as a JSON-encoded string.
+* `query(cypher: str, params: Optional[str] = None) -> str`: Executes a Cypher query, optionally with JSON-encoded parameters, and returns the results as a JSON-encoded string with `columns`, `records`, and `statement_count`. A semicolon-separated query runs every statement, but `columns`/`records` reflect only the last one; `statement_count` above 1 signals that the earlier statements' own results were not returned.
 * `explain(cypher: str) -> str`: Returns the indented execution plan tree of a Cypher query.
 * `configure_vector_index(metric: str, quantization: str = "float32", reindex: bool = False) -> None`: Sets the vector index metric and quantization; pass `reindex=True` to rebuild a populated index under the new configuration.
 * `upsert_vector(id: int, vector: List[float]) -> None`: Associates an embedding vector with a node.

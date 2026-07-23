@@ -234,7 +234,11 @@ pub(super) fn execute_read_query(
             if query.return_clause.distinct {
                 dedup_records(&mut records);
             }
-            return Ok(QueryResult { columns, records });
+            return Ok(QueryResult {
+                statement_count: 1,
+                columns,
+                records,
+            });
         }
     }
 
@@ -247,6 +251,7 @@ pub(super) fn execute_read_query(
     // A query with an empty RETURN clause is a write-only pipeline query.
     if query.return_clause.items.is_empty() {
         return Ok(QueryResult {
+            statement_count: 1,
             columns: vec![],
             records: vec![],
         });
@@ -402,7 +407,11 @@ pub(super) fn execute_read_query(
         rows_to_records(graph, &query.return_clause.items, resolved_paths)?
     };
 
-    Ok(QueryResult { columns, records })
+    Ok(QueryResult {
+        statement_count: 1,
+        columns,
+        records,
+    })
 }
 
 /// Collect the variable names a path pattern binds (node, relationship, and path

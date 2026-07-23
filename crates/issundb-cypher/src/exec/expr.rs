@@ -850,21 +850,27 @@ pub(super) fn eval_binary_op<B: Bindings>(
     match op {
         BinaryOperator::And => {
             let lv = evaluate_expr(graph, path, left, params)?;
-            let rv = evaluate_expr(graph, path, right, params)?;
-            // Type check: both must be boolean or null.
             if !matches!(lv, serde_json::Value::Bool(_) | serde_json::Value::Null) {
                 return Err(format!(
                     "TypeError: AND requires boolean operands, left operand is {}",
                     lv
                 ));
             }
+            // Short-circuit: `false AND x` is `false` for every x, so the
+            // right operand is not evaluated. This is what lets a guard
+            // clause such as `x <> 0 AND y/x > 1` actually protect against a
+            // runtime error on the right side when the left side is false.
+            if lv == serde_json::Value::Bool(false) {
+                return Ok(serde_json::Value::Bool(false));
+            }
+            let rv = evaluate_expr(graph, path, right, params)?;
             if !matches!(rv, serde_json::Value::Bool(_) | serde_json::Value::Null) {
                 return Err(format!(
                     "TypeError: AND requires boolean operands, right operand is {}",
                     rv
                 ));
             }
-            if lv == serde_json::Value::Bool(false) || rv == serde_json::Value::Bool(false) {
+            if rv == serde_json::Value::Bool(false) {
                 return Ok(serde_json::Value::Bool(false));
             }
             if lv == serde_json::Value::Null || rv == serde_json::Value::Null {
@@ -874,21 +880,25 @@ pub(super) fn eval_binary_op<B: Bindings>(
         }
         BinaryOperator::Or => {
             let lv = evaluate_expr(graph, path, left, params)?;
-            let rv = evaluate_expr(graph, path, right, params)?;
-            // Type check: both must be boolean or null.
             if !matches!(lv, serde_json::Value::Bool(_) | serde_json::Value::Null) {
                 return Err(format!(
                     "TypeError: OR requires boolean operands, left operand is {}",
                     lv
                 ));
             }
+            // Short-circuit: `true OR x` is `true` for every x, so the right
+            // operand is not evaluated.
+            if lv == serde_json::Value::Bool(true) {
+                return Ok(serde_json::Value::Bool(true));
+            }
+            let rv = evaluate_expr(graph, path, right, params)?;
             if !matches!(rv, serde_json::Value::Bool(_) | serde_json::Value::Null) {
                 return Err(format!(
                     "TypeError: OR requires boolean operands, right operand is {}",
                     rv
                 ));
             }
-            if lv == serde_json::Value::Bool(true) || rv == serde_json::Value::Bool(true) {
+            if rv == serde_json::Value::Bool(true) {
                 return Ok(serde_json::Value::Bool(true));
             }
             if lv == serde_json::Value::Null || rv == serde_json::Value::Null {

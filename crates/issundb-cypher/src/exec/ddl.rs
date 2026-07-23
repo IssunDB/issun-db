@@ -19,6 +19,7 @@ pub(super) fn execute_create_index(
             .map_err(|e| e.to_string())?,
     }
     Ok(QueryResult {
+        statement_count: 1,
         columns: vec![],
         records: vec![],
     })
@@ -37,6 +38,7 @@ pub(super) fn execute_drop_index(
             .map_err(|e| e.to_string())?,
     }
     Ok(QueryResult {
+        statement_count: 1,
         columns: vec![],
         records: vec![],
     })
@@ -61,6 +63,7 @@ pub(super) fn execute_create_constraint(
             .map_err(|e| e.to_string())?,
     }
     Ok(QueryResult {
+        statement_count: 1,
         columns: vec![],
         records: vec![],
     })
@@ -85,6 +88,7 @@ pub(super) fn execute_drop_constraint(
             .map_err(|e| e.to_string())?,
     }
     Ok(QueryResult {
+        statement_count: 1,
         columns: vec![],
         records: vec![],
     })

@@ -290,6 +290,10 @@ pub struct QueryResponse {
     /// aligned with `columns`; the per-query value types are not statically
     /// known.
     pub records: Vec<Vec<Value>>,
+    /// Number of semicolon-separated top-level statements the query contained.
+    /// Always 1 except for a multi-statement query: every statement runs, but
+    /// `columns`/`records` reflect only the last one.
+    pub statement_count: usize,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -646,7 +650,8 @@ pub async fn execute_query(
                     StatusCode::OK,
                     Json(json!({
                         "columns": result.columns,
-                        "records": records
+                        "records": records,
+                        "statement_count": result.statement_count
                     })),
                 )
                     .into_response()
