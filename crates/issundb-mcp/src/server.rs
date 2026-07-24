@@ -132,6 +132,12 @@ pub struct NodeIdArgs {
     /// numbering space and collide with internal ids. To look up a node by a
     /// domain property, run MATCH (n:Label) WHERE n.Id = x RETURN id(n) first.
     pub id: u64,
+    /// Optional expected label. When set, a node that exists but does not
+    /// carry this label is an error instead of a silent wrong-entity return;
+    /// pass it whenever the id's provenance is uncertain, since an internal
+    /// id and a domain Id value can collide across labels.
+    #[serde(default)]
+    pub expect_label: Option<String>,
     /// Optional list of property names to return; other properties are left
     /// out of the response. Omit to return every property.
     #[serde(default)]
@@ -150,6 +156,11 @@ pub struct EdgeIdArgs {
     /// domain property; those live in a separate numbering space and collide
     /// with internal ids.
     pub id: u64,
+    /// Optional expected relationship type. When set, an edge that exists but
+    /// is not of this type is an error instead of a silent wrong-entity
+    /// return (the edge counterpart of get_node's expect_label).
+    #[serde(default)]
+    pub expect_type: Option<String>,
     /// Optional list of property names to return; other properties are left
     /// out of the response. Omit to return every property.
     #[serde(default)]
@@ -259,7 +270,7 @@ impl IssunMcp {
     }
 
     #[tool(
-        description = "Fetch a node by its internal engine id (Cypher's id(n), not a domain property such as Id); returning its labels and properties. String property values longer than max_property_chars (default 2000) are truncated with an explicit marker; pass a properties list to select specific properties, or max_property_chars 0 for full values."
+        description = "Fetch a node by its internal engine id (Cypher's id(n), not a domain property such as Id); returning its labels and properties. Pass expect_label to error instead of silently returning a wrong-label node when the id's provenance is uncertain. String property values longer than max_property_chars (default 2000) are truncated with an explicit marker; pass a properties list to select specific properties, or max_property_chars 0 for full values."
     )]
     async fn get_node(
         &self,
@@ -272,6 +283,17 @@ impl IssunMcp {
         tokio::task::spawn_blocking(move || match graph.get_node(args.id).map_err(internal)? {
             Some(record) => {
                 let labels = graph.node_labels(args.id).map_err(internal)?;
+                if let Some(expected) = &args.expect_label {
+                    if !labels.iter().any(|l| l == expected) {
+                        return Err(invalid(format!(
+                            "node {} does not carry label {expected} (its labels: {labels:?}); \
+                             the id is likely a domain property value, not an internal engine \
+                             id; resolve it first with MATCH (n:{expected}) WHERE n.<prop> = \
+                             {} RETURN id(n)",
+                            args.id, args.id
+                        )));
+                    }
+                }
                 let label = labels.first().cloned().unwrap_or_default();
                 let props: Value = rmp_serde::from_slice(&record.props).map_err(internal)?;
                 let props = bound_props(
@@ -288,7 +310,7 @@ impl IssunMcp {
     }
 
     #[tool(
-        description = "Fetch an edge by its internal engine id (Cypher's id(r), not a domain property); returning its endpoints, type, and properties. String property values are bounded the same way as get_node."
+        description = "Fetch an edge by its internal engine id (Cypher's id(r), not a domain property); returning its endpoints, type, and properties. Pass expect_type to error instead of silently returning a wrong-type edge when the id's provenance is uncertain. String property values are bounded the same way as get_node."
     )]
     async fn get_edge(
         &self,
@@ -301,6 +323,15 @@ impl IssunMcp {
                     .type_name(record.edge_type)
                     .map_err(internal)?
                     .unwrap_or_default();
+                if let Some(expected) = &args.expect_type {
+                    if &edge_type != expected {
+                        return Err(invalid(format!(
+                            "edge {} is not of type {expected} (its type: {edge_type}); the id \
+                             is likely a domain property value, not an internal engine id",
+                            args.id
+                        )));
+                    }
+                }
                 let props: Value = rmp_serde::from_slice(&record.props).map_err(internal)?;
                 let props = bound_props(
                     props,
@@ -542,7 +573,8 @@ impl ServerHandler for IssunMcp {
                  never a domain property like Id: the two live in separate numbering spaces \
                  and can collide, so passing a domain Id straight to get_node can silently \
                  return the wrong, differently-labeled entity. Resolve a domain identifier \
-                 first with MATCH (n:Label) WHERE n.Id = x RETURN id(n)."
+                 first with MATCH (n:Label) WHERE n.Id = x RETURN id(n), or pass expect_label \
+                 (get_node) / expect_type (get_edge) to reject a mismatch with an error."
                     .to_string(),
             ),
         }
@@ -594,6 +626,7 @@ mod tests {
     fn node_args(id: u64) -> NodeIdArgs {
         NodeIdArgs {
             id,
+            expect_label: None,
             properties: None,
             max_property_chars: None,
         }
@@ -603,6 +636,7 @@ mod tests {
     fn edge_args(id: u64) -> EdgeIdArgs {
         EdgeIdArgs {
             id,
+            expect_type: None,
             properties: None,
             max_property_chars: None,
         }
@@ -855,6 +889,7 @@ mod tests {
         let value = body(
             mcp.get_node(Parameters(NodeIdArgs {
                 id,
+                expect_label: None,
                 properties: None,
                 max_property_chars: Some(0),
             }))
@@ -877,6 +912,7 @@ mod tests {
         let value = body(
             mcp.get_node(Parameters(NodeIdArgs {
                 id,
+                expect_label: None,
                 properties: Some(vec!["title".to_string()]),
                 max_property_chars: None,
             }))
@@ -886,6 +922,85 @@ mod tests {
         let props = value["props"].as_object().expect("props object");
         assert_eq!(props.len(), 1);
         assert_eq!(props["title"], "t");
+    }
+
+    /// `expect_label` turns the internal-id-versus-domain-Id collision from a
+    /// silent wrong-entity return into an error: a node that exists under the
+    /// requested id but does not carry the expected label is rejected.
+    #[tokio::test]
+    async fn get_node_expect_label_rejects_wrong_label() {
+        let (mcp, _dir) = fresh();
+        let id = seed_person(&mcp, "Ada");
+
+        // The matching label passes.
+        let value = body(
+            mcp.get_node(Parameters(NodeIdArgs {
+                id,
+                expect_label: Some("Person".to_string()),
+                properties: None,
+                max_property_chars: None,
+            }))
+            .await
+            .expect("get_node with matching expect_label"),
+        );
+        assert_eq!(value["label"], "Person");
+
+        // A mismatched label errors instead of returning the wrong entity.
+        let err = mcp
+            .get_node(Parameters(NodeIdArgs {
+                id,
+                expect_label: Some("Competition".to_string()),
+                properties: None,
+                max_property_chars: None,
+            }))
+            .await
+            .expect_err("wrong expect_label must error");
+        assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
+        assert!(
+            err.message.contains("does not carry label Competition"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    /// Edge counterpart: `expect_type` rejects a type mismatch.
+    #[tokio::test]
+    async fn get_edge_expect_type_rejects_wrong_type() {
+        let (mcp, _dir) = fresh();
+        let a = seed_person(&mcp, "Ada");
+        let b = seed_person(&mcp, "Grace");
+        let edge_id = mcp
+            .graph
+            .add_edge(a, b, "KNOWS", &json!({}))
+            .expect("add edge");
+
+        let value = body(
+            mcp.get_edge(Parameters(EdgeIdArgs {
+                id: edge_id,
+                expect_type: Some("KNOWS".to_string()),
+                properties: None,
+                max_property_chars: None,
+            }))
+            .await
+            .expect("get_edge with matching expect_type"),
+        );
+        assert_eq!(value["type"], "KNOWS");
+
+        let err = mcp
+            .get_edge(Parameters(EdgeIdArgs {
+                id: edge_id,
+                expect_type: Some("FOLLOWS".to_string()),
+                properties: None,
+                max_property_chars: None,
+            }))
+            .await
+            .expect_err("wrong expect_type must error");
+        assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
+        assert!(
+            err.message.contains("is not of type FOLLOWS"),
+            "got: {}",
+            err.message
+        );
     }
 
     #[tokio::test]

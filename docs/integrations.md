@@ -205,10 +205,11 @@ TLS and authentication are the reverse proxy's job; the server itself binds with
 The server registers the following tools with the connecting client:
 
 1. `get_node`: Fetch a node by its internal engine id (Cypher's `id(n)`, not a domain property such as `Id`), returning its labels and properties.
-   String property values longer than `max_property_chars` (default 2000) are truncated with an explicit marker; a `properties` list selects
+   An optional `expect_label` rejects a node that does not carry that label, turning an id mixup into an error instead of a silent wrong-entity
+   return. String property values longer than `max_property_chars` (default 2000) are truncated with an explicit marker; a `properties` list selects
    specific properties, and a cap of 0 disables truncation.
 2. `get_edge`: Fetch an edge by its internal engine id (Cypher's `id(r)`, not a domain property), returning its endpoints, type, and properties,
-   bounded the same way as `get_node`.
+   bounded the same way as `get_node`. An optional `expect_type` rejects an edge of a different relationship type.
 3. `cypher_query`: Execute a Cypher query with optional parameter bindings. `CREATE`, `SET`, `REMOVE`, `DELETE`, and `MERGE` statements can be used to mutate the graph. A semicolon-separated query runs every statement, but the returned `columns`/`records` reflect only the last one; `statement_count` says how many actually ran, so a value above 1 means the earlier statements' own results were not returned.
 4. `explain`: Return the physical query plan for a Cypher query as an indented tree.
 5. `text_search`: Full-text search over indexed node properties. Each ranked hit carries the node id, the score, the matched label and property, and
@@ -220,9 +221,10 @@ The server registers the following tools with the connecting client:
    or expansion.
 
 The internal engine id and a domain property (such as `Id`) live in separate numbering spaces and can collide: a node's internal id can equal a
-completely unrelated node's domain `Id` value. Passing a domain identifier straight to `get_node` or `get_edge` therefore does not error, it silently
-returns the wrong entity. Resolve a domain identifier to an internal id first with a Cypher query such as `MATCH (n:Label) WHERE n.Id = x RETURN
-id(n)`, then pass that id to `get_node`.
+completely unrelated node's domain `Id` value. Passing a domain identifier straight to `get_node` or `get_edge` therefore does not error by default,
+it silently returns the wrong entity. Two defenses: resolve a domain identifier to an internal id first with a Cypher query such as
+`MATCH (n:Label) WHERE n.Id = x RETURN id(n)`, or pass `expect_label` (on `get_node`) or `expect_type` (on `get_edge`) so a mismatched entity is
+rejected with an error naming its actual labels.
 
 ### Client Configurations
 

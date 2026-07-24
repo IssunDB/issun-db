@@ -430,7 +430,8 @@ concerns driven through the CLI or the Python and REST surfaces. Keep this surfa
 `get_node` and `get_edge` take the internal engine id, the same value Cypher's `id(n)`/`id(r)` returns, never a domain property such as `Id`: the two
 live in separate numbering spaces and can collide, so passing a domain identifier straight to `get_node` silently returns the wrong,
 differently-labeled entity instead of erroring. The tool descriptions, argument docs, and server instructions all say this; resolve a domain
-identifier first with `MATCH (n:Label) WHERE n.Id = x RETURN id(n)`.
+identifier first with `MATCH (n:Label) WHERE n.Id = x RETURN id(n)`, or pass `expect_label` (`get_node`) or `expect_type` (`get_edge`) to reject a
+mismatched entity with an error instead.
 
 ### `issundb_py`
 
