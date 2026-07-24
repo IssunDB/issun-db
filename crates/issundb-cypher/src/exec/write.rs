@@ -13,14 +13,14 @@ use crate::ast::{
 /// Evaluate a property map `HashMap<String, Expr>` using the given path context.
 /// Returns a JSON object containing the evaluated properties.
 fn eval_properties(
-    graph: &Graph,
+    txn: &issundb_core::WriteTxn,
     props: &HashMap<String, crate::ast::Expr>,
     path: &PathMap,
     params: &HashMap<String, serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
     let mut obj = serde_json::Map::new();
     for (k, v) in props {
-        let val = evaluate_expr(graph, path, v, params)?;
+        let val = evaluate_expr(txn.graph(), path, v, params)?;
         // Cypher semantics: assigning null to a property is equivalent to
         // removing it; null-valued properties are not stored.
         if val != serde_json::Value::Null {
@@ -30,8 +30,31 @@ fn eval_properties(
     Ok(serde_json::Value::Object(obj))
 }
 
-pub(super) fn execute_create_internal(graph: &Graph, pattern: &Pattern) -> Result<PathMap, String> {
-    execute_create_internal_with_context(graph, pattern, &PathMap::new(), &HashMap::new())
+/// Convert a Cypher-layer `String` error into an `issundb_core::Error` so it
+/// can propagate out of a `Graph::update` closure via `?` (which requires
+/// `Result<_, issundb_core::Error>`). Pair with `unwrap_txn_error` once
+/// `update` returns.
+pub(super) fn as_txn_error(msg: String) -> issundb_core::Error {
+    issundb_core::Error::InvalidArgument(msg)
+}
+
+/// Unwrap the message a `Graph::update` closure produced via `as_txn_error`
+/// back to its original Cypher-layer string. A genuine `issundb_core::Error`
+/// from a `WriteTxn` mutation (a real constraint violation, a missing node,
+/// and so on) is not produced via `as_txn_error` anywhere in this module's
+/// closures, so `Display` is the correct message for every other variant.
+pub(super) fn unwrap_txn_error(err: issundb_core::Error) -> String {
+    match err {
+        issundb_core::Error::InvalidArgument(msg) => msg,
+        other => other.to_string(),
+    }
+}
+
+pub(super) fn execute_create_internal(
+    txn: &mut issundb_core::WriteTxn,
+    pattern: &Pattern,
+) -> Result<PathMap, String> {
+    execute_create_internal_with_context(txn, pattern, &PathMap::new(), &HashMap::new())
 }
 
 pub(super) fn execute_create(
@@ -39,20 +62,29 @@ pub(super) fn execute_create(
     create: &CreateStatement,
     params: &HashMap<String, serde_json::Value>,
 ) -> Result<QueryResult, String> {
-    // Thread bindings across patterns so that variables created in one pattern
-    // (e.g., the first node in `CREATE (a:A), (a)-[:R]->(b:B)`) are available
-    // in subsequent patterns within the same CREATE clause.
-    let mut shared_bindings = PathMap::new();
-    for pattern in &create.patterns {
-        let created =
-            execute_create_internal_with_context(graph, pattern, &shared_bindings, params)?;
-        shared_bindings.extend(created);
-    }
-    Ok(QueryResult {
-        statement_count: 1,
-        columns: vec![],
-        records: vec![],
-    })
+    graph
+        .update(|txn| {
+            let _pending = expr::PendingWrites::install();
+            // Thread bindings across patterns so that variables created in one
+            // pattern (e.g., the first node in `CREATE (a:A), (a)-[:R]->(b:B)`)
+            // are available in subsequent patterns within the same CREATE
+            // clause. All patterns share this one transaction, so a later
+            // pattern's failure (e.g. a unique constraint violation) rolls
+            // back every node/edge created earlier in the same clause.
+            let mut shared_bindings = PathMap::new();
+            for pattern in &create.patterns {
+                let created =
+                    execute_create_internal_with_context(txn, pattern, &shared_bindings, params)
+                        .map_err(as_txn_error)?;
+                shared_bindings.extend(created);
+            }
+            Ok(QueryResult {
+                statement_count: 1,
+                columns: vec![],
+                records: vec![],
+            })
+        })
+        .map_err(unwrap_txn_error)
 }
 
 pub(super) fn execute_create_and_return(
@@ -60,59 +92,70 @@ pub(super) fn execute_create_and_return(
     stmt: &CreateAndReturnStatement,
     params: &HashMap<String, serde_json::Value>,
 ) -> Result<QueryResult, String> {
-    // Thread bindings across patterns within the same CREATE clause.
-    let mut bindings = PathMap::new();
-    for pattern in &stmt.patterns {
-        let created = execute_create_internal_with_context(graph, pattern, &bindings, params)?;
-        bindings.extend(created);
-    }
-
-    // Project the RETURN clause over the created bindings.
-    let columns: Vec<String> = stmt.return_clause.items.iter().map(column_name).collect();
-
-    let mut values = Vec::new();
-    for item in &stmt.return_clause.items {
-        let key = projected_key(&item.expr, &item.alias);
-        // Try evaluating the expression first.
-        let val =
-            evaluate_expr(graph, &bindings, &item.expr, params).unwrap_or(serde_json::Value::Null);
-        // If null and there's a binding by the key name, use that.
-        let val = if val == serde_json::Value::Null {
-            if let Some(binding) = bindings.get(&key) {
-                binding_to_value(graph, Some(binding)).unwrap_or(serde_json::Value::Null)
-            } else {
-                val
+    graph
+        .update(|txn| {
+            let _pending = expr::PendingWrites::install();
+            // Thread bindings across patterns within the same CREATE clause.
+            let mut bindings = PathMap::new();
+            for pattern in &stmt.patterns {
+                let created = execute_create_internal_with_context(txn, pattern, &bindings, params)
+                    .map_err(as_txn_error)?;
+                bindings.extend(created);
             }
-        } else {
-            val
-        };
-        values.push(val);
-    }
 
-    let records = if values.is_empty() {
-        vec![]
-    } else {
-        vec![Record { values }]
-    };
+            // Project the RETURN clause over the created bindings, still
+            // inside this transaction: a failure here (e.g. a division by
+            // zero) rolls back the CREATE above rather than leaving it
+            // committed with no visible result.
+            let columns: Vec<String> = stmt.return_clause.items.iter().map(column_name).collect();
 
-    // Apply SKIP/LIMIT.
-    let mut result_records = records;
-    if let Some(skip_expr) = &stmt.skip {
-        let skip_val = evaluate_expr(graph, &PathMap::new(), skip_expr, params)?;
-        let skip = skip_val.as_i64().unwrap_or(0).max(0) as usize;
-        result_records = result_records.into_iter().skip(skip).collect();
-    }
-    if let Some(limit_expr) = &stmt.limit {
-        let limit_val = evaluate_expr(graph, &PathMap::new(), limit_expr, params)?;
-        let limit = limit_val.as_i64().unwrap_or(0).max(0) as usize;
-        result_records = result_records.into_iter().take(limit).collect();
-    }
+            let mut values = Vec::new();
+            for item in &stmt.return_clause.items {
+                let key = projected_key(&item.expr, &item.alias);
+                let val = evaluate_expr(txn.graph(), &bindings, &item.expr, params)
+                    .map_err(as_txn_error)?;
+                // If null and there's a binding by the key name, use that.
+                let val = if val == serde_json::Value::Null {
+                    if let Some(binding) = bindings.get(&key) {
+                        binding_to_value(txn.graph(), Some(binding))
+                            .unwrap_or(serde_json::Value::Null)
+                    } else {
+                        val
+                    }
+                } else {
+                    val
+                };
+                values.push(val);
+            }
 
-    Ok(QueryResult {
-        statement_count: 1,
-        columns,
-        records: result_records,
-    })
+            let records = if values.is_empty() {
+                vec![]
+            } else {
+                vec![Record { values }]
+            };
+
+            // Apply SKIP/LIMIT.
+            let mut result_records = records;
+            if let Some(skip_expr) = &stmt.skip {
+                let skip_val = evaluate_expr(txn.graph(), &PathMap::new(), skip_expr, params)
+                    .map_err(as_txn_error)?;
+                let skip = skip_val.as_i64().unwrap_or(0).max(0) as usize;
+                result_records = result_records.into_iter().skip(skip).collect();
+            }
+            if let Some(limit_expr) = &stmt.limit {
+                let limit_val = evaluate_expr(txn.graph(), &PathMap::new(), limit_expr, params)
+                    .map_err(as_txn_error)?;
+                let limit = limit_val.as_i64().unwrap_or(0).max(0) as usize;
+                result_records = result_records.into_iter().take(limit).collect();
+            }
+
+            Ok(QueryResult {
+                statement_count: 1,
+                columns,
+                records: result_records,
+            })
+        })
+        .map_err(unwrap_txn_error)
 }
 
 pub(super) fn execute_set_and_return(
@@ -124,6 +167,8 @@ pub(super) fn execute_set_and_return(
     // per matched row, then the RETURN projection (including aggregation, ORDER BY, SKIP,
     // and LIMIT) operates on those same post-mutation rows. The rows are not re-matched,
     // so a SET that changes a matched property or label does not alter the cardinality.
+    // The whole statement (SET and RETURN) shares one transaction, so a failing RETURN
+    // expression rolls back the SET.
     let synthetic_query = Query {
         match_clauses: Vec::new(),
         where_clause: None,
@@ -141,7 +186,11 @@ pub(super) fn execute_set_and_return(
         skip: stmt.skip.clone(),
         limit: stmt.limit.clone(),
     };
-    execute_read_query(graph, &synthetic_query, params)
+    graph
+        .update(|txn| {
+            execute_read_query(graph, &synthetic_query, params, Some(txn)).map_err(as_txn_error)
+        })
+        .map_err(unwrap_txn_error)
 }
 
 pub(super) fn execute_set(
@@ -149,8 +198,26 @@ pub(super) fn execute_set(
     set: &SetStatement,
     params: &HashMap<String, serde_json::Value>,
 ) -> Result<QueryResult, String> {
-    // Build a synthetic read query so the MATCH and WHERE clauses go through the same
-    // planner and executor pipeline as MATCH ... RETURN queries.
+    graph
+        .update(|txn| {
+            let _pending = expr::PendingWrites::install();
+            execute_set_in(txn, set, params).map_err(as_txn_error)
+        })
+        .map_err(unwrap_txn_error)
+}
+
+/// Core SET logic, run inside an already-open write transaction. Used both by
+/// [`execute_set`] above (which opens its own transaction) and by a SET
+/// statement in a FOREACH body (which is already inside one, opened by the
+/// enclosing `execute_foreach`); LMDB permits only one open writer
+/// transaction at a time, so this must never open a second one itself.
+pub(super) fn execute_set_in(
+    txn: &mut issundb_core::WriteTxn,
+    set: &SetStatement,
+    params: &HashMap<String, serde_json::Value>,
+) -> Result<QueryResult, String> {
+    // Build a synthetic read query so the MATCH and WHERE clauses go through the
+    // same planner and executor pipeline as MATCH ... RETURN queries.
     let synthetic_query = Query {
         match_clauses: set.match_clauses.clone(),
         where_clause: set.where_clause.clone(),
@@ -165,7 +232,7 @@ pub(super) fn execute_set(
     };
     let logical = LogicalPlanner::plan(&synthetic_query).map_err(|e| e.to_string())?;
     let physical = PhysicalPlanner::plan(&logical);
-    let optimized = Optimizer::optimize(physical, Some(graph));
+    let optimized = Optimizer::optimize(physical, Some(txn.graph()));
     // `LogicalPlanner` always wraps the plan in a final Project. When the
     // RETURN clause is empty (as in this synthetic query) that Project would
     // produce PathMaps with no variables at all, making SET assignments
@@ -174,10 +241,11 @@ pub(super) fn execute_set(
         PhysicalOperator::Project { input, items, .. } if items.is_empty() => *input,
         other => other,
     };
-    let bound_paths = execute_physical_pathmaps(graph, &binding_plan, params)?;
+    let bound_paths =
+        execute_physical_pathmaps(txn.graph(), &binding_plan, params, Some(&mut *txn))?;
 
     for path in bound_paths {
-        apply_set_items(graph, &path, &set.set_items, params)?;
+        apply_set_items(txn, &path, &set.set_items, params)?;
     }
 
     Ok(QueryResult {
@@ -189,6 +257,22 @@ pub(super) fn execute_set(
 
 pub(super) fn execute_delete(
     graph: &Graph,
+    delete: &DeleteStatement,
+    params: &HashMap<String, serde_json::Value>,
+) -> Result<QueryResult, String> {
+    graph
+        .update(|txn| execute_delete_in(txn, delete, params).map_err(as_txn_error))
+        .map_err(unwrap_txn_error)
+}
+
+/// Core DELETE logic (matching plus the delete itself), run inside an
+/// already-open write transaction. Used both by [`execute_delete`] above
+/// (which opens its own transaction) and by a DELETE statement in a FOREACH
+/// body (which is already inside one, opened by the enclosing
+/// `execute_foreach`); LMDB permits only one open writer transaction at a
+/// time, so this must never open a second one itself.
+pub(super) fn execute_delete_in(
+    txn: &mut issundb_core::WriteTxn,
     delete: &DeleteStatement,
     params: &HashMap<String, serde_json::Value>,
 ) -> Result<QueryResult, String> {
@@ -208,16 +292,17 @@ pub(super) fn execute_delete(
     };
     let logical = LogicalPlanner::plan(&synthetic_query).map_err(|e| e.to_string())?;
     let physical = PhysicalPlanner::plan(&logical);
-    let optimized = Optimizer::optimize(physical, Some(graph));
+    let optimized = Optimizer::optimize(physical, Some(txn.graph()));
     // Strip the zero-item Project that LogicalPlanner adds for the empty
     // RETURN clause; otherwise execute_physical clears all matched variables.
     let binding_plan = match optimized {
         PhysicalOperator::Project { input, items, .. } if items.is_empty() => *input,
         other => other,
     };
-    let bound_paths = execute_physical_pathmaps(graph, &binding_plan, params)?;
+    let bound_paths =
+        execute_physical_pathmaps(txn.graph(), &binding_plan, params, Some(&mut *txn))?;
 
-    delete_over_paths(graph, &bound_paths, &delete.targets, delete.detach, params)?;
+    delete_over_paths_in(txn, &bound_paths, &delete.targets, delete.detach, params)?;
 
     Ok(QueryResult {
         statement_count: 1,
@@ -312,16 +397,17 @@ fn value_to_delete_targets(val: &serde_json::Value) -> Result<Vec<GraphBinding>,
 /// n's relationships) succeeds. Without DETACH, deleting a node that still has any
 /// relationship is an error (openCypher `DeleteConnectedNode`).
 pub(super) fn apply_delete_targets(
-    graph: &Graph,
+    txn: &mut issundb_core::WriteTxn,
     path: &PathMap,
     targets: &[Expr],
     detach: bool,
     params: &HashMap<String, serde_json::Value>,
 ) -> Result<(), String> {
-    delete_over_paths(graph, std::slice::from_ref(path), targets, detach, params)
+    delete_over_paths_in(txn, std::slice::from_ref(path), targets, detach, params)
 }
 
-/// Delete the targets of a DELETE clause over the full set of matched rows.
+/// Delete the targets of a DELETE clause over the full set of matched rows,
+/// inside the write transaction the enclosing statement already opened.
 ///
 /// openCypher evaluates DELETE over the whole result before applying it: all
 /// listed relationships are removed first, then all listed nodes. Collecting
@@ -329,8 +415,10 @@ pub(super) fn apply_delete_targets(
 /// r, a, b` succeed, since an undirected expand binds the same edge and nodes in
 /// more than one row. Without DETACH, a node that still has a relationship after
 /// the listed relationships are gone is an error (`DeleteConnectedNode`).
-pub(super) fn delete_over_paths(
-    graph: &Graph,
+/// LMDB permits only one open writer transaction at a time, so this must
+/// never open a second one itself.
+pub(super) fn delete_over_paths_in(
+    txn: &mut issundb_core::WriteTxn,
     paths: &[PathMap],
     targets: &[Expr],
     detach: bool,
@@ -342,7 +430,7 @@ pub(super) fn delete_over_paths(
     let mut seen_edges = std::collections::HashSet::new();
     for path in paths {
         for target in targets {
-            for binding in collect_delete_targets(graph, path, target, params)? {
+            for binding in collect_delete_targets(txn.graph(), path, target, params)? {
                 match binding {
                     GraphBinding::Node(id) if seen_nodes.insert(id) => nodes.push(id),
                     GraphBinding::Edge(id) if seen_edges.insert(id) => edges.push(id),
@@ -352,45 +440,33 @@ pub(super) fn delete_over_paths(
         }
     }
 
-    // All deletions run inside one write transaction so a failing statement
-    // (a still-connected node without DETACH) has no effect: the transaction
-    // aborts and the relationships deleted earlier in the same clause come
-    // back. The constraint failure rides an `InvalidArgument` so the abort
-    // path triggers; it is unwrapped back to the openCypher message below.
     // Relationships first: clears edges that connect nodes also being deleted
     // in the same clause.
-    graph
-        .update(|txn| {
-            for eid in &edges {
-                txn.delete_edge(*eid)?;
+    for eid in &edges {
+        txn.delete_edge(*eid).map_err(|e| e.to_string())?;
+    }
+    for nid in &nodes {
+        if detach {
+            for ne in txn.out_neighbors(*nid).map_err(|e| e.to_string())? {
+                txn.delete_edge(ne.edge).map_err(|e| e.to_string())?;
             }
-            for nid in &nodes {
-                if detach {
-                    for ne in txn.out_neighbors(*nid)? {
-                        txn.delete_edge(ne.edge)?;
-                    }
-                    for ne in txn.in_neighbors(*nid)? {
-                        txn.delete_edge(ne.edge)?;
-                    }
-                } else if !txn.out_neighbors(*nid)?.is_empty()
-                    || !txn.in_neighbors(*nid)?.is_empty()
-                {
-                    return Err(issundb_core::Error::InvalidArgument(
-                        DELETE_CONNECTED_NODE_MSG.to_string(),
-                    ));
-                }
-                txn.delete_node(*nid)?;
+            for ne in txn.in_neighbors(*nid).map_err(|e| e.to_string())? {
+                txn.delete_edge(ne.edge).map_err(|e| e.to_string())?;
             }
-            Ok(())
-        })
-        .map_err(|e| match e {
-            issundb_core::Error::InvalidArgument(msg)
-                if msg.starts_with("ConstraintVerificationFailed") =>
-            {
-                msg
-            }
-            other => other.to_string(),
-        })
+        } else if !txn
+            .out_neighbors(*nid)
+            .map_err(|e| e.to_string())?
+            .is_empty()
+            || !txn
+                .in_neighbors(*nid)
+                .map_err(|e| e.to_string())?
+                .is_empty()
+        {
+            return Err(DELETE_CONNECTED_NODE_MSG.to_string());
+        }
+        txn.delete_node(*nid).map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 /// openCypher error for deleting a node that still has relationships.
@@ -401,51 +477,63 @@ pub(super) fn execute_delete_and_return(
     stmt: &DeleteAndReturnStatement,
     params: &HashMap<String, serde_json::Value>,
 ) -> Result<QueryResult, String> {
-    graph.with_write_lock(|| {
-        let return_query = Query {
-            match_clauses: stmt.match_clauses.clone(),
-            where_clause: stmt.where_clause.clone(),
-            return_clause: stmt.return_clause.clone(),
-            parts: Vec::new(),
-            order_by: stmt.order_by.clone(),
-            skip: stmt.skip.clone(),
-            limit: stmt.limit.clone(),
-        };
-        let return_result = execute_read_query(graph, &return_query, params)?;
+    // One transaction covers the RETURN pass, the binding pass, and the
+    // delete itself, so no concurrent writer can slip in between the rows
+    // reported by RETURN and the rows actually deleted, and a failing delete
+    // (a still-connected node without DETACH) leaves nothing behind. The two
+    // read passes run before any write in this transaction, so their reads of
+    // committed state are exactly the statement's snapshot.
+    graph
+        .update(|txn| {
+            let return_query = Query {
+                match_clauses: stmt.match_clauses.clone(),
+                where_clause: stmt.where_clause.clone(),
+                return_clause: stmt.return_clause.clone(),
+                parts: Vec::new(),
+                order_by: stmt.order_by.clone(),
+                skip: stmt.skip.clone(),
+                limit: stmt.limit.clone(),
+            };
+            let return_result =
+                execute_read_query(graph, &return_query, params, None).map_err(as_txn_error)?;
 
-        let binding_query = Query {
-            match_clauses: stmt.match_clauses.clone(),
-            where_clause: stmt.where_clause.clone(),
-            return_clause: ReturnClause {
-                items: vec![],
-                distinct: false,
-            },
-            parts: Vec::new(),
-            // DELETE affects every matched element; ORDER BY, SKIP, and LIMIT
-            // restrict only the RETURN projection (computed above in `return_query`),
-            // not the set of rows fed to `delete_over_paths`.
-            order_by: None,
-            skip: None,
-            limit: None,
-        };
-        let logical = LogicalPlanner::plan(&binding_query).map_err(|e| e.to_string())?;
-        let physical = PhysicalPlanner::plan(&logical);
-        let optimized = Optimizer::optimize(physical, Some(graph));
-        let binding_plan = match &optimized {
-            PhysicalOperator::Project { input, items, .. } if items.is_empty() => {
-                input.as_ref().clone()
-            }
-            other => other.clone(),
-        };
+            let binding_query = Query {
+                match_clauses: stmt.match_clauses.clone(),
+                where_clause: stmt.where_clause.clone(),
+                return_clause: ReturnClause {
+                    items: vec![],
+                    distinct: false,
+                },
+                parts: Vec::new(),
+                // DELETE affects every matched element; ORDER BY, SKIP, and LIMIT
+                // restrict only the RETURN projection (computed above in
+                // `return_query`), not the set of rows fed to the delete.
+                order_by: None,
+                skip: None,
+                limit: None,
+            };
+            let logical =
+                LogicalPlanner::plan(&binding_query).map_err(|e| as_txn_error(e.to_string()))?;
+            let physical = PhysicalPlanner::plan(&logical);
+            let optimized = Optimizer::optimize(physical, Some(graph));
+            let binding_plan = match &optimized {
+                PhysicalOperator::Project { input, items, .. } if items.is_empty() => {
+                    input.as_ref().clone()
+                }
+                other => other.clone(),
+            };
 
-        let schema = std::sync::Arc::new(SlotSchema::from_plan(&binding_plan));
-        let bound_rows = execute_physical(graph, &binding_plan, params, &schema)?;
+            let schema = std::sync::Arc::new(SlotSchema::from_plan(&binding_plan));
+            let bound_rows = execute_physical(graph, &binding_plan, params, &schema, None)
+                .map_err(as_txn_error)?;
 
-        let bound_paths: Vec<PathMap> = bound_rows.iter().map(|r| r.to_path_map()).collect();
-        delete_over_paths(graph, &bound_paths, &stmt.targets, stmt.detach, params)?;
+            let bound_paths: Vec<PathMap> = bound_rows.iter().map(|r| r.to_path_map()).collect();
+            delete_over_paths_in(txn, &bound_paths, &stmt.targets, stmt.detach, params)
+                .map_err(as_txn_error)?;
 
-        Ok(return_result)
-    })
+            Ok(return_result)
+        })
+        .map_err(unwrap_txn_error)
 }
 
 #[instrument(skip_all)]
@@ -454,16 +542,21 @@ pub(super) fn execute_merge(
     stmt: &MergeStatement,
     params: &HashMap<String, serde_json::Value>,
 ) -> Result<QueryResult, String> {
-    graph.with_write_lock(|| execute_merge_inner(graph, stmt, params))
+    graph
+        .update(|txn| {
+            let _pending = expr::PendingWrites::install();
+            execute_merge_inner(txn, stmt, params).map_err(as_txn_error)
+        })
+        .map_err(unwrap_txn_error)
 }
 
 pub(super) fn execute_merge_inner(
-    graph: &Graph,
+    txn: &mut issundb_core::WriteTxn,
     stmt: &MergeStatement,
     params: &HashMap<String, serde_json::Value>,
 ) -> Result<QueryResult, String> {
     let empty = super::PathMap::new();
-    execute_merge_internal_with_context(graph, stmt, &empty, params)?;
+    execute_merge_internal_with_context(txn, stmt, &empty, params)?;
     Ok(QueryResult {
         statement_count: 1,
         columns: vec![],
@@ -479,8 +572,8 @@ pub(super) fn execute_merge_and_return(
     // Route through the read-query pipeline with the MERGE clauses as a write
     // part. Each MERGE binds its pattern variables into the row, then the RETURN
     // projection (including aggregation, ORDER BY, SKIP, and LIMIT) operates on
-    // those rows. The whole operation runs under the reentrant write lock so the
-    // match-or-create decision and the create are atomic.
+    // those rows. The whole statement shares one transaction, so the
+    // match-or-create decision, the create, and the RETURN are all atomic.
     let synthetic_query = Query {
         match_clauses: Vec::new(),
         where_clause: None,
@@ -492,7 +585,11 @@ pub(super) fn execute_merge_and_return(
         skip: stmt.skip.clone(),
         limit: stmt.limit.clone(),
     };
-    graph.with_write_lock(|| execute_read_query(graph, &synthetic_query, params))
+    graph
+        .update(|txn| {
+            execute_read_query(graph, &synthetic_query, params, Some(txn)).map_err(as_txn_error)
+        })
+        .map_err(unwrap_txn_error)
 }
 
 /// Apply a single REMOVE item to the element bound in `path`.
@@ -501,14 +598,14 @@ pub(super) fn execute_merge_and_return(
 /// nodes. A null or unbound variable is a no-op, matching openCypher's treatment
 /// of REMOVE over an OPTIONAL MATCH that produced no row.
 pub(super) fn apply_remove_item(
-    graph: &Graph,
+    txn: &mut issundb_core::WriteTxn,
     item: &RemoveItem,
     path: &super::PathMap,
 ) -> Result<(), String> {
     match item {
         RemoveItem::Property { variable, property } => match path.get(variable) {
             Some(GraphBinding::Node(id)) => {
-                let record = graph
+                let record = txn
                     .get_node(*id)
                     .map_err(|e| e.to_string())?
                     .ok_or_else(|| format!("node not found: {}", id))?;
@@ -517,10 +614,11 @@ pub(super) fn apply_remove_item(
                 if let Some(obj) = props.as_object_mut() {
                     obj.remove(property);
                 }
-                graph.update_node(*id, &props).map_err(|e| e.to_string())?;
+                txn.update_node(*id, &props).map_err(|e| e.to_string())?;
+                expr::PendingWrites::update_node_props(txn, *id, props);
             }
             Some(GraphBinding::Edge(id)) => {
-                let record = graph
+                let record = txn
                     .get_edge(*id)
                     .map_err(|e| e.to_string())?
                     .ok_or_else(|| format!("edge not found: {}", id))?;
@@ -529,13 +627,15 @@ pub(super) fn apply_remove_item(
                 if let Some(obj) = props.as_object_mut() {
                     obj.remove(property);
                 }
-                graph.update_edge(*id, &props).map_err(|e| e.to_string())?;
+                txn.update_edge(*id, &props).map_err(|e| e.to_string())?;
+                expr::PendingWrites::update_edge_props(txn, *id, props);
             }
             _ => {} // null, unbound, or scalar: silently skip.
         },
         RemoveItem::Label { variable, label } => {
             if let Some(GraphBinding::Node(id)) = path.get(variable) {
-                graph.remove_label(*id, label).map_err(|e| e.to_string())?;
+                txn.remove_label(*id, label).map_err(|e| e.to_string())?;
+                expr::PendingWrites::remove_label(txn, *id, label);
             }
             // null or unbound variable: silently skip.
         }
@@ -545,6 +645,24 @@ pub(super) fn apply_remove_item(
 
 pub(super) fn execute_remove(
     graph: &Graph,
+    stmt: &RemoveStatement,
+    params: &HashMap<String, serde_json::Value>,
+) -> Result<QueryResult, String> {
+    graph
+        .update(|txn| {
+            let _pending = expr::PendingWrites::install();
+            execute_remove_in(txn, stmt, params).map_err(as_txn_error)
+        })
+        .map_err(unwrap_txn_error)
+}
+
+/// Core REMOVE logic, run inside an already-open write transaction. Used both
+/// by [`execute_remove`] above (which opens its own transaction) and by a
+/// REMOVE statement in a FOREACH body (which is already inside one, opened by
+/// the enclosing `execute_foreach`); LMDB permits only one open writer
+/// transaction at a time, so this must never open a second one itself.
+pub(super) fn execute_remove_in(
+    txn: &mut issundb_core::WriteTxn,
     stmt: &RemoveStatement,
     params: &HashMap<String, serde_json::Value>,
 ) -> Result<QueryResult, String> {
@@ -562,16 +680,17 @@ pub(super) fn execute_remove(
     };
     let logical = LogicalPlanner::plan(&synthetic_query).map_err(|e| e.to_string())?;
     let physical = PhysicalPlanner::plan(&logical);
-    let optimized = Optimizer::optimize(physical, Some(graph));
+    let optimized = Optimizer::optimize(physical, Some(txn.graph()));
     let binding_plan = match optimized {
         PhysicalOperator::Project { input, items, .. } if items.is_empty() => *input,
         other => other,
     };
-    let bound_paths = execute_physical_pathmaps(graph, &binding_plan, params)?;
+    let bound_paths =
+        execute_physical_pathmaps(txn.graph(), &binding_plan, params, Some(&mut *txn))?;
 
     for path in bound_paths {
         for item in &stmt.items {
-            apply_remove_item(graph, item, &path)?;
+            apply_remove_item(txn, item, &path)?;
         }
     }
 
@@ -590,7 +709,7 @@ pub(super) fn execute_remove_and_return(
     // Route through the read-query pipeline with the REMOVE as a write part, so the
     // RETURN observes the post-removal state while the matched rows (and therefore the
     // result cardinality) are fixed at MATCH time. Re-matching would wrongly drop rows
-    // whose matched label was just removed.
+    // whose matched label was just removed. The whole statement shares one transaction.
     let synthetic_query = Query {
         match_clauses: Vec::new(),
         where_clause: None,
@@ -608,7 +727,11 @@ pub(super) fn execute_remove_and_return(
         skip: stmt.skip.clone(),
         limit: stmt.limit.clone(),
     };
-    execute_read_query(graph, &synthetic_query, params)
+    graph
+        .update(|txn| {
+            execute_read_query(graph, &synthetic_query, params, Some(txn)).map_err(as_txn_error)
+        })
+        .map_err(unwrap_txn_error)
 }
 
 pub(super) fn execute_foreach(
@@ -616,37 +739,46 @@ pub(super) fn execute_foreach(
     stmt: &ForeachStatement,
     params: &HashMap<String, serde_json::Value>,
 ) -> Result<QueryResult, String> {
-    let list_val = evaluate_expr(graph, &PathMap::new(), &stmt.list, params)?;
-    let items = match list_val {
-        serde_json::Value::Array(arr) => arr,
-        serde_json::Value::Null => vec![],
-        other => vec![other],
-    };
+    // The whole loop (every iteration, every body statement) shares one
+    // transaction, so a failure partway through rolls back every mutation
+    // FOREACH already made in earlier iterations.
+    graph
+        .update(|txn| {
+            let _pending = expr::PendingWrites::install();
+            let list_val = evaluate_expr(txn.graph(), &PathMap::new(), &stmt.list, params)
+                .map_err(as_txn_error)?;
+            let items = match list_val {
+                serde_json::Value::Array(arr) => arr,
+                serde_json::Value::Null => vec![],
+                other => vec![other],
+            };
 
-    // The body statements reference the loop variable as a plain variable,
-    // but the body executors evaluate expressions against fresh rows that do
-    // not bind it. Rewrite the body once, replacing every loop-variable
-    // reference with a parameter access, and carry the element value in the
-    // per-iteration parameter map under the same name.
-    let body: Vec<crate::ast::Statement> = stmt
-        .body
-        .iter()
-        .map(|s| subst_loop_var_stmt(s, &stmt.variable))
-        .collect();
+            // The body statements reference the loop variable as a plain variable,
+            // but the body executors evaluate expressions against fresh rows that do
+            // not bind it. Rewrite the body once, replacing every loop-variable
+            // reference with a parameter access, and carry the element value in the
+            // per-iteration parameter map under the same name.
+            let body: Vec<crate::ast::Statement> = stmt
+                .body
+                .iter()
+                .map(|s| subst_loop_var_stmt(s, &stmt.variable))
+                .collect();
 
-    for element in items {
-        let mut inner_params = params.clone();
-        inner_params.insert(stmt.variable.clone(), element);
-        for body_stmt in &body {
-            execute_foreach_body(graph, body_stmt, &inner_params)?;
-        }
-    }
+            for element in items {
+                let mut inner_params = params.clone();
+                inner_params.insert(stmt.variable.clone(), element);
+                for body_stmt in &body {
+                    execute_foreach_body(txn, body_stmt, &inner_params).map_err(as_txn_error)?;
+                }
+            }
 
-    Ok(QueryResult {
-        statement_count: 1,
-        columns: vec![],
-        records: vec![],
-    })
+            Ok(QueryResult {
+                statement_count: 1,
+                columns: vec![],
+                records: vec![],
+            })
+        })
+        .map_err(unwrap_txn_error)
 }
 
 /// Replace every reference to the FOREACH loop variable in `expr` with a
@@ -961,8 +1093,13 @@ fn subst_loop_var_stmt(stmt: &crate::ast::Statement, var: &str) -> crate::ast::S
     }
 }
 
+/// Execute one FOREACH body statement inside the transaction the enclosing
+/// `execute_foreach` already opened. Dispatches to each write clause's `_in`
+/// (or, for CREATE, pattern-level `_internal`) core rather than its public
+/// self-wrapping entry point: those each open their own `Graph::update`,
+/// which would deadlock if called while this one is already open.
 fn execute_foreach_body(
-    graph: &Graph,
+    txn: &mut issundb_core::WriteTxn,
     stmt: &crate::ast::Statement,
     params: &HashMap<String, serde_json::Value>,
 ) -> Result<(), String> {
@@ -970,24 +1107,25 @@ fn execute_foreach_body(
     match stmt {
         Statement::Create(c) => {
             for pattern in &c.patterns {
-                execute_create_internal(graph, pattern)?;
+                execute_create_internal(txn, pattern)?;
             }
         }
         Statement::Set(s) => {
-            execute_set(graph, s, params)?;
+            execute_set_in(txn, s, params)?;
         }
         Statement::Delete(d) => {
-            execute_delete(graph, d, params)?;
+            execute_delete_in(txn, d, params)?;
         }
         Statement::Merge(m) => {
-            execute_merge_inner(graph, m, params)?;
+            execute_merge_inner(txn, m, params)?;
         }
         Statement::Remove(r) => {
-            execute_remove(graph, r, params)?;
+            execute_remove_in(txn, r, params)?;
         }
         // Write-only pipeline query (e.g., standalone CREATE parsed as Statement::Query).
         Statement::Query(q) if q.return_clause.items.is_empty() => {
-            super::read::execute_read_query(graph, q, params).map_err(|e| e.to_string())?;
+            super::read::execute_read_query(txn.graph(), q, params, Some(txn))
+                .map_err(|e| e.to_string())?;
         }
         _ => {
             return Err("unsupported statement in FOREACH body".into());
@@ -997,13 +1135,13 @@ fn execute_foreach_body(
 }
 
 pub(super) fn apply_set_items(
-    graph: &Graph,
+    txn: &mut issundb_core::WriteTxn,
     path: &PathMap,
     set_items: &[SetItem],
     params: &HashMap<String, serde_json::Value>,
 ) -> Result<(), String> {
     for item in set_items {
-        apply_set_item(graph, path, item, params)?;
+        apply_set_item(txn, path, item, params)?;
     }
     Ok(())
 }
@@ -1059,7 +1197,7 @@ fn resolve_set_target(path: &PathMap, variable: &str) -> Result<SetTarget, Strin
 /// Apply a single SET item: a property assignment (on a node or edge) or a
 /// label addition (on a node).
 pub(super) fn apply_set_item(
-    graph: &Graph,
+    txn: &mut issundb_core::WriteTxn,
     path: &PathMap,
     item: &SetItem,
     params: &HashMap<String, serde_json::Value>,
@@ -1070,10 +1208,10 @@ pub(super) fn apply_set_item(
             property,
             expr,
         } => {
-            let new_val = evaluate_expr(graph, path, expr, params)?;
+            let new_val = evaluate_expr(txn.graph(), path, expr, params)?;
             match resolve_set_target(path, variable)? {
                 SetTarget::Node(nid) => {
-                    let record = graph
+                    let record = txn
                         .get_node(nid)
                         .map_err(|e| e.to_string())?
                         .ok_or_else(|| format!("node not found: {}", nid))?;
@@ -1086,10 +1224,13 @@ pub(super) fn apply_set_item(
                             obj.insert(property.clone(), new_val);
                         }
                     }
-                    graph.update_node(nid, &props).map_err(|e| e.to_string())?;
+                    txn.update_node(nid, &props).map_err(|e| e.to_string())?;
+                    // `expr` above is this arm's `SetItem::Property` field, which
+                    // shadows the `expr` module; qualify explicitly.
+                    super::expr::PendingWrites::update_node_props(txn, nid, props);
                 }
                 SetTarget::Edge(eid) => {
-                    let record = graph
+                    let record = txn
                         .get_edge(eid)
                         .map_err(|e| e.to_string())?
                         .ok_or_else(|| format!("edge not found: {}", eid))?;
@@ -1102,7 +1243,8 @@ pub(super) fn apply_set_item(
                             obj.insert(property.clone(), new_val);
                         }
                     }
-                    graph.update_edge(eid, &props).map_err(|e| e.to_string())?;
+                    txn.update_edge(eid, &props).map_err(|e| e.to_string())?;
+                    super::expr::PendingWrites::update_edge_props(txn, eid, props);
                 }
                 SetTarget::Skip => {}
             }
@@ -1110,7 +1252,8 @@ pub(super) fn apply_set_item(
         SetItem::Labels { variable, labels } => {
             if let SetTarget::Node(nid) = resolve_set_target(path, variable)? {
                 for label in labels {
-                    graph.add_label(nid, label).map_err(|e| e.to_string())?;
+                    txn.add_label(nid, label).map_err(|e| e.to_string())?;
+                    super::expr::PendingWrites::add_label(txn, nid, label);
                 }
             }
         }
@@ -1123,7 +1266,7 @@ pub(super) fn apply_set_item(
 /// This function evaluates property expressions using the provided path bindings, which
 /// allows referencing pipeline variables (e.g., `CREATE (n {num: x})` where `x` is from UNWIND).
 pub(super) fn execute_create_internal_with_context(
-    graph: &Graph,
+    txn: &mut issundb_core::WriteTxn,
     pattern: &Pattern,
     path: &super::PathMap,
     params: &HashMap<String, serde_json::Value>,
@@ -1137,25 +1280,29 @@ pub(super) fn execute_create_internal_with_context(
             *existing_id
         } else {
             let props_map = if let Some(ref props) = pattern.node.properties {
-                eval_properties(graph, props, &combined_path, params)?
+                eval_properties(txn, props, &combined_path, params)?
             } else {
                 serde_json::Value::Object(serde_json::Map::new())
             };
             let labels: Vec<&str> = pattern.node.labels.iter().map(|s| s.as_str()).collect();
-            graph
+            let id = txn
                 .add_node_multi(&labels, &props_map)
-                .map_err(|e| e.to_string())?
+                .map_err(|e| e.to_string())?;
+            expr::PendingWrites::record_node(id, pattern.node.labels.clone(), props_map);
+            id
         }
     } else {
         let props_map = if let Some(ref props) = pattern.node.properties {
-            eval_properties(graph, props, &combined_path, params)?
+            eval_properties(txn, props, &combined_path, params)?
         } else {
             serde_json::Value::Object(serde_json::Map::new())
         };
         let labels: Vec<&str> = pattern.node.labels.iter().map(|s| s.as_str()).collect();
-        graph
+        let id = txn
             .add_node_multi(&labels, &props_map)
-            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+        expr::PendingWrites::record_node(id, pattern.node.labels.clone(), props_map);
+        id
     };
 
     if let Some(ref var_name) = pattern.node.variable {
@@ -1174,14 +1321,15 @@ pub(super) fn execute_create_internal_with_context(
             } else {
                 // Create a new target node.
                 let target_props = if let Some(ref props) = node_pat.properties {
-                    eval_properties(graph, props, &combined_path, params)?
+                    eval_properties(txn, props, &combined_path, params)?
                 } else {
                     serde_json::Value::Object(serde_json::Map::new())
                 };
                 let labels: Vec<&str> = node_pat.labels.iter().map(|s| s.as_str()).collect();
-                let tid = graph
+                let tid = txn
                     .add_node_multi(&labels, &target_props)
                     .map_err(|e| e.to_string())?;
+                expr::PendingWrites::record_node(tid, node_pat.labels.clone(), target_props);
                 bindings.insert(var.clone(), GraphBinding::Node(tid));
                 combined_path.insert(var.clone(), GraphBinding::Node(tid));
                 tid
@@ -1189,14 +1337,16 @@ pub(super) fn execute_create_internal_with_context(
         } else {
             // Anonymous target node.
             let target_props = if let Some(ref props) = node_pat.properties {
-                eval_properties(graph, props, &combined_path, params)?
+                eval_properties(txn, props, &combined_path, params)?
             } else {
                 serde_json::Value::Object(serde_json::Map::new())
             };
             let labels: Vec<&str> = node_pat.labels.iter().map(|s| s.as_str()).collect();
-            graph
+            let tid = txn
                 .add_node_multi(&labels, &target_props)
-                .map_err(|e| e.to_string())?
+                .map_err(|e| e.to_string())?;
+            expr::PendingWrites::record_node(tid, node_pat.labels.clone(), target_props);
+            tid
         };
 
         let rel_type = rel_pat
@@ -1205,20 +1355,20 @@ pub(super) fn execute_create_internal_with_context(
             .unwrap_or_else(|| "EDGE".to_string());
 
         let rel_props = if let Some(ref props) = rel_pat.properties {
-            eval_properties(graph, props, &combined_path, params)?
+            eval_properties(txn, props, &combined_path, params)?
         } else {
             serde_json::Value::Object(serde_json::Map::new())
         };
 
-        let edge_id = if rel_pat.is_incoming {
-            graph
-                .add_edge(target_id, created_node_id, &rel_type, &rel_props)
-                .map_err(|e| e.to_string())?
+        let (src, dst) = if rel_pat.is_incoming {
+            (target_id, created_node_id)
         } else {
-            graph
-                .add_edge(created_node_id, target_id, &rel_type, &rel_props)
-                .map_err(|e| e.to_string())?
+            (created_node_id, target_id)
         };
+        let edge_id = txn
+            .add_edge(src, dst, &rel_type, &rel_props)
+            .map_err(|e| e.to_string())?;
+        expr::PendingWrites::record_edge(edge_id, src, dst, rel_type.clone(), rel_props);
 
         if let Some(ref var_name) = rel_pat.variable {
             bindings.insert(var_name.clone(), GraphBinding::Edge(edge_id));
@@ -1233,16 +1383,16 @@ pub(super) fn execute_create_internal_with_context(
 
 /// Read a node's stored properties as a JSON object, returning an empty object
 /// when the node is missing or has no properties.
-fn node_props_json(graph: &Graph, id: NodeId) -> Result<serde_json::Value, String> {
-    match graph.get_node(id).map_err(|e| e.to_string())? {
+fn node_props_json(txn: &issundb_core::WriteTxn, id: NodeId) -> Result<serde_json::Value, String> {
+    match txn.get_node(id).map_err(|e| e.to_string())? {
         Some(record) => rmp_serde::from_slice(&record.props).map_err(|e| e.to_string()),
         None => Ok(serde_json::Value::Object(serde_json::Map::new())),
     }
 }
 
 /// Read an edge's stored properties as a JSON object.
-fn edge_props_json(graph: &Graph, id: EdgeId) -> Result<serde_json::Value, String> {
-    match graph.get_edge(id).map_err(|e| e.to_string())? {
+fn edge_props_json(txn: &issundb_core::WriteTxn, id: EdgeId) -> Result<serde_json::Value, String> {
+    match txn.get_edge(id).map_err(|e| e.to_string())? {
         Some(record) => rmp_serde::from_slice(&record.props).map_err(|e| e.to_string()),
         None => Ok(serde_json::Value::Object(serde_json::Map::new())),
     }
@@ -1268,14 +1418,14 @@ fn props_subset_match(filter: &serde_json::Value, actual: &serde_json::Value) ->
 /// filter key would vanish and the pattern would match every candidate, so
 /// openCypher requires an error instead.
 fn eval_merge_properties(
-    graph: &Graph,
+    txn: &issundb_core::WriteTxn,
     props: &HashMap<String, crate::ast::Expr>,
     path: &PathMap,
     params: &HashMap<String, serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
     let mut obj = serde_json::Map::new();
     for (k, v) in props {
-        let val = evaluate_expr(graph, path, v, params)?;
+        let val = evaluate_expr(txn.graph(), path, v, params)?;
         if val == serde_json::Value::Null {
             return Err(format!(
                 "SemanticError(InvalidArgumentValue): cannot merge using null property value for '{k}'"
@@ -1287,43 +1437,47 @@ fn eval_merge_properties(
 }
 
 /// True when a node carries all of the required labels.
-fn node_has_labels(graph: &Graph, id: NodeId, labels: &[String]) -> Result<bool, String> {
+fn node_has_labels(
+    txn: &issundb_core::WriteTxn,
+    id: NodeId,
+    labels: &[String],
+) -> Result<bool, String> {
     if labels.is_empty() {
         return Ok(true);
     }
-    let actual = graph.node_labels(id).map_err(|e| e.to_string())?;
+    let actual = txn.node_labels(id).map_err(|e| e.to_string())?;
     Ok(labels.iter().all(|l| actual.contains(l)))
 }
 
 /// True when a node satisfies both the label and property constraints of a pattern.
 fn node_matches(
-    graph: &Graph,
+    txn: &issundb_core::WriteTxn,
     id: NodeId,
     labels: &[String],
     props: &serde_json::Value,
 ) -> Result<bool, String> {
-    if !node_has_labels(graph, id, labels)? {
+    if !node_has_labels(txn, id, labels)? {
         return Ok(false);
     }
-    Ok(props_subset_match(props, &node_props_json(graph, id)?))
+    Ok(props_subset_match(props, &node_props_json(txn, id)?))
 }
 
 /// Enumerate candidate nodes that satisfy a node pattern's label and property
 /// constraints. With no labels, this scans all nodes; otherwise it scans the
 /// first label and filters the rest.
 fn candidate_nodes(
-    graph: &Graph,
+    txn: &issundb_core::WriteTxn,
     labels: &[String],
     props: &serde_json::Value,
 ) -> Result<Vec<NodeId>, String> {
     let seed: Vec<NodeId> = if let Some(first) = labels.first() {
-        graph.nodes_by_label(first).map_err(|e| e.to_string())?
+        txn.nodes_by_label(first).map_err(|e| e.to_string())?
     } else {
-        graph.all_nodes().map_err(|e| e.to_string())?
+        txn.all_nodes().map_err(|e| e.to_string())?
     };
     let mut out = Vec::new();
     for id in seed {
-        if node_matches(graph, id, labels, props)? {
+        if node_matches(txn, id, labels, props)? {
             out.push(id);
         }
     }
@@ -1335,20 +1489,20 @@ fn candidate_nodes(
 /// variables included) over one full match. An empty result means the pattern
 /// does not yet exist and the caller should create it.
 fn merge_match(
-    graph: &Graph,
+    txn: &issundb_core::WriteTxn,
     pattern: &Pattern,
     ctx: &super::PathMap,
     params: &HashMap<String, serde_json::Value>,
 ) -> Result<Vec<super::PathMap>, String> {
     // Seed candidates for the first node in the chain.
     let seed_props = match &pattern.node.properties {
-        Some(p) => eval_merge_properties(graph, p, ctx, params)?,
+        Some(p) => eval_merge_properties(txn, p, ctx, params)?,
         None => serde_json::Value::Object(serde_json::Map::new()),
     };
     let seed_candidates: Vec<NodeId> =
         match pattern.node.variable.as_deref().and_then(|v| ctx.get(v)) {
             Some(GraphBinding::Node(id)) => vec![*id],
-            _ => candidate_nodes(graph, &pattern.node.labels, &seed_props)?,
+            _ => candidate_nodes(txn, &pattern.node.labels, &seed_props)?,
         };
 
     // Each partial carries the pattern bindings accumulated so far, the
@@ -1378,11 +1532,11 @@ fn merge_match(
                 combined.insert(k.clone(), v.clone());
             }
             let rel_props = match &rel_pat.properties {
-                Some(p) => eval_merge_properties(graph, p, &combined, params)?,
+                Some(p) => eval_merge_properties(txn, p, &combined, params)?,
                 None => serde_json::Value::Object(serde_json::Map::new()),
             };
             let tgt_props = match &node_pat.properties {
-                Some(p) => eval_merge_properties(graph, p, &combined, params)?,
+                Some(p) => eval_merge_properties(txn, p, &combined, params)?,
                 None => serde_json::Value::Object(serde_json::Map::new()),
             };
             let bound_target = node_pat
@@ -1394,7 +1548,7 @@ fn merge_match(
                     _ => None,
                 });
 
-            let neighbors = graph.all_neighbors(*cur).map_err(|e| e.to_string())?;
+            let neighbors = txn.all_neighbors(*cur).map_err(|e| e.to_string())?;
             for n in neighbors {
                 if used_edges.contains(&n.edge) {
                     continue;
@@ -1408,7 +1562,7 @@ fn merge_match(
                     }
                 }
                 if !rel_types.is_empty() {
-                    let tn = graph
+                    let tn = txn
                         .type_name(n.edge_type)
                         .map_err(|e| e.to_string())?
                         .unwrap_or_default();
@@ -1416,12 +1570,12 @@ fn merge_match(
                         continue;
                     }
                 }
-                if !props_subset_match(&rel_props, &edge_props_json(graph, n.edge)?) {
+                if !props_subset_match(&rel_props, &edge_props_json(txn, n.edge)?) {
                     continue;
                 }
                 match bound_target {
                     Some(b) if b != n.node => continue,
-                    None if !node_matches(graph, n.node, &node_pat.labels, &tgt_props)? => continue,
+                    None if !node_matches(txn, n.node, &node_pat.labels, &tgt_props)? => continue,
                     _ => {}
                 }
                 let mut npm = pm.clone();
@@ -1447,12 +1601,12 @@ fn merge_match(
 /// pattern. ON MATCH / ON CREATE SET actions are applied with the combined
 /// context so they can reference both incoming and pattern variables.
 pub(super) fn execute_merge_internal_with_context(
-    graph: &Graph,
+    txn: &mut issundb_core::WriteTxn,
     stmt: &crate::ast::MergeStatement,
     path: &super::PathMap,
     params: &HashMap<String, serde_json::Value>,
 ) -> Result<Vec<super::PathMap>, String> {
-    let matches = merge_match(graph, &stmt.pattern, path, params)?;
+    let matches = merge_match(txn, &stmt.pattern, path, params)?;
     if !matches.is_empty() {
         for m in &matches {
             if !stmt.on_match_set.is_empty() {
@@ -1460,18 +1614,18 @@ pub(super) fn execute_merge_internal_with_context(
                 for (k, v) in m {
                     combined.insert(k.clone(), v.clone());
                 }
-                apply_set_items(graph, &combined, &stmt.on_match_set, params)?;
+                apply_set_items(txn, &combined, &stmt.on_match_set, params)?;
             }
         }
         Ok(matches)
     } else {
-        let created = execute_create_internal_with_context(graph, &stmt.pattern, path, params)?;
+        let created = execute_create_internal_with_context(txn, &stmt.pattern, path, params)?;
         if !stmt.on_create_set.is_empty() {
             let mut combined = path.clone();
             for (k, v) in &created {
                 combined.insert(k.clone(), v.clone());
             }
-            apply_set_items(graph, &combined, &stmt.on_create_set, params)?;
+            apply_set_items(txn, &combined, &stmt.on_create_set, params)?;
         }
         Ok(vec![created])
     }

@@ -150,9 +150,34 @@ impl ReadTxn<'_> {
     }
 }
 
-impl WriteTxn<'_> {
+impl<'a> WriteTxn<'a> {
+    /// The `Graph` this transaction was opened against. Reads through this
+    /// handle (as opposed to through `self`) are only correct for state
+    /// that predates the transaction: use `self`'s own methods for anything
+    /// that must see this transaction's own uncommitted writes. Returns the
+    /// transaction's own `'a` lifetime (not tied to `&self`), so a caller can
+    /// hold this alongside a fresh `&mut` borrow of `self` in the same call
+    /// (e.g. passing both a stats-only `&Graph` and `Some(&mut *txn)` to one
+    /// function).
+    pub fn graph(&self) -> &'a Graph {
+        self.graph
+    }
+
     pub fn get_node(&self, id: NodeId) -> Result<Option<NodeRecord>, Error> {
         self.graph.get_node_impl(&self.wtxn, id)
+    }
+
+    /// Return the string labels of a node, seeing labels added earlier in
+    /// this same still-open transaction.
+    pub fn node_labels(&self, id: NodeId) -> Result<Vec<String>, Error> {
+        self.graph.node_labels_impl(&self.wtxn, id)
+    }
+
+    /// Return directed neighbor entries (both outgoing and incoming) for
+    /// `node`, seeing edges added earlier in this same still-open
+    /// transaction.
+    pub fn all_neighbors(&self, node: NodeId) -> Result<Vec<DirectedNeighborEntry>, Error> {
+        self.graph.all_neighbors_impl(&self.wtxn, node)
     }
 
     pub fn get_edge(&self, id: EdgeId) -> Result<Option<EdgeRecord>, Error> {
@@ -334,6 +359,15 @@ impl WriteTxn<'_> {
         Ok(edge_id)
     }
 
+    /// Update the properties of an existing edge inside this write
+    /// transaction, preserving src, dst, and type.
+    pub fn update_edge(&mut self, id: EdgeId, props: &impl Serialize) -> Result<(), Error> {
+        self.graph.update_edge_impl(&mut self.wtxn, id, props)?;
+        self.mutations_count += 1;
+        self.delta.updated_edges.push(id);
+        Ok(())
+    }
+
     #[doc(hidden)]
     pub fn put_vector_bytes(&mut self, n: NodeId, bytes: &[u8]) -> Result<(), Error> {
         self.graph.put_vector_bytes_impl(&mut self.wtxn, n, bytes)?;
@@ -498,6 +532,85 @@ mod tests {
         // The node should NOT be present in the database since the transaction rolled back
         let nodes = g.all_nodes().unwrap();
         assert_eq!(nodes.len(), 0);
+    }
+
+    /// A back-to-back sequence of heterogeneous mutations and reads inside one
+    /// `update` closure must not panic or corrupt state: each `WriteTxn` method
+    /// borrows, uses, and drops its transaction handle within its own body.
+    #[test]
+    fn write_txn_mixed_mutations_and_reads_in_one_closure() {
+        let (_dir, g) = open_tmp();
+        g.update(|txn| {
+            let a = txn.add_node("Person", &json!({"name": "Alice"}))?;
+            assert_eq!(txn.node_labels(a)?, vec!["Person".to_string()]);
+            txn.update_node(a, &json!({"name": "Alicia"}))?;
+            let b = txn.add_node("Person", &json!({"name": "Bob"}))?;
+            let e = txn.add_edge(a, b, "KNOWS", &json!({"since": 2020}))?;
+            txn.update_edge(e, &json!({"since": 2021}))?;
+            assert_eq!(txn.all_neighbors(a)?.len(), 1);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn write_txn_update_edge_sees_own_uncommitted_edge() {
+        let (_dir, g) = open_tmp();
+        let (a, b) = g
+            .update(|txn| {
+                let a = txn.add_node("Person", &json!({}))?;
+                let b = txn.add_node("Person", &json!({}))?;
+                let e = txn.add_edge(a, b, "KNOWS", &json!({"since": 2020}))?;
+                // Update an edge added earlier in this same still-open transaction.
+                txn.update_edge(e, &json!({"since": 2021}))?;
+                let rec = txn.get_edge(e)?.expect("edge visible in this txn");
+                let props: serde_json::Value = rmp_serde::from_slice(&rec.props).unwrap();
+                assert_eq!(props["since"], 2021);
+                Ok((a, b))
+            })
+            .unwrap();
+
+        // Post-commit, the update must have taken effect (not the original value).
+        let neighbors = g.out_neighbors(a).unwrap();
+        assert_eq!(neighbors.len(), 1);
+        let rec = g.get_edge(neighbors[0].edge).unwrap().unwrap();
+        let props: serde_json::Value = rmp_serde::from_slice(&rec.props).unwrap();
+        assert_eq!(props["since"], 2021);
+        let _ = b;
+    }
+
+    #[test]
+    fn write_txn_all_neighbors_sees_own_uncommitted_edge() {
+        let (_dir, g) = open_tmp();
+        g.update(|txn| {
+            let a = txn.add_node("N", &json!({}))?;
+            let b = txn.add_node("N", &json!({}))?;
+            txn.add_edge(a, b, "E", &json!({}))?;
+            let neighbors = txn.all_neighbors(a)?;
+            assert_eq!(
+                neighbors.len(),
+                1,
+                "must see the edge added earlier in this transaction"
+            );
+            assert_eq!(neighbors[0].node, b);
+            assert!(neighbors[0].outgoing);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn write_txn_node_labels_sees_own_uncommitted_label() {
+        let (_dir, g) = open_tmp();
+        g.update(|txn| {
+            let a = txn.add_node("Person", &json!({}))?;
+            txn.add_label(a, "Employee")?;
+            let mut labels = txn.node_labels(a)?;
+            labels.sort();
+            assert_eq!(labels, vec!["Employee".to_string(), "Person".to_string()]);
+            Ok(())
+        })
+        .unwrap();
     }
 
     // --- bfs_multi_source_graphblas ---

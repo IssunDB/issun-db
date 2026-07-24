@@ -90,3 +90,8 @@ The temporal constructors `date`, `time`, `localtime`, `datetime`, `localdatetim
   `"chris"`, not any string that merely contains it.
 - Temporal years are limited to roughly the range -262143 to 262143, narrower than the openCypher specification admits.
 - The openCypher TCK subset run (`make test-conformance`) tracks the remaining known gaps; failures there are documented deviations rather than silent wrong results.
+- A statement's write clauses (`CREATE`, `MERGE`, `SET`, `DELETE`, `REMOVE`, in any combination, plus the `RETURN`/`WITH` projection that follows
+  them) are atomic: an error anywhere rolls back every write the statement already made. A `RETURN`/`WITH` clause correctly sees a property of a
+  variable an earlier write in the same statement just created or changed. A `MATCH`/label-scan *after* a write clause in the same statement does not
+  see that write's structural effect until the whole statement commits (for example `CREATE (a:Foo) WITH a MATCH (m:Foo) RETURN count(m)` does not
+  count `a`).

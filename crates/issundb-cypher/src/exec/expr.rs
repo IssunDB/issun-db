@@ -80,13 +80,225 @@ impl Drop for PropCache {
     }
 }
 
-/// Decode a node's properties as JSON, serving from the statement cache when one
-/// is installed. Returns `None` if the node does not exist. The returned `Rc`
-/// shares storage with the cache, so clone the inner value before mutating it.
+thread_local! {
+    // Per-statement overlay of nodes/edges written earlier in the SAME
+    // still-open write transaction, keyed by id, most recent write per id
+    // wins. `PropColumns` (the fast property-read cache `node_prop_json`
+    // consults) only refreshes after an LMDB commit, so without this overlay
+    // a `RETURN`/`WITH` clause reading a property of a node created or
+    // updated earlier in the same not-yet-committed statement would read
+    // stale or missing data. Installed only for write-containing statements
+    // (mirrors `PropCache`'s install/drop-guard idiom), populated by the
+    // write executors in `write.rs` right after each successful mutation,
+    // and consulted here before falling through to `PropColumns`/LMDB.
+    static PENDING_WRITES: RefCell<Option<PendingWritesState>> = const { RefCell::new(None) };
+}
+
+/// A node written earlier in the currently-installed write transaction: its
+/// full current label set and properties. Labels never change via `SET`
+/// property assignment, only via `SET`/`REMOVE` label items, so those are the
+/// only mutations that touch `labels` after the node's initial `CREATE`. The
+/// props sit behind an `Rc` so an overlay hit is a pointer bump, not a deep
+/// clone of the whole property map (the same reason `PropCacheState` stores
+/// `Rc` values).
+#[derive(Clone)]
+pub(crate) struct PendingNodeInfo {
+    pub(crate) labels: Vec<String>,
+    pub(crate) props: Rc<serde_json::Value>,
+}
+
+/// An edge written earlier in the currently-installed write transaction. An
+/// edge's endpoints and type are immutable once created, so only `props`
+/// changes after the edge's initial `CREATE`.
+#[derive(Clone)]
+pub(crate) struct PendingEdgeInfo {
+    pub(crate) src: NodeId,
+    pub(crate) dst: NodeId,
+    pub(crate) edge_type: String,
+    pub(crate) props: Rc<serde_json::Value>,
+}
+
+#[derive(Default)]
+struct PendingWritesState {
+    nodes: HashMap<NodeId, PendingNodeInfo>,
+    edges: HashMap<EdgeId, PendingEdgeInfo>,
+}
+
+/// Guard that installs an empty pending-writes overlay for one write-containing
+/// statement and restores the previous overlay on drop, so a nested subquery
+/// does not clear an outer statement's overlay.
+pub(crate) struct PendingWrites {
+    previous: Option<PendingWritesState>,
+}
+
+impl PendingWrites {
+    pub(crate) fn install() -> Self {
+        let previous =
+            PENDING_WRITES.with(|c| c.borrow_mut().replace(PendingWritesState::default()));
+        PendingWrites { previous }
+    }
+
+    /// Record (or fully replace) a node's labels and properties, e.g. right
+    /// after `CREATE`.
+    pub(crate) fn record_node(id: NodeId, labels: Vec<String>, props: serde_json::Value) {
+        Self::record_node_rc(id, labels, Rc::new(props));
+    }
+
+    fn record_node_rc(id: NodeId, labels: Vec<String>, props: Rc<serde_json::Value>) {
+        PENDING_WRITES.with(|c| {
+            if let Some(s) = c.borrow_mut().as_mut() {
+                s.nodes.insert(id, PendingNodeInfo { labels, props });
+            }
+        });
+    }
+
+    /// Record (or fully replace) an edge's endpoints, type, and properties,
+    /// e.g. right after `CREATE`.
+    pub(crate) fn record_edge(
+        id: EdgeId,
+        src: NodeId,
+        dst: NodeId,
+        edge_type: String,
+        props: serde_json::Value,
+    ) {
+        PENDING_WRITES.with(|c| {
+            if let Some(s) = c.borrow_mut().as_mut() {
+                s.edges.insert(
+                    id,
+                    PendingEdgeInfo {
+                        src,
+                        dst,
+                        edge_type,
+                        props: Rc::new(props),
+                    },
+                );
+            }
+        });
+    }
+
+    /// Update a node's properties after a `SET`/`REMOVE` property change,
+    /// preserving its known labels. If this is the node's first appearance in
+    /// the overlay (it existed before this transaction and this is its first
+    /// touch), its labels are read fresh via `txn`, which sees this same
+    /// transaction's own earlier writes.
+    pub(crate) fn update_node_props(
+        txn: &issundb_core::WriteTxn,
+        id: NodeId,
+        props: serde_json::Value,
+    ) {
+        let labels = pending_node(id)
+            .map(|n| n.labels)
+            .unwrap_or_else(|| txn.node_labels(id).unwrap_or_default());
+        Self::record_node(id, labels, props);
+    }
+
+    /// Edge counterpart to [`PendingWrites::update_node_props`]. An edge's
+    /// endpoints and type are immutable, so only `props` needs updating; if
+    /// this is the edge's first appearance in the overlay, its endpoints and
+    /// type are read fresh via `txn`.
+    pub(crate) fn update_edge_props(
+        txn: &issundb_core::WriteTxn,
+        id: EdgeId,
+        props: serde_json::Value,
+    ) {
+        if let Some(existing) = pending_edge(id) {
+            Self::record_edge(id, existing.src, existing.dst, existing.edge_type, props);
+        } else if let Ok(Some(rec)) = txn.get_edge(id) {
+            let edge_type = txn
+                .type_name(rec.edge_type)
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            Self::record_edge(id, rec.src, rec.dst, edge_type, props);
+        }
+    }
+
+    /// Add a label to a node's overlay entry (`SET n:Label`), fetching its
+    /// current labels and properties via `txn` first if this is its first
+    /// appearance in the overlay.
+    pub(crate) fn add_label(txn: &issundb_core::WriteTxn, id: NodeId, label: &str) {
+        let (mut labels, props) = pending_node(id)
+            .map(|n| (n.labels, n.props))
+            .unwrap_or_else(|| {
+                (
+                    txn.node_labels(id).unwrap_or_default(),
+                    Rc::new(current_node_props_or_null(txn, id)),
+                )
+            });
+        if !labels.iter().any(|l| l == label) {
+            labels.push(label.to_string());
+        }
+        Self::record_node_rc(id, labels, props);
+    }
+
+    /// Remove a label from a node's overlay entry (`REMOVE n:Label`), same
+    /// first-appearance handling as [`PendingWrites::add_label`].
+    pub(crate) fn remove_label(txn: &issundb_core::WriteTxn, id: NodeId, label: &str) {
+        let (mut labels, props) = pending_node(id)
+            .map(|n| (n.labels, n.props))
+            .unwrap_or_else(|| {
+                (
+                    txn.node_labels(id).unwrap_or_default(),
+                    Rc::new(current_node_props_or_null(txn, id)),
+                )
+            });
+        labels.retain(|l| l != label);
+        Self::record_node_rc(id, labels, props);
+    }
+}
+
+impl Drop for PendingWrites {
+    fn drop(&mut self) {
+        PENDING_WRITES.with(|c| *c.borrow_mut() = self.previous.take());
+    }
+}
+
+/// Current properties of a node already known to exist (used only to
+/// populate a fresh overlay entry when a label change is the node's first
+/// appearance in the overlay); `Value::Null` if the node or its properties
+/// cannot be read, which then simply drops that node's properties from the
+/// overlay entry rather than failing the label update.
+fn current_node_props_or_null(txn: &issundb_core::WriteTxn, id: NodeId) -> serde_json::Value {
+    txn.get_node(id)
+        .ok()
+        .flatten()
+        .and_then(|rec| rmp_serde::from_slice(&rec.props).ok())
+        .unwrap_or(serde_json::Value::Null)
+}
+
+/// The pending-writes overlay entry for a node touched earlier in the
+/// currently-installed write transaction, if any. `pub(crate)` so the final
+/// result-materialization path in `read.rs` (whole-entity projections such as
+/// `WITH n RETURN n`) can consult the overlay too, not just expression
+/// evaluation.
+pub(crate) fn pending_node(id: NodeId) -> Option<PendingNodeInfo> {
+    PENDING_WRITES.with(|c| c.borrow().as_ref().and_then(|s| s.nodes.get(&id).cloned()))
+}
+
+/// Edge counterpart to [`pending_node`].
+pub(crate) fn pending_edge(id: EdgeId) -> Option<PendingEdgeInfo> {
+    PENDING_WRITES.with(|c| c.borrow().as_ref().and_then(|s| s.edges.get(&id).cloned()))
+}
+
+fn pending_node_props(id: NodeId) -> Option<Rc<serde_json::Value>> {
+    pending_node(id).map(|n| n.props)
+}
+
+fn pending_edge_props(id: EdgeId) -> Option<Rc<serde_json::Value>> {
+    pending_edge(id).map(|e| e.props)
+}
+
+/// Decode a node's properties as JSON, serving from the pending-writes overlay
+/// or the statement cache when installed. Returns `None` if the node does not
+/// exist. The returned `Rc` shares storage with the cache, so clone the inner
+/// value before mutating it.
 pub(crate) fn node_props(
     graph: &Graph,
     id: NodeId,
 ) -> Result<Option<Rc<serde_json::Value>>, String> {
+    if let Some(hit) = pending_node_props(id) {
+        return Ok(Some(hit));
+    }
     if let Some(hit) =
         PROP_CACHE.with(|c| c.borrow().as_ref().and_then(|s| s.nodes.get(&id).cloned()))
     {
@@ -112,6 +324,9 @@ pub(crate) fn edge_props(
     graph: &Graph,
     id: EdgeId,
 ) -> Result<Option<Rc<serde_json::Value>>, String> {
+    if let Some(hit) = pending_edge_props(id) {
+        return Ok(Some(hit));
+    }
     if let Some(hit) =
         PROP_CACHE.with(|c| c.borrow().as_ref().and_then(|s| s.edges.get(&id).cloned()))
     {
@@ -130,6 +345,16 @@ pub(crate) fn edge_props(
         }
     });
     Ok(Some(rc))
+}
+
+/// A node's labels, seeing labels added/removed earlier in the currently-
+/// installed write transaction (falls through to `graph.node_labels` when the
+/// node has no pending-writes overlay entry).
+pub(crate) fn node_labels_overlay(graph: &Graph, id: NodeId) -> Result<Vec<String>, String> {
+    if let Some(info) = pending_node(id) {
+        return Ok(info.labels);
+    }
+    graph.node_labels(id).map_err(|e| e.to_string())
 }
 
 /// Build the current value of a temporal type from the statement clock. `name` is the function
@@ -547,7 +772,7 @@ pub(super) fn evaluate_expr<B: Bindings>(
         }
         Expr::HasLabel { variable, label } => match path.get_binding(variable.as_str()) {
             Some(GraphBinding::Node(id)) => {
-                if let Ok(node_labels) = graph.node_labels(*id) {
+                if let Ok(node_labels) = node_labels_overlay(graph, *id) {
                     return Ok(serde_json::Value::Bool(
                         node_labels.iter().any(|l| l == label),
                     ));
@@ -562,7 +787,7 @@ pub(super) fn evaluate_expr<B: Bindings>(
             // and check its labels like the direct binding above.
             Some(GraphBinding::Scalar(v)) => {
                 if let Some((true, id)) = wrapped_graph_id(v) {
-                    if let Ok(node_labels) = graph.node_labels(id) {
+                    if let Ok(node_labels) = node_labels_overlay(graph, id) {
                         return Ok(serde_json::Value::Bool(
                             node_labels.iter().any(|l| l == label),
                         ));
@@ -602,6 +827,16 @@ pub(super) fn evaluate_expr<B: Bindings>(
                         );
                         m.insert("properties".to_string(), (*actual_json).clone());
                         Ok(serde_json::Value::Object(m))
+                    } else if let Some(pending) = pending_node_props(*node_id) {
+                        // A node written earlier in this same still-open write
+                        // transaction: `PropColumns` (below) only refreshes
+                        // after commit, so it would serve stale or missing
+                        // data here. The pending overlay is authoritative for
+                        // this id, so no fallback to the column cache.
+                        Ok(pending
+                            .get(prop)
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null))
                     } else {
                         // The hot single-property form reads the in-memory
                         // property columns: a dense-index lookup instead of a
@@ -613,19 +848,28 @@ pub(super) fn evaluate_expr<B: Bindings>(
                     }
                 }
                 GraphBinding::Edge(edge_id) => {
-                    // The whole-edge form needs `src`/`dst` from the record, so it
-                    // reads the record directly (which also surfaces a missing edge).
-                    // The hot single-property form reads the in-memory edge property
-                    // columns: a dense-index lookup instead of a point read plus a
-                    // full record decode, and it returns `None` for a missing edge so
-                    // no separate existence probe is needed.
+                    // The whole-edge form needs `src`/`dst`, so it reads the
+                    // record directly (which also surfaces a missing edge),
+                    // except an edge created or updated earlier in this same
+                    // still-open transaction, whose `src`/`dst` come from the
+                    // pending-writes overlay instead, since the record is not
+                    // yet committed. The hot single-property form reads the
+                    // in-memory edge property columns: a dense-index lookup
+                    // instead of a point read plus a full record decode, and
+                    // it returns `None` for a missing edge so no separate
+                    // existence probe is needed.
                     if prop.is_empty() {
-                        let record = graph
-                            .get_edge(*edge_id)
-                            .map_err(|e| e.to_string())?
-                            .ok_or_else(|| format!("edge not found: {}", edge_id))?;
-                        let actual_json: serde_json::Value =
-                            rmp_serde::from_slice(&record.props).map_err(|e| e.to_string())?;
+                        let (src, dst, props_json) = if let Some(pending) = pending_edge(*edge_id) {
+                            (pending.src, pending.dst, (*pending.props).clone())
+                        } else {
+                            let record = graph
+                                .get_edge(*edge_id)
+                                .map_err(|e| e.to_string())?
+                                .ok_or_else(|| format!("edge not found: {}", edge_id))?;
+                            let actual_json: serde_json::Value =
+                                rmp_serde::from_slice(&record.props).map_err(|e| e.to_string())?;
+                            (record.src, record.dst, actual_json)
+                        };
                         let mut m = serde_json::Map::new();
                         m.insert(
                             "__type__".to_string(),
@@ -637,14 +881,20 @@ pub(super) fn evaluate_expr<B: Bindings>(
                         );
                         m.insert(
                             "startNode".to_string(),
-                            serde_json::Value::Number((record.src as i64).into()),
+                            serde_json::Value::Number((src as i64).into()),
                         );
                         m.insert(
                             "endNode".to_string(),
-                            serde_json::Value::Number((record.dst as i64).into()),
+                            serde_json::Value::Number((dst as i64).into()),
                         );
-                        m.insert("properties".to_string(), actual_json);
+                        m.insert("properties".to_string(), props_json);
                         Ok(serde_json::Value::Object(m))
+                    } else if let Some(pending) = pending_edge_props(*edge_id) {
+                        // Same reasoning as the node case above.
+                        Ok(pending
+                            .get(prop)
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null))
                     } else {
                         graph
                             .edge_prop_json(*edge_id, prop)
@@ -1462,6 +1712,9 @@ pub(super) fn eval_function_call<B: Bindings>(
                         .and_then(|i| i.as_i64())
                         .ok_or("type(): malformed relationship value")?
                         as u64;
+                    if let Some(pending) = pending_edge(eid) {
+                        return Ok(serde_json::Value::String(pending.edge_type));
+                    }
                     let record = graph
                         .get_edge(eid)
                         .map_err(|e| e.to_string())?
@@ -1730,18 +1983,22 @@ pub(super) fn eval_function_call<B: Bindings>(
                 return Err("keys() requires exactly 1 argument".into());
             }
             // Check if the arg is a node/edge binding directly.
-            let node_props = if let Expr::Prop(var, prop) = &args[0] {
+            let bound_props = if let Expr::Prop(var, prop) = &args[0] {
                 if prop.is_empty() {
                     match path.get_binding(var.as_str()) {
                         Some(GraphBinding::Node(nid)) => {
-                            if let Ok(Some(record)) = graph.get_node(*nid) {
+                            if let Some(p) = pending_node_props(*nid) {
+                                Some((*p).clone())
+                            } else if let Ok(Some(record)) = graph.get_node(*nid) {
                                 rmp_serde::from_slice::<serde_json::Value>(&record.props).ok()
                             } else {
                                 None
                             }
                         }
                         Some(GraphBinding::Edge(eid)) => {
-                            if let Ok(Some(record)) = graph.get_edge(*eid) {
+                            if let Some(p) = pending_edge_props(*eid) {
+                                Some((*p).clone())
+                            } else if let Ok(Some(record)) = graph.get_edge(*eid) {
                                 rmp_serde::from_slice::<serde_json::Value>(&record.props).ok()
                             } else {
                                 None
@@ -1756,7 +2013,7 @@ pub(super) fn eval_function_call<B: Bindings>(
                 None
             };
 
-            let val = if let Some(props) = node_props {
+            let val = if let Some(props) = bound_props {
                 props
             } else {
                 evaluate_expr(graph, path, &args[0], params)?
@@ -2219,10 +2476,12 @@ pub(super) fn eval_function_call<B: Bindings>(
                         .and_then(|i| i.as_i64())
                         .ok_or("labels(): malformed node value")?
                         as u64;
-                    if graph.get_node(nid).map_err(|e| e.to_string())?.is_none() {
+                    if pending_node(nid).is_none()
+                        && graph.get_node(nid).map_err(|e| e.to_string())?.is_none()
+                    {
                         return Err(format!("node not found: {}", nid));
                     }
-                    let labels = graph.node_labels(nid).map_err(|e| e.to_string())?;
+                    let labels = node_labels_overlay(graph, nid)?;
                     Ok(serde_json::Value::Array(
                         labels.into_iter().map(serde_json::Value::String).collect(),
                     ))
@@ -2406,12 +2665,18 @@ pub(super) fn eval_function_call<B: Bindings>(
                 if prop.is_empty() {
                     match path.get_binding(var.as_str()) {
                         Some(GraphBinding::Node(nid)) => {
+                            if let Some(p) = pending_node_props(*nid) {
+                                return Ok((*p).clone());
+                            }
                             if let Ok(Some(record)) = graph.get_node(*nid) {
                                 return rmp_serde::from_slice::<serde_json::Value>(&record.props)
                                     .map_err(|e| e.to_string());
                             }
                         }
                         Some(GraphBinding::Edge(eid)) => {
+                            if let Some(p) = pending_edge_props(*eid) {
+                                return Ok((*p).clone());
+                            }
                             if let Ok(Some(record)) = graph.get_edge(*eid) {
                                 return rmp_serde::from_slice::<serde_json::Value>(&record.props)
                                     .map_err(|e| e.to_string());
@@ -2455,12 +2720,9 @@ pub(super) fn eval_function_call<B: Bindings>(
                     }) {
                         if let Some(id_i64) = node_id_val.as_i64() {
                             let nid = id_i64 as u64;
-                            let record = graph
-                                .get_node(nid)
-                                .map_err(|e| e.to_string())?
-                                .ok_or_else(|| format!("node not found: {}", nid))?;
-                            let actual_json: serde_json::Value =
-                                rmp_serde::from_slice(&record.props).map_err(|e| e.to_string())?;
+                            let actual_json = (*node_props(graph, nid)?
+                                .ok_or_else(|| format!("node not found: {}", nid))?)
+                            .clone();
                             let mut node_obj = serde_json::Map::new();
                             node_obj.insert(
                                 "__type__".to_string(),

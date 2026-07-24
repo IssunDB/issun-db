@@ -432,8 +432,19 @@ impl Graph {
     /// Returns directed neighbor entries for all outgoing and incoming edges of `node`.
     pub fn all_neighbors(&self, node: NodeId) -> Result<Vec<DirectedNeighborEntry>, Error> {
         let rtxn = self.storage.env.read_txn()?;
+        self.all_neighbors_impl(&rtxn, node)
+    }
+
+    /// `all_neighbors` against a caller-supplied transaction, shared with the
+    /// `WriteTxn` delegation so a write transaction's view sees its own
+    /// uncommitted edges.
+    pub(super) fn all_neighbors_impl(
+        &self,
+        txn: &heed::RoTxn,
+        node: NodeId,
+    ) -> Result<Vec<DirectedNeighborEntry>, Error> {
         let mut neighbors = Vec::new();
-        for ne in self.out_neighbors_impl(&rtxn, node)? {
+        for ne in self.out_neighbors_impl(txn, node)? {
             neighbors.push(DirectedNeighborEntry {
                 node: ne.node,
                 edge: ne.edge,
@@ -441,7 +452,7 @@ impl Graph {
                 outgoing: true,
             });
         }
-        for ne in self.in_neighbors_impl(&rtxn, node)? {
+        for ne in self.in_neighbors_impl(txn, node)? {
             neighbors.push(DirectedNeighborEntry {
                 node: ne.node,
                 edge: ne.edge,

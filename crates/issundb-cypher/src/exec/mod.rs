@@ -23,10 +23,10 @@ use ddl::{
 };
 use read::execute_read_query;
 use write::{
-    execute_create, execute_create_and_return, execute_create_internal_with_context,
+    as_txn_error, execute_create, execute_create_and_return, execute_create_internal_with_context,
     execute_delete, execute_delete_and_return, execute_foreach, execute_merge,
     execute_merge_and_return, execute_remove, execute_remove_and_return, execute_set,
-    execute_set_and_return,
+    execute_set_and_return, unwrap_txn_error,
 };
 
 /// Stack size for the dedicated thread that executes a deeply nested query.
@@ -298,19 +298,23 @@ fn execute_pipeline(
     for stmt in stmts {
         match stmt {
             Statement::Create(c) => {
-                graph.with_write_lock(|| {
-                    for pattern in &c.patterns {
-                        let created = execute_create_internal_with_context(
-                            graph,
-                            pattern,
-                            &shared_bindings,
-                            params,
-                        )
-                        .map_err(to_cypher_error)?;
-                        shared_bindings.extend(created);
-                    }
-                    Ok::<(), CypherError>(())
-                })?;
+                graph
+                    .update(|txn| {
+                        let _pending = expr::PendingWrites::install();
+                        for pattern in &c.patterns {
+                            let created = execute_create_internal_with_context(
+                                txn,
+                                pattern,
+                                &shared_bindings,
+                                params,
+                            )
+                            .map_err(as_txn_error)?;
+                            shared_bindings.extend(created);
+                        }
+                        Ok(())
+                    })
+                    .map_err(unwrap_txn_error)
+                    .map_err(to_cypher_error)?;
                 last = QueryResult {
                     columns: vec![],
                     records: vec![],
@@ -341,30 +345,41 @@ fn execute_statement(
         Statement::Query(q) => {
             // Resolve CALL clauses against the registry before planning. Cloning is
             // cheap relative to execution and keeps the parsed AST immutable.
-            if q.parts.iter().any(|p| matches!(p, QueryPart::Call { .. })) {
+            let resolved_owner;
+            let q: &Query = if q.parts.iter().any(|p| matches!(p, QueryPart::Call { .. })) {
                 let mut resolved = q.clone();
                 read::resolve_call_parts(graph, &mut resolved, registry, params)
                     .map_err(to_cypher_error)?;
-                execute_read_query(graph, &resolved, params).map_err(to_cypher_error)
+                resolved_owner = resolved;
+                &resolved_owner
             } else {
-                execute_read_query(graph, q, params).map_err(to_cypher_error)
+                q
+            };
+            // A query with write clauses (`CREATE`/`MERGE`/`SET`/`DELETE`/`REMOVE`)
+            // opens one shared write transaction here, covering every write part
+            // and the RETURN/WITH projection that follows: an error anywhere
+            // rolls back the whole statement. A pure read query needs none of
+            // this and keeps its existing fast, lock-free path.
+            if read::query_has_write_parts(q) {
+                graph
+                    .update(|txn| {
+                        execute_read_query(graph, q, params, Some(txn)).map_err(as_txn_error)
+                    })
+                    .map_err(unwrap_txn_error)
+                    .map_err(to_cypher_error)
+            } else {
+                execute_read_query(graph, q, params, None).map_err(to_cypher_error)
             }
         }
-        Statement::Create(c) => graph
-            .with_write_lock(|| execute_create(graph, c, params))
-            .map_err(to_cypher_error),
-        Statement::CreateAndReturn(c) => graph
-            .with_write_lock(|| execute_create_and_return(graph, c, params))
-            .map_err(to_cypher_error),
-        Statement::Set(s) => graph
-            .with_write_lock(|| execute_set(graph, s, params))
-            .map_err(to_cypher_error),
-        Statement::SetAndReturn(s) => graph
-            .with_write_lock(|| execute_set_and_return(graph, s, params))
-            .map_err(to_cypher_error),
-        Statement::Delete(d) => graph
-            .with_write_lock(|| execute_delete(graph, d, params))
-            .map_err(to_cypher_error),
+        Statement::Create(c) => execute_create(graph, c, params).map_err(to_cypher_error),
+        Statement::CreateAndReturn(c) => {
+            execute_create_and_return(graph, c, params).map_err(to_cypher_error)
+        }
+        Statement::Set(s) => execute_set(graph, s, params).map_err(to_cypher_error),
+        Statement::SetAndReturn(s) => {
+            execute_set_and_return(graph, s, params).map_err(to_cypher_error)
+        }
+        Statement::Delete(d) => execute_delete(graph, d, params).map_err(to_cypher_error),
         Statement::DeleteAndReturn(d) => {
             execute_delete_and_return(graph, d, params).map_err(to_cypher_error)
         }
@@ -374,16 +389,12 @@ fn execute_statement(
         }
         Statement::CreateIndex(ci) => execute_create_index(graph, ci).map_err(to_cypher_error),
         Statement::DropIndex(di) => execute_drop_index(graph, di).map_err(to_cypher_error),
-        Statement::Remove(r) => graph
-            .with_write_lock(|| execute_remove(graph, r, params))
-            .map_err(to_cypher_error),
+        Statement::Remove(r) => execute_remove(graph, r, params).map_err(to_cypher_error),
         Statement::RemoveAndReturn(r) => {
             execute_remove_and_return(graph, r, params).map_err(to_cypher_error)
         }
         Statement::Union(u) => execute_union(graph, u, params, registry).map_err(to_cypher_error),
-        Statement::Foreach(f) => graph
-            .with_write_lock(|| execute_foreach(graph, f, params))
-            .map_err(to_cypher_error),
+        Statement::Foreach(f) => execute_foreach(graph, f, params).map_err(to_cypher_error),
         Statement::CreateConstraint(cc) => {
             execute_create_constraint(graph, cc).map_err(to_cypher_error)
         }
@@ -1722,6 +1733,238 @@ mod tests {
         )
         .unwrap();
         assert_eq!(check.records[0].values[0], serde_json::json!(1));
+    }
+
+    /// `any()`/`all()` closing over the outer matched variable must not break
+    /// binding when combined with an aggregate. The quantifier's own loop
+    /// variable (`l` below) is locally bound and must never be treated as an
+    /// outer reference the filter-pushdown pass needs satisfied elsewhere in
+    /// the plan; before the fix, it leaked into `referenced_vars`, so the
+    /// filter's variable requirement (`{u, l}`) was never a subset of any
+    /// binder's bound-variable set (since `l` is bound nowhere), and the
+    /// aggregate ended up executing without `u` bound at all.
+    #[test]
+    fn quantifier_predicate_with_outer_var_plus_aggregate_stays_bound() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+        graph
+            .add_node("User", &serde_json::json!({"name": "Ada"}))
+            .unwrap();
+        graph
+            .add_node("User", &serde_json::json!({"name": "Grace"}))
+            .unwrap();
+
+        // any() alone (no aggregate) already worked.
+        let res = execute(
+            &graph,
+            "MATCH (u:User) WHERE any(l IN labels(u) WHERE l = 'User') RETURN u.name AS name ORDER BY name",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(res.records.len(), 2);
+
+        // any() + aggregate must not lose `u`'s binding.
+        let res = execute(
+            &graph,
+            "MATCH (u:User) WHERE any(l IN labels(u) WHERE l = 'User') RETURN count(u) AS c",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(res.records[0].values[0], serde_json::json!(2));
+
+        // all() has the same local-variable shape and must behave the same way.
+        let res = execute(
+            &graph,
+            "MATCH (u:User) WHERE all(l IN labels(u) WHERE l = 'User') RETURN count(u) AS c",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(res.records[0].values[0], serde_json::json!(2));
+    }
+
+    // --- Cross-clause write atomicity ---
+    //
+    // A single Cypher statement with multiple write clauses is atomic: an
+    // error partway through rolls back every write the statement already
+    // made, not just the one that failed. Both repro queries here parse as a
+    // single `Statement::Query` with multiple `QueryPart`s (see
+    // `parse_multi_clause_chaining` in parser.rs), routed through
+    // `execute_read_query`'s write-parts path, not `execute_pipeline`.
+
+    /// Repro 1: a unique-constraint failure on the second CREATE in one
+    /// statement must roll back the first CREATE's node too.
+    #[test]
+    fn create_create_rolls_back_first_node_when_second_violates_constraint() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+        graph
+            .create_node_unique_constraint("User", "email")
+            .unwrap();
+        graph
+            .add_node("User", &serde_json::json!({"email": "taken@example.com"}))
+            .unwrap();
+
+        let res = execute(
+            &graph,
+            r#"CREATE (a:Foo {name: "should not persist"}) CREATE (b:User {email: "taken@example.com"})"#,
+            &params,
+        );
+        assert!(
+            res.is_err(),
+            "the constraint violation must surface as an error"
+        );
+
+        let foos = execute(&graph, "MATCH (f:Foo) RETURN count(f) AS c", &params).unwrap();
+        assert_eq!(
+            foos.records[0].values[0],
+            serde_json::json!(0),
+            "the first CREATE's node must not have persisted"
+        );
+    }
+
+    /// Repro 2: an error in the RETURN expression (division by zero) after a
+    /// same-statement `CREATE ... WITH ...` must roll back the CREATE.
+    #[test]
+    fn create_with_return_error_rolls_back_the_create() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+
+        let res = execute(
+            &graph,
+            "CREATE (n:Foo {Id: 5}) WITH n RETURN n.Id / 0",
+            &params,
+        );
+        assert!(res.is_err(), "division by zero must surface as an error");
+
+        let foos = execute(&graph, "MATCH (f:Foo) RETURN count(f) AS c", &params).unwrap();
+        assert_eq!(
+            foos.records[0].values[0],
+            serde_json::json!(0),
+            "the CREATE must not have persisted once the statement's RETURN failed"
+        );
+    }
+
+    /// Regression: the ordinary, non-failing `CREATE ... RETURN` path (with
+    /// and without an intervening `WITH`, and a sibling pattern referencing
+    /// another pattern's just-created property) must keep working; this is
+    /// the shape most at risk from deferring commit to make the above atomic.
+    #[test]
+    fn create_return_still_sees_freshly_created_node_property() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+
+        let res = execute(&graph, "CREATE (n:Foo {a: 1}) RETURN n.a", &params).unwrap();
+        assert_eq!(res.records[0].values[0], serde_json::json!(1));
+
+        let res = execute(&graph, "CREATE (n:Foo {a: 2}) WITH n RETURN n.a", &params).unwrap();
+        assert_eq!(res.records[0].values[0], serde_json::json!(2));
+
+        // A CREATE pattern referencing a sibling pattern's just-created property.
+        let res = execute(
+            &graph,
+            "CREATE (a:Bar {x: 10}), (b:Bar {y: a.x}) RETURN b.y",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(res.records[0].values[0], serde_json::json!(10));
+
+        let both = execute(&graph, "MATCH (f:Foo) RETURN count(f) AS c", &params).unwrap();
+        assert_eq!(both.records[0].values[0], serde_json::json!(2));
+    }
+
+    /// A `MERGE ... ON CREATE SET` whose SET expression fails must leave no
+    /// partially-created node behind: the create and the ON CREATE SET share
+    /// one transaction.
+    #[test]
+    fn merge_on_create_set_failure_rolls_back_the_create() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+
+        let res = execute(
+            &graph,
+            "MERGE (n:Foo {x: 1}) ON CREATE SET n.y = 1 / 0",
+            &params,
+        );
+        assert!(res.is_err(), "division by zero must surface as an error");
+
+        let foos = execute(&graph, "MATCH (f:Foo) RETURN count(f) AS c", &params).unwrap();
+        assert_eq!(
+            foos.records[0].values[0],
+            serde_json::json!(0),
+            "MERGE's create must not have persisted once ON CREATE SET failed"
+        );
+    }
+
+    /// A whole-entity projection (`RETURN n`, not `RETURN n.prop`) after a
+    /// write in the same statement must see the statement's own uncommitted
+    /// writes: the final materialization path (`binding_to_value` and the
+    /// node/edge representation helpers) consults the pending-writes overlay
+    /// before falling back to committed state.
+    #[test]
+    fn whole_entity_return_after_write_sees_own_writes() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+
+        // A just-created node projected whole: must not error (the node is
+        // not committed yet), and must carry the fresh properties.
+        let res = execute(&graph, "CREATE (n:Foo {a: 1}) WITH n RETURN n", &params).unwrap();
+        assert_eq!(res.records[0].values[0]["a"], serde_json::json!(1));
+
+        // A SET in the same statement: the projected node reflects the new
+        // value, not the pre-SET committed record.
+        let res = execute(&graph, "MATCH (n:Foo) SET n.x = 5 WITH n RETURN n", &params).unwrap();
+        assert_eq!(res.records[0].values[0]["x"], serde_json::json!(5));
+
+        // Edge counterpart: a just-created relationship projected whole.
+        let res = execute(
+            &graph,
+            "CREATE (:A)-[r:R {w: 1}]->(:B) WITH r RETURN r",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(res.records[0].values[0]["w"], serde_json::json!(1));
+    }
+
+    /// A bare CREATE statement inside a semicolon-separated pipeline goes
+    /// through `execute_pipeline`'s dedicated Create arm; a sibling pattern
+    /// referencing an earlier pattern's just-created property must resolve
+    /// there just as it does in every other CREATE entry point.
+    #[test]
+    fn pipeline_create_sibling_reference_sees_pending_props() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+
+        execute(
+            &graph,
+            "CREATE (a:A {x: 1}), (b:B {y: a.x}); RETURN 1",
+            &params,
+        )
+        .unwrap();
+
+        let res = execute(&graph, "MATCH (b:B) RETURN b.y", &params).unwrap();
+        assert_eq!(res.records[0].values[0], serde_json::json!(1));
+    }
+
+    /// Documents a known, explicit boundary of this fix (not a bug): a
+    /// `MATCH`/label-scan after a same-statement `CREATE` does not see the
+    /// just-created node, because label scans read through the committed-only
+    /// `label_idx` index, not the still-open write transaction. Pinned down so
+    /// it cannot silently drift in either direction later.
+    #[test]
+    fn create_then_label_scan_in_same_statement_does_not_see_uncommitted_node() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+        let res = execute(
+            &graph,
+            "CREATE (a:Foo) WITH a MATCH (m:Foo) RETURN count(m) AS c",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(
+            res.records[0].values[0],
+            serde_json::json!(0),
+            "documents the boundary: label-scan reads are not txn-aware in this fix"
+        );
     }
 
     #[test]

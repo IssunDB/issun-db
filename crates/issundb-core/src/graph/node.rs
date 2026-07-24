@@ -8,6 +8,7 @@ impl Graph {
     /// Insert a node with a single string label and msgpack-serializable properties.
     #[instrument(skip(self, props), fields(label = %label))]
     pub fn add_node(&self, label: &str, props: &impl Serialize) -> Result<NodeId, Error> {
+        self.debug_assert_not_in_write_txn();
         let _guard = self._write_lock.lock();
         let mut wtxn = self.storage.env.write_txn()?;
         let id = self.add_node_impl(&mut wtxn, &[label], props)?;
@@ -21,6 +22,7 @@ impl Graph {
     /// Insert a node with zero or more string labels and msgpack-serializable
     /// properties. An empty slice creates an unlabeled node.
     pub fn add_node_multi(&self, labels: &[&str], props: &impl Serialize) -> Result<NodeId, Error> {
+        self.debug_assert_not_in_write_txn();
         let _guard = self._write_lock.lock();
         let mut wtxn = self.storage.env.write_txn()?;
         let id = self.add_node_impl(&mut wtxn, labels, props)?;
@@ -272,6 +274,7 @@ impl Graph {
     /// Do not call this method from inside a [`Graph::update`] closure. Use
     /// [`WriteTxn::update_node`] inside the closure instead.
     pub fn update_node(&self, id: NodeId, props: &impl Serialize) -> Result<(), Error> {
+        self.debug_assert_not_in_write_txn();
         let _guard = self._write_lock.lock();
         let mut wtxn = self.storage.env.write_txn()?;
         self.update_node_impl(&mut wtxn, id, props)?;
@@ -321,6 +324,7 @@ impl Graph {
 
     /// Add a label to an existing node. No-op if the node already carries it.
     pub fn add_label(&self, id: NodeId, label: &str) -> Result<(), Error> {
+        self.debug_assert_not_in_write_txn();
         let _guard = self._write_lock.lock();
         let mut wtxn = self.storage.env.write_txn()?;
         self.add_label_impl(&mut wtxn, id, label)?;
@@ -359,6 +363,7 @@ impl Graph {
     /// Remove a label from an existing node. No-op if the node lacks the label,
     /// the label was never registered, or the node does not exist.
     pub fn remove_label(&self, id: NodeId, label: &str) -> Result<(), Error> {
+        self.debug_assert_not_in_write_txn();
         let _guard = self._write_lock.lock();
         let mut wtxn = self.storage.env.write_txn()?;
         self.remove_label_impl(&mut wtxn, id, label)?;
@@ -425,6 +430,7 @@ impl Graph {
     /// Delete a node.
     #[instrument(skip(self))]
     pub fn delete_node(&self, id: NodeId) -> Result<(), Error> {
+        self.debug_assert_not_in_write_txn();
         let _guard = self._write_lock.lock();
         let mut wtxn = self.storage.env.write_txn()?;
         self.delete_node_impl(&mut wtxn, id)?;

@@ -168,10 +168,29 @@ fn resolve_skip_limit_params(
     Ok(changed.then_some(resolved))
 }
 
+/// True when `query` contains at least one write clause (`CREATE`, `MERGE`,
+/// `SET`, `DELETE`, or `REMOVE`). Shared between `execute_read_query` (which
+/// uses it to pick the row pipeline over the vectorized fast path) and the
+/// top-level statement dispatcher (which uses it to decide whether to open a
+/// `Graph::update` transaction before calling `execute_read_query` at all).
+pub(super) fn query_has_write_parts(query: &Query) -> bool {
+    query.parts.iter().any(|p| {
+        matches!(
+            p,
+            QueryPart::Create { .. }
+                | QueryPart::Merge { .. }
+                | QueryPart::Set { .. }
+                | QueryPart::Delete { .. }
+                | QueryPart::Remove { .. }
+        )
+    })
+}
+
 pub(super) fn execute_read_query(
     graph: &Graph,
     query: &Query,
     params: &HashMap<String, serde_json::Value>,
+    write_txn: Option<&mut issundb_core::WriteTxn>,
 ) -> Result<QueryResult, String> {
     // Validate non-literal SKIP/LIMIT expressions at runtime and substitute
     // their values before planning.
@@ -193,23 +212,11 @@ pub(super) fn execute_read_query(
     //    column-name keys. Reading by key here avoids a second evaluation of the
     //    same expressions (double-projection) against a row that no longer
     //    contains the pre-projection variable names.
-    // Any query containing write clauses must hold the graph write lock for the
-    // entire execution to prevent concurrent races (e.g., MERGE from two threads).
-    // This holds whether or not the query also projects a RETURN clause: a chained
-    // query such as `MATCH (a) SET a.x = 1 WITH a RETURN a` reaches this path with a
-    // non-empty RETURN, and the per-part write executors inside `execute_physical`
-    // assume the caller holds the lock (they call the `_internal` variants, which do
-    // not re-acquire it).
-    let has_write_parts = query.parts.iter().any(|p| {
-        matches!(
-            p,
-            QueryPart::Create { .. }
-                | QueryPart::Merge { .. }
-                | QueryPart::Set { .. }
-                | QueryPart::Delete { .. }
-                | QueryPart::Remove { .. }
-        )
-    });
+    // A query containing write clauses executes inside the write transaction
+    // the caller already opened and passed as `write_txn`, so every write in
+    // this statement (and its RETURN/WITH projection below) shares one
+    // transaction: an error anywhere rolls back everything.
+    let has_write_parts = query_has_write_parts(query);
 
     // Read-only queries install a statement-scoped property cache so repeated
     // property access on the same node or edge decodes once. Queries with write
@@ -217,6 +224,7 @@ pub(super) fn execute_read_query(
     // avoid serving a stale decode; the guard drops at the end of this function,
     // covering both expansion and the projection below.
     let _prop_cache = (!has_write_parts).then(expr::PropCache::install);
+    let _pending = has_write_parts.then(expr::PendingWrites::install);
 
     // Columnar fast path: a recognized final projection or aggregation over a
     // single-hop expansion executes column-at-a-time and produces the result
@@ -242,11 +250,7 @@ pub(super) fn execute_read_query(
         }
     }
 
-    let resolved_paths = if has_write_parts {
-        graph.with_write_lock(|| execute_physical(graph, &optimized, params, &schema))?
-    } else {
-        execute_physical(graph, &optimized, params, &schema)?
-    };
+    let resolved_paths = execute_physical(graph, &optimized, params, &schema, write_txn)?;
 
     // A query with an empty RETURN clause is a write-only pipeline query.
     if query.return_clause.items.is_empty() {
@@ -863,23 +867,23 @@ fn format_cypher_value(v: &serde_json::Value) -> String {
 }
 
 fn format_node_literal(graph: &Graph, nid: NodeId) -> String {
+    // Overlay-aware, so a node written earlier in this same still-open
+    // transaction displays its fresh labels and properties.
     let mut label_str = String::new();
-    if let Ok(Some(record)) = graph.get_node(nid) {
-        if let Ok(labels) = graph.node_labels(nid) {
+    if let Ok(Some(props)) = expr::node_props(graph, nid) {
+        if let Ok(labels) = expr::node_labels_overlay(graph, nid) {
             for label in labels {
                 label_str.push(':');
                 label_str.push_str(&label);
             }
         }
-        if let Ok(props) = rmp_serde::from_slice::<serde_json::Value>(&record.props) {
-            if let Some(map) = props.as_object() {
-                if !map.is_empty() {
-                    return if label_str.is_empty() {
-                        format!("({})", format_cypher_value(&props))
-                    } else {
-                        format!("({} {})", label_str, format_cypher_value(&props))
-                    };
-                }
+        if let Some(map) = props.as_object() {
+            if !map.is_empty() {
+                return if label_str.is_empty() {
+                    format!("({})", format_cypher_value(&props))
+                } else {
+                    format!("({} {})", label_str, format_cypher_value(&props))
+                };
             }
         }
     }
@@ -887,20 +891,27 @@ fn format_node_literal(graph: &Graph, nid: NodeId) -> String {
 }
 
 fn format_edge_literal_string(graph: &Graph, eid: EdgeId) -> String {
+    // Overlay-aware, matching `format_node_literal` above.
     let mut type_str = String::new();
-    if let Ok(Some(record)) = graph.get_edge(eid) {
+    let props = if let Some(pending) = expr::pending_edge(eid) {
+        type_str = format!(":{}", pending.edge_type);
+        Some((*pending.props).clone())
+    } else if let Ok(Some(record)) = graph.get_edge(eid) {
         if let Ok(Some(etype)) = graph.type_name(record.edge_type) {
             type_str = format!(":{}", etype);
         }
-        if let Ok(props) = rmp_serde::from_slice::<serde_json::Value>(&record.props) {
-            if let Some(map) = props.as_object() {
-                if !map.is_empty() {
-                    return if type_str.is_empty() {
-                        format_cypher_value(&props)
-                    } else {
-                        format!("{} {}", type_str, format_cypher_value(&props))
-                    };
-                }
+        rmp_serde::from_slice::<serde_json::Value>(&record.props).ok()
+    } else {
+        None
+    };
+    if let Some(props) = props {
+        if let Some(map) = props.as_object() {
+            if !map.is_empty() {
+                return if type_str.is_empty() {
+                    format_cypher_value(&props)
+                } else {
+                    format!("{} {}", type_str, format_cypher_value(&props))
+                };
             }
         }
     }
@@ -945,7 +956,10 @@ pub(super) fn unpack_sentinels(graph: &Graph, val: serde_json::Value) -> serde_j
 /// Convert a `GraphBinding` entry from a projected row into a JSON value.
 ///
 /// `Node` and `Edge` bindings that survive projection (e.g., `WITH n RETURN n`) are
-/// resolved by fetching the stored property blob from the graph.
+/// resolved through `expr::node_props`/`edge_props`, which consult the
+/// pending-writes overlay first: a node or edge written earlier in this same
+/// still-open transaction has no committed record yet (or a stale one), so a
+/// direct `graph.get_node` here would fail or serve pre-write data.
 pub(super) fn binding_to_value(
     graph: &Graph,
     binding: Option<&GraphBinding>,
@@ -953,20 +967,12 @@ pub(super) fn binding_to_value(
     match binding {
         None => Ok(serde_json::Value::Null),
         Some(GraphBinding::Scalar(v)) => Ok(unpack_sentinels(graph, v.clone())),
-        Some(GraphBinding::Node(id)) => {
-            let record = graph
-                .get_node(*id)
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| format!("node not found: {}", id))?;
-            rmp_serde::from_slice(&record.props).map_err(|e| e.to_string())
-        }
-        Some(GraphBinding::Edge(id)) => {
-            let record = graph
-                .get_edge(*id)
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| format!("edge not found: {}", id))?;
-            rmp_serde::from_slice(&record.props).map_err(|e| e.to_string())
-        }
+        Some(GraphBinding::Node(id)) => Ok((*expr::node_props(graph, *id)?
+            .ok_or_else(|| format!("node not found: {}", id))?)
+        .clone()),
+        Some(GraphBinding::Edge(id)) => Ok((*expr::edge_props(graph, *id)?
+            .ok_or_else(|| format!("edge not found: {}", id))?)
+        .clone()),
         // A variable-length relationship variable surfaces as the list of
         // relationship objects along the trail, matching `relationships(p)`.
         Some(GraphBinding::EdgeList(ids)) => {
@@ -1276,12 +1282,10 @@ fn filter_over_expand_batch(
 }
 
 fn get_node_representation(graph: &Graph, nid: NodeId) -> Result<serde_json::Value, String> {
-    let record = graph
-        .get_node(nid)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("node not found: {}", nid))?;
-    let actual_json: serde_json::Value =
-        rmp_serde::from_slice(&record.props).map_err(|e| e.to_string())?;
+    // Overlay-aware: a node written earlier in this same still-open
+    // transaction has no committed record yet.
+    let actual_json =
+        (*expr::node_props(graph, nid)?.ok_or_else(|| format!("node not found: {}", nid))?).clone();
     let mut node_obj = serde_json::Map::new();
     node_obj.insert(
         "__type__".to_string(),
@@ -1299,12 +1303,20 @@ pub(super) fn get_edge_representation(
     graph: &Graph,
     eid: EdgeId,
 ) -> Result<serde_json::Value, String> {
-    let record = graph
-        .get_edge(eid)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("edge not found: {}", eid))?;
-    let actual_json: serde_json::Value =
-        rmp_serde::from_slice(&record.props).map_err(|e| e.to_string())?;
+    // Overlay-aware: an edge written earlier in this same still-open
+    // transaction has no committed record yet, so its endpoints and
+    // properties come from the pending-writes overlay.
+    let (src, dst, actual_json) = if let Some(pending) = expr::pending_edge(eid) {
+        (pending.src, pending.dst, (*pending.props).clone())
+    } else {
+        let record = graph
+            .get_edge(eid)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("edge not found: {}", eid))?;
+        let actual_json: serde_json::Value =
+            rmp_serde::from_slice(&record.props).map_err(|e| e.to_string())?;
+        (record.src, record.dst, actual_json)
+    };
     let mut edge_obj = serde_json::Map::new();
     edge_obj.insert(
         "__type__".to_string(),
@@ -1316,11 +1328,11 @@ pub(super) fn get_edge_representation(
     );
     edge_obj.insert(
         "startNode".to_string(),
-        serde_json::Value::Number((record.src as i64).into()),
+        serde_json::Value::Number((src as i64).into()),
     );
     edge_obj.insert(
         "endNode".to_string(),
-        serde_json::Value::Number((record.dst as i64).into()),
+        serde_json::Value::Number((dst as i64).into()),
     );
     edge_obj.insert("properties".to_string(), actual_json);
     Ok(serde_json::Value::Object(edge_obj))
@@ -3165,6 +3177,7 @@ impl RowStream {
         graph: &Graph,
         params: &HashMap<String, serde_json::Value>,
         schema: &std::sync::Arc<SlotSchema>,
+        mut write_txn: Option<&mut issundb_core::WriteTxn>,
     ) -> Result<Vec<SlotRow>, String> {
         match self {
             RowStream::LabelScan {
@@ -3223,7 +3236,7 @@ impl RowStream {
             } => {
                 // Project is a 1:1 transform, so a non-empty input batch yields a
                 // non-empty output batch; loop only to pass through end-of-stream.
-                let batch = input.next_batch(graph, params, schema)?;
+                let batch = input.next_batch(graph, params, schema, write_txn.as_deref_mut())?;
                 if batch.is_empty() {
                     return Ok(vec![]);
                 }
@@ -3233,7 +3246,8 @@ impl RowStream {
                 // A filter can empty a batch without exhausting the input, so
                 // keep pulling until a batch survives or the input runs out.
                 loop {
-                    let batch = input.next_batch(graph, params, schema)?;
+                    let batch =
+                        input.next_batch(graph, params, schema, write_txn.as_deref_mut())?;
                     if batch.is_empty() {
                         return Ok(vec![]);
                     }
@@ -3262,7 +3276,7 @@ impl RowStream {
                     let take = buf.len().min(STREAM_BATCH);
                     return Ok(buf.drain(..take).collect());
                 }
-                let batch = input.next_batch(graph, params, schema)?;
+                let batch = input.next_batch(graph, params, schema, write_txn.as_deref_mut())?;
                 if batch.is_empty() {
                     return Ok(vec![]);
                 }
@@ -3301,7 +3315,11 @@ impl RowStream {
                 let st = match state {
                     Some(s) => s,
                     None => {
-                        let build_rows = execute_physical(graph, build_op, params, schema)?;
+                        // A join's build side arises only from a cross-product
+                        // within a single MATCH clause, before any write clause
+                        // in the sequential QueryPart chain, so it never needs
+                        // to observe this statement's own writes.
+                        let build_rows = execute_physical(graph, build_op, params, schema, None)?;
                         let common_vars = join_common_vars(probe_op, build_op);
                         let (data, probe) = if common_vars.is_empty() {
                             (
@@ -3327,7 +3345,9 @@ impl RowStream {
                         state.insert(Box::new(HashJoinState { data, probe }))
                     }
                 };
-                let probe_batch = st.probe.next_batch(graph, params, schema)?;
+                let probe_batch =
+                    st.probe
+                        .next_batch(graph, params, schema, write_txn.as_deref_mut())?;
                 if probe_batch.is_empty() {
                     return Ok(vec![]);
                 }
@@ -3349,7 +3369,7 @@ impl RowStream {
                     let take = buf.len().min(STREAM_BATCH);
                     return Ok(buf.drain(..take).collect());
                 }
-                let batch = input.next_batch(graph, params, schema)?;
+                let batch = input.next_batch(graph, params, schema, write_txn.as_deref_mut())?;
                 if batch.is_empty() {
                     return Ok(vec![]);
                 }
@@ -3385,7 +3405,7 @@ impl RowStream {
                     let take = buf.len().min(STREAM_BATCH);
                     return Ok(buf.drain(..take).collect());
                 }
-                let batch = input.next_batch(graph, params, schema)?;
+                let batch = input.next_batch(graph, params, schema, write_txn.as_deref_mut())?;
                 if batch.is_empty() {
                     return Ok(vec![]);
                 }
@@ -3411,7 +3431,7 @@ impl RowStream {
                     let take = buf.len().min(STREAM_BATCH);
                     return Ok(buf.drain(..take).collect());
                 }
-                let batch = base.next_batch(graph, params, schema)?;
+                let batch = base.next_batch(graph, params, schema, write_txn.as_deref_mut())?;
                 if batch.is_empty() {
                     return Ok(vec![]);
                 }
@@ -3445,7 +3465,7 @@ impl RowStream {
                     let take = buf.len().min(STREAM_BATCH);
                     return Ok(buf.drain(..take).collect());
                 }
-                let batch = base.next_batch(graph, params, schema)?;
+                let batch = base.next_batch(graph, params, schema, write_txn.as_deref_mut())?;
                 if batch.is_empty() {
                     return Ok(vec![]);
                 }
@@ -3476,7 +3496,12 @@ impl RowStream {
                     None => {
                         let mut rows = Vec::new();
                         loop {
-                            let batch = input.next_batch(graph, params, schema)?;
+                            let batch = input.next_batch(
+                                graph,
+                                params,
+                                schema,
+                                write_txn.as_deref_mut(),
+                            )?;
                             if batch.is_empty() {
                                 break;
                             }
@@ -3489,7 +3514,7 @@ impl RowStream {
                 Ok(iter.by_ref().take(STREAM_BATCH).collect())
             }
             RowStream::Distinct { input, keys, seen } => loop {
-                let batch = input.next_batch(graph, params, schema)?;
+                let batch = input.next_batch(graph, params, schema, write_txn.as_deref_mut())?;
                 if batch.is_empty() {
                     return Ok(vec![]);
                 }
@@ -3530,8 +3555,15 @@ impl RowStream {
                 let iter = match out {
                     Some(it) => it,
                     None => {
-                        let rows =
-                            aggregate_all(graph, input, group_by, aggregations, params, schema)?;
+                        let rows = aggregate_all(
+                            graph,
+                            input,
+                            group_by,
+                            aggregations,
+                            params,
+                            schema,
+                            write_txn.as_deref_mut(),
+                        )?;
                         out.insert(rows.into_iter())
                     }
                 };
@@ -3543,7 +3575,7 @@ impl RowStream {
                 any,
                 done,
             } => {
-                let batch = input.next_batch(graph, params, schema)?;
+                let batch = input.next_batch(graph, params, schema, write_txn.as_deref_mut())?;
                 if !batch.is_empty() {
                     *any = true;
                     return Ok(batch);
@@ -3570,7 +3602,7 @@ impl RowStream {
                     let take = buf.len().min(STREAM_BATCH);
                     return Ok(buf.drain(..take).collect());
                 }
-                let batch = input.next_batch(graph, params, schema)?;
+                let batch = input.next_batch(graph, params, schema, write_txn.as_deref_mut())?;
                 if batch.is_empty() {
                     return Ok(vec![]);
                 }
@@ -3601,7 +3633,7 @@ impl RowStream {
                     let take = buf.len().min(STREAM_BATCH);
                     return Ok(buf.drain(..take).collect());
                 }
-                let batch = input.next_batch(graph, params, schema)?;
+                let batch = input.next_batch(graph, params, schema, write_txn.as_deref_mut())?;
                 if batch.is_empty() {
                     return Ok(vec![]);
                 }
@@ -3678,7 +3710,7 @@ impl RowStream {
                     let take = buf.len().min(STREAM_BATCH);
                     return Ok(buf.drain(..take).collect());
                 }
-                let batch = input.next_batch(graph, params, schema)?;
+                let batch = input.next_batch(graph, params, schema, write_txn.as_deref_mut())?;
                 if batch.is_empty() {
                     return Ok(vec![]);
                 }
@@ -3710,7 +3742,8 @@ impl RowStream {
                     if *emitted >= *count {
                         return Ok(vec![]);
                     }
-                    let batch = input.next_batch(graph, params, schema)?;
+                    let batch =
+                        input.next_batch(graph, params, schema, write_txn.as_deref_mut())?;
                     if batch.is_empty() {
                         return Ok(vec![]);
                     }
@@ -3738,13 +3771,28 @@ impl RowStream {
                     None => {
                         let mut rows = Vec::new();
                         loop {
-                            let batch = input.next_batch(graph, params, schema)?;
+                            let batch = input.next_batch(
+                                graph,
+                                params,
+                                schema,
+                                write_txn.as_deref_mut(),
+                            )?;
                             if batch.is_empty() {
                                 break;
                             }
                             rows.extend(batch);
                         }
-                        let result = write_part_rows(graph, rows, part, params)?;
+                        // A write-containing query always reaches this arm from
+                        // inside a `Graph::update` transaction the caller
+                        // (`execute_read_query`) already opened and threaded down
+                        // as `write_txn`; a `None` here means that invariant was
+                        // violated (a planner bug), not a normal runtime state.
+                        let txn = write_txn.ok_or_else(|| {
+                            "internal error: WritePart operator reached with no open write \
+                             transaction"
+                                .to_string()
+                        })?;
+                        let result = write_part_rows(txn, rows, part, params)?;
                         out.insert(result.into_iter())
                     }
                 };
@@ -4037,6 +4085,7 @@ fn aggregate_all(
     aggregations: &[(AggFn, Expr, String)],
     params: &HashMap<String, serde_json::Value>,
     schema: &std::sync::Arc<SlotSchema>,
+    mut write_txn: Option<&mut issundb_core::WriteTxn>,
 ) -> Result<Vec<SlotRow>, String> {
     use std::collections::BTreeMap;
 
@@ -4105,7 +4154,7 @@ fn aggregate_all(
     // Drain the input stream a batch at a time so peak memory is one batch plus
     // the group table.
     loop {
-        let batch = input.next_batch(graph, params, schema)?;
+        let batch = input.next_batch(graph, params, schema, write_txn.as_deref_mut())?;
         if batch.is_empty() {
             break;
         }
@@ -4199,10 +4248,12 @@ pub(super) fn sort_all(
 /// fully materialized batch of input rows, returning the downstream rows. This is
 /// blocking by design: `DELETE` operates over the whole result at once, and a
 /// trailing `LIMIT` must not skip writes, so the caller drains the input fully
-/// before running this (matching the former materializing `WritePart` arm). The
-/// graph write lock is held for the whole statement by `execute_read_query`.
+/// before running this (matching the former materializing `WritePart` arm).
+/// Runs inside the write transaction `execute_read_query` already opened for
+/// the whole statement, so every write part (and the RETURN/WITH projection
+/// after it) shares one transaction and rolls back together on error.
 fn write_part_rows(
-    graph: &Graph,
+    txn: &mut issundb_core::WriteTxn,
     child_paths: Vec<SlotRow>,
     part: &crate::ast::QueryPart,
     params: &HashMap<String, serde_json::Value>,
@@ -4221,9 +4272,9 @@ fn write_part_rows(
     // binds the same edge in more than one row still succeeds. The rows pass
     // through unchanged for a following RETURN.
     if let QueryPart::Delete { targets, detach } = part {
-        use super::write::delete_over_paths;
+        use super::write::delete_over_paths_in;
         let maps: Vec<PathMap> = child_paths.iter().map(|p| p.to_path_map()).collect();
-        delete_over_paths(graph, &maps, targets, *detach, params)?;
+        delete_over_paths_in(txn, &maps, targets, *detach, params)?;
         return Ok(child_paths);
     }
 
@@ -4236,7 +4287,7 @@ fn write_part_rows(
                 let mut new_path = path.clone();
                 for pattern in patterns {
                     let created =
-                        execute_create_internal_with_context(graph, pattern, &path_map, params)?;
+                        execute_create_internal_with_context(txn, pattern, &path_map, params)?;
                     for (name, binding) in created {
                         new_path.bind_local(&name, binding);
                     }
@@ -4252,7 +4303,7 @@ fn write_part_rows(
                     let mut next = Vec::new();
                     for p in &current {
                         let extensions = execute_merge_internal_with_context(
-                            graph,
+                            txn,
                             merge_stmt,
                             &p.to_path_map(),
                             params,
@@ -4271,19 +4322,19 @@ fn write_part_rows(
             }
             QueryPart::Set { items } => {
                 use super::write::apply_set_items;
-                apply_set_items(graph, &path.to_path_map(), items, params)?;
+                apply_set_items(txn, &path.to_path_map(), items, params)?;
                 result_paths.push(path);
             }
             QueryPart::Delete { targets, detach } => {
                 use super::write::apply_delete_targets;
-                apply_delete_targets(graph, &path.to_path_map(), targets, *detach, params)?;
+                apply_delete_targets(txn, &path.to_path_map(), targets, *detach, params)?;
                 result_paths.push(path);
             }
             QueryPart::Remove { items } => {
                 use super::write::apply_remove_item;
                 let path_map = path.to_path_map();
                 for item in items {
-                    apply_remove_item(graph, item, &path_map)?;
+                    apply_remove_item(txn, item, &path_map)?;
                 }
                 result_paths.push(path);
             }
@@ -4772,11 +4823,12 @@ pub(super) fn execute_physical(
     op: &PhysicalOperator,
     params: &HashMap<String, serde_json::Value>,
     schema: &std::sync::Arc<SlotSchema>,
+    mut write_txn: Option<&mut issundb_core::WriteTxn>,
 ) -> Result<Vec<SlotRow>, String> {
     let mut stream = build_stream(op);
     let mut out = Vec::new();
     loop {
-        let batch = stream.next_batch(graph, params, schema)?;
+        let batch = stream.next_batch(graph, params, schema, write_txn.as_deref_mut())?;
         if batch.is_empty() {
             break;
         }
@@ -4792,9 +4844,10 @@ pub(super) fn execute_physical_pathmaps(
     graph: &Graph,
     op: &PhysicalOperator,
     params: &HashMap<String, serde_json::Value>,
+    write_txn: Option<&mut issundb_core::WriteTxn>,
 ) -> Result<Vec<PathMap>, String> {
     let schema = std::sync::Arc::new(SlotSchema::from_plan(op));
-    Ok(execute_physical(graph, op, params, &schema)?
+    Ok(execute_physical(graph, op, params, &schema, write_txn)?
         .iter()
         .map(|r| r.to_path_map())
         .collect())

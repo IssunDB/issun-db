@@ -53,6 +53,7 @@ Quick examples:
   of a sentence.
 - Write correct and complete sentences.
 - Avoid made-up words, abbreviations, and colons in the middle of sentences.
+- Use participial phrases scarcely.
 
 ## Repository Layout
 
@@ -338,6 +339,14 @@ outside `issundb`.
   `statement_count` (always 1 otherwise) lets a caller notice a multi-statement query instead of silently reading the final statement's result as if
   it were the whole query. `AND`/`OR` short-circuit (`false AND x`/`true OR x` never evaluate `x`), so a guard clause protects against a runtime
   error such as division by zero on the side that is never evaluated.
+- A single statement's write clauses (`CREATE`/`MERGE`/`SET`/`DELETE`/`REMOVE`, in any combination, and the `RETURN`/`WITH` projection that follows
+  them) share one `Graph::update` transaction: an error anywhere rolls back every write the statement already made, not just the one that failed.
+  This covers a `RETURN`/`WITH` clause reading a property of a variable bound by an earlier write in the same statement (`CREATE (n {a:1}) RETURN
+  n.a` and its `WITH`-chained form both see the fresh value via a thread-local pending-writes overlay in `exec/expr.rs`, since the in-memory property
+  columns `node_prop_json` reads only refresh after commit) and a `MERGE`'s match-or-create decision sharing a transaction with its `ON CREATE
+  SET`/`ON MATCH SET`. It does not cover a `MATCH`/label-scan/index-scan *after* a write clause in the same statement observing that write's
+  structural effect (a brand-new node becoming visible to a label scan): those read through the committed-only `label_idx`/CSR snapshot, not the
+  still-open transaction, so `CREATE (a:Foo) WITH a MATCH (m:Foo) RETURN count(m)` does not count `a` until the statement commits.
 
 The executor resolves patterns through the physical plan. Untyped expansion uses GraphBLAS SpMV; typed expansion reads the CSR snapshot in bulk behind
 `ensure_snapshot_fresh`, falling back to per-source LMDB point reads when the snapshot is stale and the source set is small. Key optimizer behaviors,
