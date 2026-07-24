@@ -173,6 +173,9 @@ pub struct GraphDelta {
     /// `added_edges`. The edge property column cache drains this to patch the
     /// new edges in without a full rebuild.
     pub added_edge_ids: Vec<crate::schema::EdgeId>,
+    /// Edge ids updated (not added) in this transaction, so the edge property
+    /// column cache can refresh them once, at commit, instead of per-call.
+    pub updated_edges: Vec<crate::schema::EdgeId>,
     pub removed_edges: Vec<(NodeId, NodeId)>,
     pub force_full: bool,
 }
@@ -185,6 +188,7 @@ impl GraphDelta {
             && self.added_nodes.is_empty()
             && self.updated_nodes.is_empty()
             && self.added_edges.is_empty()
+            && self.updated_edges.is_empty()
             && self.removed_edges.is_empty()
     }
 }

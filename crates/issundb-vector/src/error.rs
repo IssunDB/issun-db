@@ -11,6 +11,11 @@ pub enum VectorError {
     )]
     AlreadyConfigured { existing: String, requested: String },
 
+    #[error(
+        "vector index is empty: this graph has no stored embeddings, upsert vectors before searching"
+    )]
+    EmptyIndex,
+
     #[error("usearch library fault: {0}")]
     IndexFault(String),
 

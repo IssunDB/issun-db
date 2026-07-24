@@ -113,37 +113,57 @@ fn collect_expr_vars(expr: &Expr, vars: &mut HashSet<String>) {
                 collect_expr_vars(e, vars);
             }
         }
-        // variable is a local binding; do not insert it. Recurse into list and predicate.
+        // `variable` is a local binding, not a free reference: collect the
+        // predicate into a scratch set, remove it there, and merge only what
+        // remains. Merging the predicate straight into `vars` makes the local
+        // variable look like an outer reference this group's shared prefix
+        // never binds, forcing the predicate to be re-evaluated per row even
+        // when it does not need to be (or worse, mis-scoped placement
+        // upstream in the optimizer, which has the identical bug fixed the
+        // same way).
         Expr::Quantifier {
-            list, predicate, ..
+            variable,
+            list,
+            predicate,
+            ..
         } => {
             collect_expr_vars(list, vars);
-            collect_expr_vars(predicate, vars);
+            let mut inner = HashSet::new();
+            collect_expr_vars(predicate, &mut inner);
+            inner.remove(variable);
+            vars.extend(inner);
         }
-        // variable is a local binding; do not insert it. Recurse into list, predicate, and transform.
         Expr::ListComprehension {
+            variable,
             list,
             predicate,
             transform,
-            ..
         } => {
             collect_expr_vars(list, vars);
+            let mut inner = HashSet::new();
             if let Some(p) = predicate {
-                collect_expr_vars(p, vars);
+                collect_expr_vars(p, &mut inner);
             }
             if let Some(t) = transform {
-                collect_expr_vars(t, vars);
+                collect_expr_vars(t, &mut inner);
             }
+            inner.remove(variable);
+            vars.extend(inner);
         }
         Expr::Reduce {
+            accumulator,
             initial,
+            variable,
             list,
             expression,
-            ..
         } => {
             collect_expr_vars(initial, vars);
             collect_expr_vars(list, vars);
-            collect_expr_vars(expression, vars);
+            let mut inner = HashSet::new();
+            collect_expr_vars(expression, &mut inner);
+            inner.remove(accumulator);
+            inner.remove(variable);
+            vars.extend(inner);
         }
         // The anchor node is an outer reference; the relationship, target-node, and path
         // variables are local bindings. Insert the anchor, then collect from the predicate

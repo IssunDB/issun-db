@@ -401,6 +401,41 @@ async fn invalid_explain_query_is_bad_request() {
 }
 
 #[tokio::test]
+async fn vector_search_on_graph_without_embeddings_is_bad_request() {
+    let (graph, _dir) = fresh_graph();
+    let (status, body) = send(
+        &graph,
+        post("/v1/search/vector", json!({ "vector": [1.0, 0.0, 0.0] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"].is_string());
+}
+
+#[tokio::test]
+async fn text_search_with_unknown_label_filter_is_bad_request() {
+    let (graph, _dir) = fresh_graph();
+    let (status, body) = send(
+        &graph,
+        post(
+            "/v1/search/text",
+            json!({ "query": "cassava", "label": "NoSuchLabel" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"].is_string());
+}
+
+#[tokio::test]
+async fn retrieve_hybrid_without_query_inputs_is_bad_request() {
+    let (graph, _dir) = fresh_graph();
+    let (status, body) = send(&graph, post("/v1/retrieve", json!({}))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"].is_string());
+}
+
+#[tokio::test]
 async fn vector_search_with_empty_vector_is_bad_request() {
     let (graph, _dir) = fresh_graph();
     let (status, body) = send(&graph, post("/v1/search/vector", json!({ "vector": [] }))).await;

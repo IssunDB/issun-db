@@ -9,6 +9,9 @@ pub enum RetrievalError {
     #[error("vector index error: {0}")]
     Vector(#[from] issundb_vector::VectorError),
 
+    #[error("at least one of the text query or the query vector is required")]
+    NoQuery,
+
     #[error("text search error: {0}")]
     Text(#[from] issundb_text::TextError),
 }

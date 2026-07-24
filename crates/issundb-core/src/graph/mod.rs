@@ -459,6 +459,56 @@ pub struct WriteTxn<'a> {
     pub(super) delta: crate::csr::GraphDelta,
 }
 
+thread_local! {
+    /// Identity of the LMDB environment whose `Graph::update` closure this
+    /// thread is currently inside (0 when none). LMDB permits only one active
+    /// writer transaction per environment; a stray call to an auto-committing
+    /// `Graph` mutation method on the SAME environment (which opens its own
+    /// writer transaction) while this is set would block forever on the
+    /// writer lock `Graph::update` already holds. Keyed by environment so
+    /// mutating a different, independent `Graph` inside the closure (a safe
+    /// pattern, e.g. copying between databases) does not trip the assert.
+    /// Checked at the top of every auto-committing mutation method and of
+    /// `Graph::update` itself, so a missed conversion to the `WriteTxn`-based
+    /// method (or a nested `update` on the same graph) becomes an immediate,
+    /// precisely located debug-build panic instead of a silent hang.
+    static IN_WRITE_TXN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+struct WriteTxnGuard {
+    previous: usize,
+}
+
+impl WriteTxnGuard {
+    fn enter(env_id: usize) -> Self {
+        let previous = IN_WRITE_TXN.with(|f| f.replace(env_id));
+        WriteTxnGuard { previous }
+    }
+}
+
+impl Drop for WriteTxnGuard {
+    fn drop(&mut self) {
+        IN_WRITE_TXN.with(|f| f.set(self.previous));
+    }
+}
+
+impl Graph {
+    /// A stable per-environment identity for the deadlock tripwire.
+    fn write_txn_env_id(&self) -> usize {
+        Arc::as_ptr(&self.storage) as usize
+    }
+
+    fn debug_assert_not_in_write_txn(&self) {
+        debug_assert!(
+            IN_WRITE_TXN.with(|f| f.get()) != self.write_txn_env_id(),
+            "an auto-committing Graph method (or a nested Graph::update) was called while a \
+             WriteTxn from Graph::update was already open on this graph on this thread; call \
+             the WriteTxn method instead to avoid a same-thread deadlock on LMDB's \
+             single-writer lock"
+        );
+    }
+}
+
 impl Graph {
     pub fn open(path: &Path, map_size_gb: usize) -> Result<Self, Error> {
         let storage = Storage::open(path, map_size_gb)?;
@@ -722,6 +772,7 @@ impl Graph {
     where
         F: FnOnce(&mut WriteTxn) -> Result<T, Error>,
     {
+        self.debug_assert_not_in_write_txn();
         let _guard = self._write_lock.lock();
         let wtxn = self.storage.env.write_txn()?;
         let mut txn = WriteTxn {
@@ -730,6 +781,7 @@ impl Graph {
             mutations_count: 0,
             delta: crate::csr::GraphDelta::default(),
         };
+        let _txn_guard = WriteTxnGuard::enter(self.write_txn_env_id());
         match f(&mut txn) {
             Ok(val) => {
                 let mutations_count = txn.mutations_count;
@@ -743,11 +795,13 @@ impl Graph {
                 }
                 // Edge columns: an edge removal (or a node deletion that may
                 // cascade to edges) reshuffles the dense edge mapping, so fall
-                // back to a full rebuild; otherwise patch the added edges in.
+                // back to a full rebuild; otherwise patch the added and
+                // updated edges in.
                 if delta.force_full || !delta.removed_edges.is_empty() {
                     self.edge_columns.record_force_full();
                 } else {
                     self.edge_columns.record_touched_many(&delta.added_edge_ids);
+                    self.edge_columns.record_touched_many(&delta.updated_edges);
                 }
                 self.csr_cache.record_batch(delta);
                 if mutations_count > 0 {

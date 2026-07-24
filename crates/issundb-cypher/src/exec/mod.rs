@@ -23,10 +23,10 @@ use ddl::{
 };
 use read::execute_read_query;
 use write::{
-    execute_create, execute_create_and_return, execute_create_internal_with_context,
+    as_txn_error, execute_create, execute_create_and_return, execute_create_internal_with_context,
     execute_delete, execute_delete_and_return, execute_foreach, execute_merge,
     execute_merge_and_return, execute_remove, execute_remove_and_return, execute_set,
-    execute_set_and_return,
+    execute_set_and_return, unwrap_txn_error,
 };
 
 /// Stack size for the dedicated thread that executes a deeply nested query.
@@ -41,6 +41,13 @@ const EXEC_THREAD_STACK: usize = 256 * 1024 * 1024;
 pub struct QueryResult {
     pub columns: Vec<String>,
     pub records: Vec<Record>,
+    /// Number of semicolon-separated top-level statements the query string
+    /// contained. Always 1 except for a `Statement::Pipeline` (several
+    /// statements sent in one call): every statement in a pipeline runs, but
+    /// `columns`/`records` reflect only the last one, so a caller can use
+    /// this to notice a multi-statement query rather than silently reading
+    /// only the final statement's result as if it were the whole query.
+    pub statement_count: usize,
 }
 
 /// An individual row in the query result table.
@@ -244,13 +251,20 @@ fn execute_union(
         records.retain(|r| seen.insert(read::canonical_row_key(&r.values)));
     }
 
-    Ok(QueryResult { columns, records })
+    Ok(QueryResult {
+        columns,
+        records,
+        statement_count: 1,
+    })
 }
 
 /// Classify query execution errors into structured CypherError variants.
 fn to_cypher_error(err: String) -> CypherError {
     let lower = err.to_lowercase();
-    if lower.contains("type mismatch") || (lower.contains("expected") && lower.contains("got")) {
+    if lower.contains("type mismatch")
+        || lower.contains("typeerror")
+        || (lower.contains("expected") && lower.contains("got"))
+    {
         CypherError::TypeMismatch(err)
     } else if lower.contains("not bound")
         || lower.contains("undefined")
@@ -281,27 +295,33 @@ fn execute_pipeline(
     let mut last = QueryResult {
         columns: vec![],
         records: vec![],
+        statement_count: 1,
     };
 
     for stmt in stmts {
         match stmt {
             Statement::Create(c) => {
-                graph.with_write_lock(|| {
-                    for pattern in &c.patterns {
-                        let created = execute_create_internal_with_context(
-                            graph,
-                            pattern,
-                            &shared_bindings,
-                            params,
-                        )
-                        .map_err(to_cypher_error)?;
-                        shared_bindings.extend(created);
-                    }
-                    Ok::<(), CypherError>(())
-                })?;
+                graph
+                    .update(|txn| {
+                        let _pending = expr::PendingWrites::install();
+                        for pattern in &c.patterns {
+                            let created = execute_create_internal_with_context(
+                                txn,
+                                pattern,
+                                &shared_bindings,
+                                params,
+                            )
+                            .map_err(as_txn_error)?;
+                            shared_bindings.extend(created);
+                        }
+                        Ok(())
+                    })
+                    .map_err(unwrap_txn_error)
+                    .map_err(to_cypher_error)?;
                 last = QueryResult {
                     columns: vec![],
                     records: vec![],
+                    statement_count: 1,
                 };
             }
             other => {
@@ -310,6 +330,11 @@ fn execute_pipeline(
         }
     }
 
+    // Every statement in the pipeline ran (a CREATE's writes are not
+    // speculative), but `columns`/`records` reflect only the last one; report
+    // the true count so a caller does not mistake this for a single-statement
+    // result and silently miss the other statements' outcomes.
+    last.statement_count = stmts.len();
     Ok(last)
 }
 
@@ -323,30 +348,41 @@ fn execute_statement(
         Statement::Query(q) => {
             // Resolve CALL clauses against the registry before planning. Cloning is
             // cheap relative to execution and keeps the parsed AST immutable.
-            if q.parts.iter().any(|p| matches!(p, QueryPart::Call { .. })) {
+            let resolved_owner;
+            let q: &Query = if q.parts.iter().any(|p| matches!(p, QueryPart::Call { .. })) {
                 let mut resolved = q.clone();
                 read::resolve_call_parts(graph, &mut resolved, registry, params)
                     .map_err(to_cypher_error)?;
-                execute_read_query(graph, &resolved, params).map_err(to_cypher_error)
+                resolved_owner = resolved;
+                &resolved_owner
             } else {
-                execute_read_query(graph, q, params).map_err(to_cypher_error)
+                q
+            };
+            // A query with write clauses (`CREATE`/`MERGE`/`SET`/`DELETE`/`REMOVE`)
+            // opens one shared write transaction here, covering every write part
+            // and the RETURN/WITH projection that follows: an error anywhere
+            // rolls back the whole statement. A pure read query needs none of
+            // this and keeps its existing fast, lock-free path.
+            if read::query_has_write_parts(q) {
+                graph
+                    .update(|txn| {
+                        execute_read_query(graph, q, params, Some(txn)).map_err(as_txn_error)
+                    })
+                    .map_err(unwrap_txn_error)
+                    .map_err(to_cypher_error)
+            } else {
+                execute_read_query(graph, q, params, None).map_err(to_cypher_error)
             }
         }
-        Statement::Create(c) => graph
-            .with_write_lock(|| execute_create(graph, c, params))
-            .map_err(to_cypher_error),
-        Statement::CreateAndReturn(c) => graph
-            .with_write_lock(|| execute_create_and_return(graph, c, params))
-            .map_err(to_cypher_error),
-        Statement::Set(s) => graph
-            .with_write_lock(|| execute_set(graph, s, params))
-            .map_err(to_cypher_error),
-        Statement::SetAndReturn(s) => graph
-            .with_write_lock(|| execute_set_and_return(graph, s, params))
-            .map_err(to_cypher_error),
-        Statement::Delete(d) => graph
-            .with_write_lock(|| execute_delete(graph, d, params))
-            .map_err(to_cypher_error),
+        Statement::Create(c) => execute_create(graph, c, params).map_err(to_cypher_error),
+        Statement::CreateAndReturn(c) => {
+            execute_create_and_return(graph, c, params).map_err(to_cypher_error)
+        }
+        Statement::Set(s) => execute_set(graph, s, params).map_err(to_cypher_error),
+        Statement::SetAndReturn(s) => {
+            execute_set_and_return(graph, s, params).map_err(to_cypher_error)
+        }
+        Statement::Delete(d) => execute_delete(graph, d, params).map_err(to_cypher_error),
         Statement::DeleteAndReturn(d) => {
             execute_delete_and_return(graph, d, params).map_err(to_cypher_error)
         }
@@ -356,16 +392,12 @@ fn execute_statement(
         }
         Statement::CreateIndex(ci) => execute_create_index(graph, ci).map_err(to_cypher_error),
         Statement::DropIndex(di) => execute_drop_index(graph, di).map_err(to_cypher_error),
-        Statement::Remove(r) => graph
-            .with_write_lock(|| execute_remove(graph, r, params))
-            .map_err(to_cypher_error),
+        Statement::Remove(r) => execute_remove(graph, r, params).map_err(to_cypher_error),
         Statement::RemoveAndReturn(r) => {
             execute_remove_and_return(graph, r, params).map_err(to_cypher_error)
         }
         Statement::Union(u) => execute_union(graph, u, params, registry).map_err(to_cypher_error),
-        Statement::Foreach(f) => graph
-            .with_write_lock(|| execute_foreach(graph, f, params))
-            .map_err(to_cypher_error),
+        Statement::Foreach(f) => execute_foreach(graph, f, params).map_err(to_cypher_error),
         Statement::CreateConstraint(cc) => {
             execute_create_constraint(graph, cc).map_err(to_cypher_error)
         }
@@ -1560,6 +1592,398 @@ mod tests {
 
         let res = execute(&graph, "RETURN 1 + 2 AS total", &params).unwrap();
         assert_eq!(res.columns, vec!["total".to_string()]);
+    }
+
+    /// Integer division and modulo by zero raise a runtime error, matching
+    /// Neo4j; returning null would let the mistake propagate silently through
+    /// downstream aggregates. Float division by zero keeps its IEEE 754
+    /// result (NaN here, since 0.0 / 0.0 is the sentinel-visible case).
+    #[test]
+    fn integer_division_by_zero_is_a_runtime_error() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+
+        for q in ["RETURN 1 / 0 AS boom", "RETURN 1 % 0 AS boom"] {
+            let err = execute(&graph, q, &params).unwrap_err();
+            assert!(
+                matches!(err, CypherError::Math(_)),
+                "{q} must raise a math error, got {err:?}"
+            );
+        }
+
+        // The float path is unchanged: NaN, not an error.
+        let res = execute(&graph, "RETURN 0.0 / 0.0 AS nan_val", &params).unwrap();
+        assert_eq!(res.records.len(), 1);
+    }
+
+    /// Float division by zero that yields +/-Infinity must not serialize as
+    /// JSON null: that would be indistinguishable from a genuinely missing
+    /// value. It gets a distinct sentinel, mirroring how NaN (right next to
+    /// it, `0.0 / 0.0`) is already represented.
+    #[test]
+    fn float_division_by_zero_infinity_is_not_null() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+
+        let res = execute(&graph, "RETURN 1.0 / 0.0 AS v", &params).unwrap();
+        let v = &res.records[0].values[0];
+        assert_ne!(*v, serde_json::Value::Null, "got: {v:?}");
+        assert_eq!(v["__type__"], "__Infinity__", "got: {v:?}");
+
+        let res = execute(&graph, "RETURN -1.0 / 0.0 AS v", &params).unwrap();
+        let v = &res.records[0].values[0];
+        assert_ne!(*v, serde_json::Value::Null, "got: {v:?}");
+        assert_eq!(v["__type__"], "__-Infinity__", "got: {v:?}");
+
+        // The two signs must not collide with each other or with NaN.
+        let pos = execute(&graph, "RETURN 1.0 / 0.0 AS v", &params).unwrap();
+        let neg = execute(&graph, "RETURN -1.0 / 0.0 AS v", &params).unwrap();
+        let nan = execute(&graph, "RETURN 0.0 / 0.0 AS v", &params).unwrap();
+        assert_ne!(pos.records[0].values[0], neg.records[0].values[0]);
+        assert_ne!(pos.records[0].values[0], nan.records[0].values[0]);
+    }
+
+    /// When one `AND`/`OR` operand alone determines the result (`false AND x`,
+    /// `true OR x`), a runtime evaluation error in the other operand is
+    /// suppressed; this is what lets a guard clause like `x <> 0 AND y/x > 1`
+    /// protect against a division error on rows where `x` is zero. A
+    /// successfully evaluated non-boolean operand still raises, though, even
+    /// on the determined side: openCypher requires boolean operands, and the
+    /// TCK (`Boolean1 [8]`, `Boolean2 [8]`) mandates that `false AND 123`
+    /// raise rather than short-circuit.
+    #[test]
+    fn and_or_suppress_dead_branch_errors_but_still_type_check() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+
+        let res = execute(&graph, "RETURN false AND (1 / 0) AS v", &params).unwrap();
+        assert_eq!(res.records[0].values[0], serde_json::Value::Bool(false));
+
+        let res = execute(&graph, "RETURN true OR (1 / 0) AS v", &params).unwrap();
+        assert_eq!(res.records[0].values[0], serde_json::Value::Bool(true));
+
+        // A non-boolean operand raises even on the determined side.
+        for q in [
+            "RETURN false AND 123 AS v",
+            "RETURN true OR 123.4 AS v",
+            "RETURN false AND 'foo' AS v",
+        ] {
+            let err = execute(&graph, q, &params).unwrap_err();
+            assert!(
+                matches!(err, CypherError::TypeMismatch(_)),
+                "{q} must raise a type error, got {err:?}"
+            );
+        }
+
+        // The non-determined sides still evaluate the other operand and
+        // still raise: `true AND (1/0)` and `false OR (1/0)` both need the
+        // right side's value to determine the result.
+        for q in [
+            "RETURN true AND (1 / 0) AS v",
+            "RETURN false OR (1 / 0) AS v",
+        ] {
+            let err = execute(&graph, q, &params).unwrap_err();
+            assert!(
+                matches!(err, CypherError::Math(_)),
+                "{q} must still raise, got {err:?}"
+            );
+        }
+    }
+
+    /// A guard clause protects against a division error exactly the way an
+    /// agent porting SQL/Neo4j-style filters would expect.
+    #[test]
+    fn guard_clause_protects_against_division_by_zero() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+        for (x, y) in [(0i64, 10i64), (2, 10)] {
+            graph
+                .add_node("Num", &serde_json::json!({"x": x, "y": y}))
+                .unwrap();
+        }
+        let res = execute(
+            &graph,
+            "MATCH (n:Num) WHERE n.x <> 0 AND n.y / n.x > 1 RETURN n.x AS x",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(res.records.len(), 1);
+        assert_eq!(res.records[0].values[0], serde_json::json!(2));
+    }
+
+    /// A single statement reports `statement_count: 1`, the common case every
+    /// pre-existing caller relies on implicitly.
+    #[test]
+    fn single_statement_reports_statement_count_one() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+        let res = execute(&graph, "RETURN 1 AS v", &params).unwrap();
+        assert_eq!(res.statement_count, 1);
+    }
+
+    /// A semicolon-separated pipeline runs every statement (the first
+    /// statement's CREATE is visible to a later MATCH within the same
+    /// pipeline call), but `columns`/`records` reflect only the last
+    /// statement. `statement_count` makes that explicit instead of a caller
+    /// silently mistaking the final statement's result for the whole query,
+    /// or assuming the earlier statements were skipped.
+    #[test]
+    fn pipeline_runs_every_statement_but_reports_only_the_last_result() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+
+        let res = execute(
+            &graph,
+            "CREATE (n:PipelineProbe {v: 1}) RETURN n.v; RETURN 'second statement' AS v",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(res.statement_count, 2);
+        assert_eq!(
+            res.records[0].values[0],
+            serde_json::json!("second statement")
+        );
+
+        // The CREATE from the first statement was not skipped.
+        let check = execute(
+            &graph,
+            "MATCH (n:PipelineProbe) RETURN count(n) AS c",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(check.records[0].values[0], serde_json::json!(1));
+    }
+
+    /// `any()`/`all()` closing over the outer matched variable must not break
+    /// binding when combined with an aggregate. The quantifier's own loop
+    /// variable (`l` below) is locally bound and must never be treated as an
+    /// outer reference the filter-pushdown pass needs satisfied elsewhere in
+    /// the plan; before the fix, it leaked into `referenced_vars`, so the
+    /// filter's variable requirement (`{u, l}`) was never a subset of any
+    /// binder's bound-variable set (since `l` is bound nowhere), and the
+    /// aggregate ended up executing without `u` bound at all.
+    #[test]
+    fn quantifier_predicate_with_outer_var_plus_aggregate_stays_bound() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+        graph
+            .add_node("User", &serde_json::json!({"name": "Ada"}))
+            .unwrap();
+        graph
+            .add_node("User", &serde_json::json!({"name": "Grace"}))
+            .unwrap();
+
+        // any() alone (no aggregate) already worked.
+        let res = execute(
+            &graph,
+            "MATCH (u:User) WHERE any(l IN labels(u) WHERE l = 'User') RETURN u.name AS name ORDER BY name",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(res.records.len(), 2);
+
+        // any() + aggregate must not lose `u`'s binding.
+        let res = execute(
+            &graph,
+            "MATCH (u:User) WHERE any(l IN labels(u) WHERE l = 'User') RETURN count(u) AS c",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(res.records[0].values[0], serde_json::json!(2));
+
+        // all() has the same local-variable shape and must behave the same way.
+        let res = execute(
+            &graph,
+            "MATCH (u:User) WHERE all(l IN labels(u) WHERE l = 'User') RETURN count(u) AS c",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(res.records[0].values[0], serde_json::json!(2));
+    }
+
+    // --- Cross-clause write atomicity ---
+    //
+    // A single Cypher statement with multiple write clauses is atomic: an
+    // error partway through rolls back every write the statement already
+    // made, not just the one that failed. Both repro queries here parse as a
+    // single `Statement::Query` with multiple `QueryPart`s (see
+    // `parse_multi_clause_chaining` in parser.rs), routed through
+    // `execute_read_query`'s write-parts path, not `execute_pipeline`.
+
+    /// Repro 1: a unique-constraint failure on the second CREATE in one
+    /// statement must roll back the first CREATE's node too.
+    #[test]
+    fn create_create_rolls_back_first_node_when_second_violates_constraint() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+        graph
+            .create_node_unique_constraint("User", "email")
+            .unwrap();
+        graph
+            .add_node("User", &serde_json::json!({"email": "taken@example.com"}))
+            .unwrap();
+
+        let res = execute(
+            &graph,
+            r#"CREATE (a:Foo {name: "should not persist"}) CREATE (b:User {email: "taken@example.com"})"#,
+            &params,
+        );
+        assert!(
+            res.is_err(),
+            "the constraint violation must surface as an error"
+        );
+
+        let foos = execute(&graph, "MATCH (f:Foo) RETURN count(f) AS c", &params).unwrap();
+        assert_eq!(
+            foos.records[0].values[0],
+            serde_json::json!(0),
+            "the first CREATE's node must not have persisted"
+        );
+    }
+
+    /// Repro 2: an error in the RETURN expression (division by zero) after a
+    /// same-statement `CREATE ... WITH ...` must roll back the CREATE.
+    #[test]
+    fn create_with_return_error_rolls_back_the_create() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+
+        let res = execute(
+            &graph,
+            "CREATE (n:Foo {Id: 5}) WITH n RETURN n.Id / 0",
+            &params,
+        );
+        assert!(res.is_err(), "division by zero must surface as an error");
+
+        let foos = execute(&graph, "MATCH (f:Foo) RETURN count(f) AS c", &params).unwrap();
+        assert_eq!(
+            foos.records[0].values[0],
+            serde_json::json!(0),
+            "the CREATE must not have persisted once the statement's RETURN failed"
+        );
+    }
+
+    /// Regression: the ordinary, non-failing `CREATE ... RETURN` path (with
+    /// and without an intervening `WITH`, and a sibling pattern referencing
+    /// another pattern's just-created property) must keep working; this is
+    /// the shape most at risk from deferring commit to make the above atomic.
+    #[test]
+    fn create_return_still_sees_freshly_created_node_property() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+
+        let res = execute(&graph, "CREATE (n:Foo {a: 1}) RETURN n.a", &params).unwrap();
+        assert_eq!(res.records[0].values[0], serde_json::json!(1));
+
+        let res = execute(&graph, "CREATE (n:Foo {a: 2}) WITH n RETURN n.a", &params).unwrap();
+        assert_eq!(res.records[0].values[0], serde_json::json!(2));
+
+        // A CREATE pattern referencing a sibling pattern's just-created property.
+        let res = execute(
+            &graph,
+            "CREATE (a:Bar {x: 10}), (b:Bar {y: a.x}) RETURN b.y",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(res.records[0].values[0], serde_json::json!(10));
+
+        let both = execute(&graph, "MATCH (f:Foo) RETURN count(f) AS c", &params).unwrap();
+        assert_eq!(both.records[0].values[0], serde_json::json!(2));
+    }
+
+    /// A `MERGE ... ON CREATE SET` whose SET expression fails must leave no
+    /// partially-created node behind: the create and the ON CREATE SET share
+    /// one transaction.
+    #[test]
+    fn merge_on_create_set_failure_rolls_back_the_create() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+
+        let res = execute(
+            &graph,
+            "MERGE (n:Foo {x: 1}) ON CREATE SET n.y = 1 / 0",
+            &params,
+        );
+        assert!(res.is_err(), "division by zero must surface as an error");
+
+        let foos = execute(&graph, "MATCH (f:Foo) RETURN count(f) AS c", &params).unwrap();
+        assert_eq!(
+            foos.records[0].values[0],
+            serde_json::json!(0),
+            "MERGE's create must not have persisted once ON CREATE SET failed"
+        );
+    }
+
+    /// A whole-entity projection (`RETURN n`, not `RETURN n.prop`) after a
+    /// write in the same statement must see the statement's own uncommitted
+    /// writes: the final materialization path (`binding_to_value` and the
+    /// node/edge representation helpers) consults the pending-writes overlay
+    /// before falling back to committed state.
+    #[test]
+    fn whole_entity_return_after_write_sees_own_writes() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+
+        // A just-created node projected whole: must not error (the node is
+        // not committed yet), and must carry the fresh properties.
+        let res = execute(&graph, "CREATE (n:Foo {a: 1}) WITH n RETURN n", &params).unwrap();
+        assert_eq!(res.records[0].values[0]["a"], serde_json::json!(1));
+
+        // A SET in the same statement: the projected node reflects the new
+        // value, not the pre-SET committed record.
+        let res = execute(&graph, "MATCH (n:Foo) SET n.x = 5 WITH n RETURN n", &params).unwrap();
+        assert_eq!(res.records[0].values[0]["x"], serde_json::json!(5));
+
+        // Edge counterpart: a just-created relationship projected whole.
+        let res = execute(
+            &graph,
+            "CREATE (:A)-[r:R {w: 1}]->(:B) WITH r RETURN r",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(res.records[0].values[0]["w"], serde_json::json!(1));
+    }
+
+    /// A bare CREATE statement inside a semicolon-separated pipeline goes
+    /// through `execute_pipeline`'s dedicated Create arm; a sibling pattern
+    /// referencing an earlier pattern's just-created property must resolve
+    /// there just as it does in every other CREATE entry point.
+    #[test]
+    fn pipeline_create_sibling_reference_sees_pending_props() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+
+        execute(
+            &graph,
+            "CREATE (a:A {x: 1}), (b:B {y: a.x}); RETURN 1",
+            &params,
+        )
+        .unwrap();
+
+        let res = execute(&graph, "MATCH (b:B) RETURN b.y", &params).unwrap();
+        assert_eq!(res.records[0].values[0], serde_json::json!(1));
+    }
+
+    /// Documents a known, explicit boundary of this fix (not a bug): a
+    /// `MATCH`/label-scan after a same-statement `CREATE` does not see the
+    /// just-created node, because label scans read through the committed-only
+    /// `label_idx` index, not the still-open write transaction. Pinned down so
+    /// it cannot silently drift in either direction later.
+    #[test]
+    fn create_then_label_scan_in_same_statement_does_not_see_uncommitted_node() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+        let res = execute(
+            &graph,
+            "CREATE (a:Foo) WITH a MATCH (m:Foo) RETURN count(m) AS c",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(
+            res.records[0].values[0],
+            serde_json::json!(0),
+            "documents the boundary: label-scan reads are not txn-aware in this fix"
+        );
     }
 
     #[test]
@@ -3757,6 +4181,26 @@ mod tests {
         assert_eq!(result.records[0].values[0].as_str().unwrap(), "Alice");
     }
 
+    /// `=~` matches the entire string per the openCypher spec, not an
+    /// unanchored substring; a bare pattern with no `^`/`$` must not match a
+    /// value that merely contains it somewhere.
+    #[test]
+    fn regex_match_is_anchored_to_the_whole_string() {
+        let (_dir, graph) = setup_graph();
+        let params = HashMap::new();
+        execute(&graph, "CREATE (n:Person {name: 'chris'})", &params).unwrap();
+        execute(&graph, "CREATE (n:Person {name: 'brotherchris'})", &params).unwrap();
+
+        let result = execute(
+            &graph,
+            "MATCH (n:Person) WHERE n.name =~ 'chris' RETURN n.name AS name",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(result.records.len(), 1);
+        assert_eq!(result.records[0].values[0].as_str().unwrap(), "chris");
+    }
+
     // --- Feature 8: Statistical Aggregation Functions ---
 
     #[test]
@@ -4790,8 +5234,22 @@ mod tests {
             csv_path.display()
         );
         let res_csv = execute(&graph, &query_csv, &params).unwrap();
-        assert_eq!(res_csv.columns, vec!["nodes_imported".to_string()]);
-        assert_eq!(res_csv.records[0].values[0], serde_json::json!(3));
+        assert_eq!(
+            res_csv.columns,
+            vec![
+                "target".to_string(),
+                "kind".to_string(),
+                "count".to_string()
+            ]
+        );
+        assert_eq!(
+            res_csv.records[0].values,
+            vec![
+                serde_json::json!("Person"),
+                serde_json::json!("nodes"),
+                serde_json::json!(3)
+            ]
+        );
 
         // Query and verify CSV nodes
         let query_verify_csv = "MATCH (n:Person) RETURN n.name, n.age, n.active ORDER BY n.name";
@@ -4832,7 +5290,7 @@ mod tests {
 
         let query_jsonl = format!("COPY Person FROM '{}'", jsonl_path.display());
         let res_jsonl = execute(&graph, &query_jsonl, &params).unwrap();
-        assert_eq!(res_jsonl.records[0].values[0], serde_json::json!(2));
+        assert_eq!(res_jsonl.records[0].values[2], serde_json::json!(2));
 
         // Query and verify JSONL nodes
         let query_verify_jsonl = "MATCH (n:Person) WHERE n.name = 'David' OR n.name = 'Eve' RETURN n.name, n.age ORDER BY n.name";
@@ -4865,7 +5323,7 @@ mod tests {
 
         let query = format!("COPY Person FROM '{}'", jsonl_path.display());
         let res = execute(&graph, &query, &params).unwrap();
-        assert_eq!(res.records[0].values[0], serde_json::json!(2));
+        assert_eq!(res.records[0].values[2], serde_json::json!(2));
 
         let res_id = execute(
             &graph,
@@ -4889,6 +5347,205 @@ mod tests {
             res_both.records[0].values,
             vec![serde_json::json!("Bob"), serde_json::Value::Null]
         );
+    }
+
+    /// COPY reports what it did: the target, whether the file classified as
+    /// nodes or relationships, and the row count.
+    #[test]
+    fn test_copy_reports_target_kind_and_count() {
+        use std::io::Write;
+        let (tempdir, graph) = setup_graph();
+        let params = HashMap::new();
+
+        let nodes_path = tempdir.path().join("people.jsonl");
+        {
+            let mut file = std::fs::File::create(&nodes_path).unwrap();
+            writeln!(file, "{{\"_id\": 0, \"name\": \"Alice\"}}").unwrap();
+            writeln!(file, "{{\"_id\": 1, \"name\": \"Bob\"}}").unwrap();
+        }
+        let res = execute(
+            &graph,
+            &format!("COPY Person FROM '{}'", nodes_path.display()),
+            &params,
+        )
+        .unwrap();
+        assert_eq!(
+            res.columns,
+            vec![
+                "target".to_string(),
+                "kind".to_string(),
+                "count".to_string()
+            ]
+        );
+        assert_eq!(
+            res.records[0].values,
+            vec![
+                serde_json::json!("Person"),
+                serde_json::json!("nodes"),
+                serde_json::json!(2)
+            ]
+        );
+
+        // A standalone edge COPY has no id map, so the file must reference
+        // the real node ids. Look them up first.
+        let ids = execute(
+            &graph,
+            "MATCH (p:Person) RETURN id(p) ORDER BY id(p)",
+            &params,
+        )
+        .unwrap();
+        let a = ids.records[0].values[0].as_u64().unwrap();
+        let b = ids.records[1].values[0].as_u64().unwrap();
+
+        let edges_path = tempdir.path().join("knows.jsonl");
+        {
+            let mut file = std::fs::File::create(&edges_path).unwrap();
+            writeln!(file, "{{\"_from\": {a}, \"_to\": {b}}}").unwrap();
+        }
+        let res = execute(
+            &graph,
+            &format!("COPY KNOWS FROM '{}'", edges_path.display()),
+            &params,
+        )
+        .unwrap();
+        assert_eq!(
+            res.records[0].values,
+            vec![
+                serde_json::json!("KNOWS"),
+                serde_json::json!("relationships"),
+                serde_json::json!(1)
+            ]
+        );
+    }
+
+    /// IMPORT DATABASE reports one row per COPY statement in copy.cypher, so
+    /// a file that ingests zero rows or classifies unexpectedly is visible.
+    #[test]
+    fn test_import_database_reports_per_file_counts() {
+        use std::io::Write;
+        let (tempdir, graph) = setup_graph();
+        let params = HashMap::new();
+
+        let import_dir = tempdir.path().join("import_counts");
+        std::fs::create_dir(&import_dir).unwrap();
+        {
+            let mut file = std::fs::File::create(import_dir.join("Person.jsonl")).unwrap();
+            writeln!(file, "{{\"_id\": 0, \"name\": \"A\"}}").unwrap();
+            writeln!(file, "{{\"_id\": 1, \"name\": \"B\"}}").unwrap();
+            writeln!(file, "{{\"_id\": 2, \"name\": \"C\"}}").unwrap();
+        }
+        {
+            let mut file = std::fs::File::create(import_dir.join("FOLLOWS.jsonl")).unwrap();
+            writeln!(file, "{{\"_from\": 0, \"_to\": 1}}").unwrap();
+            writeln!(file, "{{\"_from\": 0, \"_to\": 2}}").unwrap();
+        }
+        std::fs::write(
+            import_dir.join("copy.cypher"),
+            "COPY Person FROM 'Person.jsonl';\nCOPY FOLLOWS FROM 'FOLLOWS.jsonl';\n",
+        )
+        .unwrap();
+
+        let res = execute(
+            &graph,
+            &format!("IMPORT DATABASE '{}'", import_dir.display()),
+            &params,
+        )
+        .unwrap();
+        assert_eq!(
+            res.columns,
+            vec![
+                "target".to_string(),
+                "kind".to_string(),
+                "count".to_string()
+            ]
+        );
+        assert_eq!(res.records.len(), 2);
+        assert_eq!(
+            res.records[0].values,
+            vec![
+                serde_json::json!("Person"),
+                serde_json::json!("nodes"),
+                serde_json::json!(3)
+            ]
+        );
+        assert_eq!(
+            res.records[1].values,
+            vec![
+                serde_json::json!("FOLLOWS"),
+                serde_json::json!("relationships"),
+                serde_json::json!(2)
+            ]
+        );
+
+        let count = execute(
+            &graph,
+            "MATCH ()-[:FOLLOWS]->() RETURN count(*) AS num",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(count.records[0].values[0], serde_json::json!(2));
+    }
+
+    /// A file whose rows carry bare `from` and `to` keys and no node metadata
+    /// is a pre-rename edge file, not a node file; importing it as nodes
+    /// would silently produce zero edges, so it must error with a migration
+    /// hint instead.
+    #[test]
+    fn test_legacy_edge_endpoint_keys_are_rejected() {
+        use std::io::Write;
+        let (tempdir, graph) = setup_graph();
+        let params = HashMap::new();
+
+        let jsonl_path = tempdir.path().join("follows_legacy.jsonl");
+        {
+            let mut file = std::fs::File::create(&jsonl_path).unwrap();
+            writeln!(file, "{{\"from\": 0, \"to\": 1}}").unwrap();
+        }
+        let err = execute(
+            &graph,
+            &format!("COPY FOLLOWS FROM '{}'", jsonl_path.display()),
+            &params,
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("_from") && msg.contains("_to"),
+            "error should point at the underscore keys, got: {msg}"
+        );
+
+        // The same shape as a CSV file is rejected too.
+        let csv_path = tempdir.path().join("follows_legacy.csv");
+        {
+            let mut file = std::fs::File::create(&csv_path).unwrap();
+            writeln!(file, "from,to").unwrap();
+            writeln!(file, "0,1").unwrap();
+        }
+        let err = execute(
+            &graph,
+            &format!("COPY FOLLOWS FROM '{}'", csv_path.display()),
+            &params,
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("_from"));
+
+        // A node row with `from`/`to` user properties imports fine as long
+        // as it carries node metadata.
+        let ok_path = tempdir.path().join("flights.jsonl");
+        {
+            let mut file = std::fs::File::create(&ok_path).unwrap();
+            writeln!(
+                file,
+                "{{\"_labels\": [\"Flight\"], \"from\": 1, \"to\": 2}}"
+            )
+            .unwrap();
+        }
+        let res = execute(
+            &graph,
+            &format!("COPY Flight FROM '{}'", ok_path.display()),
+            &params,
+        )
+        .unwrap();
+        assert_eq!(res.records[0].values[2], serde_json::json!(1));
     }
 
     #[test]
@@ -4930,9 +5587,14 @@ mod tests {
         let import_query = format!("IMPORT DATABASE '{}'", export_dir.display());
         let res_import = execute(&graph2, &import_query, &params).unwrap();
         assert_eq!(
-            res_import.records[0].values[0],
-            serde_json::Value::Bool(true)
+            res_import.columns,
+            vec![
+                "target".to_string(),
+                "kind".to_string(),
+                "count".to_string()
+            ]
         );
+        assert_eq!(res_import.records.len(), 2);
 
         // Verify the imported nodes and properties
         let verify_query = "MATCH (n:Person) RETURN n.name, n.age, n.active ORDER BY n.name";

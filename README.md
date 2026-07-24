@@ -30,7 +30,7 @@ It can be embedded in Rust applications without a separate server, and is design
 * Graph traversal and analytics using sparse matrix operations
 * Vectorized query execution with multi-core parallel processing
 * Vector, full-text, and hybrid search
-* APIs for Rust, Python, CLI, HTTP REST, and MCP
+* APIs for Rust, Python, CLI, HTTP (REST), and MCP
 * Support for Linux, macOS, and Windows
 
 > [!IMPORTANT]
@@ -45,7 +45,7 @@ To use IssunDB in your Rust project, add the dependency to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-issundb = "0.1.0-alpha.15"
+issundb = "0.1.0-alpha.16"
 serde_json = "1.0"
 ```
 

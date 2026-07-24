@@ -14,6 +14,7 @@ impl Graph {
         etype: &str,
         props: &impl Serialize,
     ) -> Result<EdgeId, Error> {
+        self.debug_assert_not_in_write_txn();
         let _guard = self._write_lock.lock();
         let mut wtxn = self.storage.env.write_txn()?;
         let edge_id = self.add_edge_impl(&mut wtxn, src, dst, etype, props)?;
@@ -75,35 +76,10 @@ impl Graph {
 
     /// Update the properties of an existing edge, preserving src, dst, and type.
     pub fn update_edge(&self, id: EdgeId, props: &impl serde::Serialize) -> Result<(), Error> {
+        self.debug_assert_not_in_write_txn();
         let _guard = self._write_lock.lock();
         let mut wtxn = self.storage.env.write_txn()?;
-        let existing = self
-            .storage
-            .edges
-            .get(&wtxn, &id)?
-            .ok_or(Error::EdgeNotFound(id))?;
-        let record: EdgeRecord = crate::storage::props::decode(existing)?;
-        let etype = self
-            .type_name_impl(&wtxn, record.edge_type)?
-            .ok_or(Error::Corrupt("edge type name missing"))?;
-
-        // Re-index under the new properties: drop the old entries first so the
-        // unique check never conflicts with the edge against itself. A
-        // constraint violation aborts the uncommitted transaction, so the old
-        // entries survive.
-        self.delete_edge_index_entries(&mut wtxn, id, &record)?;
-        let encoded_props = crate::storage::props::encode(props)?;
-        self.write_edge_index_entries(&mut wtxn, id, record.edge_type, &etype, &encoded_props)?;
-
-        let new_record = EdgeRecord {
-            src: record.src,
-            dst: record.dst,
-            edge_type: record.edge_type,
-            props: encoded_props,
-        };
-        self.storage
-            .edges
-            .put(&mut wtxn, &id, &crate::storage::props::encode(&new_record)?)?;
+        self.update_edge_impl(&mut wtxn, id, props)?;
         wtxn.commit()?;
         self.edge_columns.record_touched(id);
         // A property change can alter an edge's weight (`weight`/`cost`/
@@ -114,6 +90,42 @@ impl Graph {
         // them. Without this, `shortest_path_dijkstra` and friends serve the
         // pre-update weight (or, with a changed edge, no path at all).
         self.maybe_spawn_rebuild();
+        Ok(())
+    }
+
+    pub(super) fn update_edge_impl(
+        &self,
+        wtxn: &mut heed::RwTxn,
+        id: EdgeId,
+        props: &impl serde::Serialize,
+    ) -> Result<(), Error> {
+        let existing = self
+            .storage
+            .edges
+            .get(wtxn, &id)?
+            .ok_or(Error::EdgeNotFound(id))?;
+        let record: EdgeRecord = crate::storage::props::decode(existing)?;
+        let etype = self
+            .type_name_impl(wtxn, record.edge_type)?
+            .ok_or(Error::Corrupt("edge type name missing"))?;
+
+        // Re-index under the new properties: drop the old entries first so the
+        // unique check never conflicts with the edge against itself. A
+        // constraint violation aborts the uncommitted transaction, so the old
+        // entries survive.
+        self.delete_edge_index_entries(wtxn, id, &record)?;
+        let encoded_props = crate::storage::props::encode(props)?;
+        self.write_edge_index_entries(wtxn, id, record.edge_type, &etype, &encoded_props)?;
+
+        let new_record = EdgeRecord {
+            src: record.src,
+            dst: record.dst,
+            edge_type: record.edge_type,
+            props: encoded_props,
+        };
+        self.storage
+            .edges
+            .put(wtxn, &id, &crate::storage::props::encode(&new_record)?)?;
         Ok(())
     }
 
@@ -137,6 +149,7 @@ impl Graph {
     /// Delete an edge.
     #[instrument(skip(self))]
     pub fn delete_edge(&self, id: EdgeId) -> Result<(), Error> {
+        self.debug_assert_not_in_write_txn();
         let _guard = self._write_lock.lock();
         let mut wtxn = self.storage.env.write_txn()?;
         let endpoints = self.delete_edge_impl(&mut wtxn, id)?;

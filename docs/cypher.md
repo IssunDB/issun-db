@@ -44,7 +44,10 @@ Queries compose as pipelines: a sequence of clauses such as `MATCH ... WITH ... 
 - Arithmetic: `+`, `-`, `*`, `/`, `%`, `^`, and unary minus. Integer overflow raises an error rather than silently widening to float.
 - String predicates: `STARTS WITH`, `ENDS WITH`, `CONTAINS`, and regular expression matching with `=~`, each with a `NOT` form.
 - Comparisons: `=`, `<>`, `<`, `>`, `<=`, `>=`, including chained comparisons (`1 < x < 10`).
-- `IS NULL` and `IS NOT NULL`, three-valued `AND`, `OR`, `XOR`, and `NOT`, and membership with `IN`.
+- `IS NULL` and `IS NOT NULL`, three-valued `AND`, `OR`, `XOR`, and `NOT`, and membership with `IN`. When one `AND`/`OR` operand alone determines
+  the result (`false AND x`, `true OR x`), a runtime evaluation error in the other operand is suppressed, so a guard clause such as
+  `x <> 0 AND y / x > 1` protects against a division error. A successfully evaluated non-boolean operand still raises a type error even on the
+  determined side, as openCypher requires (`false AND 123` raises; `false AND (1 / 0)` is `false`).
 - `CASE` in both the simple (`CASE x WHEN ...`) and searched (`CASE WHEN ...`) forms, with an optional `ELSE`.
 - List comprehensions (`[x IN list WHERE pred | expr]`), pattern comprehensions (`[p = (a)-[r]->(b) WHERE pred | expr]`), the quantifiers `all`, `any`, `none`, and `single`, and `reduce(acc = init, x IN list | expr)`.
 - Label predicates in expression position: `n:Label` and `n:A:B` evaluate to booleans.
@@ -69,17 +72,27 @@ The temporal constructors `date`, `time`, `localtime`, `datetime`, `localdatetim
 
 - Built-in graph data science procedures run through `CALL issundb.<name>(...)`; the full list is in the [Cypher Built-in Procedures](api-reference.md#cypher-built-in-procedures) reference, and custom procedures can be registered through `query_with_procedures`.
 - Index and constraint DDL (`CREATE INDEX`, `DROP INDEX`, `CREATE CONSTRAINT`, and `DROP CONSTRAINT`) is covered by the [Cypher DDL Reference](api-reference.md#cypher-ddl-reference).
-- Bulk data administration statements are also available: `COPY <Label> FROM '<file>' [WITH ...]` bulk-imports nodes from a file, `EXPORT DATABASE '<path>' [WITH ...]` writes the database contents out, and `IMPORT DATABASE '<path>'` loads a previous export.
+- Bulk data administration statements are also available: `COPY <Label> FROM '<file>' [WITH ...]` bulk-imports nodes or relationships from a file, `EXPORT DATABASE '<path>' [WITH ...]` writes the database contents out, and `IMPORT DATABASE '<path>'` loads a previous export. A file classifies as a relationship import when its rows carry the `_from` and `_to` endpoint keys; rows with bare `from` and `to` keys and no node metadata key (`_id` or `_labels`) are rejected with a migration hint rather than silently imported as nodes. Both `COPY` and `IMPORT DATABASE` return one row per imported file with the columns `target`, `kind` (`nodes` or `relationships`), and `count`.
 
 ## Unsupported Constructs
 
 - `SET n = {map}` and `SET n += {map}`: assign properties individually with `SET n.prop = value`.
 - `CALL { ... }` subqueries and `EXISTS { ... }` subqueries: `CALL` is procedure invocation only, and `exists()` is a scalar null check.
+- `shortestPath(...)` and `allShortestPaths(...)` pattern functions: use the `shortest_path` and `all_shortest_paths` methods on the `Graph` API instead.
 - Map projections (`n{.name, .age}`).
 - `MANDATORY MATCH`.
 
 ## Known Deviations
 
-- Integer division or modulo by zero returns null; Neo4j raises an arithmetic exception. Float division by zero follows IEEE 754 and produces NaN or infinity.
+- Integer division or modulo by zero raises an arithmetic error, matching Neo4j. Float division by zero follows IEEE 754: `0.0/0.0` is NaN and a
+  nonzero numerator over a zero denominator is +/-Infinity. Neither has a JSON number representation, so both are returned as a tagged sentinel
+  object (`{"__type__": "__NaN__"}`, `{"__type__": "__Infinity__"}`, or `{"__type__": "__-Infinity__"}`) rather than as a number or as `null`.
+- `=~` matches the entire string, per the openCypher spec: a bare pattern with no `^`/`$` (for example `=~ 'chris'`) matches only the exact string
+  `"chris"`, not any string that merely contains it.
 - Temporal years are limited to roughly the range -262143 to 262143, narrower than the openCypher specification admits.
 - The openCypher TCK subset run (`make test-conformance`) tracks the remaining known gaps; failures there are documented deviations rather than silent wrong results.
+- A statement's write clauses (`CREATE`, `MERGE`, `SET`, `DELETE`, `REMOVE`, in any combination, plus the `RETURN`/`WITH` projection that follows
+  them) are atomic: an error anywhere rolls back every write the statement already made. A `RETURN`/`WITH` clause correctly sees a property of a
+  variable an earlier write in the same statement just created or changed. A `MATCH`/label-scan *after* a write clause in the same statement does not
+  see that write's structural effect until the whole statement commits (for example `CREATE (a:Foo) WITH a MATCH (m:Foo) RETURN count(m)` does not
+  count `a`).

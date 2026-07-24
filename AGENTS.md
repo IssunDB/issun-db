@@ -53,6 +53,7 @@ Quick examples:
   of a sentence.
 - Write correct and complete sentences.
 - Avoid made-up words, abbreviations, and colons in the middle of sentences.
+- Use participial phrases scarcely.
 
 ## Repository Layout
 
@@ -284,6 +285,8 @@ Vector search crate. Owns vector index abstractions, vector metadata, vector sto
   index from the persisted embeddings. The stored vectors are raw, metric-agnostic f32, so they re-index under any metric; this is O(n) and is an
   administrative operation, not a concurrent one.
 - `VectorGraphExt::upsert_vector(n, v) -> Result<(), VectorError>`
+- Searching a graph with no stored embeddings returns `VectorError::EmptyIndex` rather than an empty hit list, so a caller can distinguish "no
+  semantic matches" from "there is nothing to search". The Cypher `VectorTopK` operator maps that error to zero rows, keeping MATCH semantics.
 - `VectorGraphExt::remove_vector(n) -> Result<(), VectorError>`: removes the embedding from both memory and storage.
 - `VectorGraphExt::vector_search(q, k) -> Result<Vec<Hit>, VectorError>`
 - `VectorGraphExt::vector_search_with(q, opts) -> Result<Vec<Hit>, VectorError>`: adds an exact-label filter and property equality filters (both
@@ -296,6 +299,11 @@ Full-text search crate. Owns tokenization, inverted index storage, ranking, and 
 `issundb-vector`, `issundb-retrieval`, `issundb-cypher`, bindings, or CLI crates.
 
 - `TextGraphExt::text_search(query, opts) -> Result<Vec<TextHit>, TextError>`
+- `TextHit` carries `node`, `score`, and the `label` and `property` of the text index that contributed the hit's largest partial score, so a caller
+  can read the matched field without a follow-up lookup.
+- `text_search` errors instead of returning a silent empty list when the request cannot match anything: an empty query (`EmptyQuery`), a label or
+  property filter naming no active index (`LabelNotIndexed`, `PropertyNotIndexed`, or `IndexNotFound` for a pair), or a graph with no text indexes at
+  all (`NoIndexes`).
 - `TextIndexExt::create_text_index(label, property) -> Result<(), TextError>`
 - `TextIndexExt::create_text_index_with_language(label, property, lang) -> Result<(), TextError>`
 - `TextIndexExt::drop_text_index(label, property) -> Result<(), TextError>`
@@ -310,8 +318,10 @@ retrieve functions are free functions, not methods on `Graph`, to preserve the c
 - `retrieve(graph, q, k, hops) -> Result<Subgraph, RetrievalError>`
 - `retrieve_with(graph, q, opts) -> Result<Subgraph, RetrievalError>`
 - `retrieve_hybrid(graph, q, text_query, opts) -> Result<Subgraph, RetrievalError>`: fuses vector and text search seed relevance scores before running
-  expansion.
-- `Subgraph`: `nodes: Vec<NodeId>`, `edges: Vec<EdgeId>`, `scores: HashMap<NodeId, f32>`
+  expansion. When neither modality would run (both inputs empty or both k values zero) it returns `RetrievalError::NoQuery` instead of a silently
+  empty subgraph.
+- `Subgraph`: `nodes: Vec<NodeId>`, `edges: Vec<EdgeId>`, `scores: HashMap<NodeId, f32>`, and `truncated: bool` (true when the `max_nodes` cap cut
+  off seeds or expansion, so a capped result is distinguishable from a complete one)
 - `RetrieveOptions`: `k`, `hops`, `max_distance`, `max_nodes`
 - `HybridRetrieveOptions`: `vector_k`, `text_k`, `text_label`, `text_property`, `hops`, `max_distance`, `max_nodes`, `vector_label`, `fusion`
 - `FusionStrategy`: reciprocal rank fusion (`Rrf { k }`) or linear combination (`WeightedSum { vector_weight, text_weight }`)
@@ -324,7 +334,20 @@ outside `issundb`.
 - `query(cypher) -> Result<QueryResult, CypherError>`, `query_with_params(cypher, params) -> ...`,
   `query_with_procedures(cypher, params, registry) -> ...` (resolves `CALL` clauses against a custom procedure registry), and
   `explain(cypher) -> Result<String, CypherError>`
-- `QueryResult`: `columns: Vec<String>`, `records: Vec<Record>`; `Record`: `values: Vec<serde_json::Value>`
+- `QueryResult`: `columns: Vec<String>`, `records: Vec<Record>`, `statement_count: usize`; `Record`: `values: Vec<serde_json::Value>`. A
+  semicolon-separated query (`Statement::Pipeline`) runs every top-level statement, but `columns`/`records` reflect only the last one;
+  `statement_count` (always 1 otherwise) lets a caller notice a multi-statement query instead of silently reading the final statement's result as if
+  it were the whole query. When one `AND`/`OR` operand alone determines the result (`false AND x`/`true OR x`), a runtime evaluation error in the
+  other operand is suppressed, so a guard clause protects against a division error; a successfully evaluated non-boolean operand still raises a
+  type error even on the determined side, as the openCypher TCK requires (`false AND 123` raises, `false AND (1 / 0)` is `false`).
+- A single statement's write clauses (`CREATE`/`MERGE`/`SET`/`DELETE`/`REMOVE`, in any combination, and the `RETURN`/`WITH` projection that follows
+  them) share one `Graph::update` transaction: an error anywhere rolls back every write the statement already made, not just the one that failed.
+  This covers a `RETURN`/`WITH` clause reading a property of a variable bound by an earlier write in the same statement (`CREATE (n {a:1}) RETURN
+  n.a` and its `WITH`-chained form both see the fresh value via a thread-local pending-writes overlay in `exec/expr.rs`, since the in-memory property
+  columns `node_prop_json` reads only refresh after commit) and a `MERGE`'s match-or-create decision sharing a transaction with its `ON CREATE
+  SET`/`ON MATCH SET`. It does not cover a `MATCH`/label-scan/index-scan *after* a write clause in the same statement observing that write's
+  structural effect (a brand-new node becoming visible to a label scan): those read through the committed-only `label_idx`/CSR snapshot, not the
+  still-open transaction, so `CREATE (a:Foo) WITH a MATCH (m:Foo) RETURN count(m)` does not count `a` until the statement commits.
 
 The executor resolves patterns through the physical plan. Untyped expansion uses GraphBLAS SpMV; typed expansion reads the CSR snapshot in bulk behind
 `ensure_snapshot_fresh`, falling back to per-source LMDB point reads when the snapshot is stale and the source set is small. Key optimizer behaviors,
@@ -400,8 +423,16 @@ HTTP 403.
 The tool surface is deliberately curated for an LLM agent: reads, queries, and retrieval only. Tools: `get_node`, `get_edge`, `cypher_query`,
 `explain`, `text_search`, `vector_search`, and `retrieve_hybrid`. There are no typed mutation tools: graph mutations are expressed as Cypher (
 `CREATE`,
-`SET`, `REMOVE`, `DELETE`, `MERGE`) through `cypher_query`. Index administration, vector loading, thread control, and backup/restore are operator
+`SET`, `REMOVE`, `DELETE`, `MERGE`) through `cypher_query`. The responses are bounded and self-describing for an agent consumer: `get_node` and
+`get_edge` truncate string property values at `max_property_chars` (default 2000) with an explicit marker and accept a `properties` selection list,
+`text_search` hits carry the matched label, property, and a bounded value excerpt, `vector_search` hits carry the node's labels, and
+`retrieve_hybrid` reports `truncated` when the `max_nodes` cap cut off expansion. Index administration, vector loading, thread control, and backup/restore are operator
 concerns driven through the CLI or the Python and REST surfaces. Keep this surface minimal: every additional tool dilutes the agent's tool selection.
+`get_node` and `get_edge` take the internal engine id, the same value Cypher's `id(n)`/`id(r)` returns, never a domain property such as `Id`: the two
+live in separate numbering spaces and can collide, so passing a domain identifier straight to `get_node` silently returns the wrong,
+differently-labeled entity instead of erroring. The tool descriptions, argument docs, and server instructions all say this; resolve a domain
+identifier first with `MATCH (n:Label) WHERE n.Id = x RETURN id(n)`, or pass `expect_label` (`get_node`) or `expect_type` (`get_edge`) to reject a
+mismatched entity with an error instead.
 
 ### `issundb_py`
 

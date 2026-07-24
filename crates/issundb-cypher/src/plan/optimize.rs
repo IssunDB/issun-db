@@ -2299,37 +2299,55 @@ impl Optimizer {
                     Self::collect_expr_vars(e, vars);
                 }
             }
-            // variable is a local binding; do not insert it. Recurse into list and predicate.
+            // `variable` is a local binding, not a free reference: collect the
+            // predicate into a scratch set, remove it there, and merge only
+            // what remains. Merging the predicate straight into `vars` (as a
+            // prior version of this function did) makes the local variable
+            // look like an outer reference no binder in the plan ever
+            // satisfies, so the filter can never be pushed down anywhere.
             Expr::Quantifier {
-                list, predicate, ..
+                variable,
+                list,
+                predicate,
+                ..
             } => {
                 Self::collect_expr_vars(list, vars);
-                Self::collect_expr_vars(predicate, vars);
+                let mut inner = HashSet::new();
+                Self::collect_expr_vars(predicate, &mut inner);
+                inner.remove(variable);
+                vars.extend(inner);
             }
-            // variable is a local binding; do not insert it. Recurse into list, predicate, and transform.
             Expr::ListComprehension {
+                variable,
                 list,
                 predicate,
                 transform,
-                ..
             } => {
                 Self::collect_expr_vars(list, vars);
+                let mut inner = HashSet::new();
                 if let Some(p) = predicate {
-                    Self::collect_expr_vars(p, vars);
+                    Self::collect_expr_vars(p, &mut inner);
                 }
                 if let Some(t) = transform {
-                    Self::collect_expr_vars(t, vars);
+                    Self::collect_expr_vars(t, &mut inner);
                 }
+                inner.remove(variable);
+                vars.extend(inner);
             }
             Expr::Reduce {
+                accumulator,
                 initial,
+                variable,
                 list,
                 expression,
-                ..
             } => {
                 Self::collect_expr_vars(initial, vars);
                 Self::collect_expr_vars(list, vars);
-                Self::collect_expr_vars(expression, vars);
+                let mut inner = HashSet::new();
+                Self::collect_expr_vars(expression, &mut inner);
+                inner.remove(accumulator);
+                inner.remove(variable);
+                vars.extend(inner);
             }
             // The anchor node is an outer reference; the relationship, target-node, and
             // path variables are local bindings, so they are excluded.

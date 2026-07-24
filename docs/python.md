@@ -153,7 +153,7 @@ Here is a quick reference of the methods available on the `IssunDB` class:
 
 ### Querying and Search
 
-* `query(cypher: str, params: Optional[str] = None) -> str`: Executes a Cypher query, optionally with JSON-encoded parameters, and returns the results as a JSON-encoded string.
+* `query(cypher: str, params: Optional[str] = None) -> str`: Executes a Cypher query, optionally with JSON-encoded parameters, and returns the results as a JSON-encoded string with `columns`, `records`, and `statement_count`. A semicolon-separated query runs every statement, but `columns`/`records` reflect only the last one; `statement_count` above 1 signals that the earlier statements' own results were not returned.
 * `explain(cypher: str) -> str`: Returns the indented execution plan tree of a Cypher query.
 * `configure_vector_index(metric: str, quantization: str = "float32", reindex: bool = False) -> None`: Sets the vector index metric and quantization; pass `reindex=True` to rebuild a populated index under the new configuration.
 * `upsert_vector(id: int, vector: List[float]) -> None`: Associates an embedding vector with a node.
@@ -163,8 +163,8 @@ Here is a quick reference of the methods available on the `IssunDB` class:
 * `drop_text_index(label: str, property: str) -> None`: Removes a full-text search index.
 * `has_text_index(label: str, property: str) -> bool`: Checks whether a full-text search index exists for a label and property.
 * `list_text_indexes() -> str`: Returns a JSON list of active full-text search indexes.
-* `text_search(query: str, label: Optional[str] = None, property: Optional[str] = None, limit: int = 10) -> str`: Performs keyword text search.
-* `retrieve_hybrid(vector: Optional[List[float]] = None, text_query: Optional[str] = None, vector_k: int = 10, text_k: int = 10, text_label: Optional[str] = None, text_property: Optional[str] = None, vector_label: Optional[str] = None, hops: int = 2, max_distance: Optional[float] = None, max_nodes: Optional[int] = None, fusion_strategy: str = "rrf", rrf_k: int = 60, vector_weight: float = 0.5, text_weight: float = 0.5) -> str`: Runs a hybrid search and neighborhood expansion, returning a JSON-encoded subgraph.
+* `text_search(query: str, label: Optional[str] = None, property: Optional[str] = None, limit: int = 10) -> str`: Performs keyword text search. Each JSON hit carries `node`, `score`, and the `label` and `property` of the text index that matched it.
+* `retrieve_hybrid(vector: Optional[List[float]] = None, text_query: Optional[str] = None, vector_k: int = 10, text_k: int = 10, text_label: Optional[str] = None, text_property: Optional[str] = None, vector_label: Optional[str] = None, hops: int = 2, max_distance: Optional[float] = None, max_nodes: Optional[int] = None, fusion_strategy: str = "rrf", rrf_k: int = 60, vector_weight: float = 0.5, text_weight: float = 0.5) -> str`: Runs a hybrid search and neighborhood expansion, returning a JSON-encoded subgraph with `nodes`, `edges`, `scores`, and a `truncated` flag that is true when `max_nodes` cut off seeds or expansion. Raises `ValueError` when neither `vector` nor `text_query` is given.
 
 ### Maintenance and Backups
 

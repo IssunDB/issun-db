@@ -9,13 +9,49 @@ use crate::ast::{CopyStatement, ExportDatabaseStatement, Expr, ImportDatabaseSta
 use crate::exec::expr::evaluate_expr;
 use issundb_core::Graph;
 
+/// What one COPY statement did: how the file classified and how many rows it
+/// ingested. Surfacing this is the guard against a silently misclassified
+/// file (an edge file imported as nodes reports `kind: "nodes"`).
+pub(super) struct CopyOutcome {
+    pub(super) count: usize,
+    pub(super) is_relationship: bool,
+}
+
+impl CopyOutcome {
+    fn kind(&self) -> &'static str {
+        if self.is_relationship {
+            "relationships"
+        } else {
+            "nodes"
+        }
+    }
+
+    fn to_record(&self, target: &str) -> Record {
+        Record {
+            values: vec![
+                Value::String(target.to_string()),
+                Value::String(self.kind().to_string()),
+                Value::Number(self.count.into()),
+            ],
+        }
+    }
+}
+
+fn copy_result_columns() -> Vec<String> {
+    vec![
+        "target".to_string(),
+        "kind".to_string(),
+        "count".to_string(),
+    ]
+}
+
 pub(super) fn execute_copy(
     graph: &Graph,
     stmt: &CopyStatement,
     params: &HashMap<String, Value>,
 ) -> Result<QueryResult, String> {
     let mut id_map = HashMap::new();
-    let count = execute_copy_internal(graph, stmt, params, &mut id_map)?;
+    let outcome = execute_copy_internal(graph, stmt, params, &mut id_map)?;
 
     // Rebuild the CSR snapshot cache so the imported nodes/edges are available immediately.
     graph
@@ -23,10 +59,9 @@ pub(super) fn execute_copy(
         .map_err(|e| format!("failed to rebuild CSR after import: {}", e))?;
 
     Ok(QueryResult {
-        columns: vec!["nodes_imported".to_string()],
-        records: vec![Record {
-            values: vec![Value::Number(count.into())],
-        }],
+        statement_count: 1,
+        columns: copy_result_columns(),
+        records: vec![outcome.to_record(&stmt.target)],
     })
 }
 
@@ -35,7 +70,7 @@ pub(super) fn execute_copy_internal(
     stmt: &CopyStatement,
     params: &HashMap<String, Value>,
     id_map: &mut HashMap<u64, u64>,
-) -> Result<usize, String> {
+) -> Result<CopyOutcome, String> {
     // 1. Evaluate options
     let eval_opt =
         |expr: &Expr| -> Option<Value> { evaluate_expr(graph, &PathMap::new(), expr, params).ok() };
@@ -174,10 +209,6 @@ pub(super) fn execute_copy_internal(
         headers_found = headers;
     }
 
-    if entries.is_empty() {
-        return Ok(0);
-    }
-
     // 3. Determine if it is a relationship import. Only the underscore-prefixed
     // metadata keys classify: a node whose user properties happen to be named
     // `from` and `to` must import as a node, not as an edge file.
@@ -188,6 +219,44 @@ pub(super) fn execute_copy_internal(
     } else {
         false
     };
+
+    if entries.is_empty() {
+        return Ok(CopyOutcome {
+            count: 0,
+            is_relationship,
+        });
+    }
+
+    // A row shape with bare `from` and `to` keys and no node metadata key is
+    // almost certainly an edge file written for the pre-rename key contract,
+    // and importing it as nodes would silently produce zero edges. Reject it
+    // with a migration hint; a genuine node file with `from`/`to` user
+    // properties opts out by carrying `_labels` (or `_id`) on its rows, which
+    // every exported file does.
+    if !is_relationship {
+        let node_metadata_keys = ["_id", "_labels", "_label"];
+        let legacy_edge_shape = if inferred_format == "csv" {
+            headers_found.iter().any(|h| h == "from")
+                && headers_found.iter().any(|h| h == "to")
+                && !headers_found
+                    .iter()
+                    .any(|h| node_metadata_keys.contains(&h.as_str()))
+        } else if let Some(first) = entries.first() {
+            first.contains_key("from")
+                && first.contains_key("to")
+                && !node_metadata_keys.iter().any(|k| first.contains_key(*k))
+        } else {
+            false
+        };
+        if legacy_edge_shape {
+            return Err(format!(
+                "COPY {}: rows carry 'from' and 'to' keys but no '_from'/'_to'; edge endpoint \
+                 keys are '_from' and '_to'. If this is a node file whose properties are \
+                 legitimately named 'from' and 'to', add a '_labels' key to its rows.",
+                stmt.target
+            ));
+        }
+    }
 
     if is_relationship {
         graph
@@ -270,7 +339,10 @@ pub(super) fn execute_copy_internal(
             .map_err(|e| format!("node import failed: {}", e))?;
     }
 
-    Ok(count)
+    Ok(CopyOutcome {
+        count,
+        is_relationship,
+    })
 }
 
 pub(super) fn execute_export_db(
@@ -689,6 +761,7 @@ pub(super) fn execute_export_db(
     }
 
     Ok(QueryResult {
+        statement_count: 1,
         columns: vec!["exported".to_string()],
         records: vec![Record {
             values: vec![Value::Bool(true)],
@@ -726,6 +799,7 @@ pub(super) fn execute_import_db(
     // 2. Read and execute copy.cypher with shared id mapping
     let copy_path = dir.join("copy.cypher");
     let mut id_map = HashMap::new();
+    let mut records = Vec::new();
     if copy_path.is_file() {
         let file =
             File::open(&copy_path).map_err(|e| format!("failed to open copy.cypher: {}", e))?;
@@ -756,7 +830,9 @@ pub(super) fn execute_import_db(
                     options: copy_stmt.options.clone(),
                 };
 
-                execute_copy_internal(graph, &resolved_copy_stmt, params, &mut id_map)?;
+                let outcome =
+                    execute_copy_internal(graph, &resolved_copy_stmt, params, &mut id_map)?;
+                records.push(outcome.to_record(&resolved_copy_stmt.target));
             } else {
                 return Err(format!(
                     "unexpected statement in copy.cypher: {}",
@@ -785,11 +861,12 @@ pub(super) fn execute_import_db(
         .rebuild_csr()
         .map_err(|e| format!("failed to rebuild CSR after import: {}", e))?;
 
+    // One row per COPY statement, so a file that ingested zero rows or
+    // classified unexpectedly is visible to the caller.
     Ok(QueryResult {
-        columns: vec!["imported".to_string()],
-        records: vec![Record {
-            values: vec![Value::Bool(true)],
-        }],
+        statement_count: 1,
+        columns: copy_result_columns(),
+        records,
     })
 }
 
@@ -953,21 +1030,9 @@ fn build_record_batch(
         let mut type_builder = StringBuilder::new();
 
         for obj in entries {
-            let from_val = obj
-                .get("_from")
-                .or_else(|| obj.get("from"))
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            let to_val = obj
-                .get("_to")
-                .or_else(|| obj.get("to"))
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            let type_val = obj
-                .get("_type")
-                .or_else(|| obj.get("type"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let from_val = obj.get("_from").and_then(|v| v.as_u64()).unwrap_or(0);
+            let to_val = obj.get("_to").and_then(|v| v.as_u64()).unwrap_or(0);
+            let type_val = obj.get("_type").and_then(|v| v.as_str()).unwrap_or("");
 
             from_builder.append_value(from_val as i64);
             to_builder.append_value(to_val as i64);

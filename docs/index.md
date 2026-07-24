@@ -1,6 +1,6 @@
 # IssunDB
 
-IssunDB is an embedded graph database, written in Rust.
+IssunDB is an embedded graph database in Rust.
 
 ## Key Features
 
@@ -39,5 +39,5 @@ The database is designed as a set of modular crates, establishing clear boundari
 - [Cypher Support](cypher.md): The supported Cypher clauses, patterns, expressions, and functions, plus known deviations.
 - [API Reference](api-reference.md): Public Rust API reference, types, and Cypher DDL syntax.
 - [Hybrid Retrieval](hybrid-retrieval.md): Concept overview and implementation guide for GraphRAG pipelines.
-- [Integrations](integrations.md): Exposing IssunDB over HTTP REST and MCP.
+- [Integrations](integrations.md): Exposing IssunDB over HTTP (REST) and MCP.
 - [Python Integration](python.md): Working with IssunDB directly from Python.

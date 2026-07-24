@@ -13,11 +13,16 @@ use issundb_vector::{VectorGraphExt, VectorSearchOptions};
 /// For [`retrieve`] and [`retrieve_with`] the value is the seed's cosine
 /// distance from the query (lower is closer). For [`retrieve_hybrid`] it is the
 /// fused score produced by the configured [`FusionStrategy`] over the vector
-/// and text seeds (higher is more relevant).
+/// and text seeds (higher is more relevant). `truncated` is true when the
+/// `max_nodes` cap cut off seeds or expansion that would otherwise have been
+/// included, so a capped subgraph (whose missing edges would otherwise read as
+/// "these nodes are unconnected") is distinguishable from a complete one.
+#[derive(Debug)]
 pub struct Subgraph {
     pub nodes: Vec<NodeId>,
     pub edges: Vec<EdgeId>,
     pub scores: HashMap<NodeId, f32>,
+    pub truncated: bool,
 }
 
 /// Options for `retrieve_with`.
@@ -88,10 +93,12 @@ pub fn retrieve_with(
             nodes: Vec::new(),
             edges: Vec::new(),
             scores: HashMap::new(),
+            truncated: false,
         });
     }
 
-    let node_list = graph.bfs_multi_source_graphblas(&seeds, opts.hops, opts.max_nodes)?;
+    let (node_list, truncated) =
+        graph.bfs_multi_source_graphblas(&seeds, opts.hops, opts.max_nodes)?;
     let node_set: AHashSet<NodeId> = node_list.into_iter().collect();
 
     // Keep only scores whose seed node actually appears in the BFS result.
@@ -113,6 +120,7 @@ pub fn retrieve_with(
         nodes: node_set.into_iter().collect(),
         edges: edge_set.into_iter().collect(),
         scores: scores.into_iter().collect(),
+        truncated,
     })
 }
 
@@ -180,17 +188,25 @@ impl Default for HybridRetrieveOptions {
 /// Vector search is run when `opts.vector_k > 0` and `q` is non-empty.
 /// Text search is run when `opts.text_k > 0` and `text_query` is non-empty.
 /// Both may run simultaneously; their ranked lists are merged before BFS.
+/// When neither would run (both inputs empty or both disabled), the call
+/// returns `RetrievalError::NoQuery` instead of a silently empty subgraph.
 pub fn retrieve_hybrid(
     graph: &Graph,
     q: &[f32],
     text_query: &str,
     opts: &HybridRetrieveOptions,
 ) -> Result<Subgraph, RetrievalError> {
+    let vector_active = opts.vector_k > 0 && !q.is_empty();
+    let text_active = opts.text_k > 0 && !text_query.is_empty();
+    if !vector_active && !text_active {
+        return Err(RetrievalError::NoQuery);
+    }
+
     // ---- collect vector hits -----------------------------------------------
     let mut vec_ranks: AHashMap<NodeId, usize> = AHashMap::new();
     let mut vec_scores: AHashMap<NodeId, f32> = AHashMap::new();
 
-    if opts.vector_k > 0 && !q.is_empty() {
+    if vector_active {
         let hits = graph.vector_search_with(
             q,
             &VectorSearchOptions {
@@ -211,7 +227,7 @@ pub fn retrieve_hybrid(
     // ---- collect text hits -------------------------------------------------
     let mut text_ranks: AHashMap<NodeId, usize> = AHashMap::new();
 
-    if opts.text_k > 0 && !text_query.is_empty() {
+    if text_active {
         let text_opts = TextSearchOptions {
             label: opts.text_label.clone(),
             property: opts.text_property.clone(),
@@ -281,11 +297,13 @@ pub fn retrieve_hybrid(
             nodes: Vec::new(),
             edges: Vec::new(),
             scores: HashMap::new(),
+            truncated: false,
         });
     }
 
     // ---- BFS expansion -----------------------------------------------------
-    let node_list = graph.bfs_multi_source_graphblas(&seeds, opts.hops, opts.max_nodes)?;
+    let (node_list, truncated) =
+        graph.bfs_multi_source_graphblas(&seeds, opts.hops, opts.max_nodes)?;
     let node_set: AHashSet<NodeId> = node_list.into_iter().collect();
 
     let mut scores: AHashMap<NodeId, f32> = fused;
@@ -304,6 +322,7 @@ pub fn retrieve_hybrid(
         nodes: node_set.into_iter().collect(),
         edges: edge_set.into_iter().collect(),
         scores: scores.into_iter().collect(),
+        truncated,
     })
 }
 
@@ -321,12 +340,32 @@ mod tests {
     }
 
     #[test]
-    fn retrieve_empty_vector_index_returns_empty_subgraph() {
+    fn retrieve_empty_vector_index_is_an_error() {
         let (_dir, g) = open_tmp();
-        let sub = retrieve(&g, &[1.0f32, 0.0], 5, 2).unwrap();
-        assert!(sub.nodes.is_empty());
-        assert!(sub.edges.is_empty());
-        assert!(sub.scores.is_empty());
+        let err = retrieve(&g, &[1.0f32, 0.0], 5, 2).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                RetrievalError::Vector(issundb_vector::VectorError::EmptyIndex)
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn hybrid_retrieve_without_any_query_is_an_error() {
+        let (_dir, g) = open_tmp();
+        let err = retrieve_hybrid(&g, &[], "", &HybridRetrieveOptions::default()).unwrap_err();
+        assert!(matches!(err, RetrievalError::NoQuery), "got {err:?}");
+
+        // Disabling both modalities is the same misuse as omitting both inputs.
+        let opts = HybridRetrieveOptions {
+            vector_k: 0,
+            text_k: 0,
+            ..Default::default()
+        };
+        let err = retrieve_hybrid(&g, &[1.0f32, 0.0], "cassava", &opts).unwrap_err();
+        assert!(matches!(err, RetrievalError::NoQuery), "got {err:?}");
     }
 
     #[test]
@@ -453,6 +492,22 @@ mod tests {
         .unwrap();
 
         assert!(sub.nodes.len() <= 3);
+        assert!(
+            sub.truncated,
+            "the cap dropped reachable nodes, so the subgraph must say so"
+        );
+    }
+
+    #[test]
+    fn retrieve_without_a_cap_is_not_truncated() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("N", &json!({})).unwrap();
+        let b = g.add_node("N", &json!({})).unwrap();
+        g.upsert_vector(a, &[1.0f32, 0.0]).unwrap();
+        g.add_edge(a, b, "E", &json!({})).unwrap();
+
+        let sub = retrieve(&g, &[1.0f32, 0.0], 1, 1).unwrap();
+        assert!(!sub.truncated);
     }
 
     #[test]
@@ -698,6 +753,7 @@ mod tests {
             "expected at most 3 nodes, got {}",
             sub.nodes.len()
         );
+        assert!(sub.truncated, "the cap dropped reachable nodes");
     }
 
     #[test]
@@ -727,15 +783,18 @@ mod tests {
     }
 
     #[test]
-    fn graphblas_retrieve_empty_vector_index_returns_empty() {
+    fn graphblas_retrieve_empty_vector_index_is_an_error() {
         let (_dir, g) = open_tmp();
         g.rebuild_csr().unwrap();
 
-        let sub = retrieve_with(&g, &[1.0f32, 0.0], &RetrieveOptions::default()).unwrap();
-
-        assert!(sub.nodes.is_empty());
-        assert!(sub.edges.is_empty());
-        assert!(sub.scores.is_empty());
+        let err = retrieve_with(&g, &[1.0f32, 0.0], &RetrieveOptions::default()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                RetrievalError::Vector(issundb_vector::VectorError::EmptyIndex)
+            ),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -850,6 +909,7 @@ mod tests {
             nodes, expected,
             "the two highest-scored seeds must survive the max_nodes cap"
         );
+        assert!(sub.truncated, "the cap dropped two of the four seeds");
     }
 
     #[test]

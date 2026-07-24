@@ -9,6 +9,7 @@ use crate::error::VectorError;
 use issundb_core::{Graph, NodeId};
 
 /// A single result from vector search.
+#[derive(Debug)]
 pub struct Hit {
     pub node: NodeId,
     pub distance: f32,
@@ -202,6 +203,14 @@ impl VectorIndex {
         Ok(())
     }
 
+    /// True when the index holds no vectors.
+    pub fn is_empty(&self) -> bool {
+        match &*self.inner.read() {
+            Inner::Empty => true,
+            Inner::Ready { index, .. } => index.size() == 0,
+        }
+    }
+
     /// Remove the embedding for `node` from the index.
     pub fn remove(&self, node: NodeId) -> Result<(), VectorError> {
         let mut guard = self.inner.write();
@@ -348,6 +357,10 @@ pub trait VectorGraphExt {
     fn remove_vector(&self, n: NodeId) -> Result<(), VectorError>;
 
     /// Return the `k` approximate nearest neighbors to `q` by cosine distance.
+    ///
+    /// Returns `VectorError::EmptyIndex` when the graph holds no embeddings at
+    /// all, so a caller can distinguish "no semantic matches" from "there is
+    /// nothing to search".
     fn vector_search(&self, q: &[f32], k: usize) -> Result<Vec<Hit>, VectorError>;
 
     /// Return the `opts.k` approximate nearest neighbors that satisfy the label
@@ -467,6 +480,13 @@ impl VectorGraphExt for Graph {
         opts: &VectorSearchOptions,
     ) -> Result<Vec<Hit>, VectorError> {
         let arc = get_or_init_cache(self)?;
+
+        // An empty index is an error, not an empty result: for a caller (and
+        // especially an agent surface like MCP) an empty hit list claims
+        // "nothing matched", which is wrong when there was nothing to search.
+        if arc.0.is_empty() {
+            return Err(VectorError::EmptyIndex);
+        }
 
         let index_quantization = arc.0.opts.quantization;
         let rescore_factor =
@@ -822,10 +842,20 @@ mod tests {
     }
 
     #[test]
-    fn vector_search_empty_index_returns_empty() {
+    fn vector_search_empty_index_is_an_error() {
         let (_dir, graph) = open_tmp();
-        let hits = graph.vector_search(&[1.0f32, 0.0, 0.0], 5).unwrap();
-        assert!(hits.is_empty());
+        let err = graph.vector_search(&[1.0f32, 0.0, 0.0], 5).unwrap_err();
+        assert!(matches!(err, VectorError::EmptyIndex), "got {err:?}");
+    }
+
+    #[test]
+    fn vector_search_after_removing_all_vectors_is_an_error() {
+        let (_dir, graph) = open_tmp();
+        let a = graph.add_node("N", &json!({})).unwrap();
+        graph.upsert_vector(a, &[1.0f32, 0.0, 0.0]).unwrap();
+        graph.remove_vector(a).unwrap();
+        let err = graph.vector_search(&[1.0f32, 0.0, 0.0], 5).unwrap_err();
+        assert!(matches!(err, VectorError::EmptyIndex), "got {err:?}");
     }
 
     /// A node deleted through the core graph API lingers in the in-memory HNSW

@@ -1624,10 +1624,15 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
                 match retrieve_hybrid(g, &query, &text_query, &opts) {
                     Ok(sub) => {
                         println!(
-                            "{} node(s), {} edge(s), {} seed(s)",
+                            "{} node(s), {} edge(s), {} seed(s){}",
                             sub.nodes.len(),
                             sub.edges.len(),
-                            sub.scores.len()
+                            sub.scores.len(),
+                            if sub.truncated {
+                                " (truncated by the node cap)"
+                            } else {
+                                ""
+                            }
                         );
                         let mut seeds: Vec<_> = sub.scores.iter().collect();
                         seeds.sort_unstable_by(|a, b| b.1.total_cmp(a.1));
@@ -1740,7 +1745,10 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
                             println!("(no results)");
                         } else {
                             for h in &hits {
-                                println!("  node={} score={:.6}", h.node, h.score);
+                                println!(
+                                    "  node={} score={:.6} matched={}.{}",
+                                    h.node, h.score, h.label, h.property
+                                );
                             }
                         }
                     }
@@ -2088,8 +2096,28 @@ fn format_query_result(qr: &issundb::QueryResult, color: bool) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
 
+    // Every statement in a semicolon-separated pipeline runs, but only the
+    // last one's columns/records are returned; make that explicit rather than
+    // letting the earlier statements' outcomes silently vanish.
+    let pipeline_note = if qr.statement_count > 1 {
+        Some(format!(
+            "(query contained {} statements; all ran, but only the last one's result is shown)",
+            qr.statement_count
+        ))
+    } else {
+        None
+    };
+
     if qr.columns.is_empty() {
         let _ = writeln!(out, "(no columns returned)");
+        if let Some(note) = &pipeline_note {
+            let line = if color {
+                note.dimmed().to_string()
+            } else {
+                note.clone()
+            };
+            let _ = writeln!(out, "{line}");
+        }
         return out;
     }
 
@@ -2118,6 +2146,13 @@ fn format_query_result(qr: &issundb::QueryResult, color: bool) -> String {
         let _ = writeln!(out, "{}", footer.dimmed());
     } else {
         let _ = writeln!(out, "{footer}");
+    }
+    if let Some(note) = &pipeline_note {
+        if color {
+            let _ = writeln!(out, "{}", note.dimmed());
+        } else {
+            let _ = writeln!(out, "{note}");
+        }
     }
     out
 }
@@ -3511,6 +3546,7 @@ mod tests {
             records: vec![issundb::Record {
                 values: vec![serde_json::json!("Alice")],
             }],
+            statement_count: 1,
         };
         colored::control::set_override(true);
         let plain = format_query_result(&qr, false);
@@ -3525,6 +3561,34 @@ mod tests {
             styled.contains('\u{1b}'),
             "styled output lost its coloring under a forced override"
         );
+    }
+
+    /// A `statement_count` above 1 means the query was a semicolon-separated
+    /// pipeline: every statement ran, but only the last one's result is shown.
+    /// The REPL output must say so rather than looking like an ordinary
+    /// single-statement result.
+    #[test]
+    fn multi_statement_result_notes_the_statement_count() {
+        let qr = issundb::QueryResult {
+            columns: vec!["v".to_owned()],
+            records: vec![issundb::Record {
+                values: vec![serde_json::json!("second statement")],
+            }],
+            statement_count: 2,
+        };
+        let out = format_query_result(&qr, false);
+        assert!(
+            out.contains("2 statements"),
+            "missing pipeline note:\n{out}"
+        );
+
+        // The common single-statement case stays silent about it.
+        let qr = issundb::QueryResult {
+            statement_count: 1,
+            ..qr
+        };
+        let out = format_query_result(&qr, false);
+        assert!(!out.contains("statements"), "unexpected note:\n{out}");
     }
 
     /// Streaming imports flush at the batch boundary: with a batch size of 2,
