@@ -261,7 +261,10 @@ fn execute_union(
 /// Classify query execution errors into structured CypherError variants.
 fn to_cypher_error(err: String) -> CypherError {
     let lower = err.to_lowercase();
-    if lower.contains("type mismatch") || (lower.contains("expected") && lower.contains("got")) {
+    if lower.contains("type mismatch")
+        || lower.contains("typeerror")
+        || (lower.contains("expected") && lower.contains("got"))
+    {
         CypherError::TypeMismatch(err)
     } else if lower.contains("not bound")
         || lower.contains("undefined")
@@ -1640,13 +1643,16 @@ mod tests {
         assert_ne!(pos.records[0].values[0], nan.records[0].values[0]);
     }
 
-    /// `AND`/`OR` short-circuit: the determining operand's value alone
-    /// decides the result, so the other operand is never evaluated, and a
-    /// runtime error on that side (e.g. division by zero) never surfaces.
-    /// This is what lets a guard clause like `x <> 0 AND y/x > 1` actually
-    /// protect against a division error on rows where `x` is zero.
+    /// When one `AND`/`OR` operand alone determines the result (`false AND x`,
+    /// `true OR x`), a runtime evaluation error in the other operand is
+    /// suppressed; this is what lets a guard clause like `x <> 0 AND y/x > 1`
+    /// protect against a division error on rows where `x` is zero. A
+    /// successfully evaluated non-boolean operand still raises, though, even
+    /// on the determined side: openCypher requires boolean operands, and the
+    /// TCK (`Boolean1 [8]`, `Boolean2 [8]`) mandates that `false AND 123`
+    /// raise rather than short-circuit.
     #[test]
-    fn and_or_short_circuit_and_do_not_evaluate_the_other_side() {
+    fn and_or_suppress_dead_branch_errors_but_still_type_check() {
         let params = HashMap::new();
         let (_dir, graph) = setup_graph();
 
@@ -1656,7 +1662,20 @@ mod tests {
         let res = execute(&graph, "RETURN true OR (1 / 0) AS v", &params).unwrap();
         assert_eq!(res.records[0].values[0], serde_json::Value::Bool(true));
 
-        // The non-short-circuiting sides still evaluate the other operand and
+        // A non-boolean operand raises even on the determined side.
+        for q in [
+            "RETURN false AND 123 AS v",
+            "RETURN true OR 123.4 AS v",
+            "RETURN false AND 'foo' AS v",
+        ] {
+            let err = execute(&graph, q, &params).unwrap_err();
+            assert!(
+                matches!(err, CypherError::TypeMismatch(_)),
+                "{q} must raise a type error, got {err:?}"
+            );
+        }
+
+        // The non-determined sides still evaluate the other operand and
         // still raise: `true AND (1/0)` and `false OR (1/0)` both need the
         // right side's value to determine the result.
         for q in [

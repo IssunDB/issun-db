@@ -1106,11 +1106,22 @@ pub(super) fn eval_binary_op<B: Bindings>(
                     lv
                 ));
             }
-            // Short-circuit: `false AND x` is `false` for every x, so the
-            // right operand is not evaluated. This is what lets a guard
-            // clause such as `x <> 0 AND y/x > 1` actually protect against a
-            // runtime error on the right side when the left side is false.
+            // `false AND x` is `false` for every boolean-or-null x, so a
+            // runtime evaluation error in the right operand is suppressed
+            // here; this is what lets a guard clause such as
+            // `x <> 0 AND y/x > 1` protect the right side. A right operand
+            // that evaluates successfully is still type-checked: openCypher
+            // requires boolean operands (the TCK mandates that
+            // `false AND 123` raise, not short-circuit).
             if lv == serde_json::Value::Bool(false) {
+                if let Ok(rv) = evaluate_expr(graph, path, right, params) {
+                    if !matches!(rv, serde_json::Value::Bool(_) | serde_json::Value::Null) {
+                        return Err(format!(
+                            "TypeError: AND requires boolean operands, right operand is {}",
+                            rv
+                        ));
+                    }
+                }
                 return Ok(serde_json::Value::Bool(false));
             }
             let rv = evaluate_expr(graph, path, right, params)?;
@@ -1136,9 +1147,17 @@ pub(super) fn eval_binary_op<B: Bindings>(
                     lv
                 ));
             }
-            // Short-circuit: `true OR x` is `true` for every x, so the right
-            // operand is not evaluated.
+            // `true OR x` is `true` for every boolean-or-null x; same
+            // error-suppression-with-type-check treatment as AND above.
             if lv == serde_json::Value::Bool(true) {
+                if let Ok(rv) = evaluate_expr(graph, path, right, params) {
+                    if !matches!(rv, serde_json::Value::Bool(_) | serde_json::Value::Null) {
+                        return Err(format!(
+                            "TypeError: OR requires boolean operands, right operand is {}",
+                            rv
+                        ));
+                    }
+                }
                 return Ok(serde_json::Value::Bool(true));
             }
             let rv = evaluate_expr(graph, path, right, params)?;

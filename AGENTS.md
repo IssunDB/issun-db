@@ -337,8 +337,9 @@ outside `issundb`.
 - `QueryResult`: `columns: Vec<String>`, `records: Vec<Record>`, `statement_count: usize`; `Record`: `values: Vec<serde_json::Value>`. A
   semicolon-separated query (`Statement::Pipeline`) runs every top-level statement, but `columns`/`records` reflect only the last one;
   `statement_count` (always 1 otherwise) lets a caller notice a multi-statement query instead of silently reading the final statement's result as if
-  it were the whole query. `AND`/`OR` short-circuit (`false AND x`/`true OR x` never evaluate `x`), so a guard clause protects against a runtime
-  error such as division by zero on the side that is never evaluated.
+  it were the whole query. When one `AND`/`OR` operand alone determines the result (`false AND x`/`true OR x`), a runtime evaluation error in the
+  other operand is suppressed, so a guard clause protects against a division error; a successfully evaluated non-boolean operand still raises a
+  type error even on the determined side, as the openCypher TCK requires (`false AND 123` raises, `false AND (1 / 0)` is `false`).
 - A single statement's write clauses (`CREATE`/`MERGE`/`SET`/`DELETE`/`REMOVE`, in any combination, and the `RETURN`/`WITH` projection that follows
   them) share one `Graph::update` transaction: an error anywhere rolls back every write the statement already made, not just the one that failed.
   This covers a `RETURN`/`WITH` clause reading a property of a variable bound by an earlier write in the same statement (`CREATE (n {a:1}) RETURN

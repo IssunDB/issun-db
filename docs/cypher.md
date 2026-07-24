@@ -44,9 +44,10 @@ Queries compose as pipelines: a sequence of clauses such as `MATCH ... WITH ... 
 - Arithmetic: `+`, `-`, `*`, `/`, `%`, `^`, and unary minus. Integer overflow raises an error rather than silently widening to float.
 - String predicates: `STARTS WITH`, `ENDS WITH`, `CONTAINS`, and regular expression matching with `=~`, each with a `NOT` form.
 - Comparisons: `=`, `<>`, `<`, `>`, `<=`, `>=`, including chained comparisons (`1 < x < 10`).
-- `IS NULL` and `IS NOT NULL`, three-valued `AND`, `OR`, `XOR`, and `NOT`, and membership with `IN`. `AND` and `OR` short-circuit: `false AND x` and
-  `true OR x` never evaluate `x`, so a guard clause such as `x <> 0 AND y / x > 1` protects against a runtime error on the right side (`XOR` cannot
-  short-circuit, since both operands always determine its result).
+- `IS NULL` and `IS NOT NULL`, three-valued `AND`, `OR`, `XOR`, and `NOT`, and membership with `IN`. When one `AND`/`OR` operand alone determines
+  the result (`false AND x`, `true OR x`), a runtime evaluation error in the other operand is suppressed, so a guard clause such as
+  `x <> 0 AND y / x > 1` protects against a division error. A successfully evaluated non-boolean operand still raises a type error even on the
+  determined side, as openCypher requires (`false AND 123` raises; `false AND (1 / 0)` is `false`).
 - `CASE` in both the simple (`CASE x WHEN ...`) and searched (`CASE WHEN ...`) forms, with an optional `ELSE`.
 - List comprehensions (`[x IN list WHERE pred | expr]`), pattern comprehensions (`[p = (a)-[r]->(b) WHERE pred | expr]`), the quantifiers `all`, `any`, `none`, and `single`, and `reduce(acc = init, x IN list | expr)`.
 - Label predicates in expression position: `n:Label` and `n:A:B` evaluate to booleans.
