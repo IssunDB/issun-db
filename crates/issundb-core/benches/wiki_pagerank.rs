@@ -45,6 +45,11 @@ struct BenchState {
 // Graph builders
 // ---------------------------------------------------------------------------
 
+/// Records written per fixture transaction. An auto-commit insert is one durable
+/// commit, and one transaction for the whole dataset would risk exceeding LMDB's
+/// per-transaction dirty-page limit, so the load is chunked.
+const LOAD_CHUNK: usize = 10_000;
+
 fn load_synthetic() -> BenchState {
     let dir = TempDir::new().unwrap();
     let g = Graph::open(dir.path(), 8).unwrap();
@@ -57,17 +62,35 @@ fn load_synthetic() -> BenchState {
     };
 
     let mut ids = Vec::with_capacity(n_nodes);
-    for i in 0..n_nodes {
-        ids.push(g.add_node("Article", &i).unwrap());
+    let mut written = 0;
+    while written < n_nodes {
+        let upto = (written + LOAD_CHUNK).min(n_nodes);
+        g.update(|txn| {
+            for i in written..upto {
+                ids.push(txn.add_node("Article", &i)?);
+            }
+            Ok(())
+        })
+        .unwrap();
+        written = upto;
     }
     let n = ids.len();
-    for i in 0..n_edges {
-        let src = ids[i % n];
-        let dst = ids[(i
-            .wrapping_mul(6_364_136_223_846_793_005_usize)
-            .wrapping_add(rng.random_range(0..n)))
-            % n];
-        g.add_edge(src, dst, "Link", &()).unwrap();
+    let mut written = 0;
+    while written < n_edges {
+        let upto = (written + LOAD_CHUNK).min(n_edges);
+        g.update(|txn| {
+            for i in written..upto {
+                let src = ids[i % n];
+                let dst = ids[(i
+                    .wrapping_mul(6_364_136_223_846_793_005_usize)
+                    .wrapping_add(rng.random_range(0..n)))
+                    % n];
+                txn.add_edge(src, dst, "Link", &())?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        written = upto;
     }
     BenchState {
         graph: g,
@@ -102,16 +125,33 @@ fn load_snap(data_dir: &str) -> BenchState {
 
     // Insert one node per unique article ID, then insert edges.
     let mut id_map: HashMap<i64, u64> = HashMap::new();
-    for &(fr, to) in &pairs {
-        id_map
-            .entry(fr)
-            .or_insert_with(|| g.add_node("Article", &fr).unwrap());
-        id_map
-            .entry(to)
-            .or_insert_with(|| g.add_node("Article", &to).unwrap());
+    let mut written = 0;
+    while written < pairs.len() {
+        let upto = (written + LOAD_CHUNK).min(pairs.len());
+        g.update(|txn| {
+            for &(fr, to) in &pairs[written..upto] {
+                for article in [fr, to] {
+                    if let std::collections::hash_map::Entry::Vacant(slot) = id_map.entry(article) {
+                        slot.insert(txn.add_node("Article", &article)?);
+                    }
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
+        written = upto;
     }
-    for (fr, to) in pairs {
-        g.add_edge(id_map[&fr], id_map[&to], "Link", &()).unwrap();
+    let mut written = 0;
+    while written < pairs.len() {
+        let upto = (written + LOAD_CHUNK).min(pairs.len());
+        g.update(|txn| {
+            for &(fr, to) in &pairs[written..upto] {
+                txn.add_edge(id_map[&fr], id_map[&to], "Link", &())?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        written = upto;
     }
 
     BenchState {

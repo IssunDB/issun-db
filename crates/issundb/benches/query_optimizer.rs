@@ -28,29 +28,43 @@ const RARE: usize = 50; // City nodes
 const LARGE: usize = 50_000;
 const SMALL: usize = 5_000;
 
+/// Records written per fixture transaction. An auto-commit insert is one durable
+/// commit, and one transaction for a whole fixture would risk exceeding LMDB's
+/// per-transaction dirty-page limit, so the load is chunked.
+const LOAD_CHUNK: usize = 10_000;
+
 /// Build a graph with many Person nodes, few City nodes, one KNOWS edge per
 /// Person to a City, and a sequential `seq` property on each Person. Held alive
 /// by the returned `TempDir`.
 fn build_graph(common: usize) -> (TempDir, Graph, Vec<NodeId>) {
     let dir = TempDir::new().unwrap();
     let g = Graph::open(dir.path(), 1).unwrap();
-    let cities: Vec<NodeId> = (0..RARE)
-        .map(|i| {
-            g.add_node("City", &json!({ "name": format!("City{i}") }))
-                .unwrap()
-        })
-        .collect();
+    let mut cities: Vec<NodeId> = Vec::with_capacity(RARE);
+    g.update(|txn| {
+        for i in 0..RARE {
+            cities.push(txn.add_node("City", &json!({ "name": format!("City{i}") }))?);
+        }
+        Ok(())
+    })
+    .unwrap();
+
     let mut persons = Vec::with_capacity(common);
-    for i in 0..common {
-        let p = g
-            .add_node(
-                "Person",
-                &json!({ "name": format!("P{i}"), "seq": i as i64 }),
-            )
-            .unwrap();
-        g.add_edge(p, cities[i % RARE], "KNOWS", &json!({}))
-            .unwrap();
-        persons.push(p);
+    let mut written = 0;
+    while written < common {
+        let upto = (written + LOAD_CHUNK).min(common);
+        g.update(|txn| {
+            for i in written..upto {
+                let p = txn.add_node(
+                    "Person",
+                    &json!({ "name": format!("P{i}"), "seq": i as i64 }),
+                )?;
+                txn.add_edge(p, cities[i % RARE], "KNOWS", &json!({}))?;
+                persons.push(p);
+            }
+            Ok(())
+        })
+        .unwrap();
+        written = upto;
     }
     g.rebuild_csr().unwrap();
     (dir, g, persons)
@@ -115,13 +129,22 @@ fn bench_chain_fusion(c: &mut Criterion) {
     let dir = TempDir::new().unwrap();
     let g = Graph::open(dir.path(), 1).unwrap();
     let hub = g.add_node("Hub", &json!({})).unwrap();
-    for _ in 0..SMALL {
-        let a = g.add_node("A", &json!({})).unwrap();
-        let b = g.add_node("B", &json!({})).unwrap();
-        let cc = g.add_node("C", &json!({})).unwrap();
-        g.add_edge(a, b, "R1", &json!({})).unwrap();
-        g.add_edge(b, cc, "R2", &json!({})).unwrap();
-        g.add_edge(cc, hub, "R3", &json!({})).unwrap();
+    let mut written = 0;
+    while written < SMALL {
+        let upto = (written + LOAD_CHUNK).min(SMALL);
+        g.update(|txn| {
+            for _ in written..upto {
+                let a = txn.add_node("A", &json!({}))?;
+                let b = txn.add_node("B", &json!({}))?;
+                let cc = txn.add_node("C", &json!({}))?;
+                txn.add_edge(a, b, "R1", &json!({}))?;
+                txn.add_edge(b, cc, "R2", &json!({}))?;
+                txn.add_edge(cc, hub, "R3", &json!({}))?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        written = upto;
     }
     g.rebuild_csr().unwrap();
     let mut group = c.benchmark_group("chain_fusion");

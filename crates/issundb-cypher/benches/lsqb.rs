@@ -30,112 +30,103 @@ fn build_lsqb_graph() -> (TempDir, Graph) {
     let dir = TempDir::new().unwrap();
     let g = Graph::open(dir.path(), 1).unwrap();
 
-    // 1. Add Cities
-    let cities: Vec<_> = (0..NUM_CITIES)
-        .map(|i| {
-            g.add_node("City", &json!({ "name": format!("city{i}") }))
-                .unwrap()
-        })
-        .collect();
+    // An auto-commit insert is one durable commit, so the fixture is written in a
+    // few transactions grouped by section rather than one commit per record.
+    let mut cities = Vec::with_capacity(NUM_CITIES);
+    let mut persons = Vec::with_capacity(NUM_PERSONS);
+    let mut posts = Vec::with_capacity(NUM_POSTS);
+    let mut comments = Vec::with_capacity(NUM_COMMENTS);
 
-    // 2. Add Persons
-    let persons: Vec<_> = (0..NUM_PERSONS)
-        .map(|i| {
-            g.add_node(
+    g.update(|txn| {
+        // 1. Add Cities
+        for i in 0..NUM_CITIES {
+            cities.push(txn.add_node("City", &json!({ "name": format!("city{i}") }))?);
+        }
+        // 2. Add Persons
+        for i in 0..NUM_PERSONS {
+            persons.push(txn.add_node(
                 "Person",
                 &json!({ "name": format!("p{i}"), "age": 18 + (i % 60) }),
-            )
-            .unwrap()
-        })
-        .collect();
-
-    // 3. Add Posts
-    let posts: Vec<_> = (0..NUM_POSTS)
-        .map(|i| {
-            g.add_node("Post", &json!({ "title": format!("post{i}") }))
-                .unwrap()
-        })
-        .collect();
-
-    // 4. Add Comments
-    let comments: Vec<_> = (0..NUM_COMMENTS)
-        .map(|i| {
-            g.add_node("Comment", &json!({ "content": format!("comment{i}") }))
-                .unwrap()
-        })
-        .collect();
-
-    // 5. Connect Persons with LIVES_IN to Cities (deterministic)
-    for i in 0..NUM_PERSONS {
-        g.add_edge(persons[i], cities[i % NUM_CITIES], "LIVES_IN", &json!({}))
-            .unwrap();
-    }
-
-    // 6. Connect Persons with KNOWS (coprime offsets to form loops/traversals)
-    let knows_offsets = [1, 7, 13];
-    for i in 0..NUM_PERSONS {
-        for off in knows_offsets {
-            g.add_edge(
-                persons[i],
-                persons[(i + off) % NUM_PERSONS],
-                "KNOWS",
-                &json!({}),
-            )
-            .unwrap();
+            )?);
         }
-    }
+        // 3. Add Posts
+        for i in 0..NUM_POSTS {
+            posts.push(txn.add_node("Post", &json!({ "title": format!("post{i}") }))?);
+        }
+        // 4. Add Comments
+        for i in 0..NUM_COMMENTS {
+            comments.push(txn.add_node("Comment", &json!({ "content": format!("comment{i}") }))?);
+        }
+        Ok(())
+    })
+    .unwrap();
 
-    // 7. Add directed triangles and reciprocal pairs. These make cycle and
-    // endpoint-inequality predicates exercise both matching and rejected rows.
-    for base in (700..997).step_by(3) {
-        g.add_edge(persons[base + 2], persons[base], "KNOWS", &json!({}))
-            .unwrap();
-    }
-    for base in 600..650 {
-        g.add_edge(persons[base + 1], persons[base], "KNOWS", &json!({}))
-            .unwrap();
-    }
+    g.update(|txn| {
+        // 5. Connect Persons with LIVES_IN to Cities (deterministic)
+        for i in 0..NUM_PERSONS {
+            txn.add_edge(persons[i], cities[i % NUM_CITIES], "LIVES_IN", &json!({}))?;
+        }
 
-    // 8. Connect Posts with HAS_CREATOR to Persons.
-    for i in 0..NUM_POSTS {
-        g.add_edge(
-            posts[i],
-            persons[i % NUM_PERSONS],
-            "HAS_CREATOR",
-            &json!({}),
-        )
-        .unwrap();
-    }
+        // 6. Connect Persons with KNOWS (coprime offsets to form loops/traversals)
+        let knows_offsets = [1, 7, 13];
+        for i in 0..NUM_PERSONS {
+            for off in knows_offsets {
+                txn.add_edge(
+                    persons[i],
+                    persons[(i + off) % NUM_PERSONS],
+                    "KNOWS",
+                    &json!({}),
+                )?;
+            }
+        }
 
-    // 9. Create three comment cohorts: known creators, unknown creators, and
-    // comments without an author. Posts 1 through 502 form the Q7 anchor set.
-    for i in 0..500 {
-        g.add_edge(comments[i], persons[i], "HAS_CREATOR", &json!({}))
-            .unwrap();
-        g.add_edge(comments[i], posts[i + 1], "REPLY_OF", &json!({}))
-            .unwrap();
-        g.add_edge(posts[i + 1], comments[i], "HAS_COMMENT", &json!({}))
-            .unwrap();
-    }
-    for i in 0..500 {
-        let comment = comments[500 + i];
-        g.add_edge(comment, persons[i], "HAS_CREATOR", &json!({}))
-            .unwrap();
-        g.add_edge(comment, posts[i + 2], "REPLY_OF", &json!({}))
-            .unwrap();
-        g.add_edge(posts[i + 2], comment, "HAS_COMMENT", &json!({}))
-            .unwrap();
-    }
-    for i in 0..500 {
-        g.add_edge(comments[1000 + i], posts[i + 3], "REPLY_OF", &json!({}))
-            .unwrap();
-        g.add_edge(posts[i + 3], comments[1000 + i], "HAS_COMMENT", &json!({}))
-            .unwrap();
-    }
+        // 7. Add directed triangles and reciprocal pairs. These make cycle and
+        // endpoint-inequality predicates exercise both matching and rejected rows.
+        for base in (700..997).step_by(3) {
+            txn.add_edge(persons[base + 2], persons[base], "KNOWS", &json!({}))?;
+        }
+        for base in 600..650 {
+            txn.add_edge(persons[base + 1], persons[base], "KNOWS", &json!({}))?;
+        }
+        Ok(())
+    })
+    .unwrap();
 
-    for post in &posts[1..503] {
-        g.add_label(*post, "PostWithComments").unwrap();
-    }
+    g.update(|txn| {
+        // 8. Connect Posts with HAS_CREATOR to Persons.
+        for i in 0..NUM_POSTS {
+            txn.add_edge(
+                posts[i],
+                persons[i % NUM_PERSONS],
+                "HAS_CREATOR",
+                &json!({}),
+            )?;
+        }
+
+        // 9. Create three comment cohorts: known creators, unknown creators, and
+        // comments without an author. Posts 1 through 502 form the Q7 anchor set.
+        for i in 0..500 {
+            txn.add_edge(comments[i], persons[i], "HAS_CREATOR", &json!({}))?;
+            txn.add_edge(comments[i], posts[i + 1], "REPLY_OF", &json!({}))?;
+            txn.add_edge(posts[i + 1], comments[i], "HAS_COMMENT", &json!({}))?;
+        }
+        for i in 0..500 {
+            let comment = comments[500 + i];
+            txn.add_edge(comment, persons[i], "HAS_CREATOR", &json!({}))?;
+            txn.add_edge(comment, posts[i + 2], "REPLY_OF", &json!({}))?;
+            txn.add_edge(posts[i + 2], comment, "HAS_COMMENT", &json!({}))?;
+        }
+        for i in 0..500 {
+            txn.add_edge(comments[1000 + i], posts[i + 3], "REPLY_OF", &json!({}))?;
+            txn.add_edge(posts[i + 3], comments[1000 + i], "HAS_COMMENT", &json!({}))?;
+        }
+
+        for post in &posts[1..503] {
+            txn.add_label(*post, "PostWithComments")?;
+        }
+        Ok(())
+    })
+    .unwrap();
 
     g.rebuild_csr().unwrap();
     (dir, g)

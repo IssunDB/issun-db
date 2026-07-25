@@ -25,15 +25,21 @@ fn setup() -> (TempDir, Graph) {
     let dir = TempDir::new().unwrap();
     let graph = Graph::open(dir.path(), 1).unwrap();
 
-    for i in 0..100_usize {
-        // Each document picks four words from the pool, offset by node index.
-        let w0 = WORDS[i % WORDS.len()];
-        let w1 = WORDS[(i + 1) % WORDS.len()];
-        let w2 = WORDS[(i + 2) % WORDS.len()];
-        let w3 = WORDS[(i + 3) % WORDS.len()];
-        let body = format!("{w0} {w1} {w2} {w3} document number {i}");
-        graph.add_node("Article", &json!({ "body": body })).unwrap();
-    }
+    // One transaction rather than one durable commit per document.
+    graph
+        .update(|txn| {
+            for i in 0..100_usize {
+                // Each document picks four words from the pool, offset by node index.
+                let w0 = WORDS[i % WORDS.len()];
+                let w1 = WORDS[(i + 1) % WORDS.len()];
+                let w2 = WORDS[(i + 2) % WORDS.len()];
+                let w3 = WORDS[(i + 3) % WORDS.len()];
+                let body = format!("{w0} {w1} {w2} {w3} document number {i}");
+                txn.add_node("Article", &json!({ "body": body }))?;
+            }
+            Ok(())
+        })
+        .unwrap();
 
     graph.create_node_text_index("Article", "body").unwrap();
     (dir, graph)

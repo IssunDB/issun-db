@@ -67,12 +67,6 @@ codegen-units = 1
 lto = true
 
 [profile.bench]
-# Benchmarks inherit `[profile.release]`, including `strip = "debuginfo"`, so a
-# plain `debug = true` here paid for full DWARF and then stripped it away again.
-# Line tables are what a profiler needs to attribute samples, so keep those and
-# stop stripping them. Thin LTO links the bench targets: a fat-LTO link carrying
-# debug info is what dominates both the wall time and the peak memory of a bench
-# build, and it is the one step in this workspace that can exhaust a small host.
 debug = 1
 strip = "none"
 lto = "thin"

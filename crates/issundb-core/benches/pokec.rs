@@ -81,46 +81,111 @@ fn pokec_size() -> (usize, usize) {
 // Graph builders
 // ---------------------------------------------------------------------------
 
+/// Records written per fixture transaction.
+///
+/// An auto-commit insert is one durable commit, which would make loading this
+/// dataset a matter of minutes. One transaction for the whole dataset would
+/// instead risk exceeding LMDB's per-transaction dirty-page limit, so the load
+/// is chunked: the commit cost is amortized while each transaction stays small.
+const LOAD_CHUNK: usize = 10_000;
+
+/// Write one buffered chunk of profiles, recording each new node id, and clear
+/// the buffer.
+fn flush_profiles(
+    g: &Graph,
+    batch: &mut Vec<(usize, UserProps)>,
+    uid_to_node: &mut [u64],
+    n_nodes: usize,
+) {
+    if batch.is_empty() {
+        return;
+    }
+    g.update(|txn| {
+        for (uid, props) in batch.iter() {
+            let node_id = txn.add_node("User", props)?;
+            if *uid <= n_nodes {
+                uid_to_node[*uid] = node_id;
+            }
+        }
+        Ok(())
+    })
+    .unwrap();
+    batch.clear();
+}
+
+/// Write one buffered chunk of relationships and clear the buffer.
+fn flush_rels(g: &Graph, batch: &mut Vec<(u64, u64)>) {
+    if batch.is_empty() {
+        return;
+    }
+    g.update(|txn| {
+        for &(src, dst) in batch.iter() {
+            txn.add_edge(src, dst, "Friend", &())?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    batch.clear();
+}
+
 fn load_synthetic(n_nodes: usize, n_edges: usize) -> BenchState {
     let dir = TempDir::new().unwrap();
     let g = Graph::open(dir.path(), 4).unwrap();
     let mut rng = rand::rng();
 
     let mut ids = Vec::with_capacity(n_nodes);
-    for _ in 0..n_nodes {
-        let props = UserProps {
-            cmpl_pct: rng.random_range(0..100),
-            gender: if rng.random_bool(0.9) {
-                Some(
-                    if rng.random_bool(0.5) {
-                        "male"
+    let mut written = 0;
+    while written < n_nodes {
+        let upto = (written + LOAD_CHUNK).min(n_nodes);
+        g.update(|txn| {
+            for _ in written..upto {
+                let props = UserProps {
+                    cmpl_pct: rng.random_range(0..100),
+                    gender: if rng.random_bool(0.9) {
+                        Some(
+                            if rng.random_bool(0.5) {
+                                "male"
+                            } else {
+                                "female"
+                            }
+                            .into(),
+                        )
                     } else {
-                        "female"
-                    }
-                    .into(),
-                )
-            } else {
-                None
-            },
-            age: if rng.random_bool(0.8) {
-                Some(rng.random_range(14..80))
-            } else {
-                None
-            },
-        };
-        ids.push(g.add_node("User", &props).unwrap());
+                        None
+                    },
+                    age: if rng.random_bool(0.8) {
+                        Some(rng.random_range(14..80))
+                    } else {
+                        None
+                    },
+                };
+                ids.push(txn.add_node("User", &props)?);
+            }
+            Ok(())
+        })
+        .unwrap();
+        written = upto;
     }
 
     let n = ids.len();
-    for k in 0..n_edges {
-        let i = k % n;
-        let j = (k
-            .wrapping_mul(6_364_136_223_846_793_005)
-            .wrapping_add(1_442_695_040_888_963_407))
-            % n;
-        let src = ids[i];
-        let dst = ids[if j == i { (j + 1) % n } else { j }];
-        g.add_edge(src, dst, "Friend", &()).unwrap();
+    let mut written = 0;
+    while written < n_edges {
+        let upto = (written + LOAD_CHUNK).min(n_edges);
+        g.update(|txn| {
+            for k in written..upto {
+                let i = k % n;
+                let j = (k
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407))
+                    % n;
+                let src = ids[i];
+                let dst = ids[if j == i { (j + 1) % n } else { j }];
+                txn.add_edge(src, dst, "Friend", &())?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        written = upto;
     }
 
     BenchState {
@@ -142,6 +207,9 @@ fn load_snap(data_dir: &str, n_nodes: usize, n_edges: usize) -> BenchState {
 
     let profiles = File::open(&profiles_path).expect("soc-pokec-profiles.txt not found");
     let mut loaded = 0usize;
+    // The files stream, so records are buffered and flushed a chunk at a time
+    // rather than materialized in full.
+    let mut profile_batch: Vec<(usize, UserProps)> = Vec::with_capacity(LOAD_CHUNK);
     for line in io::BufReader::new(profiles).lines() {
         if loaded >= n_nodes {
             break;
@@ -170,24 +238,24 @@ fn load_snap(data_dir: &str, n_nodes: usize, n_edges: usize) -> BenchState {
             age_raw.parse().ok()
         };
 
-        let node_id = g
-            .add_node(
-                "User",
-                &UserProps {
-                    cmpl_pct,
-                    gender,
-                    age,
-                },
-            )
-            .unwrap();
-        if uid <= n_nodes {
-            uid_to_node[uid] = node_id;
-        }
+        profile_batch.push((
+            uid,
+            UserProps {
+                cmpl_pct,
+                gender,
+                age,
+            },
+        ));
         loaded += 1;
+        if profile_batch.len() == LOAD_CHUNK {
+            flush_profiles(&g, &mut profile_batch, &mut uid_to_node, n_nodes);
+        }
     }
+    flush_profiles(&g, &mut profile_batch, &mut uid_to_node, n_nodes);
 
     let rels = File::open(&rels_path).expect("soc-pokec-relationships.txt not found");
     let mut edge_count = 0usize;
+    let mut rel_batch: Vec<(u64, u64)> = Vec::with_capacity(LOAD_CHUNK);
     for line in io::BufReader::new(rels).lines() {
         if edge_count >= n_edges {
             break;
@@ -203,11 +271,14 @@ fn load_snap(data_dir: &str, n_nodes: usize, n_edges: usize) -> BenchState {
             None => continue,
         };
         if fr <= n_nodes && to <= n_nodes && uid_to_node[fr] != 0 && uid_to_node[to] != 0 {
-            g.add_edge(uid_to_node[fr], uid_to_node[to], "Friend", &())
-                .unwrap();
+            rel_batch.push((uid_to_node[fr], uid_to_node[to]));
             edge_count += 1;
+            if rel_batch.len() == LOAD_CHUNK {
+                flush_rels(&g, &mut rel_batch);
+            }
         }
     }
+    flush_rels(&g, &mut rel_batch);
 
     let ids: Vec<u64> = uid_to_node.into_iter().filter(|&id| id != 0).collect();
     BenchState {
