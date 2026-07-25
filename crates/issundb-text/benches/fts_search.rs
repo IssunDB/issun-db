@@ -1,4 +1,4 @@
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use issundb_core::Graph;
 use issundb_text::{TextGraphExt, TextSearchOptions};
 use serde_json::json;
@@ -39,22 +39,40 @@ fn setup() -> (TempDir, Graph) {
     (dir, graph)
 }
 
+/// Time only `create_node_text_index` over an already-populated graph.
+///
+/// The documents are inserted in the setup, inside one write transaction. An
+/// auto-commit `add_node` costs one durable commit each, which is around two
+/// orders of magnitude more than indexing a short document, so inserting inside
+/// the timed section would measure commit latency and hide any change in the
+/// index build itself.
 fn bench_fts_index_build(c: &mut Criterion) {
     c.bench_function("fts_index_build_100_docs", |b| {
-        b.iter(|| {
-            let dir = TempDir::new().unwrap();
-            let graph = Graph::open(dir.path(), 1).unwrap();
-            for i in 0..100_usize {
-                let w0 = WORDS[i % WORDS.len()];
-                let w1 = WORDS[(i + 1) % WORDS.len()];
-                let body = format!("{w0} {w1} document {i}");
-                graph.add_node("Article", &json!({ "body": body })).unwrap();
-            }
-            graph.create_node_text_index("Article", "body").unwrap();
-            std::hint::black_box(());
-            // Hold `dir` alive until end of iteration.
-            drop(dir);
-        });
+        b.iter_batched(
+            || {
+                let dir = TempDir::new().unwrap();
+                let graph = Graph::open(dir.path(), 1).unwrap();
+                graph
+                    .update(|txn| {
+                        for i in 0..100_usize {
+                            let w0 = WORDS[i % WORDS.len()];
+                            let w1 = WORDS[(i + 1) % WORDS.len()];
+                            let body = format!("{w0} {w1} document {i}");
+                            txn.add_node("Article", &json!({ "body": body }))?;
+                        }
+                        Ok(())
+                    })
+                    .unwrap();
+                (dir, graph)
+            },
+            |(dir, graph)| {
+                graph.create_node_text_index("Article", "body").unwrap();
+                std::hint::black_box(());
+                // Hold `dir` alive until the end of the iteration.
+                drop(dir);
+            },
+            BatchSize::PerIteration,
+        );
     });
 }
 

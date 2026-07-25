@@ -141,15 +141,21 @@ Here is a quick reference of the methods available on the `IssunDB` class:
 ### Node and Edge CRUD
 
 * `add_node(labels: Union[str, List[str]], props: str) -> int`: Adds a node and returns its unique ID.
+* `add_nodes(items: Iterable[Tuple[Union[str, List[str]], str]]) -> List[int]`: Adds many nodes in one transaction and returns their IDs in order.
 * `get_node(id: int) -> Optional[str]`: Retrieves JSON-encoded node properties, or `None`.
 * `update_node(id: int, props: str) -> None`: Overwrites node properties.
 * `delete_node(id: int) -> None`: Deletes a node and its incident edges.
 * `add_label(id: int, label: str) -> None`: Adds a label to a node.
 * `remove_label(id: int, label: str) -> None`: Removes a label from a node.
 * `add_edge(src: int, dst: int, etype: str, props: str) -> int`: Adds an edge and returns its unique ID.
+* `add_edges(items: Iterable[Tuple[int, int, str, str]]) -> List[int]`: Adds many edges in one transaction and returns their IDs in order.
 * `get_edge(id: int) -> Optional[str]`: Retrieves JSON-encoded edge properties, or `None`.
 * `update_edge(id: int, props: str) -> None`: Overwrites edge properties.
 * `delete_edge(id: int) -> None`: Deletes an edge.
+
+A single-record insert is one durable LMDB commit, so a Python loop over `add_node` or `add_edge` is bound by commit latency rather than by the work.
+Use `add_nodes` and `add_edges` to load data: they write the whole batch under one transaction. Both are all-or-nothing, so any failure rolls back
+every record in the batch.
 
 ### Querying and Search
 

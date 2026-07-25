@@ -32,7 +32,8 @@ def test_retrieve_hybrid_returns_subgraph_shape(db):
             hops=1,
         )
     )
-    assert set(result.keys()) == {"nodes", "edges", "scores"}
+    # `truncated` distinguishes a result capped by `max_nodes` from a complete one.
+    assert set(result.keys()) == {"nodes", "edges", "scores", "truncated"}
     assert a in result["nodes"]
     # The seed node carries a fusion score, keyed by its stringified ID.
     assert str(a) in result["scores"]

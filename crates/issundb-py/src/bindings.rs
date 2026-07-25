@@ -76,6 +76,44 @@ impl PyGraph {
         }
     }
 
+    /// Insert many nodes in one write transaction, returning the new ids in
+    /// order. `items` is an iterable of `(labels, props)` pairs, where `labels`
+    /// is a label string or a list of label strings and `props` is a JSON string.
+    ///
+    /// An auto-commit insert costs one durable commit per node, so a Python loop
+    /// over `add_node` is bound by commit latency rather than by the work. This
+    /// writes the whole batch under one transaction, and is all-or-nothing: any
+    /// failure rolls back every node in the batch.
+    fn add_nodes(&self, py: Python<'_>, items: &Bound<'_, PyAny>) -> PyResult<Vec<u64>> {
+        // Extract every argument to owned Rust values before releasing the GIL.
+        let mut parsed: Vec<(Vec<String>, serde_json::Value)> = Vec::new();
+        for item in items.try_iter()? {
+            let item = item?;
+            let (labels, props): (Bound<'_, PyAny>, String) = item
+                .extract()
+                .map_err(|_| val("each item must be a (labels, props_json) pair"))?;
+            let labels = match labels.extract::<String>() {
+                Ok(single) => vec![single],
+                Err(_) => labels
+                    .extract::<Vec<String>>()
+                    .map_err(|_| val("labels must be a string or a list of strings"))?,
+            };
+            parsed.push((labels, parse_json(&props)?));
+        }
+
+        py.detach(|| {
+            self.graph.update(|txn| {
+                let mut ids = Vec::with_capacity(parsed.len());
+                for (labels, props) in &parsed {
+                    let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+                    ids.push(txn.add_node_multi(&refs, props)?);
+                }
+                Ok(ids)
+            })
+        })
+        .map_err(rt)
+    }
+
     /// Return the JSON-encoded properties of node `id`, or `None` if the node does not exist.
     fn get_node(&self, py: Python<'_>, id: u64) -> PyResult<Option<String>> {
         py.detach(|| match self.graph.get_node(id).map_err(rt)? {
@@ -121,6 +159,37 @@ impl PyGraph {
         let value = parse_json(props)?;
         py.detach(|| self.graph.add_edge(src, dst, etype, &value))
             .map_err(rt)
+    }
+
+    /// Insert many edges in one write transaction, returning the new ids in
+    /// order. `items` is an iterable of `(src, dst, type, props)` tuples, where
+    /// `props` is a JSON string.
+    ///
+    /// An auto-commit insert costs one durable commit per edge, so a Python loop
+    /// over `add_edge` is bound by commit latency rather than by the work. This
+    /// writes the whole batch under one transaction, and is all-or-nothing: any
+    /// failure rolls back every edge in the batch.
+    fn add_edges(&self, py: Python<'_>, items: &Bound<'_, PyAny>) -> PyResult<Vec<u64>> {
+        // Extract every argument to owned Rust values before releasing the GIL.
+        let mut parsed: Vec<(u64, u64, String, serde_json::Value)> = Vec::new();
+        for item in items.try_iter()? {
+            let item = item?;
+            let (src, dst, etype, props): (u64, u64, String, String) = item
+                .extract()
+                .map_err(|_| val("each item must be a (src, dst, type, props_json) tuple"))?;
+            parsed.push((src, dst, etype, parse_json(&props)?));
+        }
+
+        py.detach(|| {
+            self.graph.update(|txn| {
+                let mut ids = Vec::with_capacity(parsed.len());
+                for (src, dst, etype, props) in &parsed {
+                    ids.push(txn.add_edge(*src, *dst, etype, props)?);
+                }
+                Ok(ids)
+            })
+        })
+        .map_err(rt)
     }
 
     /// Return edge `id` as a JSON string `{"src", "dst", "type", "props"}`, or

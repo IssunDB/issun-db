@@ -86,9 +86,14 @@ impl Graph {
     ) -> Result<(), Error> {
         // Constraint-bearing and explicit property indexes for this label.
         let active_indexes = self.get_active_node_indexes(wtxn, label_id)?;
+        // Property names handled by the loop below. The auto-index pass writes the
+        // same `node_prop_idx` key for the same name and value, so it skips these
+        // rather than repeating the put and the prop-key registry lookup.
+        let mut declared: Vec<String> = Vec::with_capacity(active_indexes.len());
         for (prop_key_id, flags) in active_indexes {
             if let Some(prop_name) = self.prop_key_name_impl(wtxn, prop_key_id)? {
                 let prop_val = props_json.get(&prop_name);
+                declared.push(prop_name.clone());
 
                 // Required constraint check.
                 if flags == 0x02
@@ -134,6 +139,9 @@ impl Graph {
         if let Some(obj) = props_json.as_object() {
             for (prop_name, val) in obj {
                 if val.is_null() {
+                    continue;
+                }
+                if declared.iter().any(|name| name == prop_name) {
                     continue;
                 }
                 if let Some(encoded) = encode_property_value(val) {
@@ -763,5 +771,56 @@ mod tests {
             .nodes_by_property("Person", "age", PropValue::Int(40))
             .unwrap();
         assert!(hits.is_empty());
+    }
+
+    /// A declared property index and the auto-index cover disjoint sets of a
+    /// node's properties, so both must stay reachable. The insert path skips the
+    /// auto-index write for a declared property (its key is already written), and
+    /// this pins that the skip does not drop either lookup.
+    #[test]
+    fn declared_and_auto_indexed_properties_are_both_findable() {
+        let (_dir, g) = open_tmp();
+        g.create_node_property_index("User", "email").unwrap();
+
+        let id = g
+            .add_node(
+                "User",
+                &json!({"email": "a@b.c", "nickname": "ab", "age": 30}),
+            )
+            .unwrap();
+
+        // Declared index: written by the active-index pass.
+        assert_eq!(
+            g.nodes_by_property("User", "email", PropValue::Str("a@b.c".into()))
+                .unwrap(),
+            vec![id]
+        );
+        // Not declared: written by the auto-index pass.
+        assert_eq!(
+            g.nodes_by_property("User", "nickname", PropValue::Str("ab".into()))
+                .unwrap(),
+            vec![id]
+        );
+        assert_eq!(
+            g.nodes_by_property("User", "age", PropValue::Int(30))
+                .unwrap(),
+            vec![id]
+        );
+    }
+
+    /// A unique constraint still fires for a declared property after the
+    /// auto-index pass stops re-writing that property's key.
+    #[test]
+    fn unique_constraint_still_enforced_for_declared_property() {
+        let (_dir, g) = open_tmp();
+        g.create_node_unique_constraint("User", "email").unwrap();
+        g.add_node("User", &json!({"email": "a@b.c", "nickname": "ab"}))
+            .unwrap();
+
+        assert!(
+            g.add_node("User", &json!({"email": "a@b.c", "nickname": "cd"}))
+                .is_err(),
+            "duplicate value for a uniquely constrained property must be rejected"
+        );
     }
 }

@@ -126,6 +126,13 @@ pub struct CreateNodeBody {
 }
 
 #[derive(Deserialize, ToSchema)]
+pub struct CreateNodesBody {
+    /// Nodes to insert. All of them are written in one transaction, so a single
+    /// failure leaves none of them committed.
+    pub nodes: Vec<CreateNodeBody>,
+}
+
+#[derive(Deserialize, ToSchema)]
 pub struct UpdateNodeBody {
     /// Replacement JSON property map for the node.
     #[serde(default)]
@@ -148,6 +155,13 @@ pub struct CreateEdgeBody {
     /// Free-form JSON property map for the edge.
     #[serde(default)]
     pub props: Value,
+}
+
+#[derive(Deserialize, ToSchema)]
+pub struct CreateEdgesBody {
+    /// Edges to insert. All of them are written in one transaction, so a single
+    /// failure leaves none of them committed.
+    pub edges: Vec<CreateEdgeBody>,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -314,6 +328,13 @@ pub struct RetrieveResponse {
     pub truncated: bool,
 }
 
+/// Ids assigned by a batch insert, in the same order as the request items.
+#[derive(Serialize, ToSchema)]
+#[allow(dead_code)]
+pub struct IdsResponse {
+    pub ids: Vec<u64>,
+}
+
 #[derive(Serialize, ToSchema)]
 #[allow(dead_code)]
 pub struct HealthResponse {
@@ -358,6 +379,61 @@ pub async fn create_node(
         let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
         match graph.add_node_multi(&refs, &body.props) {
             Ok(id) => (StatusCode::OK, Json(json!({ "id": id }))).into_response(),
+            Err(e) => internal(e).into_response(),
+        }
+    }))
+    .await
+}
+
+/// Create many nodes in a single write transaction.
+///
+/// An auto-commit insert costs one durable commit per record, so inserting a
+/// batch one request at a time is bound by commit latency rather than by the
+/// work. This endpoint writes the whole batch under one transaction, which is
+/// also all-or-nothing: any failure rolls back every node in the request.
+#[utoipa::path(
+    post, path = "/v1/nodes/batch", tag = "nodes",
+    request_body = CreateNodesBody,
+    responses(
+        (status = 200, description = "Nodes created", body = IdsResponse),
+        (status = 400, description = "A node has no label, or the body is malformed", body = ErrorResponse),
+        (status = 500, description = "Storage error", body = ErrorResponse),
+    ),
+)]
+pub async fn create_nodes(
+    State(graph): State<AppState>,
+    JsonBody(body): JsonBody<CreateNodesBody>,
+) -> Response {
+    join(tokio::task::spawn_blocking(move || {
+        // Resolve every item's label set before opening the transaction so a bad
+        // request fails without having started a write.
+        let mut items: Vec<(Vec<String>, Value)> = Vec::with_capacity(body.nodes.len());
+        for node in body.nodes {
+            let mut labels: Vec<String> = Vec::new();
+            if let Some(label) = node.label {
+                labels.push(label);
+            }
+            for label in node.labels {
+                if !labels.contains(&label) {
+                    labels.push(label);
+                }
+            }
+            if labels.is_empty() {
+                return bad_request("a node requires at least one label").into_response();
+            }
+            items.push((labels, node.props));
+        }
+
+        let result = graph.update(|txn| {
+            let mut ids = Vec::with_capacity(items.len());
+            for (labels, props) in &items {
+                let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+                ids.push(txn.add_node_multi(&refs, props)?);
+            }
+            Ok(ids)
+        });
+        match result {
+            Ok(ids) => (StatusCode::OK, Json(json!({ "ids": ids }))).into_response(),
             Err(e) => internal(e).into_response(),
         }
     }))
@@ -524,6 +600,44 @@ pub async fn create_edge(
     join(tokio::task::spawn_blocking(move || {
         match graph.add_edge(body.src, body.dst, &body.edge_type, &body.props) {
             Ok(id) => (StatusCode::OK, Json(json!({ "id": id }))).into_response(),
+            Err(issundb::Error::NodeNotFound(n)) => {
+                bad_request(format!("node {n} not found")).into_response()
+            }
+            Err(e) => internal(e).into_response(),
+        }
+    }))
+    .await
+}
+
+/// Create many typed edges in a single write transaction.
+///
+/// An auto-commit insert costs one durable commit per record, so inserting a
+/// batch one request at a time is bound by commit latency rather than by the
+/// work. This endpoint writes the whole batch under one transaction, which is
+/// also all-or-nothing: any failure rolls back every edge in the request.
+#[utoipa::path(
+    post, path = "/v1/edges/batch", tag = "edges",
+    request_body = CreateEdgesBody,
+    responses(
+        (status = 200, description = "Edges created", body = IdsResponse),
+        (status = 400, description = "Endpoint node not found or malformed body", body = ErrorResponse),
+        (status = 500, description = "Storage error", body = ErrorResponse),
+    ),
+)]
+pub async fn create_edges(
+    State(graph): State<AppState>,
+    JsonBody(body): JsonBody<CreateEdgesBody>,
+) -> Response {
+    join(tokio::task::spawn_blocking(move || {
+        let result = graph.update(|txn| {
+            let mut ids = Vec::with_capacity(body.edges.len());
+            for edge in &body.edges {
+                ids.push(txn.add_edge(edge.src, edge.dst, &edge.edge_type, &edge.props)?);
+            }
+            Ok(ids)
+        });
+        match result {
+            Ok(ids) => (StatusCode::OK, Json(json!({ "ids": ids }))).into_response(),
             Err(issundb::Error::NodeNotFound(n)) => {
                 bad_request(format!("node {n} not found")).into_response()
             }
@@ -936,17 +1050,18 @@ pub async fn delete_vector(State(graph): State<AppState>, PathU64(id): PathU64) 
          The server implementation exposes the core functionalies of IssunDB over HTTP.",
     ),
     paths(
-        create_node, get_node, update_node, delete_node,
+        create_node, create_nodes, get_node, update_node, delete_node,
         add_node_label, remove_node_label,
-        create_edge, get_edge, update_edge, delete_edge,
+        create_edge, create_edges, get_edge, update_edge, delete_edge,
         execute_query, explain_query,
         search_text, search_vector,
         upsert_vector, delete_vector, retrieve, health,
     ),
     components(schemas(
-        CreateNodeBody, UpdateNodeBody, CreateEdgeBody, UpdateEdgeBody, CypherQueryBody, ExplainBody,
+        CreateNodeBody, CreateNodesBody, UpdateNodeBody, CreateEdgeBody, CreateEdgesBody,
+        UpdateEdgeBody, CypherQueryBody, ExplainBody,
         TextSearchBody, VectorSearchBody, UpsertVectorBody, HybridRetrieveBody,
-        ErrorResponse, IdResponse, NodeResponse, EdgeResponse, QueryResponse,
+        ErrorResponse, IdResponse, IdsResponse, NodeResponse, EdgeResponse, QueryResponse,
         ExplainResponse, TextHitResponse, VectorHitResponse, RetrieveResponse,
         HealthResponse,
     )),
@@ -971,12 +1086,15 @@ pub fn build_router(graph: Arc<Graph>) -> Router {
     // infrastructure probes do not need to track the API version.
     let v1 = Router::new()
         .route("/nodes", post(create_node))
+        // Registered before the `{id}` routes so `batch` is not taken as an id.
+        .route("/nodes/batch", post(create_nodes))
         .route("/nodes/{id}", get(get_node))
         .route("/nodes/{id}", put(update_node))
         .route("/nodes/{id}", delete(delete_node))
         .route("/nodes/{id}/labels/{label}", post(add_node_label))
         .route("/nodes/{id}/labels/{label}", delete(remove_node_label))
         .route("/edges", post(create_edge))
+        .route("/edges/batch", post(create_edges))
         .route("/edges/{id}", get(get_edge))
         .route("/edges/{id}", put(update_edge))
         .route("/edges/{id}", delete(delete_edge))

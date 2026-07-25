@@ -33,6 +33,19 @@ All data and query endpoints are prefixed with `/v1`.
       }
       ```
     * Response: Returns the generated `NodeId` wrapped in a JSON object, e.g., `{"id": 1}`.
+* Create many nodes: `POST /v1/nodes/batch`
+    * Request body:
+      ```json
+      {
+        "nodes": [
+          { "label": "Person", "props": { "name": "Alice" } },
+          { "label": "Person", "props": { "name": "Bob" } }
+        ]
+      }
+      ```
+    * Response: The generated ids in request order, e.g., `{"ids": [1, 2]}`.
+    * A single-record insert costs one durable commit, so inserting a batch one request at a time is bound by commit latency rather than by the
+      work. The whole batch is written under one transaction, which is also all-or-nothing: any failure rolls back every node in the request.
 * Get node: `GET /v1/nodes/:id`
     * Response: A JSON object containing the node's unique ID, labels, and properties.
 * Update node: `PUT /v1/nodes/:id`
@@ -62,6 +75,18 @@ All data and query endpoints are prefixed with `/v1`.
       }
       ```
     * Response: Returns the generated `EdgeId` wrapped in a JSON object, e.g., `{"id": 1}`.
+* Create many edges: `POST /v1/edges/batch`
+    * Request body:
+      ```json
+      {
+        "edges": [
+          { "src": 1, "dst": 2, "type": "KNOWS", "props": {} },
+          { "src": 2, "dst": 3, "type": "KNOWS", "props": {} }
+        ]
+      }
+      ```
+    * Response: The generated ids in request order, e.g., `{"ids": [1, 2]}`.
+    * As with the node batch, the whole request is one transaction and is all-or-nothing.
 * Get edge: `GET /v1/edges/:id`
     * Response: A JSON object containing the edge's unique ID, source/destination node IDs, type, and properties.
 * Update edge: `PUT /v1/edges/:id`

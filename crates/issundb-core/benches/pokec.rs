@@ -243,7 +243,24 @@ fn age_from_props(props: &[u8]) -> Option<i32> {
     rmp_serde::from_slice::<UserProps>(props).ok()?.age
 }
 
+/// Read one property through the in-memory property columns.
+///
+/// This is the read path the engine provides for a single-property predicate.
+/// The alternative, `get_node` plus a full msgpack decode of every property
+/// (`is_adult_via_record` below), costs roughly a whole node read per predicate,
+/// so a filter written that way measures decode cost rather than filter cost.
 fn is_adult(graph: &Graph, id: u64) -> bool {
+    graph
+        .node_prop_json(id, "age")
+        .ok()
+        .flatten()
+        .and_then(|v| v.as_i64())
+        .is_some_and(|age| age >= 18)
+}
+
+/// Property filter via a full record read and whole-struct decode, kept so the
+/// gap against the column path stays visible rather than being assumed.
+fn is_adult_via_record(graph: &Graph, id: u64) -> bool {
     graph
         .get_node(id)
         .ok()
@@ -273,6 +290,15 @@ fn expand_k_filter(graph: &Graph, start: u64, hops: u8) -> Vec<u64> {
     expand_k(graph, start, hops)
         .into_iter()
         .filter(|&id| is_adult(graph, id))
+        .collect()
+}
+
+/// The same expansion and predicate, evaluated through a full record read and
+/// whole-struct decode instead of the property columns.
+fn expand_k_filter_via_record(graph: &Graph, start: u64, hops: u8) -> Vec<u64> {
+    expand_k(graph, start, hops)
+        .into_iter()
+        .filter(|&id| is_adult_via_record(graph, id))
         .collect()
 }
 
@@ -401,6 +427,11 @@ fn bench_expansion_4_plain(c: &mut Criterion, state: &BenchState) {
 fn bench_expansion_1_filter(c: &mut Criterion, state: &BenchState) {
     c.bench_function("expansion_1_filter", |b| {
         b.iter(|| expand_k_filter(&state.graph, random_id(&state.node_ids), 1))
+    });
+    // The same work through `get_node` plus a whole-struct decode, so the cost of
+    // that pattern against the column path is measured rather than assumed.
+    c.bench_function("expansion_1_filter_via_record", |b| {
+        b.iter(|| expand_k_filter_via_record(&state.graph, random_id(&state.node_ids), 1))
     });
 }
 

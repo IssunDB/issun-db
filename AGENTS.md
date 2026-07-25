@@ -101,6 +101,12 @@ modules according to this map.
       Realistic deep input is kept safe by running on large stacks: a deep parse runs on a dedicated large-stack thread, and a query whose nesting
       exceeds `SMALL_STACK_EXEC_BUDGET_KB` has its execution dispatched to a large-stack thread by `execute_with_procedures`. Shallow queries, the
       common case, parse and execute inline on the caller stack.
+      Building the combinator graph costs more than consuming the tokens, and for a small query more than executing it, so the executor's entry point
+      (`parse_with_exec_depth`) serves repeated query text from a bounded thread-local cache of `Arc<Statement>` and returns the same allocation.
+      Parsing reads no graph state, no parameters, and no clock, so the cached outcome (including a parse error, and including the nesting-depth
+      rejection) is always valid and the cache needs no invalidation. `parse` is the uncached entry point: it always does the work, which keeps the
+      `parse` benchmarks a regression guard on the parser itself. Query text over `PARSE_CACHE_MAX_QUERY_LEN` is parsed but not stored, so many large
+      unique statements cannot grow the cache by their length.
     - `src/ast.rs`: AST node types.
     - `src/plan/`: logical planner, physical planner, optimizer, and statistics helpers.
     - `src/exec/mod.rs`: public entry points (`execute`, `explain`), shared type definitions, and tests.
@@ -400,6 +406,8 @@ columns plus row-major records of arbitrary JSON.
 Routes:
 
 - `POST /v1/nodes`, `GET /v1/nodes/:id`, `PUT /v1/nodes/:id`, `DELETE /v1/nodes/:id`
+- `POST /v1/nodes/batch`, `POST /v1/edges/batch` (many records in one transaction; a single-record insert costs one durable LMDB commit, so
+  per-record requests are bound by commit latency, and a batch is all-or-nothing)
 - `POST /v1/edges`, `GET /v1/edges/:id`, `DELETE /v1/edges/:id`
 - `POST /v1/query` (Cypher execution), `POST /v1/explain` (query plan)
 - `POST /v1/search/text`, `POST /v1/search/vector`
@@ -439,10 +447,15 @@ mismatched entity with an error instead.
 Python bindings via PyO3. Exposes a single `IssunDB` class. The `extension-module` feature must be enabled for the Python extension to compile.
 Depends only on `issundb`.
 
-Methods: `add_node` (accepts a single label string or a list of label strings), `get_node`, `update_node`, `delete_node`, `add_label`,
-`remove_label`, `add_edge`, `get_edge`, `update_edge`, `delete_edge`, `query`, `explain`, `upsert_vector`, `remove_vector`, `vector_search` (with
-optional `label` and JSON-object `properties` filters), `configure_vector_index`, `text_search`, `create_text_index` (with optional `language`),
-`drop_text_index`, `list_text_indexes`, `has_text_index`, `retrieve_hybrid`, `set_thread_count`, `backup`, `backup_compact`, and `restore`.
+Methods: `add_node` (accepts a single label string or a list of label strings), `add_nodes`, `get_node`, `update_node`, `delete_node`, `add_label`,
+`remove_label`, `add_edge`, `add_edges`, `get_edge`, `update_edge`, `delete_edge`, `query`, `explain`, `upsert_vector`, `remove_vector`,
+`vector_search` (with optional `label` and JSON-object `properties` filters), `configure_vector_index`, `text_search`, `create_text_index` (with
+optional `language`), `drop_text_index`, `list_text_indexes`, `has_text_index`, `retrieve_hybrid`, `set_thread_count`, `backup`, `backup_compact`,
+and `restore`.
+
+`add_nodes` and `add_edges` take an iterable of `(labels, props_json)` pairs and `(src, dst, type, props_json)` tuples respectively, and write the
+whole batch under one `Graph::update` transaction. A single-record insert costs one durable LMDB commit, so a Python loop over `add_node` is bound by
+commit latency rather than by the work; the batch form is the ingestion path. Both are all-or-nothing: any failure rolls back the whole batch.
 
 Every method releases the GIL around the native engine call, so a long-running query, backup, or reindex does not stall other Python threads.
 Keep that invariant when adding a method: extract arguments to owned Rust values first, run the engine call and JSON serialization inside

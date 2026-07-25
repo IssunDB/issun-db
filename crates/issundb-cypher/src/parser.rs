@@ -3,7 +3,9 @@ use crate::error::CypherError;
 use chumsky::input::MappedInput;
 use chumsky::pratt::{infix, left, postfix, prefix};
 use chumsky::prelude::*;
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Sentinel variable emitted for a label predicate whose left side is not a
 /// variable (`n.prop:Label`). The expression fold cannot fail, so statement
@@ -5667,8 +5669,92 @@ fn close_frame(frames: &mut Vec<Frame>, cost_kb: &mut usize, op_total: &mut usiz
 // ─── Public entry point ───────────────────────────────────────────────────────
 
 /// Parse a Cypher query string into a `Statement` AST.
+///
+/// This entry point always parses; it does not consult the executor's parse
+/// cache. Callers that execute a query go through `parse_with_exec_depth`.
 pub fn parse(cypher: &str) -> Result<Statement, CypherError> {
-    parse_with_exec_depth(cypher).map(|(stmt, _)| stmt)
+    parse_uncached(cypher).map(|(stmt, _)| stmt)
+}
+
+// ─── Parse cache ──────────────────────────────────────────────────────────────
+
+// Parsing is a pure function of the query text: it reads no graph state, no
+// parameters, and no clock. A repeated query text therefore always yields the
+// same result, so the outcome is cacheable with no invalidation. This matters
+// because rebuilding the combinator graph dominates the cost of a small query,
+// exceeding the cost of executing it.
+//
+// The cache is thread-local, so it needs no lock and no shared mutable state.
+
+/// Distinct query texts held per thread. A server thread's working set of
+/// statements is small; this bounds the cache well above it.
+const PARSE_CACHE_CAPACITY: usize = 256;
+
+/// Query texts longer than this are parsed but not stored, so a caller sending
+/// many large unique statements cannot grow the cache by their length. A long
+/// statement's parse is dominated by real work, so it gains least from caching.
+const PARSE_CACHE_MAX_QUERY_LEN: usize = 8 * 1024;
+
+/// A cached parse outcome. Errors are cached too: a rejected query is also a
+/// pure function of its text, and repeating one should not repeat the work.
+type CachedParse = Result<(Arc<Statement>, bool), CypherError>;
+
+struct ParseCacheEntry {
+    value: CachedParse,
+    /// Logical time of the last hit, for least-recently-used eviction.
+    tick: u64,
+}
+
+struct ParseCache {
+    entries: HashMap<String, ParseCacheEntry>,
+    clock: u64,
+}
+
+impl ParseCache {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            clock: 0,
+        }
+    }
+
+    fn get(&mut self, cypher: &str) -> Option<CachedParse> {
+        self.clock += 1;
+        let tick = self.clock;
+        let entry = self.entries.get_mut(cypher)?;
+        entry.tick = tick;
+        Some(entry.value.clone())
+    }
+
+    fn insert(&mut self, cypher: &str, value: CachedParse) {
+        if self.entries.len() >= PARSE_CACHE_CAPACITY && !self.entries.contains_key(cypher) {
+            // Evict the least recently used entry. The scan is O(capacity) and
+            // runs only when the cache is full, not on the hit path.
+            if let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, e)| e.tick)
+                .map(|(k, _)| k.clone())
+            {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.clock += 1;
+        let tick = self.clock;
+        self.entries
+            .insert(cypher.to_string(), ParseCacheEntry { value, tick });
+    }
+}
+
+thread_local! {
+    static PARSE_CACHE: RefCell<ParseCache> = RefCell::new(ParseCache::new());
+}
+
+/// Drop every cached parse on the current thread. Used by the tests to isolate
+/// cache-behavior assertions from parses run by other tests on the same thread.
+#[cfg(test)]
+fn reset_parse_cache() {
+    PARSE_CACHE.with(|c| *c.borrow_mut() = ParseCache::new());
 }
 
 /// Parse a Cypher query string, also reporting whether its expression nesting is
@@ -5676,7 +5762,28 @@ pub fn parse(cypher: &str) -> Result<Statement, CypherError> {
 /// recurses with the nesting depth, so a deeply nested literal would overflow a
 /// small worker stack; the executor uses this flag to move such a query off the
 /// caller stack. The flag is `false` for the common shallow case.
-pub(crate) fn parse_with_exec_depth(cypher: &str) -> Result<(Statement, bool), CypherError> {
+///
+/// The result is served from the thread-local parse cache when the same text was
+/// parsed before, so a repeated statement skips lexing, parsing, and validation.
+pub(crate) fn parse_with_exec_depth(cypher: &str) -> Result<(Arc<Statement>, bool), CypherError> {
+    if cypher.len() > PARSE_CACHE_MAX_QUERY_LEN {
+        return parse_uncached(cypher).map(|(stmt, deep)| (Arc::new(stmt), deep));
+    }
+
+    // Look the text up and release the borrow before parsing, so the cache is
+    // never borrowed across the parse itself.
+    if let Some(hit) = PARSE_CACHE.with(|c| c.borrow_mut().get(cypher)) {
+        return hit;
+    }
+
+    let parsed: CachedParse = parse_uncached(cypher).map(|(stmt, deep)| (Arc::new(stmt), deep));
+    PARSE_CACHE.with(|c| c.borrow_mut().insert(cypher, parsed.clone()));
+    parsed
+}
+
+/// Parse a Cypher query string and report its execution stack requirement,
+/// always doing the work. `parse_with_exec_depth` wraps this with the cache.
+fn parse_uncached(cypher: &str) -> Result<(Statement, bool), CypherError> {
     let tokens = lexer().parse(cypher).into_result().map_err(|errs| {
         let msg = errs
             .into_iter()
@@ -5741,6 +5848,98 @@ pub(crate) fn parse_with_exec_depth(cypher: &str) -> Result<(Statement, bool), C
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod parse_cache_tests {
+    use super::*;
+
+    /// A cache hit returns the same AST the uncached parser produces, and shares
+    /// the allocation rather than reparsing.
+    #[test]
+    fn cache_hit_matches_uncached_parse() {
+        let query = "MATCH (n:Person) WHERE n.age > 25 RETURN n.name";
+        reset_parse_cache();
+
+        let (first, first_deep) = parse_with_exec_depth(query).unwrap();
+        let (second, second_deep) = parse_with_exec_depth(query).unwrap();
+        let (uncached, uncached_deep) = parse_uncached(query).unwrap();
+
+        assert_eq!(*first, uncached);
+        assert_eq!(*second, uncached);
+        assert_eq!(first_deep, uncached_deep);
+        assert_eq!(second_deep, uncached_deep);
+        // The second call served the same allocation, so it did not reparse.
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    /// Distinct query texts get distinct entries; the cache never conflates them.
+    #[test]
+    fn distinct_queries_are_not_conflated() {
+        reset_parse_cache();
+        let (a, _) = parse_with_exec_depth("MATCH (n:Person) RETURN n").unwrap();
+        let (b, _) = parse_with_exec_depth("MATCH (n:City) RETURN n").unwrap();
+        assert_ne!(*a, *b);
+        assert!(!Arc::ptr_eq(&a, &b));
+    }
+
+    /// The cache is bounded: parsing more distinct queries than its capacity
+    /// evicts rather than growing without limit.
+    #[test]
+    fn cache_is_bounded_by_capacity() {
+        reset_parse_cache();
+        for i in 0..(PARSE_CACHE_CAPACITY * 2) {
+            let query = format!("MATCH (n:L{i}) RETURN n");
+            parse_with_exec_depth(&query).unwrap();
+        }
+        let len = PARSE_CACHE.with(|c| c.borrow().entries.len());
+        assert!(
+            len <= PARSE_CACHE_CAPACITY,
+            "cache grew to {len}, over capacity {PARSE_CACHE_CAPACITY}"
+        );
+    }
+
+    /// A query longer than the cacheable limit still parses, and is not stored.
+    #[test]
+    fn oversized_query_is_not_cached() {
+        reset_parse_cache();
+        // A long but shallow disjunction, comfortably over the length limit.
+        let mut query = String::from("MATCH (n:Person) WHERE n.age = 0");
+        while query.len() <= PARSE_CACHE_MAX_QUERY_LEN {
+            query.push_str(" OR n.age = 0");
+        }
+        query.push_str(" RETURN n");
+
+        assert!(parse_with_exec_depth(&query).is_ok());
+        let len = PARSE_CACHE.with(|c| c.borrow().entries.len());
+        assert_eq!(len, 0, "oversized query must not be cached");
+    }
+
+    /// A parse failure is cached too, so a repeated bad query does not pay the
+    /// full parse cost again. The error must be reported identically both times.
+    #[test]
+    fn parse_errors_are_cached_and_stable() {
+        reset_parse_cache();
+        let bad = "MATCH (n:Person RETURN n";
+        let first = parse_with_exec_depth(bad).unwrap_err();
+        let second = parse_with_exec_depth(bad).unwrap_err();
+        assert_eq!(first, second);
+        assert_eq!(PARSE_CACHE.with(|c| c.borrow().entries.len()), 1);
+    }
+
+    /// The nesting-depth rejection is a pure function of the text, so caching it
+    /// must not change the verdict.
+    #[test]
+    fn nesting_rejection_is_stable_across_cache() {
+        reset_parse_cache();
+        let deep = format!("RETURN {}1{}", "(".repeat(20_000), ")".repeat(20_000));
+        let first = parse_with_exec_depth(&deep);
+        let second = parse_with_exec_depth(&deep);
+        assert_eq!(first.is_err(), second.is_err());
+        if let (Err(a), Err(b)) = (first, second) {
+            assert_eq!(a, b);
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
