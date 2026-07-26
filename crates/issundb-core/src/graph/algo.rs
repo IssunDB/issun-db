@@ -229,16 +229,26 @@ impl Graph {
         }
         let label_ok = |mask: &Option<Vec<bool>>, d: usize| mask.as_ref().is_none_or(|m| m[d]);
 
+        // Counting needs neighbor ids and row boundaries only, so both branches
+        // below read the snapshot's own CSR arrays and filter by type inline.
+        // Materializing a per-type sorted copy of the adjacency (as the triangle
+        // kernel does, where sorted rows enable merge intersections) would
+        // allocate and sort the whole edge set on every call for no benefit
+        // here: the only consumer of that order was the self-loop lookup, which
+        // is now a direct scan of the middle node's own row.
+        let type_ok = |want: Option<TypeId>, have: TypeId| want.is_none_or(|t| have == t);
+
         if hops == 1 {
             // Count typed edges `v0 -> v1` with `v0` and `v1` inside their masks.
-            let out1 = typed_out_sorted(&snap, type_ids[0]);
             let mut total: u64 = 0;
             for v0 in 0..n {
                 if !label_ok(&masks[0], v0) {
                     continue;
                 }
-                for &(dst, _e) in out1.row(v0) {
-                    if label_ok(&masks[1], dst as usize) {
+                for idx in snap.row_ptr[v0]..snap.row_ptr[v0 + 1] {
+                    if type_ok(type_ids[0], snap.edge_type[idx])
+                        && label_ok(&masks[1], snap.col_idx[idx] as usize)
+                    {
                         total += 1;
                     }
                 }
@@ -252,47 +262,58 @@ impl Graph {
         // qualifying hop-2 out-edges. Relationship uniqueness then removes the
         // assignments where hop 1 and hop 2 bind the same edge, which is only
         // possible for a self-loop at `v1` that satisfies both hops.
-        let in1 = typed_in_sorted(&snap, type_ids[0]); // edges into v1, type t1
-        let out2 = typed_out_sorted(&snap, type_ids[1]); // edges out of v1, type t2
+        let (t1, t2) = (type_ids[0], type_ids[1]);
         let mut total: u64 = 0;
         for b in 0..n {
             if !label_ok(&masks[1], b) {
                 continue;
             }
-            let in_row = in1.row(b);
-            let indeg = in_row
-                .iter()
-                .filter(|&&(src, _)| label_ok(&masks[0], src as usize))
-                .count() as u64;
+            // Hop-1 in-edges of `b`: type `t1`, source inside the first mask.
+            // The transposed view is part of the snapshot, so this is a scan of
+            // one contiguous row.
+            let mut indeg: u64 = 0;
+            for idx in snap.in_row_ptr[b]..snap.in_row_ptr[b + 1] {
+                if type_ok(t1, snap.in_edge_type[idx])
+                    && label_ok(&masks[0], snap.in_col_idx[idx] as usize)
+                {
+                    indeg += 1;
+                }
+            }
             if indeg == 0 {
                 continue;
             }
-            let out_row = out2.row(b);
-            let outdeg = out_row
-                .iter()
-                .filter(|&&(dst, _)| label_ok(&masks[2], dst as usize))
-                .count() as u64;
+            // Hop-2 out-edges of `b`: type `t2`, destination inside the last mask.
+            let mut outdeg: u64 = 0;
+            for idx in snap.row_ptr[b]..snap.row_ptr[b + 1] {
+                if type_ok(t2, snap.edge_type[idx])
+                    && label_ok(&masks[2], snap.col_idx[idx] as usize)
+                {
+                    outdeg += 1;
+                }
+            }
             total += indeg * outdeg;
 
             // Relationship-uniqueness correction. A single edge can fill both
-            // hops only when it is a self-loop at `b` and `b` satisfies the
-            // first and last masks. Such an edge appears in both rows with
-            // neighbor `b`; intersect those self-loop entries by edge id. Rows
-            // are sorted by `(neighbor, edge id)`, so the self-loop entries for
-            // each row are a contiguous, edge-id-ascending run.
+            // hops only when it is a self-loop at `b` whose type satisfies both
+            // hops, and `b` satisfies the first and last masks. Each such edge
+            // is counted once in `indeg` and once in `outdeg`, so it contributes
+            // exactly one `r1 == r2` assignment to the product: the number of
+            // excluded assignments is the number of those self-loops, which
+            // parallel self-loops make greater than one. Counting them by type
+            // is equivalent to intersecting the two rows by edge id, because an
+            // edge id identifies one edge and a self-loop at `b` appears once in
+            // each row.
             if label_ok(&masks[0], b) && label_ok(&masks[2], b) {
-                let in_self: Vec<EdgeId> = in_row
-                    .iter()
-                    .filter(|&&(src, _)| src as usize == b)
-                    .map(|&(_, e)| e)
-                    .collect();
-                if !in_self.is_empty() {
-                    let shared = out_row
-                        .iter()
-                        .filter(|&&(dst, e)| dst as usize == b && in_self.binary_search(&e).is_ok())
-                        .count() as u64;
-                    total = total.saturating_sub(shared);
+                let mut shared: u64 = 0;
+                for idx in snap.row_ptr[b]..snap.row_ptr[b + 1] {
+                    if snap.col_idx[idx] as usize == b
+                        && type_ok(t1, snap.edge_type[idx])
+                        && type_ok(t2, snap.edge_type[idx])
+                    {
+                        shared += 1;
+                    }
                 }
+                total = total.saturating_sub(shared);
             }
         }
         Ok(total)
@@ -1658,6 +1679,132 @@ mod linear_path_count_tests {
             ))
             .unwrap();
         assert_eq!(n, 1);
+    }
+
+    /// Several parallel self-loops at the middle node each remove exactly one
+    /// assignment, the one where that edge fills both hops.
+    ///
+    /// The middle node's in-degree and out-degree both include every self-loop,
+    /// so the raw product over-counts by the number of self-loops that satisfy
+    /// both hops, not by one. This pins the correction as a count rather than a
+    /// boolean "a self-loop exists" adjustment.
+    #[test]
+    fn two_hop_parallel_self_loops_each_remove_one_assignment() {
+        let (_dir, g) = open_tmp();
+        let w = g.add_node("Person", &json!({})).unwrap();
+        let x = g.add_node("Person", &json!({})).unwrap();
+        let y = g.add_node("Person", &json!({})).unwrap();
+        g.add_edge(w, x, "KNOWS", &json!({})).unwrap(); // in-edge
+        g.add_edge(x, x, "KNOWS", &json!({})).unwrap(); // self-loop 1
+        g.add_edge(x, x, "KNOWS", &json!({})).unwrap(); // self-loop 2 (parallel)
+        g.add_edge(x, y, "KNOWS", &json!({})).unwrap(); // out-edge
+
+        // Middle `x` has in-degree 3 and out-degree 3, so the raw product is 9.
+        // The two self-loops are the only edges that could fill both hops, so
+        // exactly two assignments are removed.
+        let n = g
+            .count_linear_paths(&spec(&[Some("KNOWS"), Some("KNOWS")], &[Some("Person"); 3]))
+            .unwrap();
+        assert_eq!(n, 7);
+    }
+
+    /// A self-loop is only excluded when its type satisfies both hops. With
+    /// distinct per-hop types no single edge can fill both, so the product
+    /// stands uncorrected.
+    #[test]
+    fn two_hop_self_loop_of_one_type_does_not_correct_a_mixed_type_pattern() {
+        let (_dir, g) = open_tmp();
+        let w = g.add_node("Person", &json!({})).unwrap();
+        let x = g.add_node("Person", &json!({})).unwrap();
+        let y = g.add_node("Person", &json!({})).unwrap();
+        g.add_edge(w, x, "KNOWS", &json!({})).unwrap();
+        g.add_edge(x, x, "KNOWS", &json!({})).unwrap(); // self-loop, hop-1 type only
+        g.add_edge(x, y, "LIKES", &json!({})).unwrap();
+
+        // Hop 1 is KNOWS (in-edges of x: w->x and the self-loop, so 2), hop 2 is
+        // LIKES (out-edges of x: x->y, so 1). The self-loop is not a LIKES edge,
+        // so it cannot fill hop 2 and nothing is subtracted.
+        let n = g
+            .count_linear_paths(&spec(&[Some("KNOWS"), Some("LIKES")], &[Some("Person"); 3]))
+            .unwrap();
+        assert_eq!(n, 2);
+    }
+
+    /// The kernel agrees with a brute-force enumeration of every `(r1, r2)`
+    /// assignment on a graph that mixes self-loops, parallel edges, two
+    /// relationship types, and an off-label endpoint.
+    ///
+    /// This is the differential guard for the counting path: the oracle applies
+    /// relationship uniqueness by comparing edge ids directly, with no degree
+    /// factorization, so any divergence in the factored kernel shows up here.
+    #[test]
+    fn two_hop_count_matches_brute_force_over_mixed_graph() {
+        let (_dir, g) = open_tmp();
+        let people: Vec<_> = (0..6)
+            .map(|_| g.add_node("Person", &json!({})).unwrap())
+            .collect();
+        // One off-label node so the endpoint masks exclude real edges.
+        let city = g.add_node("City", &json!({})).unwrap();
+
+        // (src_index, dst_index, type); index 6 is the City node.
+        let spec_edges: &[(usize, usize, &str)] = &[
+            (0, 1, "KNOWS"),
+            (0, 1, "KNOWS"), // parallel
+            (1, 1, "KNOWS"), // self-loop at a middle
+            (1, 1, "KNOWS"), // parallel self-loop
+            (1, 2, "KNOWS"),
+            (1, 2, "LIKES"),
+            (2, 3, "KNOWS"),
+            (2, 2, "LIKES"), // self-loop of the other type
+            (3, 4, "KNOWS"),
+            (4, 5, "KNOWS"),
+            (5, 0, "KNOWS"),
+            (1, 6, "KNOWS"), // into the City node
+            (6, 2, "KNOWS"), // out of the City node
+        ];
+        let all: Vec<_> = people
+            .iter()
+            .copied()
+            .chain(std::iter::once(city))
+            .collect();
+        let mut edges = Vec::new();
+        for &(s, d, t) in spec_edges {
+            let id = g.add_edge(all[s], all[d], t, &json!({})).unwrap();
+            edges.push((all[s], all[d], t, id));
+        }
+
+        // Brute-force oracle: every ordered pair of distinct edges that chains
+        // through a shared middle node, with all three endpoints on `Person`.
+        let is_person = |n| n != city;
+        for (t1, t2) in [
+            (Some("KNOWS"), Some("KNOWS")),
+            (Some("KNOWS"), Some("LIKES")),
+            (Some("LIKES"), Some("KNOWS")),
+            (None, None),
+        ] {
+            let mut expected = 0u64;
+            for &(s1, d1, ty1, e1) in &edges {
+                if t1.is_some_and(|t| t != ty1) || !is_person(s1) || !is_person(d1) {
+                    continue;
+                }
+                for &(s2, d2, ty2, e2) in &edges {
+                    if t2.is_some_and(|t| t != ty2) || !is_person(d2) {
+                        continue;
+                    }
+                    // Chain through the middle, and relationship uniqueness.
+                    if s2 == d1 && e2 != e1 {
+                        expected += 1;
+                    }
+                }
+            }
+            let got = g
+                .count_linear_paths(&spec(&[t1, t2], &[Some("Person"); 3]))
+                .unwrap();
+            assert_eq!(
+                got, expected,
+                "kernel disagreed with brute force for hops ({t1:?}, {t2:?})"
+            );
+        }
     }
 
     /// An unregistered relationship type matches nothing.
