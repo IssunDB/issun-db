@@ -268,9 +268,19 @@ bench-cypher: ## Run Cypher parser and query optimizer benchmarks
 	@DEBUG_PROJ=$(DEBUG_PROJ) cargo bench -p issundb --bench query_optimizer
 
 .PHONY: bench-ladybugdb
-bench-ladybugdb: ## Run the LadybugDB comparison harness
+bench-ladybugdb: ## Run the LadybugDB comparison harness (uniform skew)
 	@echo "Running LadybugDB comparison harness..."
 	@cd benchmarks/ladybugdb-compare && cargo run --release
+
+.PHONY: bench-ladybugdb-zipf
+bench-ladybugdb-zipf: ## Run the LadybugDB comparison harness under Zipf degree skew
+	@echo "Running LadybugDB comparison harness (zipf skew)..."
+	@cd benchmarks/ladybugdb-compare && LADYBUGDB_COMPARE_SKEW=zipf cargo run --release
+
+.PHONY: bench-ladybugdb-sweep
+bench-ladybugdb-sweep: ## Run the LadybugDB comparison harness across three dataset sizes
+	@echo "Running LadybugDB comparison harness (size sweep)..."
+	@cd benchmarks/ladybugdb-compare && LADYBUGDB_COMPARE_SWEEP=1 cargo run --release
 
 .PHONY: audit
 audit: ## Run security audit on Rust dependencies

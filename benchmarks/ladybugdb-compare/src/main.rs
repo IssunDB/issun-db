@@ -92,8 +92,17 @@ impl Config {
                 panic!("LADYBUGDB_COMPARE_SKEW must be 'uniform' or 'zipf', got {other:?}")
             }
         };
-        let nodes = var("LADYBUGDB_COMPARE_NODES", 10_000);
-        let edges = var("LADYBUGDB_COMPARE_EDGES", 50_000);
+        // The default size is large enough that the scan-and-materialize queries
+        // are doing real work rather than measuring per-query fixed overhead. At
+        // 10k nodes the dataset sits in cache and a query like `node_count`
+        // reports the floor cost of issuing a query, not the cost of scanning.
+        let nodes = var("LADYBUGDB_COMPARE_NODES", 50_000);
+        // Five edges per node by default, so overriding only the node count keeps
+        // the density fixed. A constant edge default silently thins or densifies
+        // the graph instead, and density moves the comparison more than size: at
+        // 2000 nodes with the old constant 50_000 edges (degree 25 rather than 5)
+        // `four_hop_distinct` swung from 0.24 to 29.4 against LadybugDB.
+        let edges = var("LADYBUGDB_COMPARE_EDGES", nodes.saturating_mul(5));
         let reps = var("LADYBUGDB_COMPARE_REPS", 10) as usize;
         let sweep = var("LADYBUGDB_COMPARE_SWEEP", 0) != 0;
         assert!(nodes > 0, "LADYBUGDB_COMPARE_NODES must be at least 1");
@@ -792,17 +801,15 @@ fn run_at(cfg: &Config, nodes: u64, edges: u64) -> anyhow::Result<Vec<QueryTimin
     load_issundb(&graph, &data)?;
     let is_load = start.elapsed();
 
-    println!("load: issundb {is_load:?} (single write txn), ladybugdb {lb_load:?} (COPY FROM)\n");
+    let load_ratio = is_load.as_secs_f64() / lb_load.as_secs_f64().max(f64::EPSILON);
+    println!(
+        "load: issundb {is_load:?} (single write txn), ladybugdb {lb_load:?} (COPY FROM), \
+         idb/ldb {load_ratio:.2}\n"
+    );
 
     println!(
-        "{:<20} {:>16} {:>16} {:>16} {:>10}  diff",
-        "query", "issundb", "ladybugdb", "ladybugdb(1t)", "result"
-    );
-    println!(
-        "(timings are median±h, where h is the half-width of the 95% bootstrap \
-         confidence interval over {} timed rounds; a trailing * marks fewer than \
-         {} rounds because the per-query budget ran out)\n",
-        cfg.reps, cfg.reps
+        "{:<20} {:>16} {:>16} {:>16} {:>9} {:>12} {:>10}  diff",
+        "query", "issundb", "ladybugdb", "ladybugdb(1t)", "idb/ldb", "idb/ldb(1t)", "result"
     );
     // Render a measured timing as `median±h%`, where the percentage is the
     // 95% CI half-width relative to the median.
@@ -815,6 +822,17 @@ fn run_at(cfg: &Config, nodes: u64, edges: u64) -> anyhow::Result<Vec<QueryTimin
             format!("{s}*")
         } else {
             s
+        }
+    };
+    // The issundb median over a ladybugdb median. Below 1.0 favors issundb. The
+    // sub-1.0 range carries the interesting detail once issundb is an order of
+    // magnitude ahead, so it gets an extra digit.
+    let ratio = |a: &BenchStat, b: &BenchStat| {
+        let r = a.median.as_secs_f64() / b.median.as_secs_f64().max(f64::EPSILON);
+        if r < 1.0 {
+            format!("{r:.3}")
+        } else {
+            format!("{r:.2}")
         }
     };
     let mut timings = Vec::new();
@@ -859,8 +877,10 @@ fn run_at(cfg: &Config, nodes: u64, edges: u64) -> anyhow::Result<Vec<QueryTimin
                 // not a harness failure; the run stays usable.
                 divergences += 1;
                 println!(
-                    "{name:<20} {:>16} {:>16} {:>16} {:>10}  DIVERGENT \
+                    "{name:<20} {:>16} {:>16} {:>16} {:>9} {:>12} {:>10}  DIVERGENT \
                      (ladybugdb walk semantics: ladybugdb {}, openCypher trails {})",
+                    "-",
+                    "-",
                     "-",
                     "-",
                     "-",
@@ -874,8 +894,10 @@ fn run_at(cfg: &Config, nodes: u64, edges: u64) -> anyhow::Result<Vec<QueryTimin
             } else {
                 mismatches += 1;
                 println!(
-                    "{name:<20} {:>16} {:>16} {:>16} {:>10}  MISMATCH \
+                    "{name:<20} {:>16} {:>16} {:>16} {:>9} {:>12} {:>10}  MISMATCH \
                      (issundb {} rows: {:?}..., ladybugdb {} rows: {:?}...)",
+                    "-",
+                    "-",
                     "-",
                     "-",
                     "-",
@@ -915,10 +937,12 @@ fn run_at(cfg: &Config, nodes: u64, edges: u64) -> anyhow::Result<Vec<QueryTimin
             || lb_1t_stat.samples < cfg.reps;
 
         println!(
-            "{name:<20} {:>16} {:>16} {:>16} {:>10}  OK",
+            "{name:<20} {:>16} {:>16} {:>16} {:>9} {:>12} {:>10}  OK",
             fmt(&is_stat),
             fmt(&lb_stat),
             fmt(&lb_1t_stat),
+            ratio(&is_stat, &lb_stat),
+            ratio(&is_stat, &lb_1t_stat),
             result
         );
         timings.push(QueryTiming {
@@ -928,6 +952,17 @@ fn run_at(cfg: &Config, nodes: u64, edges: u64) -> anyhow::Result<Vec<QueryTimin
             ladybugdb_1t: Some(lb_1t_stat.median),
         });
     }
+    // Legend below the table, where it does not push the rows off a first screen.
+    println!(
+        "\ntimings are the median ±the 95% bootstrap confidence interval half-width \
+         over {} rounds.",
+        cfg.reps
+    );
+    println!(
+        "idb/ldb is the issundb median over the ladybugdb median, so below 1.0 favors \
+         issundb. idb/ldb(1t) uses single-threaded ladybugdb, matching issundb's one \
+         execution thread."
+    );
     if truncated {
         println!(
             "* median and CI from fewer than {} reps; {}s per-query budget reached",

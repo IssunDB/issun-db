@@ -14,8 +14,9 @@ cd benchmarks/ladybugdb-compare && cargo run --release
 
 The runs can be configured with these environment variables:
 
-- `LADYBUGDB_COMPARE_NODES`: Person node count (default: 10000)
-- `LADYBUGDB_COMPARE_EDGES`: KNOWS edge count (default: 50000)
+- `LADYBUGDB_COMPARE_NODES`: Person node count (default: 50000)
+- `LADYBUGDB_COMPARE_EDGES`: KNOWS edge count (default: five per node, so the density stays fixed when only the node count is overridden). Setting
+  this without also setting the node count changes the average degree, which moves the comparison more than the dataset size does
 - `LADYBUGDB_COMPARE_REPS`: timed repetitions per query, median reported (default: 10)
 - `LADYBUGDB_COMPARE_WARMUPS`: untimed warmup runs per query (default: 3)
 - `LADYBUGDB_COMPARE_SKEW`: `uniform` (default) or `zipf` for a power-law degree distribution with hub nodes; the skewed graph contains far more
