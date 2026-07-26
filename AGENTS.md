@@ -194,6 +194,12 @@ modules according to this map.
 - The GraphBLAS matrices (`MatrixSet`) and the CSR snapshot back the GraphBLAS algorithms, pattern matching, and multi-source expansion. They are kept
   fresh through three gates rather than a single periodic rebuild. The write path records a structural delta (added nodes, added edges, and removed
   edges, plus a `force_full` flag set on any node deletion).
+    - `Graph::open` builds neither: it installs an empty snapshot through `CsrCache::new_unbuilt` and leaves `matrices` as `None`, so the gates below
+      do the first build when a consumer that needs one runs. A workload of point lookups, property reads, or small typed expansions never builds
+      either structure, because those paths read LMDB directly. The unbuilt cache starts `write_gen` at 1 with both installed generations at 0 so it
+      reports stale; a placeholder that claimed to be current would make typed expansion read zero rows out of the empty snapshot. Do not reintroduce
+      an eager build in `open`: it costs one full edge scan plus a full matrix materialization on every open (roughly 26 seconds for a 1 M-node,
+      14 M-edge graph) and is repaid on every reopen.
     - Pure-adjacency consumers (`bfs`, `bfs_multi_source`, untyped expansion, `degree_centrality`, and `connected_components`) call
       `ensure_matrix_view`, which applies the delta in place, falling back to a full `rebuild_csr` only when a node was deleted.
     - CSR-array and hybrid consumers (everything else, including `dfs`, the path searches, the weighted and flow algorithms, `page_rank`, and the

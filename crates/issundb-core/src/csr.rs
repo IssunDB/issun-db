@@ -35,7 +35,9 @@ pub struct CsrSnapshot {
 }
 
 impl CsrSnapshot {
-    #[cfg(test)]
+    /// An empty snapshot: no nodes, no edges. Used as the placeholder a graph
+    /// opens with before any consumer has asked for a built snapshot, and by
+    /// tests that need a snapshot without a storage environment.
     pub fn empty() -> Self {
         Self {
             row_ptr: vec![0],
@@ -249,6 +251,22 @@ impl CsrCache {
             snapshot_gen: AtomicU64::new(0),
             matrices_gen: AtomicU64::new(0),
         }
+    }
+
+    /// Cache for a graph opened without building anything: the snapshot is an
+    /// empty placeholder and the caller leaves the matrices unmaterialized.
+    ///
+    /// `write_gen` starts at 1 while both installed generations stay at 0, so
+    /// `snapshot_is_stale` and `matrices_are_stale` report true until the first
+    /// gated consumer installs a snapshot built from storage. Only equality of
+    /// these counters is ever tested, so the offset start is harmless, and the
+    /// documented invariant `matrices_gen <= snapshot_gen <= write_gen` holds.
+    /// Without the offset the empty placeholder would claim to be current and a
+    /// typed-expansion consumer would read zero rows out of it.
+    pub fn new_unbuilt() -> Self {
+        let cache = Self::new(CsrSnapshot::empty());
+        cache.write_gen.store(1, Ordering::Release);
+        cache
     }
 
     /// Current committed-write generation. Capture this before building a

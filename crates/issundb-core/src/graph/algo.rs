@@ -21,7 +21,9 @@ impl Graph {
     /// pairwise distinct (relationship uniqueness), which only constrains
     /// self-loop assignments where `a == b == c`.
     pub fn count_triangle_cycles(&self, spec: &TriangleCountSpec) -> Result<u64, Error> {
-        self.ensure_csr_fresh()?;
+        // Snapshot-only gate: this kernel reads CSR arrays and never a matrix,
+        // so it must not pay `ensure_csr_fresh`'s GraphBLAS materialization.
+        self.ensure_snapshot_fresh()?;
         let snap = self.csr_cache.snapshot.load();
         let n = snap.dense_to_id.len();
         if n == 0 {
@@ -168,7 +170,9 @@ impl Graph {
         debug_assert!(hops == 1 || hops == 2, "count_linear_paths: 1 or 2 hops");
         debug_assert_eq!(spec.labels.len(), hops + 1, "labels must be hops + 1");
 
-        self.ensure_csr_fresh()?;
+        // Snapshot-only gate: this kernel reads CSR arrays and never a matrix,
+        // so it must not pay `ensure_csr_fresh`'s GraphBLAS materialization.
+        self.ensure_snapshot_fresh()?;
         let snap = self.csr_cache.snapshot.load();
         let n = snap.dense_to_id.len();
         if n == 0 {
@@ -333,7 +337,9 @@ impl Graph {
         &self,
         spec: &GroupedDegreeSpec,
     ) -> Result<Vec<(NodeId, u64)>, Error> {
-        self.ensure_csr_fresh()?;
+        // Snapshot-only gate: this kernel reads CSR arrays and never a matrix,
+        // so it must not pay `ensure_csr_fresh`'s GraphBLAS materialization.
+        self.ensure_snapshot_fresh()?;
         let snap = self.csr_cache.snapshot.load();
         let n = snap.dense_to_id.len();
         if n == 0 {
@@ -2156,5 +2162,155 @@ mod triangle_cycle_count_tests {
                 full[n]
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod snapshot_only_gate_tests {
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    use crate::{Graph, GroupedDegreeSpec, PathCountSpec, TriangleCountSpec, schema::NodeId};
+
+    /// A triangle plus a disjoint two-edge chain, closed and reopened so the
+    /// handle starts with nothing materialized. Every expected count below is
+    /// non-zero, so reading an empty snapshot fails the assertion rather than
+    /// coincidentally matching.
+    fn seeded_dir() -> (TempDir, Vec<NodeId>) {
+        let dir = TempDir::new().unwrap();
+        let ids = {
+            let g = Graph::open(dir.path(), 1).unwrap();
+            let ids: Vec<_> = (0..6)
+                .map(|i| g.add_node("Person", &json!({ "n": i })).unwrap())
+                .collect();
+            for &(s, d) in &[(0, 1), (1, 2), (2, 0), (3, 4), (4, 5)] {
+                g.add_edge(ids[s], ids[d], "FOLLOWS", &json!({})).unwrap();
+            }
+            ids
+        };
+        (dir, ids)
+    }
+
+    fn one_hop() -> PathCountSpec<'static> {
+        PathCountSpec {
+            rel_types: vec![Some("FOLLOWS")],
+            labels: vec![Some("Person"), Some("Person")],
+            vertex_allow: Vec::new(),
+        }
+    }
+
+    fn two_hop() -> PathCountSpec<'static> {
+        PathCountSpec {
+            rel_types: vec![Some("FOLLOWS"), Some("FOLLOWS")],
+            labels: vec![Some("Person"); 3],
+            vertex_allow: Vec::new(),
+        }
+    }
+
+    /// The three counting kernels read only the CSR snapshot, so they must gate
+    /// on `ensure_snapshot_fresh` and leave the GraphBLAS matrices
+    /// unmaterialized. Materializing them would build a weight matrix and a
+    /// PageRank matrix that no counting kernel ever reads.
+    #[test]
+    fn count_kernels_serve_from_the_snapshot_without_materializing_matrices() {
+        let (dir, _ids) = seeded_dir();
+
+        {
+            let g = Graph::open(dir.path(), 1).unwrap();
+            assert_eq!(g.count_linear_paths(&one_hop()).unwrap(), 5);
+            assert!(
+                g.matrices.read().is_none(),
+                "a one-hop count must not materialize the matrices"
+            );
+        }
+        {
+            let g = Graph::open(dir.path(), 1).unwrap();
+            assert_eq!(g.count_linear_paths(&two_hop()).unwrap(), 4);
+            assert!(
+                g.matrices.read().is_none(),
+                "a two-hop count must not materialize the matrices"
+            );
+        }
+        {
+            let g = Graph::open(dir.path(), 1).unwrap();
+            let spec = TriangleCountSpec {
+                rel_types: [Some("FOLLOWS"); 3],
+                labels: [Some("Person"); 3],
+            };
+            // One directed 3-cycle, counted once per rotation of `a`.
+            assert_eq!(g.count_triangle_cycles(&spec).unwrap(), 3);
+            assert!(
+                g.matrices.read().is_none(),
+                "a triangle count must not materialize the matrices"
+            );
+        }
+        {
+            let g = Graph::open(dir.path(), 1).unwrap();
+            let spec = GroupedDegreeSpec {
+                rel_type: Some("FOLLOWS"),
+                group_is_dst: false,
+                group_label: Some("Person"),
+                counted_label: Some("Person"),
+                counted_nonnull_prop: None,
+            };
+            let counts = g.grouped_edge_counts(&spec).unwrap();
+            // Five sources each with out-degree one; the sixth node has none.
+            assert_eq!(counts.len(), 5);
+            assert!(counts.iter().all(|&(_, c)| c == 1));
+            assert!(
+                g.matrices.read().is_none(),
+                "a grouped degree count must not materialize the matrices"
+            );
+        }
+    }
+
+    /// Narrowing the gate must not weaken freshness: a kernel run after a write
+    /// in the same session observes that write, because the snapshot gate
+    /// rebuilds on the `write_gen` versus `snapshot_gen` mismatch.
+    #[test]
+    fn count_kernels_observe_writes_made_after_the_first_count() {
+        let (dir, ids) = seeded_dir();
+        let g = Graph::open(dir.path(), 1).unwrap();
+
+        assert_eq!(g.count_linear_paths(&one_hop()).unwrap(), 5);
+        assert_eq!(g.count_linear_paths(&two_hop()).unwrap(), 4);
+
+        // Close the disjoint chain into the triangle's tail: 5 -> 3 adds one
+        // edge, one new two-hop path through 3 (5->3->4), and no new triangle.
+        g.add_edge(ids[5], ids[3], "FOLLOWS", &json!({})).unwrap();
+
+        assert_eq!(
+            g.count_linear_paths(&one_hop()).unwrap(),
+            6,
+            "the one-hop count must include the edge added after the first count"
+        );
+        assert_eq!(
+            g.count_linear_paths(&two_hop()).unwrap(),
+            6,
+            "5->3 adds 4->5->3 and 5->3->4"
+        );
+        assert!(
+            g.matrices.read().is_none(),
+            "refreshing the snapshot must not drag in a matrix materialization"
+        );
+    }
+
+    /// A node deletion reshuffles the dense mapping, so the snapshot gate must
+    /// still produce correct counts afterwards.
+    #[test]
+    fn count_kernels_are_correct_after_a_node_deletion() {
+        let (dir, ids) = seeded_dir();
+        let g = Graph::open(dir.path(), 1).unwrap();
+        assert_eq!(g.count_linear_paths(&one_hop()).unwrap(), 5);
+
+        // Deleting node 5 drops the 4->5 edge with it.
+        g.delete_node(ids[5]).unwrap();
+
+        assert_eq!(g.count_linear_paths(&one_hop()).unwrap(), 4);
+        assert_eq!(
+            g.count_linear_paths(&two_hop()).unwrap(),
+            3,
+            "only the triangle's three two-hop paths remain"
+        );
     }
 }

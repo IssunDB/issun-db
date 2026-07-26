@@ -515,14 +515,19 @@ impl Graph {
         // Older versions persisted the CSR snapshot next to the LMDB files but
         // never read it back; remove the stale artifact if one is present.
         let _ = std::fs::remove_file(path.join("csr_snapshot.bin"));
-        let initial = CsrSnapshot::build(&storage)?;
         let storage = Arc::new(storage);
-        let csr_cache = Arc::new(CsrCache::new(initial));
-        let matrices = {
-            let initial_snap = csr_cache.snapshot.load();
-            let m = MatrixSet::materialize(&initial_snap, 0)?;
-            Arc::new(parking_lot::RwLock::new(Some(m)))
-        };
+        // Opening builds nothing. The CSR snapshot and the GraphBLAS matrices
+        // are materialized by the freshness gates (`ensure_snapshot_fresh`,
+        // `ensure_matrix_view`, and `ensure_csr_fresh`) when a consumer that
+        // needs them first runs, and every such consumer already calls its gate.
+        // Building them here instead cost one full edge scan plus a full matrix
+        // materialization on every open, which is time a workload of point
+        // lookups, property reads, or point adjacency never uses: those paths
+        // read LMDB directly. On a large database that eager work dominates the
+        // whole session's latency (roughly 26 s to open a 1 M-node, 14 M-edge
+        // graph), and it is repaid on every reopen.
+        let csr_cache = Arc::new(CsrCache::new_unbuilt());
+        let matrices = Arc::new(parking_lot::RwLock::new(None));
         Ok(Self {
             storage,
             _write_lock: Arc::new(ReentrantMutex::new(())),
@@ -1073,5 +1078,163 @@ mod encode_tests {
             let enc = encode_property_value(&v).unwrap();
             assert_eq!(decode_property_value(&enc), Some(v.clone()), "value {v}");
         }
+    }
+}
+
+#[cfg(test)]
+mod lazy_open_tests {
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    use super::Graph;
+    use crate::schema::NodeId;
+
+    /// Populate a graph, force the CSR and matrices to materialize, then close
+    /// it. Returns the directory so the caller can reopen the same path.
+    fn seeded_dir() -> (TempDir, Vec<NodeId>) {
+        let dir = TempDir::new().unwrap();
+        let ids = {
+            let g = Graph::open(dir.path(), 1).unwrap();
+            // 80 nodes in a ring plus a chord, so a typed expansion over more
+            // than `STALE_POINT_EXPAND_MAX` (64) sources takes the snapshot
+            // path rather than the per-source LMDB path.
+            let ids: Vec<_> = (0..80)
+                .map(|i| g.add_node("Person", &json!({ "n": i })).unwrap())
+                .collect();
+            for i in 0..ids.len() {
+                g.add_edge(ids[i], ids[(i + 1) % ids.len()], "FOLLOWS", &json!({}))
+                    .unwrap();
+            }
+            g.add_edge(ids[0], ids[40], "LIKES", &json!({})).unwrap();
+            // Touch an algorithm so this handle definitely materialized both.
+            g.bfs(ids[0], 2).unwrap();
+            assert!(g.matrices.read().is_some(), "seed handle must materialize");
+            ids
+        };
+        (dir, ids)
+    }
+
+    /// Opening an existing database does no CSR scan and no GraphBLAS
+    /// materialization. Both are the freshness gates' job, so a workload that
+    /// only reads properties or point adjacency never pays for them.
+    #[test]
+    fn open_defers_the_csr_and_matrix_build() {
+        let (dir, _ids) = seeded_dir();
+        let g = Graph::open(dir.path(), 1).unwrap();
+
+        assert!(
+            g.matrices.read().is_none(),
+            "open must not materialize the GraphBLAS matrices"
+        );
+        assert_eq!(
+            g.csr_cache.snapshot.load().dense_to_id.len(),
+            0,
+            "open must not build the CSR snapshot"
+        );
+        assert!(
+            g.csr_cache.snapshot_is_stale(),
+            "the unbuilt snapshot must report stale so a consumer rebuilds it"
+        );
+    }
+
+    /// A freshly opened handle serves every consumer class correctly, each
+    /// building what it needs through its own gate. This is the guard on the
+    /// generation bookkeeping: if the unbuilt snapshot reported itself fresh,
+    /// the typed-expansion path would read an empty CSR and silently return no
+    /// rows instead of rebuilding.
+    #[test]
+    fn reopened_graph_serves_every_consumer_class() {
+        let (dir, ids) = seeded_dir();
+
+        // Each consumer gets its own handle, scoped so the LMDB environment is
+        // closed before the next open, and so every gate is exercised from the
+        // unbuilt state rather than riding on an earlier consumer's build.
+        let reopen = || Graph::open(dir.path(), 1).unwrap();
+
+        // Typed expansion over more sources than the stale-point-read cutoff,
+        // so this goes through `ensure_snapshot_fresh`.
+        {
+            let g = reopen();
+            let wide = g
+                .expand_spmv_graphblas(&ids, Some("FOLLOWS"), false)
+                .unwrap();
+            assert_eq!(wide.len(), 80, "every ring edge must expand");
+        }
+        // Typed expansion under the cutoff, which reads LMDB point adjacency
+        // directly and needs no snapshot at all.
+        {
+            let g = reopen();
+            let narrow = g
+                .expand_spmv_graphblas(&ids[..4], Some("FOLLOWS"), false)
+                .unwrap();
+            assert_eq!(narrow.len(), 4);
+        }
+        // Matrix-view consumer. Traversal is untyped, so one hop from `ids[0]`
+        // reaches both the ring successor and the `LIKES` chord target.
+        {
+            let g = reopen();
+            assert_eq!(
+                g.bfs(ids[0], 1).unwrap().len(),
+                3,
+                "start plus both one-hop neighbors"
+            );
+        }
+        // CSR-array consumer.
+        {
+            let g = reopen();
+            assert_eq!(g.dfs(ids[0], 1).unwrap().len(), 3);
+        }
+        // Weighted matrix consumer.
+        {
+            let g = reopen();
+            assert_eq!(g.page_rank(5, 0.85).unwrap().len(), 80);
+        }
+        // Count kernel.
+        {
+            let g = reopen();
+            let spec = crate::PathCountSpec {
+                rel_types: vec![Some("FOLLOWS")],
+                labels: vec![Some("Person"), Some("Person")],
+                vertex_allow: Vec::new(),
+            };
+            assert_eq!(g.count_linear_paths(&spec).unwrap(), 80);
+        }
+        // Point adjacency, which never consults the snapshot.
+        {
+            let g = reopen();
+            assert_eq!(g.out_neighbors(ids[0]).unwrap().len(), 2);
+        }
+    }
+
+    /// The first gated consumer materializes the matrices, so the deferral is
+    /// a delay rather than a permanent absence.
+    #[test]
+    fn first_algorithm_materializes_what_open_skipped() {
+        let (dir, ids) = seeded_dir();
+        let g = Graph::open(dir.path(), 1).unwrap();
+        assert!(g.matrices.read().is_none());
+
+        assert_eq!(g.bfs(ids[0], 1).unwrap().len(), 3);
+
+        assert!(
+            g.matrices.read().is_some(),
+            "the matrix-view gate must materialize on first use"
+        );
+        assert!(!g.csr_cache.snapshot_is_stale());
+    }
+
+    /// Reopening an empty database is also lazy, and every consumer reports
+    /// empty rather than erroring on the absent snapshot.
+    #[test]
+    fn empty_database_opens_lazily_and_reads_empty() {
+        let dir = TempDir::new().unwrap();
+        {
+            Graph::open(dir.path(), 1).unwrap();
+        }
+        let g = Graph::open(dir.path(), 1).unwrap();
+        assert!(g.matrices.read().is_none());
+        assert!(g.all_nodes().unwrap().is_empty());
+        assert!(g.connected_components().unwrap().is_empty());
+        assert!(g.page_rank(3, 0.85).unwrap().is_empty());
     }
 }
