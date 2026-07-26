@@ -254,21 +254,22 @@ impl PyGraph {
     }
 
     /// Index or update the float32 embedding for node `id`.
-    fn upsert_vector(&self, py: Python<'_>, id: u64, vec: Vec<f32>) -> PyResult<()> {
-        py.detach(|| self.graph.upsert_vector(id, &vec)).map_err(rt)
+    fn upsert_vector(&self, py: Python<'_>, id: u64, vector: Vec<f32>) -> PyResult<()> {
+        py.detach(|| self.graph.upsert_vector(id, &vector))
+            .map_err(rt)
     }
 
-    /// Return the `k` nearest neighbors to `vec` as a JSON array of
+    /// Return the `k` nearest neighbors to `vector` as a JSON array of
     /// `{"node": u64, "distance": f32}`.
     ///
     /// `label` restricts results to nodes carrying that label. `properties` is a
     /// JSON object string of key-value filters; only nodes matching every filter
     /// are returned. Both filters are applied during index traversal.
-    #[pyo3(signature = (vec, k, label=None, properties=None, rescore_factor=None))]
+    #[pyo3(signature = (vector, k, label=None, properties=None, rescore_factor=None))]
     fn vector_search(
         &self,
         py: Python<'_>,
-        vec: Vec<f32>,
+        vector: Vec<f32>,
         k: usize,
         label: Option<String>,
         properties: Option<String>,
@@ -289,7 +290,7 @@ impl PyGraph {
             rescore_factor,
         };
         py.detach(|| {
-            let hits = self.graph.vector_search_with(&vec, &opts).map_err(rt)?;
+            let hits = self.graph.vector_search_with(&vector, &opts).map_err(rt)?;
             let json_hits: Vec<serde_json::Value> = hits
                 .into_iter()
                 .map(|h| serde_json::json!({ "node": h.node, "distance": h.distance }))
@@ -407,8 +408,8 @@ impl PyGraph {
     }
 
     /// Set the GraphBLAS thread count (0 restores default behavior).
-    fn set_thread_count(&self, py: Python<'_>, count: i32) -> PyResult<()> {
-        py.detach(|| self.graph.set_thread_count(count)).map_err(rt)
+    fn set_thread_count(&self, py: Python<'_>, n: i32) -> PyResult<()> {
+        py.detach(|| self.graph.set_thread_count(n)).map_err(rt)
     }
 
     /// Execute a hybrid retrieval (GraphRAG) query combining vector search, text
@@ -515,12 +516,13 @@ impl PyGraph {
             .map_err(rt)
     }
 
-    /// Restore a snapshot file at `snapshot` into a new database directory at `dst`.
+    /// Restore a snapshot file at `snapshot_path` into a new database directory
+    /// at `destination_path`.
     ///
-    /// After restoration, open the database with `IssunDB(dst)`.
+    /// After restoration, open the database with `IssunDB(destination_path)`.
     #[staticmethod]
-    fn restore(py: Python<'_>, snapshot: &str, dst: &str) -> PyResult<()> {
-        py.detach(|| Graph::restore(Path::new(snapshot), Path::new(dst)))
+    fn restore(py: Python<'_>, snapshot_path: &str, destination_path: &str) -> PyResult<()> {
+        py.detach(|| Graph::restore(Path::new(snapshot_path), Path::new(destination_path)))
             .map_err(rt)
     }
 }
