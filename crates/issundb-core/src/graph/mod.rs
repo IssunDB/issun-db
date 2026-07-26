@@ -120,9 +120,10 @@ pub struct GroupedDegreeSpec<'a> {
 /// Pattern description for [`Graph::typed_neighbor_counts`]: per-source counts
 /// of typed neighbors across one hop. `incoming` follows incoming edges instead
 /// of outgoing ones. A neighbor qualifies when it carries every label in
-/// `neighbor_labels` (an empty slice is unconstrained), and it adds to the
-/// counted total only when `neighbor_nonnull_prop` is absent or non-null on it
-/// (the semantics of `count(v.prop)` over the expansion, against `count(*)`).
+/// `neighbor_labels` (an empty slice is unconstrained) and, when
+/// `neighbor_allow` is present, is a member of that set; it adds to the counted
+/// total only when `neighbor_nonnull_prop` is absent or non-null on it (the
+/// semantics of `count(v.prop)` over the expansion, against `count(*)`).
 #[derive(Debug, Clone, Default)]
 pub struct NeighborCountSpec<'a> {
     /// Relationship type to follow, or `None` for any type.
@@ -131,6 +132,14 @@ pub struct NeighborCountSpec<'a> {
     pub incoming: bool,
     /// Labels a neighbor must all carry to qualify.
     pub neighbor_labels: &'a [&'a str],
+    /// Explicit allow-set a neighbor must belong to, intersected with the labels
+    /// above; `None` leaves the neighbor unconstrained beyond its labels. The
+    /// caller resolves this set by evaluating per-neighbor property predicates
+    /// itself, so a filtered count stays a kernel call instead of materializing
+    /// one entry per traversed edge, exactly as
+    /// [`PathCountSpec::vertex_allow`] does for the path count. An empty slice
+    /// admits no neighbor and counts zero.
+    pub neighbor_allow: Option<&'a [NodeId]>,
     /// Property that must be non-null on a qualifying neighbor for it to add to
     /// the counted total; `None` counts every qualifying neighbor.
     pub neighbor_nonnull_prop: Option<&'a str>,

@@ -1858,20 +1858,89 @@ fn leading_count_sort(
 /// `None` means at least one filter is something else (a property comparison),
 /// so the caller expands and qualifies the neighbor set instead. An empty region
 /// yields an empty label list, which constrains nothing.
-fn terminal_label_filters<'a>(
-    level: Option<&'a Vec<VecStage<'a>>>,
+fn split_terminal_filters<'a, 'b>(
+    level: Option<&'b Vec<VecStage<'a>>>,
     terminal: &str,
-) -> Option<Vec<&'a str>> {
+) -> Option<(Vec<&'a str>, Vec<&'b VecStage<'a>>)> {
     let Some(level) = level else {
-        return Some(Vec::new());
+        return Some((Vec::new(), Vec::new()));
     };
-    level
-        .iter()
-        .map(|stage| match stage {
-            VecStage::HasLabel { var, label } if *var == terminal => Some(*label),
-            _ => None,
-        })
-        .collect()
+    // Partition rather than split at a position: the recognizer reverses each
+    // filter region into the order the row pipeline applies it, so a pattern
+    // node's label test lands after the predicates written next to it, not
+    // before. The region is a conjunction, so order carries no meaning here, and
+    // `resolve_terminal_allow` re-applies every stage anyway.
+    let mut labels = Vec::new();
+    let mut others = Vec::new();
+    for stage in level {
+        match stage {
+            VecStage::HasLabel { var, label } if *var == terminal => labels.push(*label),
+            // The collapse's eligibility already requires terminal-only filters;
+            // verify it rather than trust it, since the remainder is applied to a
+            // candidate set that binds no other variable.
+            other if other.vars().iter().all(|v| *v == terminal) => others.push(other),
+            _ => return None,
+        }
+    }
+    Some((labels, others))
+}
+
+/// Resolve the neighbors satisfying the terminal filters the counting kernel
+/// cannot evaluate into an allow-set it can, by running those exact stages
+/// (reusing the row pipeline's predicate semantics) over the whole node set of
+/// the terminal's first label. `None` declines: there is no label to enumerate a
+/// candidate set from, or the enumeration would cost more than the expansion it
+/// replaces.
+///
+/// Only `others` is applied here. The enumerated candidates already carry the
+/// label they came from, and any further label goes to the kernel as a dense
+/// mask, which costs one pass over that label instead of an index probe per
+/// candidate.
+///
+/// The candidate set is a superset of the real neighbors, which is sound because
+/// a stage only filters on the terminal node's own properties: a verdict for a
+/// node no edge reaches is simply never consulted.
+#[allow(clippy::too_many_arguments)]
+fn resolve_terminal_allow(
+    graph: &Graph,
+    others: &[&VecStage<'_>],
+    terminal: &str,
+    labels: &[&str],
+    distinct: &[NodeId],
+    incoming: bool,
+    params: &HashMap<String, Value>,
+    schema: &std::sync::Arc<SlotSchema>,
+) -> Result<Option<Vec<NodeId>>, String> {
+    // Without a label the candidate set is every node, more work than expanding
+    // could be worth here.
+    let Some(label) = labels.first() else {
+        return Ok(None);
+    };
+    // Resolving costs one pass over the label; expanding costs the sources'
+    // adjacency span plus, per traversed edge, a triple, a sort slot, and a hash
+    // probe. Requiring the span to reach half the label keeps that trade
+    // comfortably positive, and keeps a selective query (few sources, few edges)
+    // on the expansion, where a full label pass would dominate its whole cost.
+    let label_count = graph
+        .node_count_by_label(label)
+        .map_err(|e| e.to_string())?;
+    let span = graph
+        .adjacency_span(distinct, incoming)
+        .map_err(|e| e.to_string())?;
+    if span.saturating_mul(2) < label_count {
+        return Ok(None);
+    }
+
+    let candidates = graph.nodes_by_label(label).map_err(|e| e.to_string())?;
+    let mut mini = IdCols {
+        cols: vec![candidates],
+        edge_cols: Vec::new(),
+    };
+    let term_only_vars = [terminal];
+    for stage in others {
+        apply_stage(graph, stage, params, schema, &term_only_vars, &mut mini)?;
+    }
+    Ok(Some(std::mem::take(&mut mini.cols[0])))
 }
 
 /// Per-source `(qualifying, counted)` tallies for a terminal count-collapse
@@ -2004,27 +2073,71 @@ fn execute_collapsed_count(
     distinct.sort_unstable();
     distinct.dedup();
 
-    // When every terminal filter is a label test, the whole hop reduces to one
-    // counting pass over the sources' adjacency: no triple per traversed edge,
-    // no distinct-neighbor sort over them, and no hash lookup per edge to
-    // qualify and tally it. Anything else (a property comparison on the
-    // terminal) falls back to expanding and qualifying the neighbor set.
-    let tallies = match terminal_label_filters(p.stages.last(), terminal) {
-        Some(labels) => {
-            let label_refs: Vec<&str> = labels;
+    // The whole hop reduces to one counting pass over the sources' adjacency (no
+    // triple per traversed edge, no distinct-neighbor sort over them, and no hash
+    // lookup per edge to qualify and tally it) when the terminal's filters can be
+    // expressed to the kernel: as labels, or as an allow-set this executor
+    // resolves for the predicates the kernel cannot evaluate itself. Failing
+    // either, the hop falls back to expanding and qualifying the neighbor set.
+    let nonnull = match tc {
+        TerminalCount::All => None,
+        TerminalCount::NonNull(prop) => Some(prop),
+    };
+    let stages = p.stages.last();
+    let kernel_tallies = match split_terminal_filters(stages, terminal) {
+        Some((labels, others)) if others.is_empty() => {
             let spec = issundb_core::NeighborCountSpec {
                 rel_type: last.rel_type,
                 incoming: last.is_incoming,
-                neighbor_labels: &label_refs,
-                neighbor_nonnull_prop: match tc {
-                    TerminalCount::All => None,
-                    TerminalCount::NonNull(prop) => Some(prop),
-                },
+                neighbor_labels: &labels,
+                neighbor_allow: None,
+                neighbor_nonnull_prop: nonnull,
             };
-            graph
-                .typed_neighbor_counts(&distinct, &spec)
-                .map_err(|e| e.to_string())?
+            Some(
+                graph
+                    .typed_neighbor_counts(&distinct, &spec)
+                    .map_err(|e| e.to_string())?,
+            )
         }
+        // Predicates beyond labels: resolve the qualifying neighbors up front by
+        // running every terminal stage over the label's whole node set, then hand
+        // the kernel that allow-set. Speculative, so a stage that errors over a
+        // node the real neighbor set never contains declines instead of raising;
+        // the fallback then evaluates the true set and raises only if it should.
+        Some((labels, rest)) if !rest.is_empty() => {
+            match resolve_terminal_allow(
+                graph,
+                &rest,
+                terminal,
+                &labels,
+                &distinct,
+                last.is_incoming,
+                params,
+                schema,
+            ) {
+                Ok(Some(allow)) => {
+                    let spec = issundb_core::NeighborCountSpec {
+                        rel_type: last.rel_type,
+                        incoming: last.is_incoming,
+                        // The allow-set was enumerated from the first label, so
+                        // only any further label still needs masking.
+                        neighbor_labels: labels.get(1..).unwrap_or(&[]),
+                        neighbor_allow: Some(&allow),
+                        neighbor_nonnull_prop: nonnull,
+                    };
+                    Some(
+                        graph
+                            .typed_neighbor_counts(&distinct, &spec)
+                            .map_err(|e| e.to_string())?,
+                    )
+                }
+                Ok(None) | Err(_) => None,
+            }
+        }
+        _ => None,
+    };
+    let tallies = match kernel_tallies {
+        Some(t) => t,
         None => expanded_neighbor_tallies(graph, p, tc, last, &distinct, terminal, params, schema)?,
     };
     // Per-source tallies are positional over `distinct`, which is sorted, so a
@@ -3096,6 +3209,132 @@ mod tests {
             "reversed top_followed_city must collapse the terminal count: {plan:?}"
         );
         assert_matches_row_path(&g, q);
+    }
+
+    /// The terminal filter split must find a label wherever it sits in the region.
+    /// `recognize` reverses each region into the order the row pipeline applies it,
+    /// so a pattern node's label test lands *after* the predicates written beside
+    /// it; a split that only accepted a leading run of labels found none and gave
+    /// up the allow-set route on exactly the shape it was built for.
+    #[test]
+    fn terminal_filter_split_finds_labels_in_any_position() {
+        let thirty = Expr::Literal(crate::ast::Literal::Int(30));
+        let cmp = || VecStage::Cmp {
+            structured: true,
+            op: CmpOp::Ge,
+            lhs: VecOperand::Col {
+                var: "p",
+                prop: "age",
+            },
+            rhs: VecOperand::Const(&thirty),
+        };
+        let label = || VecStage::HasLabel {
+            var: "p",
+            label: "Person",
+        };
+        // The real region order for `(p:Person)` with `WHERE p.age >= 30`.
+        let reversed = vec![cmp(), label()];
+        let (labels, others) = split_terminal_filters(Some(&reversed), "p").unwrap();
+        assert_eq!(labels, vec!["Person"]);
+        assert_eq!(others.len(), 1);
+
+        // Label first, and labels only, must behave the same way.
+        let leading = vec![label(), cmp()];
+        let (labels, others) = split_terminal_filters(Some(&leading), "p").unwrap();
+        assert_eq!(labels, vec!["Person"]);
+        assert_eq!(others.len(), 1);
+        let labels_only = vec![label(), label()];
+        let (labels, others) = split_terminal_filters(Some(&labels_only), "p").unwrap();
+        assert_eq!(labels, vec!["Person", "Person"]);
+        assert!(others.is_empty());
+
+        // A stage reading another variable declines, and an absent region
+        // constrains nothing.
+        let foreign = vec![VecStage::HasLabel {
+            var: "other",
+            label: "Person",
+        }];
+        assert!(split_terminal_filters(Some(&foreign), "p").is_none());
+        let (labels, others) = split_terminal_filters(None, "p").unwrap();
+        assert!(labels.is_empty() && others.is_empty());
+    }
+
+    /// A terminal property predicate is resolved into an allow-set the counting
+    /// kernel takes, instead of expanding and qualifying every neighbor. Both the
+    /// route that fires (many edges relative to the label) and the route that
+    /// declines (a selective hop over a large label) must match the row pipeline.
+    ///
+    /// The candidate set the allow-set is resolved over is a superset of the real
+    /// neighbors, so it includes nodes no edge reaches: here one carries a string
+    /// `age` and one carries none, which is where a superset evaluation could
+    /// diverge from, or raise against, the true neighbor set.
+    #[test]
+    fn terminal_predicate_resolves_to_an_allow_set() {
+        // `edges_per_person` drives the adjacency span, which decides the route.
+        let build = |people: usize, edges_per_person: usize| {
+            let dir = TempDir::new().unwrap();
+            let g = Graph::open(dir.path(), 1).unwrap();
+            let hub = g.add_node("H", &json!({"n": "hub"})).unwrap();
+            let ids: Vec<_> = (0..people)
+                .map(|i| {
+                    // Every third person has no age; one has a string age. Neither
+                    // is reachable for the low-edge graph, so the candidate set
+                    // sees values the real neighbor set does not.
+                    let props = if i == 1 {
+                        json!({"id": i as i64, "age": "old"})
+                    } else if i % 3 == 0 {
+                        json!({"id": i as i64})
+                    } else {
+                        json!({"id": i as i64, "age": (20 + i) as i64})
+                    };
+                    g.add_node("P", &props).unwrap()
+                })
+                .collect();
+            for (i, &p) in ids.iter().enumerate() {
+                if i < edges_per_person {
+                    g.add_edge(hub, p, "F", &json!({})).unwrap();
+                }
+                // Fan every person into the hub as well, so the reverse direction
+                // has a span too.
+                if i < edges_per_person {
+                    g.add_edge(p, hub, "F", &json!({})).unwrap();
+                }
+            }
+            g.rebuild_csr().unwrap();
+            (dir, g)
+        };
+
+        for (people, edges, note) in [
+            // Span (~2 * people) comfortably exceeds the label, so the allow-set
+            // route fires.
+            (12usize, 12usize, "allow-set route"),
+            // One edge over a large label: the gate declines and the expansion
+            // fallback runs.
+            (60, 1, "expansion fallback"),
+        ] {
+            let (_dir, g) = build(people, edges);
+            for cypher in [
+                "MATCH (h:H)-[:F]->(p:P) WHERE p.age >= 25 RETURN h.n AS n, count(p.id) AS num",
+                "MATCH (h:H)-[:F]->(p:P) WHERE p.age >= 25 AND p.age <= 28 \
+                 RETURN h.n AS n, count(*) AS num",
+                // The predicate keeps nothing, so the group must vanish entirely.
+                "MATCH (h:H)-[:F]->(p:P) WHERE p.age > 10000 RETURN h.n AS n, count(p.id) AS num",
+                // A comparison every candidate could pass, so the nodes that drop
+                // out are exactly the ones whose `age` is null or a string and so
+                // compares to neither true nor false.
+                "MATCH (h:H)-[:F]->(p:P) WHERE p.age <= 100000 \
+                 RETURN h.n AS n, count(p.id) AS num",
+                // Reverse direction, so the span is measured incoming.
+                "MATCH (p:P)-[:F]->(h:H) WHERE p.age >= 25 RETURN h.n AS n, count(p.id) AS num",
+            ] {
+                let plan = optimized_plan(&g, cypher);
+                assert!(
+                    matches!(recognize(&plan), Some(ref pipe) if pipe.collapse.is_some()),
+                    "collapse must fire for {note}: {cypher}\n{plan:?}"
+                );
+                assert_matches_row_path(&g, cypher);
+            }
+        }
     }
 
     /// A three-hop fixture mirroring the benchmark's geographic chain:

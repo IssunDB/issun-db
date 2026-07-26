@@ -120,10 +120,13 @@ modules according to this map.
       Stage*){0,MAX_VEC_HOPS} Leaf` with single-property expressions, executing column-at-a-time (bulk expansion via `Graph::node_props_json_table`
       and group-by-code aggregation via `Graph::node_prop_group_codes`). A multi-hop chain is recognized only when every hop carries a distinct
       relationship type, so relationship uniqueness is vacuous; a repeated type or a chain longer than `MAX_VEC_HOPS` falls back. A non-distinct
-      `count` over the terminal variable that feeds no group key collapses the final hop (`execute_collapsed_count`). When that hop's terminal filters
-      are all label tests, the collapse counts each source's qualifying neighbors through `Graph::typed_neighbor_counts`, so the final hop costs no
-      triple per traversed edge and no hash lookup per edge; a terminal property comparison falls back to expanding and qualifying the distinct
-      neighbor set. The recognizer sees through a `Distinct` because the caller deduplicates. Any unrecognized shape falls back to the row pipeline, so
+      `count` over the terminal variable that feeds no group key collapses the final hop (`execute_collapsed_count`). The collapse counts each source's
+      qualifying neighbors through `Graph::typed_neighbor_counts`, so the final hop costs no triple per traversed edge and no hash lookup per edge: a
+      terminal filter that is a label test goes straight into the spec, and a terminal property comparison is resolved into a `neighbor_allow` set by
+      running those exact stages over the label's whole node set (`resolve_terminal_allow`). That resolution is gated on the sources' `adjacency_span`
+      reaching half the label count, so a selective hop over a large label keeps the expansion fallback instead of paying for a full label pass, and it
+      is speculative: it evaluates predicates over a superset of the real neighbors, so a stage that errors there declines to the fallback rather than
+      raising. The recognizer sees through a `Distinct` because the caller deduplicates. Any unrecognized shape falls back to the row pipeline, so
       correctness never depends on the recognizer.
     - `src/exec/factorize.rs`: `FactorizedRecordGroup` (shared `Arc<PathMap>` prefix plus per-row extensions) and `filter_refs_in_expr`.
     - `src/exec/expr.rs`: expression evaluation (`evaluate_expr`, `eval_binary_op`, `eval_arithmetic`, `eval_function_call`).
@@ -296,9 +299,14 @@ pinning:
   physical operator.
 - `typed_neighbor_counts(sources, spec: &NeighborCountSpec) -> Result<Vec<(u64, u64)>, Error>`: per-source `(qualifying, counted)` neighbor counts
   across one typed hop, in input order. It reads only the sources' own CSR rows, so it costs the sum of their degrees rather than a full scan, and it
-  tallies into integers instead of materializing one entry per traversed edge. The two totals differ only for `neighbor_nonnull_prop`, where a
-  neighbor can qualify (so the source produces rows) without adding to the count. This is the kernel behind the Cypher executor's terminal
-  count-collapse; a source absent from the snapshot counts zero rather than erroring.
+  tallies into integers instead of materializing one entry per traversed edge. A neighbor qualifies when it carries every label in `neighbor_labels`
+  and belongs to `neighbor_allow` when that is present; the two totals differ only for `neighbor_nonnull_prop`, where a neighbor can qualify (so the
+  source produces rows) without adding to the count. `neighbor_allow` is the counterpart of `PathCountSpec::vertex_allow`: the caller resolves a
+  per-neighbor property predicate itself and hands the kernel the surviving ids, so a filtered count stays a kernel call. This is the kernel behind the
+  Cypher executor's terminal count-collapse; a source absent from the snapshot counts zero rather than erroring.
+- `adjacency_span(sources, incoming) -> Result<u64, Error>`: total length of `sources`' adjacency rows in one direction, an upper bound on the edges
+  `typed_neighbor_counts` would visit for them. It reads two array elements per source and no edge, so a caller can size an expansion before choosing
+  how to evaluate it.
 
 ### `issundb_vector`
 

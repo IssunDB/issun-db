@@ -451,6 +451,31 @@ impl Graph {
         Ok(out)
     }
 
+    /// Total length of `sources`' adjacency rows in the given direction: an upper
+    /// bound on the edges [`Graph::typed_neighbor_counts`] would visit for them,
+    /// before any type or label narrowing.
+    ///
+    /// This reads two array elements per source and no edge at all, so a caller
+    /// can size an expansion before choosing how to evaluate it. A source absent
+    /// from the snapshot contributes zero.
+    pub fn adjacency_span(&self, sources: &[NodeId], incoming: bool) -> Result<u64, Error> {
+        self.ensure_snapshot_fresh()?;
+        let snap = self.csr_cache.snapshot.load();
+        let row_ptr = if incoming {
+            &snap.in_row_ptr
+        } else {
+            &snap.row_ptr
+        };
+        let mut span = 0u64;
+        for src in sources {
+            if let Some(&d) = snap.id_to_dense.get(src) {
+                let d = d as usize;
+                span = span.saturating_add((row_ptr[d + 1] - row_ptr[d]) as u64);
+            }
+        }
+        Ok(span)
+    }
+
     /// Counts each source's qualifying neighbors across one typed hop, returning
     /// `(qualifying, counted)` per entry of `sources` in input order. See
     /// [`NeighborCountSpec`] for what qualifies; the two totals differ only for
@@ -494,9 +519,18 @@ impl Graph {
             None => None,
         };
 
-        // Dense conjunction of the neighbor labels; an unknown label yields an
-        // all-false mask, which counts zero without a special case.
+        // Dense conjunction of the neighbor labels and the explicit allow-set; an
+        // unknown label or an empty allow-set yields an all-false mask, which
+        // counts zero without a special case.
         let mut label_mask: Option<Vec<bool>> = None;
+        let intersect = |acc: &mut Option<Vec<bool>>, mask: Vec<bool>| match acc {
+            None => *acc = Some(mask),
+            Some(prev) => {
+                for (slot, keep) in prev.iter_mut().zip(mask) {
+                    *slot = *slot && keep;
+                }
+            }
+        };
         for name in spec.neighbor_labels {
             let mut mask = vec![false; n];
             for id in self.nodes_by_label(name)? {
@@ -504,16 +538,16 @@ impl Graph {
                     mask[d as usize] = true;
                 }
             }
-            label_mask = Some(match label_mask {
-                None => mask,
-                Some(prev) => {
-                    let mut both = mask;
-                    for (slot, &keep) in both.iter_mut().zip(prev.iter()) {
-                        *slot = *slot && keep;
-                    }
-                    both
+            intersect(&mut label_mask, mask);
+        }
+        if let Some(allow) = spec.neighbor_allow {
+            let mut mask = vec![false; n];
+            for id in allow {
+                if let Some(&d) = snap.id_to_dense.get(id) {
+                    mask[d as usize] = true;
                 }
-            });
+            }
+            intersect(&mut label_mask, mask);
         }
 
         // Non-null mask for the neighbor's property, resolved through the
@@ -2468,8 +2502,111 @@ mod typed_neighbor_count_tests {
             rel_type,
             incoming,
             neighbor_labels: labels,
+            neighbor_allow: None,
             neighbor_nonnull_prop: nonnull,
         }
+    }
+
+    /// An allow-set narrows the count on top of the labels, an empty one admits
+    /// nothing, and a member absent from the graph is simply never reached.
+    #[test]
+    fn allow_set_intersects_with_the_labels() {
+        let (_dir, g, ids) = fixture();
+        let (a, b, c, d) = (ids[0], ids[1], ids[2], ids[3]);
+
+        // a's five FOLLOWS neighbors are b, b, c, a, d. Allowing only b and c
+        // keeps the two b edges and the one c edge.
+        let allow = [b, c];
+        let narrowed = NeighborCountSpec {
+            rel_type: Some("FOLLOWS"),
+            incoming: false,
+            neighbor_labels: &[],
+            neighbor_allow: Some(&allow),
+            neighbor_nonnull_prop: None,
+        };
+        assert_eq!(
+            g.typed_neighbor_counts(&[a], &narrowed).unwrap(),
+            vec![(3, 3)]
+        );
+
+        // Intersected with the Person label, d drops out anyway; allowing only d
+        // then leaves nothing.
+        let allow_d = [d];
+        let with_label = NeighborCountSpec {
+            rel_type: Some("FOLLOWS"),
+            incoming: false,
+            neighbor_labels: &["Person"],
+            neighbor_allow: Some(&allow_d),
+            neighbor_nonnull_prop: None,
+        };
+        assert_eq!(
+            g.typed_neighbor_counts(&[a], &with_label).unwrap(),
+            vec![(0, 0)]
+        );
+
+        // An empty allow-set admits no neighbor; an unknown id is inert.
+        let empty = NeighborCountSpec {
+            rel_type: Some("FOLLOWS"),
+            incoming: false,
+            neighbor_labels: &[],
+            neighbor_allow: Some(&[]),
+            neighbor_nonnull_prop: None,
+        };
+        assert_eq!(g.typed_neighbor_counts(&[a], &empty).unwrap(), vec![(0, 0)]);
+        let unknown = [b, d + 9999];
+        let with_unknown = NeighborCountSpec {
+            rel_type: Some("FOLLOWS"),
+            incoming: false,
+            neighbor_labels: &[],
+            neighbor_allow: Some(&unknown),
+            neighbor_nonnull_prop: None,
+        };
+        assert_eq!(
+            g.typed_neighbor_counts(&[a], &with_unknown).unwrap(),
+            vec![(2, 2)]
+        );
+
+        // The non-null filter still narrows only the counted total: c has no tag.
+        let allow_bc = [b, c];
+        let tagged = NeighborCountSpec {
+            rel_type: Some("FOLLOWS"),
+            incoming: false,
+            neighbor_labels: &[],
+            neighbor_allow: Some(&allow_bc),
+            neighbor_nonnull_prop: Some("tag"),
+        };
+        assert_eq!(
+            g.typed_neighbor_counts(&[a], &tagged).unwrap(),
+            vec![(3, 2)]
+        );
+    }
+
+    /// `adjacency_span` totals the sources' adjacency rows without narrowing by
+    /// type, so it bounds the edges a count would visit for them.
+    #[test]
+    fn adjacency_span_bounds_the_visited_edges() {
+        let (_dir, g, ids) = fixture();
+        let (a, b, d) = (ids[0], ids[1], ids[3]);
+
+        // a has 5 FOLLOWS plus 1 BLOCKS out; b has 1 out.
+        assert_eq!(g.adjacency_span(&[a], false).unwrap(), 6);
+        assert_eq!(g.adjacency_span(&[a, b], false).unwrap(), 7);
+        // Incoming: a from its self-loop; b from a twice by FOLLOWS and once by
+        // BLOCKS; d once.
+        assert_eq!(g.adjacency_span(&[a], true).unwrap(), 1);
+        assert_eq!(g.adjacency_span(&[b], true).unwrap(), 3);
+        assert_eq!(g.adjacency_span(&[d], true).unwrap(), 1);
+
+        // The span is at least the typed count it bounds.
+        let typed = g
+            .typed_neighbor_counts(&[a, b], &spec(Some("FOLLOWS"), false, &[], None))
+            .unwrap();
+        let counted: u64 = typed.iter().map(|(q, _)| q).sum();
+        assert!(counted <= g.adjacency_span(&[a, b], false).unwrap());
+
+        // Unknown sources and an empty list contribute nothing.
+        assert_eq!(g.adjacency_span(&[d + 9999], false).unwrap(), 0);
+        assert_eq!(g.adjacency_span(&[], false).unwrap(), 0);
     }
 
     /// Outgoing and incoming counts, with parallel edges counted per edge and a
@@ -2635,6 +2772,7 @@ mod typed_neighbor_count_tests {
                                 rel_type: Some("F"),
                                 incoming,
                                 neighbor_labels: labels,
+                                neighbor_allow: None,
                                 neighbor_nonnull_prop: nonnull,
                             };
                             let got = g.typed_neighbor_counts(&ids, &spec).unwrap();
