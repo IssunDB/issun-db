@@ -58,8 +58,9 @@ use crate::plan::{FilterExpr, PhysicalOperator};
 
 use super::expr::{cypher_eq, evaluate_expr, is_nan, json_cmp};
 use super::read::{
-    AggState, canonical_cell_key, eval_leaf, expand_multi_type, group_by_column_name,
-    json_cmp_total, project_rows, projected_key, rows_to_records, sort_all, unpack_sentinels,
+    AggState, canonical_cell_key, canonicalize_group_codes, count_window_survivors, eval_leaf,
+    expand_multi_type, group_by_column_name, json_cmp_total, project_rows, projected_key,
+    rows_to_records, sort_all, unpack_sentinels,
 };
 use super::row::{Bindings, SlotRow, SlotSchema};
 use super::{GraphBinding, Record};
@@ -1817,42 +1818,158 @@ pub(super) fn try_execute_vectorized(
 /// group exist with count zero, exactly as the row pipeline's value-keyed fold
 /// does. Parallel edges are counted per transition, so the cardinality matches a
 /// full materialization.
-#[allow(clippy::too_many_arguments)]
-/// Remap group codes so representatives equal under canonical numeric
-/// equivalence (`1` and `1.0`, `0.0` and `-0.0`) share one code, keeping the
-/// first-occurrence representative. The code-based grouping otherwise keys on
-/// exact value identity, which would split a group the row pipeline merges;
-/// remapping keeps the two paths consistent. The common case (no merge) returns
-/// the input columns unchanged.
-fn canonicalize_group_codes(
-    group_codes: Vec<(Vec<u32>, Vec<Value>)>,
-) -> Vec<(Vec<u32>, Vec<Value>)> {
-    group_codes
-        .into_iter()
-        .map(|(codes, reps)| {
-            let mut key_to_new: ahash::AHashMap<String, u32> =
-                ahash::AHashMap::with_capacity(reps.len());
-            let mut new_reps: Vec<Value> = Vec::with_capacity(reps.len());
-            let mut old_to_new: Vec<u32> = Vec::with_capacity(reps.len());
-            for rep in &reps {
-                let new = *key_to_new
-                    .entry(canonical_cell_key(rep))
-                    .or_insert_with(|| {
-                        new_reps.push(rep.clone());
-                        (new_reps.len() - 1) as u32
-                    });
-                old_to_new.push(new);
-            }
-            if new_reps.len() == reps.len() {
-                (codes, reps)
-            } else {
-                let new_codes = codes.into_iter().map(|c| old_to_new[c as usize]).collect();
-                (new_codes, new_reps)
-            }
+/// Whether the leading sort key is the aggregate's count output, and if so
+/// whether it sorts descending. `None` when there is no sort or its leading key
+/// is something else, which forfeits the count window (any other key can order
+/// a low-count group into the window).
+fn leading_count_sort(
+    sort_items: Option<&[SortItem]>,
+    project_items: &[(Expr, Option<String>)],
+    out_name: &str,
+) -> Option<bool> {
+    let leading = sort_items?.first()?;
+    let Expr::Prop(var, prop) = &leading.expr else {
+        return None;
+    };
+    if !prop.is_empty() {
+        return None;
+    }
+    // A pruned group is never projected, so a projection that can raise at
+    // runtime would stop raising for the rows the window drops. Restrict the
+    // window to projections of bare variable and property reads, which cannot.
+    if !project_items
+        .iter()
+        .all(|(expr, _)| matches!(expr, Expr::Prop(..)))
+    {
+        return None;
+    }
+    // The count reaches the sort either by its own output name or through a
+    // projected alias for it.
+    let named = var == out_name
+        || project_items.iter().any(|(expr, alias)| {
+            alias.as_deref() == Some(var.as_str())
+                && matches!(expr, Expr::Prop(v, p) if p.is_empty() && v == out_name)
+        });
+    named.then_some(!leading.ascending)
+}
+
+/// The labels a terminal count-collapse can push into the counting kernel: the
+/// final region's filters must all be label tests on the terminal variable.
+/// `None` means at least one filter is something else (a property comparison),
+/// so the caller expands and qualifies the neighbor set instead. An empty region
+/// yields an empty label list, which constrains nothing.
+fn terminal_label_filters<'a>(
+    level: Option<&'a Vec<VecStage<'a>>>,
+    terminal: &str,
+) -> Option<Vec<&'a str>> {
+    let Some(level) = level else {
+        return Some(Vec::new());
+    };
+    level
+        .iter()
+        .map(|stage| match stage {
+            VecStage::HasLabel { var, label } if *var == terminal => Some(*label),
+            _ => None,
         })
         .collect()
 }
 
+/// Per-source `(qualifying, counted)` tallies for a terminal count-collapse
+/// whose final region carries a filter the counting kernel cannot express. This
+/// expands the sources in bulk, qualifies the distinct neighbors by running
+/// those exact stages over a one-column frame (reusing the row pipeline's
+/// predicate semantics), and tallies each transition against its source.
+#[allow(clippy::too_many_arguments)]
+fn expanded_neighbor_tallies(
+    graph: &Graph,
+    p: &VecPipeline<'_>,
+    tc: TerminalCount<'_>,
+    last: &VecExpand<'_>,
+    distinct: &[NodeId],
+    terminal: &str,
+    params: &HashMap<String, Value>,
+    schema: &std::sync::Arc<SlotSchema>,
+) -> Result<Vec<(u64, u64)>, String> {
+    let transitions = expand_multi_type(graph, distinct, last.rel_type, last.is_incoming)?;
+
+    let mut distinct_neighbors: Vec<NodeId> = transitions.iter().map(|(_, _, d)| *d).collect();
+    distinct_neighbors.sort_unstable();
+    distinct_neighbors.dedup();
+    let candidates = distinct_neighbors.len();
+    let mut mini = IdCols {
+        cols: vec![distinct_neighbors],
+        edge_cols: Vec::new(),
+    };
+    let term_only_vars = [terminal];
+    if let Some(level) = p.stages.last() {
+        for stage in level {
+            apply_stage(graph, stage, params, schema, &term_only_vars, &mut mini)?;
+        }
+    }
+    // A stage only ever removes ids, so an unchanged length means every neighbor
+    // qualifies and the per-transition membership test can be skipped entirely.
+    let all_qualify = mini.cols[0].len() == candidates;
+    let qualifying: ahash::AHashSet<NodeId> = if all_qualify {
+        ahash::AHashSet::new()
+    } else {
+        mini.cols[0].iter().copied().collect()
+    };
+
+    // For `count(terminal.prop)`, the qualifying neighbors whose `prop` is
+    // non-null: only those add to the count. When every one of them is non-null
+    // the two tallies coincide and the second test drops out too.
+    let mut all_nonnull = true;
+    let counts_nonnull: Option<ahash::AHashSet<NodeId>> = match tc {
+        TerminalCount::All => None,
+        TerminalCount::NonNull(prop) => {
+            let ids: &[NodeId] = &mini.cols[0];
+            let vals = prop_column(graph, ids, prop)?;
+            all_nonnull = vals.iter().all(|v| !v.is_null());
+            if all_nonnull {
+                None
+            } else {
+                Some(
+                    ids.iter()
+                        .zip(vals)
+                        .filter(|(_, v)| !v.is_null())
+                        .map(|(id, _)| *id)
+                        .collect(),
+                )
+            }
+        }
+    };
+
+    // Tally against `distinct` positionally. Transitions arrive grouped by
+    // source, so tracking the previous source resolves all but one entry per run
+    // without a lookup.
+    let mut out = vec![(0u64, 0u64); distinct.len()];
+    let mut cur: Option<(NodeId, usize)> = None;
+    for (s, _e, d) in &transitions {
+        if !all_qualify && !qualifying.contains(d) {
+            continue;
+        }
+        let slot = match cur {
+            Some((prev, idx)) if prev == *s => idx,
+            _ => match distinct.binary_search(s) {
+                Ok(idx) => {
+                    cur = Some((*s, idx));
+                    idx
+                }
+                // A transition out of a source no pre-row asked for matches no
+                // pre-row, so it belongs to no group.
+                Err(_) => continue,
+            },
+        };
+        out[slot].0 += 1;
+        let adds = all_nonnull || counts_nonnull.as_ref().is_none_or(|set| set.contains(d));
+        if adds {
+            out[slot].1 += 1;
+        }
+    }
+    Ok(out)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn execute_collapsed_count(
     graph: &Graph,
     p: &VecPipeline<'_>,
@@ -1881,66 +1998,43 @@ fn execute_collapsed_count(
         .last()
         .ok_or("vectorized: collapse with no source column")?;
     let n = src_col.len();
+    let terminal = p.chain_vars[p.chain_vars.len() - 1];
 
-    // Bulk-expand the distinct sources once through the final hop.
     let mut distinct: Vec<NodeId> = src_col.clone();
     distinct.sort_unstable();
     distinct.dedup();
-    let transitions = expand_multi_type(graph, &distinct, last.rel_type, last.is_incoming)?;
 
-    // Qualify the distinct neighbors against the final region's terminal-only
-    // filters by running those exact stages over a one-column frame, reusing
-    // the row pipeline's predicate semantics.
-    let terminal = p.chain_vars[p.chain_vars.len() - 1];
-    let mut distinct_neighbors: Vec<NodeId> = transitions.iter().map(|(_, _, d)| *d).collect();
-    distinct_neighbors.sort_unstable();
-    distinct_neighbors.dedup();
-    let mut mini = IdCols {
-        cols: vec![distinct_neighbors],
-        edge_cols: Vec::new(),
-    };
-    let term_only_vars = [terminal];
-    if let Some(level) = p.stages.last() {
-        for stage in level {
-            apply_stage(graph, stage, params, schema, &term_only_vars, &mut mini)?;
+    // When every terminal filter is a label test, the whole hop reduces to one
+    // counting pass over the sources' adjacency: no triple per traversed edge,
+    // no distinct-neighbor sort over them, and no hash lookup per edge to
+    // qualify and tally it. Anything else (a property comparison on the
+    // terminal) falls back to expanding and qualifying the neighbor set.
+    let tallies = match terminal_label_filters(p.stages.last(), terminal) {
+        Some(labels) => {
+            let label_refs: Vec<&str> = labels;
+            let spec = issundb_core::NeighborCountSpec {
+                rel_type: last.rel_type,
+                incoming: last.is_incoming,
+                neighbor_labels: &label_refs,
+                neighbor_nonnull_prop: match tc {
+                    TerminalCount::All => None,
+                    TerminalCount::NonNull(prop) => Some(prop),
+                },
+            };
+            graph
+                .typed_neighbor_counts(&distinct, &spec)
+                .map_err(|e| e.to_string())?
         }
-    }
-    let qualifying: ahash::AHashSet<NodeId> = mini.cols[0].iter().copied().collect();
-
-    // For `count(terminal.prop)`, the qualifying neighbors whose `prop` is
-    // non-null: only those add to the count.
-    let counts_nonnull: Option<ahash::AHashSet<NodeId>> = match tc {
-        TerminalCount::All => None,
-        TerminalCount::NonNull(prop) => {
-            let ids: Vec<NodeId> = qualifying.iter().copied().collect();
-            let vals = prop_column(graph, &ids, prop)?;
-            Some(
-                ids.iter()
-                    .zip(vals)
-                    .filter(|(_, v)| !v.is_null())
-                    .map(|(id, _)| *id)
-                    .collect(),
-            )
+        None => expanded_neighbor_tallies(graph, p, tc, last, &distinct, terminal, params, schema)?,
+    };
+    // Per-source tallies are positional over `distinct`, which is sorted, so a
+    // pre-row resolves its source by binary search.
+    let tally_of = |src: NodeId| -> (u64, u64) {
+        match distinct.binary_search(&src) {
+            Ok(i) => tallies[i],
+            Err(_) => (0, 0),
         }
     };
-
-    // Per-source tallies: `exists` is the number of qualifying neighbors (a
-    // positive value means the source's pre-rows produce terminal rows, so
-    // their group exists); `counted` is the number that also pass the non-null
-    // filter (the count contribution). They differ only for
-    // `count(terminal.prop)`.
-    let mut exists: ahash::AHashMap<NodeId, u64> = ahash::AHashMap::new();
-    let mut counted: ahash::AHashMap<NodeId, u64> = ahash::AHashMap::new();
-    for (s, _e, d) in &transitions {
-        if !qualifying.contains(d) {
-            continue;
-        }
-        *exists.entry(*s).or_default() += 1;
-        let adds = counts_nonnull.as_ref().is_none_or(|set| set.contains(d));
-        if adds {
-            *counted.entry(*s).or_default() += 1;
-        }
-    }
 
     // Group the pre-rows by the group-by value codes (all group keys read
     // pre-row columns; the terminal is excluded by the collapse eligibility).
@@ -1980,13 +2074,16 @@ fn execute_collapsed_count(
         groups.push((Vec::new(), 0));
     }
     for i in 0..n {
-        let src = src_col[i];
-        if exists.get(&src).copied().unwrap_or(0) == 0 {
+        let (qualifying, counted) = tally_of(src_col[i]);
+        // No qualifying neighbor means no terminal row, hence no group; a group
+        // that exists but whose every neighbor has a null property still appears
+        // with count zero.
+        if qualifying == 0 {
             continue;
         }
         let add = match tc {
-            TerminalCount::All => exists.get(&src).copied().unwrap_or(0),
-            TerminalCount::NonNull(_) => counted.get(&src).copied().unwrap_or(0),
+            TerminalCount::All => qualifying,
+            TerminalCount::NonNull(_) => counted,
         };
         let slot = if group_by.is_empty() {
             0
@@ -2011,8 +2108,31 @@ fn execute_collapsed_count(
         .map(|(expr, alias)| group_by_column_name(expr, alias))
         .collect();
     let out_name = &aggregations[0].2;
-    let mut keyed_rows = Vec::with_capacity(groups.len());
-    for (codes, cnt) in groups {
+
+    // A grouped count over a whole label produces a group per node, so an
+    // `ORDER BY <count> LIMIT n` above would build a row per group to keep n of
+    // them. Drop the groups that cannot reach the n-th best count first; the
+    // sort and limit below then run over the survivors and pick what they would
+    // have picked over every group (see `CountWindow`).
+    let window = p
+        .limit
+        .and_then(|(skip, count)| {
+            let bound = skip.saturating_add(count);
+            leading_count_sort(sort_items.as_deref(), project_items, out_name)
+                .map(|descending| crate::plan::physical::CountWindow { bound, descending })
+        })
+        .and_then(|w| {
+            let counts: Vec<u64> = groups.iter().map(|(_, c)| *c).collect();
+            count_window_survivors(&counts, &w)
+        });
+    let emitted: Vec<usize> = match window {
+        Some(keep) => keep,
+        None => (0..groups.len()).collect(),
+    };
+
+    let mut keyed_rows = Vec::with_capacity(emitted.len());
+    for g in emitted {
+        let (codes, cnt) = &groups[g];
         let mut gb = SlotRow::empty(schema.clone());
         let mut key_parts = Vec::with_capacity(group_cols.len());
         for (k, col) in group_cols.iter().enumerate() {
@@ -2020,7 +2140,10 @@ fn execute_collapsed_count(
             key_parts.push(canonical_cell_key(rep));
             gb.bind_local(col, GraphBinding::Scalar(rep.clone()));
         }
-        gb.bind_local(out_name, GraphBinding::Scalar(serde_json::Value::from(cnt)));
+        gb.bind_local(
+            out_name,
+            GraphBinding::Scalar(serde_json::Value::from(*cnt)),
+        );
         keyed_rows.push((key_parts.join("\x00"), gb));
     }
     keyed_rows.sort_by(|a, b| a.0.cmp(&b.0));
@@ -3328,6 +3451,136 @@ mod tests {
                     matches!(recognize(&optimized_plan(&g, cypher)), Some(ref p) if p.collapse.is_some()),
                     "collapse must fire: {}", cypher
                 );
+                assert_matches_row_path(&g, cypher);
+            }
+        }
+
+        /// Differential check for the count-collapse shapes the label-only
+        /// counting kernel cannot serve, so the expand-and-qualify fallback runs:
+        /// a comparison predicate on the terminal, and an unlabeled terminal
+        /// (which the kernel does serve, with no label constraint). Both are
+        /// checked against the row pipeline.
+        #[test]
+        fn terminal_count_collapse_fallback_matches_row_path(
+            // Per person: `tag` presence, an age used by the terminal predicate,
+            // and outgoing F targets.
+            people in proptest::collection::vec(
+                (proptest::bool::ANY, 0i64..5, proptest::collection::vec(0usize..6, 0..4)),
+                1..7,
+            ),
+        ) {
+            let dir = TempDir::new().unwrap();
+            let g = Graph::open(dir.path(), 1).unwrap();
+            let ids: Vec<_> = people
+                .iter()
+                .enumerate()
+                .map(|(i, (has_tag, age, _))| {
+                    let props = if *has_tag {
+                        json!({"id": i as i64, "age": age, "tag": i as i64})
+                    } else {
+                        json!({"id": i as i64, "age": age})
+                    };
+                    g.add_node("P", &props).unwrap()
+                })
+                .collect();
+            for (i, (_, _, targets)) in people.iter().enumerate() {
+                for &t in targets {
+                    if t < ids.len() {
+                        g.add_edge(ids[i], ids[t], "F", &json!({})).unwrap();
+                    }
+                }
+            }
+            g.rebuild_csr().unwrap();
+            for cypher in [
+                // A terminal comparison forfeits the label-only kernel.
+                "MATCH (a:P)-[:F]->(b:P) WHERE b.age > 2 RETURN a.id AS id, count(*) AS num \
+                 ORDER BY num DESC, id",
+                "MATCH (a:P)-[:F]->(b:P) WHERE b.age > 2 RETURN a.id AS id, count(b.tag) AS num \
+                 ORDER BY num DESC, id",
+                // Two terminal filters, one of each kind.
+                "MATCH (a:P)-[:F]->(b:P) WHERE b.age >= 1 AND b.age <= 3 \
+                 RETURN a.id AS id, count(b.id) AS num ORDER BY num DESC, id",
+                // Unlabeled terminal: the kernel runs with no label constraint.
+                "MATCH (a:P)-[:F]->(b) RETURN a.id AS id, count(*) AS num ORDER BY num DESC, id",
+                "MATCH (a:P)-[:F]->(b) RETURN a.id AS id, count(b.tag) AS num \
+                 ORDER BY num DESC, id",
+            ] {
+                proptest::prop_assert!(
+                    matches!(recognize(&optimized_plan(&g, cypher)), Some(ref p) if p.collapse.is_some()),
+                    "collapse must fire: {}", cypher
+                );
+                assert_matches_row_path(&g, cypher);
+            }
+        }
+
+        /// Differential check for the reversed two-hop collapse: the optimizer
+        /// roots the chain at the rarer `C`, expands backwards to `P` and then to
+        /// the terminal follower, and collapses the terminal count. This is the
+        /// benchmark's `top_followed_city` shape, where the group keys straddle
+        /// two pre-row variables.
+        #[test]
+        fn reversed_two_hop_collapse_matches_row_path(
+            // Per person: `tag` presence, home city index, and F targets.
+            people in proptest::collection::vec(
+                (proptest::bool::ANY, 0usize..3, proptest::collection::vec(0usize..6, 0..4)),
+                1..7,
+            ),
+        ) {
+            let dir = TempDir::new().unwrap();
+            let g = Graph::open(dir.path(), 1).unwrap();
+            let cities: Vec<_> = ["london", "oslo"]
+                .iter()
+                .map(|nm| g.add_node("C", &json!({"name": nm})).unwrap())
+                .collect();
+            let ids: Vec<_> = people
+                .iter()
+                .enumerate()
+                .map(|(i, (has_tag, _, _))| {
+                    let props = if *has_tag {
+                        json!({"id": i as i64, "tag": i as i64})
+                    } else {
+                        json!({"id": i as i64})
+                    };
+                    g.add_node("P", &props).unwrap()
+                })
+                .collect();
+            for (i, (_, city, targets)) in people.iter().enumerate() {
+                // A person with city index 2 lives nowhere, so some rows drop.
+                if *city < cities.len() {
+                    g.add_edge(ids[i], cities[*city], "L", &json!({})).unwrap();
+                }
+                for &t in targets {
+                    if t < ids.len() {
+                        g.add_edge(ids[i], ids[t], "F", &json!({})).unwrap();
+                    }
+                }
+            }
+            g.rebuild_csr().unwrap();
+            for cypher in [
+                "MATCH (f:P)-[:F]->(p:P)-[:L]->(c:C) \
+                 RETURN p.id AS id, count(f.id) AS num, c.name AS city ORDER BY num DESC, id",
+                "MATCH (f:P)-[:F]->(p:P)-[:L]->(c:C) \
+                 RETURN p.id AS id, count(*) AS num, c.name AS city ORDER BY num DESC, id",
+                "MATCH (f:P)-[:F]->(p:P)-[:L]->(c:C) \
+                 RETURN p.id AS id, count(f.tag) AS num, c.name AS city ORDER BY num DESC, id",
+                // Group on the far end only, so many pre-rows share a group.
+                "MATCH (f:P)-[:F]->(p:P)-[:L]->(c:C) \
+                 RETURN c.name AS city, count(f.id) AS num ORDER BY num DESC, city",
+                // With a limit the count window prunes groups before they become
+                // rows; the small degree range makes boundary ties common.
+                "MATCH (f:P)-[:F]->(p:P)-[:L]->(c:C) \
+                 RETURN p.id AS id, count(f.id) AS num, c.name AS city \
+                 ORDER BY num DESC, id LIMIT 1",
+                "MATCH (f:P)-[:F]->(p:P)-[:L]->(c:C) \
+                 RETURN p.id AS id, count(*) AS num, c.name AS city ORDER BY num DESC LIMIT 2",
+                "MATCH (f:P)-[:F]->(p:P)-[:L]->(c:C) \
+                 RETURN p.id AS id, count(f.id) AS num ORDER BY num ASC LIMIT 2",
+                "MATCH (f:P)-[:F]->(p:P)-[:L]->(c:C) \
+                 RETURN p.id AS id, count(f.id) AS num ORDER BY num DESC SKIP 1 LIMIT 2",
+                // A group key leads the sort, so the window must not fire.
+                "MATCH (f:P)-[:F]->(p:P)-[:L]->(c:C) \
+                 RETURN p.id AS id, count(f.id) AS num ORDER BY id ASC LIMIT 2",
+            ] {
                 assert_matches_row_path(&g, cypher);
             }
         }

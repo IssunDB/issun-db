@@ -9,7 +9,8 @@ pub(crate) mod storage;
 
 pub use error::Error;
 pub use graph::{
-    DegreeDirection, Graph, GroupedDegreeSpec, PathCountSpec, ReadTxn, TriangleCountSpec, WriteTxn,
+    DegreeDirection, Graph, GroupedDegreeSpec, NeighborCountSpec, PathCountSpec, ReadTxn,
+    TriangleCountSpec, WriteTxn,
 };
 pub use schema::{
     DirectedNeighborEntry, EdgeId, EdgeRecord, LabelId, Language, NeighborEntry, NodeId,

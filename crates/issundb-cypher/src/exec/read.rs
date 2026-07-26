@@ -1037,6 +1037,136 @@ pub(super) fn canonical_cell_key(v: &serde_json::Value) -> String {
     format!("J{v}")
 }
 
+/// Merge dense group codes whose representatives are canonically equal, so
+/// grouping by code matches the row pipeline's value equivalence (`1` groups
+/// with `1.0`, `0.0` with `-0.0`), keeping the first-occurrence representative.
+/// `Graph::node_prop_group_codes` keys on exact value identity, which is finer,
+/// so composing it with this yields exactly [`canonical_cell_key`] equality
+/// without a key string per row. The common case (no merge) returns the input
+/// columns unchanged.
+pub(super) fn canonicalize_group_codes(
+    group_codes: Vec<(Vec<u32>, Vec<serde_json::Value>)>,
+) -> Vec<(Vec<u32>, Vec<serde_json::Value>)> {
+    group_codes
+        .into_iter()
+        .map(|(codes, reps)| {
+            // Two reps can only share a canonical key if both are numbers: every
+            // other kind stringifies injectively, and a number's `N`/`F` key never
+            // collides with a `J` key. Distinct `i64` reps also key distinctly, so
+            // an integer or string column (the high-cardinality cases, where the
+            // key strings would cost as much as the grouping they serve) needs no
+            // merge pass at all. Only float and mixed-kind columns can collide, on
+            // `1` against `1.0` and `0.0` against `-0.0`.
+            let mut numbers = reps.iter().filter(|r| r.is_number());
+            let mergeable = numbers.clone().nth(1).is_some()
+                && !numbers
+                    .all(|r| matches!(r, serde_json::Value::Number(n) if n.as_i64().is_some()));
+            if !mergeable {
+                return (codes, reps);
+            }
+            let mut key_to_new: ahash::AHashMap<String, u32> =
+                ahash::AHashMap::with_capacity(reps.len());
+            let mut new_reps: Vec<serde_json::Value> = Vec::with_capacity(reps.len());
+            let mut old_to_new: Vec<u32> = Vec::with_capacity(reps.len());
+            for rep in &reps {
+                let new = *key_to_new
+                    .entry(canonical_cell_key(rep))
+                    .or_insert_with(|| {
+                        new_reps.push(rep.clone());
+                        (new_reps.len() - 1) as u32
+                    });
+                old_to_new.push(new);
+            }
+            if new_reps.len() == reps.len() {
+                (codes, reps)
+            } else {
+                let new_codes = codes.into_iter().map(|c| old_to_new[c as usize]).collect();
+                (new_codes, new_reps)
+            }
+        })
+        .collect()
+}
+
+/// The group indices that can survive a [`crate::plan::physical::CountWindow`],
+/// in ascending group
+/// order, or `None` when the window cannot drop anything (so the caller emits
+/// every group without paying for a selection).
+///
+/// The `bound`-th best count is the cutoff: a group whose count is worse cannot
+/// precede the `bound`-th row of the enclosing sort however the remaining sort
+/// keys order things. Every group tied with the cutoff is kept, so the enclosing
+/// sort still chooses among the ties exactly as it would have over the full group
+/// set.
+pub(super) fn count_window_survivors(
+    counts: &[u64],
+    w: &crate::plan::physical::CountWindow,
+) -> Option<Vec<usize>> {
+    if w.bound == 0 || w.bound >= counts.len() {
+        return None;
+    }
+    let mut order: Vec<usize> = (0..counts.len()).collect();
+    let cmp = |a: &usize, b: &usize| {
+        if w.descending {
+            counts[*b].cmp(&counts[*a])
+        } else {
+            counts[*a].cmp(&counts[*b])
+        }
+    };
+    order.select_nth_unstable_by(w.bound - 1, cmp);
+    let cutoff = counts[order[w.bound - 1]];
+    let keep: Vec<usize> = (0..counts.len())
+        .filter(|&g| {
+            if w.descending {
+                counts[g] >= cutoff
+            } else {
+                counts[g] <= cutoff
+            }
+        })
+        .collect();
+    // A cutoff every group ties with saves nothing; skip the extra bookkeeping.
+    if keep.len() == counts.len() {
+        None
+    } else {
+        Some(keep)
+    }
+}
+
+/// Fold per-key dense group codes into one dense code per row.
+///
+/// Returns the combined code of each of the `n` rows, one representative row
+/// index per combined code, and the number of combined codes. Each pass folds
+/// one more key column into the running code and re-densifies, so a code never
+/// exceeds the row count and the fold cannot overflow however many keys there
+/// are; packing the columns into one integer by strides would overflow once the
+/// product of the per-column cardinalities passed `u64`.
+pub(super) fn combine_group_codes(
+    key_cols: &[(Vec<u32>, Vec<serde_json::Value>)],
+    n: usize,
+) -> (Vec<u32>, Vec<usize>, usize) {
+    // No keys at all: every row folds into one group (the grouping-free shape).
+    let mut codes = vec![0u32; n];
+    let mut first_row: Vec<usize> = if n == 0 { Vec::new() } else { vec![0] };
+    for (col, _reps) in key_cols {
+        let mut seen: ahash::AHashMap<u64, u32> = ahash::AHashMap::with_capacity(first_row.len());
+        let mut next_codes = Vec::with_capacity(n);
+        let mut next_first: Vec<usize> = Vec::new();
+        for (i, &running) in codes.iter().enumerate() {
+            // Concatenating two `u32` into a `u64` is injective, so the pair
+            // identifies the refined group exactly before re-densifying.
+            let key = ((running as u64) << 32) | col[i] as u64;
+            let code = *seen.entry(key).or_insert_with(|| {
+                next_first.push(i);
+                (next_first.len() - 1) as u32
+            });
+            next_codes.push(code);
+        }
+        codes = next_codes;
+        first_row = next_first;
+    }
+    let count = first_row.len();
+    (codes, first_row, count)
+}
+
 /// Canonical DISTINCT key for a whole row, cell by cell (see
 /// [`canonical_cell_key`]). Used wherever a full projected row is deduplicated so
 /// numeric equivalence matches the grouping path.
@@ -4672,6 +4802,7 @@ pub(super) fn eval_leaf(
             group_var: _,
             group_by,
             output,
+            count_window,
         } => {
             // One kernel pass over adjacency yields the per-group-node counts;
             // it groups by node identity, so re-group by the group-by value
@@ -4688,10 +4819,8 @@ pub(super) fn eval_leaf(
             let pairs = graph
                 .grouped_edge_counts(&spec)
                 .map_err(|e| e.to_string())?;
-            // Bulk-gather the group-by properties for the group nodes in one
-            // columns pass (the recognizer guarantees each key is a
-            // single-property read on `group_var`), rather than re-reading each
-            // node per key. `col_names[j]`/`props[j]` align with `group_by[j]`.
+            // The recognizer guarantees each key is a single-property read on
+            // `group_var`. `col_names[j]`/`props[j]` align with `group_by[j]`.
             let ids: Vec<NodeId> = pairs.iter().map(|(n, _)| *n).collect();
             let mut props: Vec<&str> = Vec::with_capacity(group_by.len());
             let mut col_names: Vec<String> = Vec::with_capacity(group_by.len());
@@ -4703,39 +4832,62 @@ pub(super) fn eval_leaf(
                 }
                 col_names.push(group_by_column_name(expr, alias));
             }
-            let table = graph
-                .node_props_json_table(&ids, &props)
-                .map_err(|e| e.to_string())?;
 
             // Re-group by the group-by value tuple, summing counts, so nodes
             // that share a key merge exactly as the value-keyed row pipeline
-            // aggregate would (the kernel groups by node identity).
-            let mut groups: ahash::AHashMap<String, (SlotRow, u64)> =
-                ahash::AHashMap::with_capacity(pairs.len());
+            // aggregate would (the kernel groups by node identity). The kernel
+            // emits one entry per group *node*, which on a per-node key like an
+            // id is the whole node set, so this step is sized by the graph and
+            // not by the answer: it folds through dense integer codes (one
+            // per-key column gather plus one integer pass) rather than building
+            // a key string and a row per group node.
+            let key_cols: Vec<(Vec<u32>, Vec<serde_json::Value>)> = props
+                .iter()
+                .map(|prop| graph.node_prop_group_codes(&ids, prop))
+                .collect::<Result<_, _>>()
+                .map_err(|e: issundb_core::Error| e.to_string())?;
+            let key_cols = canonicalize_group_codes(key_cols);
+            let (codes, first_row, group_count) = combine_group_codes(&key_cols, ids.len());
+            let mut counts = vec![0u64; group_count];
             for (i, (_node, cnt)) in pairs.iter().enumerate() {
-                let row = &table[i];
+                counts[codes[i] as usize] += *cnt;
+            }
+
+            // With a top-N window pushed down from the `ORDER BY <count> LIMIT n`
+            // above, only the groups reaching the n-th best count can survive it,
+            // so the rest need no row at all. See `CountWindow` for why keeping
+            // the boundary ties makes this exact.
+            let surviving = count_window
+                .as_ref()
+                .and_then(|w| count_window_survivors(&counts, w));
+
+            // One row per distinct key tuple, ordered by the same canonical key
+            // the row pipeline's `BTreeMap` fold orders its groups by, so both
+            // paths agree without an `ORDER BY`. Only the distinct groups spend
+            // a key string here.
+            let emitted: Box<dyn Iterator<Item = usize>> = match &surviving {
+                Some(keep) => Box::new(keep.iter().copied()),
+                None => Box::new(0..group_count),
+            };
+            let mut keyed: Vec<(String, SlotRow)> =
+                Vec::with_capacity(surviving.as_ref().map_or(group_count, |k| k.len()));
+            for g in emitted {
+                let row = first_row[g];
+                let mut gb = SlotRow::empty(schema.clone());
                 let mut key_parts = Vec::with_capacity(col_names.len());
-                for val in row {
-                    key_parts.push(canonical_cell_key(val));
+                for (k, col) in col_names.iter().enumerate() {
+                    let rep = &key_cols[k].1[key_cols[k].0[row] as usize];
+                    key_parts.push(canonical_cell_key(rep));
+                    gb.bind_local(col, GraphBinding::Scalar(rep.clone()));
                 }
-                let key = key_parts.join("\x00");
-                match groups.get_mut(&key) {
-                    Some((_, c)) => *c += *cnt,
-                    None => {
-                        let mut gb = SlotRow::empty(schema.clone());
-                        for (col, val) in col_names.iter().zip(row) {
-                            gb.bind_local(col, GraphBinding::Scalar(val.clone()));
-                        }
-                        groups.insert(key, (gb, *cnt));
-                    }
-                }
+                gb.bind_local(
+                    output,
+                    GraphBinding::Scalar(serde_json::Value::from(counts[g])),
+                );
+                keyed.push((key_parts.join("\x00"), gb));
             }
-            let mut out = Vec::with_capacity(groups.len());
-            for (_key, (mut gb, cnt)) in groups {
-                gb.bind_local(output, GraphBinding::Scalar(serde_json::Value::from(cnt)));
-                out.push(gb);
-            }
-            Ok(out)
+            keyed.sort_by(|a, b| a.0.cmp(&b.0));
+            Ok(keyed.into_iter().map(|(_, gb)| gb).collect())
         }
         PhysicalOperator::VectorTopK {
             variable,
@@ -6124,16 +6276,21 @@ mod grouped_degree_exec_tests {
         format_physical_plan(&Optimizer::optimize(physical, Some(graph)), 0)
     }
 
-    /// Execute `cypher` and return its records sorted by their serialized form,
-    /// so the comparison is order-insensitive (a grouped aggregate without
-    /// `ORDER BY` yields groups in hash order on both paths).
-    fn sorted_records(graph: &Graph, cypher: &str) -> Vec<Vec<serde_json::Value>> {
-        let mut rows: Vec<Vec<serde_json::Value>> = super::execute(graph, cypher, &HashMap::new())
+    /// Execute `cypher` and return its records in the order the executor emitted
+    /// them.
+    fn records(graph: &Graph, cypher: &str) -> Vec<Vec<serde_json::Value>> {
+        super::execute(graph, cypher, &HashMap::new())
             .unwrap()
             .records
             .into_iter()
             .map(|r| r.values)
-            .collect();
+            .collect()
+    }
+
+    /// Execute `cypher` and return its records sorted by their serialized form,
+    /// so the comparison ignores group order.
+    fn sorted_records(graph: &Graph, cypher: &str) -> Vec<Vec<serde_json::Value>> {
+        let mut rows = records(graph, cypher);
         rows.sort_by_key(|r| serde_json::to_string(r).unwrap());
         rows
     }
@@ -6254,6 +6411,191 @@ mod grouped_degree_exec_tests {
             sorted_records(&graph, kernel_q),
             vec![vec![serde_json::json!(7), serde_json::json!(2)]]
         );
+    }
+
+    /// Group order without an `ORDER BY` must match the row pipeline, which folds
+    /// through a `BTreeMap` keyed by the canonical cell key. Emitting groups in
+    /// hash order would make the kernel disagree with the row path and vary
+    /// between runs, since the hasher is seeded per process.
+    #[test]
+    fn kernel_group_order_matches_row_path() {
+        let (_dir, graph) = setup();
+        // 24 distinct group keys: enough that hash order coincides with sorted
+        // order only by an accident this test would never see.
+        let mut create = String::from("CREATE (f:Person {id: 0})");
+        for i in 1..=24 {
+            create.push_str(&format!(", (p{i}:Person {{id: {i}}})"));
+        }
+        create.push_str(" CREATE ");
+        for i in 1..=24 {
+            if i > 1 {
+                create.push_str(", ");
+            }
+            create.push_str(&format!("(f)-[:FOLLOWS]->(p{i})"));
+        }
+        super::execute(&graph, &create, &HashMap::new()).unwrap();
+        graph.rebuild_csr().unwrap();
+
+        let kernel_q =
+            "MATCH (f:Person)-[:FOLLOWS]->(p:Person) RETURN p.id AS id, count(f.id) AS num";
+        let row_q = "MATCH (f:Person)-[:FOLLOWS]->(p:Person) WHERE f.__force IS NULL \
+                     RETURN p.id AS id, count(f.id) AS num";
+        assert!(plan_text(&graph, kernel_q).contains("GroupedDegree"));
+        assert!(!plan_text(&graph, row_q).contains("GroupedDegree"));
+        assert_eq!(records(&graph, kernel_q), records(&graph, row_q));
+    }
+
+    /// Numerically equal group keys of different JSON kinds (`1` and `1.0`) must
+    /// merge into one group, as the row pipeline's canonical-key fold does. The
+    /// dense-code grouping keys on exact value identity, so this pins the
+    /// canonicalization pass that reconciles the two.
+    #[test]
+    fn merges_numerically_equal_keys_of_different_kinds() {
+        let (_dir, graph) = setup();
+        // p1.k is the integer 1, p2.k the float 1.0, p3.k the float 2.0. The
+        // mixed kinds make `k` a Json column, where the two 1s stay distinct
+        // values.
+        super::execute(
+            &graph,
+            "CREATE (p1:Person {k: 1}), (p2:Person {k: 1.0}), (p3:Person {k: 2.0}), \
+                    (f1:Person {id: 1}), (f2:Person {id: 2}), (f3:Person {id: 3}) \
+             CREATE (f1)-[:FOLLOWS]->(p1), (f2)-[:FOLLOWS]->(p2), (f3)-[:FOLLOWS]->(p3)",
+            &HashMap::new(),
+        )
+        .unwrap();
+        graph.rebuild_csr().unwrap();
+
+        let kernel_q =
+            "MATCH (f:Person)-[:FOLLOWS]->(p:Person) RETURN p.k AS k, count(f.id) AS num";
+        let row_q = "MATCH (f:Person)-[:FOLLOWS]->(p:Person) WHERE f.__force IS NULL \
+                     RETURN p.k AS k, count(f.id) AS num";
+        assert!(plan_text(&graph, kernel_q).contains("GroupedDegree"));
+        // Three followed people, but `1` and `1.0` are one group of two.
+        assert_eq!(records(&graph, kernel_q).len(), 2);
+        assert_eq!(records(&graph, kernel_q), records(&graph, row_q));
+    }
+
+    /// `ORDER BY <count> LIMIT n` above the kernel pushes a top-N window into it,
+    /// through the count's projected alias or its raw output name; any other
+    /// leading sort key, or no limit, leaves the kernel emitting every group.
+    #[test]
+    fn count_window_pushes_down_only_for_a_leading_count_sort() {
+        let (_dir, graph) = setup();
+        super::execute(
+            &graph,
+            "CREATE (x:Person {id: 1}), (y:Person {id: 2}), (z:Person {id: 3}) \
+             CREATE (x)-[:FOLLOWS]->(y), (z)-[:FOLLOWS]->(y), (x)-[:FOLLOWS]->(z)",
+            &HashMap::new(),
+        )
+        .unwrap();
+        graph.rebuild_csr().unwrap();
+
+        let base = "MATCH (f:Person)-[:FOLLOWS]->(p:Person) RETURN p.id AS id, count(f.id) AS num";
+        let plan = plan_text(&graph, &format!("{base} ORDER BY num DESC, id LIMIT 3"));
+        assert!(
+            plan.contains("top=3 DESC"),
+            "expected a pushed window:\n{plan}"
+        );
+        // A skip widens the window to skip + limit.
+        let plan = plan_text(&graph, &format!("{base} ORDER BY num ASC SKIP 2 LIMIT 3"));
+        assert!(
+            plan.contains("top=5 ASC"),
+            "expected a widened window:\n{plan}"
+        );
+
+        for q in [
+            // No limit: every group must still be emitted.
+            format!("{base} ORDER BY num DESC"),
+            // A group key leads the sort, so a low-count group can still win.
+            format!("{base} ORDER BY id ASC LIMIT 3"),
+            // No sort at all.
+            format!("{base} LIMIT 3"),
+        ] {
+            let plan = plan_text(&graph, &q);
+            assert!(
+                plan.contains("GroupedDegree") && !plan.contains("top="),
+                "window must not fire for `{q}`:\n{plan}"
+            );
+        }
+    }
+
+    /// Differential parity for the pushed count window, over random multigraphs
+    /// whose small degree range makes boundary ties the common case: the window
+    /// must never change the rows an `ORDER BY <count> LIMIT n` returns, whichever
+    /// direction it sorts and whether or not a group key breaks the tie.
+    #[test]
+    fn count_window_matches_row_path_on_random_graphs() {
+        use proptest::prelude::*;
+
+        let mut runner = proptest::test_runner::TestRunner::new(ProptestConfig {
+            cases: 40,
+            ..ProptestConfig::default()
+        });
+        // Few nodes and few edges keep in-degrees in a narrow range, so many
+        // groups tie at the window boundary.
+        let strategy = (
+            2usize..=6,
+            proptest::collection::vec((0usize..6, 0usize..6), 0..18),
+        );
+        runner
+            .run(&strategy, |(n_nodes, edges)| {
+                let (_dir, graph) = setup();
+                let mut create = String::from("CREATE ");
+                for i in 0..n_nodes {
+                    if i > 0 {
+                        create.push_str(", ");
+                    }
+                    // Two nodes share id 0, so distinct nodes merge into one group.
+                    create.push_str(&format!(
+                        "(n{i}:Person {{id: {}}})",
+                        i % (n_nodes - 1).max(1)
+                    ));
+                }
+                super::execute(&graph, &create, &HashMap::new()).unwrap();
+                for (s, d) in &edges {
+                    if *s < n_nodes && *d < n_nodes {
+                        super::execute(
+                            &graph,
+                            &format!(
+                                "MATCH (a:Person), (b:Person) WHERE id(a) = {} AND id(b) = {} \
+                                 CREATE (a)-[:FOLLOWS]->(b)",
+                                s + 1,
+                                d + 1
+                            ),
+                            &HashMap::new(),
+                        )
+                        .unwrap();
+                    }
+                }
+                graph.rebuild_csr().unwrap();
+
+                for tail in [
+                    "ORDER BY num DESC LIMIT 1",
+                    "ORDER BY num DESC LIMIT 2",
+                    "ORDER BY num DESC, id LIMIT 2",
+                    "ORDER BY num ASC LIMIT 2",
+                    "ORDER BY num DESC SKIP 1 LIMIT 2",
+                    "ORDER BY num DESC LIMIT 100",
+                ] {
+                    let kernel_q = format!(
+                        "MATCH (f:Person)-[:FOLLOWS]->(p:Person) \
+                         RETURN p.id AS id, count(f.id) AS num {tail}"
+                    );
+                    let row_q = format!(
+                        "MATCH (f:Person)-[:FOLLOWS]->(p:Person) WHERE f.__force IS NULL \
+                         RETURN p.id AS id, count(f.id) AS num {tail}"
+                    );
+                    proptest::prop_assert!(plan_text(&graph, &kernel_q).contains("GroupedDegree"));
+                    proptest::prop_assert_eq!(
+                        records(&graph, &kernel_q),
+                        records(&graph, &row_q),
+                        "{}",
+                        kernel_q
+                    );
+                }
+                Ok(())
+            })
+            .unwrap();
     }
 
     /// Differential parity on random multigraphs (self-loops, parallel edges,

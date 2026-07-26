@@ -1,6 +1,24 @@
 use crate::ast::{AggFn, Expr, Literal, SortItem};
 use crate::plan::logical::{FilterExpr, LogicalOperator};
 
+/// A top-N window on a grouped count, pushed down into the operator that
+/// produces the groups from the `ORDER BY <count> LIMIT n` above it.
+///
+/// The window is deliberately conservative: the operator keeps every group whose
+/// count reaches the `bound`-th best, boundary ties included, and emits them in
+/// the order it would have emitted the full group set. The enclosing `Sort` and
+/// `Limit` then run unchanged and pick exactly the rows they would have picked
+/// over every group, because no row they could have selected was dropped and the
+/// survivors' relative order (the stable sort's tie-break) is unchanged.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CountWindow {
+    /// Number of leading rows the enclosing `Limit` keeps (`skip + count`).
+    pub bound: usize,
+    /// True when the enclosing `Sort` orders the count descending, so the
+    /// largest counts are the ones that survive.
+    pub descending: bool,
+}
+
 /// A physical representation of a query execution operator.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PhysicalOperator {
@@ -293,6 +311,9 @@ pub enum PhysicalOperator {
         group_by: Vec<(Expr, Option<String>)>,
         /// Output column the count is bound to.
         output: String,
+        /// A top-N window on the count, pushed down from an enclosing
+        /// `ORDER BY <count> LIMIT n`. `None` emits every group.
+        count_window: Option<CountWindow>,
     },
     /// Approximate k-nearest-neighbor scan over the HNSW vector index, binding
     /// `variable` to the `k` nodes nearest to `query` in ascending distance
@@ -831,6 +852,7 @@ pub fn format_physical_plan(op: &PhysicalOperator, depth: usize) -> String {
             group_var,
             group_by,
             output,
+            count_window,
         } => {
             let rel = rel_type.as_deref().unwrap_or("*");
             let glab = group_label
@@ -851,8 +873,15 @@ pub fn format_physical_plan(op: &PhysicalOperator, depth: usize) -> String {
                 Some(p) => format!("count(c.{p})"),
                 None => "count(*)".to_string(),
             };
+            let window = match count_window {
+                Some(w) => {
+                    let dir = if w.descending { "DESC" } else { "ASC" };
+                    format!(" top={} {dir}", w.bound)
+                }
+                None => String::new(),
+            };
             buf.push_str(&format!(
-                "{pad}GroupedDegree {arrow} group=[{}] {counted} AS {output}\n",
+                "{pad}GroupedDegree {arrow} group=[{}] {counted} AS {output}{window}\n",
                 keys.join(", ")
             ));
         }

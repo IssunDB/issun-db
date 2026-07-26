@@ -451,6 +451,123 @@ impl Graph {
         Ok(out)
     }
 
+    /// Counts each source's qualifying neighbors across one typed hop, returning
+    /// `(qualifying, counted)` per entry of `sources` in input order. See
+    /// [`NeighborCountSpec`] for what qualifies; the two totals differ only for
+    /// `neighbor_nonnull_prop`, where a neighbor can qualify (so the source
+    /// produces rows) without adding to the count.
+    ///
+    /// This reads only the sources' own CSR rows, so it costs the sum of their
+    /// degrees rather than a full scan, and it tallies into integers without
+    /// materializing one entry per traversed edge. It is the kernel behind the
+    /// Cypher executor's terminal count-collapse, where the alternative is a
+    /// bulk expansion whose result is one triple per edge plus a hash lookup per
+    /// edge to qualify and tally it. Parallel edges each count, and a self-loop
+    /// counts its source once, matching a materialized expansion row for row.
+    ///
+    /// A source absent from the snapshot has no neighbors and counts zero, so a
+    /// caller need not pre-filter the source list.
+    pub fn typed_neighbor_counts(
+        &self,
+        sources: &[NodeId],
+        spec: &NeighborCountSpec,
+    ) -> Result<Vec<(u64, u64)>, Error> {
+        // Snapshot-only gate: this kernel reads CSR arrays and never a matrix,
+        // so it must not pay `ensure_csr_fresh`'s GraphBLAS materialization.
+        self.ensure_snapshot_fresh()?;
+        let snap = self.csr_cache.snapshot.load();
+        let n = snap.dense_to_id.len();
+        let mut out = vec![(0u64, 0u64); sources.len()];
+        if n == 0 || sources.is_empty() {
+            return Ok(out);
+        }
+
+        // A named but unregistered relationship type matches nothing.
+        let type_id = match spec.rel_type {
+            Some(name) => {
+                let rtxn = self.storage.env.read_txn()?;
+                match get_type(&self.storage, &rtxn, name)? {
+                    Some(tid) => Some(tid),
+                    None => return Ok(out),
+                }
+            }
+            None => None,
+        };
+
+        // Dense conjunction of the neighbor labels; an unknown label yields an
+        // all-false mask, which counts zero without a special case.
+        let mut label_mask: Option<Vec<bool>> = None;
+        for name in spec.neighbor_labels {
+            let mut mask = vec![false; n];
+            for id in self.nodes_by_label(name)? {
+                if let Some(&d) = snap.id_to_dense.get(&id) {
+                    mask[d as usize] = true;
+                }
+            }
+            label_mask = Some(match label_mask {
+                None => mask,
+                Some(prev) => {
+                    let mut both = mask;
+                    for (slot, &keep) in both.iter_mut().zip(prev.iter()) {
+                        *slot = *slot && keep;
+                    }
+                    both
+                }
+            });
+        }
+
+        // Non-null mask for the neighbor's property, resolved through the
+        // property columns' own dense mapping. A missing column leaves the mask
+        // all-false, so `count(v.prop)` over an absent property counts zero,
+        // matching the row pipeline.
+        let nonnull_mask: Option<Vec<bool>> = match spec.neighbor_nonnull_prop {
+            Some(prop) => Some(self.prop_columns.with_fresh(&self.storage, |cols| {
+                let mut mask = vec![false; n];
+                if let Some(col) = cols.cols.get(prop) {
+                    for (d, id) in snap.dense_to_id.iter().enumerate() {
+                        if let Some(&cd) = cols.id_to_dense.get(id) {
+                            mask[d] = col.is_present(cd as usize);
+                        }
+                    }
+                }
+                mask
+            })?),
+            None => None,
+        };
+
+        let (row_ptr, col_idx, edge_type) = if spec.incoming {
+            (&snap.in_row_ptr, &snap.in_col_idx, &snap.in_edge_type)
+        } else {
+            (&snap.row_ptr, &snap.col_idx, &snap.edge_type)
+        };
+        let ok = |mask: &Option<Vec<bool>>, d: usize| mask.as_ref().is_none_or(|m| m[d]);
+
+        for (i, src) in sources.iter().enumerate() {
+            let Some(&d) = snap.id_to_dense.get(src) else {
+                continue;
+            };
+            let d = d as usize;
+            let (mut qualifying, mut counted) = (0u64, 0u64);
+            for k in row_ptr[d]..row_ptr[d + 1] {
+                if let Some(tid) = type_id {
+                    if edge_type[k] != tid {
+                        continue;
+                    }
+                }
+                let other = col_idx[k] as usize;
+                if !ok(&label_mask, other) {
+                    continue;
+                }
+                qualifying += 1;
+                if ok(&nonnull_mask, other) {
+                    counted += 1;
+                }
+            }
+            out[i] = (qualifying, counted);
+        }
+        Ok(out)
+    }
+
     /// Detects if there is at least one directed cycle in the graph.
     pub fn detect_cycle(&self) -> Result<bool, Error> {
         self.with_matrix_view(|m, snap| self.detect_cycle_graphblas(m, snap))
@@ -2312,5 +2429,254 @@ mod snapshot_only_gate_tests {
             3,
             "only the triangle's three two-hop paths remain"
         );
+    }
+}
+
+#[cfg(test)]
+mod typed_neighbor_count_tests {
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    use crate::{Graph, NeighborCountSpec, schema::NodeId};
+
+    /// `a` follows `b` twice (parallel edges), `c` once, and itself once; `b`
+    /// follows `c`. `c` carries no `tag`, and `d` is a differently labeled node
+    /// `a` also follows.
+    fn fixture() -> (TempDir, Graph, Vec<NodeId>) {
+        let dir = TempDir::new().unwrap();
+        let g = Graph::open(dir.path(), 1).unwrap();
+        let a = g.add_node("Person", &json!({"tag": "a"})).unwrap();
+        let b = g.add_node("Person", &json!({"tag": "b"})).unwrap();
+        let c = g.add_node("Person", &json!({})).unwrap();
+        let d = g.add_node("Robot", &json!({"tag": "d"})).unwrap();
+        for (s, t) in [(a, b), (a, b), (a, c), (a, a), (b, c)] {
+            g.add_edge(s, t, "FOLLOWS", &json!({})).unwrap();
+        }
+        g.add_edge(a, d, "FOLLOWS", &json!({})).unwrap();
+        g.add_edge(a, b, "BLOCKS", &json!({})).unwrap();
+        g.rebuild_csr().unwrap();
+        (dir, g, vec![a, b, c, d])
+    }
+
+    fn spec<'a>(
+        rel_type: Option<&'a str>,
+        incoming: bool,
+        labels: &'a [&'a str],
+        nonnull: Option<&'a str>,
+    ) -> NeighborCountSpec<'a> {
+        NeighborCountSpec {
+            rel_type,
+            incoming,
+            neighbor_labels: labels,
+            neighbor_nonnull_prop: nonnull,
+        }
+    }
+
+    /// Outgoing and incoming counts, with parallel edges counted per edge and a
+    /// self-loop counted once for its source.
+    #[test]
+    fn counts_each_edge_in_both_directions() {
+        let (_dir, g, ids) = fixture();
+        let (a, b, c, d) = (ids[0], ids[1], ids[2], ids[3]);
+
+        // a: b twice, c, a (self-loop), d = 5 FOLLOWS out; b: c = 1.
+        let out = g
+            .typed_neighbor_counts(&[a, b, c, d], &spec(Some("FOLLOWS"), false, &[], None))
+            .unwrap();
+        assert_eq!(out, vec![(5, 5), (1, 1), (0, 0), (0, 0)]);
+
+        // Incoming: a from itself; b from a twice; c from a and b; d from a.
+        let inc = g
+            .typed_neighbor_counts(&[a, b, c, d], &spec(Some("FOLLOWS"), true, &[], None))
+            .unwrap();
+        assert_eq!(inc, vec![(1, 1), (2, 2), (2, 2), (1, 1)]);
+
+        // Untyped follows every type, adding a's BLOCKS edge.
+        let any = g
+            .typed_neighbor_counts(&[a], &spec(None, false, &[], None))
+            .unwrap();
+        assert_eq!(any, vec![(6, 6)]);
+    }
+
+    /// A neighbor label narrows the count, a conjunction of labels intersects,
+    /// and an unknown label or relationship type counts zero.
+    #[test]
+    fn labels_and_types_narrow_the_count() {
+        let (_dir, g, ids) = fixture();
+        let (a, b) = (ids[0], ids[1]);
+        g.add_label(b, "Vip").unwrap();
+        g.rebuild_csr().unwrap();
+
+        // Of a's five FOLLOWS neighbors, four are Person (b, b, c, a) and d is not.
+        let person = g
+            .typed_neighbor_counts(&[a], &spec(Some("FOLLOWS"), false, &["Person"], None))
+            .unwrap();
+        assert_eq!(person, vec![(4, 4)]);
+
+        // Person AND Vip is only b, reached twice.
+        let vip = g
+            .typed_neighbor_counts(
+                &[a],
+                &spec(Some("FOLLOWS"), false, &["Person", "Vip"], None),
+            )
+            .unwrap();
+        assert_eq!(vip, vec![(2, 2)]);
+
+        for unknown in [
+            spec(Some("NOPE"), false, &[], None),
+            spec(Some("FOLLOWS"), false, &["Nope"], None),
+        ] {
+            assert_eq!(
+                g.typed_neighbor_counts(&[a], &unknown).unwrap(),
+                vec![(0, 0)]
+            );
+        }
+    }
+
+    /// `neighbor_nonnull_prop` leaves the qualifying total alone and narrows only
+    /// the counted total, so a source whose every neighbor lacks the property
+    /// still reports rows with a zero count. An absent property counts zero.
+    #[test]
+    fn nonnull_property_narrows_only_the_counted_total() {
+        let (_dir, g, ids) = fixture();
+        let (a, b) = (ids[0], ids[1]);
+
+        // a's Person neighbors are b, b, c, a; only c has no `tag`.
+        let tagged = g
+            .typed_neighbor_counts(
+                &[a],
+                &spec(Some("FOLLOWS"), false, &["Person"], Some("tag")),
+            )
+            .unwrap();
+        assert_eq!(tagged, vec![(4, 3)]);
+
+        // b's only FOLLOWS neighbor is c, which has no `tag`: one row, count zero.
+        let untagged = g
+            .typed_neighbor_counts(&[b], &spec(Some("FOLLOWS"), false, &[], Some("tag")))
+            .unwrap();
+        assert_eq!(untagged, vec![(1, 0)]);
+
+        // A property no node carries counts zero everywhere.
+        let absent = g
+            .typed_neighbor_counts(&[a], &spec(Some("FOLLOWS"), false, &[], Some("nope")))
+            .unwrap();
+        assert_eq!(absent, vec![(5, 0)]);
+    }
+
+    /// Input order is preserved, duplicate sources each get their own entry, and
+    /// a source absent from the graph counts zero rather than erroring.
+    #[test]
+    fn preserves_input_order_and_tolerates_unknown_sources() {
+        let (_dir, g, ids) = fixture();
+        let (a, b) = (ids[0], ids[1]);
+        let missing = ids[3] + 9999;
+
+        let out = g
+            .typed_neighbor_counts(
+                &[b, missing, a, b],
+                &spec(Some("FOLLOWS"), false, &[], None),
+            )
+            .unwrap();
+        assert_eq!(out, vec![(1, 1), (0, 0), (5, 5), (1, 1)]);
+
+        assert!(
+            g.typed_neighbor_counts(&[], &spec(None, false, &[], None))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// The kernel agrees with counting a materialized expansion edge by edge,
+    /// over random multigraphs with self-loops, parallel edges, mixed labels,
+    /// and a property some nodes lack.
+    #[test]
+    fn matches_a_materialized_expansion() {
+        use proptest::prelude::*;
+
+        let mut runner = proptest::test_runner::TestRunner::new(ProptestConfig {
+            cases: 32,
+            ..ProptestConfig::default()
+        });
+        let strategy = (
+            1usize..=6,
+            proptest::collection::vec((0usize..6, 0usize..6), 0..24),
+            proptest::collection::vec(any::<bool>(), 6),
+            proptest::collection::vec(any::<bool>(), 6),
+        );
+        runner
+            .run(&strategy, |(n_nodes, edges, has_tag, is_vip)| {
+                let dir = TempDir::new().unwrap();
+                let g = Graph::open(dir.path(), 1).unwrap();
+                let ids: Vec<NodeId> = (0..n_nodes)
+                    .map(|i| {
+                        let props = if has_tag[i] {
+                            json!({ "tag": i as i64 })
+                        } else {
+                            json!({})
+                        };
+                        if is_vip[i] {
+                            g.add_node_multi(&["Person", "Vip"], &props).unwrap()
+                        } else {
+                            g.add_node("Person", &props).unwrap()
+                        }
+                    })
+                    .collect();
+                for (s, d) in &edges {
+                    if *s < n_nodes && *d < n_nodes {
+                        g.add_edge(ids[*s], ids[*d], "F", &json!({})).unwrap();
+                    }
+                }
+                g.rebuild_csr().unwrap();
+
+                for incoming in [false, true] {
+                    for labels in [&[][..], &["Vip"][..]] {
+                        for nonnull in [None, Some("tag")] {
+                            let spec = NeighborCountSpec {
+                                rel_type: Some("F"),
+                                incoming,
+                                neighbor_labels: labels,
+                                neighbor_nonnull_prop: nonnull,
+                            };
+                            let got = g.typed_neighbor_counts(&ids, &spec).unwrap();
+                            for (i, &src) in ids.iter().enumerate() {
+                                // Oracle: enumerate the source's edges directly.
+                                let neighbors: Vec<NodeId> = if incoming {
+                                    g.in_neighbors(src)
+                                        .unwrap()
+                                        .into_iter()
+                                        .map(|e| e.node)
+                                        .collect()
+                                } else {
+                                    g.out_neighbors(src)
+                                        .unwrap()
+                                        .into_iter()
+                                        .map(|e| e.node)
+                                        .collect()
+                                };
+                                let mut qualifying = 0u64;
+                                let mut counted = 0u64;
+                                for nb in neighbors {
+                                    let idx = ids.iter().position(|x| *x == nb).unwrap();
+                                    if !labels.is_empty() && !is_vip[idx] {
+                                        continue;
+                                    }
+                                    qualifying += 1;
+                                    if nonnull.is_none() || has_tag[idx] {
+                                        counted += 1;
+                                    }
+                                }
+                                assert_eq!(
+                                    got[i],
+                                    (qualifying, counted),
+                                    "source {i}, incoming={incoming}, labels={labels:?}, \
+                                     nonnull={nonnull:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            })
+            .unwrap();
     }
 }

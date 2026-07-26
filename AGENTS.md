@@ -120,9 +120,11 @@ modules according to this map.
       Stage*){0,MAX_VEC_HOPS} Leaf` with single-property expressions, executing column-at-a-time (bulk expansion via `Graph::node_props_json_table`
       and group-by-code aggregation via `Graph::node_prop_group_codes`). A multi-hop chain is recognized only when every hop carries a distinct
       relationship type, so relationship uniqueness is vacuous; a repeated type or a chain longer than `MAX_VEC_HOPS` falls back. A non-distinct
-      `count` over the terminal variable that feeds no group key collapses the final hop (`execute_collapsed_count`). The recognizer sees through a
-      `Distinct` because the caller deduplicates. Any unrecognized shape falls back to the row pipeline, so correctness never depends on the
-      recognizer.
+      `count` over the terminal variable that feeds no group key collapses the final hop (`execute_collapsed_count`). When that hop's terminal filters
+      are all label tests, the collapse counts each source's qualifying neighbors through `Graph::typed_neighbor_counts`, so the final hop costs no
+      triple per traversed edge and no hash lookup per edge; a terminal property comparison falls back to expanding and qualifying the distinct
+      neighbor set. The recognizer sees through a `Distinct` because the caller deduplicates. Any unrecognized shape falls back to the row pipeline, so
+      correctness never depends on the recognizer.
     - `src/exec/factorize.rs`: `FactorizedRecordGroup` (shared `Arc<PathMap>` prefix plus per-row extensions) and `filter_refs_in_expr`.
     - `src/exec/expr.rs`: expression evaluation (`evaluate_expr`, `eval_binary_op`, `eval_arithmetic`, `eval_function_call`).
     - `src/exec/write.rs`: mutation execution (`execute_create`, `execute_set`, `execute_delete`, `execute_merge`).
@@ -282,7 +284,7 @@ The read-path and statistics methods carry non-obvious semantics:
 
 Graph algorithms have self-describing signatures over `NodeId` and `EdgeId`: `bfs`, `dfs`, `shortest_path`, `all_paths`, `all_shortest_paths`,
 `longest_path`, `shortest_path_top_k`, `page_rank`, `connected_components`, `strongly_connected_components`, `detect_cycle`, `label_propagation`,
-`degree_centrality`, `betweenness_centrality`, `harmonic_centrality`, `spanning_forest`, `maximum_flow`, and `all_neighbors`. Two carry behavior worth
+`degree_centrality`, `betweenness_centrality`, `harmonic_centrality`, `spanning_forest`, `maximum_flow`, and `all_neighbors`. Three carry behavior worth
 pinning:
 
 - `shortest_path_dijkstra(src, dst) -> Result<Option<WeightedPath>, Error>`: edge weight is the first present of the `weight`, `cost`, `capacity`, or
@@ -292,6 +294,11 @@ pinning:
   `(a)-[t1]->(b)-[t2]->(c)-[t3]->(a)` with optional per-hop relationship types and per-variable labels, following Cypher MATCH row semantics including
   relationship uniqueness; the Cypher optimizer lowers grouping-free `count` aggregates over that pattern to this kernel via the `TriangleCount`
   physical operator.
+- `typed_neighbor_counts(sources, spec: &NeighborCountSpec) -> Result<Vec<(u64, u64)>, Error>`: per-source `(qualifying, counted)` neighbor counts
+  across one typed hop, in input order. It reads only the sources' own CSR rows, so it costs the sum of their degrees rather than a full scan, and it
+  tallies into integers instead of materializing one entry per traversed edge. The two totals differ only for `neighbor_nonnull_prop`, where a
+  neighbor can qualify (so the source produces rows) without adding to the count. This is the kernel behind the Cypher executor's terminal
+  count-collapse; a source absent from the snapshot counts zero rather than erroring.
 
 ### `issundb_vector`
 
@@ -388,6 +395,15 @@ each navigable by the named symbol:
   every other shape runs the row pipeline.
 - A grouping-free `count` over a one-hop or two-hop directed expansion lowers to the `PathCount` kernel (`Graph::count_linear_paths`); per-vertex
   `prop CMP literal` predicates push down into the kernel as index-resolved node-id allow-sets (`PathCountSpec::vertex_allow`).
+- A `count` grouped by one endpoint of a single directed hop lowers to the `GroupedDegree` kernel (`Graph::grouped_edge_counts`), which emits one entry
+  per group node; the executor folds those into groups through dense integer codes (`combine_group_codes`) rather than a key string per group node, and
+  emits them in the canonical-key order the row pipeline's `BTreeMap` fold uses, so both paths agree without an `ORDER BY`.
+- An `ORDER BY <count> LIMIT n` above a grouped count pushes a `CountWindow` into the operator that produces the groups (`set_count_window` for
+  `GroupedDegree`, `leading_count_sort` for the vectorized collapse), so a grouped count over a whole label stops building a row per group to keep `n`
+  of them. The window keeps every group reaching the `n`-th best count, boundary ties included, and emits survivors in the order it would have emitted
+  the full group set, so the enclosing `Sort` and `Limit` pick exactly what they would have over every group. It declines when the leading sort key is
+  not the count, when a `Distinct` sits between the sort and the projection, and when any projected item is more than a variable or property read (a
+  pruned group is never projected, so an expression that can raise must not be skipped).
 - `RETURN DISTINCT` plans a `Distinct` between the final `Project` and `Sort`, so deduplication happens before `ORDER BY` and `SKIP`/`LIMIT`;
   `WITH DISTINCT` keeps full-row deduplication behind its barrier project; only `RETURN DISTINCT *` deduplicates after projection in the executor.
 - A type-inference pass (`prune_unsatisfiable`) consults `Graph::schema_has_edge`: a typed hop between two labeled endpoints with no realized triple

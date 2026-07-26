@@ -117,6 +117,25 @@ pub struct GroupedDegreeSpec<'a> {
     pub counted_nonnull_prop: Option<&'a str>,
 }
 
+/// Pattern description for [`Graph::typed_neighbor_counts`]: per-source counts
+/// of typed neighbors across one hop. `incoming` follows incoming edges instead
+/// of outgoing ones. A neighbor qualifies when it carries every label in
+/// `neighbor_labels` (an empty slice is unconstrained), and it adds to the
+/// counted total only when `neighbor_nonnull_prop` is absent or non-null on it
+/// (the semantics of `count(v.prop)` over the expansion, against `count(*)`).
+#[derive(Debug, Clone, Default)]
+pub struct NeighborCountSpec<'a> {
+    /// Relationship type to follow, or `None` for any type.
+    pub rel_type: Option<&'a str>,
+    /// Follow incoming edges (neighbors are edge sources) instead of outgoing.
+    pub incoming: bool,
+    /// Labels a neighbor must all carry to qualify.
+    pub neighbor_labels: &'a [&'a str],
+    /// Property that must be non-null on a qualifying neighbor for it to add to
+    /// the counted total; `None` counts every qualifying neighbor.
+    pub neighbor_nonnull_prop: Option<&'a str>,
+}
+
 /// Builds a 12-byte composite key `(prefix u32 BE, id u64 BE)` for secondary index lookups.
 pub(super) fn composite_key(prefix: u32, id: u64) -> [u8; 12] {
     let mut key = [0u8; 12];

@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::ast::{AggFn, BinaryOperator, Expr, Literal};
 use crate::plan::logical::FilterExpr;
-use crate::plan::physical::{PhysicalOperator, VertexCmp, VertexPred};
+use crate::plan::physical::{CountWindow, PhysicalOperator, VertexCmp, VertexPred};
 use crate::plan::stats::StatsProvider;
 
 /// An optimizer that applies relational algebra optimization passes to physical plans.
@@ -134,6 +134,11 @@ impl Optimizer {
         // the grouped-degree kernel. Runs after the path-count rewrite, which
         // claims the grouping-free counts; only grouped aggregates remain here.
         result = rewrite_grouped_degree(result);
+        // Push an `ORDER BY <count> LIMIT n` above a grouped-degree kernel into
+        // the kernel as a top-N window, so a query asking for the few largest
+        // counts stops building a row per group. Runs directly after the rewrite
+        // that produces the kernel, and only ever narrows what the kernel emits.
+        result = rewrite_grouped_degree_window(result);
         // Type inference: when the data schema contains no edge matching a typed
         // hop between two labeled endpoints, that hop (and so the whole pattern)
         // is unsatisfiable, so it is replaced with a zero-row operator that never
@@ -4465,7 +4470,112 @@ fn try_grouped_degree(op: &PhysicalOperator) -> Option<PhysicalOperator> {
         group_var: dst_var.clone(),
         group_by: group_by.clone(),
         output: out_name.clone(),
+        // Filled in by `rewrite_grouped_degree_window` from the plan above.
+        count_window: None,
     })
+}
+
+/// Push an enclosing `ORDER BY <count> LIMIT n` into a `GroupedDegree` kernel as
+/// a top-N window. Recursion mirrors `rewrite_grouped_degree`, but the match
+/// starts at the `Limit` so the sort and projection between it and the kernel are
+/// visible.
+fn rewrite_grouped_degree_window(op: PhysicalOperator) -> PhysicalOperator {
+    match op {
+        PhysicalOperator::Limit {
+            mut input,
+            skip,
+            count,
+        } => {
+            set_count_window(input.as_mut(), skip.saturating_add(count));
+            PhysicalOperator::Limit { input, skip, count }
+        }
+        PhysicalOperator::Project {
+            input,
+            items,
+            is_barrier,
+        } => PhysicalOperator::Project {
+            input: Box::new(rewrite_grouped_degree_window(*input)),
+            items,
+            is_barrier,
+        },
+        PhysicalOperator::Sort { input, items } => PhysicalOperator::Sort {
+            input: Box::new(rewrite_grouped_degree_window(*input)),
+            items,
+        },
+        PhysicalOperator::Distinct { input, keys } => PhysicalOperator::Distinct {
+            keys,
+            input: Box::new(rewrite_grouped_degree_window(*input)),
+        },
+        PhysicalOperator::Filter { input, expression } => PhysicalOperator::Filter {
+            input: Box::new(rewrite_grouped_degree_window(*input)),
+            expression,
+        },
+        other => other,
+    }
+}
+
+/// Set the top-N window on the `GroupedDegree` under `Sort > Project`, when the
+/// sort's leading key is the kernel's count output. Any other shape is left
+/// alone.
+///
+/// Only the leading sort key matters: the `bound`-th row of the full sort has
+/// some count, and no group with a worse count can precede it however the
+/// remaining keys order things, so keeping every group that reaches that count is
+/// enough. A `Distinct` between the sort and the projection is deliberately not
+/// seen through, because deduplicating projected rows can pull a group with a
+/// worse count into the window.
+fn set_count_window(op: &mut PhysicalOperator, bound: usize) {
+    let PhysicalOperator::Sort { input, items } = op else {
+        return;
+    };
+    let Some(leading) = items.first() else {
+        return;
+    };
+    let PhysicalOperator::Project {
+        input: proj_input,
+        items: proj_items,
+        ..
+    } = input.as_mut()
+    else {
+        return;
+    };
+    let PhysicalOperator::GroupedDegree {
+        output,
+        count_window,
+        ..
+    } = proj_input.as_mut()
+    else {
+        return;
+    };
+    // A pruned group is never projected, so a projection that can raise at
+    // runtime would stop raising for the rows the window drops. Restrict the
+    // window to projections of bare variable and property reads, which cannot.
+    if !proj_items
+        .iter()
+        .all(|(expr, _)| matches!(expr, Expr::Prop(..)))
+    {
+        return;
+    }
+    // The count reaches the sort either directly by its output name or through a
+    // projected alias for it; any other leading key leaves the kernel alone.
+    let out = output.as_str();
+    let names_count =
+        |expr: &Expr| matches!(expr, Expr::Prop(v, p) if p.is_empty() && v.as_str() == out);
+    let leads_with_count = match &leading.expr {
+        Expr::Prop(var, prop) if prop.is_empty() => {
+            var.as_str() == out
+                || proj_items.iter().any(|(expr, alias)| {
+                    alias.as_deref() == Some(var.as_str()) && names_count(expr)
+                })
+        }
+        _ => false,
+    };
+    if leads_with_count {
+        *count_window = Some(CountWindow {
+            bound,
+            descending: !leading.ascending,
+        });
+    }
 }
 
 /// A single-variable constraint peeled from the `Filter` run above an expand:
