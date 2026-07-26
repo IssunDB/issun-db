@@ -24,13 +24,15 @@ The WAND top-k retrieval algorithm prunes documents by comparing the sum of per-
 for `Scorer::upper_bound` is:
 
 ```
-scorer.upper_bound(idf) >= scorer.score(tf, doc_len, avgdl, idf, 1.0)
+scorer.upper_bound(idf, max_tf) >= scorer.score(tf, doc_len, avgdl, idf, 1.0)
 ```
 
-for **any** `tf`, `doc_len`, and `avgdl`. Violating this contract causes WAND to skip documents that would have been in the top-k results, producing
-incorrect output without any compile-time or runtime error.
+for **any** `doc_len`, `avgdl`, and any `tf` up to `max_tf`. Violating this contract causes WAND to skip documents that would have been in the top-k
+results, producing incorrect output without any compile-time or runtime error.
 
-For `Bm25Scorer`, the tight upper bound is `idf * (k1 + 1)` because BM25's TF saturation factor converges to `(k1 + 1)` as `tf → ∞`.
+`max_tf` is the highest term frequency in the posting list being bounded. A scorer whose score keeps growing with `tf` needs it to stay sound;
+a scorer that saturates may ignore it. `Bm25Scorer` saturates, so it takes `_max_tf` and returns the tight bound `idf * (k1 + 1)`, the limit of BM25's
+TF factor as `tf → ∞`. `TfIdfScorer` does not saturate, so it must use `max_tf`.
 
 ## Adding a New `Scorer`
 
@@ -41,7 +43,7 @@ When implementing a custom scoring strategy:
 
    ```rust
    let idf = scorer.idf(100.0, 10.0);
-   let ub = scorer.upper_bound(idf);
+   let ub = scorer.upper_bound(idf, 100);
    for &tf in &[1.0_f32, 2.0, 5.0, 10.0, 100.0] {
        for &(doc_len, avgdl) in &[(10.0, 50.0), (100.0, 50.0), (1.0, 50.0)] {
            let s = scorer.score(tf, doc_len, avgdl, idf, 1.0);

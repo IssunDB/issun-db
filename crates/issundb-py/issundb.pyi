@@ -6,7 +6,7 @@ so callers serialize with `json.dumps` on the way in and `json.loads` on the way
 out.
 """
 
-from typing import List, Optional, Union
+from typing import Iterable, List, Optional, Tuple, Union
 
 
 class IssunDB:
@@ -43,6 +43,30 @@ class IssunDB:
         Raises:
             ValueError: If ``props`` is not valid JSON.
             RuntimeError: If the write fails.
+        """
+        ...
+
+    def add_nodes(
+        self, items: Iterable[Tuple[Union[str, List[str]], str]]
+    ) -> List[int]:
+        """Insert many nodes in one write transaction.
+
+        A single-record insert costs one durable commit, so a Python loop over
+        ``add_node`` is bound by commit latency rather than by the work. This is
+        the ingestion path.
+
+        Args:
+            items: An iterable of ``(labels, props)`` pairs, where ``labels`` is
+                a single label string or a list of label strings, and ``props``
+                is a JSON object string.
+
+        Returns:
+            The new node IDs, in the order the items were given.
+
+        Raises:
+            ValueError: If any ``props`` is not valid JSON.
+            RuntimeError: If the write fails. The batch is all-or-nothing, so a
+                failure rolls back every node in it.
         """
         ...
 
@@ -127,6 +151,26 @@ class IssunDB:
         """
         ...
 
+    def add_edges(self, items: Iterable[Tuple[int, int, str, str]]) -> List[int]:
+        """Insert many edges in one write transaction.
+
+        The batch counterpart to ``add_edge``, for the same reason ``add_nodes``
+        exists: a per-record loop is bound by commit latency.
+
+        Args:
+            items: An iterable of ``(src, dst, type, props)`` tuples, where
+                ``props`` is a JSON object string.
+
+        Returns:
+            The new edge IDs, in the order the items were given.
+
+        Raises:
+            ValueError: If any ``props`` is not valid JSON.
+            RuntimeError: If the write fails. The batch is all-or-nothing, so a
+                failure rolls back every edge in it.
+        """
+        ...
+
     def get_edge(self, id: int) -> Optional[str]:
         """Return edge ``id`` as a JSON string.
 
@@ -198,12 +242,12 @@ class IssunDB:
         """
         ...
 
-    def upsert_vector(self, id: int, vec: List[float]) -> None:
+    def upsert_vector(self, id: int, vector: List[float]) -> None:
         """Index or update the float32 embedding for node ``id``.
 
         Args:
             id: The node ID.
-            vec: The embedding as a list of floats.
+            vector: The embedding as a list of floats.
 
         Raises:
             RuntimeError: If the write fails.
@@ -223,16 +267,16 @@ class IssunDB:
 
     def vector_search(
         self,
-        vec: List[float],
+        vector: List[float],
         k: int,
         label: Optional[str] = None,
         properties: Optional[str] = None,
         rescore_factor: Optional[int] = None,
     ) -> str:
-        """Return the ``k`` nearest neighbors to ``vec``.
+        """Return the ``k`` nearest neighbors to ``vector``.
 
         Args:
-            vec: The query embedding as a list of floats.
+            vector: The query embedding as a list of floats.
             k: The number of neighbors to return.
             label: Restricts search to nodes carrying this label.
             properties: A JSON object string of key-value property filters.
@@ -375,11 +419,11 @@ class IssunDB:
         """
         ...
 
-    def set_thread_count(self, count: int) -> None:
+    def set_thread_count(self, n: int) -> None:
         """Set the GraphBLAS thread count (0 restores the default).
 
         Args:
-            count: The number of threads.
+            n: The number of threads.
 
         Raises:
             RuntimeError: If the count cannot be applied.
@@ -409,14 +453,14 @@ class IssunDB:
         ...
 
     @staticmethod
-    def restore(snapshot: str, dst: str) -> None:
+    def restore(snapshot_path: str, destination_path: str) -> None:
         """Restore a snapshot into a new database directory.
 
-        Open the restored database with ``IssunDB(dst)`` afterward.
+        Open the restored database with ``IssunDB(destination_path)`` afterward.
 
         Args:
-            snapshot: The source snapshot path.
-            dst: The destination database directory.
+            snapshot_path: The source snapshot path.
+            destination_path: The destination database directory.
 
         Raises:
             RuntimeError: If the restore fails.

@@ -712,3 +712,166 @@ async fn update_missing_edge_is_not_found() {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
+
+// ---------------------------------------------------------------------------
+// Batch insert
+// ---------------------------------------------------------------------------
+
+/// A node batch returns one id per request item, in request order, and every
+/// node is readable afterwards.
+#[tokio::test]
+async fn node_batch_creates_every_node_in_order() {
+    let (graph, _dir) = fresh_graph();
+    let (status, body) = send(
+        &graph,
+        post(
+            "/v1/nodes/batch",
+            json!({ "nodes": [
+                { "label": "Person", "props": { "name": "Alice" } },
+                { "label": "Person", "labels": ["Employee"], "props": { "name": "Bob" } },
+            ]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let ids: Vec<u64> = body["ids"]
+        .as_array()
+        .expect("ids array")
+        .iter()
+        .map(|v| v.as_u64().expect("id"))
+        .collect();
+    assert_eq!(ids.len(), 2);
+
+    let (status, first) = send(&graph, get(&format!("/v1/nodes/{}", ids[0]))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(first["props"]["name"], "Alice");
+
+    let (status, second) = send(&graph, get(&format!("/v1/nodes/{}", ids[1]))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(second["props"]["name"], "Bob");
+    // The singular `label` is placed first, then any `labels`.
+    assert_eq!(second["labels"], json!(["Person", "Employee"]));
+}
+
+/// A batch is one transaction: an item with no label rejects the whole request
+/// and commits none of it.
+#[tokio::test]
+async fn node_batch_with_unlabeled_item_commits_nothing() {
+    let (graph, _dir) = fresh_graph();
+    let (status, _) = send(
+        &graph,
+        post(
+            "/v1/nodes/batch",
+            json!({ "nodes": [
+                { "label": "Person", "props": { "name": "Alice" } },
+                { "props": { "name": "NoLabel" } },
+            ]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Nothing was written, so the first node is absent too.
+    let (status, body) = send(
+        &graph,
+        post(
+            "/v1/query",
+            json!({ "query": "MATCH (n:Person) RETURN count(n) AS c" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["records"][0][0], 0);
+}
+
+/// An edge batch links existing nodes and returns one id per item.
+#[tokio::test]
+async fn edge_batch_creates_every_edge() {
+    let (graph, _dir) = fresh_graph();
+    let (_, nodes) = send(
+        &graph,
+        post(
+            "/v1/nodes/batch",
+            json!({ "nodes": [
+                { "label": "N", "props": {} },
+                { "label": "N", "props": {} },
+                { "label": "N", "props": {} },
+            ]}),
+        ),
+    )
+    .await;
+    let ids: Vec<u64> = nodes["ids"]
+        .as_array()
+        .expect("ids array")
+        .iter()
+        .map(|v| v.as_u64().expect("id"))
+        .collect();
+
+    let (status, body) = send(
+        &graph,
+        post(
+            "/v1/edges/batch",
+            json!({ "edges": [
+                { "src": ids[0], "dst": ids[1], "type": "R", "props": {} },
+                { "src": ids[1], "dst": ids[2], "type": "R", "props": {} },
+            ]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["ids"].as_array().expect("ids array").len(), 2);
+
+    let (status, edge) = send(
+        &graph,
+        get(&format!("/v1/edges/{}", body["ids"][0].as_u64().unwrap())),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(edge["src"], ids[0]);
+    assert_eq!(edge["dst"], ids[1]);
+}
+
+/// An edge batch naming a missing endpoint rejects the whole request and commits
+/// none of its edges.
+#[tokio::test]
+async fn edge_batch_with_missing_endpoint_commits_nothing() {
+    let (graph, _dir) = fresh_graph();
+    let (_, nodes) = send(
+        &graph,
+        post(
+            "/v1/nodes/batch",
+            json!({ "nodes": [
+                { "label": "N", "props": {} },
+                { "label": "N", "props": {} },
+            ]}),
+        ),
+    )
+    .await;
+    let a = nodes["ids"][0].as_u64().expect("id");
+    let b = nodes["ids"][1].as_u64().expect("id");
+
+    let (status, _) = send(
+        &graph,
+        post(
+            "/v1/edges/batch",
+            json!({ "edges": [
+                { "src": a, "dst": b, "type": "R", "props": {} },
+                { "src": a, "dst": 999_999, "type": "R", "props": {} },
+            ]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let (status, body) = send(
+        &graph,
+        post(
+            "/v1/query",
+            json!({ "query": "MATCH ()-[r:R]->() RETURN count(r) AS c" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["records"][0][0], 0);
+}

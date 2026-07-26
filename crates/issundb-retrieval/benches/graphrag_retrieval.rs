@@ -75,38 +75,54 @@ fn build_graphrag_graph() -> (TempDir, Graph) {
     let graph = Graph::open(dir.path(), 1).unwrap();
 
     // 1. Create nodes with structured topic text and perturbed vector embeddings.
+    //
+    // An auto-commit insert is one durable commit, so the nodes go in under one
+    // transaction. The embeddings follow separately: `upsert_vector` maintains the
+    // HNSW index and has no transaction-scoped form.
     let mut nodes = Vec::with_capacity(NUM_NODES);
-    for i in 0..NUM_NODES {
-        let topic_idx = i % 5;
-        let words: Vec<&str> = TOPICS[topic_idx].split_whitespace().collect();
-        // Generate a synthetic document body by repeating topic words
-        let body = format!(
-            "{} {} {} {} {} {}",
-            words[i % words.len()],
-            words[(i + 1) % words.len()],
-            words[(i + 2) % words.len()],
-            words[(i + 3) % words.len()],
-            words[(i + 4) % words.len()],
-            words[(i + 5) % words.len()]
-        );
-        let nid = graph.add_node("Entity", &json!({ "body": body })).unwrap();
+    let mut embeddings = Vec::with_capacity(NUM_NODES);
+    graph
+        .update(|txn| {
+            for i in 0..NUM_NODES {
+                let topic_idx = i % 5;
+                let words: Vec<&str> = TOPICS[topic_idx].split_whitespace().collect();
+                // Generate a synthetic document body by repeating topic words
+                let body = format!(
+                    "{} {} {} {} {} {}",
+                    words[i % words.len()],
+                    words[(i + 1) % words.len()],
+                    words[(i + 2) % words.len()],
+                    words[(i + 3) % words.len()],
+                    words[(i + 4) % words.len()],
+                    words[(i + 5) % words.len()]
+                );
+                let nid = txn.add_node("Entity", &json!({ "body": body }))?;
 
-        // Topic-based base vector + small perturbation
-        let mut vec = vec![0.0_f32; DIMS];
-        vec[topic_idx * 20] = 1.0_f32;
-        vec[topic_idx * 20 + 10] = 0.5_f32;
-        let mut lcg = Lcg::new((i + 1) as u64);
-        for d in 0..DIMS {
-            vec[d] += (lcg.unit() as f32 - 0.5) * 0.1;
-        }
-        graph.upsert_vector(nid, &vec).unwrap();
-        nodes.push(nid);
+                // Topic-based base vector + small perturbation
+                let mut vec = vec![0.0_f32; DIMS];
+                vec[topic_idx * 20] = 1.0_f32;
+                vec[topic_idx * 20 + 10] = 0.5_f32;
+                let mut lcg = Lcg::new((i + 1) as u64);
+                for d in 0..DIMS {
+                    vec[d] += (lcg.unit() as f32 - 0.5) * 0.1;
+                }
+                embeddings.push(vec);
+                nodes.push(nid);
+            }
+            Ok(())
+        })
+        .unwrap();
+    for (nid, vec) in nodes.iter().zip(&embeddings) {
+        graph.upsert_vector(*nid, vec).unwrap();
     }
 
     // 2. Add RELATED edges using a Zipf distribution (scale-free community structure)
     let zipf = Zipf::new(NUM_NODES as u64, 0.8);
     let mut rng = Lcg::new(0x2F7B_19D5);
     let mut seen = std::collections::HashSet::new();
+    // The rejection sampling below cannot run inside a transaction closure, so the
+    // accepted pairs are collected first and written in one transaction after.
+    let mut pairs: Vec<(u64, u64)> = Vec::with_capacity(3000);
     while seen.len() < 3000 {
         let src = zipf.sample(rng.unit()) as usize;
         let dst = zipf.sample(rng.unit()) as usize;
@@ -118,11 +134,17 @@ fn build_graphrag_graph() -> (TempDir, Graph) {
             continue;
         }
         if seen.insert((src, dst)) {
-            graph
-                .add_edge(nodes[src], nodes[dst], "RELATED", &json!({}))
-                .unwrap();
+            pairs.push((nodes[src], nodes[dst]));
         }
     }
+    graph
+        .update(|txn| {
+            for &(src, dst) in &pairs {
+                txn.add_edge(src, dst, "RELATED", &json!({}))?;
+            }
+            Ok(())
+        })
+        .unwrap();
 
     // 3. Create full-text index on the Entity nodes
     graph.create_node_text_index("Entity", "body").unwrap();

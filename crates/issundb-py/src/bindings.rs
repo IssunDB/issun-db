@@ -76,6 +76,44 @@ impl PyGraph {
         }
     }
 
+    /// Insert many nodes in one write transaction, returning the new ids in
+    /// order. `items` is an iterable of `(labels, props)` pairs, where `labels`
+    /// is a label string or a list of label strings and `props` is a JSON string.
+    ///
+    /// An auto-commit insert costs one durable commit per node, so a Python loop
+    /// over `add_node` is bound by commit latency rather than by the work. This
+    /// writes the whole batch under one transaction, and is all-or-nothing: any
+    /// failure rolls back every node in the batch.
+    fn add_nodes(&self, py: Python<'_>, items: &Bound<'_, PyAny>) -> PyResult<Vec<u64>> {
+        // Extract every argument to owned Rust values before releasing the GIL.
+        let mut parsed: Vec<(Vec<String>, serde_json::Value)> = Vec::new();
+        for item in items.try_iter()? {
+            let item = item?;
+            let (labels, props): (Bound<'_, PyAny>, String) = item
+                .extract()
+                .map_err(|_| val("each item must be a (labels, props_json) pair"))?;
+            let labels = match labels.extract::<String>() {
+                Ok(single) => vec![single],
+                Err(_) => labels
+                    .extract::<Vec<String>>()
+                    .map_err(|_| val("labels must be a string or a list of strings"))?,
+            };
+            parsed.push((labels, parse_json(&props)?));
+        }
+
+        py.detach(|| {
+            self.graph.update(|txn| {
+                let mut ids = Vec::with_capacity(parsed.len());
+                for (labels, props) in &parsed {
+                    let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+                    ids.push(txn.add_node_multi(&refs, props)?);
+                }
+                Ok(ids)
+            })
+        })
+        .map_err(rt)
+    }
+
     /// Return the JSON-encoded properties of node `id`, or `None` if the node does not exist.
     fn get_node(&self, py: Python<'_>, id: u64) -> PyResult<Option<String>> {
         py.detach(|| match self.graph.get_node(id).map_err(rt)? {
@@ -123,6 +161,37 @@ impl PyGraph {
             .map_err(rt)
     }
 
+    /// Insert many edges in one write transaction, returning the new ids in
+    /// order. `items` is an iterable of `(src, dst, type, props)` tuples, where
+    /// `props` is a JSON string.
+    ///
+    /// An auto-commit insert costs one durable commit per edge, so a Python loop
+    /// over `add_edge` is bound by commit latency rather than by the work. This
+    /// writes the whole batch under one transaction, and is all-or-nothing: any
+    /// failure rolls back every edge in the batch.
+    fn add_edges(&self, py: Python<'_>, items: &Bound<'_, PyAny>) -> PyResult<Vec<u64>> {
+        // Extract every argument to owned Rust values before releasing the GIL.
+        let mut parsed: Vec<(u64, u64, String, serde_json::Value)> = Vec::new();
+        for item in items.try_iter()? {
+            let item = item?;
+            let (src, dst, etype, props): (u64, u64, String, String) = item
+                .extract()
+                .map_err(|_| val("each item must be a (src, dst, type, props_json) tuple"))?;
+            parsed.push((src, dst, etype, parse_json(&props)?));
+        }
+
+        py.detach(|| {
+            self.graph.update(|txn| {
+                let mut ids = Vec::with_capacity(parsed.len());
+                for (src, dst, etype, props) in &parsed {
+                    ids.push(txn.add_edge(*src, *dst, etype, props)?);
+                }
+                Ok(ids)
+            })
+        })
+        .map_err(rt)
+    }
+
     /// Return edge `id` as a JSON string `{"src", "dst", "type", "props"}`, or
     /// `None` if the edge does not exist.
     fn get_edge(&self, py: Python<'_>, id: u64) -> PyResult<Option<String>> {
@@ -159,7 +228,8 @@ impl PyGraph {
 
     /// Execute a Cypher query with optional JSON-encoded parameter bindings and return the result as a JSON string.
     ///
-    /// The returned object has the shape `{"columns": [...], "records": [[...]]}`.
+    /// The returned object has the shape
+    /// `{"columns": [...], "records": [{"values": [...]}], "statement_count": n}`.
     #[pyo3(signature = (cypher, params=None))]
     fn query(&self, py: Python<'_>, cypher: &str, params: Option<String>) -> PyResult<String> {
         let params: Option<HashMap<String, serde_json::Value>> = match params {
@@ -184,21 +254,22 @@ impl PyGraph {
     }
 
     /// Index or update the float32 embedding for node `id`.
-    fn upsert_vector(&self, py: Python<'_>, id: u64, vec: Vec<f32>) -> PyResult<()> {
-        py.detach(|| self.graph.upsert_vector(id, &vec)).map_err(rt)
+    fn upsert_vector(&self, py: Python<'_>, id: u64, vector: Vec<f32>) -> PyResult<()> {
+        py.detach(|| self.graph.upsert_vector(id, &vector))
+            .map_err(rt)
     }
 
-    /// Return the `k` nearest neighbors to `vec` as a JSON array of
+    /// Return the `k` nearest neighbors to `vector` as a JSON array of
     /// `{"node": u64, "distance": f32}`.
     ///
     /// `label` restricts results to nodes carrying that label. `properties` is a
     /// JSON object string of key-value filters; only nodes matching every filter
     /// are returned. Both filters are applied during index traversal.
-    #[pyo3(signature = (vec, k, label=None, properties=None, rescore_factor=None))]
+    #[pyo3(signature = (vector, k, label=None, properties=None, rescore_factor=None))]
     fn vector_search(
         &self,
         py: Python<'_>,
-        vec: Vec<f32>,
+        vector: Vec<f32>,
         k: usize,
         label: Option<String>,
         properties: Option<String>,
@@ -219,7 +290,7 @@ impl PyGraph {
             rescore_factor,
         };
         py.detach(|| {
-            let hits = self.graph.vector_search_with(&vec, &opts).map_err(rt)?;
+            let hits = self.graph.vector_search_with(&vector, &opts).map_err(rt)?;
             let json_hits: Vec<serde_json::Value> = hits
                 .into_iter()
                 .map(|h| serde_json::json!({ "node": h.node, "distance": h.distance }))
@@ -337,8 +408,8 @@ impl PyGraph {
     }
 
     /// Set the GraphBLAS thread count (0 restores default behavior).
-    fn set_thread_count(&self, py: Python<'_>, count: i32) -> PyResult<()> {
-        py.detach(|| self.graph.set_thread_count(count)).map_err(rt)
+    fn set_thread_count(&self, py: Python<'_>, n: i32) -> PyResult<()> {
+        py.detach(|| self.graph.set_thread_count(n)).map_err(rt)
     }
 
     /// Execute a hybrid retrieval (GraphRAG) query combining vector search, text
@@ -445,12 +516,13 @@ impl PyGraph {
             .map_err(rt)
     }
 
-    /// Restore a snapshot file at `snapshot` into a new database directory at `dst`.
+    /// Restore a snapshot file at `snapshot_path` into a new database directory
+    /// at `destination_path`.
     ///
-    /// After restoration, open the database with `IssunDB(dst)`.
+    /// After restoration, open the database with `IssunDB(destination_path)`.
     #[staticmethod]
-    fn restore(py: Python<'_>, snapshot: &str, dst: &str) -> PyResult<()> {
-        py.detach(|| Graph::restore(Path::new(snapshot), Path::new(dst)))
+    fn restore(py: Python<'_>, snapshot_path: &str, destination_path: &str) -> PyResult<()> {
+        py.detach(|| Graph::restore(Path::new(snapshot_path), Path::new(destination_path)))
             .map_err(rt)
     }
 }

@@ -46,33 +46,56 @@ fn build_graph() -> (TempDir, Graph, Vec<NodeId>) {
     let dir = TempDir::new().unwrap();
     let g = Graph::open(dir.path(), 2).unwrap();
 
-    let cities: Vec<NodeId> = (0..CITIES)
-        .map(|i| {
-            g.add_node("City", &json!({ "name": format!("City{i}") }))
-                .unwrap()
-        })
-        .collect();
+    // An auto-commit insert is one durable commit, so the fixture is written in
+    // chunked transactions: the commit cost is amortized while each transaction
+    // stays inside LMDB's per-transaction dirty-page limit.
+    const LOAD_CHUNK: usize = 5_000;
 
-    let persons: Vec<NodeId> = (0..PERSONS)
-        .map(|i| {
-            g.add_node(
-                "Person",
-                &json!({ "name": format!("P{i}"), "seq": i as i64 }),
-            )
-            .unwrap()
-        })
-        .collect();
-
-    for (i, &p) in persons.iter().enumerate() {
-        // Every Person lives in one City.
-        g.add_edge(p, cities[i % CITIES], "LIVES_IN", &json!({}))
-            .unwrap();
-        // Every Person knows two others; hubs know many.
-        let degree = if i < HUBS { HUB_DEGREE } else { 2 };
-        for step in 1..=degree {
-            let target = persons[(i + step) % PERSONS];
-            g.add_edge(p, target, "KNOWS", &json!({})).unwrap();
+    let mut cities: Vec<NodeId> = Vec::with_capacity(CITIES);
+    let mut persons: Vec<NodeId> = Vec::with_capacity(PERSONS);
+    g.update(|txn| {
+        for i in 0..CITIES {
+            cities.push(txn.add_node("City", &json!({ "name": format!("City{i}") }))?);
         }
+        Ok(())
+    })
+    .unwrap();
+
+    let mut written = 0;
+    while written < PERSONS {
+        let upto = (written + LOAD_CHUNK).min(PERSONS);
+        g.update(|txn| {
+            for i in written..upto {
+                persons.push(txn.add_node(
+                    "Person",
+                    &json!({ "name": format!("P{i}"), "seq": i as i64 }),
+                )?);
+            }
+            Ok(())
+        })
+        .unwrap();
+        written = upto;
+    }
+
+    let mut written = 0;
+    while written < PERSONS {
+        let upto = (written + LOAD_CHUNK).min(PERSONS);
+        g.update(|txn| {
+            for i in written..upto {
+                let p = persons[i];
+                // Every Person lives in one City.
+                txn.add_edge(p, cities[i % CITIES], "LIVES_IN", &json!({}))?;
+                // Every Person knows two others; hubs know many.
+                let degree = if i < HUBS { HUB_DEGREE } else { 2 };
+                for step in 1..=degree {
+                    let target = persons[(i + step) % PERSONS];
+                    txn.add_edge(p, target, "KNOWS", &json!({}))?;
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
+        written = upto;
     }
 
     g.rebuild_csr().unwrap();

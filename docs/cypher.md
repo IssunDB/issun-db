@@ -62,7 +62,7 @@ Function names are matched case-insensitively.
 - Numeric: `abs`, `sqrt`, `floor`, `ceil` (alias `ceiling`), `round`, `sign`, `log`, `log10`, `exp`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`, `degrees`, `radians`, `haversin`, `pi`, `e`, `rand`, and the multi-argument scalar forms of `min` and `max`.
 - Conversion: `toString`, `toInteger` (alias `toInt`), `toFloat`, `toBoolean`. Converting a non-numeric string with `toInteger` or `toFloat` yields null.
 - Vector and set similarity: `vector_dist`, `issundb.distance.cosine`, `issundb.distance.euclidean`, `issundb.similarity.jaccard`, and `issundb.similarity.overlap`; see the [Cypher Functions](api-reference.md#cypher-functions) reference.
-- Aggregates: `count(*)`, `count`, `sum`, `avg`, `min`, `max`, `collect`, `stdev` (sample), `stdevP` (population), `percentileDisc`, and `percentileCont`. `DISTINCT` is supported inside `count`, `sum`, `avg`, `min`, `max`, and `collect`.
+- Aggregates: `count(*)`, `count`, `sum`, `avg`, `min`, `max`, `collect`, `stdev` (sample), `stdevP` (population), `percentileDisc`, and `percentileCont`. `DISTINCT` is supported inside `count`, `sum`, `avg`, `min`, `max`, `collect`, `stdev`, and `stdevP`.
 
 ## Temporal Values
 

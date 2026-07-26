@@ -2,7 +2,7 @@
 
 This directory contains a benchmark harness for comparing the performance of LadybugDB and IssunDB databases.
 The harness runs an identical Cypher workload against IssunDB and LadybugDB (the Kùzu successor; via the `lbug` crate).
-It reports the median wall time and and also checks that the results are identical.
+It reports the median wall time and also checks that the results are identical.
 
 ### Running the Harness
 
@@ -14,8 +14,9 @@ cd benchmarks/ladybugdb-compare && cargo run --release
 
 The runs can be configured with these environment variables:
 
-- `LADYBUGDB_COMPARE_NODES`: Person node count (default: 10000)
-- `LADYBUGDB_COMPARE_EDGES`: KNOWS edge count (default: 50000)
+- `LADYBUGDB_COMPARE_NODES`: Person node count (default: 50000)
+- `LADYBUGDB_COMPARE_EDGES`: KNOWS edge count (default: five per node, so the density stays fixed when only the node count is overridden). Setting
+  this without also setting the node count changes the average degree, which moves the comparison more than the dataset size does
 - `LADYBUGDB_COMPARE_REPS`: timed repetitions per query, median reported (default: 10)
 - `LADYBUGDB_COMPARE_WARMUPS`: untimed warmup runs per query (default: 3)
 - `LADYBUGDB_COMPARE_SKEW`: `uniform` (default) or `zipf` for a power-law degree distribution with hub nodes; the skewed graph contains far more
@@ -30,7 +31,7 @@ The runs can be configured with these environment variables:
 The graph used in the benchmarks is a social network (Person nodes with id, name, age, and city; distinct KNOWS edges, no self-loops).
 It is synthetically generated with a fixed random seed so runs are reproducible.
 Edge endpoints are sampled uniformly by default or from a Zipf distribution (with exponent 0.8) with `LADYBUGDB_COMPARE_SKEW=zipf`,
-which produces hub nodes as in real social graphs and help stress-test the joins (with sckewed degree distributions).
+which produces hub nodes as in real social graphs and helps stress-test the joins under a skewed degree distribution.
 
 Currently, these queries are used in the benchmarks:
 
@@ -50,17 +51,17 @@ Currently, these queries are used in the benchmarks:
 - Aggregation over a one-hop traversal grouped by city
 
 > [!NOTE]
-> Currently, the benchmarks only include read-only queries, which are more directly comparable across the two databses.
+> Currently, the benchmarks only include read-only queries, which are more directly comparable across the two databases.
 > Things like mutation throughput, concurrent clients, and direct graph-algorithm APIs are deliberately excluded.
 > They need separate setup and transaction semantics that would make it hard to maintain a clean comparison in a single harness.
 
 To make the measurements more comparable, LadybugDB query runs are measured twice per query.
-Once using LadybugDB's default thread count and once with the number of thread pinned to one, since IssunDB currently executes
+Once using LadybugDB's default thread count and once with the number of threads pinned to one, since IssunDB currently executes
 a query in a single thread.
 
 ### Fairness Notes
 
-- Loading data differ structurally for the two databases. LadybugDB bulk-loads via `COPY FROM` CSV; IssunDB inserts per record through `add_node` and
+- Loading data differs structurally for the two databases. LadybugDB bulk-loads via `COPY FROM` CSV; IssunDB inserts per record through `add_node` and
   `add_edge`. Both are timed and reported, but they measure different ingestion models.
 - LadybugDB defaults to WALK semantics for variable-length patterns (a relationship may repeat within a path); the harness pins
   `recursive_pattern_semantic = 'TRAIL'` so both databases use the openCypher path semantics on identical query strings.

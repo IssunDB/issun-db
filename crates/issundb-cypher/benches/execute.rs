@@ -41,21 +41,24 @@ const OFFSETS: [usize; 3] = [1, 7, 13];
 fn build_graph() -> (TempDir, Graph) {
     let dir = TempDir::new().unwrap();
     let g = Graph::open(dir.path(), 1).unwrap();
-    let ids: Vec<_> = (0..NUM_NODES)
-        .map(|i| {
-            g.add_node(
+    // An auto-commit insert is one durable commit, so the fixture is written in
+    // one transaction rather than one commit per record.
+    let mut ids = Vec::with_capacity(NUM_NODES);
+    g.update(|txn| {
+        for i in 0..NUM_NODES {
+            ids.push(txn.add_node(
                 "Person",
                 &json!({ "name": format!("p{i}"), "age": 18 + (i % 60) }),
-            )
-            .unwrap()
-        })
-        .collect();
-    for i in 0..NUM_NODES {
-        for off in OFFSETS {
-            g.add_edge(ids[i], ids[(i + off) % NUM_NODES], "KNOWS", &json!({}))
-                .unwrap();
+            )?);
         }
-    }
+        for i in 0..NUM_NODES {
+            for off in OFFSETS {
+                txn.add_edge(ids[i], ids[(i + off) % NUM_NODES], "KNOWS", &json!({}))?;
+            }
+        }
+        Ok(())
+    })
+    .unwrap();
     g.rebuild_csr().unwrap();
     (dir, g)
 }
@@ -65,20 +68,18 @@ fn build_graph() -> (TempDir, Graph) {
 fn build_triangle_graph(num_triangles: usize) -> (TempDir, Graph) {
     let dir = TempDir::new().unwrap();
     let g = Graph::open(dir.path(), 1).unwrap();
-    for t in 0..num_triangles {
-        let a = g
-            .add_node("N", &json!({ "name": format!("a{t}") }))
-            .unwrap();
-        let b = g
-            .add_node("N", &json!({ "name": format!("b{t}") }))
-            .unwrap();
-        let c = g
-            .add_node("N", &json!({ "name": format!("c{t}") }))
-            .unwrap();
-        g.add_edge(a, b, "R", &json!({})).unwrap();
-        g.add_edge(b, c, "R", &json!({})).unwrap();
-        g.add_edge(c, a, "R", &json!({})).unwrap();
-    }
+    g.update(|txn| {
+        for t in 0..num_triangles {
+            let a = txn.add_node("N", &json!({ "name": format!("a{t}") }))?;
+            let b = txn.add_node("N", &json!({ "name": format!("b{t}") }))?;
+            let c = txn.add_node("N", &json!({ "name": format!("c{t}") }))?;
+            txn.add_edge(a, b, "R", &json!({}))?;
+            txn.add_edge(b, c, "R", &json!({}))?;
+            txn.add_edge(c, a, "R", &json!({}))?;
+        }
+        Ok(())
+    })
+    .unwrap();
     g.rebuild_csr().unwrap();
     (dir, g)
 }

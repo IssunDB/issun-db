@@ -2,6 +2,7 @@
 
 import json
 
+import pytest
 from conftest import rows
 
 
@@ -70,3 +71,42 @@ def test_update_edge(db):
     db.update_edge(eid, json.dumps({"since": 2022, "source": "referral"}))
     edge = json.loads(db.get_edge(eid))
     assert edge["props"] == {"since": 2022, "source": "referral"}
+
+
+def test_add_edges_returns_ids_in_order(db):
+    ids = db.add_nodes([("N", "{}"), ("N", "{}"), ("N", "{}")])
+    edge_ids = db.add_edges(
+        [
+            (ids[0], ids[1], "R", json.dumps({"w": 1})),
+            (ids[1], ids[2], "R", json.dumps({"w": 2})),
+        ]
+    )
+    assert len(edge_ids) == 2
+    first = json.loads(db.get_edge(edge_ids[0]))
+    assert first["src"] == ids[0]
+    assert first["dst"] == ids[1]
+    assert first["props"] == {"w": 1}
+
+
+def test_add_edges_empty_batch_is_a_noop(db):
+    assert db.add_edges([]) == []
+
+
+def test_add_edges_rejects_a_malformed_item(db):
+    with pytest.raises(ValueError):
+        db.add_edges([(1, 2, "R")])
+
+
+def test_add_edges_rolls_back_the_whole_batch_on_failure(db):
+    ids = db.add_nodes([("N", "{}"), ("N", "{}")])
+
+    # The second edge names a node that does not exist, so neither edge commits.
+    with pytest.raises(RuntimeError):
+        db.add_edges(
+            [
+                (ids[0], ids[1], "R", "{}"),
+                (ids[0], 999999, "R", "{}"),
+            ]
+        )
+
+    assert rows(json.loads(db.query("MATCH ()-[r:R]->() RETURN count(r)"))) == [[0]]

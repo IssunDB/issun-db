@@ -637,6 +637,7 @@ Graph Algorithms
 Vector and Text Search
   configure-vec <metric> [quantization] Configure or reindex vector metric and quantization (e.g., configure-vec cosine float32)
   upsert-vec <id> <values...>          Attach/upsert a vector embedding on a node (e.g., upsert-vec 1 0.1 0.2 0.3)
+  remove-vec <id>                      Remove the vector embedding from a node (e.g., remove-vec 1)
   vsearch <k> <query...> [--label L]   Query the vector index for k-nearest neighbors (e.g., vsearch 5 0.1 0.2 0.3 --label Person)
   retrieve <k> <hops> <query...>       Run hybrid retrieval; add --text <q> for text seeds (e.g., retrieve 5 2 0.1 0.2 0.3 --text alice)
   text-index <act> [label] [property]  Perform full-text index actions (e.g., text-index create Person name --lang german)

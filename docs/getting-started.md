@@ -64,6 +64,10 @@ The REPL supports meta commands (prefixed with `:`) to manage the session, take 
 | `:import-nodes`   | `:import-nodes /path/to/nodes.csv Label`        | Bulk-import nodes from a CSV or Parquet file whose columns become properties.                                             |
 | `:import-edges`   | `:import-edges /path/to/edges.csv Src Dst Type` | Bulk-import edges from a two-column CSV or Parquet file of domain keys.                                                   |
 | `:explain`        | `:explain MATCH (n) RETURN n`                   | Explain the physical plan of a Cypher query.                                                                              |
+| `:threads`        | `:threads 4`                                    | Set the GraphBLAS thread count, with 0 restoring the default.                                                             |
+| `:version`        | `:version`                                      | Show the IssunDB version.                                                                                                 |
+| `help`            | `help`                                          | Show the built-in command list.                                                                                           |
+| `quit`            | `quit`                                          | Exit the CLI (alias `exit`).                                                                                              |
 
 ### Graph Shell Commands
 
@@ -102,7 +106,6 @@ The REPL also supports direct operations and queries to manipulate nodes and edg
 | `configure-vec`       | Configure vector index metric and quantization (e.g., `configure-vec cosine int8`).                |
 | `text-index`          | Configure and manage full-text indexes (e.g., `text-index create Book title`).                     |
 | `text-search`         | Query the BM25 full-text search index (e.g., `text-search "query" Book summary 5`).                |
-| `:threads`            | Set the GraphBLAS thread count, with 0 restoring the default (e.g., `:threads 4`).                 |
 
 ---
 
@@ -112,7 +115,7 @@ To use IssunDB as an embedded database in a Rust project, add the `issundb` libr
 
 ```toml
 [dependencies]
-issundb = "0.1.0-alpha.15"   # Match the version published on crates.io
+issundb = "0.1.0-alpha.17"   # Match the version published on crates.io
 serde_json = "1.0"           # Used to construct property maps
 ```
 

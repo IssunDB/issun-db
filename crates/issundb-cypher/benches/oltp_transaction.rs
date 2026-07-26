@@ -20,59 +20,59 @@ fn build_oltp_graph() -> (TempDir, Graph) {
     let dir = TempDir::new().unwrap();
     let g = Graph::open(dir.path(), 1).unwrap();
 
-    // 1. Add Cities
-    let cities: Vec<_> = (0..NUM_CITIES)
-        .map(|i| {
-            g.add_node("City", &json!({ "name": format!("city{i}") }))
-                .unwrap()
-        })
-        .collect();
+    // An auto-commit insert is one durable commit, so the fixture is written in
+    // two transactions rather than one commit per record.
+    let mut cities = Vec::with_capacity(NUM_CITIES);
+    let mut persons = Vec::with_capacity(NUM_PERSONS);
+    let mut posts = Vec::with_capacity(NUM_POSTS);
 
-    // 2. Add Persons
-    let persons: Vec<_> = (0..NUM_PERSONS)
-        .map(|i| {
-            g.add_node(
+    g.update(|txn| {
+        // 1. Add Cities
+        for i in 0..NUM_CITIES {
+            cities.push(txn.add_node("City", &json!({ "name": format!("city{i}") }))?);
+        }
+        // 2. Add Persons
+        for i in 0..NUM_PERSONS {
+            persons.push(txn.add_node(
                 "Person",
                 &json!({ "name": format!("p{i}"), "age": 18 + (i % 60) }),
-            )
-            .unwrap()
-        })
-        .collect();
-
-    // 3. Add Posts
-    let posts: Vec<_> = (0..NUM_POSTS)
-        .map(|i| {
-            g.add_node("Post", &json!({ "title": format!("post{i}") }))
-                .unwrap()
-        })
-        .collect();
-
-    // 4. Connect Persons with LIVES_IN to Cities
-    for i in 0..NUM_PERSONS {
-        g.add_edge(persons[i], cities[i % NUM_CITIES], "LIVES_IN", &json!({}))
-            .unwrap();
-    }
-
-    // 5. Connect Persons with KNOWS (coprime offsets)
-    let knows_offsets = [1, 7, 13];
-    for i in 0..NUM_PERSONS {
-        for off in knows_offsets {
-            g.add_edge(
-                persons[i],
-                persons[(i + off) % NUM_PERSONS],
-                "KNOWS",
-                &json!({}),
-            )
-            .unwrap();
+            )?);
         }
-    }
+        // 3. Add Posts
+        for i in 0..NUM_POSTS {
+            posts.push(txn.add_node("Post", &json!({ "title": format!("post{i}") }))?);
+        }
+        Ok(())
+    })
+    .unwrap();
 
-    // 6. Give each of the first 50 people 20 posts so IS2 performs a real
-    // top-10 selection instead of sorting a single row.
-    for i in 0..NUM_POSTS {
-        g.add_edge(posts[i], persons[i % 50], "HAS_CREATOR", &json!({}))
-            .unwrap();
-    }
+    g.update(|txn| {
+        // 4. Connect Persons with LIVES_IN to Cities
+        for i in 0..NUM_PERSONS {
+            txn.add_edge(persons[i], cities[i % NUM_CITIES], "LIVES_IN", &json!({}))?;
+        }
+
+        // 5. Connect Persons with KNOWS (coprime offsets)
+        let knows_offsets = [1, 7, 13];
+        for i in 0..NUM_PERSONS {
+            for off in knows_offsets {
+                txn.add_edge(
+                    persons[i],
+                    persons[(i + off) % NUM_PERSONS],
+                    "KNOWS",
+                    &json!({}),
+                )?;
+            }
+        }
+
+        // 6. Give each of the first 50 people 20 posts so IS2 performs a real
+        // top-10 selection instead of sorting a single row.
+        for i in 0..NUM_POSTS {
+            txn.add_edge(posts[i], persons[i % 50], "HAS_CREATOR", &json!({}))?;
+        }
+        Ok(())
+    })
+    .unwrap();
 
     g.rebuild_csr().unwrap();
     (dir, g)

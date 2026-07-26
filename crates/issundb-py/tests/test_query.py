@@ -11,7 +11,10 @@ from conftest import rows
 def test_query_result_shape(db):
     db.add_node("Person", json.dumps({"name": "Grace"}))
     result = json.loads(db.query("MATCH (n:Person) RETURN n.name AS name"))
-    assert set(result.keys()) == {"columns", "records"}
+    # `statement_count` lets a caller notice a multi-statement (semicolon
+    # separated) query instead of reading the last statement's result as the whole.
+    assert set(result.keys()) == {"columns", "records", "statement_count"}
+    assert result["statement_count"] == 1
     assert result["columns"] == ["name"]
     assert rows(result) == [["Grace"]]
 

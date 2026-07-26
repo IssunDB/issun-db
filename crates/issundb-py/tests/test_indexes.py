@@ -125,9 +125,12 @@ def test_remove_vector(db):
     hits = json.loads(db.vector_search([1.0, 0.0, 0.0], 5))
     assert any(h["node"] == nid for h in hits)
 
+    # That was the only embedding, so the index is now empty. A search reports
+    # that rather than returning an empty hit list, so a caller can tell "no
+    # semantic matches" apart from "there is nothing to search".
     db.remove_vector(nid)
-    hits = json.loads(db.vector_search([1.0, 0.0, 0.0], 5))
-    assert not any(h["node"] == nid for h in hits)
+    with pytest.raises(RuntimeError, match="vector index is empty"):
+        db.vector_search([1.0, 0.0, 0.0], 5)
 
     # A repeat removal of the same vector is a no-op.
     db.remove_vector(nid)

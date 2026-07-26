@@ -7,7 +7,7 @@ apply everywhere and are not repeated here.
 
 Every Cypher string passes through five stages, each owned by a distinct source file:
 
-1. **Parse** (`src/parser.rs`): recursive-descent parser produces a `Statement` AST from the raw query string.
+1. **Parse** (`src/parser.rs`): a `chumsky` combinator parser produces a `Statement` AST from the raw query string.
 2. **Logical plan** (`src/plan/logical.rs`): `LogicalPlanner` walks the AST and emits a tree of `LogicalOperator` nodes. All variable bindings and
    label/type resolutions are established here.
 3. **Physical plan** (`src/plan/physical.rs`): `PhysicalPlanner` converts each `LogicalOperator` into a `PhysicalOperator`, choosing access paths (
@@ -21,26 +21,23 @@ Every Cypher string passes through five stages, each owned by a distinct source 
 
 Keep each concern in its own file. Do not call `Graph` methods from `parser.rs`, `logical.rs`, or `physical.rs`.
 
-## Parser Recursion Rules
+## Parser Structure Rules
 
-The parser is hand-written and must avoid left-recursion. Expression parsing uses a descent chain ordered by precedence (lowest to highest):
+The parser is built with the `chumsky` parser-combinator library, in two phases. Phase 1 lexes the query text into a token stream. Phase 2 builds the
+combinator graph, with operator precedence expressed through chumsky's Pratt parser (`chumsky::pratt::{infix, left, postfix, prefix}`) rather than a
+hand-written descent chain.
 
-```
-parse_expr
-  └─ parse_expr_or
-       └─ parse_expr_and
-            └─ parse_expr_cmp
-                 └─ parse_expr_isnull
-                      └─ parse_expr_unary
-                           └─ parse_expr_call
-                                └─ parse_expr_atom
-```
-
-Each level handles only its own operators and calls the next level for sub-expressions. Never call a higher-precedence function from a
-lower-precedence one except through this chain.
-
-String tokenization uses a single forward pass without backtracking. If a lookahead of more than one token is needed, use a local peek variable rather
-than a global parser state.
+- Add a new operator by giving it a binding power in the Pratt rule table, not by inserting a new precedence level function. Getting the binding power
+  wrong is the common failure, so cover every new operator against its neighbors in a precedence test.
+- Combinators compose bottom-up: a sub-parser must be defined before the parser that uses it, and recursive positions go through `recursive`. Do not
+  reach for a shared mutable parser state to carry a lookahead; express it with the combinators.
+- Building the combinator graph costs more than consuming the tokens, and for a small query more than executing it. `parse_with_exec_depth` therefore
+  serves repeated query text from a bounded thread-local cache of `Arc<Statement>`. Parsing reads no graph state, no parameters, and no clock, so a
+  cached outcome (including a parse error) is always valid and the cache needs no invalidation. Keep it that way: never make a parse decision depend
+  on anything outside the query text. `parse` is the uncached entry point and must stay uncached so the `parse` benchmarks keep measuring the parser.
+- Deep nesting is handled by stack budget, not by recursion limits inside the grammar. An iterative token-stream scan (`scan_nesting`) rejects
+  genuinely pathological input before any AST is built, a deep parse runs on a dedicated large-stack thread, and a query whose nesting exceeds
+  `SMALL_STACK_EXEC_BUDGET_KB` has its execution dispatched to a large-stack thread by `execute_with_procedures`.
 
 ## AST Immutability Policy
 
@@ -64,7 +61,7 @@ than a global parser state.
 Follow this checklist in order:
 
 1. **AST variant**: add the new clause type to `src/ast.rs`. Derive `Clone` and `PartialEq`.
-2. **Parser rule**: add a parsing function in `src/parser.rs`. Wire it into the dispatch table at the top of `parse`.
+2. **Parser rule**: add a combinator for the clause in `src/parser.rs` and wire it into the statement-level `choice(...)` alternation.
 3. **Logical planner arm**: add a match arm in `LogicalPlanner::plan` in `src/plan/logical.rs`.
 4. **Physical planner arm**: add a match arm in `PhysicalPlanner::plan` in `src/plan/physical.rs`.
 5. **Optimizer arm** (if applicable): if the new clause benefits from rewriting, add a rewrite rule in `src/plan/optimize.rs`. Skip this step if no
