@@ -228,7 +228,8 @@ impl PyGraph {
 
     /// Execute a Cypher query with optional JSON-encoded parameter bindings and return the result as a JSON string.
     ///
-    /// The returned object has the shape `{"columns": [...], "records": [[...]]}`.
+    /// The returned object has the shape
+    /// `{"columns": [...], "records": [{"values": [...]}], "statement_count": n}`.
     #[pyo3(signature = (cypher, params=None))]
     fn query(&self, py: Python<'_>, cypher: &str, params: Option<String>) -> PyResult<String> {
         let params: Option<HashMap<String, serde_json::Value>> = match params {

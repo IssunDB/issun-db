@@ -22,7 +22,7 @@ These invariants must hold after every successful write transaction:
 4. **Secondary index consistency.** `label_idx` and `type_idx` use composite keys `(u32 BE, u64 BE)` with `Unit` values. Every `add_node` must insert
    its `(LabelId, NodeId)` entry, and every `delete_node` must remove it. Same rule applies to `type_idx` for edges.
 
-5. **Property column consistency.** Every `add_node` must write a `node_prop_idx` entry for each non-null scalar property in `props_json`. Every
+5. **Property index consistency.** Every `add_node` must write a `node_prop_idx` entry for each non-null scalar property in `props_json`. Every
    `update_node` must delete old entries and write new ones for all changed scalar properties. Every `delete_node` must remove all `node_prop_idx`
    entries for the deleted node. Failing to maintain this invariant causes `has_node_property_index` to return stale results and the Cypher optimizer
    to emit incorrect `NodeIndexScan` plans.
@@ -55,10 +55,14 @@ All mutations to the graph go through the `Graph` API. Inside `Graph`:
 
 ## OpenMP Thread Count
 
-`MatrixSet::materialize` (in `matrices.rs`) calls `GxB_Global_Option_set(GxB_NTHREADS, n)` immediately after creating the SuiteSparse:GraphBLAS
-context. The thread count is threshold-gated: graphs with more than 100 000 edges use `std::thread::available_parallelism()` cores; smaller graphs use
-1 thread to avoid scheduling overhead on short operations. This setting is global to the SuiteSparse runtime for the lifetime of the process; do not
-call `GxB_Global_Option_set` from anywhere else.
+`MatrixSet::materialize` (in `matrices.rs`) sets the thread count immediately after creating the SuiteSparse:GraphBLAS context, through
+`issundb_graphblas::set_global_threads(n)`. The count resolves in one fixed order: the `programmatic_threads` argument when it is greater than zero
+(what `Graph::set_thread_count` supplies), otherwise the `ISSUNDB_NUM_THREADS` environment variable, otherwise 1. There is no graph-size heuristic;
+the conservative default of 1 thread avoids scheduling overhead on the short operations that dominate small graphs, and a caller that wants
+parallelism asks for it explicitly.
+
+The setting is global to the SuiteSparse runtime for the lifetime of the process. `GxB_Global_Option_set(GxB_NTHREADS, n)` is called in exactly one
+place, `issundb_graphblas::set_global_threads`; do not call the raw FFI from `issundb-core` or from anywhere else.
 
 ## CSR Snapshot Vs. LMDB Adjacency
 
@@ -68,14 +72,16 @@ via `arc_swap::ArcSwap`. `MatrixSet` (in `matrices.rs`) holds the GraphBLAS spar
 - **Always write to LMDB first.** The CSR snapshot is derived from LMDB, not the other way around.
 - Use LMDB adjacency databases (`out_adj`, `in_adj`) for correctness-critical reads: single-node neighbor lookups, existence checks, and anything
   inside a transaction.
-- Note that `out_neighbors` consults the CSR snapshot first and falls back to `out_adj` only when the snapshot has no entry for the node, so it can
-  return stale results until the background rebuild completes. `in_neighbors` reads `in_adj` directly. A write-time consistency check (such as the
-  DELETE connected-node guard) must read storage truth: use `node_has_relationships`, which reads both adjacency databases and never consults the
-  snapshot.
-- Use the CSR snapshot as the hot read path for graph algorithms (BFS, DFS, PageRank, SCC). After a batch of writes, call `Graph::rebuild_csr` to
-  refresh it.
-- `MatrixSet` is rebuilt from the CSR snapshot by `MatrixSet::materialize`. Rebuild both the CSR and the matrix set together; do not update one
-  without the other.
+- The point adjacency lookups (`out_neighbors`, `in_neighbors`, `all_neighbors`, and `node_has_relationships`) all read `out_adj` and `in_adj`
+  directly through the transaction and never consult the snapshot, so they always reflect committed and in-transaction writes. A write-time
+  consistency check (such as the DELETE connected-node guard) depends on that: keep any new point lookup on storage truth rather than routing it
+  through the snapshot for speed.
+- Use the CSR snapshot as the hot read path for graph algorithms (BFS, DFS, PageRank, SCC). Callers do not have to refresh it by hand: the algorithm
+  entry points go through `ensure_matrix_view`, `ensure_csr_fresh`, or `ensure_snapshot_fresh` (see the freshness gates in the root `AGENTS.md`).
+  `Graph::rebuild_csr` remains available for forcing a full rebuild before a burst of algorithm calls.
+- `MatrixSet` is derived from the CSR snapshot. A full rebuild goes through `MatrixSet::materialize`; incremental maintenance goes through
+  `MatrixSet::apply_delta`, which patches the matrices in place from the write path's `GraphDelta` and falls back to a full rebuild when a node was
+  deleted. Either way the CSR and the matrix set advance together; do not update one without the other.
 
 ## In-memory Property Columns
 

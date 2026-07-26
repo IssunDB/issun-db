@@ -270,7 +270,7 @@ impl IssunMcp {
     }
 
     #[tool(
-        description = "Fetch a node by its internal engine id (Cypher's id(n), not a domain property such as Id); returning its labels and properties. Pass expect_label to error instead of silently returning a wrong-label node when the id's provenance is uncertain. String property values longer than max_property_chars (default 2000) are truncated with an explicit marker; pass a properties list to select specific properties, or max_property_chars 0 for full values."
+        description = "Fetch a node by its internal engine id (Cypher's id(n), not a domain property such as Id), returning its labels and properties. Pass expect_label to error instead of silently returning a wrong-label node when the id's provenance is uncertain. String property values longer than max_property_chars (default 2000) are truncated with an explicit marker; pass a properties list to select specific properties, or max_property_chars 0 for full values."
     )]
     async fn get_node(
         &self,

@@ -31,7 +31,7 @@ bob = db.add_node("Person", json.dumps({"name": "Bob", "age": 28}))
 # Add a directed edge between the nodes
 db.add_edge(alice, bob, "KNOWS", json.dumps({"since": 2021}))
 
-# Run a Cypher query and and print the results
+# Run a Cypher query and print the results
 result = json.loads(
     db.query("MATCH (a:Person)-[r:KNOWS]->(b:Person) RETURN a.name, b.name, r.since")
 )
@@ -53,4 +53,4 @@ Visit [IssunDB's documentation](https://IssunDB.github.io/issun-db/) for detaile
 
 ### License
 
-The content of this directory are avaible under the [MIT License](https://github.com/IssunDB/issun-db/blob/main/LICENSE-MIT).
+The contents of this directory are available under the [MIT License](https://github.com/IssunDB/issun-db/blob/main/LICENSE-MIT).

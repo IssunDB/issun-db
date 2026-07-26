@@ -149,7 +149,7 @@ Here is a quick reference of the methods available on the `IssunDB` class:
 * `remove_label(id: int, label: str) -> None`: Removes a label from a node.
 * `add_edge(src: int, dst: int, etype: str, props: str) -> int`: Adds an edge and returns its unique ID.
 * `add_edges(items: Iterable[Tuple[int, int, str, str]]) -> List[int]`: Adds many edges in one transaction and returns their IDs in order.
-* `get_edge(id: int) -> Optional[str]`: Retrieves JSON-encoded edge properties, or `None`.
+* `get_edge(id: int) -> Optional[str]`: Retrieves the edge as a JSON-encoded object with `src`, `dst`, `type`, and `props`, or `None`. Unlike `get_node`, this returns the whole record rather than the properties alone.
 * `update_edge(id: int, props: str) -> None`: Overwrites edge properties.
 * `delete_edge(id: int) -> None`: Deletes an edge.
 

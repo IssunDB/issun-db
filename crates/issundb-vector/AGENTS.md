@@ -10,7 +10,7 @@ Read the root `AGENTS.md` first; the rules there apply everywhere and are not re
 1. **Empty**: no usearch index exists yet; the dimension count is unknown.
 2. **Ready**: the index is live with a fixed dimension count; `upsert` and `search` both operate against it.
 
-State transitions are guarded by an internal `parking_lot::Mutex<Inner>`.
+State transitions are guarded by an internal `RwLock<Inner>`; a read-only search takes the read guard, and `upsert` and `remove` take the write guard.
 Initialization happens inside the mutex: create an `IndexOptions`, call `Index::new`, call `index.reserve(64)`, then insert the first vector.
 Once `Ready`, the dimension count is immutable for the lifetime of the index.
 
@@ -19,8 +19,9 @@ Once `Ready`, the dimension count is immutable for the lifetime of the index.
 All vectors added to a given `VectorIndex` must have the same number of dimensions.
 This is enforced at the API boundary:
 
-- In `upsert`, if `v.len() != dims` for a `Ready` index, return `Err(Error::Vector(...))` immediately. Never silently truncate or pad the vector.
-- In `search`, if `q.len() != dims`, return `Err(Error::Vector(...))`.
+- In `upsert`, if `v.len() != dims` for a `Ready` index, return `Err(VectorError::DimensionMismatch { expected, got })` immediately. Never silently
+  truncate or pad the vector.
+- In `search`, if `q.len() != dims`, return the same `VectorError::DimensionMismatch`.
 - An empty vector (`v.len() == 0`) is rejected by `upsert` before the state check.
 
 Do not add any path that changes `dims` after initialization.
@@ -33,12 +34,15 @@ Do not add any path that changes `dims` after initialization.
     - `Cosine`: angular similarity; suitable for normalized text embeddings.
     - `L2`: Euclidean distance; suitable for spatial or non-normalized vectors.
     - `Dot`: inner product; use when vectors are already normalized to unit length and maximum dot product is the goal.
-- `quantization: VectorQuantization` (default: `F32`): scalar precision for stored vectors. Trade-offs:
+- `quantization: VectorQuantization` (default: `Float32`): scalar precision for stored vectors. Trade-offs:
     - `Float32`: full precision, no recall loss.
     - `Float16`: 2x memory reduction, minor recall loss (typically < 1 %).
     - `Int8`: 4x memory reduction, moderate recall loss; suitable for large corpora where approximate results are acceptable.
 
-The metric and quantization are fixed at index construction time and cannot be changed without rebuilding the index from scratch.
+The metric and quantization are fixed at index construction time. `configure_vector_index` therefore returns `VectorError::AlreadyConfigured` when it
+would change either one on a graph that already holds embeddings. `reindex_vector_index` is the sanctioned way to change them afterward: the stored
+vectors are raw, metric-agnostic f32, so it rebuilds the whole in-memory index from LMDB under the new configuration. That rebuild is O(n) and is an
+administrative operation, not a concurrent one.
 
 ## `usearch` API Notes
 
@@ -67,14 +71,19 @@ Never call `graph.vector_bytes()` or any `Graph` method while holding the `exten
 
 ## `VectorSearchOptions` Filters
 
-When `opts.label` or `opts.properties` are set:
+When `opts.label` or `opts.properties` are set, the filter is evaluated **during** the HNSW traversal, not after it. `vector_search_with` builds a
+predicate over `NodeId` and hands it to `VectorIndex::search_filtered`, which calls usearch's `filtered_search`. A node matches when it carries
+`opts.label` (if set) and every entry in `opts.properties` (if set) equals the node's value for that property.
 
-1. Over-fetch from the index: request `(opts.k * 4).max(opts.k + 64)` candidates.
-2. For each candidate, call `graph.get_node(hit.node)` and `graph.label_name(record.label)` to verify the label.
-3. Collect the first `opts.k` survivors.
+Do not replace this with a post-filter over a fixed over-fetch. Over-fetching a constant multiple of `k` and then discarding non-matching hits
+silently under-returns for a selective filter: the traversal stops after `k * factor` candidates whether or not any of them match, so a filter that
+excludes most of the index yields fewer than `opts.k` results even when far more matching nodes exist. Filtering inside the traversal keeps expanding
+until it has `opts.k` matching neighbors. Fewer than `opts.k` results then means the index genuinely holds fewer matching nodes; do not error in that
+case.
 
-This over-fetch factor compensates for label distribution skew. Fewer than `opts.k` results may be returned when the index contains fewer matching
-nodes. Do not error in this case; return whatever survivors were found.
+`opts.rescore_factor` is a separate mechanism and is not a filtering over-fetch. On a quantized index the search fetches `k * rescore_factor`
+candidates (default 2) and re-ranks them by exact distance against the full-precision vectors in LMDB. It defaults to 1 on a `Float32` index, and
+`Some(1)` disables it.
 
 ## Testing Rules
 
@@ -83,7 +92,9 @@ Every test that touches vector behavior must cover all three of the following sc
 1. **Persist and reload**: `upsert → search` in one `Graph` instance; then reopen the same path and `search` again. The same nearest neighbor must
    appear after reload.
 2. **Dimension mismatch**: after the first `upsert` fixes dimensions, a second `upsert` with a different dimension count must return
-   `Err(Error::Vector(...))`.
-3. **Empty index**: `vector_search` on a graph with no vectors must return an empty `Vec`, not an error.
+   `Err(VectorError::DimensionMismatch { .. })`.
+3. **Empty index**: `vector_search` on a graph with no vectors must return `Err(VectorError::EmptyIndex)`, not an empty `Vec`, so a caller can tell
+   "no semantic matches" apart from "there is nothing to search". Mapping that error back to zero rows is the caller's job where MATCH semantics
+   demand it, as the Cypher `VectorTopK` operator does.
 
 Each test must open its own `TempDir` and must not share a `Graph` instance with other tests.
