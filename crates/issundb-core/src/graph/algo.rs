@@ -528,23 +528,48 @@ impl Graph {
         // pipeline emits it.
         let mut qualifying = vec![0u64; n];
         let mut present = vec![false; n];
-        let mut visited_counted = vec![false; n];
-        walk_qualifying(
-            &snap,
-            n,
-            type_id,
-            spec.group_is_dst,
-            &group_mask,
-            &counted_mask,
-            |group_d, counted_d| {
-                present[group_d] = true;
-                qualifying[group_d] += 1;
-                visited_counted[counted_d] = true;
-            },
-        );
+        // Only the non-null filter needs to know which counted endpoints were
+        // reached, so `count(*)`, the common shape, allocates no bitmap and pays no
+        // store per traversed edge.
+        let mut visited_counted = if spec.counted_nonnull_prop.is_some() {
+            vec![false; n]
+        } else {
+            Vec::new()
+        };
+        if visited_counted.is_empty() {
+            walk_qualifying(
+                &snap,
+                n,
+                type_id,
+                spec.group_is_dst,
+                &group_mask,
+                &counted_mask,
+                |group_d, _| {
+                    present[group_d] = true;
+                    qualifying[group_d] += 1;
+                },
+            );
+        } else {
+            walk_qualifying(
+                &snap,
+                n,
+                type_id,
+                spec.group_is_dst,
+                &group_mask,
+                &counted_mask,
+                |group_d, counted_d| {
+                    present[group_d] = true;
+                    qualifying[group_d] += 1;
+                    visited_counted[counted_d] = true;
+                },
+            );
+        }
 
-        // Resolve the non-null filter over the endpoints the walk actually
-        // reached, and re-tally only when some of them really are null.
+        // Resolve the non-null filter over the endpoints the walk actually reached,
+        // and re-tally only when some of them really are null. The second pass is
+        // the price of resolving presence for the visited set rather than trusting a
+        // whole-column summary, which was unsound; it is paid only for
+        // `count(prop)` and only when a null is actually present.
         let counts = match spec.counted_nonnull_prop {
             None => qualifying,
             Some(prop) => match self.visited_nonnull_mask(&snap, &visited_counted, prop)? {
@@ -699,7 +724,13 @@ impl Graph {
     /// can size an expansion before choosing how to evaluate it. A source absent
     /// from the snapshot contributes zero.
     pub fn adjacency_span(&self, sources: &[NodeId], incoming: bool) -> Result<u64, Error> {
-        self.ensure_snapshot_fresh()?;
+        // Deliberately no freshness gate. This measures the installed snapshot so a
+        // caller can decide whether an expansion is worth doing, and callers use it
+        // precisely to avoid provoking a rebuild; refreshing here made the sizing
+        // call perform the very work it exists to help skip. The answer is advisory,
+        // so a stale or absent snapshot giving a low span is sound: the caller either
+        // proceeds (and its own gate refreshes) or declines to a path that needs no
+        // snapshot at all. A source the snapshot does not know contributes zero.
         let snap = self.csr_cache.snapshot.load();
         let row_ptr = if incoming {
             &snap.in_row_ptr
@@ -796,9 +827,20 @@ impl Graph {
             (&snap.row_ptr, &snap.col_idx, &snap.edge_type)
         };
 
-        // One pass over one source's qualifying neighbors, shared by both walks so
-        // their type and label filters cannot drift apart.
-        let walk_source = |d: usize, visit: &mut dyn FnMut(usize)| {
+        // One pass over one source's qualifying neighbors. A nested `fn` generic
+        // over the visitor rather than a closure taking `&mut dyn FnMut`, so the
+        // visitor inlines: this runs once per traversed edge, and an indirect call
+        // there would be a cost the whole kernel exists to avoid. Shared by both
+        // walks below so their type and label filters cannot drift apart.
+        fn walk_source<F: FnMut(usize)>(
+            d: usize,
+            row_ptr: &[usize],
+            col_idx: &[u32],
+            edge_type: &[TypeId],
+            type_id: Option<TypeId>,
+            label_mask: &Option<Vec<bool>>,
+            mut visit: F,
+        ) {
             for k in row_ptr[d]..row_ptr[d + 1] {
                 if let Some(tid) = type_id {
                     if edge_type[k] != tid {
@@ -810,20 +852,49 @@ impl Graph {
                     visit(other);
                 }
             }
+        }
+
+        // The non-null filter is what needs to know which neighbors were reached,
+        // so the bitmap is allocated only for that case. `count(*)` is the common
+        // shape and must not pay for a whole-graph vector it never reads, nor a
+        // store per traversed edge.
+        let mut visited = if spec.neighbor_nonnull_prop.is_some() {
+            vec![false; n]
+        } else {
+            Vec::new()
         };
 
         // First pass: the qualifying tally, which is already the answer for
-        // `count(*)`, plus which neighbors a non-null filter would need resolved.
-        let mut visited = vec![false; n];
+        // `count(*)`.
         for (i, src) in sources.iter().enumerate() {
             let Some(&d) = snap.id_to_dense.get(src) else {
                 continue;
             };
             let mut qualifying = 0u64;
-            walk_source(d as usize, &mut |other| {
-                qualifying += 1;
-                visited[other] = true;
-            });
+            if visited.is_empty() {
+                walk_source(
+                    d as usize,
+                    row_ptr,
+                    col_idx,
+                    edge_type,
+                    type_id,
+                    &label_mask,
+                    |_| qualifying += 1,
+                );
+            } else {
+                walk_source(
+                    d as usize,
+                    row_ptr,
+                    col_idx,
+                    edge_type,
+                    type_id,
+                    &label_mask,
+                    |other| {
+                        qualifying += 1;
+                        visited[other] = true;
+                    },
+                );
+            }
             out[i] = (qualifying, qualifying);
         }
 
@@ -836,11 +907,19 @@ impl Graph {
                         continue;
                     };
                     let mut counted = 0u64;
-                    walk_source(d as usize, &mut |other| {
-                        if mask[other] {
-                            counted += 1;
-                        }
-                    });
+                    walk_source(
+                        d as usize,
+                        row_ptr,
+                        col_idx,
+                        edge_type,
+                        type_id,
+                        &label_mask,
+                        |other| {
+                            if mask[other] {
+                                counted += 1;
+                            }
+                        },
+                    );
                     out[i].1 = counted;
                 }
             }
@@ -1325,6 +1404,20 @@ impl Graph {
                     cache.clear_delta();
                     match CsrSnapshot::build(&storage) {
                         Ok(snap) => {
+                            // Materialize only if the matrices already exist. This is
+                            // the compaction pass, and it fires after
+                            // `REBUILD_THRESHOLD` writes, so on a bulk load it fires
+                            // repeatedly; materializing unconditionally there would
+                            // undo the whole point of `Graph::open` building nothing,
+                            // paying a full GraphBLAS materialization no consumer has
+                            // asked for. When they do not exist, refresh the snapshot
+                            // alone and leave the first materialization to whichever
+                            // gate needs one.
+                            if matrices.read().is_none() {
+                                cache.install_snapshot(snap, built_gen);
+                                cache.cancel_rebuild();
+                                break;
+                            }
                             match MatrixSet::materialize(
                                 &snap,
                                 thread_count.load(std::sync::atomic::Ordering::Acquire),
@@ -2837,8 +2930,11 @@ mod typed_neighbor_count_tests {
 
         // Force the columns to exist and to hold no nulls for `tag` among the
         // nodes that carry it, the state the old length-plus-all-present shortcut
-        // recognized.
-        g.node_prop_group_codes(&ids, "tag").unwrap();
+        // recognized. Asked for directly: no reader builds them unconditionally, so
+        // a grouped read over this many ids is served without them.
+        g.prop_columns
+            .with_fresh(&g.storage, |_| ())
+            .expect("materialize the property columns");
         assert!(g.prop_columns.is_built());
 
         let counts = g

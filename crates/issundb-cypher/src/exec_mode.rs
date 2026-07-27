@@ -23,9 +23,15 @@
 //!   consults,
 //! - the `TriangleCount`, `PathCount`, and `GroupedDegree` counting kernels, plus
 //!   the count window pushed into the last of those,
-//! - the fused `ExpandIntersect` closing hop, and
+//! - the fused `ExpandIntersect` closing hop,
 //! - the metadata shortcut for a count over a bare label scan, so the count comes
-//!   from a scan rather than from the stored per-label counter.
+//!   from a scan rather than from the stored per-label counter, and
+//! - the type-inference pruning pass (`prune_unsatisfiable`). This one is not a
+//!   faster way to compute the same rows: it drops an `Expand` outright on the word
+//!   of the cached data schema, so a wrong `schema_has_edge` negative turns a real
+//!   result set into zero rows. Leaving it outside the switch made that invisible,
+//!   because both halves of every differential comparison pruned identically and
+//!   agreed on nothing.
 //!
 //! What it deliberately leaves alone:
 //!

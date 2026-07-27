@@ -990,3 +990,43 @@ fn fmt_agg(f: &AggFn) -> String {
         AggFn::PercentileCont { .. } => "percentileCont".to_string(),
     }
 }
+
+/// Whether an enclosing sort leads with this operator's count output, and if so
+/// whether it is descending.
+///
+/// One definition shared by the two paths that push a count window: the
+/// `GroupedDegree` kernel (`Optimizer::set_count_window`) and the columnar
+/// collapse (`exec::vectorized`). They previously each spelled out the alias walk,
+/// the empty-property test, and the raise-safety restriction, and had to stay in
+/// lockstep by hand; a change applied to one would have diverged the two silently,
+/// visible only as differing rows under a boundary tie.
+pub(crate) fn leading_count_sort(
+    sort_items: Option<&[SortItem]>,
+    project_items: &[(Expr, Option<String>)],
+    out_name: &str,
+) -> Option<bool> {
+    let leading = sort_items?.first()?;
+    let Expr::Prop(var, prop) = &leading.expr else {
+        return None;
+    };
+    if !prop.is_empty() {
+        return None;
+    }
+    // A pruned group is never projected, so a projection that can raise at
+    // runtime would stop raising for the rows the window drops. Restrict the
+    // window to projections of bare variable and property reads, which cannot.
+    if !project_items
+        .iter()
+        .all(|(expr, _)| matches!(expr, Expr::Prop(..)))
+    {
+        return None;
+    }
+    // The count reaches the sort either by its own output name or through a
+    // projected alias for it.
+    let named = var == out_name
+        || project_items.iter().any(|(expr, alias)| {
+            alias.as_deref() == Some(var.as_str())
+                && matches!(expr, Expr::Prop(v, p) if p.is_empty() && v == out_name)
+        });
+    named.then_some(!leading.ascending)
+}

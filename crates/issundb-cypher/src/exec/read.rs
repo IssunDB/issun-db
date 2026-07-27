@@ -240,12 +240,11 @@ pub(super) fn execute_read_query(
     // the star: correctness never depends on the recognizer, and `RETURN *` is a
     // convenience form, not a shape worth a second implementation of the scope
     // rules.
-    let return_clause_has_star = query.return_clause.items.iter().any(|item| {
-        matches!(
-            &item.expr,
-            Expr::FunctionCall { name, .. } if name == "__star__"
-        )
-    });
+    let return_clause_has_star = query
+        .return_clause
+        .items
+        .iter()
+        .any(crate::parser::is_star_item);
 
     // Columnar fast path: a recognized final projection or aggregation over a
     // single-hop expansion executes column-at-a-time and produces the result
@@ -288,10 +287,7 @@ pub(super) fn execute_read_query(
 
     // Check whether the RETURN clause is RETURN * (the __star__ sentinel).
     let is_return_star = query.return_clause.items.len() == 1
-        && matches!(
-            &query.return_clause.items[0].expr,
-            Expr::FunctionCall { name, .. } if name == "__star__"
-        );
+        && crate::parser::is_star_item(&query.return_clause.items[0]);
 
     // 3. Derive column names. For RETURN *, use all keys from the first resolved path.
     let columns: Vec<String> = if is_return_star {
@@ -331,11 +327,8 @@ pub(super) fn execute_read_query(
                             }
                         }
                         QueryPart::With { items, .. } => {
-                            let is_star = items.len() == 1
-                                && matches!(
-                                    &items[0].expr,
-                                    Expr::FunctionCall { name, .. } if name == "__star__"
-                                );
+                            let is_star =
+                                items.len() == 1 && crate::parser::is_star_item(&items[0]);
                             if is_star {
                                 for item in items {
                                     if let Some(alias) = &item.alias {
@@ -517,10 +510,8 @@ pub(super) fn resolve_call_parts(
                 for item in items {
                     if let Some(alias) = &item.alias {
                         next.insert(alias.clone());
-                    } else if let crate::ast::Expr::FunctionCall { name, .. } = &item.expr {
-                        if name == "__star__" {
-                            next.extend(scope.iter().cloned());
-                        }
+                    } else if crate::parser::is_star_item(item) {
+                        next.extend(scope.iter().cloned());
                     } else if let crate::ast::Expr::Prop(v, p) = &item.expr {
                         if p.is_empty() {
                             next.insert(v.clone());
@@ -2634,11 +2625,7 @@ pub(super) fn project_rows(
 
     for path in child_paths {
         // RETURN * / WITH * passes all current bindings through unchanged.
-        let is_star = items.len() == 1
-            && matches!(
-                &items[0].0,
-                Expr::FunctionCall { name, .. } if name == "__star__"
-            );
+        let is_star = items.len() == 1 && crate::parser::is_star_expr(&items[0].0);
         if is_star {
             next_paths.push(path);
             continue;

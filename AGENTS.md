@@ -190,12 +190,12 @@ modules according to this map.
       same-direction hops and no closing hop: walk-versus-trail is *not* only a variable-length question, because relationship uniqueness applies to any
       pattern with two or more slots, and the pinned LadybugDB build permits the reuse openCypher forbids. Row sets are bounded so the pass costs the
       same at every size in a sweep. `differential_corpus_is_fixed_length_and_row_returning` pins both rules. Projections avoid floats and nulls because
-      the two engines' display forms differ there (a whole-valued float is `0.0` against `0`), which is not a semantic divergence.
+      the two databases' display forms differ there (a whole-valued float is `0.0` against `0`), which is not a semantic divergence.
     - `generate_queries` plus `reference_rows`: the generated corpus, enabled by `LADYBUGDB_COMPARE_GENERATED` and run by `make test-ladybugdb`. Shapes
       outside the curated corpus's rule belong here, because here they are adjudicated rather than merely compared: `reference_rows` evaluates each
-      generated query over the dataset by brute force under openCypher semantics, so a divergence names the engine at fault instead of leaving a human to
+      generated query over the dataset by brute force under openCypher semantics, so a divergence names the database at fault instead of leaving a human to
       decide. IssunDB disagreeing with the reference fails the run; LadybugDB disagreeing is counted as a walk-semantics divergence and does not; the
-      reference disagreeing with both engines while they agree fails as a harness defect. Findings are shrunk to their smallest reproducing shape.
+      reference disagreeing with both databases while they agree fails as a harness defect. Findings are shrunk to their smallest reproducing shape.
       `make test-ladybugdb` runs the pass twice, once with the fast paths and once under `ISSUNDB_ROW_PIPELINE_ONLY`, which composes the two oracles.
     - `workload`: the timed comparison. Its queries are shaped for measurement, so most return a single `count(...)`; a `DIVERGENT` verdict there is an
       attributed LadybugDB walk-semantics overcount and does not fail the run, but a `MISMATCH` does (`tests/lbug_trail_semantics.rs` pins the
@@ -216,8 +216,9 @@ modules according to this map.
   default `make test` stays fast (run them via `make test-conformance`).
 - Property-based tests (via `proptest`) belong alongside the unit tests for the module whose invariants they exercise.
 - The row pipeline is the differential oracle for every shape-specific fast path. `ISSUNDB_ROW_PIPELINE_ONLY=1` keeps the columnar executor, the
-  `PathCount`, `GroupedDegree`, and `TriangleCount` kernels, the fused `ExpandIntersect` hop, and the metadata count shortcut out of the answer, so any
-  suite can be swept through the general path and compared. Both `cargo test` and `ISSUNDB_CONFORMANCE=1` runs must pass identically with and without
+  `PathCount`, `GroupedDegree`, and `TriangleCount` kernels, the fused `ExpandIntersect` hop, the metadata count shortcut, and the type-inference pruning
+  pass out of the answer, so any suite can be swept through the general path and compared. Pruning is in the switch because it is the one pass that drops
+  rows rather than reorganizing them, so leaving it outside made a wrong `schema_has_edge` negative invisible to the comparison. Both `cargo test` and `ISSUNDB_CONFORMANCE=1` runs must pass identically with and without
   it; a divergence is a fast-path defect, not a configuration difference. A test whose premise is that a particular operator lowers, and the fast half
   of any differential comparison, must pin the setting with `exec_mode::fast_paths_required` rather than inherit it, or the sweep makes it either fail
   on its own premise or pass vacuously. The corpus lives in `crates/issundb-cypher/src/exec/differential.rs`. `VectorTopK` is deliberately outside the
@@ -313,7 +314,12 @@ The read-path and statistics methods carry non-obvious semantics:
   of nodes must not pay it. The size test is on the request, not the method, because the vectorized executor gathers even a one-row projection through
   the bulk API; keying on the method instead left a cold point query paying roughly 1.2 seconds on an 800 K-node graph. Sustained direct reads amortize
   the build after `DIRECT_READ_BUILD_THRESHOLD` of them, so a row pipeline reading one property per row still ends up on the columns.
-  `node_prop_group_codes` always builds, since grouping is inherently a bulk read.
+  `node_prop_group_codes` follows the same size test: a large request builds the columns, while a small one is grouped over an ephemeral column set
+  built from just those entities. Grouping is a bulk read only when the id set is bulk, and both go through the same `PropColumns::from_items` and
+  `group_codes`, so the narrower population is the same grouping code rather than a second implementation of it.
+- `materialize_property_columns() -> Result<(), Error>`: build the in-memory property columns now. Nothing builds them as a side effect of a
+  small workload, so this is the deliberate way to make the optimizer's selectivity estimates and zone-map pruning available on a cold graph, or to pay
+  the one full scan up front rather than in a later bulk read.
 - `node_prop_group_codes(ids, prop) -> Result<(Vec<u32>, Vec<Value>), Error>`: dense group codes under exact value identity of one property, plus one
   representative value per code; null and missing values share one `Value::Null` code.
 - `node_prop_min_max(prop) -> Result<Option<(Value, Value)>, Error>`: bounds of one property's non-null values from the column statistics; `None` for
@@ -325,9 +331,9 @@ The read-path and statistics methods carry non-obvious semantics:
 - Those three readers are advisory, and none of them builds the property columns: each also returns `None` when the columns do not exist yet, leaving
   the caller on its default plan weight or declining to prune. Forcing a build for them made the first query mentioning any property pay one full node
   scan (measured at roughly 1.3 seconds on an 800 K-node graph), which was the dominant cold-start latency, and the answer only weights a choice.
-  A caller that needs statistics on a cold graph must materialize the columns first, and only a reader that actually builds them will do:
-  `node_prop_group_codes`, or a gather of more than `SMALL_GATHER_MAX` ids. A smaller gather is served directly and leaves the columns absent, so
-  the statistics still answer `None`.
+  A caller that needs statistics on a cold graph must materialize the columns first, and `Graph::materialize_property_columns` is how: no small read
+  builds them as a side effect any more, so a gather of more than `SMALL_GATHER_MAX` ids is the only other thing that will. Calling a reader and
+  discarding the result is no longer an idiom for warming them.
 - `estimate_expand_fanout(src_label, rel_type, incoming) -> Result<Option<f64>, Error>`: per-source-label typed degree (the count of `rel_type` edges
   incident to `src_label` nodes in the given direction, divided by the `src_label` node count), the "expand ratio" that sharpens the optimizer's
   `Expand` plan weight over the global average on a skewed schema. `None` when a label or type is unknown or no such edges exist. The estimate only
@@ -579,8 +585,10 @@ error types through the public facade.
 ### Encapsulation Rule
 
 `Storage` and the `storage` module are `pub(crate)` inside `issundb-core` and are not reachable from any other crate. The `issundb` facade re-exports
-only `Graph`, `Error`, `Hit`, hybrid retrieval types and functions, Cypher result types, and the schema ID and record types. Do not add a "just for
-now" re-export anywhere else; add a deliberate testing helper in `issundb-core` if a test needs internal access.
+only `Graph`, `Error`, `Hit`, hybrid retrieval types and functions, Cypher result types, the schema ID and record types, and the counting-kernel spec
+types (`TriangleCountSpec`, `PathCountSpec`, `GroupedDegreeSpec`, and `NeighborCountSpec`), which are re-exported because the `Graph` methods taking them
+are part of the documented public surface and a method whose argument type cannot be named is not callable. Do not add a "just for now" re-export
+anywhere else; add a deliberate testing helper in `issundb-core` if a test needs internal access.
 
 ## Workflow
 

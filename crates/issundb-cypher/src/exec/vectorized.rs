@@ -1793,54 +1793,6 @@ pub(super) fn try_execute_vectorized(
     }
 }
 
-/// Execute a recognized aggregate pipeline whose single `count` is over the
-/// chain's terminal variable, collapsing the final hop.
-///
-/// `cols` holds the pre-rows: every chain column except the terminal, already
-/// fanned out and filtered through the second-to-last hop. Instead of fanning
-/// the final hop into one row per terminal neighbor, this counts each source's
-/// qualifying neighbors once and folds that weight into the group the source's
-/// pre-row belongs to. A neighbor "qualifies" when it passes the final region's
-/// (terminal-only) filters; for `count(terminal.prop)` only neighbors with a
-/// non-null `prop` add to the count, but any qualifying neighbor still makes the
-/// group exist with count zero, exactly as the row pipeline's value-keyed fold
-/// does. Parallel edges are counted per transition, so the cardinality matches a
-/// full materialization.
-/// Whether the leading sort key is the aggregate's count output, and if so
-/// whether it sorts descending. `None` when there is no sort or its leading key
-/// is something else, which forfeits the count window (any other key can order
-/// a low-count group into the window).
-fn leading_count_sort(
-    sort_items: Option<&[SortItem]>,
-    project_items: &[(Expr, Option<String>)],
-    out_name: &str,
-) -> Option<bool> {
-    let leading = sort_items?.first()?;
-    let Expr::Prop(var, prop) = &leading.expr else {
-        return None;
-    };
-    if !prop.is_empty() {
-        return None;
-    }
-    // A pruned group is never projected, so a projection that can raise at
-    // runtime would stop raising for the rows the window drops. Restrict the
-    // window to projections of bare variable and property reads, which cannot.
-    if !project_items
-        .iter()
-        .all(|(expr, _)| matches!(expr, Expr::Prop(..)))
-    {
-        return None;
-    }
-    // The count reaches the sort either by its own output name or through a
-    // projected alias for it.
-    let named = var == out_name
-        || project_items.iter().any(|(expr, alias)| {
-            alias.as_deref() == Some(var.as_str())
-                && matches!(expr, Expr::Prop(v, p) if p.is_empty() && v == out_name)
-        });
-    named.then_some(!leading.ascending)
-}
-
 /// The labels a terminal count-collapse can push into the counting kernel: the
 /// final region's filters must all be label tests on the terminal variable.
 /// `None` means at least one filter is something else (a property comparison),
@@ -2233,8 +2185,12 @@ fn execute_collapsed_count(
         .limit
         .and_then(|(skip, count)| {
             let bound = skip.saturating_add(count);
-            leading_count_sort(sort_items.as_deref(), project_items, out_name)
-                .map(|descending| crate::plan::physical::CountWindow { bound, descending })
+            crate::plan::physical::leading_count_sort(
+                sort_items.as_deref(),
+                project_items,
+                out_name,
+            )
+            .map(|descending| crate::plan::physical::CountWindow { bound, descending })
         })
         .and_then(|w| {
             let counts: Vec<u64> = groups.iter().map(|(_, c)| *c).collect();
@@ -3034,9 +2990,10 @@ mod tests {
         }
         let srcs = g.nodes_by_label("Person").unwrap();
         // The zone map is advisory, so `node_prop_min_max` does not build the
-        // property columns; a gather has to, or the prune declines for want of
-        // bounds rather than because the comparison is satisfiable.
-        g.node_prop_group_codes(&srcs, "age").unwrap();
+        // property columns, and no small read does either; ask for them, or the
+        // prune declines for want of bounds rather than because the comparison is
+        // satisfiable.
+        g.materialize_property_columns().unwrap();
         let n = srcs.len();
         let cols = IdCols {
             cols: vec![srcs],

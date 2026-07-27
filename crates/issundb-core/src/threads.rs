@@ -16,10 +16,10 @@ pub(crate) const MAX_THREADS: usize = 64;
 ///
 /// Precedence, first positive value wins:
 ///
-/// 1. `programmatic` — the value [`crate::Graph::set_thread_count`] stored, when
+/// 1. `programmatic`: the value [`crate::Graph::set_thread_count`] stored, when
 ///    positive. Zero means "unset", which is what that method documents.
-/// 2. `ISSUNDB_NUM_THREADS` — this engine's own environment override.
-/// 3. `OMP_NUM_THREADS` — the ecosystem-standard cap. Honored because GraphBLAS's
+/// 2. `ISSUNDB_NUM_THREADS`: this engine's own environment override.
+/// 3. `OMP_NUM_THREADS`: the ecosystem-standard cap. Honored because GraphBLAS's
 ///    pool is an OpenMP pool, and because setting it is how a caller (including
 ///    this repository's own coverage job) caps that pool; resolving it here keeps
 ///    an explicit `set_global_threads` call from overriding a cap set deliberately.

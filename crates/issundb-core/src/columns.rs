@@ -58,7 +58,14 @@ pub(crate) trait ColumnSource {
     /// acquisition per id, so a gather of a thousand ids paid a thousand of each;
     /// worse, it would observe up to a thousand different commit points, letting
     /// two values of the same row-major gather come from different graph states.
-    /// One transaction makes the whole request a single point in time.
+    ///
+    /// One call is therefore a single point in time, but note the scope of that: a
+    /// *request* spanning several calls is not. `PropColumns::patch` deliberately
+    /// chunks, because the alternative is holding every touched entity's decoded
+    /// properties in memory at once, so a patch observes one commit point per chunk.
+    /// That is sound for a refresh, which converges because each later commit records
+    /// its own touched ids, but a caller needing one snapshot across many ids must
+    /// pass them in one call.
     fn fetch_many(storage: &Storage, ids: &[Self::Id]) -> Result<Vec<Option<Value>>, Error> {
         let rtxn = storage.env.read_txn()?;
         ids.iter()
@@ -388,7 +395,22 @@ pub(crate) struct PropColumns<S: ColumnSource> {
 impl<S: ColumnSource> PropColumns<S> {
     /// Build columns for every property name present, from one full scan.
     fn build(storage: &Storage) -> Result<Self, Error> {
-        let items = S::scan_all(storage)?;
+        Ok(Self::from_items(S::scan_all(storage)?))
+    }
+
+    /// Build columns over exactly `items`, rather than over every entity.
+    ///
+    /// The whole-graph build goes through here too, so a partial set is grouped by
+    /// the same code. That equivalence is what lets a small grouped read skip the
+    /// full scan: the only thing a narrower population can change is the inferred
+    /// column kind, and it can only make it *more* specific (fewer distinct kinds
+    /// present), never less. Every specific arm yields the same representative
+    /// `Value` and the same grouping identity the `Json` fallback would: `Int`
+    /// re-wraps through `Value::from(i64)`, `Float` keys on `to_bits`, which the
+    /// fallback's shortest-roundtrip string matches, and `Str` clones the same
+    /// string. An out-of-range `u64` is `Kind::Other` in `kind_of`, so no arm can
+    /// silently null a value the fallback would have kept.
+    pub(crate) fn from_items(items: Vec<(S::Id, Value)>) -> Self {
         let n = items.len();
         let mut dense_to_id = Vec::with_capacity(n);
         let mut id_to_dense: AHashMap<S::Id, u32> = AHashMap::with_capacity(n);
@@ -410,12 +432,12 @@ impl<S: ColumnSource> PropColumns<S> {
             .into_iter()
             .map(|(k, v)| (k, PropColumn::from_values(v)))
             .collect();
-        Ok(Self {
+        Self {
             id_to_dense,
             dense_to_id,
             cols,
             stats: AHashMap::new(),
-        })
+        }
     }
 
     /// Statistics for `prop`, computed on first access and cached until the
@@ -607,40 +629,45 @@ impl<S: ColumnSource> PropColumns<S> {
         if !touched.is_empty() {
             self.stats.clear();
         }
-        // One transaction for the whole patch: a batch commit can touch many
-        // thousands of entities, and a transaction per entity would charge the
-        // next refresh one begin/end pair for each.
-        let fetched = S::fetch_many(storage, touched)?;
-        for (&id, json) in touched.iter().zip(fetched) {
-            let json = match json {
-                Some(j) => j,
-                // Deleted between commit and refresh; deletion also sets
-                // force_full, so this patch run's result is discarded anyway.
-                None => continue,
-            };
-            let dense = match self.id_to_dense.get(&id) {
-                Some(&d) => d as usize,
-                None => {
-                    let d = self.dense_to_id.len();
-                    self.dense_to_id.push(id);
-                    self.id_to_dense.insert(id, d as u32);
-                    d
-                }
-            };
-            let n = self.dense_to_id.len();
-            for col in self.cols.values_mut() {
-                col.grow(n);
-                col.clear(dense);
-            }
-            if let Value::Object(map) = json {
-                for (k, v) in map {
-                    let col = self.cols.entry(k).or_insert_with(|| {
-                        let mut c = PropColumn::Json(Vec::new());
-                        c.grow(n);
-                        c
-                    });
+        // Read in chunks, not all at once. One transaction per entity would charge
+        // the next refresh a begin/end pair for each, but one gather over the whole
+        // list would hold every touched entity's decoded properties in memory at
+        // once, and that list is unbounded: a million-node batch under a single
+        // `Graph::update` accumulates a million ids. Chunking keeps the transient
+        // proportional to the chunk while still amortizing the transaction.
+        for chunk in touched.chunks(PATCH_CHUNK) {
+            let fetched = S::fetch_many(storage, chunk)?;
+            for (&id, json) in chunk.iter().zip(fetched) {
+                let json = match json {
+                    Some(j) => j,
+                    // Deleted between commit and refresh; deletion also sets
+                    // force_full, so this patch run's result is discarded anyway.
+                    None => continue,
+                };
+                let dense = match self.id_to_dense.get(&id) {
+                    Some(&d) => d as usize,
+                    None => {
+                        let d = self.dense_to_id.len();
+                        self.dense_to_id.push(id);
+                        self.id_to_dense.insert(id, d as u32);
+                        d
+                    }
+                };
+                let n = self.dense_to_id.len();
+                for col in self.cols.values_mut() {
                     col.grow(n);
-                    col.set(dense, v);
+                    col.clear(dense);
+                }
+                if let Value::Object(map) = json {
+                    for (k, v) in map {
+                        let col = self.cols.entry(k).or_insert_with(|| {
+                            let mut c = PropColumn::Json(Vec::new());
+                            c.grow(n);
+                            c
+                        });
+                        col.grow(n);
+                        col.set(dense, v);
+                    }
                 }
             }
         }
@@ -733,6 +760,12 @@ pub(crate) struct ColumnsCache<S: ColumnSource> {
 /// property per row would pay the per-read decode forever, so the reads
 /// amortize the build after this many.
 const DIRECT_READ_BUILD_THRESHOLD: u64 = 4096;
+
+/// Entities re-read per transaction when patching. Bounds the transient memory a
+/// refresh holds: the pending touched list is unbounded (one `Graph::update` may
+/// insert millions of nodes), so a single gather over all of it would decode every
+/// one of their property maps at once.
+const PATCH_CHUNK: usize = 4096;
 
 /// Largest gather served straight from storage while the columns are absent.
 /// Above this the request is bulk enough that one scan is the cheaper way to
@@ -933,6 +966,59 @@ mod tests {
     use super::{ColumnsCache, DIRECT_READ_BUILD_THRESHOLD, NodeSource};
     use crate::{Graph, error::Error};
 
+    /// A small grouped read must not build every column, and must produce exactly
+    /// what the built columns would.
+    ///
+    /// Grouping used to always build, so a grouped count over a handful of group
+    /// nodes paid one full node scan on a cold graph. The ephemeral path has to
+    /// agree with the shared one on the cases where a narrower population infers a
+    /// different column kind: `mixed` is a `Json` column over the whole graph but
+    /// `Int` over an int-only subset, and both must group and represent identically.
+    #[test]
+    fn small_grouped_read_avoids_the_build_and_agrees_with_it() {
+        let (_dir, g) = open_tmp();
+        let ints: Vec<_> = (0..4)
+            .map(|i| {
+                g.add_node("N", &json!({ "mixed": i % 2, "s": "x" }))
+                    .unwrap()
+            })
+            .collect();
+        // These make the whole-graph `mixed` column a Json fallback, while any
+        // subset drawn from `ints` alone infers `Int`.
+        g.add_node("N", &json!({ "mixed": 1.5 })).unwrap();
+        g.add_node("N", &json!({ "mixed": "one" })).unwrap();
+        // A node with no `mixed` at all, so the null group is exercised.
+        let bare = g.add_node("N", &json!({ "s": "y" })).unwrap();
+
+        let mut ask = ints.clone();
+        ask.push(bare);
+
+        assert!(!g.prop_columns.is_built(), "cold to start");
+        let direct = g.node_prop_group_codes(&ask, "mixed").unwrap();
+        assert!(
+            !g.prop_columns.is_built(),
+            "a small grouped read must not build every column"
+        );
+
+        // Force the shared columns, then ask again: same codes, same
+        // representatives, even though the column kind differs between the two
+        // populations.
+        g.prop_columns
+            .with_fresh(&g.storage, |_| ())
+            .expect("build the shared columns");
+        assert!(g.prop_columns.is_built());
+        let built = g.node_prop_group_codes(&ask, "mixed").unwrap();
+
+        assert_eq!(direct.0, built.0, "group codes must agree");
+        assert_eq!(direct.1, built.1, "representative values must agree");
+        // Sanity: 0 and 1 are distinct groups and the missing value is its own.
+        assert_eq!(direct.0.len(), 5);
+        assert_eq!(direct.1.len(), 3);
+
+        // A node that does not exist is still an error on the direct path.
+        assert!(g.node_prop_group_codes(&[999_999], "mixed").is_err());
+    }
+
     /// A failed absorb must leave a full rebuild pending. The delta is taken out
     /// of the shared buffer before the absorb runs, so propagating the error
     /// alone would drop that work and leave the columns serving pre-write values
@@ -975,11 +1061,14 @@ mod tests {
         (dir, g)
     }
 
-    /// Materialize the property columns. Neither the advisory statistics nor a
-    /// small gather builds them, so a test that exercises either has to. Group
-    /// codes are the remaining reader that always builds.
+    /// Materialize the property columns. No reader builds them unconditionally any
+    /// more: the advisory statistics never do, and both a small gather and a small
+    /// grouped read are served without them, so a test that needs the shared
+    /// columns present has to ask for them directly.
     fn materialize_columns(g: &Graph) {
-        g.node_prop_group_codes(&[], "").unwrap();
+        g.prop_columns
+            .with_fresh(&g.storage, |_| ())
+            .expect("materialize the property columns");
     }
 
     #[test]

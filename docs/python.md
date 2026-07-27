@@ -135,14 +135,17 @@ Here is a quick reference of the methods available on the `IssunDB` class:
 
 ### Connection and Settings
 
-* `IssunDB(path: str, map_size_gb: Optional[int] = None)`: Opens or creates a database at `path`.
+* `IssunDB(path: str, map_size_gb: Optional[int] = None)`: Opens or creates a database at `path`. `map_size_gb` defaults to 1 and is a hard ceiling on
+  how large the database may grow, not an allocation. There is no resize path: once the data exceeds it every write fails until the database is
+  reopened with a larger value, which is safe and keeps the existing data. Size it for the eventual database rather than the current one.
 * `set_thread_count(n: int) -> None`: Sets the thread count for parallel GraphBLAS operations (set `0` for default).
 
 ### Node and Edge CRUD
 
 * `add_node(labels: Union[str, List[str]], props: str) -> int`: Adds a node and returns its unique ID.
 * `add_nodes(items: Iterable[Tuple[Union[str, List[str]], str]]) -> List[int]`: Adds many nodes in one transaction and returns their IDs in order.
-* `get_node(id: int) -> Optional[str]`: Retrieves JSON-encoded node properties, or `None`.
+* `get_node(id: int) -> Optional[str]`: Retrieves JSON-encoded node properties, or `None`. Properties only; use `node_labels` for the labels.
+* `node_labels(id: int) -> List[str]`: Returns a node's labels in insertion order. An unlabeled node and a missing node both give an empty list.
 * `update_node(id: int, props: str) -> None`: Overwrites node properties.
 * `delete_node(id: int) -> None`: Deletes a node and its incident edges.
 * `add_label(id: int, label: str) -> None`: Adds a label to a node.

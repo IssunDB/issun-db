@@ -103,8 +103,10 @@ It is derived from LMDB, like the CSR snapshot, and follows the same write-LMDB-
   request for at most `SMALL_GATHER_MAX` entities is served as point reads straight from storage while the columns are absent
   (`should_serve_directly`), because building every column is one full scan and that is the wrong answer to a request for a handful of entities. Those
   direct reads amortize a build after `DIRECT_READ_BUILD_THRESHOLD` of them, so a row pipeline reading one property per row still ends up on the
-  columns. The advisory statistics readers never build (see `with_existing_mut` below). Size the test on the request, not on the method: the Cypher
-  vectorized executor gathers even a one-row projection through the bulk API.
+  columns. The advisory statistics readers never build (see `with_existing_mut` below), and a grouped read follows the same size test by building an
+  ephemeral column set over just the requested entities. Size the test on the request, not on the method: the Cypher vectorized executor gathers even a
+  one-row projection through the bulk API. Nothing builds the shared columns as a side effect of a small workload, so a caller that wants them warm
+  calls `Graph::materialize_property_columns`.
 - Once built, the columns are kept fresh by post-commit deltas: writers call `record_touched`/`record_force_full`, and `with_fresh` patches the touched
   ids (one read transaction for the whole batch, via `fetch_many`) or rebuilds on `force_full` before serving a read. A failed absorb queues a full
   rebuild rather than dropping the taken delta, so a transient storage error cannot leave the columns quietly serving pre-write values.

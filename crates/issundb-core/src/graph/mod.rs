@@ -758,6 +758,24 @@ impl Graph {
         })
     }
 
+    /// Build the in-memory property columns now, if they are not built already.
+    ///
+    /// Every reader either serves a small request without them or, for the advisory
+    /// statistics, declines rather than pay for them, so nothing builds them as a
+    /// side effect of a small workload. That is deliberate: the build is one full
+    /// entity scan, and it used to dominate cold-start latency. This is the
+    /// deliberate way to ask for it, for a caller that wants the optimizer's
+    /// selectivity estimates and zone-map pruning available on a cold graph, or that
+    /// would rather pay the scan once up front than have a later bulk read pay it.
+    ///
+    /// It replaces an accident: `node_prop_group_codes` used to build
+    /// unconditionally, so "call it and discard the result" was the idiom for
+    /// warming the columns. Grouping now follows the same size test as the other
+    /// readers, and warming them is this call.
+    pub fn materialize_property_columns(&self) -> Result<(), Error> {
+        self.prop_columns.with_fresh(&self.storage, |_| ())
+    }
+
     /// Group `ids` by the exact value of `prop` through the in-memory
     /// property columns: one dense group code per id, plus one representative
     /// value per code (the first occurrence). Null and missing property
@@ -769,6 +787,28 @@ impl Graph {
         ids: &[NodeId],
         prop: &str,
     ) -> Result<(Vec<u32>, Vec<serde_json::Value>), Error> {
+        // A small request is grouped over an ephemeral column set built from just
+        // those nodes, rather than by building every column from a full scan.
+        // Grouping is a bulk read only when the id set is bulk; a grouped count
+        // whose groups are a handful of nodes was paying one full node scan with a
+        // decode per node, which is the cold-start cost the small-gather path exists
+        // to avoid, and the caller had no way to opt out.
+        //
+        // The ephemeral set goes through the same `from_items` and `group_codes` as
+        // the shared one, so this is the same grouping code over a narrower
+        // population, not a second implementation of it. A node that is gone is left
+        // out, which makes `group_codes` report `NodeNotFound` for it exactly as the
+        // shared columns would.
+        if self.prop_columns.should_serve_directly(ids.len()) {
+            let fetched = self.direct_node_props_many(ids)?;
+            let items: Vec<(NodeId, serde_json::Value)> = ids
+                .iter()
+                .zip(fetched)
+                .filter_map(|(&id, obj)| obj.map(|o| (id, o)))
+                .collect();
+            let cols = crate::columns::PropColumns::<crate::columns::NodeSource>::from_items(items);
+            return cols.group_codes(ids, prop);
+        }
         self.prop_columns
             .with_fresh(&self.storage, |cols| cols.group_codes(ids, prop))?
     }
@@ -976,14 +1016,21 @@ impl Graph {
                 // write is one atomic increment wide rather than the width of
                 // the batch. See `CsrCache::advance_write_gen`.
                 self.commit_and_publish(wtxn, mutations_count)?;
-                // Record the structural delta next, before the column bookkeeping.
-                // `ensure_matrix_view` gates on the delta alone (gating it on the
-                // generation would force a full rebuild after every write, since
-                // only a full rebuild advances `matrices_gen`), so the delta being
-                // absent is that gate's whole blind spot. Recording it here rather
-                // than after the column patches shrinks the blind spot from the
-                // width of the batch's column bookkeeping to a few instructions.
-                self.csr_cache.record_batch(&delta);
+                // Column bookkeeping next, then the structural delta.
+                //
+                // Both orderings leave one gate briefly blind, and this picks which.
+                // `node_prop_json` documents that its result reflects committed
+                // state, so the property columns get the earlier slot; the reverse
+                // order let a concurrent reader take the columns' fast path and
+                // serve a pre-write value for as long as the structural copy took,
+                // which on a large batch is not brief. `ensure_matrix_view` gates on
+                // the delta alone (gating it on the generation would force a full
+                // rebuild after every write, since only a full rebuild advances
+                // `matrices_gen`), so it stays blind until `record_batch` below;
+                // that is the pre-existing behavior, and its consumers publish no
+                // per-call freshness guarantee for `node_prop_json` to trade against.
+                // Both windows are bounded by the generation bump above, which is
+                // what the gates that can see it use.
                 if delta.force_full {
                     self.prop_columns.record_force_full();
                 } else {
@@ -1000,6 +1047,7 @@ impl Graph {
                     self.edge_columns.record_touched_many(&delta.added_edge_ids);
                     self.edge_columns.record_touched_many(&delta.updated_edges);
                 }
+                self.csr_cache.record_batch(&delta);
                 if mutations_count > 0 {
                     self.maybe_spawn_rebuild_n(mutations_count);
                 }

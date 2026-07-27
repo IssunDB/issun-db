@@ -40,7 +40,7 @@ The runs can be configured with these environment variables:
 
 ### Differential Pass
 
-Before anything is timed, a corpus of row-returning queries runs on both engines and their sorted row sets must match exactly.
+Before anything is timed, a corpus of row-returning queries runs on both databases and their sorted row sets must match exactly.
 Any mismatch fails the run and prints the first differing row.
 
 This corpus is deliberately separate from the timed workload. That workload is shaped for measurement, so most of its queries return a single
@@ -55,7 +55,7 @@ Two invariants keep it cheap to extend, and a unit test pins both:
   narrower than "fixed-length" and the difference matters: relationship uniqueness applies to any pattern with two or more slots, so
   `(a)-[:KNOWS]->(b)<-[:KNOWS]-(c)` diverges when `c` is `a`, and `(a)<-[:KNOWS]-(b)-[:KNOWS]->(a)` always does. The pinned LadybugDB build permits
   that reuse where openCypher forbids it, and it does not honor the `TRAIL` setting. Two same-direction hops are safe only because the generator emits
-  no self-loops. Within this rule no adjudication is needed, so any divergence is a real defect in one of the two engines; shapes outside it belong in
+  no self-loops. Within this rule no adjudication is needed, so any divergence is a real defect in one of the two databases; shapes outside it belong in
   the generated corpus below, where a reference evaluator adjudicates them.
 - Row sets stay small and skew-independent, either anchored at a non-hub probe or bounded by an `id` predicate, so the pass costs the same at every
   size in a sweep. It runs at every size on purpose, because the engine switches internal strategies at size thresholds and the same corpus at 10k and
@@ -75,13 +75,13 @@ direction with an optional closing hop, `WHERE` over id, age, and city, and eith
 and the seed is printed with every finding, so a report replays exactly. Multi-source anchors are bounded by measuring real out-degrees rather than by
 guessing, because the skewed generator concentrates edges on low ids: under Zipf a plain `id < 100` selects precisely the hubs.
 
-These are adjudicated by a third oracle rather than by comparing the two engines against each other. `reference_rows` evaluates each generated query
-directly over the dataset by brute force under openCypher semantics, so every divergence names the engine at fault:
+These are adjudicated by a third oracle rather than by comparing the two databases against each other. `reference_rows` evaluates each generated query
+directly over the dataset by brute force under openCypher semantics, so every divergence names the database at fault:
 
-- both engines match the reference: agreement,
+- both databases match the reference: agreement,
 - IssunDB matches and LadybugDB does not: a LadybugDB walk-semantics divergence, counted and not a failure,
 - IssunDB does not match: an IssunDB defect, which fails the run and is reported at its smallest reproducing shape,
-- the reference disagrees with both engines while they agree with each other: the reference is the suspect, since two independent implementations
+- the reference disagrees with both databases while they agree with each other: the reference is the suspect, since two independent implementations
   agreeing is stronger evidence than one brute-force evaluator, and the run fails as a harness defect.
 
 The adjudicator is what makes the generated corpus usable at all. Without it roughly one generated query in ten diverges, because any pattern that can

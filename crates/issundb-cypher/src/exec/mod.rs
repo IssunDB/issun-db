@@ -721,6 +721,7 @@ mod tests {
     /// A satisfiable pattern over the same graph is untouched and returns rows.
     #[test]
     fn type_inference_prunes_unsatisfiable_pattern() {
+        let _fast_paths = crate::exec_mode::fast_paths_required();
         let (_dir, graph) = setup_graph();
         // Cities KNOW only other cities; people KNOW only other people. The
         // schema therefore contains City-KNOWS->City and Person-KNOWS->Person,

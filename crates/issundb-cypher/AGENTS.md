@@ -161,7 +161,9 @@ the columnar fast path. Do not reduce either fold back to `evaluate_expr(...).to
 ## Row-pipeline-only Switch
 
 `exec_mode.rs` holds `ISSUNDB_ROW_PIPELINE_ONLY` and the `RowPipelineOnly` guard, which take the columnar executor, the counting kernels, the fused
-`ExpandIntersect` hop, and the metadata count shortcut out of the answer so the general row pipeline answers the query. That makes the row pipeline
+`ExpandIntersect` hop, the metadata count shortcut, and the type-inference pruning pass out of the answer so the general row pipeline answers the query.
+Pruning is in that set because it is the one pass that drops rows rather than reorganizing them, so leaving it out made a wrong `schema_has_edge`
+negative invisible to every differential comparison. That makes the row pipeline
 usable as a differential oracle: the four ways of answering a query each reproduce MATCH semantics independently, and nothing in the type system makes
 them agree. Read the module doc before adding to it, and note the two test shapes that must pin the setting with `fast_paths_required` rather than
 inherit it, or a sweep silently defeats them. The corpus lives in `exec/differential.rs`.

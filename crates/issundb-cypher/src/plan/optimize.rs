@@ -183,7 +183,13 @@ impl Optimizer {
         // on read-only plans: the committed-state schema cannot see edges that a
         // write part of the same statement would create, so pruning a plan with
         // writes could drop rows the query should return.
-        if ctx.allow_prune {
+        // Gated by the switch as well as by write-freedom. This is the one pass that
+        // can drop rows rather than reorganize them, and it drops them on the word of
+        // the cached data schema: a wrong `schema_has_edge` negative turns a real
+        // result set into zero rows. Leaving it outside the switch made that
+        // invisible to the differential oracle, because both halves of every
+        // comparison pruned identically and agreed on nothing.
+        if ctx.allow_prune && !ctx.row_pipeline_only {
             result = Self::prune_unsatisfiable(result, stats);
         }
         // Fuse each directed `MultiwayJoin` with the directed single-hop
@@ -4586,11 +4592,15 @@ fn try_grouped_degree(op: &PhysicalOperator) -> Option<PhysicalOperator> {
 /// visible.
 fn rewrite_grouped_degree_window(op: PhysicalOperator) -> PhysicalOperator {
     match op {
-        PhysicalOperator::Limit {
-            mut input,
-            skip,
-            count,
-        } => {
+        PhysicalOperator::Limit { input, skip, count } => {
+            // Recurse first, then try this `Limit`. Without the recursion a nested
+            // `Limit` (an inner `ORDER BY <count> LIMIT n` under an outer one) stopped
+            // the walk here: `set_count_window` found the inner `Limit` rather than a
+            // `GroupedDegree`, returned, and the inner window never fired, so the
+            // inner sort built a row per group over the whole label. Correctness was
+            // unaffected; the optimization simply did not happen on the shape it was
+            // written for.
+            let mut input = Box::new(rewrite_grouped_degree_window(*input));
             set_count_window(input.as_mut(), skip.saturating_add(count));
             PhysicalOperator::Limit { input, skip, count }
         }
@@ -4633,9 +4643,6 @@ fn set_count_window(op: &mut PhysicalOperator, bound: usize) {
     let PhysicalOperator::Sort { input, items } = op else {
         return;
     };
-    let Some(leading) = items.first() else {
-        return;
-    };
     let PhysicalOperator::Project {
         input: proj_input,
         items: proj_items,
@@ -4652,34 +4659,14 @@ fn set_count_window(op: &mut PhysicalOperator, bound: usize) {
     else {
         return;
     };
-    // A pruned group is never projected, so a projection that can raise at
-    // runtime would stop raising for the rows the window drops. Restrict the
-    // window to projections of bare variable and property reads, which cannot.
-    if !proj_items
-        .iter()
-        .all(|(expr, _)| matches!(expr, Expr::Prop(..)))
+    // One shared predicate with the columnar collapse, so the two count-window
+    // paths cannot drift apart. It covers the raise-safety restriction (a pruned
+    // group is never projected, so a projection that can raise must not be skipped)
+    // and the alias walk from the sort key to the kernel's output name.
+    if let Some(descending) =
+        crate::plan::physical::leading_count_sort(Some(items), proj_items, output.as_str())
     {
-        return;
-    }
-    // The count reaches the sort either directly by its output name or through a
-    // projected alias for it; any other leading key leaves the kernel alone.
-    let out = output.as_str();
-    let names_count =
-        |expr: &Expr| matches!(expr, Expr::Prop(v, p) if p.is_empty() && v.as_str() == out);
-    let leads_with_count = match &leading.expr {
-        Expr::Prop(var, prop) if prop.is_empty() => {
-            var.as_str() == out
-                || proj_items.iter().any(|(expr, alias)| {
-                    alias.as_deref() == Some(var.as_str()) && names_count(expr)
-                })
-        }
-        _ => false,
-    };
-    if leads_with_count {
-        *count_window = Some(CountWindow {
-            bound,
-            descending: !leading.ascending,
-        });
+        *count_window = Some(CountWindow { bound, descending });
     }
 }
 
@@ -5513,6 +5500,7 @@ mod tests {
     /// cannot see an edge the write would create).
     #[test]
     fn prune_unsatisfiable_pass_gating() {
+        let _fast_paths = crate::exec_mode::fast_paths_required();
         struct SchemaStats;
         impl StatsProvider for SchemaStats {
             fn node_count_by_label(&self, _l: &str) -> Option<u64> {

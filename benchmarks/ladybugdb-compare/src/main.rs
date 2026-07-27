@@ -272,6 +272,17 @@ fn out_adjacency(data: &Dataset) -> Vec<Vec<u64>> {
     adjacency
 }
 
+/// In-adjacency lists in generation order, the incoming counterpart of
+/// [`out_adjacency`]. The generated corpus traverses both directions, so bounding
+/// its work needs both.
+fn in_adjacency(data: &Dataset) -> Vec<Vec<u64>> {
+    let mut adjacency: Vec<Vec<u64>> = vec![Vec::new(); data.persons.len()];
+    for &(src, dst, _) in &data.knows {
+        adjacency[dst as usize].push(src);
+    }
+    adjacency
+}
+
 fn pick_probes(data: &Dataset) -> Probes {
     let nodes = data.persons.len() as u64;
     let adjacency = out_adjacency(data);
@@ -591,7 +602,7 @@ struct QueryTiming {
 }
 
 /// The benchmark queries, anchored at the degree-percentile probes.
-/// A differential-only query: run on both engines, compare sorted row sets.
+/// A differential-only query: run on both databases, compare sorted row sets.
 ///
 /// Kept separate from the timing workload on purpose. That workload is shaped for
 /// measurement, so nearly every query in it returns a single `count(...)`, and a
@@ -624,18 +635,41 @@ struct QueryTiming {
 /// back as `0.0` from IssunDB (serde_json's float form) and as `0` from LadybugDB,
 /// while fractional weights agree, so returning a float column reports a mismatch
 /// on roughly one row in a thousand of this dataset. Reconciling numeric display
-/// across the two engines in `issundb_rows`/`ladybugdb_rows` would let floats join
+/// across the two databases in `issundb_rows`/`ladybugdb_rows` would let floats join
 /// the corpus.
 struct DiffQuery {
     name: &'static str,
     cypher: String,
+    /// Whether the projection is a grouped aggregate (a group key plus an
+    /// aggregate) rather than plain property reads.
+    ///
+    /// Declared rather than inferred from the query text. The invariant test needs
+    /// to reject an *ungrouped* aggregate, which compares a single scalar and so
+    /// defeats the corpus's purpose, and sniffing that from strings meant
+    /// enumerating aggregate names: a new `max`- or `sum`-grouped query would have
+    /// tripped the invariant rather than any real violation.
+    ///
+    /// Only the invariant test reads it, so a non-test build sees it as dead. It is
+    /// declared data about the corpus, not a runtime input, which is the point.
+    #[cfg_attr(not(test), allow(dead_code))]
+    grouped: bool,
 }
 
 fn differential_workload(probes: &Probes) -> Vec<DiffQuery> {
     let median = probes.median;
     let cold = probes.cold;
     let target = probes.expand_target;
-    let q = |name, cypher| DiffQuery { name, cypher };
+    // `q` for a property projection, `qg` for a grouped aggregate.
+    let q = |name, cypher| DiffQuery {
+        name,
+        cypher,
+        grouped: false,
+    };
+    let qg = |name, cypher| DiffQuery {
+        name,
+        cypher,
+        grouped: true,
+    };
     vec![
         // ---- Projection fidelity over a bounded slice of the label scan -----
         q(
@@ -728,27 +762,27 @@ fn differential_workload(probes: &Probes) -> Vec<DiffQuery> {
         // The output stays bounded by the group count even where the work is not,
         // and a per-group result catches a wrong group key or a wrong per-group
         // tally that a single total would hide.
-        q(
+        qg(
             "grouped_out_degree",
             "MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE a.id < 50 \
              RETURN a.id, count(b)"
                 .to_string(),
         ),
-        q(
+        qg(
             "grouped_count_star",
             "MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE a.id < 50 \
              RETURN a.id, count(*)"
                 .to_string(),
         ),
-        q(
+        qg(
             "grouped_by_city",
             "MATCH (p:Person) WHERE p.id < 1000 RETURN p.city, count(p)".to_string(),
         ),
-        q(
+        qg(
             "grouped_min_max",
             "MATCH (p:Person) WHERE p.id < 1000 RETURN p.city, min(p.age), max(p.age)".to_string(),
         ),
-        q(
+        qg(
             "grouped_two_hop",
             format!(
                 "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person) \
@@ -758,7 +792,7 @@ fn differential_workload(probes: &Probes) -> Vec<DiffQuery> {
     ]
 }
 
-/// Run the differential corpus on both engines and report. Returns the number of
+/// Run the differential corpus on both databases and report. Returns the number of
 /// mismatches so the caller can fail the run.
 ///
 /// Nothing here is timed. A divergence is unconditionally a defect (see
@@ -777,7 +811,7 @@ fn run_differential(graph: &Graph, conn: &Connection, queries: &[DiffQuery]) -> 
             }
             Verdict::Unsupported(detail) => {
                 // A curated query is supposed to be inside both surfaces, so this
-                // is a corpus bug rather than an engine bug; it is reported but
+                // is a corpus bug rather than a defect in either database; it is
                 // does not fail the run.
                 unsupported += 1;
                 println!("  UNSUPPORTED {:<23} {detail}", query.name);
@@ -790,7 +824,7 @@ fn run_differential(graph: &Graph, conn: &Connection, queries: &[DiffQuery]) -> 
         queries.len(),
         if queries.len() == 1 { "y" } else { "ies" },
         if unsupported > 0 {
-            format!(", {unsupported} outside one engine's surface")
+            format!(", {unsupported} outside one database's surface")
         } else {
             String::new()
         }
@@ -802,7 +836,7 @@ fn run_differential(graph: &Graph, conn: &Connection, queries: &[DiffQuery]) -> 
 ///
 /// Returns the count that should fail the run: IssunDB defects plus reference
 /// defects. A LadybugDB divergence is counted and reported separately, because it
-/// is a known difference in that engine rather than a problem here.
+/// is a known difference in that database rather than a problem here.
 fn run_generated(
     graph: &Graph,
     conn: &Connection,
@@ -848,7 +882,7 @@ fn run_generated(
         shapes.len(),
         if shapes.len() == 1 { "y" } else { "ies" },
         if unsupported > 0 {
-            format!(", {unsupported} outside one engine's surface")
+            format!(", {unsupported} outside one database's surface")
         } else {
             String::new()
         }
@@ -1042,25 +1076,35 @@ impl GenQuery {
 /// Zipf a plain `id < 100` selects precisely the hubs, and a two-hop expansion
 /// from them can enumerate a large fraction of the graph. Measuring the real
 /// out-degrees keeps the bound honest under either skew.
-fn bounded_id_cutoff(adjacency: &[Vec<u64>], edge_budget: u64, max_cutoff: u64) -> u64 {
+fn bounded_id_cutoff(
+    out_adj: &[Vec<u64>],
+    in_adj: &[Vec<u64>],
+    edge_budget: u64,
+    max_cutoff: u64,
+) -> u64 {
     let mut total = 0u64;
-    for (id, out) in adjacency.iter().enumerate() {
-        let id = id as u64;
+    for id in 0..out_adj.len() as u64 {
         if id >= max_cutoff {
             return max_cutoff;
         }
-        total += out.len() as u64;
+        // Budget against the larger of the two directions. The generator emits
+        // incoming hops as well as outgoing ones, so a cutoff measured only over
+        // out-degrees says nothing about the work an incoming chain does, and under
+        // Zipf the in-degree hubs are exactly the low ids an `id <` bound selects.
+        let out_deg = out_adj[id as usize].len() as u64;
+        let in_deg = in_adj[id as usize].len() as u64;
+        total += out_deg.max(in_deg);
         if total > edge_budget {
             return id.max(1);
         }
     }
-    (adjacency.len() as u64).min(max_cutoff).max(1)
+    (out_adj.len() as u64).min(max_cutoff).max(1)
 }
 
 /// Generate `count` differential queries from `seed`.
 ///
 /// Deterministic, so a reported failure replays from the seed the run prints. The
-/// shapes stay inside the intersection of the two engines' surfaces: fixed-length
+/// shapes stay inside the intersection of the two databases' surfaces: fixed-length
 /// `:KNOWS` hops, `WHERE` over the three comparable property types, and either a
 /// property projection or a single grouped aggregate. No variable-length pattern,
 /// no relationship variable (its only property is a float), no float or null in a
@@ -1070,7 +1114,8 @@ fn generate_queries(
     count: usize,
     seed: u64,
     probes: &Probes,
-    adjacency: &[Vec<u64>],
+    out_adj: &[Vec<u64>],
+    in_adj: &[Vec<u64>],
 ) -> Vec<GenQuery> {
     let mut rng = Lcg(seed);
     // Edge budget per hop count: the reachable set multiplies with each hop, so
@@ -1081,7 +1126,7 @@ fn generate_queries(
             2 => 200,
             _ => 40,
         };
-        let max = bounded_id_cutoff(adjacency, budget, 2_000);
+        let max = bounded_id_cutoff(out_adj, in_adj, budget, 2_000);
         // Vary the cutoff below the bound so runs cover more than one width.
         1 + rng.next() % max
     };
@@ -1158,10 +1203,21 @@ fn generate_queries(
             let mut items: Vec<(usize, Prop)> = (0..1 + rng.next() % 3)
                 .map(|_| ((rng.next() % vars as u64) as usize, prop(&mut rng)))
                 .collect();
-            // A repeated item would project one column twice, where the two
-            // engines' column naming (which this harness does not compare) is the
-            // only thing that differs.
-            items.dedup();
+            // Drop repeats wherever they fall. `dedup` alone removes only adjacent
+            // ones, so a draw of `[(0, Id), (1, Age), (0, Id)]` kept the repeat and
+            // still emitted `RETURN v0.id, v1.age, v0.id`, the exact case this
+            // guards: a projected column appearing twice, where the two databases'
+            // column naming (which this harness does not compare) is the only thing
+            // that could differ. Order is preserved so the seed still reproduces.
+            let mut seen = Vec::new();
+            items.retain(|item| {
+                if seen.contains(item) {
+                    false
+                } else {
+                    seen.push(*item);
+                    true
+                }
+            });
             (Projection::Props(items), rng.next() % 4 == 0)
         };
 
@@ -1291,8 +1347,8 @@ impl RefGraph {
 /// semantics, and return its rows normalized the way [`issundb_rows`] normalizes.
 ///
 /// This is the adjudicating oracle for the generated corpus, and it is what makes a
-/// divergence attributable instead of merely visible. Both engines are compared
-/// against it, so a disagreement names the engine at fault rather than leaving a
+/// divergence attributable instead of merely visible. Both databases are compared
+/// against it, so a disagreement names the database at fault rather than leaving a
 /// human to work out which of two answers is right.
 ///
 /// It exists because the assumption that a fixed-length pattern needs no
@@ -1427,22 +1483,22 @@ fn reference_rows(g: &RefGraph, q: &GenQuery) -> Vec<Vec<String>> {
     }
 }
 
-/// What a generated query established, once both engines are compared against the
+/// What a generated query established, once both databases are compared against the
 /// reference evaluator.
 enum GenVerdict {
-    /// Both engines match the reference.
+    /// Both databases match the reference.
     Agree,
     /// IssunDB matches the reference and LadybugDB does not: the walk-against-trail
-    /// difference. Reported, and not a failure of this repository's engine.
+    /// difference. Reported, and not a failure of IssunDB.
     LadybugDivergence,
     /// IssunDB does not match the reference. This is the finding worth having.
     IssundbBug(String),
-    /// The reference disagrees with both engines, which agree with each other. Two
+    /// The reference disagrees with both databases, which agree with each other. Two
     /// independent implementations agreeing is strong evidence the reference is the
     /// thing that is wrong, so this fails the run as a harness defect rather than
-    /// being attributed to either engine.
+    /// being attributed to either database.
     ReferenceSuspect(String),
-    /// One engine rejected the query. LadybugDB's surface is narrower, so this is
+    /// One database rejected the query. LadybugDB's surface is narrower, so this is
     /// not a defect.
     Unsupported,
 }
@@ -1452,7 +1508,22 @@ fn classify_generated(graph: &Graph, conn: &Connection, g: &RefGraph, q: &GenQue
     let (is_res, lb_res) = match (graph.query(&cypher), conn.query(&cypher)) {
         (Ok(a), Ok(b)) => (a, b),
         (Ok(_), Err(_)) | (Err(_), Ok(_)) => return GenVerdict::Unsupported,
-        (Err(_), Err(_)) => return GenVerdict::Agree,
+        (Err(e), Err(_)) => {
+            // Both rejected it. That is only agreement if the query really has no
+            // rows; consulting the reference here is the whole point of having an
+            // adjudicator, since a shape IssunDB has just regressed on would
+            // otherwise be scored as agreement by the oracle added to catch it.
+            let expected = reference_rows(g, q);
+            return if expected.is_empty() {
+                GenVerdict::Agree
+            } else {
+                GenVerdict::IssundbBug(format!(
+                    "both databases rejected a query the reference answers with {} row(s); \
+                     issundb said: {e}",
+                    expected.len()
+                ))
+            };
+        }
     };
     let sorted = |mut rows: Vec<Vec<String>>| {
         rows.sort();
@@ -1480,15 +1551,15 @@ fn classify_generated(graph: &Graph, conn: &Connection, g: &RefGraph, q: &GenQue
         (true, true) => GenVerdict::Agree,
         (true, false) => GenVerdict::LadybugDivergence,
         (false, _) if is_rows == lb_rows => {
-            GenVerdict::ReferenceSuspect(summary(&ref_rows, &is_rows, "both engines"))
+            GenVerdict::ReferenceSuspect(summary(&ref_rows, &is_rows, "both databases"))
         }
         (false, _) => GenVerdict::IssundbBug(summary(&ref_rows, &is_rows, "issundb")),
     }
 }
 
-/// Compare one query on both engines.
+/// Compare one query on both databases.
 ///
-/// `Ok(Verdict::Agree)` when the sorted row sets match. A query one engine rejects
+/// `Ok(Verdict::Agree)` when the sorted row sets match. A query one database rejects
 /// and the other accepts is a surface difference, not a wrong answer: LadybugDB
 /// supports a narrower Cypher surface, so that must not fail the run or a single
 /// unsupported construct would stop the whole sweep.
@@ -1516,9 +1587,23 @@ fn compare_query(graph: &Graph, conn: &Connection, cypher: &str) -> Verdict {
                 lb_rows.len()
             ))
         }
-        (Err(_), Err(_)) => Verdict::Agree,
+        // Both rejected it. Unlike `classify_generated`, this has no reference to
+        // adjudicate against, so it cannot know whether the query should have
+        // returned rows. It must not call that agreement either: a curated query
+        // IssunDB has regressed on will usually also be rejected by LadybugDB, whose
+        // surface is narrower, which is precisely how the corpus would go dark one
+        // query at a time while the gate kept exiting zero.
+        (Err(is_err), Err(lb_err)) => Verdict::Mismatch(format!(
+            "both databases rejected a curated query; issundb said: {is_err}; \
+             ladybugdb said: {lb_err}"
+        )),
+        // LadybugDB's surface is narrower, so it rejecting a query is tolerated.
+        // IssunDB rejecting one is not: the curated corpus is by construction inside
+        // IssunDB's surface, so a rejection there is a regression, and scoring it as
+        // merely "unsupported" would let the whole corpus go dark one query at a
+        // time while the gate kept exiting zero.
         (Ok(_), Err(e)) => Verdict::Unsupported(format!("ladybugdb rejected it: {e}")),
-        (Err(e), Ok(_)) => Verdict::Unsupported(format!("issundb rejected it: {e}")),
+        (Err(e), Ok(_)) => Verdict::Mismatch(format!("issundb rejected a curated query: {e}")),
     }
 }
 
@@ -1770,7 +1855,13 @@ fn run_at(cfg: &Config, nodes: u64, edges: u64) -> anyhow::Result<Vec<QueryTimin
     // same test.
     let mut diff_mismatches = run_differential(&graph, &conn, &differential_workload(&probes));
     if cfg.generated > 0 {
-        let shapes = generate_queries(cfg.generated, cfg.seed, &probes, &out_adjacency(&data));
+        let shapes = generate_queries(
+            cfg.generated,
+            cfg.seed,
+            &probes,
+            &out_adjacency(&data),
+            &in_adjacency(&data),
+        );
         diff_mismatches += run_generated(&graph, &conn, &RefGraph::build(&data), &shapes, cfg.seed);
     }
     println!();
@@ -2094,14 +2185,15 @@ mod tests {
     }
 
     /// The generator must stay inside the shapes the reference evaluator and both
-    /// engines can all handle, and it must be reproducible from its seed.
+    /// databases can all handle, and it must be reproducible from its seed.
     #[test]
     fn generated_queries_are_deterministic_and_in_surface() {
         let data = generate(1_000, 5_000, Skew::Uniform);
         let probes = pick_probes(&data);
-        let adjacency = out_adjacency(&data);
-        let a = generate_queries(200, 0x1234, &probes, &adjacency);
-        let b = generate_queries(200, 0x1234, &probes, &adjacency);
+        let out_adj = out_adjacency(&data);
+        let in_adj = in_adjacency(&data);
+        let a = generate_queries(200, 0x1234, &probes, &out_adj, &in_adj);
+        let b = generate_queries(200, 0x1234, &probes, &out_adj, &in_adj);
         let rendered: Vec<String> = a.iter().map(GenQuery::render).collect();
         assert_eq!(
             rendered,
@@ -2109,7 +2201,7 @@ mod tests {
             "the same seed must produce the same queries, or a report cannot be replayed"
         );
         assert!(
-            generate_queries(200, 0x99, &probes, &adjacency)
+            generate_queries(200, 0x99, &probes, &out_adj, &in_adj)
                 .iter()
                 .map(GenQuery::render)
                 .collect::<Vec<_>>()
@@ -2197,6 +2289,9 @@ mod tests {
             projection: Projection::Props(vec![(0, Prop::Id), (1, Prop::Name)]),
             distinct: true,
         };
+        // The metric has to score the aggregate, not just the projection kind, or
+        // the `Grouped -> CountStar` simplification is not strictly smaller and the
+        // invariant this test states is violated by a branch it cannot see.
         let size = |q: &GenQuery| {
             q.hops.len()
                 + q.predicates.len()
@@ -2204,16 +2299,34 @@ mod tests {
                 + usize::from(q.distinct)
                 + match &q.projection {
                     Projection::Props(items) => items.len(),
-                    Projection::Grouped { .. } => 1,
+                    // `count(*)` is the floor; every other aggregate can still
+                    // simplify to it, so it must score higher.
+                    Projection::Grouped {
+                        agg: Agg::CountStar,
+                        ..
+                    } => 1,
+                    Projection::Grouped { .. } => 2,
                 }
         };
-        let candidates = simplifications(&q);
-        assert!(!candidates.is_empty());
-        for c in &candidates {
-            assert!(
-                size(c) < size(&q),
-                "every simplification must be strictly smaller, or shrinking loops"
-            );
+        // Both projection kinds, so the grouped branch of `simplifications` is
+        // actually generated here rather than only existing.
+        let grouped = GenQuery {
+            projection: Projection::Grouped {
+                key: (0, Prop::City),
+                agg: Agg::MaxAge(1),
+            },
+            distinct: false,
+            ..q.clone()
+        };
+        for start in [&q, &grouped] {
+            let candidates = simplifications(start);
+            assert!(!candidates.is_empty());
+            for c in &candidates {
+                assert!(
+                    size(c) < size(start),
+                    "every simplification must be strictly smaller, or shrinking loops"
+                );
+            }
         }
         // A minimal shape offers nothing further to drop, which is what terminates
         // the shrink loop.
@@ -2259,7 +2372,7 @@ mod tests {
             assert!(
                 outgoing + incoming <= 2 && (outgoing == 0 || incoming == 0),
                 "{}: at most two same-direction hops, or LadybugDB's walk semantics \
-                 may disagree without either engine being wrong",
+                 may disagree without either database being wrong",
                 q.name
             );
             assert!(
@@ -2267,19 +2380,26 @@ mod tests {
                 "{}: a closing hop can always reuse an edge",
                 q.name
             );
-            // A grouped aggregate returns one row per group, which is the point;
-            // an aggregate with no grouping key collapses to a single row and is
-            // back to comparing one number.
-            let is_bare_aggregate = ["count(", "min(", "max(", "sum(", "avg("]
+            // A grouped aggregate returns one row per group, which is the point; an
+            // aggregate with no grouping key collapses to a single row and is back to
+            // comparing one number. The declared flag decides, so adding a query with
+            // any aggregate function cannot trip this by accident.
+            let has_aggregate = ["count(", "min(", "max(", "sum(", "avg("]
                 .iter()
-                .any(|f| q.cypher.contains(f))
-                && !q.cypher.contains(", count(")
-                && !q.cypher.contains(", min(");
+                .any(|f| q.cypher.contains(f));
             assert!(
-                !is_bare_aggregate,
-                "{}: an ungrouped aggregate compares a single scalar",
+                q.grouped || !has_aggregate,
+                "{}: an aggregate in a projection declared non-grouped compares a \
+                 single scalar; use the grouped constructor if it has a group key",
                 q.name
             );
+            if q.grouped {
+                assert!(
+                    has_aggregate,
+                    "{}: declared grouped but projects no aggregate",
+                    q.name
+                );
+            }
         }
 
         let names: HashSet<_> = corpus.iter().map(|q| q.name).collect();
