@@ -580,7 +580,18 @@ impl Graph {
     pub fn set_thread_count(&self, n: i32) -> Result<(), Error> {
         self.n_threads
             .store(n, std::sync::atomic::Ordering::Release);
-        issundb_graphblas::set_global_threads(n).map_err(|e| Error::GraphBLAS(e.to_string()))?;
+        // `MatrixSet::materialize` reads this value and applies it when it builds
+        // the matrices, which is also the call that initializes the GraphBLAS
+        // context. Setting the live thread pool is therefore only possible once
+        // that has happened: before the first materialization GraphBLAS is not
+        // initialized and setting a global option fails. Since `open` no longer
+        // materializes eagerly, a caller that configures threads up front hits
+        // exactly that window, so the stored value carries the setting instead.
+        // A count of zero means "resolve the default", which materialize does.
+        if n > 0 && self.matrices.read().is_some() {
+            issundb_graphblas::set_global_threads(n)
+                .map_err(|e| Error::GraphBLAS(e.to_string()))?;
+        }
         Ok(())
     }
 

@@ -283,7 +283,10 @@ The read-path and statistics methods carry non-obvious semantics:
   optimizer's type-inference pass.
 - `label_filter(nodes, label) -> Result<Vec<NodeId>, Error>`: subset of `nodes` carrying `label`, via one `label_idx` point lookup per candidate.
 - `set_thread_count(n: i32) -> Result<(), Error>`: sets the GraphBLAS thread count, overriding the `ISSUNDB_NUM_THREADS` environment variable (0
-  restores default behavior).
+  restores default behavior). The count is stored and applied by `MatrixSet::materialize`, which is also what initializes the GraphBLAS context, so a
+  call made before the matrices exist takes effect at the next materialization rather than reaching GraphBLAS immediately. Since `Graph::open` no longer
+  materializes eagerly, that is the normal case for a caller configuring threads up front; setting a global option on an uninitialized context would
+  fail.
 
 Graph algorithms have self-describing signatures over `NodeId` and `EdgeId`: `bfs`, `dfs`, `shortest_path`, `all_paths`, `all_shortest_paths`,
 `longest_path`, `shortest_path_top_k`, `page_rank`, `connected_components`, `strongly_connected_components`, `detect_cycle`, `label_propagation`,
