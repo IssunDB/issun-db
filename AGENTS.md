@@ -92,6 +92,12 @@ modules according to this map.
       persisted.
     - `src/matrices.rs`: GraphBLAS matrix materialization from the CSR snapshot, plus `MatrixSet::apply_delta` for incremental in-place maintenance
       (resize plus per-element set and drop) and the self-contained `dense_to_id`/`id_to_dense` mapping the matrix-view consumers read.
+    - `src/threads.rs`: the one resolution of the thread budget every parallel consumer shares (`threads::resolve`). Precedence is the programmatic
+      override from `set_thread_count`, then `ISSUNDB_NUM_THREADS`, then `OMP_NUM_THREADS`, then the machine's parallelism, clamped to `MAX_THREADS`.
+      Both the GraphBLAS pool (`MatrixSet::materialize`) and the counting kernels' scoped threads (`Graph::kernel_threads`) resolve through it, so the one
+      knob has one meaning; resolving it in two places previously made an unset configuration mean one thread for the matrices and the whole machine for a
+      kernel pass, letting the two pools oversubscribe each other. `OMP_NUM_THREADS` is honored because the GraphBLAS pool is an OpenMP pool and capping
+      it is how this repository's own `test` and `coverage` targets keep the pools in check.
     - `src/error.rs`: `Error` enum; all storage and serialization errors unify here.
 - `crates/issundb-cypher/`: Cypher parser, AST, logical planner, physical planner, optimizer, and executor.
     - `src/parser.rs`: Cypher parser built with the `chumsky` parser-combinator library (with a Pratt parser for operator-precedence expressions),
@@ -221,6 +227,9 @@ modules according to this map.
   (`git submodule update --init external/GraphBLAS`) plus CMake and Clang.
 - Async is not used in the core engine. LMDB and GraphBLAS are synchronous. `tokio` is an optional dependency for server mode only; do not add
   `.await` inside `issundb-core`.
+- Parallelism has exactly two consumers, and both resolve their thread count through `threads::resolve` (see the module map): the GraphBLAS OpenMP pool,
+  and the scoped-thread reductions in the counting kernels, which split a pass only above `MIN_PARALLEL_WORK` items so a small pass and a unit test stay
+  serial and deterministic. Writes are never parallel: they serialize on the `ReentrantMutex` write lock and on LMDB's single writer.
 - GraphBLAS initializes a process-global context and OpenMP thread pool on first use (`GrB_init`) and never finalizes it. Under `cargo nextest`
   (process-per-test, used by `make coverage`) every process pays this cost, so on small CI runners the thread pools oversubscribe and a GraphBLAS call
   can fail intermittently. The coverage job pins `OMP_NUM_THREADS=1` and sets `NEXTEST_RETRIES=2` to compensate.
@@ -283,7 +292,7 @@ The read-path and statistics methods carry non-obvious semantics:
   optimizer's type-inference pass.
 - `label_filter(nodes, label) -> Result<Vec<NodeId>, Error>`: subset of `nodes` carrying `label`, via one `label_idx` point lookup per candidate.
 - `set_thread_count(n: i32) -> Result<(), Error>`: sets the GraphBLAS thread count, overriding the `ISSUNDB_NUM_THREADS` environment variable (0
-  restores default behavior). The count is stored and applied by `MatrixSet::materialize`, which is also what initializes the GraphBLAS context, so a
+  restores default behavior, resolved by `threads::resolve`). The count is stored and applied by `MatrixSet::materialize`, which is also what initializes the GraphBLAS context, so a
   call made before the matrices exist takes effect at the next materialization rather than reaching GraphBLAS immediately. Since `Graph::open` no longer
   materializes eagerly, that is the normal case for a caller configuring threads up front; setting a global option on an uninitialized context would
   fail.

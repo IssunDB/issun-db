@@ -56,7 +56,7 @@ doctest: ## Run documentation tests (code examples in comments)
 .PHONY: test
 test: format doctest ## Run the tests
 	@echo "Running tests..."
-	@DEBUG_PROJ=$(DEBUG_PROJ) RUST_BACKTRACE=$(RUST_BACKTRACE) cargo test --lib --bins --tests --workspace -- --nocapture
+	@OMP_NUM_THREADS=$(OMP_NUM_THREADS) DEBUG_PROJ=$(DEBUG_PROJ) RUST_BACKTRACE=$(RUST_BACKTRACE) cargo test --lib --bins --tests --workspace -- --nocapture
 
 .PHONY: test-conformance
 test-conformance: format ## Run the openCypher TCK conformance integration tests

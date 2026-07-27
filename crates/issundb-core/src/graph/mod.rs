@@ -576,7 +576,11 @@ impl Graph {
     }
 
     /// Set the thread count for GraphBLAS matrix computations, overriding the
-    /// `ISSUNDB_NUM_THREADS` environment variable. Set to 0 to restore the default behavior.
+    /// `ISSUNDB_NUM_THREADS` environment variable. Set to 0 to restore the default
+    /// behavior, which resolves through `threads::resolve`: `ISSUNDB_NUM_THREADS`,
+    /// then `OMP_NUM_THREADS`, then the machine's parallelism. Every parallel
+    /// consumer (the GraphBLAS pool and the counting kernels) shares that
+    /// resolution, so this one knob has one meaning.
     pub fn set_thread_count(&self, n: i32) -> Result<(), Error> {
         self.n_threads
             .store(n, std::sync::atomic::Ordering::Release);

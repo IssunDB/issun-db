@@ -529,11 +529,9 @@ impl Graph {
     /// A counting kernel is a pure reduction over disjoint slices of the CSR
     /// arrays, so it parallelizes without synchronization; the arrays are read
     /// through an immutable snapshot, so this takes no lock and never races a
-    /// writer. The programmatic override and `ISSUNDB_NUM_THREADS` are honored so
-    /// one knob controls both this and the GraphBLAS pool; with neither set it
-    /// uses the machine's parallelism, unlike the GraphBLAS default of one (that
-    /// default exists to stop an OpenMP pool from oversubscribing, which
-    /// short-lived scoped threads do not).
+    /// writer. The count itself comes from [`crate::threads::resolve`], the single
+    /// resolution every parallel consumer shares, so the one knob means the same
+    /// thing here as it does for the GraphBLAS pool.
     ///
     /// A small pass stays single-threaded: below the threshold the spawn cost
     /// exceeds the saving, which also keeps unit tests deterministic and off the
@@ -553,23 +551,7 @@ impl Graph {
         if work < MIN_PARALLEL_WORK {
             return 1;
         }
-        let programmatic = self.n_threads.load(std::sync::atomic::Ordering::Acquire);
-        let configured = if programmatic > 0 {
-            programmatic as usize
-        } else {
-            std::env::var("ISSUNDB_NUM_THREADS")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(0)
-        };
-        let n = if configured > 0 {
-            configured
-        } else {
-            std::thread::available_parallelism()
-                .map(|p| p.get())
-                .unwrap_or(1)
-        };
-        n.clamp(1, 64)
+        crate::threads::resolve(self.n_threads.load(std::sync::atomic::Ordering::Acquire))
     }
 
     /// Total length of `sources`' adjacency rows in the given direction: an upper

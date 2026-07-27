@@ -6,6 +6,7 @@ pub(crate) mod histogram;
 pub(crate) mod matrices;
 mod schema;
 pub(crate) mod storage;
+pub(crate) mod threads;
 
 pub use error::Error;
 pub use graph::{
