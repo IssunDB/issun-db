@@ -112,9 +112,43 @@ pub struct GroupedDegreeSpec<'a> {
     pub group_label: Option<&'a str>,
     /// Label required on the counted endpoint.
     pub counted_label: Option<&'a str>,
+    /// Explicit allow-set the counted endpoint must belong to, intersected with
+    /// `counted_label`; `None` leaves it unconstrained beyond the label. The
+    /// caller resolves this set by pushing a per-vertex property predicate down
+    /// into index lookups, as [`PathCountSpec::vertex_allow`] does, so a filtered
+    /// grouped count stays a kernel call. An empty slice counts zero.
+    pub counted_allow: Option<&'a [NodeId]>,
     /// Property that must be non-null on the counted endpoint for an edge to
     /// count; `None` counts every qualifying edge.
     pub counted_nonnull_prop: Option<&'a str>,
+}
+
+/// Pattern description for [`Graph::typed_neighbor_counts`]: per-source counts
+/// of typed neighbors across one hop. `incoming` follows incoming edges instead
+/// of outgoing ones. A neighbor qualifies when it carries every label in
+/// `neighbor_labels` (an empty slice is unconstrained) and, when
+/// `neighbor_allow` is present, is a member of that set; it adds to the counted
+/// total only when `neighbor_nonnull_prop` is absent or non-null on it (the
+/// semantics of `count(v.prop)` over the expansion, against `count(*)`).
+#[derive(Debug, Clone, Default)]
+pub struct NeighborCountSpec<'a> {
+    /// Relationship type to follow, or `None` for any type.
+    pub rel_type: Option<&'a str>,
+    /// Follow incoming edges (neighbors are edge sources) instead of outgoing.
+    pub incoming: bool,
+    /// Labels a neighbor must all carry to qualify.
+    pub neighbor_labels: &'a [&'a str],
+    /// Explicit allow-set a neighbor must belong to, intersected with the labels
+    /// above; `None` leaves the neighbor unconstrained beyond its labels. The
+    /// caller resolves this set by evaluating per-neighbor property predicates
+    /// itself, so a filtered count stays a kernel call instead of materializing
+    /// one entry per traversed edge, exactly as
+    /// [`PathCountSpec::vertex_allow`] does for the path count. An empty slice
+    /// admits no neighbor and counts zero.
+    pub neighbor_allow: Option<&'a [NodeId]>,
+    /// Property that must be non-null on a qualifying neighbor for it to add to
+    /// the counted total; `None` counts every qualifying neighbor.
+    pub neighbor_nonnull_prop: Option<&'a str>,
 }
 
 /// Builds a 12-byte composite key `(prefix u32 BE, id u64 BE)` for secondary index lookups.
@@ -510,19 +544,36 @@ impl Graph {
 }
 
 impl Graph {
+    /// Open (creating if absent) the database at `path`.
+    ///
+    /// `map_size_gb` is the size of the LMDB memory map, and it is an upper bound
+    /// on how large the database may grow for the lifetime of this handle, not an
+    /// allocation: LMDB reserves the address range and commits pages as they are
+    /// written, so a large value costs virtual address space rather than disk or
+    /// RAM. There is no resize path. Once the data exceeds the bound, every write
+    /// fails with the underlying `MDB_MAP_FULL` through [`Error::Storage`] until
+    /// the database is reopened with a larger value, which is safe to do and keeps
+    /// the existing data. Size it for the eventual database, not the current one.
+    ///
+    /// Opening builds none of the derived structures; see the comment inside.
     pub fn open(path: &Path, map_size_gb: usize) -> Result<Self, Error> {
         let storage = Storage::open(path, map_size_gb)?;
         // Older versions persisted the CSR snapshot next to the LMDB files but
         // never read it back; remove the stale artifact if one is present.
         let _ = std::fs::remove_file(path.join("csr_snapshot.bin"));
-        let initial = CsrSnapshot::build(&storage)?;
         let storage = Arc::new(storage);
-        let csr_cache = Arc::new(CsrCache::new(initial));
-        let matrices = {
-            let initial_snap = csr_cache.snapshot.load();
-            let m = MatrixSet::materialize(&initial_snap, 0)?;
-            Arc::new(parking_lot::RwLock::new(Some(m)))
-        };
+        // Opening builds nothing. The CSR snapshot and the GraphBLAS matrices
+        // are materialized by the freshness gates (`ensure_snapshot_fresh`,
+        // `ensure_matrix_view`, and `ensure_csr_fresh`) when a consumer that
+        // needs them first runs, and every such consumer already calls its gate.
+        // Building them here instead cost one full edge scan plus a full matrix
+        // materialization on every open, which is time a workload of point
+        // lookups, property reads, or point adjacency never uses: those paths
+        // read LMDB directly. On a large database that eager work dominates the
+        // whole session's latency (roughly 26 s to open a 1 M-node, 14 M-edge
+        // graph), and it is repaid on every reopen.
+        let csr_cache = Arc::new(CsrCache::new_unbuilt());
+        let matrices = Arc::new(parking_lot::RwLock::new(None));
         Ok(Self {
             storage,
             _write_lock: Arc::new(ReentrantMutex::new(())),
@@ -537,24 +588,59 @@ impl Graph {
     }
 
     /// Set the thread count for GraphBLAS matrix computations, overriding the
-    /// `ISSUNDB_NUM_THREADS` environment variable. Set to 0 to restore the default behavior.
+    /// `ISSUNDB_NUM_THREADS` environment variable. Set to 0 to restore the default
+    /// behavior, which resolves through `threads::resolve`: `ISSUNDB_NUM_THREADS`,
+    /// then `OMP_NUM_THREADS`, then the machine's parallelism. Every parallel
+    /// consumer (the GraphBLAS pool and the counting kernels) shares that
+    /// resolution, so this one knob has one meaning.
     pub fn set_thread_count(&self, n: i32) -> Result<(), Error> {
         self.n_threads
             .store(n, std::sync::atomic::Ordering::Release);
-        issundb_graphblas::set_global_threads(n).map_err(|e| Error::GraphBLAS(e.to_string()))?;
+        // `MatrixSet::materialize` reads this value and applies it when it builds
+        // the matrices, which is also the call that initializes the GraphBLAS
+        // context. Setting the live thread pool is therefore only possible once
+        // that has happened: before the first materialization GraphBLAS is not
+        // initialized and setting a global option fails. Since `open` no longer
+        // materializes eagerly, a caller that configures threads up front hits
+        // exactly that window, so the stored value carries the setting instead.
+        if self.matrices.read().is_some() {
+            // Resolve rather than forward `n`: zero means "restore the default",
+            // which this method documents, and only `threads::resolve` knows what
+            // that is. Resolving also clamps, so the live pool cannot diverge from
+            // what the next materialization would pick.
+            let resolved = crate::threads::resolve(n) as i32;
+            issundb_graphblas::set_global_threads(resolved)
+                .map_err(|e| Error::GraphBLAS(e.to_string()))?;
+        }
         Ok(())
     }
 
-    /// Read one property of a node through the in-memory property columns,
-    /// as the `serde_json::Value` that decoding the stored record would give.
-    /// Returns `None` for a nonexistent node and `Some(Value::Null)` for a
-    /// missing property. Builds or refreshes the columns on first use after a
-    /// write, so the result always reflects committed state.
+    /// Read one property of a node as the `serde_json::Value` that decoding the
+    /// stored record would give. Returns `None` for a nonexistent node and
+    /// `Some(Value::Null)` for a missing property. Either way the result
+    /// reflects committed state.
+    ///
+    /// Served through the in-memory property columns once they exist, refreshing
+    /// them against pending writes first; while they are absent the read goes
+    /// straight to storage instead of building them (see
+    /// [`crate::columns::ColumnsCache::should_serve_directly`]).
     pub fn node_prop_json(
         &self,
         id: NodeId,
         prop: &str,
     ) -> Result<Option<serde_json::Value>, Error> {
+        // One property of one node is an LMDB point read. Serving it by building
+        // every column costs a full node scan, which is the wrong trade for a
+        // point query; the read only goes through the columns once they exist,
+        // or once enough direct reads have amortized building them.
+        if self.prop_columns.should_serve_directly(1) {
+            let Some(obj) = self.direct_node_props(id)? else {
+                return Ok(None);
+            };
+            return Ok(Some(
+                obj.get(prop).cloned().unwrap_or(serde_json::Value::Null),
+            ));
+        }
         self.prop_columns.with_fresh(&self.storage, |cols| {
             cols.id_to_dense.get(&id).map(|&d| {
                 cols.cols
@@ -575,6 +661,22 @@ impl Graph {
         ids: &[NodeId],
         props: &[&str],
     ) -> Result<Vec<Vec<serde_json::Value>>, Error> {
+        if self.prop_columns.should_serve_directly(ids.len()) {
+            // One transaction for the whole gather, so the request is a single
+            // point in time and pays one begin/end pair rather than one per id.
+            return self
+                .direct_node_props_many(ids)?
+                .into_iter()
+                .zip(ids)
+                .map(|(obj, &id)| {
+                    let obj = obj.ok_or(Error::NodeNotFound(id))?;
+                    Ok(props
+                        .iter()
+                        .map(|p| obj.get(*p).cloned().unwrap_or(serde_json::Value::Null))
+                        .collect())
+                })
+                .collect();
+        }
         self.prop_columns
             .with_fresh(&self.storage, |cols| cols.props_table(ids, props))?
     }
@@ -589,8 +691,89 @@ impl Graph {
         ids: &[NodeId],
         prop: &str,
     ) -> Result<Vec<serde_json::Value>, Error> {
+        if self.prop_columns.should_serve_directly(ids.len()) {
+            return self
+                .direct_node_props_many(ids)?
+                .into_iter()
+                .zip(ids)
+                .map(|(obj, &id)| {
+                    let obj = obj.ok_or(Error::NodeNotFound(id))?;
+                    Ok(obj.get(prop).cloned().unwrap_or(serde_json::Value::Null))
+                })
+                .collect();
+        }
         self.prop_columns
             .with_fresh(&self.storage, |cols| cols.prop_column(ids, prop))?
+    }
+
+    /// One node's user properties decoded from storage, the way the column
+    /// build decodes them, so a gather served directly and the same gather
+    /// served through the columns cannot disagree. `None` if the node is gone.
+    fn direct_node_props(&self, id: NodeId) -> Result<Option<serde_json::Value>, Error> {
+        <crate::columns::NodeSource as crate::columns::ColumnSource>::fetch_one(&self.storage, id)
+    }
+
+    /// [`Graph::direct_node_props`] for many ids under one transaction, in input
+    /// order. `None` for a node that is gone.
+    fn direct_node_props_many(
+        &self,
+        ids: &[NodeId],
+    ) -> Result<Vec<Option<serde_json::Value>>, Error> {
+        <crate::columns::NodeSource as crate::columns::ColumnSource>::fetch_many(&self.storage, ids)
+    }
+
+    /// Whether each of `ids` carries a non-null value for `prop`, in input order.
+    ///
+    /// A node that is not there reads as absent rather than raising, because the
+    /// callers' ids come from the CSR snapshot, which can lag a deletion; treating
+    /// the gap as a null value is what the row pipeline would effectively produce
+    /// for a row a stale snapshot should no longer have offered.
+    ///
+    /// Honors the same small-request path the property gathers do, so resolving
+    /// presence for a handful of nodes costs a handful of point reads instead of
+    /// one full scan to build every column. That is the whole point of it existing
+    /// separately: the counting kernels need presence for the neighbors they
+    /// actually visit, not a dense mask over the entire graph.
+    pub(super) fn nodes_prop_present(
+        &self,
+        ids: &[NodeId],
+        prop: &str,
+    ) -> Result<Vec<bool>, Error> {
+        if self.prop_columns.should_serve_directly(ids.len()) {
+            return Ok(self
+                .direct_node_props_many(ids)?
+                .into_iter()
+                .map(|obj| obj.is_some_and(|o| o.get(prop).is_some_and(|v| !v.is_null())))
+                .collect());
+        }
+        self.prop_columns.with_fresh(&self.storage, |cols| {
+            ids.iter()
+                .map(|id| match (cols.id_to_dense.get(id), cols.cols.get(prop)) {
+                    (Some(&d), Some(col)) => col.is_present(d as usize),
+                    // Either the columns never saw this entity or no such property
+                    // exists anywhere; both read as null.
+                    _ => false,
+                })
+                .collect()
+        })
+    }
+
+    /// Build the in-memory property columns now, if they are not built already.
+    ///
+    /// Every reader either serves a small request without them or, for the advisory
+    /// statistics, declines rather than pay for them, so nothing builds them as a
+    /// side effect of a small workload. That is deliberate: the build is one full
+    /// entity scan, and it used to dominate cold-start latency. This is the
+    /// deliberate way to ask for it, for a caller that wants the optimizer's
+    /// selectivity estimates and zone-map pruning available on a cold graph, or that
+    /// would rather pay the scan once up front than have a later bulk read pay it.
+    ///
+    /// It replaces an accident: `node_prop_group_codes` used to build
+    /// unconditionally, so "call it and discard the result" was the idiom for
+    /// warming the columns. Grouping now follows the same size test as the other
+    /// readers, and warming them is this call.
+    pub fn materialize_property_columns(&self) -> Result<(), Error> {
+        self.prop_columns.with_fresh(&self.storage, |_| ())
     }
 
     /// Group `ids` by the exact value of `prop` through the in-memory
@@ -604,6 +787,33 @@ impl Graph {
         ids: &[NodeId],
         prop: &str,
     ) -> Result<(Vec<u32>, Vec<serde_json::Value>), Error> {
+        // A small request is grouped over an ephemeral column set built from just
+        // those nodes, rather than by building every column from a full scan.
+        // Grouping is a bulk read only when the id set is bulk; a grouped count
+        // whose groups are a handful of nodes was paying one full node scan with a
+        // decode per node, which is the cold-start cost the small-gather path exists
+        // to avoid, and the caller had no way to opt out.
+        //
+        // The ephemeral set goes through the same `from_items` and `group_codes` as
+        // the shared one, so this is the same grouping code over a narrower
+        // population, not a second implementation of it. A node that is gone is left
+        // out, which makes `group_codes` report `NodeNotFound` for it exactly as the
+        // shared columns would.
+        if self.prop_columns.should_serve_directly(ids.len()) {
+            let fetched = self.direct_node_props_many(ids)?;
+            let items: Vec<(NodeId, serde_json::Value)> = ids
+                .iter()
+                .zip(fetched)
+                .filter_map(|(&id, obj)| obj.map(|o| (id, o)))
+                .collect();
+            // Only the grouped property is columnarized; the rest would be built
+            // and dropped.
+            let cols = crate::columns::PropColumns::<crate::columns::NodeSource>::from_items_for(
+                items,
+                Some(prop),
+            );
+            return cols.group_codes(ids, prop);
+        }
         self.prop_columns
             .with_fresh(&self.storage, |cols| cols.group_codes(ids, prop))?
     }
@@ -671,43 +881,59 @@ impl Graph {
 
     /// The minimum and maximum non-null value of one node property, from the
     /// lazily computed statistics over the in-memory property columns.
-    /// `None` when the property has no typed column or no non-null values.
+    /// `None` when the property has no typed column or no non-null values, and
+    /// also when the columns are not built yet: this reader never builds them,
+    /// because it is advisory (see [`Graph::estimate_equality_selectivity`]).
     pub fn node_prop_min_max(
         &self,
         prop: &str,
     ) -> Result<Option<(serde_json::Value, serde_json::Value)>, Error> {
-        self.prop_columns.with_fresh_mut(&self.storage, |cols| {
-            cols.prop_stats(prop)
-                .map(|s| (s.min.clone(), s.max.clone()))
-        })
+        Ok(self
+            .prop_columns
+            .with_existing_mut(&self.storage, |cols| {
+                cols.prop_stats(prop)
+                    .map(|s| (s.min.clone(), s.max.clone()))
+            })?
+            .flatten())
     }
 
     /// Estimated fraction of non-null values of `prop` inside the given
     /// bounds (either bound optional), from the property's equi-depth
-    /// histogram. `None` when no statistics exist for the property.
+    /// histogram. `None` when no statistics exist for the property or the
+    /// columns are not built yet; this reader never builds them.
     pub fn estimate_range_selectivity(
         &self,
         prop: &str,
         lower: Option<&serde_json::Value>,
         upper: Option<&serde_json::Value>,
     ) -> Result<Option<f64>, Error> {
-        self.prop_columns.with_fresh_mut(&self.storage, |cols| {
-            cols.prop_stats(prop)
-                .map(|s| s.histogram.estimate_range_selectivity(lower, upper))
-        })
+        Ok(self
+            .prop_columns
+            .with_existing_mut(&self.storage, |cols| {
+                cols.prop_stats(prop)
+                    .map(|s| s.histogram.estimate_range_selectivity(lower, upper))
+            })?
+            .flatten())
     }
 
     /// Estimated fraction of non-null values of `prop` equal to `val`: exact
     /// for the property's most common values, histogram-estimated otherwise.
-    /// `None` when no statistics exist for the property.
+    ///
+    /// `None` when no statistics exist for the property, and also when the
+    /// property columns have not been built yet: the estimate only weights plan
+    /// choices, so answering is never worth one full node scan on a query that
+    /// would not otherwise materialize the columns.
     pub fn estimate_equality_selectivity(
         &self,
         prop: &str,
         val: &serde_json::Value,
     ) -> Result<Option<f64>, Error> {
-        self.prop_columns.with_fresh_mut(&self.storage, |cols| {
-            cols.prop_stats(prop).map(|s| s.equality_selectivity(val))
-        })
+        Ok(self
+            .prop_columns
+            .with_existing_mut(&self.storage, |cols| {
+                cols.prop_stats(prop).map(|s| s.equality_selectivity(val))
+            })?
+            .flatten())
     }
 
     /// Store an extension value (as `Arc`) keyed by its concrete type.
@@ -784,9 +1010,36 @@ impl Graph {
         let _txn_guard = WriteTxnGuard::enter(self.write_txn_env_id());
         match f(&mut txn) {
             Ok(val) => {
-                let mutations_count = txn.mutations_count;
-                let delta = std::mem::take(&mut txn.delta);
-                txn.wtxn.commit()?;
+                let WriteTxn {
+                    wtxn,
+                    mutations_count,
+                    delta,
+                    graph: _,
+                } = txn;
+                // Publish before any other bookkeeping, so the window in which
+                // the caches claim to be current while LMDB already holds this
+                // write is one atomic increment wide rather than the width of
+                // the batch. See `CsrCache::advance_write_gen`.
+                self.commit_and_publish(wtxn, mutations_count)?;
+                // Column bookkeeping next, then the structural delta.
+                //
+                // Whichever of the two publishes runs second is blind for as long as
+                // the first takes, and neither ordering escapes that: the two share
+                // `added_nodes`, so one of them has to copy it rather than move it,
+                // and on a large batch that copy is the window. Ordering only picks
+                // which gate pays. The columns go first because `node_prop_json`
+                // documents that its result reflects committed state, which is a
+                // per-call promise; `ensure_matrix_view` gates on the delta alone
+                // (gating it on the generation would force a full rebuild after
+                // every write, since only a full rebuild advances `matrices_gen`)
+                // and makes no equivalent promise, and this is its pre-existing
+                // exposure rather than a new one.
+                //
+                // Closing it properly is the read-isolation question, not an
+                // ordering one: a reader that pinned one generation of every cache
+                // for the length of a statement would not care what order these two
+                // ran in. Until then the generation bump above, which happens first
+                // and is a single atomic, is what the gates that can see it use.
                 if delta.force_full {
                     self.prop_columns.record_force_full();
                 } else {
@@ -803,7 +1056,7 @@ impl Graph {
                     self.edge_columns.record_touched_many(&delta.added_edge_ids);
                     self.edge_columns.record_touched_many(&delta.updated_edges);
                 }
-                self.csr_cache.record_batch(delta);
+                self.csr_cache.record_batch(&delta);
                 if mutations_count > 0 {
                     self.maybe_spawn_rebuild_n(mutations_count);
                 }
@@ -814,6 +1067,32 @@ impl Graph {
                 Err(err)
             }
         }
+    }
+
+    /// Commit `wtxn` and publish the write to the caches' freshness counters as
+    /// one step, where `count` is the number of mutations the transaction made.
+    ///
+    /// Every mutation that changes adjacency, an edge weight, or a node record
+    /// commits through here rather than calling `wtxn.commit()` directly. The
+    /// publish is what makes every freshness gate notice the write, so a method
+    /// that committed without it would leave the caches permanently claiming to be
+    /// current rather than briefly.
+    ///
+    /// This is convention plus a test, not an enforced invariant: `wtxn.commit()`
+    /// is still called directly by the index, vector, and FTS writers, none of
+    /// which touch adjacency or a cached property, so nothing structurally prevents
+    /// a new mutation method from committing without publishing.
+    /// `publish_tests::every_committing_mutation_publishes_the_write` enumerates
+    /// today's methods by hand, so add a new one to it. Ordering inside here is
+    /// deliberate: see [`crate::csr::CsrCache::advance_write_gen`].
+    pub(super) fn commit_and_publish(
+        &self,
+        wtxn: heed::RwTxn<'_>,
+        count: usize,
+    ) -> Result<(), Error> {
+        wtxn.commit()?;
+        self.csr_cache.advance_write_gen(count as u64);
+        Ok(())
     }
 
     /// Hold the write lock for the duration of `f`, executing `f` without
@@ -901,8 +1180,21 @@ impl Graph {
     /// `dst_dir/data.mdb`. After this call succeeds the caller can open the
     /// restored database with `Graph::open(dst_dir, map_size_gb)`.
     pub fn restore(snapshot_file: &Path, dst_dir: &Path) -> Result<(), Error> {
-        std::fs::create_dir_all(dst_dir)?;
         let dst_file = dst_dir.join("data.mdb");
+        // Refuse a destination that already holds a database. The copy below
+        // truncates, so without this the call silently destroys whatever was there
+        // and still reports success, including the caller's own open database.
+        // The check lives here rather than in any one front end because every
+        // caller reaches the same `fs::copy`: the CLI, the Python binding's
+        // `restore`, and any library consumer of the facade.
+        if dst_file.exists() {
+            return Err(Error::InvalidArgument(format!(
+                "{} already contains a database (data.mdb); restore into a new or \
+                 empty directory rather than overwriting it",
+                dst_dir.display()
+            )));
+        }
+        std::fs::create_dir_all(dst_dir)?;
         std::fs::copy(snapshot_file, &dst_file)?;
         Ok(())
     }
@@ -1073,5 +1365,310 @@ mod encode_tests {
             let enc = encode_property_value(&v).unwrap();
             assert_eq!(decode_property_value(&enc), Some(v.clone()), "value {v}");
         }
+    }
+}
+
+#[cfg(test)]
+mod restore_tests {
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    use super::Graph;
+
+    /// Restoring over an existing database must fail rather than truncate it.
+    ///
+    /// The copy is `fs::copy`, which overwrites, so this used to destroy the
+    /// destination and report success. Every front end reaches this function, so the
+    /// refusal belongs here rather than in one of them.
+    #[test]
+    fn restore_refuses_an_existing_database() {
+        let src = TempDir::new().unwrap();
+        let snap_dir = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        let snap = snap_dir.path().join("a.mdb");
+
+        {
+            let a = Graph::open(src.path(), 1).unwrap();
+            a.add_node("FromA", &json!({ "n": 1 })).unwrap();
+            a.backup(&snap).unwrap();
+        }
+        {
+            let b = Graph::open(dst.path(), 1).unwrap();
+            for i in 0..5 {
+                b.add_node("FromB", &json!({ "n": i })).unwrap();
+            }
+        }
+
+        let err = Graph::restore(&snap, dst.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("already contains a database"),
+            "{err}"
+        );
+
+        // The destination is untouched.
+        let b = Graph::open(dst.path(), 1).unwrap();
+        assert_eq!(b.nodes_by_label("FromB").unwrap().len(), 5);
+        assert!(b.nodes_by_label("FromA").unwrap().is_empty());
+
+        // A fresh directory still works, including one that does not exist yet.
+        let fresh = TempDir::new().unwrap();
+        let nested = fresh.path().join("new");
+        Graph::restore(&snap, &nested).unwrap();
+        let restored = Graph::open(&nested, 1).unwrap();
+        assert_eq!(restored.nodes_by_label("FromA").unwrap().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod publish_tests {
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    use super::Graph;
+
+    /// Every committing mutation must publish its write to the freshness
+    /// counters, which is what [`Graph::commit_and_publish`] exists to make
+    /// unforgettable. A method that committed without publishing would leave
+    /// every gate reporting the caches as current, so a typed expansion or a
+    /// graph algorithm would read pre-write state indefinitely rather than for
+    /// the length of one atomic increment.
+    #[test]
+    fn every_committing_mutation_publishes_the_write() {
+        let dir = TempDir::new().unwrap();
+        let g = Graph::open(dir.path(), 1).unwrap();
+        let a = g.add_node("P", &json!({ "n": 1 })).unwrap();
+        let b = g.add_node("P", &json!({ "n": 2 })).unwrap();
+        let edge = g.add_edge(a, b, "T", &json!({ "weight": 1.0 })).unwrap();
+        // Targets for the cases that consume what they touch, created up front so
+        // the mutation under test is the only write inside its own window.
+        let victim_node = g.add_node("P", &json!({})).unwrap();
+        let victim_edge = g.add_edge(a, b, "T", &json!({})).unwrap();
+        let label_target = g.add_node("P", &json!({})).unwrap();
+
+        macro_rules! assert_publishes {
+            ($name:literal, $body:block) => {{
+                g.rebuild_csr().unwrap();
+                assert!(
+                    !g.csr_cache.snapshot_is_stale(),
+                    concat!($name, ": a fresh rebuild must report current")
+                );
+                $body
+                assert!(
+                    g.csr_cache.snapshot_is_stale(),
+                    concat!($name, " committed without publishing the write generation")
+                );
+            }};
+        }
+
+        assert_publishes!("add_node", {
+            g.add_node("P", &json!({})).unwrap();
+        });
+        assert_publishes!("add_node_multi", {
+            g.add_node_multi(&["P", "Q"], &json!({})).unwrap();
+        });
+        assert_publishes!("add_edge", {
+            g.add_edge(a, b, "T", &json!({})).unwrap();
+        });
+        assert_publishes!("update_node", {
+            g.update_node(a, &json!({ "n": 9 })).unwrap();
+        });
+        assert_publishes!("update_edge", {
+            g.update_edge(edge, &json!({ "weight": 2.0 })).unwrap();
+        });
+        assert_publishes!("add_label", {
+            g.add_label(label_target, "R").unwrap();
+        });
+        assert_publishes!("remove_label", {
+            g.remove_label(label_target, "R").unwrap();
+        });
+        assert_publishes!("delete_edge", {
+            g.delete_edge(victim_edge).unwrap();
+        });
+        assert_publishes!("delete_node", {
+            g.delete_node(victim_node).unwrap();
+        });
+        assert_publishes!("update", {
+            g.update(|txn| {
+                txn.add_node("P", &json!({}))?;
+                Ok(())
+            })
+            .unwrap();
+        });
+    }
+
+    /// A `Graph::update` closure that mutates nothing must not advance the
+    /// generation, so a read-only use of the write transaction does not force
+    /// every cache to rebuild.
+    #[test]
+    fn a_mutation_free_update_publishes_nothing() {
+        let dir = TempDir::new().unwrap();
+        let g = Graph::open(dir.path(), 1).unwrap();
+        g.add_node("P", &json!({})).unwrap();
+        g.rebuild_csr().unwrap();
+
+        g.update(|txn| txn.get_node(1).map(|_| ())).unwrap();
+
+        assert!(
+            !g.csr_cache.snapshot_is_stale(),
+            "a read-only update must leave the caches current"
+        );
+    }
+}
+
+#[cfg(test)]
+mod lazy_open_tests {
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    use super::Graph;
+    use crate::schema::NodeId;
+
+    /// Populate a graph, force the CSR and matrices to materialize, then close
+    /// it. Returns the directory so the caller can reopen the same path.
+    fn seeded_dir() -> (TempDir, Vec<NodeId>) {
+        let dir = TempDir::new().unwrap();
+        let ids = {
+            let g = Graph::open(dir.path(), 1).unwrap();
+            // 80 nodes in a ring plus a chord, so a typed expansion over more
+            // than `STALE_POINT_EXPAND_MAX` (64) sources takes the snapshot
+            // path rather than the per-source LMDB path.
+            let ids: Vec<_> = (0..80)
+                .map(|i| g.add_node("Person", &json!({ "n": i })).unwrap())
+                .collect();
+            for i in 0..ids.len() {
+                g.add_edge(ids[i], ids[(i + 1) % ids.len()], "FOLLOWS", &json!({}))
+                    .unwrap();
+            }
+            g.add_edge(ids[0], ids[40], "LIKES", &json!({})).unwrap();
+            // Touch an algorithm so this handle definitely materialized both.
+            g.bfs(ids[0], 2).unwrap();
+            assert!(g.matrices.read().is_some(), "seed handle must materialize");
+            ids
+        };
+        (dir, ids)
+    }
+
+    /// Opening an existing database does no CSR scan and no GraphBLAS
+    /// materialization. Both are the freshness gates' job, so a workload that
+    /// only reads properties or point adjacency never pays for them.
+    #[test]
+    fn open_defers_the_csr_and_matrix_build() {
+        let (dir, _ids) = seeded_dir();
+        let g = Graph::open(dir.path(), 1).unwrap();
+
+        assert!(
+            g.matrices.read().is_none(),
+            "open must not materialize the GraphBLAS matrices"
+        );
+        assert_eq!(
+            g.csr_cache.snapshot.load().dense_to_id.len(),
+            0,
+            "open must not build the CSR snapshot"
+        );
+        assert!(
+            g.csr_cache.snapshot_is_stale(),
+            "the unbuilt snapshot must report stale so a consumer rebuilds it"
+        );
+    }
+
+    /// A freshly opened handle serves every consumer class correctly, each
+    /// building what it needs through its own gate. This is the guard on the
+    /// generation bookkeeping: if the unbuilt snapshot reported itself fresh,
+    /// the typed-expansion path would read an empty CSR and silently return no
+    /// rows instead of rebuilding.
+    #[test]
+    fn reopened_graph_serves_every_consumer_class() {
+        let (dir, ids) = seeded_dir();
+
+        // Each consumer gets its own handle, scoped so the LMDB environment is
+        // closed before the next open, and so every gate is exercised from the
+        // unbuilt state rather than riding on an earlier consumer's build.
+        let reopen = || Graph::open(dir.path(), 1).unwrap();
+
+        // Typed expansion over more sources than the stale-point-read cutoff,
+        // so this goes through `ensure_snapshot_fresh`.
+        {
+            let g = reopen();
+            let wide = g
+                .expand_spmv_graphblas(&ids, Some("FOLLOWS"), false)
+                .unwrap();
+            assert_eq!(wide.len(), 80, "every ring edge must expand");
+        }
+        // Typed expansion under the cutoff, which reads LMDB point adjacency
+        // directly and needs no snapshot at all.
+        {
+            let g = reopen();
+            let narrow = g
+                .expand_spmv_graphblas(&ids[..4], Some("FOLLOWS"), false)
+                .unwrap();
+            assert_eq!(narrow.len(), 4);
+        }
+        // Matrix-view consumer. Traversal is untyped, so one hop from `ids[0]`
+        // reaches both the ring successor and the `LIKES` chord target.
+        {
+            let g = reopen();
+            assert_eq!(
+                g.bfs(ids[0], 1).unwrap().len(),
+                3,
+                "start plus both one-hop neighbors"
+            );
+        }
+        // CSR-array consumer.
+        {
+            let g = reopen();
+            assert_eq!(g.dfs(ids[0], 1).unwrap().len(), 3);
+        }
+        // Weighted matrix consumer.
+        {
+            let g = reopen();
+            assert_eq!(g.page_rank(5, 0.85).unwrap().len(), 80);
+        }
+        // Count kernel.
+        {
+            let g = reopen();
+            let spec = crate::PathCountSpec {
+                rel_types: vec![Some("FOLLOWS")],
+                labels: vec![Some("Person"), Some("Person")],
+                vertex_allow: Vec::new(),
+            };
+            assert_eq!(g.count_linear_paths(&spec).unwrap(), 80);
+        }
+        // Point adjacency, which never consults the snapshot.
+        {
+            let g = reopen();
+            assert_eq!(g.out_neighbors(ids[0]).unwrap().len(), 2);
+        }
+    }
+
+    /// The first gated consumer materializes the matrices, so the deferral is
+    /// a delay rather than a permanent absence.
+    #[test]
+    fn first_algorithm_materializes_what_open_skipped() {
+        let (dir, ids) = seeded_dir();
+        let g = Graph::open(dir.path(), 1).unwrap();
+        assert!(g.matrices.read().is_none());
+
+        assert_eq!(g.bfs(ids[0], 1).unwrap().len(), 3);
+
+        assert!(
+            g.matrices.read().is_some(),
+            "the matrix-view gate must materialize on first use"
+        );
+        assert!(!g.csr_cache.snapshot_is_stale());
+    }
+
+    /// Reopening an empty database is also lazy, and every consumer reports
+    /// empty rather than erroring on the absent snapshot.
+    #[test]
+    fn empty_database_opens_lazily_and_reads_empty() {
+        let dir = TempDir::new().unwrap();
+        {
+            Graph::open(dir.path(), 1).unwrap();
+        }
+        let g = Graph::open(dir.path(), 1).unwrap();
+        assert!(g.matrices.read().is_none());
+        assert!(g.all_nodes().unwrap().is_empty());
+        assert!(g.connected_components().unwrap().is_empty());
+        assert!(g.page_rank(3, 0.85).unwrap().is_empty());
     }
 }

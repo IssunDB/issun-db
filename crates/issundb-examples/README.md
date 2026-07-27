@@ -7,7 +7,7 @@
 | 3 | [load_ldbc](load_ldbc.rs)                                     | An example loading a social network graph and running a few graph analytics algorithms (including PageRank, connected components, betweenness centrality, and BFS) |
 | 4 | [neo4j_migration](neo4j_migration.rs)                         | An example showing how to migrate sample data from a Neo4j-style JSON export into IssunDB                                                                          |
 | 5 | [graph_analytics](graph_analytics.rs)                         | A demo of a few graph analytics algorithms in IssunDB, including PageRank, degree centrality, weighted shortest path, label propagation, and connected components  |
-| 6 | [concurrent_ops](concurrent_ops.rs)                           | A demo of concurrent reads and writes over a cloned `Graph` handle that shows transactional snapshot isolation for readers                                         |
+| 6 | [concurrent_ops](concurrent_ops.rs)                           | A demo of concurrent reads and writes over a cloned `Graph` handle, showing that readers never block the writer or each other                                         |
 | 7 | [gds_cypher](gds_cypher.rs)                                   | A demo of the graph data science features in Cypher (the `CALL issundb.*` analytics, pathfinding, and retrieval procedures plus comparison functions)              |
 
 ### Running Examples

@@ -2682,10 +2682,8 @@ fn collect_pattern_vars(pattern: &Pattern, out: &mut std::collections::HashSet<S
 fn with_output_scope(items: &[ReturnItem]) -> Option<std::collections::HashSet<String>> {
     let mut scope = std::collections::HashSet::new();
     for item in items {
-        if let Expr::FunctionCall { name, .. } = &item.expr {
-            if name == "__star__" {
-                return None;
-            }
+        if is_star_item(item) {
+            return None;
         }
         if let Some(alias) = &item.alias {
             scope.insert(alias.clone());
@@ -3050,11 +3048,8 @@ fn validate_query_order_by(query: &Query) -> Result<(), String> {
         }
     }
 
-    let is_return_star = query.return_clause.items.len() == 1
-        && matches!(
-            &query.return_clause.items[0].expr,
-            Expr::FunctionCall { name, .. } if name == "__star__"
-        );
+    let is_return_star =
+        query.return_clause.items.len() == 1 && is_star_item(&query.return_clause.items[0]);
     if is_return_star && bound.is_empty() {
         return Err(
             "SyntaxError(NoVariablesInScope): RETURN * without variables in scope is not allowed"
@@ -4273,9 +4268,19 @@ fn validate_statement_undefined_vars_impl(
     Ok(())
 }
 
+/// Whether an expression is the `*` sentinel.
+///
+/// This and [`is_star_item`] are the only places that name the sentinel. It was
+/// previously matched by hand at seven sites across the parser and the executor,
+/// so renaming it or changing how a star is represented would have silently left
+/// some of them matching nothing.
+pub(crate) fn is_star_expr(expr: &Expr) -> bool {
+    matches!(expr, Expr::FunctionCall { name, .. } if name == "__star__")
+}
+
 /// Whether a projection item is the `*` sentinel.
-fn is_star_item(item: &ReturnItem) -> bool {
-    matches!(&item.expr, Expr::FunctionCall { name, .. } if name == "__star__")
+pub(crate) fn is_star_item(item: &ReturnItem) -> bool {
+    is_star_expr(&item.expr)
 }
 
 /// Expand a `*` projection combined with explicit items (`RETURN *, expr` or
@@ -5055,8 +5060,7 @@ fn check_with_aliasing(stmt: &Statement) -> Result<(), String> {
         for item in items {
             let is_bare_var = matches!(&item.expr, Expr::Prop(_, p) if p.is_empty());
             // `WITH *` is parsed as a `__star__` sentinel; it needs no alias.
-            let is_star =
-                matches!(&item.expr, Expr::FunctionCall { name, .. } if name == "__star__");
+            let is_star = is_star_item(item);
             if item.alias.is_none() && !is_bare_var && !is_star {
                 return Err(
                     "SyntaxError(NoExpressionAlias): expression in WITH must be aliased"

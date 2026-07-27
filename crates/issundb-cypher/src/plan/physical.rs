@@ -1,6 +1,24 @@
 use crate::ast::{AggFn, Expr, Literal, SortItem};
 use crate::plan::logical::{FilterExpr, LogicalOperator};
 
+/// A top-N window on a grouped count, pushed down into the operator that
+/// produces the groups from the `ORDER BY <count> LIMIT n` above it.
+///
+/// The window is deliberately conservative: the operator keeps every group whose
+/// count reaches the `bound`-th best, boundary ties included, and emits them in
+/// the order it would have emitted the full group set. The enclosing `Sort` and
+/// `Limit` then run unchanged and pick exactly the rows they would have picked
+/// over every group, because no row they could have selected was dropped and the
+/// survivors' relative order (the stable sort's tie-break) is unchanged.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CountWindow {
+    /// Number of leading rows the enclosing `Limit` keeps (`skip + count`).
+    pub bound: usize,
+    /// True when the enclosing `Sort` orders the count descending, so the
+    /// largest counts are the ones that survive.
+    pub descending: bool,
+}
+
 /// A physical representation of a query execution operator.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PhysicalOperator {
@@ -285,6 +303,17 @@ pub enum PhysicalOperator {
         /// Property that must be non-null on the counted endpoint for an edge
         /// to count (`count(v.prop)`); `None` for `count(*)` or `count(v)`.
         counted_nonnull_prop: Option<String>,
+        /// `prop CMP literal` constraints on the counted endpoint, pushed down
+        /// into the kernel. The executor resolves them to an allow-set through
+        /// the property index (as `PathCount` does with `vertex_filters`), so a
+        /// filtered grouped count stays a kernel call. Empty means unconstrained.
+        counted_filters: Vec<VertexPred>,
+        /// The counted endpoint's leaf scan when it is an index or range scan
+        /// rather than a plain label scan, which is the form a `prop CMP literal`
+        /// predicate on that endpoint usually takes once index-scan rewriting has
+        /// run. The executor evaluates it to an allow-set, so such a predicate
+        /// still reaches the kernel. `None` for a plain label scan.
+        counted_leaf: Option<Box<PhysicalOperator>>,
         /// The variable bound to the group endpoint node, so the executor can
         /// evaluate the group-by expressions against it.
         group_var: String,
@@ -293,6 +322,9 @@ pub enum PhysicalOperator {
         group_by: Vec<(Expr, Option<String>)>,
         /// Output column the count is bound to.
         output: String,
+        /// A top-N window on the count, pushed down from an enclosing
+        /// `ORDER BY <count> LIMIT n`. `None` emits every group.
+        count_window: Option<CountWindow>,
     },
     /// Approximate k-nearest-neighbor scan over the HNSW vector index, binding
     /// `variable` to the `k` nodes nearest to `query` in ascending distance
@@ -828,9 +860,12 @@ pub fn format_physical_plan(op: &PhysicalOperator, depth: usize) -> String {
             group_label,
             counted_label,
             counted_nonnull_prop,
+            counted_filters,
+            counted_leaf,
             group_var,
             group_by,
             output,
+            count_window,
         } => {
             let rel = rel_type.as_deref().unwrap_or("*");
             let glab = group_label
@@ -851,8 +886,26 @@ pub fn format_physical_plan(op: &PhysicalOperator, depth: usize) -> String {
                 Some(p) => format!("count(c.{p})"),
                 None => "count(*)".to_string(),
             };
+            // A resolved leaf and residual per-row filters can both be present, and
+            // then both are applied, so the display shows both. Collapsing them
+            // into one marker left the plan text identical whether or not the
+            // residual filters were attached, which is exactly the difference that
+            // once silently over-counted.
+            let filters = match (counted_leaf.is_some(), counted_filters.len()) {
+                (false, 0) => String::new(),
+                (false, n) => format!(" filter(c)x{n}"),
+                (true, 0) => " filter(c)=scan".to_string(),
+                (true, n) => format!(" filter(c)=scan+{n}"),
+            };
+            let window = match count_window {
+                Some(w) => {
+                    let dir = if w.descending { "DESC" } else { "ASC" };
+                    format!(" top={} {dir}", w.bound)
+                }
+                None => String::new(),
+            };
             buf.push_str(&format!(
-                "{pad}GroupedDegree {arrow} group=[{}] {counted} AS {output}\n",
+                "{pad}GroupedDegree {arrow} group=[{}] {counted} AS {output}{filters}{window}\n",
                 keys.join(", ")
             ));
         }
@@ -936,4 +989,44 @@ fn fmt_agg(f: &AggFn) -> String {
         AggFn::PercentileDisc { .. } => "percentileDisc".to_string(),
         AggFn::PercentileCont { .. } => "percentileCont".to_string(),
     }
+}
+
+/// Whether an enclosing sort leads with this operator's count output, and if so
+/// whether it is descending.
+///
+/// One definition shared by the two paths that push a count window: the
+/// `GroupedDegree` kernel (`Optimizer::set_count_window`) and the columnar
+/// collapse (`exec::vectorized`). They previously each spelled out the alias walk,
+/// the empty-property test, and the raise-safety restriction, and had to stay in
+/// lockstep by hand; a change applied to one would have diverged the two silently,
+/// visible only as differing rows under a boundary tie.
+pub(crate) fn leading_count_sort(
+    sort_items: Option<&[SortItem]>,
+    project_items: &[(Expr, Option<String>)],
+    out_name: &str,
+) -> Option<bool> {
+    let leading = sort_items?.first()?;
+    let Expr::Prop(var, prop) = &leading.expr else {
+        return None;
+    };
+    if !prop.is_empty() {
+        return None;
+    }
+    // A pruned group is never projected, so a projection that can raise at
+    // runtime would stop raising for the rows the window drops. Restrict the
+    // window to projections of bare variable and property reads, which cannot.
+    if !project_items
+        .iter()
+        .all(|(expr, _)| matches!(expr, Expr::Prop(..)))
+    {
+        return None;
+    }
+    // The count reaches the sort either by its own output name or through a
+    // projected alias for it.
+    let named = var == out_name
+        || project_items.iter().any(|(expr, alias)| {
+            alias.as_deref() == Some(var.as_str())
+                && matches!(expr, Expr::Prop(v, p) if p.is_empty() && v == out_name)
+        });
+    named.then_some(!leading.ascending)
 }

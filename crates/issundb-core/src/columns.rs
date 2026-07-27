@@ -32,12 +32,46 @@ pub(crate) trait ColumnSource {
     /// order. Each item is `(id, props_json)`.
     fn scan_all(storage: &Storage) -> Result<Vec<(Self::Id, Value)>, Error>;
 
-    /// Re-read one entity's user properties as JSON; `None` if it no longer
-    /// exists (deleted between commit and refresh).
-    fn fetch_one(storage: &Storage, id: Self::Id) -> Result<Option<Value>, Error>;
+    /// Decode one entity's user properties as JSON through a caller-supplied
+    /// transaction; `None` if it no longer exists (deleted between commit and
+    /// refresh). This is the single primitive the two fetch forms below share, so
+    /// a direct read and a column build cannot decode a record differently.
+    fn get_in_txn(
+        storage: &Storage,
+        rtxn: &heed::RoTxn,
+        id: Self::Id,
+    ) -> Result<Option<Value>, Error>;
 
     /// The not-found error for this entity kind.
     fn not_found(id: Self::Id) -> Error;
+
+    /// Re-read one entity's user properties under its own transaction.
+    fn fetch_one(storage: &Storage, id: Self::Id) -> Result<Option<Value>, Error> {
+        let rtxn = storage.env.read_txn()?;
+        Self::get_in_txn(storage, &rtxn, id)
+    }
+
+    /// Read many entities under **one** transaction, in input order.
+    ///
+    /// Both callers need this rather than a loop over [`ColumnSource::fetch_one`].
+    /// A transaction per entity would cost one begin/end pair and one reader-slot
+    /// acquisition per id, so a gather of a thousand ids paid a thousand of each;
+    /// worse, it would observe up to a thousand different commit points, letting
+    /// two values of the same row-major gather come from different graph states.
+    ///
+    /// One call is therefore a single point in time, but note the scope of that: a
+    /// *request* spanning several calls is not. `PropColumns::patch` deliberately
+    /// chunks, because the alternative is holding every touched entity's decoded
+    /// properties in memory at once, so a patch observes one commit point per chunk.
+    /// That is sound for a refresh, which converges because each later commit records
+    /// its own touched ids, but a caller needing one snapshot across many ids must
+    /// pass them in one call.
+    fn fetch_many(storage: &Storage, ids: &[Self::Id]) -> Result<Vec<Option<Value>>, Error> {
+        let rtxn = storage.env.read_txn()?;
+        ids.iter()
+            .map(|&id| Self::get_in_txn(storage, &rtxn, id))
+            .collect()
+    }
 }
 
 /// Builds node property columns from the `nodes` sub-database.
@@ -57,9 +91,12 @@ impl ColumnSource for NodeSource {
         Ok(out)
     }
 
-    fn fetch_one(storage: &Storage, id: NodeId) -> Result<Option<Value>, Error> {
-        let rtxn = storage.env.read_txn()?;
-        match storage.nodes.get(&rtxn, &id)? {
+    fn get_in_txn(
+        storage: &Storage,
+        rtxn: &heed::RoTxn,
+        id: NodeId,
+    ) -> Result<Option<Value>, Error> {
+        match storage.nodes.get(rtxn, &id)? {
             Some(bytes) => {
                 let rec: NodeRecord = props::decode(bytes)?;
                 Ok(Some(props::decode(&rec.props)?))
@@ -90,9 +127,12 @@ impl ColumnSource for EdgeSource {
         Ok(out)
     }
 
-    fn fetch_one(storage: &Storage, id: EdgeId) -> Result<Option<Value>, Error> {
-        let rtxn = storage.env.read_txn()?;
-        match storage.edges.get(&rtxn, &id)? {
+    fn get_in_txn(
+        storage: &Storage,
+        rtxn: &heed::RoTxn,
+        id: EdgeId,
+    ) -> Result<Option<Value>, Error> {
+        match storage.edges.get(rtxn, &id)? {
             Some(bytes) => {
                 let rec: EdgeRecord = props::decode(bytes)?;
                 Ok(Some(props::decode(&rec.props)?))
@@ -212,7 +252,7 @@ impl PropColumn {
         }
     }
 
-    fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         match self {
             Self::Int(v) => v.len(),
             Self::Float(v) => v.len(),
@@ -355,7 +395,32 @@ pub(crate) struct PropColumns<S: ColumnSource> {
 impl<S: ColumnSource> PropColumns<S> {
     /// Build columns for every property name present, from one full scan.
     fn build(storage: &Storage) -> Result<Self, Error> {
-        let items = S::scan_all(storage)?;
+        Ok(Self::from_items(S::scan_all(storage)?))
+    }
+
+    /// Build columns over exactly `items`, rather than over every entity.
+    ///
+    /// The whole-graph build goes through here too, so a partial set is grouped by
+    /// the same code. That equivalence is what lets a small grouped read skip the
+    /// full scan: the only thing a narrower population can change is the inferred
+    /// column kind, and it can only make it *more* specific (fewer distinct kinds
+    /// present), never less. Every specific arm yields the same representative
+    /// `Value` and the same grouping identity the `Json` fallback would: `Int`
+    /// re-wraps through `Value::from(i64)`, `Float` keys on `to_bits`, which the
+    /// fallback's shortest-roundtrip string matches, and `Str` clones the same
+    /// string. An out-of-range `u64` is `Kind::Other` in `kind_of`, so no arm can
+    /// silently null a value the fallback would have kept.
+    pub(crate) fn from_items(items: Vec<(S::Id, Value)>) -> Self {
+        Self::from_items_for(items, None)
+    }
+
+    /// [`PropColumns::from_items`] restricted to one property.
+    ///
+    /// A grouped read touches exactly one property, so columnarizing the rest is
+    /// pure waste: over entities carrying thirty properties it decoded and built
+    /// thirty columns to use one, once per group-by expression. `None` keeps every
+    /// property, which is what the shared whole-graph build needs.
+    pub(crate) fn from_items_for(items: Vec<(S::Id, Value)>, only: Option<&str>) -> Self {
         let n = items.len();
         let mut dense_to_id = Vec::with_capacity(n);
         let mut id_to_dense: AHashMap<S::Id, u32> = AHashMap::with_capacity(n);
@@ -368,6 +433,9 @@ impl<S: ColumnSource> PropColumns<S> {
         for (dense, (_, json)) in items.into_iter().enumerate() {
             if let Value::Object(map) = json {
                 for (k, v) in map {
+                    if only.is_some_and(|want| want != k) {
+                        continue;
+                    }
                     let col = values.entry(k).or_insert_with(|| vec![None; n]);
                     col[dense] = Some(v);
                 }
@@ -377,12 +445,12 @@ impl<S: ColumnSource> PropColumns<S> {
             .into_iter()
             .map(|(k, v)| (k, PropColumn::from_values(v)))
             .collect();
-        Ok(Self {
+        Self {
             id_to_dense,
             dense_to_id,
             cols,
             stats: AHashMap::new(),
-        })
+        }
     }
 
     /// Statistics for `prop`, computed on first access and cached until the
@@ -574,36 +642,45 @@ impl<S: ColumnSource> PropColumns<S> {
         if !touched.is_empty() {
             self.stats.clear();
         }
-        for &id in touched {
-            let json = match S::fetch_one(storage, id)? {
-                Some(j) => j,
-                // Deleted between commit and refresh; deletion also sets
-                // force_full, so this patch run's result is discarded anyway.
-                None => continue,
-            };
-            let dense = match self.id_to_dense.get(&id) {
-                Some(&d) => d as usize,
-                None => {
-                    let d = self.dense_to_id.len();
-                    self.dense_to_id.push(id);
-                    self.id_to_dense.insert(id, d as u32);
-                    d
-                }
-            };
-            let n = self.dense_to_id.len();
-            for col in self.cols.values_mut() {
-                col.grow(n);
-                col.clear(dense);
-            }
-            if let Value::Object(map) = json {
-                for (k, v) in map {
-                    let col = self.cols.entry(k).or_insert_with(|| {
-                        let mut c = PropColumn::Json(Vec::new());
-                        c.grow(n);
-                        c
-                    });
+        // Read in chunks, not all at once. One transaction per entity would charge
+        // the next refresh a begin/end pair for each, but one gather over the whole
+        // list would hold every touched entity's decoded properties in memory at
+        // once, and that list is unbounded: a million-node batch under a single
+        // `Graph::update` accumulates a million ids. Chunking keeps the transient
+        // proportional to the chunk while still amortizing the transaction.
+        for chunk in touched.chunks(PATCH_CHUNK) {
+            let fetched = S::fetch_many(storage, chunk)?;
+            for (&id, json) in chunk.iter().zip(fetched) {
+                let json = match json {
+                    Some(j) => j,
+                    // Deleted between commit and refresh; deletion also sets
+                    // force_full, so this patch run's result is discarded anyway.
+                    None => continue,
+                };
+                let dense = match self.id_to_dense.get(&id) {
+                    Some(&d) => d as usize,
+                    None => {
+                        let d = self.dense_to_id.len();
+                        self.dense_to_id.push(id);
+                        self.id_to_dense.insert(id, d as u32);
+                        d
+                    }
+                };
+                let n = self.dense_to_id.len();
+                for col in self.cols.values_mut() {
                     col.grow(n);
-                    col.set(dense, v);
+                    col.clear(dense);
+                }
+                if let Value::Object(map) = json {
+                    for (k, v) in map {
+                        let col = self.cols.entry(k).or_insert_with(|| {
+                            let mut c = PropColumn::Json(Vec::new());
+                            c.grow(n);
+                            c
+                        });
+                        col.grow(n);
+                        col.set(dense, v);
+                    }
                 }
             }
         }
@@ -686,13 +763,41 @@ impl<Id> Default for ColumnsDelta<Id> {
 pub(crate) struct ColumnsCache<S: ColumnSource> {
     columns: parking_lot::RwLock<Option<PropColumns<S>>>,
     pending: parking_lot::Mutex<ColumnsDelta<S::Id>>,
+    /// Point reads served straight from storage while the columns were absent.
+    /// See [`ColumnsCache::note_direct_reads`].
+    direct_reads: std::sync::atomic::AtomicU64,
 }
+
+/// Direct point reads tolerated before building the columns anyway. A single
+/// point lookup must not pay for a full scan, but a row pipeline that reads one
+/// property per row would pay the per-read decode forever, so the reads
+/// amortize the build after this many.
+const DIRECT_READ_BUILD_THRESHOLD: u64 = 4096;
+
+/// Entities re-read per transaction when patching. Bounds the transient memory a
+/// *patch* holds: the pending touched list is unbounded (one `Graph::update` may
+/// insert millions of nodes), so a single gather over all of it would decode every
+/// one of their property maps at once.
+///
+/// This bounds the patch path only. A `force_full` refresh takes
+/// `PropColumns::build` instead, whose `scan_all` still returns a decoded property
+/// map for every entity in the graph before `from_items` runs, so the same
+/// transient is paid there. Since a node deletion in a batch sets `force_full`, a
+/// large batch containing one can still take that path; bounding it needs a
+/// streaming build, which is a larger change than this constant.
+const PATCH_CHUNK: usize = 4096;
+
+/// Largest gather served straight from storage while the columns are absent.
+/// Above this the request is bulk enough that one scan is the cheaper way to
+/// answer it, since the scan decodes each record exactly once either way.
+const SMALL_GATHER_MAX: usize = 1024;
 
 impl<S: ColumnSource> Default for ColumnsCache<S> {
     fn default() -> Self {
         Self {
             columns: parking_lot::RwLock::new(None),
             pending: parking_lot::Mutex::new(ColumnsDelta::default()),
+            direct_reads: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }
@@ -741,34 +846,133 @@ impl<S: ColumnSource> ColumnsCache<S> {
             }
             let mut guard = self.columns.write();
             let delta = std::mem::take(&mut *self.pending.lock());
-            match guard.as_mut() {
-                Some(cols) if !delta.force_full => cols.patch(storage, &delta.touched)?,
-                _ => *guard = Some(PropColumns::build(storage)?),
-            }
+            let absorbed = match guard.as_mut() {
+                Some(cols) if !delta.force_full => cols.patch(storage, &delta.touched),
+                _ => PropColumns::build(storage).map(|cols| {
+                    *guard = Some(cols);
+                    self.forget_direct_reads();
+                }),
+            };
+            self.recover_if_failed(absorbed)?;
             // Loop back to the fast path so a delta that landed during the
             // rebuild is also absorbed before serving.
         }
     }
 
-    /// Like [`with_fresh`], but with mutable column access, for readers that
-    /// fill the lazy statistics cache. Takes the write lock for the whole
-    /// call, so this is for optimizer-time stats reads, not the gather path.
-    pub(crate) fn with_fresh_mut<T>(
+    /// Turn a failed absorb into a pending full rebuild instead of a silently
+    /// stale cache.
+    ///
+    /// The delta was already taken out of the shared buffer before the absorb ran,
+    /// so propagating the error on its own would drop that work: the buffer would
+    /// be empty, the columns would still hold pre-write values, and every later
+    /// read would take the fast path and serve them indefinitely. One transient
+    /// LMDB error would become permanently wrong property reads.
+    ///
+    /// The recovery has to be a full rebuild rather than re-queueing the taken ids,
+    /// because `patch` applies per entity and may have failed partway, leaving the
+    /// columns in a state no id list describes.
+    fn recover_if_failed(&self, outcome: Result<(), Error>) -> Result<(), Error> {
+        if outcome.is_err() {
+            self.record_force_full();
+        }
+        outcome
+    }
+
+    /// Whether the columns are already materialized. A caller that can serve
+    /// itself from storage uses this to avoid *causing* a build.
+    pub(crate) fn is_built(&self) -> bool {
+        self.columns.read().is_some()
+    }
+
+    /// Forget the accumulated direct reads. Called whenever the columns are
+    /// installed or dropped, because the counter asks "have enough direct reads
+    /// piled up to justify a build?" and that question restarts with each column
+    /// lifetime.
+    ///
+    /// Without the reset the counter was monotonic for the life of the process, so
+    /// once any 4096 reads had amortized one build the small-request escape hatch
+    /// was disabled forever. A later `force_full` that dropped the columns then
+    /// left a single point read paying a full node scan to rebuild them, which is
+    /// the exact cost the escape hatch exists to avoid.
+    fn forget_direct_reads(&self) {
+        self.direct_reads
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Record `n` reads served without the columns, reporting whether the
+    /// accumulated direct reads now justify building them.
+    fn note_direct_reads(&self, n: usize) -> bool {
+        let n = n.max(1) as u64;
+        self.direct_reads
+            .fetch_add(n, std::sync::atomic::Ordering::Relaxed)
+            + n
+            >= DIRECT_READ_BUILD_THRESHOLD
+    }
+
+    /// Whether a gather over `ids` entities should be served straight from
+    /// storage instead of by building every column.
+    ///
+    /// True only while the columns are absent, the request is small, and the
+    /// accumulated direct reads have not yet amortized a build. Building is one
+    /// full entity scan, so it is the wrong answer to a request for a handful of
+    /// entities however the caller phrased it: the vectorized executor gathers
+    /// even a one-row projection through the bulk API, and that is what made the
+    /// first property-touching query on a large graph pay a full scan.
+    pub(crate) fn should_serve_directly(&self, ids: usize) -> bool {
+        ids <= SMALL_GATHER_MAX && !self.is_built() && !self.note_direct_reads(ids)
+    }
+
+    /// Like [`ColumnsCache::with_fresh`], but with the mutable access the lazy
+    /// statistics cache needs, and it never builds an absent cache: returns
+    /// `Ok(None)` when the columns do not exist yet.
+    ///
+    /// This is for advisory readers, the optimizer's selectivity estimates and
+    /// the zone-map prune, whose answers only weight a choice. Building for them
+    /// costs one full entity scan on the first query that so much as mentions a
+    /// property, which dominates cold-start latency; declining to answer leaves
+    /// the caller on its default weight, which is always sound.
+    pub(crate) fn with_existing_mut<T>(
         &self,
         storage: &Storage,
         f: impl FnOnce(&mut PropColumns<S>) -> T,
-    ) -> Result<T, Error> {
+    ) -> Result<Option<T>, Error> {
+        // Checked under the read lock so the common absent case does not
+        // serialize against concurrent gathers.
+        if self.columns.read().is_none() {
+            return Ok(None);
+        }
         let mut guard = self.columns.write();
+        if guard.is_none() {
+            return Ok(None);
+        }
         loop {
             let delta = std::mem::take(&mut *self.pending.lock());
             if delta.touched.is_empty() && !delta.force_full {
                 if let Some(cols) = guard.as_mut() {
-                    return Ok(f(cols));
+                    return Ok(Some(f(cols)));
                 }
             }
             match guard.as_mut() {
-                Some(cols) if !delta.force_full => cols.patch(storage, &delta.touched)?,
-                _ => *guard = Some(PropColumns::build(storage)?),
+                // Patching is per touched entity, so an advisory reader can
+                // afford to bring existing columns up to date. A failure here must
+                // leave a full rebuild pending rather than drop the taken delta;
+                // see `recover_if_failed`.
+                Some(cols) if !delta.force_full => {
+                    self.recover_if_failed(cols.patch(storage, &delta.touched))?
+                }
+                // A node deletion invalidates the dense mapping and forces a
+                // full rebuild, which is the one refresh an advisory reader must
+                // not pay for: dropping the columns and declining leaves the
+                // rebuild to the next gather. Rebuilding here would make a
+                // delete-then-query session pay one full scan per query, the
+                // exact cost this reader exists to avoid.
+                _ => {
+                    *guard = None;
+                    // The columns are gone, so small requests must be servable
+                    // directly again rather than forced to rebuild them.
+                    self.forget_direct_reads();
+                    return Ok(None);
+                }
             }
         }
     }
@@ -779,12 +983,112 @@ mod tests {
     use serde_json::json;
     use tempfile::TempDir;
 
-    use crate::Graph;
+    use super::{ColumnsCache, DIRECT_READ_BUILD_THRESHOLD, NodeSource};
+    use crate::{Graph, error::Error};
+
+    /// A small grouped read must not build every column, and must produce exactly
+    /// what the built columns would.
+    ///
+    /// Grouping used to always build, so a grouped count over a handful of group
+    /// nodes paid one full node scan on a cold graph. The ephemeral path has to
+    /// agree with the shared one on the cases where a narrower population infers a
+    /// different column kind: `mixed` is a `Json` column over the whole graph but
+    /// `Int` over an int-only subset, and both must group and represent identically.
+    #[test]
+    fn small_grouped_read_avoids_the_build_and_agrees_with_it() {
+        let (_dir, g) = open_tmp();
+        let ints: Vec<_> = (0..4)
+            .map(|i| {
+                g.add_node("N", &json!({ "mixed": i % 2, "s": "x" }))
+                    .unwrap()
+            })
+            .collect();
+        // These make the whole-graph `mixed` column a Json fallback, while any
+        // subset drawn from `ints` alone infers `Int`.
+        g.add_node("N", &json!({ "mixed": 1.5 })).unwrap();
+        g.add_node("N", &json!({ "mixed": "one" })).unwrap();
+        // A node with no `mixed` at all, so the null group is exercised.
+        let bare = g.add_node("N", &json!({ "s": "y" })).unwrap();
+
+        let mut ask = ints.clone();
+        ask.push(bare);
+
+        assert!(!g.prop_columns.is_built(), "cold to start");
+        let direct = g.node_prop_group_codes(&ask, "mixed").unwrap();
+        assert!(
+            !g.prop_columns.is_built(),
+            "a small grouped read must not build every column"
+        );
+
+        // Force the shared columns, then ask again: same codes, same
+        // representatives, even though the column kind differs between the two
+        // populations.
+        g.prop_columns
+            .with_fresh(&g.storage, |_| ())
+            .expect("build the shared columns");
+        assert!(g.prop_columns.is_built());
+        let built = g.node_prop_group_codes(&ask, "mixed").unwrap();
+
+        assert_eq!(direct.0, built.0, "group codes must agree");
+        assert_eq!(direct.1, built.1, "representative values must agree");
+        // Sanity: 0 and 1 are distinct groups and the missing value is its own.
+        assert_eq!(direct.0.len(), 5);
+        assert_eq!(direct.1.len(), 3);
+
+        // A node that does not exist is still an error on the direct path.
+        assert!(g.node_prop_group_codes(&[999_999], "mixed").is_err());
+    }
+
+    /// A failed absorb must leave a full rebuild pending. The delta is taken out
+    /// of the shared buffer before the absorb runs, so propagating the error
+    /// alone would drop that work and leave the columns serving pre-write values
+    /// forever, with an empty buffer telling every later reader they are current.
+    #[test]
+    fn a_failed_absorb_leaves_a_full_rebuild_pending() {
+        let cache: ColumnsCache<NodeSource> = ColumnsCache::default();
+        cache.record_touched(7);
+
+        let outcome = cache.recover_if_failed(Err(Error::Corrupt("simulated absorb failure")));
+
+        assert!(outcome.is_err(), "the error still propagates to the caller");
+        let pending = cache.pending.lock();
+        assert!(
+            pending.force_full,
+            "a failed absorb must queue a full rebuild, not vanish"
+        );
+        assert!(
+            pending.touched.is_empty(),
+            "a full rebuild supersedes the per-entity list"
+        );
+    }
+
+    /// A successful absorb must leave the buffer alone, so the recovery path
+    /// cannot cost a rebuild on the happy path.
+    #[test]
+    fn a_successful_absorb_queues_nothing() {
+        let cache: ColumnsCache<NodeSource> = ColumnsCache::default();
+
+        assert!(cache.recover_if_failed(Ok(())).is_ok());
+
+        let pending = cache.pending.lock();
+        assert!(!pending.force_full);
+        assert!(pending.touched.is_empty());
+    }
 
     fn open_tmp() -> (TempDir, Graph) {
         let dir = TempDir::new().unwrap();
         let g = Graph::open(dir.path(), 1).unwrap();
         (dir, g)
+    }
+
+    /// Materialize the property columns. No reader builds them unconditionally any
+    /// more: the advisory statistics never do, and both a small gather and a small
+    /// grouped read are served without them, so a test that needs the shared
+    /// columns present has to ask for them directly.
+    fn materialize_columns(g: &Graph) {
+        g.prop_columns
+            .with_fresh(&g.storage, |_| ())
+            .expect("materialize the property columns");
     }
 
     #[test]
@@ -1046,6 +1350,7 @@ mod tests {
             )
             .unwrap();
 
+        materialize_columns(&g);
         let (min_age, max_age) = g.node_prop_min_max("age").unwrap().unwrap();
         assert_eq!(min_age, json!(20));
         assert_eq!(max_age, json!(40));
@@ -1074,11 +1379,144 @@ mod tests {
         assert_eq!(max_age, json!(50));
     }
 
+    /// A point read must agree with the column read for every representable
+    /// value, since the two now serve the same call depending only on whether
+    /// the columns happen to exist.
+    #[test]
+    fn direct_point_read_agrees_with_the_column_read() {
+        let (_dir, g) = open_tmp();
+        let props = json!({
+            "i": 42,
+            "neg": -7,
+            "big": i64::MAX,
+            "f": 1.5,
+            "whole_f": 3.0,
+            "b": true,
+            "s": "hello",
+            "empty_s": "",
+            "null": serde_json::Value::Null,
+            "list": [1, 2, 3],
+            "obj": { "k": "v" },
+        });
+        let n = g.add_node("N", &props).unwrap();
+        let keys: Vec<&str> = props
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .chain(std::iter::once("absent"))
+            .collect();
+
+        // Columns absent: these go straight to storage.
+        assert!(!g.prop_columns.is_built());
+        let direct: Vec<_> = keys
+            .iter()
+            .map(|k| g.node_prop_json(n, k).unwrap())
+            .collect();
+
+        // Force the columns, then read the same values through them.
+        materialize_columns(&g);
+        assert!(g.prop_columns.is_built());
+        let columnar: Vec<_> = keys
+            .iter()
+            .map(|k| g.node_prop_json(n, k).unwrap())
+            .collect();
+
+        for ((k, d), c) in keys.iter().zip(direct).zip(columnar) {
+            assert_eq!(d, c, "property {k} disagrees between the two read paths");
+        }
+    }
+
+    #[test]
+    fn direct_point_read_reports_a_missing_node_as_none() {
+        let (_dir, g) = open_tmp();
+        assert!(!g.prop_columns.is_built());
+        assert_eq!(g.node_prop_json(9999, "x").unwrap(), None);
+    }
+
+    /// The advisory statistics must not build the columns: that build is the
+    /// dominant cold-start cost, and an absent estimate only costs plan quality.
+    #[test]
+    fn advisory_statistics_do_not_build_the_columns() {
+        let (_dir, g) = open_tmp();
+        g.add_node("N", &json!({ "age": 30 })).unwrap();
+
+        assert_eq!(g.node_prop_min_max("age").unwrap(), None);
+        assert_eq!(
+            g.estimate_equality_selectivity("age", &json!(30)).unwrap(),
+            None
+        );
+        assert_eq!(
+            g.estimate_range_selectivity("age", Some(&json!(0)), None)
+                .unwrap(),
+            None
+        );
+        assert!(
+            !g.prop_columns.is_built(),
+            "an advisory read built the columns"
+        );
+
+        // Once a gather has built them, the same readers answer.
+        materialize_columns(&g);
+        assert_eq!(
+            g.node_prop_min_max("age").unwrap(),
+            Some((json!(30), json!(30)))
+        );
+        assert!(
+            g.estimate_equality_selectivity("age", &json!(30))
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// A node deletion forces a full rebuild, and an advisory reader must not
+    /// pay for it: it drops the stale columns and declines, leaving the rebuild
+    /// to the next gather.
+    #[test]
+    fn a_pending_deletion_makes_the_advisory_readers_decline() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("N", &json!({ "age": 10 })).unwrap();
+        g.add_node("N", &json!({ "age": 20 })).unwrap();
+        materialize_columns(&g);
+        assert!(g.node_prop_min_max("age").unwrap().is_some());
+
+        g.delete_node(a).unwrap();
+        assert_eq!(g.node_prop_min_max("age").unwrap(), None);
+        assert!(
+            !g.prop_columns.is_built(),
+            "the advisory read paid for a full rebuild"
+        );
+
+        // A gather rebuilds them, and the statistics then reflect the deletion.
+        materialize_columns(&g);
+        assert_eq!(
+            g.node_prop_min_max("age").unwrap(),
+            Some((json!(20), json!(20)))
+        );
+    }
+
+    /// Sustained point reads must fall back to building, so a row pipeline that
+    /// reads one property per row does not pay the per-read decode forever.
+    #[test]
+    fn sustained_direct_reads_amortize_into_a_build() {
+        let (_dir, g) = open_tmp();
+        let n = g.add_node("N", &json!({ "age": 30 })).unwrap();
+        for _ in 0..DIRECT_READ_BUILD_THRESHOLD {
+            assert_eq!(g.node_prop_json(n, "age").unwrap(), Some(json!(30)));
+        }
+        assert!(
+            g.prop_columns.is_built(),
+            "the columns never built despite {DIRECT_READ_BUILD_THRESHOLD} direct reads"
+        );
+        assert_eq!(g.node_prop_json(n, "age").unwrap(), Some(json!(30)));
+    }
+
     #[test]
     fn prop_stats_refresh_when_update_removes_the_property() {
         let (_dir, g) = open_tmp();
         let a = g.add_node("N", &json!({ "age": 10 })).unwrap();
         let _b = g.add_node("N", &json!({ "age": 99 })).unwrap();
+        materialize_columns(&g);
         let (_, max_age) = g.node_prop_min_max("age").unwrap().unwrap();
         assert_eq!(max_age, json!(99));
 
@@ -1100,6 +1538,7 @@ mod tests {
             g.add_node("N", &json!({ "team": format!("t{i}") }))
                 .unwrap();
         }
+        materialize_columns(&g);
         let sel = g
             .estimate_equality_selectivity("team", &json!("blue"))
             .unwrap()
@@ -1125,6 +1564,7 @@ mod tests {
         for i in 0..100 {
             g.add_node("N", &json!({ "age": i })).unwrap();
         }
+        materialize_columns(&g);
         let sel = g
             .estimate_range_selectivity("age", Some(&json!(50)), None)
             .unwrap()

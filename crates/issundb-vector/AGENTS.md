@@ -7,8 +7,8 @@ Read the root `AGENTS.md` first; the rules there apply everywhere and are not re
 
 `VectorIndex` starts in the `Inner::Empty` state and is lazily initialized on the first call to `upsert`:
 
-1. **Empty**: no usearch index exists yet; the dimension count is unknown.
-2. **Ready**: the index is live with a fixed dimension count; `upsert` and `search` both operate against it.
+1. Empty: no usearch index exists yet; the dimension count is unknown.
+2. Ready: the index is live with a fixed dimension count; `upsert` and `search` both operate against it.
 
 State transitions are guarded by an internal `RwLock<Inner>`; a read-only search takes the read guard, and `upsert` and `remove` take the write guard.
 Initialization happens inside the mutex: create an `IndexOptions`, call `Index::new`, call `index.reserve(64)`, then insert the first vector.
@@ -89,11 +89,11 @@ candidates (default 2) and re-ranks them by exact distance against the full-prec
 
 Every test that touches vector behavior must cover all three of the following scenarios, each in its own test function:
 
-1. **Persist and reload**: `upsert → search` in one `Graph` instance; then reopen the same path and `search` again. The same nearest neighbor must
+1. Persist and reload: `upsert → search` in one `Graph` instance; then reopen the same path and `search` again. The same nearest neighbor must
    appear after reload.
-2. **Dimension mismatch**: after the first `upsert` fixes dimensions, a second `upsert` with a different dimension count must return
+2. Dimension mismatch: after the first `upsert` fixes dimensions, a second `upsert` with a different dimension count must return
    `Err(VectorError::DimensionMismatch { .. })`.
-3. **Empty index**: `vector_search` on a graph with no vectors must return `Err(VectorError::EmptyIndex)`, not an empty `Vec`, so a caller can tell
+3. Empty index: `vector_search` on a graph with no vectors must return `Err(VectorError::EmptyIndex)`, not an empty `Vec`, so a caller can tell
    "no semantic matches" apart from "there is nothing to search". Mapping that error back to zero rows is the caller's job where MATCH semantics
    demand it, as the Cypher `VectorTopK` operator does.
 

@@ -1,5 +1,21 @@
 use super::*;
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only override for [`Graph::kernel_threads`], so a unit test can drive
+    /// the parallel reduction on a graph small enough to build in a test.
+    ///
+    /// Thread-local rather than process-global: the test binary runs its tests
+    /// concurrently, and a global would let the forcing test change the worker
+    /// count every other test sees for as long as it holds the override. That
+    /// would put unrelated tests on the parallel path (spawning up to the forced
+    /// count) and make coverage of the reduction nondeterministic.
+    /// `kernel_threads` reads this on the calling thread, so a thread-local is
+    /// read where it is set.
+    pub(super) static FORCE_KERNEL_THREADS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
 impl Graph {
     // ------------------------------------------------------------------
     // Graph algorithms
@@ -21,7 +37,9 @@ impl Graph {
     /// pairwise distinct (relationship uniqueness), which only constrains
     /// self-loop assignments where `a == b == c`.
     pub fn count_triangle_cycles(&self, spec: &TriangleCountSpec) -> Result<u64, Error> {
-        self.ensure_csr_fresh()?;
+        // Snapshot-only gate: this kernel reads CSR arrays and never a matrix,
+        // so it must not pay `ensure_csr_fresh`'s GraphBLAS materialization.
+        self.ensure_snapshot_fresh()?;
         let snap = self.csr_cache.snapshot.load();
         let n = snap.dense_to_id.len();
         if n == 0 {
@@ -45,17 +63,31 @@ impl Graph {
         // Dense-index masks for the per-variable labels; `None` means
         // unconstrained. An unknown label yields an all-false mask, which
         // counts zero without a special case.
+        // A pattern almost always repeats a label across its variables
+        // (`(:Person)->(:Person)->(:Person)`), and building one mask costs a full
+        // label-index scan plus a dense lookup per node. Build each *distinct*
+        // label once and copy it for the repeats: the copy is a memcpy over the
+        // dense space, against an index scan of the whole label. Each variable
+        // still owns its mask, because a pushed-down `vertex_allow` intersects
+        // into it in place.
         let mut masks: [Option<Vec<bool>>; 3] = [None, None, None];
+        let mut built: Vec<(&str, Vec<bool>)> = Vec::new();
         for (i, label) in spec.labels.iter().enumerate() {
-            if let Some(name) = label {
-                let mut mask = vec![false; n];
-                for id in self.nodes_by_label(name)? {
-                    if let Some(&d) = snap.id_to_dense.get(&id) {
-                        mask[d as usize] = true;
+            let Some(name) = label else { continue };
+            let at = match built.iter().position(|(seen, _)| seen == name) {
+                Some(at) => at,
+                None => {
+                    let mut mask = vec![false; n];
+                    for id in self.nodes_by_label(name)? {
+                        if let Some(&d) = snap.id_to_dense.get(&id) {
+                            mask[d as usize] = true;
+                        }
                     }
+                    built.push((name, mask));
+                    built.len() - 1
                 }
-                masks[i] = Some(mask);
-            }
+            };
+            masks[i] = Some(built[at].1.clone());
         }
         let label_ok = |mask: &Option<Vec<bool>>, d: usize| mask.as_ref().is_none_or(|m| m[d]);
 
@@ -168,14 +200,9 @@ impl Graph {
         debug_assert!(hops == 1 || hops == 2, "count_linear_paths: 1 or 2 hops");
         debug_assert_eq!(spec.labels.len(), hops + 1, "labels must be hops + 1");
 
-        self.ensure_csr_fresh()?;
-        let snap = self.csr_cache.snapshot.load();
-        let n = snap.dense_to_id.len();
-        if n == 0 {
-            return Ok(0);
-        }
-
-        // A named but unregistered relationship type matches nothing.
+        // A named but unregistered relationship type matches nothing. Resolved
+        // before the freshness gate below, because it reads only the type
+        // registry: an unregistered type counts zero without any rebuild.
         let mut type_ids: Vec<Option<TypeId>> = vec![None; hops];
         {
             let rtxn = self.storage.env.read_txn()?;
@@ -189,20 +216,43 @@ impl Graph {
             }
         }
 
+        // Snapshot-only gate: this kernel reads CSR arrays and never a matrix,
+        // so it must not pay `ensure_csr_fresh`'s GraphBLAS materialization.
+        self.ensure_snapshot_fresh()?;
+        let snap = self.csr_cache.snapshot.load();
+        let n = snap.dense_to_id.len();
+        if n == 0 {
+            return Ok(0);
+        }
+
         // Dense-index masks for the per-variable labels; `None` is
         // unconstrained. An unknown label yields an all-false mask, counting
         // zero without a special case.
+        // Every variable in a path pattern usually carries the same label
+        // (`(:Person)->(:Person)->(:Person)`), and one mask costs a full
+        // label-index scan plus a dense lookup per node. Build each *distinct*
+        // label once and copy it for the repeats: the copy is a memcpy over the
+        // dense space, against an index scan of the whole label. Each variable
+        // keeps its own mask, because a pushed-down `vertex_allow` intersects
+        // into it in place.
         let mut masks: Vec<Option<Vec<bool>>> = vec![None; hops + 1];
+        let mut built: Vec<(&str, Vec<bool>)> = Vec::new();
         for (i, label) in spec.labels.iter().enumerate() {
-            if let Some(name) = label {
-                let mut mask = vec![false; n];
-                for id in self.nodes_by_label(name)? {
-                    if let Some(&d) = snap.id_to_dense.get(&id) {
-                        mask[d as usize] = true;
+            let Some(name) = label else { continue };
+            let at = match built.iter().position(|(seen, _)| seen == name) {
+                Some(at) => at,
+                None => {
+                    let mut mask = vec![false; n];
+                    for id in self.nodes_by_label(name)? {
+                        if let Some(&d) = snap.id_to_dense.get(&id) {
+                            mask[d as usize] = true;
+                        }
                     }
+                    built.push((name, mask));
+                    built.len() - 1
                 }
-                masks[i] = Some(mask);
-            }
+            };
+            masks[i] = Some(built[at].1.clone());
         }
         // Per-variable allow-sets from pushed-down property predicates. A
         // present set intersects with the label mask (a node passes only when it
@@ -229,16 +279,26 @@ impl Graph {
         }
         let label_ok = |mask: &Option<Vec<bool>>, d: usize| mask.as_ref().is_none_or(|m| m[d]);
 
+        // Counting needs neighbor ids and row boundaries only, so both branches
+        // below read the snapshot's own CSR arrays and filter by type inline.
+        // Materializing a per-type sorted copy of the adjacency (as the triangle
+        // kernel does, where sorted rows enable merge intersections) would
+        // allocate and sort the whole edge set on every call for no benefit
+        // here: the only consumer of that order was the self-loop lookup, which
+        // is now a direct scan of the middle node's own row.
+        let type_ok = |want: Option<TypeId>, have: TypeId| want.is_none_or(|t| have == t);
+
         if hops == 1 {
             // Count typed edges `v0 -> v1` with `v0` and `v1` inside their masks.
-            let out1 = typed_out_sorted(&snap, type_ids[0]);
             let mut total: u64 = 0;
             for v0 in 0..n {
                 if !label_ok(&masks[0], v0) {
                     continue;
                 }
-                for &(dst, _e) in out1.row(v0) {
-                    if label_ok(&masks[1], dst as usize) {
+                for idx in snap.row_ptr[v0]..snap.row_ptr[v0 + 1] {
+                    if type_ok(type_ids[0], snap.edge_type[idx])
+                        && label_ok(&masks[1], snap.col_idx[idx] as usize)
+                    {
                         total += 1;
                     }
                 }
@@ -252,50 +312,97 @@ impl Graph {
         // qualifying hop-2 out-edges. Relationship uniqueness then removes the
         // assignments where hop 1 and hop 2 bind the same edge, which is only
         // possible for a self-loop at `v1` that satisfies both hops.
-        let in1 = typed_in_sorted(&snap, type_ids[0]); // edges into v1, type t1
-        let out2 = typed_out_sorted(&snap, type_ids[1]); // edges out of v1, type t2
-        let mut total: u64 = 0;
-        for b in 0..n {
-            if !label_ok(&masks[1], b) {
-                continue;
-            }
-            let in_row = in1.row(b);
-            let indeg = in_row
-                .iter()
-                .filter(|&&(src, _)| label_ok(&masks[0], src as usize))
-                .count() as u64;
-            if indeg == 0 {
-                continue;
-            }
-            let out_row = out2.row(b);
-            let outdeg = out_row
-                .iter()
-                .filter(|&&(dst, _)| label_ok(&masks[2], dst as usize))
-                .count() as u64;
-            total += indeg * outdeg;
+        let (t1, t2) = (type_ids[0], type_ids[1]);
+        // The per-middle-node contributions are independent, so the count is a
+        // reduction over disjoint node ranges: each worker sums its own range of
+        // `b` and the ranges are added at the end. Every array read is through the
+        // immutable snapshot, so no worker synchronizes with any other.
+        let snap_ref: &CsrSnapshot = &snap;
+        let masks_ref = &masks;
+        let count_middles = move |lo: usize, hi: usize| -> u64 {
+            let type_ok = |want: Option<TypeId>, have: TypeId| want.is_none_or(|t| have == t);
+            let label_ok = |mask: &Option<Vec<bool>>, d: usize| mask.as_ref().is_none_or(|m| m[d]);
+            let (snap, masks) = (snap_ref, masks_ref);
+            let mut total: u64 = 0;
+            for b in lo..hi {
+                if !label_ok(&masks[1], b) {
+                    continue;
+                }
+                // Hop-1 in-edges of `b`: type `t1`, source inside the first mask.
+                // The transposed view is part of the snapshot, so this is a scan of
+                // one contiguous row.
+                let mut indeg: u64 = 0;
+                for idx in snap.in_row_ptr[b]..snap.in_row_ptr[b + 1] {
+                    if type_ok(t1, snap.in_edge_type[idx])
+                        && label_ok(&masks[0], snap.in_col_idx[idx] as usize)
+                    {
+                        indeg += 1;
+                    }
+                }
+                if indeg == 0 {
+                    continue;
+                }
+                // Hop-2 out-edges of `b`: type `t2`, destination inside the last mask.
+                let mut outdeg: u64 = 0;
+                for idx in snap.row_ptr[b]..snap.row_ptr[b + 1] {
+                    if type_ok(t2, snap.edge_type[idx])
+                        && label_ok(&masks[2], snap.col_idx[idx] as usize)
+                    {
+                        outdeg += 1;
+                    }
+                }
+                total += indeg * outdeg;
 
-            // Relationship-uniqueness correction. A single edge can fill both
-            // hops only when it is a self-loop at `b` and `b` satisfies the
-            // first and last masks. Such an edge appears in both rows with
-            // neighbor `b`; intersect those self-loop entries by edge id. Rows
-            // are sorted by `(neighbor, edge id)`, so the self-loop entries for
-            // each row are a contiguous, edge-id-ascending run.
-            if label_ok(&masks[0], b) && label_ok(&masks[2], b) {
-                let in_self: Vec<EdgeId> = in_row
-                    .iter()
-                    .filter(|&&(src, _)| src as usize == b)
-                    .map(|&(_, e)| e)
-                    .collect();
-                if !in_self.is_empty() {
-                    let shared = out_row
-                        .iter()
-                        .filter(|&&(dst, e)| dst as usize == b && in_self.binary_search(&e).is_ok())
-                        .count() as u64;
+                // Relationship-uniqueness correction. A single edge can fill both
+                // hops only when it is a self-loop at `b` whose type satisfies both
+                // hops, and `b` satisfies the first and last masks. Each such edge
+                // is counted once in `indeg` and once in `outdeg`, so it contributes
+                // exactly one `r1 == r2` assignment to the product: the number of
+                // excluded assignments is the number of those self-loops, which
+                // parallel self-loops make greater than one. Counting them by type
+                // is equivalent to intersecting the two rows by edge id, because an
+                // edge id identifies one edge and a self-loop at `b` appears once in
+                // each row.
+                if label_ok(&masks[0], b) && label_ok(&masks[2], b) {
+                    let mut shared: u64 = 0;
+                    for idx in snap.row_ptr[b]..snap.row_ptr[b + 1] {
+                        if snap.col_idx[idx] as usize == b
+                            && type_ok(t1, snap.edge_type[idx])
+                            && type_ok(t2, snap.edge_type[idx])
+                        {
+                            shared += 1;
+                        }
+                    }
                     total = total.saturating_sub(shared);
                 }
             }
+            total
+        };
+
+        let threads = self.kernel_threads(n.saturating_add(snap.col_idx.len()));
+        if threads <= 1 {
+            return Ok(count_middles(0, n));
         }
-        Ok(total)
+        let chunk = n.div_ceil(threads);
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..threads)
+                .map(|t| {
+                    let lo = (t * chunk).min(n);
+                    let hi = lo.saturating_add(chunk).min(n);
+                    scope.spawn(move || count_middles(lo, hi))
+                })
+                .collect();
+            let mut total: u64 = 0;
+            for worker in workers {
+                // A worker only reads the snapshot, so a panic here is a bug, not
+                // a data condition; surface it instead of returning a short count.
+                match worker.join() {
+                    Ok(part) => total = total.saturating_add(part),
+                    Err(_) => return Err(Error::Corrupt("path-count worker panicked")),
+                }
+            }
+            Ok(total)
+        })
     }
 
     /// Counts typed edges grouped by one endpoint, returning `(group node id, count)`
@@ -312,7 +419,9 @@ impl Graph {
         &self,
         spec: &GroupedDegreeSpec,
     ) -> Result<Vec<(NodeId, u64)>, Error> {
-        self.ensure_csr_fresh()?;
+        // Snapshot-only gate: this kernel reads CSR arrays and never a matrix,
+        // so it must not pay `ensure_csr_fresh`'s GraphBLAS materialization.
+        self.ensure_snapshot_fresh()?;
         let snap = self.csr_cache.snapshot.load();
         let n = snap.dense_to_id.len();
         if n == 0 {
@@ -350,75 +459,469 @@ impl Graph {
         let group_mask = label_mask(spec.group_label)?;
         // The endpoints usually carry the same label (e.g. `(:Person)->(:Person)`);
         // reuse the mask instead of scanning that label a second time.
-        let counted_mask = if spec.counted_label == spec.group_label {
+        let mut counted_mask = if spec.counted_label == spec.group_label {
             group_mask.clone()
         } else {
             label_mask(spec.counted_label)?
         };
+        // An explicit allow-set narrows the counted endpoint further; an empty one
+        // yields an all-false mask, which counts zero without a special case.
+        if let Some(allow) = spec.counted_allow {
+            let mut allowed = vec![false; n];
+            for id in allow {
+                if let Some(&d) = snap.id_to_dense.get(id) {
+                    allowed[d as usize] = true;
+                }
+            }
+            counted_mask = Some(match counted_mask {
+                None => allowed,
+                Some(prev) => {
+                    let mut both = allowed;
+                    for (slot, &keep) in both.iter_mut().zip(prev.iter()) {
+                        *slot = *slot && keep;
+                    }
+                    both
+                }
+            });
+        }
 
-        // Non-null mask for the counted endpoint's property: dense index `d` is
-        // true when the property is present on `dense_to_id[d]`. The property
-        // columns carry their own dense mapping, so resolve each CSR node id
-        // through it. A missing column (no such property anywhere) leaves the
-        // mask all-false, so `count(v.prop)` over an absent property counts
-        // zero, matching the row pipeline.
-        let nonnull_mask: Option<Vec<bool>> = match spec.counted_nonnull_prop {
-            Some(prop) => Some(self.prop_columns.with_fresh(&self.storage, |cols| {
-                let mut mask = vec![false; n];
-                if let Some(col) = cols.cols.get(prop) {
-                    for (d, id) in snap.dense_to_id.iter().enumerate() {
-                        if let Some(&cd) = cols.id_to_dense.get(id) {
-                            mask[d] = col.is_present(cd as usize);
+        // One pass over the qualifying edges, shared by both walks below so their
+        // type and label filters cannot drift apart.
+        fn walk_qualifying<F: FnMut(usize, usize)>(
+            snap: &CsrSnapshot,
+            n: usize,
+            type_id: Option<TypeId>,
+            group_is_dst: bool,
+            group_mask: &Option<Vec<bool>>,
+            counted_mask: &Option<Vec<bool>>,
+            mut visit: F,
+        ) {
+            let ok = |mask: &Option<Vec<bool>>, d: usize| mask.as_ref().is_none_or(|m| m[d]);
+            for v0 in 0..n {
+                for k in snap.row_ptr[v0]..snap.row_ptr[v0 + 1] {
+                    if let Some(tid) = type_id {
+                        if snap.edge_type[k] != tid {
+                            continue;
                         }
                     }
-                }
-                mask
-            })?),
-            None => None,
-        };
-
-        let ok = |mask: &Option<Vec<bool>>, d: usize| mask.as_ref().is_none_or(|m| m[d]);
-
-        // `present` marks a group node with at least one label-qualifying edge,
-        // so it produces a MATCH row and therefore a group. `counts` is the
-        // number of those edges whose counted endpoint also passes the non-null
-        // filter. The two differ for `count(v.prop)`: a group can exist (an edge
-        // reaches it) while its count is zero (every counted source has a null
-        // property), and that group must still appear with count zero, exactly
-        // as the row pipeline emits it.
-        let mut counts = vec![0u64; n];
-        let mut present = vec![false; n];
-        for v0 in 0..n {
-            for k in snap.row_ptr[v0]..snap.row_ptr[v0 + 1] {
-                if let Some(tid) = type_id {
-                    if snap.edge_type[k] != tid {
+                    let v1 = snap.col_idx[k] as usize;
+                    // Map the stored edge `v0 -> v1` to the group and counted
+                    // endpoints per the grouping direction.
+                    let (group_d, counted_d) = if group_is_dst { (v1, v0) } else { (v0, v1) };
+                    // Label constraints decide which edges match (existence); the
+                    // non-null property filter only narrows the count within them.
+                    if !ok(group_mask, group_d) || !ok(counted_mask, counted_d) {
                         continue;
                     }
-                }
-                let v1 = snap.col_idx[k] as usize;
-                // Map the stored edge `v0 -> v1` to the group and counted
-                // endpoints per the grouping direction.
-                let (group_d, counted_d) = if spec.group_is_dst {
-                    (v1, v0)
-                } else {
-                    (v0, v1)
-                };
-                // Label constraints decide which edges match (existence); the
-                // non-null property filter only narrows the count within them.
-                if !ok(&group_mask, group_d) || !ok(&counted_mask, counted_d) {
-                    continue;
-                }
-                present[group_d] = true;
-                if ok(&nonnull_mask, counted_d) {
-                    counts[group_d] += 1;
+                    visit(group_d, counted_d);
                 }
             }
         }
+
+        // `present` marks a group node with at least one label-qualifying edge,
+        // so it produces a MATCH row and therefore a group. `qualifying` counts
+        // those edges. For `count(*)` that is already the answer; for
+        // `count(v.prop)` the tally narrows to the edges whose counted endpoint is
+        // non-null, and the two differ: a group can exist (an edge reaches it)
+        // while its count is zero (every counted source has a null property), and
+        // that group must still appear with count zero, exactly as the row
+        // pipeline emits it.
+        let mut qualifying = vec![0u64; n];
+        let mut present = vec![false; n];
+        // Only the non-null filter needs to know which counted endpoints were
+        // reached, so `count(*)`, the common shape, allocates no bitmap and pays no
+        // store per traversed edge.
+        let mut visited_counted = if spec.counted_nonnull_prop.is_some() {
+            vec![false; n]
+        } else {
+            Vec::new()
+        };
+        if spec.counted_nonnull_prop.is_none() {
+            walk_qualifying(
+                &snap,
+                n,
+                type_id,
+                spec.group_is_dst,
+                &group_mask,
+                &counted_mask,
+                |group_d, _| {
+                    present[group_d] = true;
+                    qualifying[group_d] += 1;
+                },
+            );
+        } else {
+            walk_qualifying(
+                &snap,
+                n,
+                type_id,
+                spec.group_is_dst,
+                &group_mask,
+                &counted_mask,
+                |group_d, counted_d| {
+                    present[group_d] = true;
+                    qualifying[group_d] += 1;
+                    visited_counted[counted_d] = true;
+                },
+            );
+        }
+
+        // Resolve the non-null filter over the endpoints the walk actually reached,
+        // and re-tally only when some of them really are null. The second pass is
+        // the price of resolving presence for the visited set rather than trusting a
+        // whole-column summary, which was unsound; it is paid only for
+        // `count(prop)` and only when a null is actually present.
+        let counts = match spec.counted_nonnull_prop {
+            None => qualifying,
+            Some(prop) => match self.visited_nonnull_mask(&snap, &visited_counted, prop)? {
+                None => qualifying,
+                Some(mask) => {
+                    let mut counts = vec![0u64; n];
+                    walk_qualifying(
+                        &snap,
+                        n,
+                        type_id,
+                        spec.group_is_dst,
+                        &group_mask,
+                        &counted_mask,
+                        |group_d, counted_d| {
+                            if mask[counted_d] {
+                                counts[group_d] += 1;
+                            }
+                        },
+                    );
+                    counts
+                }
+            },
+        };
 
         let mut out = Vec::new();
         for (d, &p) in present.iter().enumerate() {
             if p {
                 out.push((snap.dense_to_id[d], counts[d]));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Dense non-null mask over the snapshot for `prop`, resolved for exactly the
+    /// nodes `visited` marks.
+    ///
+    /// `None` means every visited node carries a non-null value, so the caller can
+    /// skip the mask entirely. That is sound only because the caller queries the
+    /// mask for visited nodes and no others, which is the same set this resolved:
+    /// a kernel tests the non-null filter only on an endpoint that already passed
+    /// its label and allow-set filters, and those are exactly the endpoints it
+    /// marked.
+    ///
+    /// Resolving the visited nodes rather than the whole graph is what keeps a
+    /// `count(v.prop)` collapse off a full node scan. The presence read goes
+    /// through the same small-request path a point read uses, so a pass over a
+    /// handful of neighbors costs a handful of point reads instead of building
+    /// every property column, which on a large graph is the dominant cost and the
+    /// one a lazily opened graph exists to defer.
+    ///
+    /// It is also why there is no "this column has no nulls anywhere, skip the
+    /// mask" shortcut. That test needed the column set and the snapshot to cover
+    /// the same nodes, and it compared their *counts*: equal counts do not imply
+    /// equal sets, so a deletion and an insertion landing between the snapshot
+    /// refresh and the column refresh would pass the size test while the snapshot
+    /// still held a node the columns never saw, and that node's edges would count
+    /// as non-null. Resolving per visited node needs no such coverage assumption.
+    fn visited_nonnull_mask(
+        &self,
+        snap: &CsrSnapshot,
+        visited: &[bool],
+        prop: &str,
+    ) -> Result<Option<Vec<bool>>, Error> {
+        let ids: Vec<NodeId> = visited
+            .iter()
+            .enumerate()
+            .filter(|&(_, &seen)| seen)
+            .map(|(d, _)| snap.dense_to_id[d])
+            .collect();
+        if ids.is_empty() {
+            return Ok(None);
+        }
+        let present = self.nodes_prop_present(&ids, prop)?;
+        if present.iter().all(|&p| p) {
+            return Ok(None);
+        }
+        let mut mask = vec![false; visited.len()];
+        for (id, is_present) in ids.iter().zip(present) {
+            if is_present {
+                if let Some(&d) = snap.id_to_dense.get(id) {
+                    mask[d as usize] = true;
+                }
+            }
+        }
+        Ok(Some(mask))
+    }
+
+    /// Threads to spread a read-only kernel pass over, given the number of items
+    /// it will touch.
+    ///
+    /// A counting kernel is a pure reduction over disjoint slices of the CSR
+    /// arrays, so it parallelizes without synchronization; the arrays are read
+    /// through an immutable snapshot, so this takes no lock and never races a
+    /// writer. The count itself comes from [`crate::threads::resolve`], the single
+    /// resolution every parallel consumer shares, so the one knob means the same
+    /// thing here as it does for the GraphBLAS pool.
+    ///
+    /// A small pass stays single-threaded: below the threshold the spawn cost
+    /// exceeds the saving, which also keeps unit tests deterministic and off the
+    /// thread pool entirely.
+    pub(super) fn kernel_threads(&self, work: usize) -> usize {
+        /// Items below which a pass is not worth splitting.
+        const MIN_PARALLEL_WORK: usize = 1 << 18;
+        // Tests force the split on graphs far below the threshold, so the
+        // parallel reduction is exercised rather than only its fallback.
+        #[cfg(test)]
+        {
+            let forced = FORCE_KERNEL_THREADS.with(|f| f.get());
+            if forced > 0 {
+                return forced;
+            }
+        }
+        if work < MIN_PARALLEL_WORK {
+            return 1;
+        }
+        // A counting pass streams adjacency arrays, so it saturates memory
+        // bandwidth long before it saturates compute, and past its peak extra
+        // workers add traffic and coordination without adding throughput. Measured
+        // on the two-hop path count over an 11.1 M-edge graph (12-thread machine):
+        // 71.1 ms at one worker, 47.0 at two, 40.5 at four, 43.8 at eight, 46.1 at
+        // twelve. Twelve is 14% *slower* than four, so the resolved budget must not
+        // be spent in full here: cap the split at the peak.
+        //
+        // The cap is calibrated on one machine. Re-measure the curve on hardware
+        // with a different memory subsystem before treating four as general; the
+        // test override above bypasses this so a test can still drive more workers.
+        const MAX_SCAN_THREADS: usize = 4;
+        crate::threads::resolve(self.n_threads.load(std::sync::atomic::Ordering::Acquire))
+            .min(MAX_SCAN_THREADS)
+    }
+
+    /// Whether expanding `sources` from storage would beat bringing the CSR
+    /// snapshot up to date.
+    ///
+    /// The counting kernels read the snapshot, so they must gate on
+    /// `ensure_snapshot_fresh`, which is an `O(nodes + edges)` rebuild when a write
+    /// has landed since the last build. Bulk expansion has always had an escape
+    /// hatch for that case: a handful of sources over a stale snapshot is served
+    /// from per-source adjacency with no rebuild. A caller choosing between a
+    /// kernel and a per-source path should consult this first, so an interleaved
+    /// write-then-count session does not pay a full rebuild per query.
+    pub fn prefers_point_expansion(&self, sources: usize) -> bool {
+        self.csr_cache.snapshot_is_stale()
+            && sources <= crate::graph::graphblas::traversal::STALE_POINT_EXPAND_MAX
+    }
+
+    /// Total length of `sources`' adjacency rows in the given direction: an upper
+    /// bound on the edges [`Graph::typed_neighbor_counts`] would visit for them,
+    /// before any type or label narrowing.
+    ///
+    /// This reads two array elements per source and no edge at all, so a caller
+    /// can size an expansion before choosing how to evaluate it. A source absent
+    /// from the snapshot contributes zero.
+    pub fn adjacency_span(&self, sources: &[NodeId], incoming: bool) -> Result<u64, Error> {
+        // Deliberately no freshness gate. This measures the installed snapshot so a
+        // caller can decide whether an expansion is worth doing, and callers use it
+        // precisely to avoid provoking a rebuild; refreshing here made the sizing
+        // call perform the very work it exists to help skip. The answer is advisory,
+        // so a stale or absent snapshot giving a low span is sound: the caller either
+        // proceeds (and its own gate refreshes) or declines to a path that needs no
+        // snapshot at all. A source the snapshot does not know contributes zero.
+        let snap = self.csr_cache.snapshot.load();
+        let row_ptr = if incoming {
+            &snap.in_row_ptr
+        } else {
+            &snap.row_ptr
+        };
+        let mut span = 0u64;
+        for src in sources {
+            if let Some(&d) = snap.id_to_dense.get(src) {
+                let d = d as usize;
+                span = span.saturating_add((row_ptr[d + 1] - row_ptr[d]) as u64);
+            }
+        }
+        Ok(span)
+    }
+
+    /// Counts each source's qualifying neighbors across one typed hop, returning
+    /// `(qualifying, counted)` per entry of `sources` in input order. See
+    /// [`NeighborCountSpec`] for what qualifies; the two totals differ only for
+    /// `neighbor_nonnull_prop`, where a neighbor can qualify (so the source
+    /// produces rows) without adding to the count.
+    ///
+    /// This reads only the sources' own CSR rows, so it costs the sum of their
+    /// degrees rather than a full scan, and it tallies into integers without
+    /// materializing one entry per traversed edge. It is the kernel behind the
+    /// Cypher executor's terminal count-collapse, where the alternative is a
+    /// bulk expansion whose result is one triple per edge plus a hash lookup per
+    /// edge to qualify and tally it. Parallel edges each count, and a self-loop
+    /// counts its source once, matching a materialized expansion row for row.
+    ///
+    /// A source absent from the snapshot has no neighbors and counts zero, so a
+    /// caller need not pre-filter the source list.
+    pub fn typed_neighbor_counts(
+        &self,
+        sources: &[NodeId],
+        spec: &NeighborCountSpec,
+    ) -> Result<Vec<(u64, u64)>, Error> {
+        // Snapshot-only gate: this kernel reads CSR arrays and never a matrix,
+        // so it must not pay `ensure_csr_fresh`'s GraphBLAS materialization.
+        self.ensure_snapshot_fresh()?;
+        let snap = self.csr_cache.snapshot.load();
+        let n = snap.dense_to_id.len();
+        let mut out = vec![(0u64, 0u64); sources.len()];
+        if n == 0 || sources.is_empty() {
+            return Ok(out);
+        }
+
+        // A named but unregistered relationship type matches nothing.
+        let type_id = match spec.rel_type {
+            Some(name) => {
+                let rtxn = self.storage.env.read_txn()?;
+                match get_type(&self.storage, &rtxn, name)? {
+                    Some(tid) => Some(tid),
+                    None => return Ok(out),
+                }
+            }
+            None => None,
+        };
+
+        // Dense conjunction of the neighbor labels and the explicit allow-set; an
+        // unknown label or an empty allow-set yields an all-false mask, which
+        // counts zero without a special case.
+        let mut label_mask: Option<Vec<bool>> = None;
+        let intersect = |acc: &mut Option<Vec<bool>>, mask: Vec<bool>| match acc {
+            None => *acc = Some(mask),
+            Some(prev) => {
+                for (slot, keep) in prev.iter_mut().zip(mask) {
+                    *slot = *slot && keep;
+                }
+            }
+        };
+        for name in spec.neighbor_labels {
+            let mut mask = vec![false; n];
+            for id in self.nodes_by_label(name)? {
+                if let Some(&d) = snap.id_to_dense.get(&id) {
+                    mask[d as usize] = true;
+                }
+            }
+            intersect(&mut label_mask, mask);
+        }
+        if let Some(allow) = spec.neighbor_allow {
+            let mut mask = vec![false; n];
+            for id in allow {
+                if let Some(&d) = snap.id_to_dense.get(id) {
+                    mask[d as usize] = true;
+                }
+            }
+            intersect(&mut label_mask, mask);
+        }
+
+        let (row_ptr, col_idx, edge_type) = if spec.incoming {
+            (&snap.in_row_ptr, &snap.in_col_idx, &snap.in_edge_type)
+        } else {
+            (&snap.row_ptr, &snap.col_idx, &snap.edge_type)
+        };
+
+        // One pass over one source's qualifying neighbors. A nested `fn` generic
+        // over the visitor rather than a closure taking `&mut dyn FnMut`, so the
+        // visitor inlines: this runs once per traversed edge, and an indirect call
+        // there would be a cost the whole kernel exists to avoid. Shared by both
+        // walks below so their type and label filters cannot drift apart.
+        fn walk_source<F: FnMut(usize)>(
+            d: usize,
+            row_ptr: &[usize],
+            col_idx: &[u32],
+            edge_type: &[TypeId],
+            type_id: Option<TypeId>,
+            label_mask: &Option<Vec<bool>>,
+            mut visit: F,
+        ) {
+            for k in row_ptr[d]..row_ptr[d + 1] {
+                if let Some(tid) = type_id {
+                    if edge_type[k] != tid {
+                        continue;
+                    }
+                }
+                let other = col_idx[k] as usize;
+                if label_mask.as_ref().is_none_or(|m| m[other]) {
+                    visit(other);
+                }
+            }
+        }
+
+        // The non-null filter is what needs to know which neighbors were reached,
+        // so the bitmap is allocated only for that case. `count(*)` is the common
+        // shape and must not pay for a whole-graph vector it never reads, nor a
+        // store per traversed edge.
+        let mut visited = if spec.neighbor_nonnull_prop.is_some() {
+            vec![false; n]
+        } else {
+            Vec::new()
+        };
+
+        // First pass: the qualifying tally, which is already the answer for
+        // `count(*)`.
+        for (i, src) in sources.iter().enumerate() {
+            let Some(&d) = snap.id_to_dense.get(src) else {
+                continue;
+            };
+            let mut qualifying = 0u64;
+            if spec.neighbor_nonnull_prop.is_none() {
+                walk_source(
+                    d as usize,
+                    row_ptr,
+                    col_idx,
+                    edge_type,
+                    type_id,
+                    &label_mask,
+                    |_| qualifying += 1,
+                );
+            } else {
+                walk_source(
+                    d as usize,
+                    row_ptr,
+                    col_idx,
+                    edge_type,
+                    type_id,
+                    &label_mask,
+                    |other| {
+                        qualifying += 1;
+                        visited[other] = true;
+                    },
+                );
+            }
+            out[i] = (qualifying, qualifying);
+        }
+
+        // Resolve the non-null filter over the neighbors the walk actually
+        // reached, and re-tally only when some of them really are null.
+        if let Some(prop) = spec.neighbor_nonnull_prop {
+            if let Some(mask) = self.visited_nonnull_mask(&snap, &visited, prop)? {
+                for (i, src) in sources.iter().enumerate() {
+                    let Some(&d) = snap.id_to_dense.get(src) else {
+                        continue;
+                    };
+                    let mut counted = 0u64;
+                    walk_source(
+                        d as usize,
+                        row_ptr,
+                        col_idx,
+                        edge_type,
+                        type_id,
+                        &label_mask,
+                        |other| {
+                            if mask[other] {
+                                counted += 1;
+                            }
+                        },
+                    );
+                    out[i].1 = counted;
+                }
             }
         }
         Ok(out)
@@ -606,11 +1109,20 @@ impl Graph {
         // algorithm (Dijkstra, PageRank, spanning forest) reads pre-write weights
         // after a bulk typed expansion or an `update_edge`.
         // Lock-free pre-check: nothing to do when the matrices are current and no
-        // structural delta is pending. `has_pending` also covers the window where
-        // a write has recorded its delta but not yet bumped `write_gen`, so
-        // `matrices_are_stale` is momentarily false even though the weight and
-        // PageRank matrices lag a committed edge; rebuilding then keeps a weighted
-        // algorithm from reading pre-write matrices.
+        // structural delta is pending. Both conditions are needed. A pending delta
+        // with current-looking matrices is the normal state after an incremental
+        // apply advanced `snapshot_gen` while the weight and PageRank matrices,
+        // which have no incremental maintenance, stayed behind; draining it here is
+        // what keeps a weighted algorithm off pre-write matrices.
+        //
+        // The two conditions do not, however, cover the same window. A write
+        // publishes its generation immediately after the commit and records its
+        // delta just after that (`Graph::commit_and_publish`, then
+        // `record_batch`), so between those two points `matrices_are_stale` is
+        // already true while `has_pending` is not yet. This gate is therefore
+        // covered throughout by the generation check alone; `ensure_matrix_view`,
+        // which gates on the delta alone, is the one left uncovered there, which
+        // is why the delta is recorded as early as the ordering allows.
         if self.matrices.read().is_some()
             && !self.csr_cache.matrices_are_stale()
             && !self.csr_cache.has_pending()
@@ -671,6 +1183,24 @@ impl Graph {
     /// expansion). Rebuilds the snapshot alone when it lags committed writes,
     /// skipping GraphBLAS matrix materialization; the pending structural delta
     /// stays in place for `ensure_matrix_view` to drain later.
+    ///
+    /// Unlike its two sibling gates this one deliberately does *not* also gate on
+    /// `has_pending`, and the asymmetry is required rather than an oversight. A
+    /// pending delta belongs to the matrices, and the refresh here installs
+    /// through `install_snapshot`, which leaves the delta in place on purpose so
+    /// the matrices are not stranded stale behind a fresh snapshot. Gating on the
+    /// delta would therefore make every typed expansion after a write rebuild the
+    /// whole snapshot again, once per call, until some matrix consumer happened to
+    /// drain it: a full edge scan per query on a workload that only expands.
+    /// `ensure_csr_fresh` can afford the same check because its refresh path
+    /// clears the delta as part of the full rebuild.
+    ///
+    /// The generation counter is published immediately after the commit (see
+    /// [`crate::csr::CsrCache::advance_write_gen`]), so what remains uncovered is
+    /// the gap between LMDB making a write visible and that one increment, not the
+    /// width of the write's bookkeeping. Closing it outright is a read-isolation
+    /// question, not a gate question: a reader here holds no transaction, so it
+    /// has no point in time to be consistent with in the first place.
     pub(crate) fn ensure_snapshot_fresh(&self) -> Result<(), Error> {
         // Lock-free pre-check.
         if !self.csr_cache.snapshot_is_stale() {
@@ -837,12 +1367,17 @@ impl Graph {
     /// Increment the dirty counter and, if the threshold is crossed and no
     /// rebuild is already running, spawn a background thread to rebuild the
     /// CSR snapshot from LMDB.
+    ///
+    /// This is the compaction safety net only. Marking the caches stale is a
+    /// separate step that happens at commit time, in
+    /// [`Graph::commit_and_publish`], so it cannot be delayed behind the rest of
+    /// the post-commit bookkeeping.
     pub(super) fn maybe_spawn_rebuild(&self) {
         self.maybe_spawn_rebuild_n(1);
     }
 
     pub(super) fn maybe_spawn_rebuild_n(&self, count: usize) {
-        if self.csr_cache.mark_dirty_n(count as u64) {
+        if self.csr_cache.note_dirty_n(count as u64) {
             let cache = Arc::clone(&self.csr_cache);
             let storage = Arc::clone(&self.storage);
             let matrices = Arc::clone(&self.matrices);
@@ -869,6 +1404,26 @@ impl Graph {
                     cache.clear_delta();
                     match CsrSnapshot::build(&storage) {
                         Ok(snap) => {
+                            // Materialize only if the matrices already exist. This is
+                            // the compaction pass, and it fires after
+                            // `REBUILD_THRESHOLD` writes, so on a bulk load it fires
+                            // repeatedly; materializing unconditionally there would
+                            // undo the whole point of `Graph::open` building nothing,
+                            // paying a full GraphBLAS materialization no consumer has
+                            // asked for. When they do not exist, refresh the snapshot
+                            // alone and leave the first materialization to whichever
+                            // gate needs one.
+                            if matrices.read().is_none() {
+                                cache.install_snapshot(snap, built_gen);
+                                // Settle, do not cancel: cancelling leaves the
+                                // claimed dirty count in place, so the counter stays
+                                // above the threshold and the next commit spawns this
+                                // pass again, and so does every commit after it.
+                                if cache.settle_rebuild_claim() {
+                                    continue;
+                                }
+                                break;
+                            }
                             match MatrixSet::materialize(
                                 &snap,
                                 thread_count.load(std::sync::atomic::Ordering::Acquire),
@@ -1660,6 +2215,132 @@ mod linear_path_count_tests {
         assert_eq!(n, 1);
     }
 
+    /// Several parallel self-loops at the middle node each remove exactly one
+    /// assignment, the one where that edge fills both hops.
+    ///
+    /// The middle node's in-degree and out-degree both include every self-loop,
+    /// so the raw product over-counts by the number of self-loops that satisfy
+    /// both hops, not by one. This pins the correction as a count rather than a
+    /// boolean "a self-loop exists" adjustment.
+    #[test]
+    fn two_hop_parallel_self_loops_each_remove_one_assignment() {
+        let (_dir, g) = open_tmp();
+        let w = g.add_node("Person", &json!({})).unwrap();
+        let x = g.add_node("Person", &json!({})).unwrap();
+        let y = g.add_node("Person", &json!({})).unwrap();
+        g.add_edge(w, x, "KNOWS", &json!({})).unwrap(); // in-edge
+        g.add_edge(x, x, "KNOWS", &json!({})).unwrap(); // self-loop 1
+        g.add_edge(x, x, "KNOWS", &json!({})).unwrap(); // self-loop 2 (parallel)
+        g.add_edge(x, y, "KNOWS", &json!({})).unwrap(); // out-edge
+
+        // Middle `x` has in-degree 3 and out-degree 3, so the raw product is 9.
+        // The two self-loops are the only edges that could fill both hops, so
+        // exactly two assignments are removed.
+        let n = g
+            .count_linear_paths(&spec(&[Some("KNOWS"), Some("KNOWS")], &[Some("Person"); 3]))
+            .unwrap();
+        assert_eq!(n, 7);
+    }
+
+    /// A self-loop is only excluded when its type satisfies both hops. With
+    /// distinct per-hop types no single edge can fill both, so the product
+    /// stands uncorrected.
+    #[test]
+    fn two_hop_self_loop_of_one_type_does_not_correct_a_mixed_type_pattern() {
+        let (_dir, g) = open_tmp();
+        let w = g.add_node("Person", &json!({})).unwrap();
+        let x = g.add_node("Person", &json!({})).unwrap();
+        let y = g.add_node("Person", &json!({})).unwrap();
+        g.add_edge(w, x, "KNOWS", &json!({})).unwrap();
+        g.add_edge(x, x, "KNOWS", &json!({})).unwrap(); // self-loop, hop-1 type only
+        g.add_edge(x, y, "LIKES", &json!({})).unwrap();
+
+        // Hop 1 is KNOWS (in-edges of x: w->x and the self-loop, so 2), hop 2 is
+        // LIKES (out-edges of x: x->y, so 1). The self-loop is not a LIKES edge,
+        // so it cannot fill hop 2 and nothing is subtracted.
+        let n = g
+            .count_linear_paths(&spec(&[Some("KNOWS"), Some("LIKES")], &[Some("Person"); 3]))
+            .unwrap();
+        assert_eq!(n, 2);
+    }
+
+    /// The kernel agrees with a brute-force enumeration of every `(r1, r2)`
+    /// assignment on a graph that mixes self-loops, parallel edges, two
+    /// relationship types, and an off-label endpoint.
+    ///
+    /// This is the differential guard for the counting path: the oracle applies
+    /// relationship uniqueness by comparing edge ids directly, with no degree
+    /// factorization, so any divergence in the factored kernel shows up here.
+    #[test]
+    fn two_hop_count_matches_brute_force_over_mixed_graph() {
+        let (_dir, g) = open_tmp();
+        let people: Vec<_> = (0..6)
+            .map(|_| g.add_node("Person", &json!({})).unwrap())
+            .collect();
+        // One off-label node so the endpoint masks exclude real edges.
+        let city = g.add_node("City", &json!({})).unwrap();
+
+        // (src_index, dst_index, type); index 6 is the City node.
+        let spec_edges: &[(usize, usize, &str)] = &[
+            (0, 1, "KNOWS"),
+            (0, 1, "KNOWS"), // parallel
+            (1, 1, "KNOWS"), // self-loop at a middle
+            (1, 1, "KNOWS"), // parallel self-loop
+            (1, 2, "KNOWS"),
+            (1, 2, "LIKES"),
+            (2, 3, "KNOWS"),
+            (2, 2, "LIKES"), // self-loop of the other type
+            (3, 4, "KNOWS"),
+            (4, 5, "KNOWS"),
+            (5, 0, "KNOWS"),
+            (1, 6, "KNOWS"), // into the City node
+            (6, 2, "KNOWS"), // out of the City node
+        ];
+        let all: Vec<_> = people
+            .iter()
+            .copied()
+            .chain(std::iter::once(city))
+            .collect();
+        let mut edges = Vec::new();
+        for &(s, d, t) in spec_edges {
+            let id = g.add_edge(all[s], all[d], t, &json!({})).unwrap();
+            edges.push((all[s], all[d], t, id));
+        }
+
+        // Brute-force oracle: every ordered pair of distinct edges that chains
+        // through a shared middle node, with all three endpoints on `Person`.
+        let is_person = |n| n != city;
+        for (t1, t2) in [
+            (Some("KNOWS"), Some("KNOWS")),
+            (Some("KNOWS"), Some("LIKES")),
+            (Some("LIKES"), Some("KNOWS")),
+            (None, None),
+        ] {
+            let mut expected = 0u64;
+            for &(s1, d1, ty1, e1) in &edges {
+                if t1.is_some_and(|t| t != ty1) || !is_person(s1) || !is_person(d1) {
+                    continue;
+                }
+                for &(s2, d2, ty2, e2) in &edges {
+                    if t2.is_some_and(|t| t != ty2) || !is_person(d2) {
+                        continue;
+                    }
+                    // Chain through the middle, and relationship uniqueness.
+                    if s2 == d1 && e2 != e1 {
+                        expected += 1;
+                    }
+                }
+            }
+            let got = g
+                .count_linear_paths(&spec(&[t1, t2], &[Some("Person"); 3]))
+                .unwrap();
+            assert_eq!(
+                got, expected,
+                "kernel disagreed with brute force for hops ({t1:?}, {t2:?})"
+            );
+        }
+    }
+
     /// An unregistered relationship type matches nothing.
     #[test]
     fn unknown_relationship_type_counts_zero() {
@@ -2007,6 +2688,774 @@ mod triangle_cycle_count_tests {
                 "page_rank for {n} diverges after a snapshot-only refresh: {} vs {}",
                 incremental[n],
                 full[n]
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod snapshot_only_gate_tests {
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    use crate::{Graph, GroupedDegreeSpec, PathCountSpec, TriangleCountSpec, schema::NodeId};
+
+    /// A triangle plus a disjoint two-edge chain, closed and reopened so the
+    /// handle starts with nothing materialized. Every expected count below is
+    /// non-zero, so reading an empty snapshot fails the assertion rather than
+    /// coincidentally matching.
+    fn seeded_dir() -> (TempDir, Vec<NodeId>) {
+        let dir = TempDir::new().unwrap();
+        let ids = {
+            let g = Graph::open(dir.path(), 1).unwrap();
+            let ids: Vec<_> = (0..6)
+                .map(|i| g.add_node("Person", &json!({ "n": i })).unwrap())
+                .collect();
+            for &(s, d) in &[(0, 1), (1, 2), (2, 0), (3, 4), (4, 5)] {
+                g.add_edge(ids[s], ids[d], "FOLLOWS", &json!({})).unwrap();
+            }
+            ids
+        };
+        (dir, ids)
+    }
+
+    fn one_hop() -> PathCountSpec<'static> {
+        PathCountSpec {
+            rel_types: vec![Some("FOLLOWS")],
+            labels: vec![Some("Person"), Some("Person")],
+            vertex_allow: Vec::new(),
+        }
+    }
+
+    fn two_hop() -> PathCountSpec<'static> {
+        PathCountSpec {
+            rel_types: vec![Some("FOLLOWS"), Some("FOLLOWS")],
+            labels: vec![Some("Person"); 3],
+            vertex_allow: Vec::new(),
+        }
+    }
+
+    /// The three counting kernels read only the CSR snapshot, so they must gate
+    /// on `ensure_snapshot_fresh` and leave the GraphBLAS matrices
+    /// unmaterialized. Materializing them would build a weight matrix and a
+    /// PageRank matrix that no counting kernel ever reads.
+    #[test]
+    fn count_kernels_serve_from_the_snapshot_without_materializing_matrices() {
+        let (dir, _ids) = seeded_dir();
+
+        {
+            let g = Graph::open(dir.path(), 1).unwrap();
+            assert_eq!(g.count_linear_paths(&one_hop()).unwrap(), 5);
+            assert!(
+                g.matrices.read().is_none(),
+                "a one-hop count must not materialize the matrices"
+            );
+        }
+        {
+            let g = Graph::open(dir.path(), 1).unwrap();
+            assert_eq!(g.count_linear_paths(&two_hop()).unwrap(), 4);
+            assert!(
+                g.matrices.read().is_none(),
+                "a two-hop count must not materialize the matrices"
+            );
+        }
+        {
+            let g = Graph::open(dir.path(), 1).unwrap();
+            let spec = TriangleCountSpec {
+                rel_types: [Some("FOLLOWS"); 3],
+                labels: [Some("Person"); 3],
+            };
+            // One directed 3-cycle, counted once per rotation of `a`.
+            assert_eq!(g.count_triangle_cycles(&spec).unwrap(), 3);
+            assert!(
+                g.matrices.read().is_none(),
+                "a triangle count must not materialize the matrices"
+            );
+        }
+        {
+            let g = Graph::open(dir.path(), 1).unwrap();
+            let spec = GroupedDegreeSpec {
+                rel_type: Some("FOLLOWS"),
+                group_is_dst: false,
+                group_label: Some("Person"),
+                counted_label: Some("Person"),
+                counted_allow: None,
+                counted_nonnull_prop: None,
+            };
+            let counts = g.grouped_edge_counts(&spec).unwrap();
+            // Five sources each with out-degree one; the sixth node has none.
+            assert_eq!(counts.len(), 5);
+            assert!(counts.iter().all(|&(_, c)| c == 1));
+            assert!(
+                g.matrices.read().is_none(),
+                "a grouped degree count must not materialize the matrices"
+            );
+        }
+    }
+
+    /// Narrowing the gate must not weaken freshness: a kernel run after a write
+    /// in the same session observes that write, because the snapshot gate
+    /// rebuilds on the `write_gen` versus `snapshot_gen` mismatch.
+    #[test]
+    fn count_kernels_observe_writes_made_after_the_first_count() {
+        let (dir, ids) = seeded_dir();
+        let g = Graph::open(dir.path(), 1).unwrap();
+
+        assert_eq!(g.count_linear_paths(&one_hop()).unwrap(), 5);
+        assert_eq!(g.count_linear_paths(&two_hop()).unwrap(), 4);
+
+        // Close the disjoint chain into the triangle's tail: 5 -> 3 adds one
+        // edge, one new two-hop path through 3 (5->3->4), and no new triangle.
+        g.add_edge(ids[5], ids[3], "FOLLOWS", &json!({})).unwrap();
+
+        assert_eq!(
+            g.count_linear_paths(&one_hop()).unwrap(),
+            6,
+            "the one-hop count must include the edge added after the first count"
+        );
+        assert_eq!(
+            g.count_linear_paths(&two_hop()).unwrap(),
+            6,
+            "5->3 adds 4->5->3 and 5->3->4"
+        );
+        assert!(
+            g.matrices.read().is_none(),
+            "refreshing the snapshot must not drag in a matrix materialization"
+        );
+    }
+
+    /// A node deletion reshuffles the dense mapping, so the snapshot gate must
+    /// still produce correct counts afterwards.
+    #[test]
+    fn count_kernels_are_correct_after_a_node_deletion() {
+        let (dir, ids) = seeded_dir();
+        let g = Graph::open(dir.path(), 1).unwrap();
+        assert_eq!(g.count_linear_paths(&one_hop()).unwrap(), 5);
+
+        // Deleting node 5 drops the 4->5 edge with it.
+        g.delete_node(ids[5]).unwrap();
+
+        assert_eq!(g.count_linear_paths(&one_hop()).unwrap(), 4);
+        assert_eq!(
+            g.count_linear_paths(&two_hop()).unwrap(),
+            3,
+            "only the triangle's three two-hop paths remain"
+        );
+    }
+}
+
+#[cfg(test)]
+mod typed_neighbor_count_tests {
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    use crate::{Graph, NeighborCountSpec, schema::NodeId};
+
+    /// `a` follows `b` twice (parallel edges), `c` once, and itself once; `b`
+    /// follows `c`. `c` carries no `tag`, and `d` is a differently labeled node
+    /// `a` also follows.
+    fn fixture() -> (TempDir, Graph, Vec<NodeId>) {
+        let dir = TempDir::new().unwrap();
+        let g = Graph::open(dir.path(), 1).unwrap();
+        let a = g.add_node("Person", &json!({"tag": "a"})).unwrap();
+        let b = g.add_node("Person", &json!({"tag": "b"})).unwrap();
+        let c = g.add_node("Person", &json!({})).unwrap();
+        let d = g.add_node("Robot", &json!({"tag": "d"})).unwrap();
+        for (s, t) in [(a, b), (a, b), (a, c), (a, a), (b, c)] {
+            g.add_edge(s, t, "FOLLOWS", &json!({})).unwrap();
+        }
+        g.add_edge(a, d, "FOLLOWS", &json!({})).unwrap();
+        g.add_edge(a, b, "BLOCKS", &json!({})).unwrap();
+        g.rebuild_csr().unwrap();
+        (dir, g, vec![a, b, c, d])
+    }
+
+    fn spec<'a>(
+        rel_type: Option<&'a str>,
+        incoming: bool,
+        labels: &'a [&'a str],
+        nonnull: Option<&'a str>,
+    ) -> NeighborCountSpec<'a> {
+        NeighborCountSpec {
+            rel_type,
+            incoming,
+            neighbor_labels: labels,
+            neighbor_allow: None,
+            neighbor_nonnull_prop: nonnull,
+        }
+    }
+
+    /// A `count(v.prop)` pass over a handful of neighbors must not build the
+    /// property columns.
+    ///
+    /// Presence is resolved for the neighbors the walk actually reaches, through
+    /// the same small-request path a point read uses. Resolving it from the columns
+    /// instead forced one full node scan with a msgpack decode per node, which on a
+    /// large graph is the dominant cost and the one a lazily opened graph exists to
+    /// defer; the fallback this kernel replaces never paid it.
+    #[test]
+    fn a_nonnull_count_over_few_neighbors_does_not_build_the_columns() {
+        let (_dir, g, ids) = fixture();
+        let (a, b) = (ids[0], ids[1]);
+        assert!(
+            !g.prop_columns.is_built(),
+            "the fixture must start with the columns absent"
+        );
+
+        // a's Person FOLLOWS neighbors are b, b, c, and a. Only c lacks `tag`, so
+        // four qualify and three count.
+        let counts = g
+            .typed_neighbor_counts(
+                &[a, b],
+                &spec(Some("FOLLOWS"), false, &["Person"], Some("tag")),
+            )
+            .unwrap();
+        assert_eq!(counts, vec![(4, 3), (1, 0)]);
+
+        assert!(
+            !g.prop_columns.is_built(),
+            "resolving presence for a few neighbors must not build every column"
+        );
+    }
+
+    /// Presence must come from the nodes the walk reached, not from a whole-column
+    /// summary trusted because its length matched the snapshot's node count.
+    ///
+    /// The previous shortcut skipped the mask when the column had no nulls and its
+    /// length equalled the snapshot's node count. Equal counts do not imply equal
+    /// node sets, so a deletion plus an insertion between the snapshot refresh and
+    /// the column refresh passed that test while the snapshot still held a node the
+    /// columns had never seen, and that node's edges counted as non-null. Here the
+    /// property is present on every node that has it, which is exactly the state
+    /// that used to trigger the shortcut, and the node missing it must still be
+    /// excluded from the count.
+    #[test]
+    fn presence_is_resolved_per_visited_neighbor() {
+        let (_dir, g, ids) = fixture();
+        let a = ids[0];
+
+        // Force the columns to exist and to hold no nulls for `tag` among the
+        // nodes that carry it, the state the old length-plus-all-present shortcut
+        // recognized. Asked for directly: no reader builds them unconditionally, so
+        // a grouped read over this many ids is served without them.
+        g.prop_columns
+            .with_fresh(&g.storage, |_| ())
+            .expect("materialize the property columns");
+        assert!(g.prop_columns.is_built());
+
+        let counts = g
+            .typed_neighbor_counts(
+                &[a],
+                &spec(Some("FOLLOWS"), false, &["Person"], Some("tag")),
+            )
+            .unwrap();
+        assert_eq!(
+            counts,
+            vec![(4, 3)],
+            "the neighbor with no `tag` must not be counted"
+        );
+    }
+
+    /// An allow-set narrows the count on top of the labels, an empty one admits
+    /// nothing, and a member absent from the graph is simply never reached.
+    #[test]
+    fn allow_set_intersects_with_the_labels() {
+        let (_dir, g, ids) = fixture();
+        let (a, b, c, d) = (ids[0], ids[1], ids[2], ids[3]);
+
+        // a's five FOLLOWS neighbors are b, b, c, a, d. Allowing only b and c
+        // keeps the two b edges and the one c edge.
+        let allow = [b, c];
+        let narrowed = NeighborCountSpec {
+            rel_type: Some("FOLLOWS"),
+            incoming: false,
+            neighbor_labels: &[],
+            neighbor_allow: Some(&allow),
+            neighbor_nonnull_prop: None,
+        };
+        assert_eq!(
+            g.typed_neighbor_counts(&[a], &narrowed).unwrap(),
+            vec![(3, 3)]
+        );
+
+        // Intersected with the Person label, d drops out anyway; allowing only d
+        // then leaves nothing.
+        let allow_d = [d];
+        let with_label = NeighborCountSpec {
+            rel_type: Some("FOLLOWS"),
+            incoming: false,
+            neighbor_labels: &["Person"],
+            neighbor_allow: Some(&allow_d),
+            neighbor_nonnull_prop: None,
+        };
+        assert_eq!(
+            g.typed_neighbor_counts(&[a], &with_label).unwrap(),
+            vec![(0, 0)]
+        );
+
+        // An empty allow-set admits no neighbor; an unknown id is inert.
+        let empty = NeighborCountSpec {
+            rel_type: Some("FOLLOWS"),
+            incoming: false,
+            neighbor_labels: &[],
+            neighbor_allow: Some(&[]),
+            neighbor_nonnull_prop: None,
+        };
+        assert_eq!(g.typed_neighbor_counts(&[a], &empty).unwrap(), vec![(0, 0)]);
+        let unknown = [b, d + 9999];
+        let with_unknown = NeighborCountSpec {
+            rel_type: Some("FOLLOWS"),
+            incoming: false,
+            neighbor_labels: &[],
+            neighbor_allow: Some(&unknown),
+            neighbor_nonnull_prop: None,
+        };
+        assert_eq!(
+            g.typed_neighbor_counts(&[a], &with_unknown).unwrap(),
+            vec![(2, 2)]
+        );
+
+        // The non-null filter still narrows only the counted total: c has no tag.
+        let allow_bc = [b, c];
+        let tagged = NeighborCountSpec {
+            rel_type: Some("FOLLOWS"),
+            incoming: false,
+            neighbor_labels: &[],
+            neighbor_allow: Some(&allow_bc),
+            neighbor_nonnull_prop: Some("tag"),
+        };
+        assert_eq!(
+            g.typed_neighbor_counts(&[a], &tagged).unwrap(),
+            vec![(3, 2)]
+        );
+    }
+
+    /// `adjacency_span` totals the sources' adjacency rows without narrowing by
+    /// type, so it bounds the edges a count would visit for them.
+    #[test]
+    fn adjacency_span_bounds_the_visited_edges() {
+        let (_dir, g, ids) = fixture();
+        let (a, b, d) = (ids[0], ids[1], ids[3]);
+
+        // a has 5 FOLLOWS plus 1 BLOCKS out; b has 1 out.
+        assert_eq!(g.adjacency_span(&[a], false).unwrap(), 6);
+        assert_eq!(g.adjacency_span(&[a, b], false).unwrap(), 7);
+        // Incoming: a from its self-loop; b from a twice by FOLLOWS and once by
+        // BLOCKS; d once.
+        assert_eq!(g.adjacency_span(&[a], true).unwrap(), 1);
+        assert_eq!(g.adjacency_span(&[b], true).unwrap(), 3);
+        assert_eq!(g.adjacency_span(&[d], true).unwrap(), 1);
+
+        // The span is at least the typed count it bounds.
+        let typed = g
+            .typed_neighbor_counts(&[a, b], &spec(Some("FOLLOWS"), false, &[], None))
+            .unwrap();
+        let counted: u64 = typed.iter().map(|(q, _)| q).sum();
+        assert!(counted <= g.adjacency_span(&[a, b], false).unwrap());
+
+        // Unknown sources and an empty list contribute nothing.
+        assert_eq!(g.adjacency_span(&[d + 9999], false).unwrap(), 0);
+        assert_eq!(g.adjacency_span(&[], false).unwrap(), 0);
+    }
+
+    /// Outgoing and incoming counts, with parallel edges counted per edge and a
+    /// self-loop counted once for its source.
+    #[test]
+    fn counts_each_edge_in_both_directions() {
+        let (_dir, g, ids) = fixture();
+        let (a, b, c, d) = (ids[0], ids[1], ids[2], ids[3]);
+
+        // a: b twice, c, a (self-loop), d = 5 FOLLOWS out; b: c = 1.
+        let out = g
+            .typed_neighbor_counts(&[a, b, c, d], &spec(Some("FOLLOWS"), false, &[], None))
+            .unwrap();
+        assert_eq!(out, vec![(5, 5), (1, 1), (0, 0), (0, 0)]);
+
+        // Incoming: a from itself; b from a twice; c from a and b; d from a.
+        let inc = g
+            .typed_neighbor_counts(&[a, b, c, d], &spec(Some("FOLLOWS"), true, &[], None))
+            .unwrap();
+        assert_eq!(inc, vec![(1, 1), (2, 2), (2, 2), (1, 1)]);
+
+        // Untyped follows every type, adding a's BLOCKS edge.
+        let any = g
+            .typed_neighbor_counts(&[a], &spec(None, false, &[], None))
+            .unwrap();
+        assert_eq!(any, vec![(6, 6)]);
+    }
+
+    /// A neighbor label narrows the count, a conjunction of labels intersects,
+    /// and an unknown label or relationship type counts zero.
+    #[test]
+    fn labels_and_types_narrow_the_count() {
+        let (_dir, g, ids) = fixture();
+        let (a, b) = (ids[0], ids[1]);
+        g.add_label(b, "Vip").unwrap();
+        g.rebuild_csr().unwrap();
+
+        // Of a's five FOLLOWS neighbors, four are Person (b, b, c, a) and d is not.
+        let person = g
+            .typed_neighbor_counts(&[a], &spec(Some("FOLLOWS"), false, &["Person"], None))
+            .unwrap();
+        assert_eq!(person, vec![(4, 4)]);
+
+        // Person AND Vip is only b, reached twice.
+        let vip = g
+            .typed_neighbor_counts(
+                &[a],
+                &spec(Some("FOLLOWS"), false, &["Person", "Vip"], None),
+            )
+            .unwrap();
+        assert_eq!(vip, vec![(2, 2)]);
+
+        for unknown in [
+            spec(Some("NOPE"), false, &[], None),
+            spec(Some("FOLLOWS"), false, &["Nope"], None),
+        ] {
+            assert_eq!(
+                g.typed_neighbor_counts(&[a], &unknown).unwrap(),
+                vec![(0, 0)]
+            );
+        }
+    }
+
+    /// `neighbor_nonnull_prop` leaves the qualifying total alone and narrows only
+    /// the counted total, so a source whose every neighbor lacks the property
+    /// still reports rows with a zero count. An absent property counts zero.
+    #[test]
+    fn nonnull_property_narrows_only_the_counted_total() {
+        let (_dir, g, ids) = fixture();
+        let (a, b) = (ids[0], ids[1]);
+
+        // a's Person neighbors are b, b, c, a; only c has no `tag`.
+        let tagged = g
+            .typed_neighbor_counts(
+                &[a],
+                &spec(Some("FOLLOWS"), false, &["Person"], Some("tag")),
+            )
+            .unwrap();
+        assert_eq!(tagged, vec![(4, 3)]);
+
+        // b's only FOLLOWS neighbor is c, which has no `tag`: one row, count zero.
+        let untagged = g
+            .typed_neighbor_counts(&[b], &spec(Some("FOLLOWS"), false, &[], Some("tag")))
+            .unwrap();
+        assert_eq!(untagged, vec![(1, 0)]);
+
+        // A property no node carries counts zero everywhere.
+        let absent = g
+            .typed_neighbor_counts(&[a], &spec(Some("FOLLOWS"), false, &[], Some("nope")))
+            .unwrap();
+        assert_eq!(absent, vec![(5, 0)]);
+    }
+
+    /// Variables sharing a label share the *scan* that builds their mask, not the
+    /// mask itself: a pushed-down allow-set intersects into one variable's mask in
+    /// place, so aliasing them would leak one variable's filter onto another. This
+    /// pins that by giving three same-labelled variables different allow-sets.
+    #[test]
+    fn same_label_variables_do_not_share_a_mutated_mask() {
+        let dir = TempDir::new().unwrap();
+        let g = Graph::open(dir.path(), 1).unwrap();
+        let ids: Vec<NodeId> = (0..4)
+            .map(|i| g.add_node("P", &json!({ "k": i })).unwrap())
+            .collect();
+        // A 3-chain plus a shortcut, so several two-hop paths exist.
+        for &(a, b) in &[(0, 1), (1, 2), (2, 3), (0, 2)] {
+            g.add_edge(ids[a], ids[b], "F", &json!({})).unwrap();
+        }
+        g.rebuild_csr().unwrap();
+
+        // Unfiltered: 0->1->2, 1->2->3, 0->2->3.
+        let base = crate::PathCountSpec {
+            rel_types: vec![Some("F"), Some("F")],
+            labels: vec![Some("P"); 3],
+            vertex_allow: Vec::new(),
+        };
+        assert_eq!(g.count_linear_paths(&base).unwrap(), 3);
+
+        // Restricting only the middle variable to node 2 keeps both paths through
+        // it (1->2->3 and 0->2->3) and drops 0->1->2, whose middle is node 1. If
+        // the three same-labelled variables shared one mask, this intersection
+        // would also constrain the endpoints and the count would fall further.
+        let middle_only = crate::PathCountSpec {
+            rel_types: vec![Some("F"), Some("F")],
+            labels: vec![Some("P"); 3],
+            vertex_allow: vec![None, Some(vec![ids[2]]), None],
+        };
+        assert_eq!(
+            g.count_linear_paths(&middle_only).unwrap(),
+            2,
+            "an allow-set on the middle variable must not constrain the others"
+        );
+
+        // A different allow-set per same-labelled variable: source in {0}, middle
+        // in {1,2}, destination in {2}. Only 0->1->2 satisfies all three.
+        let per_variable = crate::PathCountSpec {
+            rel_types: vec![Some("F"), Some("F")],
+            labels: vec![Some("P"); 3],
+            vertex_allow: vec![
+                Some(vec![ids[0]]),
+                Some(vec![ids[1], ids[2]]),
+                Some(vec![ids[2]]),
+            ],
+        };
+        assert_eq!(g.count_linear_paths(&per_variable).unwrap(), 1);
+    }
+
+    /// The non-null filter agrees whether the mask is built or skipped. A column
+    /// with no nulls anywhere takes the skip, one with a null takes the mask, and
+    /// both must count the same edges.
+    #[test]
+    fn nonnull_filter_agrees_when_the_mask_is_skipped() {
+        let dir = TempDir::new().unwrap();
+        let g = Graph::open(dir.path(), 1).unwrap();
+        // Every node carries `k`, so the column has no nulls.
+        let ids: Vec<NodeId> = (0..4)
+            .map(|i| g.add_node("P", &json!({ "k": i })).unwrap())
+            .collect();
+        for &(s, d) in &[(0, 1), (0, 2), (0, 3), (1, 2)] {
+            g.add_edge(ids[s], ids[d], "F", &json!({})).unwrap();
+        }
+        g.rebuild_csr().unwrap();
+
+        // All-present: the mask is skipped, so the counted total equals the
+        // unfiltered one.
+        let unfiltered = g
+            .typed_neighbor_counts(&ids, &spec(Some("F"), false, &[], None))
+            .unwrap();
+        let all_present = g
+            .typed_neighbor_counts(&ids, &spec(Some("F"), false, &[], Some("k")))
+            .unwrap();
+        assert_eq!(
+            unfiltered, all_present,
+            "an all-present column filters nothing"
+        );
+        assert_eq!(unfiltered[0], (3, 3), "the first node has three neighbors");
+
+        // Drop `k` from one neighbor: the column now has a null, so the mask is
+        // built and the count follows it.
+        g.update_node(ids[2], &json!({})).unwrap();
+        g.rebuild_csr().unwrap();
+        let with_null = g
+            .typed_neighbor_counts(&ids, &spec(Some("F"), false, &[], Some("k")))
+            .unwrap();
+        assert_eq!(
+            with_null[0],
+            (3, 2),
+            "the neighbor that lost `k` no longer counts"
+        );
+        // Existence is unchanged: only the counted total narrows.
+        assert_eq!(
+            g.typed_neighbor_counts(&ids, &spec(Some("F"), false, &[], None))
+                .unwrap(),
+            unfiltered
+        );
+    }
+
+    /// Input order is preserved, duplicate sources each get their own entry, and
+    /// a source absent from the graph counts zero rather than erroring.
+    #[test]
+    fn preserves_input_order_and_tolerates_unknown_sources() {
+        let (_dir, g, ids) = fixture();
+        let (a, b) = (ids[0], ids[1]);
+        let missing = ids[3] + 9999;
+
+        let out = g
+            .typed_neighbor_counts(
+                &[b, missing, a, b],
+                &spec(Some("FOLLOWS"), false, &[], None),
+            )
+            .unwrap();
+        assert_eq!(out, vec![(1, 1), (0, 0), (5, 5), (1, 1)]);
+
+        assert!(
+            g.typed_neighbor_counts(&[], &spec(None, false, &[], None))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// The kernel agrees with counting a materialized expansion edge by edge,
+    /// over random multigraphs with self-loops, parallel edges, mixed labels,
+    /// and a property some nodes lack.
+    #[test]
+    fn matches_a_materialized_expansion() {
+        use proptest::prelude::*;
+
+        let mut runner = proptest::test_runner::TestRunner::new(ProptestConfig {
+            cases: 32,
+            ..ProptestConfig::default()
+        });
+        let strategy = (
+            1usize..=6,
+            proptest::collection::vec((0usize..6, 0usize..6), 0..24),
+            proptest::collection::vec(any::<bool>(), 6),
+            proptest::collection::vec(any::<bool>(), 6),
+        );
+        runner
+            .run(&strategy, |(n_nodes, edges, has_tag, is_vip)| {
+                let dir = TempDir::new().unwrap();
+                let g = Graph::open(dir.path(), 1).unwrap();
+                let ids: Vec<NodeId> = (0..n_nodes)
+                    .map(|i| {
+                        let props = if has_tag[i] {
+                            json!({ "tag": i as i64 })
+                        } else {
+                            json!({})
+                        };
+                        if is_vip[i] {
+                            g.add_node_multi(&["Person", "Vip"], &props).unwrap()
+                        } else {
+                            g.add_node("Person", &props).unwrap()
+                        }
+                    })
+                    .collect();
+                for (s, d) in &edges {
+                    if *s < n_nodes && *d < n_nodes {
+                        g.add_edge(ids[*s], ids[*d], "F", &json!({})).unwrap();
+                    }
+                }
+                g.rebuild_csr().unwrap();
+
+                for incoming in [false, true] {
+                    for labels in [&[][..], &["Vip"][..]] {
+                        for nonnull in [None, Some("tag")] {
+                            let spec = NeighborCountSpec {
+                                rel_type: Some("F"),
+                                incoming,
+                                neighbor_labels: labels,
+                                neighbor_allow: None,
+                                neighbor_nonnull_prop: nonnull,
+                            };
+                            let got = g.typed_neighbor_counts(&ids, &spec).unwrap();
+                            for (i, &src) in ids.iter().enumerate() {
+                                // Oracle: enumerate the source's edges directly.
+                                let neighbors: Vec<NodeId> = if incoming {
+                                    g.in_neighbors(src)
+                                        .unwrap()
+                                        .into_iter()
+                                        .map(|e| e.node)
+                                        .collect()
+                                } else {
+                                    g.out_neighbors(src)
+                                        .unwrap()
+                                        .into_iter()
+                                        .map(|e| e.node)
+                                        .collect()
+                                };
+                                let mut qualifying = 0u64;
+                                let mut counted = 0u64;
+                                for nb in neighbors {
+                                    let idx = ids.iter().position(|x| *x == nb).unwrap();
+                                    if !labels.is_empty() && !is_vip[idx] {
+                                        continue;
+                                    }
+                                    qualifying += 1;
+                                    if nonnull.is_none() || has_tag[idx] {
+                                        counted += 1;
+                                    }
+                                }
+                                assert_eq!(
+                                    got[i],
+                                    (qualifying, counted),
+                                    "source {i}, incoming={incoming}, labels={labels:?}, \
+                                     nonnull={nonnull:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            })
+            .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod parallel_kernel_tests {
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    use crate::{Graph, PathCountSpec, graph::algo::FORCE_KERNEL_THREADS, schema::NodeId};
+
+    /// Splitting a counting kernel across threads must not change its result. The
+    /// two-hop count reduces over disjoint ranges of the middle node, so this
+    /// drives the same graph at one thread and at several and compares, including
+    /// the self-loop correction that relationship uniqueness applies.
+    #[test]
+    fn two_hop_count_is_thread_count_invariant() {
+        let dir = TempDir::new().unwrap();
+        let g = Graph::open(dir.path(), 1).unwrap();
+        // A chain, a fan, parallel edges, a self-loop, and a differently labeled
+        // node, so every branch of the correction is reachable.
+        let ids: Vec<NodeId> = (0..9)
+            .map(|i| {
+                if i == 8 {
+                    g.add_node("Robot", &json!({ "n": i })).unwrap()
+                } else {
+                    g.add_node("Person", &json!({ "n": i })).unwrap()
+                }
+            })
+            .collect();
+        for &(a, b) in &[
+            (0, 1),
+            (1, 2),
+            (2, 3),
+            (0, 2),
+            (0, 2),
+            (3, 3),
+            (3, 4),
+            (4, 5),
+            (5, 6),
+            (6, 7),
+            (7, 8),
+            (8, 0),
+        ] {
+            g.add_edge(ids[a], ids[b], "F", &json!({})).unwrap();
+        }
+        g.add_edge(ids[1], ids[2], "B", &json!({})).unwrap();
+        g.rebuild_csr().unwrap();
+
+        let specs = [
+            PathCountSpec {
+                rel_types: vec![Some("F"), Some("F")],
+                labels: vec![None, None, None],
+                vertex_allow: Vec::new(),
+            },
+            PathCountSpec {
+                rel_types: vec![Some("F"), Some("F")],
+                labels: vec![Some("Person"); 3],
+                vertex_allow: Vec::new(),
+            },
+            // Mixed types, so the self-loop correction sees only one of them.
+            PathCountSpec {
+                rel_types: vec![Some("B"), Some("F")],
+                labels: vec![None, None, None],
+                vertex_allow: Vec::new(),
+            },
+            PathCountSpec {
+                rel_types: vec![None, None],
+                labels: vec![None, Some("Person"), None],
+                vertex_allow: Vec::new(),
+            },
+        ];
+
+        for spec in &specs {
+            FORCE_KERNEL_THREADS.with(|f| f.set(0));
+            let serial = g.count_linear_paths(spec).unwrap();
+            for threads in [2usize, 3, 5, 16] {
+                FORCE_KERNEL_THREADS.with(|f| f.set(threads));
+                let parallel = g.count_linear_paths(spec).unwrap();
+                assert_eq!(
+                    serial, parallel,
+                    "two-hop count changed at {threads} threads (serial {serial})"
+                );
+            }
+            FORCE_KERNEL_THREADS.with(|f| f.set(0));
+            assert!(
+                serial > 0,
+                "fixture must produce paths for a meaningful check"
             );
         }
     }

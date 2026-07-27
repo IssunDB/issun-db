@@ -12,7 +12,7 @@ impl Graph {
         let _guard = self._write_lock.lock();
         let mut wtxn = self.storage.env.write_txn()?;
         let id = self.add_node_impl(&mut wtxn, &[label], props)?;
-        wtxn.commit()?;
+        self.commit_and_publish(wtxn, 1)?;
         self.csr_cache.record_added_node(id);
         self.prop_columns.record_touched(id);
         self.maybe_spawn_rebuild();
@@ -26,7 +26,7 @@ impl Graph {
         let _guard = self._write_lock.lock();
         let mut wtxn = self.storage.env.write_txn()?;
         let id = self.add_node_impl(&mut wtxn, labels, props)?;
-        wtxn.commit()?;
+        self.commit_and_publish(wtxn, 1)?;
         self.csr_cache.record_added_node(id);
         self.prop_columns.record_touched(id);
         self.maybe_spawn_rebuild();
@@ -286,7 +286,7 @@ impl Graph {
         let _guard = self._write_lock.lock();
         let mut wtxn = self.storage.env.write_txn()?;
         self.update_node_impl(&mut wtxn, id, props)?;
-        wtxn.commit()?;
+        self.commit_and_publish(wtxn, 1)?;
         self.prop_columns.record_touched(id);
         self.maybe_spawn_rebuild();
         Ok(())
@@ -336,7 +336,7 @@ impl Graph {
         let _guard = self._write_lock.lock();
         let mut wtxn = self.storage.env.write_txn()?;
         self.add_label_impl(&mut wtxn, id, label)?;
-        wtxn.commit()?;
+        self.commit_and_publish(wtxn, 1)?;
         self.maybe_spawn_rebuild();
         Ok(())
     }
@@ -375,7 +375,7 @@ impl Graph {
         let _guard = self._write_lock.lock();
         let mut wtxn = self.storage.env.write_txn()?;
         self.remove_label_impl(&mut wtxn, id, label)?;
-        wtxn.commit()?;
+        self.commit_and_publish(wtxn, 1)?;
         self.maybe_spawn_rebuild();
         Ok(())
     }
@@ -442,7 +442,7 @@ impl Graph {
         let _guard = self._write_lock.lock();
         let mut wtxn = self.storage.env.write_txn()?;
         self.delete_node_impl(&mut wtxn, id)?;
-        wtxn.commit()?;
+        self.commit_and_publish(wtxn, 1)?;
         // A node deletion reshuffles the sorted dense-index mapping, so the next
         // matrix refresh must rebuild fully rather than patch incrementally. The
         // deletion also cascades to every incident edge, so the edge property

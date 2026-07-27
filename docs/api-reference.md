@@ -28,9 +28,14 @@ The `Graph` struct coordinates all transactional graph storage, retrieval, and i
 ### Transactions and Concurrency
 
 IssunDB uses a single-writer, multi-reader model.
-Writes are serialized through an internal write lock and one LMDB write transaction at a time; every mutation method (and every write Cypher query) commits atomically. Reads execute against MVCC snapshots and never block writers or one another, so read-heavy workloads scale across threads over one shared `Graph`.
+Writes are serialized through an internal write lock and one LMDB write transaction at a time; every mutation method (and every write Cypher query) commits atomically. Reads never block writers or one another, so read-heavy workloads scale across threads over one shared `Graph`.
 
-- `Graph::view(f)` runs the closure inside a read-only transaction (`ReadTxn`); every read observes one consistent snapshot.
+Reader isolation has a boundary worth knowing.
+LMDB gives a read transaction a consistent snapshot, so everything inside one `Graph::view` closure observes a single point in time.
+A read that does *not* go through `view`, which includes every Cypher query, is not one transaction: each accessor opens its own short read transaction, and the in-memory structures behind the hot read paths (the CSR snapshot, the GraphBLAS matrices, and the property columns) are refreshed on their own schedule rather than being tied to a transaction.
+A query running concurrently with a committing writer can therefore observe more than one commit point. Reads are always of committed data, never of a partial write, but a whole query is not evaluated against a single snapshot. Wrap the reads in one `Graph::view` closure when a sequence of reads has to agree with itself.
+
+- `Graph::view(f)` runs the closure inside a read-only transaction (`ReadTxn`); every read inside it observes one consistent snapshot.
 - `Graph::update(f)` runs the closure inside a read-write transaction (`WriteTxn`); the transaction commits when the closure returns `Ok` and aborts, leaving the database unchanged, when it returns `Err`.
 - `ReadTxn` and `WriteTxn` expose the same node, edge, adjacency, and lookup methods as `Graph`, so multi-step logic can run atomically inside one closure.
 

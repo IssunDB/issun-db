@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::ast::{AggFn, BinaryOperator, Expr, Literal};
 use crate::plan::logical::FilterExpr;
-use crate::plan::physical::{PhysicalOperator, VertexCmp, VertexPred};
+use crate::plan::physical::{CountWindow, PhysicalOperator, VertexCmp, VertexPred};
 use crate::plan::stats::StatsProvider;
 
 /// An optimizer that applies relational algebra optimization passes to physical plans.
@@ -31,24 +31,54 @@ struct CorrelatedSeek {
     key: Expr,
 }
 
+/// Decisions taken once for a whole plan and threaded through the recursive
+/// optimize calls, which cannot re-derive them from a subtree alone.
+#[derive(Clone, Copy)]
+struct PlanCtx {
+    /// Whether schema-based pruning may run. False when any part of the plan
+    /// writes: a write can create the very edge a pattern matches, which the
+    /// committed-state schema cannot see, so a write subtree must never let a
+    /// recursively optimized read sub-plan prune itself.
+    allow_prune: bool,
+    /// Whether the shape-specific fast paths must stay out of the plan so the
+    /// general operators answer the query.
+    ///
+    /// Carried here rather than read from thread-local state at each rewrite, so
+    /// which plan comes out does not depend on which thread built it, and so the
+    /// executor cannot end up running a plan optimized under the other mode. See
+    /// [`crate::exec_mode`].
+    row_pipeline_only: bool,
+}
+
 impl Optimizer {
     /// Optimize a `PhysicalOperator` plan by standardizing operator sequences,
     /// extracting filter predicates, and pushing them down to the lowest possible nodes.
+    ///
+    /// Reads the execution mode from the current thread. The execution path uses
+    /// [`Optimizer::optimize_with_mode`] instead, resolving it once per statement.
     pub fn optimize(op: PhysicalOperator, stats: Option<&dyn StatsProvider>) -> PhysicalOperator {
-        // Schema-based pruning may only run on a fully read-only query: a write
-        // anywhere in the plan can create the very edge a pattern matches, which
-        // the committed-state schema cannot see. The flag is decided once over
-        // the whole tree and threaded through the opaque recursive optimize
-        // calls (barrier `Project`, `WritePart`) so a write subtree never lets a
-        // recursively optimized read sub-plan prune itself.
-        let allow_prune = !Self::plan_has_write(&op);
-        Self::optimize_impl(op, stats, allow_prune)
+        Self::optimize_with_mode(op, stats, crate::exec_mode::row_pipeline_only())
+    }
+
+    /// [`Optimizer::optimize`] with the execution mode supplied rather than read
+    /// from the calling thread, so the plan and the executor that runs it cannot
+    /// disagree about which fast paths exist.
+    pub fn optimize_with_mode(
+        op: PhysicalOperator,
+        stats: Option<&dyn StatsProvider>,
+        row_pipeline_only: bool,
+    ) -> PhysicalOperator {
+        let ctx = PlanCtx {
+            allow_prune: !Self::plan_has_write(&op),
+            row_pipeline_only,
+        };
+        Self::optimize_impl(op, stats, ctx)
     }
 
     fn optimize_impl(
         op: PhysicalOperator,
         stats: Option<&dyn StatsProvider>,
-        allow_prune: bool,
+        ctx: PlanCtx,
     ) -> PhysicalOperator {
         // Collect each variable's declared label constraints from the original
         // tree before `extract_filters` strips the `HasLabel` filters that carry
@@ -59,7 +89,7 @@ impl Optimizer {
         // than a scanned one (multi-hop fan-out chaining).
         let mut labels: HashMap<String, Vec<String>> = HashMap::new();
         Self::collect_label_constraints(&op, &mut labels);
-        let (stripped_op, raw_filters) = Self::extract_filters(op, stats, allow_prune);
+        let (stripped_op, raw_filters) = Self::extract_filters(op, stats, ctx);
         // Split top-level AND conjunctions so each conjunct pushes down to its
         // own lowest binder: `a.id = 1 AND b.age > 30` as a whole references
         // both endpoints and would stay above the Expand, while its conjuncts
@@ -120,20 +150,32 @@ impl Optimizer {
         // Rewrite closing Expand nodes into MultiwayJoin after index-scan optimization
         // so that both passes benefit each other.
         result = rewrite_closing_expands(result);
-        // Replace a count aggregation over a bare labeled scan with a constant read
-        // from graph metadata, avoiding a full scan.
-        result = Self::reduce_count(result, stats);
-        // Replace a grouping-free count over a MultiwayJoin-closed directed
-        // triangle chain with the core sorted-intersect kernel.
-        result = rewrite_triangle_count(result);
-        // Replace a grouping-free count over a one-hop or two-hop directed
-        // expansion with the core path-count kernel. Runs after the triangle
-        // rewrite so a closed triangle is never mistaken for an open path.
-        result = rewrite_path_count(result);
-        // Replace a count grouped by one endpoint of a single directed hop with
-        // the grouped-degree kernel. Runs after the path-count rewrite, which
-        // claims the grouping-free counts; only grouped aggregates remain here.
-        result = rewrite_grouped_degree(result);
+        // The counting kernels answer their shapes outside the row pipeline, each
+        // reproducing MATCH row semantics on its own, so the row-pipeline-only
+        // switch keeps them out of the plan and lets the general operators answer
+        // instead. That is what makes the two answers comparable, with the row
+        // pipeline as the oracle. See `crate::exec_mode`.
+        if !ctx.row_pipeline_only {
+            // Replace a count aggregation over a bare labeled scan with a constant read
+            // from graph metadata, avoiding a full scan.
+            result = Self::reduce_count(result, stats);
+            // Replace a grouping-free count over a MultiwayJoin-closed directed
+            // triangle chain with the core sorted-intersect kernel.
+            result = rewrite_triangle_count(result);
+            // Replace a grouping-free count over a one-hop or two-hop directed
+            // expansion with the core path-count kernel. Runs after the triangle
+            // rewrite so a closed triangle is never mistaken for an open path.
+            result = rewrite_path_count(result);
+            // Replace a count grouped by one endpoint of a single directed hop with
+            // the grouped-degree kernel. Runs after the path-count rewrite, which
+            // claims the grouping-free counts; only grouped aggregates remain here.
+            result = rewrite_grouped_degree(result);
+            // Push an `ORDER BY <count> LIMIT n` above a grouped-degree kernel into
+            // the kernel as a top-N window, so a query asking for the few largest
+            // counts stops building a row per group. Runs directly after the rewrite
+            // that produces the kernel, and only ever narrows what the kernel emits.
+            result = rewrite_grouped_degree_window(result);
+        }
         // Type inference: when the data schema contains no edge matching a typed
         // hop between two labeled endpoints, that hop (and so the whole pattern)
         // is unsatisfiable, so it is replaced with a zero-row operator that never
@@ -141,15 +183,25 @@ impl Optimizer {
         // on read-only plans: the committed-state schema cannot see edges that a
         // write part of the same statement would create, so pruning a plan with
         // writes could drop rows the query should return.
-        if allow_prune {
+        // Gated by the switch as well as by write-freedom. This is the one pass that
+        // can drop rows rather than reorganize them, and it drops them on the word of
+        // the cached data schema: a wrong `schema_has_edge` negative turns a real
+        // result set into zero rows. Leaving it outside the switch made that
+        // invisible to the differential oracle, because both halves of every
+        // comparison pruned identically and agreed on nothing.
+        if ctx.allow_prune && !ctx.row_pipeline_only {
             result = Self::prune_unsatisfiable(result, stats);
         }
         // Fuse each directed `MultiwayJoin` with the directed single-hop
         // `Expand` that binds its closing-source variable, so the executor
         // intersects the two adjacency lists per row instead of materializing
         // every middle-hop neighbor first. Runs last: the count-lowering and
-        // pruning passes above match the unfused `MultiwayJoin` shape.
-        result = rewrite_expand_intersect(result);
+        // pruning passes above match the unfused `MultiwayJoin` shape. Skipped
+        // under the row-pipeline-only switch, which leaves the unfused shape for
+        // the general operators to answer.
+        if !ctx.row_pipeline_only {
+            result = rewrite_expand_intersect(result);
+        }
         result
     }
 
@@ -178,12 +230,11 @@ impl Optimizer {
     fn extract_filters(
         op: PhysicalOperator,
         stats: Option<&dyn StatsProvider>,
-        allow_prune: bool,
+        ctx: PlanCtx,
     ) -> (PhysicalOperator, Vec<PendingFilter>) {
         match op {
             PhysicalOperator::Filter { input, expression } => {
-                let (inner_op, mut inner_filters) =
-                    Self::extract_filters(*input, stats, allow_prune);
+                let (inner_op, mut inner_filters) = Self::extract_filters(*input, stats, ctx);
                 inner_filters.push(PendingFilter {
                     expr: expression,
                     limits_crossable: 0,
@@ -196,7 +247,7 @@ impl Optimizer {
                 expr,
                 variable,
             } => {
-                let (inner_op, inner_filters) = Self::extract_filters(*input, stats, allow_prune);
+                let (inner_op, inner_filters) = Self::extract_filters(*input, stats, ctx);
                 (
                     PhysicalOperator::Unwind {
                         input: Box::new(inner_op),
@@ -269,7 +320,7 @@ impl Optimizer {
                 needs_path,
                 is_var_length,
             } => {
-                let (inner_op, inner_filters) = Self::extract_filters(*input, stats, allow_prune);
+                let (inner_op, inner_filters) = Self::extract_filters(*input, stats, ctx);
                 (
                     PhysicalOperator::Expand {
                         input: Box::new(inner_op),
@@ -300,7 +351,7 @@ impl Optimizer {
                     // filters would re-place them above the barrier, where the variables
                     // they reference are no longer in scope. Treat barrier projects as
                     // opaque: do not extract filters from inside them, but optimize their subplan.
-                    let optimized_input = Self::optimize_impl(*input, stats, allow_prune);
+                    let optimized_input = Self::optimize_impl(*input, stats, ctx);
                     (
                         PhysicalOperator::Project {
                             input: Box::new(optimized_input),
@@ -310,8 +361,7 @@ impl Optimizer {
                         Vec::new(),
                     )
                 } else {
-                    let (inner_op, inner_filters) =
-                        Self::extract_filters(*input, stats, allow_prune);
+                    let (inner_op, inner_filters) = Self::extract_filters(*input, stats, ctx);
                     (
                         PhysicalOperator::Project {
                             input: Box::new(inner_op),
@@ -323,8 +373,8 @@ impl Optimizer {
                 }
             }
             PhysicalOperator::HashJoin { left, right } => {
-                let (left_op, mut left_filters) = Self::extract_filters(*left, stats, allow_prune);
-                let (right_op, right_filters) = Self::extract_filters(*right, stats, allow_prune);
+                let (left_op, mut left_filters) = Self::extract_filters(*left, stats, ctx);
+                let (right_op, right_filters) = Self::extract_filters(*right, stats, ctx);
                 left_filters.extend(right_filters);
                 (
                     PhysicalOperator::HashJoin {
@@ -341,7 +391,7 @@ impl Optimizer {
                 group_by,
                 aggregations,
             } => {
-                let (inner, filters) = Self::extract_filters(*input, stats, allow_prune);
+                let (inner, filters) = Self::extract_filters(*input, stats, ctx);
                 (
                     PhysicalOperator::Aggregate {
                         input: Box::new(inner),
@@ -352,7 +402,7 @@ impl Optimizer {
                 )
             }
             PhysicalOperator::Sort { input, items } => {
-                let (inner, filters) = Self::extract_filters(*input, stats, allow_prune);
+                let (inner, filters) = Self::extract_filters(*input, stats, ctx);
                 (
                     PhysicalOperator::Sort {
                         input: Box::new(inner),
@@ -362,7 +412,7 @@ impl Optimizer {
                 )
             }
             PhysicalOperator::Limit { input, skip, count } => {
-                let (inner, mut filters) = Self::extract_filters(*input, stats, allow_prune);
+                let (inner, mut filters) = Self::extract_filters(*input, stats, ctx);
                 // These filters originated below this LIMIT, so they may cross
                 // it again on the way back down during pushdown.
                 for f in &mut filters {
@@ -391,7 +441,7 @@ impl Optimizer {
                 Vec::new(),
             ),
             PhysicalOperator::Distinct { input, keys } => {
-                let (inner, inner_filters) = Self::extract_filters(*input, stats, allow_prune);
+                let (inner, inner_filters) = Self::extract_filters(*input, stats, ctx);
                 (
                     PhysicalOperator::Distinct {
                         input: Box::new(inner),
@@ -403,7 +453,7 @@ impl Optimizer {
             // WritePart operators are opaque: do not extract filters from inside them,
             // but recursively optimize their input subplans.
             PhysicalOperator::WritePart { input, part } => {
-                let optimized_input = Self::optimize_impl(*input, stats, allow_prune);
+                let optimized_input = Self::optimize_impl(*input, stats, ctx);
                 (
                     PhysicalOperator::WritePart {
                         input: Box::new(optimized_input),
@@ -436,7 +486,7 @@ impl Optimizer {
                 closing_is_undirected,
                 closing_unique_rels,
             } => {
-                let (inner_op, inner_filters) = Self::extract_filters(*input, stats, allow_prune);
+                let (inner_op, inner_filters) = Self::extract_filters(*input, stats, ctx);
                 (
                     PhysicalOperator::MultiwayJoin {
                         input: Box::new(inner_op),
@@ -4083,6 +4133,52 @@ type ForwardExpand<'a> = (
     &'a Vec<String>,
 );
 
+/// Like [`match_forward_expand`] but accepting either direction, returning the
+/// same binding plus the hop's `is_incoming` flag. Used by the grouped-degree
+/// rewrite, whose kernel counts both directions, so restricting it to forward
+/// hops would forfeit the rewrite whenever the optimizer roots a pattern at its
+/// rarer end and expands backwards.
+#[allow(clippy::type_complexity)]
+fn match_directed_expand(
+    op: &PhysicalOperator,
+) -> Option<(
+    &PhysicalOperator,
+    &String,
+    &String,
+    &String,
+    &Option<String>,
+    &Vec<String>,
+    bool,
+)> {
+    if let PhysicalOperator::Expand {
+        input,
+        src_var,
+        rel_var,
+        dst_var,
+        rel_type,
+        is_incoming,
+        is_undirected: false,
+        min_hops: 1,
+        max_hops: 1,
+        unique_rels,
+        needs_path: false,
+        is_var_length: false,
+    } = op
+    {
+        Some((
+            input.as_ref(),
+            src_var,
+            rel_var,
+            dst_var,
+            rel_type,
+            unique_rels,
+            *is_incoming,
+        ))
+    } else {
+        None
+    }
+}
+
 fn match_forward_expand(op: &PhysicalOperator) -> Option<ForwardExpand<'_>> {
     if let PhysicalOperator::Expand {
         input,
@@ -4398,23 +4494,33 @@ fn try_grouped_degree(op: &PhysicalOperator) -> Option<PhysicalOperator> {
         return None;
     }
 
-    // The group endpoint's constraints sit above the single forward expand.
+    // The group endpoint's constraints sit above the single directed expand. The
+    // kernel counts either direction, so unlike the path count this rewrite does
+    // not require a forward hop: what matters is which endpoint of the stored
+    // edge the group variable is.
     let (cons_dst, exp) = peel_vertex_constraints(input.as_ref());
-    let (below, src_var, _rel_var, dst_var, rel_type, unique) = match_forward_expand(exp)?;
+    let (below, src_var, _rel_var, dst_var, rel_type, unique, incoming) =
+        match_directed_expand(exp)?;
     if !unique.is_empty() || src_var == dst_var {
         return None;
     }
 
-    // One hop only: the source's constraints sit directly over a `LabelScan`.
-    // A second expand beneath leaves `scan` non-`LabelScan`, so a two-hop chain
-    // falls back here.
+    // One hop only: the counted endpoint's constraints sit directly over its leaf
+    // scan. A second expand beneath leaves `scan` a non-leaf, so a two-hop chain
+    // falls back here. An index or range scan is accepted as well as a plain label
+    // scan, because that is the form a `prop CMP literal` predicate on this
+    // endpoint takes once index-scan rewriting has claimed it; the executor turns
+    // such a leaf into the counted allow-set.
     let (cons_src, scan) = peel_vertex_constraints(below);
-    let PhysicalOperator::LabelScan {
-        variable: v0,
-        label: l0,
-    } = scan
-    else {
-        return None;
+    let (v0, l0, counted_leaf) = match scan {
+        PhysicalOperator::LabelScan { variable, label } => (variable, label.clone(), None),
+        PhysicalOperator::NodeIndexScan {
+            variable, label, ..
+        }
+        | PhysicalOperator::NodeRangeScan {
+            variable, label, ..
+        } => (variable, Some(label.clone()), Some(Box::new(scan.clone()))),
+        _ => return None,
     };
     if v0 != src_var {
         return None;
@@ -4445,27 +4551,123 @@ fn try_grouped_degree(op: &PhysicalOperator) -> Option<PhysicalOperator> {
         _ => return None,
     };
 
-    // Resolve the per-endpoint labels. Property predicates are not lowered into
-    // the grouped-degree kernel, so any predicate forfeits the rewrite.
+    // Resolve the per-endpoint labels. A predicate on the group endpoint is not
+    // lowered here (it would narrow which groups exist, not just their counts),
+    // but one on the counted endpoint becomes an index-resolved allow-set, the
+    // same way the path count pushes down `PathCountSpec::vertex_allow`. The
+    // property index is label-scoped, so a predicate needs its endpoint labeled.
     let (group_label, group_preds) = resolve_vertex_constraints(&cons_dst, dst_var)?;
     let (src_label, src_preds) = resolve_vertex_constraints(&cons_src, v0)?;
-    if !group_preds.is_empty() || !src_preds.is_empty() {
+    if !group_preds.is_empty() {
         return None;
     }
-    let counted_label = merge_scan_label(l0.clone(), src_label)?;
+    let counted_label = merge_scan_label(l0, src_label)?;
+    if !src_preds.is_empty() && counted_label.is_none() {
+        return None;
+    }
 
     Some(PhysicalOperator::GroupedDegree {
         rel_type: rel_type.clone(),
-        // A forward expand binds the destination as the edge destination, so
-        // grouping by it counts incoming edges.
-        group_is_dst: true,
+        // The group endpoint is the expand's newly bound variable. A forward
+        // expand binds it as the stored edge's destination, so grouping by it
+        // counts incoming edges; an incoming expand binds it as the stored edge's
+        // source, so grouping by it counts outgoing ones.
+        group_is_dst: !incoming,
         group_label,
         counted_label,
         counted_nonnull_prop,
+        counted_filters: src_preds,
+        counted_leaf,
         group_var: dst_var.clone(),
         group_by: group_by.clone(),
         output: out_name.clone(),
+        // Filled in by `rewrite_grouped_degree_window` from the plan above.
+        count_window: None,
     })
+}
+
+/// Push an enclosing `ORDER BY <count> LIMIT n` into a `GroupedDegree` kernel as
+/// a top-N window. Recursion mirrors `rewrite_grouped_degree`, but the match
+/// starts at the `Limit` so the sort and projection between it and the kernel are
+/// visible.
+fn rewrite_grouped_degree_window(op: PhysicalOperator) -> PhysicalOperator {
+    match op {
+        PhysicalOperator::Limit { input, skip, count } => {
+            // Recurse first, then try this `Limit`. Without the recursion a nested
+            // `Limit` (an inner `ORDER BY <count> LIMIT n` under an outer one) stopped
+            // the walk here: `set_count_window` found the inner `Limit` rather than a
+            // `GroupedDegree`, returned, and the inner window never fired, so the
+            // inner sort built a row per group over the whole label. Correctness was
+            // unaffected; the optimization simply did not happen on the shape it was
+            // written for.
+            let mut input = Box::new(rewrite_grouped_degree_window(*input));
+            set_count_window(input.as_mut(), skip.saturating_add(count));
+            PhysicalOperator::Limit { input, skip, count }
+        }
+        PhysicalOperator::Project {
+            input,
+            items,
+            is_barrier,
+        } => PhysicalOperator::Project {
+            input: Box::new(rewrite_grouped_degree_window(*input)),
+            items,
+            is_barrier,
+        },
+        PhysicalOperator::Sort { input, items } => PhysicalOperator::Sort {
+            input: Box::new(rewrite_grouped_degree_window(*input)),
+            items,
+        },
+        PhysicalOperator::Distinct { input, keys } => PhysicalOperator::Distinct {
+            keys,
+            input: Box::new(rewrite_grouped_degree_window(*input)),
+        },
+        PhysicalOperator::Filter { input, expression } => PhysicalOperator::Filter {
+            input: Box::new(rewrite_grouped_degree_window(*input)),
+            expression,
+        },
+        other => other,
+    }
+}
+
+/// Set the top-N window on the `GroupedDegree` under `Sort > Project`, when the
+/// sort's leading key is the kernel's count output. Any other shape is left
+/// alone.
+///
+/// Only the leading sort key matters: the `bound`-th row of the full sort has
+/// some count, and no group with a worse count can precede it however the
+/// remaining keys order things, so keeping every group that reaches that count is
+/// enough. A `Distinct` between the sort and the projection is deliberately not
+/// seen through, because deduplicating projected rows can pull a group with a
+/// worse count into the window.
+fn set_count_window(op: &mut PhysicalOperator, bound: usize) {
+    let PhysicalOperator::Sort { input, items } = op else {
+        return;
+    };
+    let PhysicalOperator::Project {
+        input: proj_input,
+        items: proj_items,
+        ..
+    } = input.as_mut()
+    else {
+        return;
+    };
+    let PhysicalOperator::GroupedDegree {
+        output,
+        count_window,
+        ..
+    } = proj_input.as_mut()
+    else {
+        return;
+    };
+    // One shared predicate with the columnar collapse, so the two count-window
+    // paths cannot drift apart. It covers the raise-safety restriction (a pruned
+    // group is never projected, so a projection that can raise must not be skipped)
+    // and the alias walk from the sort key to the kernel's output name.
+    if let Some(descending) =
+        crate::plan::physical::leading_count_sort(Some(items), proj_items, output.as_str())
+    {
+        *count_window = Some(CountWindow { bound, descending });
+    }
 }
 
 /// A single-variable constraint peeled from the `Filter` run above an expand:
@@ -5298,6 +5500,7 @@ mod tests {
     /// cannot see an edge the write would create).
     #[test]
     fn prune_unsatisfiable_pass_gating() {
+        let _fast_paths = crate::exec_mode::fast_paths_required();
         struct SchemaStats;
         impl StatsProvider for SchemaStats {
             fn node_count_by_label(&self, _l: &str) -> Option<u64> {
@@ -6021,6 +6224,7 @@ mod tests {
 
     #[test]
     fn reduce_count_replaces_scan_with_constant() {
+        let _fast_paths = crate::exec_mode::fast_paths_required();
         let stats = TestStats::new(&[("Person", 42)]);
         let plan = optimize_query("MATCH (n:Person) RETURN count(*)", &stats);
 
@@ -6175,6 +6379,7 @@ mod tests {
 
     #[test]
     fn reduce_count_replaces_typed_edge_expand_with_constant() {
+        let _fast_paths = crate::exec_mode::fast_paths_required();
         let stats = TestStats::new(&[]).with_type("KNOWS", 7);
         for q in [
             "MATCH ()-[r:KNOWS]->() RETURN count(r)",

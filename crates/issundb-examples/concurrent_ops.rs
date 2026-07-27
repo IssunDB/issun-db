@@ -7,7 +7,13 @@
 //!   1. Opens a temporary graph database.
 //!   2. Spawns multiple concurrent reader threads that query the graph using Cypher.
 //!   3. Spawns a writer thread that continuously inserts and updates nodes.
-//!   4. Demonstrates transactional isolation (readers get consistent snapshots).
+//!   4. Shows that readers never block the writer or one another.
+//!
+//! The readers here use `query`, which is not one transaction: each accessor it
+//! calls opens its own short read transaction, so a reader can observe more than
+//! one commit point as the writer proceeds. Every value it sees is committed, but
+//! the query as a whole is not evaluated against a single snapshot. Use one
+//! `Graph::view` closure when a sequence of reads has to agree with itself.
 
 use issundb::{Graph, GraphQueryExt};
 use serde_json::json;

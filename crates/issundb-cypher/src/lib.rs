@@ -7,6 +7,7 @@ pub mod ast;
 mod builtin_procs;
 mod error;
 mod exec;
+mod exec_mode;
 #[doc(hidden)]
 pub mod parser;
 mod plan;

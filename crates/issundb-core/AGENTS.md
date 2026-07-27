@@ -7,22 +7,22 @@ Read the root `AGENTS.md` first; the rules there apply everywhere and are not re
 
 These invariants must hold after every successful write transaction:
 
-1. **Adjacency consistency.** For every edge `(src → dst)` stored in `out_adj` under key `src`, a matching `AdjEntry` must exist in `in_adj` under key
+1. Adjacency consistency. For every edge `(src → dst)` stored in `out_adj` under key `src`, a matching `AdjEntry` must exist in `in_adj` under key
    `dst`, and vice versa. Both entries encode the same `EdgeId`, `TypeId`, and the other node. Never write one side without writing the other in the
    same`RwTxn`.
 
-2. **ID monotonicity.** `NodeId` and `EdgeId` are allocated by `alloc_node_id` and `alloc_edge_id` in `storage/ids.rs`, which increment a `u64`
+2. ID monotonicity. `NodeId` and `EdgeId` are allocated by `alloc_node_id` and `alloc_edge_id` in `storage/ids.rs`, which increment a `u64`
    counter stored in the `meta` sub-database. These counters must only ever increase. Never reset, reuse, or manually write a counter key outside
    `ids.rs`.
 
-3. **Label and type registry persistence.** String-to-integer mappings for labels (`LabelId`) and edge types (`TypeId`) are stored as `"label:<name>"`
+3. Label and type registry persistence. String-to-integer mappings for labels (`LabelId`) and edge types (`TypeId`) are stored as `"label:<name>"`
    and `"type:<name>"` keys in `meta`. Every node or edge write must call `get_or_create_label` or `get_or_create_type` inside the same `RwTxn` that
    writes the record. Do not cache integer IDs in memory between transactions and then use them in a later transaction without verifying they exist.
 
-4. **Secondary index consistency.** `label_idx` and `type_idx` use composite keys `(u32 BE, u64 BE)` with `Unit` values. Every `add_node` must insert
+4. Secondary index consistency. `label_idx` and `type_idx` use composite keys `(u32 BE, u64 BE)` with `Unit` values. Every `add_node` must insert
    its `(LabelId, NodeId)` entry, and every `delete_node` must remove it. Same rule applies to `type_idx` for edges.
 
-5. **Property index consistency.** Every `add_node` must write a `node_prop_idx` entry for each non-null scalar property in `props_json`. Every
+5. Property index consistency. Every `add_node` must write a `node_prop_idx` entry for each non-null scalar property in `props_json`. Every
    `update_node` must delete old entries and write new ones for all changed scalar properties. Every `delete_node` must remove all `node_prop_idx`
    entries for the deleted node. Failing to maintain this invariant causes `has_node_property_index` to return stale results and the Cypher optimizer
    to emit incorrect `NodeIndexScan` plans.
@@ -56,20 +56,28 @@ All mutations to the graph go through the `Graph` API. Inside `Graph`:
 ## OpenMP Thread Count
 
 `MatrixSet::materialize` (in `matrices.rs`) sets the thread count immediately after creating the SuiteSparse:GraphBLAS context, through
-`issundb_graphblas::set_global_threads(n)`. The count resolves in one fixed order: the `programmatic_threads` argument when it is greater than zero
-(what `Graph::set_thread_count` supplies), otherwise the `ISSUNDB_NUM_THREADS` environment variable, otherwise 1. There is no graph-size heuristic;
-the conservative default of 1 thread avoids scheduling overhead on the short operations that dominate small graphs, and a caller that wants
-parallelism asks for it explicitly.
+`issundb_graphblas::set_global_threads(n)`. It does not decide the count itself: every parallel consumer resolves through `threads::resolve`
+(`threads.rs`), which is the single resolution the GraphBLAS pool and the counting kernels share. Precedence, first positive value winning: the
+programmatic override `Graph::set_thread_count` stored, then `ISSUNDB_NUM_THREADS`, then `OMP_NUM_THREADS`, then the machine's available parallelism,
+clamped to `MAX_THREADS`. There is no graph-size heuristic.
+
+Resolve through that one function rather than reading the environment here. Resolving it in two places is what previously made an unset configuration
+mean one thread for the matrices and the whole machine for a kernel pass, so the two pools oversubscribed each other. `OMP_NUM_THREADS` is honored
+because the GraphBLAS pool is an OpenMP pool and capping it is how a caller (including this repository's coverage job) caps that pool.
 
 The setting is global to the SuiteSparse runtime for the lifetime of the process. `GxB_Global_Option_set(GxB_NTHREADS, n)` is called in exactly one
 place, `issundb_graphblas::set_global_threads`; do not call the raw FFI from `issundb-core` or from anywhere else.
 
 ## CSR Snapshot Vs. LMDB Adjacency
 
-`CsrSnapshot` (in `csr.rs`) is a read-only in-memory Compressed Sparse Row view of outgoing edges, rebuilt in the background and swapped atomically
-via `arc_swap::ArcSwap`. `MatrixSet` (in `matrices.rs`) holds the GraphBLAS sparse matrices derived from the CSR snapshot.
+`CsrSnapshot` (in `csr.rs`) is a read-only in-memory Compressed Sparse Row view of the adjacency: the outgoing arrays plus a transposed incoming view
+carrying per-edge type and edge ids, and a per-edge weight. It is swapped atomically via `arc_swap::ArcSwap`. `MatrixSet` (in `matrices.rs`) holds the
+GraphBLAS sparse matrices derived from it.
 
-- **Always write to LMDB first.** The CSR snapshot is derived from LMDB, not the other way around.
+Rebuilds happen on demand through the freshness gates below; the background rebuild after `REBUILD_THRESHOLD` writes is a compaction safety net, not
+the freshness path.
+
+- Always write to LMDB first. The CSR snapshot is derived from LMDB, not the other way around.
 - Use LMDB adjacency databases (`out_adj`, `in_adj`) for correctness-critical reads: single-node neighbor lookups, existence checks, and anything
   inside a transaction.
 - The point adjacency lookups (`out_neighbors`, `in_neighbors`, `all_neighbors`, and `node_has_relationships`) all read `out_adj` and `in_adj`
@@ -91,12 +99,23 @@ It is derived from LMDB, like the CSR snapshot, and follows the same write-LMDB-
 - `PropColumns<S: ColumnSource>` stores one typed column per property (Int, Float, Bool, dict-encoded Str, or a JSON fallback) over a dense
   `id -> index` map. `NodeSource` and `EdgeSource` implement `ColumnSource`, so nodes and edges share one generic store; `Graph` holds
   `prop_columns: ColumnsCache<NodeSource>` and `edge_columns: ColumnsCache<EdgeSource>`.
-- `ColumnsCache<S>` builds lazily on first access from one full `scan_all`, so the first property read of a process pays an O(records) build (visible
-  as a slow first query). After that it is kept fresh by post-commit deltas: writers call `record_touched`/`record_force_full`, and `with_fresh`
-  patches touched ids via `fetch_one` or rebuilds on `force_full` before serving a read.
-- Read it only through `with_fresh`/`with_fresh_mut`. Prefer the bulk forms(`Graph::node_props_json_table`, `node_prop_json_column`,
-  `node_prop_group_codes`, and the `edge_*` equivalents): they refresh once and gather a whole column, versus `node_prop_json`, which refreshes per
-  call. The Cypher vectorized aggregate path depends on the bulk forms (see `issundb-cypher/AGENTS.md`).
+- `ColumnsCache<S>` builds lazily from one full `scan_all`, but a read does not necessarily cause that build, and the distinction is deliberate. A
+  request for at most `SMALL_GATHER_MAX` entities is served as point reads straight from storage while the columns are absent
+  (`should_serve_directly`), because building every column is one full scan and that is the wrong answer to a request for a handful of entities. Those
+  direct reads amortize a build after `DIRECT_READ_BUILD_THRESHOLD` of them, so a row pipeline reading one property per row still ends up on the
+  columns. The advisory statistics readers never build (see `with_existing_mut` below), and a grouped read follows the same size test by building an
+  ephemeral column set over just the requested entities. Size the test on the request, not on the method: the Cypher vectorized executor gathers even a
+  one-row projection through the bulk API. Nothing builds the shared columns as a side effect of a small workload, so a caller that wants them warm
+  calls `Graph::materialize_property_columns`.
+- Once built, the columns are kept fresh by post-commit deltas: writers call `record_touched`/`record_force_full`, and `with_fresh` patches the touched
+  ids (one read transaction for the whole batch, via `fetch_many`) or rebuilds on `force_full` before serving a read. A failed absorb queues a full
+  rebuild rather than dropping the taken delta, so a transient storage error cannot leave the columns quietly serving pre-write values.
+- Read the columns through `with_fresh`, or through `with_existing_mut` when the caller is advisory. `with_existing_mut` never builds an absent cache;
+  it answers `None` instead. That is what keeps the optimizer's selectivity estimates and the zone-map prune from making the first query that mentions
+  any property pay a full node scan, so do not "fix" an advisory reader by switching it to `with_fresh`.
+- Prefer the bulk forms (`Graph::node_props_json_table`, `node_prop_json_column`, `node_prop_group_codes`, and the `edge_*` equivalents): they refresh
+  once and gather a whole column, versus `node_prop_json`, which refreshes per call. The Cypher vectorized aggregate path depends on the bulk forms
+  (see `issundb-cypher/AGENTS.md`).
 - This store is a cache, never the source of truth. Any new write path that changes a scalar property must record a delta against both `prop_columns`
   and `edge_columns` as applicable, the same way it updates `node_prop_idx`.
 
@@ -139,9 +158,9 @@ All sub-databases are opened once by `Storage::open` in `storage/lmdb.rs`:
 
 `deepsize` is used to track heap allocation of record types for memory instrumentation:
 
-- **Derive** `#[derive(DeepSizeOf)]` for types that own heap-allocated fields (`Vec<u8>`, `String`, nested structs with allocations). Examples:
+- Derive `#[derive(DeepSizeOf)]` for types that own heap-allocated fields (`Vec<u8>`, `String`, nested structs with allocations). Examples:
   `NodeRecord`, `EdgeRecord`.
-- **Implement manually** for `#[repr(C, packed)]` or zero-copy structs that contain no heap allocations. Override `deep_size_of_children` to return
+- Implement manually for `#[repr(C, packed)]` or zero-copy structs that contain no heap allocations. Override `deep_size_of_children` to return
   `0`. Example: `AdjEntry`.
 - Do not derive `DeepSizeOf` for types that are never measured; implement it only where the size is actually read at runtime.
 

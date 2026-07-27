@@ -914,9 +914,22 @@ impl Completer for ReplHelper {
         ctx: &Context<'_>,
     ) -> rustyline::Result<(usize, Vec<Pair>)> {
         let head = &line[..pos];
-        // Start byte of the word under the cursor. Whitespace is ASCII, so the
-        // byte index after it is a valid char boundary.
-        let word_start = head.rfind(char::is_whitespace).map(|i| i + 1).unwrap_or(0);
+        // Start byte of the word under the cursor.
+        //
+        // The separator test must be ASCII-only. `char::is_whitespace` follows the
+        // Unicode White_Space property, so it matches multi-byte characters such as
+        // U+00A0 (no-break space), U+2000-200A, and U+3000, and `i + 1` after one of
+        // those lands inside the character rather than after it, panicking on the
+        // slice below. A no-break space is routine in text pasted from web
+        // documentation or a PDF, so pressing Tab on a pasted query would kill the
+        // session. Note this is close to, but not the same as, `split_cmd`, which
+        // finds a plain space only: a tab separates words here and does not there.
+        // That affects which completions are offered for tab-separated input, never
+        // whether the slice is valid, which is what this test is for.
+        let word_start = head
+            .rfind(|c: char| c.is_ascii_whitespace())
+            .map(|i| i + 1)
+            .unwrap_or(0);
         let word = &head[word_start..];
         let is_first_token = head[..word_start].trim().is_empty();
 
@@ -1177,16 +1190,21 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
             }
         }
         ReplCommand::Restore { snapshot, dst } => {
-            // Restore materializes a fresh database directory; it does not touch
-            // the currently open graph. Use `:open <dst>` afterward to switch to it.
-            match Graph::restore(&snapshot, &dst) {
-                Ok(()) => eprintln!(
-                    "restored {} into {} (use `:open {}` to switch)",
-                    snapshot.display(),
-                    dst.display(),
-                    dst.display()
-                ),
-                Err(e) => cli_eprintln!("restore failed: {e}"),
+            // Restore must materialize a *fresh* database directory, which
+            // `restore_precheck` enforces rather than assumes: the copy would
+            // otherwise overwrite an existing `data.mdb`, including the open
+            // database's own. Use `:open <dst>` afterward to switch to it.
+            match restore_precheck(&dst, state.db_path.as_deref()) {
+                Err(e) => cli_eprintln!("{e}"),
+                Ok(()) => match Graph::restore(&snapshot, &dst) {
+                    Ok(()) => eprintln!(
+                        "restored {} into {} (use `:open {}` to switch)",
+                        snapshot.display(),
+                        dst.display(),
+                        dst.display()
+                    ),
+                    Err(e) => cli_eprintln!("restore failed: {e}"),
+                },
             }
         }
         ReplCommand::ImportNodes { file, label } => {
@@ -2358,6 +2376,29 @@ fn print_named_counts(rows: &[(String, u64)]) {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Whether `:restore` may write into `dst`, given the currently open database
+/// directory.
+///
+/// This adds only the refinement the CLI alone can make: `dst` being the database
+/// this session has open, which would rewrite `data.mdb` underneath a live LMDB
+/// mapping. Refusing a destination that merely already holds a database is
+/// `Graph::restore`'s job, because every front end reaches the same truncating
+/// copy. `:open` guards the same-path case with `fs::canonicalize`; this is the
+/// destructive counterpart it was missing.
+fn restore_precheck(dst: &Path, open_db_path: Option<&Path>) -> Result<(), String> {
+    let canon = |p: &Path| fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    if let Some(open) = open_db_path {
+        if canon(dst) == canon(open) {
+            return Err(format!(
+                "refusing to restore into {}: it is the database currently open. \
+                 Restore into a new directory, then `:open` it.",
+                dst.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn split_cmd(s: &str) -> (&str, &str) {
     let s = s.trim();
     match s.find(' ') {
@@ -2563,7 +2604,7 @@ fn cmd_import_nodes(state: &mut State, path: &str, label: &str) {
     };
     match import_nodes_stream(g, path, label, IMPORT_BATCH) {
         Ok(inserted) => eprintln!("imported {inserted} {label} nodes from {path}"),
-        Err(e) => cli_eprintln!("{e}"),
+        Err(e) => cli_eprintln!("import failed: {e}"),
     }
 }
 
@@ -2590,6 +2631,34 @@ fn insert_node_batch(
     Ok(())
 }
 
+/// A failed import, carrying how many rows were already durably committed.
+///
+/// Import commits once per batch, so a failure partway through a file leaves every
+/// earlier batch in the database. Reporting only the error left the user unable to
+/// tell "nothing happened" from "49,000 rows landed", and the obvious recovery,
+/// re-running the import, silently duplicates every committed row because insertion
+/// is not idempotent.
+#[derive(Debug)]
+struct ImportFailure {
+    inserted: u64,
+    message: String,
+}
+
+impl std::fmt::Display for ImportFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.inserted == 0 {
+            write!(f, "{} (no rows were committed)", self.message)
+        } else {
+            write!(
+                f,
+                "{} after {} row(s) were already committed; those rows are in the \
+                 database, so re-running this import would duplicate them",
+                self.message, self.inserted
+            )
+        }
+    }
+}
+
 /// Streaming body of `:import-nodes`: rows are read one at a time and flushed
 /// every `batch_size` rows, so at most one batch is in memory. Returns the
 /// inserted row count. `batch_size` is a parameter so tests can exercise the
@@ -2599,16 +2668,31 @@ fn import_nodes_stream(
     path: &str,
     label: &str,
     batch_size: usize,
-) -> Result<u64, String> {
+) -> Result<u64, ImportFailure> {
+    let mut inserted: u64 = 0;
+    match import_nodes_body(g, path, label, batch_size, &mut inserted) {
+        Ok(()) => Ok(inserted),
+        Err(message) => Err(ImportFailure { inserted, message }),
+    }
+}
+
+/// Body of [`import_nodes_stream`], writing its progress through `inserted` so the
+/// wrapper can report how far a failed import got.
+fn import_nodes_body(
+    g: &Graph,
+    path: &str,
+    label: &str,
+    batch_size: usize,
+    inserted: &mut u64,
+) -> Result<(), String> {
     let batch_size = batch_size.max(1);
     let mut buf: Vec<serde_json::Value> = Vec::new();
-    let mut inserted: u64 = 0;
 
     if is_parquet_path(path) {
         stream_parquet_entries(path, |obj| {
             buf.push(serde_json::Value::Object(obj));
             if buf.len() >= batch_size {
-                insert_node_batch(g, label, &mut buf, &mut inserted)?;
+                insert_node_batch(g, label, &mut buf, inserted)?;
             }
             Ok(())
         })?;
@@ -2640,7 +2724,7 @@ fn import_nodes_stream(
                     }
                     buf.push(serde_json::Value::Object(props));
                     if buf.len() >= batch_size {
-                        insert_node_batch(g, label, &mut buf, &mut inserted)?;
+                        insert_node_batch(g, label, &mut buf, inserted)?;
                     }
                 }
             }
@@ -2650,8 +2734,8 @@ fn import_nodes_stream(
         }
     }
 
-    insert_node_batch(g, label, &mut buf, &mut inserted)?;
-    Ok(inserted)
+    insert_node_batch(g, label, &mut buf, inserted)?;
+    Ok(())
 }
 
 /// Resolve a domain key to a node id via the always-on scalar auto-index on
@@ -2704,7 +2788,7 @@ fn cmd_import_edges(state: &mut State, path: &str, src_label: &str, dst_label: &
             "imported {} {etype} edges from {path} ({} unresolved endpoint(s), {} malformed row(s))",
             report.inserted, report.unresolved, report.malformed
         ),
-        Err(e) => cli_eprintln!("{e}"),
+        Err(e) => cli_eprintln!("import failed: {e}"),
     }
 }
 
@@ -2762,16 +2846,45 @@ fn import_edges_stream(
     dst_label: &str,
     etype: &str,
     batch_size: usize,
-) -> Result<EdgeImportReport, String> {
+) -> Result<EdgeImportReport, ImportFailure> {
+    let mut report = EdgeImportReport::default();
+    match import_edges_body(
+        g,
+        path,
+        src_label,
+        dst_label,
+        etype,
+        batch_size,
+        &mut report,
+    ) {
+        Ok(()) => Ok(report),
+        Err(message) => Err(ImportFailure {
+            inserted: report.inserted,
+            message,
+        }),
+    }
+}
+
+/// Body of [`import_edges_stream`], writing its progress into `report` so the
+/// wrapper can report how far a failed import got.
+#[allow(clippy::too_many_arguments)]
+fn import_edges_body(
+    g: &Graph,
+    path: &str,
+    src_label: &str,
+    dst_label: &str,
+    etype: &str,
+    batch_size: usize,
+    report: &mut EdgeImportReport,
+) -> Result<(), String> {
     let batch_size = batch_size.max(1);
     let mut buf: Vec<(String, String)> = Vec::new();
-    let mut report = EdgeImportReport::default();
 
     if is_parquet_path(path) {
         report.malformed = stream_parquet_edge_pairs(path, |src, dst| {
             buf.push((src, dst));
             if buf.len() >= batch_size {
-                insert_edge_batch(g, src_label, dst_label, etype, &mut buf, &mut report)?;
+                insert_edge_batch(g, src_label, dst_label, etype, &mut buf, report)?;
             }
             Ok(())
         })?;
@@ -2797,7 +2910,7 @@ fn import_edges_stream(
                 (Some(s), Some(d)) => {
                     buf.push((s.to_owned(), d.to_owned()));
                     if buf.len() >= batch_size {
-                        insert_edge_batch(g, src_label, dst_label, etype, &mut buf, &mut report)?;
+                        insert_edge_batch(g, src_label, dst_label, etype, &mut buf, report)?;
                     }
                 }
                 _ => report.malformed += 1,
@@ -2808,8 +2921,8 @@ fn import_edges_stream(
         }
     }
 
-    insert_edge_batch(g, src_label, dst_label, etype, &mut buf, &mut report)?;
-    Ok(report)
+    insert_edge_batch(g, src_label, dst_label, etype, &mut buf, report)?;
+    Ok(())
 }
 
 /// Stream every row of a Parquet file as one property map per row, each column
@@ -3061,6 +3174,57 @@ mod tests {
         let ctx = Context::new(&hist);
         let (start, pairs) = helper.complete(line, line.len(), &ctx).expect("completion");
         (start, pairs.into_iter().map(|p| p.replacement).collect())
+    }
+
+    /// `:restore` must refuse the open database outright. Refusing a destination
+    /// that merely holds a database is `Graph::restore`'s job, covered by
+    /// `restore_refuses_an_existing_database` in `issundb-core`.
+    #[test]
+    fn restore_refuses_the_open_database() {
+        let empty = TempDir::new().unwrap();
+        assert!(
+            restore_precheck(empty.path(), None).is_ok(),
+            "an empty directory is a valid destination"
+        );
+
+        // A directory holding a database is not this check's concern; the engine
+        // refuses it.
+        let populated = TempDir::new().unwrap();
+        fs::write(populated.path().join("data.mdb"), b"existing").unwrap();
+        assert!(restore_precheck(populated.path(), None).is_ok());
+
+        // The open database is refused, including through a non-canonical spelling
+        // of the same path.
+        let open = TempDir::new().unwrap();
+        let err = restore_precheck(open.path(), Some(open.path())).unwrap_err();
+        assert!(err.contains("currently open"), "{err}");
+        let indirect = open.path().join(".");
+        let err = restore_precheck(&indirect, Some(open.path())).unwrap_err();
+        assert!(err.contains("currently open"), "{err}");
+    }
+
+    /// Unicode whitespace must not break the completer's byte arithmetic.
+    ///
+    /// `char::is_whitespace` matches multi-byte characters, so taking the byte after
+    /// a match landed inside one and panicked when the word was sliced out. A
+    /// no-break space arrives whenever a query is pasted from web documentation, and
+    /// pressing Tab then ended the session.
+    #[test]
+    fn completion_survives_unicode_whitespace() {
+        let helper = ReplHelper::new();
+        for line in [
+            "MATCH\u{00A0}(n)",
+            "MATCH\u{3000}(n)",
+            "SHOW\u{2000}x",
+            "\u{00A0}",
+            "a\u{00A0}b\u{3000}c",
+        ] {
+            let (start, _) = complete_at_end(&helper, line);
+            assert!(
+                line.is_char_boundary(start),
+                "word start {start} is not a char boundary in {line:?}"
+            );
+        }
     }
 
     /// Segment with the real command-name set and return just the statement

@@ -14,7 +14,7 @@ The `crates/issundb-examples` crate contains complete, runnable programs; run on
 | `gds_cypher`                  | The graph data science surface in Cypher: `CALL issundb.*` procedures and the comparison functions.                    |
 | `load_ldbc`                   | Loading a social network graph and running analytics over it.                                                          |
 | `neo4j_migration`             | Migrating sample data from a Neo4j-style JSON export into IssunDB.                                                     |
-| `concurrent_ops`              | Concurrent reads and writes over a shared `Graph` handle, demonstrating snapshot isolation for readers.               |
+| `concurrent_ops`              | Concurrent reads and writes over a shared `Graph` handle: readers never block the writer or each other.               |
 
 ## Vector Search Example
 

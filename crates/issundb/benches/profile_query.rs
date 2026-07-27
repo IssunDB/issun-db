@@ -12,6 +12,9 @@
 //! - `PROFILE_QUERY_REPS`: query repetitions (default 3)
 //! - `PROFILE_QUERY_DB`: database directory (default
 //!   `$TMPDIR/issundb-query-profile-<nodes>-<edges>`)
+//! - `PROFILE_QUERY_MAP_GB`: LMDB map size in GiB (default 2). An existing
+//!   database whose file already exceeds the map size cannot be opened, so
+//!   reusing a large graph needs this raised to at least its on-disk size.
 
 use std::collections::HashSet;
 use std::time::Instant;
@@ -98,9 +101,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::env::temp_dir().join(format!("issundb-query-profile-{nodes}-{edges}"))
         });
 
+    let map_gb = var("PROFILE_QUERY_MAP_GB", 2) as usize;
     let fresh = !db_dir.join("data.mdb").exists();
     std::fs::create_dir_all(&db_dir)?;
-    let graph = Graph::open(&db_dir, 2)?;
+    let graph = Graph::open(&db_dir, map_gb)?;
     if fresh {
         let start = Instant::now();
         load(&graph, nodes, edges)?;

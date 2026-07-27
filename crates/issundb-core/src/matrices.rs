@@ -39,16 +39,10 @@ impl MatrixSet {
     pub fn materialize(csr: &CsrSnapshot, programmatic_threads: i32) -> Result<Self, Error> {
         let context = Context::init_default().map_err(|e| Error::GraphBLAS(e.to_string()))?;
 
-        // Support checking for programmatic thread override. If 0/unset, fall back to
-        // checking the ISSUNDB_NUM_THREADS environment variable. If that is also
-        // absent, default to 1.
-        let n_threads: i32 = if programmatic_threads > 0 {
-            programmatic_threads
-        } else if let Ok(val) = std::env::var("ISSUNDB_NUM_THREADS") {
-            val.parse::<i32>().unwrap_or(1).max(1)
-        } else {
-            1
-        };
+        // One shared resolution of the thread budget, so this pool and the
+        // counting kernels' scoped threads read the same knob the same way and
+        // cannot oversubscribe each other. See `crate::threads`.
+        let n_threads = crate::threads::resolve(programmatic_threads) as i32;
         issundb_graphblas::set_global_threads(n_threads)
             .map_err(|e| Error::GraphBLAS(e.to_string()))?;
 

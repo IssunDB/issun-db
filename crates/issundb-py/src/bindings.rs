@@ -31,10 +31,32 @@ fn val(e: impl std::fmt::Display) -> PyErr {
     PyValueError::new_err(e.to_string())
 }
 
-/// Parse a JSON-string argument into a `serde_json::Value`, raising `ValueError`
-/// on malformed input.
-fn parse_json(s: &str) -> PyResult<serde_json::Value> {
-    serde_json::from_str(s).map_err(val)
+/// Parse a property-map argument, raising `ValueError` on malformed JSON or on
+/// JSON that is not an object.
+///
+/// The shape check matters as much as the syntax check. A property bag is a map,
+/// and the engine stores whatever it is given: passing `[1,2,3]` or `5` created a
+/// node that took an id and counted in a label scan but had no readable properties
+/// and could never match a property predicate, with no error at any layer. The
+/// binding already required an object for `query` parameters and for
+/// `vector_search` filters; properties were the inconsistent case.
+fn parse_props(s: &str) -> PyResult<serde_json::Value> {
+    let value: serde_json::Value = serde_json::from_str(s).map_err(val)?;
+    if !value.is_object() {
+        let kind = match &value {
+            serde_json::Value::Null => "null",
+            serde_json::Value::Bool(_) => "a boolean",
+            serde_json::Value::Number(_) => "a number",
+            serde_json::Value::String(_) => "a string",
+            serde_json::Value::Array(_) => "an array",
+            serde_json::Value::Object(_) => unreachable!(),
+        };
+        return Err(val(format!(
+            "props must be a JSON object, got {kind}; a non-object would be stored \
+             but no property read or predicate could ever see it"
+        )));
+    }
+    Ok(value)
 }
 
 /// Python-facing handle for an IssunDB graph database.
@@ -60,7 +82,7 @@ impl PyGraph {
     /// new node ID. `labels` accepts either a single label string or a list of
     /// label strings (multi-label node).
     fn add_node(&self, py: Python<'_>, labels: &Bound<'_, PyAny>, props: &str) -> PyResult<u64> {
-        let value = parse_json(props)?;
+        let value = parse_props(props)?;
         if let Ok(single) = labels.extract::<String>() {
             py.detach(|| self.graph.add_node(&single, &value))
                 .map_err(rt)
@@ -98,7 +120,7 @@ impl PyGraph {
                     .extract::<Vec<String>>()
                     .map_err(|_| val("labels must be a string or a list of strings"))?,
             };
-            parsed.push((labels, parse_json(&props)?));
+            parsed.push((labels, parse_props(&props)?));
         }
 
         py.detach(|| {
@@ -127,13 +149,23 @@ impl PyGraph {
 
     /// Replace the properties of node `id` with JSON-encoded `props`.
     fn update_node(&self, py: Python<'_>, id: u64, props: &str) -> PyResult<()> {
-        let value = parse_json(props)?;
+        let value = parse_props(props)?;
         py.detach(|| self.graph.update_node(id, &value)).map_err(rt)
     }
 
     /// Delete node `id` and all of its incident edges.
     fn delete_node(&self, py: Python<'_>, id: u64) -> PyResult<()> {
         py.detach(|| self.graph.delete_node(id)).map_err(rt)
+    }
+
+    /// Return the labels of node `id` in insertion order.
+    ///
+    /// An unlabeled node and a node that does not exist both read as an empty list,
+    /// which is what the underlying accessor reports; use `get_node` to tell them
+    /// apart. Without this, `add_label` and `remove_label` had no read counterpart,
+    /// so a node's labels could be written but never enumerated.
+    fn node_labels(&self, py: Python<'_>, id: u64) -> PyResult<Vec<String>> {
+        py.detach(|| self.graph.node_labels(id)).map_err(rt)
     }
 
     /// Add a label to node `id`. No-op if it already has it.
@@ -156,7 +188,7 @@ impl PyGraph {
         etype: &str,
         props: &str,
     ) -> PyResult<u64> {
-        let value = parse_json(props)?;
+        let value = parse_props(props)?;
         py.detach(|| self.graph.add_edge(src, dst, etype, &value))
             .map_err(rt)
     }
@@ -177,7 +209,7 @@ impl PyGraph {
             let (src, dst, etype, props): (u64, u64, String, String) = item
                 .extract()
                 .map_err(|_| val("each item must be a (src, dst, type, props_json) tuple"))?;
-            parsed.push((src, dst, etype, parse_json(&props)?));
+            parsed.push((src, dst, etype, parse_props(&props)?));
         }
 
         py.detach(|| {
@@ -217,7 +249,7 @@ impl PyGraph {
 
     /// Replace the properties of edge `id` with JSON-encoded `props`.
     fn update_edge(&self, py: Python<'_>, id: u64, props: &str) -> PyResult<()> {
-        let value = parse_json(props)?;
+        let value = parse_props(props)?;
         py.detach(|| self.graph.update_edge(id, &value)).map_err(rt)
     }
 
@@ -414,7 +446,9 @@ impl PyGraph {
 
     /// Execute a hybrid retrieval (GraphRAG) query combining vector search, text
     /// search, and relationship expansion. Returns a JSON object
-    /// `{"nodes", "edges", "scores"}`.
+    /// `{"nodes", "edges", "scores", "truncated"}`, where `truncated` is true when
+    /// the `max_nodes` cap cut off seeds or expansion, so a capped result is
+    /// distinguishable from a complete one.
     ///
     /// `fusion_strategy` is 'rrf' (default) or 'weighted_sum' (alias 'weighted').
     #[pyo3(signature = (

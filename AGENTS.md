@@ -87,11 +87,19 @@ modules according to this map.
     - `src/columns.rs`: in-memory property columns for the read path. One typed column (`Int`, `Float`, `Bool`, dictionary-encoded `Str`, or the
       exact-semantics `Json` fallback) per node property, built lazily from one full node scan and kept fresh by a post-commit delta (node deletion
       forces a rebuild). Read through `Graph::node_prop_json`. Also owns the lazily computed per-property statistics (`PropStats`: bounds, an
-      equi-depth histogram, and the most common values) that back the selectivity estimates, invalidated by the post-commit patch.
+      equi-depth histogram, and the most common values) that back the selectivity estimates, invalidated by the post-commit patch. Which readers may
+      cause the build is deliberate, because the build is one full scan: a gather larger than `SMALL_GATHER_MAX` does, a smaller one is served straight
+      from storage (`should_serve_directly`), and the advisory statistics never do (`with_existing_mut` rather than `with_fresh`).
     - `src/histogram.rs`: equi-depth histogram over property values with equality and range selectivity estimates; backs `PropStats`. Nothing here is
       persisted.
     - `src/matrices.rs`: GraphBLAS matrix materialization from the CSR snapshot, plus `MatrixSet::apply_delta` for incremental in-place maintenance
       (resize plus per-element set and drop) and the self-contained `dense_to_id`/`id_to_dense` mapping the matrix-view consumers read.
+    - `src/threads.rs`: the one resolution of the thread budget every parallel consumer shares (`threads::resolve`). Precedence is the programmatic
+      override from `set_thread_count`, then `ISSUNDB_NUM_THREADS`, then `OMP_NUM_THREADS`, then the machine's parallelism, clamped to `MAX_THREADS`.
+      Both the GraphBLAS pool (`MatrixSet::materialize`) and the counting kernels' scoped threads (`Graph::kernel_threads`) resolve through it, so the one
+      knob has one meaning; resolving it in two places previously made an unset configuration mean one thread for the matrices and the whole machine for a
+      kernel pass, letting the two pools oversubscribe each other. `OMP_NUM_THREADS` is honored because the GraphBLAS pool is an OpenMP pool and capping
+      it is how this repository's own `test` and `coverage` targets keep the pools in check.
     - `src/error.rs`: `Error` enum; all storage and serialization errors unify here.
 - `crates/issundb-cypher/`: Cypher parser, AST, logical planner, physical planner, optimizer, and executor.
     - `src/parser.rs`: Cypher parser built with the `chumsky` parser-combinator library (with a Pratt parser for operator-precedence expressions),
@@ -114,15 +122,22 @@ modules according to this map.
       planning. Path algorithms other than `shortestPath` and `dijkstra` are deliberately excluded.
     - `src/exec/mod.rs`: public entry points (`execute`, `explain`), shared type definitions, and tests.
     - `src/exec/read.rs`: `execute_physical` and read-path helpers (`evaluate_where`, `evaluate_sort_key`, `json_to_prop_value`,
-      `execute_filter_over_expand`).
+      `filter_over_expand_batch`, and `multiway_join_rows`, the last shared by the materializing and streaming `MultiwayJoin` paths).
     - `src/exec/vectorized.rs`: columnar fast path for the final projection or aggregation over a linear chain of up to `MAX_VEC_HOPS` directed
       single hops. A structural recognizer matches `[Limit]? [Sort]? [Distinct]? Project [Aggregate]? Stage* (Expand(directed single hop)
       Stage*){0,MAX_VEC_HOPS} Leaf` with single-property expressions, executing column-at-a-time (bulk expansion via `Graph::node_props_json_table`
       and group-by-code aggregation via `Graph::node_prop_group_codes`). A multi-hop chain is recognized only when every hop carries a distinct
       relationship type, so relationship uniqueness is vacuous; a repeated type or a chain longer than `MAX_VEC_HOPS` falls back. A non-distinct
-      `count` over the terminal variable that feeds no group key collapses the final hop (`execute_collapsed_count`). The recognizer sees through a
-      `Distinct` because the caller deduplicates. Any unrecognized shape falls back to the row pipeline, so correctness never depends on the
-      recognizer.
+      `count` over the terminal variable that feeds no group key collapses the final hop (`execute_collapsed_count`). The collapse counts each source's
+      qualifying neighbors through `Graph::typed_neighbor_counts`, so the final hop costs no triple per traversed edge and no hash lookup per edge: a
+      terminal filter that is a label test goes straight into the spec, and a terminal property comparison is resolved into a `neighbor_allow` set by
+      running those exact stages over the label's whole node set (`resolve_terminal_allow`). That resolution is gated on the sources' `adjacency_span`
+      reaching half the label count, so a selective hop over a large label keeps the expansion fallback instead of paying for a full label pass, and it
+      is speculative: it evaluates predicates over a superset of the real neighbors, so a stage that errors there declines to the fallback rather than
+      raising. Two shapes route to the fallback regardless: a multi-type hop, because `Expand::rel_type` carries the raw pattern text (`"F|G"`) and the
+      kernel resolves one registered type; and a stale snapshot with at most `STALE_POINT_EXPAND_MAX` sources (`Graph::prefers_point_expansion`), because
+      the kernel would rebuild the whole snapshot where the fallback serves those sources from per-source adjacency. The recognizer sees through a `Distinct` because the caller deduplicates. Any unrecognized shape falls back to the row pipeline, so
+      correctness never depends on the recognizer.
     - `src/exec/factorize.rs`: `FactorizedRecordGroup` (shared `Arc<PathMap>` prefix plus per-row extensions) and `filter_refs_in_expr`.
     - `src/exec/expr.rs`: expression evaluation (`evaluate_expr`, `eval_binary_op`, `eval_arithmetic`, `eval_function_call`).
     - `src/exec/write.rs`: mutation execution (`execute_create`, `execute_set`, `execute_delete`, `execute_merge`).
@@ -139,7 +154,12 @@ modules according to this map.
   build from triples, `mxv` over predefined semirings, `ewise_add` over predefined monoids, and the descriptor flags). Depends only on
   `issundb-graphblas-sys`. `issundb-core` reaches GraphBLAS exclusively through this crate.
 - `crates/issundb-vector/`: vector index abstraction, vector metadata, vector storage integration, and vector search APIs.
-- `crates/issundb-text/`: tokenization, full-text index storage, text search APIs, and ranking.
+- `crates/issundb-text/`: text query APIs and ranking. Tokenization and the inverted-index storage are *not* here: they live in
+  `issundb-core` (`graph/fts_mod.rs` and `storage/fts.rs`), because the write path is in core and the FTS postings are maintained inside the same
+  write transaction as the node record (`index_node_for_label` on insert and update, `delete_node_fts` on delete). A tokenizer in this crate could not
+  be reached from there without inverting the dependency, so the full-text index is the one secondary structure that is transactional rather than an
+  eventually-consistent cache. This crate owns the `Scorer` trait (BM25), query evaluation, and the `TextGraphExt`/`TextIndexExt` surface, and it
+  tokenizes queries through core's `tokenize_text` so indexing and querying cannot disagree.
 - `crates/issundb-retrieval/`: hybrid retrieval over graph traversal, vector hits, text hits, property filters, score fusion, and subgraph
   materialization.
 - `crates/issundb/`: public facade. Re-exports the deliberate public surface from `issundb-core`, `issundb-vector`, `issundb-text`,
@@ -161,12 +181,31 @@ modules according to this map.
 - `crates/issundb/tests/conformance/`: openCypher TCK subset integration tests.
 - `benchmarks/ladybugdb-compare/`: differential comparison harness against LadybugDB. Deliberately excluded from the workspace (own `[workspace]`
   stanza, root `exclude`, and own `rust-toolchain.toml`) because the `lbug` crate links the LadybugDB C++ library and needs a newer Rust than the
-  workspace MSRV; it must never become part of `make build` or `make test`. Run via `make bench-ladybugdb`. Cross-engine harnesses belong here, not
-  in crate-local `benches/`, which is reserved for Criterion targets. The differential row-set check runs before timing; a `DIVERGENT` verdict is an
-  attributed LadybugDB walk-semantics overcount and does not fail the run, but a `MISMATCH` does (`tests/lbug_trail_semantics.rs` pins the
-  walk-versus-trail divergence).
+  workspace MSRV; it must never become part of `make build` or `make test`. Run via `make test-ladybugdb` for correctness and `make bench-ladybugdb`
+  for timing. Cross-engine harnesses belong here, not
+  in crate-local `benches/`, which is reserved for Criterion targets. It runs two separate passes.
+    - `differential_workload`: curated row-returning queries whose sorted row sets must match exactly, run before anything is timed. Together with the
+      generated corpus below this is the only oracle that can catch a mistake IssunDB makes consistently across all of its own execution paths, which is
+      exactly what `ISSUNDB_ROW_PIPELINE_ONLY` cannot see. No pattern here may bind one edge to two relationship slots, which means at most two
+      same-direction hops and no closing hop: walk-versus-trail is *not* only a variable-length question, because relationship uniqueness applies to any
+      pattern with two or more slots, and the pinned LadybugDB build permits the reuse openCypher forbids. Row sets are bounded so the pass costs the
+      same at every size in a sweep. `differential_corpus_is_fixed_length_and_row_returning` pins both rules. Projections avoid floats and nulls because
+      the two databases' display forms differ there (a whole-valued float is `0.0` against `0`), which is not a semantic divergence.
+    - `generate_queries` plus `reference_rows`: the generated corpus, enabled by `LADYBUGDB_COMPARE_GENERATED` and run by `make test-ladybugdb`. Shapes
+      outside the curated corpus's rule belong here, because here they are adjudicated rather than merely compared: `reference_rows` evaluates each
+      generated query over the dataset by brute force under openCypher semantics, so a divergence names the database at fault instead of leaving a human to
+      decide. IssunDB disagreeing with the reference fails the run; LadybugDB disagreeing is counted as a walk-semantics divergence and does not; the
+      reference disagreeing with both databases while they agree fails as a harness defect. Findings are shrunk to their smallest reproducing shape.
+      `make test-ladybugdb` runs the pass twice, once with the fast paths and once under `ISSUNDB_ROW_PIPELINE_ONLY`, which composes the two oracles.
+    - `workload`: the timed comparison. Its queries are shaped for measurement, so most return a single `count(...)`; a `DIVERGENT` verdict there is an
+      attributed LadybugDB walk-semantics overcount and does not fail the run, but a `MISMATCH` does (`tests/lbug_trail_semantics.rs` pins the
+      walk-versus-trail divergence). Add a correctness query to the differential corpus, not here.
 - `Cargo.toml`: workspace root with shared `[workspace.dependencies]`. All version pins live here.
 - `Makefile`: developer workflow entry points.
+- Directory-scoped guides: `crates/issundb-core/AGENTS.md`, `crates/issundb-cypher/AGENTS.md`, `crates/issundb-text/AGENTS.md`, and
+  `crates/issundb-vector/AGENTS.md` carry crate-specific rules that this file does not repeat (LMDB lifetime rules, the query pipeline stages, the
+  tokenization order, the HNSW lock ordering). Read the one covering the crate being changed, and update it in the same patch when its subject changes:
+  being unreferenced from here is what let several of them drift behind the code.
 
 ## Testing Layout Rules
 
@@ -176,6 +215,14 @@ modules according to this map.
 - Cypher conformance tests belong in `crates/issundb/tests/conformance/` and are gated on the `ISSUNDB_CONFORMANCE=1` environment variable so the
   default `make test` stays fast (run them via `make test-conformance`).
 - Property-based tests (via `proptest`) belong alongside the unit tests for the module whose invariants they exercise.
+- The row pipeline is the differential oracle for every shape-specific fast path. `ISSUNDB_ROW_PIPELINE_ONLY=1` keeps the columnar executor, the
+  `PathCount`, `GroupedDegree`, and `TriangleCount` kernels, the fused `ExpandIntersect` hop, the metadata count shortcut, and the type-inference pruning
+  pass out of the answer, so any suite can be swept through the general path and compared. Pruning is in the switch because it is the one pass that drops
+  rows rather than reorganizing them, so leaving it outside made a wrong `schema_has_edge` negative invisible to the comparison. Both `cargo test` and `ISSUNDB_CONFORMANCE=1` runs must pass identically with and without
+  it; a divergence is a fast-path defect, not a configuration difference. A test whose premise is that a particular operator lowers, and the fast half
+  of any differential comparison, must pin the setting with `exec_mode::fast_paths_required` rather than inherit it, or the sweep makes it either fail
+  on its own premise or pass vacuously. The corpus lives in `crates/issundb-cypher/src/exec/differential.rs`. `VectorTopK` is deliberately outside the
+  switch, because an HNSW search is approximate and is entitled to differ from the exact sort it replaces.
 - Do not reach into `issundb-core` internals from integration tests; drive behavior through the `issundb` public facade or the `Graph` API.
 - If you move code across modules, move or rewrite the unit tests with it.
 - Benchmark targets live in crate-local `benches/` directories; do not add `#[bench]` to source files.
@@ -194,6 +241,12 @@ modules according to this map.
 - The GraphBLAS matrices (`MatrixSet`) and the CSR snapshot back the GraphBLAS algorithms, pattern matching, and multi-source expansion. They are kept
   fresh through three gates rather than a single periodic rebuild. The write path records a structural delta (added nodes, added edges, and removed
   edges, plus a `force_full` flag set on any node deletion).
+    - `Graph::open` builds neither: it installs an empty snapshot through `CsrCache::new_unbuilt` and leaves `matrices` as `None`, so the gates below
+      do the first build when a consumer that needs one runs. A workload of point lookups, property reads, or small typed expansions never builds
+      either structure, because those paths read LMDB directly. The unbuilt cache starts `write_gen` at 1 with both installed generations at 0 so it
+      reports stale; a placeholder that claimed to be current would make typed expansion read zero rows out of the empty snapshot. Do not reintroduce
+      an eager build in `open`: it costs one full edge scan plus a full matrix materialization on every open (roughly 26 seconds for a 1 M-node,
+      14 M-edge graph) and is repaid on every reopen.
     - Pure-adjacency consumers (`bfs`, `bfs_multi_source`, untyped expansion, `degree_centrality`, and `connected_components`) call
       `ensure_matrix_view`, which applies the delta in place, falling back to a full `rebuild_csr` only when a node was deleted.
     - CSR-array and hybrid consumers (everything else, including `dfs`, the path searches, the weighted and flow algorithms, `page_rank`, and the
@@ -210,6 +263,9 @@ modules according to this map.
   (`git submodule update --init external/GraphBLAS`) plus CMake and Clang.
 - Async is not used in the core engine. LMDB and GraphBLAS are synchronous. `tokio` is an optional dependency for server mode only; do not add
   `.await` inside `issundb-core`.
+- Parallelism has exactly two consumers, and both resolve their thread count through `threads::resolve` (see the module map): the GraphBLAS OpenMP pool,
+  and the scoped-thread reductions in the counting kernels, which split a pass only above `MIN_PARALLEL_WORK` items so a small pass and a unit test stay
+  serial and deterministic. Writes are never parallel: they serialize on the `ReentrantMutex` write lock and on LMDB's single writer.
 - GraphBLAS initializes a process-global context and OpenMP thread pool on first use (`GrB_init`) and never finalizes it. Under `cargo nextest`
   (process-per-test, used by `make coverage`) every process pays this cost, so on small CI runners the thread pools oversubscribe and a GraphBLAS call
   can fail intermittently. The coverage job pins `OMP_NUM_THREADS=1` and sets `NEXTEST_RETRIES=2` to compensate.
@@ -247,12 +303,23 @@ Node and edge CRUD, accessors, and registry lookups have self-describing signatu
 
 The read-path and statistics methods carry non-obvious semantics:
 
-- `node_prop_json(id, prop) -> Result<Option<Value>, Error>`: single-property read through the in-memory property columns; `None` for a nonexistent
-  node, `Some(Value::Null)` for a missing property.
+- `node_prop_json(id, prop) -> Result<Option<Value>, Error>`: single-property read; `None` for a nonexistent node, `Some(Value::Null)` for a missing
+  property.
 - `node_props_json_table(ids, props) -> Result<Vec<Vec<Value>>, Error>`: bulk row-major property gather; `Value::Null` for a missing property and
   `Error::NodeNotFound` for a nonexistent node.
 - `node_prop_json_column(ids, prop) -> Result<Vec<Value>, Error>`: single-property column form of the table gather, one flat vector with no per-row
   allocation; same null and missing-node semantics.
+- Those three read through the in-memory property columns once those exist, but a small request does not build them (`should_serve_directly`): up to
+  `SMALL_GATHER_MAX` ids are served as LMDB point reads instead, because building every column costs one full node scan and a query touching a handful
+  of nodes must not pay it. The size test is on the request, not the method, because the vectorized executor gathers even a one-row projection through
+  the bulk API; keying on the method instead left a cold point query paying roughly 1.2 seconds on an 800 K-node graph. Sustained direct reads amortize
+  the build after `DIRECT_READ_BUILD_THRESHOLD` of them, so a row pipeline reading one property per row still ends up on the columns.
+  `node_prop_group_codes` follows the same size test: a large request builds the columns, while a small one is grouped over an ephemeral column set
+  built from just those entities. Grouping is a bulk read only when the id set is bulk, and both go through the same `PropColumns::from_items` and
+  `group_codes`, so the narrower population is the same grouping code rather than a second implementation of it.
+- `materialize_property_columns() -> Result<(), Error>`: build the in-memory property columns now. Nothing builds them as a side effect of a
+  small workload, so this is the deliberate way to make the optimizer's selectivity estimates and zone-map pruning available on a cold graph, or to pay
+  the one full scan up front rather than in a later bulk read.
 - `node_prop_group_codes(ids, prop) -> Result<(Vec<u32>, Vec<Value>), Error>`: dense group codes under exact value identity of one property, plus one
   representative value per code; null and missing values share one `Value::Null` code.
 - `node_prop_min_max(prop) -> Result<Option<(Value, Value)>, Error>`: bounds of one property's non-null values from the column statistics; `None` for
@@ -261,6 +328,12 @@ The read-path and statistics methods carry non-obvious semantics:
   property's equi-depth histogram.
 - `estimate_equality_selectivity(prop, val) -> Result<Option<f64>, Error>`: estimated fraction of non-null values equal to `val`, exact for the most
   common values and histogram-estimated otherwise; both feed the optimizer's selectivity-aware `Filter` plan weight.
+- Those three readers are advisory, and none of them builds the property columns: each also returns `None` when the columns do not exist yet, leaving
+  the caller on its default plan weight or declining to prune. Forcing a build for them made the first query mentioning any property pay one full node
+  scan (measured at roughly 1.3 seconds on an 800 K-node graph), which was the dominant cold-start latency, and the answer only weights a choice.
+  A caller that needs statistics on a cold graph must materialize the columns first, and `Graph::materialize_property_columns` is how: no small read
+  builds them as a side effect any more, so a gather of more than `SMALL_GATHER_MAX` ids is the only other thing that will. Calling a reader and
+  discarding the result is no longer an idiom for warming them.
 - `estimate_expand_fanout(src_label, rel_type, incoming) -> Result<Option<f64>, Error>`: per-source-label typed degree (the count of `rel_type` edges
   incident to `src_label` nodes in the given direction, divided by the `src_label` node count), the "expand ratio" that sharpens the optimizer's
   `Expand` plan weight over the global average on a skewed schema. `None` when a label or type is unknown or no such edges exist. The estimate only
@@ -272,11 +345,14 @@ The read-path and statistics methods carry non-obvious semantics:
   optimizer's type-inference pass.
 - `label_filter(nodes, label) -> Result<Vec<NodeId>, Error>`: subset of `nodes` carrying `label`, via one `label_idx` point lookup per candidate.
 - `set_thread_count(n: i32) -> Result<(), Error>`: sets the GraphBLAS thread count, overriding the `ISSUNDB_NUM_THREADS` environment variable (0
-  restores default behavior).
+  restores default behavior, resolved by `threads::resolve`). The count is stored and applied by `MatrixSet::materialize`, which is also what initializes the GraphBLAS context, so a
+  call made before the matrices exist takes effect at the next materialization rather than reaching GraphBLAS immediately. Since `Graph::open` no longer
+  materializes eagerly, that is the normal case for a caller configuring threads up front; setting a global option on an uninitialized context would
+  fail.
 
 Graph algorithms have self-describing signatures over `NodeId` and `EdgeId`: `bfs`, `dfs`, `shortest_path`, `all_paths`, `all_shortest_paths`,
 `longest_path`, `shortest_path_top_k`, `page_rank`, `connected_components`, `strongly_connected_components`, `detect_cycle`, `label_propagation`,
-`degree_centrality`, `betweenness_centrality`, `harmonic_centrality`, `spanning_forest`, `maximum_flow`, and `all_neighbors`. Two carry behavior worth
+`degree_centrality`, `betweenness_centrality`, `harmonic_centrality`, `spanning_forest`, `maximum_flow`, and `all_neighbors`. Five carry behavior worth
 pinning:
 
 - `shortest_path_dijkstra(src, dst) -> Result<Option<WeightedPath>, Error>`: edge weight is the first present of the `weight`, `cost`, `capacity`, or
@@ -286,6 +362,22 @@ pinning:
   `(a)-[t1]->(b)-[t2]->(c)-[t3]->(a)` with optional per-hop relationship types and per-variable labels, following Cypher MATCH row semantics including
   relationship uniqueness; the Cypher optimizer lowers grouping-free `count` aggregates over that pattern to this kernel via the `TriangleCount`
   physical operator.
+- `typed_neighbor_counts(sources, spec: &NeighborCountSpec) -> Result<Vec<(u64, u64)>, Error>`: per-source `(qualifying, counted)` neighbor counts
+  across one typed hop, in input order. It reads only the sources' own CSR rows, so it costs the sum of their degrees rather than a full scan, and it
+  tallies into integers instead of materializing one entry per traversed edge. A neighbor qualifies when it carries every label in `neighbor_labels`
+  and belongs to `neighbor_allow` when that is present; the two totals differ only for `neighbor_nonnull_prop`, where a neighbor can qualify (so the
+  source produces rows) without adding to the count. `neighbor_allow` is the counterpart of `PathCountSpec::vertex_allow`: the caller resolves a
+  per-neighbor property predicate itself and hands the kernel the surviving ids, so a filtered count stays a kernel call. This is the kernel behind the
+  Cypher executor's terminal count-collapse; a source absent from the snapshot counts zero rather than erroring.
+- `prefers_point_expansion(sources) -> bool`: whether a typed expansion over `sources` many source nodes should read per-source LMDB adjacency instead of
+  refreshing the CSR snapshot, true only when the snapshot is stale and the source set is at most `STALE_POINT_EXPAND_MAX`. Advisory: both routes return
+  the same rows, so a caller ignoring it is correct but may rebuild a whole snapshot to serve a handful of sources. It is public because the Cypher
+  executor's collapse decision needs it from another crate.
+- `adjacency_span(sources, incoming) -> Result<u64, Error>`: total length of `sources`' adjacency rows in one direction, measured over the *installed*
+  CSR snapshot. It reads two array elements per source and no edge, and deliberately does not refresh: it exists so a caller can size an expansion before
+  choosing how to evaluate it, and refreshing would make the sizing call perform the work it is meant to help skip. The value is therefore advisory and
+  snapshot-relative, not a guaranteed bound on what a subsequent `typed_neighbor_counts` visits: after a write, or on a graph whose snapshot is not built,
+  it under-reports, and a caller that treats a low span as "cheap" simply declines an optimization rather than computing a wrong answer.
 
 ### `issundb_vector`
 
@@ -309,7 +401,8 @@ Vector search crate. Owns vector index abstractions, vector metadata, vector sto
 
 ### `issundb_text`
 
-Full-text search crate. Owns tokenization, inverted index storage, ranking, and text search APIs. May depend on `issundb-core`; must not depend on
+Full-text search crate. Owns ranking and the text query APIs. Tokenization and the inverted-index storage live in `issundb-core` so the postings can
+be written inside the same transaction as the node record; see the Repository Layout entry. May depend on `issundb-core`; must not depend on
 `issundb-vector`, `issundb-retrieval`, `issundb-cypher`, bindings, or CLI crates.
 
 - `TextGraphExt::text_search(query, opts) -> Result<Vec<TextHit>, TextError>`
@@ -382,6 +475,15 @@ each navigable by the named symbol:
   every other shape runs the row pipeline.
 - A grouping-free `count` over a one-hop or two-hop directed expansion lowers to the `PathCount` kernel (`Graph::count_linear_paths`); per-vertex
   `prop CMP literal` predicates push down into the kernel as index-resolved node-id allow-sets (`PathCountSpec::vertex_allow`).
+- A `count` grouped by one endpoint of a single directed hop lowers to the `GroupedDegree` kernel (`Graph::grouped_edge_counts`), which emits one entry
+  per group node; the executor folds those into groups through dense integer codes (`combine_group_codes`) rather than a key string per group node, and
+  emits them in the canonical-key order the row pipeline's `BTreeMap` fold uses, so both paths agree without an `ORDER BY`.
+- An `ORDER BY <count> LIMIT n` above a grouped count pushes a `CountWindow` into the operator that produces the groups (`set_count_window` for
+  `GroupedDegree`, `leading_count_sort` for the vectorized collapse), so a grouped count over a whole label stops building a row per group to keep `n`
+  of them. The window keeps every group reaching the `n`-th best count, boundary ties included, and emits survivors in the order it would have emitted
+  the full group set, so the enclosing `Sort` and `Limit` pick exactly what they would have over every group. It declines when the leading sort key is
+  not the count, when a `Distinct` sits between the sort and the projection, and when any projected item is more than a variable or property read (a
+  pruned group is never projected, so an expression that can raise must not be skipped).
 - `RETURN DISTINCT` plans a `Distinct` between the final `Project` and `Sort`, so deduplication happens before `ORDER BY` and `SKIP`/`LIMIT`;
   `WITH DISTINCT` keeps full-row deduplication behind its barrier project; only `RETURN DISTINCT *` deduplicates after projection in the executor.
 - A type-inference pass (`prune_unsatisfiable`) consults `Graph::schema_has_edge`: a typed hop between two labeled endpoints with no realized triple
@@ -485,8 +587,10 @@ error types through the public facade.
 ### Encapsulation Rule
 
 `Storage` and the `storage` module are `pub(crate)` inside `issundb-core` and are not reachable from any other crate. The `issundb` facade re-exports
-only `Graph`, `Error`, `Hit`, hybrid retrieval types and functions, Cypher result types, and the schema ID and record types. Do not add a "just for
-now" re-export anywhere else; add a deliberate testing helper in `issundb-core` if a test needs internal access.
+only `Graph`, `Error`, `Hit`, hybrid retrieval types and functions, Cypher result types, the schema ID and record types, and the counting-kernel spec
+types (`TriangleCountSpec`, `PathCountSpec`, `GroupedDegreeSpec`, and `NeighborCountSpec`), which are re-exported because the `Graph` methods taking them
+are part of the documented public surface and a method whose argument type cannot be named is not callable. Do not add a "just for now" re-export
+anywhere else; add a deliberate testing helper in `issundb-core` if a test needs internal access.
 
 ## Workflow
 

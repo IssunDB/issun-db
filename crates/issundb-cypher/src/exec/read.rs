@@ -197,10 +197,16 @@ pub(super) fn execute_read_query(
     let resolved_query = resolve_skip_limit_params(graph, query, params)?;
     let query = resolved_query.as_ref().unwrap_or(query);
 
+    // Resolve the execution mode once for this statement and use that one value
+    // for both the plan and the executor choice below. Reading it separately in
+    // each place would let a statement plan under one mode and execute under
+    // another if it ever moved between threads. See `crate::exec_mode`.
+    let row_pipeline_only = crate::exec_mode::row_pipeline_only();
+
     // 1. Compile query AST into an optimized physical plan
     let logical = LogicalPlanner::plan(query).map_err(|e| e.to_string())?;
     let physical = PhysicalPlanner::plan(&logical);
-    let optimized = Optimizer::optimize(physical, Some(graph));
+    let optimized = Optimizer::optimize_with_mode(physical, Some(graph), row_pipeline_only);
 
     // One slot schema per query, walked from the optimized plan: every row of
     // this execution (join build sides included) binds against these slots.
@@ -226,11 +232,29 @@ pub(super) fn execute_read_query(
     let _prop_cache = (!has_write_parts).then(expr::PropCache::install);
     let _pending = has_write_parts.then(expr::PendingWrites::install);
 
+    // `RETURN *` names its columns by expanding the star over the variables in
+    // scope, which needs the resolved bindings the row pipeline produces below.
+    // The columnar caller names a column per `RETURN` item instead, so for the
+    // star it would name the column after the sentinel itself (`__star__()`).
+    // Declining the shape is the fix rather than teaching the fast path to expand
+    // the star: correctness never depends on the recognizer, and `RETURN *` is a
+    // convenience form, not a shape worth a second implementation of the scope
+    // rules.
+    let return_clause_has_star = query
+        .return_clause
+        .items
+        .iter()
+        .any(crate::parser::is_star_item);
+
     // Columnar fast path: a recognized final projection or aggregation over a
     // single-hop expansion executes column-at-a-time and produces the result
     // records directly. Any other shape (and every write query) takes the row
     // pipeline below.
-    if !has_write_parts && !query.return_clause.items.is_empty() {
+    if !has_write_parts
+        && !row_pipeline_only
+        && !return_clause_has_star
+        && !query.return_clause.items.is_empty()
+    {
         if let Some(mut records) = super::vectorized::try_execute_vectorized(
             graph,
             &optimized,
@@ -263,10 +287,7 @@ pub(super) fn execute_read_query(
 
     // Check whether the RETURN clause is RETURN * (the __star__ sentinel).
     let is_return_star = query.return_clause.items.len() == 1
-        && matches!(
-            &query.return_clause.items[0].expr,
-            Expr::FunctionCall { name, .. } if name == "__star__"
-        );
+        && crate::parser::is_star_item(&query.return_clause.items[0]);
 
     // 3. Derive column names. For RETURN *, use all keys from the first resolved path.
     let columns: Vec<String> = if is_return_star {
@@ -306,11 +327,8 @@ pub(super) fn execute_read_query(
                             }
                         }
                         QueryPart::With { items, .. } => {
-                            let is_star = items.len() == 1
-                                && matches!(
-                                    &items[0].expr,
-                                    Expr::FunctionCall { name, .. } if name == "__star__"
-                                );
+                            let is_star =
+                                items.len() == 1 && crate::parser::is_star_item(&items[0]);
                             if is_star {
                                 for item in items {
                                     if let Some(alias) = &item.alias {
@@ -492,10 +510,8 @@ pub(super) fn resolve_call_parts(
                 for item in items {
                     if let Some(alias) = &item.alias {
                         next.insert(alias.clone());
-                    } else if let crate::ast::Expr::FunctionCall { name, .. } = &item.expr {
-                        if name == "__star__" {
-                            next.extend(scope.iter().cloned());
-                        }
+                    } else if crate::parser::is_star_item(item) {
+                        next.extend(scope.iter().cloned());
                     } else if let crate::ast::Expr::Prop(v, p) = &item.expr {
                         if p.is_empty() {
                             next.insert(v.clone());
@@ -1035,6 +1051,136 @@ pub(super) fn canonical_cell_key(v: &serde_json::Value) -> String {
         }
     }
     format!("J{v}")
+}
+
+/// Merge dense group codes whose representatives are canonically equal, so
+/// grouping by code matches the row pipeline's value equivalence (`1` groups
+/// with `1.0`, `0.0` with `-0.0`), keeping the first-occurrence representative.
+/// `Graph::node_prop_group_codes` keys on exact value identity, which is finer,
+/// so composing it with this yields exactly [`canonical_cell_key`] equality
+/// without a key string per row. The common case (no merge) returns the input
+/// columns unchanged.
+pub(super) fn canonicalize_group_codes(
+    group_codes: Vec<(Vec<u32>, Vec<serde_json::Value>)>,
+) -> Vec<(Vec<u32>, Vec<serde_json::Value>)> {
+    group_codes
+        .into_iter()
+        .map(|(codes, reps)| {
+            // Two reps can only share a canonical key if both are numbers: every
+            // other kind stringifies injectively, and a number's `N`/`F` key never
+            // collides with a `J` key. Distinct `i64` reps also key distinctly, so
+            // an integer or string column (the high-cardinality cases, where the
+            // key strings would cost as much as the grouping they serve) needs no
+            // merge pass at all. Only float and mixed-kind columns can collide, on
+            // `1` against `1.0` and `0.0` against `-0.0`.
+            let mut numbers = reps.iter().filter(|r| r.is_number());
+            let mergeable = numbers.clone().nth(1).is_some()
+                && !numbers
+                    .all(|r| matches!(r, serde_json::Value::Number(n) if n.as_i64().is_some()));
+            if !mergeable {
+                return (codes, reps);
+            }
+            let mut key_to_new: ahash::AHashMap<String, u32> =
+                ahash::AHashMap::with_capacity(reps.len());
+            let mut new_reps: Vec<serde_json::Value> = Vec::with_capacity(reps.len());
+            let mut old_to_new: Vec<u32> = Vec::with_capacity(reps.len());
+            for rep in &reps {
+                let new = *key_to_new
+                    .entry(canonical_cell_key(rep))
+                    .or_insert_with(|| {
+                        new_reps.push(rep.clone());
+                        (new_reps.len() - 1) as u32
+                    });
+                old_to_new.push(new);
+            }
+            if new_reps.len() == reps.len() {
+                (codes, reps)
+            } else {
+                let new_codes = codes.into_iter().map(|c| old_to_new[c as usize]).collect();
+                (new_codes, new_reps)
+            }
+        })
+        .collect()
+}
+
+/// The group indices that can survive a [`crate::plan::physical::CountWindow`],
+/// in ascending group
+/// order, or `None` when the window cannot drop anything (so the caller emits
+/// every group without paying for a selection).
+///
+/// The `bound`-th best count is the cutoff: a group whose count is worse cannot
+/// precede the `bound`-th row of the enclosing sort however the remaining sort
+/// keys order things. Every group tied with the cutoff is kept, so the enclosing
+/// sort still chooses among the ties exactly as it would have over the full group
+/// set.
+pub(super) fn count_window_survivors(
+    counts: &[u64],
+    w: &crate::plan::physical::CountWindow,
+) -> Option<Vec<usize>> {
+    if w.bound == 0 || w.bound >= counts.len() {
+        return None;
+    }
+    let mut order: Vec<usize> = (0..counts.len()).collect();
+    let cmp = |a: &usize, b: &usize| {
+        if w.descending {
+            counts[*b].cmp(&counts[*a])
+        } else {
+            counts[*a].cmp(&counts[*b])
+        }
+    };
+    order.select_nth_unstable_by(w.bound - 1, cmp);
+    let cutoff = counts[order[w.bound - 1]];
+    let keep: Vec<usize> = (0..counts.len())
+        .filter(|&g| {
+            if w.descending {
+                counts[g] >= cutoff
+            } else {
+                counts[g] <= cutoff
+            }
+        })
+        .collect();
+    // A cutoff every group ties with saves nothing; skip the extra bookkeeping.
+    if keep.len() == counts.len() {
+        None
+    } else {
+        Some(keep)
+    }
+}
+
+/// Fold per-key dense group codes into one dense code per row.
+///
+/// Returns the combined code of each of the `n` rows, one representative row
+/// index per combined code, and the number of combined codes. Each pass folds
+/// one more key column into the running code and re-densifies, so a code never
+/// exceeds the row count and the fold cannot overflow however many keys there
+/// are; packing the columns into one integer by strides would overflow once the
+/// product of the per-column cardinalities passed `u64`.
+pub(super) fn combine_group_codes(
+    key_cols: &[(Vec<u32>, Vec<serde_json::Value>)],
+    n: usize,
+) -> (Vec<u32>, Vec<usize>, usize) {
+    // No keys at all: every row folds into one group (the grouping-free shape).
+    let mut codes = vec![0u32; n];
+    let mut first_row: Vec<usize> = if n == 0 { Vec::new() } else { vec![0] };
+    for (col, _reps) in key_cols {
+        let mut seen: ahash::AHashMap<u64, u32> = ahash::AHashMap::with_capacity(first_row.len());
+        let mut next_codes = Vec::with_capacity(n);
+        let mut next_first: Vec<usize> = Vec::new();
+        for (i, &running) in codes.iter().enumerate() {
+            // Concatenating two `u32` into a `u64` is injective, so the pair
+            // identifies the refined group exactly before re-densifying.
+            let key = ((running as u64) << 32) | col[i] as u64;
+            let code = *seen.entry(key).or_insert_with(|| {
+                next_first.push(i);
+                (next_first.len() - 1) as u32
+            });
+            next_codes.push(code);
+        }
+        codes = next_codes;
+        first_row = next_first;
+    }
+    let count = first_row.len();
+    (codes, first_row, count)
 }
 
 /// Canonical DISTINCT key for a whole row, cell by cell (see
@@ -2479,11 +2625,7 @@ pub(super) fn project_rows(
 
     for path in child_paths {
         // RETURN * / WITH * passes all current bindings through unchanged.
-        let is_star = items.len() == 1
-            && matches!(
-                &items[0].0,
-                Expr::FunctionCall { name, .. } if name == "__star__"
-            );
+        let is_star = items.len() == 1 && crate::parser::is_star_expr(&items[0].0);
         if is_star {
             next_paths.push(path);
             continue;
@@ -4667,31 +4809,89 @@ pub(super) fn eval_leaf(
             group_label,
             counted_label,
             counted_nonnull_prop,
+            counted_filters,
+            counted_leaf,
             // `group_var` names the group endpoint for the plan display; the
             // executor reads the group properties by name, so it is not used here.
             group_var: _,
             group_by,
             output,
+            count_window,
         } => {
             // One kernel pass over adjacency yields the per-group-node counts;
             // it groups by node identity, so re-group by the group-by value
             // tuple to merge nodes that share a key (the row pipeline groups by
             // value, not identity). The merge is over the distinct-group-node
             // set, far smaller than the edge set the fold would touch.
+            // Resolve any pushed-down predicate on the counted endpoint to an
+            // allow-set through the property index, intersecting the conjuncts,
+            // so the filtered grouped count stays one kernel call instead of an
+            // expansion. The rewrite guarantees a filtered endpoint is labeled.
+            // An index or range scan leaf already encodes the predicate on the
+            // counted endpoint, so evaluating it yields the allow-set directly.
+            // Both sources can be present at once: index-scan rewriting turns one
+            // conjunct into the leaf scan and leaves the rest as a `Filter`, which
+            // the rewrite carries in `counted_filters`. Honouring only the leaf
+            // would silently drop those predicates and over-count.
+            let leaf_allow: Option<Vec<NodeId>> = if let Some(leaf) = counted_leaf {
+                let rows = eval_leaf(graph, leaf, params, schema)?;
+                let var = match leaf.as_ref() {
+                    PhysicalOperator::NodeIndexScan { variable, .. }
+                    | PhysicalOperator::NodeRangeScan { variable, .. } => variable.as_str(),
+                    _ => return Err("grouped-degree counted leaf must be an index scan".into()),
+                };
+                let mut ids = Vec::with_capacity(rows.len());
+                for row in &rows {
+                    for (name, binding) in row.bound_entries() {
+                        if name == var {
+                            if let GraphBinding::Node(id) = binding {
+                                ids.push(*id);
+                            }
+                        }
+                    }
+                }
+                Some(ids)
+            } else {
+                None
+            };
+            let filter_allow: Option<Vec<NodeId>> = if counted_filters.is_empty() {
+                None
+            } else {
+                let label = counted_label
+                    .as_deref()
+                    .ok_or("grouped-degree counted filter requires a label")?;
+                let mut allow: Option<std::collections::HashSet<NodeId>> = None;
+                for pred in counted_filters {
+                    let resolved = resolve_path_count_pred(graph, label, pred, params)?;
+                    allow = Some(match allow {
+                        None => resolved,
+                        Some(acc) => acc.intersection(&resolved).copied().collect(),
+                    });
+                }
+                Some(allow.unwrap_or_default().into_iter().collect())
+            };
+            // Both present: the counted endpoint must satisfy every predicate, so
+            // intersect rather than letting either source win.
+            let counted_allow: Option<Vec<NodeId>> = match (leaf_allow, filter_allow) {
+                (Some(a), Some(b)) => {
+                    let keep: std::collections::HashSet<NodeId> = b.into_iter().collect();
+                    Some(a.into_iter().filter(|id| keep.contains(id)).collect())
+                }
+                (only, None) | (None, only) => only,
+            };
             let spec = issundb_core::GroupedDegreeSpec {
                 rel_type: rel_type.as_deref(),
                 group_is_dst: *group_is_dst,
                 group_label: group_label.as_deref(),
                 counted_label: counted_label.as_deref(),
+                counted_allow: counted_allow.as_deref(),
                 counted_nonnull_prop: counted_nonnull_prop.as_deref(),
             };
             let pairs = graph
                 .grouped_edge_counts(&spec)
                 .map_err(|e| e.to_string())?;
-            // Bulk-gather the group-by properties for the group nodes in one
-            // columns pass (the recognizer guarantees each key is a
-            // single-property read on `group_var`), rather than re-reading each
-            // node per key. `col_names[j]`/`props[j]` align with `group_by[j]`.
+            // The recognizer guarantees each key is a single-property read on
+            // `group_var`. `col_names[j]`/`props[j]` align with `group_by[j]`.
             let ids: Vec<NodeId> = pairs.iter().map(|(n, _)| *n).collect();
             let mut props: Vec<&str> = Vec::with_capacity(group_by.len());
             let mut col_names: Vec<String> = Vec::with_capacity(group_by.len());
@@ -4703,39 +4903,62 @@ pub(super) fn eval_leaf(
                 }
                 col_names.push(group_by_column_name(expr, alias));
             }
-            let table = graph
-                .node_props_json_table(&ids, &props)
-                .map_err(|e| e.to_string())?;
 
             // Re-group by the group-by value tuple, summing counts, so nodes
             // that share a key merge exactly as the value-keyed row pipeline
-            // aggregate would (the kernel groups by node identity).
-            let mut groups: ahash::AHashMap<String, (SlotRow, u64)> =
-                ahash::AHashMap::with_capacity(pairs.len());
+            // aggregate would (the kernel groups by node identity). The kernel
+            // emits one entry per group *node*, which on a per-node key like an
+            // id is the whole node set, so this step is sized by the graph and
+            // not by the answer: it folds through dense integer codes (one
+            // per-key column gather plus one integer pass) rather than building
+            // a key string and a row per group node.
+            let key_cols: Vec<(Vec<u32>, Vec<serde_json::Value>)> = props
+                .iter()
+                .map(|prop| graph.node_prop_group_codes(&ids, prop))
+                .collect::<Result<_, _>>()
+                .map_err(|e: issundb_core::Error| e.to_string())?;
+            let key_cols = canonicalize_group_codes(key_cols);
+            let (codes, first_row, group_count) = combine_group_codes(&key_cols, ids.len());
+            let mut counts = vec![0u64; group_count];
             for (i, (_node, cnt)) in pairs.iter().enumerate() {
-                let row = &table[i];
+                counts[codes[i] as usize] += *cnt;
+            }
+
+            // With a top-N window pushed down from the `ORDER BY <count> LIMIT n`
+            // above, only the groups reaching the n-th best count can survive it,
+            // so the rest need no row at all. See `CountWindow` for why keeping
+            // the boundary ties makes this exact.
+            let surviving = count_window
+                .as_ref()
+                .and_then(|w| count_window_survivors(&counts, w));
+
+            // One row per distinct key tuple, ordered by the same canonical key
+            // the row pipeline's `BTreeMap` fold orders its groups by, so both
+            // paths agree without an `ORDER BY`. Only the distinct groups spend
+            // a key string here.
+            let emitted: Box<dyn Iterator<Item = usize>> = match &surviving {
+                Some(keep) => Box::new(keep.iter().copied()),
+                None => Box::new(0..group_count),
+            };
+            let mut keyed: Vec<(String, SlotRow)> =
+                Vec::with_capacity(surviving.as_ref().map_or(group_count, |k| k.len()));
+            for g in emitted {
+                let row = first_row[g];
+                let mut gb = SlotRow::empty(schema.clone());
                 let mut key_parts = Vec::with_capacity(col_names.len());
-                for val in row {
-                    key_parts.push(canonical_cell_key(val));
+                for (k, col) in col_names.iter().enumerate() {
+                    let rep = &key_cols[k].1[key_cols[k].0[row] as usize];
+                    key_parts.push(canonical_cell_key(rep));
+                    gb.bind_local(col, GraphBinding::Scalar(rep.clone()));
                 }
-                let key = key_parts.join("\x00");
-                match groups.get_mut(&key) {
-                    Some((_, c)) => *c += *cnt,
-                    None => {
-                        let mut gb = SlotRow::empty(schema.clone());
-                        for (col, val) in col_names.iter().zip(row) {
-                            gb.bind_local(col, GraphBinding::Scalar(val.clone()));
-                        }
-                        groups.insert(key, (gb, *cnt));
-                    }
-                }
+                gb.bind_local(
+                    output,
+                    GraphBinding::Scalar(serde_json::Value::from(counts[g])),
+                );
+                keyed.push((key_parts.join("\x00"), gb));
             }
-            let mut out = Vec::with_capacity(groups.len());
-            for (_key, (mut gb, cnt)) in groups {
-                gb.bind_local(output, GraphBinding::Scalar(serde_json::Value::from(cnt)));
-                out.push(gb);
-            }
-            Ok(out)
+            keyed.sort_by(|a, b| a.0.cmp(&b.0));
+            Ok(keyed.into_iter().map(|(_, gb)| gb).collect())
         }
         PhysicalOperator::VectorTopK {
             variable,
@@ -5233,6 +5456,7 @@ mod stream_join_tests {
 
     #[test]
     fn streaming_directed_multiway_join_matches_materialized() {
+        let _fast_paths = crate::exec_mode::fast_paths_required();
         let (_dir, graph) = triangle_graph();
         // A directed closing hop over a directed final expand fuses into the
         // closing intersection; the streamed result must still match.
@@ -5255,6 +5479,7 @@ mod stream_join_tests {
     /// emits twice and the wedge emits nothing.
     #[test]
     fn expand_intersect_triangle_rows_exact() {
+        let _fast_paths = crate::exec_mode::fast_paths_required();
         let (_dir, graph) = setup();
         exec(
             &graph,
@@ -5292,6 +5517,7 @@ mod stream_join_tests {
     /// matches in both rotations, and the two bound edges are never the same.
     #[test]
     fn expand_intersect_two_cycle_uniqueness() {
+        let _fast_paths = crate::exec_mode::fast_paths_required();
         let (_dir, graph) = setup();
         exec(
             &graph,
@@ -5326,6 +5552,7 @@ mod stream_join_tests {
     /// hop written `(b)<-[:R]-(c)` expands over incoming adjacency.
     #[test]
     fn expand_intersect_incoming_hops_exact() {
+        let _fast_paths = crate::exec_mode::fast_paths_required();
         let (_dir, graph) = setup();
         exec(
             &graph,
@@ -5372,6 +5599,7 @@ mod stream_join_tests {
     /// destination carries the label survives.
     #[test]
     fn expand_intersect_hoists_dst_label_filter() {
+        let _fast_paths = crate::exec_mode::fast_paths_required();
         let (_dir, graph) = setup();
         exec(
             &graph,
@@ -5703,6 +5931,7 @@ mod triangle_count_exec_tests {
     /// row per rotation of the single cycle.
     #[test]
     fn kernel_plan_shape_and_result() {
+        let _fast_paths = crate::exec_mode::fast_paths_required();
         let (_dir, graph) = triangle_fixture();
         let plan = plan_text(&graph, KERNEL_Q);
         assert!(
@@ -5725,6 +5954,7 @@ mod triangle_count_exec_tests {
     /// path too; every variable is bound in every match, so the counts agree.
     #[test]
     fn kernel_accepts_count_star_and_other_variables() {
+        let _fast_paths = crate::exec_mode::fast_paths_required();
         let (_dir, graph) = triangle_fixture();
         for ret in ["count(*)", "count(b)", "count(c)", "count(r1)"] {
             let q = format!(
@@ -5785,6 +6015,7 @@ mod triangle_count_exec_tests {
     /// parallel edges.
     #[test]
     fn kernel_matches_row_path_on_random_multigraphs() {
+        let _fast_paths = crate::exec_mode::fast_paths_required();
         use proptest::prelude::*;
 
         let mut runner = proptest::test_runner::TestRunner::new(ProptestConfig {
@@ -5880,6 +6111,7 @@ mod path_count_exec_tests {
     /// while forcing a pushed-down predicate keeps the row pipeline.
     #[test]
     fn kernel_plan_shape() {
+        let _fast_paths = crate::exec_mode::fast_paths_required();
         let (_dir, graph) = setup();
         super::execute(
             &graph,
@@ -5947,6 +6179,7 @@ mod path_count_exec_tests {
     /// includes.
     #[test]
     fn filtered_two_hop_matches_row_path() {
+        let _fast_paths = crate::exec_mode::fast_paths_required();
         let (_dir, graph) = setup();
         super::execute(
             &graph,
@@ -5990,6 +6223,7 @@ mod path_count_exec_tests {
     /// predicates on the middle and destination nodes.
     #[test]
     fn filtered_kernel_matches_row_path_on_random_graphs() {
+        let _fast_paths = crate::exec_mode::fast_paths_required();
         use proptest::prelude::*;
 
         let mut runner = proptest::test_runner::TestRunner::new(ProptestConfig {
@@ -6043,6 +6277,7 @@ mod path_count_exec_tests {
     /// the one-hop and two-hop counts.
     #[test]
     fn kernel_matches_row_path_on_random_multigraphs() {
+        let _fast_paths = crate::exec_mode::fast_paths_required();
         use proptest::prelude::*;
 
         let mut runner = proptest::test_runner::TestRunner::new(ProptestConfig {
@@ -6124,16 +6359,21 @@ mod grouped_degree_exec_tests {
         format_physical_plan(&Optimizer::optimize(physical, Some(graph)), 0)
     }
 
-    /// Execute `cypher` and return its records sorted by their serialized form,
-    /// so the comparison is order-insensitive (a grouped aggregate without
-    /// `ORDER BY` yields groups in hash order on both paths).
-    fn sorted_records(graph: &Graph, cypher: &str) -> Vec<Vec<serde_json::Value>> {
-        let mut rows: Vec<Vec<serde_json::Value>> = super::execute(graph, cypher, &HashMap::new())
+    /// Execute `cypher` and return its records in the order the executor emitted
+    /// them.
+    fn records(graph: &Graph, cypher: &str) -> Vec<Vec<serde_json::Value>> {
+        super::execute(graph, cypher, &HashMap::new())
             .unwrap()
             .records
             .into_iter()
             .map(|r| r.values)
-            .collect();
+            .collect()
+    }
+
+    /// Execute `cypher` and return its records sorted by their serialized form,
+    /// so the comparison ignores group order.
+    fn sorted_records(graph: &Graph, cypher: &str) -> Vec<Vec<serde_json::Value>> {
+        let mut rows = records(graph, cypher);
         rows.sort_by_key(|r| serde_json::to_string(r).unwrap());
         rows
     }
@@ -6143,6 +6383,7 @@ mod grouped_degree_exec_tests {
     /// keep the row pipeline.
     #[test]
     fn kernel_plan_shape() {
+        let _fast_paths = crate::exec_mode::fast_paths_required();
         let (_dir, graph) = setup();
         super::execute(
             &graph,
@@ -6195,6 +6436,7 @@ mod grouped_degree_exec_tests {
     /// edges, matching `count(prop)` null semantics, not raw in-degree.
     #[test]
     fn counts_nonnull_property_only() {
+        let _fast_paths = crate::exec_mode::fast_paths_required();
         let (_dir, graph) = setup();
         // f1 and f2 carry `tag`; f3 does not. All three follow p.
         super::execute(
@@ -6228,6 +6470,7 @@ mod grouped_degree_exec_tests {
     /// counts, exactly as the value-keyed row pipeline aggregate does.
     #[test]
     fn merges_groups_sharing_a_key() {
+        let _fast_paths = crate::exec_mode::fast_paths_required();
         let (_dir, graph) = setup();
         // p1 and p2 share id=7; each is followed once. The group keyed on id=7
         // must sum to 2, not appear as two rows.
@@ -6256,12 +6499,411 @@ mod grouped_degree_exec_tests {
         );
     }
 
+    /// Group order without an `ORDER BY` must match the row pipeline, which folds
+    /// through a `BTreeMap` keyed by the canonical cell key. Emitting groups in
+    /// hash order would make the kernel disagree with the row path and vary
+    /// between runs, since the hasher is seeded per process.
+    #[test]
+    fn kernel_group_order_matches_row_path() {
+        let _fast_paths = crate::exec_mode::fast_paths_required();
+        let (_dir, graph) = setup();
+        // 24 distinct group keys: enough that hash order coincides with sorted
+        // order only by an accident this test would never see.
+        let mut create = String::from("CREATE (f:Person {id: 0})");
+        for i in 1..=24 {
+            create.push_str(&format!(", (p{i}:Person {{id: {i}}})"));
+        }
+        create.push_str(" CREATE ");
+        for i in 1..=24 {
+            if i > 1 {
+                create.push_str(", ");
+            }
+            create.push_str(&format!("(f)-[:FOLLOWS]->(p{i})"));
+        }
+        super::execute(&graph, &create, &HashMap::new()).unwrap();
+        graph.rebuild_csr().unwrap();
+
+        let kernel_q =
+            "MATCH (f:Person)-[:FOLLOWS]->(p:Person) RETURN p.id AS id, count(f.id) AS num";
+        let row_q = "MATCH (f:Person)-[:FOLLOWS]->(p:Person) WHERE f.__force IS NULL \
+                     RETURN p.id AS id, count(f.id) AS num";
+        assert!(plan_text(&graph, kernel_q).contains("GroupedDegree"));
+        assert!(!plan_text(&graph, row_q).contains("GroupedDegree"));
+        assert_eq!(records(&graph, kernel_q), records(&graph, row_q));
+    }
+
+    /// Numerically equal group keys of different JSON kinds (`1` and `1.0`) must
+    /// merge into one group, as the row pipeline's canonical-key fold does. The
+    /// dense-code grouping keys on exact value identity, so this pins the
+    /// canonicalization pass that reconciles the two.
+    #[test]
+    fn merges_numerically_equal_keys_of_different_kinds() {
+        let _fast_paths = crate::exec_mode::fast_paths_required();
+        let (_dir, graph) = setup();
+        // p1.k is the integer 1, p2.k the float 1.0, p3.k the float 2.0. The
+        // mixed kinds make `k` a Json column, where the two 1s stay distinct
+        // values.
+        super::execute(
+            &graph,
+            "CREATE (p1:Person {k: 1}), (p2:Person {k: 1.0}), (p3:Person {k: 2.0}), \
+                    (f1:Person {id: 1}), (f2:Person {id: 2}), (f3:Person {id: 3}) \
+             CREATE (f1)-[:FOLLOWS]->(p1), (f2)-[:FOLLOWS]->(p2), (f3)-[:FOLLOWS]->(p3)",
+            &HashMap::new(),
+        )
+        .unwrap();
+        graph.rebuild_csr().unwrap();
+
+        let kernel_q =
+            "MATCH (f:Person)-[:FOLLOWS]->(p:Person) RETURN p.k AS k, count(f.id) AS num";
+        let row_q = "MATCH (f:Person)-[:FOLLOWS]->(p:Person) WHERE f.__force IS NULL \
+                     RETURN p.k AS k, count(f.id) AS num";
+        assert!(plan_text(&graph, kernel_q).contains("GroupedDegree"));
+        // Three followed people, but `1` and `1.0` are one group of two.
+        assert_eq!(records(&graph, kernel_q).len(), 2);
+        assert_eq!(records(&graph, kernel_q), records(&graph, row_q));
+    }
+
+    /// `ORDER BY <count> LIMIT n` above the kernel pushes a top-N window into it,
+    /// through the count's projected alias or its raw output name; any other
+    /// leading sort key, or no limit, leaves the kernel emitting every group.
+    #[test]
+    fn count_window_pushes_down_only_for_a_leading_count_sort() {
+        let _fast_paths = crate::exec_mode::fast_paths_required();
+        let (_dir, graph) = setup();
+        super::execute(
+            &graph,
+            "CREATE (x:Person {id: 1}), (y:Person {id: 2}), (z:Person {id: 3}) \
+             CREATE (x)-[:FOLLOWS]->(y), (z)-[:FOLLOWS]->(y), (x)-[:FOLLOWS]->(z)",
+            &HashMap::new(),
+        )
+        .unwrap();
+        graph.rebuild_csr().unwrap();
+
+        let base = "MATCH (f:Person)-[:FOLLOWS]->(p:Person) RETURN p.id AS id, count(f.id) AS num";
+        let plan = plan_text(&graph, &format!("{base} ORDER BY num DESC, id LIMIT 3"));
+        assert!(
+            plan.contains("top=3 DESC"),
+            "expected a pushed window:\n{plan}"
+        );
+        // A skip widens the window to skip + limit.
+        let plan = plan_text(&graph, &format!("{base} ORDER BY num ASC SKIP 2 LIMIT 3"));
+        assert!(
+            plan.contains("top=5 ASC"),
+            "expected a widened window:\n{plan}"
+        );
+
+        for q in [
+            // No limit: every group must still be emitted.
+            format!("{base} ORDER BY num DESC"),
+            // A group key leads the sort, so a low-count group can still win.
+            format!("{base} ORDER BY id ASC LIMIT 3"),
+            // No sort at all.
+            format!("{base} LIMIT 3"),
+        ] {
+            let plan = plan_text(&graph, &q);
+            assert!(
+                plan.contains("GroupedDegree") && !plan.contains("top="),
+                "window must not fire for `{q}`:\n{plan}"
+            );
+        }
+    }
+
+    /// Differential parity for the pushed count window, over random multigraphs
+    /// whose small degree range makes boundary ties the common case: the window
+    /// must never change the rows an `ORDER BY <count> LIMIT n` returns, whichever
+    /// direction it sorts and whether or not a group key breaks the tie.
+    #[test]
+    fn count_window_matches_row_path_on_random_graphs() {
+        let _fast_paths = crate::exec_mode::fast_paths_required();
+        use proptest::prelude::*;
+
+        let mut runner = proptest::test_runner::TestRunner::new(ProptestConfig {
+            cases: 40,
+            ..ProptestConfig::default()
+        });
+        // Few nodes and few edges keep in-degrees in a narrow range, so many
+        // groups tie at the window boundary.
+        let strategy = (
+            2usize..=6,
+            proptest::collection::vec((0usize..6, 0usize..6), 0..18),
+        );
+        runner
+            .run(&strategy, |(n_nodes, edges)| {
+                let (_dir, graph) = setup();
+                let mut create = String::from("CREATE ");
+                for i in 0..n_nodes {
+                    if i > 0 {
+                        create.push_str(", ");
+                    }
+                    // Two nodes share id 0, so distinct nodes merge into one group.
+                    create.push_str(&format!(
+                        "(n{i}:Person {{id: {}}})",
+                        i % (n_nodes - 1).max(1)
+                    ));
+                }
+                super::execute(&graph, &create, &HashMap::new()).unwrap();
+                for (s, d) in &edges {
+                    if *s < n_nodes && *d < n_nodes {
+                        super::execute(
+                            &graph,
+                            &format!(
+                                "MATCH (a:Person), (b:Person) WHERE id(a) = {} AND id(b) = {} \
+                                 CREATE (a)-[:FOLLOWS]->(b)",
+                                s + 1,
+                                d + 1
+                            ),
+                            &HashMap::new(),
+                        )
+                        .unwrap();
+                    }
+                }
+                graph.rebuild_csr().unwrap();
+
+                for tail in [
+                    "ORDER BY num DESC LIMIT 1",
+                    "ORDER BY num DESC LIMIT 2",
+                    "ORDER BY num DESC, id LIMIT 2",
+                    "ORDER BY num ASC LIMIT 2",
+                    "ORDER BY num DESC SKIP 1 LIMIT 2",
+                    "ORDER BY num DESC LIMIT 100",
+                ] {
+                    let kernel_q = format!(
+                        "MATCH (f:Person)-[:FOLLOWS]->(p:Person) \
+                         RETURN p.id AS id, count(f.id) AS num {tail}"
+                    );
+                    let row_q = format!(
+                        "MATCH (f:Person)-[:FOLLOWS]->(p:Person) WHERE f.__force IS NULL \
+                         RETURN p.id AS id, count(f.id) AS num {tail}"
+                    );
+                    proptest::prop_assert!(plan_text(&graph, &kernel_q).contains("GroupedDegree"));
+                    proptest::prop_assert_eq!(
+                        records(&graph, &kernel_q),
+                        records(&graph, &row_q),
+                        "{}",
+                        kernel_q
+                    );
+                }
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    /// The kernel counts a hop the optimizer rooted at its rarer end and expanded
+    /// backwards, and it pushes a predicate on the counted endpoint down as an
+    /// index-resolved allow-set. Both are shapes the rewrite used to decline: the
+    /// first because it required a forward hop, the second because any property
+    /// predicate forfeited it.
+    ///
+    /// The rewrite groups by the expand's newly bound variable and counts the
+    /// scanned one. A predicate on the group endpoint still declines, since it
+    /// would change which groups exist rather than only their counts; grouping by
+    /// the scanned variable instead is a different assignment the collapse path in
+    /// `exec/vectorized.rs` owns.
+    #[test]
+    fn kernel_covers_reversed_hops_and_counted_predicates() {
+        let _fast_paths = crate::exec_mode::fast_paths_required();
+        let (_dir, graph) = setup();
+        // Few interests, many people, so the optimizer roots at Interest and
+        // expands backwards to bind Person: the group endpoint is Person and the
+        // counted endpoint is the scanned Interest.
+        super::execute(
+            &graph,
+            "CREATE (i1:Interest {name: 'a', rank: 1}), (i2:Interest {name: 'b', rank: 5}) \
+             CREATE (p1:Person {id: 1, age: 20}), (p2:Person {id: 2, age: 40}), \
+                    (p3:Person {id: 3, age: 60}) \
+             CREATE (p1)-[:HAS]->(i1), (p1)-[:HAS]->(i2), (p2)-[:HAS]->(i1), \
+                    (p3)-[:HAS]->(i2)",
+            &HashMap::new(),
+        )
+        .unwrap();
+        graph.rebuild_csr().unwrap();
+
+        // Reversed hop: group by the person, count their interests.
+        let reversed =
+            "MATCH (p:Person)-[:HAS]->(i:Interest) RETURN p.id AS id, count(i.name) AS num";
+        let plan = plan_text(&graph, reversed);
+        assert!(
+            plan.contains("GroupedDegree"),
+            "expected the kernel:\n{plan}"
+        );
+        let row_q = "MATCH (p:Person)-[:HAS]->(i:Interest) WHERE i.__force IS NULL \
+                     RETURN p.id AS id, count(i.name) AS num";
+        assert_eq!(records(&graph, reversed), records(&graph, row_q));
+        assert_eq!(
+            sorted_records(&graph, reversed),
+            vec![
+                vec![serde_json::json!(1), serde_json::json!(2)],
+                vec![serde_json::json!(2), serde_json::json!(1)],
+                vec![serde_json::json!(3), serde_json::json!(1)],
+            ]
+        );
+
+        // A predicate on the counted (scanned) endpoint becomes an allow-set.
+        let filtered = "MATCH (p:Person)-[:HAS]->(i:Interest) WHERE i.rank >= 5 \
+                        RETURN p.id AS id, count(i.name) AS num";
+        let plan = plan_text(&graph, filtered);
+        assert!(
+            plan.contains("GroupedDegree") && plan.contains("filter(c)"),
+            "expected a pushed counted filter:\n{plan}"
+        );
+        let filtered_row = "MATCH (p:Person)-[:HAS]->(i:Interest) \
+                           WHERE i.rank >= 5 AND i.__force IS NULL \
+                           RETURN p.id AS id, count(i.name) AS num";
+        assert_eq!(
+            sorted_records(&graph, filtered),
+            sorted_records(&graph, filtered_row)
+        );
+        // Only i2 (rank 5) qualifies: p1 and p3 keep one, p2 drops out.
+        assert_eq!(
+            sorted_records(&graph, filtered),
+            vec![
+                vec![serde_json::json!(1), serde_json::json!(1)],
+                vec![serde_json::json!(3), serde_json::json!(1)],
+            ]
+        );
+
+        // A predicate on the group endpoint is still not lowered.
+        let group_pred = "MATCH (p:Person)-[:HAS]->(i:Interest) WHERE p.age > 30 \
+                          RETURN p.id AS id, count(i.name) AS num";
+        assert!(!plan_text(&graph, group_pred).contains("GroupedDegree"));
+        super::execute(&graph, group_pred, &HashMap::new()).unwrap();
+    }
+
+    /// An index-scan leaf and a residual `Filter` can both constrain the counted
+    /// endpoint: `optimize_index_scans` lowers one conjunct into the leaf and
+    /// leaves the rest as a filter, so the rewrite carries both. Honouring only
+    /// the leaf silently dropped the residual predicate and over-counted.
+    #[test]
+    fn counted_leaf_and_residual_filters_are_both_applied() {
+        let _fast_paths = crate::exec_mode::fast_paths_required();
+        let (_dir, graph) = setup();
+        // Few interests, many people, so the optimizer roots at Interest and the
+        // counted endpoint is the scanned one.
+        super::execute(
+            &graph,
+            "CREATE (i1:Interest {name: 'a', rank: 1, score: 1}), \
+                    (i2:Interest {name: 'b', rank: 5, score: 1}) \
+             CREATE (p1:Person {id: 1}), (p2:Person {id: 2}), (p3:Person {id: 3}), \
+                    (p4:Person {id: 4}), (p5:Person {id: 5}), (p6:Person {id: 6}), \
+                    (p7:Person {id: 7}), (p8:Person {id: 8}) \
+             CREATE (p1)-[:HAS]->(i1), (p2)-[:HAS]->(i2), (p3)-[:HAS]->(i1), \
+                    (p4)-[:HAS]->(i2), (p5)-[:HAS]->(i1), (p6)-[:HAS]->(i2), \
+                    (p7)-[:HAS]->(i1), (p8)-[:HAS]->(i2)",
+            &HashMap::new(),
+        )
+        .unwrap();
+        graph.rebuild_csr().unwrap();
+
+        // Two conjuncts on different properties: no interest satisfies both, so
+        // every group must vanish.
+        let q = "MATCH (p:Person)-[:HAS]->(i:Interest) WHERE i.rank >= 5 AND i.score >= 9 \
+                 RETURN p.id AS id, count(i.name) AS num";
+        let row_q = "MATCH (p:Person)-[:HAS]->(i:Interest) \
+                     WHERE i.rank >= 5 AND i.score >= 9 AND i.__force IS NULL \
+                     RETURN p.id AS id, count(i.name) AS num";
+        assert_eq!(sorted_records(&graph, q), sorted_records(&graph, row_q));
+        assert!(
+            sorted_records(&graph, q).is_empty(),
+            "no interest has score >= 9, so no group survives"
+        );
+
+        // Two conjuncts on the *same* property: the looser one stays a residual
+        // filter over the range scan and must not widen the result.
+        let q2 = "MATCH (p:Person)-[:HAS]->(i:Interest) WHERE i.rank >= 1 AND i.rank >= 5 \
+                  RETURN p.id AS id, count(i.name) AS num";
+        let row_q2 = "MATCH (p:Person)-[:HAS]->(i:Interest) \
+                      WHERE i.rank >= 1 AND i.rank >= 5 AND i.__force IS NULL \
+                      RETURN p.id AS id, count(i.name) AS num";
+        assert_eq!(sorted_records(&graph, q2), sorted_records(&graph, row_q2));
+    }
+
+    /// Differential parity for the two generalizations over random multigraphs:
+    /// a reversed hop, and range predicates on the counted endpoint, against the
+    /// forced row pipeline.
+    #[test]
+    fn reversed_and_filtered_kernel_match_row_path_on_random_graphs() {
+        let _fast_paths = crate::exec_mode::fast_paths_required();
+        use proptest::prelude::*;
+
+        let mut runner = proptest::test_runner::TestRunner::new(ProptestConfig {
+            cases: 32,
+            ..ProptestConfig::default()
+        });
+        let strategy = (
+            1usize..=5,
+            proptest::collection::vec((0usize..5, 0usize..3), 0..16),
+            proptest::collection::vec(0i64..5, 3),
+        );
+        runner
+            .run(&strategy, |(n_people, edges, ranks)| {
+                let (_dir, graph) = setup();
+                let mut create = String::new();
+                for (k, r) in ranks.iter().enumerate() {
+                    create.push_str(&format!(
+                        "{}(i{k}:Interest {{name: '{}', rank: {r}}})",
+                        if k == 0 { "CREATE " } else { ", " },
+                        ["a", "b", "c"][k]
+                    ));
+                }
+                for p in 0..n_people {
+                    create.push_str(&format!(", (p{p}:Person {{id: {p}}})"));
+                }
+                super::execute(&graph, &create, &HashMap::new()).unwrap();
+                for (p, i) in &edges {
+                    if *p < n_people {
+                        super::execute(
+                            &graph,
+                            &format!(
+                                "MATCH (a:Person), (b:Interest) WHERE a.id = {p} AND b.name = '{}' \
+                                 CREATE (a)-[:HAS]->(b)",
+                                ["a", "b", "c"][*i]
+                            ),
+                            &HashMap::new(),
+                        )
+                        .unwrap();
+                    }
+                }
+                graph.rebuild_csr().unwrap();
+
+                for tail in [
+                    "RETURN p.id AS id, count(i.name) AS num ORDER BY num DESC, id",
+                    "RETURN p.id AS id, count(*) AS num ORDER BY num DESC, id LIMIT 2",
+                ] {
+                    for pred in [
+                        "",
+                        "WHERE i.rank >= 2 ",
+                        "WHERE i.rank >= 1 AND i.rank <= 3 ",
+                    ] {
+                        let kernel_q =
+                            format!("MATCH (p:Person)-[:HAS]->(i:Interest) {pred}{tail}");
+                        let row_q = format!(
+                            "MATCH (p:Person)-[:HAS]->(i:Interest) {}i.__force IS NULL {tail}",
+                            if pred.is_empty() {
+                                "WHERE ".to_string()
+                            } else {
+                                format!("{} AND ", pred.trim_end())
+                            }
+                        );
+                        proptest::prop_assert_eq!(
+                            records(&graph, &kernel_q),
+                            records(&graph, &row_q),
+                            "{}",
+                            kernel_q
+                        );
+                    }
+                }
+                Ok(())
+            })
+            .unwrap();
+    }
+
     /// Differential parity on random multigraphs (self-loops, parallel edges,
     /// some sources without `id`, a second label): the grouped-degree kernel and
     /// the forced row pipeline agree for `count(*)`, `count(f)`, and
     /// `count(f.id)`, grouped on one and on two destination properties.
     #[test]
     fn kernel_matches_row_path_on_random_graphs() {
+        let _fast_paths = crate::exec_mode::fast_paths_required();
         use proptest::prelude::*;
 
         let mut runner = proptest::test_runner::TestRunner::new(ProptestConfig {

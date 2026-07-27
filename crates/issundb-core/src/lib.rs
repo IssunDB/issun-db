@@ -6,10 +6,12 @@ pub(crate) mod histogram;
 pub(crate) mod matrices;
 mod schema;
 pub(crate) mod storage;
+pub(crate) mod threads;
 
 pub use error::Error;
 pub use graph::{
-    DegreeDirection, Graph, GroupedDegreeSpec, PathCountSpec, ReadTxn, TriangleCountSpec, WriteTxn,
+    DegreeDirection, Graph, GroupedDegreeSpec, NeighborCountSpec, PathCountSpec, ReadTxn,
+    TriangleCountSpec, WriteTxn,
 };
 pub use schema::{
     DirectedNeighborEntry, EdgeId, EdgeRecord, LabelId, Language, NeighborEntry, NodeId,

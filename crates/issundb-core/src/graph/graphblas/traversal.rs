@@ -5,7 +5,7 @@ use super::*;
 /// snapshot refresh. Point reads are a few microseconds each, so below this
 /// size they are cheaper than any refresh; above it the refreshed CSR wins and
 /// also amortizes over subsequent expansions.
-const STALE_POINT_EXPAND_MAX: usize = 64;
+pub(crate) const STALE_POINT_EXPAND_MAX: usize = 64;
 
 impl Graph {
     /// BFS via repeated SpMV over the combined adjacency using the MinPlus semiring.

@@ -7,17 +7,21 @@ apply everywhere and are not repeated here.
 
 Every Cypher string passes through five stages, each owned by a distinct source file:
 
-1. **Parse** (`src/parser.rs`): a `chumsky` combinator parser produces a `Statement` AST from the raw query string.
-2. **Logical plan** (`src/plan/logical.rs`): `LogicalPlanner` walks the AST and emits a tree of `LogicalOperator` nodes. All variable bindings and
+1. Parse (`src/parser.rs`): a `chumsky` combinator parser produces a `Statement` AST from the raw query string.
+2. Logical plan (`src/plan/logical.rs`): `LogicalPlanner` walks the AST and emits a tree of `LogicalOperator` nodes. All variable bindings and
    label/type resolutions are established here.
-3. **Physical plan** (`src/plan/physical.rs`): `PhysicalPlanner` converts each `LogicalOperator` into a `PhysicalOperator`, choosing access paths (
+3. Physical plan (`src/plan/physical.rs`): `PhysicalPlanner` converts each `LogicalOperator` into a `PhysicalOperator`, choosing access paths (
    label scan, index seek, adjacency expansion).
-4. **Optimize** (`src/plan/optimize.rs`): `Optimizer` rewrites the physical tree. Passes run in this order: extract filters, eliminate statically-true
-   filters, reorder operators, select the cheapest scan node (reversing linear expand chains), push-down filters, optimize index scans and id seeks,
-   rewrite closing expands into `MultiwayJoin`, then reduce counts over a bare labeled scan to a constant. The optimizer takes ownership of the
-   physical tree and returns a new tree; it never mutates in place.
-5. **Execute** (`src/exec/read.rs`): `execute_physical` drives the physical tree against a `Graph` reference, producing a `Vec<PathMap>`. The
-   `Filter { input: Expand }` pattern uses a factorized fast path implemented in `execute_filter_over_expand`.
+4. Optimize (`src/plan/optimize.rs`): `Optimizer` rewrites the physical tree. It takes ownership and returns a new tree; it never mutates in place.
+   Order matters between several of these, so read `optimize_impl` rather than this summary before inserting a pass: collect label constraints, extract
+   filters, split top-level conjunctions, drop statically-true predicates, reorder operators, choose the cheapest scan node (reversing linear expand
+   chains), push filters down, lower a `vector_dist` top-k sort to `VectorTopK`, optimize index scans and id seeks, rewrite a correlated equality into
+   `CorrelatedIndexSeek`, linearize a re-scanning `HashJoin` into an expand chain, rewrite closing expands into `MultiwayJoin`, reduce a count over a
+   bare labeled scan to a constant, lower grouping-free and grouped counts to the `TriangleCount`, `PathCount`, and `GroupedDegree` kernels, push an
+   `ORDER BY <count> LIMIT n` into the grouped kernel as a window, prune provably-empty typed hops, and fuse a closing hop into `ExpandIntersect`.
+   Everything from the count reduction onward is skipped under the row-pipeline-only switch (see "Row-pipeline-only Switch" below).
+5. Execute (`src/exec/read.rs`): `execute_physical` drives the physical tree against a `Graph` reference. The `Filter { input: Expand }` pattern uses a
+   factorized fast path in `filter_over_expand_batch`.
 
 Keep each concern in its own file. Do not call `Graph` methods from `parser.rs`, `logical.rs`, or `physical.rs`.
 
@@ -60,14 +64,14 @@ hand-written descent chain.
 
 Follow this checklist in order:
 
-1. **AST variant**: add the new clause type to `src/ast.rs`. Derive `Clone` and `PartialEq`.
-2. **Parser rule**: add a combinator for the clause in `src/parser.rs` and wire it into the statement-level `choice(...)` alternation.
-3. **Logical planner arm**: add a match arm in `LogicalPlanner::plan` in `src/plan/logical.rs`.
-4. **Physical planner arm**: add a match arm in `PhysicalPlanner::plan` in `src/plan/physical.rs`.
-5. **Optimizer arm** (if applicable): if the new clause benefits from rewriting, add a rewrite rule in `src/plan/optimize.rs`. Skip this step if no
+1. AST variant: add the new clause type to `src/ast.rs`. Derive `Clone` and `PartialEq`.
+2. Parser rule: add a combinator for the clause in `src/parser.rs` and wire it into the statement-level `choice(...)` alternation.
+3. Logical planner arm: add a match arm in `LogicalPlanner::plan` in `src/plan/logical.rs`.
+4. Physical planner arm: add a match arm in `PhysicalPlanner::plan` in `src/plan/physical.rs`.
+5. Optimizer arm (if applicable): if the new clause benefits from rewriting, add a rewrite rule in `src/plan/optimize.rs`. Skip this step if no
    rewrite applies; do not add a pass-through arm unless the optimizer explicitly needs to descend into the clause.
-6. **Executor arm**: add a match arm in the physical operator dispatch loop in `execute_physical` (`src/exec/read.rs`).
-7. **Conformance test**: add at least one TCK scenario in `crates/issundb/tests/conformance/` gated on `ISSUNDB_CONFORMANCE=1`.
+6. Executor arm: add a match arm in the physical operator dispatch loop in `execute_physical` (`src/exec/read.rs`).
+7. Conformance test: add at least one TCK scenario in `crates/issundb/tests/conformance/` gated on `ISSUNDB_CONFORMANCE=1`.
 
 All seven steps are required for the change to be considered complete.
 
@@ -98,12 +102,17 @@ reorder them; fall back to `Expr` only when no comparison variant applies.
 `PhysicalOperator::MultiwayJoin` is emitted by the `rewrite_closing_expands` pass (in `optimize.rs`) when a single-hop directed `Expand` node's
 `dst_var` is already bound by an earlier operator in the same plan tree. This is the "closing hop" of a cyclic pattern (triangles, cliques, etc.).
 
-The executor (`exec/read.rs`) handles `MultiwayJoin` by:
+The executor (`exec/read.rs`) closes it in `multiway_join_rows`, over one batch of child rows:
 
-1. Collecting unique `closing_src_var` node IDs from all input rows.
-2. Bulk-expanding from those nodes once via `expand_multi_type`.
-3. Building a `(src_node, dst_node) → EdgeId` hash map.
-4. For each input row, doing an O(1) lookup to check the closing edge and bind `closing_rel_var`.
+1. Collect the distinct `closing_src_var` node ids in the batch.
+2. Bulk-expand from those nodes once.
+3. Index the transitions.
+4. Emit a row per matching `(closing_src, closing_dst)` pair, binding `closing_rel_var`.
+
+There are two callers of that one implementation: the materializing operator arm, and the streaming `RowStream::MultiwayJoin`. Streaming runs the bulk
+expansion once per batch rather than once over every row, which for a typed relationship is a cheap per-source adjacency loop and lets a `LIMIT` bound
+the number of batches. Keep both on the shared helper so they cannot diverge; `streaming_directed_multiway_join_matches_materialized` pins that they
+agree.
 
 `MultiwayJoin` is optimizer-generated only: `PhysicalPlanner::plan` never emits it. Every match arm in `optimize.rs` that recurses into operator
 children must handle the `MultiwayJoin` variant.
@@ -114,21 +123,19 @@ children must handle the `MultiwayJoin` variant.
 `(rel_var, rel_binding, dst_var, dst_binding)` for the current hop. Using `Arc` avoids O(shared_vars) HashMap clone cost for every destination; only
 the two new bindings are paid per output row.
 
-`execute_filter_over_expand` (in `exec/read.rs`) handles the `Filter { input: Expand(single-hop, directed) }` pattern:
+`filter_over_expand_batch` (in `exec/read.rs`) handles the `Filter { input: Expand(single-hop, directed) }` pattern over one batch of child rows:
 
-- **Factorized fast path**: when the filter expression does not reference `rel_var` or `dst_var`, it is evaluated once per source path. Sources that
-  fail skip all their destinations, costing zero PathMap clones for rejected sources.
-- **Per-row fallback**: when the filter touches the expansion variables, the full path is materialized before evaluation.
-- **`HasLabel` filters**: always route through the existing bulk-GraphBLAS path; `execute_filter_over_expand` is not called for `HasLabel`
-  expressions.
+- Factorized fast path: when the filter expression references neither `rel_var` nor `dst_var` (decided by `filter_refs_in_expr`), it is evaluated once
+  per source row. Sources that fail skip all their destinations, costing zero row clones for rejected sources.
+- Per-row fallback: when the filter touches the expansion variables, the full row is materialized before evaluation.
+- `HasLabel` filters: always route through the existing bulk path; this function is not called for `HasLabel` expressions.
 
 ## Vectorized Aggregate and Columnar Fast Path
 
 `exec/vectorized.rs` is an alternative executor for read queries whose optimized physical plan is a linear chain (a scan, then zero or more single-hop
 expands) topped by a projection, an aggregation, or an aggregation feeding projections and an optional sort. `recognize` inspects the optimized
 `PhysicalOperator` tree and returns a `VecPipeline` when the shape qualifies; `execute` runs it, and any unrecognized plan falls through to the row
-pipeline in `exec/read.rs`. The fast path is a performance choice only: declining it must never change results, and the `DISABLE_FOR_TEST`
-thread-local forces the row path so tests can compare the two.
+pipeline in `exec/read.rs`. The fast path is a performance choice only: declining it must never change results.
 
 The `VecRoot` variants escalate in generality:
 
@@ -151,15 +158,30 @@ its materialized property bag, and the group row keeps the `Node` or `Edge` bind
 is an O(rows x properties) cliff (it regressed RE24 by roughly 5x), and re-materializing the entity as a `Scalar` forces downstream property reads off
 the columnar fast path. Do not reduce either fold back to `evaluate_expr(...).to_string()` for a node or edge group key.
 
+## Row-pipeline-only Switch
+
+`exec_mode.rs` holds `ISSUNDB_ROW_PIPELINE_ONLY` and the `RowPipelineOnly` guard, which take the columnar executor, the counting kernels, the fused
+`ExpandIntersect` hop, the metadata count shortcut, and the type-inference pruning pass out of the answer so the general row pipeline answers the query.
+Pruning is in that set because it is the one pass that drops rows rather than reorganizing them, so leaving it out made a wrong `schema_has_edge`
+negative invisible to every differential comparison. That makes the row pipeline
+usable as a differential oracle: the four ways of answering a query each reproduce MATCH semantics independently, and nothing in the type system makes
+them agree. Read the module doc before adding to it, and note the two test shapes that must pin the setting with `fast_paths_required` rather than
+inherit it, or a sweep silently defeats them. The corpus lives in `exec/differential.rs`.
+
 ## Executor Mutation Safety
 
 CREATE, SET, DELETE, and MERGE all mutate the graph:
 
-- Acquire the graph write lock before opening a `RwTxn` and hold it for the entire duration of the mutation. Do not interleave reads and writes in the
-  same transaction.
-- All graph mutations go through `Graph` public methods (`add_node`, `add_edge`, `update_node`, `delete_node`, `delete_edge`). Do not call `Storage`
-  directly from the `exec` module.
-- After a mutation, the caller is responsible for deciding whether to rebuild the CSR snapshot. The executor does not rebuild it automatically.
+- A single statement's write clauses, and the `RETURN`/`WITH` projection that follows them, share one `Graph::update` transaction, so an error anywhere
+  rolls back every write the statement already made. Do not open a second transaction inside a statement.
+- Mutate through the `WriteTxn` methods on the open transaction (`txn.add_node`, `txn.add_edge`, `txn.update_node`, `txn.delete_node`,
+  `txn.delete_edge`), not through the auto-committing `Graph` methods of the same name: those open their own transaction and would deadlock against the
+  one `Graph::update` already holds. A debug assertion catches that mistake at the call site. Never call `Storage` from the `exec` module.
+- Do not rebuild the CSR snapshot by hand. `Graph::update` publishes the write to the caches' freshness counters at commit, and each consumer's gate
+  rebuilds what it needs on demand (see the freshness gates in the root `AGENTS.md`).
+- A `MATCH` or scan *after* a write clause in the same statement does not see that write's structural effect, because it reads the committed-only label
+  index and CSR snapshot rather than the open transaction. A `RETURN`/`WITH` reading a property of a variable the statement just wrote does see it,
+  through the pending-writes overlay in `exec/expr.rs`.
 
 ## Statement Clock
 

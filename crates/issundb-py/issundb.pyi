@@ -22,7 +22,11 @@ class IssunDB:
         Args:
             path: Filesystem directory for the LMDB environment. It is created
                 if it does not exist.
-            map_size_gb: Optional map size in gigabytes (defaults to 1).
+            map_size_gb: Optional map size in gigabytes (defaults to 1). This is a
+                hard ceiling on how large the database may grow, not an allocation,
+                and there is no resize path: once the data exceeds it every write
+                fails until the database is reopened with a larger value (which is
+                safe and keeps the data). Size it for the eventual database.
 
         Raises:
             RuntimeError: If the environment cannot be opened.
@@ -41,7 +45,9 @@ class IssunDB:
             The new node ID.
 
         Raises:
-            ValueError: If ``props`` is not valid JSON.
+            ValueError: If ``props`` is not valid JSON, or is valid JSON that is
+                not an object. A property bag is a map; a non-object would be
+                stored but no property read or predicate could ever see it.
             RuntimeError: If the write fails.
         """
         ...
@@ -64,7 +70,9 @@ class IssunDB:
             The new node IDs, in the order the items were given.
 
         Raises:
-            ValueError: If any ``props`` is not valid JSON.
+            ValueError: If any ``props`` is not valid JSON, or is valid JSON that
+                is not an object. A property bag is a map; a non-object would be
+                stored but no property read or predicate could ever see it.
             RuntimeError: If the write fails. The batch is all-or-nothing, so a
                 failure rolls back every node in it.
         """
@@ -93,7 +101,9 @@ class IssunDB:
             props: A JSON object string holding the replacement properties.
 
         Raises:
-            ValueError: If ``props`` is not valid JSON.
+            ValueError: If ``props`` is not valid JSON, or is valid JSON that is
+                not an object. A property bag is a map; a non-object would be
+                stored but no property read or predicate could ever see it.
             RuntimeError: If the node does not exist or the write fails.
         """
         ...
@@ -106,6 +116,21 @@ class IssunDB:
 
         Raises:
             RuntimeError: If the write fails.
+        """
+        ...
+
+    def node_labels(self, id: int) -> List[str]:
+        """Return the labels of node ``id`` in insertion order.
+
+        Args:
+            id: The node ID.
+
+        Returns:
+            The node's labels. An unlabeled node and a node that does not exist
+            both give an empty list; use ``get_node`` to tell them apart.
+
+        Raises:
+            RuntimeError: If the read fails.
         """
         ...
 
@@ -146,7 +171,9 @@ class IssunDB:
             The new edge ID.
 
         Raises:
-            ValueError: If ``props`` is not valid JSON.
+            ValueError: If ``props`` is not valid JSON, or is valid JSON that is
+                not an object. A property bag is a map; a non-object would be
+                stored but no property read or predicate could ever see it.
             RuntimeError: If the write fails.
         """
         ...
@@ -165,7 +192,9 @@ class IssunDB:
             The new edge IDs, in the order the items were given.
 
         Raises:
-            ValueError: If any ``props`` is not valid JSON.
+            ValueError: If any ``props`` is not valid JSON, or is valid JSON that
+                is not an object. A property bag is a map; a non-object would be
+                stored but no property read or predicate could ever see it.
             RuntimeError: If the write fails. The batch is all-or-nothing, so a
                 failure rolls back every edge in it.
         """
@@ -195,7 +224,9 @@ class IssunDB:
             props: A JSON object string holding the replacement properties.
 
         Raises:
-            ValueError: If ``props`` is not valid JSON.
+            ValueError: If ``props`` is not valid JSON, or is valid JSON that is
+                not an object. A property bag is a map; a non-object would be
+                stored but no property read or predicate could ever see it.
             RuntimeError: If the edge does not exist or the write fails.
         """
         ...
@@ -412,7 +443,9 @@ class IssunDB:
 
         Returns:
             A JSON object string of the shape
-            ``{"nodes": [...], "edges": [...], "scores": {...}}``.
+            ``{"nodes": [...], "edges": [...], "scores": {...}, "truncated": bool}``.
+            ``truncated`` is true when the ``max_nodes`` cap cut off seeds or
+            expansion, so a capped result is distinguishable from a complete one.
 
         Raises:
             RuntimeError: If the retrieval fails.

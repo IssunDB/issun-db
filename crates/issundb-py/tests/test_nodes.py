@@ -123,3 +123,46 @@ def test_add_nodes_rolls_back_the_whole_batch_on_failure(db):
 
     result = json.loads(db.query("MATCH (n:User) RETURN count(n)"))
     assert [record["values"] for record in result["records"]] == [[1]]
+
+
+def test_props_must_be_a_json_object(db):
+    """A non-object property bag is stored but unreadable, so it is rejected.
+
+    An array or scalar used to be accepted: the node took an id and counted in a
+    label scan, but every property read returned null and no property predicate
+    could ever match it, with no error at any layer.
+    """
+    for bad in ("[1, 2, 3]", "5", '"a string"', "null", "true"):
+        with pytest.raises(ValueError, match="must be a JSON object"):
+            db.add_node("Thing", bad)
+
+    nid = db.add_node("Thing", json.dumps({"n": 1}))
+    with pytest.raises(ValueError, match="must be a JSON object"):
+        db.update_node(nid, "[1]")
+    with pytest.raises(ValueError, match="must be a JSON object"):
+        db.add_nodes([("Thing", "[1]")])
+
+    other = db.add_node("Thing", json.dumps({"n": 2}))
+    with pytest.raises(ValueError, match="must be a JSON object"):
+        db.add_edge(nid, other, "LINKS", "[1]")
+    with pytest.raises(ValueError, match="must be a JSON object"):
+        db.add_edges([(nid, other, "LINKS", "[1]")])
+
+    # The rejected writes left nothing behind.
+    result = json.loads(db.query("MATCH (t:Thing) RETURN count(t)"))
+    assert [record["values"] for record in result["records"]] == [[2]]
+
+
+def test_node_labels_round_trip(db):
+    """Labels must be readable, not just writable."""
+    nid = db.add_node(["Person", "Admin"], json.dumps({"name": "Ada"}))
+    assert db.node_labels(nid) == ["Person", "Admin"]
+
+    db.add_label(nid, "Auditor")
+    assert db.node_labels(nid) == ["Person", "Admin", "Auditor"]
+
+    db.remove_label(nid, "Admin")
+    assert db.node_labels(nid) == ["Person", "Auditor"]
+
+    # A node that does not exist reads as no labels rather than raising.
+    assert db.node_labels(999_999) == []
