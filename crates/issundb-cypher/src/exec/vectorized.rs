@@ -2084,7 +2084,13 @@ fn execute_collapsed_count(
         TerminalCount::NonNull(prop) => Some(prop),
     };
     let stages = p.stages.last();
+    // `Expand::rel_type` holds the raw pattern text, so a multi-type hop arrives as
+    // `"F|G"`. The counting kernel resolves one registered type, which that is not,
+    // so it would tally zero for every source and the query would return no rows.
+    // The expansion fallback splits on `|`, so route multi-type hops there.
+    let multi_type = last.rel_type.is_some_and(|t| t.contains('|'));
     let kernel_tallies = match split_terminal_filters(stages, terminal) {
+        _ if multi_type => None,
         Some((labels, others)) if others.is_empty() => {
             let spec = issundb_core::NeighborCountSpec {
                 rel_type: last.rel_type,
@@ -3284,6 +3290,36 @@ mod tests {
         assert!(split_terminal_filters(Some(&foreign), "p").is_none());
         let (labels, others) = split_terminal_filters(None, "p").unwrap();
         assert!(labels.is_empty() && others.is_empty());
+    }
+
+    /// A multi-type hop (`[:F|G]`) reaches the collapse as the raw pattern text,
+    /// which is not a registered relationship type. Routing it into the
+    /// single-type counting kernel tallied zero for every source and returned no
+    /// rows at all; it must take the expansion fallback, which splits on `|`.
+    #[test]
+    fn multi_type_terminal_hop_matches_row_path() {
+        let dir = TempDir::new().unwrap();
+        let g = Graph::open(dir.path(), 1).unwrap();
+        let ids: Vec<_> = (0..3)
+            .map(|i| g.add_node("P", &json!({ "id": i as i64 })).unwrap())
+            .collect();
+        g.add_edge(ids[1], ids[0], "F", &json!({})).unwrap();
+        g.add_edge(ids[1], ids[2], "G", &json!({})).unwrap();
+        g.add_edge(ids[0], ids[1], "X", &json!({})).unwrap();
+        g.rebuild_csr().unwrap();
+
+        for cypher in [
+            "MATCH (b:P)-[:F|G]->(c:P) RETURN b.id AS id, count(*) AS num ORDER BY num DESC, id",
+            "MATCH (a:P)-[:X]->(b:P)-[:F|G]->(c:P) RETURN a.id AS id, count(*) AS num \
+             ORDER BY num DESC, id",
+        ] {
+            assert_matches_row_path(&g, cypher);
+            let rows = execute(&g, cypher, &std::collections::HashMap::new()).unwrap();
+            assert!(
+                !rows.records.is_empty(),
+                "must not return zero rows: {cypher}"
+            );
+        }
     }
 
     /// A terminal property predicate is resolved into an allow-set the counting

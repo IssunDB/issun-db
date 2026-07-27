@@ -4817,7 +4817,11 @@ pub(super) fn eval_leaf(
             // expansion. The rewrite guarantees a filtered endpoint is labeled.
             // An index or range scan leaf already encodes the predicate on the
             // counted endpoint, so evaluating it yields the allow-set directly.
-            let counted_allow: Option<Vec<NodeId>> = if let Some(leaf) = counted_leaf {
+            // Both sources can be present at once: index-scan rewriting turns one
+            // conjunct into the leaf scan and leaves the rest as a `Filter`, which
+            // the rewrite carries in `counted_filters`. Honouring only the leaf
+            // would silently drop those predicates and over-count.
+            let leaf_allow: Option<Vec<NodeId>> = if let Some(leaf) = counted_leaf {
                 let rows = eval_leaf(graph, leaf, params, schema)?;
                 let var = match leaf.as_ref() {
                     PhysicalOperator::NodeIndexScan { variable, .. }
@@ -4835,7 +4839,10 @@ pub(super) fn eval_leaf(
                     }
                 }
                 Some(ids)
-            } else if counted_filters.is_empty() {
+            } else {
+                None
+            };
+            let filter_allow: Option<Vec<NodeId>> = if counted_filters.is_empty() {
                 None
             } else {
                 let label = counted_label
@@ -4850,6 +4857,15 @@ pub(super) fn eval_leaf(
                     });
                 }
                 Some(allow.unwrap_or_default().into_iter().collect())
+            };
+            // Both present: the counted endpoint must satisfy every predicate, so
+            // intersect rather than letting either source win.
+            let counted_allow: Option<Vec<NodeId>> = match (leaf_allow, filter_allow) {
+                (Some(a), Some(b)) => {
+                    let keep: std::collections::HashSet<NodeId> = b.into_iter().collect();
+                    Some(a.into_iter().filter(|id| keep.contains(id)).collect())
+                }
+                (only, None) | (None, only) => only,
             };
             let spec = issundb_core::GroupedDegreeSpec {
                 rel_type: rel_type.as_deref(),
@@ -6719,6 +6735,53 @@ mod grouped_degree_exec_tests {
                           RETURN p.id AS id, count(i.name) AS num";
         assert!(!plan_text(&graph, group_pred).contains("GroupedDegree"));
         super::execute(&graph, group_pred, &HashMap::new()).unwrap();
+    }
+
+    /// An index-scan leaf and a residual `Filter` can both constrain the counted
+    /// endpoint: `optimize_index_scans` lowers one conjunct into the leaf and
+    /// leaves the rest as a filter, so the rewrite carries both. Honouring only
+    /// the leaf silently dropped the residual predicate and over-counted.
+    #[test]
+    fn counted_leaf_and_residual_filters_are_both_applied() {
+        let (_dir, graph) = setup();
+        // Few interests, many people, so the optimizer roots at Interest and the
+        // counted endpoint is the scanned one.
+        super::execute(
+            &graph,
+            "CREATE (i1:Interest {name: 'a', rank: 1, score: 1}), \
+                    (i2:Interest {name: 'b', rank: 5, score: 1}) \
+             CREATE (p1:Person {id: 1}), (p2:Person {id: 2}), (p3:Person {id: 3}), \
+                    (p4:Person {id: 4}), (p5:Person {id: 5}), (p6:Person {id: 6}), \
+                    (p7:Person {id: 7}), (p8:Person {id: 8}) \
+             CREATE (p1)-[:HAS]->(i1), (p2)-[:HAS]->(i2), (p3)-[:HAS]->(i1), \
+                    (p4)-[:HAS]->(i2), (p5)-[:HAS]->(i1), (p6)-[:HAS]->(i2), \
+                    (p7)-[:HAS]->(i1), (p8)-[:HAS]->(i2)",
+            &HashMap::new(),
+        )
+        .unwrap();
+        graph.rebuild_csr().unwrap();
+
+        // Two conjuncts on different properties: no interest satisfies both, so
+        // every group must vanish.
+        let q = "MATCH (p:Person)-[:HAS]->(i:Interest) WHERE i.rank >= 5 AND i.score >= 9 \
+                 RETURN p.id AS id, count(i.name) AS num";
+        let row_q = "MATCH (p:Person)-[:HAS]->(i:Interest) \
+                     WHERE i.rank >= 5 AND i.score >= 9 AND i.__force IS NULL \
+                     RETURN p.id AS id, count(i.name) AS num";
+        assert_eq!(sorted_records(&graph, q), sorted_records(&graph, row_q));
+        assert!(
+            sorted_records(&graph, q).is_empty(),
+            "no interest has score >= 9, so no group survives"
+        );
+
+        // Two conjuncts on the *same* property: the looser one stays a residual
+        // filter over the range scan and must not widen the result.
+        let q2 = "MATCH (p:Person)-[:HAS]->(i:Interest) WHERE i.rank >= 1 AND i.rank >= 5 \
+                  RETURN p.id AS id, count(i.name) AS num";
+        let row_q2 = "MATCH (p:Person)-[:HAS]->(i:Interest) \
+                      WHERE i.rank >= 1 AND i.rank >= 5 AND i.__force IS NULL \
+                      RETURN p.id AS id, count(i.name) AS num";
+        assert_eq!(sorted_records(&graph, q2), sorted_records(&graph, row_q2));
     }
 
     /// Differential parity for the two generalizations over random multigraphs:

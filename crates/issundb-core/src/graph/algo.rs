@@ -579,7 +579,20 @@ impl Graph {
         if work < MIN_PARALLEL_WORK {
             return 1;
         }
+        // A counting pass streams adjacency arrays, so it saturates memory
+        // bandwidth long before it saturates compute, and past its peak extra
+        // workers add traffic and coordination without adding throughput. Measured
+        // on the two-hop path count over an 11.1 M-edge graph (12-thread machine):
+        // 71.1 ms at one worker, 47.0 at two, 40.5 at four, 43.8 at eight, 46.1 at
+        // twelve. Twelve is 14% *slower* than four, so the resolved budget must not
+        // be spent in full here: cap the split at the peak.
+        //
+        // The cap is calibrated on one machine. Re-measure the curve on hardware
+        // with a different memory subsystem before treating four as general; the
+        // test override above bypasses this so a test can still drive more workers.
+        const MAX_SCAN_THREADS: usize = 4;
         crate::threads::resolve(self.n_threads.load(std::sync::atomic::Ordering::Acquire))
+            .min(MAX_SCAN_THREADS)
     }
 
     /// Total length of `sources`' adjacency rows in the given direction: an upper

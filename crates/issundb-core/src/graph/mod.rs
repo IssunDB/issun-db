@@ -591,9 +591,13 @@ impl Graph {
         // initialized and setting a global option fails. Since `open` no longer
         // materializes eagerly, a caller that configures threads up front hits
         // exactly that window, so the stored value carries the setting instead.
-        // A count of zero means "resolve the default", which materialize does.
-        if n > 0 && self.matrices.read().is_some() {
-            issundb_graphblas::set_global_threads(n)
+        if self.matrices.read().is_some() {
+            // Resolve rather than forward `n`: zero means "restore the default",
+            // which this method documents, and only `threads::resolve` knows what
+            // that is. Resolving also clamps, so the live pool cannot diverge from
+            // what the next materialization would pick.
+            let resolved = crate::threads::resolve(n) as i32;
+            issundb_graphblas::set_global_threads(resolved)
                 .map_err(|e| Error::GraphBLAS(e.to_string()))?;
         }
         Ok(())
