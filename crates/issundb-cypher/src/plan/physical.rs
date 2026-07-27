@@ -303,6 +303,17 @@ pub enum PhysicalOperator {
         /// Property that must be non-null on the counted endpoint for an edge
         /// to count (`count(v.prop)`); `None` for `count(*)` or `count(v)`.
         counted_nonnull_prop: Option<String>,
+        /// `prop CMP literal` constraints on the counted endpoint, pushed down
+        /// into the kernel. The executor resolves them to an allow-set through
+        /// the property index (as `PathCount` does with `vertex_filters`), so a
+        /// filtered grouped count stays a kernel call. Empty means unconstrained.
+        counted_filters: Vec<VertexPred>,
+        /// The counted endpoint's leaf scan when it is an index or range scan
+        /// rather than a plain label scan, which is the form a `prop CMP literal`
+        /// predicate on that endpoint usually takes once index-scan rewriting has
+        /// run. The executor evaluates it to an allow-set, so such a predicate
+        /// still reaches the kernel. `None` for a plain label scan.
+        counted_leaf: Option<Box<PhysicalOperator>>,
         /// The variable bound to the group endpoint node, so the executor can
         /// evaluate the group-by expressions against it.
         group_var: String,
@@ -849,6 +860,8 @@ pub fn format_physical_plan(op: &PhysicalOperator, depth: usize) -> String {
             group_label,
             counted_label,
             counted_nonnull_prop,
+            counted_filters,
+            counted_leaf,
             group_var,
             group_by,
             output,
@@ -873,6 +886,11 @@ pub fn format_physical_plan(op: &PhysicalOperator, depth: usize) -> String {
                 Some(p) => format!("count(c.{p})"),
                 None => "count(*)".to_string(),
             };
+            let filters = match (counted_filters.is_empty(), counted_leaf.is_some()) {
+                (true, false) => String::new(),
+                (_, true) => " filter(c)=scan".to_string(),
+                (false, false) => format!(" filter(c)x{}", counted_filters.len()),
+            };
             let window = match count_window {
                 Some(w) => {
                     let dir = if w.descending { "DESC" } else { "ASC" };
@@ -881,7 +899,7 @@ pub fn format_physical_plan(op: &PhysicalOperator, depth: usize) -> String {
                 None => String::new(),
             };
             buf.push_str(&format!(
-                "{pad}GroupedDegree {arrow} group=[{}] {counted} AS {output}{window}\n",
+                "{pad}GroupedDegree {arrow} group=[{}] {counted} AS {output}{filters}{window}\n",
                 keys.join(", ")
             ));
         }

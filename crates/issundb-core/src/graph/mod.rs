@@ -112,6 +112,12 @@ pub struct GroupedDegreeSpec<'a> {
     pub group_label: Option<&'a str>,
     /// Label required on the counted endpoint.
     pub counted_label: Option<&'a str>,
+    /// Explicit allow-set the counted endpoint must belong to, intersected with
+    /// `counted_label`; `None` leaves it unconstrained beyond the label. The
+    /// caller resolves this set by pushing a per-vertex property predicate down
+    /// into index lookups, as [`PathCountSpec::vertex_allow`] does, so a filtered
+    /// grouped count stays a kernel call. An empty slice counts zero.
+    pub counted_allow: Option<&'a [NodeId]>,
     /// Property that must be non-null on the counted endpoint for an edge to
     /// count; `None` counts every qualifying edge.
     pub counted_nonnull_prop: Option<&'a str>,

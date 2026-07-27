@@ -1,5 +1,11 @@
 use super::*;
 
+/// Test-only override for [`Graph::kernel_threads`], so a unit test can drive the
+/// parallel reduction on a graph small enough to build in a test.
+#[cfg(test)]
+pub(super) static FORCE_KERNEL_THREADS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 impl Graph {
     // ------------------------------------------------------------------
     // Graph algorithms
@@ -267,60 +273,96 @@ impl Graph {
         // assignments where hop 1 and hop 2 bind the same edge, which is only
         // possible for a self-loop at `v1` that satisfies both hops.
         let (t1, t2) = (type_ids[0], type_ids[1]);
-        let mut total: u64 = 0;
-        for b in 0..n {
-            if !label_ok(&masks[1], b) {
-                continue;
-            }
-            // Hop-1 in-edges of `b`: type `t1`, source inside the first mask.
-            // The transposed view is part of the snapshot, so this is a scan of
-            // one contiguous row.
-            let mut indeg: u64 = 0;
-            for idx in snap.in_row_ptr[b]..snap.in_row_ptr[b + 1] {
-                if type_ok(t1, snap.in_edge_type[idx])
-                    && label_ok(&masks[0], snap.in_col_idx[idx] as usize)
-                {
-                    indeg += 1;
+        // The per-middle-node contributions are independent, so the count is a
+        // reduction over disjoint node ranges: each worker sums its own range of
+        // `b` and the ranges are added at the end. Every array read is through the
+        // immutable snapshot, so no worker synchronizes with any other.
+        let snap_ref: &CsrSnapshot = &snap;
+        let masks_ref = &masks;
+        let count_middles = move |lo: usize, hi: usize| -> u64 {
+            let type_ok = |want: Option<TypeId>, have: TypeId| want.is_none_or(|t| have == t);
+            let label_ok = |mask: &Option<Vec<bool>>, d: usize| mask.as_ref().is_none_or(|m| m[d]);
+            let (snap, masks) = (snap_ref, masks_ref);
+            let mut total: u64 = 0;
+            for b in lo..hi {
+                if !label_ok(&masks[1], b) {
+                    continue;
                 }
-            }
-            if indeg == 0 {
-                continue;
-            }
-            // Hop-2 out-edges of `b`: type `t2`, destination inside the last mask.
-            let mut outdeg: u64 = 0;
-            for idx in snap.row_ptr[b]..snap.row_ptr[b + 1] {
-                if type_ok(t2, snap.edge_type[idx])
-                    && label_ok(&masks[2], snap.col_idx[idx] as usize)
-                {
-                    outdeg += 1;
-                }
-            }
-            total += indeg * outdeg;
-
-            // Relationship-uniqueness correction. A single edge can fill both
-            // hops only when it is a self-loop at `b` whose type satisfies both
-            // hops, and `b` satisfies the first and last masks. Each such edge
-            // is counted once in `indeg` and once in `outdeg`, so it contributes
-            // exactly one `r1 == r2` assignment to the product: the number of
-            // excluded assignments is the number of those self-loops, which
-            // parallel self-loops make greater than one. Counting them by type
-            // is equivalent to intersecting the two rows by edge id, because an
-            // edge id identifies one edge and a self-loop at `b` appears once in
-            // each row.
-            if label_ok(&masks[0], b) && label_ok(&masks[2], b) {
-                let mut shared: u64 = 0;
-                for idx in snap.row_ptr[b]..snap.row_ptr[b + 1] {
-                    if snap.col_idx[idx] as usize == b
-                        && type_ok(t1, snap.edge_type[idx])
-                        && type_ok(t2, snap.edge_type[idx])
+                // Hop-1 in-edges of `b`: type `t1`, source inside the first mask.
+                // The transposed view is part of the snapshot, so this is a scan of
+                // one contiguous row.
+                let mut indeg: u64 = 0;
+                for idx in snap.in_row_ptr[b]..snap.in_row_ptr[b + 1] {
+                    if type_ok(t1, snap.in_edge_type[idx])
+                        && label_ok(&masks[0], snap.in_col_idx[idx] as usize)
                     {
-                        shared += 1;
+                        indeg += 1;
                     }
                 }
-                total = total.saturating_sub(shared);
+                if indeg == 0 {
+                    continue;
+                }
+                // Hop-2 out-edges of `b`: type `t2`, destination inside the last mask.
+                let mut outdeg: u64 = 0;
+                for idx in snap.row_ptr[b]..snap.row_ptr[b + 1] {
+                    if type_ok(t2, snap.edge_type[idx])
+                        && label_ok(&masks[2], snap.col_idx[idx] as usize)
+                    {
+                        outdeg += 1;
+                    }
+                }
+                total += indeg * outdeg;
+
+                // Relationship-uniqueness correction. A single edge can fill both
+                // hops only when it is a self-loop at `b` whose type satisfies both
+                // hops, and `b` satisfies the first and last masks. Each such edge
+                // is counted once in `indeg` and once in `outdeg`, so it contributes
+                // exactly one `r1 == r2` assignment to the product: the number of
+                // excluded assignments is the number of those self-loops, which
+                // parallel self-loops make greater than one. Counting them by type
+                // is equivalent to intersecting the two rows by edge id, because an
+                // edge id identifies one edge and a self-loop at `b` appears once in
+                // each row.
+                if label_ok(&masks[0], b) && label_ok(&masks[2], b) {
+                    let mut shared: u64 = 0;
+                    for idx in snap.row_ptr[b]..snap.row_ptr[b + 1] {
+                        if snap.col_idx[idx] as usize == b
+                            && type_ok(t1, snap.edge_type[idx])
+                            && type_ok(t2, snap.edge_type[idx])
+                        {
+                            shared += 1;
+                        }
+                    }
+                    total = total.saturating_sub(shared);
+                }
             }
+            total
+        };
+
+        let threads = self.kernel_threads(n.saturating_add(snap.col_idx.len()));
+        if threads <= 1 {
+            return Ok(count_middles(0, n));
         }
-        Ok(total)
+        let chunk = n.div_ceil(threads);
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..threads)
+                .map(|t| {
+                    let lo = (t * chunk).min(n);
+                    let hi = lo.saturating_add(chunk).min(n);
+                    scope.spawn(move || count_middles(lo, hi))
+                })
+                .collect();
+            let mut total: u64 = 0;
+            for worker in workers {
+                // A worker only reads the snapshot, so a panic here is a bug, not
+                // a data condition; surface it instead of returning a short count.
+                match worker.join() {
+                    Ok(part) => total = total.saturating_add(part),
+                    Err(_) => return Err(Error::Corrupt("path-count worker panicked")),
+                }
+            }
+            Ok(total)
+        })
     }
 
     /// Counts typed edges grouped by one endpoint, returning `(group node id, count)`
@@ -377,11 +419,31 @@ impl Graph {
         let group_mask = label_mask(spec.group_label)?;
         // The endpoints usually carry the same label (e.g. `(:Person)->(:Person)`);
         // reuse the mask instead of scanning that label a second time.
-        let counted_mask = if spec.counted_label == spec.group_label {
+        let mut counted_mask = if spec.counted_label == spec.group_label {
             group_mask.clone()
         } else {
             label_mask(spec.counted_label)?
         };
+        // An explicit allow-set narrows the counted endpoint further; an empty one
+        // yields an all-false mask, which counts zero without a special case.
+        if let Some(allow) = spec.counted_allow {
+            let mut allowed = vec![false; n];
+            for id in allow {
+                if let Some(&d) = snap.id_to_dense.get(id) {
+                    allowed[d as usize] = true;
+                }
+            }
+            counted_mask = Some(match counted_mask {
+                None => allowed,
+                Some(prev) => {
+                    let mut both = allowed;
+                    for (slot, &keep) in both.iter_mut().zip(prev.iter()) {
+                        *slot = *slot && keep;
+                    }
+                    both
+                }
+            });
+        }
 
         // Non-null mask for the counted endpoint's property: dense index `d` is
         // true when the property is present on `dense_to_id[d]`. The property
@@ -390,17 +452,27 @@ impl Graph {
         // mask all-false, so `count(v.prop)` over an absent property counts
         // zero, matching the row pipeline.
         let nonnull_mask: Option<Vec<bool>> = match spec.counted_nonnull_prop {
-            Some(prop) => Some(self.prop_columns.with_fresh(&self.storage, |cols| {
-                let mut mask = vec![false; n];
-                if let Some(col) = cols.cols.get(prop) {
-                    for (d, id) in snap.dense_to_id.iter().enumerate() {
-                        if let Some(&cd) = cols.id_to_dense.get(id) {
-                            mask[d] = col.is_present(cd as usize);
+            Some(prop) => self.prop_columns.with_fresh(&self.storage, |cols| {
+                // A column with no nulls anywhere is non-null on every node the
+                // walk can reach, so the mask would pass unconditionally: skip
+                // building it and spend no hash lookup per node. Requiring the
+                // column to cover the snapshot's node count keeps that sound, so
+                // a node the columns do not know about cannot slip through.
+                match cols.cols.get(prop) {
+                    Some(col) if col.len() == n && col.all_present() => None,
+                    Some(col) => {
+                        let mut mask = vec![false; n];
+                        for (d, id) in snap.dense_to_id.iter().enumerate() {
+                            if let Some(&cd) = cols.id_to_dense.get(id) {
+                                mask[d] = col.is_present(cd as usize);
+                            }
                         }
+                        Some(mask)
                     }
+                    // No such column anywhere: `count(v.prop)` counts zero.
+                    None => Some(vec![false; n]),
                 }
-                mask
-            })?),
+            })?,
             None => None,
         };
 
@@ -449,6 +521,55 @@ impl Graph {
             }
         }
         Ok(out)
+    }
+
+    /// Threads to spread a read-only kernel pass over, given the number of items
+    /// it will touch.
+    ///
+    /// A counting kernel is a pure reduction over disjoint slices of the CSR
+    /// arrays, so it parallelizes without synchronization; the arrays are read
+    /// through an immutable snapshot, so this takes no lock and never races a
+    /// writer. The programmatic override and `ISSUNDB_NUM_THREADS` are honored so
+    /// one knob controls both this and the GraphBLAS pool; with neither set it
+    /// uses the machine's parallelism, unlike the GraphBLAS default of one (that
+    /// default exists to stop an OpenMP pool from oversubscribing, which
+    /// short-lived scoped threads do not).
+    ///
+    /// A small pass stays single-threaded: below the threshold the spawn cost
+    /// exceeds the saving, which also keeps unit tests deterministic and off the
+    /// thread pool entirely.
+    pub(super) fn kernel_threads(&self, work: usize) -> usize {
+        /// Items below which a pass is not worth splitting.
+        const MIN_PARALLEL_WORK: usize = 1 << 18;
+        // Tests force the split on graphs far below the threshold, so the
+        // parallel reduction is exercised rather than only its fallback.
+        #[cfg(test)]
+        {
+            let forced = FORCE_KERNEL_THREADS.load(std::sync::atomic::Ordering::Acquire);
+            if forced > 0 {
+                return forced;
+            }
+        }
+        if work < MIN_PARALLEL_WORK {
+            return 1;
+        }
+        let programmatic = self.n_threads.load(std::sync::atomic::Ordering::Acquire);
+        let configured = if programmatic > 0 {
+            programmatic as usize
+        } else {
+            std::env::var("ISSUNDB_NUM_THREADS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0)
+        };
+        let n = if configured > 0 {
+            configured
+        } else {
+            std::thread::available_parallelism()
+                .map(|p| p.get())
+                .unwrap_or(1)
+        };
+        n.clamp(1, 64)
     }
 
     /// Total length of `sources`' adjacency rows in the given direction: an upper
@@ -555,17 +676,27 @@ impl Graph {
         // all-false, so `count(v.prop)` over an absent property counts zero,
         // matching the row pipeline.
         let nonnull_mask: Option<Vec<bool>> = match spec.neighbor_nonnull_prop {
-            Some(prop) => Some(self.prop_columns.with_fresh(&self.storage, |cols| {
-                let mut mask = vec![false; n];
-                if let Some(col) = cols.cols.get(prop) {
-                    for (d, id) in snap.dense_to_id.iter().enumerate() {
-                        if let Some(&cd) = cols.id_to_dense.get(id) {
-                            mask[d] = col.is_present(cd as usize);
+            Some(prop) => self.prop_columns.with_fresh(&self.storage, |cols| {
+                // A column with no nulls anywhere is non-null on every node the
+                // walk can reach, so the mask would pass unconditionally: skip
+                // building it and spend no hash lookup per node. Requiring the
+                // column to cover the snapshot's node count keeps that sound, so
+                // a node the columns do not know about cannot slip through.
+                match cols.cols.get(prop) {
+                    Some(col) if col.len() == n && col.all_present() => None,
+                    Some(col) => {
+                        let mut mask = vec![false; n];
+                        for (d, id) in snap.dense_to_id.iter().enumerate() {
+                            if let Some(&cd) = cols.id_to_dense.get(id) {
+                                mask[d] = col.is_present(cd as usize);
+                            }
                         }
+                        Some(mask)
                     }
+                    // No such column anywhere: `count(v.prop)` counts zero.
+                    None => Some(vec![false; n]),
                 }
-                mask
-            })?),
+            })?,
             None => None,
         };
 
@@ -2402,6 +2533,7 @@ mod snapshot_only_gate_tests {
                 group_is_dst: false,
                 group_label: Some("Person"),
                 counted_label: Some("Person"),
+                counted_allow: None,
                 counted_nonnull_prop: None,
             };
             let counts = g.grouped_edge_counts(&spec).unwrap();
@@ -2700,6 +2832,56 @@ mod typed_neighbor_count_tests {
         assert_eq!(absent, vec![(5, 0)]);
     }
 
+    /// The non-null filter agrees whether the mask is built or skipped. A column
+    /// with no nulls anywhere takes the skip, one with a null takes the mask, and
+    /// both must count the same edges.
+    #[test]
+    fn nonnull_filter_agrees_when_the_mask_is_skipped() {
+        let dir = TempDir::new().unwrap();
+        let g = Graph::open(dir.path(), 1).unwrap();
+        // Every node carries `k`, so the column has no nulls.
+        let ids: Vec<NodeId> = (0..4)
+            .map(|i| g.add_node("P", &json!({ "k": i })).unwrap())
+            .collect();
+        for &(s, d) in &[(0, 1), (0, 2), (0, 3), (1, 2)] {
+            g.add_edge(ids[s], ids[d], "F", &json!({})).unwrap();
+        }
+        g.rebuild_csr().unwrap();
+
+        // All-present: the mask is skipped, so the counted total equals the
+        // unfiltered one.
+        let unfiltered = g
+            .typed_neighbor_counts(&ids, &spec(Some("F"), false, &[], None))
+            .unwrap();
+        let all_present = g
+            .typed_neighbor_counts(&ids, &spec(Some("F"), false, &[], Some("k")))
+            .unwrap();
+        assert_eq!(
+            unfiltered, all_present,
+            "an all-present column filters nothing"
+        );
+        assert_eq!(unfiltered[0], (3, 3), "the first node has three neighbors");
+
+        // Drop `k` from one neighbor: the column now has a null, so the mask is
+        // built and the count follows it.
+        g.update_node(ids[2], &json!({})).unwrap();
+        g.rebuild_csr().unwrap();
+        let with_null = g
+            .typed_neighbor_counts(&ids, &spec(Some("F"), false, &[], Some("k")))
+            .unwrap();
+        assert_eq!(
+            with_null[0],
+            (3, 2),
+            "the neighbor that lost `k` no longer counts"
+        );
+        // Existence is unchanged: only the counted total narrows.
+        assert_eq!(
+            g.typed_neighbor_counts(&ids, &spec(Some("F"), false, &[], None))
+                .unwrap(),
+            unfiltered
+        );
+    }
+
     /// Input order is preserved, duplicate sources each get their own entry, and
     /// a source absent from the graph counts zero rather than erroring.
     #[test]
@@ -2816,5 +2998,95 @@ mod typed_neighbor_count_tests {
                 Ok(())
             })
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod parallel_kernel_tests {
+    use serde_json::json;
+    use std::sync::atomic::Ordering;
+    use tempfile::TempDir;
+
+    use crate::{Graph, PathCountSpec, graph::algo::FORCE_KERNEL_THREADS, schema::NodeId};
+
+    /// Splitting a counting kernel across threads must not change its result. The
+    /// two-hop count reduces over disjoint ranges of the middle node, so this
+    /// drives the same graph at one thread and at several and compares, including
+    /// the self-loop correction that relationship uniqueness applies.
+    #[test]
+    fn two_hop_count_is_thread_count_invariant() {
+        let dir = TempDir::new().unwrap();
+        let g = Graph::open(dir.path(), 1).unwrap();
+        // A chain, a fan, parallel edges, a self-loop, and a differently labeled
+        // node, so every branch of the correction is reachable.
+        let ids: Vec<NodeId> = (0..9)
+            .map(|i| {
+                if i == 8 {
+                    g.add_node("Robot", &json!({ "n": i })).unwrap()
+                } else {
+                    g.add_node("Person", &json!({ "n": i })).unwrap()
+                }
+            })
+            .collect();
+        for &(a, b) in &[
+            (0, 1),
+            (1, 2),
+            (2, 3),
+            (0, 2),
+            (0, 2),
+            (3, 3),
+            (3, 4),
+            (4, 5),
+            (5, 6),
+            (6, 7),
+            (7, 8),
+            (8, 0),
+        ] {
+            g.add_edge(ids[a], ids[b], "F", &json!({})).unwrap();
+        }
+        g.add_edge(ids[1], ids[2], "B", &json!({})).unwrap();
+        g.rebuild_csr().unwrap();
+
+        let specs = [
+            PathCountSpec {
+                rel_types: vec![Some("F"), Some("F")],
+                labels: vec![None, None, None],
+                vertex_allow: Vec::new(),
+            },
+            PathCountSpec {
+                rel_types: vec![Some("F"), Some("F")],
+                labels: vec![Some("Person"); 3],
+                vertex_allow: Vec::new(),
+            },
+            // Mixed types, so the self-loop correction sees only one of them.
+            PathCountSpec {
+                rel_types: vec![Some("B"), Some("F")],
+                labels: vec![None, None, None],
+                vertex_allow: Vec::new(),
+            },
+            PathCountSpec {
+                rel_types: vec![None, None],
+                labels: vec![None, Some("Person"), None],
+                vertex_allow: Vec::new(),
+            },
+        ];
+
+        for spec in &specs {
+            FORCE_KERNEL_THREADS.store(0, Ordering::Release);
+            let serial = g.count_linear_paths(spec).unwrap();
+            for threads in [2usize, 3, 5, 16] {
+                FORCE_KERNEL_THREADS.store(threads, Ordering::Release);
+                let parallel = g.count_linear_paths(spec).unwrap();
+                assert_eq!(
+                    serial, parallel,
+                    "two-hop count changed at {threads} threads (serial {serial})"
+                );
+            }
+            FORCE_KERNEL_THREADS.store(0, Ordering::Release);
+            assert!(
+                serial > 0,
+                "fixture must produce paths for a meaningful check"
+            );
+        }
     }
 }

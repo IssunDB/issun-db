@@ -4797,6 +4797,8 @@ pub(super) fn eval_leaf(
             group_label,
             counted_label,
             counted_nonnull_prop,
+            counted_filters,
+            counted_leaf,
             // `group_var` names the group endpoint for the plan display; the
             // executor reads the group properties by name, so it is not used here.
             group_var: _,
@@ -4809,11 +4811,52 @@ pub(super) fn eval_leaf(
             // tuple to merge nodes that share a key (the row pipeline groups by
             // value, not identity). The merge is over the distinct-group-node
             // set, far smaller than the edge set the fold would touch.
+            // Resolve any pushed-down predicate on the counted endpoint to an
+            // allow-set through the property index, intersecting the conjuncts,
+            // so the filtered grouped count stays one kernel call instead of an
+            // expansion. The rewrite guarantees a filtered endpoint is labeled.
+            // An index or range scan leaf already encodes the predicate on the
+            // counted endpoint, so evaluating it yields the allow-set directly.
+            let counted_allow: Option<Vec<NodeId>> = if let Some(leaf) = counted_leaf {
+                let rows = eval_leaf(graph, leaf, params, schema)?;
+                let var = match leaf.as_ref() {
+                    PhysicalOperator::NodeIndexScan { variable, .. }
+                    | PhysicalOperator::NodeRangeScan { variable, .. } => variable.as_str(),
+                    _ => return Err("grouped-degree counted leaf must be an index scan".into()),
+                };
+                let mut ids = Vec::with_capacity(rows.len());
+                for row in &rows {
+                    for (name, binding) in row.bound_entries() {
+                        if name == var {
+                            if let GraphBinding::Node(id) = binding {
+                                ids.push(*id);
+                            }
+                        }
+                    }
+                }
+                Some(ids)
+            } else if counted_filters.is_empty() {
+                None
+            } else {
+                let label = counted_label
+                    .as_deref()
+                    .ok_or("grouped-degree counted filter requires a label")?;
+                let mut allow: Option<std::collections::HashSet<NodeId>> = None;
+                for pred in counted_filters {
+                    let resolved = resolve_path_count_pred(graph, label, pred, params)?;
+                    allow = Some(match allow {
+                        None => resolved,
+                        Some(acc) => acc.intersection(&resolved).copied().collect(),
+                    });
+                }
+                Some(allow.unwrap_or_default().into_iter().collect())
+            };
             let spec = issundb_core::GroupedDegreeSpec {
                 rel_type: rel_type.as_deref(),
                 group_is_dst: *group_is_dst,
                 group_label: group_label.as_deref(),
                 counted_label: counted_label.as_deref(),
+                counted_allow: counted_allow.as_deref(),
                 counted_nonnull_prop: counted_nonnull_prop.as_deref(),
             };
             let pairs = graph
@@ -6592,6 +6635,165 @@ mod grouped_degree_exec_tests {
                         "{}",
                         kernel_q
                     );
+                }
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    /// The kernel counts a hop the optimizer rooted at its rarer end and expanded
+    /// backwards, and it pushes a predicate on the counted endpoint down as an
+    /// index-resolved allow-set. Both are shapes the rewrite used to decline: the
+    /// first because it required a forward hop, the second because any property
+    /// predicate forfeited it.
+    ///
+    /// The rewrite groups by the expand's newly bound variable and counts the
+    /// scanned one. A predicate on the group endpoint still declines, since it
+    /// would change which groups exist rather than only their counts; grouping by
+    /// the scanned variable instead is a different assignment the collapse path in
+    /// `exec/vectorized.rs` owns.
+    #[test]
+    fn kernel_covers_reversed_hops_and_counted_predicates() {
+        let (_dir, graph) = setup();
+        // Few interests, many people, so the optimizer roots at Interest and
+        // expands backwards to bind Person: the group endpoint is Person and the
+        // counted endpoint is the scanned Interest.
+        super::execute(
+            &graph,
+            "CREATE (i1:Interest {name: 'a', rank: 1}), (i2:Interest {name: 'b', rank: 5}) \
+             CREATE (p1:Person {id: 1, age: 20}), (p2:Person {id: 2, age: 40}), \
+                    (p3:Person {id: 3, age: 60}) \
+             CREATE (p1)-[:HAS]->(i1), (p1)-[:HAS]->(i2), (p2)-[:HAS]->(i1), \
+                    (p3)-[:HAS]->(i2)",
+            &HashMap::new(),
+        )
+        .unwrap();
+        graph.rebuild_csr().unwrap();
+
+        // Reversed hop: group by the person, count their interests.
+        let reversed =
+            "MATCH (p:Person)-[:HAS]->(i:Interest) RETURN p.id AS id, count(i.name) AS num";
+        let plan = plan_text(&graph, reversed);
+        assert!(
+            plan.contains("GroupedDegree"),
+            "expected the kernel:\n{plan}"
+        );
+        let row_q = "MATCH (p:Person)-[:HAS]->(i:Interest) WHERE i.__force IS NULL \
+                     RETURN p.id AS id, count(i.name) AS num";
+        assert_eq!(records(&graph, reversed), records(&graph, row_q));
+        assert_eq!(
+            sorted_records(&graph, reversed),
+            vec![
+                vec![serde_json::json!(1), serde_json::json!(2)],
+                vec![serde_json::json!(2), serde_json::json!(1)],
+                vec![serde_json::json!(3), serde_json::json!(1)],
+            ]
+        );
+
+        // A predicate on the counted (scanned) endpoint becomes an allow-set.
+        let filtered = "MATCH (p:Person)-[:HAS]->(i:Interest) WHERE i.rank >= 5 \
+                        RETURN p.id AS id, count(i.name) AS num";
+        let plan = plan_text(&graph, filtered);
+        assert!(
+            plan.contains("GroupedDegree") && plan.contains("filter(c)"),
+            "expected a pushed counted filter:\n{plan}"
+        );
+        let filtered_row = "MATCH (p:Person)-[:HAS]->(i:Interest) \
+                           WHERE i.rank >= 5 AND i.__force IS NULL \
+                           RETURN p.id AS id, count(i.name) AS num";
+        assert_eq!(
+            sorted_records(&graph, filtered),
+            sorted_records(&graph, filtered_row)
+        );
+        // Only i2 (rank 5) qualifies: p1 and p3 keep one, p2 drops out.
+        assert_eq!(
+            sorted_records(&graph, filtered),
+            vec![
+                vec![serde_json::json!(1), serde_json::json!(1)],
+                vec![serde_json::json!(3), serde_json::json!(1)],
+            ]
+        );
+
+        // A predicate on the group endpoint is still not lowered.
+        let group_pred = "MATCH (p:Person)-[:HAS]->(i:Interest) WHERE p.age > 30 \
+                          RETURN p.id AS id, count(i.name) AS num";
+        assert!(!plan_text(&graph, group_pred).contains("GroupedDegree"));
+        super::execute(&graph, group_pred, &HashMap::new()).unwrap();
+    }
+
+    /// Differential parity for the two generalizations over random multigraphs:
+    /// a reversed hop, and range predicates on the counted endpoint, against the
+    /// forced row pipeline.
+    #[test]
+    fn reversed_and_filtered_kernel_match_row_path_on_random_graphs() {
+        use proptest::prelude::*;
+
+        let mut runner = proptest::test_runner::TestRunner::new(ProptestConfig {
+            cases: 32,
+            ..ProptestConfig::default()
+        });
+        let strategy = (
+            1usize..=5,
+            proptest::collection::vec((0usize..5, 0usize..3), 0..16),
+            proptest::collection::vec(0i64..5, 3),
+        );
+        runner
+            .run(&strategy, |(n_people, edges, ranks)| {
+                let (_dir, graph) = setup();
+                let mut create = String::new();
+                for (k, r) in ranks.iter().enumerate() {
+                    create.push_str(&format!(
+                        "{}(i{k}:Interest {{name: '{}', rank: {r}}})",
+                        if k == 0 { "CREATE " } else { ", " },
+                        ["a", "b", "c"][k]
+                    ));
+                }
+                for p in 0..n_people {
+                    create.push_str(&format!(", (p{p}:Person {{id: {p}}})"));
+                }
+                super::execute(&graph, &create, &HashMap::new()).unwrap();
+                for (p, i) in &edges {
+                    if *p < n_people {
+                        super::execute(
+                            &graph,
+                            &format!(
+                                "MATCH (a:Person), (b:Interest) WHERE a.id = {p} AND b.name = '{}' \
+                                 CREATE (a)-[:HAS]->(b)",
+                                ["a", "b", "c"][*i]
+                            ),
+                            &HashMap::new(),
+                        )
+                        .unwrap();
+                    }
+                }
+                graph.rebuild_csr().unwrap();
+
+                for tail in [
+                    "RETURN p.id AS id, count(i.name) AS num ORDER BY num DESC, id",
+                    "RETURN p.id AS id, count(*) AS num ORDER BY num DESC, id LIMIT 2",
+                ] {
+                    for pred in [
+                        "",
+                        "WHERE i.rank >= 2 ",
+                        "WHERE i.rank >= 1 AND i.rank <= 3 ",
+                    ] {
+                        let kernel_q =
+                            format!("MATCH (p:Person)-[:HAS]->(i:Interest) {pred}{tail}");
+                        let row_q = format!(
+                            "MATCH (p:Person)-[:HAS]->(i:Interest) {}i.__force IS NULL {tail}",
+                            if pred.is_empty() {
+                                "WHERE ".to_string()
+                            } else {
+                                format!("{} AND ", pred.trim_end())
+                            }
+                        );
+                        proptest::prop_assert_eq!(
+                            records(&graph, &kernel_q),
+                            records(&graph, &row_q),
+                            "{}",
+                            kernel_q
+                        );
+                    }
                 }
                 Ok(())
             })

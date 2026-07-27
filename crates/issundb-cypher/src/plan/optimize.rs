@@ -4088,6 +4088,52 @@ type ForwardExpand<'a> = (
     &'a Vec<String>,
 );
 
+/// Like [`match_forward_expand`] but accepting either direction, returning the
+/// same binding plus the hop's `is_incoming` flag. Used by the grouped-degree
+/// rewrite, whose kernel counts both directions, so restricting it to forward
+/// hops would forfeit the rewrite whenever the optimizer roots a pattern at its
+/// rarer end and expands backwards.
+#[allow(clippy::type_complexity)]
+fn match_directed_expand(
+    op: &PhysicalOperator,
+) -> Option<(
+    &PhysicalOperator,
+    &String,
+    &String,
+    &String,
+    &Option<String>,
+    &Vec<String>,
+    bool,
+)> {
+    if let PhysicalOperator::Expand {
+        input,
+        src_var,
+        rel_var,
+        dst_var,
+        rel_type,
+        is_incoming,
+        is_undirected: false,
+        min_hops: 1,
+        max_hops: 1,
+        unique_rels,
+        needs_path: false,
+        is_var_length: false,
+    } = op
+    {
+        Some((
+            input.as_ref(),
+            src_var,
+            rel_var,
+            dst_var,
+            rel_type,
+            unique_rels,
+            *is_incoming,
+        ))
+    } else {
+        None
+    }
+}
+
 fn match_forward_expand(op: &PhysicalOperator) -> Option<ForwardExpand<'_>> {
     if let PhysicalOperator::Expand {
         input,
@@ -4403,23 +4449,33 @@ fn try_grouped_degree(op: &PhysicalOperator) -> Option<PhysicalOperator> {
         return None;
     }
 
-    // The group endpoint's constraints sit above the single forward expand.
+    // The group endpoint's constraints sit above the single directed expand. The
+    // kernel counts either direction, so unlike the path count this rewrite does
+    // not require a forward hop: what matters is which endpoint of the stored
+    // edge the group variable is.
     let (cons_dst, exp) = peel_vertex_constraints(input.as_ref());
-    let (below, src_var, _rel_var, dst_var, rel_type, unique) = match_forward_expand(exp)?;
+    let (below, src_var, _rel_var, dst_var, rel_type, unique, incoming) =
+        match_directed_expand(exp)?;
     if !unique.is_empty() || src_var == dst_var {
         return None;
     }
 
-    // One hop only: the source's constraints sit directly over a `LabelScan`.
-    // A second expand beneath leaves `scan` non-`LabelScan`, so a two-hop chain
-    // falls back here.
+    // One hop only: the counted endpoint's constraints sit directly over its leaf
+    // scan. A second expand beneath leaves `scan` a non-leaf, so a two-hop chain
+    // falls back here. An index or range scan is accepted as well as a plain label
+    // scan, because that is the form a `prop CMP literal` predicate on this
+    // endpoint takes once index-scan rewriting has claimed it; the executor turns
+    // such a leaf into the counted allow-set.
     let (cons_src, scan) = peel_vertex_constraints(below);
-    let PhysicalOperator::LabelScan {
-        variable: v0,
-        label: l0,
-    } = scan
-    else {
-        return None;
+    let (v0, l0, counted_leaf) = match scan {
+        PhysicalOperator::LabelScan { variable, label } => (variable, label.clone(), None),
+        PhysicalOperator::NodeIndexScan {
+            variable, label, ..
+        }
+        | PhysicalOperator::NodeRangeScan {
+            variable, label, ..
+        } => (variable, Some(label.clone()), Some(Box::new(scan.clone()))),
+        _ => return None,
     };
     if v0 != src_var {
         return None;
@@ -4450,23 +4506,33 @@ fn try_grouped_degree(op: &PhysicalOperator) -> Option<PhysicalOperator> {
         _ => return None,
     };
 
-    // Resolve the per-endpoint labels. Property predicates are not lowered into
-    // the grouped-degree kernel, so any predicate forfeits the rewrite.
+    // Resolve the per-endpoint labels. A predicate on the group endpoint is not
+    // lowered here (it would narrow which groups exist, not just their counts),
+    // but one on the counted endpoint becomes an index-resolved allow-set, the
+    // same way the path count pushes down `PathCountSpec::vertex_allow`. The
+    // property index is label-scoped, so a predicate needs its endpoint labeled.
     let (group_label, group_preds) = resolve_vertex_constraints(&cons_dst, dst_var)?;
     let (src_label, src_preds) = resolve_vertex_constraints(&cons_src, v0)?;
-    if !group_preds.is_empty() || !src_preds.is_empty() {
+    if !group_preds.is_empty() {
         return None;
     }
-    let counted_label = merge_scan_label(l0.clone(), src_label)?;
+    let counted_label = merge_scan_label(l0, src_label)?;
+    if !src_preds.is_empty() && counted_label.is_none() {
+        return None;
+    }
 
     Some(PhysicalOperator::GroupedDegree {
         rel_type: rel_type.clone(),
-        // A forward expand binds the destination as the edge destination, so
-        // grouping by it counts incoming edges.
-        group_is_dst: true,
+        // The group endpoint is the expand's newly bound variable. A forward
+        // expand binds it as the stored edge's destination, so grouping by it
+        // counts incoming edges; an incoming expand binds it as the stored edge's
+        // source, so grouping by it counts outgoing ones.
+        group_is_dst: !incoming,
         group_label,
         counted_label,
         counted_nonnull_prop,
+        counted_filters: src_preds,
+        counted_leaf,
         group_var: dst_var.clone(),
         group_by: group_by.clone(),
         output: out_name.clone(),

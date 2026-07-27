@@ -2393,8 +2393,10 @@ mod tests {
 
     /// A group-by over a property that mixes integer and float representations of
     /// the same value (`1` and `1.0`) must form one group under openCypher
-    /// numeric equivalence, and the vectorized fast path must agree with the row
-    /// pipeline.
+    /// numeric equivalence, on both paths that can own the shape: the one-hop
+    /// query lowers to the grouped-degree kernel (the optimizer roots it at the
+    /// rarer `B` and expands backwards, which the kernel now counts), and the
+    /// two-hop query stays with the columnar aggregate.
     #[test]
     fn mixed_int_float_group_merges_and_matches_row_path() {
         let dir = TempDir::new().unwrap();
@@ -2405,17 +2407,42 @@ mod tests {
         let a2 = g.add_node("A", &json!({ "v": 1.0 })).unwrap(); // float 1.0
         let a3 = g.add_node("A", &json!({ "v": 2 })).unwrap();
         let b = g.add_node("B", &json!({})).unwrap();
+        let c = g.add_node("C", &json!({})).unwrap();
         for a in [a1, a2, a3] {
             g.add_edge(a, b, "R", &json!({})).unwrap();
         }
+        g.add_edge(b, c, "S", &json!({})).unwrap();
+        g.rebuild_csr().unwrap();
 
-        let cypher = "MATCH (a:A)-[:R]->(b:B) RETURN a.v AS v, count(*) AS c ORDER BY v";
-        assert_matches_row_path(&g, cypher);
+        let params = std::collections::HashMap::new();
+        let one_hop = "MATCH (a:A)-[:R]->(b:B) RETURN a.v AS v, count(*) AS c ORDER BY v";
+        // A one-hop grouped count is the kernel's shape, so compare it against the
+        // row pipeline directly rather than asserting columnar eligibility.
+        let fast = execute(&g, one_hop, &params).unwrap();
+        let slow = row_path_execute(&g, one_hop, &params).unwrap();
+        let fast_rows: Vec<_> = fast.records.iter().map(|r| &r.values).collect();
+        let slow_rows: Vec<_> = slow.records.iter().map(|r| &r.values).collect();
+        assert_eq!(fast_rows, slow_rows, "records for: {one_hop}");
 
-        // 1 and 1.0 collapse into a single group of two.
-        let res = execute(&g, cypher, &std::collections::HashMap::new()).unwrap();
-        assert_eq!(res.records.len(), 2, "1 and 1.0 must form one group");
-        assert_eq!(res.records[0].values[1], json!(2), "the merged group has 2");
+        // Two hops are beyond the one-hop kernel, so this stays columnar.
+        let two_hop = "MATCH (a:A)-[:R]->(b:B)-[:S]->(d:C) \
+                       RETURN a.v AS v, count(*) AS c ORDER BY v";
+        assert_matches_row_path(&g, two_hop);
+
+        // 1 and 1.0 collapse into a single group of two, on either path.
+        for cypher in [one_hop, two_hop] {
+            let res = execute(&g, cypher, &params).unwrap();
+            assert_eq!(
+                res.records.len(),
+                2,
+                "1 and 1.0 must form one group: {cypher}"
+            );
+            assert_eq!(
+                res.records[0].values[1],
+                json!(2),
+                "the merged group has 2: {cypher}"
+            );
+        }
     }
 
     /// `count(DISTINCT ...)` and `collect(DISTINCT ...)` treat `1` and `1.0` as

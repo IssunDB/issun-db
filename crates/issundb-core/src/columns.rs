@@ -212,7 +212,7 @@ impl PropColumn {
         }
     }
 
-    fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         match self {
             Self::Int(v) => v.len(),
             Self::Float(v) => v.len(),
@@ -283,6 +283,24 @@ impl PropColumn {
             Self::Bool(v) => v[dense].is_some(),
             Self::Str { idx, .. } => idx[dense] != STR_NULL,
             Self::Json(v) => v[dense].is_some(),
+        }
+    }
+
+    /// Whether every slot holds a non-null value.
+    ///
+    /// A column with no nulls anywhere is non-null on every subset of it, so a
+    /// caller filtering on presence can skip building a per-entity mask
+    /// altogether. This is a sequential pass over the presence representation,
+    /// which is far cheaper than the mask it avoids: that mask costs one hash
+    /// lookup per entity to translate between two independently built dense
+    /// spaces.
+    pub(crate) fn all_present(&self) -> bool {
+        match self {
+            Self::Int(v) => v.iter().all(Option::is_some),
+            Self::Float(v) => v.iter().all(Option::is_some),
+            Self::Bool(v) => v.iter().all(Option::is_some),
+            Self::Str { idx, .. } => idx.iter().all(|i| *i != STR_NULL),
+            Self::Json(v) => v.iter().all(Option::is_some),
         }
     }
 
