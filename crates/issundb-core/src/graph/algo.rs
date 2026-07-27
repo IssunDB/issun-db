@@ -53,17 +53,31 @@ impl Graph {
         // Dense-index masks for the per-variable labels; `None` means
         // unconstrained. An unknown label yields an all-false mask, which
         // counts zero without a special case.
+        // A pattern almost always repeats a label across its variables
+        // (`(:Person)->(:Person)->(:Person)`), and building one mask costs a full
+        // label-index scan plus a dense lookup per node. Build each *distinct*
+        // label once and copy it for the repeats: the copy is a memcpy over the
+        // dense space, against an index scan of the whole label. Each variable
+        // still owns its mask, because a pushed-down `vertex_allow` intersects
+        // into it in place.
         let mut masks: [Option<Vec<bool>>; 3] = [None, None, None];
+        let mut built: Vec<(&str, Vec<bool>)> = Vec::new();
         for (i, label) in spec.labels.iter().enumerate() {
-            if let Some(name) = label {
-                let mut mask = vec![false; n];
-                for id in self.nodes_by_label(name)? {
-                    if let Some(&d) = snap.id_to_dense.get(&id) {
-                        mask[d as usize] = true;
+            let Some(name) = label else { continue };
+            let at = match built.iter().position(|(seen, _)| seen == name) {
+                Some(at) => at,
+                None => {
+                    let mut mask = vec![false; n];
+                    for id in self.nodes_by_label(name)? {
+                        if let Some(&d) = snap.id_to_dense.get(&id) {
+                            mask[d as usize] = true;
+                        }
                     }
+                    built.push((name, mask));
+                    built.len() - 1
                 }
-                masks[i] = Some(mask);
-            }
+            };
+            masks[i] = Some(built[at].1.clone());
         }
         let label_ok = |mask: &Option<Vec<bool>>, d: usize| mask.as_ref().is_none_or(|m| m[d]);
 
@@ -202,17 +216,31 @@ impl Graph {
         // Dense-index masks for the per-variable labels; `None` is
         // unconstrained. An unknown label yields an all-false mask, counting
         // zero without a special case.
+        // Every variable in a path pattern usually carries the same label
+        // (`(:Person)->(:Person)->(:Person)`), and one mask costs a full
+        // label-index scan plus a dense lookup per node. Build each *distinct*
+        // label once and copy it for the repeats: the copy is a memcpy over the
+        // dense space, against an index scan of the whole label. Each variable
+        // keeps its own mask, because a pushed-down `vertex_allow` intersects
+        // into it in place.
         let mut masks: Vec<Option<Vec<bool>>> = vec![None; hops + 1];
+        let mut built: Vec<(&str, Vec<bool>)> = Vec::new();
         for (i, label) in spec.labels.iter().enumerate() {
-            if let Some(name) = label {
-                let mut mask = vec![false; n];
-                for id in self.nodes_by_label(name)? {
-                    if let Some(&d) = snap.id_to_dense.get(&id) {
-                        mask[d as usize] = true;
+            let Some(name) = label else { continue };
+            let at = match built.iter().position(|(seen, _)| seen == name) {
+                Some(at) => at,
+                None => {
+                    let mut mask = vec![false; n];
+                    for id in self.nodes_by_label(name)? {
+                        if let Some(&d) = snap.id_to_dense.get(&id) {
+                            mask[d as usize] = true;
+                        }
                     }
+                    built.push((name, mask));
+                    built.len() - 1
                 }
-                masks[i] = Some(mask);
-            }
+            };
+            masks[i] = Some(built[at].1.clone());
         }
         // Per-variable allow-sets from pushed-down property predicates. A
         // present set intersects with the label mask (a node passes only when it
@@ -2812,6 +2840,60 @@ mod typed_neighbor_count_tests {
             .typed_neighbor_counts(&[a], &spec(Some("FOLLOWS"), false, &[], Some("nope")))
             .unwrap();
         assert_eq!(absent, vec![(5, 0)]);
+    }
+
+    /// Variables sharing a label share the *scan* that builds their mask, not the
+    /// mask itself: a pushed-down allow-set intersects into one variable's mask in
+    /// place, so aliasing them would leak one variable's filter onto another. This
+    /// pins that by giving three same-labelled variables different allow-sets.
+    #[test]
+    fn same_label_variables_do_not_share_a_mutated_mask() {
+        let dir = TempDir::new().unwrap();
+        let g = Graph::open(dir.path(), 1).unwrap();
+        let ids: Vec<NodeId> = (0..4)
+            .map(|i| g.add_node("P", &json!({ "k": i })).unwrap())
+            .collect();
+        // A 3-chain plus a shortcut, so several two-hop paths exist.
+        for &(a, b) in &[(0, 1), (1, 2), (2, 3), (0, 2)] {
+            g.add_edge(ids[a], ids[b], "F", &json!({})).unwrap();
+        }
+        g.rebuild_csr().unwrap();
+
+        // Unfiltered: 0->1->2, 1->2->3, 0->2->3.
+        let base = crate::PathCountSpec {
+            rel_types: vec![Some("F"), Some("F")],
+            labels: vec![Some("P"); 3],
+            vertex_allow: Vec::new(),
+        };
+        assert_eq!(g.count_linear_paths(&base).unwrap(), 3);
+
+        // Restricting only the middle variable to node 2 keeps both paths through
+        // it (1->2->3 and 0->2->3) and drops 0->1->2, whose middle is node 1. If
+        // the three same-labelled variables shared one mask, this intersection
+        // would also constrain the endpoints and the count would fall further.
+        let middle_only = crate::PathCountSpec {
+            rel_types: vec![Some("F"), Some("F")],
+            labels: vec![Some("P"); 3],
+            vertex_allow: vec![None, Some(vec![ids[2]]), None],
+        };
+        assert_eq!(
+            g.count_linear_paths(&middle_only).unwrap(),
+            2,
+            "an allow-set on the middle variable must not constrain the others"
+        );
+
+        // A different allow-set per same-labelled variable: source in {0}, middle
+        // in {1,2}, destination in {2}. Only 0->1->2 satisfies all three.
+        let per_variable = crate::PathCountSpec {
+            rel_types: vec![Some("F"), Some("F")],
+            labels: vec![Some("P"); 3],
+            vertex_allow: vec![
+                Some(vec![ids[0]]),
+                Some(vec![ids[1], ids[2]]),
+                Some(vec![ids[2]]),
+            ],
+        };
+        assert_eq!(g.count_linear_paths(&per_variable).unwrap(), 1);
     }
 
     /// The non-null filter agrees whether the mask is built or skipped. A column
