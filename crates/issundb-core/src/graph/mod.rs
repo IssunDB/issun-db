@@ -1015,13 +1015,19 @@ impl Graph {
     /// Commit `wtxn` and publish the write to the caches' freshness counters as
     /// one step, where `count` is the number of mutations the transaction made.
     ///
-    /// Every auto-committing mutation method and [`Graph::update`] commit through
-    /// here rather than calling `wtxn.commit()` directly. The publish is what
-    /// makes every freshness gate notice the write, so a mutation method that
-    /// committed without it would leave the caches permanently claiming to be
-    /// current; routing both through one call that consumes the transaction makes
-    /// that combination unwritable. Ordering inside is deliberate: see
-    /// [`crate::csr::CsrCache::advance_write_gen`].
+    /// Every mutation that changes adjacency, an edge weight, or a node record
+    /// commits through here rather than calling `wtxn.commit()` directly. The
+    /// publish is what makes every freshness gate notice the write, so a method
+    /// that committed without it would leave the caches permanently claiming to be
+    /// current rather than briefly.
+    ///
+    /// This is convention plus a test, not an enforced invariant: `wtxn.commit()`
+    /// is still called directly by the index, vector, and FTS writers, none of
+    /// which touch adjacency or a cached property, so nothing structurally prevents
+    /// a new mutation method from committing without publishing.
+    /// `publish_tests::every_committing_mutation_publishes_the_write` enumerates
+    /// today's methods by hand, so add a new one to it. Ordering inside here is
+    /// deliberate: see [`crate::csr::CsrCache::advance_write_gen`].
     pub(super) fn commit_and_publish(
         &self,
         wtxn: heed::RwTxn<'_>,

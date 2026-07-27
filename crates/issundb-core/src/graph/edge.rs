@@ -80,15 +80,15 @@ impl Graph {
         let _guard = self._write_lock.lock();
         let mut wtxn = self.storage.env.write_txn()?;
         self.update_edge_impl(&mut wtxn, id, props)?;
+        // Publishing matters even though no adjacency changed. A property change can
+        // alter an edge's weight (`weight`/`cost`/`capacity`/`cap`), which the CSR
+        // snapshot and the derived weight and PageRank matrices bake in, and those
+        // matrices have no incremental maintenance. Advancing the generation here is
+        // what marks them stale so the next `ensure_csr_fresh` rebuilds before a
+        // weighted algorithm reads them; without it `shortest_path_dijkstra` and
+        // friends serve the pre-update weight.
         self.commit_and_publish(wtxn, 1)?;
         self.edge_columns.record_touched(id);
-        // A property change can alter an edge's weight (`weight`/`cost`/
-        // `capacity`/`cap`), which the CSR snapshot and the derived weight and
-        // PageRank matrices bake in. Those matrices have no incremental
-        // maintenance, so advance the write generation to mark them stale; the
-        // next `ensure_csr_fresh` then rebuilds before a weighted algorithm reads
-        // them. Without this, `shortest_path_dijkstra` and friends serve the
-        // pre-update weight (or, with a changed edge, no path at all).
         self.maybe_spawn_rebuild();
         Ok(())
     }

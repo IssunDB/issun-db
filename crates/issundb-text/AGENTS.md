@@ -8,12 +8,12 @@ everywhere and are not repeated here.
 The tokenizer currently lives in `crates/issundb-core/src/storage/fts.rs` (the `tokenize` function), pending the target decoupling that moves it into
 this crate. Every string is processed through the following stages, applied in this exact order at both **index time** and **query time**:
 
-1. **`fold_ascii`**: normalize diacritics and accented characters to their ASCII base forms (e.g., `é → e`, `ü → u`). This ensures that queries
+1. `fold_ascii`: normalize diacritics and accented characters to their ASCII base forms (e.g., `é → e`, `ü → u`). This ensures that queries
    without diacritics match documents indexed with them.
-2. **`unicode_words` segmentation**: split the folded string into word tokens on Unicode word boundaries.
-3. **`to_lowercase`**: fold all tokens to lowercase.
-4. **Stop-word filter**: discard tokens that appear in the stop-word list for the active language.
-5. **Snowball stemmer**: reduce each surviving token to its stem using the language-appropriate Snowball algorithm.
+2. `unicode_words` segmentation: split the folded string into word tokens on Unicode word boundaries.
+3. `to_lowercase`: fold all tokens to lowercase.
+4. Stop-word filter: discard tokens that appear in the stop-word list for the active language.
+5. Snowball stemmer: reduce each surviving token to its stem using the language-appropriate Snowball algorithm.
 
 Applying the stages in a different order at index time versus query time will produce mismatches and silent recall failures. If you change any stage,
 change it in both paths simultaneously.
@@ -98,12 +98,12 @@ This pattern is already in place in `TextGraphExt::text_search`; do not regress 
 
 To add support for a new language (the tokenizer constants and selectors live in `crates/issundb-core/src/storage/fts.rs`):
 
-1. **Stop-word list constant definition**: in `crates/issundb-core/src/storage/fts.rs` (e.g., `STOP_WORDS_DUTCH: &[&str]`).
-2. **Stop-word retrieval mapping**: an arm for the new language in `get_stop_words` (same file).
-3. **Stemmer algorithm mapping**: an arm for the new language in `map_algorithm` (same file; the Snowball stemmer language selector).
-4. **Language enum variant**: the new variant in the `Language` enum in `crates/issundb-core/src/schema.rs`, keeping the `#[repr(u8)]` discriminant
+1. Stop-word list constant definition: in `crates/issundb-core/src/storage/fts.rs` (e.g., `STOP_WORDS_DUTCH: &[&str]`).
+2. Stop-word retrieval mapping: an arm for the new language in `get_stop_words` (same file).
+3. Stemmer algorithm mapping: an arm for the new language in `map_algorithm` (same file; the Snowball stemmer language selector).
+4. Language enum variant: the new variant in the `Language` enum in `crates/issundb-core/src/schema.rs`, keeping the `#[repr(u8)]` discriminant
    values contiguous.
-5. **Unit test validation**: a unit test in `issundb-core` that round-trips the new `Language` variant through `to_u8` / `from_u8`.
+5. Unit test validation: a unit test in `issundb-core` that round-trips the new `Language` variant through `to_u8` / `from_u8`.
 
 All five steps are required; partial additions will compile but produce incorrect stemming or serialization.
 

@@ -122,7 +122,7 @@ modules according to this map.
       planning. Path algorithms other than `shortestPath` and `dijkstra` are deliberately excluded.
     - `src/exec/mod.rs`: public entry points (`execute`, `explain`), shared type definitions, and tests.
     - `src/exec/read.rs`: `execute_physical` and read-path helpers (`evaluate_where`, `evaluate_sort_key`, `json_to_prop_value`,
-      `execute_filter_over_expand`).
+      `filter_over_expand_batch`, and `multiway_join_rows`, the last shared by the materializing and streaming `MultiwayJoin` paths).
     - `src/exec/vectorized.rs`: columnar fast path for the final projection or aggregation over a linear chain of up to `MAX_VEC_HOPS` directed
       single hops. A structural recognizer matches `[Limit]? [Sort]? [Distinct]? Project [Aggregate]? Stage* (Expand(directed single hop)
       Stage*){0,MAX_VEC_HOPS} Leaf` with single-property expressions, executing column-at-a-time (bulk expansion via `Graph::node_props_json_table`
@@ -202,6 +202,10 @@ modules according to this map.
       walk-versus-trail divergence). Add a correctness query to the differential corpus, not here.
 - `Cargo.toml`: workspace root with shared `[workspace.dependencies]`. All version pins live here.
 - `Makefile`: developer workflow entry points.
+- Directory-scoped guides: `crates/issundb-core/AGENTS.md`, `crates/issundb-cypher/AGENTS.md`, `crates/issundb-text/AGENTS.md`, and
+  `crates/issundb-vector/AGENTS.md` carry crate-specific rules that this file does not repeat (LMDB lifetime rules, the query pipeline stages, the
+  tokenization order, the HNSW lock ordering). Read the one covering the crate being changed, and update it in the same patch when its subject changes:
+  being unreferenced from here is what let several of them drift behind the code.
 
 ## Testing Layout Rules
 

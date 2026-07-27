@@ -284,6 +284,10 @@ test-ladybugdb-zipf: ## Run the differential tests (using LadybugDB) under Zipf 
 	@cd benchmarks/ladybugdb-compare && LADYBUGDB_COMPARE_SKEW=zipf LADYBUGDB_COMPARE_DIFF_ONLY=1 \
 		LADYBUGDB_COMPARE_NODES=$(LADYBUGDB_DIFF_NODES) \
 		LADYBUGDB_COMPARE_GENERATED=$(LADYBUGDB_DIFF_GENERATED) cargo run --release
+	@echo "Running differential tests (using LadybugDB) (with Zipf skew, row pipeline)..."
+	@cd benchmarks/ladybugdb-compare && ISSUNDB_ROW_PIPELINE_ONLY=1 LADYBUGDB_COMPARE_SKEW=zipf \
+		LADYBUGDB_COMPARE_DIFF_ONLY=1 LADYBUGDB_COMPARE_NODES=$(LADYBUGDB_DIFF_NODES) \
+		LADYBUGDB_COMPARE_GENERATED=$(LADYBUGDB_DIFF_GENERATED) cargo run --release
 
 .PHONY: bench-ladybugdb
 bench-ladybugdb: ## Run the LadybugDB comparison harness (uniform skew)

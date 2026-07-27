@@ -46,15 +46,17 @@ Any mismatch fails the run and prints the first differing row.
 This corpus is deliberately separate from the timed workload. That workload is shaped for measurement, so most of its queries return a single
 `count(...)`, and a scalar count is a weak differential signal: it cannot see wrong row content, wrong column names, wrong row multiplicity, or two
 errors that cancel. The differential corpus returns the rows themselves, and covers projections over a bounded slice of the label scan, range and
-string predicates, disjunction and negation, one hop in both directions, two fixed hops with and without `DISTINCT`, expand-into, a closed triangle,
+string predicates, disjunction and negation, one hop in both directions, two fixed hops with and without `DISTINCT`, expand-into,
 and grouped aggregation (which emits one row per group, so a wrong group key or per-group tally is visible where a single total would hide it).
 
 Two invariants keep it cheap to extend, and a unit test pins both:
 
-- Every pattern is fixed-length. LadybugDB evaluates variable-length patterns under walk semantics where openCypher requires trails, and the pinned
-  build does not honor the `TRAIL` setting, so a variable-length query needs a hand-written reference to decide which engine diverged. That is what
-  the timed workload's `Oracle` does, and it does not scale to breadth. A fixed-length pattern has no such ambiguity, so any divergence is a real
-  defect in one of the two engines.
+- No pattern can bind one edge to two relationship slots, which means at most two hops, both in the same direction, and no closing hop. That is
+  narrower than "fixed-length" and the difference matters: relationship uniqueness applies to any pattern with two or more slots, so
+  `(a)-[:KNOWS]->(b)<-[:KNOWS]-(c)` diverges when `c` is `a`, and `(a)<-[:KNOWS]-(b)-[:KNOWS]->(a)` always does. The pinned LadybugDB build permits
+  that reuse where openCypher forbids it, and it does not honor the `TRAIL` setting. Two same-direction hops are safe only because the generator emits
+  no self-loops. Within this rule no adjudication is needed, so any divergence is a real defect in one of the two engines; shapes outside it belong in
+  the generated corpus below, where a reference evaluator adjudicates them.
 - Row sets stay small and skew-independent, either anchored at a non-hub probe or bounded by an `id` predicate, so the pass costs the same at every
   size in a sweep. It runs at every size on purpose, because the engine switches internal strategies at size thresholds and the same corpus at 10k and
   250k nodes is therefore not the same test.
@@ -65,12 +67,6 @@ comes back as `0.0` from IssunDB and `0` from LadybugDB, while fractional weight
 
 Running the harness under `ISSUNDB_ROW_PIPELINE_ONLY=1` compares LadybugDB against IssunDB's row pipeline instead of its fast paths, which composes
 the two oracles: agreement in both configurations means the fast paths and the general path both match an independent implementation.
-
-One rule is narrower than it looks. No curated query may bind one edge to two relationship slots, which means at most two same-direction hops and no
-closing hop. Walk-against-trail is not only a variable-length question: relationship uniqueness applies to any pattern with two or more slots, so
-`(a)-[:KNOWS]->(b)<-[:KNOWS]-(c)` diverges when `c` is `a` and one edge fills both slots, and `(a)<-[:KNOWS]-(b)-[:KNOWS]->(a)` always does. Two
-same-direction hops are safe only because the generator emits no self-loops. Shapes outside that rule belong in the generated corpus below, where they
-are adjudicated instead of merely compared.
 
 ### Generated Queries
 

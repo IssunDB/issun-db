@@ -37,13 +37,18 @@
 //!   executor evaluates them. The row pipeline answers those plans either way.
 //!
 //! The flag is per thread, so tests that force it do not disturb the other tests
-//! sharing their process. It is read at exactly two entry points, the read path in
-//! [`crate::exec`] and `explain`, and threaded from there: the read path resolves
-//! it once per statement and hands the same value to both the optimizer
-//! (`Optimizer::optimize_with_mode`) and its choice of executor, so a statement
-//! cannot plan under one mode and execute under the other. A thread spawned
-//! mid-execution does not inherit the flag, which is why the large-stack dispatch
-//! in [`crate::exec`] carries it across explicitly.
+//! sharing their process.
+//!
+//! The read path resolves it once per statement and hands that one value to both
+//! the optimizer (`Optimizer::optimize_with_mode`) and its choice of executor, so a
+//! read statement cannot plan under one mode and execute under the other. Three
+//! other places still read it from the ambient thread through the convenience
+//! `Optimizer::optimize`: `explain`, which should show what would run on this
+//! thread, and the write path's four `Optimizer::optimize` call sites in
+//! `exec::write`, which have not been threaded. Thread them if a write-path
+//! executor choice is ever made from the flag. A thread spawned mid-execution does
+//! not inherit the flag either, which is why the large-stack dispatch in
+//! [`crate::exec`] carries it across explicitly.
 
 use std::cell::Cell;
 
