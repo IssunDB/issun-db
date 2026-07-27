@@ -536,7 +536,7 @@ impl Graph {
         } else {
             Vec::new()
         };
-        if visited_counted.is_empty() {
+        if spec.counted_nonnull_prop.is_none() {
             walk_qualifying(
                 &snap,
                 n,
@@ -871,7 +871,7 @@ impl Graph {
                 continue;
             };
             let mut qualifying = 0u64;
-            if visited.is_empty() {
+            if spec.neighbor_nonnull_prop.is_none() {
                 walk_source(
                     d as usize,
                     row_ptr,
@@ -1415,7 +1415,13 @@ impl Graph {
                             // gate needs one.
                             if matrices.read().is_none() {
                                 cache.install_snapshot(snap, built_gen);
-                                cache.cancel_rebuild();
+                                // Settle, do not cancel: cancelling leaves the
+                                // claimed dirty count in place, so the counter stays
+                                // above the threshold and the next commit spawns this
+                                // pass again, and so does every commit after it.
+                                if cache.settle_rebuild_claim() {
+                                    continue;
+                                }
                                 break;
                             }
                             match MatrixSet::materialize(

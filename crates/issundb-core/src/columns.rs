@@ -411,6 +411,16 @@ impl<S: ColumnSource> PropColumns<S> {
     /// string. An out-of-range `u64` is `Kind::Other` in `kind_of`, so no arm can
     /// silently null a value the fallback would have kept.
     pub(crate) fn from_items(items: Vec<(S::Id, Value)>) -> Self {
+        Self::from_items_for(items, None)
+    }
+
+    /// [`PropColumns::from_items`] restricted to one property.
+    ///
+    /// A grouped read touches exactly one property, so columnarizing the rest is
+    /// pure waste: over entities carrying thirty properties it decoded and built
+    /// thirty columns to use one, once per group-by expression. `None` keeps every
+    /// property, which is what the shared whole-graph build needs.
+    pub(crate) fn from_items_for(items: Vec<(S::Id, Value)>, only: Option<&str>) -> Self {
         let n = items.len();
         let mut dense_to_id = Vec::with_capacity(n);
         let mut id_to_dense: AHashMap<S::Id, u32> = AHashMap::with_capacity(n);
@@ -423,6 +433,9 @@ impl<S: ColumnSource> PropColumns<S> {
         for (dense, (_, json)) in items.into_iter().enumerate() {
             if let Value::Object(map) = json {
                 for (k, v) in map {
+                    if only.is_some_and(|want| want != k) {
+                        continue;
+                    }
                     let col = values.entry(k).or_insert_with(|| vec![None; n]);
                     col[dense] = Some(v);
                 }
@@ -762,9 +775,16 @@ pub(crate) struct ColumnsCache<S: ColumnSource> {
 const DIRECT_READ_BUILD_THRESHOLD: u64 = 4096;
 
 /// Entities re-read per transaction when patching. Bounds the transient memory a
-/// refresh holds: the pending touched list is unbounded (one `Graph::update` may
+/// *patch* holds: the pending touched list is unbounded (one `Graph::update` may
 /// insert millions of nodes), so a single gather over all of it would decode every
 /// one of their property maps at once.
+///
+/// This bounds the patch path only. A `force_full` refresh takes
+/// `PropColumns::build` instead, whose `scan_all` still returns a decoded property
+/// map for every entity in the graph before `from_items` runs, so the same
+/// transient is paid there. Since a node deletion in a batch sets `force_full`, a
+/// large batch containing one can still take that path; bounding it needs a
+/// streaming build, which is a larger change than this constant.
 const PATCH_CHUNK: usize = 4096;
 
 /// Largest gather served straight from storage while the columns are absent.

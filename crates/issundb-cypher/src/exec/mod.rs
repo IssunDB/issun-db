@@ -606,6 +606,7 @@ mod tests {
     /// for the pruner discarding `min_hops`/`max_hops`.
     #[test]
     fn varlen_hop_not_pruned_by_direct_edge_schema() {
+        let _fast_paths = crate::exec_mode::fast_paths_required();
         let (_dir, graph) = setup_graph();
         let a = graph.add_node("A", &serde_json::json!({})).unwrap();
         let x = graph.add_node("X", &serde_json::json!({})).unwrap();
@@ -4807,6 +4808,7 @@ mod tests {
     /// when the schema-based prune judges the second hop.
     #[test]
     fn prune_does_not_leak_labels_across_with_scope() {
+        let _fast_paths = crate::exec_mode::fast_paths_required();
         let (_dir, graph) = setup_graph();
         let params = HashMap::new();
         execute(&graph, "CREATE (:AA {name: 'a'})", &params).unwrap();
@@ -4827,6 +4829,7 @@ mod tests {
     /// shared variable: the mandatory pattern must not be pruned against it.
     #[test]
     fn prune_ignores_optional_match_labels() {
+        let _fast_paths = crate::exec_mode::fast_paths_required();
         let (_dir, graph) = setup_graph();
         let params = HashMap::new();
         // A :DD node with an SS edge to a :CC2 node; DD never has an RR2 edge,

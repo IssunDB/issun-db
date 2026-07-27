@@ -373,9 +373,11 @@ pinning:
   refreshing the CSR snapshot, true only when the snapshot is stale and the source set is at most `STALE_POINT_EXPAND_MAX`. Advisory: both routes return
   the same rows, so a caller ignoring it is correct but may rebuild a whole snapshot to serve a handful of sources. It is public because the Cypher
   executor's collapse decision needs it from another crate.
-- `adjacency_span(sources, incoming) -> Result<u64, Error>`: total length of `sources`' adjacency rows in one direction, an upper bound on the edges
-  `typed_neighbor_counts` would visit for them. It reads two array elements per source and no edge, so a caller can size an expansion before choosing
-  how to evaluate it.
+- `adjacency_span(sources, incoming) -> Result<u64, Error>`: total length of `sources`' adjacency rows in one direction, measured over the *installed*
+  CSR snapshot. It reads two array elements per source and no edge, and deliberately does not refresh: it exists so a caller can size an expansion before
+  choosing how to evaluate it, and refreshing would make the sizing call perform the work it is meant to help skip. The value is therefore advisory and
+  snapshot-relative, not a guaranteed bound on what a subsequent `typed_neighbor_counts` visits: after a write, or on a graph whose snapshot is not built,
+  it under-reports, and a caller that treats a low span as "cheap" simply declines an optimization rather than computing a wrong answer.
 
 ### `issundb_vector`
 

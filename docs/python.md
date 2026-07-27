@@ -142,6 +142,11 @@ Here is a quick reference of the methods available on the `IssunDB` class:
 
 ### Node and Edge CRUD
 
+> [!NOTE]
+> Every `props` argument must be a JSON object. Valid JSON that is not an object (an array, a number, a string) raises `ValueError`: a property bag
+> is a map, and a non-object would be stored but no property read or predicate could ever see it.
+
+
 * `add_node(labels: Union[str, List[str]], props: str) -> int`: Adds a node and returns its unique ID.
 * `add_nodes(items: Iterable[Tuple[Union[str, List[str]], str]]) -> List[int]`: Adds many nodes in one transaction and returns their IDs in order.
 * `get_node(id: int) -> Optional[str]`: Retrieves JSON-encoded node properties, or `None`. Properties only; use `node_labels` for the labels.

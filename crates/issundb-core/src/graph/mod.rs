@@ -806,7 +806,12 @@ impl Graph {
                 .zip(fetched)
                 .filter_map(|(&id, obj)| obj.map(|o| (id, o)))
                 .collect();
-            let cols = crate::columns::PropColumns::<crate::columns::NodeSource>::from_items(items);
+            // Only the grouped property is columnarized; the rest would be built
+            // and dropped.
+            let cols = crate::columns::PropColumns::<crate::columns::NodeSource>::from_items_for(
+                items,
+                Some(prop),
+            );
             return cols.group_codes(ids, prop);
         }
         self.prop_columns
@@ -1018,19 +1023,23 @@ impl Graph {
                 self.commit_and_publish(wtxn, mutations_count)?;
                 // Column bookkeeping next, then the structural delta.
                 //
-                // Both orderings leave one gate briefly blind, and this picks which.
-                // `node_prop_json` documents that its result reflects committed
-                // state, so the property columns get the earlier slot; the reverse
-                // order let a concurrent reader take the columns' fast path and
-                // serve a pre-write value for as long as the structural copy took,
-                // which on a large batch is not brief. `ensure_matrix_view` gates on
-                // the delta alone (gating it on the generation would force a full
-                // rebuild after every write, since only a full rebuild advances
-                // `matrices_gen`), so it stays blind until `record_batch` below;
-                // that is the pre-existing behavior, and its consumers publish no
-                // per-call freshness guarantee for `node_prop_json` to trade against.
-                // Both windows are bounded by the generation bump above, which is
-                // what the gates that can see it use.
+                // Whichever of the two publishes runs second is blind for as long as
+                // the first takes, and neither ordering escapes that: the two share
+                // `added_nodes`, so one of them has to copy it rather than move it,
+                // and on a large batch that copy is the window. Ordering only picks
+                // which gate pays. The columns go first because `node_prop_json`
+                // documents that its result reflects committed state, which is a
+                // per-call promise; `ensure_matrix_view` gates on the delta alone
+                // (gating it on the generation would force a full rebuild after
+                // every write, since only a full rebuild advances `matrices_gen`)
+                // and makes no equivalent promise, and this is its pre-existing
+                // exposure rather than a new one.
+                //
+                // Closing it properly is the read-isolation question, not an
+                // ordering one: a reader that pinned one generation of every cache
+                // for the length of a statement would not care what order these two
+                // ran in. Until then the generation bump above, which happens first
+                // and is a single atomic, is what the gates that can see it use.
                 if delta.force_full {
                     self.prop_columns.record_force_full();
                 } else {
@@ -1171,8 +1180,21 @@ impl Graph {
     /// `dst_dir/data.mdb`. After this call succeeds the caller can open the
     /// restored database with `Graph::open(dst_dir, map_size_gb)`.
     pub fn restore(snapshot_file: &Path, dst_dir: &Path) -> Result<(), Error> {
-        std::fs::create_dir_all(dst_dir)?;
         let dst_file = dst_dir.join("data.mdb");
+        // Refuse a destination that already holds a database. The copy below
+        // truncates, so without this the call silently destroys whatever was there
+        // and still reports success, including the caller's own open database.
+        // The check lives here rather than in any one front end because every
+        // caller reaches the same `fs::copy`: the CLI, the Python binding's
+        // `restore`, and any library consumer of the facade.
+        if dst_file.exists() {
+            return Err(Error::InvalidArgument(format!(
+                "{} already contains a database (data.mdb); restore into a new or \
+                 empty directory rather than overwriting it",
+                dst_dir.display()
+            )));
+        }
+        std::fs::create_dir_all(dst_dir)?;
         std::fs::copy(snapshot_file, &dst_file)?;
         Ok(())
     }
@@ -1343,6 +1365,57 @@ mod encode_tests {
             let enc = encode_property_value(&v).unwrap();
             assert_eq!(decode_property_value(&enc), Some(v.clone()), "value {v}");
         }
+    }
+}
+
+#[cfg(test)]
+mod restore_tests {
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    use super::Graph;
+
+    /// Restoring over an existing database must fail rather than truncate it.
+    ///
+    /// The copy is `fs::copy`, which overwrites, so this used to destroy the
+    /// destination and report success. Every front end reaches this function, so the
+    /// refusal belongs here rather than in one of them.
+    #[test]
+    fn restore_refuses_an_existing_database() {
+        let src = TempDir::new().unwrap();
+        let snap_dir = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        let snap = snap_dir.path().join("a.mdb");
+
+        {
+            let a = Graph::open(src.path(), 1).unwrap();
+            a.add_node("FromA", &json!({ "n": 1 })).unwrap();
+            a.backup(&snap).unwrap();
+        }
+        {
+            let b = Graph::open(dst.path(), 1).unwrap();
+            for i in 0..5 {
+                b.add_node("FromB", &json!({ "n": i })).unwrap();
+            }
+        }
+
+        let err = Graph::restore(&snap, dst.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("already contains a database"),
+            "{err}"
+        );
+
+        // The destination is untouched.
+        let b = Graph::open(dst.path(), 1).unwrap();
+        assert_eq!(b.nodes_by_label("FromB").unwrap().len(), 5);
+        assert!(b.nodes_by_label("FromA").unwrap().is_empty());
+
+        // A fresh directory still works, including one that does not exist yet.
+        let fresh = TempDir::new().unwrap();
+        let nested = fresh.path().join("new");
+        Graph::restore(&snap, &nested).unwrap();
+        let restored = Graph::open(&nested, 1).unwrap();
+        assert_eq!(restored.nodes_by_label("FromA").unwrap().len(), 1);
     }
 }
 

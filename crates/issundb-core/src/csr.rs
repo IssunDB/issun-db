@@ -459,6 +459,21 @@ impl CsrCache {
         // too.
         self.snapshot_gen.store(built_gen, Ordering::Release);
         self.matrices_gen.store(built_gen, Ordering::Release);
+        self.settle_rebuild_claim()
+    }
+
+    /// Settle a claimed rebuild pass: subtract the claimed dirty count, then either
+    /// retain the claim (returning `true`, meaning build again because that much
+    /// landed while this pass ran) or release it.
+    ///
+    /// Split out of [`CsrCache::install`] so a pass that refreshes the snapshot
+    /// alone can settle its claim without also advancing `matrices_gen`, which would
+    /// assert that matrices nobody materialized are fresh. Such a pass must settle
+    /// rather than [`CsrCache::cancel_rebuild`]: cancelling releases the claim but
+    /// leaves `dirty` untouched, so the counter stays above `REBUILD_THRESHOLD` and
+    /// the next commit spawns the pass again, and every commit after that does too.
+    #[must_use]
+    pub fn settle_rebuild_claim(&self) -> bool {
         let claimed = self.claimed.swap(0, Ordering::AcqRel);
         let prev = self.dirty.fetch_sub(claimed, Ordering::AcqRel);
         let remaining = prev.saturating_sub(claimed);
@@ -684,6 +699,41 @@ mod cache_tests {
         );
         assert!(drained.added_edges.is_empty());
         assert!(!drained.force_full);
+    }
+
+    /// A snapshot-only background pass must settle its claim, not cancel it.
+    ///
+    /// Cancelling releases the claim while leaving `dirty` above the threshold, so
+    /// the next write re-triggers the pass, and every write after that does too: a
+    /// continuous background full scan on any write workload with no GraphBLAS
+    /// consumer, which is exactly the workload the lazy open serves.
+    #[test]
+    fn a_snapshot_only_pass_settles_its_claim() {
+        let cache = CsrCache::new(CsrSnapshot::empty());
+        assert!(
+            cache.note_dirty_n(REBUILD_THRESHOLD),
+            "crossing claims a pass"
+        );
+
+        cache.install_snapshot(CsrSnapshot::empty(), cache.current_gen());
+        assert!(
+            !cache.settle_rebuild_claim(),
+            "nothing landed during the pass"
+        );
+
+        assert!(
+            !cache.note_dirty_n(1),
+            "one more write must not re-trigger; the claimed count was subtracted"
+        );
+
+        // Cancelling instead would have left the counter armed, which is the bug.
+        let leaky = CsrCache::new(CsrSnapshot::empty());
+        assert!(leaky.note_dirty_n(REBUILD_THRESHOLD));
+        leaky.cancel_rebuild();
+        assert!(
+            leaky.note_dirty_n(1),
+            "cancel leaves the dirty count armed, so this documents why settle exists"
+        );
     }
 
     /// A full synchronous rebuild clears the counter and any outstanding claim.

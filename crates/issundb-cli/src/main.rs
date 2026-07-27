@@ -922,8 +922,10 @@ impl Completer for ReplHelper {
         // those lands inside the character rather than after it, panicking on the
         // slice below. A no-break space is routine in text pasted from web
         // documentation or a PDF, so pressing Tab on a pasted query would kill the
-        // session. ASCII-only also matches `split_cmd`, which splits on a plain
-        // space, so the completer and the dispatcher agree on where a word begins.
+        // session. Note this is close to, but not the same as, `split_cmd`, which
+        // finds a plain space only: a tab separates words here and does not there.
+        // That affects which completions are offered for tab-separated input, never
+        // whether the slice is valid, which is what this test is for.
         let word_start = head
             .rfind(|c: char| c.is_ascii_whitespace())
             .map(|i| i + 1)
@@ -2377,12 +2379,12 @@ fn print_named_counts(rows: &[(String, u64)]) {
 /// Whether `:restore` may write into `dst`, given the currently open database
 /// directory.
 ///
-/// `Graph::restore` copies the snapshot over `dst/data.mdb` with `fs::copy`, which
-/// truncates an existing file. Without this check, restoring into a directory that
-/// already held a database destroyed it silently and reported success, and
-/// restoring into the *open* database's directory rewrote `data.mdb` underneath a
-/// live LMDB mapping. `:open` already guards the same-path case with
-/// `fs::canonicalize`; this is the destructive counterpart it was missing.
+/// This adds only the refinement the CLI alone can make: `dst` being the database
+/// this session has open, which would rewrite `data.mdb` underneath a live LMDB
+/// mapping. Refusing a destination that merely already holds a database is
+/// `Graph::restore`'s job, because every front end reaches the same truncating
+/// copy. `:open` guards the same-path case with `fs::canonicalize`; this is the
+/// destructive counterpart it was missing.
 fn restore_precheck(dst: &Path, open_db_path: Option<&Path>) -> Result<(), String> {
     let canon = |p: &Path| fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     if let Some(open) = open_db_path {
@@ -2393,13 +2395,6 @@ fn restore_precheck(dst: &Path, open_db_path: Option<&Path>) -> Result<(), Strin
                 dst.display()
             ));
         }
-    }
-    if dst.join("data.mdb").exists() {
-        return Err(format!(
-            "refusing to restore into {}: it already contains a database (data.mdb). \
-             Restore into a new or empty directory to avoid overwriting it.",
-            dst.display()
-        ));
     }
     Ok(())
 }
@@ -2636,10 +2631,6 @@ fn insert_node_batch(
     Ok(())
 }
 
-/// Streaming body of `:import-nodes`: rows are read one at a time and flushed
-/// every `batch_size` rows, so at most one batch is in memory. Returns the
-/// inserted row count. `batch_size` is a parameter so tests can exercise the
-/// batch boundary cheaply.
 /// A failed import, carrying how many rows were already durably committed.
 ///
 /// Import commits once per batch, so a failure partway through a file leaves every
@@ -2668,6 +2659,10 @@ impl std::fmt::Display for ImportFailure {
     }
 }
 
+/// Streaming body of `:import-nodes`: rows are read one at a time and flushed
+/// every `batch_size` rows, so at most one batch is in memory. Returns the
+/// inserted row count. `batch_size` is a parameter so tests can exercise the
+/// batch boundary cheaply.
 fn import_nodes_stream(
     g: &Graph,
     path: &str,
@@ -3181,27 +3176,25 @@ mod tests {
         (start, pairs.into_iter().map(|p| p.replacement).collect())
     }
 
-    /// `:restore` must refuse to overwrite an existing database, and must refuse
-    /// the open one outright.
-    ///
-    /// `Graph::restore` copies over `dst/data.mdb` with `fs::copy`, which truncates.
-    /// Without the precheck, restoring into a populated directory destroyed it and
-    /// still printed success.
+    /// `:restore` must refuse the open database outright. Refusing a destination
+    /// that merely holds a database is `Graph::restore`'s job, covered by
+    /// `restore_refuses_an_existing_database` in `issundb-core`.
     #[test]
-    fn restore_refuses_to_overwrite_a_database() {
+    fn restore_refuses_the_open_database() {
         let empty = TempDir::new().unwrap();
         assert!(
             restore_precheck(empty.path(), None).is_ok(),
             "an empty directory is a valid destination"
         );
 
+        // A directory holding a database is not this check's concern; the engine
+        // refuses it.
         let populated = TempDir::new().unwrap();
         fs::write(populated.path().join("data.mdb"), b"existing").unwrap();
-        let err = restore_precheck(populated.path(), None).unwrap_err();
-        assert!(err.contains("already contains a database"), "{err}");
+        assert!(restore_precheck(populated.path(), None).is_ok());
 
-        // The open database is refused even before the data.mdb test, and refused
-        // through a non-canonical spelling of the same path.
+        // The open database is refused, including through a non-canonical spelling
+        // of the same path.
         let open = TempDir::new().unwrap();
         let err = restore_precheck(open.path(), Some(open.path())).unwrap_err();
         assert!(err.contains("currently open"), "{err}");

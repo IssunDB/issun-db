@@ -1507,7 +1507,20 @@ fn classify_generated(graph: &Graph, conn: &Connection, g: &RefGraph, q: &GenQue
     let cypher = q.render();
     let (is_res, lb_res) = match (graph.query(&cypher), conn.query(&cypher)) {
         (Ok(a), Ok(b)) => (a, b),
-        (Ok(_), Err(_)) | (Err(_), Ok(_)) => return GenVerdict::Unsupported,
+        // LadybugDB's surface is narrower, so it rejecting a query is expected.
+        (Ok(_), Err(_)) => return GenVerdict::Unsupported,
+        // IssunDB rejecting one is not. The generator stays inside its surface by
+        // construction, and the reference is right here to say what the answer
+        // should have been, so this is at least as strong a signal as the mutual
+        // rejection below, which is already failed.
+        (Err(e), Ok(_)) => {
+            let expected = reference_rows(g, q);
+            return GenVerdict::IssundbBug(format!(
+                "issundb rejected a query ladybugdb answered and the reference gives \
+                 {} row(s) for; issundb said: {e}",
+                expected.len()
+            ));
+        }
         (Err(e), Err(_)) => {
             // Both rejected it. That is only agreement if the query really has no
             // rows; consulting the reference here is the whole point of having an

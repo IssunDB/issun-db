@@ -1978,6 +1978,19 @@ fn expanded_neighbor_tallies(
     Ok(out)
 }
 
+/// Execute a recognized aggregate pipeline whose single `count` is over the
+/// chain's terminal variable, collapsing the final hop.
+///
+/// `cols` holds the pre-rows: every chain column except the terminal, already
+/// fanned out and filtered through the second-to-last hop. Instead of fanning
+/// the final hop into one row per terminal neighbor, this counts each source's
+/// qualifying neighbors once and folds that weight into the group the source's
+/// pre-row belongs to. A neighbor "qualifies" when it passes the final region's
+/// (terminal-only) filters; for `count(terminal.prop)` only neighbors with a
+/// non-null `prop` add to the count, but any qualifying neighbor still makes the
+/// group exist with count zero, exactly as the row pipeline's value-keyed fold
+/// does. Parallel edges are counted per transition, so the cardinality matches a
+/// full materialization.
 #[allow(clippy::too_many_arguments)]
 fn execute_collapsed_count(
     graph: &Graph,

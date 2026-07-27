@@ -45,7 +45,9 @@ class IssunDB:
             The new node ID.
 
         Raises:
-            ValueError: If ``props`` is not valid JSON.
+            ValueError: If ``props`` is not valid JSON, or is valid JSON that is
+                not an object. A property bag is a map; a non-object would be
+                stored but no property read or predicate could ever see it.
             RuntimeError: If the write fails.
         """
         ...
@@ -68,7 +70,9 @@ class IssunDB:
             The new node IDs, in the order the items were given.
 
         Raises:
-            ValueError: If any ``props`` is not valid JSON.
+            ValueError: If any ``props`` is not valid JSON, or is valid JSON that
+                is not an object. A property bag is a map; a non-object would be
+                stored but no property read or predicate could ever see it.
             RuntimeError: If the write fails. The batch is all-or-nothing, so a
                 failure rolls back every node in it.
         """
@@ -97,7 +101,9 @@ class IssunDB:
             props: A JSON object string holding the replacement properties.
 
         Raises:
-            ValueError: If ``props`` is not valid JSON.
+            ValueError: If ``props`` is not valid JSON, or is valid JSON that is
+                not an object. A property bag is a map; a non-object would be
+                stored but no property read or predicate could ever see it.
             RuntimeError: If the node does not exist or the write fails.
         """
         ...
@@ -165,7 +171,9 @@ class IssunDB:
             The new edge ID.
 
         Raises:
-            ValueError: If ``props`` is not valid JSON.
+            ValueError: If ``props`` is not valid JSON, or is valid JSON that is
+                not an object. A property bag is a map; a non-object would be
+                stored but no property read or predicate could ever see it.
             RuntimeError: If the write fails.
         """
         ...
@@ -184,7 +192,9 @@ class IssunDB:
             The new edge IDs, in the order the items were given.
 
         Raises:
-            ValueError: If any ``props`` is not valid JSON.
+            ValueError: If any ``props`` is not valid JSON, or is valid JSON that
+                is not an object. A property bag is a map; a non-object would be
+                stored but no property read or predicate could ever see it.
             RuntimeError: If the write fails. The batch is all-or-nothing, so a
                 failure rolls back every edge in it.
         """
@@ -214,7 +224,9 @@ class IssunDB:
             props: A JSON object string holding the replacement properties.
 
         Raises:
-            ValueError: If ``props`` is not valid JSON.
+            ValueError: If ``props`` is not valid JSON, or is valid JSON that is
+                not an object. A property bag is a map; a non-object would be
+                stored but no property read or predicate could ever see it.
             RuntimeError: If the edge does not exist or the write fails.
         """
         ...
