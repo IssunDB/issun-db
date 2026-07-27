@@ -181,10 +181,25 @@ modules according to this map.
 - `crates/issundb/tests/conformance/`: openCypher TCK subset integration tests.
 - `benchmarks/ladybugdb-compare/`: differential comparison harness against LadybugDB. Deliberately excluded from the workspace (own `[workspace]`
   stanza, root `exclude`, and own `rust-toolchain.toml`) because the `lbug` crate links the LadybugDB C++ library and needs a newer Rust than the
-  workspace MSRV; it must never become part of `make build` or `make test`. Run via `make bench-ladybugdb`. Cross-engine harnesses belong here, not
-  in crate-local `benches/`, which is reserved for Criterion targets. The differential row-set check runs before timing; a `DIVERGENT` verdict is an
-  attributed LadybugDB walk-semantics overcount and does not fail the run, but a `MISMATCH` does (`tests/lbug_trail_semantics.rs` pins the
-  walk-versus-trail divergence).
+  workspace MSRV; it must never become part of `make build` or `make test`. Run via `make test-ladybugdb` for correctness and `make bench-ladybugdb`
+  for timing. Cross-engine harnesses belong here, not
+  in crate-local `benches/`, which is reserved for Criterion targets. It runs two separate passes.
+    - `differential_workload`: curated row-returning queries whose sorted row sets must match exactly, run before anything is timed. Together with the
+      generated corpus below this is the only oracle that can catch a mistake IssunDB makes consistently across all of its own execution paths, which is
+      exactly what `ISSUNDB_ROW_PIPELINE_ONLY` cannot see. No pattern here may bind one edge to two relationship slots, which means at most two
+      same-direction hops and no closing hop: walk-versus-trail is *not* only a variable-length question, because relationship uniqueness applies to any
+      pattern with two or more slots, and the pinned LadybugDB build permits the reuse openCypher forbids. Row sets are bounded so the pass costs the
+      same at every size in a sweep. `differential_corpus_is_fixed_length_and_row_returning` pins both rules. Projections avoid floats and nulls because
+      the two engines' display forms differ there (a whole-valued float is `0.0` against `0`), which is not a semantic divergence.
+    - `generate_queries` plus `reference_rows`: the generated corpus, enabled by `LADYBUGDB_COMPARE_GENERATED` and run by `make test-ladybugdb`. Shapes
+      outside the curated corpus's rule belong here, because here they are adjudicated rather than merely compared: `reference_rows` evaluates each
+      generated query over the dataset by brute force under openCypher semantics, so a divergence names the engine at fault instead of leaving a human to
+      decide. IssunDB disagreeing with the reference fails the run; LadybugDB disagreeing is counted as a walk-semantics divergence and does not; the
+      reference disagreeing with both engines while they agree fails as a harness defect. Findings are shrunk to their smallest reproducing shape.
+      `make test-ladybugdb` runs the pass twice, once with the fast paths and once under `ISSUNDB_ROW_PIPELINE_ONLY`, which composes the two oracles.
+    - `workload`: the timed comparison. Its queries are shaped for measurement, so most return a single `count(...)`; a `DIVERGENT` verdict there is an
+      attributed LadybugDB walk-semantics overcount and does not fail the run, but a `MISMATCH` does (`tests/lbug_trail_semantics.rs` pins the
+      walk-versus-trail divergence). Add a correctness query to the differential corpus, not here.
 - `Cargo.toml`: workspace root with shared `[workspace.dependencies]`. All version pins live here.
 - `Makefile`: developer workflow entry points.
 

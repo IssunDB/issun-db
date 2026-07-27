@@ -75,6 +75,13 @@ struct Config {
     /// Time budget per query per engine configuration; repetitions stop early
     /// once it is spent (at least one timed repetition always runs).
     budget: Duration,
+    /// Generated differential queries per dataset size. Zero keeps a timing run
+    /// the length it was.
+    generated: usize,
+    /// Seed for the generator, printed with the run so a failure replays.
+    seed: u64,
+    /// Run the differential passes and skip timing entirely.
+    diff_only: bool,
 }
 
 impl Config {
@@ -132,6 +139,9 @@ impl Config {
             skew,
             sweep,
             budget: Duration::from_secs(var("LADYBUGDB_COMPARE_BUDGET_SECS", 30)),
+            generated: var("LADYBUGDB_COMPARE_GENERATED", 0) as usize,
+            seed: var("LADYBUGDB_COMPARE_SEED", 0x5EED_1234),
+            diff_only: var("LADYBUGDB_COMPARE_DIFF_ONLY", 0) != 0,
         }
     }
 }
@@ -581,6 +591,943 @@ struct QueryTiming {
 }
 
 /// The benchmark queries, anchored at the degree-percentile probes.
+/// A differential-only query: run on both engines, compare sorted row sets.
+///
+/// Kept separate from the timing workload on purpose. That workload is shaped for
+/// measurement, so nearly every query in it returns a single `count(...)`, and a
+/// scalar count is close to the weakest differential signal available: it cannot
+/// see wrong row content, wrong column names, wrong row multiplicity, or two
+/// errors that cancel. These return the rows themselves, so the comparison has
+/// something to disagree about.
+///
+/// Two invariants keep this corpus cheap to extend, and `differential_invariants`
+/// pins both:
+///
+/// 1. No pattern here can bind one edge to two relationship slots, which means at
+///    most two slots, all in the same direction, and no closing hop. This is
+///    narrower than "fixed-length", and the difference matters: walk-against-trail
+///    is not a variable-length question. Relationship uniqueness applies to every
+///    pattern with two or more slots, so `(a)-[:R]->(b)<-[:R]-(c)` diverges when
+///    `c` is `a` and one edge fills both slots, and `(a)<-[:R]-(b)-[:R]->(a)`
+///    always does. The pinned LadybugDB build permits that reuse where openCypher
+///    forbids it. Two same-direction slots are safe only because the generator
+///    emits no self-loops (`generate_produces_distinct_non_self_loop_edges`), so
+///    one edge cannot chain to itself. Shapes outside this rule belong in the
+///    generated corpus, where `reference_rows` adjudicates them.
+/// 2. Row sets stay small and skew-independent, either anchored at a
+///    non-hub probe or bounded by an `id` predicate, so the comparison costs the
+///    same at every dataset size in a sweep.
+///
+/// Projections avoid floats and nulls. That is a display-form difference rather
+/// than a semantic one, and a corpus that reports formatting as a mismatch gets
+/// ignored. The float case is measured, not assumed: a whole-valued weight comes
+/// back as `0.0` from IssunDB (serde_json's float form) and as `0` from LadybugDB,
+/// while fractional weights agree, so returning a float column reports a mismatch
+/// on roughly one row in a thousand of this dataset. Reconciling numeric display
+/// across the two engines in `issundb_rows`/`ladybugdb_rows` would let floats join
+/// the corpus.
+struct DiffQuery {
+    name: &'static str,
+    cypher: String,
+}
+
+fn differential_workload(probes: &Probes) -> Vec<DiffQuery> {
+    let median = probes.median;
+    let cold = probes.cold;
+    let target = probes.expand_target;
+    let q = |name, cypher| DiffQuery { name, cypher };
+    vec![
+        // ---- Projection fidelity over a bounded slice of the label scan -----
+        q(
+            "scan_projection",
+            "MATCH (p:Person) WHERE p.id < 200 \
+             RETURN p.id, p.name, p.age, p.city"
+                .to_string(),
+        ),
+        // Deliberately wider than the engine's small-gather cutoff, so the
+        // property read is served by the columnar path rather than as point reads.
+        // `scan_projection` above stays under it, so between them both regimes of
+        // the same read are compared.
+        q(
+            "scan_projection_wide",
+            "MATCH (p:Person) WHERE p.id < 2000 RETURN p.id, p.age".to_string(),
+        ),
+        q(
+            "range_rows",
+            "MATCH (p:Person) WHERE p.id < 500 AND p.age >= 30 AND p.age < 32 \
+             RETURN p.id, p.age"
+                .to_string(),
+        ),
+        q(
+            "string_equality_rows",
+            "MATCH (p:Person) WHERE p.id < 300 AND p.city = 'berlin' \
+             RETURN p.id, p.city"
+                .to_string(),
+        ),
+        q(
+            "disjunction_rows",
+            "MATCH (p:Person) WHERE p.id < 200 AND (p.age < 25 OR p.age >= 60) \
+             RETURN p.id, p.age"
+                .to_string(),
+        ),
+        q(
+            "negation_rows",
+            "MATCH (p:Person) WHERE p.id < 100 AND NOT p.age < 40 RETURN p.id, p.age".to_string(),
+        ),
+        // ---- One hop, in both directions ------------------------------------
+        q(
+            "one_hop_rows",
+            format!(
+                "MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE a.id = {median} \
+                 RETURN b.id, b.name"
+            ),
+        ),
+        q(
+            "one_hop_cold_rows",
+            format!("MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE a.id = {cold} RETURN b.id"),
+        ),
+        q(
+            "incoming_hop_rows",
+            format!("MATCH (a:Person)<-[:KNOWS]-(b:Person) WHERE a.id = {median} RETURN b.id"),
+        ),
+        q(
+            "one_hop_filtered_rows",
+            format!(
+                "MATCH (a:Person)-[:KNOWS]->(b:Person) \
+                 WHERE a.id = {median} AND b.age >= 30 AND b.age < 40 RETURN b.id, b.age"
+            ),
+        ),
+        // ---- Two fixed hops, where relationship uniqueness is observable ----
+        q(
+            "two_hop_rows",
+            format!(
+                "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person) \
+                 WHERE a.id = {median} RETURN b.id, c.id"
+            ),
+        ),
+        q(
+            "two_hop_distinct_rows",
+            format!(
+                "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person) \
+                 WHERE a.id = {median} RETURN DISTINCT c.id"
+            ),
+        ),
+        q(
+            "expand_into_rows",
+            format!(
+                "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person) \
+                 WHERE a.id = {median} AND c.id = {target} RETURN b.id"
+            ),
+        ),
+        // No cyclic or direction-mixing pattern here: it could bind one edge to
+        // two slots, where LadybugDB's walk semantics legitimately disagree. Those
+        // shapes are covered by the generated corpus, which has an adjudicating
+        // reference; putting one here would make this gate report a divergence that
+        // is not a defect.
+        // ---- Grouped aggregation, which emits one row per group -------------
+        // The output stays bounded by the group count even where the work is not,
+        // and a per-group result catches a wrong group key or a wrong per-group
+        // tally that a single total would hide.
+        q(
+            "grouped_out_degree",
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE a.id < 50 \
+             RETURN a.id, count(b)"
+                .to_string(),
+        ),
+        q(
+            "grouped_count_star",
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE a.id < 50 \
+             RETURN a.id, count(*)"
+                .to_string(),
+        ),
+        q(
+            "grouped_by_city",
+            "MATCH (p:Person) WHERE p.id < 1000 RETURN p.city, count(p)".to_string(),
+        ),
+        q(
+            "grouped_min_max",
+            "MATCH (p:Person) WHERE p.id < 1000 RETURN p.city, min(p.age), max(p.age)".to_string(),
+        ),
+        q(
+            "grouped_two_hop",
+            format!(
+                "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person) \
+                 WHERE a.id = {median} RETURN b.id, count(c)"
+            ),
+        ),
+    ]
+}
+
+/// Run the differential corpus on both engines and report. Returns the number of
+/// mismatches so the caller can fail the run.
+///
+/// Nothing here is timed. A divergence is unconditionally a defect (see
+/// [`DiffQuery`]), so unlike the timing workload's pre-check there is no oracle to
+/// consult and no attributed-divergence category to fall into.
+fn run_differential(graph: &Graph, conn: &Connection, queries: &[DiffQuery]) -> usize {
+    let mut mismatches = 0;
+    let mut unsupported = 0;
+    for query in queries {
+        match compare_query(graph, conn, &query.cypher) {
+            Verdict::Agree => {}
+            Verdict::Mismatch(detail) => {
+                mismatches += 1;
+                println!("  MISMATCH {:<26} {detail}", query.name);
+                println!("    {}", query.cypher);
+            }
+            Verdict::Unsupported(detail) => {
+                // A curated query is supposed to be inside both surfaces, so this
+                // is a corpus bug rather than an engine bug; it is reported but
+                // does not fail the run.
+                unsupported += 1;
+                println!("  UNSUPPORTED {:<23} {detail}", query.name);
+                println!("    {}", query.cypher);
+            }
+        }
+    }
+    println!(
+        "differential: {} curated quer{} compared, {mismatches} mismatch(es){}",
+        queries.len(),
+        if queries.len() == 1 { "y" } else { "ies" },
+        if unsupported > 0 {
+            format!(", {unsupported} outside one engine's surface")
+        } else {
+            String::new()
+        }
+    );
+    mismatches
+}
+
+/// Run the generated corpus, attributing and shrinking anything that diverges.
+///
+/// Returns the count that should fail the run: IssunDB defects plus reference
+/// defects. A LadybugDB divergence is counted and reported separately, because it
+/// is a known difference in that engine rather than a problem here.
+fn run_generated(
+    graph: &Graph,
+    conn: &Connection,
+    g: &RefGraph,
+    shapes: &[GenQuery],
+    seed: u64,
+) -> usize {
+    let (mut bugs, mut ladybug, mut suspect, mut unsupported) = (0, 0, 0, 0);
+    for (i, shape) in shapes.iter().enumerate() {
+        // Only the actionable classes are reported in detail. A LadybugDB
+        // walk-semantics divergence is expected on any pattern that can bind one
+        // edge to two slots, and printing each one would bury the rest.
+        let (label, detail) = match classify_generated(graph, conn, g, shape) {
+            GenVerdict::Agree => continue,
+            GenVerdict::Unsupported => {
+                unsupported += 1;
+                continue;
+            }
+            GenVerdict::LadybugDivergence => {
+                ladybug += 1;
+                continue;
+            }
+            GenVerdict::IssundbBug(d) => {
+                bugs += 1;
+                ("ISSUNDB BUG", d)
+            }
+            GenVerdict::ReferenceSuspect(d) => {
+                suspect += 1;
+                ("REFERENCE SUSPECT", d)
+            }
+        };
+        let small = shrink(graph, conn, g, shape);
+        println!("  {label} generated[{i}] (seed {seed})  {detail}");
+        println!("    shrunk:   {}", small.render());
+        let original = shape.render();
+        if original != small.render() {
+            println!("    original: {original}");
+        }
+    }
+    println!(
+        "generated:    {} quer{} compared; {bugs} issundb defect(s), \
+         {ladybug} ladybugdb walk-semantics divergence(s), {suspect} reference suspect(s){}",
+        shapes.len(),
+        if shapes.len() == 1 { "y" } else { "ies" },
+        if unsupported > 0 {
+            format!(", {unsupported} outside one engine's surface")
+        } else {
+            String::new()
+        }
+    );
+    bugs + suspect
+}
+
+/// Greedily drop pieces of a failing query while its verdict stays actionable.
+///
+/// Bounded by `SHRINK_BUDGET` classifications so one failure cannot turn into a
+/// long run; the result is the smallest shape reached inside that budget, which is
+/// always still a reproducing one.
+fn shrink(graph: &Graph, conn: &Connection, g: &RefGraph, start: &GenQuery) -> GenQuery {
+    /// Classifications the shrinker may spend on one finding.
+    const SHRINK_BUDGET: usize = 60;
+    let mut best = start.clone();
+    let mut spent = 0;
+    'outer: loop {
+        for candidate in simplifications(&best) {
+            if spent >= SHRINK_BUDGET {
+                break 'outer;
+            }
+            spent += 1;
+            if matches!(
+                classify_generated(graph, conn, g, &candidate),
+                GenVerdict::IssundbBug(_) | GenVerdict::ReferenceSuspect(_)
+            ) {
+                best = candidate;
+                continue 'outer;
+            }
+        }
+        break;
+    }
+    best
+}
+
+/// A generated differential query in structured form.
+///
+/// Structured rather than a string so a failure can be shrunk mechanically: the
+/// shrinker drops pieces and re-tests, which turns a three-hop query carrying four
+/// predicates into the smallest shape that still reproduces. Rendering happens in
+/// one place ([`GenQuery::render`]), so every generated query is built the same way
+/// the invariants assume.
+#[derive(Clone)]
+struct GenQuery {
+    /// One entry per fixed hop; `v0` through `v{hops.len()}` are the variables.
+    hops: Vec<Hop>,
+    /// Closes the last variable back onto `v0` with one more outgoing hop.
+    cycle: bool,
+    anchor: Anchor,
+    predicates: Vec<Pred>,
+    projection: Projection,
+    distinct: bool,
+}
+
+#[derive(Clone, Copy)]
+struct Hop {
+    incoming: bool,
+}
+
+/// How `v0` is pinned down. Every generated query has an anchor, because an
+/// unanchored pattern over a large graph returns a row set too big to compare.
+#[derive(Clone, Copy)]
+enum Anchor {
+    /// A single source node, by indexed id.
+    Probe(u64),
+    /// An id prefix, for multi-source expansion. The cutoff comes from
+    /// [`bounded_id_cutoff`], never from a guess.
+    IdBelow(u64),
+}
+
+#[derive(Clone, Copy)]
+struct Pred {
+    var: usize,
+    kind: PredKind,
+}
+
+/// Predicate forms over the three comparable property types in the dataset.
+/// Deliberately no float and no null: see [`DiffQuery`].
+#[derive(Clone, Copy)]
+enum PredKind {
+    AgeRange(u64, u64),
+    AgeAtLeast(u64),
+    NotAgeBelow(u64),
+    AgeOutside(u64, u64),
+    CityEq(&'static str),
+    CityNe(&'static str),
+    IdBelow(u64),
+}
+
+#[derive(Clone)]
+enum Projection {
+    /// Plain property reads, so the comparison is over row content.
+    Props(Vec<(usize, Prop)>),
+    /// One group key plus one aggregate, so the comparison is over one row per
+    /// group rather than a single total.
+    Grouped { key: (usize, Prop), agg: Agg },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Prop {
+    Id,
+    Name,
+    Age,
+    City,
+}
+
+impl Prop {
+    fn as_str(self) -> &'static str {
+        match self {
+            Prop::Id => "id",
+            Prop::Name => "name",
+            Prop::Age => "age",
+            Prop::City => "city",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Agg {
+    CountStar,
+    CountVar(usize),
+    CountProp(usize, Prop),
+    MinAge(usize),
+    MaxAge(usize),
+}
+
+impl GenQuery {
+    fn render(&self) -> String {
+        let mut pattern = String::from("(v0:Person)");
+        for (i, hop) in self.hops.iter().enumerate() {
+            pattern.push_str(if hop.incoming {
+                "<-[:KNOWS]-"
+            } else {
+                "-[:KNOWS]->"
+            });
+            pattern.push_str(&format!("(v{}:Person)", i + 1));
+        }
+        if self.cycle {
+            pattern.push_str("-[:KNOWS]->(v0)");
+        }
+
+        let mut wheres = vec![match self.anchor {
+            Anchor::Probe(id) => format!("v0.id = {id}"),
+            Anchor::IdBelow(k) => format!("v0.id < {k}"),
+        }];
+        for p in &self.predicates {
+            let v = p.var;
+            wheres.push(match p.kind {
+                PredKind::AgeRange(lo, hi) => format!("v{v}.age >= {lo} AND v{v}.age < {hi}"),
+                PredKind::AgeAtLeast(n) => format!("v{v}.age >= {n}"),
+                PredKind::NotAgeBelow(n) => format!("NOT v{v}.age < {n}"),
+                PredKind::AgeOutside(lo, hi) => format!("(v{v}.age < {lo} OR v{v}.age >= {hi})"),
+                PredKind::CityEq(c) => format!("v{v}.city = '{c}'"),
+                PredKind::CityNe(c) => format!("v{v}.city <> '{c}'"),
+                PredKind::IdBelow(k) => format!("v{v}.id < {k}"),
+            });
+        }
+
+        let projection = match &self.projection {
+            Projection::Props(items) => items
+                .iter()
+                .map(|(v, prop)| format!("v{v}.{}", prop.as_str()))
+                .collect::<Vec<_>>()
+                .join(", "),
+            Projection::Grouped { key, agg } => {
+                let key_text = format!("v{}.{}", key.0, key.1.as_str());
+                let agg_text = match *agg {
+                    Agg::CountStar => "count(*)".to_string(),
+                    Agg::CountVar(v) => format!("count(v{v})"),
+                    Agg::CountProp(v, prop) => format!("count(v{v}.{})", prop.as_str()),
+                    Agg::MinAge(v) => format!("min(v{v}.age)"),
+                    Agg::MaxAge(v) => format!("max(v{v}.age)"),
+                };
+                format!("{key_text}, {agg_text}")
+            }
+        };
+        let distinct = if self.distinct { "DISTINCT " } else { "" };
+        format!(
+            "MATCH {pattern} WHERE {} RETURN {distinct}{projection}",
+            wheres.join(" AND ")
+        )
+    }
+}
+
+/// Largest `id` cutoff whose nodes together have at most `edge_budget` outgoing
+/// edges, capped at `max_cutoff`.
+///
+/// Multi-source expansion has to be bounded by construction rather than by a
+/// guess, because the skewed generator concentrates edges on **low** ids: under
+/// Zipf a plain `id < 100` selects precisely the hubs, and a two-hop expansion
+/// from them can enumerate a large fraction of the graph. Measuring the real
+/// out-degrees keeps the bound honest under either skew.
+fn bounded_id_cutoff(adjacency: &[Vec<u64>], edge_budget: u64, max_cutoff: u64) -> u64 {
+    let mut total = 0u64;
+    for (id, out) in adjacency.iter().enumerate() {
+        let id = id as u64;
+        if id >= max_cutoff {
+            return max_cutoff;
+        }
+        total += out.len() as u64;
+        if total > edge_budget {
+            return id.max(1);
+        }
+    }
+    (adjacency.len() as u64).min(max_cutoff).max(1)
+}
+
+/// Generate `count` differential queries from `seed`.
+///
+/// Deterministic, so a reported failure replays from the seed the run prints. The
+/// shapes stay inside the intersection of the two engines' surfaces: fixed-length
+/// `:KNOWS` hops, `WHERE` over the three comparable property types, and either a
+/// property projection or a single grouped aggregate. No variable-length pattern,
+/// no relationship variable (its only property is a float), no float or null in a
+/// projection, and no `ORDER BY` (rows are compared as sorted sets, so a tie would
+/// be a false mismatch).
+fn generate_queries(
+    count: usize,
+    seed: u64,
+    probes: &Probes,
+    adjacency: &[Vec<u64>],
+) -> Vec<GenQuery> {
+    let mut rng = Lcg(seed);
+    // Edge budget per hop count: the reachable set multiplies with each hop, so
+    // the multi-source cutoff has to tighten as the chain grows.
+    let cutoff_for = |hops: usize, rng: &mut Lcg| -> u64 {
+        let budget = match hops {
+            0 | 1 => 2_000,
+            2 => 200,
+            _ => 40,
+        };
+        let max = bounded_id_cutoff(adjacency, budget, 2_000);
+        // Vary the cutoff below the bound so runs cover more than one width.
+        1 + rng.next() % max
+    };
+    let city = |rng: &mut Lcg| CITIES[(rng.next() % CITIES.len() as u64) as usize];
+    // Ages are `18 + id % 50`, so bounds are drawn from that range plus a margin
+    // either side to cover the empty and total selections.
+    let age = |rng: &mut Lcg| 15 + rng.next() % 55;
+    let prop = |rng: &mut Lcg| match rng.next() % 4 {
+        0 => Prop::Id,
+        1 => Prop::Name,
+        2 => Prop::Age,
+        _ => Prop::City,
+    };
+
+    let mut out = Vec::with_capacity(count);
+    while out.len() < count {
+        let hops: Vec<Hop> = (0..rng.next() % 4)
+            .map(|_| Hop {
+                incoming: rng.next() % 4 == 0,
+            })
+            .collect();
+        let cycle = !hops.is_empty() && rng.next() % 5 == 0;
+        let vars = hops.len() + 1;
+        let anchor = if hops.is_empty() || rng.next() % 2 == 0 {
+            Anchor::IdBelow(cutoff_for(hops.len(), &mut rng))
+        } else if rng.next() % 2 == 0 {
+            Anchor::Probe(probes.median)
+        } else {
+            Anchor::Probe(probes.cold)
+        };
+
+        let predicates: Vec<Pred> = (0..rng.next() % 4)
+            .map(|_| {
+                let var = (rng.next() % vars as u64) as usize;
+                let kind = match rng.next() % 7 {
+                    0 => {
+                        let lo = age(&mut rng);
+                        PredKind::AgeRange(lo, lo + 1 + rng.next() % 20)
+                    }
+                    1 => PredKind::AgeAtLeast(age(&mut rng)),
+                    2 => PredKind::NotAgeBelow(age(&mut rng)),
+                    3 => {
+                        let lo = age(&mut rng);
+                        PredKind::AgeOutside(lo, lo + 1 + rng.next() % 20)
+                    }
+                    4 => PredKind::CityEq(city(&mut rng)),
+                    5 => PredKind::CityNe(city(&mut rng)),
+                    _ => PredKind::IdBelow(1 + rng.next() % 2_000),
+                };
+                Pred { var, kind }
+            })
+            .collect();
+
+        let (projection, distinct) = if rng.next() % 5 < 2 {
+            let key_var = (rng.next() % vars as u64) as usize;
+            let agg_var = (rng.next() % vars as u64) as usize;
+            let agg = match rng.next() % 5 {
+                0 => Agg::CountStar,
+                1 => Agg::CountVar(agg_var),
+                2 => Agg::CountProp(agg_var, prop(&mut rng)),
+                3 => Agg::MinAge(agg_var),
+                _ => Agg::MaxAge(agg_var),
+            };
+            // No `DISTINCT` over an aggregate: it would deduplicate group rows,
+            // which says nothing about traversal or grouping.
+            (
+                Projection::Grouped {
+                    key: (key_var, prop(&mut rng)),
+                    agg,
+                },
+                false,
+            )
+        } else {
+            let mut items: Vec<(usize, Prop)> = (0..1 + rng.next() % 3)
+                .map(|_| ((rng.next() % vars as u64) as usize, prop(&mut rng)))
+                .collect();
+            // A repeated item would project one column twice, where the two
+            // engines' column naming (which this harness does not compare) is the
+            // only thing that differs.
+            items.dedup();
+            (Projection::Props(items), rng.next() % 4 == 0)
+        };
+
+        out.push(GenQuery {
+            hops,
+            cycle,
+            anchor,
+            predicates,
+            projection,
+            distinct,
+        });
+    }
+    out
+}
+
+/// Every one-step simplification of `q`, for the shrinker to try.
+fn simplifications(q: &GenQuery) -> Vec<GenQuery> {
+    let mut out = Vec::new();
+    if q.distinct {
+        let mut s = q.clone();
+        s.distinct = false;
+        out.push(s);
+    }
+    if q.cycle {
+        let mut s = q.clone();
+        s.cycle = false;
+        out.push(s);
+    }
+    for i in 0..q.predicates.len() {
+        let mut s = q.clone();
+        s.predicates.remove(i);
+        out.push(s);
+    }
+    // Dropping the last hop unbinds its variable, so only offer it when nothing
+    // still refers to that variable.
+    if let Some(highest_var) = q.hops.len().checked_sub(1) {
+        let refers = |v: usize| v > highest_var;
+        let projection_refers = match &q.projection {
+            Projection::Props(items) => items.iter().any(|(v, _)| refers(*v)),
+            Projection::Grouped { key, agg } => {
+                refers(key.0)
+                    || match *agg {
+                        Agg::CountStar => false,
+                        Agg::CountVar(v)
+                        | Agg::CountProp(v, _)
+                        | Agg::MinAge(v)
+                        | Agg::MaxAge(v) => refers(v),
+                    }
+            }
+        };
+        if !q.predicates.iter().any(|p| refers(p.var)) && !projection_refers {
+            let mut s = q.clone();
+            s.hops.pop();
+            out.push(s);
+        }
+    }
+    if let Projection::Props(items) = &q.projection {
+        if items.len() > 1 {
+            let mut s = q.clone();
+            s.projection = Projection::Props(vec![items[0]]);
+            out.push(s);
+        }
+    }
+    if let Projection::Grouped { key, agg } = &q.projection {
+        if !matches!(agg, Agg::CountStar) {
+            let mut s = q.clone();
+            s.projection = Projection::Grouped {
+                key: *key,
+                agg: Agg::CountStar,
+            };
+            out.push(s);
+        }
+    }
+    out
+}
+
+/// Edge-identified adjacency in both directions: `(neighbor, edge index)` per
+/// entry, where the index is the position in `Dataset::knows`.
+///
+/// The edge index is what makes relationship uniqueness expressible, so the
+/// reference evaluator needs this rather than the plain neighbour lists
+/// [`out_adjacency`] returns.
+struct RefGraph {
+    out: Vec<Vec<(u64, usize)>>,
+    inc: Vec<Vec<(u64, usize)>>,
+    /// `(name, age, city)` per node id.
+    props: Vec<(String, u64, &'static str)>,
+}
+
+impl RefGraph {
+    fn build(data: &Dataset) -> Self {
+        let n = data.persons.len();
+        let mut out = vec![Vec::new(); n];
+        let mut inc = vec![Vec::new(); n];
+        for (e, &(src, dst, _)) in data.knows.iter().enumerate() {
+            out[src as usize].push((dst, e));
+            inc[dst as usize].push((src, e));
+        }
+        let props = data
+            .persons
+            .iter()
+            .map(|(_, name, age, city)| (name.clone(), *age, *city))
+            .collect();
+        Self { out, inc, props }
+    }
+
+    fn prop(&self, id: u64, prop: Prop) -> String {
+        let (name, age, city) = &self.props[id as usize];
+        match prop {
+            Prop::Id => id.to_string(),
+            Prop::Name => name.clone(),
+            Prop::Age => age.to_string(),
+            Prop::City => (*city).to_string(),
+        }
+    }
+
+    fn age(&self, id: u64) -> u64 {
+        self.props[id as usize].1
+    }
+
+    fn city(&self, id: u64) -> &'static str {
+        self.props[id as usize].2
+    }
+}
+
+/// Evaluate a generated query directly over the dataset, under openCypher
+/// semantics, and return its rows normalized the way [`issundb_rows`] normalizes.
+///
+/// This is the adjudicating oracle for the generated corpus, and it is what makes a
+/// divergence attributable instead of merely visible. Both engines are compared
+/// against it, so a disagreement names the engine at fault rather than leaving a
+/// human to work out which of two answers is right.
+///
+/// It exists because the assumption that a fixed-length pattern needs no
+/// adjudication is false. Relationship uniqueness applies to every pattern with two
+/// or more relationship slots: `(a)-[:R]->(b)<-[:R]-(c)` can bind one edge to both
+/// slots when `c` is `a`, and `(a)<-[:R]-(b)-[:R]->(a)` always can. openCypher
+/// forbids that; the pinned LadybugDB build permits it, which is the same
+/// walk-against-trail difference the timed workload's `Oracle` adjudicates for its
+/// longer chains.
+///
+/// Brute force on purpose: it enumerates assignments and filters, so it is easy to
+/// read against the specification and has no plan to be wrong about. The generated
+/// anchors are bounded ([`bounded_id_cutoff`]) precisely so this stays cheap.
+fn reference_rows(g: &RefGraph, q: &GenQuery) -> Vec<Vec<String>> {
+    let node_count = g.props.len() as u64;
+    let sources: Vec<u64> = match q.anchor {
+        Anchor::Probe(id) => {
+            if id < node_count {
+                vec![id]
+            } else {
+                Vec::new()
+            }
+        }
+        Anchor::IdBelow(k) => (0..k.min(node_count)).collect(),
+    };
+
+    // Depth-first over the hop chain, carrying the bound variables and the edges
+    // already used so no edge fills two slots.
+    let mut assignments: Vec<Vec<u64>> = Vec::new();
+    let mut stack: Vec<(Vec<u64>, Vec<usize>)> =
+        sources.into_iter().map(|s| (vec![s], Vec::new())).collect();
+    while let Some((vars, used)) = stack.pop() {
+        let depth = vars.len() - 1;
+        if depth == q.hops.len() {
+            if !q.cycle {
+                assignments.push(vars);
+                continue;
+            }
+            // The closing hop is always outgoing from the last variable to `v0`.
+            let last = *vars.last().unwrap();
+            let first = vars[0];
+            for &(dst, e) in &g.out[last as usize] {
+                if dst == first && !used.contains(&e) {
+                    assignments.push(vars.clone());
+                }
+            }
+            continue;
+        }
+        let from = vars[depth];
+        let edges = if q.hops[depth].incoming {
+            &g.inc[from as usize]
+        } else {
+            &g.out[from as usize]
+        };
+        for &(next, e) in edges {
+            if used.contains(&e) {
+                continue;
+            }
+            let mut vars_next = vars.clone();
+            vars_next.push(next);
+            let mut used_next = used.clone();
+            used_next.push(e);
+            stack.push((vars_next, used_next));
+        }
+    }
+
+    // Predicates apply to whole assignments, exactly as a `WHERE` over the bound
+    // variables does.
+    assignments.retain(|vars| {
+        q.predicates.iter().all(|p| {
+            let id = vars[p.var];
+            match p.kind {
+                PredKind::AgeRange(lo, hi) => g.age(id) >= lo && g.age(id) < hi,
+                PredKind::AgeAtLeast(n) => g.age(id) >= n,
+                PredKind::NotAgeBelow(n) => g.age(id) >= n,
+                PredKind::AgeOutside(lo, hi) => g.age(id) < lo || g.age(id) >= hi,
+                PredKind::CityEq(c) => g.city(id) == c,
+                PredKind::CityNe(c) => g.city(id) != c,
+                PredKind::IdBelow(k) => id < k,
+            }
+        })
+    });
+
+    match &q.projection {
+        Projection::Props(items) => {
+            let mut rows: Vec<Vec<String>> = assignments
+                .iter()
+                .map(|vars| {
+                    items
+                        .iter()
+                        .map(|(v, prop)| g.prop(vars[*v], *prop))
+                        .collect()
+                })
+                .collect();
+            if q.distinct {
+                rows.sort();
+                rows.dedup();
+            }
+            rows
+        }
+        Projection::Grouped { key, agg } => {
+            // Group in first-seen order; the caller sorts, so only the grouping
+            // itself has to match.
+            let mut groups: Vec<(String, Vec<u64>)> = Vec::new();
+            for vars in &assignments {
+                let k = g.prop(vars[key.0], key.1);
+                let agg_input = match *agg {
+                    // Every property in this dataset is present on every node, so
+                    // `count(v.prop)` and `count(v)` both count the row.
+                    Agg::CountStar | Agg::CountVar(_) | Agg::CountProp(_, _) => 0,
+                    Agg::MinAge(v) | Agg::MaxAge(v) => g.age(vars[v]),
+                };
+                match groups.iter_mut().find(|(gk, _)| *gk == k) {
+                    Some((_, acc)) => acc.push(agg_input),
+                    None => groups.push((k, vec![agg_input])),
+                }
+            }
+            groups
+                .into_iter()
+                .map(|(k, acc)| {
+                    let value = match *agg {
+                        Agg::CountStar | Agg::CountVar(_) | Agg::CountProp(_, _) => {
+                            acc.len() as u64
+                        }
+                        Agg::MinAge(_) => acc.iter().copied().min().unwrap_or(0),
+                        Agg::MaxAge(_) => acc.iter().copied().max().unwrap_or(0),
+                    };
+                    vec![k, value.to_string()]
+                })
+                .collect()
+        }
+    }
+}
+
+/// What a generated query established, once both engines are compared against the
+/// reference evaluator.
+enum GenVerdict {
+    /// Both engines match the reference.
+    Agree,
+    /// IssunDB matches the reference and LadybugDB does not: the walk-against-trail
+    /// difference. Reported, and not a failure of this repository's engine.
+    LadybugDivergence,
+    /// IssunDB does not match the reference. This is the finding worth having.
+    IssundbBug(String),
+    /// The reference disagrees with both engines, which agree with each other. Two
+    /// independent implementations agreeing is strong evidence the reference is the
+    /// thing that is wrong, so this fails the run as a harness defect rather than
+    /// being attributed to either engine.
+    ReferenceSuspect(String),
+    /// One engine rejected the query. LadybugDB's surface is narrower, so this is
+    /// not a defect.
+    Unsupported,
+}
+
+fn classify_generated(graph: &Graph, conn: &Connection, g: &RefGraph, q: &GenQuery) -> GenVerdict {
+    let cypher = q.render();
+    let (is_res, lb_res) = match (graph.query(&cypher), conn.query(&cypher)) {
+        (Ok(a), Ok(b)) => (a, b),
+        (Ok(_), Err(_)) | (Err(_), Ok(_)) => return GenVerdict::Unsupported,
+        (Err(_), Err(_)) => return GenVerdict::Agree,
+    };
+    let sorted = |mut rows: Vec<Vec<String>>| {
+        rows.sort();
+        rows
+    };
+    let is_rows = sorted(issundb_rows(&is_res));
+    let lb_rows = sorted(ladybugdb_rows(lb_res));
+    let ref_rows = sorted(reference_rows(g, q));
+
+    let summary = |a: &[Vec<String>], b: &[Vec<String>], b_name: &str| {
+        let first = a
+            .iter()
+            .zip(b)
+            .find(|(x, y)| x != y)
+            .map(|(x, y)| format!("reference {x:?} against {b_name} {y:?}"))
+            .unwrap_or_else(|| "no differing shared row; the row counts differ".to_string());
+        format!(
+            "reference {} row(s), {b_name} {} row(s); first difference: {first}",
+            a.len(),
+            b.len()
+        )
+    };
+
+    match (is_rows == ref_rows, lb_rows == ref_rows) {
+        (true, true) => GenVerdict::Agree,
+        (true, false) => GenVerdict::LadybugDivergence,
+        (false, _) if is_rows == lb_rows => {
+            GenVerdict::ReferenceSuspect(summary(&ref_rows, &is_rows, "both engines"))
+        }
+        (false, _) => GenVerdict::IssundbBug(summary(&ref_rows, &is_rows, "issundb")),
+    }
+}
+
+/// Compare one query on both engines.
+///
+/// `Ok(Verdict::Agree)` when the sorted row sets match. A query one engine rejects
+/// and the other accepts is a surface difference, not a wrong answer: LadybugDB
+/// supports a narrower Cypher surface, so that must not fail the run or a single
+/// unsupported construct would stop the whole sweep.
+fn compare_query(graph: &Graph, conn: &Connection, cypher: &str) -> Verdict {
+    let is_result = graph.query(cypher);
+    let lb_result = conn.query(cypher);
+    match (is_result, lb_result) {
+        (Ok(is_res), Ok(lb_res)) => {
+            let mut is_rows = issundb_rows(&is_res);
+            let mut lb_rows = ladybugdb_rows(lb_res);
+            is_rows.sort();
+            lb_rows.sort();
+            if is_rows == lb_rows {
+                return Verdict::Agree;
+            }
+            let first_diff = is_rows
+                .iter()
+                .zip(&lb_rows)
+                .find(|(a, b)| a != b)
+                .map(|(a, b)| format!("issundb {a:?} against ladybugdb {b:?}"))
+                .unwrap_or_else(|| "no differing shared row; the row counts differ".to_string());
+            Verdict::Mismatch(format!(
+                "issundb {} row(s), ladybugdb {} row(s); first difference: {first_diff}",
+                is_rows.len(),
+                lb_rows.len()
+            ))
+        }
+        (Err(_), Err(_)) => Verdict::Agree,
+        (Ok(_), Err(e)) => Verdict::Unsupported(format!("ladybugdb rejected it: {e}")),
+        (Err(e), Ok(_)) => Verdict::Unsupported(format!("issundb rejected it: {e}")),
+    }
+}
+
+enum Verdict {
+    Agree,
+    Mismatch(String),
+    Unsupported(String),
+}
+
 fn workload(probes: &Probes) -> Vec<Query> {
     let cold = probes.cold;
     let median = probes.median;
@@ -766,13 +1713,21 @@ fn workload(probes: &Probes) -> Vec<Query> {
 /// Loads both databases at the given size, runs the workload, prints the result
 /// table, and returns the per-query timings for the sweep's scaling summary.
 fn run_at(cfg: &Config, nodes: u64, edges: u64) -> anyhow::Result<Vec<QueryTiming>> {
-    println!(
-        "dataset: {nodes} Person nodes, {edges} KNOWS edges ({} skew); \
-         {} reps ({} warmups) per query\n",
-        cfg.skew.as_str(),
-        cfg.reps,
-        cfg.warmups
-    );
+    if cfg.diff_only {
+        println!(
+            "dataset: {nodes} Person nodes, {edges} KNOWS edges ({} skew); \
+             differential only, no timing\n",
+            cfg.skew.as_str()
+        );
+    } else {
+        println!(
+            "dataset: {nodes} Person nodes, {edges} KNOWS edges ({} skew); \
+             {} reps ({} warmups) per query\n",
+            cfg.skew.as_str(),
+            cfg.reps,
+            cfg.warmups
+        );
+    }
 
     let data = generate(nodes, edges, cfg.skew);
     let probes = pick_probes(&data);
@@ -806,6 +1761,26 @@ fn run_at(cfg: &Config, nodes: u64, edges: u64) -> anyhow::Result<Vec<QueryTimin
         "load: issundb {is_load:?} (single write txn), ladybugdb {lb_load:?} (COPY FROM), \
          idb/ldb {load_ratio:.2}\n"
     );
+
+    // Differential pass first, on row-returning queries, before anything is
+    // timed. It runs at every dataset size in a sweep on purpose: the engine
+    // switches internal strategies at size thresholds (a small gather served from
+    // storage against built property columns, a per-source adjacency read against
+    // a rebuilt snapshot), so the same corpus at 10k and 250k nodes is not the
+    // same test.
+    let mut diff_mismatches = run_differential(&graph, &conn, &differential_workload(&probes));
+    if cfg.generated > 0 {
+        let shapes = generate_queries(cfg.generated, cfg.seed, &probes, &out_adjacency(&data));
+        diff_mismatches += run_generated(&graph, &conn, &RefGraph::build(&data), &shapes, cfg.seed);
+    }
+    println!();
+
+    if cfg.diff_only {
+        if diff_mismatches > 0 {
+            anyhow::bail!("{diff_mismatches} differential mismatch(es)");
+        }
+        return Ok(Vec::new());
+    }
 
     println!(
         "{:<20} {:>16} {:>16} {:>16} {:>9} {:>12} {:>10}  diff",
@@ -977,8 +1952,12 @@ fn run_at(cfg: &Config, nodes: u64, edges: u64) -> anyhow::Result<Vec<QueryTimin
              the affected queries are reported, not timed"
         );
     }
-    if mismatches > 0 {
-        anyhow::bail!("{mismatches} differential mismatch(es)");
+    let total_mismatches = mismatches + diff_mismatches;
+    if total_mismatches > 0 {
+        anyhow::bail!(
+            "{total_mismatches} differential mismatch(es) \
+             ({diff_mismatches} in the row-returning corpus, {mismatches} in the timed workload)"
+        );
     }
     Ok(timings)
 }
@@ -1112,6 +2091,199 @@ mod tests {
             max >= 50,
             "max in-degree {max} is too small for a skewed graph"
         );
+    }
+
+    /// The generator must stay inside the shapes the reference evaluator and both
+    /// engines can all handle, and it must be reproducible from its seed.
+    #[test]
+    fn generated_queries_are_deterministic_and_in_surface() {
+        let data = generate(1_000, 5_000, Skew::Uniform);
+        let probes = pick_probes(&data);
+        let adjacency = out_adjacency(&data);
+        let a = generate_queries(200, 0x1234, &probes, &adjacency);
+        let b = generate_queries(200, 0x1234, &probes, &adjacency);
+        let rendered: Vec<String> = a.iter().map(GenQuery::render).collect();
+        assert_eq!(
+            rendered,
+            b.iter().map(GenQuery::render).collect::<Vec<_>>(),
+            "the same seed must produce the same queries, or a report cannot be replayed"
+        );
+        assert!(
+            generate_queries(200, 0x99, &probes, &adjacency)
+                .iter()
+                .map(GenQuery::render)
+                .collect::<Vec<_>>()
+                != rendered,
+            "a different seed should explore different shapes"
+        );
+
+        for (q, text) in a.iter().zip(&rendered) {
+            assert!(text.starts_with("MATCH (v0:Person)"), "{text}");
+            assert!(text.contains(" WHERE "), "every query is anchored: {text}");
+            // A variable-length pattern would leave the fixed-length grammar the
+            // reference evaluator implements.
+            assert!(
+                !text.contains("*1") && !text.contains(".."),
+                "no variable-length pattern: {text}"
+            );
+            // A relationship variable would expose the float weight.
+            assert!(!text.contains("[r"), "no relationship variable: {text}");
+            assert!(!text.contains("weight"), "no float projection: {text}");
+            assert!(
+                !text.contains("ORDER BY"),
+                "rows are compared sorted: {text}"
+            );
+            // Every referenced variable must be bound by the pattern.
+            let bound = q.hops.len();
+            for p in &q.predicates {
+                assert!(p.var <= bound, "predicate on an unbound variable: {text}");
+            }
+        }
+    }
+
+    /// The reference evaluator has to enforce relationship uniqueness, since that
+    /// is the whole reason it exists. A two-hop pattern that doubles back can only
+    /// match by binding one edge to both slots, so under openCypher it matches
+    /// nothing.
+    #[test]
+    fn reference_evaluator_enforces_relationship_uniqueness() {
+        let data = generate(50, 100, Skew::Uniform);
+        let g = RefGraph::build(&data);
+        let anchor = data.knows[0].1;
+
+        let doubling_back = GenQuery {
+            hops: vec![Hop { incoming: true }],
+            cycle: true,
+            anchor: Anchor::Probe(anchor),
+            predicates: Vec::new(),
+            projection: Projection::Props(vec![(1, Prop::Id)]),
+            distinct: false,
+        };
+        assert!(
+            reference_rows(&g, &doubling_back).is_empty(),
+            "one edge cannot fill both relationship slots"
+        );
+
+        // The same pattern without the closing hop does match: one hop, one edge.
+        let single_hop = GenQuery {
+            cycle: false,
+            ..doubling_back.clone()
+        };
+        assert_eq!(
+            reference_rows(&g, &single_hop).len(),
+            g.inc[anchor as usize].len(),
+            "one incoming hop matches once per incoming edge"
+        );
+    }
+
+    /// Shrinking must only ever return a shape reachable by dropping pieces, and
+    /// must terminate. The simplification set is what both properties rest on.
+    #[test]
+    fn simplifications_strictly_shrink() {
+        let q = GenQuery {
+            hops: vec![Hop { incoming: false }, Hop { incoming: true }],
+            cycle: true,
+            anchor: Anchor::IdBelow(10),
+            predicates: vec![
+                Pred {
+                    var: 0,
+                    kind: PredKind::AgeAtLeast(30),
+                },
+                Pred {
+                    var: 1,
+                    kind: PredKind::CityEq("oslo"),
+                },
+            ],
+            projection: Projection::Props(vec![(0, Prop::Id), (1, Prop::Name)]),
+            distinct: true,
+        };
+        let size = |q: &GenQuery| {
+            q.hops.len()
+                + q.predicates.len()
+                + usize::from(q.cycle)
+                + usize::from(q.distinct)
+                + match &q.projection {
+                    Projection::Props(items) => items.len(),
+                    Projection::Grouped { .. } => 1,
+                }
+        };
+        let candidates = simplifications(&q);
+        assert!(!candidates.is_empty());
+        for c in &candidates {
+            assert!(
+                size(c) < size(&q),
+                "every simplification must be strictly smaller, or shrinking loops"
+            );
+        }
+        // A minimal shape offers nothing further to drop, which is what terminates
+        // the shrink loop.
+        let minimal = GenQuery {
+            hops: Vec::new(),
+            cycle: false,
+            anchor: Anchor::Probe(1),
+            predicates: Vec::new(),
+            projection: Projection::Props(vec![(0, Prop::Id)]),
+            distinct: false,
+        };
+        assert!(simplifications(&minimal).is_empty());
+    }
+
+    /// The differential corpus rests on two invariants, and neither is enforced by
+    /// the type system, so they are pinned here.
+    ///
+    /// A variable-length pattern would reintroduce the walk-versus-trail question
+    /// the timing workload needs a hand-written `Oracle` to answer, and turn a
+    /// mismatch back into something a human has to adjudicate. A projection of
+    /// nothing but an aggregate over the whole match would make the query a scalar
+    /// comparison again, which is the weakness this corpus exists to avoid.
+    #[test]
+    fn differential_corpus_is_fixed_length_and_row_returning() {
+        let data = generate(1_000, 5_000, Skew::Uniform);
+        let probes = pick_probes(&data);
+        let corpus = differential_workload(&probes);
+        assert!(
+            corpus.len() >= 15,
+            "the corpus should be broad, not a token"
+        );
+
+        for q in &corpus {
+            assert!(
+                !q.cypher.contains('*') || q.cypher.contains("count(*)"),
+                "{}: a variable-length pattern needs an adjudicating oracle, \
+                 so it belongs in the generated corpus instead",
+                q.name
+            );
+            // No pattern may be able to bind one edge to two relationship slots.
+            let outgoing = q.cypher.matches("-[:KNOWS]->").count();
+            let incoming = q.cypher.matches("<-[:KNOWS]-").count();
+            assert!(
+                outgoing + incoming <= 2 && (outgoing == 0 || incoming == 0),
+                "{}: at most two same-direction hops, or LadybugDB's walk semantics \
+                 may disagree without either engine being wrong",
+                q.name
+            );
+            assert!(
+                !q.cypher.contains("->(a)") && !q.cypher.contains("->(v0)"),
+                "{}: a closing hop can always reuse an edge",
+                q.name
+            );
+            // A grouped aggregate returns one row per group, which is the point;
+            // an aggregate with no grouping key collapses to a single row and is
+            // back to comparing one number.
+            let is_bare_aggregate = ["count(", "min(", "max(", "sum(", "avg("]
+                .iter()
+                .any(|f| q.cypher.contains(f))
+                && !q.cypher.contains(", count(")
+                && !q.cypher.contains(", min(");
+            assert!(
+                !is_bare_aggregate,
+                "{}: an ungrouped aggregate compares a single scalar",
+                q.name
+            );
+        }
+
+        let names: HashSet<_> = corpus.iter().map(|q| q.name).collect();
+        assert_eq!(names.len(), corpus.len(), "query names must be unique");
     }
 
     #[test]

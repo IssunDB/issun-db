@@ -1,16 +1,25 @@
 ## Comparison with LadybugDB
 
-This directory contains a benchmark harness for comparing the performance of LadybugDB and IssunDB databases.
-The harness runs an identical Cypher workload against IssunDB and LadybugDB (the Kùzu successor; via the `lbug` crate).
-It reports the median wall time and also checks that the results are identical.
+This directory contains a harness for comparing LadybugDB and IssunDB (the Kùzu successor; via the `lbug` crate).
+It does two separate jobs: a differential correctness pass over row-returning queries, and a timing comparison.
+LadybugDB is a genuinely independent implementation, which makes it the one oracle that can catch a mistake IssunDB makes consistently across all of
+its own execution paths.
+The in-tree `ISSUNDB_ROW_PIPELINE_ONLY` sweep cannot: it compares IssunDB's fast paths against IssunDB's own row pipeline, so a shared
+misunderstanding of Cypher looks like agreement.
 
 ### Running the Harness
 
 ```bash
-make bench-ladybugdb
+make test-ladybugdb       # differential correctness only, no timing
+make test-ladybugdb-zipf  # the same under a skewed degree distribution
+make bench-ladybugdb      # timing comparison (runs the curated differential pass first)
 # Or directly (from this directory, so the local toolchain pin applies):
 cd benchmarks/ladybugdb-compare && cargo run --release
 ```
+
+`make test-ladybugdb` runs the differential passes twice, once normally and once with `ISSUNDB_ROW_PIPELINE_ONLY=1`, so both IssunDB's fast paths and its
+general row pipeline are checked. Size and breadth come from `LADYBUGDB_DIFF_NODES` and `LADYBUGDB_DIFF_GENERATED` in the root Makefile; raise the latter
+for a longer hunt.
 
 The runs can be configured with these environment variables:
 
@@ -25,6 +34,64 @@ The runs can be configured with these environment variables:
   sizes; ratios above the 5x dataset growth indicate superlinear behavior
 - `LADYBUGDB_COMPARE_BUDGET_SECS`: time budget per query configuration (default: 30s); repetitions stop early when the budget is spent, and
   a trailing `*` in the table shows the median taken from fewer than the requested repetitions
+- `LADYBUGDB_COMPARE_DIFF_ONLY`: set to `1` to run the differential passes and skip timing entirely
+- `LADYBUGDB_COMPARE_GENERATED`: generated differential queries per dataset size (default: 0, so a timing run keeps its length)
+- `LADYBUGDB_COMPARE_SEED`: seed for the generator, printed with any finding so it replays
+
+### Differential Pass
+
+Before anything is timed, a corpus of row-returning queries runs on both engines and their sorted row sets must match exactly.
+Any mismatch fails the run and prints the first differing row.
+
+This corpus is deliberately separate from the timed workload. That workload is shaped for measurement, so most of its queries return a single
+`count(...)`, and a scalar count is a weak differential signal: it cannot see wrong row content, wrong column names, wrong row multiplicity, or two
+errors that cancel. The differential corpus returns the rows themselves, and covers projections over a bounded slice of the label scan, range and
+string predicates, disjunction and negation, one hop in both directions, two fixed hops with and without `DISTINCT`, expand-into, a closed triangle,
+and grouped aggregation (which emits one row per group, so a wrong group key or per-group tally is visible where a single total would hide it).
+
+Two invariants keep it cheap to extend, and a unit test pins both:
+
+- Every pattern is fixed-length. LadybugDB evaluates variable-length patterns under walk semantics where openCypher requires trails, and the pinned
+  build does not honor the `TRAIL` setting, so a variable-length query needs a hand-written reference to decide which engine diverged. That is what
+  the timed workload's `Oracle` does, and it does not scale to breadth. A fixed-length pattern has no such ambiguity, so any divergence is a real
+  defect in one of the two engines.
+- Row sets stay small and skew-independent, either anchored at a non-hub probe or bounded by an `id` predicate, so the pass costs the same at every
+  size in a sweep. It runs at every size on purpose, because the engine switches internal strategies at size thresholds and the same corpus at 10k and
+  250k nodes is therefore not the same test.
+
+Projections avoid floats and nulls, which is a display-form difference rather than a semantic one. The float case is measured: a whole-valued weight
+comes back as `0.0` from IssunDB and `0` from LadybugDB, while fractional weights agree. Reconciling numeric display in `issundb_rows` and
+`ladybugdb_rows` would let floats join the corpus.
+
+Running the harness under `ISSUNDB_ROW_PIPELINE_ONLY=1` compares LadybugDB against IssunDB's row pipeline instead of its fast paths, which composes
+the two oracles: agreement in both configurations means the fast paths and the general path both match an independent implementation.
+
+One rule is narrower than it looks. No curated query may bind one edge to two relationship slots, which means at most two same-direction hops and no
+closing hop. Walk-against-trail is not only a variable-length question: relationship uniqueness applies to any pattern with two or more slots, so
+`(a)-[:KNOWS]->(b)<-[:KNOWS]-(c)` diverges when `c` is `a` and one edge fills both slots, and `(a)<-[:KNOWS]-(b)-[:KNOWS]->(a)` always does. Two
+same-direction hops are safe only because the generator emits no self-loops. Shapes outside that rule belong in the generated corpus below, where they
+are adjudicated instead of merely compared.
+
+### Generated Queries
+
+`LADYBUGDB_COMPARE_GENERATED=n` adds `n` generated queries per dataset size, drawn from a small grammar: fixed-length `:KNOWS` hop chains in either
+direction with an optional closing hop, `WHERE` over id, age, and city, and either a property projection or one grouped aggregate. Generation is seeded
+and the seed is printed with every finding, so a report replays exactly. Multi-source anchors are bounded by measuring real out-degrees rather than by
+guessing, because the skewed generator concentrates edges on low ids: under Zipf a plain `id < 100` selects precisely the hubs.
+
+These are adjudicated by a third oracle rather than by comparing the two engines against each other. `reference_rows` evaluates each generated query
+directly over the dataset by brute force under openCypher semantics, so every divergence names the engine at fault:
+
+- both engines match the reference: agreement,
+- IssunDB matches and LadybugDB does not: a LadybugDB walk-semantics divergence, counted and not a failure,
+- IssunDB does not match: an IssunDB defect, which fails the run and is reported at its smallest reproducing shape,
+- the reference disagrees with both engines while they agree with each other: the reference is the suspect, since two independent implementations
+  agreeing is stronger evidence than one brute-force evaluator, and the run fails as a harness defect.
+
+The adjudicator is what makes the generated corpus usable at all. Without it roughly one generated query in ten diverges, because any pattern that can
+bind one edge to two relationship slots hits the walk-against-trail difference, and each would need a human to attribute. Findings are shrunk before
+being reported: pieces are dropped while the verdict holds, which turns a three-hop query carrying four predicates into the smallest shape that still
+reproduces.
 
 ### Data and Workload
 
@@ -50,14 +117,16 @@ Currently, these queries are used in the benchmarks:
 - Cyclic triangle count
 - Aggregation over a one-hop traversal grouped by city
 
+The differential corpus is listed in `differential_workload`; the timed one in `workload`.
+
 > [!NOTE]
 > Currently, the benchmarks only include read-only queries, which are more directly comparable across the two databases.
 > Things like mutation throughput, concurrent clients, and direct graph-algorithm APIs are deliberately excluded.
 > They need separate setup and transaction semantics that would make it hard to maintain a clean comparison in a single harness.
 
 To make the measurements more comparable, LadybugDB query runs are measured twice per query.
-Once using LadybugDB's default thread count and once with the number of threads pinned to one, since IssunDB currently executes
-a query in a single thread.
+Once using LadybugDB's default thread count and once with the number of threads pinned to one, since IssunDB currently executes a query in a single
+thread.
 
 ### Fairness Notes
 

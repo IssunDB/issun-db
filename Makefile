@@ -22,13 +22,13 @@ NEXTEST_VERSION := 0.9.100
 AUDIT_VERSION := 0.21.2
 CAREFUL_VERSION := 0.4.8
 
-# GraphBLAS initializes a process-global OpenMP pool on first use, and the
-# coverage run is process-per-test under nextest, so the pools oversubscribe on
-# smaller or loaded machines and a GraphBLAS call can fail intermittently.
-# Pinning the pool to one thread and retrying twice compensates.
-# Both are overridable from the environment.
+# Multithreading parameters
 OMP_NUM_THREADS ?= 1
 NEXTEST_RETRIES ?= 2
+
+# Differential testing parameters
+LADYBUGDB_DIFF_NODES ?= 5000
+LADYBUGDB_DIFF_GENERATED ?= 500
 
 # Default target
 .DEFAULT_GOAL := help
@@ -267,6 +267,24 @@ bench-cypher: ## Run Cypher parser and query optimizer benchmarks
 	@DEBUG_PROJ=$(DEBUG_PROJ) cargo bench -p issundb-cypher
 	@DEBUG_PROJ=$(DEBUG_PROJ) cargo bench -p issundb --bench query_optimizer
 
+.PHONY: test-ladybugdb
+test-ladybugdb: ## Run the differential tests (using LadybugDB)
+	@echo "Running LadybugDB differential pass (issundb fast paths)..."
+	@cd benchmarks/ladybugdb-compare && LADYBUGDB_COMPARE_DIFF_ONLY=1 \
+		LADYBUGDB_COMPARE_NODES=$(LADYBUGDB_DIFF_NODES) \
+		LADYBUGDB_COMPARE_GENERATED=$(LADYBUGDB_DIFF_GENERATED) cargo run --release
+	@echo "Running LadybugDB differential pass (issundb row pipeline)..."
+	@cd benchmarks/ladybugdb-compare && ISSUNDB_ROW_PIPELINE_ONLY=1 LADYBUGDB_COMPARE_DIFF_ONLY=1 \
+		LADYBUGDB_COMPARE_NODES=$(LADYBUGDB_DIFF_NODES) \
+		LADYBUGDB_COMPARE_GENERATED=$(LADYBUGDB_DIFF_GENERATED) cargo run --release
+
+.PHONY: test-ladybugdb-zipf
+test-ladybugdb-zipf: ## Run the differential tests (using LadybugDB) under Zipf degree skew
+	@echo "Running differential tests (using LadybugDB) (with Zipf skew)..."
+	@cd benchmarks/ladybugdb-compare && LADYBUGDB_COMPARE_SKEW=zipf LADYBUGDB_COMPARE_DIFF_ONLY=1 \
+		LADYBUGDB_COMPARE_NODES=$(LADYBUGDB_DIFF_NODES) \
+		LADYBUGDB_COMPARE_GENERATED=$(LADYBUGDB_DIFF_GENERATED) cargo run --release
+
 .PHONY: bench-ladybugdb
 bench-ladybugdb: ## Run the LadybugDB comparison harness (uniform skew)
 	@echo "Running LadybugDB comparison harness..."
@@ -274,7 +292,7 @@ bench-ladybugdb: ## Run the LadybugDB comparison harness (uniform skew)
 
 .PHONY: bench-ladybugdb-zipf
 bench-ladybugdb-zipf: ## Run the LadybugDB comparison harness under Zipf degree skew
-	@echo "Running LadybugDB comparison harness (zipf skew)..."
+	@echo "Running LadybugDB comparison harness (with Zipf skew)..."
 	@cd benchmarks/ladybugdb-compare && LADYBUGDB_COMPARE_SKEW=zipf cargo run --release
 
 .PHONY: bench-ladybugdb-sweep
