@@ -774,13 +774,33 @@ impl<S: ColumnSource> ColumnsCache<S> {
             }
             let mut guard = self.columns.write();
             let delta = std::mem::take(&mut *self.pending.lock());
-            match guard.as_mut() {
-                Some(cols) if !delta.force_full => cols.patch(storage, &delta.touched)?,
-                _ => *guard = Some(PropColumns::build(storage)?),
-            }
+            let absorbed = match guard.as_mut() {
+                Some(cols) if !delta.force_full => cols.patch(storage, &delta.touched),
+                _ => PropColumns::build(storage).map(|cols| *guard = Some(cols)),
+            };
+            self.recover_if_failed(absorbed)?;
             // Loop back to the fast path so a delta that landed during the
             // rebuild is also absorbed before serving.
         }
+    }
+
+    /// Turn a failed absorb into a pending full rebuild instead of a silently
+    /// stale cache.
+    ///
+    /// The delta was already taken out of the shared buffer before the absorb ran,
+    /// so propagating the error on its own would drop that work: the buffer would
+    /// be empty, the columns would still hold pre-write values, and every later
+    /// read would take the fast path and serve them indefinitely. One transient
+    /// LMDB error would become permanently wrong property reads.
+    ///
+    /// The recovery has to be a full rebuild rather than re-queueing the taken ids,
+    /// because `patch` applies per entity and may have failed partway, leaving the
+    /// columns in a state no id list describes.
+    fn recover_if_failed(&self, outcome: Result<(), Error>) -> Result<(), Error> {
+        if outcome.is_err() {
+            self.record_force_full();
+        }
+        outcome
     }
 
     /// Whether the columns are already materialized. A caller that can serve
@@ -844,8 +864,12 @@ impl<S: ColumnSource> ColumnsCache<S> {
             }
             match guard.as_mut() {
                 // Patching is per touched entity, so an advisory reader can
-                // afford to bring existing columns up to date.
-                Some(cols) if !delta.force_full => cols.patch(storage, &delta.touched)?,
+                // afford to bring existing columns up to date. A failure here must
+                // leave a full rebuild pending rather than drop the taken delta;
+                // see `recover_if_failed`.
+                Some(cols) if !delta.force_full => {
+                    self.recover_if_failed(cols.patch(storage, &delta.touched))?
+                }
                 // A node deletion invalidates the dense mapping and forces a
                 // full rebuild, which is the one refresh an advisory reader must
                 // not pay for: dropping the columns and declining leaves the
@@ -866,8 +890,44 @@ mod tests {
     use serde_json::json;
     use tempfile::TempDir;
 
-    use super::DIRECT_READ_BUILD_THRESHOLD;
-    use crate::Graph;
+    use super::{ColumnsCache, DIRECT_READ_BUILD_THRESHOLD, NodeSource};
+    use crate::{Graph, error::Error};
+
+    /// A failed absorb must leave a full rebuild pending. The delta is taken out
+    /// of the shared buffer before the absorb runs, so propagating the error
+    /// alone would drop that work and leave the columns serving pre-write values
+    /// forever, with an empty buffer telling every later reader they are current.
+    #[test]
+    fn a_failed_absorb_leaves_a_full_rebuild_pending() {
+        let cache: ColumnsCache<NodeSource> = ColumnsCache::default();
+        cache.record_touched(7);
+
+        let outcome = cache.recover_if_failed(Err(Error::Corrupt("simulated absorb failure")));
+
+        assert!(outcome.is_err(), "the error still propagates to the caller");
+        let pending = cache.pending.lock();
+        assert!(
+            pending.force_full,
+            "a failed absorb must queue a full rebuild, not vanish"
+        );
+        assert!(
+            pending.touched.is_empty(),
+            "a full rebuild supersedes the per-entity list"
+        );
+    }
+
+    /// A successful absorb must leave the buffer alone, so the recovery path
+    /// cannot cost a rebuild on the happy path.
+    #[test]
+    fn a_successful_absorb_queues_nothing() {
+        let cache: ColumnsCache<NodeSource> = ColumnsCache::default();
+
+        assert!(cache.recover_if_failed(Ok(())).is_ok());
+
+        let pending = cache.pending.lock();
+        assert!(!pending.force_full);
+        assert!(pending.touched.is_empty());
+    }
 
     fn open_tmp() -> (TempDir, Graph) {
         let dir = TempDir::new().unwrap();

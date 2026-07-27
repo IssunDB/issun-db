@@ -154,7 +154,12 @@ modules according to this map.
   build from triples, `mxv` over predefined semirings, `ewise_add` over predefined monoids, and the descriptor flags). Depends only on
   `issundb-graphblas-sys`. `issundb-core` reaches GraphBLAS exclusively through this crate.
 - `crates/issundb-vector/`: vector index abstraction, vector metadata, vector storage integration, and vector search APIs.
-- `crates/issundb-text/`: tokenization, full-text index storage, text search APIs, and ranking.
+- `crates/issundb-text/`: text query APIs and ranking. Tokenization and the inverted-index storage are *not* here: they live in
+  `issundb-core` (`graph/fts_mod.rs` and `storage/fts.rs`), because the write path is in core and the FTS postings are maintained inside the same
+  write transaction as the node record (`index_node_for_label` on insert and update, `delete_node_fts` on delete). A tokenizer in this crate could not
+  be reached from there without inverting the dependency, so the full-text index is the one secondary structure that is transactional rather than an
+  eventually-consistent cache. This crate owns the `Scorer` trait (BM25), query evaluation, and the `TextGraphExt`/`TextIndexExt` surface, and it
+  tokenizes queries through core's `tokenize_text` so indexing and querying cannot disagree.
 - `crates/issundb-retrieval/`: hybrid retrieval over graph traversal, vector hits, text hits, property filters, score fusion, and subgraph
   materialization.
 - `crates/issundb/`: public facade. Re-exports the deliberate public surface from `issundb-core`, `issundb-vector`, `issundb-text`,
@@ -191,6 +196,13 @@ modules according to this map.
 - Cypher conformance tests belong in `crates/issundb/tests/conformance/` and are gated on the `ISSUNDB_CONFORMANCE=1` environment variable so the
   default `make test` stays fast (run them via `make test-conformance`).
 - Property-based tests (via `proptest`) belong alongside the unit tests for the module whose invariants they exercise.
+- The row pipeline is the differential oracle for every shape-specific fast path. `ISSUNDB_ROW_PIPELINE_ONLY=1` keeps the columnar executor, the
+  `PathCount`, `GroupedDegree`, and `TriangleCount` kernels, the fused `ExpandIntersect` hop, and the metadata count shortcut out of the answer, so any
+  suite can be swept through the general path and compared. Both `cargo test` and `ISSUNDB_CONFORMANCE=1` runs must pass identically with and without
+  it; a divergence is a fast-path defect, not a configuration difference. A test whose premise is that a particular operator lowers, and the fast half
+  of any differential comparison, must pin the setting with `exec_mode::fast_paths_required` rather than inherit it, or the sweep makes it either fail
+  on its own premise or pass vacuously. The corpus lives in `crates/issundb-cypher/src/exec/differential.rs`. `VectorTopK` is deliberately outside the
+  switch, because an HNSW search is approximate and is entitled to differ from the exact sort it replaces.
 - Do not reach into `issundb-core` internals from integration tests; drive behavior through the `issundb` public facade or the `Graph` API.
 - If you move code across modules, move or rewrite the unit tests with it.
 - Benchmark targets live in crate-local `benches/` directories; do not add `#[bench]` to source files.
@@ -315,7 +327,7 @@ The read-path and statistics methods carry non-obvious semantics:
 
 Graph algorithms have self-describing signatures over `NodeId` and `EdgeId`: `bfs`, `dfs`, `shortest_path`, `all_paths`, `all_shortest_paths`,
 `longest_path`, `shortest_path_top_k`, `page_rank`, `connected_components`, `strongly_connected_components`, `detect_cycle`, `label_propagation`,
-`degree_centrality`, `betweenness_centrality`, `harmonic_centrality`, `spanning_forest`, `maximum_flow`, and `all_neighbors`. Three carry behavior worth
+`degree_centrality`, `betweenness_centrality`, `harmonic_centrality`, `spanning_forest`, `maximum_flow`, and `all_neighbors`. Four carry behavior worth
 pinning:
 
 - `shortest_path_dijkstra(src, dst) -> Result<Option<WeightedPath>, Error>`: edge weight is the first present of the `weight`, `cost`, `capacity`, or
@@ -358,7 +370,8 @@ Vector search crate. Owns vector index abstractions, vector metadata, vector sto
 
 ### `issundb_text`
 
-Full-text search crate. Owns tokenization, inverted index storage, ranking, and text search APIs. May depend on `issundb-core`; must not depend on
+Full-text search crate. Owns ranking and the text query APIs. Tokenization and the inverted-index storage live in `issundb-core` so the postings can
+be written inside the same transaction as the node record; see the Repository Layout entry. May depend on `issundb-core`; must not depend on
 `issundb-vector`, `issundb-retrieval`, `issundb-cypher`, bindings, or CLI crates.
 
 - `TextGraphExt::text_search(query, opts) -> Result<Vec<TextHit>, TextError>`

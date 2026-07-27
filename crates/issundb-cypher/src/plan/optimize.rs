@@ -120,25 +120,32 @@ impl Optimizer {
         // Rewrite closing Expand nodes into MultiwayJoin after index-scan optimization
         // so that both passes benefit each other.
         result = rewrite_closing_expands(result);
-        // Replace a count aggregation over a bare labeled scan with a constant read
-        // from graph metadata, avoiding a full scan.
-        result = Self::reduce_count(result, stats);
-        // Replace a grouping-free count over a MultiwayJoin-closed directed
-        // triangle chain with the core sorted-intersect kernel.
-        result = rewrite_triangle_count(result);
-        // Replace a grouping-free count over a one-hop or two-hop directed
-        // expansion with the core path-count kernel. Runs after the triangle
-        // rewrite so a closed triangle is never mistaken for an open path.
-        result = rewrite_path_count(result);
-        // Replace a count grouped by one endpoint of a single directed hop with
-        // the grouped-degree kernel. Runs after the path-count rewrite, which
-        // claims the grouping-free counts; only grouped aggregates remain here.
-        result = rewrite_grouped_degree(result);
-        // Push an `ORDER BY <count> LIMIT n` above a grouped-degree kernel into
-        // the kernel as a top-N window, so a query asking for the few largest
-        // counts stops building a row per group. Runs directly after the rewrite
-        // that produces the kernel, and only ever narrows what the kernel emits.
-        result = rewrite_grouped_degree_window(result);
+        // The counting kernels answer their shapes outside the row pipeline, each
+        // reproducing MATCH row semantics on its own, so the row-pipeline-only
+        // switch keeps them out of the plan and lets the general operators answer
+        // instead. That is what makes the two answers comparable, with the row
+        // pipeline as the oracle. See `crate::exec_mode`.
+        if !crate::exec_mode::row_pipeline_only() {
+            // Replace a count aggregation over a bare labeled scan with a constant read
+            // from graph metadata, avoiding a full scan.
+            result = Self::reduce_count(result, stats);
+            // Replace a grouping-free count over a MultiwayJoin-closed directed
+            // triangle chain with the core sorted-intersect kernel.
+            result = rewrite_triangle_count(result);
+            // Replace a grouping-free count over a one-hop or two-hop directed
+            // expansion with the core path-count kernel. Runs after the triangle
+            // rewrite so a closed triangle is never mistaken for an open path.
+            result = rewrite_path_count(result);
+            // Replace a count grouped by one endpoint of a single directed hop with
+            // the grouped-degree kernel. Runs after the path-count rewrite, which
+            // claims the grouping-free counts; only grouped aggregates remain here.
+            result = rewrite_grouped_degree(result);
+            // Push an `ORDER BY <count> LIMIT n` above a grouped-degree kernel into
+            // the kernel as a top-N window, so a query asking for the few largest
+            // counts stops building a row per group. Runs directly after the rewrite
+            // that produces the kernel, and only ever narrows what the kernel emits.
+            result = rewrite_grouped_degree_window(result);
+        }
         // Type inference: when the data schema contains no edge matching a typed
         // hop between two labeled endpoints, that hop (and so the whole pattern)
         // is unsatisfiable, so it is replaced with a zero-row operator that never
@@ -153,8 +160,12 @@ impl Optimizer {
         // `Expand` that binds its closing-source variable, so the executor
         // intersects the two adjacency lists per row instead of materializing
         // every middle-hop neighbor first. Runs last: the count-lowering and
-        // pruning passes above match the unfused `MultiwayJoin` shape.
-        result = rewrite_expand_intersect(result);
+        // pruning passes above match the unfused `MultiwayJoin` shape. Skipped
+        // under the row-pipeline-only switch, which leaves the unfused shape for
+        // the general operators to answer.
+        if !crate::exec_mode::row_pipeline_only() {
+            result = rewrite_expand_intersect(result);
+        }
         result
     }
 
@@ -6197,6 +6208,7 @@ mod tests {
 
     #[test]
     fn reduce_count_replaces_scan_with_constant() {
+        let _fast_paths = crate::exec_mode::fast_paths_required();
         let stats = TestStats::new(&[("Person", 42)]);
         let plan = optimize_query("MATCH (n:Person) RETURN count(*)", &stats);
 
@@ -6351,6 +6363,7 @@ mod tests {
 
     #[test]
     fn reduce_count_replaces_typed_edge_expand_with_constant() {
+        let _fast_paths = crate::exec_mode::fast_paths_required();
         let stats = TestStats::new(&[]).with_type("KNOWS", 7);
         for q in [
             "MATCH ()-[r:KNOWS]->() RETURN count(r)",

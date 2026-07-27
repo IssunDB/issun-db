@@ -226,11 +226,26 @@ pub(super) fn execute_read_query(
     let _prop_cache = (!has_write_parts).then(expr::PropCache::install);
     let _pending = has_write_parts.then(expr::PendingWrites::install);
 
+    // `RETURN *` names its columns by expanding the star over the variables in
+    // scope, which needs the resolved bindings the row pipeline produces below.
+    // The columnar caller names a column per `RETURN` item instead, so for the
+    // star it would name the column after the sentinel itself (`__star__()`).
+    // Declining the shape is the fix rather than teaching the fast path to expand
+    // the star: correctness never depends on the recognizer, and `RETURN *` is a
+    // convenience form, not a shape worth a second implementation of the scope
+    // rules.
+    let return_clause_has_star = query.return_clause.items.iter().any(|item| {
+        matches!(
+            &item.expr,
+            Expr::FunctionCall { name, .. } if name == "__star__"
+        )
+    });
+
     // Columnar fast path: a recognized final projection or aggregation over a
     // single-hop expansion executes column-at-a-time and produces the result
     // records directly. Any other shape (and every write query) takes the row
     // pipeline below.
-    if !has_write_parts && !query.return_clause.items.is_empty() {
+    if !has_write_parts && !return_clause_has_star && !query.return_clause.items.is_empty() {
         if let Some(mut records) = super::vectorized::try_execute_vectorized(
             graph,
             &optimized,
@@ -5444,6 +5459,7 @@ mod stream_join_tests {
 
     #[test]
     fn streaming_directed_multiway_join_matches_materialized() {
+        let _fast_paths = crate::exec_mode::fast_paths_required();
         let (_dir, graph) = triangle_graph();
         // A directed closing hop over a directed final expand fuses into the
         // closing intersection; the streamed result must still match.
@@ -5466,6 +5482,7 @@ mod stream_join_tests {
     /// emits twice and the wedge emits nothing.
     #[test]
     fn expand_intersect_triangle_rows_exact() {
+        let _fast_paths = crate::exec_mode::fast_paths_required();
         let (_dir, graph) = setup();
         exec(
             &graph,
@@ -5503,6 +5520,7 @@ mod stream_join_tests {
     /// matches in both rotations, and the two bound edges are never the same.
     #[test]
     fn expand_intersect_two_cycle_uniqueness() {
+        let _fast_paths = crate::exec_mode::fast_paths_required();
         let (_dir, graph) = setup();
         exec(
             &graph,
@@ -5537,6 +5555,7 @@ mod stream_join_tests {
     /// hop written `(b)<-[:R]-(c)` expands over incoming adjacency.
     #[test]
     fn expand_intersect_incoming_hops_exact() {
+        let _fast_paths = crate::exec_mode::fast_paths_required();
         let (_dir, graph) = setup();
         exec(
             &graph,
@@ -5583,6 +5602,7 @@ mod stream_join_tests {
     /// destination carries the label survives.
     #[test]
     fn expand_intersect_hoists_dst_label_filter() {
+        let _fast_paths = crate::exec_mode::fast_paths_required();
         let (_dir, graph) = setup();
         exec(
             &graph,
@@ -5914,6 +5934,7 @@ mod triangle_count_exec_tests {
     /// row per rotation of the single cycle.
     #[test]
     fn kernel_plan_shape_and_result() {
+        let _fast_paths = crate::exec_mode::fast_paths_required();
         let (_dir, graph) = triangle_fixture();
         let plan = plan_text(&graph, KERNEL_Q);
         assert!(
@@ -5936,6 +5957,7 @@ mod triangle_count_exec_tests {
     /// path too; every variable is bound in every match, so the counts agree.
     #[test]
     fn kernel_accepts_count_star_and_other_variables() {
+        let _fast_paths = crate::exec_mode::fast_paths_required();
         let (_dir, graph) = triangle_fixture();
         for ret in ["count(*)", "count(b)", "count(c)", "count(r1)"] {
             let q = format!(
@@ -5996,6 +6018,7 @@ mod triangle_count_exec_tests {
     /// parallel edges.
     #[test]
     fn kernel_matches_row_path_on_random_multigraphs() {
+        let _fast_paths = crate::exec_mode::fast_paths_required();
         use proptest::prelude::*;
 
         let mut runner = proptest::test_runner::TestRunner::new(ProptestConfig {
@@ -6091,6 +6114,7 @@ mod path_count_exec_tests {
     /// while forcing a pushed-down predicate keeps the row pipeline.
     #[test]
     fn kernel_plan_shape() {
+        let _fast_paths = crate::exec_mode::fast_paths_required();
         let (_dir, graph) = setup();
         super::execute(
             &graph,
@@ -6158,6 +6182,7 @@ mod path_count_exec_tests {
     /// includes.
     #[test]
     fn filtered_two_hop_matches_row_path() {
+        let _fast_paths = crate::exec_mode::fast_paths_required();
         let (_dir, graph) = setup();
         super::execute(
             &graph,
@@ -6201,6 +6226,7 @@ mod path_count_exec_tests {
     /// predicates on the middle and destination nodes.
     #[test]
     fn filtered_kernel_matches_row_path_on_random_graphs() {
+        let _fast_paths = crate::exec_mode::fast_paths_required();
         use proptest::prelude::*;
 
         let mut runner = proptest::test_runner::TestRunner::new(ProptestConfig {
@@ -6254,6 +6280,7 @@ mod path_count_exec_tests {
     /// the one-hop and two-hop counts.
     #[test]
     fn kernel_matches_row_path_on_random_multigraphs() {
+        let _fast_paths = crate::exec_mode::fast_paths_required();
         use proptest::prelude::*;
 
         let mut runner = proptest::test_runner::TestRunner::new(ProptestConfig {
@@ -6359,6 +6386,7 @@ mod grouped_degree_exec_tests {
     /// keep the row pipeline.
     #[test]
     fn kernel_plan_shape() {
+        let _fast_paths = crate::exec_mode::fast_paths_required();
         let (_dir, graph) = setup();
         super::execute(
             &graph,
@@ -6411,6 +6439,7 @@ mod grouped_degree_exec_tests {
     /// edges, matching `count(prop)` null semantics, not raw in-degree.
     #[test]
     fn counts_nonnull_property_only() {
+        let _fast_paths = crate::exec_mode::fast_paths_required();
         let (_dir, graph) = setup();
         // f1 and f2 carry `tag`; f3 does not. All three follow p.
         super::execute(
@@ -6444,6 +6473,7 @@ mod grouped_degree_exec_tests {
     /// counts, exactly as the value-keyed row pipeline aggregate does.
     #[test]
     fn merges_groups_sharing_a_key() {
+        let _fast_paths = crate::exec_mode::fast_paths_required();
         let (_dir, graph) = setup();
         // p1 and p2 share id=7; each is followed once. The group keyed on id=7
         // must sum to 2, not appear as two rows.
@@ -6478,6 +6508,7 @@ mod grouped_degree_exec_tests {
     /// between runs, since the hasher is seeded per process.
     #[test]
     fn kernel_group_order_matches_row_path() {
+        let _fast_paths = crate::exec_mode::fast_paths_required();
         let (_dir, graph) = setup();
         // 24 distinct group keys: enough that hash order coincides with sorted
         // order only by an accident this test would never see.
@@ -6510,6 +6541,7 @@ mod grouped_degree_exec_tests {
     /// canonicalization pass that reconciles the two.
     #[test]
     fn merges_numerically_equal_keys_of_different_kinds() {
+        let _fast_paths = crate::exec_mode::fast_paths_required();
         let (_dir, graph) = setup();
         // p1.k is the integer 1, p2.k the float 1.0, p3.k the float 2.0. The
         // mixed kinds make `k` a Json column, where the two 1s stay distinct
@@ -6539,6 +6571,7 @@ mod grouped_degree_exec_tests {
     /// leading sort key, or no limit, leaves the kernel emitting every group.
     #[test]
     fn count_window_pushes_down_only_for_a_leading_count_sort() {
+        let _fast_paths = crate::exec_mode::fast_paths_required();
         let (_dir, graph) = setup();
         super::execute(
             &graph,
@@ -6584,6 +6617,7 @@ mod grouped_degree_exec_tests {
     /// direction it sorts and whether or not a group key breaks the tie.
     #[test]
     fn count_window_matches_row_path_on_random_graphs() {
+        let _fast_paths = crate::exec_mode::fast_paths_required();
         use proptest::prelude::*;
 
         let mut runner = proptest::test_runner::TestRunner::new(ProptestConfig {
@@ -6670,6 +6704,7 @@ mod grouped_degree_exec_tests {
     /// `exec/vectorized.rs` owns.
     #[test]
     fn kernel_covers_reversed_hops_and_counted_predicates() {
+        let _fast_paths = crate::exec_mode::fast_paths_required();
         let (_dir, graph) = setup();
         // Few interests, many people, so the optimizer roots at Interest and
         // expands backwards to bind Person: the group endpoint is Person and the
@@ -6743,6 +6778,7 @@ mod grouped_degree_exec_tests {
     /// the leaf silently dropped the residual predicate and over-counted.
     #[test]
     fn counted_leaf_and_residual_filters_are_both_applied() {
+        let _fast_paths = crate::exec_mode::fast_paths_required();
         let (_dir, graph) = setup();
         // Few interests, many people, so the optimizer roots at Interest and the
         // counted endpoint is the scanned one.
@@ -6789,6 +6825,7 @@ mod grouped_degree_exec_tests {
     /// forced row pipeline.
     #[test]
     fn reversed_and_filtered_kernel_match_row_path_on_random_graphs() {
+        let _fast_paths = crate::exec_mode::fast_paths_required();
         use proptest::prelude::*;
 
         let mut runner = proptest::test_runner::TestRunner::new(ProptestConfig {
@@ -6869,6 +6906,7 @@ mod grouped_degree_exec_tests {
     /// `count(f.id)`, grouped on one and on two destination properties.
     #[test]
     fn kernel_matches_row_path_on_random_graphs() {
+        let _fast_paths = crate::exec_mode::fast_paths_required();
         use proptest::prelude::*;
 
         let mut runner = proptest::test_runner::TestRunner::new(ProptestConfig {

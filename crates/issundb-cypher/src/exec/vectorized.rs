@@ -1231,14 +1231,6 @@ fn leaf_node_ids(
     Ok(Some(ids))
 }
 
-#[cfg(test)]
-thread_local! {
-    /// Test-only switch: when true, `try_execute_vectorized` declines every
-    /// plan, so the row pipeline executes the identical optimized plan and
-    /// the differential tests compare the two executors and nothing else.
-    static DISABLE_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
 /// Execute `plan` column-at-a-time if it matches the recognized shape,
 /// producing the final result records directly. `Ok(None)` means the plan is
 /// not eligible and the row pipeline must run instead.
@@ -1306,8 +1298,9 @@ pub(super) fn try_execute_vectorized(
     params: &HashMap<String, Value>,
     schema: &std::sync::Arc<SlotSchema>,
 ) -> Result<Option<Vec<Record>>, String> {
-    #[cfg(test)]
-    if DISABLE_FOR_TEST.with(|d| d.get()) {
+    // The row-pipeline-only switch takes this executor out of the picture, so the
+    // row pipeline answers the identical optimized plan. See `crate::exec_mode`.
+    if crate::exec_mode::row_pipeline_only() {
         return Ok(None);
     }
     let Some(p) = recognize(plan) else {
@@ -2348,17 +2341,17 @@ mod tests {
         (dir, g)
     }
 
-    /// Run `cypher` with the fast path declined, so the row pipeline executes
-    /// the identical optimized plan.
+    /// Run `cypher` with every shape-specific fast path declined, so the row
+    /// pipeline answers it. For a vectorized-eligible query this is the identical
+    /// optimized plan with a different executor; for a kernel-eligible one the
+    /// kernel is also kept out of the plan. See [`crate::exec_mode`].
     fn row_path_execute(
         graph: &Graph,
         cypher: &str,
         params: &std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<crate::QueryResult, crate::CypherError> {
-        DISABLE_FOR_TEST.with(|d| d.set(true));
-        let out = execute(graph, cypher, params);
-        DISABLE_FOR_TEST.with(|d| d.set(false));
-        out
+        let _guard = crate::exec_mode::RowPipelineOnly::install();
+        execute(graph, cypher, params)
     }
 
     /// Run `cypher` (vectorized-eligible) through both executors over the same
@@ -2387,7 +2380,12 @@ mod tests {
             pruned_empty || recognize(&plan).is_some(),
             "expected a vectorized-eligible plan for: {cypher}\n{plan:?}"
         );
-        let fast = execute(graph, cypher, params);
+        // Pinned on, so a sweep of the suite with the switch forced cannot turn
+        // this comparison into the row pipeline against itself.
+        let fast = {
+            let _guard = crate::exec_mode::fast_paths_required();
+            execute(graph, cypher, params)
+        };
         let slow = row_path_execute(graph, cypher, params);
         match (fast, slow) {
             (Ok(fast), Ok(slow)) => {

@@ -18,7 +18,7 @@ impl Graph {
         let _guard = self._write_lock.lock();
         let mut wtxn = self.storage.env.write_txn()?;
         let edge_id = self.add_edge_impl(&mut wtxn, src, dst, etype, props)?;
-        wtxn.commit()?;
+        self.commit_and_publish(wtxn, 1)?;
         self.csr_cache.record_added_edge(src, dst);
         self.edge_columns.record_touched(edge_id);
         self.maybe_spawn_rebuild();
@@ -80,7 +80,7 @@ impl Graph {
         let _guard = self._write_lock.lock();
         let mut wtxn = self.storage.env.write_txn()?;
         self.update_edge_impl(&mut wtxn, id, props)?;
-        wtxn.commit()?;
+        self.commit_and_publish(wtxn, 1)?;
         self.edge_columns.record_touched(id);
         // A property change can alter an edge's weight (`weight`/`cost`/
         // `capacity`/`cap`), which the CSR snapshot and the derived weight and
@@ -153,7 +153,7 @@ impl Graph {
         let _guard = self._write_lock.lock();
         let mut wtxn = self.storage.env.write_txn()?;
         let endpoints = self.delete_edge_impl(&mut wtxn, id)?;
-        wtxn.commit()?;
+        self.commit_and_publish(wtxn, 1)?;
         if let Some((src, dst)) = endpoints {
             self.csr_cache.record_removed_edge(src, dst);
             // The deletion reshuffles the dense edge mapping; force a rebuild.

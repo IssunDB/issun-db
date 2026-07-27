@@ -965,11 +965,20 @@ impl Graph {
         // algorithm (Dijkstra, PageRank, spanning forest) reads pre-write weights
         // after a bulk typed expansion or an `update_edge`.
         // Lock-free pre-check: nothing to do when the matrices are current and no
-        // structural delta is pending. `has_pending` also covers the window where
-        // a write has recorded its delta but not yet bumped `write_gen`, so
-        // `matrices_are_stale` is momentarily false even though the weight and
-        // PageRank matrices lag a committed edge; rebuilding then keeps a weighted
-        // algorithm from reading pre-write matrices.
+        // structural delta is pending. Both conditions are needed. A pending delta
+        // with current-looking matrices is the normal state after an incremental
+        // apply advanced `snapshot_gen` while the weight and PageRank matrices,
+        // which have no incremental maintenance, stayed behind; draining it here is
+        // what keeps a weighted algorithm off pre-write matrices.
+        //
+        // The two conditions do not, however, cover the same window. A write
+        // publishes its generation immediately after the commit and records its
+        // delta just after that (`Graph::commit_and_publish`, then
+        // `record_batch`), so between those two points `matrices_are_stale` is
+        // already true while `has_pending` is not yet. This gate is therefore
+        // covered throughout by the generation check alone; `ensure_matrix_view`,
+        // which gates on the delta alone, is the one left uncovered there, which
+        // is why the delta is recorded as early as the ordering allows.
         if self.matrices.read().is_some()
             && !self.csr_cache.matrices_are_stale()
             && !self.csr_cache.has_pending()
@@ -1030,6 +1039,24 @@ impl Graph {
     /// expansion). Rebuilds the snapshot alone when it lags committed writes,
     /// skipping GraphBLAS matrix materialization; the pending structural delta
     /// stays in place for `ensure_matrix_view` to drain later.
+    ///
+    /// Unlike its two sibling gates this one deliberately does *not* also gate on
+    /// `has_pending`, and the asymmetry is required rather than an oversight. A
+    /// pending delta belongs to the matrices, and the refresh here installs
+    /// through `install_snapshot`, which leaves the delta in place on purpose so
+    /// the matrices are not stranded stale behind a fresh snapshot. Gating on the
+    /// delta would therefore make every typed expansion after a write rebuild the
+    /// whole snapshot again, once per call, until some matrix consumer happened to
+    /// drain it: a full edge scan per query on a workload that only expands.
+    /// `ensure_csr_fresh` can afford the same check because its refresh path
+    /// clears the delta as part of the full rebuild.
+    ///
+    /// The generation counter is published immediately after the commit (see
+    /// [`crate::csr::CsrCache::advance_write_gen`]), so what remains uncovered is
+    /// the gap between LMDB making a write visible and that one increment, not the
+    /// width of the write's bookkeeping. Closing it outright is a read-isolation
+    /// question, not a gate question: a reader here holds no transaction, so it
+    /// has no point in time to be consistent with in the first place.
     pub(crate) fn ensure_snapshot_fresh(&self) -> Result<(), Error> {
         // Lock-free pre-check.
         if !self.csr_cache.snapshot_is_stale() {
@@ -1196,12 +1223,17 @@ impl Graph {
     /// Increment the dirty counter and, if the threshold is crossed and no
     /// rebuild is already running, spawn a background thread to rebuild the
     /// CSR snapshot from LMDB.
+    ///
+    /// This is the compaction safety net only. Marking the caches stale is a
+    /// separate step that happens at commit time, in
+    /// [`Graph::commit_and_publish`], so it cannot be delayed behind the rest of
+    /// the post-commit bookkeeping.
     pub(super) fn maybe_spawn_rebuild(&self) {
         self.maybe_spawn_rebuild_n(1);
     }
 
     pub(super) fn maybe_spawn_rebuild_n(&self, count: usize) {
-        if self.csr_cache.mark_dirty_n(count as u64) {
+        if self.csr_cache.note_dirty_n(count as u64) {
             let cache = Arc::clone(&self.csr_cache);
             let storage = Arc::clone(&self.storage);
             let matrices = Arc::clone(&self.matrices);

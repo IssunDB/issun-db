@@ -544,6 +544,18 @@ impl Graph {
 }
 
 impl Graph {
+    /// Open (creating if absent) the database at `path`.
+    ///
+    /// `map_size_gb` is the size of the LMDB memory map, and it is an upper bound
+    /// on how large the database may grow for the lifetime of this handle, not an
+    /// allocation: LMDB reserves the address range and commits pages as they are
+    /// written, so a large value costs virtual address space rather than disk or
+    /// RAM. There is no resize path. Once the data exceeds the bound, every write
+    /// fails with the underlying `MDB_MAP_FULL` through [`Error::Storage`] until
+    /// the database is reopened with a larger value, which is safe to do and keeps
+    /// the existing data. Size it for the eventual database, not the current one.
+    ///
+    /// Opening builds none of the derived structures; see the comment inside.
     pub fn open(path: &Path, map_size_gb: usize) -> Result<Self, Error> {
         let storage = Storage::open(path, map_size_gb)?;
         // Older versions persisted the CSR snapshot next to the LMDB files but
@@ -902,9 +914,25 @@ impl Graph {
         let _txn_guard = WriteTxnGuard::enter(self.write_txn_env_id());
         match f(&mut txn) {
             Ok(val) => {
-                let mutations_count = txn.mutations_count;
-                let delta = std::mem::take(&mut txn.delta);
-                txn.wtxn.commit()?;
+                let WriteTxn {
+                    wtxn,
+                    mutations_count,
+                    delta,
+                    graph: _,
+                } = txn;
+                // Publish before any other bookkeeping, so the window in which
+                // the caches claim to be current while LMDB already holds this
+                // write is one atomic increment wide rather than the width of
+                // the batch. See `CsrCache::advance_write_gen`.
+                self.commit_and_publish(wtxn, mutations_count)?;
+                // Record the structural delta next, before the column bookkeeping.
+                // `ensure_matrix_view` gates on the delta alone (gating it on the
+                // generation would force a full rebuild after every write, since
+                // only a full rebuild advances `matrices_gen`), so the delta being
+                // absent is that gate's whole blind spot. Recording it here rather
+                // than after the column patches shrinks the blind spot from the
+                // width of the batch's column bookkeeping to a few instructions.
+                self.csr_cache.record_batch(&delta);
                 if delta.force_full {
                     self.prop_columns.record_force_full();
                 } else {
@@ -921,7 +949,6 @@ impl Graph {
                     self.edge_columns.record_touched_many(&delta.added_edge_ids);
                     self.edge_columns.record_touched_many(&delta.updated_edges);
                 }
-                self.csr_cache.record_batch(delta);
                 if mutations_count > 0 {
                     self.maybe_spawn_rebuild_n(mutations_count);
                 }
@@ -932,6 +959,26 @@ impl Graph {
                 Err(err)
             }
         }
+    }
+
+    /// Commit `wtxn` and publish the write to the caches' freshness counters as
+    /// one step, where `count` is the number of mutations the transaction made.
+    ///
+    /// Every auto-committing mutation method and [`Graph::update`] commit through
+    /// here rather than calling `wtxn.commit()` directly. The publish is what
+    /// makes every freshness gate notice the write, so a mutation method that
+    /// committed without it would leave the caches permanently claiming to be
+    /// current; routing both through one call that consumes the transaction makes
+    /// that combination unwritable. Ordering inside is deliberate: see
+    /// [`crate::csr::CsrCache::advance_write_gen`].
+    pub(super) fn commit_and_publish(
+        &self,
+        wtxn: heed::RwTxn<'_>,
+        count: usize,
+    ) -> Result<(), Error> {
+        wtxn.commit()?;
+        self.csr_cache.advance_write_gen(count as u64);
+        Ok(())
     }
 
     /// Hold the write lock for the duration of `f`, executing `f` without
@@ -1191,6 +1238,102 @@ mod encode_tests {
             let enc = encode_property_value(&v).unwrap();
             assert_eq!(decode_property_value(&enc), Some(v.clone()), "value {v}");
         }
+    }
+}
+
+#[cfg(test)]
+mod publish_tests {
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    use super::Graph;
+
+    /// Every committing mutation must publish its write to the freshness
+    /// counters, which is what [`Graph::commit_and_publish`] exists to make
+    /// unforgettable. A method that committed without publishing would leave
+    /// every gate reporting the caches as current, so a typed expansion or a
+    /// graph algorithm would read pre-write state indefinitely rather than for
+    /// the length of one atomic increment.
+    #[test]
+    fn every_committing_mutation_publishes_the_write() {
+        let dir = TempDir::new().unwrap();
+        let g = Graph::open(dir.path(), 1).unwrap();
+        let a = g.add_node("P", &json!({ "n": 1 })).unwrap();
+        let b = g.add_node("P", &json!({ "n": 2 })).unwrap();
+        let edge = g.add_edge(a, b, "T", &json!({ "weight": 1.0 })).unwrap();
+        // Targets for the cases that consume what they touch, created up front so
+        // the mutation under test is the only write inside its own window.
+        let victim_node = g.add_node("P", &json!({})).unwrap();
+        let victim_edge = g.add_edge(a, b, "T", &json!({})).unwrap();
+        let label_target = g.add_node("P", &json!({})).unwrap();
+
+        macro_rules! assert_publishes {
+            ($name:literal, $body:block) => {{
+                g.rebuild_csr().unwrap();
+                assert!(
+                    !g.csr_cache.snapshot_is_stale(),
+                    concat!($name, ": a fresh rebuild must report current")
+                );
+                $body
+                assert!(
+                    g.csr_cache.snapshot_is_stale(),
+                    concat!($name, " committed without publishing the write generation")
+                );
+            }};
+        }
+
+        assert_publishes!("add_node", {
+            g.add_node("P", &json!({})).unwrap();
+        });
+        assert_publishes!("add_node_multi", {
+            g.add_node_multi(&["P", "Q"], &json!({})).unwrap();
+        });
+        assert_publishes!("add_edge", {
+            g.add_edge(a, b, "T", &json!({})).unwrap();
+        });
+        assert_publishes!("update_node", {
+            g.update_node(a, &json!({ "n": 9 })).unwrap();
+        });
+        assert_publishes!("update_edge", {
+            g.update_edge(edge, &json!({ "weight": 2.0 })).unwrap();
+        });
+        assert_publishes!("add_label", {
+            g.add_label(label_target, "R").unwrap();
+        });
+        assert_publishes!("remove_label", {
+            g.remove_label(label_target, "R").unwrap();
+        });
+        assert_publishes!("delete_edge", {
+            g.delete_edge(victim_edge).unwrap();
+        });
+        assert_publishes!("delete_node", {
+            g.delete_node(victim_node).unwrap();
+        });
+        assert_publishes!("update", {
+            g.update(|txn| {
+                txn.add_node("P", &json!({}))?;
+                Ok(())
+            })
+            .unwrap();
+        });
+    }
+
+    /// A `Graph::update` closure that mutates nothing must not advance the
+    /// generation, so a read-only use of the write transaction does not force
+    /// every cache to rebuild.
+    #[test]
+    fn a_mutation_free_update_publishes_nothing() {
+        let dir = TempDir::new().unwrap();
+        let g = Graph::open(dir.path(), 1).unwrap();
+        g.add_node("P", &json!({})).unwrap();
+        g.rebuild_csr().unwrap();
+
+        g.update(|txn| txn.get_node(1).map(|_| ())).unwrap();
+
+        assert!(
+            !g.csr_cache.snapshot_is_stale(),
+            "a read-only update must leave the caches current"
+        );
     }
 }
 

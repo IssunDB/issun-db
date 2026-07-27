@@ -10,6 +10,8 @@ use crate::plan::{FilterExpr, LogicalPlanner, Optimizer, PhysicalOperator, Physi
 
 mod copy;
 mod ddl;
+#[cfg(test)]
+mod differential;
 mod expr;
 mod factorize;
 pub(crate) mod read;
@@ -138,11 +140,16 @@ pub fn execute_with_procedures(
     // thread. The statement clock is thread-local, so it is installed inside the
     // worker, not on the caller. Shallow queries (the common case) execute inline.
     if exec_needs_large_stack {
+        // Both the statement clock and the row-pipeline-only switch are
+        // thread-local, and a fresh thread starts from neither this thread's
+        // setting nor an installed clock, so both are installed inside the worker.
+        let row_pipeline_only = crate::exec_mode::row_pipeline_only();
         return std::thread::scope(|scope| {
             let handle = std::thread::Builder::new()
                 .stack_size(EXEC_THREAD_STACK)
                 .spawn_scoped(scope, || {
                     let _clock = expr::StatementClock::install();
+                    let _mode = crate::exec_mode::RowPipelineOnly::install_as(row_pipeline_only);
                     execute_statement(graph, &stmt, params, registry)
                 })
                 .map_err(|e| {
