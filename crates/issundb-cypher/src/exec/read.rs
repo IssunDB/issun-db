@@ -197,10 +197,16 @@ pub(super) fn execute_read_query(
     let resolved_query = resolve_skip_limit_params(graph, query, params)?;
     let query = resolved_query.as_ref().unwrap_or(query);
 
+    // Resolve the execution mode once for this statement and use that one value
+    // for both the plan and the executor choice below. Reading it separately in
+    // each place would let a statement plan under one mode and execute under
+    // another if it ever moved between threads. See `crate::exec_mode`.
+    let row_pipeline_only = crate::exec_mode::row_pipeline_only();
+
     // 1. Compile query AST into an optimized physical plan
     let logical = LogicalPlanner::plan(query).map_err(|e| e.to_string())?;
     let physical = PhysicalPlanner::plan(&logical);
-    let optimized = Optimizer::optimize(physical, Some(graph));
+    let optimized = Optimizer::optimize_with_mode(physical, Some(graph), row_pipeline_only);
 
     // One slot schema per query, walked from the optimized plan: every row of
     // this execution (join build sides included) binds against these slots.
@@ -245,7 +251,11 @@ pub(super) fn execute_read_query(
     // single-hop expansion executes column-at-a-time and produces the result
     // records directly. Any other shape (and every write query) takes the row
     // pipeline below.
-    if !has_write_parts && !return_clause_has_star && !query.return_clause.items.is_empty() {
+    if !has_write_parts
+        && !row_pipeline_only
+        && !return_clause_has_star
+        && !query.return_clause.items.is_empty()
+    {
         if let Some(mut records) = super::vectorized::try_execute_vectorized(
             graph,
             &optimized,

@@ -27,26 +27,43 @@ pub(crate) const MAX_THREADS: usize = 64;
 ///
 /// The result is clamped to `1..=MAX_THREADS`, so a caller never has to handle a
 /// zero or absurd count.
+///
+/// Every configured case returns before the machine count is needed, so that count
+/// is measured lazily: `available_parallelism` is a syscall, and this resolves once
+/// per kernel pass.
 pub(crate) fn resolve(programmatic: i32) -> usize {
-    let machine = std::thread::available_parallelism()
-        .map(|p| p.get())
-        .unwrap_or(1);
-    resolve_from(
+    resolve_from_lazy(
         programmatic,
         std::env::var("ISSUNDB_NUM_THREADS").ok().as_deref(),
         std::env::var("OMP_NUM_THREADS").ok().as_deref(),
-        machine,
+        || {
+            std::thread::available_parallelism()
+                .map(|p| p.get())
+                .unwrap_or(1)
+        },
     )
 }
 
 /// [`resolve`] with its inputs supplied, so the precedence is testable without
 /// mutating process-global environment variables (which would race across the
 /// test binary's threads).
-pub(crate) fn resolve_from(
+#[cfg(test)]
+fn resolve_from(
     programmatic: i32,
     issundb_env: Option<&str>,
     omp_env: Option<&str>,
     machine: usize,
+) -> usize {
+    resolve_from_lazy(programmatic, issundb_env, omp_env, || machine)
+}
+
+/// [`resolve_from`] with the machine count behind a closure, so a configured
+/// value never pays for measuring the machine.
+fn resolve_from_lazy(
+    programmatic: i32,
+    issundb_env: Option<&str>,
+    omp_env: Option<&str>,
+    machine: impl FnOnce() -> usize,
 ) -> usize {
     if programmatic > 0 {
         return (programmatic as usize).clamp(1, MAX_THREADS);
@@ -59,12 +76,32 @@ pub(crate) fn resolve_from(
             return n.clamp(1, MAX_THREADS);
         }
     }
-    machine.clamp(1, MAX_THREADS)
+    machine().clamp(1, MAX_THREADS)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A configured value must not measure the machine: `available_parallelism`
+    /// is a syscall and this resolves once per kernel pass.
+    #[test]
+    fn a_configured_value_never_measures_the_machine() {
+        let panic_if_called = || panic!("the machine count must not be computed");
+        assert_eq!(resolve_from_lazy(4, None, None, panic_if_called), 4);
+        assert_eq!(
+            resolve_from_lazy(0, Some("6"), None, panic_if_called),
+            6,
+            "the engine's own variable short-circuits too"
+        );
+        assert_eq!(
+            resolve_from_lazy(0, None, Some("3"), panic_if_called),
+            3,
+            "so does the OpenMP variable"
+        );
+        // Nothing configured is the one case that must measure it.
+        assert_eq!(resolve_from_lazy(0, None, None, || 9), 9);
+    }
 
     /// The programmatic override wins over both environment variables, and zero
     /// or negative means unset rather than "no threads".

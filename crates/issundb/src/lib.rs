@@ -26,10 +26,14 @@
 //! `serde_json` crate is re-exported as [`issundb::serde_json`](serde_json) so
 //! callers do not need to track a separate, version-compatible dependency.
 
+// The counting-kernel specs are re-exported alongside the methods that take them:
+// `Graph::count_linear_paths`, `grouped_edge_counts`, `typed_neighbor_counts`, and
+// `count_triangle_cycles` are all part of the documented public surface, and a
+// method whose argument type cannot be named from here is not callable.
 pub use issundb_core::{
-    DegreeDirection, DirectedNeighborEntry, EdgeId, EdgeRecord, Error, Graph, LabelId, Language,
-    NeighborEntry, NodeId, NodeRecord, PropValue, ReadTxn, TriangleCountSpec, TypeId, WeightedPath,
-    WriteTxn,
+    DegreeDirection, DirectedNeighborEntry, EdgeId, EdgeRecord, Error, Graph, GroupedDegreeSpec,
+    LabelId, Language, NeighborCountSpec, NeighborEntry, NodeId, NodeRecord, PathCountSpec,
+    PropValue, ReadTxn, TriangleCountSpec, TypeId, WeightedPath, WriteTxn,
 };
 pub use issundb_cypher::{
     CypherError, CypherType, Procedure, ProcedureRegistry, QueryResult, Record,

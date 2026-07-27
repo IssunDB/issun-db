@@ -31,24 +31,54 @@ struct CorrelatedSeek {
     key: Expr,
 }
 
+/// Decisions taken once for a whole plan and threaded through the recursive
+/// optimize calls, which cannot re-derive them from a subtree alone.
+#[derive(Clone, Copy)]
+struct PlanCtx {
+    /// Whether schema-based pruning may run. False when any part of the plan
+    /// writes: a write can create the very edge a pattern matches, which the
+    /// committed-state schema cannot see, so a write subtree must never let a
+    /// recursively optimized read sub-plan prune itself.
+    allow_prune: bool,
+    /// Whether the shape-specific fast paths must stay out of the plan so the
+    /// general operators answer the query.
+    ///
+    /// Carried here rather than read from thread-local state at each rewrite, so
+    /// which plan comes out does not depend on which thread built it, and so the
+    /// executor cannot end up running a plan optimized under the other mode. See
+    /// [`crate::exec_mode`].
+    row_pipeline_only: bool,
+}
+
 impl Optimizer {
     /// Optimize a `PhysicalOperator` plan by standardizing operator sequences,
     /// extracting filter predicates, and pushing them down to the lowest possible nodes.
+    ///
+    /// Reads the execution mode from the current thread. The execution path uses
+    /// [`Optimizer::optimize_with_mode`] instead, resolving it once per statement.
     pub fn optimize(op: PhysicalOperator, stats: Option<&dyn StatsProvider>) -> PhysicalOperator {
-        // Schema-based pruning may only run on a fully read-only query: a write
-        // anywhere in the plan can create the very edge a pattern matches, which
-        // the committed-state schema cannot see. The flag is decided once over
-        // the whole tree and threaded through the opaque recursive optimize
-        // calls (barrier `Project`, `WritePart`) so a write subtree never lets a
-        // recursively optimized read sub-plan prune itself.
-        let allow_prune = !Self::plan_has_write(&op);
-        Self::optimize_impl(op, stats, allow_prune)
+        Self::optimize_with_mode(op, stats, crate::exec_mode::row_pipeline_only())
+    }
+
+    /// [`Optimizer::optimize`] with the execution mode supplied rather than read
+    /// from the calling thread, so the plan and the executor that runs it cannot
+    /// disagree about which fast paths exist.
+    pub fn optimize_with_mode(
+        op: PhysicalOperator,
+        stats: Option<&dyn StatsProvider>,
+        row_pipeline_only: bool,
+    ) -> PhysicalOperator {
+        let ctx = PlanCtx {
+            allow_prune: !Self::plan_has_write(&op),
+            row_pipeline_only,
+        };
+        Self::optimize_impl(op, stats, ctx)
     }
 
     fn optimize_impl(
         op: PhysicalOperator,
         stats: Option<&dyn StatsProvider>,
-        allow_prune: bool,
+        ctx: PlanCtx,
     ) -> PhysicalOperator {
         // Collect each variable's declared label constraints from the original
         // tree before `extract_filters` strips the `HasLabel` filters that carry
@@ -59,7 +89,7 @@ impl Optimizer {
         // than a scanned one (multi-hop fan-out chaining).
         let mut labels: HashMap<String, Vec<String>> = HashMap::new();
         Self::collect_label_constraints(&op, &mut labels);
-        let (stripped_op, raw_filters) = Self::extract_filters(op, stats, allow_prune);
+        let (stripped_op, raw_filters) = Self::extract_filters(op, stats, ctx);
         // Split top-level AND conjunctions so each conjunct pushes down to its
         // own lowest binder: `a.id = 1 AND b.age > 30` as a whole references
         // both endpoints and would stay above the Expand, while its conjuncts
@@ -125,7 +155,7 @@ impl Optimizer {
         // switch keeps them out of the plan and lets the general operators answer
         // instead. That is what makes the two answers comparable, with the row
         // pipeline as the oracle. See `crate::exec_mode`.
-        if !crate::exec_mode::row_pipeline_only() {
+        if !ctx.row_pipeline_only {
             // Replace a count aggregation over a bare labeled scan with a constant read
             // from graph metadata, avoiding a full scan.
             result = Self::reduce_count(result, stats);
@@ -153,7 +183,7 @@ impl Optimizer {
         // on read-only plans: the committed-state schema cannot see edges that a
         // write part of the same statement would create, so pruning a plan with
         // writes could drop rows the query should return.
-        if allow_prune {
+        if ctx.allow_prune {
             result = Self::prune_unsatisfiable(result, stats);
         }
         // Fuse each directed `MultiwayJoin` with the directed single-hop
@@ -163,7 +193,7 @@ impl Optimizer {
         // pruning passes above match the unfused `MultiwayJoin` shape. Skipped
         // under the row-pipeline-only switch, which leaves the unfused shape for
         // the general operators to answer.
-        if !crate::exec_mode::row_pipeline_only() {
+        if !ctx.row_pipeline_only {
             result = rewrite_expand_intersect(result);
         }
         result
@@ -194,12 +224,11 @@ impl Optimizer {
     fn extract_filters(
         op: PhysicalOperator,
         stats: Option<&dyn StatsProvider>,
-        allow_prune: bool,
+        ctx: PlanCtx,
     ) -> (PhysicalOperator, Vec<PendingFilter>) {
         match op {
             PhysicalOperator::Filter { input, expression } => {
-                let (inner_op, mut inner_filters) =
-                    Self::extract_filters(*input, stats, allow_prune);
+                let (inner_op, mut inner_filters) = Self::extract_filters(*input, stats, ctx);
                 inner_filters.push(PendingFilter {
                     expr: expression,
                     limits_crossable: 0,
@@ -212,7 +241,7 @@ impl Optimizer {
                 expr,
                 variable,
             } => {
-                let (inner_op, inner_filters) = Self::extract_filters(*input, stats, allow_prune);
+                let (inner_op, inner_filters) = Self::extract_filters(*input, stats, ctx);
                 (
                     PhysicalOperator::Unwind {
                         input: Box::new(inner_op),
@@ -285,7 +314,7 @@ impl Optimizer {
                 needs_path,
                 is_var_length,
             } => {
-                let (inner_op, inner_filters) = Self::extract_filters(*input, stats, allow_prune);
+                let (inner_op, inner_filters) = Self::extract_filters(*input, stats, ctx);
                 (
                     PhysicalOperator::Expand {
                         input: Box::new(inner_op),
@@ -316,7 +345,7 @@ impl Optimizer {
                     // filters would re-place them above the barrier, where the variables
                     // they reference are no longer in scope. Treat barrier projects as
                     // opaque: do not extract filters from inside them, but optimize their subplan.
-                    let optimized_input = Self::optimize_impl(*input, stats, allow_prune);
+                    let optimized_input = Self::optimize_impl(*input, stats, ctx);
                     (
                         PhysicalOperator::Project {
                             input: Box::new(optimized_input),
@@ -326,8 +355,7 @@ impl Optimizer {
                         Vec::new(),
                     )
                 } else {
-                    let (inner_op, inner_filters) =
-                        Self::extract_filters(*input, stats, allow_prune);
+                    let (inner_op, inner_filters) = Self::extract_filters(*input, stats, ctx);
                     (
                         PhysicalOperator::Project {
                             input: Box::new(inner_op),
@@ -339,8 +367,8 @@ impl Optimizer {
                 }
             }
             PhysicalOperator::HashJoin { left, right } => {
-                let (left_op, mut left_filters) = Self::extract_filters(*left, stats, allow_prune);
-                let (right_op, right_filters) = Self::extract_filters(*right, stats, allow_prune);
+                let (left_op, mut left_filters) = Self::extract_filters(*left, stats, ctx);
+                let (right_op, right_filters) = Self::extract_filters(*right, stats, ctx);
                 left_filters.extend(right_filters);
                 (
                     PhysicalOperator::HashJoin {
@@ -357,7 +385,7 @@ impl Optimizer {
                 group_by,
                 aggregations,
             } => {
-                let (inner, filters) = Self::extract_filters(*input, stats, allow_prune);
+                let (inner, filters) = Self::extract_filters(*input, stats, ctx);
                 (
                     PhysicalOperator::Aggregate {
                         input: Box::new(inner),
@@ -368,7 +396,7 @@ impl Optimizer {
                 )
             }
             PhysicalOperator::Sort { input, items } => {
-                let (inner, filters) = Self::extract_filters(*input, stats, allow_prune);
+                let (inner, filters) = Self::extract_filters(*input, stats, ctx);
                 (
                     PhysicalOperator::Sort {
                         input: Box::new(inner),
@@ -378,7 +406,7 @@ impl Optimizer {
                 )
             }
             PhysicalOperator::Limit { input, skip, count } => {
-                let (inner, mut filters) = Self::extract_filters(*input, stats, allow_prune);
+                let (inner, mut filters) = Self::extract_filters(*input, stats, ctx);
                 // These filters originated below this LIMIT, so they may cross
                 // it again on the way back down during pushdown.
                 for f in &mut filters {
@@ -407,7 +435,7 @@ impl Optimizer {
                 Vec::new(),
             ),
             PhysicalOperator::Distinct { input, keys } => {
-                let (inner, inner_filters) = Self::extract_filters(*input, stats, allow_prune);
+                let (inner, inner_filters) = Self::extract_filters(*input, stats, ctx);
                 (
                     PhysicalOperator::Distinct {
                         input: Box::new(inner),
@@ -419,7 +447,7 @@ impl Optimizer {
             // WritePart operators are opaque: do not extract filters from inside them,
             // but recursively optimize their input subplans.
             PhysicalOperator::WritePart { input, part } => {
-                let optimized_input = Self::optimize_impl(*input, stats, allow_prune);
+                let optimized_input = Self::optimize_impl(*input, stats, ctx);
                 (
                     PhysicalOperator::WritePart {
                         input: Box::new(optimized_input),
@@ -452,7 +480,7 @@ impl Optimizer {
                 closing_is_undirected,
                 closing_unique_rels,
             } => {
-                let (inner_op, inner_filters) = Self::extract_filters(*input, stats, allow_prune);
+                let (inner_op, inner_filters) = Self::extract_filters(*input, stats, ctx);
                 (
                     PhysicalOperator::MultiwayJoin {
                         input: Box::new(inner_op),

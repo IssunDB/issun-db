@@ -485,74 +485,89 @@ impl Graph {
             });
         }
 
-        // Non-null mask for the counted endpoint's property: dense index `d` is
-        // true when the property is present on `dense_to_id[d]`. The property
-        // columns carry their own dense mapping, so resolve each CSR node id
-        // through it. A missing column (no such property anywhere) leaves the
-        // mask all-false, so `count(v.prop)` over an absent property counts
-        // zero, matching the row pipeline.
-        let nonnull_mask: Option<Vec<bool>> = match spec.counted_nonnull_prop {
-            Some(prop) => self.prop_columns.with_fresh(&self.storage, |cols| {
-                // A column with no nulls anywhere is non-null on every node the
-                // walk can reach, so the mask would pass unconditionally: skip
-                // building it and spend no hash lookup per node. Requiring the
-                // column to cover the snapshot's node count keeps that sound, so
-                // a node the columns do not know about cannot slip through.
-                match cols.cols.get(prop) {
-                    Some(col) if col.len() == n && col.all_present() => None,
-                    Some(col) => {
-                        let mut mask = vec![false; n];
-                        for (d, id) in snap.dense_to_id.iter().enumerate() {
-                            if let Some(&cd) = cols.id_to_dense.get(id) {
-                                mask[d] = col.is_present(cd as usize);
-                            }
+        // One pass over the qualifying edges, shared by both walks below so their
+        // type and label filters cannot drift apart.
+        fn walk_qualifying<F: FnMut(usize, usize)>(
+            snap: &CsrSnapshot,
+            n: usize,
+            type_id: Option<TypeId>,
+            group_is_dst: bool,
+            group_mask: &Option<Vec<bool>>,
+            counted_mask: &Option<Vec<bool>>,
+            mut visit: F,
+        ) {
+            let ok = |mask: &Option<Vec<bool>>, d: usize| mask.as_ref().is_none_or(|m| m[d]);
+            for v0 in 0..n {
+                for k in snap.row_ptr[v0]..snap.row_ptr[v0 + 1] {
+                    if let Some(tid) = type_id {
+                        if snap.edge_type[k] != tid {
+                            continue;
                         }
-                        Some(mask)
                     }
-                    // No such column anywhere: `count(v.prop)` counts zero.
-                    None => Some(vec![false; n]),
-                }
-            })?,
-            None => None,
-        };
-
-        let ok = |mask: &Option<Vec<bool>>, d: usize| mask.as_ref().is_none_or(|m| m[d]);
-
-        // `present` marks a group node with at least one label-qualifying edge,
-        // so it produces a MATCH row and therefore a group. `counts` is the
-        // number of those edges whose counted endpoint also passes the non-null
-        // filter. The two differ for `count(v.prop)`: a group can exist (an edge
-        // reaches it) while its count is zero (every counted source has a null
-        // property), and that group must still appear with count zero, exactly
-        // as the row pipeline emits it.
-        let mut counts = vec![0u64; n];
-        let mut present = vec![false; n];
-        for v0 in 0..n {
-            for k in snap.row_ptr[v0]..snap.row_ptr[v0 + 1] {
-                if let Some(tid) = type_id {
-                    if snap.edge_type[k] != tid {
+                    let v1 = snap.col_idx[k] as usize;
+                    // Map the stored edge `v0 -> v1` to the group and counted
+                    // endpoints per the grouping direction.
+                    let (group_d, counted_d) = if group_is_dst { (v1, v0) } else { (v0, v1) };
+                    // Label constraints decide which edges match (existence); the
+                    // non-null property filter only narrows the count within them.
+                    if !ok(group_mask, group_d) || !ok(counted_mask, counted_d) {
                         continue;
                     }
-                }
-                let v1 = snap.col_idx[k] as usize;
-                // Map the stored edge `v0 -> v1` to the group and counted
-                // endpoints per the grouping direction.
-                let (group_d, counted_d) = if spec.group_is_dst {
-                    (v1, v0)
-                } else {
-                    (v0, v1)
-                };
-                // Label constraints decide which edges match (existence); the
-                // non-null property filter only narrows the count within them.
-                if !ok(&group_mask, group_d) || !ok(&counted_mask, counted_d) {
-                    continue;
-                }
-                present[group_d] = true;
-                if ok(&nonnull_mask, counted_d) {
-                    counts[group_d] += 1;
+                    visit(group_d, counted_d);
                 }
             }
         }
+
+        // `present` marks a group node with at least one label-qualifying edge,
+        // so it produces a MATCH row and therefore a group. `qualifying` counts
+        // those edges. For `count(*)` that is already the answer; for
+        // `count(v.prop)` the tally narrows to the edges whose counted endpoint is
+        // non-null, and the two differ: a group can exist (an edge reaches it)
+        // while its count is zero (every counted source has a null property), and
+        // that group must still appear with count zero, exactly as the row
+        // pipeline emits it.
+        let mut qualifying = vec![0u64; n];
+        let mut present = vec![false; n];
+        let mut visited_counted = vec![false; n];
+        walk_qualifying(
+            &snap,
+            n,
+            type_id,
+            spec.group_is_dst,
+            &group_mask,
+            &counted_mask,
+            |group_d, counted_d| {
+                present[group_d] = true;
+                qualifying[group_d] += 1;
+                visited_counted[counted_d] = true;
+            },
+        );
+
+        // Resolve the non-null filter over the endpoints the walk actually
+        // reached, and re-tally only when some of them really are null.
+        let counts = match spec.counted_nonnull_prop {
+            None => qualifying,
+            Some(prop) => match self.visited_nonnull_mask(&snap, &visited_counted, prop)? {
+                None => qualifying,
+                Some(mask) => {
+                    let mut counts = vec![0u64; n];
+                    walk_qualifying(
+                        &snap,
+                        n,
+                        type_id,
+                        spec.group_is_dst,
+                        &group_mask,
+                        &counted_mask,
+                        |group_d, counted_d| {
+                            if mask[counted_d] {
+                                counts[group_d] += 1;
+                            }
+                        },
+                    );
+                    counts
+                }
+            },
+        };
 
         let mut out = Vec::new();
         for (d, &p) in present.iter().enumerate() {
@@ -561,6 +576,60 @@ impl Graph {
             }
         }
         Ok(out)
+    }
+
+    /// Dense non-null mask over the snapshot for `prop`, resolved for exactly the
+    /// nodes `visited` marks.
+    ///
+    /// `None` means every visited node carries a non-null value, so the caller can
+    /// skip the mask entirely. That is sound only because the caller queries the
+    /// mask for visited nodes and no others, which is the same set this resolved:
+    /// a kernel tests the non-null filter only on an endpoint that already passed
+    /// its label and allow-set filters, and those are exactly the endpoints it
+    /// marked.
+    ///
+    /// Resolving the visited nodes rather than the whole graph is what keeps a
+    /// `count(v.prop)` collapse off a full node scan. The presence read goes
+    /// through the same small-request path a point read uses, so a pass over a
+    /// handful of neighbors costs a handful of point reads instead of building
+    /// every property column, which on a large graph is the dominant cost and the
+    /// one a lazily opened graph exists to defer.
+    ///
+    /// It is also why there is no "this column has no nulls anywhere, skip the
+    /// mask" shortcut. That test needed the column set and the snapshot to cover
+    /// the same nodes, and it compared their *counts*: equal counts do not imply
+    /// equal sets, so a deletion and an insertion landing between the snapshot
+    /// refresh and the column refresh would pass the size test while the snapshot
+    /// still held a node the columns never saw, and that node's edges would count
+    /// as non-null. Resolving per visited node needs no such coverage assumption.
+    fn visited_nonnull_mask(
+        &self,
+        snap: &CsrSnapshot,
+        visited: &[bool],
+        prop: &str,
+    ) -> Result<Option<Vec<bool>>, Error> {
+        let ids: Vec<NodeId> = visited
+            .iter()
+            .enumerate()
+            .filter(|&(_, &seen)| seen)
+            .map(|(d, _)| snap.dense_to_id[d])
+            .collect();
+        if ids.is_empty() {
+            return Ok(None);
+        }
+        let present = self.nodes_prop_present(&ids, prop)?;
+        if present.iter().all(|&p| p) {
+            return Ok(None);
+        }
+        let mut mask = vec![false; visited.len()];
+        for (id, is_present) in ids.iter().zip(present) {
+            if is_present {
+                if let Some(&d) = snap.id_to_dense.get(id) {
+                    mask[d as usize] = true;
+                }
+            }
+        }
+        Ok(Some(mask))
     }
 
     /// Threads to spread a read-only kernel pass over, given the number of items
@@ -721,48 +790,15 @@ impl Graph {
             intersect(&mut label_mask, mask);
         }
 
-        // Non-null mask for the neighbor's property, resolved through the
-        // property columns' own dense mapping. A missing column leaves the mask
-        // all-false, so `count(v.prop)` over an absent property counts zero,
-        // matching the row pipeline.
-        let nonnull_mask: Option<Vec<bool>> = match spec.neighbor_nonnull_prop {
-            Some(prop) => self.prop_columns.with_fresh(&self.storage, |cols| {
-                // A column with no nulls anywhere is non-null on every node the
-                // walk can reach, so the mask would pass unconditionally: skip
-                // building it and spend no hash lookup per node. Requiring the
-                // column to cover the snapshot's node count keeps that sound, so
-                // a node the columns do not know about cannot slip through.
-                match cols.cols.get(prop) {
-                    Some(col) if col.len() == n && col.all_present() => None,
-                    Some(col) => {
-                        let mut mask = vec![false; n];
-                        for (d, id) in snap.dense_to_id.iter().enumerate() {
-                            if let Some(&cd) = cols.id_to_dense.get(id) {
-                                mask[d] = col.is_present(cd as usize);
-                            }
-                        }
-                        Some(mask)
-                    }
-                    // No such column anywhere: `count(v.prop)` counts zero.
-                    None => Some(vec![false; n]),
-                }
-            })?,
-            None => None,
-        };
-
         let (row_ptr, col_idx, edge_type) = if spec.incoming {
             (&snap.in_row_ptr, &snap.in_col_idx, &snap.in_edge_type)
         } else {
             (&snap.row_ptr, &snap.col_idx, &snap.edge_type)
         };
-        let ok = |mask: &Option<Vec<bool>>, d: usize| mask.as_ref().is_none_or(|m| m[d]);
 
-        for (i, src) in sources.iter().enumerate() {
-            let Some(&d) = snap.id_to_dense.get(src) else {
-                continue;
-            };
-            let d = d as usize;
-            let (mut qualifying, mut counted) = (0u64, 0u64);
+        // One pass over one source's qualifying neighbors, shared by both walks so
+        // their type and label filters cannot drift apart.
+        let walk_source = |d: usize, visit: &mut dyn FnMut(usize)| {
             for k in row_ptr[d]..row_ptr[d + 1] {
                 if let Some(tid) = type_id {
                     if edge_type[k] != tid {
@@ -770,15 +806,44 @@ impl Graph {
                     }
                 }
                 let other = col_idx[k] as usize;
-                if !ok(&label_mask, other) {
-                    continue;
-                }
-                qualifying += 1;
-                if ok(&nonnull_mask, other) {
-                    counted += 1;
+                if label_mask.as_ref().is_none_or(|m| m[other]) {
+                    visit(other);
                 }
             }
-            out[i] = (qualifying, counted);
+        };
+
+        // First pass: the qualifying tally, which is already the answer for
+        // `count(*)`, plus which neighbors a non-null filter would need resolved.
+        let mut visited = vec![false; n];
+        for (i, src) in sources.iter().enumerate() {
+            let Some(&d) = snap.id_to_dense.get(src) else {
+                continue;
+            };
+            let mut qualifying = 0u64;
+            walk_source(d as usize, &mut |other| {
+                qualifying += 1;
+                visited[other] = true;
+            });
+            out[i] = (qualifying, qualifying);
+        }
+
+        // Resolve the non-null filter over the neighbors the walk actually
+        // reached, and re-tally only when some of them really are null.
+        if let Some(prop) = spec.neighbor_nonnull_prop {
+            if let Some(mask) = self.visited_nonnull_mask(&snap, &visited, prop)? {
+                for (i, src) in sources.iter().enumerate() {
+                    let Some(&d) = snap.id_to_dense.get(src) else {
+                        continue;
+                    };
+                    let mut counted = 0u64;
+                    walk_source(d as usize, &mut |other| {
+                        if mask[other] {
+                            counted += 1;
+                        }
+                    });
+                    out[i].1 = counted;
+                }
+            }
         }
         Ok(out)
     }
@@ -2719,6 +2784,74 @@ mod typed_neighbor_count_tests {
             neighbor_allow: None,
             neighbor_nonnull_prop: nonnull,
         }
+    }
+
+    /// A `count(v.prop)` pass over a handful of neighbors must not build the
+    /// property columns.
+    ///
+    /// Presence is resolved for the neighbors the walk actually reaches, through
+    /// the same small-request path a point read uses. Resolving it from the columns
+    /// instead forced one full node scan with a msgpack decode per node, which on a
+    /// large graph is the dominant cost and the one a lazily opened graph exists to
+    /// defer; the fallback this kernel replaces never paid it.
+    #[test]
+    fn a_nonnull_count_over_few_neighbors_does_not_build_the_columns() {
+        let (_dir, g, ids) = fixture();
+        let (a, b) = (ids[0], ids[1]);
+        assert!(
+            !g.prop_columns.is_built(),
+            "the fixture must start with the columns absent"
+        );
+
+        // a's Person FOLLOWS neighbors are b, b, c, and a. Only c lacks `tag`, so
+        // four qualify and three count.
+        let counts = g
+            .typed_neighbor_counts(
+                &[a, b],
+                &spec(Some("FOLLOWS"), false, &["Person"], Some("tag")),
+            )
+            .unwrap();
+        assert_eq!(counts, vec![(4, 3), (1, 0)]);
+
+        assert!(
+            !g.prop_columns.is_built(),
+            "resolving presence for a few neighbors must not build every column"
+        );
+    }
+
+    /// Presence must come from the nodes the walk reached, not from a whole-column
+    /// summary trusted because its length matched the snapshot's node count.
+    ///
+    /// The previous shortcut skipped the mask when the column had no nulls and its
+    /// length equalled the snapshot's node count. Equal counts do not imply equal
+    /// node sets, so a deletion plus an insertion between the snapshot refresh and
+    /// the column refresh passed that test while the snapshot still held a node the
+    /// columns had never seen, and that node's edges counted as non-null. Here the
+    /// property is present on every node that has it, which is exactly the state
+    /// that used to trigger the shortcut, and the node missing it must still be
+    /// excluded from the count.
+    #[test]
+    fn presence_is_resolved_per_visited_neighbor() {
+        let (_dir, g, ids) = fixture();
+        let a = ids[0];
+
+        // Force the columns to exist and to hold no nulls for `tag` among the
+        // nodes that carry it, the state the old length-plus-all-present shortcut
+        // recognized.
+        g.node_prop_group_codes(&ids, "tag").unwrap();
+        assert!(g.prop_columns.is_built());
+
+        let counts = g
+            .typed_neighbor_counts(
+                &[a],
+                &spec(Some("FOLLOWS"), false, &["Person"], Some("tag")),
+            )
+            .unwrap();
+        assert_eq!(
+            counts,
+            vec![(4, 3)],
+            "the neighbor with no `tag` must not be counted"
+        );
     }
 
     /// An allow-set narrows the count on top of the labels, an empty one admits

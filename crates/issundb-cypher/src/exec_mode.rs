@@ -19,7 +19,8 @@
 //!
 //! What it takes out of the plan:
 //!
-//! - the columnar executor (`exec::vectorized`), which then declines every plan,
+//! - the columnar executor (`exec::vectorized`), which the read path then never
+//!   consults,
 //! - the `TriangleCount`, `PathCount`, and `GroupedDegree` counting kernels, plus
 //!   the count window pushed into the last of those,
 //! - the fused `ExpandIntersect` closing hop, and
@@ -36,8 +37,13 @@
 //!   executor evaluates them. The row pipeline answers those plans either way.
 //!
 //! The flag is per thread, so tests that force it do not disturb the other tests
-//! sharing their process. A thread spawned mid-execution does not inherit it; the
-//! large-stack dispatch in [`crate::exec`] therefore carries it across explicitly.
+//! sharing their process. It is read at exactly two entry points, the read path in
+//! [`crate::exec`] and `explain`, and threaded from there: the read path resolves
+//! it once per statement and hands the same value to both the optimizer
+//! (`Optimizer::optimize_with_mode`) and its choice of executor, so a statement
+//! cannot plan under one mode and execute under the other. A thread spawned
+//! mid-execution does not inherit the flag, which is why the large-stack dispatch
+//! in [`crate::exec`] carries it across explicitly.
 
 use std::cell::Cell;
 

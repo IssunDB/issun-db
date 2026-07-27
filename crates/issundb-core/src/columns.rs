@@ -32,12 +32,39 @@ pub(crate) trait ColumnSource {
     /// order. Each item is `(id, props_json)`.
     fn scan_all(storage: &Storage) -> Result<Vec<(Self::Id, Value)>, Error>;
 
-    /// Re-read one entity's user properties as JSON; `None` if it no longer
-    /// exists (deleted between commit and refresh).
-    fn fetch_one(storage: &Storage, id: Self::Id) -> Result<Option<Value>, Error>;
+    /// Decode one entity's user properties as JSON through a caller-supplied
+    /// transaction; `None` if it no longer exists (deleted between commit and
+    /// refresh). This is the single primitive the two fetch forms below share, so
+    /// a direct read and a column build cannot decode a record differently.
+    fn get_in_txn(
+        storage: &Storage,
+        rtxn: &heed::RoTxn,
+        id: Self::Id,
+    ) -> Result<Option<Value>, Error>;
 
     /// The not-found error for this entity kind.
     fn not_found(id: Self::Id) -> Error;
+
+    /// Re-read one entity's user properties under its own transaction.
+    fn fetch_one(storage: &Storage, id: Self::Id) -> Result<Option<Value>, Error> {
+        let rtxn = storage.env.read_txn()?;
+        Self::get_in_txn(storage, &rtxn, id)
+    }
+
+    /// Read many entities under **one** transaction, in input order.
+    ///
+    /// Both callers need this rather than a loop over [`ColumnSource::fetch_one`].
+    /// A transaction per entity would cost one begin/end pair and one reader-slot
+    /// acquisition per id, so a gather of a thousand ids paid a thousand of each;
+    /// worse, it would observe up to a thousand different commit points, letting
+    /// two values of the same row-major gather come from different graph states.
+    /// One transaction makes the whole request a single point in time.
+    fn fetch_many(storage: &Storage, ids: &[Self::Id]) -> Result<Vec<Option<Value>>, Error> {
+        let rtxn = storage.env.read_txn()?;
+        ids.iter()
+            .map(|&id| Self::get_in_txn(storage, &rtxn, id))
+            .collect()
+    }
 }
 
 /// Builds node property columns from the `nodes` sub-database.
@@ -57,9 +84,12 @@ impl ColumnSource for NodeSource {
         Ok(out)
     }
 
-    fn fetch_one(storage: &Storage, id: NodeId) -> Result<Option<Value>, Error> {
-        let rtxn = storage.env.read_txn()?;
-        match storage.nodes.get(&rtxn, &id)? {
+    fn get_in_txn(
+        storage: &Storage,
+        rtxn: &heed::RoTxn,
+        id: NodeId,
+    ) -> Result<Option<Value>, Error> {
+        match storage.nodes.get(rtxn, &id)? {
             Some(bytes) => {
                 let rec: NodeRecord = props::decode(bytes)?;
                 Ok(Some(props::decode(&rec.props)?))
@@ -90,9 +120,12 @@ impl ColumnSource for EdgeSource {
         Ok(out)
     }
 
-    fn fetch_one(storage: &Storage, id: EdgeId) -> Result<Option<Value>, Error> {
-        let rtxn = storage.env.read_txn()?;
-        match storage.edges.get(&rtxn, &id)? {
+    fn get_in_txn(
+        storage: &Storage,
+        rtxn: &heed::RoTxn,
+        id: EdgeId,
+    ) -> Result<Option<Value>, Error> {
+        match storage.edges.get(rtxn, &id)? {
             Some(bytes) => {
                 let rec: EdgeRecord = props::decode(bytes)?;
                 Ok(Some(props::decode(&rec.props)?))
@@ -283,24 +316,6 @@ impl PropColumn {
             Self::Bool(v) => v[dense].is_some(),
             Self::Str { idx, .. } => idx[dense] != STR_NULL,
             Self::Json(v) => v[dense].is_some(),
-        }
-    }
-
-    /// Whether every slot holds a non-null value.
-    ///
-    /// A column with no nulls anywhere is non-null on every subset of it, so a
-    /// caller filtering on presence can skip building a per-entity mask
-    /// altogether. This is a sequential pass over the presence representation,
-    /// which is far cheaper than the mask it avoids: that mask costs one hash
-    /// lookup per entity to translate between two independently built dense
-    /// spaces.
-    pub(crate) fn all_present(&self) -> bool {
-        match self {
-            Self::Int(v) => v.iter().all(Option::is_some),
-            Self::Float(v) => v.iter().all(Option::is_some),
-            Self::Bool(v) => v.iter().all(Option::is_some),
-            Self::Str { idx, .. } => idx.iter().all(|i| *i != STR_NULL),
-            Self::Json(v) => v.iter().all(Option::is_some),
         }
     }
 
@@ -592,8 +607,12 @@ impl<S: ColumnSource> PropColumns<S> {
         if !touched.is_empty() {
             self.stats.clear();
         }
-        for &id in touched {
-            let json = match S::fetch_one(storage, id)? {
+        // One transaction for the whole patch: a batch commit can touch many
+        // thousands of entities, and a transaction per entity would charge the
+        // next refresh one begin/end pair for each.
+        let fetched = S::fetch_many(storage, touched)?;
+        for (&id, json) in touched.iter().zip(fetched) {
+            let json = match json {
                 Some(j) => j,
                 // Deleted between commit and refresh; deletion also sets
                 // force_full, so this patch run's result is discarded anyway.
@@ -776,7 +795,10 @@ impl<S: ColumnSource> ColumnsCache<S> {
             let delta = std::mem::take(&mut *self.pending.lock());
             let absorbed = match guard.as_mut() {
                 Some(cols) if !delta.force_full => cols.patch(storage, &delta.touched),
-                _ => PropColumns::build(storage).map(|cols| *guard = Some(cols)),
+                _ => PropColumns::build(storage).map(|cols| {
+                    *guard = Some(cols);
+                    self.forget_direct_reads();
+                }),
             };
             self.recover_if_failed(absorbed)?;
             // Loop back to the fast path so a delta that landed during the
@@ -807,6 +829,21 @@ impl<S: ColumnSource> ColumnsCache<S> {
     /// itself from storage uses this to avoid *causing* a build.
     pub(crate) fn is_built(&self) -> bool {
         self.columns.read().is_some()
+    }
+
+    /// Forget the accumulated direct reads. Called whenever the columns are
+    /// installed or dropped, because the counter asks "have enough direct reads
+    /// piled up to justify a build?" and that question restarts with each column
+    /// lifetime.
+    ///
+    /// Without the reset the counter was monotonic for the life of the process, so
+    /// once any 4096 reads had amortized one build the small-request escape hatch
+    /// was disabled forever. A later `force_full` that dropped the columns then
+    /// left a single point read paying a full node scan to rebuild them, which is
+    /// the exact cost the escape hatch exists to avoid.
+    fn forget_direct_reads(&self) {
+        self.direct_reads
+            .store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Record `n` reads served without the columns, reporting whether the
@@ -878,6 +915,9 @@ impl<S: ColumnSource> ColumnsCache<S> {
                 // exact cost this reader exists to avoid.
                 _ => {
                     *guard = None;
+                    // The columns are gone, so small requests must be servable
+                    // directly again rather than forced to rebuild them.
+                    self.forget_direct_reads();
                     return Ok(None);
                 }
             }

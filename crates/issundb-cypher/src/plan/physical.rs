@@ -886,10 +886,16 @@ pub fn format_physical_plan(op: &PhysicalOperator, depth: usize) -> String {
                 Some(p) => format!("count(c.{p})"),
                 None => "count(*)".to_string(),
             };
-            let filters = match (counted_filters.is_empty(), counted_leaf.is_some()) {
-                (true, false) => String::new(),
-                (_, true) => " filter(c)=scan".to_string(),
-                (false, false) => format!(" filter(c)x{}", counted_filters.len()),
+            // A resolved leaf and residual per-row filters can both be present, and
+            // then both are applied, so the display shows both. Collapsing them
+            // into one marker left the plan text identical whether or not the
+            // residual filters were attached, which is exactly the difference that
+            // once silently over-counted.
+            let filters = match (counted_leaf.is_some(), counted_filters.len()) {
+                (false, 0) => String::new(),
+                (false, n) => format!(" filter(c)x{n}"),
+                (true, 0) => " filter(c)=scan".to_string(),
+                (true, n) => format!(" filter(c)=scan+{n}"),
             };
             let window = match count_window {
                 Some(w) => {

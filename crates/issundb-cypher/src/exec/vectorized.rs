@@ -1298,11 +1298,6 @@ pub(super) fn try_execute_vectorized(
     params: &HashMap<String, Value>,
     schema: &std::sync::Arc<SlotSchema>,
 ) -> Result<Option<Vec<Record>>, String> {
-    // The row-pipeline-only switch takes this executor out of the picture, so the
-    // row pipeline answers the identical optimized plan. See `crate::exec_mode`.
-    if crate::exec_mode::row_pipeline_only() {
-        return Ok(None);
-    }
     let Some(p) = recognize(plan) else {
         return Ok(None);
     };

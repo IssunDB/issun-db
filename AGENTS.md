@@ -327,7 +327,7 @@ The read-path and statistics methods carry non-obvious semantics:
 
 Graph algorithms have self-describing signatures over `NodeId` and `EdgeId`: `bfs`, `dfs`, `shortest_path`, `all_paths`, `all_shortest_paths`,
 `longest_path`, `shortest_path_top_k`, `page_rank`, `connected_components`, `strongly_connected_components`, `detect_cycle`, `label_propagation`,
-`degree_centrality`, `betweenness_centrality`, `harmonic_centrality`, `spanning_forest`, `maximum_flow`, and `all_neighbors`. Four carry behavior worth
+`degree_centrality`, `betweenness_centrality`, `harmonic_centrality`, `spanning_forest`, `maximum_flow`, and `all_neighbors`. Five carry behavior worth
 pinning:
 
 - `shortest_path_dijkstra(src, dst) -> Result<Option<WeightedPath>, Error>`: edge weight is the first present of the `weight`, `cost`, `capacity`, or
@@ -344,6 +344,10 @@ pinning:
   source produces rows) without adding to the count. `neighbor_allow` is the counterpart of `PathCountSpec::vertex_allow`: the caller resolves a
   per-neighbor property predicate itself and hands the kernel the surviving ids, so a filtered count stays a kernel call. This is the kernel behind the
   Cypher executor's terminal count-collapse; a source absent from the snapshot counts zero rather than erroring.
+- `prefers_point_expansion(sources) -> bool`: whether a typed expansion over `sources` many source nodes should read per-source LMDB adjacency instead of
+  refreshing the CSR snapshot, true only when the snapshot is stale and the source set is at most `STALE_POINT_EXPAND_MAX`. Advisory: both routes return
+  the same rows, so a caller ignoring it is correct but may rebuild a whole snapshot to serve a handful of sources. It is public because the Cypher
+  executor's collapse decision needs it from another crate.
 - `adjacency_span(sources, incoming) -> Result<u64, Error>`: total length of `sources`' adjacency rows in one direction, an upper bound on the edges
   `typed_neighbor_counts` would visit for them. It reads two array elements per source and no edge, so a caller can size an expansion before choosing
   how to evaluate it.

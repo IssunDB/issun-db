@@ -662,10 +662,14 @@ impl Graph {
         props: &[&str],
     ) -> Result<Vec<Vec<serde_json::Value>>, Error> {
         if self.prop_columns.should_serve_directly(ids.len()) {
-            return ids
-                .iter()
-                .map(|&id| {
-                    let obj = self.direct_node_props(id)?.ok_or(Error::NodeNotFound(id))?;
+            // One transaction for the whole gather, so the request is a single
+            // point in time and pays one begin/end pair rather than one per id.
+            return self
+                .direct_node_props_many(ids)?
+                .into_iter()
+                .zip(ids)
+                .map(|(obj, &id)| {
+                    let obj = obj.ok_or(Error::NodeNotFound(id))?;
                     Ok(props
                         .iter()
                         .map(|p| obj.get(*p).cloned().unwrap_or(serde_json::Value::Null))
@@ -688,10 +692,12 @@ impl Graph {
         prop: &str,
     ) -> Result<Vec<serde_json::Value>, Error> {
         if self.prop_columns.should_serve_directly(ids.len()) {
-            return ids
-                .iter()
-                .map(|&id| {
-                    let obj = self.direct_node_props(id)?.ok_or(Error::NodeNotFound(id))?;
+            return self
+                .direct_node_props_many(ids)?
+                .into_iter()
+                .zip(ids)
+                .map(|(obj, &id)| {
+                    let obj = obj.ok_or(Error::NodeNotFound(id))?;
                     Ok(obj.get(prop).cloned().unwrap_or(serde_json::Value::Null))
                 })
                 .collect();
@@ -705,6 +711,51 @@ impl Graph {
     /// served through the columns cannot disagree. `None` if the node is gone.
     fn direct_node_props(&self, id: NodeId) -> Result<Option<serde_json::Value>, Error> {
         <crate::columns::NodeSource as crate::columns::ColumnSource>::fetch_one(&self.storage, id)
+    }
+
+    /// [`Graph::direct_node_props`] for many ids under one transaction, in input
+    /// order. `None` for a node that is gone.
+    fn direct_node_props_many(
+        &self,
+        ids: &[NodeId],
+    ) -> Result<Vec<Option<serde_json::Value>>, Error> {
+        <crate::columns::NodeSource as crate::columns::ColumnSource>::fetch_many(&self.storage, ids)
+    }
+
+    /// Whether each of `ids` carries a non-null value for `prop`, in input order.
+    ///
+    /// A node that is not there reads as absent rather than raising, because the
+    /// callers' ids come from the CSR snapshot, which can lag a deletion; treating
+    /// the gap as a null value is what the row pipeline would effectively produce
+    /// for a row a stale snapshot should no longer have offered.
+    ///
+    /// Honors the same small-request path the property gathers do, so resolving
+    /// presence for a handful of nodes costs a handful of point reads instead of
+    /// one full scan to build every column. That is the whole point of it existing
+    /// separately: the counting kernels need presence for the neighbors they
+    /// actually visit, not a dense mask over the entire graph.
+    pub(super) fn nodes_prop_present(
+        &self,
+        ids: &[NodeId],
+        prop: &str,
+    ) -> Result<Vec<bool>, Error> {
+        if self.prop_columns.should_serve_directly(ids.len()) {
+            return Ok(self
+                .direct_node_props_many(ids)?
+                .into_iter()
+                .map(|obj| obj.is_some_and(|o| o.get(prop).is_some_and(|v| !v.is_null())))
+                .collect());
+        }
+        self.prop_columns.with_fresh(&self.storage, |cols| {
+            ids.iter()
+                .map(|id| match (cols.id_to_dense.get(id), cols.cols.get(prop)) {
+                    (Some(&d), Some(col)) => col.is_present(d as usize),
+                    // Either the columns never saw this entity or no such property
+                    // exists anywhere; both read as null.
+                    _ => false,
+                })
+                .collect()
+        })
     }
 
     /// Group `ids` by the exact value of `prop` through the in-memory
