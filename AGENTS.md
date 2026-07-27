@@ -132,7 +132,9 @@ modules according to this map.
       running those exact stages over the label's whole node set (`resolve_terminal_allow`). That resolution is gated on the sources' `adjacency_span`
       reaching half the label count, so a selective hop over a large label keeps the expansion fallback instead of paying for a full label pass, and it
       is speculative: it evaluates predicates over a superset of the real neighbors, so a stage that errors there declines to the fallback rather than
-      raising. The recognizer sees through a `Distinct` because the caller deduplicates. Any unrecognized shape falls back to the row pipeline, so
+      raising. Two shapes route to the fallback regardless: a multi-type hop, because `Expand::rel_type` carries the raw pattern text (`"F|G"`) and the
+      kernel resolves one registered type; and a stale snapshot with at most `STALE_POINT_EXPAND_MAX` sources (`Graph::prefers_point_expansion`), because
+      the kernel would rebuild the whole snapshot where the fallback serves those sources from per-source adjacency. The recognizer sees through a `Distinct` because the caller deduplicates. Any unrecognized shape falls back to the row pipeline, so
       correctness never depends on the recognizer.
     - `src/exec/factorize.rs`: `FactorizedRecordGroup` (shared `Arc<PathMap>` prefix plus per-row extensions) and `filter_refs_in_expr`.
     - `src/exec/expr.rs`: expression evaluation (`evaluate_expr`, `eval_binary_op`, `eval_arithmetic`, `eval_function_call`).

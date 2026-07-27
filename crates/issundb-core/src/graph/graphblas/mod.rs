@@ -3,4 +3,4 @@ use super::*;
 mod analytics;
 mod flow;
 mod paths;
-mod traversal;
+pub(crate) mod traversal;

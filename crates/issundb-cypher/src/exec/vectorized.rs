@@ -2089,8 +2089,16 @@ fn execute_collapsed_count(
     // so it would tally zero for every source and the query would return no rows.
     // The expansion fallback splits on `|`, so route multi-type hops there.
     let multi_type = last.rel_type.is_some_and(|t| t.contains('|'));
+    // The kernel reads the CSR snapshot, so it first brings it up to date, which is
+    // a full rebuild when a write has landed since the last build. For a handful of
+    // sources over a stale snapshot the expansion fallback is cheaper: it serves
+    // them from per-source adjacency with no rebuild. Without this an interleaved
+    // write-then-count session pays an `O(nodes + edges)` rebuild per query, and
+    // the first collapsed count after opening a large database pays the build that
+    // the lazy `Graph::open` exists to avoid.
+    let point_cheaper = graph.prefers_point_expansion(distinct.len());
     let kernel_tallies = match split_terminal_filters(stages, terminal) {
-        _ if multi_type => None,
+        _ if multi_type || point_cheaper => None,
         Some((labels, others)) if others.is_empty() => {
             let spec = issundb_core::NeighborCountSpec {
                 rel_type: last.rel_type,
@@ -3290,6 +3298,47 @@ mod tests {
         assert!(split_terminal_filters(Some(&foreign), "p").is_none());
         let (labels, others) = split_terminal_filters(None, "p").unwrap();
         assert!(labels.is_empty() && others.is_empty());
+    }
+
+    /// A write landing after the last snapshot build makes the snapshot stale. With
+    /// few sources the collapse must then take the expansion fallback, which serves
+    /// them from per-source adjacency, rather than the kernel, which would rebuild
+    /// the whole snapshot. Results must be identical either way, including the
+    /// just-written edge.
+    #[test]
+    fn stale_snapshot_with_few_sources_still_matches_row_path() {
+        let dir = TempDir::new().unwrap();
+        let g = Graph::open(dir.path(), 1).unwrap();
+        let hub = g.add_node("H", &json!({"n": "hub"})).unwrap();
+        let people: Vec<_> = (0..4)
+            .map(|i| g.add_node("P", &json!({"id": i as i64})).unwrap())
+            .collect();
+        for &p in &people {
+            g.add_edge(hub, p, "F", &json!({})).unwrap();
+        }
+        g.rebuild_csr().unwrap();
+        assert!(
+            !g.prefers_point_expansion(1),
+            "snapshot is fresh after a rebuild"
+        );
+
+        // A write after the build leaves the snapshot stale; with one source the
+        // point path is preferred.
+        let extra = g.add_node("P", &json!({"id": 99})).unwrap();
+        g.add_edge(hub, extra, "F", &json!({})).unwrap();
+        assert!(
+            g.prefers_point_expansion(1),
+            "a write leaves the snapshot stale, and one source is under the cap"
+        );
+
+        let cypher = "MATCH (h:H)-[:F]->(p:P) RETURN h.n AS n, count(p.id) AS num";
+        assert_matches_row_path(&g, cypher);
+        let rows = execute(&g, cypher, &std::collections::HashMap::new()).unwrap();
+        assert_eq!(
+            rows.records[0].values[1],
+            json!(5),
+            "the edge written after the build must be counted"
+        );
     }
 
     /// A multi-type hop (`[:F|G]`) reaches the collapse as the raw pattern text,

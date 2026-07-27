@@ -595,6 +595,21 @@ impl Graph {
             .min(MAX_SCAN_THREADS)
     }
 
+    /// Whether expanding `sources` from storage would beat bringing the CSR
+    /// snapshot up to date.
+    ///
+    /// The counting kernels read the snapshot, so they must gate on
+    /// `ensure_snapshot_fresh`, which is an `O(nodes + edges)` rebuild when a write
+    /// has landed since the last build. Bulk expansion has always had an escape
+    /// hatch for that case: a handful of sources over a stale snapshot is served
+    /// from per-source adjacency with no rebuild. A caller choosing between a
+    /// kernel and a per-source path should consult this first, so an interleaved
+    /// write-then-count session does not pay a full rebuild per query.
+    pub fn prefers_point_expansion(&self, sources: usize) -> bool {
+        self.csr_cache.snapshot_is_stale()
+            && sources <= crate::graph::graphblas::traversal::STALE_POINT_EXPAND_MAX
+    }
+
     /// Total length of `sources`' adjacency rows in the given direction: an upper
     /// bound on the edges [`Graph::typed_neighbor_counts`] would visit for them,
     /// before any type or label narrowing.
