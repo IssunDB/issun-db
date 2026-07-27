@@ -87,7 +87,9 @@ modules according to this map.
     - `src/columns.rs`: in-memory property columns for the read path. One typed column (`Int`, `Float`, `Bool`, dictionary-encoded `Str`, or the
       exact-semantics `Json` fallback) per node property, built lazily from one full node scan and kept fresh by a post-commit delta (node deletion
       forces a rebuild). Read through `Graph::node_prop_json`. Also owns the lazily computed per-property statistics (`PropStats`: bounds, an
-      equi-depth histogram, and the most common values) that back the selectivity estimates, invalidated by the post-commit patch.
+      equi-depth histogram, and the most common values) that back the selectivity estimates, invalidated by the post-commit patch. Which readers may
+      cause the build is deliberate, because the build is one full scan: a gather larger than `SMALL_GATHER_MAX` does, a smaller one is served straight
+      from storage (`should_serve_directly`), and the advisory statistics never do (`with_existing_mut` rather than `with_fresh`).
     - `src/histogram.rs`: equi-depth histogram over property values with equality and range selectivity estimates; backs `PropStats`. Nothing here is
       persisted.
     - `src/matrices.rs`: GraphBLAS matrix materialization from the CSR snapshot, plus `MatrixSet::apply_delta` for incremental in-place maintenance
@@ -269,12 +271,18 @@ Node and edge CRUD, accessors, and registry lookups have self-describing signatu
 
 The read-path and statistics methods carry non-obvious semantics:
 
-- `node_prop_json(id, prop) -> Result<Option<Value>, Error>`: single-property read through the in-memory property columns; `None` for a nonexistent
-  node, `Some(Value::Null)` for a missing property.
+- `node_prop_json(id, prop) -> Result<Option<Value>, Error>`: single-property read; `None` for a nonexistent node, `Some(Value::Null)` for a missing
+  property.
 - `node_props_json_table(ids, props) -> Result<Vec<Vec<Value>>, Error>`: bulk row-major property gather; `Value::Null` for a missing property and
   `Error::NodeNotFound` for a nonexistent node.
 - `node_prop_json_column(ids, prop) -> Result<Vec<Value>, Error>`: single-property column form of the table gather, one flat vector with no per-row
   allocation; same null and missing-node semantics.
+- Those three read through the in-memory property columns once those exist, but a small request does not build them (`should_serve_directly`): up to
+  `SMALL_GATHER_MAX` ids are served as LMDB point reads instead, because building every column costs one full node scan and a query touching a handful
+  of nodes must not pay it. The size test is on the request, not the method, because the vectorized executor gathers even a one-row projection through
+  the bulk API; keying on the method instead left a cold point query paying roughly 1.2 seconds on an 800 K-node graph. Sustained direct reads amortize
+  the build after `DIRECT_READ_BUILD_THRESHOLD` of them, so a row pipeline reading one property per row still ends up on the columns.
+  `node_prop_group_codes` always builds, since grouping is inherently a bulk read.
 - `node_prop_group_codes(ids, prop) -> Result<(Vec<u32>, Vec<Value>), Error>`: dense group codes under exact value identity of one property, plus one
   representative value per code; null and missing values share one `Value::Null` code.
 - `node_prop_min_max(prop) -> Result<Option<(Value, Value)>, Error>`: bounds of one property's non-null values from the column statistics; `None` for
@@ -283,6 +291,12 @@ The read-path and statistics methods carry non-obvious semantics:
   property's equi-depth histogram.
 - `estimate_equality_selectivity(prop, val) -> Result<Option<f64>, Error>`: estimated fraction of non-null values equal to `val`, exact for the most
   common values and histogram-estimated otherwise; both feed the optimizer's selectivity-aware `Filter` plan weight.
+- Those three readers are advisory, and none of them builds the property columns: each also returns `None` when the columns do not exist yet, leaving
+  the caller on its default plan weight or declining to prune. Forcing a build for them made the first query mentioning any property pay one full node
+  scan (measured at roughly 1.3 seconds on an 800 K-node graph), which was the dominant cold-start latency, and the answer only weights a choice.
+  A caller that needs statistics on a cold graph must materialize the columns first, and only a reader that actually builds them will do:
+  `node_prop_group_codes`, or a gather of more than `SMALL_GATHER_MAX` ids. A smaller gather is served directly and leaves the columns absent, so
+  the statistics still answer `None`.
 - `estimate_expand_fanout(src_label, rel_type, incoming) -> Result<Option<f64>, Error>`: per-source-label typed degree (the count of `rel_type` edges
   incident to `src_label` nodes in the given direction, divided by the `src_label` node count), the "expand ratio" that sharpens the optimizer's
   `Expand` plan weight over the global average on a skewed schema. `None` when a label or type is unknown or no such edges exist. The estimate only

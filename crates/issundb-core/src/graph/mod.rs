@@ -603,16 +603,32 @@ impl Graph {
         Ok(())
     }
 
-    /// Read one property of a node through the in-memory property columns,
-    /// as the `serde_json::Value` that decoding the stored record would give.
-    /// Returns `None` for a nonexistent node and `Some(Value::Null)` for a
-    /// missing property. Builds or refreshes the columns on first use after a
-    /// write, so the result always reflects committed state.
+    /// Read one property of a node as the `serde_json::Value` that decoding the
+    /// stored record would give. Returns `None` for a nonexistent node and
+    /// `Some(Value::Null)` for a missing property. Either way the result
+    /// reflects committed state.
+    ///
+    /// Served through the in-memory property columns once they exist, refreshing
+    /// them against pending writes first; while they are absent the read goes
+    /// straight to storage instead of building them (see
+    /// [`crate::columns::ColumnsCache::should_serve_directly`]).
     pub fn node_prop_json(
         &self,
         id: NodeId,
         prop: &str,
     ) -> Result<Option<serde_json::Value>, Error> {
+        // One property of one node is an LMDB point read. Serving it by building
+        // every column costs a full node scan, which is the wrong trade for a
+        // point query; the read only goes through the columns once they exist,
+        // or once enough direct reads have amortized building them.
+        if self.prop_columns.should_serve_directly(1) {
+            let Some(obj) = self.direct_node_props(id)? else {
+                return Ok(None);
+            };
+            return Ok(Some(
+                obj.get(prop).cloned().unwrap_or(serde_json::Value::Null),
+            ));
+        }
         self.prop_columns.with_fresh(&self.storage, |cols| {
             cols.id_to_dense.get(&id).map(|&d| {
                 cols.cols
@@ -633,6 +649,18 @@ impl Graph {
         ids: &[NodeId],
         props: &[&str],
     ) -> Result<Vec<Vec<serde_json::Value>>, Error> {
+        if self.prop_columns.should_serve_directly(ids.len()) {
+            return ids
+                .iter()
+                .map(|&id| {
+                    let obj = self.direct_node_props(id)?.ok_or(Error::NodeNotFound(id))?;
+                    Ok(props
+                        .iter()
+                        .map(|p| obj.get(*p).cloned().unwrap_or(serde_json::Value::Null))
+                        .collect())
+                })
+                .collect();
+        }
         self.prop_columns
             .with_fresh(&self.storage, |cols| cols.props_table(ids, props))?
     }
@@ -647,8 +675,24 @@ impl Graph {
         ids: &[NodeId],
         prop: &str,
     ) -> Result<Vec<serde_json::Value>, Error> {
+        if self.prop_columns.should_serve_directly(ids.len()) {
+            return ids
+                .iter()
+                .map(|&id| {
+                    let obj = self.direct_node_props(id)?.ok_or(Error::NodeNotFound(id))?;
+                    Ok(obj.get(prop).cloned().unwrap_or(serde_json::Value::Null))
+                })
+                .collect();
+        }
         self.prop_columns
             .with_fresh(&self.storage, |cols| cols.prop_column(ids, prop))?
+    }
+
+    /// One node's user properties decoded from storage, the way the column
+    /// build decodes them, so a gather served directly and the same gather
+    /// served through the columns cannot disagree. `None` if the node is gone.
+    fn direct_node_props(&self, id: NodeId) -> Result<Option<serde_json::Value>, Error> {
+        <crate::columns::NodeSource as crate::columns::ColumnSource>::fetch_one(&self.storage, id)
     }
 
     /// Group `ids` by the exact value of `prop` through the in-memory
@@ -729,43 +773,59 @@ impl Graph {
 
     /// The minimum and maximum non-null value of one node property, from the
     /// lazily computed statistics over the in-memory property columns.
-    /// `None` when the property has no typed column or no non-null values.
+    /// `None` when the property has no typed column or no non-null values, and
+    /// also when the columns are not built yet: this reader never builds them,
+    /// because it is advisory (see [`Graph::estimate_equality_selectivity`]).
     pub fn node_prop_min_max(
         &self,
         prop: &str,
     ) -> Result<Option<(serde_json::Value, serde_json::Value)>, Error> {
-        self.prop_columns.with_fresh_mut(&self.storage, |cols| {
-            cols.prop_stats(prop)
-                .map(|s| (s.min.clone(), s.max.clone()))
-        })
+        Ok(self
+            .prop_columns
+            .with_existing_mut(&self.storage, |cols| {
+                cols.prop_stats(prop)
+                    .map(|s| (s.min.clone(), s.max.clone()))
+            })?
+            .flatten())
     }
 
     /// Estimated fraction of non-null values of `prop` inside the given
     /// bounds (either bound optional), from the property's equi-depth
-    /// histogram. `None` when no statistics exist for the property.
+    /// histogram. `None` when no statistics exist for the property or the
+    /// columns are not built yet; this reader never builds them.
     pub fn estimate_range_selectivity(
         &self,
         prop: &str,
         lower: Option<&serde_json::Value>,
         upper: Option<&serde_json::Value>,
     ) -> Result<Option<f64>, Error> {
-        self.prop_columns.with_fresh_mut(&self.storage, |cols| {
-            cols.prop_stats(prop)
-                .map(|s| s.histogram.estimate_range_selectivity(lower, upper))
-        })
+        Ok(self
+            .prop_columns
+            .with_existing_mut(&self.storage, |cols| {
+                cols.prop_stats(prop)
+                    .map(|s| s.histogram.estimate_range_selectivity(lower, upper))
+            })?
+            .flatten())
     }
 
     /// Estimated fraction of non-null values of `prop` equal to `val`: exact
     /// for the property's most common values, histogram-estimated otherwise.
-    /// `None` when no statistics exist for the property.
+    ///
+    /// `None` when no statistics exist for the property, and also when the
+    /// property columns have not been built yet: the estimate only weights plan
+    /// choices, so answering is never worth one full node scan on a query that
+    /// would not otherwise materialize the columns.
     pub fn estimate_equality_selectivity(
         &self,
         prop: &str,
         val: &serde_json::Value,
     ) -> Result<Option<f64>, Error> {
-        self.prop_columns.with_fresh_mut(&self.storage, |cols| {
-            cols.prop_stats(prop).map(|s| s.equality_selectivity(val))
-        })
+        Ok(self
+            .prop_columns
+            .with_existing_mut(&self.storage, |cols| {
+                cols.prop_stats(prop).map(|s| s.equality_selectivity(val))
+            })?
+            .flatten())
     }
 
     /// Store an extension value (as `Arc`) keyed by its concrete type.

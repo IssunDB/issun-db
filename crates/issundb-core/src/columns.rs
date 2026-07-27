@@ -704,13 +704,28 @@ impl<Id> Default for ColumnsDelta<Id> {
 pub(crate) struct ColumnsCache<S: ColumnSource> {
     columns: parking_lot::RwLock<Option<PropColumns<S>>>,
     pending: parking_lot::Mutex<ColumnsDelta<S::Id>>,
+    /// Point reads served straight from storage while the columns were absent.
+    /// See [`ColumnsCache::note_direct_reads`].
+    direct_reads: std::sync::atomic::AtomicU64,
 }
+
+/// Direct point reads tolerated before building the columns anyway. A single
+/// point lookup must not pay for a full scan, but a row pipeline that reads one
+/// property per row would pay the per-read decode forever, so the reads
+/// amortize the build after this many.
+const DIRECT_READ_BUILD_THRESHOLD: u64 = 4096;
+
+/// Largest gather served straight from storage while the columns are absent.
+/// Above this the request is bulk enough that one scan is the cheaper way to
+/// answer it, since the scan decodes each record exactly once either way.
+const SMALL_GATHER_MAX: usize = 1024;
 
 impl<S: ColumnSource> Default for ColumnsCache<S> {
     fn default() -> Self {
         Self {
             columns: parking_lot::RwLock::new(None),
             pending: parking_lot::Mutex::new(ColumnsDelta::default()),
+            direct_reads: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }
@@ -768,25 +783,79 @@ impl<S: ColumnSource> ColumnsCache<S> {
         }
     }
 
-    /// Like [`with_fresh`], but with mutable column access, for readers that
-    /// fill the lazy statistics cache. Takes the write lock for the whole
-    /// call, so this is for optimizer-time stats reads, not the gather path.
-    pub(crate) fn with_fresh_mut<T>(
+    /// Whether the columns are already materialized. A caller that can serve
+    /// itself from storage uses this to avoid *causing* a build.
+    pub(crate) fn is_built(&self) -> bool {
+        self.columns.read().is_some()
+    }
+
+    /// Record `n` reads served without the columns, reporting whether the
+    /// accumulated direct reads now justify building them.
+    fn note_direct_reads(&self, n: usize) -> bool {
+        let n = n.max(1) as u64;
+        self.direct_reads
+            .fetch_add(n, std::sync::atomic::Ordering::Relaxed)
+            + n
+            >= DIRECT_READ_BUILD_THRESHOLD
+    }
+
+    /// Whether a gather over `ids` entities should be served straight from
+    /// storage instead of by building every column.
+    ///
+    /// True only while the columns are absent, the request is small, and the
+    /// accumulated direct reads have not yet amortized a build. Building is one
+    /// full entity scan, so it is the wrong answer to a request for a handful of
+    /// entities however the caller phrased it: the vectorized executor gathers
+    /// even a one-row projection through the bulk API, and that is what made the
+    /// first property-touching query on a large graph pay a full scan.
+    pub(crate) fn should_serve_directly(&self, ids: usize) -> bool {
+        ids <= SMALL_GATHER_MAX && !self.is_built() && !self.note_direct_reads(ids)
+    }
+
+    /// Like [`ColumnsCache::with_fresh`], but with the mutable access the lazy
+    /// statistics cache needs, and it never builds an absent cache: returns
+    /// `Ok(None)` when the columns do not exist yet.
+    ///
+    /// This is for advisory readers, the optimizer's selectivity estimates and
+    /// the zone-map prune, whose answers only weight a choice. Building for them
+    /// costs one full entity scan on the first query that so much as mentions a
+    /// property, which dominates cold-start latency; declining to answer leaves
+    /// the caller on its default weight, which is always sound.
+    pub(crate) fn with_existing_mut<T>(
         &self,
         storage: &Storage,
         f: impl FnOnce(&mut PropColumns<S>) -> T,
-    ) -> Result<T, Error> {
+    ) -> Result<Option<T>, Error> {
+        // Checked under the read lock so the common absent case does not
+        // serialize against concurrent gathers.
+        if self.columns.read().is_none() {
+            return Ok(None);
+        }
         let mut guard = self.columns.write();
+        if guard.is_none() {
+            return Ok(None);
+        }
         loop {
             let delta = std::mem::take(&mut *self.pending.lock());
             if delta.touched.is_empty() && !delta.force_full {
                 if let Some(cols) = guard.as_mut() {
-                    return Ok(f(cols));
+                    return Ok(Some(f(cols)));
                 }
             }
             match guard.as_mut() {
+                // Patching is per touched entity, so an advisory reader can
+                // afford to bring existing columns up to date.
                 Some(cols) if !delta.force_full => cols.patch(storage, &delta.touched)?,
-                _ => *guard = Some(PropColumns::build(storage)?),
+                // A node deletion invalidates the dense mapping and forces a
+                // full rebuild, which is the one refresh an advisory reader must
+                // not pay for: dropping the columns and declining leaves the
+                // rebuild to the next gather. Rebuilding here would make a
+                // delete-then-query session pay one full scan per query, the
+                // exact cost this reader exists to avoid.
+                _ => {
+                    *guard = None;
+                    return Ok(None);
+                }
             }
         }
     }
@@ -797,12 +866,20 @@ mod tests {
     use serde_json::json;
     use tempfile::TempDir;
 
+    use super::DIRECT_READ_BUILD_THRESHOLD;
     use crate::Graph;
 
     fn open_tmp() -> (TempDir, Graph) {
         let dir = TempDir::new().unwrap();
         let g = Graph::open(dir.path(), 1).unwrap();
         (dir, g)
+    }
+
+    /// Materialize the property columns. Neither the advisory statistics nor a
+    /// small gather builds them, so a test that exercises either has to. Group
+    /// codes are the remaining reader that always builds.
+    fn materialize_columns(g: &Graph) {
+        g.node_prop_group_codes(&[], "").unwrap();
     }
 
     #[test]
@@ -1064,6 +1141,7 @@ mod tests {
             )
             .unwrap();
 
+        materialize_columns(&g);
         let (min_age, max_age) = g.node_prop_min_max("age").unwrap().unwrap();
         assert_eq!(min_age, json!(20));
         assert_eq!(max_age, json!(40));
@@ -1092,11 +1170,144 @@ mod tests {
         assert_eq!(max_age, json!(50));
     }
 
+    /// A point read must agree with the column read for every representable
+    /// value, since the two now serve the same call depending only on whether
+    /// the columns happen to exist.
+    #[test]
+    fn direct_point_read_agrees_with_the_column_read() {
+        let (_dir, g) = open_tmp();
+        let props = json!({
+            "i": 42,
+            "neg": -7,
+            "big": i64::MAX,
+            "f": 1.5,
+            "whole_f": 3.0,
+            "b": true,
+            "s": "hello",
+            "empty_s": "",
+            "null": serde_json::Value::Null,
+            "list": [1, 2, 3],
+            "obj": { "k": "v" },
+        });
+        let n = g.add_node("N", &props).unwrap();
+        let keys: Vec<&str> = props
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .chain(std::iter::once("absent"))
+            .collect();
+
+        // Columns absent: these go straight to storage.
+        assert!(!g.prop_columns.is_built());
+        let direct: Vec<_> = keys
+            .iter()
+            .map(|k| g.node_prop_json(n, k).unwrap())
+            .collect();
+
+        // Force the columns, then read the same values through them.
+        materialize_columns(&g);
+        assert!(g.prop_columns.is_built());
+        let columnar: Vec<_> = keys
+            .iter()
+            .map(|k| g.node_prop_json(n, k).unwrap())
+            .collect();
+
+        for ((k, d), c) in keys.iter().zip(direct).zip(columnar) {
+            assert_eq!(d, c, "property {k} disagrees between the two read paths");
+        }
+    }
+
+    #[test]
+    fn direct_point_read_reports_a_missing_node_as_none() {
+        let (_dir, g) = open_tmp();
+        assert!(!g.prop_columns.is_built());
+        assert_eq!(g.node_prop_json(9999, "x").unwrap(), None);
+    }
+
+    /// The advisory statistics must not build the columns: that build is the
+    /// dominant cold-start cost, and an absent estimate only costs plan quality.
+    #[test]
+    fn advisory_statistics_do_not_build_the_columns() {
+        let (_dir, g) = open_tmp();
+        g.add_node("N", &json!({ "age": 30 })).unwrap();
+
+        assert_eq!(g.node_prop_min_max("age").unwrap(), None);
+        assert_eq!(
+            g.estimate_equality_selectivity("age", &json!(30)).unwrap(),
+            None
+        );
+        assert_eq!(
+            g.estimate_range_selectivity("age", Some(&json!(0)), None)
+                .unwrap(),
+            None
+        );
+        assert!(
+            !g.prop_columns.is_built(),
+            "an advisory read built the columns"
+        );
+
+        // Once a gather has built them, the same readers answer.
+        materialize_columns(&g);
+        assert_eq!(
+            g.node_prop_min_max("age").unwrap(),
+            Some((json!(30), json!(30)))
+        );
+        assert!(
+            g.estimate_equality_selectivity("age", &json!(30))
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// A node deletion forces a full rebuild, and an advisory reader must not
+    /// pay for it: it drops the stale columns and declines, leaving the rebuild
+    /// to the next gather.
+    #[test]
+    fn a_pending_deletion_makes_the_advisory_readers_decline() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("N", &json!({ "age": 10 })).unwrap();
+        g.add_node("N", &json!({ "age": 20 })).unwrap();
+        materialize_columns(&g);
+        assert!(g.node_prop_min_max("age").unwrap().is_some());
+
+        g.delete_node(a).unwrap();
+        assert_eq!(g.node_prop_min_max("age").unwrap(), None);
+        assert!(
+            !g.prop_columns.is_built(),
+            "the advisory read paid for a full rebuild"
+        );
+
+        // A gather rebuilds them, and the statistics then reflect the deletion.
+        materialize_columns(&g);
+        assert_eq!(
+            g.node_prop_min_max("age").unwrap(),
+            Some((json!(20), json!(20)))
+        );
+    }
+
+    /// Sustained point reads must fall back to building, so a row pipeline that
+    /// reads one property per row does not pay the per-read decode forever.
+    #[test]
+    fn sustained_direct_reads_amortize_into_a_build() {
+        let (_dir, g) = open_tmp();
+        let n = g.add_node("N", &json!({ "age": 30 })).unwrap();
+        for _ in 0..DIRECT_READ_BUILD_THRESHOLD {
+            assert_eq!(g.node_prop_json(n, "age").unwrap(), Some(json!(30)));
+        }
+        assert!(
+            g.prop_columns.is_built(),
+            "the columns never built despite {DIRECT_READ_BUILD_THRESHOLD} direct reads"
+        );
+        assert_eq!(g.node_prop_json(n, "age").unwrap(), Some(json!(30)));
+    }
+
     #[test]
     fn prop_stats_refresh_when_update_removes_the_property() {
         let (_dir, g) = open_tmp();
         let a = g.add_node("N", &json!({ "age": 10 })).unwrap();
         let _b = g.add_node("N", &json!({ "age": 99 })).unwrap();
+        materialize_columns(&g);
         let (_, max_age) = g.node_prop_min_max("age").unwrap().unwrap();
         assert_eq!(max_age, json!(99));
 
@@ -1118,6 +1329,7 @@ mod tests {
             g.add_node("N", &json!({ "team": format!("t{i}") }))
                 .unwrap();
         }
+        materialize_columns(&g);
         let sel = g
             .estimate_equality_selectivity("team", &json!("blue"))
             .unwrap()
@@ -1143,6 +1355,7 @@ mod tests {
         for i in 0..100 {
             g.add_node("N", &json!({ "age": i })).unwrap();
         }
+        materialize_columns(&g);
         let sel = g
             .estimate_range_selectivity("age", Some(&json!(50)), None)
             .unwrap()

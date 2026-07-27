@@ -3040,6 +3040,10 @@ mod tests {
             g.add_node("Person", &json!({ "age": age })).unwrap();
         }
         let srcs = g.nodes_by_label("Person").unwrap();
+        // The zone map is advisory, so `node_prop_min_max` does not build the
+        // property columns; a gather has to, or the prune declines for want of
+        // bounds rather than because the comparison is satisfiable.
+        g.node_prop_group_codes(&srcs, "age").unwrap();
         let n = srcs.len();
         let cols = IdCols {
             cols: vec![srcs],

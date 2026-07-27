@@ -1,10 +1,20 @@
 use super::*;
 
-/// Test-only override for [`Graph::kernel_threads`], so a unit test can drive the
-/// parallel reduction on a graph small enough to build in a test.
 #[cfg(test)]
-pub(super) static FORCE_KERNEL_THREADS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    /// Test-only override for [`Graph::kernel_threads`], so a unit test can drive
+    /// the parallel reduction on a graph small enough to build in a test.
+    ///
+    /// Thread-local rather than process-global: the test binary runs its tests
+    /// concurrently, and a global would let the forcing test change the worker
+    /// count every other test sees for as long as it holds the override. That
+    /// would put unrelated tests on the parallel path (spawning up to the forced
+    /// count) and make coverage of the reduction nondeterministic.
+    /// `kernel_threads` reads this on the calling thread, so a thread-local is
+    /// read where it is set.
+    pub(super) static FORCE_KERNEL_THREADS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
 
 impl Graph {
     // ------------------------------------------------------------------
@@ -190,16 +200,9 @@ impl Graph {
         debug_assert!(hops == 1 || hops == 2, "count_linear_paths: 1 or 2 hops");
         debug_assert_eq!(spec.labels.len(), hops + 1, "labels must be hops + 1");
 
-        // Snapshot-only gate: this kernel reads CSR arrays and never a matrix,
-        // so it must not pay `ensure_csr_fresh`'s GraphBLAS materialization.
-        self.ensure_snapshot_fresh()?;
-        let snap = self.csr_cache.snapshot.load();
-        let n = snap.dense_to_id.len();
-        if n == 0 {
-            return Ok(0);
-        }
-
-        // A named but unregistered relationship type matches nothing.
+        // A named but unregistered relationship type matches nothing. Resolved
+        // before the freshness gate below, because it reads only the type
+        // registry: an unregistered type counts zero without any rebuild.
         let mut type_ids: Vec<Option<TypeId>> = vec![None; hops];
         {
             let rtxn = self.storage.env.read_txn()?;
@@ -211,6 +214,15 @@ impl Graph {
                     }
                 }
             }
+        }
+
+        // Snapshot-only gate: this kernel reads CSR arrays and never a matrix,
+        // so it must not pay `ensure_csr_fresh`'s GraphBLAS materialization.
+        self.ensure_snapshot_fresh()?;
+        let snap = self.csr_cache.snapshot.load();
+        let n = snap.dense_to_id.len();
+        if n == 0 {
+            return Ok(0);
         }
 
         // Dense-index masks for the per-variable labels; `None` is
@@ -571,7 +583,7 @@ impl Graph {
         // parallel reduction is exercised rather than only its fallback.
         #[cfg(test)]
         {
-            let forced = FORCE_KERNEL_THREADS.load(std::sync::atomic::Ordering::Acquire);
+            let forced = FORCE_KERNEL_THREADS.with(|f| f.get());
             if forced > 0 {
                 return forced;
             }
@@ -3096,7 +3108,6 @@ mod typed_neighbor_count_tests {
 #[cfg(test)]
 mod parallel_kernel_tests {
     use serde_json::json;
-    use std::sync::atomic::Ordering;
     use tempfile::TempDir;
 
     use crate::{Graph, PathCountSpec, graph::algo::FORCE_KERNEL_THREADS, schema::NodeId};
@@ -3164,17 +3175,17 @@ mod parallel_kernel_tests {
         ];
 
         for spec in &specs {
-            FORCE_KERNEL_THREADS.store(0, Ordering::Release);
+            FORCE_KERNEL_THREADS.with(|f| f.set(0));
             let serial = g.count_linear_paths(spec).unwrap();
             for threads in [2usize, 3, 5, 16] {
-                FORCE_KERNEL_THREADS.store(threads, Ordering::Release);
+                FORCE_KERNEL_THREADS.with(|f| f.set(threads));
                 let parallel = g.count_linear_paths(spec).unwrap();
                 assert_eq!(
                     serial, parallel,
                     "two-hop count changed at {threads} threads (serial {serial})"
                 );
             }
-            FORCE_KERNEL_THREADS.store(0, Ordering::Release);
+            FORCE_KERNEL_THREADS.with(|f| f.set(0));
             assert!(
                 serial > 0,
                 "fixture must produce paths for a meaningful check"
