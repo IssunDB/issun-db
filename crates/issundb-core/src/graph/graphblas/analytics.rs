@@ -17,12 +17,25 @@ impl Graph {
     ) -> Result<HashMap<NodeId, f32>, Error> {
         use issundb_graphblas::{Descriptor, Reducer, Semiring, Vector, mxv};
 
+        // Gate before taking the read guard, not after. This method is public, so it
+        // can be called on a graph whose matrices are absent or were materialized
+        // below `MatrixTier::PageRank`, and both cases need the same thing: a
+        // rebuild. Doing that from inside a `match` on a live read guard, as this
+        // did, deadlocks the calling thread against itself, because the rebuild takes
+        // the matrices write lock and `parking_lot::RwLock` is neither reentrant nor
+        // aware that this thread already holds a read.
+        self.ensure_page_rank_matrix()?;
+
         let guard = self.matrices.read();
-        let m = match guard.as_ref() {
-            Some(m) => m,
-            None => return self.page_rank(iterations, damping),
-        };
+        let m = guard
+            .as_ref()
+            .ok_or(Error::Corrupt("matrices not initialized"))?;
         let snap = self.csr_cache.snapshot.load();
+        // Present because the gate above materialized at least this tier.
+        let page_rank_matrix = m
+            .page_rank_matrix
+            .as_ref()
+            .ok_or(Error::Corrupt("PageRank matrix not materialized"))?;
         let n = m.n_nodes;
         if n == 0 {
             return Ok(HashMap::new());
@@ -45,7 +58,7 @@ impl Graph {
                 &mut raw,
                 None,
                 Semiring::PlusTimes,
-                &m.page_rank_matrix,
+                page_rank_matrix,
                 &rank,
                 Descriptor::NULL,
             )

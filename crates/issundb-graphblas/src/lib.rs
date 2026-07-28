@@ -95,6 +95,7 @@ pub trait GbType: sealed::Sealed + Copy + Default {
     fn plus_monoid() -> gb::GrB_Monoid;
     fn first_binop() -> gb::GrB_BinaryOp;
     fn plus_binop() -> gb::GrB_BinaryOp;
+    fn min_binop() -> gb::GrB_BinaryOp;
 
     unsafe fn vec_build(
         w: gb::GrB_Vector,
@@ -134,7 +135,7 @@ macro_rules! impl_gb_type {
     (
         $t:ty, $gbtype:ident,
         $minplus:ident, $plustimes:ident, $minsecond:ident,
-        $minmon:ident, $plusmon:ident, $first:ident, $plusbin:ident,
+        $minmon:ident, $plusmon:ident, $first:ident, $plusbin:ident, $minbin:ident,
         $vbuild:ident, $vset:ident, $vextel:ident, $vextup:ident,
         $mbuild:ident, $mset:ident, $mextup:ident
     ) => {
@@ -162,6 +163,9 @@ macro_rules! impl_gb_type {
             }
             fn plus_binop() -> gb::GrB_BinaryOp {
                 unsafe { gb::$plusbin }
+            }
+            fn min_binop() -> gb::GrB_BinaryOp {
+                unsafe { gb::$minbin }
             }
 
             unsafe fn vec_build(
@@ -224,6 +228,7 @@ impl_gb_type!(
     GrB_PLUS_MONOID_INT32,
     GrB_FIRST_INT32,
     GrB_PLUS_INT32,
+    GrB_MIN_INT32,
     GrB_Vector_build_INT32,
     GrB_Vector_setElement_INT32,
     GrB_Vector_extractElement_INT32,
@@ -242,6 +247,7 @@ impl_gb_type!(
     GrB_PLUS_MONOID_FP32,
     GrB_FIRST_FP32,
     GrB_PLUS_FP32,
+    GrB_MIN_FP32,
     GrB_Vector_build_FP32,
     GrB_Vector_setElement_FP32,
     GrB_Vector_extractElement_FP32,
@@ -260,6 +266,7 @@ impl_gb_type!(
     GrB_PLUS_MONOID_FP64,
     GrB_FIRST_FP64,
     GrB_PLUS_FP64,
+    GrB_MIN_FP64,
     GrB_Vector_build_FP64,
     GrB_Vector_setElement_FP64,
     GrB_Vector_extractElement_FP64,
@@ -279,6 +286,10 @@ pub enum Reducer {
     First,
     /// Sum duplicate values (`GrB_PLUS_*`): used for parallel-edge weights.
     Plus,
+    /// Keep the smallest duplicate value (`GrB_MIN_*`): used for a weighted
+    /// adjacency matrix, where parallel edges between one pair of nodes must
+    /// collapse to the cheapest of them rather than to their sum.
+    Min,
 }
 
 impl Reducer {
@@ -286,6 +297,7 @@ impl Reducer {
         match self {
             Reducer::First => T::first_binop(),
             Reducer::Plus => T::plus_binop(),
+            Reducer::Min => T::min_binop(),
         }
     }
 }
@@ -531,6 +543,14 @@ impl<T: GbType> Matrix<T> {
 
     /// Build an `nrows` x `ncols` matrix from `(row, col, value)` triples,
     /// combining any duplicate coordinates with `dup`.
+    ///
+    /// `GrB_Matrix_build` takes the coordinates and the values as three separate
+    /// arrays, so a triple slice has to be split into three before the call. A
+    /// caller building several matrices over the same coordinates therefore pays
+    /// for one triple buffer plus the split per matrix; [`Matrix::from_arrays`] is
+    /// the entry point that avoids both, and is what `issundb-core` builds through.
+    /// This form remains because a triple slice is the natural shape for a small or
+    /// literal matrix, which is what the tests here and any external caller want.
     pub fn from_triples(
         ctx: Arc<Context>,
         nrows: usize,
@@ -538,11 +558,43 @@ impl<T: GbType> Matrix<T> {
         triples: &[(usize, usize, T)],
         dup: Reducer,
     ) -> Result<Self> {
+        let rows: Vec<u64> = triples.iter().map(|&(r, _, _)| r as u64).collect();
+        let cols: Vec<u64> = triples.iter().map(|&(_, c, _)| c as u64).collect();
+        let vals: Vec<T> = triples.iter().map(|&(_, _, v)| v).collect();
+        Self::from_arrays(ctx, nrows, ncols, &rows, &cols, &vals, dup)
+    }
+
+    /// Build an `nrows` x `ncols` matrix from parallel coordinate and value
+    /// arrays, combining any duplicate coordinates with `dup`.
+    ///
+    /// This is the shape `GrB_Matrix_build` consumes, so nothing is copied or
+    /// reshaped on the way in. It exists for the caller that builds more than one
+    /// matrix over the same set of coordinates: the index arrays are built once
+    /// and passed to each build, with `rows` and `cols` swapped for a transpose,
+    /// so only the value array differs per matrix.
+    ///
+    /// The three slices must have equal length; a mismatch is an error rather than
+    /// a panic, since the lengths usually come from a computation rather than a
+    /// literal.
+    pub fn from_arrays(
+        ctx: Arc<Context>,
+        nrows: usize,
+        ncols: usize,
+        rows: &[u64],
+        cols: &[u64],
+        vals: &[T],
+        dup: Reducer,
+    ) -> Result<Self> {
+        if rows.len() != cols.len() || rows.len() != vals.len() {
+            return Err(GraphblasError(format!(
+                "from_arrays: rows ({}), cols ({}), and vals ({}) must have equal length",
+                rows.len(),
+                cols.len(),
+                vals.len()
+            )));
+        }
         let m = Self::new(ctx, nrows, ncols)?;
-        if !triples.is_empty() {
-            let rows: Vec<u64> = triples.iter().map(|&(r, _, _)| r as u64).collect();
-            let cols: Vec<u64> = triples.iter().map(|&(_, c, _)| c as u64).collect();
-            let vals: Vec<T> = triples.iter().map(|&(_, _, v)| v).collect();
+        if !rows.is_empty() {
             check(
                 unsafe {
                     T::mat_build(
@@ -550,7 +602,7 @@ impl<T: GbType> Matrix<T> {
                         rows.as_ptr(),
                         cols.as_ptr(),
                         vals.as_ptr(),
-                        triples.len() as u64,
+                        rows.len() as u64,
                         dup.binop::<T>(),
                     )
                 },
@@ -754,6 +806,79 @@ mod tests {
         let mut t = m.triples().unwrap();
         t.sort_by_key(|&(r, c, _)| (r, c));
         assert_eq!(t, vec![(0, 1, 2.5), (1, 0, 4.0)]);
+    }
+
+    /// `from_arrays` must accept the same coordinates as `from_triples` and
+    /// produce the same matrix, and must build a transpose from the same two index
+    /// arrays with their roles swapped. That reuse is the reason it exists.
+    #[test]
+    fn from_arrays_matches_from_triples_and_transposes_by_swapping() {
+        let ctx = Context::init_default().unwrap();
+        let rows = [0u64, 1, 1];
+        let cols = [1u64, 0, 2];
+        let vals = [1i32, 1, 1];
+
+        let a = Matrix::<i32>::from_arrays(ctx.clone(), 3, 3, &rows, &cols, &vals, Reducer::First)
+            .unwrap();
+        let expected = Matrix::<i32>::from_triples(
+            ctx.clone(),
+            3,
+            3,
+            &[(0, 1, 1), (1, 0, 1), (1, 2, 1)],
+            Reducer::First,
+        )
+        .unwrap();
+        let sorted = |m: &Matrix<i32>| {
+            let mut t = m.triples().unwrap();
+            t.sort_by_key(|&(r, c, _)| (r, c));
+            t
+        };
+        assert_eq!(sorted(&a), sorted(&expected));
+
+        // Same arrays, roles swapped: the transpose, with no second coordinate buffer.
+        let a_t =
+            Matrix::<i32>::from_arrays(ctx.clone(), 3, 3, &cols, &rows, &vals, Reducer::First)
+                .unwrap();
+        assert_eq!(
+            sorted(&a_t),
+            vec![(0, 1, 1), (1, 0, 1), (2, 1, 1)],
+            "each (r, c) appears as (c, r)"
+        );
+    }
+
+    /// `Reducer::Min` must keep the smallest of the values given for one
+    /// coordinate. A weighted adjacency matrix relies on this to collapse parallel
+    /// edges to the cheapest one; `Plus` would invent a weight no edge has.
+    #[test]
+    fn min_reducer_keeps_the_smallest_duplicate() {
+        let ctx = Context::init_default().unwrap();
+        let m = Matrix::<f64>::from_arrays(
+            ctx.clone(),
+            2,
+            2,
+            &[0, 0, 0],
+            &[1, 1, 1],
+            &[7.5, 2.5, 4.0],
+            Reducer::Min,
+        )
+        .unwrap();
+        assert_eq!(m.triples().unwrap(), vec![(0, 1, 2.5)]);
+    }
+
+    /// Mismatched array lengths are a caller error, reported rather than read past.
+    #[test]
+    fn from_arrays_rejects_mismatched_lengths() {
+        let ctx = Context::init_default().unwrap();
+        let Err(err) =
+            Matrix::<i32>::from_arrays(ctx, 2, 2, &[0, 1], &[1], &[1, 1], Reducer::First)
+        else {
+            panic!("length mismatch must not build");
+        };
+        assert!(
+            err.0.contains("equal length"),
+            "unexpected message: {}",
+            err.0
+        );
     }
 
     #[test]

@@ -15,11 +15,17 @@ impl Graph {
             return Ok(Some(vec![src]));
         }
 
+        // Gate before taking the read guard. This method is public, so it can be
+        // called on a graph with no materialized matrices; recursing into the gated
+        // `shortest_path` from inside a `match` on a live read guard, as this did,
+        // deadlocks the calling thread against itself, since the rebuild takes the
+        // matrices write lock and `parking_lot::RwLock` is not reentrant.
+        self.ensure_csr_fresh()?;
+
         let guard = self.matrices.read();
-        let m = match guard.as_ref() {
-            Some(m) => m,
-            None => return self.shortest_path(src, dst),
-        };
+        let m = guard
+            .as_ref()
+            .ok_or(Error::Corrupt("matrices not initialized"))?;
         let snap = self.csr_cache.snapshot.load();
         let n = m.n_nodes;
 
@@ -148,6 +154,13 @@ impl Graph {
             }));
         }
 
+        // Present because this runs behind `MatrixTier::Weighted`; the other tier
+        // does not build it, so reaching here without one is a gating mistake
+        // rather than a data condition.
+        let weight_matrix = m.weight_matrix.as_ref().ok_or(Error::Corrupt(
+            "Dijkstra needs the weighted matrix tier; the matrices were materialized without it",
+        ))?;
+
         let n = m.n_nodes;
         let src_dense = match snap.id_to_dense.get(&src) {
             Some(&d) => d as usize,
@@ -175,7 +188,7 @@ impl Graph {
                 &mut next,
                 None,
                 Semiring::MinPlus,
-                &m.weight_matrix,
+                weight_matrix,
                 &dist,
                 opts_next,
             )

@@ -93,7 +93,13 @@ modules according to this map.
     - `src/graph/txn.rs`: `ReadTxn` and `WriteTxn` delegation impls and transaction tests.
     - `src/csr.rs`: in-memory CSR snapshot (outgoing arrays plus a transposed incoming view with per-edge type and edge ids), rebuilt in the
       background and swapped via `arc-swap`. Also owns the `GraphDelta` buffer captured on the write path and the `write_gen`/`snapshot_gen`
-      generation counters that drive incremental matrix maintenance and on-demand CSR refresh.
+      generation counters that drive incremental matrix maintenance and on-demand CSR refresh. The adjacency is read from `out_adj`, whose 20-byte
+      `AdjEntry` carries every field the arrays hold, already grouped by source in ascending key order, so the build decodes no `EdgeRecord` and copies
+      no property blob. Entries go straight into the flat arrays, counting each row as it goes: a per-node `Vec` staged first, as this once did, cost
+      one allocation per node and left 3.3 GB resident for 620 MB of live arrays on a 1 M-node, 13.9 M-edge graph, because a million freed small chunks
+      are holes the allocator cannot return. Because `DUPSORT` orders duplicates by their raw little-endian bytes, each row is then reordered by
+      ascending edge id, which is the order every consumer has always seen and which `load_weights` binary-searches. The per-entry `edge_weight` is
+      `Option`, built only by `build_weighted`, since a weight lives in the edge's property blob and only Dijkstra's matrix reads one.
     - `src/columns.rs`: in-memory property columns for the read path. One typed column (`Int`, `Float`, `Bool`, dictionary-encoded `Str`, or the
       exact-semantics `Json` fallback) per node property, built lazily from one full node scan and kept fresh by a post-commit delta (node deletion
       forces a rebuild). Read through `Graph::node_prop_json`. Also owns the lazily computed per-property statistics (`PropStats`: bounds, an
@@ -103,7 +109,17 @@ modules according to this map.
     - `src/histogram.rs`: equi-depth histogram over property values with equality and range selectivity estimates; backs `PropStats`. Nothing here is
       persisted.
     - `src/matrices.rs`: GraphBLAS matrix materialization from the CSR snapshot, plus `MatrixSet::apply_delta` for incremental in-place maintenance
-      (resize plus per-element set and drop) and the self-contained `dense_to_id`/`id_to_dense` mapping the matrix-view consumers read.
+      (resize plus per-element set and drop) and the self-contained `dense_to_id`/`id_to_dense` mapping the matrix-view consumers read. `MatrixTier`
+      is how much of the set a consumer needs, as a three-rung ladder: `Adjacency` is the two boolean matrices, `PageRank` adds `page_rank_matrix`
+      (derived from the CSR row boundaries, so an unweighted snapshot serves it), and `Weighted` adds `weight_matrix`, the only thing that needs the
+      per-edge weights and so the second `edges` scan that loads them. The two upper matrices have exactly one consumer each, `page_rank` and
+      `shortest_path_dijkstra`, which is why they are separate rungs: sharing one made PageRank pay for that scan and for a 111 MB matrix it never
+      reads. So `page_rank_matrix` and `weight_matrix` are `Option`, the tier is stored on the set rather than inferred from which of them is present,
+      and every matrix is built over the same coordinates, so the two index arrays are built once and passed to each build with their roles
+      swapped for a transpose, one value array at a time (`Matrix::from_arrays`); staging four triple buffers and two coordinate hash maps instead, as
+      this once did, cost 2.7 GB above the finished matrices. Duplicate handling belongs to the build's reducer (`First` for the boolean union, `Plus`
+      for the PageRank transition probabilities of parallel edges, and `Min` for the weight matrix, which models the cheapest connection), not to a
+      deduplicating map.
     - `src/threads.rs`: the one resolution of the thread budget every parallel consumer shares (`threads::resolve`). Precedence is the programmatic
       override from `set_thread_count`, then `ISSUNDB_NUM_THREADS`, then `OMP_NUM_THREADS`, then the machine's parallelism, clamped to `MAX_THREADS`.
       Both the GraphBLAS pool (`MatrixSet::materialize`) and the counting kernels' scoped threads (`Graph::kernel_threads`) resolve through it, so the one
@@ -249,8 +265,9 @@ modules according to this map.
   value out of the index; the property is still stored, and equality lookups (`nodes_by_property`, `edges_by_property`) fall back to a label or type
   scan that compares the stored value directly, so results stay correct. Long text belongs in a full-text index, not a property index.
 - The GraphBLAS matrices (`MatrixSet`) and the CSR snapshot back the GraphBLAS algorithms, pattern matching, and multi-source expansion. They are kept
-  fresh through three gates rather than a single periodic rebuild. The write path records a structural delta (added nodes, added edges, and removed
-  edges, plus a `force_full` flag set on any node deletion).
+  fresh through four gates rather than a single periodic rebuild, and each builds the least its consumer reads: what a gate declines to build is the
+  saving, so a gate that materialized more than it needs would be indistinguishable except in memory. The write path records a structural delta (added
+  nodes, added edges, and removed edges, plus a `force_full` flag set on any node deletion).
     - `Graph::open` builds neither: it installs an empty snapshot through `CsrCache::new_unbuilt` and leaves `matrices` as `None`, so the gates below
       do the first build when a consumer that needs one runs. A workload of point lookups, property reads, or small typed expansions never builds
       either structure, because those paths read LMDB directly. The unbuilt cache starts `write_gen` at 1 with both installed generations at 0 so it
@@ -258,10 +275,16 @@ modules according to this map.
       an eager build in `open`: it costs one full edge scan plus a full matrix materialization on every open (roughly 26 seconds for a 1 M-node,
       14 M-edge graph) and is repaid on every reopen.
     - Pure-adjacency consumers (`bfs`, `bfs_multi_source`, untyped expansion, `degree_centrality`, and `connected_components`) call
-      `ensure_matrix_view`, which applies the delta in place, falling back to a full `rebuild_csr` only when a node was deleted.
-    - CSR-array and hybrid consumers (everything else, including `dfs`, the path searches, the weighted and flow algorithms, `page_rank`, and the
-      remaining centralities) call `ensure_csr_fresh`, which rebuilds on demand gated by the `write_gen` versus `snapshot_gen` counter; when the
-      snapshot is already fresh it still drains the pending delta into the matrices.
+      `ensure_matrix_view`, which applies the delta in place, falling back to a `MatrixTier::Adjacency` rebuild only when a node was deleted.
+    - CSR-array and hybrid consumers (`dfs`, the path searches, the flow algorithms, and the remaining centralities) call `ensure_csr_fresh`, which
+      rebuilds at `MatrixTier::Adjacency` on demand gated by the `write_gen` versus `snapshot_gen` counter; when the snapshot is already fresh it still
+      drains the pending delta into the matrices.
+    - `page_rank` gates on `MatrixTier::PageRank` (through `ensure_page_rank_matrix`, which its public `page_rank_graphblas` calls itself) and
+      `shortest_path_dijkstra` on `MatrixTier::Weighted` (through `with_weighted_matrix_view`), the latter being the only gate whose snapshot carries
+      weights. The tier is a separate condition from the generation, because a set materialized for an adjacency consumer is current at its generation
+      and still carries no weighted matrix. A rebuild never downgrades an installed tier, or a workload alternating two consumers would rebuild twice
+      per write; the cost is that one weighted call keeps the extra matrix for the life of the process, which is also why `Graph::rebuild_csr` asks for
+      `Adjacency` rather than the top rung: it is what every bulk load calls, so asking for weights there would pin every process that loads data.
     - Typed bulk expansion calls `ensure_snapshot_fresh`, which rebuilds only the snapshot (no GraphBLAS materialization); for a small source set over
       a stale snapshot it skips the gate and reads per-source LMDB adjacency.
       The background rebuild after `REBUILD_THRESHOLD` writes is a compaction safety net, not the freshness path; callers needing a guaranteed fresh

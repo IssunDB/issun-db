@@ -5,10 +5,11 @@ use std::sync::{
 
 use ahash::AHashMap;
 use arc_swap::ArcSwap;
+use zerocopy::FromBytes;
 
 use crate::{
     error::Error,
-    schema::{EdgeId, EdgeRecord, NodeId, TypeId},
+    schema::{AdjEntry, EdgeId, EdgeRecord, NodeId, TypeId},
     storage::{lmdb::Storage, props},
 };
 
@@ -22,7 +23,16 @@ pub struct CsrSnapshot {
     pub col_idx: Vec<u32>,
     pub edge_type: Vec<TypeId>,
     pub edge_id: Vec<EdgeId>,
-    pub edge_weight: Vec<f64>,
+    /// Per-entry edge weight, parallel to `col_idx`, present only on a snapshot
+    /// built by [`CsrSnapshot::build_weighted`].
+    ///
+    /// `None` on every other snapshot, and that is the common case: the only
+    /// consumer is the weighted adjacency matrix, which in turn is read only by
+    /// Dijkstra. Loading it costs a full `edges` scan that decodes each record and
+    /// its property blob to look for one key, and holds eight bytes per edge for
+    /// the life of the snapshot, so a workload that never asks a weighted question
+    /// must not pay it. [`crate::matrices::MatrixTier`] is how a consumer asks.
+    pub edge_weight: Option<Vec<f64>>,
     /// Transpose of the outgoing CSR: `in_row_ptr[i]..in_row_ptr[i+1]` ranges
     /// over the i-th node's incoming edges, `in_col_idx` holds source dense
     /// indices, and entries within a row are ordered by ascending source.
@@ -44,7 +54,7 @@ impl CsrSnapshot {
             col_idx: vec![],
             edge_type: vec![],
             edge_id: vec![],
-            edge_weight: vec![],
+            edge_weight: None,
             in_row_ptr: vec![0],
             in_col_idx: vec![],
             in_edge_type: vec![],
@@ -54,8 +64,43 @@ impl CsrSnapshot {
         }
     }
 
-    /// Scan `nodes` and `edges` sub-databases and build a fresh in-RAM snapshot.
+    /// Build a fresh in-RAM snapshot of the adjacency, without edge weights.
+    ///
+    /// This is what every consumer but Dijkstra wants. See
+    /// [`CsrSnapshot::build_weighted`] for the other one, and the `edge_weight`
+    /// field for why they are separate.
     pub fn build(storage: &Storage) -> Result<Self, Error> {
+        Self::build_inner(storage, false)
+    }
+
+    /// Build a snapshot that also carries a per-entry edge weight, for the
+    /// weighted adjacency matrix.
+    ///
+    /// The weights cost a full scan of `edges` on top of the adjacency scan, since
+    /// a weight lives in the edge's property blob and nowhere else, so only a
+    /// consumer that reads them asks for this.
+    pub fn build_weighted(storage: &Storage) -> Result<Self, Error> {
+        Self::build_inner(storage, true)
+    }
+
+    /// Body of both builders.
+    ///
+    /// The adjacency comes from `out_adj`, which stores one 20-byte `AdjEntry` per
+    /// edge under its source node id: the destination, the type id, and the edge id
+    /// are every field the arrays hold, already grouped by source and in ascending
+    /// key order. Reading them from there rather than from `edges` avoids decoding
+    /// one `EdgeRecord` per edge, which also copies that edge's whole encoded
+    /// property blob, and it is what lets the entries go straight into the flat
+    /// arrays.
+    ///
+    /// Filling the arrays directly is the point. The previous builder accumulated
+    /// one `Vec` per node first and copied that into the arrays afterwards, so a
+    /// graph with a million nodes made a million small allocations, held them
+    /// alongside the finished arrays at the peak, and then returned them to the
+    /// allocator's bins as a million holes that could not be handed back to the
+    /// operating system. On a 1 M-node, 13.9 M-edge graph that left 3.3 GB resident
+    /// for 620 MB of live arrays. Do not reintroduce a per-node buffer here.
+    fn build_inner(storage: &Storage, weighted: bool) -> Result<Self, Error> {
         let rtxn = storage.env.read_txn()?;
 
         let mut dense_to_id: Vec<NodeId> = storage
@@ -72,45 +117,103 @@ impl CsrSnapshot {
             .map(|(i, &id)| (id, i as u32))
             .collect();
 
-        let mut adj: Vec<Vec<(u32, TypeId, EdgeId, f64)>> = vec![vec![]; n];
-        for result in storage.edges.iter(&rtxn)? {
-            let (edge_id, bytes) = result?;
-            let rec: EdgeRecord = props::decode(bytes)?;
-            if let (Some(&src_d), Some(&dst_d)) =
-                (id_to_dense.get(&rec.src), id_to_dense.get(&rec.dst))
-            {
-                let weight: f64 = {
-                    let val: serde_json::Value =
-                        props::decode(&rec.props).unwrap_or(serde_json::Value::Null);
-                    val.get("weight")
-                        .or_else(|| val.get("cost"))
-                        .or_else(|| val.get("capacity"))
-                        .or_else(|| val.get("cap"))
-                        .and_then(|v| v.as_f64())
-                        .unwrap_or(1.0)
-                };
-                adj[src_d as usize].push((dst_d, rec.edge_type, edge_id, weight));
+        // One pass over `out_adj`. Keys ascend by node id and the dense index is
+        // the rank in that same order, so the entries arrive grouped by ascending
+        // dense index: pushing them in arrival order puts each one inside its own
+        // row, and counting per row at the same time yields the boundaries. The
+        // capacity is a hint (the total number of duplicate values); nothing here
+        // depends on it being exact.
+        let hint = storage.out_adj.len(&rtxn)? as usize;
+        let mut row_ptr = vec![0usize; n + 1];
+        let mut col_idx: Vec<u32> = Vec::with_capacity(hint);
+        let mut edge_type: Vec<TypeId> = Vec::with_capacity(hint);
+        let mut edge_id: Vec<EdgeId> = Vec::with_capacity(hint);
+
+        let mut cached_src: Option<NodeId> = None;
+        let mut src_dense: Option<u32> = None;
+        for result in storage.out_adj.iter(&rtxn)? {
+            let (src, bytes) = result?;
+            // Resolved once per key rather than once per entry, since the entries
+            // of one node arrive consecutively.
+            if cached_src != Some(src) {
+                cached_src = Some(src);
+                src_dense = id_to_dense.get(&src).copied();
+            }
+            // An endpoint with no record in `nodes` has no dense index, so its
+            // entries are skipped, exactly as the previous builder skipped an edge
+            // whose endpoints it could not map. The skip must happen identically in
+            // the count and in the push, which is why both live in this one loop.
+            let Some(src_d) = src_dense else { continue };
+            let entry = AdjEntry::read_from_bytes(bytes)
+                .ok()
+                .ok_or(Error::Corrupt("AdjEntry value is not exactly 20 bytes"))?;
+            // Copied out before use: `AdjEntry` is `repr(packed)`, so a field
+            // cannot be borrowed.
+            let dst = entry.other;
+            let Some(&dst_d) = id_to_dense.get(&dst) else {
+                continue;
+            };
+            row_ptr[src_d as usize + 1] += 1;
+            col_idx.push(dst_d);
+            edge_type.push(entry.edge_type);
+            edge_id.push(entry.edge_id);
+        }
+        for i in 0..n {
+            row_ptr[i + 1] += row_ptr[i];
+        }
+        let total = row_ptr[n];
+        debug_assert_eq!(total, col_idx.len());
+
+        // Restore the by-edge-id order inside each row.
+        //
+        // This pass exists because of the `AdjEntry` byte layout, not because of
+        // anything here: the struct is `repr(C, packed)` with native little-endian
+        // fields and `edge_type` first, so LMDB's `memcmp` ordering of duplicates
+        // starts from the low byte of the type id. Almost every row with two or more
+        // entries therefore arrives unordered and gets sorted, which is O(E log d) per
+        // rebuild. Ordering `edge_id` first in big-endian, or installing a `DUPSORT`
+        // comparator, would make `out_adj` iterate in edge-id order natively and
+        // delete this pass; both change the stored format and the order
+        // `out_neighbors` returns, so they belong with the other on-disk work rather
+        // than here.
+        //
+        // The previous builder read `edges` in ascending edge-id order, so that is the
+        // order every consumer has seen, and an expansion emits its neighbors in it.
+        // `DUPSORT` instead
+        // orders duplicates by their raw bytes, and `AdjEntry` holds native
+        // little-endian integers, so its order is neither edge-id nor destination
+        // order. The scratch buffer is reused across rows, so this costs one
+        // allocation of the largest row rather than one per row, and
+        // `load_weights` then relies on the ordering to find an edge's slot.
+        let mut scratch: Vec<(EdgeId, u32, TypeId)> = Vec::new();
+        for i in 0..n {
+            let (start, end) = (row_ptr[i], row_ptr[i + 1]);
+            if end - start < 2 || edge_id[start..end].is_sorted() {
+                continue;
+            }
+            scratch.clear();
+            scratch.extend((start..end).map(|k| (edge_id[k], col_idx[k], edge_type[k])));
+            // Edge ids are unique, so the order is total and the sort is stable
+            // regardless.
+            scratch.sort_unstable_by_key(|&(eid, _, _)| eid);
+            for (slot, &(eid, col, ty)) in (start..end).zip(scratch.iter()) {
+                edge_id[slot] = eid;
+                col_idx[slot] = col;
+                edge_type[slot] = ty;
             }
         }
 
-        let mut row_ptr = vec![0usize; n + 1];
-        for (i, neighbors) in adj.iter().enumerate() {
-            row_ptr[i + 1] = row_ptr[i] + neighbors.len();
-        }
-        let total = row_ptr[n];
-        let mut col_idx = vec![0u32; total];
-        let mut edge_type = vec![0u32; total];
-        let mut edge_id_arr = vec![0u64; total];
-        let mut edge_weight_arr = vec![0.0f64; total];
-        for (i, neighbors) in adj.iter().enumerate() {
-            let base = row_ptr[i];
-            for (j, &(dst_d, etype, eid, weight)) in neighbors.iter().enumerate() {
-                col_idx[base + j] = dst_d;
-                edge_type[base + j] = etype;
-                edge_id_arr[base + j] = eid;
-                edge_weight_arr[base + j] = weight;
-            }
-        }
+        let edge_weight = if weighted {
+            Some(Self::load_weights(
+                storage,
+                &rtxn,
+                &row_ptr,
+                &edge_id,
+                &id_to_dense,
+            )?)
+        } else {
+            None
+        };
 
         // Counting-sort transpose for the incoming view. Walking the outgoing
         // rows in ascending source order keeps each incoming row ordered by
@@ -132,7 +235,7 @@ impl CsrSnapshot {
                 cursor[col_idx[k] as usize] += 1;
                 in_col_idx[slot] = src_d as u32;
                 in_edge_type[slot] = edge_type[k];
-                in_edge_id[slot] = edge_id_arr[k];
+                in_edge_id[slot] = edge_id[k];
             }
         }
 
@@ -140,8 +243,8 @@ impl CsrSnapshot {
             row_ptr,
             col_idx,
             edge_type,
-            edge_id: edge_id_arr,
-            edge_weight: edge_weight_arr,
+            edge_id,
+            edge_weight,
             in_row_ptr,
             in_col_idx,
             in_edge_type,
@@ -149,6 +252,53 @@ impl CsrSnapshot {
             dense_to_id,
             id_to_dense,
         })
+    }
+
+    /// Read one weight per outgoing entry, in `col_idx` order.
+    ///
+    /// A weight is the first present of the `weight`, `cost`, `capacity`, or `cap`
+    /// property, defaulting to `1.0`, so the array starts filled with the default
+    /// and a scan of `edges` overwrites the entries it finds a value for. Each edge
+    /// is placed by looking its id up in its source's row, which is sorted by edge
+    /// id, so an edge whose adjacency entry is missing simply finds no slot and an
+    /// entry no edge claims keeps the default: neither can shift another entry's
+    /// weight, which a cursor-per-row fill could.
+    fn load_weights(
+        storage: &Storage,
+        rtxn: &heed::RoTxn,
+        row_ptr: &[usize],
+        edge_id: &[EdgeId],
+        id_to_dense: &AHashMap<NodeId, u32>,
+    ) -> Result<Vec<f64>, Error> {
+        let mut weights = vec![1.0f64; edge_id.len()];
+        for result in storage.edges.iter(rtxn)? {
+            let (id, bytes) = result?;
+            let rec: EdgeRecord = props::decode(bytes)?;
+            // No properties means no weight property, so the default already holds
+            // and the blob decode below is skipped.
+            if rec.props.is_empty() {
+                continue;
+            }
+            let Some(&src_d) = id_to_dense.get(&rec.src) else {
+                continue;
+            };
+            let (start, end) = (row_ptr[src_d as usize], row_ptr[src_d as usize + 1]);
+            let Ok(offset) = edge_id[start..end].binary_search(&id) else {
+                continue;
+            };
+            let val: serde_json::Value =
+                props::decode(&rec.props).unwrap_or(serde_json::Value::Null);
+            if let Some(w) = val
+                .get("weight")
+                .or_else(|| val.get("cost"))
+                .or_else(|| val.get("capacity"))
+                .or_else(|| val.get("cap"))
+                .and_then(|v| v.as_f64())
+            {
+                weights[start + offset] = w;
+            }
+        }
+        Ok(weights)
     }
 }
 
@@ -523,10 +673,278 @@ impl CsrCache {
 
 #[cfg(test)]
 mod snapshot_tests {
+    use proptest::prelude::*;
+    use proptest::test_runner::TestCaseError;
     use tempfile::TempDir;
 
     use super::*;
     use crate::Graph;
+
+    /// Every array exactly as the builder produced it before it read `out_adj`: one
+    /// `Vec` per node, filled by a scan of `edges` in ascending edge-id order, plus
+    /// the counting-sort transpose derived from those rows.
+    ///
+    /// This is the reference the current builder is checked against. The entry order
+    /// inside a row is observable (an expansion emits its neighbors in it) and the
+    /// rewrite had to preserve it while changing where the entries are read from, so
+    /// a comparison that only counted entries or compared them as sets would not have
+    /// held the rewrite to anything.
+    struct Reference {
+        row_ptr: Vec<usize>,
+        col_idx: Vec<u32>,
+        edge_type: Vec<TypeId>,
+        edge_id: Vec<EdgeId>,
+        edge_weight: Vec<f64>,
+        in_row_ptr: Vec<usize>,
+        in_col_idx: Vec<u32>,
+        in_edge_type: Vec<TypeId>,
+        in_edge_id: Vec<EdgeId>,
+    }
+
+    fn reference_arrays(storage: &Storage) -> Reference {
+        let rtxn = storage.env.read_txn().unwrap();
+        let mut dense_to_id: Vec<NodeId> = storage
+            .nodes
+            .iter(&rtxn)
+            .unwrap()
+            .map(|r| r.map(|(k, _)| k))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        dense_to_id.sort_unstable();
+        let n = dense_to_id.len();
+        let id_to_dense: AHashMap<NodeId, u32> = dense_to_id
+            .iter()
+            .enumerate()
+            .map(|(i, &id)| (id, i as u32))
+            .collect();
+
+        let mut adj: Vec<Vec<(u32, TypeId, EdgeId, f64)>> = vec![vec![]; n];
+        for result in storage.edges.iter(&rtxn).unwrap() {
+            let (edge_id, bytes) = result.unwrap();
+            let rec: EdgeRecord = props::decode(bytes).unwrap();
+            if let (Some(&src_d), Some(&dst_d)) =
+                (id_to_dense.get(&rec.src), id_to_dense.get(&rec.dst))
+            {
+                let weight: f64 = {
+                    let val: serde_json::Value =
+                        props::decode(&rec.props).unwrap_or(serde_json::Value::Null);
+                    val.get("weight")
+                        .or_else(|| val.get("cost"))
+                        .or_else(|| val.get("capacity"))
+                        .or_else(|| val.get("cap"))
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(1.0)
+                };
+                adj[src_d as usize].push((dst_d, rec.edge_type, edge_id, weight));
+            }
+        }
+
+        let mut row_ptr = vec![0usize; n + 1];
+        for (i, neighbors) in adj.iter().enumerate() {
+            row_ptr[i + 1] = row_ptr[i] + neighbors.len();
+        }
+        let mut col_idx = Vec::new();
+        let mut edge_type = Vec::new();
+        let mut edge_id = Vec::new();
+        let mut edge_weight = Vec::new();
+        for neighbors in adj.iter() {
+            for &(dst_d, etype, eid, weight) in neighbors {
+                col_idx.push(dst_d);
+                edge_type.push(etype);
+                edge_id.push(eid);
+                edge_weight.push(weight);
+            }
+        }
+
+        // The transpose, by the same counting sort the builder uses. Derived from the
+        // rows above, so comparing it catches a permutation that the outgoing
+        // comparison alone would miss only if the two were built independently, and
+        // it pins the incoming order an in-direction expansion emits rows in.
+        let total = row_ptr[n];
+        let mut in_row_ptr = vec![0usize; n + 1];
+        for &dst_d in &col_idx {
+            in_row_ptr[dst_d as usize + 1] += 1;
+        }
+        for i in 0..n {
+            in_row_ptr[i + 1] += in_row_ptr[i];
+        }
+        let mut in_col_idx = vec![0u32; total];
+        let mut in_edge_type = vec![0u32; total];
+        let mut in_edge_id = vec![0u64; total];
+        let mut cursor = in_row_ptr.clone();
+        for src_d in 0..n {
+            for k in row_ptr[src_d]..row_ptr[src_d + 1] {
+                let slot = cursor[col_idx[k] as usize];
+                cursor[col_idx[k] as usize] += 1;
+                in_col_idx[slot] = src_d as u32;
+                in_edge_type[slot] = edge_type[k];
+                in_edge_id[slot] = edge_id[k];
+            }
+        }
+
+        Reference {
+            row_ptr,
+            col_idx,
+            edge_type,
+            edge_id,
+            edge_weight,
+            in_row_ptr,
+            in_col_idx,
+            in_edge_type,
+            in_edge_id,
+        }
+    }
+
+    /// After any random write history, every array must equal what the previous
+    /// builder produced: same row boundaries, same entries, the same order inside
+    /// each row, the same transpose, and the same weights.
+    ///
+    /// The rewrite reads `out_adj` instead of `edges`, and LMDB orders duplicate
+    /// values by their raw little-endian bytes, which is not edge-id order. So the
+    /// builder restores the order per row, and this is what pins that: without it a
+    /// row's entries come out permuted, which is invisible to a count and to a set
+    /// comparison but changes the order an expansion emits its neighbors in.
+    ///
+    /// Each case generates its whole history up front and replays it on a fresh
+    /// graph. Mutating one shared graph across cases instead would make every case
+    /// depend on the ones before it, so proptest's shrinker would replay candidate
+    /// histories against a graph that had moved on and could report a minimal
+    /// counterexample that does not reproduce on its own.
+    #[test]
+    fn build_matches_the_previous_builder_over_a_random_write_history() {
+        /// One step of a generated history: connect two of the six nodes with one of
+        /// three types, or delete the edge added `nth` steps ago.
+        #[derive(Debug, Clone)]
+        enum Op {
+            Add { src: usize, dst: usize, ty: usize },
+            Delete { nth: usize },
+        }
+
+        let op = prop_oneof![
+            8 => (0usize..6, 0usize..6, 0usize..3).prop_map(|(src, dst, ty)| Op::Add { src, dst, ty }),
+            2 => (0usize..8).prop_map(|nth| Op::Delete { nth }),
+        ];
+
+        let config = ProptestConfig {
+            fork: false,
+            cases: 48,
+            ..Default::default()
+        };
+        proptest!(config, |(ops in proptest::collection::vec(op, 1..24))| {
+            let dir = TempDir::new().map_err(|e| TestCaseError::fail(e.to_string()))?;
+            let g = Graph::open(dir.path(), 1).map_err(|e| TestCaseError::fail(e.to_string()))?;
+            let nodes: Vec<NodeId> = (0..6)
+                .map(|_| g.add_node("N", &()).unwrap())
+                .collect();
+            let mut live: Vec<EdgeId> = Vec::new();
+
+            for op in &ops {
+                match *op {
+                    // Parallel edges and self-loops arise naturally from picking both
+                    // endpoints at random, and both are cases where row order matters.
+                    // A weight on every third edge exercises the weighted build too.
+                    Op::Add { src, dst, ty } => {
+                        let props = if (src + dst) % 3 == 0 {
+                            serde_json::json!({ "weight": (src + dst + 1) as f64 })
+                        } else {
+                            serde_json::Value::Null
+                        };
+                        let id = g
+                            .add_edge(nodes[src], nodes[dst], ["t", "u", "v"][ty], &props)
+                            .map_err(|e| TestCaseError::fail(e.to_string()))?;
+                        live.push(id);
+                    }
+                    // Deleting makes rows shrink as well as grow and leaves the
+                    // surviving edge ids non-contiguous, which is what the per-row
+                    // ordering step has to cope with.
+                    Op::Delete { nth } => {
+                        if !live.is_empty() {
+                            let victim = live.remove(nth % live.len());
+                            g.delete_edge(victim)
+                                .map_err(|e| TestCaseError::fail(e.to_string()))?;
+                        }
+                    }
+                }
+            }
+
+            let want = reference_arrays(&g.storage);
+            let snap = CsrSnapshot::build_weighted(&g.storage)
+                .map_err(|e| TestCaseError::fail(e.to_string()))?;
+            prop_assert_eq!(&snap.row_ptr, &want.row_ptr);
+            prop_assert_eq!(&snap.col_idx, &want.col_idx);
+            prop_assert_eq!(&snap.edge_type, &want.edge_type);
+            prop_assert_eq!(&snap.edge_id, &want.edge_id);
+            prop_assert_eq!(snap.edge_weight.as_ref(), Some(&want.edge_weight));
+            prop_assert_eq!(&snap.in_row_ptr, &want.in_row_ptr);
+            prop_assert_eq!(&snap.in_col_idx, &want.in_col_idx);
+            prop_assert_eq!(&snap.in_edge_type, &want.in_edge_type);
+            prop_assert_eq!(&snap.in_edge_id, &want.in_edge_id);
+
+            // The unweighted build must agree on everything except the weights it
+            // deliberately does not load.
+            let plain = CsrSnapshot::build(&g.storage)
+                .map_err(|e| TestCaseError::fail(e.to_string()))?;
+            prop_assert!(plain.edge_weight.is_none());
+            prop_assert_eq!(&plain.col_idx, &want.col_idx);
+            prop_assert_eq!(&plain.edge_id, &want.edge_id);
+        });
+    }
+
+    /// `build` must carry no weights and `build_weighted` must carry one per entry,
+    /// aligned with the entry it belongs to.
+    ///
+    /// Alignment is the part worth pinning: the weights are placed by looking each
+    /// edge id up in its source's row rather than by the order `edges` is scanned
+    /// in, so a mis-sorted row would attach a weight to the wrong edge. The graph
+    /// below gives one node several outgoing edges with distinct weights, which is
+    /// where such a mix-up would show.
+    #[test]
+    fn build_omits_weights_and_build_weighted_aligns_them_with_their_entries() {
+        let dir = TempDir::new().unwrap();
+        let g = Graph::open(dir.path(), 1).unwrap();
+        let a = g.add_node("n", &()).unwrap();
+        let b = g.add_node("n", &()).unwrap();
+        let c = g.add_node("n", &()).unwrap();
+        // Distinct property names, since a weight is the first present of four, plus
+        // one edge with no weight property at all to exercise the 1.0 default.
+        let e_ab = g
+            .add_edge(a, b, "t", &serde_json::json!({"weight": 2.5}))
+            .unwrap();
+        let e_ac = g
+            .add_edge(a, c, "t", &serde_json::json!({"cost": 4.0}))
+            .unwrap();
+        let e_ba = g
+            .add_edge(b, a, "t", &serde_json::json!({"capacity": 8.0}))
+            .unwrap();
+        let e_bc = g
+            .add_edge(b, c, "t", &serde_json::json!({"cap": 16.0}))
+            .unwrap();
+        let e_ca = g.add_edge(c, a, "t", &()).unwrap();
+
+        let plain = CsrSnapshot::build(&g.storage).unwrap();
+        assert!(
+            plain.edge_weight.is_none(),
+            "an unweighted build must not pay for the weights"
+        );
+
+        let snap = CsrSnapshot::build_weighted(&g.storage).unwrap();
+        let weights = snap
+            .edge_weight
+            .as_ref()
+            .expect("weighted build carries them");
+        assert_eq!(weights.len(), snap.col_idx.len());
+        let by_edge: AHashMap<EdgeId, f64> = snap
+            .edge_id
+            .iter()
+            .zip(weights.iter())
+            .map(|(&e, &w)| (e, w))
+            .collect();
+        assert_eq!(by_edge[&e_ab], 2.5);
+        assert_eq!(by_edge[&e_ac], 4.0);
+        assert_eq!(by_edge[&e_ba], 8.0);
+        assert_eq!(by_edge[&e_bc], 16.0);
+        assert_eq!(by_edge[&e_ca], 1.0, "no weight property means 1.0");
+    }
 
     /// The incoming arrays must be an exact transpose of the outgoing CSR:
     /// every outgoing entry appears exactly once under its destination row,

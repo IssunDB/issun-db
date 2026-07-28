@@ -12,7 +12,7 @@ use zerocopy::{FromBytes, IntoBytes};
 
 use ahash::{AHashMap, AHashSet};
 
-use crate::matrices::MatrixSet;
+use crate::matrices::{MatrixSet, MatrixTier};
 use crate::{
     csr::{CsrCache, CsrSnapshot},
     error::Error,
@@ -1121,20 +1121,41 @@ impl Graph {
     /// Synchronously rebuild the CSR snapshot from LMDB. Useful after bulk
     /// loads or when tests need a consistent read view before the threshold
     /// has been crossed.
+    ///
+    /// Rebuilds at [`MatrixTier::Adjacency`], which is a fresh snapshot plus the
+    /// boolean adjacency: everything expansion and all but two algorithms read. It
+    /// deliberately does *not* request the weighted tier. This is the call every
+    /// bulk load makes (`COPY ... FROM` and `IMPORT DATABASE` both end with it), and
+    /// because a rebuild never downgrades an installed tier, asking for weights here
+    /// would pin every process that ever loads data to the weighted matrices and the
+    /// extra `edges` scan for the rest of its life, whether or not anything asks a
+    /// weighted question. The two consumers that need more upgrade through their own
+    /// gate on first use.
     #[instrument(skip(self))]
     pub fn rebuild_csr(&self) -> Result<(), Error> {
         // Serialize against every other maintenance path (incremental applies,
         // snapshot-only refreshes, and the background rebuild) so no two run
         // concurrently and an incremental drain cannot race this install.
         let _maint = self.csr_cache.maintenance.lock();
-        self.rebuild_csr_locked()
+        self.rebuild_csr_locked(MatrixTier::Adjacency)
     }
 
-    /// Full CSR-snapshot and matrix rebuild from LMDB. The caller must already
-    /// hold `csr_cache.maintenance`; the public [`Graph::rebuild_csr`] acquires
-    /// it. Kept separate so the freshness gates, which already hold the lock, do
-    /// not deadlock on the non-reentrant mutex.
-    pub(super) fn rebuild_csr_locked(&self) -> Result<(), Error> {
+    /// Full CSR-snapshot and matrix rebuild from LMDB, materializing `tier`. The
+    /// caller must already hold `csr_cache.maintenance`; the public
+    /// [`Graph::rebuild_csr`] acquires it. Kept separate so the freshness gates,
+    /// which already hold the lock, do not deadlock on the non-reentrant mutex.
+    ///
+    /// The requested tier is raised to the installed one when the matrices already
+    /// carry more: a rebuild triggered by an adjacency-only consumer must not strip
+    /// the weighted matrices off a graph that has been running weighted queries, or
+    /// a workload alternating the two would rebuild twice per write instead of once.
+    pub(super) fn rebuild_csr_locked(&self, tier: MatrixTier) -> Result<(), Error> {
+        let tier = self
+            .matrices
+            .read()
+            .as_ref()
+            .map(|m| m.tier().max(tier))
+            .unwrap_or(tier);
         // Capture the generation before reading LMDB so writes that land during
         // the build leave the snapshot conservatively stale.
         let built_gen = self.csr_cache.current_gen();
@@ -1142,9 +1163,15 @@ impl Graph {
         // build land in the emptied delta and are re-applied incrementally later
         // (idempotently) rather than lost.
         self.csr_cache.clear_delta();
-        let snap = CsrSnapshot::build(&self.storage)?;
+        // Only the weighted tier needs the per-edge weights, and they cost a second
+        // full scan of `edges`; the PageRank matrix is built from the row boundaries.
+        let snap = match tier {
+            MatrixTier::Adjacency | MatrixTier::PageRank => CsrSnapshot::build(&self.storage)?,
+            MatrixTier::Weighted => CsrSnapshot::build_weighted(&self.storage)?,
+        };
         let m = MatrixSet::materialize(
             &snap,
+            tier,
             self.n_threads.load(std::sync::atomic::Ordering::Acquire),
         )?;
         // Install the matrices and the snapshot together under the matrices write

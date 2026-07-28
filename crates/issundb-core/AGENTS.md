@@ -71,8 +71,35 @@ place, `issundb_graphblas::set_global_threads`; do not call the raw FFI from `is
 ## CSR Snapshot Vs. LMDB Adjacency
 
 `CsrSnapshot` (in `csr.rs`) is a read-only in-memory Compressed Sparse Row view of the adjacency: the outgoing arrays plus a transposed incoming view
-carrying per-edge type and edge ids, and a per-edge weight. It is swapped atomically via `arc_swap::ArcSwap`. `MatrixSet` (in `matrices.rs`) holds the
-GraphBLAS sparse matrices derived from it.
+carrying per-edge type and edge ids, and optionally a per-edge weight. It is swapped atomically via `arc_swap::ArcSwap`. `MatrixSet` (in `matrices.rs`)
+holds the GraphBLAS sparse matrices derived from it.
+
+Both are built at the smallest size their consumer reads, and both builds are memory-shaped in ways that are easy to undo by accident:
+
+- The snapshot is built from `out_adj`, not from `edges`. The 20-byte `AdjEntry` holds the destination, the type id, and the edge id, which is every
+  field the arrays carry, and the entries arrive grouped by source in ascending key order. Reading them from `edges` instead means decoding one
+  `EdgeRecord` per edge, which also copies that edge's whole property blob.
+- Entries go straight into the flat arrays while the pass counts each row. Do not stage a `Vec` per node first: that is one allocation per node, held
+  alongside the finished arrays at the peak and then returned to the allocator as one hole per node, which `malloc_trim` cannot hand back. On a 1 M-node,
+  13.9 M-edge graph it left 3.3 GB resident for 620 MB of live arrays.
+- Each row is reordered by ascending edge id after the fill, because `DUPSORT` orders duplicates by the raw little-endian bytes of an `AdjEntry`, whose
+  first field is `edge_type`. That order is observable (an expansion emits its neighbors in it) and `load_weights` binary-searches it, so `csr.rs` has a
+  proptest pinning every array, incoming included, against the builder this replaced. The pass is a consequence of the stored layout: putting `edge_id`
+  first in big-endian, or installing a `DUPSORT` comparator, would make the iteration order right natively and delete it, but both change the format and
+  the order `out_neighbors` returns.
+- `edge_weight` is `Option` and only `build_weighted` fills it, at the cost of a second full scan of `edges`, since a weight lives in a property blob.
+  Only the weight matrix reads it, and only Dijkstra reads that.
+- `MatrixTier` decides how many matrices `MatrixSet::materialize` builds, and the three rungs exist because the two upper matrices have different
+  prerequisites: `page_rank_matrix` needs only the row boundaries, while `weight_matrix` needs a snapshot from `build_weighted`. Keep them apart. The
+  tier is stored on the set, not inferred from which `Option` is populated, so the two cannot desynchronize into a set that claims a tier it cannot
+  serve. Requesting `Weighted` with an unweighted snapshot is `Error::InvalidArgument`, not `Error::Corrupt`: it is a caller mistake about gating, and
+  `Corrupt` is what tells an operator to restore a backup.
+- The public `page_rank_graphblas` and `shortest_path_graphblas` gate themselves, and do it *before* taking the matrices read guard. They used to
+  recurse into their gated wrapper from inside a `match` on a live guard, which deadlocks the calling thread against itself as soon as the gate reaches a
+  rebuild, since `parking_lot::RwLock` is not reentrant. Any new public entry point here must follow the same order: gate, then read.
+- The materialization builds one row array and one column array for the whole set and swaps their roles for a transpose, with one value array alive at a
+  time. Do not go back to a triple buffer per matrix or a coordinate hash map for deduplication: `GrB_Matrix_build` wants three arrays and takes a
+  duplicate-combining operator, so both were pure overhead, worth 2.7 GB above the finished matrices on that same graph.
 
 Rebuilds happen on demand through the freshness gates below; the background rebuild after `REBUILD_THRESHOLD` writes is a compaction safety net, not
 the freshness path.
@@ -85,11 +112,13 @@ the freshness path.
   consistency check (such as the DELETE connected-node guard) depends on that: keep any new point lookup on storage truth rather than routing it
   through the snapshot for speed.
 - Use the CSR snapshot as the hot read path for graph algorithms (BFS, DFS, PageRank, SCC). Callers do not have to refresh it by hand: the algorithm
-  entry points go through `ensure_matrix_view`, `ensure_csr_fresh`, or `ensure_snapshot_fresh` (see the freshness gates in the root `AGENTS.md`).
-  `Graph::rebuild_csr` remains available for forcing a full rebuild before a burst of algorithm calls.
+  entry points go through `ensure_matrix_view`, `ensure_csr_fresh`, `ensure_weighted_matrices`, or `ensure_snapshot_fresh` (see the freshness gates in the
+  root `AGENTS.md`). A new algorithm picks its gate by what it reads, and reading a weighted matrix behind the wrong one is an error rather than a wrong
+  answer. `Graph::rebuild_csr` remains available for forcing a full weighted-tier rebuild before a burst of algorithm calls.
 - `MatrixSet` is derived from the CSR snapshot. A full rebuild goes through `MatrixSet::materialize`; incremental maintenance goes through
   `MatrixSet::apply_delta`, which patches the matrices in place from the write path's `GraphDelta` and falls back to a full rebuild when a node was
-  deleted. Either way the CSR and the matrix set advance together; do not update one without the other.
+  deleted. Either way the CSR and the matrix set advance together; do not update one without the other. `apply_delta` maintains only the boolean
+  adjacency, so the weighted matrices go stale behind it, which is why their consumers gate on the matrices generation rather than on the pending delta.
 
 ## In-memory Property Columns
 
