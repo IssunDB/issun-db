@@ -5,7 +5,6 @@ use std::sync::{
 
 use ahash::AHashMap;
 use arc_swap::ArcSwap;
-use zerocopy::FromBytes;
 
 use crate::{
     error::Error,
@@ -31,7 +30,7 @@ pub struct CsrSnapshot {
     /// Dijkstra. Loading it costs a full `edges` scan that decodes each record and
     /// its property blob to look for one key, and holds eight bytes per edge for
     /// the life of the snapshot, so a workload that never asks a weighted question
-    /// must not pay it. [`crate::matrices::MatrixTier`] is how a consumer asks.
+    /// must not pay it. [`crate::matrices::MatrixKinds`] is how a consumer asks.
     pub edge_weight: Option<Vec<f64>>,
     /// Transpose of the outgoing CSR: `in_row_ptr[i]..in_row_ptr[i+1]` ranges
     /// over the i-th node's incoming edges, `in_col_idx` holds source dense
@@ -144,9 +143,7 @@ impl CsrSnapshot {
             // whose endpoints it could not map. The skip must happen identically in
             // the count and in the push, which is why both live in this one loop.
             let Some(src_d) = src_dense else { continue };
-            let entry = AdjEntry::read_from_bytes(bytes)
-                .ok()
-                .ok_or(Error::Corrupt("AdjEntry value is not exactly 20 bytes"))?;
+            let entry = AdjEntry::decode_value(bytes)?;
             // Copied out before use: `AdjEntry` is `repr(packed)`, so a field
             // cannot be borrowed.
             let dst = entry.other;
@@ -274,11 +271,6 @@ impl CsrSnapshot {
         for result in storage.edges.iter(rtxn)? {
             let (id, bytes) = result?;
             let rec: EdgeRecord = props::decode(bytes)?;
-            // No properties means no weight property, so the default already holds
-            // and the blob decode below is skipped.
-            if rec.props.is_empty() {
-                continue;
-            }
             let Some(&src_d) = id_to_dense.get(&rec.src) else {
                 continue;
             };
@@ -825,12 +817,20 @@ mod snapshot_tests {
             2 => (0usize..8).prop_map(|nth| Op::Delete { nth }),
         ];
 
+        // 24 cases, not proptest's default 256 and not the 48 this started at. Each case
+        // opens its own LMDB environment and commits every operation separately, so a case
+        // costs milliseconds rather than microseconds: 48 cases of up to 24 operations
+        // measured 3.7 s, most of a suite whose whole point is to stay fast, while 24
+        // cases of up to 20 measure 0.31 s. The drop is far more than the halving suggests
+        // because cost grows with history length as well as case count. Coverage is
+        // unaffected in practice: what this pins is a permuted row, which shows up in
+        // almost every case rather than a rare one.
         let config = ProptestConfig {
             fork: false,
-            cases: 48,
+            cases: 24,
             ..Default::default()
         };
-        proptest!(config, |(ops in proptest::collection::vec(op, 1..24))| {
+        proptest!(config, |(ops in proptest::collection::vec(op, 1..20))| {
             let dir = TempDir::new().map_err(|e| TestCaseError::fail(e.to_string()))?;
             let g = Graph::open(dir.path(), 1).map_err(|e| TestCaseError::fail(e.to_string()))?;
             let nodes: Vec<NodeId> = (0..6)
@@ -888,6 +888,91 @@ mod snapshot_tests {
             prop_assert_eq!(&plain.col_idx, &want.col_idx);
             prop_assert_eq!(&plain.edge_id, &want.edge_id);
         });
+    }
+
+    /// An adjacency entry whose destination node does not exist must be skipped, and
+    /// skipped consistently in the row boundaries and in the arrays.
+    ///
+    /// The rewrite moved the source of truth from `edges` to `out_adj`, so which entries
+    /// survive an inconsistency between the two changed: this is the direction that used
+    /// to be filtered by `id_to_dense` on both endpoints and still must be. The write
+    /// path never produces this state (`add_edge` requires both endpoints to exist), so
+    /// the entry is written straight to storage, which is also the only way to reach the
+    /// skip at all.
+    #[test]
+    fn build_skips_an_adjacency_entry_whose_endpoint_is_missing() {
+        let dir = TempDir::new().unwrap();
+        let g = Graph::open(dir.path(), 1).unwrap();
+        let a = g.add_node("n", &()).unwrap();
+        let b = g.add_node("n", &()).unwrap();
+        let real = g.add_edge(a, b, "t", &()).unwrap();
+
+        // One entry under a live source pointing at a node id that was never allocated,
+        // and one under a source that does not exist either.
+        let ghost = 999_999u64;
+        {
+            use zerocopy::IntoBytes;
+            // Written as raw duplicate values rather than through the write path, which
+            // refuses a nonexistent endpoint and so cannot produce this state.
+            let dangling_dst = AdjEntry {
+                edge_type: 0,
+                other: ghost,
+                edge_id: 12_345,
+            };
+            let dangling_src = AdjEntry {
+                edge_type: 0,
+                other: b,
+                edge_id: 12_346,
+            };
+            let mut wtxn = g.storage.env.write_txn().unwrap();
+            g.storage
+                .out_adj
+                .put(&mut wtxn, &a, dangling_dst.as_bytes())
+                .unwrap();
+            g.storage
+                .out_adj
+                .put(&mut wtxn, &ghost, dangling_src.as_bytes())
+                .unwrap();
+            wtxn.commit().unwrap();
+        }
+
+        let snap = CsrSnapshot::build(&g.storage).unwrap();
+        assert_eq!(
+            snap.col_idx.len(),
+            1,
+            "only the edge with two live endpoints belongs in the snapshot"
+        );
+        assert_eq!(snap.edge_id, vec![real]);
+        assert_eq!(
+            snap.row_ptr[snap.dense_to_id.len()],
+            1,
+            "the row boundaries must count exactly what the arrays hold"
+        );
+        // The transpose is derived from those arrays, so it must agree.
+        assert_eq!(snap.in_col_idx.len(), 1);
+        assert_eq!(snap.in_edge_id, vec![real]);
+    }
+
+    /// A duplicate value that is not a whole `AdjEntry` is reported, not silently
+    /// reinterpreted. The size in the message is the layout invariant declared on the
+    /// struct, which is why the check lives on the type.
+    #[test]
+    fn build_rejects_a_malformed_adjacency_value() {
+        let dir = TempDir::new().unwrap();
+        let g = Graph::open(dir.path(), 1).unwrap();
+        let a = g.add_node("n", &()).unwrap();
+        {
+            let mut wtxn = g.storage.env.write_txn().unwrap();
+            g.storage.out_adj.put(&mut wtxn, &a, &[1u8, 2, 3]).unwrap();
+            wtxn.commit().unwrap();
+        }
+        let Err(err) = CsrSnapshot::build(&g.storage) else {
+            panic!("a short value must be rejected");
+        };
+        assert!(
+            matches!(err, Error::Corrupt(msg) if msg.contains("20 bytes")),
+            "unexpected error: {err}"
+        );
     }
 
     /// `build` must carry no weights and `build_weighted` must carry one per entry,

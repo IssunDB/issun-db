@@ -163,27 +163,53 @@ async fn validate_host(
 /// holding the statistics lock, installing the finished table at the end, so tool calls
 /// keep planning throughout on the bounded probe and the global average fan-out.
 ///
-/// It runs on the blocking pool because the scan is synchronous LMDB work that would
-/// otherwise stall a runtime worker.
+/// It runs on a detached thread rather than the runtime's blocking pool, because
+/// dropping the runtime waits for a started blocking task and would put the scan's
+/// remaining time back on shutdown, which for a stdio client is one subprocess exit per
+/// session.
 ///
 /// A failure is logged and ignored, because every reader of the table works without
 /// it: the fan-out estimates fall back to the global average, and the schema question
 /// falls back to a bounded probe. Diagnostics go to stderr like everything else here,
 /// since the stdio transport owns stdout.
 fn spawn_statistics_warm_up(graph: Arc<Graph>) {
-    tokio::task::spawn_blocking(move || {
-        let started = std::time::Instant::now();
-        match graph.materialize_edge_statistics() {
-            Ok(()) => info!(
-                elapsed_ms = started.elapsed().as_millis() as u64,
-                "warmed schema statistics"
-            ),
-            Err(error) => warn!(
-                %error,
-                "could not warm schema statistics; continuing on default plan weights"
-            ),
-        }
-    });
+    // A detached OS thread rather than `tokio::task::spawn_blocking`. Dropping the
+    // runtime waits for any blocking task that has already started, so a session that
+    // ends before the scan does would have blocked at exit for the rest of it (measured
+    // at 1.5 s for a 1.5 s task, and this scan takes seconds on a large graph), which is
+    // exactly the delay backgrounding it was supposed to remove. A detached thread is
+    // not joined by the runtime and is abandoned at process exit; the scan installs its
+    // table only at the end, so abandoning it leaves the graph as it was, which every
+    // reader already tolerates.
+    //
+    // `issundb-rest` carries the same function for the same reason. Keep the two bodies
+    // identical: the shutdown behavior above is the kind of fix that gets applied to one
+    // copy and not the other.
+    // `Builder::spawn` rather than `thread::spawn`, which panics when the OS refuses a
+    // thread (a low pids cgroup, an exhausted host). Panicking would unwind out of
+    // `main` before the server starts serving, over an optimization this very comment
+    // says is logged and ignored.
+    let spawned = std::thread::Builder::new()
+        .name("statistics-warm-up".to_string())
+        .spawn(move || {
+            let started = std::time::Instant::now();
+            match graph.materialize_edge_statistics() {
+                Ok(()) => info!(
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "warmed schema statistics"
+                ),
+                Err(error) => warn!(
+                    %error,
+                    "could not warm schema statistics; continuing on default plan weights"
+                ),
+            }
+        });
+    if let Err(error) = spawned {
+        warn!(
+            %error,
+            "could not spawn the schema statistics warm-up; continuing on default plan weights"
+        );
+    }
 }
 
 #[tokio::main]

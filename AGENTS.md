@@ -109,12 +109,14 @@ modules according to this map.
     - `src/histogram.rs`: equi-depth histogram over property values with equality and range selectivity estimates; backs `PropStats`. Nothing here is
       persisted.
     - `src/matrices.rs`: GraphBLAS matrix materialization from the CSR snapshot, plus `MatrixSet::apply_delta` for incremental in-place maintenance
-      (resize plus per-element set and drop) and the self-contained `dense_to_id`/`id_to_dense` mapping the matrix-view consumers read. `MatrixTier`
-      is how much of the set a consumer needs, as a three-rung ladder: `Adjacency` is the two boolean matrices, `PageRank` adds `page_rank_matrix`
-      (derived from the CSR row boundaries, so an unweighted snapshot serves it), and `Weighted` adds `weight_matrix`, the only thing that needs the
-      per-edge weights and so the second `edges` scan that loads them. The two upper matrices have exactly one consumer each, `page_rank` and
-      `shortest_path_dijkstra`, which is why they are separate rungs: sharing one made PageRank pay for that scan and for a 111 MB matrix it never
-      reads. So `page_rank_matrix` and `weight_matrix` are `Option`, the tier is stored on the set rather than inferred from which of them is present,
+      (resize plus per-element set and drop) and the self-contained `dense_to_id`/`id_to_dense` mapping the matrix-view consumers read. `MatrixKinds`
+      is which optional matrices a consumer needs, as a *set* rather than an ordering: `ADJACENCY` (the empty set) is the two boolean matrices,
+      `PAGE_RANK` adds `page_rank_matrix` (derived from the CSR row boundaries, so an unweighted snapshot serves it), and `WEIGHTED` adds `weight_matrix`,
+      the only thing that needs the per-edge weights and so the second `edges` scan that loads them. The two are independent, with exactly one consumer
+      each (`page_rank` and `shortest_path_dijkstra`), which is why neither implies the other: any ordering between them makes asking for one build both,
+      which cost PageRank a scan it does not need and Dijkstra a 167 MB matrix it never reads. Requests combine with `union` and a requirement is a
+      `contains` test. So `page_rank_matrix` and `weight_matrix` are `Option`, the set is stored on the `MatrixSet` rather than inferred from which of
+      them is present, a weighted rebuild releases `snap.edge_weight` once the matrix is built (the matrix is its only reader),
       and every matrix is built over the same coordinates, so the two index arrays are built once and passed to each build with their roles
       swapped for a transpose, one value array at a time (`Matrix::from_arrays`); staging four triple buffers and two coordinate hash maps instead, as
       this once did, cost 2.7 GB above the finished matrices. Duplicate handling belongs to the build's reducer (`First` for the boolean union, `Plus`
@@ -275,16 +277,17 @@ modules according to this map.
       an eager build in `open`: it costs one full edge scan plus a full matrix materialization on every open (roughly 26 seconds for a 1 M-node,
       14 M-edge graph) and is repaid on every reopen.
     - Pure-adjacency consumers (`bfs`, `bfs_multi_source`, untyped expansion, `degree_centrality`, and `connected_components`) call
-      `ensure_matrix_view`, which applies the delta in place, falling back to a `MatrixTier::Adjacency` rebuild only when a node was deleted.
+      `ensure_matrix_view`, which applies the delta in place, falling back to a rebuild of the boolean adjacency alone when a node was deleted.
     - CSR-array and hybrid consumers (`dfs`, the path searches, the flow algorithms, and the remaining centralities) call `ensure_csr_fresh`, which
-      rebuilds at `MatrixTier::Adjacency` on demand gated by the `write_gen` versus `snapshot_gen` counter; when the snapshot is already fresh it still
+      rebuilds the snapshot and the boolean adjacency on demand, gated by the `write_gen` versus `snapshot_gen` counter; when the snapshot is already fresh it still
       drains the pending delta into the matrices.
-    - `page_rank` gates on `MatrixTier::PageRank` (through `ensure_page_rank_matrix`, which its public `page_rank_graphblas` calls itself) and
-      `shortest_path_dijkstra` on `MatrixTier::Weighted` (through `with_weighted_matrix_view`), the latter being the only gate whose snapshot carries
-      weights. The tier is a separate condition from the generation, because a set materialized for an adjacency consumer is current at its generation
-      and still carries no weighted matrix. A rebuild never downgrades an installed tier, or a workload alternating two consumers would rebuild twice
-      per write; the cost is that one weighted call keeps the extra matrix for the life of the process, which is also why `Graph::rebuild_csr` asks for
-      `Adjacency` rather than the top rung: it is what every bulk load calls, so asking for weights there would pin every process that loads data.
+    - `page_rank` gates on `MatrixKinds::PAGE_RANK` (through `ensure_page_rank_matrix`, which its public `page_rank_graphblas` calls itself) and
+      `shortest_path_dijkstra` on `MatrixKinds::WEIGHTED` (through `with_weighted_matrix_view`), the latter being the only gate whose snapshot carries
+      weights. What the matrices carry is a separate condition from the generation, because a set materialized for an adjacency consumer is current at its
+      generation and still carries neither optional matrix. A rebuild unions the request with what is installed rather than replacing it, or a workload
+      alternating two consumers would rebuild twice per write; the cost is that one weighted call keeps that matrix for the life of the process, which is
+      also why `Graph::rebuild_csr` asks for neither optional matrix: it is what every bulk load calls, so asking for weights there would pin every
+      process that loads data.
     - Typed bulk expansion calls `ensure_snapshot_fresh`, which rebuilds only the snapshot (no GraphBLAS materialization); for a small source set over
       a stale snapshot it skips the gate and reads per-source LMDB adjacency.
       The background rebuild after `REBUILD_THRESHOLD` writes is a compaction safety net, not the freshness path; callers needing a guaranteed fresh
@@ -564,7 +567,7 @@ body reports the crate `version` and the current `api` version.
 REST exposes the data plane and retrieval only. Index administration (vector index configuration, text index create/drop/list), GraphBLAS thread
 control, and backup/restore are intentionally absent: provisioning and host operations are done through the CLI or the Python surface, not over HTTP.
 
-Startup spawns `Graph::materialize_edge_statistics` on the blocking pool, so the optimizer's expand-ratio estimates and exact type-inference pruning become
+Startup spawns `Graph::materialize_edge_statistics` on a detached thread, so the optimizer's expand-ratio estimates and exact type-inference pruning become
 available without gating readiness: nothing builds that table as a side effect of a query, and an HTTP caller has no way to ask for it. It is deliberately
 *not* synchronous. The scan costs seconds on a large graph (3.4 s on a 1 M-node, 13.9 M-edge graph, measured through the release wheel), while the plans it
 sharpens measured a few percent on a workload of ordinary aggregations, so delaying readiness to buy that is the wrong trade. Backgrounding it is only safe
@@ -621,12 +624,15 @@ differently-labeled entity instead of erroring. The tool descriptions, argument 
 identifier first with `MATCH (n:Label) WHERE n.Id = x RETURN id(n)`, or pass `expect_label` (`get_node`) or `expect_type` (`get_edge`) to reject a
 mismatched entity with an error instead.
 
-Startup spawns `Graph::materialize_edge_statistics` on the blocking pool, as REST does and for the same reason: an agent issuing Cypher through
+Startup spawns `Graph::materialize_edge_statistics` on a detached thread, as REST does and for the same reason: an agent issuing Cypher through
 `cypher_query` cannot ask for the optimizer's statistics, and a session outlives any one tool call. Backgrounding matters more here than in REST, because a
 stdio client launches one subprocess per session, so a synchronous scan would be repeated every session and would land on the initialize handshake where a
 client with a startup timeout can abandon it. `--no-warm-statistics` (or `ISSUNDB_NO_WARM_STATISTICS`) skips it. `issundb-cli` warms *synchronously* on
 every open, at launch and on `:open`, and takes the same flag: a visible pause before an interactive prompt is honest, and there is no readiness contract
-to break. `issundb-py` deliberately does not warm on construction, because a short script should not pay a scan it may never use; it exposes
+to break. That pause is worth knowing the size of: measured at 3.7 s on a 1 M-node, 13.9 M-edge graph, against a 4 ms open with the flag, so a `--script`
+run of a few statements should pass it. Those two numbers come from wall-clocking the process, since `:timer` covers Cypher statements only and neither the
+warm-up nor the open is one. `:timer` (or `--timer`) is how a *query* is timed: it measures execution alone, not the row formatting, so it is comparable with
+a timing taken around the same query in another surface. `issundb-py` deliberately does not warm on construction, because a short script should not pay a scan it may never use; it exposes
 `materialize_edge_statistics` and `materialize_property_columns` so a long-lived Python process asks for itself. A caller that measures IssunDB through the
 Python binding and does not call them is measuring the planner with its statistics unavailable, which is worth stating in any comparison, the same way an
 index-creation step is.

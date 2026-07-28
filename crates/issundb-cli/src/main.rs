@@ -87,6 +87,9 @@ struct State {
     /// Whether opening a database also builds its schema statistics. Carried on the
     /// state because `:open` mid-session must honor the launch flag.
     warm_statistics: bool,
+    /// Whether to report how long each statement took. Off by default, so ordinary
+    /// output stays unchanged; `:timer` and the `--timer` launch flag turn it on.
+    timer: bool,
 }
 
 impl State {
@@ -95,6 +98,7 @@ impl State {
         db_path: Option<PathBuf>,
         map_size_gb: usize,
         warm_statistics: bool,
+        timer: bool,
     ) -> Self {
         Self {
             graph,
@@ -104,6 +108,7 @@ impl State {
             map_size_gb,
             in_script: false,
             warm_statistics,
+            timer,
         }
     }
 }
@@ -155,6 +160,14 @@ struct Cli {
         value_parser = clap::builder::FalseyValueParser::new(),
     )]
     no_warm_statistics: bool,
+
+    /// Report how long each Cypher statement takes, as `:timer on` does from the prompt.
+    ///
+    /// Useful with `--script`, where there is no prompt to type `:timer` at. Cypher
+    /// statements only, and the reported time covers executing the statement, not
+    /// printing its rows.
+    #[arg(long)]
+    timer: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -200,6 +213,18 @@ enum ReplCommand {
     Save {
         /// Path to the output file
         file: PathBuf,
+    },
+
+    /// Report how long each Cypher statement takes, or stop reporting (e.g., `:timer on`)
+    ///
+    /// With no argument this toggles. Cypher statements only: the data and meta commands
+    /// print no timing. The reported time covers executing the statement, not formatting
+    /// or printing its rows, so it is comparable with a timing taken around the same
+    /// query in another surface.
+    #[command(name = ":timer")]
+    Timer {
+        /// `on` or `off`; omit to toggle
+        state: Option<String>,
     },
 
     /// List all current query parameters (e.g., `:params`)
@@ -619,6 +644,7 @@ Scripting and Parameters
   :run <file>                          Execute a script file (multi-line Cypher statements end with ;), stopping at the first failing command (e.g., :run ./setup.txt)
   :! / :shell <command>                Run a shell command (e.g., :! ls -l ./data); note that it's disabled inside :run scripts
   :save <file>                         Save the output of the next query to a file (e.g., :save ./output.txt)
+  :timer [on|off]                      Report how long each Cypher statement takes, execution only (omit the argument to toggle)
   :params                              List all current query parameters
   :set <name> <value>                  Set a query parameter (e.g., :set limit 10 or :set person {"name": "Alice"})
   :unset <name>                        Remove a query parameter (e.g., :unset limit)
@@ -833,7 +859,13 @@ fn main() {
         None => (None, None),
     };
 
-    let mut state = State::new(graph, db_path, cli.map_size_gb, !cli.no_warm_statistics);
+    let mut state = State::new(
+        graph,
+        db_path,
+        cli.map_size_gb,
+        !cli.no_warm_statistics,
+        cli.timer,
+    );
 
     // Batch mode: run the script then exit without starting the prompt. The
     // script may `:open` its own database, so a launch path is not required.
@@ -1109,6 +1141,9 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
             | ReplCommand::Params
             | ReplCommand::Set { .. }
             | ReplCommand::Unset { .. }
+            // A session setting, like the parameters above it: settable before opening
+            // anything, and it survives `:close` and the next `:open`.
+            | ReplCommand::Timer { .. }
             | ReplCommand::Save { .. }
             | ReplCommand::Restore { .. }
             | ReplCommand::Help
@@ -1191,6 +1226,21 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
         ReplCommand::Save { file } => {
             state.save_path = Some(file.clone());
             eprintln!("next query output will be saved to: {}", file.display());
+        }
+        ReplCommand::Timer { state: setting } => {
+            let on = match setting.as_deref() {
+                None => !state.timer,
+                Some(v) if v.eq_ignore_ascii_case("on") => true,
+                Some(v) if v.eq_ignore_ascii_case("off") => false,
+                Some(other) => {
+                    // `cli_eprintln!` flags the command as failed, so a `:run` script
+                    // stops here; `true` keeps the session itself alive.
+                    cli_eprintln!("expected 'on', 'off', or no argument, got '{other}'");
+                    return true;
+                }
+            };
+            state.timer = on;
+            eprintln!("timer {}", if on { "on" } else { "off" });
         }
         ReplCommand::Params => {
             if state.params.is_empty() {
@@ -2130,11 +2180,24 @@ fn run_cypher(state: &mut State, cypher: &str) {
     };
 
     let save_path = state.save_path.take();
+    // Timed around execution alone. Formatting and printing the rows is the CLI's work,
+    // not the engine's, and including it would make the number depend on how many rows
+    // land on a terminal. This is the only timed path, so the data and meta commands
+    // report nothing; extending it to `import-nodes` or `backup` would mean timing each
+    // of their handlers.
+    let started = std::time::Instant::now();
     let result = if state.params.is_empty() {
         g.query(cypher)
     } else {
         g.query_with_params(cypher, &state.params)
     };
+    let elapsed = started.elapsed();
+
+    // Reported for a failed statement too: a query that takes four seconds to fail is
+    // worth knowing about, and suppressing the number there would hide it.
+    if state.timer {
+        eprintln!("time: {}", format_duration(elapsed));
+    }
 
     match result {
         Err(e) => cli_eprintln!("{}", format!("error: {e}").red()),
@@ -2156,6 +2219,23 @@ fn run_cypher(state: &mut State, cypher: &str) {
                 print!("{output}");
             }
         }
+    }
+}
+
+/// Format a statement's duration for the `:timer` line.
+///
+/// Three significant figures worth of resolution at every scale a query lands on:
+/// microseconds for a point lookup, milliseconds for an ordinary query, and seconds
+/// once a whole-graph pass is involved. Printing one unit for all three either loses
+/// the point lookup in rounding or renders a five-second scan as a seven-digit number.
+fn format_duration(elapsed: std::time::Duration) -> String {
+    let micros = elapsed.as_micros();
+    if micros < 1_000 {
+        format!("{micros} µs")
+    } else if micros < 1_000_000 {
+        format!("{:.2} ms", micros as f64 / 1_000.0)
+    } else {
+        format!("{:.3} s", micros as f64 / 1_000_000.0)
     }
 }
 
@@ -3646,10 +3726,55 @@ mod tests {
         assert_eq!(value_to_key_string(&json!(null)), None);
     }
 
+    /// `:timer` must toggle, accept an explicit setting, and reject anything else
+    /// without killing the session.
+    #[test]
+    fn timer_command_toggles_and_validates() {
+        let mut state = State::new(None, None, 1, true, false);
+        assert!(!state.timer);
+
+        assert!(handle(&mut state, ":timer"));
+        assert!(state.timer, "no argument toggles");
+        assert!(handle(&mut state, ":timer"));
+        assert!(!state.timer);
+
+        assert!(handle(&mut state, ":timer on"));
+        assert!(state.timer);
+        assert!(
+            handle(&mut state, ":timer ON"),
+            "the setting is case-insensitive"
+        );
+        assert!(state.timer);
+        assert!(handle(&mut state, ":timer off"));
+        assert!(!state.timer);
+
+        // A bad argument leaves the setting alone and keeps the session running, while
+        // still flagging the command as failed so a script stops on it.
+        assert!(handle(&mut state, ":timer maybe"));
+        assert!(!state.timer);
+        assert!(
+            take_command_error(),
+            "a rejected setting must flag an error"
+        );
+    }
+
+    /// The duration format must keep three significant figures at every scale a query
+    /// lands on, since one unit for all of them either rounds a point lookup to zero or
+    /// prints a whole-graph scan as seven digits of milliseconds.
+    #[test]
+    fn durations_are_formatted_per_scale() {
+        use std::time::Duration;
+        assert_eq!(format_duration(Duration::from_micros(8)), "8 µs");
+        assert_eq!(format_duration(Duration::from_micros(999)), "999 µs");
+        assert_eq!(format_duration(Duration::from_micros(1_500)), "1.50 ms");
+        assert_eq!(format_duration(Duration::from_millis(472)), "472.00 ms");
+        assert_eq!(format_duration(Duration::from_micros(5_803_100)), "5.803 s");
+    }
+
     #[test]
     fn test_repl_commands_handle() {
         let temp = TempDir::new().unwrap();
-        let mut state = State::new(None, None, 1, true);
+        let mut state = State::new(None, None, 1, true, false);
 
         // 1. Open database via REPL command
         let open_cmd = format!(":open {}", temp.path().display());
@@ -3738,7 +3863,7 @@ mod tests {
     #[test]
     fn reopen_same_path_replaces_environment() {
         let temp = TempDir::new().unwrap();
-        let mut state = State::new(None, None, 1, true);
+        let mut state = State::new(None, None, 1, true, false);
         let open_cmd = format!(":open {}", temp.path().display());
         assert!(handle(&mut state, &open_cmd));
         assert!(handle(&mut state, "add-node Person {\"name\": \"Alice\"}"));
@@ -3838,7 +3963,7 @@ mod tests {
     #[test]
     fn test_import_edges_resolves_domain_keys() {
         let temp = TempDir::new().unwrap();
-        let mut state = State::new(None, None, 1, true);
+        let mut state = State::new(None, None, 1, true, false);
         assert!(handle(
             &mut state,
             &format!(":open {}", temp.path().display())
@@ -3890,7 +4015,7 @@ mod tests {
     #[test]
     fn test_import_nodes_loads_csv_columns_as_properties() {
         let temp = TempDir::new().unwrap();
-        let mut state = State::new(None, None, 1, true);
+        let mut state = State::new(None, None, 1, true, false);
         assert!(handle(
             &mut state,
             &format!(":open {}", temp.path().display())
@@ -3947,7 +4072,7 @@ mod tests {
         use std::sync::Arc;
 
         let temp = TempDir::new().unwrap();
-        let mut state = State::new(None, None, 1, true);
+        let mut state = State::new(None, None, 1, true, false);
         assert!(handle(
             &mut state,
             &format!(":open {}", temp.path().display())
@@ -4000,7 +4125,7 @@ mod tests {
         use std::sync::Arc;
 
         let temp = TempDir::new().unwrap();
-        let mut state = State::new(None, None, 1, true);
+        let mut state = State::new(None, None, 1, true, false);
         assert!(handle(
             &mut state,
             &format!(":open {}", temp.path().display())
@@ -4061,7 +4186,7 @@ mod tests {
     fn shell_escape_runs_interactively() {
         let temp = TempDir::new().unwrap();
         let marker = temp.path().join("ran");
-        let mut state = State::new(None, None, 1, true);
+        let mut state = State::new(None, None, 1, true, false);
 
         // At the interactive prompt the escape runs the command.
         assert!(handle(
@@ -4084,7 +4209,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut state = State::new(None, None, 1, true);
+        let mut state = State::new(None, None, 1, true, false);
         assert!(run_script(&mut state, script.to_str().unwrap()));
     }
 
@@ -4102,7 +4227,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut state = State::new(None, None, 1, true);
+        let mut state = State::new(None, None, 1, true, false);
         assert!(!run_script(&mut state, script.to_str().unwrap()));
 
         // The command after the failure never executed, so only Alice exists.
@@ -4113,7 +4238,7 @@ mod tests {
 
     #[test]
     fn script_run_fails_on_missing_file() {
-        let mut state = State::new(None, None, 1, true);
+        let mut state = State::new(None, None, 1, true, false);
         assert!(!run_script(&mut state, "/no/such/script.txt"));
     }
 
@@ -4124,7 +4249,7 @@ mod tests {
         let script = temp.path().join("setup.txt");
         std::fs::write(&script, format!(":! touch {}\n", marker.display())).unwrap();
 
-        let mut state = State::new(None, None, 1, true);
+        let mut state = State::new(None, None, 1, true, false);
         assert!(handle(&mut state, &format!(":run {}", script.display())));
 
         // The script line is parsed and dispatched, but the escape refuses to run

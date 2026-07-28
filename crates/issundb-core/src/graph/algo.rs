@@ -1086,7 +1086,7 @@ impl Graph {
         self.shortest_path_graphblas(src, dst)
     }
 
-    /// Iterative PageRank over the current CSR snapshot.
+    /// Iterative PageRank over the materialized PageRank matrix.
     ///
     /// The gate lives inside `page_rank_graphblas`, which is public and must be safe
     /// to call directly, so this is a plain delegation rather than a gate plus a call.
@@ -1094,44 +1094,32 @@ impl Graph {
         self.page_rank_graphblas(iterations, damping)
     }
 
-    /// Freshness gate for consumers that read the CSR snapshot: the native-CSR
-    /// algorithms (`dfs`, `strongly_connected_components`, `maximum_flow`,
-    /// `spanning_forest`, `shortest_path_top_k`, `all_paths`, `longest_path`,
-    /// `detect_cycle`) and the hybrid SpMV-plus-path-reconstruction algorithms
-    /// (`betweenness_centrality`, `harmonic_centrality`, `all_shortest_paths`). A
-    /// rebuild refreshes the snapshot and the boolean adjacency matrices, which is
-    /// everything these read; the two consumers of a weighted matrix use
-    /// [`Graph::ensure_weighted_matrices`] instead. Gated by the write generation,
-    /// so it catches edge-only drift, not just node-count changes.
+    /// Freshness gate behind every matrix consumer: refresh when the matrices are
+    /// missing, when they lag committed writes, when a structural delta is pending, or
+    /// when they were materialized without something in `kinds`.
     ///
-    /// Note that the weight-property algorithms here (`spanning_forest`,
-    /// `shortest_path_top_k`, `maximum_flow`) take a weight property as an argument
-    /// and read it from storage themselves, so they need no weighted matrix. Only
-    /// Dijkstra's fixed weight source comes from one.
-    pub(crate) fn ensure_csr_fresh(&self) -> Result<(), Error> {
-        self.ensure_matrices_fresh(MatrixTier::Adjacency)
-    }
-
-    /// [`Graph::ensure_csr_fresh`] for `page_rank`, the only consumer of
-    /// `page_rank_matrix`.
+    /// Reached through [`Graph::with_matrix_view`] and
+    /// [`Graph::with_matrix_view_at`] rather than called directly, since a consumer
+    /// needs the matched pair those return, not just the refresh. Who asks for what:
+    /// `MatrixKinds::ADJACENCY` covers the native-CSR algorithms (`dfs`,
+    /// `strongly_connected_components`, `maximum_flow`, `spanning_forest`,
+    /// `shortest_path_top_k`, `all_paths`, `longest_path`, `detect_cycle`,
+    /// `shortest_path`) and the hybrid SpMV-plus-path-reconstruction ones
+    /// (`betweenness_centrality`, `harmonic_centrality`, `all_shortest_paths`);
+    /// `PAGE_RANK` is `page_rank` alone; `WEIGHTED` is `shortest_path_dijkstra` alone.
+    /// Gated by the write generation, so it catches edge-only drift, not just
+    /// node-count changes.
     ///
-    /// Its own tier rather than the weighted one, because the PageRank matrix is
-    /// built from the CSR row boundaries and needs no weights. Sharing a tier with
-    /// the weight matrix made PageRank pay for a second full scan of `edges` and for
-    /// a 111 MB matrix it never reads.
-    pub(crate) fn ensure_page_rank_matrix(&self) -> Result<(), Error> {
-        self.ensure_matrices_fresh(MatrixTier::PageRank)
-    }
-
-    /// Shared body of the two matrix gates: refresh when the matrices are missing,
-    /// when they lag committed writes, when a structural delta is pending, or when
-    /// they were materialized below `tier`.
+    /// Note that the weight-*property* algorithms (`spanning_forest`,
+    /// `shortest_path_top_k`, `maximum_flow`) take a weight property as an argument and
+    /// read it from storage themselves, so they need no weight matrix. Only Dijkstra's
+    /// fixed weight source comes from one.
     ///
-    /// The last condition is what the tiering adds. A set materialized for an
-    /// adjacency consumer is current at its generation yet carries no weighted
-    /// matrices, so a generation check alone would hand a weighted consumer a set
-    /// without the matrix it reads.
-    fn ensure_matrices_fresh(&self, tier: MatrixTier) -> Result<(), Error> {
+    /// The `kinds` condition is separate from the generation on purpose. A set
+    /// materialized for an adjacency consumer is current at its generation yet carries
+    /// neither optional matrix, so a generation check alone would hand PageRank or
+    /// Dijkstra a set without the matrix it reads.
+    fn ensure_matrices_fresh(&self, kinds: MatrixKinds) -> Result<(), Error> {
         // Gate on the matrices generation, not the snapshot generation. The
         // weight and PageRank matrices have no incremental maintenance, so a
         // snapshot-only refresh (`ensure_snapshot_fresh`) or an adjacency-only
@@ -1158,7 +1146,7 @@ impl Graph {
         // covered throughout by the generation check alone; `ensure_matrix_view`,
         // which gates on the delta alone, is the one left uncovered there, which
         // is why the delta is recorded as early as the ordering allows.
-        if self.matrices_satisfy(tier)
+        if self.matrices_satisfy(kinds)
             && !self.csr_cache.matrices_are_stale()
             && !self.csr_cache.has_pending()
         {
@@ -1167,21 +1155,21 @@ impl Graph {
         let _maint = self.csr_cache.maintenance.lock();
         // Re-check under the lock: another maintenance pass may have refreshed
         // while this thread waited.
-        if !self.matrices_satisfy(tier)
+        if !self.matrices_satisfy(kinds)
             || self.csr_cache.matrices_are_stale()
             || self.csr_cache.has_pending()
         {
-            self.rebuild_csr_locked(tier)?;
+            self.rebuild_csr_locked(kinds)?;
         }
         Ok(())
     }
 
-    /// True when the materialized matrices exist and carry at least `tier`.
-    fn matrices_satisfy(&self, tier: MatrixTier) -> bool {
+    /// True when the materialized matrices exist and carry everything in `kinds`.
+    fn matrices_satisfy(&self, kinds: MatrixKinds) -> bool {
         self.matrices
             .read()
             .as_ref()
-            .is_some_and(|m| m.tier() >= tier)
+            .is_some_and(|m| m.kinds().contains(kinds))
     }
 
     /// Run `f` with a matched `(MatrixSet, CsrSnapshot)` pair, both reflecting the
@@ -1192,11 +1180,11 @@ impl Graph {
     /// pair a matrix with a longer snapshot and mis-map dense indices. The
     /// matrices and their snapshot are installed together, so equal node counts
     /// mean the pair agrees (a node deletion forces a full rebuild of both).
-    fn with_matrix_view<T>(
+    pub(in crate::graph) fn with_matrix_view<T>(
         &self,
         f: impl FnOnce(&MatrixSet, &CsrSnapshot) -> Result<T, Error>,
     ) -> Result<T, Error> {
-        self.with_matrix_view_at(MatrixTier::Adjacency, f)
+        self.with_matrix_view_at(MatrixKinds::ADJACENCY, f)
     }
 
     /// [`Graph::with_matrix_view`] for a consumer that reads a weighted matrix, so
@@ -1205,15 +1193,15 @@ impl Graph {
         &self,
         f: impl FnOnce(&MatrixSet, &CsrSnapshot) -> Result<T, Error>,
     ) -> Result<T, Error> {
-        self.with_matrix_view_at(MatrixTier::Weighted, f)
+        self.with_matrix_view_at(MatrixKinds::WEIGHTED, f)
     }
 
-    fn with_matrix_view_at<T>(
+    pub(in crate::graph) fn with_matrix_view_at<T>(
         &self,
-        tier: MatrixTier,
+        kinds: MatrixKinds,
         f: impl FnOnce(&MatrixSet, &CsrSnapshot) -> Result<T, Error>,
     ) -> Result<T, Error> {
-        self.ensure_matrices_fresh(tier)?;
+        self.ensure_matrices_fresh(kinds)?;
         // Fast path: read the pair without the maintenance lock and use it when the
         // node counts agree and the set carries the requested tier. The tier is
         // re-checked rather than assumed: the gate above guarantees it, and so does
@@ -1226,7 +1214,7 @@ impl Graph {
             let guard = self.matrices.read();
             if let Some(m) = guard.as_ref() {
                 let snap = self.csr_cache.snapshot.load();
-                if m.n_nodes == snap.dense_to_id.len() && m.tier() >= tier {
+                if m.n_nodes == snap.dense_to_id.len() && m.kinds().contains(kinds) {
                     return f(m, &snap);
                 }
             }
@@ -1236,7 +1224,7 @@ impl Graph {
         // still holding it, so no snapshot-only refresh can advance the snapshot
         // between the rebuild and the read.
         let _maint = self.csr_cache.maintenance.lock();
-        self.rebuild_csr_locked(tier)?;
+        self.rebuild_csr_locked(kinds)?;
         let guard = self.matrices.read();
         let m = guard
             .as_ref()
@@ -1318,7 +1306,7 @@ impl Graph {
         // tier; `rebuild_csr_locked` still keeps the weighted matrices when they are
         // already installed.
         if self.matrices.read().is_none() || self.csr_cache.pending_force_full() {
-            return self.rebuild_csr_locked(MatrixTier::Adjacency);
+            return self.rebuild_csr_locked(MatrixKinds::ADJACENCY);
         }
         // Cheap pre-check: skip the exclusive lock when nothing is pending.
         if !self.csr_cache.has_pending() {
@@ -1332,7 +1320,7 @@ impl Graph {
             // (rebuild_csr re-acquires the write lock) and rebuild from LMDB; the
             // taken delta is superseded.
             drop(guard);
-            return self.rebuild_csr_locked(MatrixTier::Adjacency);
+            return self.rebuild_csr_locked(MatrixKinds::ADJACENCY);
         }
         if delta.is_empty() {
             return Ok(());
@@ -1480,16 +1468,17 @@ impl Graph {
                     // Reading the tier before the snapshot build is what lets the
                     // build skip the weights scan for an adjacency-tier graph, so it
                     // happens here rather than after.
-                    let installed_tier = matrices.read().as_ref().map(|m| m.tier());
-                    let built = match installed_tier {
-                        Some(MatrixTier::Weighted) => CsrSnapshot::build_weighted(&storage),
-                        _ => CsrSnapshot::build(&storage),
+                    let installed_kinds = matrices.read().as_ref().map(|m| m.kinds());
+                    let built = if installed_kinds.is_some_and(|k| k.needs_weights()) {
+                        CsrSnapshot::build_weighted(&storage)
+                    } else {
+                        CsrSnapshot::build(&storage)
                     };
                     match built {
                         Ok(snap) => {
                             // No matrices yet: refresh the snapshot alone and leave
                             // the first materialization to whichever gate needs one.
-                            let Some(tier) = installed_tier else {
+                            let Some(kinds) = installed_kinds else {
                                 cache.install_snapshot(snap, built_gen);
                                 // Settle, do not cancel: cancelling leaves the
                                 // claimed dirty count in place, so the counter stays
@@ -1502,7 +1491,7 @@ impl Graph {
                             };
                             match MatrixSet::materialize(
                                 &snap,
-                                tier,
+                                kinds,
                                 thread_count.load(std::sync::atomic::Ordering::Acquire),
                             ) {
                                 Ok(m) => {
@@ -1511,6 +1500,12 @@ impl Graph {
                                     // sees a mismatched pair.
                                     let mut guard = matrices.write();
                                     *guard = Some(m);
+                                    // As in `rebuild_csr_locked`: the weight matrix is
+                                    // the only reader of the weights, and it has been
+                                    // built, so releasing them here keeps eight bytes
+                                    // per edge off the installed snapshot.
+                                    let mut snap = snap;
+                                    snap.edge_weight = None;
                                     let again = cache.install(snap, built_gen);
                                     drop(guard);
                                     if !again {
@@ -1518,12 +1513,25 @@ impl Graph {
                                     }
                                 }
                                 Err(_) => {
+                                    // The delta was emptied before the build, so
+                                    // failing here would leave `has_pending` false with
+                                    // neither the snapshot nor the matrices advanced,
+                                    // and `ensure_matrix_view` gates on the delta alone:
+                                    // every pure-adjacency consumer would then read
+                                    // pre-write state until the next write happened to
+                                    // re-trigger this pass. Requesting a full rebuild
+                                    // puts the work back on the queue instead.
+                                    cache.mark_force_full();
                                     cache.cancel_rebuild();
                                     break;
                                 }
                             }
                         }
                         Err(_) => {
+                            // See the sibling arm: the emptied delta has to be replaced
+                            // by a full-rebuild request, or the failure is invisible to
+                            // the gate that reads it.
+                            cache.mark_force_full();
                             cache.cancel_rebuild();
                             break;
                         }
@@ -1587,9 +1595,7 @@ impl Graph {
         let mut out = Vec::new();
         for result in iter {
             let (_, bytes) = result?;
-            let entry = AdjEntry::read_from_bytes(bytes)
-                .ok()
-                .ok_or(Error::Corrupt("AdjEntry value is not exactly 20 bytes"))?;
+            let entry = AdjEntry::decode_value(bytes)?;
             out.push(NeighborEntry {
                 node: entry.other,
                 edge: entry.edge_id,
@@ -2779,8 +2785,8 @@ mod triangle_cycle_count_tests {
         g3.add_edge(c, d, "R", &json!({})).unwrap();
         g3.bfs(c, 1).unwrap();
         assert_eq!(
-            g3.matrices.read().as_ref().map(|m| m.tier()),
-            Some(crate::matrices::MatrixTier::Adjacency)
+            g3.matrices.read().as_ref().map(|m| m.kinds()),
+            Some(crate::matrices::MatrixKinds::ADJACENCY)
         );
         let g4 = g3.clone();
         let ranks = within_deadline(
@@ -2790,8 +2796,8 @@ mod triangle_cycle_count_tests {
         .expect("PageRank must upgrade the tier, not fail");
         assert_eq!(ranks.len(), 2);
         assert_eq!(
-            g3.matrices.read().as_ref().map(|m| m.tier()),
-            Some(crate::matrices::MatrixTier::PageRank),
+            g3.matrices.read().as_ref().map(|m| m.kinds()),
+            Some(crate::matrices::MatrixKinds::PAGE_RANK),
             "PageRank must not pull in the weight matrix it never reads"
         );
     }
@@ -2819,8 +2825,8 @@ mod triangle_cycle_count_tests {
         // An adjacency-tier consumer materializes first.
         assert!(!g.bfs(a, 2).unwrap().is_empty());
         assert_eq!(
-            g.matrices.read().as_ref().map(|m| m.tier()),
-            Some(crate::matrices::MatrixTier::Adjacency),
+            g.matrices.read().as_ref().map(|m| m.kinds()),
+            Some(crate::matrices::MatrixKinds::ADJACENCY),
             "bfs must not have paid for the weighted matrices"
         );
 
@@ -2831,8 +2837,8 @@ mod triangle_cycle_count_tests {
         assert_eq!(p.total_weight, 2.0, "the weights must be the stored ones");
         assert_eq!(p.nodes, vec![a, c, b]);
         assert_eq!(
-            g.matrices.read().as_ref().map(|m| m.tier()),
-            Some(crate::matrices::MatrixTier::Weighted),
+            g.matrices.read().as_ref().map(|m| m.kinds()),
+            Some(crate::matrices::MatrixKinds::WEIGHTED),
             "the weighted consumer upgraded the tier"
         );
 
@@ -2842,9 +2848,9 @@ mod triangle_cycle_count_tests {
         g.add_edge(b, c, "R", &json!({ "weight": 1.0 })).unwrap();
         assert!(!g.bfs(a, 2).unwrap().is_empty());
         assert_eq!(
-            g.matrices.read().as_ref().map(|m| m.tier()),
-            Some(crate::matrices::MatrixTier::Weighted),
-            "an adjacency consumer must not downgrade an installed weighted tier"
+            g.matrices.read().as_ref().map(|m| m.kinds()),
+            Some(crate::matrices::MatrixKinds::WEIGHTED),
+            "an adjacency consumer must not strip an installed weight matrix"
         );
     }
 

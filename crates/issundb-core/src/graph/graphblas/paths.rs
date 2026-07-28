@@ -3,30 +3,38 @@ use super::*;
 impl Graph {
     /// Unweighted SSSP from `src` to `dst` via MinPlus SpMV, with path reconstruction
     /// from the LMDB in-adjacency once the destination is reached.
+    /// Gates and validates, then delegates. This is public, so it can be called on a
+    /// graph with no materialized matrices; going through
+    /// [`Graph::with_matrix_view_at`] is what supplies a matrix set and a snapshot that
+    /// agree on their dense mapping, and what keeps the gate out of a `match` on a live
+    /// read guard (recursing there deadlocks the calling thread against itself, since
+    /// the rebuild takes the matrices write lock and `parking_lot::RwLock` is not
+    /// reentrant).
     #[doc(hidden)]
     pub fn shortest_path_graphblas(
         &self,
         src: NodeId,
         dst: NodeId,
     ) -> Result<Option<Vec<NodeId>>, Error> {
-        use issundb_graphblas::{Descriptor, Monoid, Semiring, Vector, ewise_add, mxv};
-
         if src == dst {
             return Ok(Some(vec![src]));
         }
+        self.with_matrix_view(|m, snap| self.shortest_path_graphblas_inner(m, snap, src, dst))
+    }
 
-        // Gate before taking the read guard. This method is public, so it can be
-        // called on a graph with no materialized matrices; recursing into the gated
-        // `shortest_path` from inside a `match` on a live read guard, as this did,
-        // deadlocks the calling thread against itself, since the rebuild takes the
-        // matrices write lock and `parking_lot::RwLock` is not reentrant.
-        self.ensure_csr_fresh()?;
+    fn shortest_path_graphblas_inner(
+        &self,
+        m: &MatrixSet,
+        snap: &CsrSnapshot,
+        src: NodeId,
+        dst: NodeId,
+    ) -> Result<Option<Vec<NodeId>>, Error> {
+        use issundb_graphblas::{Descriptor, Monoid, Semiring, Vector, ewise_add, mxv};
 
-        let guard = self.matrices.read();
-        let m = guard
-            .as_ref()
-            .ok_or(Error::Corrupt("matrices not initialized"))?;
-        let snap = self.csr_cache.snapshot.load();
+        // Every index below is used against `m`-sized buffers, and the caller's pair
+        // check guarantees the snapshot's mapping has the same length, so this reads the
+        // snapshot's like every other algorithm in this file. Mixing the two mappings
+        // inside one function is the thing to avoid.
         let n = m.n_nodes;
 
         let src_dense = match snap.id_to_dense.get(&src) {
@@ -154,12 +162,15 @@ impl Graph {
             }));
         }
 
-        // Present because this runs behind `MatrixTier::Weighted`; the other tier
-        // does not build it, so reaching here without one is a gating mistake
-        // rather than a data condition.
-        let weight_matrix = m.weight_matrix.as_ref().ok_or(Error::Corrupt(
-            "Dijkstra needs the weighted matrix tier; the matrices were materialized without it",
-        ))?;
+        // Present because this runs behind `MatrixKinds::WEIGHTED`. A set materialized
+        // without it is a gating mistake rather than a data condition, which is why it
+        // is reported and not worked around.
+        let weight_matrix = m.weight_matrix.as_ref().ok_or_else(|| {
+            Error::InvalidArgument(
+                "Dijkstra needs the weight matrix; the matrices were materialized without it"
+                    .to_string(),
+            )
+        })?;
 
         let n = m.n_nodes;
         let src_dense = match snap.id_to_dense.get(&src) {

@@ -55,6 +55,7 @@ The REPL supports meta commands (prefixed with `:`) to manage the session, take 
 | `:run`            | `:run /path/to/script.cypher`                   | Execute a script file; meta and data commands are one line each, and a Cypher statement may span lines and ends with `;`. |
 | `:!`              | `:! ls -la`                                     | Run a shell command from the REPL (alias `:shell`); rejected inside a script file.                                        |
 | `:save`           | `:save /path/to/output.txt`                     | Direct the output of the next query to a file.                                                                            |
+| `:timer`          | `:timer on`                                     | Report how long each Cypher statement takes, execution only; omit the argument to toggle. Also `--timer` at launch.        |
 | `:params`         | `:params`                                       | List all current query parameters.                                                                                        |
 | `:set`            | `:set limit 10`                                 | Set a query parameter value (JSON or string).                                                                             |
 | `:unset`          | `:unset limit`                                  | Remove a query parameter.                                                                                                 |

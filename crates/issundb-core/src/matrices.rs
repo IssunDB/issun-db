@@ -8,36 +8,71 @@ use ahash::AHashMap;
 
 use crate::{csr::CsrSnapshot, error::Error, schema::NodeId};
 
-/// How much of a [`MatrixSet`] a consumer needs materialized.
+/// Which of a [`MatrixSet`]'s optional matrices a consumer needs materialized.
 ///
-/// Three tiers rather than two, because the two extra matrices have different
-/// prerequisites and exactly one consumer each. `page_rank_matrix` is derived from
-/// the CSR out-degrees alone, so it needs no weights; `weight_matrix` needs a
-/// per-edge weight, which is a second full scan of `edges` decoding every record
-/// and its property blob. Collapsing the two into one tier made PageRank pay for
-/// that scan and for a 111 MB matrix it never reads.
+/// A set rather than a ladder, because the two optional matrices are independent:
+/// each has exactly one consumer, and neither implies the other. `page_rank_matrix`
+/// is derived from the CSR row boundaries and is read only by `page_rank`;
+/// `weight_matrix` needs a per-edge weight, which costs a second full scan of
+/// `edges` decoding every record and its property blob, and is read only by
+/// `shortest_path_dijkstra`. An ordering would make each of them imply the cheaper
+/// one, so asking for either would build both, which is the coupling this exists to
+/// avoid: it cost PageRank a scan it does not need, and Dijkstra a 167 MB matrix it
+/// never reads.
 ///
-/// The tiers form a ladder, so a consumer's requirement is a `>=` test and two
-/// requirements combine with `max`.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
-pub enum MatrixTier {
+/// The two boolean adjacency matrices are not optional and so are not represented
+/// here; [`MatrixKinds::ADJACENCY`] is the empty set.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct MatrixKinds {
+    page_rank: bool,
+    weight: bool,
+}
+
+impl MatrixKinds {
     /// `adjacency` and `adjacency_t` only. What traversal, the path searches, the
     /// centralities, and the components algorithms read.
-    Adjacency,
-    /// Adds `page_rank_matrix`, which only `page_rank` reads. Built from the CSR
-    /// row boundaries, so an unweighted snapshot is enough.
-    PageRank,
-    /// Adds `weight_matrix`, which only `shortest_path_dijkstra` reads. Requires a
-    /// snapshot built by [`CsrSnapshot::build_weighted`].
-    Weighted,
+    pub const ADJACENCY: Self = Self {
+        page_rank: false,
+        weight: false,
+    };
+    /// Adds `page_rank_matrix`. An unweighted snapshot serves it.
+    pub const PAGE_RANK: Self = Self {
+        page_rank: true,
+        weight: false,
+    };
+    /// Adds `weight_matrix`. Requires a snapshot built by
+    /// [`CsrSnapshot::build_weighted`].
+    pub const WEIGHTED: Self = Self {
+        page_rank: false,
+        weight: true,
+    };
+
+    /// Whether this set covers everything `needed` asks for.
+    pub fn contains(self, needed: Self) -> bool {
+        (self.page_rank || !needed.page_rank) && (self.weight || !needed.weight)
+    }
+
+    /// The smallest set covering both, used to keep a rebuild from stripping a
+    /// matrix some other consumer already asked for.
+    pub fn union(self, other: Self) -> Self {
+        Self {
+            page_rank: self.page_rank || other.page_rank,
+            weight: self.weight || other.weight,
+        }
+    }
+
+    /// Whether a snapshot for this set must carry per-edge weights.
+    pub fn needs_weights(self) -> bool {
+        self.weight
+    }
 }
 
 /// Set of materialized adjacency matrices for all edge types.
 ///
-/// Owns the GraphBLAS context and, by [`MatrixTier`]:
+/// Owns the GraphBLAS context and, by [`MatrixKinds`]:
 /// - A combined integer adjacency matrix and its transpose, for BFS and SSSP SpMV.
-/// - From [`MatrixTier::PageRank`] up, a column-stochastic float matrix for PageRank SpMV.
-/// - At [`MatrixTier::Weighted`], a weighted adjacency matrix for Dijkstra.
+/// - With [`MatrixKinds::PAGE_RANK`], a column-stochastic float matrix for PageRank SpMV.
+/// - With [`MatrixKinds::WEIGHTED`], a weighted adjacency matrix for Dijkstra.
 pub struct MatrixSet {
     pub context: Arc<Context>,
     /// Combined outgoing adjacency: `A[i][j] = 1` for any edge i→j.
@@ -45,16 +80,16 @@ pub struct MatrixSet {
     /// Combined transpose adjacency: `A^T[i][j] = 1` if edge j→i exists.
     pub adjacency_t: Matrix<i32>,
     /// Column-stochastic matrix: `M[j][i] = 1 / out_degree(i)` for each edge i→j.
-    /// `None` below [`MatrixTier::PageRank`].
+    /// `None` without [`MatrixKinds::PAGE_RANK`].
     pub page_rank_matrix: Option<Matrix<f32>>,
-    /// Weighted adjacency: `W[i][j] = weight` for each edge i→j. `None` below
-    /// [`MatrixTier::Weighted`].
+    /// Weighted adjacency: `W[i][j] = weight` for each edge i→j. `None` without
+    /// [`MatrixKinds::WEIGHTED`].
     pub weight_matrix: Option<Matrix<f64>>,
-    /// The tier this set was materialized at, recorded rather than inferred from
-    /// which matrices are present. Inferring it made the tier a function of one of
-    /// the two `Option`s it governs, so a set with a weight matrix but no PageRank
-    /// matrix would have reported `Weighted` and then failed when PageRank read it.
-    tier: MatrixTier,
+    /// Which optional matrices this set was materialized with, recorded rather than
+    /// inferred from which are present. Inferring it made the answer a function of one
+    /// of the two `Option`s it governs, so a set carrying a weight matrix but no
+    /// PageRank matrix would have claimed to cover both and then failed at the read.
+    kinds: MatrixKinds,
     pub n_nodes: usize,
     /// Dense-index → node id, mirroring the CSR snapshot the matrices were built
     /// from. Owned here so the matrix view is self-contained and can be extended
@@ -65,7 +100,7 @@ pub struct MatrixSet {
 }
 
 impl MatrixSet {
-    /// Materialize the sparse matrices of `tier` from the CSR snapshot.
+    /// Materialize the boolean adjacency matrices plus whatever `kinds` asks for.
     ///
     /// Every matrix is built over the same coordinates, one entry per edge, so the
     /// two index arrays are built once and handed to each build with their roles
@@ -79,7 +114,7 @@ impl MatrixSet {
     /// build's reducer.
     pub fn materialize(
         csr: &CsrSnapshot,
-        tier: MatrixTier,
+        kinds: MatrixKinds,
         programmatic_threads: i32,
     ) -> Result<Self, Error> {
         let context = Context::init_default().map_err(|e| Error::GraphBLAS(e.to_string()))?;
@@ -114,7 +149,7 @@ impl MatrixSet {
         // builds. `GxB_Matrix_build_Scalar` builds from a single scalar and would
         // remove it, at the cost of a `GrB_Scalar` wrapper this crate does not have
         // yet. Left as a known remaining cost rather than an oversight.
-        let ones = vec![1i32; nnz];
+        let ones = vec![1i32; rows.len()];
         let adjacency = Matrix::<i32>::from_arrays(
             context.clone(),
             n_nodes,
@@ -137,27 +172,53 @@ impl MatrixSet {
         .map_err(gb)?;
         drop(ones);
 
-        let page_rank_matrix = if tier >= MatrixTier::PageRank {
-            // M[col][i] = 1/out_deg(i) so that M * r gives incoming rank. Plus sums
-            // the contributions of parallel edges i→j, which is what the transition
-            // probability of the pair is. Note this reads only the row boundaries,
-            // which is why it does not belong to the weighted tier.
-            let mut pr_vals: Vec<f32> = Vec::with_capacity(nnz);
+        let page_rank_matrix = if kinds.contains(MatrixKinds::PAGE_RANK) {
+            // M[col][i] = 1/out_deg(i) so that M * r gives incoming rank. Note this
+            // reads only the row boundaries, which is why it is independent of the
+            // weight matrix.
+            //
+            // Parallel edges i→j contribute once each, so the pair's transition
+            // probability is their count over the out-degree. That count is taken here
+            // rather than left to `Reducer::Plus`, because `GrB_Matrix_build` may combine
+            // duplicates in any order and `f32` addition is not associative, which would
+            // make the ranks depend on the thread count. One multiply per distinct pair
+            // is exact and order-independent, and it emits fewer entries besides.
+            let mut pr_rows: Vec<u64> = Vec::new();
+            let mut pr_cols: Vec<u64> = Vec::new();
+            let mut pr_vals: Vec<f32> = Vec::new();
+            let mut row_targets: Vec<u32> = Vec::new();
             for i in 0..n_nodes {
                 let (start, end) = (csr.row_ptr[i], csr.row_ptr[i + 1]);
+                if start == end {
+                    continue;
+                }
                 let out_deg = (end - start) as f32;
-                for _ in start..end {
-                    pr_vals.push(1.0f32 / out_deg);
+                // Sorted so parallel edges to one destination sit together; the CSR row
+                // is ordered by edge id, not by destination.
+                row_targets.clear();
+                row_targets.extend_from_slice(&csr.col_idx[start..end]);
+                row_targets.sort_unstable();
+                let mut k = 0;
+                while k < row_targets.len() {
+                    let col = row_targets[k];
+                    let mut run = 1;
+                    while k + run < row_targets.len() && row_targets[k + run] == col {
+                        run += 1;
+                    }
+                    pr_rows.push(col as u64);
+                    pr_cols.push(i as u64);
+                    pr_vals.push(run as f32 / out_deg);
+                    k += run;
                 }
             }
             let m = Matrix::<f32>::from_arrays(
                 context.clone(),
                 n_nodes,
                 n_nodes,
-                &cols,
-                &rows,
+                &pr_rows,
+                &pr_cols,
                 &pr_vals,
-                Reducer::Plus,
+                Reducer::First,
             )
             .map_err(gb)?;
             Some(m)
@@ -165,7 +226,7 @@ impl MatrixSet {
             None
         };
 
-        let weight_matrix = if tier >= MatrixTier::Weighted {
+        let weight_matrix = if kinds.contains(MatrixKinds::WEIGHTED) {
             let weights = csr.edge_weight.as_deref().ok_or_else(|| {
                 Error::InvalidArgument(
                     "the weighted matrix tier needs a snapshot built by \
@@ -205,16 +266,16 @@ impl MatrixSet {
             adjacency_t,
             page_rank_matrix,
             weight_matrix,
-            tier,
+            kinds,
             n_nodes,
             dense_to_id: csr.dense_to_id.clone(),
             id_to_dense: csr.id_to_dense.clone(),
         })
     }
 
-    /// The tier this set was materialized at.
-    pub fn tier(&self) -> MatrixTier {
-        self.tier
+    /// Which optional matrices this set carries.
+    pub fn kinds(&self) -> MatrixKinds {
+        self.kinds
     }
 
     /// Apply a structural delta to the cached matrices in place, instead of
@@ -311,14 +372,14 @@ mod tests {
     fn test_num_threads_env_override() {
         // Test default execution (should default to 1 thread)
         let csr = CsrSnapshot::empty();
-        let ms_default = MatrixSet::materialize(&csr, MatrixTier::Adjacency, 0).unwrap();
+        let ms_default = MatrixSet::materialize(&csr, MatrixKinds::ADJACENCY, 0).unwrap();
         assert_eq!(ms_default.n_nodes, 0);
 
         // Test explicit override via environment variable
         unsafe {
             std::env::set_var("ISSUNDB_NUM_THREADS", "2");
         }
-        let ms_override = MatrixSet::materialize(&csr, MatrixTier::Adjacency, 0).unwrap();
+        let ms_override = MatrixSet::materialize(&csr, MatrixKinds::ADJACENCY, 0).unwrap();
         unsafe {
             std::env::remove_var("ISSUNDB_NUM_THREADS");
         }
@@ -328,23 +389,24 @@ mod tests {
         unsafe {
             std::env::set_var("ISSUNDB_NUM_THREADS", "2");
         }
-        let ms_prog = MatrixSet::materialize(&csr, MatrixTier::Adjacency, 4).unwrap();
+        let ms_prog = MatrixSet::materialize(&csr, MatrixKinds::ADJACENCY, 4).unwrap();
         unsafe {
             std::env::remove_var("ISSUNDB_NUM_THREADS");
         }
         assert_eq!(ms_prog.n_nodes, 0);
     }
 
-    /// Each tier must build exactly its own matrices. What a tier declines to build
-    /// is the whole saving, so a set that quietly carried all four would be
-    /// indistinguishable from a correct one except in memory.
+    /// Each request must build exactly what it asked for and nothing else. What a
+    /// request declines to build is the whole saving, so a set that quietly carried all
+    /// four matrices would be indistinguishable from a correct one except in memory.
     ///
-    /// The PageRank tier is the case worth pinning: it must build its matrix from an
-    /// *unweighted* snapshot, because that matrix is derived from the row boundaries
-    /// alone. If it ever required weights again, PageRank would be paying for a
-    /// second full scan of `edges` and for a weight matrix it never reads.
+    /// Both directions are pinned here, because an ordering between the two optional
+    /// matrices would silently satisfy one of them. `PAGE_RANK` must build from an
+    /// *unweighted* snapshot, since that matrix comes from the row boundaries alone, and
+    /// `WEIGHTED` must not drag the PageRank matrix along: 167 MB on a 13.9 M-edge graph
+    /// that Dijkstra never reads.
     #[test]
-    fn each_tier_builds_exactly_its_own_matrices() {
+    fn each_request_builds_exactly_the_matrices_it_asked_for() {
         let dir = tempfile::TempDir::new().unwrap();
         let g = crate::Graph::open(dir.path(), 1).unwrap();
         let a = g.add_node("n", &()).unwrap();
@@ -352,13 +414,15 @@ mod tests {
         g.add_edge(a, b, "t", &()).unwrap();
 
         let plain = CsrSnapshot::build(&g.storage).unwrap();
-        let adjacency = MatrixSet::materialize(&plain, MatrixTier::Adjacency, 1).unwrap();
-        assert_eq!(adjacency.tier(), MatrixTier::Adjacency);
+        let adjacency = MatrixSet::materialize(&plain, MatrixKinds::ADJACENCY, 1).unwrap();
+        assert_eq!(adjacency.kinds(), MatrixKinds::ADJACENCY);
         assert!(adjacency.page_rank_matrix.is_none());
         assert!(adjacency.weight_matrix.is_none());
+        assert_eq!(adjacency.adjacency.nvals().unwrap(), 1);
+        assert_eq!(adjacency.adjacency_t.nvals().unwrap(), 1);
 
-        let pr = MatrixSet::materialize(&plain, MatrixTier::PageRank, 1).unwrap();
-        assert_eq!(pr.tier(), MatrixTier::PageRank);
+        let pr = MatrixSet::materialize(&plain, MatrixKinds::PAGE_RANK, 1).unwrap();
+        assert_eq!(pr.kinds(), MatrixKinds::PAGE_RANK);
         assert_eq!(
             pr.page_rank_matrix.as_ref().unwrap().nvals().unwrap(),
             1,
@@ -366,50 +430,39 @@ mod tests {
         );
         assert!(
             pr.weight_matrix.is_none(),
-            "the PageRank tier must not build the weight matrix"
+            "a PageRank request must not build the weight matrix"
         );
 
         let weighted_snap = CsrSnapshot::build_weighted(&g.storage).unwrap();
-        let weighted = MatrixSet::materialize(&weighted_snap, MatrixTier::Weighted, 1).unwrap();
-        assert_eq!(weighted.tier(), MatrixTier::Weighted);
-        assert!(weighted.page_rank_matrix.is_some());
+        let weighted = MatrixSet::materialize(&weighted_snap, MatrixKinds::WEIGHTED, 1).unwrap();
+        assert_eq!(weighted.kinds(), MatrixKinds::WEIGHTED);
+        assert!(
+            weighted.page_rank_matrix.is_none(),
+            "a weighted request must not build the PageRank matrix"
+        );
         assert_eq!(weighted.weight_matrix.unwrap().nvals().unwrap(), 1);
+
+        // And a consumer that wants both gets both from one materialization.
+        let both = MatrixSet::materialize(
+            &weighted_snap,
+            MatrixKinds::PAGE_RANK.union(MatrixKinds::WEIGHTED),
+            1,
+        )
+        .unwrap();
+        assert!(both.page_rank_matrix.is_some());
+        assert!(both.weight_matrix.is_some());
+        assert!(both.kinds().contains(MatrixKinds::PAGE_RANK));
+        assert!(both.kinds().contains(MatrixKinds::WEIGHTED));
     }
 
-    /// One graph, both ends of the ladder: the adjacency tier must build the two
-    /// boolean matrices and nothing else, and the weighted tier must add the other
-    /// two.
-    #[test]
-    fn adjacency_tier_builds_two_matrices_and_weighted_builds_four() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let g = crate::Graph::open(dir.path(), 1).unwrap();
-        let a = g.add_node("n", &()).unwrap();
-        let b = g.add_node("n", &()).unwrap();
-        g.add_edge(a, b, "t", &()).unwrap();
-
-        let plain = CsrSnapshot::build(&g.storage).unwrap();
-        let adjacency = MatrixSet::materialize(&plain, MatrixTier::Adjacency, 1).unwrap();
-        assert_eq!(adjacency.tier(), MatrixTier::Adjacency);
-        assert!(adjacency.page_rank_matrix.is_none());
-        assert!(adjacency.weight_matrix.is_none());
-        assert_eq!(adjacency.adjacency.nvals().unwrap(), 1);
-        assert_eq!(adjacency.adjacency_t.nvals().unwrap(), 1);
-
-        let weighted_snap = CsrSnapshot::build_weighted(&g.storage).unwrap();
-        let weighted = MatrixSet::materialize(&weighted_snap, MatrixTier::Weighted, 1).unwrap();
-        assert_eq!(weighted.tier(), MatrixTier::Weighted);
-        assert_eq!(weighted.page_rank_matrix.unwrap().nvals().unwrap(), 1);
-        assert_eq!(weighted.weight_matrix.unwrap().nvals().unwrap(), 1);
-    }
-
-    /// The weighted tier needs weights, so asking for it with a snapshot that
+    /// The weight matrix needs weights, so asking for it with a snapshot that
     /// carries none is a gating mistake and must be reported rather than silently
     /// producing a matrix of default weights, which would make every path cost 1.
     #[test]
     fn weighted_tier_rejects_a_snapshot_without_weights() {
         let csr = CsrSnapshot::empty();
-        let Err(err) = MatrixSet::materialize(&csr, MatrixTier::Weighted, 1) else {
-            panic!("no weights, no weighted tier");
+        let Err(err) = MatrixSet::materialize(&csr, MatrixKinds::WEIGHTED, 1) else {
+            panic!("no weights, no weight matrix");
         };
         // `InvalidArgument`, not `Corrupt`: this is a caller passing a tier the
         // snapshot cannot serve, and `Corrupt` tells an operator to restore a backup.
@@ -436,7 +489,7 @@ mod tests {
             .unwrap();
 
         let snap = CsrSnapshot::build_weighted(&g.storage).unwrap();
-        let m = MatrixSet::materialize(&snap, MatrixTier::Weighted, 1).unwrap();
+        let m = MatrixSet::materialize(&snap, MatrixKinds::WEIGHTED, 1).unwrap();
         let weights = m.weight_matrix.unwrap().triples().unwrap();
         assert_eq!(
             weights.len(),

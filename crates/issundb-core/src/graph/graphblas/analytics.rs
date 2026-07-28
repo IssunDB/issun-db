@@ -3,6 +3,13 @@ use super::*;
 impl Graph {
     /// PageRank via iterative SpMV over the column-stochastic matrix.
     ///
+    /// Public, so it gates and validates before reading: [`Graph::with_matrix_view_at`]
+    /// materializes the PageRank matrix if it is missing and hands over a matrix set and
+    /// a snapshot whose dense mappings agree. That agreement is what keeps a node
+    /// `apply_delta` appended to the matrix mapping, but gave no matrix row, out of the
+    /// result, where it would otherwise be reported with a bare teleport value that
+    /// looks like a genuine dangling node.
+    ///
     /// Each iteration computes `raw = M * rank` using PlusTimes, then applies the
     /// damping formula `rank[i] = d * raw[i] + (1 - d) / n` in Rust. A node with
     /// no incoming edges receives only the teleportation term. The rank mass of
@@ -15,27 +22,29 @@ impl Graph {
         iterations: u32,
         damping: f32,
     ) -> Result<HashMap<NodeId, f32>, Error> {
+        self.with_matrix_view_at(MatrixKinds::PAGE_RANK, |m, snap| {
+            self.page_rank_graphblas_inner(m, snap, iterations, damping)
+        })
+    }
+
+    fn page_rank_graphblas_inner(
+        &self,
+        m: &MatrixSet,
+        snap: &CsrSnapshot,
+        iterations: u32,
+        damping: f32,
+    ) -> Result<HashMap<NodeId, f32>, Error> {
         use issundb_graphblas::{Descriptor, Reducer, Semiring, Vector, mxv};
 
-        // Gate before taking the read guard, not after. This method is public, so it
-        // can be called on a graph whose matrices are absent or were materialized
-        // below `MatrixTier::PageRank`, and both cases need the same thing: a
-        // rebuild. Doing that from inside a `match` on a live read guard, as this
-        // did, deadlocks the calling thread against itself, because the rebuild takes
-        // the matrices write lock and `parking_lot::RwLock` is neither reentrant nor
-        // aware that this thread already holds a read.
-        self.ensure_page_rank_matrix()?;
-
-        let guard = self.matrices.read();
-        let m = guard
-            .as_ref()
-            .ok_or(Error::Corrupt("matrices not initialized"))?;
-        let snap = self.csr_cache.snapshot.load();
-        // Present because the gate above materialized at least this tier.
-        let page_rank_matrix = m
-            .page_rank_matrix
-            .as_ref()
-            .ok_or(Error::Corrupt("PageRank matrix not materialized"))?;
+        // Present because the caller gated on `PAGE_RANK`. A set materialized without it
+        // is a gating mistake, which this tree reports as `InvalidArgument`; `Corrupt`
+        // would tell an operator to restore a backup.
+        let page_rank_matrix = m.page_rank_matrix.as_ref().ok_or_else(|| {
+            Error::InvalidArgument(
+                "PageRank needs the PageRank matrix; the matrices were materialized without it"
+                    .to_string(),
+            )
+        })?;
         let n = m.n_nodes;
         if n == 0 {
             return Ok(HashMap::new());

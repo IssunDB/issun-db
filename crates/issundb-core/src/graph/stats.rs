@@ -43,7 +43,6 @@
 //! consequences, and these three readers do not share a consequence.
 
 use ahash::AHashMap;
-use zerocopy::FromBytes;
 
 use crate::{
     error::Error,
@@ -183,9 +182,7 @@ impl EdgeFanout {
                 cached_src = Some(src);
                 src_labels = node_labels.get(&src).map(Vec::as_slice).unwrap_or_default();
             }
-            let entry = AdjEntry::read_from_bytes(bytes)
-                .ok()
-                .ok_or(Error::Corrupt("AdjEntry value is not exactly 20 bytes"))?;
+            let entry = AdjEntry::decode_value(bytes)?;
             // Copied out before use: `AdjEntry` is `repr(packed)`, so borrowing a
             // field to pass it by reference is not allowed.
             let edge_type = entry.edge_type;
@@ -631,9 +628,7 @@ impl Graph {
                     return Ok(None);
                 }
                 budget -= 1;
-                let entry = AdjEntry::read_from_bytes(bytes)
-                    .ok()
-                    .ok_or(Error::Corrupt("AdjEntry value is not exactly 20 bytes"))?;
+                let entry = AdjEntry::decode_value(bytes)?;
                 if entry.edge_type != rel_type {
                     continue;
                 }

@@ -77,6 +77,22 @@ pub struct AdjEntry {
     pub edge_id: EdgeId,   // 8 bytes
 }
 
+impl AdjEntry {
+    /// Parse one raw `DUPFIXED` duplicate value.
+    ///
+    /// Lives here because the size in the error message is this struct's layout
+    /// invariant: three call sites used to repeat both the parse and the number, so a
+    /// layout change had to be chased through their string literals.
+    pub fn decode_value(bytes: &[u8]) -> Result<Self, crate::error::Error> {
+        use zerocopy::FromBytes;
+        Self::read_from_bytes(bytes)
+            .ok()
+            .ok_or(crate::error::Error::Corrupt(
+                "AdjEntry value is not exactly 20 bytes",
+            ))
+    }
+}
+
 impl DeepSizeOf for AdjEntry {
     fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
         // AdjEntry is a fixed-size packed struct of primitives: no heap allocations.
