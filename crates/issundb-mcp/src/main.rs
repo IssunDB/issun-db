@@ -69,6 +69,22 @@ struct Args {
     /// proxy forwards under.
     #[arg(long = "allowed-host")]
     allowed_hosts: Vec<String>,
+
+    /// Skip the schema-statistics warm-up at startup. The warm-up is one pass over
+    /// the label index and the adjacency, and it is what makes the query optimizer's
+    /// expand-ratio estimates and type-inference pruning available: nothing builds
+    /// them as a side effect of a query. Skip it when a client that launches this
+    /// server per session needs it responsive sooner than it needs good plans.
+    // `FalseyValueParser` because a bare `#[arg(long, env)]` on a bool parses the
+    // environment value with clap's strict bool parser, so the `=1`/`=yes`/`=on` that
+    // container env blocks routinely set is a hard startup failure rather than a
+    // toggle. Only `0`, `false`, `no`, `off`, and empty read as false here.
+    #[arg(
+        long,
+        env = "ISSUNDB_NO_WARM_STATISTICS",
+        value_parser = clap::builder::FalseyValueParser::new(),
+    )]
+    no_warm_statistics: bool,
 }
 
 /// Returns the host portion of an `addr:port` or `[ipv6]:port` value, stripped
@@ -128,6 +144,42 @@ async fn validate_host(
     }
 }
 
+/// Build the schema statistics before either transport starts serving.
+///
+/// An MCP session outlives any one tool call, so the pass is amortized over everything
+/// that session asks for, and without it the process spends its whole life on default
+/// plan weights: nothing builds the table as a side effect of a query, and an agent
+/// issuing Cypher through `cypher_query` has no way to ask for it.
+///
+/// The amortization is per session, not per graph, and that is the limit of the
+/// argument: a stdio client launches this server as a subprocess per session, so a
+/// session that asks one question pays the whole scan, and the delay lands on the
+/// initialize handshake where a client with a startup timeout can give up on it. The
+/// warm-up stays on by default because a session is usually a conversation rather than
+/// one question, but `--no-warm-statistics` exists for that case and is the right
+/// answer for a large graph behind a per-session client.
+///
+/// Synchronous on purpose, matching `Graph::open` just above: nothing else is
+/// scheduled on the runtime yet.
+///
+/// A failure is logged and ignored, because every reader of the table works without
+/// it: the fan-out estimates fall back to the global average, and the schema question
+/// falls back to a bounded probe. Diagnostics go to stderr like everything else here,
+/// since the stdio transport owns stdout.
+fn warm_statistics(graph: &Graph) {
+    let started = std::time::Instant::now();
+    match graph.materialize_edge_statistics() {
+        Ok(()) => info!(
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "warmed schema statistics"
+        ),
+        Err(error) => warn!(
+            %error,
+            "could not warm schema statistics; continuing on default plan weights"
+        ),
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
@@ -141,7 +193,11 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     info!(db_path = %args.db_path.display(), "opening graph");
-    let graph = Arc::new(Graph::open(&args.db_path, args.map_size_gb)?);
+    let graph = Graph::open(&args.db_path, args.map_size_gb)?;
+    if !args.no_warm_statistics {
+        warm_statistics(&graph);
+    }
+    let graph = Arc::new(graph);
 
     match args.transport {
         Transport::Stdio => {

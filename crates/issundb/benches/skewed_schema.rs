@@ -99,6 +99,14 @@ fn build_graph() -> (TempDir, Graph, Vec<NodeId>) {
     }
 
     g.rebuild_csr().unwrap();
+    // The expand-ratio and chaining passes read the schema statistics table, and
+    // nothing builds it as a side effect of a query, so a fixture that skipped this
+    // would measure the planner falling back to the global average fan-out: the
+    // opposite of what the `expand_ratio` and `multi_hop` groups exist to guard.
+    // The `type_inference` group would still prune without it, since
+    // `schema_has_edge` probes the label index directly when no table is available,
+    // but it is measured here in the configuration where the answer is exact.
+    g.materialize_edge_statistics().unwrap();
     (dir, g, persons)
 }
 

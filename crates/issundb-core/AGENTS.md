@@ -119,6 +119,42 @@ It is derived from LMDB, like the CSR snapshot, and follows the same write-LMDB-
 - This store is a cache, never the source of truth. Any new write path that changes a scalar property must record a delta against both `prop_columns`
   and `edge_columns` as applicable, the same way it updates `node_prop_idx`.
 
+## Schema Statistics
+
+`graph/stats.rs` holds the schema-level edge statistics: the `(label, type)` fan-out marginals and the realized `(src_label, type, dst_label)` triples.
+Like the property columns it is a derived cache, and it follows the same rule that an advisory reader never builds one. It differs in one way that
+matters, so keep the two readers apart when changing it.
+
+- The build is one pass over `label_idx` and one over `out_adj`. Do not "simplify" it back to scanning `nodes` and `edges`: decoding a `NodeRecord` to
+  read its `labels` also copies that node's whole property blob, and decoding an `EdgeRecord` to read its endpoints copies the edge's, which is most of
+  the cost and none of the answer. Reading the labels from `label_idx` also means the statistics describe exactly the population a label scan enumerates.
+- The generation check gates use, not refresh. A table from an earlier generation is ignored, never served: `schema_has_edge` reads the same table, and a
+  stale negative there would deny a triple a committed write just realized.
+- `estimate_expand_fanout` and `estimate_expand_fanout_to` are advisory, and read through `with_possibly_stale_fanout`. Nothing builds the table for them;
+  `Graph::materialize_edge_statistics` is the deliberate warm-up, and the long-lived consumers (`issundb-cli`, `issundb-rest`, `issundb-mcp`) call it at
+  startup. They accept a table the generation has moved past, bounded per relationship type by `STALE_FANOUT_GROWTH_FACTOR` against that type's live
+  `stats:t:` counter. Do not "fix" this to a strict generation check: that is what made a warmed process lose its statistics on the first write and never
+  recover them. Do not weaken the bound to a global edge count either, which cannot see a skewed ingest that quadruples one type inside a graph that grew
+  by a third, and do not remove it, or a process that warms at startup and then ingests plans forever against the startup snapshot.
+- The whole build runs outside the `edge_fanout` lock, with the result installed at the end. Holding the lock across it was tolerable while this was an
+  internal lazy helper; it is not now that consumers call it on a live graph, where it would block every concurrent query's planning for the scan's
+  duration.
+- Both accessors read `csr_cache.current_gen()` *after* taking the lock. Reading it first leaves a window in which a write commits before the lock is
+  acquired, so a table predating that write matches the captured value and passes as current: for `schema_has_edge` that is a stale negative, and the
+  optimizer drops rows on it.
+- `schema_has_edge` is not advisory, because the optimizer prunes rows on a negative. It must keep answering with no table, so it falls back to a bounded
+  probe of `label_idx` plus the adjacency (`SCHEMA_PROBE_BUDGET`), settling on the first matching edge and reporting `None` when the budget runs out.
+  Do not make this reader table-only: that leaves `prune_unsatisfiable` dormant on every graph nobody has materialized, which is a silent loss of the
+  pass rather than a visible failure. Its one test is `type_inference_prunes_unsatisfiable_pattern` in `issundb-cypher`.
+- Charge the probe budget for every storage operation, including visiting a node before its adjacency is read. Charging only adjacency entries left the
+  walk unbounded for exactly the population most likely to be chosen: a small label whose nodes have no edges in the direction under test, where every
+  node took the "no adjacency" path for free.
+- Probe verdicts are memoized in `schema_probes` against the write generation. The pass that asks runs on every execution because there is no plan cache,
+  so without the memo an unsatisfiable hop re-walks the graph once per query rather than once per generation. The memo is keyed on the generation, never
+  cleared lazily, so it cannot answer for a graph a write has changed.
+- A `Some(false)` from either path must never rest on a stored counter. The probe reads the per-label counter only to choose which endpoint population to
+  walk, where a wrong answer costs at most an undecided verdict; emptiness is asked of `label_idx` directly.
+
 ## GraphBLAS Semiring Choices
 
 Use the correct GraphBLAS semiring for each algorithm:

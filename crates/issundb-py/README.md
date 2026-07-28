@@ -3,8 +3,8 @@
 [![Python version](https://img.shields.io/badge/python-%3E=3.10-3776ab?style=flat&labelColor=282c34&logo=python)](https://github.com/IssunDB/issun-db)
 [![PyPI version](https://img.shields.io/pypi/v/issundb?style=flat&labelColor=282c34&color=3776ab&logo=pypi)](https://pypi.org/project/issundb/)
 [![Documentation](https://img.shields.io/badge/docs-read-3776ab?style=flat&labelColor=282c34&logo=readthedocs)](https://issundb.github.io/issun-db/)
-[![Examples](https://img.shields.io/badge/examples-view-ffd343?style=flat&labelColor=282c34&logo=python)](https://github.com/IssunDB/issun-db/tree/main/crates/issundb-py/examples)
-[![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-ffd343?style=flat&labelColor=282c34&logo=open-source-initiative)](https://github.com/IssunDB/issun-db)
+[![Examples](https://img.shields.io/badge/examples-view-3776ab?style=flat&labelColor=282c34&logo=python)](https://github.com/IssunDB/issun-db/tree/main/crates/issundb-py/examples)
+[![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-3776ab?style=flat&labelColor=282c34&logo=open-source-initiative)](https://github.com/IssunDB/issun-db)
 
 The Python bindings for [IssunDB](https://github.com/IssunDB/issun-db).
 

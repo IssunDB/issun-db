@@ -84,10 +84,18 @@ struct State {
     /// True while a `:run` script is executing, so the `:!` shell escape can
     /// refuse to run from inside a script file.
     in_script: bool,
+    /// Whether opening a database also builds its schema statistics. Carried on the
+    /// state because `:open` mid-session must honor the launch flag.
+    warm_statistics: bool,
 }
 
 impl State {
-    fn new(graph: Option<Graph>, db_path: Option<PathBuf>, map_size_gb: usize) -> Self {
+    fn new(
+        graph: Option<Graph>,
+        db_path: Option<PathBuf>,
+        map_size_gb: usize,
+        warm_statistics: bool,
+    ) -> Self {
         Self {
             graph,
             db_path,
@@ -95,6 +103,7 @@ impl State {
             save_path: None,
             map_size_gb,
             in_script: false,
+            warm_statistics,
         }
     }
 }
@@ -130,6 +139,22 @@ struct Cli {
     /// command, and the process exits non-zero.
     #[arg(long, short = 'f')]
     script: Option<String>,
+
+    /// Skip the schema-statistics warm-up performed when a database is opened.
+    ///
+    /// The warm-up is one pass over the label index and the adjacency, and it is what
+    /// makes the query optimizer's expand-ratio estimates and type-inference pruning
+    /// available: nothing builds them as a side effect of a query. An interactive
+    /// session almost always wants it; a `--script` run that issues a couple of point
+    /// lookups on a large graph does not, which is why this exists.
+    // `FalseyValueParser` for the same reason as the servers: a bare bool with `env`
+    // rejects `=1` instead of reading it as true.
+    #[arg(
+        long,
+        env = "ISSUNDB_NO_WARM_STATISTICS",
+        value_parser = clap::builder::FalseyValueParser::new(),
+    )]
+    no_warm_statistics: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -765,6 +790,26 @@ fn print_help() {
 // Entry point
 // ---------------------------------------------------------------------------
 
+/// Build the schema statistics for the graph a session has just opened.
+///
+/// Nothing builds them as a side effect of a query, so without this every
+/// relationship pattern is planned on the global average fan-out and a provably empty
+/// typed hop is never pruned. One pass over the label index and the adjacency buys
+/// both for as long as the graph stays open, which for a REPL session or a script is
+/// every query it will run.
+///
+/// A failure is reported and ignored: the fan-out estimates fall back to the global
+/// average and the schema question falls back to a bounded probe, so a session with no
+/// statistics is slower, never wrong.
+fn warm_statistics(graph: &Graph) {
+    if let Err(e) = graph.materialize_edge_statistics() {
+        eprintln!(
+            "{}",
+            format!("warning: could not warm statistics: {e}").yellow()
+        );
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
     let opened = cli
@@ -773,6 +818,9 @@ fn main() {
         .and_then(|p| match Graph::open(p, cli.map_size_gb) {
             Ok(g) => {
                 eprintln!("{}", format!("opened: {}", p.display()).green());
+                if !cli.no_warm_statistics {
+                    warm_statistics(&g);
+                }
                 Some((g, p.clone()))
             }
             Err(e) => {
@@ -785,7 +833,7 @@ fn main() {
         None => (None, None),
     };
 
-    let mut state = State::new(graph, db_path, cli.map_size_gb);
+    let mut state = State::new(graph, db_path, cli.map_size_gb, !cli.no_warm_statistics);
 
     // Batch mode: run the script then exit without starting the prompt. The
     // script may `:open` its own database, so a launch path is not required.
@@ -1121,6 +1169,9 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
             match Graph::open(&path, map_size_gb.unwrap_or(state.map_size_gb)) {
                 Ok(g) => {
                     eprintln!("{}", format!("opened: {}", path.display()).green());
+                    if state.warm_statistics {
+                        warm_statistics(&g);
+                    }
                     state.graph = Some(g);
                     state.db_path = Some(path);
                 }
@@ -3598,7 +3649,7 @@ mod tests {
     #[test]
     fn test_repl_commands_handle() {
         let temp = TempDir::new().unwrap();
-        let mut state = State::new(None, None, 1);
+        let mut state = State::new(None, None, 1, true);
 
         // 1. Open database via REPL command
         let open_cmd = format!(":open {}", temp.path().display());
@@ -3687,7 +3738,7 @@ mod tests {
     #[test]
     fn reopen_same_path_replaces_environment() {
         let temp = TempDir::new().unwrap();
-        let mut state = State::new(None, None, 1);
+        let mut state = State::new(None, None, 1, true);
         let open_cmd = format!(":open {}", temp.path().display());
         assert!(handle(&mut state, &open_cmd));
         assert!(handle(&mut state, "add-node Person {\"name\": \"Alice\"}"));
@@ -3787,7 +3838,7 @@ mod tests {
     #[test]
     fn test_import_edges_resolves_domain_keys() {
         let temp = TempDir::new().unwrap();
-        let mut state = State::new(None, None, 1);
+        let mut state = State::new(None, None, 1, true);
         assert!(handle(
             &mut state,
             &format!(":open {}", temp.path().display())
@@ -3839,7 +3890,7 @@ mod tests {
     #[test]
     fn test_import_nodes_loads_csv_columns_as_properties() {
         let temp = TempDir::new().unwrap();
-        let mut state = State::new(None, None, 1);
+        let mut state = State::new(None, None, 1, true);
         assert!(handle(
             &mut state,
             &format!(":open {}", temp.path().display())
@@ -3896,7 +3947,7 @@ mod tests {
         use std::sync::Arc;
 
         let temp = TempDir::new().unwrap();
-        let mut state = State::new(None, None, 1);
+        let mut state = State::new(None, None, 1, true);
         assert!(handle(
             &mut state,
             &format!(":open {}", temp.path().display())
@@ -3949,7 +4000,7 @@ mod tests {
         use std::sync::Arc;
 
         let temp = TempDir::new().unwrap();
-        let mut state = State::new(None, None, 1);
+        let mut state = State::new(None, None, 1, true);
         assert!(handle(
             &mut state,
             &format!(":open {}", temp.path().display())
@@ -4010,7 +4061,7 @@ mod tests {
     fn shell_escape_runs_interactively() {
         let temp = TempDir::new().unwrap();
         let marker = temp.path().join("ran");
-        let mut state = State::new(None, None, 1);
+        let mut state = State::new(None, None, 1, true);
 
         // At the interactive prompt the escape runs the command.
         assert!(handle(
@@ -4033,7 +4084,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut state = State::new(None, None, 1);
+        let mut state = State::new(None, None, 1, true);
         assert!(run_script(&mut state, script.to_str().unwrap()));
     }
 
@@ -4051,7 +4102,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut state = State::new(None, None, 1);
+        let mut state = State::new(None, None, 1, true);
         assert!(!run_script(&mut state, script.to_str().unwrap()));
 
         // The command after the failure never executed, so only Alice exists.
@@ -4062,7 +4113,7 @@ mod tests {
 
     #[test]
     fn script_run_fails_on_missing_file() {
-        let mut state = State::new(None, None, 1);
+        let mut state = State::new(None, None, 1, true);
         assert!(!run_script(&mut state, "/no/such/script.txt"));
     }
 
@@ -4073,7 +4124,7 @@ mod tests {
         let script = temp.path().join("setup.txt");
         std::fs::write(&script, format!(":! touch {}\n", marker.display())).unwrap();
 
-        let mut state = State::new(None, None, 1);
+        let mut state = State::new(None, None, 1, true);
         assert!(handle(&mut state, &format!(":run {}", script.display())));
 
         // The script line is parsed and dispatched, but the escape refuses to run

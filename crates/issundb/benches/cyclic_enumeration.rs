@@ -103,7 +103,11 @@ fn load(graph: &Graph, nodes: u64, edges: u64) -> Result<(), Box<dyn std::error:
         )?;
         inserted += 1;
     }
+    // The optimizer's expand-ratio estimates read the schema statistics, and nothing
+    // builds them as a side effect of a query, so a fixture that skipped this would
+    // measure the planner falling back to the global average fan-out.
     graph.rebuild_csr()?;
+    graph.materialize_edge_statistics()?;
     Ok(())
 }
 

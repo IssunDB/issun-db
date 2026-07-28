@@ -66,7 +66,11 @@ fn build_graph(common: usize) -> (TempDir, Graph, Vec<NodeId>) {
         .unwrap();
         written = upto;
     }
+    // The optimizer's expand-ratio estimates read the schema statistics, and nothing
+    // builds them as a side effect of a query, so a fixture that skipped this would
+    // measure the planner falling back to the global average fan-out.
     g.rebuild_csr().unwrap();
+    g.materialize_edge_statistics().unwrap();
     (dir, g, persons)
 }
 
@@ -146,7 +150,11 @@ fn bench_chain_fusion(c: &mut Criterion) {
         .unwrap();
         written = upto;
     }
+    // The optimizer's expand-ratio estimates read the schema statistics, and nothing
+    // builds them as a side effect of a query, so a fixture that skipped this would
+    // measure the planner falling back to the global average fan-out.
     g.rebuild_csr().unwrap();
+    g.materialize_edge_statistics().unwrap();
     let mut group = c.benchmark_group("chain_fusion");
     group.bench_function("three_hop", |b| {
         b.iter(|| {

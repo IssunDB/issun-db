@@ -152,6 +152,11 @@ pub struct NeighborCountSpec<'a> {
 }
 
 /// Builds a 12-byte composite key `(prefix u32 BE, id u64 BE)` for secondary index lookups.
+/// Decided `schema_has_edge` verdicts and the write generation they were decided
+/// under. A `None` value is a remembered "undecided", which is worth keeping so the
+/// probe budget is not respent to reach the same non-answer.
+pub(super) type SchemaProbeMemo = (u64, AHashMap<(LabelId, TypeId, LabelId), Option<bool>>);
+
 pub(super) fn composite_key(prefix: u32, id: u64) -> [u8; 12] {
     let mut key = [0u8; 12];
     key[..4].copy_from_slice(&prefix.to_be_bytes());
@@ -465,9 +470,15 @@ pub struct Graph {
     pub(super) prop_columns: Arc<crate::columns::ColumnsCache<crate::columns::NodeSource>>,
     pub(super) edge_columns: Arc<crate::columns::ColumnsCache<crate::columns::EdgeSource>>,
     /// Per-`(label, type)` edge frequencies backing the optimizer's per-source-label
-    /// expand-ratio estimate, recomputed lazily when committed writes advance past
-    /// the cached generation. See [`crate::graph::stats`].
+    /// expand-ratio estimate. Never built as a side effect of a query; see
+    /// [`crate::graph::stats`] for which reader tolerates which staleness.
     pub(super) edge_fanout: Arc<parking_lot::Mutex<Option<crate::graph::stats::EdgeFanout>>>,
+    /// Decided `schema_has_edge` verdicts for one write generation, keyed by
+    /// `(src_label, type, dst_label)`. The type-inference pass asks the same questions
+    /// on every execution because there is no plan cache, and answering without the
+    /// statistics table means walking the graph, so a decided verdict is remembered
+    /// until a write invalidates the generation. See [`crate::graph::stats`].
+    pub(super) schema_probes: Arc<parking_lot::Mutex<SchemaProbeMemo>>,
     pub(super) n_threads: Arc<std::sync::atomic::AtomicI32>,
     /// Type-erased extension cache. Higher-level crates attach caches (e.g. the
     /// HNSW vector index) to a Graph without creating a circular dependency,
@@ -582,6 +593,7 @@ impl Graph {
             prop_columns: Arc::new(crate::columns::ColumnsCache::default()),
             edge_columns: Arc::new(crate::columns::ColumnsCache::default()),
             edge_fanout: Arc::new(parking_lot::Mutex::new(None)),
+            schema_probes: Arc::new(parking_lot::Mutex::new((0, AHashMap::new()))),
             n_threads: Arc::new(std::sync::atomic::AtomicI32::new(0)),
             extensions: Arc::new(parking_lot::Mutex::new(AHashMap::new())),
         })
