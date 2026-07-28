@@ -870,7 +870,7 @@ impl Graph {
             .with_fresh(&self.storage, |cols| cols.props_table(ids, props))?
     }
 
-    /// Single-property column gather for edges: `out[i]` is `prop` on `ids[i]`.
+    /// Gathers one property column for edges, where `out[i]` is `prop` on `ids[i]`.
     pub fn edge_prop_json_column(
         &self,
         ids: &[EdgeId],
@@ -1163,7 +1163,7 @@ impl Graph {
     /// `/backups/mydb_2026-05-27.mdb`). The file is a complete, portable
     /// LMDB snapshot. Concurrent reads and writes are not blocked.
     ///
-    /// To restore: create an empty directory, copy the snapshot file to
+    /// To restore, create an empty directory, copy the snapshot file to
     /// `<dir>/data.mdb`, then call `Graph::open(<dir>, map_size_gb)`.
     pub fn backup(&self, destination: &Path) -> Result<(), Error> {
         self.storage

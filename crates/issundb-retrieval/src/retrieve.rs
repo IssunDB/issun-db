@@ -33,7 +33,7 @@ pub struct RetrieveOptions {
     pub hops: u8,
     /// Maximum cosine distance for a vector hit to qualify as a seed.
     /// Hits with `distance > max_distance` are dropped before BFS expansion.
-    /// Default: `f32::MAX` (keep all k hits).
+    /// Defaults to `f32::MAX`, which keeps all `k` hits.
     pub max_distance: f32,
     /// Hard cap on the total number of nodes in the returned subgraph.
     /// BFS stops as soon as this limit is reached.
@@ -52,7 +52,7 @@ impl Default for RetrieveOptions {
     }
 }
 
-/// Convenience wrapper: vector search to k seeds, then `hops`-hop BFS expansion to
+/// Wraps a vector search to `k` seeds and a `hops`-hop BFS expansion into one
 /// subgraph materialization.
 pub fn retrieve(graph: &Graph, q: &[f32], k: usize, hops: u8) -> Result<Subgraph, RetrievalError> {
     retrieve_with(
@@ -127,11 +127,12 @@ pub fn retrieve_with(
 /// Strategy for fusing vector and text relevance scores.
 #[derive(Debug, Clone)]
 pub enum FusionStrategy {
-    /// Reciprocal Rank Fusion: score = Σ 1 / (k + rank + 1), summed over the
-    /// modalities that ranked the item, where `rank` is 0-based. `k` is a
-    /// smoothing constant; default 60.
+    /// Reciprocal Rank Fusion, scoring an item as Σ 1 / (k + rank + 1) summed over
+    /// the modalities that ranked it, where `rank` is 0-based. `k` is a smoothing
+    /// constant; default 60.
     Rrf { k: u32 },
-    /// Weighted linear combination: score = α·vector_score + β·text_score.
+    /// Weighted linear combination, scoring an item as α·vector_score +
+    /// β·text_score.
     WeightedSum {
         vector_weight: f32,
         text_weight: f32,
@@ -182,8 +183,8 @@ impl Default for HybridRetrieveOptions {
     }
 }
 
-/// Hybrid retrieval: merges vector search seeds with full-text search seeds,
-/// fuses their scores using `opts.fusion`, then expands via BFS.
+/// Merges vector search seeds with full-text search seeds, fuses their scores
+/// using `opts.fusion`, then expands via BFS.
 ///
 /// Vector search is run when `opts.vector_k > 0` and `q` is non-empty.
 /// Text search is run when `opts.text_k > 0` and `text_query` is non-empty.

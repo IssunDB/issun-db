@@ -5,8 +5,8 @@ thread_local! {
     /// Test-only override for [`Graph::kernel_threads`], so a unit test can drive
     /// the parallel reduction on a graph small enough to build in a test.
     ///
-    /// Thread-local rather than process-global: the test binary runs its tests
-    /// concurrently, and a global would let the forcing test change the worker
+    /// It is thread-local rather than process-global because the test binary runs its
+    /// tests concurrently, and a global would let the forcing test change the worker
     /// count every other test sees for as long as it holds the override. That
     /// would put unrelated tests on the parallel path (spawning up to the forced
     /// count) and make coverage of the reduction nondeterministic.
