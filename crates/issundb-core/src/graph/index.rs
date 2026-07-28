@@ -301,7 +301,7 @@ impl Graph {
         self.node_count_by_label_impl(&rtxn, label)
     }
 
-    /// Upper-bound estimate of the node count: the node-id high-water mark. This
+    /// Estimates the node count from the node-id high-water mark, an upper bound. It
     /// does not decrease when a node is deleted, so it is not an exact live
     /// count; it exists for query-planner cardinality estimates (for example,
     /// average relationship fan-out). O(1).

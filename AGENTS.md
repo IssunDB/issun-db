@@ -52,8 +52,13 @@ Quick examples:
 - Start each sentence with a capital letter, capitalize proper nouns (Rust, Cypher, LMDB, GraphBLAS), and leave common nouns lowercase in the middle
   of a sentence.
 - Write correct and complete sentences.
-- Avoid made-up words, abbreviations, and colons in the middle of sentences.
-- Use participial phrases scarcely.
+- Avoid made-up words.
+- Do not use a colon in place of a verb. Three uses are fine: joining two clauses inside a complete sentence (the replacement the em-dash rule above
+  calls for), introducing the gloss of a list item, and introducing an enumeration, whether as a list or inline ("Methods: `add_node`, `add_nodes`,
+  ..."). What a colon must not do is turn a sentence into a label and a definition: write "Merges vector search seeds with text search seeds, then
+  expands via BFS" rather than "Hybrid retrieval: merges vector search seeds with text search seeds". That shape belongs to a list item, and carrying it
+  into prose (a doc comment summary, a paragraph) leaves a fragment where a sentence was required.
+- Use participial phrases and abbreviations scarcely.
 
 ## Repository Layout
 
@@ -75,7 +80,12 @@ modules according to this map.
     - `src/graph/index.rs`: label and type indexes, property indexes, constraints, and property scan methods.
     - `src/graph/stats.rs`: high-order cardinality statistics and the data-graph schema for the optimizer. Owns the `(label, type)` edge-frequency
       table behind `estimate_expand_fanout` and the realized `(src_label, type, dst_label)` triples behind `estimate_expand_fanout_to` and
-      `schema_has_edge`, recomputed by one full scan and cached against the committed-write generation.
+      `schema_has_edge`, built by one pass over `label_idx` and one over `out_adj` (neither decodes a record, since a `NodeRecord` or `EdgeRecord`
+      decode also copies a property blob this table never reads) and cached against the committed-write generation. Nothing builds it as a side effect
+      of a query, and the generation check gates use rather than refresh: a table from an earlier generation is ignored, never trusted. The two fan-out
+      estimates are advisory and fall back to the global average without it, so only `Graph::materialize_edge_statistics` builds it. `schema_has_edge`
+      is not advisory (the optimizer drops rows on a negative), so it never depends on the table existing: with no current table it probes `label_idx`
+      and the adjacency directly under `SCHEMA_PROBE_BUDGET`, settling on the first matching edge and reporting `None` when the budget runs out.
     - `src/graph/fts_mod.rs`: full-text search index lifecycle and FTS storage primitives.
     - `src/graph/vector.rs`: vector byte storage helpers.
     - `src/graph/algo.rs`: public algorithm dispatch methods and internal traversal helpers.
@@ -83,7 +93,13 @@ modules according to this map.
     - `src/graph/txn.rs`: `ReadTxn` and `WriteTxn` delegation impls and transaction tests.
     - `src/csr.rs`: in-memory CSR snapshot (outgoing arrays plus a transposed incoming view with per-edge type and edge ids), rebuilt in the
       background and swapped via `arc-swap`. Also owns the `GraphDelta` buffer captured on the write path and the `write_gen`/`snapshot_gen`
-      generation counters that drive incremental matrix maintenance and on-demand CSR refresh.
+      generation counters that drive incremental matrix maintenance and on-demand CSR refresh. The adjacency is read from `out_adj`, whose 20-byte
+      `AdjEntry` carries every field the arrays hold, already grouped by source in ascending key order, so the build decodes no `EdgeRecord` and copies
+      no property blob. Entries go straight into the flat arrays, counting each row as it goes: a per-node `Vec` staged first, as this once did, cost
+      one allocation per node and left 3.3 GB resident for 620 MB of live arrays on a 1 M-node, 13.9 M-edge graph, because a million freed small chunks
+      are holes the allocator cannot return. Because `DUPSORT` orders duplicates by their raw little-endian bytes, each row is then reordered by
+      ascending edge id, which is the order every consumer has always seen and which `load_weights` binary-searches. The per-entry `edge_weight` is
+      `Option`, built only by `build_weighted`, since a weight lives in the edge's property blob and only Dijkstra's matrix reads one.
     - `src/columns.rs`: in-memory property columns for the read path. One typed column (`Int`, `Float`, `Bool`, dictionary-encoded `Str`, or the
       exact-semantics `Json` fallback) per node property, built lazily from one full node scan and kept fresh by a post-commit delta (node deletion
       forces a rebuild). Read through `Graph::node_prop_json`. Also owns the lazily computed per-property statistics (`PropStats`: bounds, an
@@ -93,7 +109,19 @@ modules according to this map.
     - `src/histogram.rs`: equi-depth histogram over property values with equality and range selectivity estimates; backs `PropStats`. Nothing here is
       persisted.
     - `src/matrices.rs`: GraphBLAS matrix materialization from the CSR snapshot, plus `MatrixSet::apply_delta` for incremental in-place maintenance
-      (resize plus per-element set and drop) and the self-contained `dense_to_id`/`id_to_dense` mapping the matrix-view consumers read.
+      (resize plus per-element set and drop) and the self-contained `dense_to_id`/`id_to_dense` mapping the matrix-view consumers read. `MatrixKinds`
+      is which optional matrices a consumer needs, as a *set* rather than an ordering: `ADJACENCY` (the empty set) is the two boolean matrices,
+      `PAGE_RANK` adds `page_rank_matrix` (derived from the CSR row boundaries, so an unweighted snapshot serves it), and `WEIGHTED` adds `weight_matrix`,
+      the only thing that needs the per-edge weights and so the second `edges` scan that loads them. The two are independent, with exactly one consumer
+      each (`page_rank` and `shortest_path_dijkstra`), which is why neither implies the other: any ordering between them makes asking for one build both,
+      which cost PageRank a scan it does not need and Dijkstra a 167 MB matrix it never reads. Requests combine with `union` and a requirement is a
+      `contains` test. So `page_rank_matrix` and `weight_matrix` are `Option`, the set is stored on the `MatrixSet` rather than inferred from which of
+      them is present, a weighted rebuild releases `snap.edge_weight` once the matrix is built (the matrix is its only reader),
+      and every matrix is built over the same coordinates, so the two index arrays are built once and passed to each build with their roles
+      swapped for a transpose, one value array at a time (`Matrix::from_arrays`); staging four triple buffers and two coordinate hash maps instead, as
+      this once did, cost 2.7 GB above the finished matrices. Duplicate handling belongs to the build's reducer (`First` for the boolean union, `Plus`
+      for the PageRank transition probabilities of parallel edges, and `Min` for the weight matrix, which models the cheapest connection), not to a
+      deduplicating map.
     - `src/threads.rs`: the one resolution of the thread budget every parallel consumer shares (`threads::resolve`). Precedence is the programmatic
       override from `set_thread_count`, then `ISSUNDB_NUM_THREADS`, then `OMP_NUM_THREADS`, then the machine's parallelism, clamped to `MAX_THREADS`.
       Both the GraphBLAS pool (`MatrixSet::materialize`) and the counting kernels' scoped threads (`Graph::kernel_threads`) resolve through it, so the one
@@ -239,8 +267,9 @@ modules according to this map.
   value out of the index; the property is still stored, and equality lookups (`nodes_by_property`, `edges_by_property`) fall back to a label or type
   scan that compares the stored value directly, so results stay correct. Long text belongs in a full-text index, not a property index.
 - The GraphBLAS matrices (`MatrixSet`) and the CSR snapshot back the GraphBLAS algorithms, pattern matching, and multi-source expansion. They are kept
-  fresh through three gates rather than a single periodic rebuild. The write path records a structural delta (added nodes, added edges, and removed
-  edges, plus a `force_full` flag set on any node deletion).
+  fresh through four gates rather than a single periodic rebuild, and each builds the least its consumer reads: what a gate declines to build is the
+  saving, so a gate that materialized more than it needs would be indistinguishable except in memory. The write path records a structural delta (added
+  nodes, added edges, and removed edges, plus a `force_full` flag set on any node deletion).
     - `Graph::open` builds neither: it installs an empty snapshot through `CsrCache::new_unbuilt` and leaves `matrices` as `None`, so the gates below
       do the first build when a consumer that needs one runs. A workload of point lookups, property reads, or small typed expansions never builds
       either structure, because those paths read LMDB directly. The unbuilt cache starts `write_gen` at 1 with both installed generations at 0 so it
@@ -248,10 +277,17 @@ modules according to this map.
       an eager build in `open`: it costs one full edge scan plus a full matrix materialization on every open (roughly 26 seconds for a 1 M-node,
       14 M-edge graph) and is repaid on every reopen.
     - Pure-adjacency consumers (`bfs`, `bfs_multi_source`, untyped expansion, `degree_centrality`, and `connected_components`) call
-      `ensure_matrix_view`, which applies the delta in place, falling back to a full `rebuild_csr` only when a node was deleted.
-    - CSR-array and hybrid consumers (everything else, including `dfs`, the path searches, the weighted and flow algorithms, `page_rank`, and the
-      remaining centralities) call `ensure_csr_fresh`, which rebuilds on demand gated by the `write_gen` versus `snapshot_gen` counter; when the
-      snapshot is already fresh it still drains the pending delta into the matrices.
+      `ensure_matrix_view`, which applies the delta in place, falling back to a rebuild of the boolean adjacency alone when a node was deleted.
+    - CSR-array and hybrid consumers (`dfs`, the path searches, the flow algorithms, and the remaining centralities) call `ensure_csr_fresh`, which
+      rebuilds the snapshot and the boolean adjacency on demand, gated by the `write_gen` versus `snapshot_gen` counter; when the snapshot is already fresh it still
+      drains the pending delta into the matrices.
+    - `page_rank` gates on `MatrixKinds::PAGE_RANK` (through `ensure_page_rank_matrix`, which its public `page_rank_graphblas` calls itself) and
+      `shortest_path_dijkstra` on `MatrixKinds::WEIGHTED` (through `with_weighted_matrix_view`), the latter being the only gate whose snapshot carries
+      weights. What the matrices carry is a separate condition from the generation, because a set materialized for an adjacency consumer is current at its
+      generation and still carries neither optional matrix. A rebuild unions the request with what is installed rather than replacing it, or a workload
+      alternating two consumers would rebuild twice per write; the cost is that one weighted call keeps that matrix for the life of the process, which is
+      also why `Graph::rebuild_csr` asks for neither optional matrix: it is what every bulk load calls, so asking for weights there would pin every
+      process that loads data.
     - Typed bulk expansion calls `ensure_snapshot_fresh`, which rebuilds only the snapshot (no GraphBLAS materialization); for a small source set over
       a stale snapshot it skips the gate and reads per-source LMDB adjacency.
       The background rebuild after `REBUILD_THRESHOLD` writes is a compaction safety net, not the freshness path; callers needing a guaranteed fresh
@@ -340,9 +376,34 @@ The read-path and statistics methods carry non-obvious semantics:
   weights plan choices, so a stale or absent value never affects correctness.
 - `estimate_expand_fanout_to(src_label, rel_type, dst_label, incoming) -> Result<Option<f64>, Error>`: destination-label-aware refinement, the average
   number of `dst_label` neighbors per `src_label` node; sharpens the plan weight of a `HasLabel` filter over an `Expand`.
+- Both fan-out estimates are advisory in the same sense the property-column statistics are, and neither builds the schema statistics table: each returns
+  `None` when no usable table exists, leaving the caller on the global average fan-out. Building it to sharpen a plan weight made the first query
+  mentioning a relationship pattern pay for the whole graph (measured at roughly 5 seconds on a 1 M-node, 13.9 M-edge graph, which was the cold
+  `one_hop_neighbors` latency). `Graph::materialize_edge_statistics` is how a caller asks for them.
+- They do accept a table the write generation has moved past, unlike `schema_has_edge`, because their alternative is not a fresher estimate but no
+  estimate, and the global average is cruder than a dated per-label ratio. Refusing every stale table meant a process that materialized lost its
+  statistics on the first write and never recovered them, so a long-lived server that ingests anything spent the rest of its life on default plan
+  weights. The tolerance is bounded by growth rather than age, and *per relationship type*: a stale table is refused for a given type once that type's
+  live `stats:t:` count exceeds `STALE_FANOUT_GROWTH_FACTOR` times the count recorded at build time. Growth is the right bound because a generation is
+  one commit and a commit may be a single edge or a bulk import; per type is necessary because a global edge count cannot see skew, and a skewed ingest
+  that adds half a million edges of one type to a graph of a million stays inside any global factor while moving that type's fan-out by orders of
+  magnitude. Because the counter never decreases, the refusal catches a type that grew (where a stale estimate understates fan-out and invites the
+  planner to treat an expensive expansion as free) and not one that shrank (where it overstates and the planner is merely conservative). What it still
+  cannot see is redistribution *within* a type, which would need the live per-`(label, type)` counter that is the table itself; that residual weights a
+  plan and never changes an answer.
+- `materialize_edge_statistics() -> Result<(), Error>`: build the schema statistics table now, the counterpart of `materialize_property_columns` for the
+  edge-level statistics. One pass over `label_idx` and one over `out_adj`, cached until a committed write advances the generation. It is what makes the
+  expand-ratio estimates available at all, and it upgrades `schema_has_edge` from a budgeted probe to an exact lookup that also decides the questions the
+  probe gives up on. A caller wanting the optimizer at full strength on a cold graph wants this and `materialize_property_columns`.
 - `schema_has_edge(src_label, rel_type, dst_label) -> Result<Option<bool>, Error>`: whether the committed data schema contains any directed edge
-  `src_label --rel_type--> dst_label`. `Some(false)` means the directed pattern is provably unsatisfiable; `None` when any name is unknown. Backs the
-  optimizer's type-inference pass.
+  `src_label --rel_type--> dst_label`. `Some(false)` means the directed pattern is provably unsatisfiable; `None` when any name is unknown or the
+  question could not be settled within `SCHEMA_PROBE_BUDGET`. Backs the optimizer's type-inference pass. Unlike the fan-out estimates this one is not
+  advisory, since a negative drops rows, so it never depends on the statistics table existing: with no current table it walks the smaller endpoint
+  population through `label_idx` and tests each of its `rel_type` edges for the opposite label, settling on the first match and otherwise exhausting that
+  population. Every storage operation the walk performs is charged against the budget, visiting a node included, or a population whose nodes have no
+  adjacency in the direction under test would walk to the end of the label for free. Only the choice of which side to walk reads the stored per-label
+  counter; the emptiness shortcut asks `label_idx` instead, so a prune never rests on a counter being exact. A decided verdict is memoized against the
+  write generation, because the pass that asks runs on every execution (there is no plan cache) and would otherwise re-walk the graph per query.
 - `label_filter(nodes, label) -> Result<Vec<NodeId>, Error>`: subset of `nodes` carrying `label`, via one `label_idx` point lookup per candidate.
 - `set_thread_count(n: i32) -> Result<(), Error>`: sets the GraphBLAS thread count, overriding the `ISSUNDB_NUM_THREADS` environment variable (0
   restores default behavior, resolved by `threads::resolve`). The count is stored and applied by `MatrixSet::materialize`, which is also what initializes the GraphBLAS context, so a
@@ -506,6 +567,16 @@ body reports the crate `version` and the current `api` version.
 REST exposes the data plane and retrieval only. Index administration (vector index configuration, text index create/drop/list), GraphBLAS thread
 control, and backup/restore are intentionally absent: provisioning and host operations are done through the CLI or the Python surface, not over HTTP.
 
+Startup spawns `Graph::materialize_edge_statistics` on a detached thread, so the optimizer's expand-ratio estimates and exact type-inference pruning become
+available without gating readiness: nothing builds that table as a side effect of a query, and an HTTP caller has no way to ask for it. It is deliberately
+*not* synchronous. The scan costs seconds on a large graph (3.4 s on a 1 M-node, 13.9 M-edge graph, measured through the release wheel), while the plans it
+sharpens measured a few percent on a workload of ordinary aggregations, so delaying readiness to buy that is the wrong trade. Backgrounding it is only safe
+because `materialize_edge_statistics` scans *without* holding the statistics lock and installs the finished table at the end; concurrent requests keep
+planning on the bounded probe and the global average throughout, verified at a 1.5 ms median and an 18.6 ms maximum for point queries issued during the
+scan. Do not move the build back under that lock, and do not make this call synchronous again. A failure is logged and ignored, since every reader works
+without the table. `--no-warm-statistics` (or `ISSUNDB_NO_WARM_STATISTICS`) skips the scan entirely. The property columns are deliberately not warmed here:
+that build is a full node scan and holds every scalar property in memory, which is a footprint decision an operator should make, not a startup default.
+
 The API is self-describing: the OpenAPI 3.1 document is generated from the handler annotations (`#[utoipa::path]`) and the request and response
 `ToSchema` derives, served as JSON at `GET /v1/openapi.json` with a Scalar UI at `GET /v1/docs`. The generator crates are `utoipa` and
 `utoipa-scalar` (both MIT or Apache-2.0), pinned to the Axum 0.7 line. Because the handlers build their JSON bodies inline with `json!`, the
@@ -553,6 +624,19 @@ differently-labeled entity instead of erroring. The tool descriptions, argument 
 identifier first with `MATCH (n:Label) WHERE n.Id = x RETURN id(n)`, or pass `expect_label` (`get_node`) or `expect_type` (`get_edge`) to reject a
 mismatched entity with an error instead.
 
+Startup spawns `Graph::materialize_edge_statistics` on a detached thread, as REST does and for the same reason: an agent issuing Cypher through
+`cypher_query` cannot ask for the optimizer's statistics, and a session outlives any one tool call. Backgrounding matters more here than in REST, because a
+stdio client launches one subprocess per session, so a synchronous scan would be repeated every session and would land on the initialize handshake where a
+client with a startup timeout can abandon it. `--no-warm-statistics` (or `ISSUNDB_NO_WARM_STATISTICS`) skips it. `issundb-cli` warms *synchronously* on
+every open, at launch and on `:open`, and takes the same flag: a visible pause before an interactive prompt is honest, and there is no readiness contract
+to break. That pause is worth knowing the size of: measured at 3.7 s on a 1 M-node, 13.9 M-edge graph, against a 4 ms open with the flag, so a `--script`
+run of a few statements should pass it. Those two numbers come from wall-clocking the process, since `:timer` covers Cypher statements only and neither the
+warm-up nor the open is one. `:timer` (or `--timer`) is how a *query* is timed: it measures execution alone, not the row formatting, so it is comparable with
+a timing taken around the same query in another surface. `issundb-py` deliberately does not warm on construction, because a short script should not pay a scan it may never use; it exposes
+`materialize_edge_statistics` and `materialize_property_columns` so a long-lived Python process asks for itself. A caller that measures IssunDB through the
+Python binding and does not call them is measuring the planner with its statistics unavailable, which is worth stating in any comparison, the same way an
+index-creation step is.
+
 ### `issundb_py`
 
 Python bindings via PyO3. Exposes a single `IssunDB` class. The `extension-module` feature must be enabled for the Python extension to compile.
@@ -561,16 +645,23 @@ Depends only on `issundb`.
 Methods: `add_node` (accepts a single label string or a list of label strings), `add_nodes`, `get_node`, `update_node`, `delete_node`, `add_label`,
 `remove_label`, `add_edge`, `add_edges`, `get_edge`, `update_edge`, `delete_edge`, `query`, `explain`, `upsert_vector`, `remove_vector`,
 `vector_search` (with optional `label` and JSON-object `properties` filters), `configure_vector_index`, `text_search`, `create_text_index` (with
-optional `language`), `drop_text_index`, `list_text_indexes`, `has_text_index`, `retrieve_hybrid`, `set_thread_count`, `backup`, `backup_compact`,
-and `restore`.
+optional `language`), `drop_text_index`, `list_text_indexes`, `has_text_index`, `retrieve_hybrid`, `set_thread_count`,
+`materialize_edge_statistics`, `materialize_property_columns`, `backup`, `backup_compact`, and `restore`.
 
 `add_nodes` and `add_edges` take an iterable of `(labels, props_json)` pairs and `(src, dst, type, props_json)` tuples respectively, and write the
 whole batch under one `Graph::update` transaction. A single-record insert costs one durable LMDB commit, so a Python loop over `add_node` is bound by
 commit latency rather than by the work; the batch form is the ingestion path. Both are all-or-nothing: any failure rolls back the whole batch.
 
-Every method releases the GIL around the native engine call, so a long-running query, backup, or reindex does not stall other Python threads.
+`materialize_edge_statistics` and `materialize_property_columns` are the two deliberate warm-ups. Nothing builds either structure as a side effect of a
+query, so a Python process that never calls them plans every relationship pattern on the global average fan-out and gets no selectivity estimates; they are
+exposed because a Python caller otherwise has no way to ask. They are not equal in cost: the edge statistics are one pass over the label index and the
+adjacency (measured at 226 ms over 300 K nodes), while the property columns are a full node scan whose result holds every scalar node property in memory
+for the life of the object (1355 ms over the same graph). Call the first freely in a long-lived process; treat the second as a memory commitment.
+
+Every method releases the GIL around the native engine call, so a long-running query, backup, reindex, or warm-up does not stall other Python threads.
 Keep that invariant when adding a method: extract arguments to owned Rust values first, run the engine call and JSON serialization inside
-`Python::detach`, and never touch a Python object in the released section.
+`Python::detach`, and never touch a Python object in the released section. The two warm-ups are the longest-running calls on this surface, so they are
+where the invariant matters most.
 
 ### `issundb_core::Storage`
 

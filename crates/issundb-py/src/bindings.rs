@@ -444,6 +444,41 @@ impl PyGraph {
         py.detach(|| self.graph.set_thread_count(n)).map_err(rt)
     }
 
+    /// Build the schema statistics the query optimizer reads, now.
+    ///
+    /// Nothing builds them as a side effect of a query, so without this call a
+    /// process plans every relationship pattern on the global average fan-out
+    /// instead of the per-source-label expand ratio, and a provably empty typed hop
+    /// is pruned by a bounded probe rather than an exact lookup. One pass over the
+    /// label index and the adjacency, cached until the next committed write, and
+    /// then reused while the graph has not grown much past its size at build time.
+    ///
+    /// Worth calling once for a long-lived process (a service, a notebook, a
+    /// benchmark harness) and not worth it for a script that runs a handful of
+    /// point lookups, which never consult these statistics at all.
+    fn materialize_edge_statistics(&self, py: Python<'_>) -> PyResult<()> {
+        py.detach(|| self.graph.materialize_edge_statistics())
+            .map_err(rt)
+    }
+
+    /// Build the in-memory property columns, now.
+    ///
+    /// The counterpart of `materialize_edge_statistics` for property-level
+    /// statistics: it is what makes the optimizer's selectivity estimates and its
+    /// zone-map filter pruning available, and it warms the columnar read path that
+    /// backs bulk property gathers and aggregations. A caller that wants the
+    /// optimizer at full strength on a cold graph wants both.
+    ///
+    /// Note the cost, which is larger than its sibling's in both directions: one
+    /// full scan of every node record, and the resulting columns hold every scalar
+    /// node property in memory for the life of the graph handle. On a large graph
+    /// that is a deliberate memory commitment, which is why nothing makes it for
+    /// you.
+    fn materialize_property_columns(&self, py: Python<'_>) -> PyResult<()> {
+        py.detach(|| self.graph.materialize_property_columns())
+            .map_err(rt)
+    }
+
     /// Execute a hybrid retrieval (GraphRAG) query combining vector search, text
     /// search, and relationship expansion. Returns a JSON object
     /// `{"nodes", "edges", "scores", "truncated"}`, where `truncated` is true when

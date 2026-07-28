@@ -69,6 +69,23 @@ struct Args {
     /// proxy forwards under.
     #[arg(long = "allowed-host")]
     allowed_hosts: Vec<String>,
+
+    /// Skip the schema-statistics warm-up. The warm-up is one background pass over
+    /// the label index and the adjacency, and it is what makes the query optimizer's
+    /// expand-ratio estimates and exact type-inference pruning available: nothing
+    /// builds them as a side effect of a query. It does not delay the initialize
+    /// handshake, so skip it only to avoid the scan itself, which a stdio client
+    /// launching one subprocess per session would otherwise repeat every session.
+    // `FalseyValueParser` because a bare `#[arg(long, env)]` on a bool parses the
+    // environment value with clap's strict bool parser, so the `=1`/`=yes`/`=on` that
+    // container env blocks routinely set is a hard startup failure rather than a
+    // toggle. Only `0`, `false`, `no`, `off`, and empty read as false here.
+    #[arg(
+        long,
+        env = "ISSUNDB_NO_WARM_STATISTICS",
+        value_parser = clap::builder::FalseyValueParser::new(),
+    )]
+    no_warm_statistics: bool,
 }
 
 /// Returns the host portion of an `addr:port` or `[ipv6]:port` value, stripped
@@ -128,6 +145,73 @@ async fn validate_host(
     }
 }
 
+/// Build the schema statistics in the background, without delaying either transport.
+///
+/// An MCP session outlives any one tool call, so the pass is amortized over everything
+/// that session asks for, and without it the process spends its whole life on default
+/// plan weights: nothing builds the table as a side effect of a query, and an agent
+/// issuing Cypher through `cypher_query` has no way to ask for it.
+///
+/// The amortization is per session rather than per graph, which is why this must not be
+/// synchronous. A stdio client launches this server as a subprocess per session, so the
+/// scan (measured at 3.4 s on a 1 M-node, 13.9 M-edge graph) would be repeated every
+/// session and would land on the initialize handshake, where a client with a startup
+/// timeout can give up on it. In the background it costs the session nothing but the
+/// first few tool calls planning without the table.
+///
+/// This is safe because `materialize_edge_statistics` performs its scan *without*
+/// holding the statistics lock, installing the finished table at the end, so tool calls
+/// keep planning throughout on the bounded probe and the global average fan-out.
+///
+/// It runs on a detached thread rather than the runtime's blocking pool, because
+/// dropping the runtime waits for a started blocking task and would put the scan's
+/// remaining time back on shutdown, which for a stdio client is one subprocess exit per
+/// session.
+///
+/// A failure is logged and ignored, because every reader of the table works without
+/// it: the fan-out estimates fall back to the global average, and the schema question
+/// falls back to a bounded probe. Diagnostics go to stderr like everything else here,
+/// since the stdio transport owns stdout.
+fn spawn_statistics_warm_up(graph: Arc<Graph>) {
+    // A detached OS thread rather than `tokio::task::spawn_blocking`. Dropping the
+    // runtime waits for any blocking task that has already started, so a session that
+    // ends before the scan does would have blocked at exit for the rest of it (measured
+    // at 1.5 s for a 1.5 s task, and this scan takes seconds on a large graph), which is
+    // exactly the delay backgrounding it was supposed to remove. A detached thread is
+    // not joined by the runtime and is abandoned at process exit; the scan installs its
+    // table only at the end, so abandoning it leaves the graph as it was, which every
+    // reader already tolerates.
+    //
+    // `issundb-rest` carries the same function for the same reason. Keep the two bodies
+    // identical: the shutdown behavior above is the kind of fix that gets applied to one
+    // copy and not the other.
+    // `Builder::spawn` rather than `thread::spawn`, which panics when the OS refuses a
+    // thread (a low pids cgroup, an exhausted host). Panicking would unwind out of
+    // `main` before the server starts serving, over an optimization this very comment
+    // says is logged and ignored.
+    let spawned = std::thread::Builder::new()
+        .name("statistics-warm-up".to_string())
+        .spawn(move || {
+            let started = std::time::Instant::now();
+            match graph.materialize_edge_statistics() {
+                Ok(()) => info!(
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "warmed schema statistics"
+                ),
+                Err(error) => warn!(
+                    %error,
+                    "could not warm schema statistics; continuing on default plan weights"
+                ),
+            }
+        });
+    if let Err(error) = spawned {
+        warn!(
+            %error,
+            "could not spawn the schema statistics warm-up; continuing on default plan weights"
+        );
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
@@ -142,6 +226,9 @@ async fn main() -> anyhow::Result<()> {
 
     info!(db_path = %args.db_path.display(), "opening graph");
     let graph = Arc::new(Graph::open(&args.db_path, args.map_size_gb)?);
+    if !args.no_warm_statistics {
+        spawn_statistics_warm_up(graph.clone());
+    }
 
     match args.transport {
         Transport::Stdio => {

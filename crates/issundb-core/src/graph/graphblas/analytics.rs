@@ -3,6 +3,13 @@ use super::*;
 impl Graph {
     /// PageRank via iterative SpMV over the column-stochastic matrix.
     ///
+    /// Public, so it gates and validates before reading: [`Graph::with_matrix_view_at`]
+    /// materializes the PageRank matrix if it is missing and hands over a matrix set and
+    /// a snapshot whose dense mappings agree. That agreement is what keeps a node
+    /// `apply_delta` appended to the matrix mapping, but gave no matrix row, out of the
+    /// result, where it would otherwise be reported with a bare teleport value that
+    /// looks like a genuine dangling node.
+    ///
     /// Each iteration computes `raw = M * rank` using PlusTimes, then applies the
     /// damping formula `rank[i] = d * raw[i] + (1 - d) / n` in Rust. A node with
     /// no incoming edges receives only the teleportation term. The rank mass of
@@ -15,14 +22,29 @@ impl Graph {
         iterations: u32,
         damping: f32,
     ) -> Result<HashMap<NodeId, f32>, Error> {
+        self.with_matrix_view_at(MatrixKinds::PAGE_RANK, |m, snap| {
+            self.page_rank_graphblas_inner(m, snap, iterations, damping)
+        })
+    }
+
+    fn page_rank_graphblas_inner(
+        &self,
+        m: &MatrixSet,
+        snap: &CsrSnapshot,
+        iterations: u32,
+        damping: f32,
+    ) -> Result<HashMap<NodeId, f32>, Error> {
         use issundb_graphblas::{Descriptor, Reducer, Semiring, Vector, mxv};
 
-        let guard = self.matrices.read();
-        let m = match guard.as_ref() {
-            Some(m) => m,
-            None => return self.page_rank(iterations, damping),
-        };
-        let snap = self.csr_cache.snapshot.load();
+        // Present because the caller gated on `PAGE_RANK`. A set materialized without it
+        // is a gating mistake, which this tree reports as `InvalidArgument`; `Corrupt`
+        // would tell an operator to restore a backup.
+        let page_rank_matrix = m.page_rank_matrix.as_ref().ok_or_else(|| {
+            Error::InvalidArgument(
+                "PageRank needs the PageRank matrix; the matrices were materialized without it"
+                    .to_string(),
+            )
+        })?;
         let n = m.n_nodes;
         if n == 0 {
             return Ok(HashMap::new());
@@ -45,7 +67,7 @@ impl Graph {
                 &mut raw,
                 None,
                 Semiring::PlusTimes,
-                &m.page_rank_matrix,
+                page_rank_matrix,
                 &rank,
                 Descriptor::NULL,
             )

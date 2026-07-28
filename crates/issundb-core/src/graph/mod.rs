@@ -12,7 +12,7 @@ use zerocopy::{FromBytes, IntoBytes};
 
 use ahash::{AHashMap, AHashSet};
 
-use crate::matrices::MatrixSet;
+use crate::matrices::{MatrixKinds, MatrixSet};
 use crate::{
     csr::{CsrCache, CsrSnapshot},
     error::Error,
@@ -152,6 +152,11 @@ pub struct NeighborCountSpec<'a> {
 }
 
 /// Builds a 12-byte composite key `(prefix u32 BE, id u64 BE)` for secondary index lookups.
+/// Decided `schema_has_edge` verdicts and the write generation they were decided
+/// under. A `None` value is a remembered "undecided", which is worth keeping so the
+/// probe budget is not respent to reach the same non-answer.
+pub(super) type SchemaProbeMemo = (u64, AHashMap<(LabelId, TypeId, LabelId), Option<bool>>);
+
 pub(super) fn composite_key(prefix: u32, id: u64) -> [u8; 12] {
     let mut key = [0u8; 12];
     key[..4].copy_from_slice(&prefix.to_be_bytes());
@@ -465,9 +470,15 @@ pub struct Graph {
     pub(super) prop_columns: Arc<crate::columns::ColumnsCache<crate::columns::NodeSource>>,
     pub(super) edge_columns: Arc<crate::columns::ColumnsCache<crate::columns::EdgeSource>>,
     /// Per-`(label, type)` edge frequencies backing the optimizer's per-source-label
-    /// expand-ratio estimate, recomputed lazily when committed writes advance past
-    /// the cached generation. See [`crate::graph::stats`].
+    /// expand-ratio estimate. Never built as a side effect of a query; see
+    /// [`crate::graph::stats`] for which reader tolerates which staleness.
     pub(super) edge_fanout: Arc<parking_lot::Mutex<Option<crate::graph::stats::EdgeFanout>>>,
+    /// Decided `schema_has_edge` verdicts for one write generation, keyed by
+    /// `(src_label, type, dst_label)`. The type-inference pass asks the same questions
+    /// on every execution because there is no plan cache, and answering without the
+    /// statistics table means walking the graph, so a decided verdict is remembered
+    /// until a write invalidates the generation. See [`crate::graph::stats`].
+    pub(super) schema_probes: Arc<parking_lot::Mutex<SchemaProbeMemo>>,
     pub(super) n_threads: Arc<std::sync::atomic::AtomicI32>,
     /// Type-erased extension cache. Higher-level crates attach caches (e.g. the
     /// HNSW vector index) to a Graph without creating a circular dependency,
@@ -582,6 +593,7 @@ impl Graph {
             prop_columns: Arc::new(crate::columns::ColumnsCache::default()),
             edge_columns: Arc::new(crate::columns::ColumnsCache::default()),
             edge_fanout: Arc::new(parking_lot::Mutex::new(None)),
+            schema_probes: Arc::new(parking_lot::Mutex::new((0, AHashMap::new()))),
             n_threads: Arc::new(std::sync::atomic::AtomicI32::new(0)),
             extensions: Arc::new(parking_lot::Mutex::new(AHashMap::new())),
         })
@@ -858,7 +870,7 @@ impl Graph {
             .with_fresh(&self.storage, |cols| cols.props_table(ids, props))?
     }
 
-    /// Single-property column gather for edges: `out[i]` is `prop` on `ids[i]`.
+    /// Gathers one property column for edges, where `out[i]` is `prop` on `ids[i]`.
     pub fn edge_prop_json_column(
         &self,
         ids: &[EdgeId],
@@ -1109,20 +1121,41 @@ impl Graph {
     /// Synchronously rebuild the CSR snapshot from LMDB. Useful after bulk
     /// loads or when tests need a consistent read view before the threshold
     /// has been crossed.
+    ///
+    /// Rebuilds a fresh snapshot plus the boolean adjacency matrices, which is what
+    /// expansion and all but two algorithms read. It deliberately does *not* build the
+    /// PageRank or weighted matrices. This is the call every
+    /// bulk load makes (`COPY ... FROM` and `IMPORT DATABASE` both end with it), and
+    /// because a rebuild never downgrades an installed tier, asking for weights here
+    /// would pin every process that ever loads data to the weighted matrices and the
+    /// extra `edges` scan for the rest of its life, whether or not anything asks a
+    /// weighted question. The two consumers that need more upgrade through their own
+    /// gate on first use. (Those two are `page_rank` and `shortest_path_dijkstra`.)
     #[instrument(skip(self))]
     pub fn rebuild_csr(&self) -> Result<(), Error> {
         // Serialize against every other maintenance path (incremental applies,
         // snapshot-only refreshes, and the background rebuild) so no two run
         // concurrently and an incremental drain cannot race this install.
         let _maint = self.csr_cache.maintenance.lock();
-        self.rebuild_csr_locked()
+        self.rebuild_csr_locked(MatrixKinds::ADJACENCY)
     }
 
-    /// Full CSR-snapshot and matrix rebuild from LMDB. The caller must already
-    /// hold `csr_cache.maintenance`; the public [`Graph::rebuild_csr`] acquires
-    /// it. Kept separate so the freshness gates, which already hold the lock, do
-    /// not deadlock on the non-reentrant mutex.
-    pub(super) fn rebuild_csr_locked(&self) -> Result<(), Error> {
+    /// Full CSR-snapshot and matrix rebuild from LMDB, materializing `tier`. The
+    /// caller must already hold `csr_cache.maintenance`; the public
+    /// [`Graph::rebuild_csr`] acquires it. Kept separate so the freshness gates,
+    /// which already hold the lock, do not deadlock on the non-reentrant mutex.
+    ///
+    /// The request is unioned with what the installed matrices already carry: a
+    /// rebuild triggered by one consumer must not strip a matrix another consumer
+    /// asked for, or a workload alternating the two would rebuild twice per write
+    /// instead of once.
+    pub(super) fn rebuild_csr_locked(&self, kinds: MatrixKinds) -> Result<(), Error> {
+        let kinds = self
+            .matrices
+            .read()
+            .as_ref()
+            .map(|m| m.kinds().union(kinds))
+            .unwrap_or(kinds);
         // Capture the generation before reading LMDB so writes that land during
         // the build leave the snapshot conservatively stale.
         let built_gen = self.csr_cache.current_gen();
@@ -1130,11 +1163,29 @@ impl Graph {
         // build land in the emptied delta and are re-applied incrementally later
         // (idempotently) rather than lost.
         self.csr_cache.clear_delta();
-        let snap = CsrSnapshot::build(&self.storage)?;
+        // From here on a failure has to put the drained delta's work back, or the caches
+        // report themselves current while neither advanced: `clear_delta` above already
+        // emptied the buffer that `ensure_matrix_view` gates on, so `mark_force_full` on
+        // each fallible step is the request for the rebuild this attempt did not finish.
+        // Only the weight matrix needs the per-edge weights, and they cost a second
+        // full scan of `edges`; the PageRank matrix is built from the row boundaries.
+        let mut snap = if kinds.needs_weights() {
+            CsrSnapshot::build_weighted(&self.storage)
+        } else {
+            CsrSnapshot::build(&self.storage)
+        }
+        .inspect_err(|_| self.csr_cache.mark_force_full())?;
         let m = MatrixSet::materialize(
             &snap,
+            kinds,
             self.n_threads.load(std::sync::atomic::Ordering::Acquire),
-        )?;
+        )
+        .inspect_err(|_| self.csr_cache.mark_force_full())?;
+        // The weights have served their only purpose. `MatrixSet::materialize` is the
+        // sole reader, so keeping them on the installed snapshot would hold eight bytes
+        // per edge (111 MB on a 13.9 M-edge graph) for the life of that snapshot with
+        // nothing able to read it. A later weighted rebuild loads them again.
+        snap.edge_weight = None;
         // Install the matrices and the snapshot together under the matrices write
         // lock so a reader holding `matrices.read()` never observes a matrix from
         // one generation paired with a snapshot from another (the snapshot store
@@ -1151,7 +1202,7 @@ impl Graph {
     /// `/backups/mydb_2026-05-27.mdb`). The file is a complete, portable
     /// LMDB snapshot. Concurrent reads and writes are not blocked.
     ///
-    /// To restore: create an empty directory, copy the snapshot file to
+    /// To restore, create an empty directory, copy the snapshot file to
     /// `<dir>/data.mdb`, then call `Graph::open(<dir>, map_size_gb)`.
     pub fn backup(&self, destination: &Path) -> Result<(), Error> {
         self.storage

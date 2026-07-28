@@ -94,8 +94,8 @@ Relevance scores from different sources are merged using one of two strategies:
 * Reciprocal rank fusion (RRF): Merges ranked lists using the reciprocal of each item's rank, `score = Σ 1 / (k + rank + 1)` over the modalities that
   ranked the item, where `rank` is 0-based. This is the default
   strategy; because it uses ranks rather than raw scores, it needs no normalization when relevance scores have different scales.
-* Weighted linear combination: Combines raw relevance scores linearly: `score = α * vector_score + β * text_score`. Use this to prioritize one
-  index type over the other.
+* Weighted linear combination: Combines raw relevance scores linearly, scoring an item as `α * vector_score + β * text_score`. Use this to
+  prioritize one index type over the other.
 
 The `FusionStrategy` enum contains the following variants:
 

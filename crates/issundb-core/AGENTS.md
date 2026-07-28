@@ -71,8 +71,39 @@ place, `issundb_graphblas::set_global_threads`; do not call the raw FFI from `is
 ## CSR Snapshot Vs. LMDB Adjacency
 
 `CsrSnapshot` (in `csr.rs`) is a read-only in-memory Compressed Sparse Row view of the adjacency: the outgoing arrays plus a transposed incoming view
-carrying per-edge type and edge ids, and a per-edge weight. It is swapped atomically via `arc_swap::ArcSwap`. `MatrixSet` (in `matrices.rs`) holds the
-GraphBLAS sparse matrices derived from it.
+carrying per-edge type and edge ids, and optionally a per-edge weight. It is swapped atomically via `arc_swap::ArcSwap`. `MatrixSet` (in `matrices.rs`)
+holds the GraphBLAS sparse matrices derived from it.
+
+Both are built at the smallest size their consumer reads, and both builds are memory-shaped in ways that are easy to undo by accident:
+
+- The snapshot is built from `out_adj`, not from `edges`. The 20-byte `AdjEntry` holds the destination, the type id, and the edge id, which is every
+  field the arrays carry, and the entries arrive grouped by source in ascending key order. Reading them from `edges` instead means decoding one
+  `EdgeRecord` per edge, which also copies that edge's whole property blob.
+- Entries go straight into the flat arrays while the pass counts each row. Do not stage a `Vec` per node first: that is one allocation per node, held
+  alongside the finished arrays at the peak and then returned to the allocator as one hole per node, which `malloc_trim` cannot hand back. On a 1 M-node,
+  13.9 M-edge graph it left 3.3 GB resident for 620 MB of live arrays.
+- Each row is reordered by ascending edge id after the fill, because `DUPSORT` orders duplicates by the raw little-endian bytes of an `AdjEntry`, whose
+  first field is `edge_type`. That order is observable (an expansion emits its neighbors in it) and `load_weights` binary-searches it, so `csr.rs` has a
+  proptest pinning every array, incoming included, against the builder this replaced. The pass is a consequence of the stored layout: putting `edge_id`
+  first in big-endian, or installing a `DUPSORT` comparator, would make the iteration order right natively and delete it, but both change the format and
+  the order `out_neighbors` returns.
+- `edge_weight` is `Option` and only `build_weighted` fills it, at the cost of a second full scan of `edges`, since a weight lives in a property blob.
+  Only the weight matrix reads it, and only Dijkstra reads that.
+- `MatrixKinds` decides which optional matrices `MatrixSet::materialize` builds, and it is a *set*, not an ordering. The two are independent:
+  `page_rank_matrix` needs only the row boundaries and is read only by `page_rank`, while `weight_matrix` needs a snapshot from `build_weighted` and is
+  read only by `shortest_path_dijkstra`. Do not reintroduce a ladder between them, in either direction: an ordering makes asking for one build both, which
+  cost PageRank a full `edges` scan it does not need and Dijkstra a 167 MB matrix it never reads. Requests combine with `union`, a requirement is a
+  `contains` test, and the set is stored on the `MatrixSet` rather than inferred from which `Option` is populated, so the two cannot desynchronize into a
+  set that claims to cover a matrix it lacks. Requesting the weight matrix with an unweighted snapshot is `Error::InvalidArgument`, not `Error::Corrupt`:
+  it is a caller mistake about gating, and `Corrupt` is what tells an operator to restore a backup.
+- A weighted rebuild clears `snap.edge_weight` once the weight matrix is built, in both `rebuild_csr_locked` and the background pass. The matrix is the
+  only reader, so leaving them on the installed snapshot holds eight bytes per edge that nothing can consume.
+- The public `page_rank_graphblas` and `shortest_path_graphblas` gate themselves, and do it *before* taking the matrices read guard. They used to
+  recurse into their gated wrapper from inside a `match` on a live guard, which deadlocks the calling thread against itself as soon as the gate reaches a
+  rebuild, since `parking_lot::RwLock` is not reentrant. Any new public entry point here must follow the same order: gate, then read.
+- The materialization builds one row array and one column array for the whole set and swaps their roles for a transpose, with one value array alive at a
+  time. Do not go back to a triple buffer per matrix or a coordinate hash map for deduplication: `GrB_Matrix_build` wants three arrays and takes a
+  duplicate-combining operator, so both were pure overhead, worth 2.7 GB above the finished matrices on that same graph.
 
 Rebuilds happen on demand through the freshness gates below; the background rebuild after `REBUILD_THRESHOLD` writes is a compaction safety net, not
 the freshness path.
@@ -85,11 +116,15 @@ the freshness path.
   consistency check (such as the DELETE connected-node guard) depends on that: keep any new point lookup on storage truth rather than routing it
   through the snapshot for speed.
 - Use the CSR snapshot as the hot read path for graph algorithms (BFS, DFS, PageRank, SCC). Callers do not have to refresh it by hand: the algorithm
-  entry points go through `ensure_matrix_view`, `ensure_csr_fresh`, or `ensure_snapshot_fresh` (see the freshness gates in the root `AGENTS.md`).
-  `Graph::rebuild_csr` remains available for forcing a full rebuild before a burst of algorithm calls.
+  entry points go through `ensure_matrix_view`, `ensure_csr_fresh`, `ensure_snapshot_fresh`, `ensure_page_rank_matrix` (what `page_rank` uses), or
+  `with_weighted_matrix_view` (what `shortest_path_dijkstra` uses) — see the freshness gates in the root `AGENTS.md`. A new algorithm picks its gate by
+  what it reads, and reading an optional matrix behind the wrong one is an error rather than a wrong answer. `Graph::rebuild_csr` refreshes the snapshot
+  and the boolean adjacency only; it deliberately does not build the PageRank or weight matrices, so it is not a way to warm them before a burst of
+  weighted calls (their own gates do that on first use).
 - `MatrixSet` is derived from the CSR snapshot. A full rebuild goes through `MatrixSet::materialize`; incremental maintenance goes through
   `MatrixSet::apply_delta`, which patches the matrices in place from the write path's `GraphDelta` and falls back to a full rebuild when a node was
-  deleted. Either way the CSR and the matrix set advance together; do not update one without the other.
+  deleted. Either way the CSR and the matrix set advance together; do not update one without the other. `apply_delta` maintains only the boolean
+  adjacency, so the weighted matrices go stale behind it, which is why their consumers gate on the matrices generation rather than on the pending delta.
 
 ## In-memory Property Columns
 
@@ -118,6 +153,42 @@ It is derived from LMDB, like the CSR snapshot, and follows the same write-LMDB-
   (see `issundb-cypher/AGENTS.md`).
 - This store is a cache, never the source of truth. Any new write path that changes a scalar property must record a delta against both `prop_columns`
   and `edge_columns` as applicable, the same way it updates `node_prop_idx`.
+
+## Schema Statistics
+
+`graph/stats.rs` holds the schema-level edge statistics: the `(label, type)` fan-out marginals and the realized `(src_label, type, dst_label)` triples.
+Like the property columns it is a derived cache, and it follows the same rule that an advisory reader never builds one. It differs in one way that
+matters, so keep the two readers apart when changing it.
+
+- The build is one pass over `label_idx` and one over `out_adj`. Do not "simplify" it back to scanning `nodes` and `edges`: decoding a `NodeRecord` to
+  read its `labels` also copies that node's whole property blob, and decoding an `EdgeRecord` to read its endpoints copies the edge's, which is most of
+  the cost and none of the answer. Reading the labels from `label_idx` also means the statistics describe exactly the population a label scan enumerates.
+- The generation check gates use, not refresh. A table from an earlier generation is ignored, never served: `schema_has_edge` reads the same table, and a
+  stale negative there would deny a triple a committed write just realized.
+- `estimate_expand_fanout` and `estimate_expand_fanout_to` are advisory, and read through `with_possibly_stale_fanout`. Nothing builds the table for them;
+  `Graph::materialize_edge_statistics` is the deliberate warm-up: `issundb-cli` calls it synchronously on open, and `issundb-rest` and `issundb-mcp` spawn
+  it in the background so readiness is not gated on a scan that costs seconds (3.4 s on a 1 M-node, 13.9 M-edge graph). They accept a table the generation
+  has moved past, bounded per relationship type by `STALE_FANOUT_GROWTH_FACTOR` against that type's live `stats:t:` counter. Do not "fix" this to a strict generation check: that is what made a warmed process lose its statistics on the first write and never
+  recover them. Do not weaken the bound to a global edge count either, which cannot see a skewed ingest that quadruples one type inside a graph that grew
+  by a third, and do not remove it, or a process that warms at startup and then ingests plans forever against the startup snapshot.
+- The whole build runs outside the `edge_fanout` lock, with the result installed at the end. Holding the lock across it was tolerable while this was an
+  internal lazy helper; it is not now that consumers call it on a live graph, where it would block every concurrent query's planning for the scan's
+  duration.
+- Both accessors read `csr_cache.current_gen()` *after* taking the lock. Reading it first leaves a window in which a write commits before the lock is
+  acquired, so a table predating that write matches the captured value and passes as current: for `schema_has_edge` that is a stale negative, and the
+  optimizer drops rows on it.
+- `schema_has_edge` is not advisory, because the optimizer prunes rows on a negative. It must keep answering with no table, so it falls back to a bounded
+  probe of `label_idx` plus the adjacency (`SCHEMA_PROBE_BUDGET`), settling on the first matching edge and reporting `None` when the budget runs out.
+  Do not make this reader table-only: that leaves `prune_unsatisfiable` dormant on every graph nobody has materialized, which is a silent loss of the
+  pass rather than a visible failure. Its one test is `type_inference_prunes_unsatisfiable_pattern` in `issundb-cypher`.
+- Charge the probe budget for every storage operation, including visiting a node before its adjacency is read. Charging only adjacency entries left the
+  walk unbounded for exactly the population most likely to be chosen: a small label whose nodes have no edges in the direction under test, where every
+  node took the "no adjacency" path for free.
+- Probe verdicts are memoized in `schema_probes` against the write generation. The pass that asks runs on every execution because there is no plan cache,
+  so without the memo an unsatisfiable hop re-walks the graph once per query rather than once per generation. The memo is keyed on the generation, never
+  cleared lazily, so it cannot answer for a graph a write has changed.
+- A `Some(false)` from either path must never rest on a stored counter. The probe reads the per-label counter only to choose which endpoint population to
+  walk, where a wrong answer costs at most an undecided verdict; emptiness is asked of `label_idx` directly.
 
 ## GraphBLAS Semiring Choices
 

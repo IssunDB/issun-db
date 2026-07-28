@@ -463,6 +463,48 @@ class IssunDB:
         """
         ...
 
+    def materialize_edge_statistics(self) -> None:
+        """Build the schema statistics the query optimizer reads, now.
+
+        Nothing builds them as a side effect of a query, so without this call a
+        process plans every relationship pattern on the global average fan-out
+        instead of the per-source-label expand ratio, and a provably empty typed
+        hop is pruned by a bounded probe rather than an exact lookup. Costs one
+        pass over the label index and the adjacency.
+
+        The result is exact until the next committed write, and is then still used
+        for the fan-out estimates while the relationship type in question has not
+        grown much: call this again after reshaping the graph. The pruning answer
+        never reads a stale table.
+
+        Worth calling once for a long-lived process (a service, a notebook, a
+        benchmark harness); not worth it for a script running a handful of point
+        lookups, which never consult these statistics.
+
+        Raises:
+            RuntimeError: If the statistics cannot be built.
+        """
+        ...
+
+    def materialize_property_columns(self) -> None:
+        """Build the in-memory property columns, now.
+
+        The counterpart of :meth:`materialize_edge_statistics` for property-level
+        statistics: it is what makes the optimizer's selectivity estimates and
+        zone-map filter pruning available, and it warms the columnar read path
+        behind bulk property gathers and aggregations. A caller that wants the
+        optimizer at full strength on a cold graph wants both.
+
+        Costs one full scan of every node record, and the resulting columns hold
+        every scalar node property in memory for the life of this object. On a
+        large graph that is a deliberate memory commitment, which is why nothing
+        makes it for you.
+
+        Raises:
+            RuntimeError: If the columns cannot be built.
+        """
+        ...
+
     def backup(self, path: str) -> None:
         """Write a hot backup of the database to ``path``.
 

@@ -746,9 +746,9 @@ mod tests {
         Ok(())
     }
 
-    /// Silent-empty guards: a filter naming no active index, a graph with no
-    /// text indexes, and an empty query string all error instead of returning
-    /// an empty hit list an agent would read as "nothing matched".
+    /// A filter naming no active index, a graph with no text indexes, and an empty
+    /// query string all error instead of returning an empty hit list an agent would
+    /// read as "nothing matched".
     #[test]
     fn text_search_unknown_label_filter_is_an_error() -> Result<(), Box<dyn std::error::Error>> {
         let temp = TempDir::new()?;
