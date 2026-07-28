@@ -53,10 +53,11 @@ Quick examples:
   of a sentence.
 - Write correct and complete sentences.
 - Avoid made-up words.
-- Do not use a colon in place of a verb. A colon may join two clauses inside a complete sentence, which is the replacement the em-dash rule above calls
-  for, and it introduces the gloss of a list item. It must not turn a sentence into a label and a definition: write "Merges vector search seeds with
-  text search seeds, then expands via BFS" rather than "Hybrid retrieval: merges vector search seeds with text search seeds". That shape belongs to a
-  list item, and carrying it into prose (a doc comment summary, a paragraph) leaves a fragment where a sentence was required.
+- Do not use a colon in place of a verb. Three uses are fine: joining two clauses inside a complete sentence (the replacement the em-dash rule above
+  calls for), introducing the gloss of a list item, and introducing an enumeration, whether as a list or inline ("Methods: `add_node`, `add_nodes`,
+  ..."). What a colon must not do is turn a sentence into a label and a definition: write "Merges vector search seeds with text search seeds, then
+  expands via BFS" rather than "Hybrid retrieval: merges vector search seeds with text search seeds". That shape belongs to a list item, and carrying it
+  into prose (a doc comment summary, a paragraph) leaves a fragment where a sentence was required.
 - Use participial phrases and abbreviations scarcely.
 
 ## Repository Layout

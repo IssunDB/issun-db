@@ -247,7 +247,7 @@ The server registers the following tools with the connecting client:
 
 The internal engine id and a domain property (such as `Id`) live in separate numbering spaces and can collide: a node's internal id can equal a
 completely unrelated node's domain `Id` value. Passing a domain identifier straight to `get_node` or `get_edge` therefore does not error by default,
-it silently returns the wrong entity. Two defenses: resolve a domain identifier to an internal id first with a Cypher query such as
+it silently returns the wrong entity. There are two defenses. Resolve a domain identifier to an internal id first with a Cypher query such as
 `MATCH (n:Label) WHERE n.Id = x RETURN id(n)`, or pass `expect_label` (on `get_node`) or `expect_type` (on `get_edge`) so a mismatched entity is
 rejected with an error naming its actual labels.
 
