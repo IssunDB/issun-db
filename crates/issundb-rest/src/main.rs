@@ -31,11 +31,12 @@ struct Args {
     #[arg(long, env = "ISSUNDB_REST_PORT", default_value_t = 7474)]
     port: u16,
 
-    /// Skip the schema-statistics warm-up at startup. The warm-up is one pass over
+    /// Skip the schema-statistics warm-up. The warm-up is one background pass over
     /// the label index and the adjacency, and it is what makes the query optimizer's
-    /// expand-ratio estimates and type-inference pruning available: nothing builds
-    /// them as a side effect of a query. Skip it when readiness matters more than
-    /// plan quality, which on a very large graph it may.
+    /// expand-ratio estimates and exact type-inference pruning available: nothing
+    /// builds them as a side effect of a query. It does not delay readiness, so skip
+    /// it only to avoid the scan itself, which on a large graph is seconds of I/O
+    /// this process may never benefit from.
     // `FalseyValueParser` because a bare `#[arg(long, env)]` on a bool parses the
     // environment value with clap's strict bool parser, so the `=1`/`=yes`/`=on` that
     // container env blocks routinely set is a hard startup failure rather than a
@@ -48,33 +49,46 @@ struct Args {
     no_warm_statistics: bool,
 }
 
-/// Build the schema statistics before the listener is bound.
+/// Build the schema statistics in the background, without delaying readiness.
 ///
-/// A server outlives any one query, so the one pass this costs is amortized over
-/// everything it will serve, and without it the process spends its whole life on
-/// default plan weights: nothing builds the table as a side effect of a query, and a
-/// query that would benefit cannot ask for it. Warming here rather than on the first
-/// query also means the process is never serving while its planner is uninformed.
+/// A server outlives any one query, so the pass is amortized over everything it will
+/// serve, and without it the process spends its whole life on default plan weights:
+/// nothing builds the table as a side effect of a query, and an HTTP caller has no way
+/// to ask for it.
 ///
-/// Synchronous on purpose. Nothing else is scheduled on the runtime yet (`Graph::open`
-/// just above blocks the same way), and readiness that lags the warm-up is the point:
-/// a caller that would rather serve immediately passes `--no-warm-statistics`.
+/// It runs in the background rather than before the listener binds because the scan
+/// costs seconds on a large graph (measured at 3.4 s on a 1 M-node, 13.9 M-edge graph)
+/// while the plans it sharpens were worth a few percent on a workload of ordinary
+/// aggregations. Delaying readiness by seconds to buy that is the wrong trade, and
+/// serving immediately costs only the queries that arrive before the scan lands.
+///
+/// This is safe because `materialize_edge_statistics` performs its scan *without*
+/// holding the statistics lock, installing the finished table at the end. Concurrent
+/// requests therefore keep planning throughout, on the bounded probe and the global
+/// average fan-out, rather than blocking on a half-built table. Backgrounding this
+/// while the build held that lock would have been worse than doing it synchronously.
+///
+/// It runs on the blocking pool because the scan is synchronous LMDB work that would
+/// otherwise stall a runtime worker. The read transaction it holds pins a snapshot for
+/// its duration, so on a write-heavy graph it delays page reuse while it runs.
 ///
 /// A failure is logged and ignored, because every reader of the table works without
 /// it: the fan-out estimates fall back to the global average, and the schema question
 /// falls back to a bounded probe.
-fn warm_statistics(graph: &Graph) {
-    let started = std::time::Instant::now();
-    match graph.materialize_edge_statistics() {
-        Ok(()) => info!(
-            elapsed_ms = started.elapsed().as_millis() as u64,
-            "warmed schema statistics"
-        ),
-        Err(error) => warn!(
-            %error,
-            "could not warm schema statistics; continuing on default plan weights"
-        ),
-    }
+fn spawn_statistics_warm_up(graph: Arc<Graph>) {
+    tokio::task::spawn_blocking(move || {
+        let started = std::time::Instant::now();
+        match graph.materialize_edge_statistics() {
+            Ok(()) => info!(
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "warmed schema statistics"
+            ),
+            Err(error) => warn!(
+                %error,
+                "could not warm schema statistics; continuing on default plan weights"
+            ),
+        }
+    });
 }
 
 #[tokio::main]
@@ -84,11 +98,10 @@ async fn main() -> anyhow::Result<()> {
     fmt().with_env_filter(EnvFilter::from_default_env()).init();
 
     info!(db_path = %args.db_path.display(), "opening graph");
-    let graph = Graph::open(&args.db_path, args.map_size_gb)?;
+    let graph = Arc::new(Graph::open(&args.db_path, args.map_size_gb)?);
     if !args.no_warm_statistics {
-        warm_statistics(&graph);
+        spawn_statistics_warm_up(graph.clone());
     }
-    let graph = Arc::new(graph);
 
     let router = routes::build_router(graph);
 

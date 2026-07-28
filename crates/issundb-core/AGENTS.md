@@ -131,9 +131,9 @@ matters, so keep the two readers apart when changing it.
 - The generation check gates use, not refresh. A table from an earlier generation is ignored, never served: `schema_has_edge` reads the same table, and a
   stale negative there would deny a triple a committed write just realized.
 - `estimate_expand_fanout` and `estimate_expand_fanout_to` are advisory, and read through `with_possibly_stale_fanout`. Nothing builds the table for them;
-  `Graph::materialize_edge_statistics` is the deliberate warm-up, and the long-lived consumers (`issundb-cli`, `issundb-rest`, `issundb-mcp`) call it at
-  startup. They accept a table the generation has moved past, bounded per relationship type by `STALE_FANOUT_GROWTH_FACTOR` against that type's live
-  `stats:t:` counter. Do not "fix" this to a strict generation check: that is what made a warmed process lose its statistics on the first write and never
+  `Graph::materialize_edge_statistics` is the deliberate warm-up: `issundb-cli` calls it synchronously on open, and `issundb-rest` and `issundb-mcp` spawn
+  it in the background so readiness is not gated on a scan that costs seconds (3.4 s on a 1 M-node, 13.9 M-edge graph). They accept a table the generation
+  has moved past, bounded per relationship type by `STALE_FANOUT_GROWTH_FACTOR` against that type's live `stats:t:` counter. Do not "fix" this to a strict generation check: that is what made a warmed process lose its statistics on the first write and never
   recover them. Do not weaken the bound to a global edge count either, which cannot see a skewed ingest that quadruples one type inside a graph that grew
   by a third, and do not remove it, or a process that warms at startup and then ingests plans forever against the startup snapshot.
 - The whole build runs outside the `edge_fanout` lock, with the result installed at the end. Holding the lock across it was tolerable while this was an

@@ -541,12 +541,15 @@ body reports the crate `version` and the current `api` version.
 REST exposes the data plane and retrieval only. Index administration (vector index configuration, text index create/drop/list), GraphBLAS thread
 control, and backup/restore are intentionally absent: provisioning and host operations are done through the CLI or the Python surface, not over HTTP.
 
-Startup calls `Graph::materialize_edge_statistics` before binding the listener, so the optimizer's expand-ratio estimates and type-inference pruning are
-available to every request rather than to none: nothing builds that table as a side effect of a query, and an HTTP caller has no way to ask for it. The
-warm-up is synchronous, because a process that is not ready is better than one serving on default plan weights, and a failure is logged and ignored since
-every reader of the table works without it. `--no-warm-statistics` (or `ISSUNDB_NO_WARM_STATISTICS`) skips it for a graph large enough that readiness
-matters more. The property columns are deliberately *not* warmed here: that build is a full node scan and holds every scalar property in memory, which is
-a footprint decision an operator should make, not a startup default.
+Startup spawns `Graph::materialize_edge_statistics` on the blocking pool, so the optimizer's expand-ratio estimates and exact type-inference pruning become
+available without gating readiness: nothing builds that table as a side effect of a query, and an HTTP caller has no way to ask for it. It is deliberately
+*not* synchronous. The scan costs seconds on a large graph (3.4 s on a 1 M-node, 13.9 M-edge graph, measured through the release wheel), while the plans it
+sharpens measured a few percent on a workload of ordinary aggregations, so delaying readiness to buy that is the wrong trade. Backgrounding it is only safe
+because `materialize_edge_statistics` scans *without* holding the statistics lock and installs the finished table at the end; concurrent requests keep
+planning on the bounded probe and the global average throughout, verified at a 1.5 ms median and an 18.6 ms maximum for point queries issued during the
+scan. Do not move the build back under that lock, and do not make this call synchronous again. A failure is logged and ignored, since every reader works
+without the table. `--no-warm-statistics` (or `ISSUNDB_NO_WARM_STATISTICS`) skips the scan entirely. The property columns are deliberately not warmed here:
+that build is a full node scan and holds every scalar property in memory, which is a footprint decision an operator should make, not a startup default.
 
 The API is self-describing: the OpenAPI 3.1 document is generated from the handler annotations (`#[utoipa::path]`) and the request and response
 `ToSchema` derives, served as JSON at `GET /v1/openapi.json` with a Scalar UI at `GET /v1/docs`. The generator crates are `utoipa` and
@@ -595,10 +598,12 @@ differently-labeled entity instead of erroring. The tool descriptions, argument 
 identifier first with `MATCH (n:Label) WHERE n.Id = x RETURN id(n)`, or pass `expect_label` (`get_node`) or `expect_type` (`get_edge`) to reject a
 mismatched entity with an error instead.
 
-Startup calls `Graph::materialize_edge_statistics` before either transport serves, for the same reason REST does: an agent issuing Cypher through
-`cypher_query` cannot ask for the optimizer's statistics, and a session outlives any one tool call. `--no-warm-statistics` (or `ISSUNDB_NO_WARM_STATISTICS`)
-skips it. `issundb-cli` warms on every open, at launch and on `:open`, and takes no flag: a slow open there is visible and interactive rather than a
-readiness contract. `issundb-py` deliberately does not warm on construction, because a short script should not pay a scan it may never use; it exposes
+Startup spawns `Graph::materialize_edge_statistics` on the blocking pool, as REST does and for the same reason: an agent issuing Cypher through
+`cypher_query` cannot ask for the optimizer's statistics, and a session outlives any one tool call. Backgrounding matters more here than in REST, because a
+stdio client launches one subprocess per session, so a synchronous scan would be repeated every session and would land on the initialize handshake where a
+client with a startup timeout can abandon it. `--no-warm-statistics` (or `ISSUNDB_NO_WARM_STATISTICS`) skips it. `issundb-cli` warms *synchronously* on
+every open, at launch and on `:open`, and takes the same flag: a visible pause before an interactive prompt is honest, and there is no readiness contract
+to break. `issundb-py` deliberately does not warm on construction, because a short script should not pay a scan it may never use; it exposes
 `materialize_edge_statistics` and `materialize_property_columns` so a long-lived Python process asks for itself. A caller that measures IssunDB through the
 Python binding and does not call them is measuring the planner with its statistics unavailable, which is worth stating in any comparison, the same way an
 index-creation step is.

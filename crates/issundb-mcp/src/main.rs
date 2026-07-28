@@ -70,11 +70,12 @@ struct Args {
     #[arg(long = "allowed-host")]
     allowed_hosts: Vec<String>,
 
-    /// Skip the schema-statistics warm-up at startup. The warm-up is one pass over
+    /// Skip the schema-statistics warm-up. The warm-up is one background pass over
     /// the label index and the adjacency, and it is what makes the query optimizer's
-    /// expand-ratio estimates and type-inference pruning available: nothing builds
-    /// them as a side effect of a query. Skip it when a client that launches this
-    /// server per session needs it responsive sooner than it needs good plans.
+    /// expand-ratio estimates and exact type-inference pruning available: nothing
+    /// builds them as a side effect of a query. It does not delay the initialize
+    /// handshake, so skip it only to avoid the scan itself, which a stdio client
+    /// launching one subprocess per session would otherwise repeat every session.
     // `FalseyValueParser` because a bare `#[arg(long, env)]` on a bool parses the
     // environment value with clap's strict bool parser, so the `=1`/`=yes`/`=on` that
     // container env blocks routinely set is a hard startup failure rather than a
@@ -144,40 +145,45 @@ async fn validate_host(
     }
 }
 
-/// Build the schema statistics before either transport starts serving.
+/// Build the schema statistics in the background, without delaying either transport.
 ///
 /// An MCP session outlives any one tool call, so the pass is amortized over everything
 /// that session asks for, and without it the process spends its whole life on default
 /// plan weights: nothing builds the table as a side effect of a query, and an agent
 /// issuing Cypher through `cypher_query` has no way to ask for it.
 ///
-/// The amortization is per session, not per graph, and that is the limit of the
-/// argument: a stdio client launches this server as a subprocess per session, so a
-/// session that asks one question pays the whole scan, and the delay lands on the
-/// initialize handshake where a client with a startup timeout can give up on it. The
-/// warm-up stays on by default because a session is usually a conversation rather than
-/// one question, but `--no-warm-statistics` exists for that case and is the right
-/// answer for a large graph behind a per-session client.
+/// The amortization is per session rather than per graph, which is why this must not be
+/// synchronous. A stdio client launches this server as a subprocess per session, so the
+/// scan (measured at 3.4 s on a 1 M-node, 13.9 M-edge graph) would be repeated every
+/// session and would land on the initialize handshake, where a client with a startup
+/// timeout can give up on it. In the background it costs the session nothing but the
+/// first few tool calls planning without the table.
 ///
-/// Synchronous on purpose, matching `Graph::open` just above: nothing else is
-/// scheduled on the runtime yet.
+/// This is safe because `materialize_edge_statistics` performs its scan *without*
+/// holding the statistics lock, installing the finished table at the end, so tool calls
+/// keep planning throughout on the bounded probe and the global average fan-out.
+///
+/// It runs on the blocking pool because the scan is synchronous LMDB work that would
+/// otherwise stall a runtime worker.
 ///
 /// A failure is logged and ignored, because every reader of the table works without
 /// it: the fan-out estimates fall back to the global average, and the schema question
 /// falls back to a bounded probe. Diagnostics go to stderr like everything else here,
 /// since the stdio transport owns stdout.
-fn warm_statistics(graph: &Graph) {
-    let started = std::time::Instant::now();
-    match graph.materialize_edge_statistics() {
-        Ok(()) => info!(
-            elapsed_ms = started.elapsed().as_millis() as u64,
-            "warmed schema statistics"
-        ),
-        Err(error) => warn!(
-            %error,
-            "could not warm schema statistics; continuing on default plan weights"
-        ),
-    }
+fn spawn_statistics_warm_up(graph: Arc<Graph>) {
+    tokio::task::spawn_blocking(move || {
+        let started = std::time::Instant::now();
+        match graph.materialize_edge_statistics() {
+            Ok(()) => info!(
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "warmed schema statistics"
+            ),
+            Err(error) => warn!(
+                %error,
+                "could not warm schema statistics; continuing on default plan weights"
+            ),
+        }
+    });
 }
 
 #[tokio::main]
@@ -193,11 +199,10 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     info!(db_path = %args.db_path.display(), "opening graph");
-    let graph = Graph::open(&args.db_path, args.map_size_gb)?;
+    let graph = Arc::new(Graph::open(&args.db_path, args.map_size_gb)?);
     if !args.no_warm_statistics {
-        warm_statistics(&graph);
+        spawn_statistics_warm_up(graph.clone());
     }
-    let graph = Arc::new(graph);
 
     match args.transport {
         Transport::Stdio => {
