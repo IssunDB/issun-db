@@ -1,13 +1,7 @@
 // Run every playground demo through the compiled wasm module and fail on any error.
 //
-// The demo catalog is Cypher held in a JavaScript file, so nothing in the Rust test
-// suite can see it: a wrong yield name or argument form is a broken button that only a
-// person clicking it would find. This runs the catalog the way the page does, against
-// the same module the page loads, and is what `make playground-check` invokes.
-//
-// It needs the `nodejs` target of the module rather than the `web` target the page uses,
-// because the latter fetches its own `.wasm` by URL. `make playground-check` builds it
-// into `target/`, so the two never collide.
+// Invoked by `make playground-check`. It needs the `nodejs` target of the module rather than
+// the `web` target the page uses, because the latter fetches its own `.wasm` by URL.
 
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
@@ -32,7 +26,6 @@ for (const category of DEMO_CATEGORIES) {
   for (const demo of category.demos) {
     checked += 1;
     // A fresh instance per demo, so one demo's writes cannot make another pass or fail.
-    // The page seeds the same sample at startup, so this matches what a visitor sees.
     const p = new Playground();
     try {
       if (demo.cypher !== SAMPLE_SOCIAL) {
@@ -51,8 +44,6 @@ for (const category of DEMO_CATEGORIES) {
         detail = `${result.rows.length} row(s), ${result.columns.length} col(s)`;
       }
 
-      // The two capabilities Cypher cannot reach are driven by the same hooks the page
-      // uses, so the catalog's non-Cypher demos are checked too rather than assumed.
       if (demo.textIndex) {
         p.createTextIndex(demo.textIndex[0], demo.textIndex[1]);
         const hits = JSON.parse(p.textSearch(demo.textSearch, 10)).hits;

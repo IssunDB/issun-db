@@ -31,15 +31,14 @@ see, so this is what keeps a button from silently breaking.
 
 ## What This Build Is
 
-The module is built with `--no-default-features --features hnsw`, which selects the two
-non-LMDB backends:
+The module is built with `--no-default-features`, which selects the two pure-Rust backends:
 
 - Storage is the in-memory backend, because LMDB needs a filesystem and memory mapping
   that `wasm32-unknown-unknown` does not have. Nothing survives a reload, which the page
   states in the header rather than leaving a visitor to discover.
-- The vector index is the exact-scan backend, since `usearch` is C++. Results are the true
-  nearest neighbors rather than approximate ones, so the demo is honest, just not
-  sublinear.
+- The vector index is the exact-scan backend, since the `hnsw` feature selects `usearch`,
+  which is C++ and fails the wasm build in `cxx`. Results are the true nearest neighbors
+  rather than approximate ones, so the demo is honest, just not sublinear.
 
 Everything else is the ordinary engine: the same parser, planner, optimizer, executor,
 counting kernels, CSR snapshot, and BM25 index.

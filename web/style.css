@@ -1,10 +1,5 @@
-/* IssunDB playground.
- *
- * Two themes over one set of custom properties, defaulting to the visitor's system
- * preference and overridable by the header toggle. Nothing is loaded from a network:
- * the type stack is whatever the system provides, so the page renders with no request
- * beyond the module itself.
- */
+/* IssunDB playground. The type stack is whatever the system provides, so the page renders
+ * with no network request beyond the module itself. */
 
 :root {
   --ink: #16181d;
@@ -357,7 +352,7 @@ main {
 }
 
 /* The highlighted copy sits under a transparent textarea, so the caret, selection, and
- * native editing all stay real; the two must therefore use identical metrics. */
+ * native editing stay real. The two must therefore keep identical metrics. */
 .editor {
   position: relative;
   height: 190px;

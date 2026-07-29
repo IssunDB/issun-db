@@ -1,13 +1,8 @@
-// The demo catalog: what the playground is for.
+// The demo catalog.
 //
-// Grouped by the capability being shown, because the point is breadth. A graph engine
-// with an openCypher planner, graph algorithms, full-text search, and vector search in
-// one place is the claim, and each group evidences one part of it.
-//
-// Every query here is executed against the real engine, so every signature in it is
-// checked by `make playground-check`, which runs the whole catalog through the compiled
-// module and fails on an error. The first draft of this file had the wrong yield names
-// and the wrong argument form for every procedure; that check is why they are right now.
+// Nothing in the Rust suite can see these queries, so `make playground-check` runs the whole
+// catalog through the compiled module and fails on an error. The first draft of this file had
+// the wrong yield names and the wrong argument form for every procedure.
 
 export const SAMPLE_SOCIAL = `// A small social graph. Several demos below query it.
 CREATE (ada:Person {name: 'Ada', city: 'London', age: 36}),
@@ -26,9 +21,6 @@ CREATE (ada:Person {name: 'Ada', city: 'London', age: 36}),
        (alan)-[:KNOWS {since: 1945, weight: 2}]->(barbara),
        (grace)-[:KNOWS {since: 1955, weight: 3}]->(ada)`;
 
-// A procedure's arguments are resolved before the query is planned, so they must be
-// literals: `id(a)` cannot be passed. The ids below are the ones the sample graph gets
-// in a freshly seeded playground, which is why these demos say so.
 const PATH_NOTE = `// Procedure arguments are resolved before planning, so they are literal ids
 // rather than expressions. 0 is Ada and 5 is Donald in the seeded sample.`;
 

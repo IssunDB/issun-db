@@ -1,12 +1,6 @@
-// The IssunDB playground.
-//
-// Vanilla ES modules, no build step and no network dependency: the page loads the
-// wasm-bindgen glue, the module, this file, and one stylesheet. Everything else,
-// including the Cypher highlighter and the force-directed layout, is here, which keeps
-// the whole page auditable and lets it be served from any static host.
-//
-// There is exactly one `Playground` for the tab's lifetime, so data accumulates across
-// queries the way it would in an embedded database. "Reset data" replaces it.
+// The IssunDB playground. Vanilla ES modules, no build step, nothing fetched from a
+// network. One `Playground` for the tab's lifetime, so data accumulates across queries the
+// way it would in an embedded database; "Reset data" replaces it.
 
 import init, { Playground } from "./pkg/issundb_wasm.js";
 import { DEMO_CATEGORIES, SAMPLE_SOCIAL } from "./demos.js";
@@ -17,9 +11,6 @@ const $ = (id) => document.getElementById(id);
 // Cypher highlighting
 // ---------------------------------------------------------------------------
 
-// Written here rather than vendored because a highlighter for one language is smaller
-// than the library that would supply it, and the page deliberately loads nothing it does
-// not contain.
 const KEYWORDS = new Set(
   `match optional where return create merge set remove delete detach with unwind
    order by skip limit distinct as and or xor not in starts ends contains is null
@@ -33,15 +24,15 @@ const KEYWORDS = new Set(
 
 const TOKEN = new RegExp(
   [
-    "(\\/\\/[^\\n]*)", // 1 line comment
-    "(\\/\\*[\\s\\S]*?\\*\\/)", // 2 block comment
-    "('(?:[^'\\\\]|\\\\.)*'|\"(?:[^\"\\\\]|\\\\.)*\")", // 3 string
-    "(\\$[A-Za-z_]\\w*)", // 4 parameter
-    "(:[A-Za-z_]\\w*)", // 5 label or relationship type
-    "(\\b\\d+\\.?\\d*(?:[eE][-+]?\\d+)?\\b)", // 6 number
-    "([A-Za-z_]\\w*)(?=\\s*\\()", // 7 function call
-    "([A-Za-z_][\\w.]*)", // 8 word
-    "([-=<>|*+\\/%!,.;{}\\[\\]()]+)", // 9 operator or punctuation
+    "(\\/\\/[^\\n]*)",
+    "(\\/\\*[\\s\\S]*?\\*\\/)",
+    "('(?:[^'\\\\]|\\\\.)*'|\"(?:[^\"\\\\]|\\\\.)*\")",
+    "(\\$[A-Za-z_]\\w*)",
+    "(:[A-Za-z_]\\w*)",
+    "(\\b\\d+\\.?\\d*(?:[eE][-+]?\\d+)?\\b)",
+    "([A-Za-z_]\\w*)(?=\\s*\\()",
+    "([A-Za-z_][\\w.]*)",
+    "([-=<>|*+\\/%!,.;{}\\[\\]()]+)",
   ].join("|"),
   "g",
 );
@@ -74,9 +65,9 @@ function highlight(src) {
 // ---------------------------------------------------------------------------
 
 let db = null;
-let lastResult = null; // {columns, rows} of the most recent successful query
-let sim = null; // the running force layout, if any
-let rankSizes = null; // node id -> PageRank score, when sizing by rank
+let lastResult = null;
+let sim = null;
+let rankSizes = null;
 
 const HISTORY_KEY = "issundb.history";
 const THEME_KEY = "issundb.theme";
@@ -89,8 +80,8 @@ const editor = $("editor");
 const highlightEl = $("highlight");
 
 function syncHighlight() {
-  // The trailing newline keeps the backdrop's last line from collapsing, which would
-  // otherwise let the two panes disagree by one line height at the bottom.
+  // The trailing newline stops the backdrop's last line from collapsing, which would let
+  // the two panes disagree by one line height at the bottom.
   highlightEl.innerHTML = highlight(editor.value) + "\n";
   highlightEl.parentElement.scrollTop = editor.scrollTop;
   highlightEl.parentElement.scrollLeft = editor.scrollLeft;
@@ -112,7 +103,6 @@ editor.addEventListener("keydown", (e) => {
     run();
     return;
   }
-  // A query is indented text, so Tab has to insert rather than leave the field.
   if (e.key === "Tab") {
     e.preventDefault();
     const { selectionStart: a, selectionEnd: b, value } = editor;
@@ -193,8 +183,8 @@ async function run(mode = "run") {
 
   $("run").disabled = true;
   setStatus("running…");
-  // Yield once so the browser paints the disabled button before the engine blocks the
-  // thread. Execution is synchronous inside the module, so this is the only chance to.
+  // Execution is synchronous inside the module, so this is the only chance the browser gets
+  // to paint the disabled button before the thread blocks.
   await new Promise((r) => setTimeout(r, 0));
 
   try {
@@ -215,8 +205,6 @@ async function run(mode = "run") {
     renderTable(result);
     $("pane-json").innerHTML = `<pre class="json">${esc(JSON.stringify(result.rows, null, 2))}</pre>`;
 
-    // The plan pane is kept in step with the query, so switching to it never shows the
-    // plan of something else. A statement EXPLAIN cannot describe is simply left blank.
     try {
       $("pane-plan").innerHTML = `<pre class="plan">${esc(db.explain(cypher))}</pre>`;
     } catch {
@@ -269,7 +257,7 @@ function remember(cypher) {
   try {
     localStorage.setItem(HISTORY_KEY, JSON.stringify(history.slice(0, 25)));
   } catch {
-    // A browser refusing storage is not a reason to fail a query.
+    // A browser refusing storage must not fail the query.
   }
   renderHistory();
 }
@@ -310,8 +298,6 @@ function renderDemos() {
         button.classList.add("active");
         setQuery(demo.cypher, demo.desc);
         await run(demo.explain ? "explain" : "run");
-        // The two capabilities Cypher cannot express are driven here, after the demo's
-        // own statement, so a single click still shows the whole feature.
         if (demo.textIndex) await runTextDemo(demo);
         if (demo.vectors) await runVectorDemo();
       });
@@ -353,8 +339,8 @@ async function runVectorDemo() {
       showError("No Person nodes to embed. Run the sample graph first.");
       return;
     }
-    // A readable stand-in for a real embedding: each person is placed on a circle, so
-    // "nearest" has an obvious meaning the table can be checked against by eye.
+    // Each person is placed on a circle, so "nearest" has a meaning the table can be
+    // checked against by eye.
     people.forEach(([id], i) => {
       const angle = (i / people.length) * Math.PI * 2;
       db.upsertVector(id, new Float32Array([Math.cos(angle), Math.sin(angle), 0.25]));
@@ -382,8 +368,7 @@ async function runVectorDemo() {
 // Schema panel
 // ---------------------------------------------------------------------------
 
-// A stable color per label, so a vertex keeps its color across redraws and matches the
-// legend and the schema list. Hashing the name is what makes it stable without a table.
+// Hashing the name is what keeps a vertex's color stable across redraws without a table.
 function hueOf(name) {
   let hash = 0;
   for (let i = 0; i < name.length; i += 1) {
@@ -447,9 +432,8 @@ async function computeRanks() {
   }
 }
 
-// A small velocity-Verlet layout: repulsion between every pair, springs along the
-// relationships, and a pull toward the centre. At the 300-node cap the all-pairs pass is
-// cheap enough that no spatial index is worth the code it would take.
+// Velocity-Verlet, with all-pairs repulsion: at the 300-node cap that pass is cheap enough
+// that no spatial index is worth the code it would take.
 function layout(nodes, edges, svg) {
   const width = svg.clientWidth || 800;
   const height = svg.clientHeight || 500;
@@ -486,8 +470,8 @@ function layout(nodes, edges, svg) {
         let dy = b.y - a.y;
         let d2 = dx * dx + dy * dy;
         if (d2 < 0.01) {
-          // Two nodes exactly on top of each other have no direction to separate along,
-          // so nudge them deterministically by index instead of randomly.
+          // Coincident nodes have no direction to separate along, so nudge them by index
+          // rather than randomly, which would make a layout unreproducible.
           dx = (i - j) * 0.1 + 0.1;
           dy = 0.1;
           d2 = dx * dx + dy * dy;
@@ -555,9 +539,8 @@ function captionOf(node) {
   return `#${node.id}`;
 }
 
-// Node ids the current result names, so a query's answer can be seen in the picture. Only
-// these three column names are treated as node references; guessing from the values would
-// light up unrelated integers.
+// Only these three column names are treated as node references. Guessing from the values
+// instead would light up unrelated integers.
 function highlighted() {
   if (!lastResult) return null;
   const columns = lastResult.columns
@@ -755,7 +738,7 @@ $("json-dl").addEventListener("click", () => {
   download("issundb-result.json", "application/json", JSON.stringify(objects, null, 2));
 });
 
-// The query travels in the fragment, so a shared link never reaches a server even if the
+// The query travels in the fragment, so a shared link never reaches a server even when the
 // page is hosted on one.
 const b64url = {
   encode: (s) =>
@@ -828,7 +811,7 @@ async function boot() {
   try {
     applyTheme(localStorage.getItem(THEME_KEY));
   } catch {
-    // No stored preference; the system one applies.
+    // No stored preference, so the system one applies.
   }
 
   await init();

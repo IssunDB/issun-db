@@ -37,6 +37,10 @@ PLAYGROUND_NODE_PKG := target/playground-pkg-node
 WASM_ARTIFACT := target/wasm32-unknown-unknown/release/issundb_wasm.wasm
 WASM_BINDGEN_VERSION := 0.2.122
 
+# `hnsw` selects usearch, which is C++ and cannot build for wasm, so the exact-scan vector
+# index is what omitting it gives. One variable because two copies of this drifted once.
+WASM_BUILD := cargo build -p issundb-wasm --release --target wasm32-unknown-unknown --no-default-features
+
 # Default target
 .DEFAULT_GOAL := help
 
@@ -242,8 +246,7 @@ playground-deps: ## Install the wasm target and the matching wasm-bindgen CLI
 .PHONY: playground-build
 playground-build: check-wasm-bindgen ## Build the browser module into web/pkg
 	@echo "Building issundb-wasm for wasm32-unknown-unknown (in-memory storage, exact vector index)..."
-	@cargo build -p issundb-wasm --release --target wasm32-unknown-unknown \
-		--no-default-features --features hnsw
+	@$(WASM_BUILD)
 	@echo "Generating the JavaScript glue into $(PLAYGROUND_DIR)/pkg..."
 	@wasm-bindgen $(WASM_ARTIFACT) --out-dir $(PLAYGROUND_DIR)/pkg --target web --no-typescript
 	@ls -l $(PLAYGROUND_DIR)/pkg
@@ -251,8 +254,7 @@ playground-build: check-wasm-bindgen ## Build the browser module into web/pkg
 .PHONY: playground-check
 playground-check: check-wasm-bindgen ## Run every playground demo through the compiled module
 	@echo "Building the module for Node..."
-	@cargo build -p issundb-wasm --release --target wasm32-unknown-unknown \
-		--no-default-features --features hnsw
+	@$(WASM_BUILD)
 	@wasm-bindgen $(WASM_ARTIFACT) --out-dir $(PLAYGROUND_NODE_PKG) --target nodejs --no-typescript
 	@echo "Running the demo catalog..."
 	@node $(SCRIPTS_DIR)/check_playground.mjs

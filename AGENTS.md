@@ -198,8 +198,10 @@ modules according to this map.
 - `crates/issundb-py/`: Python bindings via PyO3. Exposes the `IssunDB` class. Depends only on `issundb`.
 - `crates/issundb-wasm/`: browser bindings, exposing one `Playground` type that owns a single `Graph`. Depends only on `issundb`, and is the only crate
   built for `wasm32-unknown-unknown`. It is what proves the storage-backend seam and the pure-Rust kernels actually hold: the module is built
-  `--no-default-features --features hnsw`, so storage is the in-memory backend and the vector index is the exact scan, and a regression that reintroduces
-  an LMDB or C++ dependency below the facade breaks this build rather than going unnoticed. Every method returns a JSON string, so the boundary carries one
+  `--no-default-features`, so storage is the in-memory backend and the vector index is the exact scan, and a regression that reintroduces an LMDB or C++
+  dependency below the facade breaks this build rather than going unnoticed. Do not add `--features hnsw` to that build, which reads like it selects the
+  index and in fact selects `usearch`: the wasm build then fails compiling `cxx`. `make playground-check` is where that was caught, so keep the flags in
+  the `WASM_BUILD` variable rather than repeating them per target. Every method returns a JSON string, so the boundary carries one
   type in both directions instead of a second serialization contract. The methods are split into a private logic layer returning `Result<_, String>` and a
   thin exported layer that converts to `JsError`, because constructing a `JsError` calls a wasm-bindgen import that panics off-target, and without the
   split none of it could be covered by `cargo test`. Reading all of a node's properties decodes the stored msgpack blob directly, as the REST node route
