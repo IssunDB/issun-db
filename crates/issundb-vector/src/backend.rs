@@ -8,10 +8,17 @@
 //! and it is the only C++ dependency in the workspace.
 //!
 //! With the default `hnsw` feature the backend is `usearch`, an approximate index.
-//! Without it the backend is an exact scan, which is slower per query by a factor of
+//! Without it the backend is an exact scan, which is slower per *query* by a factor of
 //! the vector count and does not honor `quantization` (it keeps the raw `f32` it was
 //! given). It is not a stub: the results are the true nearest neighbors under the
 //! same distance conventions, so the crate's own tests hold for both.
+//!
+//! Only the query is linear. Insertion and removal are `O(1)`, which matters because
+//! those are what a *rebuild* does, once per stored vector, and the index is rebuilt
+//! from the persisted embeddings on every `Graph::open`; see `ExactBackend::slots`.
+//! `exact_backend_cost` is the harness for deciding whether a linear query is still
+//! acceptable at a given vector count, which is the question that would justify
+//! replacing this with a pure-Rust approximate index.
 
 use issundb_core::NodeId;
 
@@ -62,15 +69,26 @@ pub(crate) fn new_backend(
 /// with `hnsw` on, nothing constructs it and it is correctly absent.
 #[cfg(any(not(feature = "hnsw"), test))]
 pub(crate) mod exact {
+    use std::collections::HashMap;
+
     use super::*;
     use crate::index::exact_distance;
 
     pub(crate) struct ExactBackend {
         dims: usize,
         metric: VectorMetric,
-        /// Insertion-ordered, and the search sorts by `(distance, node)`, so the
-        /// result order does not depend on this order for equal distances.
+        /// The vectors, in no particular order: a removal swaps the last entry into the
+        /// hole it leaves. That is safe because the search sorts by `(distance, node)`,
+        /// a total order, so no result depends on where an entry sits here.
         vectors: Vec<(NodeId, Vec<f32>)>,
+        /// Each node's slot in `vectors`.
+        ///
+        /// The point of the map is that `upsert` and `remove` are the operations a
+        /// *rebuild* performs, once per stored vector, and the index is rebuilt from the
+        /// persisted embeddings on every `Graph::open`. Finding the slot by scanning made
+        /// each one `O(n)` and so the rebuild `O(n^2)`: about 5x10^9 comparisons for
+        /// 100 k vectors, spent before the first query could run.
+        slots: HashMap<NodeId, usize>,
     }
 
     impl ExactBackend {
@@ -79,6 +97,7 @@ pub(crate) mod exact {
                 dims,
                 metric: opts.metric,
                 vectors: Vec::new(),
+                slots: HashMap::new(),
             }
         }
 
@@ -121,18 +140,36 @@ pub(crate) mod exact {
 
     impl VectorBackend for ExactBackend {
         fn upsert(&mut self, node: NodeId, v: &[f32]) -> Result<(), VectorError> {
-            match self.vectors.iter_mut().find(|(n, _)| *n == node) {
-                Some((_, slot)) => {
-                    slot.clear();
-                    slot.extend_from_slice(v);
+            match self.slots.get(&node) {
+                Some(&slot) => {
+                    // Reuse the allocation rather than replacing the `Vec`, so a
+                    // re-upsert of the same node does not churn the heap.
+                    let stored = &mut self.vectors[slot].1;
+                    stored.clear();
+                    stored.extend_from_slice(v);
                 }
-                None => self.vectors.push((node, v.to_vec())),
+                None => {
+                    self.slots.insert(node, self.vectors.len());
+                    self.vectors.push((node, v.to_vec()));
+                }
             }
             Ok(())
         }
 
         fn remove(&mut self, node: NodeId) -> Result<(), VectorError> {
-            self.vectors.retain(|(n, _)| *n != node);
+            let Some(slot) = self.slots.remove(&node) else {
+                return Ok(());
+            };
+            let last = self.vectors.len() - 1;
+            self.vectors.swap_remove(slot);
+            // `swap_remove` moved the final entry into the vacated slot, so that entry's
+            // recorded position is now wrong. Missing this is the one way this
+            // bookkeeping can go bad, and it goes bad silently: the map would point at
+            // another node's vector, and a search would answer with it.
+            if slot != last {
+                let moved = self.vectors[slot].0;
+                self.slots.insert(moved, slot);
+            }
             Ok(())
         }
 
@@ -340,6 +377,64 @@ mod tests {
         assert_eq!(hits.iter().map(|h| h.node).collect::<Vec<_>>(), vec![3, 7]);
     }
 
+    /// Removing from the middle moves the last entry into the vacated slot, so the
+    /// slot map has to be repaired for the entry that moved. If it is not, the map
+    /// points at another node's vector and a search answers with it — silently, with
+    /// no length change and no error. This interleaves removals with re-upserts and
+    /// then asks, per surviving node, whether its own vector comes back.
+    #[test]
+    fn removals_from_the_middle_keep_every_node_pointing_at_its_own_vector() {
+        // Node `i` gets the one-dimensional vector `[i]`, so a search at `[i]` must
+        // return `i` and a distance of zero.
+        let entries: Vec<(NodeId, Vec<f32>)> = (0u64..12).map(|i| (i, vec![i as f32])).collect();
+        let mut b = backend(VectorMetric::L2, &entries);
+
+        // Remove from the middle, from the front, and the (then) last entry, so the
+        // swap-into-the-hole case fires both ways round.
+        for node in [5u64, 0, 11, 6] {
+            b.remove(node).unwrap();
+        }
+        // Re-add two of them, which appends into slots the removals shuffled.
+        b.upsert(5, &[5.0]).unwrap();
+        b.upsert(11, &[11.0]).unwrap();
+        // Overwrite one that has been moved by a swap, to catch a stale slot on upsert.
+        b.upsert(9, &[9.0]).unwrap();
+
+        let expected: Vec<u64> = vec![1, 2, 3, 4, 5, 7, 8, 9, 10, 11];
+        assert_eq!(b.len(), expected.len());
+        for node in expected {
+            let hits = b.search(&[node as f32], 1).unwrap();
+            assert_eq!(hits[0].node, node, "node {node} resolved to another vector");
+            assert!(
+                hits[0].distance.abs() < 1e-6,
+                "node {node} holds the wrong vector: {:?}",
+                hits[0]
+            );
+        }
+        // A removed node must be gone rather than aliased to a survivor.
+        for gone in [0u64, 6] {
+            assert!(
+                b.search(&[gone as f32], 12)
+                    .unwrap()
+                    .iter()
+                    .all(|h| h.node != gone),
+                "removed node {gone} still present"
+            );
+        }
+    }
+
+    /// Removing a node that was never added is a no-op, not a panic: `remove` reads a
+    /// slot out of the map and would index the vector list with whatever it found.
+    #[test]
+    fn removing_an_absent_node_is_a_no_op() {
+        let mut b = backend(VectorMetric::L2, &[(1, vec![1.0])]);
+        b.remove(42).unwrap();
+        assert_eq!(b.len(), 1);
+        b.remove(1).unwrap();
+        b.remove(1).unwrap();
+        assert_eq!(b.len(), 0);
+    }
+
     #[test]
     fn upsert_replaces_and_remove_deletes() {
         let mut b = backend(VectorMetric::L2, &[(1, vec![9.0]), (2, vec![0.5])]);
@@ -395,5 +490,61 @@ mod tests {
         assert!((dot.search(&[3.0, 0.0], 1).unwrap()[0].distance - (1.0 - 6.0)).abs() < 1e-6);
         let l2 = backend(VectorMetric::L2, &[(1, vec![3.0, 4.0])]);
         assert!((l2.search(&[0.0, 0.0], 1).unwrap()[0].distance - 25.0).abs() < 1e-6);
+    }
+
+    /// Measurement, not an assertion: rebuild and query cost of the exact backend.
+    ///
+    /// Run with
+    /// `cargo test --release -p issundb-vector --lib exact_backend_cost -- --ignored --nocapture`.
+    ///
+    /// It exists to answer the one question that decides whether this backend needs
+    /// replacing with an approximate index on a target that cannot have `usearch`: the
+    /// vector count at which a linear scan stops being acceptable. A query is one
+    /// distance per stored vector, so the answer depends on the dimension count and the
+    /// latency budget, not on anything here.
+    ///
+    /// Measured on a 12-thread x86-64 machine, release build, at the four dimensions
+    /// below: rebuild 0.9 ms at 10 k vectors, 4.0 ms at 40 k, 13.5 ms at 160 k, and a
+    /// query 24 / 95 / 360 us across the same sizes. Both are linear, as the slot map
+    /// intends.
+    ///
+    /// Before that map each `upsert` scanned the vector list, and the same rebuild
+    /// measured 21.4 ms at 10 k, 80.7 ms at 20 k and 334.6 ms at 40 k: quadratic, and
+    /// roughly 80x slower by 40 k. Extrapolating that curve is what made a 1 M-vector
+    /// graph take minutes to open, since the index is rebuilt from the persisted
+    /// embeddings on every `Graph::open`.
+    ///
+    /// Note the dimension count when reading the query figure: it is four here, and a
+    /// real embedding is 384 or 768, so multiply by about a hundred before comparing
+    /// against a latency budget.
+    #[test]
+    #[ignore = "measurement: prints exact-backend rebuild and query timings"]
+    fn exact_backend_cost() {
+        const DIMS: usize = 4;
+        for n in [10_000u64, 40_000, 160_000] {
+            let mut b = super::exact::ExactBackend::new(
+                DIMS,
+                &VectorIndexOptions {
+                    metric: VectorMetric::L2,
+                    ..Default::default()
+                },
+            );
+            let build = std::time::Instant::now();
+            for i in 0..n {
+                b.upsert(i, &[i as f32, 1.0, 2.0, 3.0]).unwrap();
+            }
+            let build_ms = build.elapsed().as_secs_f64() * 1000.0;
+
+            let query = std::time::Instant::now();
+            const QUERIES: usize = 100;
+            for q in 0..QUERIES {
+                let _ = b.search(&[q as f32, 1.0, 2.0, 3.0], 10).unwrap();
+            }
+            let per_query_us = query.elapsed().as_secs_f64() * 1_000_000.0 / QUERIES as f64;
+
+            println!(
+                "n={n:>7}  rebuild {build_ms:>8.1} ms  query {per_query_us:>9.1} us ({DIMS} dims)"
+            );
+        }
     }
 }

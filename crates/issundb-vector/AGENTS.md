@@ -51,6 +51,10 @@ on by default:
 
 - With `hnsw`: `HnswBackend`, wrapping `usearch`. This is the workspace's only C++ dependency, reached through `cxx`, and it is why a build without the
   feature exists at all: `usearch` cannot cross-compile to a target with no C++ toolchain.
+- Only `ExactBackend`'s *query* is linear. Insertion and removal are `O(1)` through a `node -> slot` map, because those are the operations a rebuild performs and the
+  index rebuilds from stored embeddings on every `Graph::open`; a scan there made the rebuild quadratic (roughly 80x slower by 40 k vectors). A removal
+  `swap_remove`s and repairs the moved entry's slot, which is safe only because the search sorts by `(distance, node)` and so never depends on vector order.
+  `exact_backend_cost` (ignored by default) is the harness for the exact-versus-approximate decision.
 - Without `hnsw`: `ExactBackend`, a pure-Rust scan. It is exact rather than approximate, ranks through the same `exact_distance` the rescore pass uses, and
   breaks distance ties by node id so a top-k is deterministic. It ignores `quantization`, keeping the raw `f32`, and its query cost is linear in the vector
   count.
