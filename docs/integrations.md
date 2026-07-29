@@ -291,10 +291,9 @@ Note that `issundb-mcp-server-host:8000` must be replaced with the actual host (
 
 ## Docker
 
-The repository ships a `Dockerfile` that builds one image containing the `issundb-cli`, `issundb-rest`, and `issundb-mcp` binaries. Build it from the repository root with the GraphBLAS submodule checked out:
+The repository ships a `Dockerfile` that builds one image containing the `issundb-cli`, `issundb-rest`, and `issundb-mcp` binaries. Build it from the repository root:
 
 ```bash
-git submodule update --init external/GraphBLAS
 docker build -t issundb .
 ```
 

@@ -15,7 +15,7 @@ The `Graph` struct coordinates all transactional graph storage, retrieval, and i
 - `Graph::update<F, T>(&self, f: F) -> Result<T, Error>`  
   Executes a read-write transaction inside a closure.
 - `Graph::set_thread_count(&self, n: i32) -> Result<(), Error>`  
-  Sets the thread count for GraphBLAS matrix computations, overriding the `ISSUNDB_NUM_THREADS` environment variable. Set to `0` to restore default behavior.
+  Sets the thread count for the parallel read passes, overriding the `ISSUNDB_NUM_THREADS` environment variable. Set to `0` to restore default behavior.
 - `Graph::backup(&self, destination: &Path) -> Result<(), Error>`  
   Writes a hot backup snapshot of the database environment to the destination file while the graph stays open.
 - `Graph::backup_compact(&self, destination: &Path) -> Result<(), Error>`  
@@ -32,7 +32,7 @@ Writes are serialized through an internal write lock and one LMDB write transact
 
 Reader isolation has a boundary worth knowing.
 LMDB gives a read transaction a consistent snapshot, so everything inside one `Graph::view` closure observes a single point in time.
-A read that does *not* go through `view`, which includes every Cypher query, is not one transaction: each accessor opens its own short read transaction, and the in-memory structures behind the hot read paths (the CSR snapshot, the GraphBLAS matrices, and the property columns) are refreshed on their own schedule rather than being tied to a transaction.
+A read that does *not* go through `view`, which includes every Cypher query, is not one transaction: each accessor opens its own short read transaction, and the in-memory structures behind the hot read paths (the CSR snapshot and the property columns) are refreshed on their own schedule rather than being tied to a transaction.
 A query running concurrently with a committing writer can therefore observe more than one commit point. Reads are always of committed data, never of a partial write, but a whole query is not evaluated against a single snapshot. Wrap the reads in one `Graph::view` closure when a sequence of reads has to agree with itself.
 
 - `Graph::view(f)` runs the closure inside a read-only transaction (`ReadTxn`); every read inside it observes one consistent snapshot.
@@ -129,9 +129,9 @@ These methods are the Rust equivalents of the Cypher DDL statements in the [Cyph
 
 ---
 
-## GraphBLAS Algorithms
+## Graph Algorithms
 
-Pathfinding, network centrality, and connectivity algorithms are executed using SuiteSparse:GraphBLAS operations on the in-memory CSR (Compressed Sparse Row) snapshot. Each algorithm automatically refreshes the snapshot cache on demand, making committed mutations immediately visible without manual calls to `rebuild_csr()`.
+Pathfinding, network centrality, and connectivity algorithms run over the in-memory CSR (Compressed Sparse Row) snapshot. Each algorithm automatically refreshes the snapshot cache on demand, making committed mutations immediately visible without manual calls to `rebuild_csr()`.
 
 ### Traversal and Paths
 
@@ -237,14 +237,14 @@ Stemming and stop words are language-aware. `create_text_index` uses English; `c
 
 ## Hybrid Retrieval Extensions
 
-Hybrid retrieval functions combine vector search and full-text keyword search with GraphBLAS multi-source expansion:
+Hybrid retrieval functions combine vector search and full-text keyword search with multi-source graph expansion:
 
 - `retrieve(graph: &Graph, q: &[f32], k: usize, hops: u8) -> Result<Subgraph, RetrievalError>`  
   Runs a vector search to find `k` seed nodes, then performs a BFS traversal up to `hops` depth to build the result subgraph.
 - `retrieve_with(graph: &Graph, q: &[f32], opts: &RetrieveOptions) -> Result<Subgraph, RetrievalError>`  
   Runs a vector search to find seeds with fine-grained control over distance and traversal limits.
 - `retrieve_hybrid(graph: &Graph, q: &[f32], text_query: &str, opts: &HybridRetrieveOptions) -> Result<Subgraph, RetrievalError>`  
-  Merges seed nodes from vector and full-text keyword searches, fuses their scores, and performs a GraphBLAS multi-source expansion. When neither
+  Merges seed nodes from vector and full-text keyword searches, fuses their scores, and performs a multi-source expansion. When neither
   search would run (both inputs empty or both k values zero) it returns `RetrievalError::NoQuery`.
 
 The returned `Subgraph` carries `nodes`, `edges`, `scores`, and `truncated`. The `truncated` flag is true when the `max_nodes` cap cut off seeds or

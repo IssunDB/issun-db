@@ -1,7 +1,3 @@
 [submodule "external/openCypher"]
 	path = external/openCypher
 	url = https://github.com/opencypher/openCypher
-[submodule "external/GraphBLAS"]
-	path = external/GraphBLAS
-	url = https://github.com/DrTimothyAldenDavis/GraphBLAS.git
-	branch = v10.3.1

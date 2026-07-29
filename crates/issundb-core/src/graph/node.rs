@@ -13,7 +13,6 @@ impl Graph {
         let mut wtxn = self.storage.env.write_txn()?;
         let id = self.add_node_impl(&mut wtxn, &[label], props)?;
         self.commit_and_publish(wtxn, 1)?;
-        self.csr_cache.record_added_node(id);
         self.prop_columns.record_touched(id);
         self.maybe_spawn_rebuild();
         Ok(id)
@@ -27,7 +26,6 @@ impl Graph {
         let mut wtxn = self.storage.env.write_txn()?;
         let id = self.add_node_impl(&mut wtxn, labels, props)?;
         self.commit_and_publish(wtxn, 1)?;
-        self.csr_cache.record_added_node(id);
         self.prop_columns.record_touched(id);
         self.maybe_spawn_rebuild();
         Ok(id)
@@ -443,12 +441,9 @@ impl Graph {
         let mut wtxn = self.storage.env.write_txn()?;
         self.delete_node_impl(&mut wtxn, id)?;
         self.commit_and_publish(wtxn, 1)?;
-        // A node deletion reshuffles the sorted dense-index mapping, so the next
-        // matrix refresh must rebuild fully rather than patch incrementally. The
-        // deletion also cascades to every incident edge, so the edge property
-        // columns must rebuild too; without this a deleted edge stays readable
+        // A node deletion cascades to every incident edge, so the edge property
+        // columns must rebuild; without this a deleted edge stays readable
         // through `edge_prop_json` and the vectorized executor's edge reads.
-        self.csr_cache.mark_force_full();
         self.prop_columns.record_force_full();
         self.edge_columns.record_force_full();
         self.maybe_spawn_rebuild();

@@ -26,12 +26,19 @@ pub struct CsrSnapshot {
     /// built by [`CsrSnapshot::build_weighted`].
     ///
     /// `None` on every other snapshot, and that is the common case: the only
-    /// consumer is the weighted adjacency matrix, which in turn is read only by
-    /// Dijkstra. Loading it costs a full `edges` scan that decodes each record and
-    /// its property blob to look for one key, and holds eight bytes per edge for
-    /// the life of the snapshot, so a workload that never asks a weighted question
-    /// must not pay it. [`crate::matrices::MatrixKinds`] is how a consumer asks.
+    /// consumer is Dijkstra. Loading it costs a full `edges` scan that decodes each
+    /// record and its property blob to look for one key, and holds eight bytes per
+    /// edge for the life of the snapshot, so a workload that never asks a weighted
+    /// question must not pay it. [`CsrCache::request_weights`] is how a consumer
+    /// asks.
     pub edge_weight: Option<Vec<f64>>,
+    /// Whether any entry of `edge_weight` is negative, decided once at build time.
+    ///
+    /// Dijkstra's heap relaxation needs non-negative weights and falls back to a
+    /// label-correcting pass when it cannot have them, so it has to ask this on every
+    /// call; asking the array directly would scan all E weights per query. Always
+    /// false on an unweighted snapshot, which has no weights to be negative.
+    pub has_negative_weight: bool,
     /// Transpose of the outgoing CSR: `in_row_ptr[i]..in_row_ptr[i+1]` ranges
     /// over the i-th node's incoming edges, `in_col_idx` holds source dense
     /// indices, and entries within a row are ordered by ascending source.
@@ -54,6 +61,7 @@ impl CsrSnapshot {
             edge_type: vec![],
             edge_id: vec![],
             edge_weight: None,
+            has_negative_weight: false,
             in_row_ptr: vec![0],
             in_col_idx: vec![],
             in_edge_type: vec![],
@@ -211,6 +219,9 @@ impl CsrSnapshot {
         } else {
             None
         };
+        let has_negative_weight = edge_weight
+            .as_ref()
+            .is_some_and(|weights| weights.iter().any(|w| *w < 0.0));
 
         // Counting-sort transpose for the incoming view. Walking the outgoing
         // rows in ascending source order keeps each incoming row ordered by
@@ -242,6 +253,7 @@ impl CsrSnapshot {
             edge_type,
             edge_id,
             edge_weight,
+            has_negative_weight,
             in_row_ptr,
             in_col_idx,
             in_edge_type,
@@ -297,60 +309,34 @@ impl CsrSnapshot {
 /// Mutations staged during one write transaction, flushed to the caches only on
 /// commit so an aborted transaction never pollutes them.
 ///
-/// The staged fields serve two consumers whose buffers have different lifetimes,
-/// so the delta is split at commit rather than shared whole. `Graph::update`
-/// drains the entity-level fields (`updated_nodes`, `added_edge_ids`, and
-/// `updated_edges`) straight into the property-column caches, which absorb them
-/// on the spot; only the structural remainder goes on to accumulate in
-/// [`CsrCache::pending`], where it waits for the next matrix refresh. Keeping the
-/// column-only fields out of that buffer is what stops a property-update workload
-/// that never touches the matrices from growing it without bound.
+/// `Graph::update` drains this into the property-column caches, which absorb it on
+/// the spot. The CSR snapshot needs nothing from it: it is rebuilt whole rather
+/// than patched, and the committed-write generation alone tells a reader that its
+/// snapshot lags (see [`CsrCache::advance_write_gen`]).
 ///
-/// `updated_nodes` records property updates on existing nodes. The matrix
-/// refresh ignores it (adjacency is unchanged); the property-column cache
-/// drains it to re-read those records.
+/// `updated_nodes` records property updates on existing nodes, which the column
+/// cache drains to re-read those records.
+///
+/// Every field here has a reader, and that is a size constraint rather than
+/// tidiness: one transaction can be a whole bulk load, so a per-edge `Vec` nobody
+/// drains costs 16 bytes per edge for the length of the load. The edge endpoints
+/// used to be collected for the incremental matrix patch; with that gone, an edge
+/// removal only has to be *noticed*, so `removed_edges` is a flag and not a list.
 #[derive(Default)]
 pub struct GraphDelta {
     pub added_nodes: Vec<NodeId>,
     pub updated_nodes: Vec<NodeId>,
-    pub added_edges: Vec<(NodeId, NodeId)>,
-    /// Edge ids of the edges added in this transaction, parallel in spirit to
-    /// `added_edges`. The edge property column cache drains this to patch the
-    /// new edges in without a full rebuild.
+    /// Edge ids of the edges added in this transaction. The edge property column
+    /// cache drains this to patch the new edges in without a full rebuild.
     pub added_edge_ids: Vec<crate::schema::EdgeId>,
     /// Edge ids updated (not added) in this transaction, so the edge property
     /// column cache can refresh them once, at commit, instead of per-call.
     pub updated_edges: Vec<crate::schema::EdgeId>,
-    pub removed_edges: Vec<(NodeId, NodeId)>,
+    /// Whether any edge was removed. A removal reshuffles the dense edge mapping,
+    /// so the edge columns rebuild rather than patch; which edges went is not part
+    /// of that decision.
+    pub removed_edge: bool,
     pub force_full: bool,
-}
-
-/// The structural part of a [`GraphDelta`]: exactly what the GraphBLAS matrices
-/// need to be patched in place instead of rebuilt from a full LMDB scan. This is
-/// what accumulates in [`CsrCache::pending`] between matrix refreshes.
-///
-/// `added_edges` and `removed_edges` carry the source and destination node ids;
-/// the combined adjacency matrices are a boolean union, so the matrix-refresh
-/// path resolves parallel edges against LMDB before deciding to clear a bit.
-/// Node deletion reshuffles the sorted dense-index mapping, so it sets
-/// `force_full` to fall back to a full rebuild rather than an incremental patch.
-#[derive(Default)]
-pub struct StructuralDelta {
-    pub added_nodes: Vec<NodeId>,
-    pub added_edges: Vec<(NodeId, NodeId)>,
-    pub removed_edges: Vec<(NodeId, NodeId)>,
-    pub force_full: bool,
-}
-
-impl StructuralDelta {
-    /// True when there is nothing to apply: no structural change and no forced
-    /// full rebuild pending.
-    pub fn is_empty(&self) -> bool {
-        !self.force_full
-            && self.added_nodes.is_empty()
-            && self.added_edges.is_empty()
-            && self.removed_edges.is_empty()
-    }
 }
 
 /// Thread-safe handle around a `CsrSnapshot` that supports atomic swaps and
@@ -363,37 +349,23 @@ pub struct CsrCache {
     /// install this much is subtracted from `dirty` rather than zeroing it, so
     /// writes that committed while the rebuild ran are not lost.
     claimed: AtomicU64,
-    /// Structural mutations accumulated since the last matrix refresh. Writers
-    /// serialize on the `Graph` write lock, so contention here is only between a
-    /// writer recording a mutation and the refresh path draining it.
-    pending: parking_lot::Mutex<StructuralDelta>,
-    /// Serializes every cache-maintenance operation (incremental delta apply,
-    /// snapshot-only refresh, and full rebuild, foreground or background) against
-    /// each other. Writers do not take it (they only record the delta and bump
-    /// `write_gen`), and idle reads skip it via a lock-free pre-check, so it is
-    /// contended only when maintenance is actually needed. Holding it across a
-    /// full rebuild is what keeps an incremental drain from racing a background
-    /// rebuild that would otherwise discard the drained write, and keeps two
-    /// rebuilds from running concurrently.
+    /// Serializes every cache-maintenance operation (a foreground refresh and a
+    /// background rebuild) against each other. Writers do not take it (they only
+    /// bump `write_gen`), and idle reads skip it via a lock-free pre-check, so it is
+    /// contended only when maintenance is actually needed. Holding it across a whole
+    /// pass is what keeps two rebuilds from running concurrently and installing over
+    /// each other.
     pub(crate) maintenance: parking_lot::Mutex<()>,
-    /// Monotonic count of committed structural writes. Bumped on every write,
-    /// independent of the `pending` delta (which the incremental matrix-refresh
-    /// path drains). The CSR snapshot records the value it was built at in
-    /// `snapshot_gen`; a mismatch means the snapshot lags committed writes.
+    /// Monotonic count of committed structural writes, bumped on every write. The
+    /// CSR snapshot records the value it was built at in `snapshot_gen`; a mismatch
+    /// means the snapshot lags committed writes.
     write_gen: AtomicU64,
     /// The `write_gen` value the currently installed snapshot reflects.
     snapshot_gen: AtomicU64,
-    /// The `write_gen` value the currently materialized `MatrixSet` reflects.
-    ///
-    /// The weight and PageRank matrices have no incremental maintenance: a
-    /// snapshot-only refresh (`install_snapshot`) and an in-place adjacency delta
-    /// (`MatrixSet::apply_delta`) both leave them untouched. So a fresh
-    /// `snapshot_gen` does not imply fresh matrices. Only a full rebuild
-    /// (`install`/`install_full`, which re-run `MatrixSet::materialize`) advances
-    /// this counter; weighted consumers gate on it via `matrices_stale`. The
-    /// invariant `matrices_gen <= snapshot_gen <= write_gen` always holds, so
-    /// `matrices_stale` subsumes `snapshot_is_stale`.
-    matrices_gen: AtomicU64,
+    /// Whether any consumer has asked for per-edge weights, which only Dijkstra
+    /// does. Sticky once set, so a later unweighted refresh does not strip them out
+    /// from under an alternating workload; see `Graph::weighted_snapshot`.
+    weights_requested: AtomicBool,
 }
 
 impl CsrCache {
@@ -403,24 +375,21 @@ impl CsrCache {
             dirty: AtomicU64::new(0),
             rebuilding: AtomicBool::new(false),
             claimed: AtomicU64::new(0),
-            pending: parking_lot::Mutex::new(StructuralDelta::default()),
             maintenance: parking_lot::Mutex::new(()),
             write_gen: AtomicU64::new(0),
             snapshot_gen: AtomicU64::new(0),
-            matrices_gen: AtomicU64::new(0),
+            weights_requested: AtomicBool::new(false),
         }
     }
 
     /// Cache for a graph opened without building anything: the snapshot is an
-    /// empty placeholder and the caller leaves the matrices unmaterialized.
+    /// empty placeholder.
     ///
-    /// `write_gen` starts at 1 while both installed generations stay at 0, so
-    /// `snapshot_is_stale` and `matrices_are_stale` report true until the first
-    /// gated consumer installs a snapshot built from storage. Only equality of
-    /// these counters is ever tested, so the offset start is harmless, and the
-    /// documented invariant `matrices_gen <= snapshot_gen <= write_gen` holds.
-    /// Without the offset the empty placeholder would claim to be current and a
-    /// typed-expansion consumer would read zero rows out of it.
+    /// `write_gen` starts at 1 while `snapshot_gen` stays at 0, so
+    /// `snapshot_is_stale` reports true until the first gated consumer installs a
+    /// snapshot built from storage. Only equality of these counters is ever tested,
+    /// so the offset start is harmless. Without it the empty placeholder would claim
+    /// to be current and a typed-expansion consumer would read zero rows out of it.
     pub fn new_unbuilt() -> Self {
         let cache = Self::new(CsrSnapshot::empty());
         cache.write_gen.store(1, Ordering::Release);
@@ -440,111 +409,23 @@ impl CsrCache {
         self.write_gen.load(Ordering::Acquire) != self.snapshot_gen.load(Ordering::Acquire)
     }
 
-    /// True when the materialized `MatrixSet` lags committed writes, so a
-    /// consumer of the weight or PageRank matrices must rebuild before reading
-    /// them. Strictly weaker than fresh matrices being current: it also catches
-    /// the case where a snapshot-only refresh or an adjacency-only delta advanced
-    /// the snapshot while leaving the weighted matrices behind.
-    pub fn matrices_are_stale(&self) -> bool {
-        self.write_gen.load(Ordering::Acquire) != self.matrices_gen.load(Ordering::Acquire)
-    }
-
-    /// Record a newly inserted node. Called post-commit under the write lock.
-    pub fn record_added_node(&self, node: NodeId) {
-        self.pending.lock().added_nodes.push(node);
-    }
-
-    /// Record a newly inserted edge by its endpoints. Called post-commit under
-    /// the write lock.
-    pub fn record_added_edge(&self, src: NodeId, dst: NodeId) {
-        self.pending.lock().added_edges.push((src, dst));
-    }
-
-    /// Record a removed edge by its endpoints. Called post-commit under the
-    /// write lock.
-    pub fn record_removed_edge(&self, src: NodeId, dst: NodeId) {
-        self.pending.lock().removed_edges.push((src, dst));
-    }
-
-    /// Mark that the next refresh must do a full rebuild (a node was deleted, so
-    /// the sorted dense-index mapping is reshuffled).
-    pub fn mark_force_full(&self) {
-        self.pending.lock().force_full = true;
-    }
-
-    /// True when a structural mutation is pending. A cheap pre-check so the
-    /// incremental refresh avoids the exclusive matrices lock when idle.
-    pub fn has_pending(&self) -> bool {
-        !self.pending.lock().is_empty()
-    }
-
-    /// True when a node deletion is pending, requiring a full rebuild.
-    pub fn pending_force_full(&self) -> bool {
-        self.pending.lock().force_full
-    }
-
-    /// Merge the structural part of one transaction's staged mutations into the
-    /// pending buffer. Called once, post-commit, so an aborted transaction
-    /// contributes nothing.
+    /// Ask for per-edge weights on every snapshot built from here on.
     ///
-    /// Destructured exhaustively on purpose: a new [`GraphDelta`] field cannot be
-    /// added without deciding here whether the matrix refresh needs it. The
-    /// previous version copied a hand-written subset and silently dropped the
-    /// rest, which was correct only for as long as nobody made the matrix path
-    /// read one of the dropped ones.
-    ///
-    /// The column-only fields are deliberately not accumulated. `Graph::update`
-    /// drains those into the property columns on the spot, and nothing here would
-    /// ever consume them, so buffering them would grow this buffer without bound
-    /// on a property-update workload that never touches the matrices.
-    ///
-    /// Takes the delta by reference rather than by value so the caller can record
-    /// it immediately after publishing the commit and still hand the same delta to
-    /// the column bookkeeping afterwards. Extending from slices copies the same
-    /// elements a moved `Vec` would, since the target buffer is not empty.
-    pub fn record_batch(&self, batch: &GraphDelta) {
-        let GraphDelta {
-            added_nodes,
-            updated_nodes: _,
-            added_edges,
-            added_edge_ids: _,
-            updated_edges: _,
-            removed_edges,
-            force_full,
-        } = batch;
-        // Nothing structural to apply: a property-only update must not queue work
-        // that no consumer drains, and must not make `has_pending` report true.
-        if !*force_full
-            && added_nodes.is_empty()
-            && added_edges.is_empty()
-            && removed_edges.is_empty()
-        {
-            return;
-        }
-        let mut pending = self.pending.lock();
-        pending.force_full |= *force_full;
-        pending.added_nodes.extend_from_slice(added_nodes);
-        pending.added_edges.extend_from_slice(added_edges);
-        pending.removed_edges.extend_from_slice(removed_edges);
+    /// Sticky, and deliberately so: without it an unweighted refresh would strip
+    /// the weights and the next weighted query would rebuild from storage again, so
+    /// a workload alternating Dijkstra with any other algorithm would rebuild twice
+    /// per write. See `Graph::weighted_snapshot` for the memory this trades away.
+    pub fn request_weights(&self) {
+        self.weights_requested.store(true, Ordering::Release);
     }
 
-    /// Take the accumulated delta, leaving the buffer empty.
-    pub fn take_delta(&self) -> StructuralDelta {
-        std::mem::take(&mut *self.pending.lock())
-    }
-
-    /// Clear the accumulated delta. A full rebuild calls this *before* reading
-    /// LMDB (after capturing the generation), so writes that commit during the
-    /// build land in the freshly-emptied delta and are re-applied incrementally
-    /// later rather than lost.
-    pub fn clear_delta(&self) {
-        *self.pending.lock() = StructuralDelta::default();
+    /// Whether a snapshot built now must carry per-edge weights.
+    pub fn wants_weights(&self) -> bool {
+        self.weights_requested.load(Ordering::Acquire)
     }
 
     /// Advance the committed-write generation by `count`, which is what marks the
-    /// snapshot and the matrices stale. Every committed write advances it, so a
-    /// CSR consumer can tell its snapshot lags even when the matrix-refresh path
-    /// has drained the structural delta.
+    /// snapshot stale. Every committed write advances it.
     ///
     /// Call this immediately after `wtxn.commit()` returns, ahead of every other
     /// piece of post-commit bookkeeping. LMDB's commit is what makes a write
@@ -596,11 +477,8 @@ impl CsrCache {
         // `built_gen` was captured before the build, so the snapshot reflects at
         // least that generation. Writes that landed during the build keep
         // `write_gen` ahead, leaving the snapshot correctly stale until the next
-        // pass. This is a full rebuild (the caller re-ran `MatrixSet::materialize`
-        // before installing), so the weighted matrices are fresh at `built_gen`
-        // too.
+        // pass.
         self.snapshot_gen.store(built_gen, Ordering::Release);
-        self.matrices_gen.store(built_gen, Ordering::Release);
         self.settle_rebuild_claim()
     }
 
@@ -608,14 +486,12 @@ impl CsrCache {
     /// retain the claim (returning `true`, meaning build again because that much
     /// landed while this pass ran) or release it.
     ///
-    /// Split out of [`CsrCache::install`] so a pass that refreshes the snapshot
-    /// alone can settle its claim without also advancing `matrices_gen`, which would
-    /// assert that matrices nobody materialized are fresh. Such a pass must settle
-    /// rather than [`CsrCache::cancel_rebuild`]: cancelling releases the claim but
-    /// leaves `dirty` untouched, so the counter stays above `REBUILD_THRESHOLD` and
-    /// the next commit spawns the pass again, and every commit after that does too.
+    /// A pass that installed something must settle rather than
+    /// [`CsrCache::cancel_rebuild`]: cancelling releases the claim but leaves
+    /// `dirty` untouched, so the counter stays above `REBUILD_THRESHOLD` and the
+    /// next commit spawns the pass again, and every commit after that does too.
     #[must_use]
-    pub fn settle_rebuild_claim(&self) -> bool {
+    fn settle_rebuild_claim(&self) -> bool {
         let claimed = self.claimed.swap(0, Ordering::AcqRel);
         let prev = self.dirty.fetch_sub(claimed, Ordering::AcqRel);
         let remaining = prev.saturating_sub(claimed);
@@ -628,13 +504,19 @@ impl CsrCache {
         }
     }
 
-    /// Install a snapshot-only refresh: store the snapshot and the generation
-    /// it was built at, leaving the dirty counter, any rebuild claim, and the
-    /// pending structural delta untouched. The delta still belongs to the
-    /// incremental matrix path (`ensure_matrix_view`); clearing it here would
-    /// strand the matrices stale behind a fresh snapshot.
+    /// Install a foreground refresh: store the snapshot and the generation it was
+    /// built at, leaving the dirty counter and any rebuild claim untouched, since
+    /// this pass did not claim one.
     pub fn install_snapshot(&self, snap: CsrSnapshot, built_gen: u64) {
-        self.snapshot.store(Arc::new(snap));
+        self.install_snapshot_shared(Arc::new(snap), built_gen);
+    }
+
+    /// [`CsrCache::install_snapshot`] for a caller that already holds the snapshot
+    /// behind an `Arc` and needs to keep reading it after the install, which is how
+    /// the weighted gate avoids reloading a pointer another refresh may have
+    /// replaced in between.
+    pub fn install_snapshot_shared(&self, snap: Arc<CsrSnapshot>, built_gen: u64) {
+        self.snapshot.store(snap);
         self.snapshot_gen.store(built_gen, Ordering::Release);
     }
 
@@ -644,15 +526,9 @@ impl CsrCache {
     pub fn install_full(&self, snap: CsrSnapshot, built_gen: u64) {
         self.snapshot.store(Arc::new(snap));
         self.snapshot_gen.store(built_gen, Ordering::Release);
-        // A full synchronous rebuild also re-materialized the `MatrixSet`, so the
-        // weighted matrices are fresh at `built_gen`.
-        self.matrices_gen.store(built_gen, Ordering::Release);
         self.dirty.store(0, Ordering::Release);
         self.claimed.store(0, Ordering::Release);
         self.rebuilding.store(false, Ordering::Release);
-        // Note: the delta is cleared by `clear_delta` *before* the build, not
-        // here, so writes that committed during the build are retained in the
-        // freshly-emptied delta for a later incremental apply.
     }
 
     /// Release the rebuild claim without installing a snapshot; used when the
@@ -1120,122 +996,51 @@ mod cache_tests {
         assert!(!cache.install(CsrSnapshot::empty(), 0), "now caught up");
     }
 
-    /// A snapshot-only install must refresh the generation while leaving the
-    /// pending structural delta in place: the delta still belongs to the
-    /// incremental matrix path, which drains it later.
+    /// A foreground refresh must advance the generation without touching the dirty
+    /// counter or an outstanding rebuild claim, which belong to the background pass.
     #[test]
-    fn install_snapshot_leaves_the_matrix_delta() {
+    fn install_snapshot_advances_the_generation_alone() {
         let cache = CsrCache::new(CsrSnapshot::empty());
         cache.advance_write_gen(1);
         assert!(!cache.note_dirty_n(1));
-        cache.record_added_edge(1, 2);
         assert!(cache.snapshot_is_stale());
 
         cache.install_snapshot(CsrSnapshot::empty(), cache.current_gen());
 
         assert!(!cache.snapshot_is_stale());
         assert!(
-            cache.has_pending(),
-            "the delta is drained by ensure_matrix_view, not by a snapshot install"
+            !cache.note_dirty_n(REBUILD_THRESHOLD - 2),
+            "the dirty count kept accumulating across the foreground refresh"
         );
     }
 
-    /// `record_batch` must carry every structural field into the pending buffer.
-    /// The previous version copied a hand-written subset of a wider struct and
-    /// dropped the rest, so this pins that each field the matrix refresh reads
-    /// survives the hand-off.
+    /// Asking for weights is sticky, so a later build still loads them. Without
+    /// that, an unweighted refresh between two weighted queries would make each one
+    /// rebuild from storage.
     #[test]
-    fn record_batch_carries_every_structural_field() {
+    fn requesting_weights_is_sticky() {
         let cache = CsrCache::new(CsrSnapshot::empty());
-        cache.record_batch(&GraphDelta {
-            added_nodes: vec![1, 2],
-            added_edges: vec![(1, 2)],
-            removed_edges: vec![(3, 4)],
-            force_full: true,
-            ..GraphDelta::default()
-        });
-
-        let drained = cache.take_delta();
-        assert_eq!(drained.added_nodes, vec![1, 2]);
-        assert_eq!(drained.added_edges, vec![(1, 2)]);
-        assert_eq!(drained.removed_edges, vec![(3, 4)]);
-        assert!(drained.force_full);
+        assert!(!cache.wants_weights());
+        cache.request_weights();
+        assert!(cache.wants_weights());
+        cache.install_snapshot(CsrSnapshot::empty(), 0);
         assert!(
-            cache.take_delta().is_empty(),
-            "the buffer must be empty once drained"
+            cache.wants_weights(),
+            "an install must not withdraw the request"
         );
     }
 
-    /// The column-only fields of a `GraphDelta` must not reach the cache's
-    /// pending buffer: `Graph::update` has already drained them into the property
-    /// columns, and nothing here would ever consume them, so accumulating them
-    /// would grow the buffer without bound on a property-update workload that
-    /// never touches the matrices. A property-only update must leave the buffer
-    /// empty, so `has_pending` keeps reporting false and the idle-read fast path
-    /// in `ensure_matrix_view` stays lock-free.
+    /// Cancelling a claimed pass leaves the dirty counter armed, so a later commit
+    /// retries it. That is deliberate: the failed pass installed nothing, so the
+    /// work still needs doing.
     #[test]
-    fn record_batch_ignores_the_column_only_fields() {
+    fn cancelling_a_claim_leaves_the_counter_armed() {
         let cache = CsrCache::new(CsrSnapshot::empty());
-        cache.record_batch(&GraphDelta {
-            updated_nodes: vec![2],
-            added_edge_ids: vec![10],
-            updated_edges: vec![11],
-            ..GraphDelta::default()
-        });
+        assert!(cache.note_dirty_n(REBUILD_THRESHOLD));
+        cache.cancel_rebuild();
         assert!(
-            !cache.has_pending(),
-            "a property-only update must queue no structural work"
-        );
-
-        cache.record_batch(&GraphDelta {
-            added_nodes: vec![1],
-            updated_nodes: vec![2],
-            added_edge_ids: vec![10],
-            updated_edges: vec![11],
-            ..GraphDelta::default()
-        });
-        let drained = cache.take_delta();
-        assert_eq!(
-            drained.added_nodes,
-            vec![1],
-            "the structural field survives"
-        );
-        assert!(drained.added_edges.is_empty());
-        assert!(!drained.force_full);
-    }
-
-    /// A snapshot-only background pass must settle its claim, not cancel it.
-    ///
-    /// Cancelling releases the claim while leaving `dirty` above the threshold, so
-    /// the next write re-triggers the pass, and every write after that does too: a
-    /// continuous background full scan on any write workload with no GraphBLAS
-    /// consumer, which is exactly the workload the lazy open serves.
-    #[test]
-    fn a_snapshot_only_pass_settles_its_claim() {
-        let cache = CsrCache::new(CsrSnapshot::empty());
-        assert!(
-            cache.note_dirty_n(REBUILD_THRESHOLD),
-            "crossing claims a pass"
-        );
-
-        cache.install_snapshot(CsrSnapshot::empty(), cache.current_gen());
-        assert!(
-            !cache.settle_rebuild_claim(),
-            "nothing landed during the pass"
-        );
-
-        assert!(
-            !cache.note_dirty_n(1),
-            "one more write must not re-trigger; the claimed count was subtracted"
-        );
-
-        // Cancelling instead would have left the counter armed, which is the bug.
-        let leaky = CsrCache::new(CsrSnapshot::empty());
-        assert!(leaky.note_dirty_n(REBUILD_THRESHOLD));
-        leaky.cancel_rebuild();
-        assert!(
-            leaky.note_dirty_n(1),
-            "cancel leaves the dirty count armed, so this documents why settle exists"
+            cache.note_dirty_n(1),
+            "the next write re-triggers the pass the failure abandoned"
         );
     }
 

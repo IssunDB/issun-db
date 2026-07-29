@@ -138,7 +138,7 @@ Here is a quick reference of the methods available on the `IssunDB` class:
 * `IssunDB(path: str, map_size_gb: Optional[int] = None)`: Opens or creates a database at `path`. `map_size_gb` defaults to 1 and is a hard ceiling on
   how large the database may grow, not an allocation. There is no resize path: once the data exceeds it every write fails until the database is
   reopened with a larger value, which is safe and keeps the existing data. Size it for the eventual database rather than the current one.
-* `set_thread_count(n: int) -> None`: Sets the thread count for parallel GraphBLAS operations (set `0` for default).
+* `set_thread_count(n: int) -> None`: Sets the thread count for the parallel read passes (set `0` for default).
 
 ### Node and Edge CRUD
 

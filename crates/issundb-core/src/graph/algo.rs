@@ -23,7 +23,7 @@ impl Graph {
 
     /// Depth-first search outward from `start` up to `hops` levels deep.
     pub fn dfs(&self, start: NodeId, hops: u8) -> Result<Vec<NodeId>, Error> {
-        self.with_matrix_view(|m, snap| self.dfs_graphblas(m, snap, start, hops))
+        self.with_snapshot(|snap| self.dfs_kernel(snap, start, hops))
     }
 
     /// Counts variable assignments of the directed triangle pattern
@@ -38,7 +38,6 @@ impl Graph {
     /// self-loop assignments where `a == b == c`.
     pub fn count_triangle_cycles(&self, spec: &TriangleCountSpec) -> Result<u64, Error> {
         // Snapshot-only gate: this kernel reads CSR arrays and never a matrix,
-        // so it must not pay `ensure_csr_fresh`'s GraphBLAS materialization.
         self.ensure_snapshot_fresh()?;
         let snap = self.csr_cache.snapshot.load();
         let n = snap.dense_to_id.len();
@@ -217,7 +216,6 @@ impl Graph {
         }
 
         // Snapshot-only gate: this kernel reads CSR arrays and never a matrix,
-        // so it must not pay `ensure_csr_fresh`'s GraphBLAS materialization.
         self.ensure_snapshot_fresh()?;
         let snap = self.csr_cache.snapshot.load();
         let n = snap.dense_to_id.len();
@@ -420,7 +418,6 @@ impl Graph {
         spec: &GroupedDegreeSpec,
     ) -> Result<Vec<(NodeId, u64)>, Error> {
         // Snapshot-only gate: this kernel reads CSR arrays and never a matrix,
-        // so it must not pay `ensure_csr_fresh`'s GraphBLAS materialization.
         self.ensure_snapshot_fresh()?;
         let snap = self.csr_cache.snapshot.load();
         let n = snap.dense_to_id.len();
@@ -665,12 +662,36 @@ impl Graph {
     /// through an immutable snapshot, so this takes no lock and never races a
     /// writer. The count itself comes from [`crate::threads::resolve`], the single
     /// resolution every parallel consumer shares, so the one knob means the same
-    /// thing here as it does for the GraphBLAS pool.
+    /// thing here as it does for the analytics passes.
     ///
     /// A small pass stays single-threaded: below the threshold the spawn cost
     /// exceeds the saving, which also keeps unit tests deterministic and off the
     /// thread pool entirely.
     pub(super) fn kernel_threads(&self, work: usize) -> usize {
+        // A counting pass streams adjacency arrays, so it saturates memory
+        // bandwidth long before it saturates compute, and past its peak extra
+        // workers add traffic and coordination without adding throughput. Measured
+        // on the two-hop path count over an 11.1 M-edge graph (12-thread machine):
+        // 71.1 ms at one worker, 47.0 at two, 40.5 at four, 43.8 at eight, 46.1 at
+        // twelve. Twelve is 14% *slower* than four, so the resolved budget must not
+        // be spent in full here: cap the split at the peak.
+        //
+        // The cap is calibrated on one machine. Re-measure the curve on hardware
+        // with a different memory subsystem before treating four as general; the
+        // test override bypasses it so a test can still drive more workers.
+        const MAX_SCAN_THREADS: usize = 4;
+        self.parallel_threads(work).min(MAX_SCAN_THREADS)
+    }
+
+    /// Threads for a pass whose cost is arithmetic per source rather than a stream
+    /// over the adjacency arrays.
+    ///
+    /// This is [`Graph::kernel_threads`] without the memory-bandwidth cap, and the
+    /// difference is the point: an all-pairs pass (betweenness, harmonic centrality)
+    /// does `O(n * m)` work from per-worker buffers with no shared writes, so it keeps
+    /// scaling past the four workers a streaming reduction peaks at. Capping it too
+    /// would silently ignore most of the budget `set_thread_count` was given.
+    pub(super) fn parallel_threads(&self, work: usize) -> usize {
         /// Items below which a pass is not worth splitting.
         const MIN_PARALLEL_WORK: usize = 1 << 18;
         // Tests force the split on graphs far below the threshold, so the
@@ -685,20 +706,7 @@ impl Graph {
         if work < MIN_PARALLEL_WORK {
             return 1;
         }
-        // A counting pass streams adjacency arrays, so it saturates memory
-        // bandwidth long before it saturates compute, and past its peak extra
-        // workers add traffic and coordination without adding throughput. Measured
-        // on the two-hop path count over an 11.1 M-edge graph (12-thread machine):
-        // 71.1 ms at one worker, 47.0 at two, 40.5 at four, 43.8 at eight, 46.1 at
-        // twelve. Twelve is 14% *slower* than four, so the resolved budget must not
-        // be spent in full here: cap the split at the peak.
-        //
-        // The cap is calibrated on one machine. Re-measure the curve on hardware
-        // with a different memory subsystem before treating four as general; the
-        // test override above bypasses this so a test can still drive more workers.
-        const MAX_SCAN_THREADS: usize = 4;
         crate::threads::resolve(self.n_threads.load(std::sync::atomic::Ordering::Acquire))
-            .min(MAX_SCAN_THREADS)
     }
 
     /// Whether expanding `sources` from storage would beat bringing the CSR
@@ -713,7 +721,7 @@ impl Graph {
     /// write-then-count session does not pay a full rebuild per query.
     pub fn prefers_point_expansion(&self, sources: usize) -> bool {
         self.csr_cache.snapshot_is_stale()
-            && sources <= crate::graph::graphblas::traversal::STALE_POINT_EXPAND_MAX
+            && sources <= crate::graph::kernels::traversal::STALE_POINT_EXPAND_MAX
     }
 
     /// Total length of `sources`' adjacency rows in the given direction: an upper
@@ -769,7 +777,6 @@ impl Graph {
         spec: &NeighborCountSpec,
     ) -> Result<Vec<(u64, u64)>, Error> {
         // Snapshot-only gate: this kernel reads CSR arrays and never a matrix,
-        // so it must not pay `ensure_csr_fresh`'s GraphBLAS materialization.
         self.ensure_snapshot_fresh()?;
         let snap = self.csr_cache.snapshot.load();
         let n = snap.dense_to_id.len();
@@ -929,7 +936,7 @@ impl Graph {
 
     /// Detects if there is at least one directed cycle in the graph.
     pub fn detect_cycle(&self) -> Result<bool, Error> {
-        self.with_matrix_view(|m, snap| self.detect_cycle_graphblas(m, snap))
+        self.with_snapshot(|snap| self.detect_cycle_kernel(snap))
     }
 
     /// Returns directed neighbor entries for all outgoing and incoming edges of `node`.
@@ -968,34 +975,34 @@ impl Graph {
 
     /// Returns all simple paths (no repeated nodes) between `src` and `dst`.
     pub fn all_paths(&self, src: NodeId, dst: NodeId) -> Result<Vec<Vec<NodeId>>, Error> {
-        self.with_matrix_view(|m, snap| self.all_paths_graphblas(m, snap, src, dst))
+        self.with_snapshot(|snap| self.all_paths_kernel(snap, src, dst))
     }
 
     /// Returns all unweighted shortest paths between `src` and `dst`.
     pub fn all_shortest_paths(&self, src: NodeId, dst: NodeId) -> Result<Vec<Vec<NodeId>>, Error> {
-        self.with_matrix_view(|m, snap| self.all_shortest_paths_graphblas(m, snap, src, dst))
+        self.with_snapshot(|snap| self.all_shortest_paths_kernel(snap, src, dst))
     }
 
     /// Returns the longest simple path (no repeated nodes) between `src` and `dst`.
     pub fn longest_path(&self, src: NodeId, dst: NodeId) -> Result<Option<Vec<NodeId>>, Error> {
-        self.with_matrix_view(|m, snap| self.longest_path_graphblas(m, snap, src, dst))
+        self.with_snapshot(|snap| self.longest_path_kernel(snap, src, dst))
     }
 
     /// Computes the weighted shortest path between `src` and `dst` using Dijkstra's algorithm.
     ///
-    /// Edge weights come from the materialized CSR snapshot, which reads the
-    /// first present of the `weight`, `cost`, `capacity`, or `cap` edge
-    /// properties, defaulting to `1.0`. The weight source is fixed: unlike
-    /// `shortest_path_top_k` and `spanning_forest`, this method does not take a
-    /// weight-property argument.
+    /// Edge weights come from the CSR snapshot, which reads the first present of
+    /// the `weight`, `cost`, `capacity`, or `cap` edge properties, defaulting to
+    /// `1.0`. The weight source is fixed: unlike `shortest_path_top_k` and
+    /// `spanning_forest`, this method does not take a weight-property argument.
+    ///
+    /// This is the one algorithm needing a *weighted* snapshot, which costs a second
+    /// scan of `edges` to load; see [`Graph::with_weighted_snapshot`].
     pub fn shortest_path_dijkstra(
         &self,
         src: NodeId,
         dst: NodeId,
     ) -> Result<Option<WeightedPath>, Error> {
-        self.with_weighted_matrix_view(|m, snap| {
-            self.shortest_path_dijkstra_graphblas(m, snap, src, dst)
-        })
+        self.with_weighted_snapshot(|snap| self.shortest_path_dijkstra_kernel(snap, src, dst))
     }
 
     /// Computes the Minimum or Maximum Spanning Forest (MSF) of the graph.
@@ -1004,42 +1011,37 @@ impl Graph {
         weight_property: &str,
         maximum: bool,
     ) -> Result<Vec<EdgeId>, Error> {
-        self.with_matrix_view(|m, snap| {
-            self.spanning_forest_graphblas(m, snap, weight_property, maximum)
-        })
+        self.with_snapshot(|snap| self.spanning_forest_kernel(snap, weight_property, maximum))
     }
 
     /// Computes community detection on the graph using the Label Propagation Algorithm (LPA / CDLP).
     pub fn label_propagation(&self, max_iterations: usize) -> Result<HashMap<NodeId, u64>, Error> {
-        self.with_matrix_view(|m, snap| self.label_propagation_graphblas(m, snap, max_iterations))
+        self.label_propagation_kernel(max_iterations)
     }
 
     /// Computes the harmonic closeness centrality for all nodes in the graph.
     pub fn harmonic_centrality(&self) -> Result<HashMap<NodeId, f64>, Error> {
-        self.with_matrix_view(|m, snap| self.harmonic_centrality_graphblas(m, snap))
+        self.with_snapshot(|snap| self.harmonic_centrality_kernel(snap))
     }
 
     /// Computes the betweenness centrality for all nodes in the graph.
     pub fn betweenness_centrality(&self) -> Result<HashMap<NodeId, f64>, Error> {
-        self.with_matrix_view(|m, snap| self.betweenness_centrality_graphblas(m, snap))
+        self.with_snapshot(|snap| self.betweenness_centrality_kernel(snap))
     }
 
     /// Computes the strongly connected components (SCC) of the graph using Tarjan's algorithm.
     pub fn strongly_connected_components(&self) -> Result<HashMap<NodeId, u64>, Error> {
-        self.with_matrix_view(|m, snap| self.strongly_connected_components_graphblas(m, snap))
+        self.with_snapshot(|snap| self.strongly_connected_components_kernel(snap))
     }
 
-    /// Computes the degree centrality for all nodes in the graph based on the specified direction.
+    /// Computes the degree centrality for all nodes in the graph based on the
+    /// specified direction. Counts *distinct* neighbors; see
+    /// [`Graph::degree_centrality_kernel`].
     pub fn degree_centrality(
         &self,
         direction: DegreeDirection,
     ) -> Result<HashMap<NodeId, u64>, Error> {
-        self.ensure_matrix_view()?;
-        let guard = self.matrices.read();
-        let m = guard
-            .as_ref()
-            .ok_or(Error::Corrupt("matrices not initialized"))?;
-        self.degree_centrality_graphblas(m, direction)
+        self.with_snapshot(|snap| self.degree_centrality_kernel(snap, direction))
     }
 
     /// Computes the maximum flow from a source node to a sink node.
@@ -1049,9 +1051,7 @@ impl Graph {
         sink: NodeId,
         capacity_property: &str,
     ) -> Result<f64, Error> {
-        self.with_matrix_view(|m, snap| {
-            self.maximum_flow_graphblas(m, snap, source, sink, capacity_property)
-        })
+        self.with_snapshot(|snap| self.maximum_flow_kernel(snap, source, sink, capacity_property))
     }
 
     /// Computes the K shortest paths from a source node to a destination node using Yen's algorithm.
@@ -1062,8 +1062,8 @@ impl Graph {
         k: usize,
         weight_property: &str,
     ) -> Result<Vec<WeightedPath>, Error> {
-        let paths = self.with_matrix_view(|m, snap| {
-            self.shortest_path_top_k_graphblas(m, snap, src, dst, k, weight_property)
+        let paths = self.with_snapshot(|snap| {
+            self.shortest_path_top_k_kernel(snap, src, dst, k, weight_property)
         })?;
         Ok(paths
             .into_iter()
@@ -1074,180 +1074,73 @@ impl Graph {
             .collect())
     }
 
-    /// Breadth-first search outward from `start` up to `hops` levels deep.
-    pub fn bfs(&self, start: NodeId, hops: u8) -> Result<Vec<NodeId>, Error> {
-        self.ensure_matrix_view()?;
-        self.bfs_graphblas(start, hops)
+    /// Run `f` over a CSR snapshot that reflects every committed write.
+    ///
+    /// This is the one gate in front of every algorithm kernel. All of them read the
+    /// snapshot and nothing else, so there is a single freshness condition to
+    /// satisfy: the installed snapshot's generation against the committed-write
+    /// generation. Point adjacency lookups (`out_neighbors` and friends) do not come
+    /// through here at all; they read LMDB directly and so always see the latest
+    /// write, in or out of a transaction.
+    ///
+    /// The snapshot arrives as an `ArcSwap` load, so `f` reads one immutable
+    /// snapshot throughout even if a concurrent refresh installs a newer one
+    /// meanwhile.
+    pub(in crate::graph) fn with_snapshot<T>(
+        &self,
+        f: impl FnOnce(&CsrSnapshot) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        self.ensure_snapshot_fresh()?;
+        f(&self.csr_cache.snapshot.load())
     }
 
-    /// Unweighted shortest path from `src` to `dst` by BFS.
-    pub fn shortest_path(&self, src: NodeId, dst: NodeId) -> Result<Option<Vec<NodeId>>, Error> {
-        // Gated inside `shortest_path_graphblas`, which is public and self-gates.
-        self.shortest_path_graphblas(src, dst)
+    /// [`Graph::with_snapshot`] for the one consumer that reads per-edge weights,
+    /// so the snapshot it receives is guaranteed to carry them.
+    pub(in crate::graph) fn with_weighted_snapshot<T>(
+        &self,
+        f: impl FnOnce(&CsrSnapshot) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        let snap = self.weighted_snapshot()?;
+        f(&snap)
     }
 
-    /// Iterative PageRank over the materialized PageRank matrix.
+    /// A fresh snapshot carrying per-edge weights.
     ///
-    /// The gate lives inside `page_rank_graphblas`, which is public and must be safe
-    /// to call directly, so this is a plain delegation rather than a gate plus a call.
-    pub fn page_rank(&self, iterations: u32, damping: f32) -> Result<HashMap<NodeId, f32>, Error> {
-        self.page_rank_graphblas(iterations, damping)
-    }
-
-    /// Freshness gate behind every matrix consumer: refresh when the matrices are
-    /// missing, when they lag committed writes, when a structural delta is pending, or
-    /// when they were materialized without something in `kinds`.
+    /// Returns the snapshot it validated rather than leaving the caller to reload
+    /// it. A concurrent unweighted refresh can replace the pointer between a gate
+    /// and a load, and the caller would then find no weights on a snapshot the gate
+    /// had just vouched for.
     ///
-    /// Reached through [`Graph::with_matrix_view`] and
-    /// [`Graph::with_matrix_view_at`] rather than called directly, since a consumer
-    /// needs the matched pair those return, not just the refresh. Who asks for what:
-    /// `MatrixKinds::ADJACENCY` covers the native-CSR algorithms (`dfs`,
-    /// `strongly_connected_components`, `maximum_flow`, `spanning_forest`,
-    /// `shortest_path_top_k`, `all_paths`, `longest_path`, `detect_cycle`,
-    /// `shortest_path`) and the hybrid SpMV-plus-path-reconstruction ones
-    /// (`betweenness_centrality`, `harmonic_centrality`, `all_shortest_paths`);
-    /// `PAGE_RANK` is `page_rank` alone; `WEIGHTED` is `shortest_path_dijkstra` alone.
-    /// Gated by the write generation, so it catches edge-only drift, not just
-    /// node-count changes.
-    ///
-    /// Note that the weight-*property* algorithms (`spanning_forest`,
-    /// `shortest_path_top_k`, `maximum_flow`) take a weight property as an argument and
-    /// read it from storage themselves, so they need no weight matrix. Only Dijkstra's
-    /// fixed weight source comes from one.
-    ///
-    /// The `kinds` condition is separate from the generation on purpose. A set
-    /// materialized for an adjacency consumer is current at its generation yet carries
-    /// neither optional matrix, so a generation check alone would hand PageRank or
-    /// Dijkstra a set without the matrix it reads.
-    fn ensure_matrices_fresh(&self, kinds: MatrixKinds) -> Result<(), Error> {
-        // Gate on the matrices generation, not the snapshot generation. The
-        // weight and PageRank matrices have no incremental maintenance, so a
-        // snapshot-only refresh (`ensure_snapshot_fresh`) or an adjacency-only
-        // delta apply can advance `snapshot_gen` while leaving those matrices
-        // stale. `matrices_are_stale` catches both cases, and because
-        // `matrices_gen <= snapshot_gen` it also covers a stale snapshot; a rebuild
-        // re-materializes every matrix of the requested tier. Without this, Dijkstra
-        // or PageRank reads pre-write weights or pre-write out-degrees after a bulk
-        // typed expansion or an `update_edge`. (The weight-*property* algorithms,
-        // `spanning_forest` and `shortest_path_top_k` and `maximum_flow`, read their
-        // weights from storage per call and so are not affected either way.)
-        // Lock-free pre-check: nothing to do when the matrices are current and no
-        // structural delta is pending. Both conditions are needed. A pending delta
-        // with current-looking matrices is the normal state after an incremental
-        // apply advanced `snapshot_gen` while the weight and PageRank matrices,
-        // which have no incremental maintenance, stayed behind; draining it here is
-        // what keeps a weighted algorithm off pre-write matrices.
-        //
-        // The two conditions do not, however, cover the same window. A write
-        // publishes its generation immediately after the commit and records its
-        // delta just after that (`Graph::commit_and_publish`, then
-        // `record_batch`), so between those two points `matrices_are_stale` is
-        // already true while `has_pending` is not yet. This gate is therefore
-        // covered throughout by the generation check alone; `ensure_matrix_view`,
-        // which gates on the delta alone, is the one left uncovered there, which
-        // is why the delta is recorded as early as the ordering allows.
-        if self.matrices_satisfy(kinds)
-            && !self.csr_cache.matrices_are_stale()
-            && !self.csr_cache.has_pending()
-        {
-            return Ok(());
+    /// Asking for weights is sticky, so every later rebuild keeps loading them.
+    /// Without that, one unweighted refresh would strip them and the next weighted
+    /// query would rebuild from storage again, so a workload alternating a weighted
+    /// algorithm with any other would rebuild twice per write instead of once. The
+    /// cost is eight bytes per edge held for as long as the snapshot lives, once
+    /// anything asks a weighted question. That is the trade the weighted adjacency
+    /// matrix made before it, at under half the size, and it is why `rebuild_csr`
+    /// does not ask: bulk loads call that, and asking there would pin the weights in
+    /// every process that ever loads data.
+    fn weighted_snapshot(&self) -> Result<Arc<CsrSnapshot>, Error> {
+        self.csr_cache.request_weights();
+        let installed = self.csr_cache.snapshot.load_full();
+        if !self.csr_cache.snapshot_is_stale() && installed.edge_weight.is_some() {
+            return Ok(installed);
         }
         let _maint = self.csr_cache.maintenance.lock();
-        // Re-check under the lock: another maintenance pass may have refreshed
-        // while this thread waited.
-        if !self.matrices_satisfy(kinds)
-            || self.csr_cache.matrices_are_stale()
-            || self.csr_cache.has_pending()
-        {
-            self.rebuild_csr_locked(kinds)?;
+        // Re-check under the lock: another maintenance pass may have refreshed while
+        // this thread waited.
+        let installed = self.csr_cache.snapshot.load_full();
+        if !self.csr_cache.snapshot_is_stale() && installed.edge_weight.is_some() {
+            return Ok(installed);
         }
-        Ok(())
+        let built_gen = self.csr_cache.current_gen();
+        let snap = Arc::new(CsrSnapshot::build_weighted(&self.storage)?);
+        self.csr_cache
+            .install_snapshot_shared(Arc::clone(&snap), built_gen);
+        Ok(snap)
     }
 
-    /// True when the materialized matrices exist and carry everything in `kinds`.
-    fn matrices_satisfy(&self, kinds: MatrixKinds) -> bool {
-        self.matrices
-            .read()
-            .as_ref()
-            .is_some_and(|m| m.kinds().contains(kinds))
-    }
-
-    /// Run `f` with a matched `(MatrixSet, CsrSnapshot)` pair, both reflecting the
-    /// same node set. A GraphBLAS matrix consumer needs its matrix and the
-    /// snapshot's dense-index mapping to agree; a snapshot-only refresh
-    /// (`ensure_snapshot_fresh`) can otherwise advance the shared snapshot past
-    /// the matrices, so a naive `matrices.read()` then `snapshot.load()` could
-    /// pair a matrix with a longer snapshot and mis-map dense indices. The
-    /// matrices and their snapshot are installed together, so equal node counts
-    /// mean the pair agrees (a node deletion forces a full rebuild of both).
-    pub(in crate::graph) fn with_matrix_view<T>(
-        &self,
-        f: impl FnOnce(&MatrixSet, &CsrSnapshot) -> Result<T, Error>,
-    ) -> Result<T, Error> {
-        self.with_matrix_view_at(MatrixKinds::ADJACENCY, f)
-    }
-
-    /// [`Graph::with_matrix_view`] for a consumer that reads a weighted matrix, so
-    /// the pair it receives is guaranteed to carry one.
-    fn with_weighted_matrix_view<T>(
-        &self,
-        f: impl FnOnce(&MatrixSet, &CsrSnapshot) -> Result<T, Error>,
-    ) -> Result<T, Error> {
-        self.with_matrix_view_at(MatrixKinds::WEIGHTED, f)
-    }
-
-    pub(in crate::graph) fn with_matrix_view_at<T>(
-        &self,
-        kinds: MatrixKinds,
-        f: impl FnOnce(&MatrixSet, &CsrSnapshot) -> Result<T, Error>,
-    ) -> Result<T, Error> {
-        self.ensure_matrices_fresh(kinds)?;
-        // Fast path: read the pair without the maintenance lock and use it when the
-        // node counts agree and the set carries the requested tier. The tier is
-        // re-checked rather than assumed: the gate above guarantees it, and so does
-        // the rule that a rebuild never downgrades, but that rule lives in one line
-        // of `rebuild_csr_locked`, and a future install path that forgot it would
-        // otherwise hand a weighted consumer an adjacency-tier set that passes the
-        // node-count check and fails at the matrix read. Re-checking turns that into
-        // one extra rebuild instead of a user-visible error.
-        {
-            let guard = self.matrices.read();
-            if let Some(m) = guard.as_ref() {
-                let snap = self.csr_cache.snapshot.load();
-                if m.n_nodes == snap.dense_to_id.len() && m.kinds().contains(kinds) {
-                    return f(m, &snap);
-                }
-            }
-        }
-        // Slow path: a snapshot-only refresh advanced the snapshot past the
-        // matrices. Rebuild both under the maintenance lock and read them while
-        // still holding it, so no snapshot-only refresh can advance the snapshot
-        // between the rebuild and the read.
-        let _maint = self.csr_cache.maintenance.lock();
-        self.rebuild_csr_locked(kinds)?;
-        let guard = self.matrices.read();
-        let m = guard
-            .as_ref()
-            .ok_or(Error::Corrupt("matrices not initialized"))?;
-        let snap = self.csr_cache.snapshot.load();
-        f(m, &snap)
-    }
-
-    /// Freshness gate for consumers that read only the CSR snapshot (typed
-    /// expansion). Rebuilds the snapshot alone when it lags committed writes,
-    /// skipping GraphBLAS matrix materialization; the pending structural delta
-    /// stays in place for `ensure_matrix_view` to drain later.
-    ///
-    /// Unlike its two sibling gates this one deliberately does *not* also gate on
-    /// `has_pending`, and the asymmetry is required rather than an oversight. A
-    /// pending delta belongs to the matrices, and the refresh here installs
-    /// through `install_snapshot`, which leaves the delta in place on purpose so
-    /// the matrices are not stranded stale behind a fresh snapshot. Gating on the
-    /// delta would therefore make every typed expansion after a write rebuild the
-    /// whole snapshot again, once per call, until some matrix consumer happened to
-    /// drain it: a full edge scan per query on a workload that only expands.
-    /// `ensure_csr_fresh` can afford the same check because its refresh path
-    /// clears the delta as part of the full rebuild.
+    /// Refresh the CSR snapshot when it lags committed writes.
     ///
     /// The generation counter is published immediately after the commit (see
     /// [`crate::csr::CsrCache::advance_write_gen`]), so what remains uncovered is
@@ -1264,88 +1157,20 @@ impl Graph {
         // Re-check under the lock in case another pass already refreshed.
         if self.csr_cache.snapshot_is_stale() {
             let built_gen = self.csr_cache.current_gen();
-            let snap = CsrSnapshot::build(&self.storage)?;
-            // Store the snapshot pointer under the matrices write lock so a
-            // matrix-view consumer holding `matrices.read()` cannot observe this
-            // snapshot advance while its paired matrices stay behind. Snapshot-only
-            // consumers read the pointer lock-free and see one consistent snapshot.
-            let _guard = self.matrices.write();
+            let snap = self.build_snapshot()?;
             self.csr_cache.install_snapshot(snap, built_gen);
         }
         Ok(())
     }
 
-    /// Freshness gate for the pure-adjacency consumers (`bfs`,
-    /// `bfs_multi_source`, untyped `expand`, `degree_centrality`,
-    /// `connected_components`), which read only `adjacency`/`adjacency_t` and the
-    /// dense mapping carried on `MatrixSet`. Applies the pending structural delta
-    /// to the cached matrices in place (resize plus per-element set/drop) in
-    /// O(delta), falling back to a full rebuild when a node was deleted (the
-    /// dense-index mapping is reshuffled) or the matrices are not yet
-    /// materialized. The take-and-apply runs under the matrices write lock, so a
-    /// reader's subsequent `matrices.read()` never observes a partial apply.
-    pub(crate) fn ensure_matrix_view(&self) -> Result<(), Error> {
-        // Lock-free pre-check: skip the maintenance lock when the matrices exist
-        // and nothing is pending (`has_pending` also reports a pending forced full
-        // rebuild). Idle reads never contend on the lock.
-        if self.matrices.read().is_some() && !self.csr_cache.has_pending() {
-            return Ok(());
+    /// Build a snapshot from storage, carrying weights when some consumer has asked
+    /// for them. See [`Graph::weighted_snapshot`] for why that request is sticky.
+    pub(super) fn build_snapshot(&self) -> Result<CsrSnapshot, Error> {
+        if self.csr_cache.wants_weights() {
+            CsrSnapshot::build_weighted(&self.storage)
+        } else {
+            CsrSnapshot::build(&self.storage)
         }
-        let _maint = self.csr_cache.maintenance.lock();
-        self.ensure_matrix_view_locked()
-    }
-
-    /// Body of [`Graph::ensure_matrix_view`]; the caller must already hold
-    /// `csr_cache.maintenance`. Serializing the take-and-apply against the
-    /// background rebuild here is what stops a drained write from being applied
-    /// to a matrices object the rebuild then discards.
-    fn ensure_matrix_view_locked(&self) -> Result<(), Error> {
-        // A node deletion or an unmaterialized matrix set needs a full rebuild,
-        // which refreshes the snapshot and the matrices from LMDB. The consumers of
-        // this gate read only the boolean adjacency, so the rebuild asks for that
-        // tier; `rebuild_csr_locked` still keeps the weighted matrices when they are
-        // already installed.
-        if self.matrices.read().is_none() || self.csr_cache.pending_force_full() {
-            return self.rebuild_csr_locked(MatrixKinds::ADJACENCY);
-        }
-        // Cheap pre-check: skip the exclusive lock when nothing is pending.
-        if !self.csr_cache.has_pending() {
-            return Ok(());
-        }
-
-        let mut guard = self.matrices.write();
-        let delta = self.csr_cache.take_delta();
-        if delta.force_full {
-            // A node deletion raced in after the peek above. Drop the guard
-            // (rebuild_csr re-acquires the write lock) and rebuild from LMDB; the
-            // taken delta is superseded.
-            drop(guard);
-            return self.rebuild_csr_locked(MatrixKinds::ADJACENCY);
-        }
-        if delta.is_empty() {
-            return Ok(());
-        }
-
-        // A removed edge clears the boolean adjacency bit only when no parallel
-        // edge between the same endpoints remains. LMDB is the fresh truth.
-        let mut clear_edges = Vec::new();
-        {
-            let rtxn = self.storage.env.read_txn()?;
-            for &(src, dst) in &delta.removed_edges {
-                let still_connected = self
-                    .out_neighbors_impl(&rtxn, src)?
-                    .into_iter()
-                    .any(|ne| ne.node == dst);
-                if !still_connected {
-                    clear_edges.push((src, dst));
-                }
-            }
-        }
-
-        if let Some(m) = guard.as_mut() {
-            m.apply_delta(&delta.added_nodes, &delta.added_edges, &clear_edges)?;
-        }
-        Ok(())
     }
 
     /// Returns all node IDs in the graph in ascending order.
@@ -1365,56 +1190,14 @@ impl Graph {
         Ok(ids)
     }
 
-    /// Weakly connected components via BFS treating all edges as undirected.
+    /// Weakly connected components, treating every edge as undirected.
     ///
-    /// Returns a map from each node ID to a component ID. Component IDs are
-    /// assigned in ascending order of first discovery and have no guaranteed
-    /// relationship to node IDs.
+    /// Returns a map from each node ID to a component ID. Only the induced
+    /// partition is part of the contract; as it happens the id is the smallest node
+    /// id in the component (see [`Graph::connected_components_kernel`]), but a caller
+    /// should compare membership rather than depend on the numbering.
     pub fn connected_components(&self) -> Result<HashMap<NodeId, u64>, Error> {
-        self.ensure_matrix_view()?;
-        {
-            let guard = self.matrices.read();
-            if let Some(m) = guard.as_ref() {
-                if m.n_nodes > 0 {
-                    return self.connected_components_graphblas(m);
-                }
-            }
-        }
-        let nodes: Vec<NodeId> = {
-            let rtxn = self.storage.env.read_txn()?;
-            self.storage
-                .nodes
-                .iter(&rtxn)?
-                .map(|r| r.map(|(k, _)| k))
-                .collect::<Result<Vec<_>, _>>()?
-        };
-
-        let mut component: HashMap<NodeId, u64> = HashMap::with_capacity(nodes.len());
-        let mut next_id: u64 = 0;
-
-        for &start in &nodes {
-            if component.contains_key(&start) {
-                continue;
-            }
-            let comp_id = next_id;
-            next_id += 1;
-            component.insert(start, comp_id);
-            let mut queue = vec![start];
-            while let Some(node) = queue.pop() {
-                for ne in self.out_neighbors(node)? {
-                    if component.insert(ne.node, comp_id).is_none() {
-                        queue.push(ne.node);
-                    }
-                }
-                for ne in self.in_neighbors(node)? {
-                    if component.insert(ne.node, comp_id).is_none() {
-                        queue.push(ne.node);
-                    }
-                }
-            }
-        }
-
-        Ok(component)
+        self.with_snapshot(|snap| self.connected_components_kernel(snap))
     }
 
     // ------------------------------------------------------------------
@@ -1437,8 +1220,6 @@ impl Graph {
         if self.csr_cache.note_dirty_n(count as u64) {
             let cache = Arc::clone(&self.csr_cache);
             let storage = Arc::clone(&self.storage);
-            let matrices = Arc::clone(&self.matrices);
-            let thread_count = Arc::clone(&self.n_threads);
             std::thread::spawn(move || {
                 // Rebuild until the dirty count drops below the threshold: writes
                 // that commit while a rebuild runs keep the count above zero, and
@@ -1447,91 +1228,34 @@ impl Graph {
                 loop {
                     // Hold the maintenance lock across the whole pass (build plus
                     // install), reacquiring it each iteration so a foreground
-                    // maintenance pass can interleave between passes. This keeps a
-                    // concurrent incremental drain from applying a post-`built_gen`
-                    // write to the live matrices that this pass would then discard
-                    // by replacement, and serializes against any other rebuild.
+                    // maintenance pass can interleave between passes. This serializes
+                    // against any other rebuild, so two passes cannot install over
+                    // each other.
                     let _maint = cache.maintenance.lock();
                     // Capture the generation before reading LMDB; writes that
                     // commit during the build leave the snapshot stale until the
                     // next pass, which the dirty-count loop already drives.
                     let built_gen = cache.current_gen();
-                    // Clear before reading LMDB so writes during the build are
-                    // retained in the emptied delta for a later incremental apply.
-                    cache.clear_delta();
-                    // Materialize only if the matrices already exist, and then only
-                    // at the tier they already carry. This is the compaction pass,
-                    // and it fires after `REBUILD_THRESHOLD` writes, so on a bulk
-                    // load it fires repeatedly; materializing unconditionally there
-                    // would undo the whole point of `Graph::open` building nothing,
-                    // paying a GraphBLAS materialization no consumer has asked for.
-                    // Reading the tier before the snapshot build is what lets the
-                    // build skip the weights scan for an adjacency-tier graph, so it
-                    // happens here rather than after.
-                    let installed_kinds = matrices.read().as_ref().map(|m| m.kinds());
-                    let built = if installed_kinds.is_some_and(|k| k.needs_weights()) {
+                    let built = if cache.wants_weights() {
                         CsrSnapshot::build_weighted(&storage)
                     } else {
                         CsrSnapshot::build(&storage)
                     };
                     match built {
                         Ok(snap) => {
-                            // No matrices yet: refresh the snapshot alone and leave
-                            // the first materialization to whichever gate needs one.
-                            let Some(kinds) = installed_kinds else {
-                                cache.install_snapshot(snap, built_gen);
-                                // Settle, do not cancel: cancelling leaves the
-                                // claimed dirty count in place, so the counter stays
-                                // above the threshold and the next commit spawns this
-                                // pass again, and so does every commit after it.
-                                if cache.settle_rebuild_claim() {
-                                    continue;
-                                }
+                            let again = cache.install(snap, built_gen);
+                            if !again {
                                 break;
-                            };
-                            match MatrixSet::materialize(
-                                &snap,
-                                kinds,
-                                thread_count.load(std::sync::atomic::Ordering::Acquire),
-                            ) {
-                                Ok(m) => {
-                                    // Install the matrices and the snapshot together
-                                    // under the matrices write lock so a reader never
-                                    // sees a mismatched pair.
-                                    let mut guard = matrices.write();
-                                    *guard = Some(m);
-                                    // As in `rebuild_csr_locked`: the weight matrix is
-                                    // the only reader of the weights, and it has been
-                                    // built, so releasing them here keeps eight bytes
-                                    // per edge off the installed snapshot.
-                                    let mut snap = snap;
-                                    snap.edge_weight = None;
-                                    let again = cache.install(snap, built_gen);
-                                    drop(guard);
-                                    if !again {
-                                        break;
-                                    }
-                                }
-                                Err(_) => {
-                                    // The delta was emptied before the build, so
-                                    // failing here would leave `has_pending` false with
-                                    // neither the snapshot nor the matrices advanced,
-                                    // and `ensure_matrix_view` gates on the delta alone:
-                                    // every pure-adjacency consumer would then read
-                                    // pre-write state until the next write happened to
-                                    // re-trigger this pass. Requesting a full rebuild
-                                    // puts the work back on the queue instead.
-                                    cache.mark_force_full();
-                                    cache.cancel_rebuild();
-                                    break;
-                                }
                             }
                         }
                         Err(_) => {
-                            // See the sibling arm: the emptied delta has to be replaced
-                            // by a full-rebuild request, or the failure is invisible to
-                            // the gate that reads it.
-                            cache.mark_force_full();
+                            // Nothing was installed, so `snapshot_gen` did not advance
+                            // and the snapshot still reports itself stale: the next
+                            // gated read rebuilds in the foreground and surfaces the
+                            // error to its caller. Releasing the claim without
+                            // clearing the dirty count is deliberate, so a later
+                            // commit retries this pass rather than leaving compaction
+                            // permanently disowned.
                             cache.cancel_rebuild();
                             break;
                         }
@@ -1685,8 +1409,7 @@ fn typed_in_sorted(snap: &CsrSnapshot, type_id: Option<TypeId>) -> TypedSortedAd
 }
 
 #[cfg(test)]
-mod incremental_matrix_tests {
-    use issundb_graphblas::Matrix;
+mod snapshot_freshness_tests {
     use serde_json::json;
     use tempfile::TempDir;
 
@@ -1696,13 +1419,9 @@ mod incremental_matrix_tests {
     use crate::graph::DegreeDirection;
     use crate::schema::NodeId;
 
-    /// Adjacency coordinates, transpose coordinates, and the dense-index mapping:
-    /// the matrix-view state the incremental path maintains.
-    type MatrixView = (Vec<(usize, usize)>, Vec<(usize, usize)>, Vec<NodeId>);
-
     /// Canonicalize a component map to its underlying partition (each node mapped
     /// to the smallest node id in its component), so two results compare equal
-    /// regardless of the arbitrary component-id numbering.
+    /// regardless of the component-id numbering.
     fn canonical_partition(cc: &HashMap<NodeId, u64>) -> BTreeMap<NodeId, NodeId> {
         let mut groups: HashMap<u64, Vec<NodeId>> = HashMap::new();
         for (&node, &comp) in cc {
@@ -1718,189 +1437,12 @@ mod incremental_matrix_tests {
         out
     }
 
-    /// Sorted, deduplicated `(row, col)` coordinates of a boolean adjacency
-    /// matrix, for set comparison independent of internal storage order.
-    fn matrix_coords(m: &Matrix<i32>) -> Vec<(usize, usize)> {
-        let mut out: Vec<(usize, usize)> = m
-            .triples()
-            .expect("triples")
-            .into_iter()
-            .map(|(r, c, _)| (r, c))
-            .collect();
-        out.sort_unstable();
-        out.dedup();
-        out
-    }
-
-    /// Snapshot the matrix-view state that the incremental path maintains:
-    /// adjacency coordinates, transpose coordinates, and the dense-index mapping.
-    fn extract(graph: &Graph) -> MatrixView {
-        let guard = graph.matrices.read();
-        let m = guard.as_ref().expect("matrices materialized");
-        (
-            matrix_coords(&m.adjacency),
-            matrix_coords(&m.adjacency_t),
-            m.dense_to_id.clone(),
-        )
-    }
-
-    /// The incrementally-maintained matrices must be byte-identical (as element
-    /// sets and dense mapping) to a full rebuild over the same final LMDB state.
-    /// Because the incremental matrices equal the freshly-built ones, any
-    /// consumer reading them sees every committed mutation: this is the freshness
-    /// proof as well as the correctness proof.
+    /// A gate-driven refresh must produce what an explicit `rebuild_csr` would.
+    /// Every kernel reads the snapshot, so this is the freshness proof for all of
+    /// them: whatever the gate installed answers the same as a forced rebuild over
+    /// the same LMDB state.
     #[test]
-    fn incremental_matrices_match_full_rebuild() {
-        let dir = TempDir::new().unwrap();
-        let g = Graph::open(dir.path(), 1).unwrap();
-
-        // Base graph: a 20-node ring.
-        let ids: Vec<NodeId> = (0..20)
-            .map(|i| g.add_node("N", &json!({ "v": i })).unwrap())
-            .collect();
-        let mut base_edges = Vec::new();
-        for i in 0..20 {
-            base_edges.push(
-                g.add_edge(ids[i], ids[(i + 1) % 20], "R", &json!({}))
-                    .unwrap(),
-            );
-        }
-        // Establish the base matrices and clear the pending delta.
-        g.rebuild_csr().unwrap();
-
-        // Mutations recorded into the delta:
-        // 1. New edges among existing nodes.
-        g.add_edge(ids[0], ids[5], "R", &json!({})).unwrap();
-        g.add_edge(ids[3], ids[10], "R", &json!({})).unwrap();
-        // 2. Parallel edges, then remove one: the adjacency bit must stay set.
-        let par_a = g.add_edge(ids[2], ids[4], "R", &json!({})).unwrap();
-        let _par_b = g.add_edge(ids[2], ids[4], "R", &json!({})).unwrap();
-        // 3. New nodes with edges (matrix must grow).
-        let n20 = g.add_node("N", &json!({ "v": 20 })).unwrap();
-        let n21 = g.add_node("N", &json!({ "v": 21 })).unwrap();
-        g.add_edge(n20, n21, "R", &json!({})).unwrap();
-        g.add_edge(ids[1], n20, "R", &json!({})).unwrap();
-        // 4. Remove an edge with no parallel: the adjacency bit must clear.
-        g.delete_edge(base_edges[7]).unwrap();
-        // 5. Remove one of the parallel pair (the other still connects the pair).
-        g.delete_edge(par_a).unwrap();
-
-        // Incremental refresh, then snapshot.
-        g.ensure_matrix_view().unwrap();
-        let incremental = extract(&g);
-
-        // Full rebuild over the same LMDB state, then snapshot.
-        g.rebuild_csr().unwrap();
-        let full = extract(&g);
-
-        assert_eq!(incremental.0, full.0, "adjacency element sets differ");
-        assert_eq!(incremental.1, full.1, "adjacency_t element sets differ");
-        assert_eq!(incremental.2, full.2, "dense-index mapping differs");
-    }
-
-    /// A node deletion reshuffles dense indices, so the refresh must fall back to
-    /// a full rebuild and still match.
-    #[test]
-    fn node_deletion_forces_full_rebuild_and_matches() {
-        let dir = TempDir::new().unwrap();
-        let g = Graph::open(dir.path(), 1).unwrap();
-        let ids: Vec<NodeId> = (0..10)
-            .map(|i| g.add_node("N", &json!({ "v": i })).unwrap())
-            .collect();
-        for i in 0..10 {
-            g.add_edge(ids[i], ids[(i + 1) % 10], "R", &json!({}))
-                .unwrap();
-        }
-        g.rebuild_csr().unwrap();
-
-        // Delete a node (cascades its edges) and add a fresh edge.
-        g.delete_node(ids[3]).unwrap();
-        g.add_edge(ids[5], ids[7], "R", &json!({})).unwrap();
-
-        g.ensure_matrix_view().unwrap();
-        let incremental = extract(&g);
-        g.rebuild_csr().unwrap();
-        let full = extract(&g);
-
-        assert_eq!(incremental.0, full.0, "adjacency element sets differ");
-        assert_eq!(incremental.1, full.1, "adjacency_t element sets differ");
-        assert_eq!(incremental.2, full.2, "dense-index mapping differs");
-    }
-
-    /// Go/no-go measurement (ignored by default; the build dominates runtime).
-    /// Run with:
-    /// `cargo test -p issundb-core --release incremental_apply_cost -- --ignored --nocapture`
-    #[test]
-    #[ignore = "measurement: prints incremental-apply vs full-rebuild timings"]
-    fn incremental_apply_cost() {
-        use std::time::Instant;
-
-        fn measure(n_nodes: usize, out_degree: usize, k_added: usize) {
-            let dir = TempDir::new().unwrap();
-            let g = Graph::open(dir.path(), 4).unwrap();
-            // Build the base graph in one batched transaction: individual commits
-            // would dominate the runtime and swamp the measurement.
-            let ids: Vec<NodeId> = g
-                .update(|txn| {
-                    let ids: Vec<NodeId> = (0..n_nodes)
-                        .map(|i| txn.add_node("N", &json!({ "v": i })).unwrap())
-                        .collect();
-                    for i in 0..n_nodes {
-                        for k in 0..out_degree {
-                            let off = 1 + k * 7;
-                            txn.add_edge(ids[i], ids[(i + off) % n_nodes], "R", &json!({}))
-                                .unwrap();
-                        }
-                    }
-                    Ok(ids)
-                })
-                .unwrap();
-            g.rebuild_csr().unwrap();
-
-            // Stage `k_added` new edges among existing nodes, then time the
-            // incremental apply of exactly that delta.
-            for j in 0..k_added {
-                let a = (j * 31) % n_nodes;
-                let b = (j * 97 + 5) % n_nodes;
-                g.add_edge(ids[a], ids[b], "R", &json!({})).unwrap();
-            }
-            let t = Instant::now();
-            g.ensure_matrix_view().unwrap();
-            let incr = t.elapsed();
-
-            // Full rebuild is independent of the delta size: it is the cost the
-            // incremental path replaces.
-            let mut best_full = std::time::Duration::from_secs(3600);
-            for _ in 0..3 {
-                let t = Instant::now();
-                g.rebuild_csr().unwrap();
-                let e = t.elapsed();
-                if e < best_full {
-                    best_full = e;
-                }
-            }
-            let n_edges = n_nodes * out_degree + k_added;
-            println!(
-                "{:>7} nodes, {:>9} edges: incremental apply of {} edges = {:>8.3} ms; full rebuild = {:>8.2} ms",
-                n_nodes,
-                n_edges,
-                k_added,
-                incr.as_secs_f64() * 1e3,
-                best_full.as_secs_f64() * 1e3,
-            );
-        }
-
-        measure(10_000, 5, 1_000);
-        measure(50_000, 5, 1_000);
-        measure(100_000, 5, 1_000);
-    }
-
-    /// End-to-end differential check: the migrated matrix-view consumers (`bfs`,
-    /// `degree_centrality`, `connected_components`) must return identical results
-    /// whether refreshed incrementally or via a forced full rebuild, over a
-    /// mutation battery including a new node reached through a new edge.
-    #[test]
-    fn incremental_consumers_match_full_rebuild() {
+    fn gated_consumers_match_a_forced_rebuild() {
         let dir = TempDir::new().unwrap();
         let g = Graph::open(dir.path(), 1).unwrap();
         let ids: Vec<NodeId> = (0..15)
@@ -1912,41 +1454,33 @@ mod incremental_matrix_tests {
         }
         g.rebuild_csr().unwrap();
 
-        // Mutations recorded into the delta, with no rebuild in between.
+        // Mutations with no rebuild in between, including a brand-new node, so the
+        // refresh has to extend the dense mapping as well as the rows.
         g.add_edge(ids[0], ids[7], "R", &json!({})).unwrap();
         let n15 = g.add_node("N", &json!({ "v": 15 })).unwrap();
         g.add_edge(ids[2], n15, "R", &json!({})).unwrap();
         g.add_edge(n15, ids[5], "R", &json!({})).unwrap();
 
-        // Results via the incremental matrix-view path.
-        let bfs_incr = {
-            let mut v = g.bfs(ids[0], 3).unwrap();
-            v.sort_unstable();
-            v
-        };
-        let deg_incr = g.degree_centrality(DegreeDirection::Both).unwrap();
-        let cc_incr = canonical_partition(&g.connected_components().unwrap());
+        // Results through the freshness gate.
+        let bfs_gated = g.bfs(ids[0], 3).unwrap();
+        let deg_gated = g.degree_centrality(DegreeDirection::Both).unwrap();
+        let cc_gated = canonical_partition(&g.connected_components().unwrap());
 
-        // Results via a forced full rebuild over the same LMDB state.
+        // Results after a forced full rebuild over the same LMDB state.
         g.rebuild_csr().unwrap();
-        let bfs_full = {
-            let mut v = g.bfs(ids[0], 3).unwrap();
-            v.sort_unstable();
-            v
-        };
+        let bfs_full = g.bfs(ids[0], 3).unwrap();
         let deg_full = g.degree_centrality(DegreeDirection::Both).unwrap();
         let cc_full = canonical_partition(&g.connected_components().unwrap());
 
-        assert_eq!(bfs_incr, bfs_full, "bfs: incremental vs full rebuild");
-        assert_eq!(deg_incr, deg_full, "degree: incremental vs full rebuild");
-        assert_eq!(cc_incr, cc_full, "components: incremental vs full rebuild");
+        assert_eq!(bfs_gated, bfs_full, "bfs: gated vs forced rebuild");
+        assert_eq!(deg_gated, deg_full, "degree: gated vs forced rebuild");
+        assert_eq!(cc_gated, cc_full, "components: gated vs forced rebuild");
     }
 
-    /// Freshness: a matrix-view consumer reflects an edge, and a brand-new node
-    /// reached through a new edge, with no explicit `rebuild_csr` between the
-    /// write and the read. This is the edge-drift bug the migration closes.
+    /// Freshness: a traversal reflects an edge, and a brand-new node reached through
+    /// a new edge, with no explicit `rebuild_csr` between the write and the read.
     #[test]
-    fn matrix_view_consumers_reflect_writes_without_rebuild() {
+    fn traversals_reflect_writes_without_an_explicit_rebuild() {
         let dir = TempDir::new().unwrap();
         let g = Graph::open(dir.path(), 1).unwrap();
         let a = g.add_node("N", &json!({})).unwrap();
@@ -1957,15 +1491,15 @@ mod incremental_matrix_tests {
             "b is unreachable before the edge exists"
         );
 
-        // Edge between existing nodes, no rebuild: the incremental view sees it.
+        // Edge between existing nodes, no rebuild.
         g.add_edge(a, b, "R", &json!({})).unwrap();
         assert!(
             g.bfs(a, 1).unwrap().contains(&b),
             "b reachable from a after the edge, without a rebuild"
         );
 
-        // A brand-new node reached through a new edge, still no rebuild: this
-        // exercises the matrix resize plus dense-mapping extension end to end.
+        // A brand-new node reached through a new edge, still no rebuild: the refresh
+        // has to grow the dense mapping, not just a row.
         let c = g.add_node("N", &json!({})).unwrap();
         g.add_edge(b, c, "R", &json!({})).unwrap();
         assert!(
@@ -1974,11 +1508,10 @@ mod incremental_matrix_tests {
         );
     }
 
-    /// Freshness for the CSR-snapshot consumers: a generation-gated rebuild makes
-    /// a native-CSR algorithm (`all_paths`) reflect an edge added with no explicit
-    /// `rebuild_csr`.
+    /// The same for a path search, which reads the CSR arrays rather than walking
+    /// levels: one generation-gated refresh serves both.
     #[test]
-    fn csr_consumers_reflect_writes_without_rebuild() {
+    fn path_searches_reflect_writes_without_an_explicit_rebuild() {
         let dir = TempDir::new().unwrap();
         let g = Graph::open(dir.path(), 1).unwrap();
         let a = g.add_node("N", &json!({})).unwrap();
@@ -1999,17 +1532,12 @@ mod incremental_matrix_tests {
         );
     }
 
-    /// After a write, `ensure_matrix_view` applies the delta with
-    /// `GrB_Matrix_setElement` (lazy in non-blocking mode), then drops the write
-    /// lock. Multiple `bfs` calls then take the shared `matrices.read()` lock and
-    /// run `mxv` concurrently. If the pending operations were not materialized
-    /// under the write lock, the first `mxv` triggers GraphBLAS lazy completion,
-    /// which mutates the shared matrix's internal representation while other
-    /// readers race on it: undefined behavior. With the fix (`apply_delta`
-    /// materializes the adjacency matrices before releasing the write lock),
-    /// every concurrent `bfs` returns the full reachable set deterministically.
+    /// Concurrent traversals interleaved with writes must each see one consistent
+    /// snapshot. A reader takes the snapshot through an `ArcSwap` load, so a refresh
+    /// installing a newer one mid-traversal cannot be observed halfway; a reader
+    /// that re-read the pointer per hop could see a node set grow underneath it.
     #[test]
-    fn concurrent_bfs_after_incremental_write_is_consistent() {
+    fn concurrent_traversals_after_a_write_are_consistent() {
         use std::sync::Barrier;
 
         let dir = TempDir::new().unwrap();
@@ -2027,14 +1555,12 @@ mod incremental_matrix_tests {
         g.rebuild_csr().unwrap();
 
         const THREADS: usize = 6;
-        const ROUNDS: usize = 200;
+        const ROUNDS: usize = 50;
         let mut expected = N;
         for r in 0..ROUNDS {
-            // Attach a fresh node directly to `start`. The edge start -> new is a
-            // brand-new matrix coordinate, so `apply_delta` records a pending
-            // `setElement` (lazy in non-blocking mode), re-opening the
-            // lazy-completion race window. The reachable set from `start` grows by
-            // exactly one, keeping the expected count deterministic.
+            // Attach a fresh node directly to `start`, so the reachable set grows by
+            // exactly one and the expected count stays deterministic. Each round
+            // leaves the snapshot stale, so the readers race on the refresh.
             let leaf = g.add_node("N", &json!({ "leaf": r })).unwrap();
             g.add_edge(start, leaf, "R", &json!({})).unwrap();
             expected += 1;
@@ -2045,14 +1571,13 @@ mod incremental_matrix_tests {
                     let g = &g;
                     let barrier = &barrier;
                     s.spawn(move || {
-                        // Synchronize so the threads reach the shared-read `mxv`
-                        // together, maximizing the overlap on the pending matrix.
+                        // Synchronize so the threads hit the gate together.
                         barrier.wait();
                         let reached = g.bfs(start, u8::MAX).unwrap();
                         assert_eq!(
                             reached.len(),
                             expected,
-                            "concurrent bfs saw a partially materialized matrix"
+                            "a concurrent traversal saw an inconsistent snapshot"
                         );
                     });
                 }
@@ -2060,14 +1585,13 @@ mod incremental_matrix_tests {
         }
     }
 
-    /// Writers running concurrently with algorithm readers must not lose an
-    /// update from the cached matrices. A writer builds a star (every leaf edged
-    /// to the center) large enough to cross the background-rebuild threshold, so
-    /// the background full rebuild runs concurrently with the readers' incremental
-    /// `ensure_matrix_view` drains and their `ensure_csr_fresh` rebuilds. If a
-    /// drained edge were applied to a matrices object the background rebuild then
-    /// discarded (the pre-fix race), the star would fracture into more than one
-    /// connected component. It also exercises the maintenance lock for deadlock.
+    /// Writers running concurrently with algorithm readers must not lose an update.
+    /// A writer builds a star (every leaf edged to the center) large enough to cross
+    /// the background-rebuild threshold, so the background rebuild runs concurrently
+    /// with the readers' foreground refreshes. If a background pass installed a
+    /// snapshot built before a write while claiming the later generation, the star
+    /// would fracture into more than one connected component. It also exercises the
+    /// maintenance lock for deadlock.
     #[test]
     fn concurrent_writes_and_reads_lose_no_edges() {
         use std::sync::Arc;
@@ -2097,8 +1621,8 @@ mod incremental_matrix_tests {
                     done.store(true, Ordering::Release);
                 });
             }
-            // Readers: hammer the incremental (`bfs`, `connected_components`) and
-            // the rebuild-gated (`dfs`) paths until the writer is done.
+            // Readers: hammer the gate from several kernels at once until the writer
+            // is done.
             for _ in 0..4 {
                 let g = Arc::clone(&g);
                 let done = Arc::clone(&done);
@@ -2691,11 +2215,10 @@ mod triangle_cycle_count_tests {
     }
 
     /// Changing an edge's weight through `update_edge` must be reflected by the
-    /// next weighted shortest path. The weight and PageRank matrices have no
-    /// incremental maintenance, so `update_edge` must advance the write
-    /// generation to force a rebuild; otherwise the stale matrix serves the old
-    /// weight, or (with a changed weight the reconstruction can no longer match)
-    /// no path at all.
+    /// next weighted shortest path. The snapshot's weights have no incremental
+    /// maintenance, so `update_edge` must advance the write generation to force a
+    /// rebuild; otherwise the stale array serves the old weight, or (with a changed
+    /// weight the reconstruction can no longer match) no path at all.
     #[test]
     fn update_edge_weight_refreshes_dijkstra() {
         let (_dir, g) = open_tmp();
@@ -2725,19 +2248,16 @@ mod triangle_cycle_count_tests {
         assert_eq!(p.nodes, vec![a, c, b]);
     }
 
-    /// The public GraphBLAS entry points must gate themselves, and must do it without
-    /// holding the matrices read lock.
+    /// The public algorithm entry points must gate themselves, and must do it
+    /// without deadlocking.
     ///
-    /// Both `page_rank_graphblas` and `shortest_path_graphblas` are `pub`, so they can
-    /// be called on a graph whose matrices are absent or were materialized below the
-    /// tier they read. They used to handle the absent case by recursing into their
-    /// gated wrapper from inside a `match` on a live read guard, which deadlocks the
-    /// calling thread against itself once the gate reaches a rebuild:
-    /// `parking_lot::RwLock` is not reentrant and does not know the thread already
-    /// holds a read. Each call runs on its own thread with a deadline, so a
-    /// regression fails this test instead of hanging the suite.
+    /// Each can be called on a graph that has built nothing, so each reaches its
+    /// gate, and the gate takes a non-reentrant mutex before rebuilding. A gate that
+    /// acquired it twice, or that recursed into a sibling gate while holding it,
+    /// would hang rather than fail. Each call runs on its own thread with a
+    /// deadline, so a regression fails this test instead of hanging the suite.
     #[test]
-    fn public_graphblas_entry_points_gate_themselves_without_deadlocking() {
+    fn public_entry_points_gate_themselves_without_deadlocking() {
         fn within_deadline<T: Send + 'static>(
             what: &str,
             f: impl FnOnce() -> T + Send + 'static,
@@ -2747,87 +2267,71 @@ mod triangle_cycle_count_tests {
                 let _ = tx.send(f());
             });
             rx.recv_timeout(std::time::Duration::from_secs(30))
-                .unwrap_or_else(|_| {
-                    panic!("{what} did not return: it deadlocked on its own read guard")
-                })
+                .unwrap_or_else(|_| panic!("{what} did not return: it deadlocked on its own gate"))
         }
 
-        // A fresh graph materializes nothing, so both entry points hit the
-        // "no matrices at all" path.
+        // A fresh graph builds nothing, so each entry point hits the unbuilt path.
         let dir = TempDir::new().unwrap();
-        let path = dir.path().to_path_buf();
-        let g = std::sync::Arc::new(Graph::open(&path, 1).unwrap());
+        let g = std::sync::Arc::new(Graph::open(dir.path(), 1).unwrap());
         let a = g.add_node("N", &json!({})).unwrap();
         let b = g.add_node("N", &json!({})).unwrap();
         g.add_edge(a, b, "R", &json!({ "weight": 2.0 })).unwrap();
 
         let g1 = g.clone();
-        let ranks = within_deadline("page_rank_graphblas on an unbuilt graph", move || {
-            g1.page_rank_graphblas(3, 0.85)
+        let ranks = within_deadline("page_rank on an unbuilt graph", move || {
+            g1.page_rank(3, 0.85)
         })
-        .expect("PageRank must materialize what it needs");
+        .expect("PageRank must build what it needs");
         assert_eq!(ranks.len(), 2);
 
         let g2 = g.clone();
-        let path_found =
-            within_deadline("shortest_path_graphblas on an unbuilt graph", move || {
-                g2.shortest_path_graphblas(a, b)
-            })
-            .expect("shortest path must materialize what it needs");
+        let path_found = within_deadline("shortest_path on an unbuilt graph", move || {
+            g2.shortest_path(a, b)
+        })
+        .expect("shortest path must build what it needs");
         assert_eq!(path_found, Some(vec![a, b]));
 
-        // Now the wrong-tier path: an adjacency-tier set is installed, and PageRank
-        // must upgrade rather than report the missing matrix as corruption.
+        // The weighted gate is the one that installs a different kind of snapshot,
+        // so it gets its own unbuilt-graph pass.
         let dir2 = TempDir::new().unwrap();
         let g3 = std::sync::Arc::new(Graph::open(dir2.path(), 1).unwrap());
         let c = g3.add_node("N", &json!({})).unwrap();
         let d = g3.add_node("N", &json!({})).unwrap();
-        g3.add_edge(c, d, "R", &json!({})).unwrap();
-        g3.bfs(c, 1).unwrap();
-        assert_eq!(
-            g3.matrices.read().as_ref().map(|m| m.kinds()),
-            Some(crate::matrices::MatrixKinds::ADJACENCY)
-        );
+        g3.add_edge(c, d, "R", &json!({ "weight": 4.0 })).unwrap();
         let g4 = g3.clone();
-        let ranks = within_deadline(
-            "page_rank_graphblas over adjacency-tier matrices",
-            move || g4.page_rank_graphblas(3, 0.85),
-        )
-        .expect("PageRank must upgrade the tier, not fail");
-        assert_eq!(ranks.len(), 2);
-        assert_eq!(
-            g3.matrices.read().as_ref().map(|m| m.kinds()),
-            Some(crate::matrices::MatrixKinds::PAGE_RANK),
-            "PageRank must not pull in the weight matrix it never reads"
-        );
+        let weighted = within_deadline("shortest_path_dijkstra on an unbuilt graph", move || {
+            g4.shortest_path_dijkstra(c, d)
+        })
+        .expect("Dijkstra must build the weighted snapshot it needs");
+        assert_eq!(weighted.unwrap().total_weight, 4.0);
     }
 
-    /// A weighted consumer must get correct weights on a graph whose matrices were
-    /// already materialized by an adjacency-only one.
+    /// A weighted consumer must get real weights on a graph whose snapshot was
+    /// already built by an unweighted one, and a later unweighted consumer must not
+    /// strip them back off.
     ///
-    /// The adjacency tier builds neither the weight matrix nor the weights the
-    /// snapshot would carry, and it is current at its generation, so a gate that only
-    /// compared generations would hand Dijkstra a set with no weight matrix. Running
-    /// `bfs` first and then Dijkstra with no write in between is exactly that
-    /// sequence.
+    /// An unweighted build carries no weights and is current at its generation, so a
+    /// gate that only compared generations would hand Dijkstra a snapshot with none.
+    /// Running `bfs` first and then Dijkstra with no write in between is exactly that
+    /// sequence. The second half pins the stickiness: without it the two consumers
+    /// would rebuild in turn, once each per write.
     #[test]
-    fn a_weighted_consumer_upgrades_matrices_materialized_for_an_adjacency_one() {
+    fn a_weighted_consumer_gets_weights_after_an_unweighted_build() {
         let (_dir, g) = open_tmp();
         let a = g.add_node("N", &json!({})).unwrap();
         let b = g.add_node("N", &json!({})).unwrap();
         let c = g.add_node("N", &json!({})).unwrap();
-        // The detour is cheaper than the direct edge, so a matrix of default
-        // weights (every edge 1.0) would pick the direct edge and score it 1.0.
+        // The detour is cheaper than the direct edge, so a default weight of 1.0 per
+        // edge would pick the direct edge and score it 1.0.
         g.add_edge(a, b, "R", &json!({ "weight": 100.0 })).unwrap();
         g.add_edge(a, c, "R", &json!({ "weight": 1.0 })).unwrap();
         g.add_edge(c, b, "R", &json!({ "weight": 1.0 })).unwrap();
 
-        // An adjacency-tier consumer materializes first.
+        // An unweighted consumer builds first.
         assert!(!g.bfs(a, 2).unwrap().is_empty());
-        assert_eq!(
-            g.matrices.read().as_ref().map(|m| m.kinds()),
-            Some(crate::matrices::MatrixKinds::ADJACENCY),
-            "bfs must not have paid for the weighted matrices"
+        assert!(
+            g.csr_cache.snapshot.load().edge_weight.is_none(),
+            "bfs must not have paid the weights scan"
         );
 
         let p = g
@@ -2836,47 +2340,22 @@ mod triangle_cycle_count_tests {
             .expect("a path a->b exists");
         assert_eq!(p.total_weight, 2.0, "the weights must be the stored ones");
         assert_eq!(p.nodes, vec![a, c, b]);
-        assert_eq!(
-            g.matrices.read().as_ref().map(|m| m.kinds()),
-            Some(crate::matrices::MatrixKinds::WEIGHTED),
-            "the weighted consumer upgraded the tier"
-        );
 
-        // And the upgrade is not lost: an adjacency consumer running afterwards must
-        // not strip the weighted matrices back off, or the two would rebuild in turn.
+        // The request is sticky, so an unweighted consumer running afterwards, and a
+        // rebuild triggered by a write, both keep the weights loaded.
         assert!(!g.bfs(a, 2).unwrap().is_empty());
         g.add_edge(b, c, "R", &json!({ "weight": 1.0 })).unwrap();
         assert!(!g.bfs(a, 2).unwrap().is_empty());
-        assert_eq!(
-            g.matrices.read().as_ref().map(|m| m.kinds()),
-            Some(crate::matrices::MatrixKinds::WEIGHTED),
-            "an adjacency consumer must not strip an installed weight matrix"
+        assert!(
+            g.csr_cache.snapshot.load().edge_weight.is_some(),
+            "an unweighted consumer must not strip weights another one asked for"
         );
     }
 
-    /// Two parallel edges between the same pair must take the cheaper weight, not
-    /// the sum, and must still yield a path (a summed weight matches no real edge
-    /// and breaks path reconstruction).
+    /// PageRank must not depend on whether a prior bulk typed expansion refreshed
+    /// the snapshot.
     #[test]
-    fn dijkstra_parallel_edges_use_min_weight() {
-        let (_dir, g) = open_tmp();
-        let a = g.add_node("N", &json!({})).unwrap();
-        let b = g.add_node("N", &json!({})).unwrap();
-        g.add_edge(a, b, "R", &json!({ "weight": 2.0 })).unwrap();
-        g.add_edge(a, b, "R", &json!({ "weight": 3.0 })).unwrap();
-        g.rebuild_csr().unwrap();
-
-        let p = g
-            .shortest_path_dijkstra(a, b)
-            .unwrap()
-            .expect("parallel edges must still yield a path");
-        assert_eq!(p.total_weight, 2.0, "parallel edges take the min weight");
-    }
-
-    /// PageRank must not depend on whether a prior bulk typed expansion advanced
-    /// the snapshot generation without re-materializing the PageRank matrix.
-    #[test]
-    fn page_rank_fresh_after_snapshot_only_refresh() {
+    fn page_rank_fresh_after_a_bulk_expansion_refresh() {
         let (_dir, g) = open_tmp();
         let mut nodes = Vec::new();
         for _ in 0..70 {
@@ -2886,19 +2365,19 @@ mod triangle_cycle_count_tests {
         for w in nodes.windows(2) {
             g.add_edge(w[0], w[1], "R", &json!({})).unwrap();
         }
-        // A bulk typed expansion over >64 sources advances the snapshot only,
-        // leaving the pending delta for the (matrix-free) snapshot refresh.
-        let _ = g.expand_spmv_graphblas(&nodes, Some("R"), false).unwrap();
-        let incremental = g.page_rank(20, 0.85).unwrap();
+        // A bulk typed expansion over more than `STALE_POINT_EXPAND_MAX` sources
+        // refreshes the snapshot as a side effect.
+        let _ = g.expand_bulk(&nodes, Some("R"), false).unwrap();
+        let gated = g.page_rank(20, 0.85).unwrap();
 
         g.rebuild_csr().unwrap();
         let full = g.page_rank(20, 0.85).unwrap();
 
         for n in &nodes {
             assert!(
-                (incremental[n] - full[n]).abs() < 1e-6,
-                "page_rank for {n} diverges after a snapshot-only refresh: {} vs {}",
-                incremental[n],
+                (gated[n] - full[n]).abs() < 1e-6,
+                "page_rank for {n} diverges after a bulk-expansion refresh: {} vs {}",
+                gated[n],
                 full[n]
             );
         }
@@ -2947,28 +2426,28 @@ mod snapshot_only_gate_tests {
         }
     }
 
-    /// The three counting kernels read only the CSR snapshot, so they must gate
-    /// on `ensure_snapshot_fresh` and leave the GraphBLAS matrices
-    /// unmaterialized. Materializing them would build a weight matrix and a
-    /// PageRank matrix that no counting kernel ever reads.
+    /// The counting kernels read the adjacency arrays alone, so they must build no
+    /// more than that. The per-edge weights are the one extra a snapshot can carry,
+    /// and loading them costs a second full scan of `edges` that no counting kernel
+    /// ever reads.
     #[test]
-    fn count_kernels_serve_from_the_snapshot_without_materializing_matrices() {
+    fn count_kernels_serve_from_the_snapshot_without_loading_weights() {
         let (dir, _ids) = seeded_dir();
 
         {
             let g = Graph::open(dir.path(), 1).unwrap();
             assert_eq!(g.count_linear_paths(&one_hop()).unwrap(), 5);
             assert!(
-                g.matrices.read().is_none(),
-                "a one-hop count must not materialize the matrices"
+                g.csr_cache.snapshot.load().edge_weight.is_none(),
+                "a one-hop count must not pay the weights scan"
             );
         }
         {
             let g = Graph::open(dir.path(), 1).unwrap();
             assert_eq!(g.count_linear_paths(&two_hop()).unwrap(), 4);
             assert!(
-                g.matrices.read().is_none(),
-                "a two-hop count must not materialize the matrices"
+                g.csr_cache.snapshot.load().edge_weight.is_none(),
+                "a two-hop count must not pay the weights scan"
             );
         }
         {
@@ -2980,8 +2459,8 @@ mod snapshot_only_gate_tests {
             // One directed 3-cycle, counted once per rotation of `a`.
             assert_eq!(g.count_triangle_cycles(&spec).unwrap(), 3);
             assert!(
-                g.matrices.read().is_none(),
-                "a triangle count must not materialize the matrices"
+                g.csr_cache.snapshot.load().edge_weight.is_none(),
+                "a triangle count must not pay the weights scan"
             );
         }
         {
@@ -2999,8 +2478,8 @@ mod snapshot_only_gate_tests {
             assert_eq!(counts.len(), 5);
             assert!(counts.iter().all(|&(_, c)| c == 1));
             assert!(
-                g.matrices.read().is_none(),
-                "a grouped degree count must not materialize the matrices"
+                g.csr_cache.snapshot.load().edge_weight.is_none(),
+                "a grouped degree count must not pay the weights scan"
             );
         }
     }
@@ -3031,8 +2510,8 @@ mod snapshot_only_gate_tests {
             "5->3 adds 4->5->3 and 5->3->4"
         );
         assert!(
-            g.matrices.read().is_none(),
-            "refreshing the snapshot must not drag in a matrix materialization"
+            g.csr_cache.snapshot.load().edge_weight.is_none(),
+            "refreshing the snapshot must not drag in the weights scan"
         );
     }
 

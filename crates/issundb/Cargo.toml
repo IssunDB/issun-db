@@ -19,7 +19,12 @@ issundb-retrieval.workspace = true
 serde_json = "1"
 
 [features]
-default = []
+default = ["hnsw"]
+hnsw = [
+    "issundb-vector/hnsw",
+    "issundb-cypher/hnsw",
+    "issundb-retrieval/hnsw",
+]
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -7,11 +7,11 @@ Read the root `AGENTS.md` first; the rules there apply everywhere and are not re
 
 `VectorIndex` starts in the `Inner::Empty` state and is lazily initialized on the first call to `upsert`:
 
-1. Empty: no usearch index exists yet; the dimension count is unknown.
-2. Ready: the index is live with a fixed dimension count; `upsert` and `search` both operate against it.
+1. Empty: no backend exists yet; the dimension count is unknown.
+2. Ready: a backend is live with a fixed dimension count; `upsert` and `search` both operate against it.
 
 State transitions are guarded by an internal `RwLock<Inner>`; a read-only search takes the read guard, and `upsert` and `remove` take the write guard.
-Initialization happens inside the mutex: create an `IndexOptions`, call `Index::new`, call `index.reserve(64)`, then insert the first vector.
+Initialization happens inside the mutex: call `backend::new_backend(dims, opts)`, then insert the first vector.
 Once `Ready`, the dimension count is immutable for the lifetime of the index.
 
 ## Dimension Contract
@@ -44,15 +44,34 @@ would change either one on a graph that already holds embeddings. `reindex_vecto
 vectors are raw, metric-agnostic f32, so it rebuilds the whole in-memory index from LMDB under the new configuration. That rebuild is O(n) and is an
 administrative operation, not a concurrent one.
 
-## `usearch` API Notes
+## The Backend Seam
 
-The usearch `Index` does not auto-grow its internal capacity. Follow these rules:
+`backend.rs` owns the index and is the only module that may name `usearch`. It selects one implementation at compile time from the `hnsw` feature, which is
+on by default:
 
-- Call `index.reserve(n)` before calling `index.add`. The initial reservation on first `upsert` is `64`.
-- Before each subsequent `upsert` in the `Ready` branch, check `index.size() >= index.capacity()`. If true, call
-  `index.reserve((index.capacity() * 2).max(64))` before adding.
-- `index.add(node_id, vector)` does not replace an existing entry; call `index.remove(node_id)` first if the node already exists in the index (
-  `index.contains(node_id)`).
+- With `hnsw`: `HnswBackend`, wrapping `usearch`. This is the workspace's only C++ dependency, reached through `cxx`, and it is why a build without the
+  feature exists at all: `usearch` cannot cross-compile to a target with no C++ toolchain.
+- Without `hnsw`: `ExactBackend`, a pure-Rust scan. It is exact rather than approximate, ranks through the same `exact_distance` the rescore pass uses, and
+  breaks distance ties by node id so a top-k is deterministic. It ignores `quantization`, keeping the raw `f32`, and its query cost is linear in the vector
+  count.
+
+Rules for changing this:
+
+- Keep the trait small; it is five methods, and every one of them is a promise a future backend has to keep. Push anything a backend can do for itself, such
+  as the capacity dance below, behind `upsert` rather than into the trait.
+- `ExactBackend` compiles in both configurations and has its own tests, so it cannot rot while the feature is on. Do not `cfg` it out to silence a
+  dead-code warning; construct it in a test instead.
+- The whole suite must pass in both configurations: `cargo test -p issundb-vector` and `cargo test -p issundb-vector --no-default-features`. A test that
+  genuinely depends on approximate behavior or on quantization belongs behind `#[cfg(feature = "hnsw")]`; none needed it so far, because the quantization
+  test only asserts that well-separated vectors still rank correctly.
+
+### `usearch` API Notes
+
+These constraints are the reason `HnswBackend::upsert` looks the way it does. The usearch `Index` does not auto-grow its internal capacity:
+
+- Call `index.reserve(n)` before calling `index.add`. The initial reservation on construction is `64`.
+- Before each subsequent add, check `index.size() >= index.capacity()`. If true, call `index.reserve((index.capacity() * 2).max(64))` first.
+- `index.add(node_id, vector)` does not replace an existing entry; call `index.remove(node_id)` first when `index.contains(node_id)`.
 - usearch `search` returns at most `min(k, index.size())` results. Clamp `k` to `index.size()` before searching to avoid requesting more results than
   the index holds.
 

@@ -614,7 +614,7 @@ enum ReplCommand {
     #[command(name = ":version")]
     Version,
 
-    /// Set the thread count for GraphBLAS matrix computations (e.g., `:threads 4`)
+    /// Set the thread count for the parallel read passes (e.g., `:threads 4`)
     #[command(name = ":threads")]
     Threads {
         /// Number of threads (0 to restore default behavior)
@@ -638,7 +638,7 @@ const HELP_TEXT: &str = r#"
 Database Control
   :open <path> [map_size_gb]           Open or reopen a database at the given path (e.g., :open ./issundb-data 2)
   :close                               Close the open database without exiting the CLI
-  :threads <count>                     Set the thread count for GraphBLAS computations (e.g., :threads 4)
+  :threads <count>                     Set the thread count for parallel read passes (e.g., :threads 4)
 
 Scripting and Parameters
   :run <file>                          Execute a script file (multi-line Cypher statements end with ;), stopping at the first failing command (e.g., :run ./setup.txt)

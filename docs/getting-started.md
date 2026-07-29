@@ -7,9 +7,10 @@ It explains prerequisites, building the engine from source, and using the comman
 
 Compiling IssunDB and its native dependencies requires Rust 1.85.0 or later, along with the following system tools:
 
-- Build tools: CMake and a C/C++ compiler (such as Clang or GCC) to compile the SuiteSparse:GraphBLAS static library.
-- FFI bindings: `libclang`, which `bindgen` uses to build the raw GraphBLAS wrappers.
-- OpenMP runtime: This resolves to `libgomp` (bundled with GCC) on Linux, `libomp` on macOS (`brew install libomp`), and `vcomp` (usually part of the MSVC runtime) on Windows.
+- Build tools: a C/C++ compiler (such as Clang or GCC), which compiles the bundled LMDB sources and the vector index. Building with
+  `--no-default-features` drops the vector index and with it the only C++ dependency.
+
+There is nothing else to install: no CMake, no `libclang`, and no OpenMP runtime.
 
 ## Build from Source
 
@@ -65,7 +66,7 @@ The REPL supports meta commands (prefixed with `:`) to manage the session, take 
 | `:import-nodes`   | `:import-nodes /path/to/nodes.csv Label`        | Bulk-import nodes from a CSV or Parquet file whose columns become properties.                                             |
 | `:import-edges`   | `:import-edges /path/to/edges.csv Src Dst Type` | Bulk-import edges from a two-column CSV or Parquet file of domain keys.                                                   |
 | `:explain`        | `:explain MATCH (n) RETURN n`                   | Explain the physical plan of a Cypher query.                                                                              |
-| `:threads`        | `:threads 4`                                    | Set the GraphBLAS thread count, with 0 restoring the default.                                                             |
+| `:threads`        | `:threads 4`                                    | Set the thread count for the parallel read passes, with 0 restoring the default.                                          |
 | `:version`        | `:version`                                      | Show the IssunDB version.                                                                                                 |
 | `help`            | `help`                                          | Show the built-in command list.                                                                                           |
 | `quit`            | `quit`                                          | Exit the CLI (alias `exit`).                                                                                              |

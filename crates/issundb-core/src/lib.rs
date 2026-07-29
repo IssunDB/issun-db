@@ -3,7 +3,6 @@ pub(crate) mod csr;
 mod error;
 mod graph;
 pub(crate) mod histogram;
-pub(crate) mod matrices;
 mod schema;
 pub(crate) mod storage;
 pub(crate) mod threads;
@@ -252,7 +251,7 @@ mod tests {
     #[test]
     fn bfs_works_via_dynamic_matrix_materialization_without_manual_rebuild() {
         let (_dir, g) = open_tmp();
-        // Dynamic materialization automatically loads the newly added nodes into CSR snapshot and MatrixSet.
+        // The freshness gate loads the newly added nodes into the CSR snapshot.
         let a = g.add_node("N", &json!({})).unwrap();
         let b = g.add_node("N", &json!({})).unwrap();
         let c = g.add_node("N", &json!({})).unwrap();
@@ -1355,10 +1354,10 @@ mod tests {
     }
 
     #[test]
-    fn connected_components_graphblas_path_node_zero_connected() {
-        // Regression: after rebuild_csr the GraphBLAS path runs. Node index 0
+    fn connected_components_node_zero_connected() {
+        // Regression: node index 0
         // must join its component rather than being stranded as a singleton by a
-        // label value colliding with the semiring's implicit zero.
+        // component id colliding with a sentinel.
         let (_dir, g) = open_tmp();
         let a = g.add_node("N", &json!({})).unwrap();
         let b = g.add_node("N", &json!({})).unwrap();
@@ -1375,10 +1374,10 @@ mod tests {
     }
 
     #[test]
-    fn connected_components_graphblas_path_keeps_components_separate() {
-        // Regression: the GraphBLAS WCC propagation must reduce over neighbor
+    fn connected_components_keeps_components_separate() {
+        // Regression: the WCC union must reduce over neighbor
         // labels, not the adjacency matrix value. Two disjoint edges A->B and
-        // C->D form two components; a MinFirst semiring collapses every
+        // C->D form two components; a union over the wrong endpoint collapses every
         // edge-touching node into one component, so this guards MinSecond.
         let (_dir, g) = open_tmp();
         let a = g.add_node("N", &json!({})).unwrap();
@@ -1445,7 +1444,7 @@ mod tests {
     }
 
     #[test]
-    fn graphblas_bfs_page_rank_sssp() {
+    fn bfs_page_rank_and_sssp() {
         let (_dir, g) = open_tmp();
         let a = g.add_node("Person", &json!({})).unwrap();
         let b = g.add_node("Person", &json!({})).unwrap();
@@ -1455,19 +1454,19 @@ mod tests {
         g.rebuild_csr().unwrap();
 
         // BFS from a with 1 hop should reach a and b only.
-        let bfs1 = g.bfs_graphblas(a, 1).unwrap();
+        let bfs1 = g.bfs(a, 1).unwrap();
         assert!(bfs1.contains(&a));
         assert!(bfs1.contains(&b));
         assert!(!bfs1.contains(&c));
 
         // BFS from a with 2 hops should reach all three.
-        let bfs2 = g.bfs_graphblas(a, 2).unwrap();
+        let bfs2 = g.bfs(a, 2).unwrap();
         assert!(bfs2.contains(&a));
         assert!(bfs2.contains(&b));
         assert!(bfs2.contains(&c));
 
         // PageRank returns one entry per node.
-        let pr = g.page_rank_graphblas(10, 0.85).unwrap();
+        let pr = g.page_rank(10, 0.85).unwrap();
         assert_eq!(pr.len(), 3);
         for &id in &[a, b, c] {
             assert!(pr.contains_key(&id));
@@ -1475,18 +1474,15 @@ mod tests {
         }
 
         // SSSP a→c should return the two-hop path [a, b, c].
-        let path = g
-            .shortest_path_graphblas(a, c)
-            .unwrap()
-            .expect("path a→c must exist");
+        let path = g.shortest_path(a, c).unwrap().expect("path a→c must exist");
         assert_eq!(path, vec![a, b, c]);
 
         // SSSP a→a is a trivial path.
-        let trivial = g.shortest_path_graphblas(a, a).unwrap().unwrap();
+        let trivial = g.shortest_path(a, a).unwrap().unwrap();
         assert_eq!(trivial, vec![a]);
 
         // SSSP in reverse direction (no edge) returns None.
-        assert!(g.shortest_path_graphblas(c, a).unwrap().is_none());
+        assert!(g.shortest_path(c, a).unwrap().is_none());
     }
 }
 
@@ -1649,7 +1645,7 @@ mod differential_tests {
 
     /// Union-find reference for weakly connected components: treat every edge
     /// as undirected and union its endpoints. This is the textbook definition
-    /// the GraphBLAS min-label propagation in `connected_components` computes.
+    /// the min-representative numbering `connected_components` computes.
     fn reference_wcc(n: usize, edges: &[(usize, usize)]) -> Vec<usize> {
         fn find(parent: &mut [usize], mut x: usize) -> usize {
             while parent[x] != x {

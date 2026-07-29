@@ -1,9 +1,9 @@
 use std::cell::RefCell;
 use std::sync::Arc;
 
+use crate::backend::{VectorBackend, new_backend};
 use parking_lot::RwLock;
 use tracing::instrument;
-use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
 
 use crate::error::VectorError;
 use issundb_core::{Graph, NodeId};
@@ -113,10 +113,15 @@ pub struct VectorIndexOptions {
 
 enum Inner {
     Empty,
-    Ready { index: Index, dims: usize },
+    Ready {
+        index: Box<dyn VectorBackend>,
+        dims: usize,
+    },
 }
 
-/// An in-memory HNSW vector index using the `usearch` library.
+/// An in-memory vector index over whichever backend this crate was compiled with
+/// (see [`crate::backend`]): an approximate HNSW index by default, an exact scan
+/// without the `hnsw` feature.
 ///
 /// Internal building block for the `VectorGraphExt` implementation on `Graph`.
 /// It holds no persistence of its own, so it is not part of the public surface;
@@ -161,20 +166,8 @@ impl VectorIndex {
         let mut guard = self.inner.write();
         match &mut *guard {
             Inner::Empty => {
-                let opts = IndexOptions {
-                    dimensions: dims,
-                    metric: metric_to_usearch(self.opts.metric),
-                    quantization: quantization_to_usearch(self.opts.quantization),
-                    ..Default::default()
-                };
-                let index =
-                    Index::new(&opts).map_err(|e| VectorError::IndexFault(e.to_string()))?;
-                index
-                    .reserve(64)
-                    .map_err(|e| VectorError::IndexFault(e.to_string()))?;
-                index
-                    .add(node, v)
-                    .map_err(|e| VectorError::IndexFault(e.to_string()))?;
+                let mut index = new_backend(dims, &self.opts)?;
+                index.upsert(node, v)?;
                 *guard = Inner::Ready { index, dims };
             }
             Inner::Ready { index, dims: d } => {
@@ -184,20 +177,7 @@ impl VectorIndex {
                         got: dims,
                     });
                 }
-                if index.contains(node) {
-                    index
-                        .remove(node)
-                        .map_err(|e| VectorError::IndexFault(e.to_string()))?;
-                }
-                if index.size() >= index.capacity() {
-                    let new_cap = (index.capacity() * 2).max(64);
-                    index
-                        .reserve(new_cap)
-                        .map_err(|e| VectorError::IndexFault(e.to_string()))?;
-                }
-                index
-                    .add(node, v)
-                    .map_err(|e| VectorError::IndexFault(e.to_string()))?;
+                index.upsert(node, v)?;
             }
         }
         Ok(())
@@ -207,7 +187,7 @@ impl VectorIndex {
     pub fn is_empty(&self) -> bool {
         match &*self.inner.read() {
             Inner::Empty => true,
-            Inner::Ready { index, .. } => index.size() == 0,
+            Inner::Ready { index, .. } => index.len() == 0,
         }
     }
 
@@ -215,11 +195,7 @@ impl VectorIndex {
     pub fn remove(&self, node: NodeId) -> Result<(), VectorError> {
         let mut guard = self.inner.write();
         if let Inner::Ready { index, .. } = &mut *guard {
-            if index.contains(node) {
-                index
-                    .remove(node)
-                    .map_err(|e| VectorError::IndexFault(e.to_string()))?;
-            }
+            index.remove(node)?;
         }
         Ok(())
     }
@@ -232,27 +208,7 @@ impl VectorIndex {
         let guard = self.inner.read();
         match &*guard {
             Inner::Empty => Ok(vec![]),
-            Inner::Ready { index, dims } => {
-                if q.len() != *dims {
-                    return Err(VectorError::DimensionMismatch {
-                        expected: *dims,
-                        got: q.len(),
-                    });
-                }
-                if k == 0 || index.size() == 0 {
-                    return Ok(vec![]);
-                }
-                let actual_k = k.min(index.size());
-                let matches = index
-                    .search::<f32>(q, actual_k)
-                    .map_err(|e| VectorError::IndexFault(e.to_string()))?;
-                Ok(matches
-                    .keys
-                    .iter()
-                    .zip(matches.distances.iter())
-                    .map(|(&node, &distance)| Hit { node, distance })
-                    .collect())
-            }
+            Inner::Ready { index, .. } => index.search(q, k),
         }
     }
 
@@ -275,27 +231,7 @@ impl VectorIndex {
         let guard = self.inner.read();
         match &*guard {
             Inner::Empty => Ok(vec![]),
-            Inner::Ready { index, dims } => {
-                if q.len() != *dims {
-                    return Err(VectorError::DimensionMismatch {
-                        expected: *dims,
-                        got: q.len(),
-                    });
-                }
-                if k == 0 || index.size() == 0 {
-                    return Ok(vec![]);
-                }
-                let actual_k = k.min(index.size());
-                let matches = index
-                    .filtered_search::<f32, _>(q, actual_k, predicate)
-                    .map_err(|e| VectorError::IndexFault(e.to_string()))?;
-                Ok(matches
-                    .keys
-                    .iter()
-                    .zip(matches.distances.iter())
-                    .map(|(&node, &distance)| Hit { node, distance })
-                    .collect())
-            }
+            Inner::Ready { index, .. } => index.search_filtered(q, k, &predicate),
         }
     }
 }
@@ -648,7 +584,7 @@ impl VectorGraphExt for Graph {
 /// distance convention `usearch` reports for the same metric (squared L2,
 /// `1 - dot` for inner product) so rescored and approximate distances stay
 /// comparable.
-fn exact_distance(q: &[f32], v: &[f32], metric: VectorMetric) -> f32 {
+pub(crate) fn exact_distance(q: &[f32], v: &[f32], metric: VectorMetric) -> f32 {
     match metric {
         VectorMetric::Cosine => {
             let mut dot = 0.0;
@@ -765,22 +701,6 @@ fn decode_config(bytes: &[u8]) -> Result<VectorIndexOptions, VectorError> {
         metric,
         quantization,
     })
-}
-
-fn metric_to_usearch(m: VectorMetric) -> MetricKind {
-    match m {
-        VectorMetric::Cosine => MetricKind::Cos,
-        VectorMetric::L2 => MetricKind::L2sq,
-        VectorMetric::Dot => MetricKind::IP,
-    }
-}
-
-fn quantization_to_usearch(q: VectorQuantization) -> ScalarKind {
-    match q {
-        VectorQuantization::Float32 => ScalarKind::F32,
-        VectorQuantization::Float16 => ScalarKind::F16,
-        VectorQuantization::Int8 => ScalarKind::I8,
-    }
 }
 
 #[cfg(test)]

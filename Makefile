@@ -114,9 +114,7 @@ clean: ## Remove generated and temporary files
 install-snap: ## Install a few dependencies using Snapcraft
 	@echo "Installing the snap package..."
 	@sudo apt-get update
-	@# cmake, clang, and libclang build the GraphBLAS submodule (issundb-graphblas-sys);
-	@# patchelf lets maturin set the libgomp rpath when packaging the Python wheel.
-	@sudo apt-get install -y snapd graphviz wget cmake clang libclang-dev patchelf
+	@sudo apt-get install -y snapd graphviz wget
 	@sudo snap refresh
 	@sudo snap install rustup --classic
 
@@ -144,10 +142,6 @@ install-msrv: ## Install the minimum supported Rust version (MSRV=$(MSRV)) and s
 lint: format ## Run the linters
 	@echo "Linting Rust files..."
 	@DEBUG_PROJ=$(DEBUG_PROJ) cargo clippy -- -D warnings -D clippy::unwrap_used -D clippy::expect_used
-
-.PHONY: check-graphblas-pin
-check-graphblas-pin: ## Verify the GraphBLAS pin is consistent (across build.rs, the submodule, and .gitmodules)
-	@./scripts/check_graphblas_pin.sh
 
 .PHONY: publish
 publish: ## Publish the package to crates.io (requires CARGO_REGISTRY_TOKEN to be set)

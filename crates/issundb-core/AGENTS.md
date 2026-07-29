@@ -53,28 +53,36 @@ All mutations to the graph go through the `Graph` API. Inside `Graph`:
 
 - Do not bypass either lock. Do not open a `RwTxn` directly from outside `Graph` methods.
 
-## OpenMP Thread Count
+## Thread Count
 
-`MatrixSet::materialize` (in `matrices.rs`) sets the thread count immediately after creating the SuiteSparse:GraphBLAS context, through
-`issundb_graphblas::set_global_threads(n)`. It does not decide the count itself: every parallel consumer resolves through `threads::resolve`
-(`threads.rs`), which is the single resolution the GraphBLAS pool and the counting kernels share. Precedence, first positive value winning: the
-programmatic override `Graph::set_thread_count` stored, then `ISSUNDB_NUM_THREADS`, then `OMP_NUM_THREADS`, then the machine's available parallelism,
-clamped to `MAX_THREADS`. There is no graph-size heuristic.
+Every parallel consumer resolves its budget through `threads::resolve` (`threads.rs`). Precedence, first positive value winning: the programmatic
+override `Graph::set_thread_count` stored, then `ISSUNDB_NUM_THREADS`, then `OMP_NUM_THREADS`, then the machine's available parallelism, clamped to
+`MAX_THREADS`. There is no graph-size heuristic.
 
-Resolve through that one function rather than reading the environment here. Resolving it in two places is what previously made an unset configuration
-mean one thread for the matrices and the whole machine for a kernel pass, so the two pools oversubscribed each other. `OMP_NUM_THREADS` is honored
-because the GraphBLAS pool is an OpenMP pool and capping it is how a caller (including this repository's coverage job) caps that pool.
+Resolve through that one function rather than reading the environment here, or the same value comes to mean two things and two overlapping passes each
+claim the whole machine. `OMP_NUM_THREADS` is honored because setting it is how a caller (including this repository's coverage job) caps parallelism
+process-wide, and a caller that set it deliberately should not have to learn a second variable.
 
-The setting is global to the SuiteSparse runtime for the lifetime of the process. `GxB_Global_Option_set(GxB_NTHREADS, n)` is called in exactly one
-place, `issundb_graphblas::set_global_threads`; do not call the raw FFI from `issundb-core` or from anywhere else.
+There is no thread pool. Each pass resolves the budget when it starts and spawns scoped threads for its own duration, so `Graph::set_thread_count`
+stores a value, takes effect on the next pass, and cannot fail. Both stay serial below `MIN_PARALLEL_WORK`, so a unit test is deterministic.
+
+Pick the resolver by regime, not by habit. `Graph::kernel_threads` applies `MAX_SCAN_THREADS`, because a pass that streams the adjacency arrays (a
+counting kernel, or a PageRank iteration) saturates memory bandwidth long before compute and measurably slows down past that cap.
+`Graph::parallel_threads` is the same resolution without the cap, for the all-pairs passes (betweenness, harmonic centrality) whose cost is arithmetic
+per source out of per-worker buffers and which keep scaling. Capping those too silently discards most of the budget a caller asked for.
+
+PageRank and harmonic centrality write disjoint output chunks and so are split-invariant; betweenness sums per-worker partials, so a total's last bits
+depend on the worker count. Prefer the first shape where the algorithm allows it. A worker panic is a bug in the kernel, so it is resumed into the
+caller's thread with `resume_unwind` rather than converted to an `Error`: `Corrupt` would tell an operator to restore a backup over a code defect.
 
 ## CSR Snapshot Vs. LMDB Adjacency
 
 `CsrSnapshot` (in `csr.rs`) is a read-only in-memory Compressed Sparse Row view of the adjacency: the outgoing arrays plus a transposed incoming view
-carrying per-edge type and edge ids, and optionally a per-edge weight. It is swapped atomically via `arc_swap::ArcSwap`. `MatrixSet` (in `matrices.rs`)
-holds the GraphBLAS sparse matrices derived from it.
+carrying per-edge type and edge ids, and optionally a per-edge weight. It is swapped atomically via `arc_swap::ArcSwap`. It is the only in-memory
+adjacency structure, and every algorithm kernel in `graph/kernels/` reads it — bar `label_propagation`, which walks storage per node and is noted as the
+exception in that module's header.
 
-Both are built at the smallest size their consumer reads, and both builds are memory-shaped in ways that are easy to undo by accident:
+It is built at the smallest size its consumers read, and the build is memory-shaped in ways that are easy to undo by accident:
 
 - The snapshot is built from `out_adj`, not from `edges`. The 20-byte `AdjEntry` holds the destination, the type id, and the edge id, which is every
   field the arrays carry, and the entries arrive grouped by source in ascending key order. Reading them from `edges` instead means decoding one
@@ -88,22 +96,15 @@ Both are built at the smallest size their consumer reads, and both builds are me
   first in big-endian, or installing a `DUPSORT` comparator, would make the iteration order right natively and delete it, but both change the format and
   the order `out_neighbors` returns.
 - `edge_weight` is `Option` and only `build_weighted` fills it, at the cost of a second full scan of `edges`, since a weight lives in a property blob.
-  Only the weight matrix reads it, and only Dijkstra reads that.
-- `MatrixKinds` decides which optional matrices `MatrixSet::materialize` builds, and it is a *set*, not an ordering. The two are independent:
-  `page_rank_matrix` needs only the row boundaries and is read only by `page_rank`, while `weight_matrix` needs a snapshot from `build_weighted` and is
-  read only by `shortest_path_dijkstra`. Do not reintroduce a ladder between them, in either direction: an ordering makes asking for one build both, which
-  cost PageRank a full `edges` scan it does not need and Dijkstra a 167 MB matrix it never reads. Requests combine with `union`, a requirement is a
-  `contains` test, and the set is stored on the `MatrixSet` rather than inferred from which `Option` is populated, so the two cannot desynchronize into a
-  set that claims to cover a matrix it lacks. Requesting the weight matrix with an unweighted snapshot is `Error::InvalidArgument`, not `Error::Corrupt`:
-  it is a caller mistake about gating, and `Corrupt` is what tells an operator to restore a backup.
-- A weighted rebuild clears `snap.edge_weight` once the weight matrix is built, in both `rebuild_csr_locked` and the background pass. The matrix is the
-  only reader, so leaving them on the installed snapshot holds eight bytes per edge that nothing can consume.
-- The public `page_rank_graphblas` and `shortest_path_graphblas` gate themselves, and do it *before* taking the matrices read guard. They used to
-  recurse into their gated wrapper from inside a `match` on a live guard, which deadlocks the calling thread against itself as soon as the gate reaches a
-  rebuild, since `parking_lot::RwLock` is not reentrant. Any new public entry point here must follow the same order: gate, then read.
-- The materialization builds one row array and one column array for the whole set and swaps their roles for a transpose, with one value array alive at a
-  time. Do not go back to a triple buffer per matrix or a coordinate hash map for deduplication: `GrB_Matrix_build` wants three arrays and takes a
-  duplicate-combining operator, so both were pure overhead, worth 2.7 GB above the finished matrices on that same graph.
+  `shortest_path_dijkstra` is its only reader. Asking for it is sticky (`CsrCache::request_weights`), so a later unweighted refresh does not strip it out
+  from under an alternating workload; the cost is eight bytes per edge held once anything asks a weighted question. Requesting Dijkstra against a
+  snapshot without weights is `Error::InvalidArgument`, not `Error::Corrupt`: it is a caller mistake about gating, and `Corrupt` is what tells an operator
+  to restore a backup.
+- `Graph::with_weighted_snapshot` returns the snapshot it validated instead of letting the caller reload the pointer. A concurrent unweighted refresh can
+  replace it between a gate and a load, and the caller would then find no weights on a snapshot the gate had just vouched for.
+- The public entry points that gate themselves (`page_rank`, `shortest_path`, `bfs`, `expand_bulk`) must gate *before* reading, never from inside a
+  live guard. An entry point that recursed into its own gate while holding one deadlocked the calling thread against itself as soon as the gate reached a
+  rebuild, since the maintenance mutex is not reentrant. Any new public entry point here follows the same order: gate, then read.
 
 Rebuilds happen on demand through the freshness gates below; the background rebuild after `REBUILD_THRESHOLD` writes is a compaction safety net, not
 the freshness path.
@@ -115,16 +116,13 @@ the freshness path.
   directly through the transaction and never consult the snapshot, so they always reflect committed and in-transaction writes. A write-time
   consistency check (such as the DELETE connected-node guard) depends on that: keep any new point lookup on storage truth rather than routing it
   through the snapshot for speed.
-- Use the CSR snapshot as the hot read path for graph algorithms (BFS, DFS, PageRank, SCC). Callers do not have to refresh it by hand: the algorithm
-  entry points go through `ensure_matrix_view`, `ensure_csr_fresh`, `ensure_snapshot_fresh`, `ensure_page_rank_matrix` (what `page_rank` uses), or
-  `with_weighted_matrix_view` (what `shortest_path_dijkstra` uses) — see the freshness gates in the root `AGENTS.md`. A new algorithm picks its gate by
-  what it reads, and reading an optional matrix behind the wrong one is an error rather than a wrong answer. `Graph::rebuild_csr` refreshes the snapshot
-  and the boolean adjacency only; it deliberately does not build the PageRank or weight matrices, so it is not a way to warm them before a burst of
-  weighted calls (their own gates do that on first use).
-- `MatrixSet` is derived from the CSR snapshot. A full rebuild goes through `MatrixSet::materialize`; incremental maintenance goes through
-  `MatrixSet::apply_delta`, which patches the matrices in place from the write path's `GraphDelta` and falls back to a full rebuild when a node was
-  deleted. Either way the CSR and the matrix set advance together; do not update one without the other. `apply_delta` maintains only the boolean
-  adjacency, so the weighted matrices go stale behind it, which is why their consumers gate on the matrices generation rather than on the pending delta.
+- Use the CSR snapshot as the hot read path for graph algorithms (BFS, DFS, PageRank, SCC). Callers do not have to refresh it by hand: every algorithm
+  entry point goes through `Graph::with_snapshot`, or `Graph::with_weighted_snapshot` for the one that reads per-edge weights. A new algorithm picks
+  between those two by what it reads, and reading `edge_weight` behind the unweighted one is an error rather than a wrong answer. `Graph::rebuild_csr`
+  does not *ask* for weights (though it keeps loading them once something else has), so it is not a way to warm them before a burst of weighted calls;
+  Dijkstra's own gate does that on first use.
+- A kernel that needs a per-edge property the snapshot does not carry reads it from storage per call. That is deliberate for the weight-*property*
+  algorithms (`spanning_forest`, `shortest_path_top_k`, `maximum_flow`), which take the property name as an argument: there is no fixed key to preload.
 
 ## In-memory Property Columns
 
@@ -190,18 +188,24 @@ matters, so keep the two readers apart when changing it.
 - A `Some(false)` from either path must never rest on a stored counter. The probe reads the per-label counter only to choose which endpoint population to
   walk, where a wrong answer costs at most an undecided verdict; emptiness is asked of `label_idx` directly.
 
-## GraphBLAS Semiring Choices
+## Algorithm Kernels
 
-Use the correct GraphBLAS semiring for each algorithm:
+The kernels live in `graph/kernels/`, split by family: `traversal.rs` (BFS and bulk expansion), `analytics.rs` (PageRank, components, the centralities,
+label propagation), `paths.rs` (the shortest-path family and the simple-path searches), and `flow.rs` (spanning forest and maximum flow). Each is plain
+Rust over the CSR arrays.
 
-| Algorithm                      | Semiring                              | Notes                                                                           |
-|--------------------------------|---------------------------------------|---------------------------------------------------------------------------------|
-| BFS / reachability             | Boolean (`any + land` / `lor + land`) | Frontier is a boolean vector; multiplication is logical AND.                    |
-| PageRank                       | FP32 / FP64 (`plus × times`)          | Column-stochastic matrix `M` times rank vector; accumulate with addition.       |
-| SSSP (Dijkstra / Bellman-Ford) | Min-plus tropical (`min + plus`)      | Relax edge weights; `min` replaces addition and `plus` replaces multiplication. |
-| Typed pattern matching         | Boolean element-wise                  | Per-type boolean matrix; element-wise `land` between type matrices.             |
+Two rules matter when adding or changing one, because both have been silently violated before:
 
-When adding a new graph algorithm, document the semiring choice in a comment above the operation.
+- Duplicate handling is per algorithm, and the conventions disagree. `degree_centrality` counts *distinct* neighbors, so parallel edges collapse;
+  `page_rank` spreads a source's rank over its *edges*, so parallel edges each carry mass; `betweenness_centrality` counts distinct pairs, because two
+  parallel edges are one shortest path and crediting both inflates `sigma` and every dependency downstream of it; Dijkstra takes the cheapest. These were
+  the `First`, `Plus`, `break`-after-first, and `Min` duplicate rules of the matrix formulation that preceded this code, and each has a test pinning it.
+  A row length is not a degree and a row scan is not a transition probability: decide which convention a new kernel wants and say so in a comment. Note
+  that the NetworkX oracle cannot catch a mistake here, because its corpus is simple graphs.
+- Where a result's sequence is observable, fix it deliberately. A traversal reports reached nodes in ascending dense (so ascending node id) order, each
+  frontier is sorted before it is consumed, so a `max_nodes` cap keeps the lowest-numbered nodes rather than whichever the traversal happened to reach
+  first. Brandes accumulates over sources and predecessors in that same order, which is what makes a betweenness total reproducible run to run rather
+  than merely close.
 
 ## The 12 LMDB Sub-databases
 

@@ -14,26 +14,18 @@ FROM rust:1.85-bookworm AS build
 WORKDIR /src
 
 # Native build dependencies for the engine's C/C++ libraries:
-#   - Cmake builds SuiteSparse:GraphBLAS from the external/GraphBLAS submodule
-#     (issundb-graphblas-sys), position-independent with a dynamic libgomp.
-#   - Clang plus libclang-dev back the bindgen invocations.
-#   - G++/gcc/make (build-essential) compile GraphBLAS, usearch, and the LMDB sources.
+#   - G++/gcc/make (build-essential) compile usearch and the LMDB sources.
 #   - Pkg-config plus libssl-dev resolve the remaining system libraries.
-# The build context must include the checked-out external/GraphBLAS submodule
-# (run `git submodule update --init external/GraphBLAS` before building).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
-    clang \
-    libclang-dev \
-    cmake \
     pkg-config \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Build the three facade binaries in one pass. The cargo registry and the
-# target directory are BuildKit cache mounts, so repeat builds skip the
-# expensive GraphBLAS compile; the binaries are copied out of the cached
-# target tree within the same step because the mount does not persist.
+# target directory are BuildKit cache mounts, so repeat builds reuse the
+# compiled dependencies; the binaries are copied out of the cached target tree
+# within the same step because the mount does not persist.
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/src/target,sharing=locked \
@@ -49,13 +41,11 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 # ---------------------------------------------------------------------------
 FROM debian:trixie-slim
 
-# Shared libraries the binaries link: libstdc++ for the C++ engine libraries
-# (usearch), and libgomp (the GNU OpenMP runtime) which GraphBLAS now links
-# dynamically rather than bundling statically. libgcc_s ships in the slim base.
-# ca-certificates is included for completeness.
+# Shared libraries the binaries link: libstdc++ for the one C++ engine library
+# (usearch). libgcc_s ships in the slim base. ca-certificates is included for
+# completeness.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libstdc++6 \
-    libgomp1 \
     ca-certificates \
     nano htop duff \
     && rm -rf /var/lib/apt/lists/*

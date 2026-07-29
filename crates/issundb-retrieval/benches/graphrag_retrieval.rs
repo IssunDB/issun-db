@@ -299,7 +299,7 @@ fn bench_global_search_pagerank(c: &mut Criterion) {
             let anchors = &sorted_nodes[0..5];
 
             // 2. Expand their 1-hop neighborhoods
-            let (node_list, _) = graph.bfs_multi_source_graphblas(anchors, 1, None).unwrap();
+            let (node_list, _) = graph.bfs_multi_source(anchors, 1, None).unwrap();
             let node_set: std::collections::HashSet<NodeId> = node_list.into_iter().collect();
 
             // 3. Extract subgraph edges connecting those nodes

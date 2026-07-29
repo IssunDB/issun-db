@@ -329,15 +329,16 @@ impl<'a> WriteTxn<'a> {
     pub fn delete_node(&mut self, id: NodeId) -> Result<(), Error> {
         self.graph.delete_node_impl(&mut self.wtxn, id)?;
         self.mutations_count += 1;
-        // A node deletion reshuffles the sorted dense-index mapping, so the next
-        // refresh must rebuild fully rather than patch incrementally.
+        // A node deletion cascades to every incident edge, so the property columns
+        // rebuild rather than patch. The CSR snapshot needs no flag: it is rebuilt
+        // whole, and the committed-write generation is what marks it stale.
         self.delta.force_full = true;
         Ok(())
     }
 
     pub fn delete_edge(&mut self, id: EdgeId) -> Result<(), Error> {
-        if let Some((src, dst)) = self.graph.delete_edge_impl(&mut self.wtxn, id)? {
-            self.delta.removed_edges.push((src, dst));
+        if self.graph.delete_edge_impl(&mut self.wtxn, id)?.is_some() {
+            self.delta.removed_edge = true;
         }
         self.mutations_count += 1;
         Ok(())
@@ -354,7 +355,6 @@ impl<'a> WriteTxn<'a> {
             .graph
             .add_edge_impl(&mut self.wtxn, src, dst, etype, props)?;
         self.mutations_count += 1;
-        self.delta.added_edges.push((src, dst));
         self.delta.added_edge_ids.push(edge_id);
         Ok(edge_id)
     }
@@ -613,23 +613,23 @@ mod tests {
         .unwrap();
     }
 
-    // --- bfs_multi_source_graphblas ---
+    // --- bfs_multi_source ---
     //
-    // Each test calls `rebuild_csr()` after mutating the graph so the GraphBLAS
-    // adjacency matrix reflects the inserted edges before BFS is invoked.
+    // Each test calls `rebuild_csr()` after mutating the graph so the
+    // CSR snapshot reflects the inserted edges before BFS is invoked.
 
     #[test]
-    fn graphblas_multi_source_empty_seeds_returns_empty() {
+    fn multi_source_empty_seeds_returns_empty() {
         let (_dir, g) = open_tmp();
         g.add_node("N", &json!({})).unwrap();
         g.rebuild_csr().unwrap();
-        let (result, truncated) = g.bfs_multi_source_graphblas(&[], 2, None).unwrap();
+        let (result, truncated) = g.bfs_multi_source(&[], 2, None).unwrap();
         assert!(result.is_empty());
         assert!(!truncated);
     }
 
     #[test]
-    fn graphblas_multi_source_hops_zero_returns_only_seeds() {
+    fn multi_source_hops_zero_returns_only_seeds() {
         let (_dir, g) = open_tmp();
         let a = g.add_node("N", &json!({})).unwrap();
         let b = g.add_node("N", &json!({})).unwrap();
@@ -637,14 +637,14 @@ mod tests {
         g.add_edge(a, c, "E", &json!({})).unwrap();
         g.rebuild_csr().unwrap();
 
-        let (mut result, _) = g.bfs_multi_source_graphblas(&[a, b], 0, None).unwrap();
+        let (mut result, _) = g.bfs_multi_source(&[a, b], 0, None).unwrap();
         result.sort_unstable();
         assert_eq!(result, vec![a, b]);
         assert!(!result.contains(&c));
     }
 
     #[test]
-    fn graphblas_multi_source_expands_to_correct_depth() {
+    fn multi_source_expands_to_correct_depth() {
         let (_dir, g) = open_tmp();
         // Chain: a → b → c → d
         let a = g.add_node("N", &json!({})).unwrap();
@@ -656,13 +656,13 @@ mod tests {
         g.add_edge(c, d, "E", &json!({})).unwrap();
         g.rebuild_csr().unwrap();
 
-        let (r1, _) = g.bfs_multi_source_graphblas(&[a], 1, None).unwrap();
+        let (r1, _) = g.bfs_multi_source(&[a], 1, None).unwrap();
         assert!(r1.contains(&a));
         assert!(r1.contains(&b));
         assert!(!r1.contains(&c));
         assert!(!r1.contains(&d));
 
-        let (r2, _) = g.bfs_multi_source_graphblas(&[a], 2, None).unwrap();
+        let (r2, _) = g.bfs_multi_source(&[a], 2, None).unwrap();
         assert!(r2.contains(&a));
         assert!(r2.contains(&b));
         assert!(r2.contains(&c));
@@ -670,7 +670,7 @@ mod tests {
     }
 
     #[test]
-    fn graphblas_multi_source_max_nodes_cap_respected() {
+    fn multi_source_max_nodes_cap_respected() {
         let (_dir, g) = open_tmp();
         // Star + tail: a → b, c, d; b → e
         let a = g.add_node("N", &json!({})).unwrap();
@@ -684,7 +684,7 @@ mod tests {
         g.add_edge(b, e, "E", &json!({})).unwrap();
         g.rebuild_csr().unwrap();
 
-        let (result, truncated) = g.bfs_multi_source_graphblas(&[a], 2, Some(3)).unwrap();
+        let (result, truncated) = g.bfs_multi_source(&[a], 2, Some(3)).unwrap();
         assert!(
             result.len() <= 3,
             "expected at most 3 nodes, got {}",
@@ -694,7 +694,7 @@ mod tests {
     }
 
     #[test]
-    fn graphblas_multi_source_cap_covering_all_reachable_is_not_truncated() {
+    fn multi_source_cap_covering_all_reachable_is_not_truncated() {
         let (_dir, g) = open_tmp();
         // Chain: a → b; exactly two reachable nodes at hops=1.
         let a = g.add_node("N", &json!({})).unwrap();
@@ -702,7 +702,7 @@ mod tests {
         g.add_edge(a, b, "E", &json!({})).unwrap();
         g.rebuild_csr().unwrap();
 
-        let (result, truncated) = g.bfs_multi_source_graphblas(&[a], 2, Some(2)).unwrap();
+        let (result, truncated) = g.bfs_multi_source(&[a], 2, Some(2)).unwrap();
         assert_eq!(result.len(), 2);
         assert!(
             !truncated,
@@ -711,18 +711,18 @@ mod tests {
     }
 
     #[test]
-    fn graphblas_multi_source_seed_cap_reports_truncation() {
+    fn multi_source_seed_cap_reports_truncation() {
         let (_dir, g) = open_tmp();
         let a = g.add_node("N", &json!({})).unwrap();
         let b = g.add_node("N", &json!({})).unwrap();
         g.rebuild_csr().unwrap();
 
-        let (result, truncated) = g.bfs_multi_source_graphblas(&[a, b], 0, Some(1)).unwrap();
+        let (result, truncated) = g.bfs_multi_source(&[a, b], 0, Some(1)).unwrap();
         assert_eq!(result.len(), 1);
         assert!(truncated, "the cap dropped seed b");
 
         // A duplicate seed within the cap is not truncation.
-        let (result, truncated) = g.bfs_multi_source_graphblas(&[a, a], 0, Some(1)).unwrap();
+        let (result, truncated) = g.bfs_multi_source(&[a, a], 0, Some(1)).unwrap();
         assert_eq!(result, vec![a]);
         assert!(
             !truncated,
@@ -731,7 +731,7 @@ mod tests {
     }
 
     #[test]
-    fn graphblas_multi_source_two_seeds_union_disconnected_components() {
+    fn multi_source_two_seeds_union_disconnected_components() {
         let (_dir, g) = open_tmp();
         // Two disconnected chains: a → b; c → d
         let a = g.add_node("N", &json!({})).unwrap();
@@ -742,7 +742,7 @@ mod tests {
         g.add_edge(c, d, "E", &json!({})).unwrap();
         g.rebuild_csr().unwrap();
 
-        let (result, _) = g.bfs_multi_source_graphblas(&[a, c], 1, None).unwrap();
+        let (result, _) = g.bfs_multi_source(&[a, c], 1, None).unwrap();
         assert!(result.contains(&a));
         assert!(result.contains(&b));
         assert!(result.contains(&c));
@@ -750,7 +750,7 @@ mod tests {
     }
 
     #[test]
-    fn graphblas_multi_source_deduplicates_shared_neighbors() {
+    fn multi_source_deduplicates_shared_neighbors() {
         let (_dir, g) = open_tmp();
         // a → c; b → c; c must appear once.
         let a = g.add_node("N", &json!({})).unwrap();
@@ -760,29 +760,30 @@ mod tests {
         g.add_edge(b, c, "E", &json!({})).unwrap();
         g.rebuild_csr().unwrap();
 
-        let (result, _) = g.bfs_multi_source_graphblas(&[a, b], 1, None).unwrap();
+        let (result, _) = g.bfs_multi_source(&[a, b], 1, None).unwrap();
         let count_c = result.iter().filter(|&&n| n == c).count();
         assert_eq!(count_c, 1);
         assert_eq!(result.len(), 3); // a, b, c
     }
 
     #[test]
-    fn graphblas_multi_source_handles_newly_added_seeds_via_dynamic_materialization() {
+    fn multi_source_handles_newly_added_seeds_via_dynamic_materialization() {
         let (_dir, g) = open_tmp();
-        // Seed a is in the CSR; b is added after rebuild_csr (making snapshot/matrices stale).
-        // The function must detect the new nodes, dynamically rebuild the CSR/matrices, and run successfully.
+        // Seed a is in the CSR; b is added after rebuild_csr, making the snapshot
+        // stale. The gate must notice and refresh before the search runs.
         let a = g.add_node("N", &json!({})).unwrap();
         let c = g.add_node("N", &json!({})).unwrap();
         g.add_edge(a, c, "E", &json!({})).unwrap();
         g.rebuild_csr().unwrap();
 
-        // b is inserted AFTER rebuild, so it makes the existing MatrixSet stale.
+        // b is inserted AFTER rebuild, so it makes the installed snapshot stale.
         let b = g.add_node("N", &json!({})).unwrap();
         let d = g.add_node("N", &json!({})).unwrap();
         g.add_edge(b, d, "E", &json!({})).unwrap();
 
-        // Both seeds must appear in the result; d must be reachable from b via the dynamically rematerialized matrices.
-        let (result, _) = g.bfs_multi_source_graphblas(&[a, b], 1, None).unwrap();
+        // Both seeds must appear in the result; d must be reachable from b through
+        // the refreshed snapshot.
+        let (result, _) = g.bfs_multi_source(&[a, b], 1, None).unwrap();
         assert!(result.contains(&a), "seed a must be present");
         assert!(result.contains(&b), "seed b must be present");
         assert!(result.contains(&c), "c reachable from a");

@@ -22,7 +22,6 @@ arc-swap.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 ahash.workspace = true
-issundb-graphblas = { workspace = true }
 rust-stemmers.workspace = true
 unicode-segmentation.workspace = true
 deepsize.workspace = true

@@ -10,7 +10,7 @@ use issundb_vector::VectorGraphExt;
 /// merges the results, deduplicating by `(EdgeId, NodeId)` pair.
 ///
 /// Every returned triple references existing node and edge records, so no
-/// per-transition validation is needed here. `expand_spmv_graphblas` sources
+/// per-transition validation is needed here. `expand_bulk` sources
 /// transitions either from the CSR snapshot, whose build only admits an edge
 /// when both endpoints exist in the node store (see `CsrSnapshot::build`), or
 /// from committed `out_adj`/`in_adj`, which `delete_node` and `delete_edge`
@@ -24,10 +24,10 @@ pub(super) fn expand_multi_type(
 ) -> Result<Vec<(NodeId, EdgeId, NodeId)>, String> {
     match rel_type {
         None => graph
-            .expand_spmv_graphblas(src_nodes, None, is_incoming)
+            .expand_bulk(src_nodes, None, is_incoming)
             .map_err(|e| e.to_string()),
         Some(t) if !t.contains('|') => graph
-            .expand_spmv_graphblas(src_nodes, Some(t), is_incoming)
+            .expand_bulk(src_nodes, Some(t), is_incoming)
             .map_err(|e| e.to_string()),
         Some(t) => {
             let mut seen: std::collections::HashSet<(NodeId, EdgeId, NodeId)> =
@@ -39,7 +39,7 @@ pub(super) fn expand_multi_type(
                     continue;
                 }
                 let partial = graph
-                    .expand_spmv_graphblas(src_nodes, Some(part), is_incoming)
+                    .expand_bulk(src_nodes, Some(part), is_incoming)
                     .map_err(|e| e.to_string())?;
                 for triple in partial {
                     if seen.insert(triple) {
@@ -1300,7 +1300,7 @@ fn filter_over_expand_batch(
 
     let mut next_paths = Vec::new();
 
-    // HasLabel on a shared variable: bulk-filter sources with GraphBLAS, then expand survivors.
+    // HasLabel on a shared variable: bulk-filter the sources, then expand survivors.
     if let FilterExpr::HasLabel(variable, label) = expression {
         if variable != rel_var && variable != dst_var {
             let mut active: Vec<NodeId> = child_paths
@@ -1528,8 +1528,8 @@ fn extend_or_create_path(
 /// `max_hops` edges, merging the requested directions and deduplicating each
 /// node's `(edge, neighbor)` entries the same way `transition_map` does.
 ///
-/// Each batched frontier expansion resolves the relationship type and runs one
-/// SpMV for the whole frontier, so the variable-length BFS that consumes this
+/// Each batched frontier expansion resolves the relationship type and runs one bulk
+/// expansion for the whole frontier, so the variable-length BFS that consumes this
 /// map pays a hash-map lookup per step instead of a per-node graph query. A
 /// node's neighbors are computed once (the first time it enters the frontier);
 /// `seen` makes the build terminate on cyclic graphs and unbounded ranges.
@@ -1624,7 +1624,7 @@ fn expand_from_paths(
 
     // Variable-length traversals walk one node at a time per source path. Rather
     // than issue a single-source graph query for every node at every hop (each
-    // resolves the relationship type and runs an SpMV), build the adjacency for
+    // resolves the relationship type and reads the snapshot rows), build the adjacency for
     // the whole reachable closure once with batched frontier expansions and walk
     // that in-memory map. `transition_map` already covers the single-hop case.
     let closure_map: ahash::AHashMap<NodeId, Vec<(EdgeId, NodeId)>> =
@@ -2692,7 +2692,7 @@ pub(super) fn project_rows(
 }
 
 /// Apply a `Filter` operator's predicate to an already-materialized batch of
-/// rows. `FilterExpr::HasLabel` routes through the bulk GraphBLAS label filter
+/// rows. `FilterExpr::HasLabel` routes through the bulk label filter
 /// (one set-membership pass over the distinct bound nodes); every other
 /// predicate is evaluated row by row. This is the shared body of the
 /// `PhysicalOperator::Filter` default path and the streaming `Filter` node, so

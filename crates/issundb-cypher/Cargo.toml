@@ -50,3 +50,7 @@ harness = false
 [[bench]]
 name = "oltp_transaction"
 harness = false
+
+[features]
+default = ["hnsw"]
+hnsw = ["issundb-vector/hnsw", "issundb-retrieval/hnsw"]

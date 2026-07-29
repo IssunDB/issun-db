@@ -115,9 +115,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?;
     }
 
-    // Manually trigger a CSR rebuild to materialize matrices for GraphBLAS analytics
+    // Manually trigger a CSR rebuild so the analytics read a built snapshot
     graph.rebuild_csr()?;
-    println!("\nGraph populated and GraphBLAS CSR matrices materialized.");
+    println!("\nGraph populated and the CSR snapshot built.");
 
     // Helper closure to resolve developer name from NodeId
     let get_node_name = |id: NodeId| -> String {

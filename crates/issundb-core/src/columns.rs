@@ -1,7 +1,7 @@
 //! In-memory property columns for the read path.
 //!
 //! `ColumnsCache` holds one typed column per node property name, indexed by a
-//! self-contained dense node mapping (the same pattern as `MatrixSet`). It is
+//! self-contained dense node mapping (the same pattern as the CSR snapshot). It is
 //! built lazily from one full scan of the `nodes` sub-database and kept fresh
 //! by a post-commit delta: added and updated nodes are re-read individually,
 //! node deletion forces a full rebuild because it reshuffles nothing here but

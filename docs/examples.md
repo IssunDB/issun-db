@@ -1,6 +1,6 @@
 # Code Examples
 
-This page provides code examples for performing vector search, full-text keyword search, Cypher queries, running script files via the CLI, and executing GraphBLAS-backed graph algorithms in Rust and Cypher.
+This page provides code examples for performing vector search, full-text keyword search, Cypher queries, running script files via the CLI, and executing graph algorithms in Rust and Cypher.
 
 ## Example Programs
 
@@ -149,9 +149,9 @@ When writing scripts, remember that a semicolon inside a string literal or comme
 `{name: 'a;b'}` are safe. If two Cypher statements are written with no semicolon and no blank line between them, the CLI will read them as a single
 statement, so it is a good idea to separate distinct statements with a semicolon. The `query`, `cypher`, and `:explain` forms always stay single-line.
 
-## GraphBLAS Algorithms Example
+## Graph Algorithms Example
 
-The following example demonstrates running GraphBLAS-backed pathfinding and centrality algorithms. These algorithms run on the in-memory CSR snapshot and automatically refresh the snapshot on demand, removing the need to call `rebuild_csr()` manually after inserting data:
+The following example demonstrates running pathfinding and centrality algorithms. These algorithms run on the in-memory CSR snapshot and automatically refresh it on demand, removing the need to call `rebuild_csr()` manually after inserting data:
 
 ```rust
 use issundb::{Graph, NodeId};

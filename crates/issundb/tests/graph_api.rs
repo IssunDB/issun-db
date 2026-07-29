@@ -552,7 +552,7 @@ fn test_set_thread_count() {
     // Test setting to 2 threads
     g.set_thread_count(2).unwrap();
 
-    // Add nodes and rebuild matrices to verify it runs with the thread configuration
+    // Add nodes and rebuild the snapshot to verify it runs with the thread configuration
     let _a = g.add_node("Person", &json!({ "name": "Alice" })).unwrap();
     g.rebuild_csr().unwrap();
 

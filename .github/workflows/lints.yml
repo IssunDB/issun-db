@@ -46,13 +46,10 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang pkg-config libssl-dev
+          sudo apt-get install -y pkg-config libssl-dev
 
       - name: Check formatting
         run: make format-check
-
-      - name: Check GraphBLAS pin consistency
-        run: make check-graphblas-pin
 
       - name: Run linters
         run: make lint

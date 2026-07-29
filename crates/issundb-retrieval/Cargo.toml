@@ -19,7 +19,8 @@ thiserror.workspace = true
 ahash.workspace = true
 
 [features]
-default = []
+default = ["hnsw"]
+hnsw = ["issundb-vector/hnsw"]
 
 [dev-dependencies]
 tempfile.workspace = true

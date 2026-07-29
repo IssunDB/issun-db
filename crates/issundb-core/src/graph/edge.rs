@@ -19,7 +19,6 @@ impl Graph {
         let mut wtxn = self.storage.env.write_txn()?;
         let edge_id = self.add_edge_impl(&mut wtxn, src, dst, etype, props)?;
         self.commit_and_publish(wtxn, 1)?;
-        self.csr_cache.record_added_edge(src, dst);
         self.edge_columns.record_touched(edge_id);
         self.maybe_spawn_rebuild();
         Ok(edge_id)
@@ -82,8 +81,8 @@ impl Graph {
         self.update_edge_impl(&mut wtxn, id, props)?;
         // Publishing matters even though no adjacency changed. A property change can
         // alter an edge's weight (`weight`/`cost`/`capacity`/`cap`), which the CSR
-        // snapshot and the derived weight and PageRank matrices bake in, and those
-        // matrices have no incremental maintenance. Advancing the generation here is
+        // snapshot's per-edge weights bake in, and those have no incremental
+        // maintenance. Advancing the generation here is
         // what marks them stale so the next `ensure_csr_fresh` rebuilds before a
         // weighted algorithm reads them; without it `shortest_path_dijkstra` and
         // friends serve the pre-update weight.
@@ -154,8 +153,7 @@ impl Graph {
         let mut wtxn = self.storage.env.write_txn()?;
         let endpoints = self.delete_edge_impl(&mut wtxn, id)?;
         self.commit_and_publish(wtxn, 1)?;
-        if let Some((src, dst)) = endpoints {
-            self.csr_cache.record_removed_edge(src, dst);
+        if endpoints.is_some() {
             // The deletion reshuffles the dense edge mapping; force a rebuild.
             self.edge_columns.record_force_full();
         }
@@ -225,7 +223,7 @@ impl Graph {
     /// it lags writes until the background rebuild runs, so serving point
     /// lookups from it would return deleted edges, hide newly added ones, and
     /// disagree with [`Self::in_neighbors`]. The snapshot remains the basis for
-    /// the GraphBLAS matrix algorithms, which have explicit snapshot semantics.
+    /// the CSR snapshot algorithms, which have explicit snapshot semantics.
     pub fn out_neighbors(&self, node: NodeId) -> Result<Vec<NeighborEntry>, Error> {
         let rtxn = self.storage.env.read_txn()?;
         self.out_neighbors_impl(&rtxn, node)
