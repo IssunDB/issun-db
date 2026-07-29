@@ -340,10 +340,10 @@ async function runVectorDemo() {
       return;
     }
     // Each person is placed on a circle, so "nearest" has a meaning the table can be
-    // checked against by eye.
+    // checked against by eye. A node id is a u64, so the parameter is a BigInt.
     people.forEach(([id], i) => {
       const angle = (i / people.length) * Math.PI * 2;
-      db.upsertVector(id, new Float32Array([Math.cos(angle), Math.sin(angle), 0.25]));
+      db.upsertVector(BigInt(id), new Float32Array([Math.cos(angle), Math.sin(angle), 0.25]));
     });
     const query = new Float32Array([1, 0, 0.25]);
     const { hits } = JSON.parse(db.vectorSearch(query, Math.min(5, people.length)));

@@ -55,8 +55,9 @@ for (const category of DEMO_CATEGORIES) {
       if (demo.vectors) {
         const ids = JSON.parse(p.query("MATCH (p:Person) RETURN id(p) ORDER BY id(p)"))
           .rows.map((r) => r[0]);
+        // A node id is a u64, which wasm-bindgen exposes as a BigInt parameter.
         ids.forEach((id, i) =>
-          p.upsertVector(id, new Float32Array([Math.cos(i), Math.sin(i), 0.5])),
+          p.upsertVector(BigInt(id), new Float32Array([Math.cos(i), Math.sin(i), 0.5])),
         );
         const hits = JSON.parse(p.vectorSearch(new Float32Array([1, 0, 0.5]), 3)).hits;
         if (hits.length === 0) {

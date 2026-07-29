@@ -242,6 +242,15 @@ fn encode_vector(v: &[f32]) -> Result<Vec<u8>, VectorError> {
             "embedding must not be empty".into(),
         ));
     }
+    // A NaN or infinity would be stored and then produce a NaN distance at every search,
+    // which no ranking can order meaningfully, so it is rejected at the boundary rather
+    // than silently poisoning every later query.
+    if let Some(position) = v.iter().position(|f| !f.is_finite()) {
+        return Err(VectorError::IndexFault(format!(
+            "embedding component {position} is not finite ({})",
+            v[position]
+        )));
+    }
     Ok(v.iter().flat_map(|f| f.to_le_bytes()).collect())
 }
 
@@ -546,11 +555,12 @@ impl VectorGraphExt for Graph {
                     None => hit,
                 });
             }
-            rescored.sort_unstable_by(|a, b| {
-                a.distance
-                    .partial_cmp(&b.distance)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
+            // Same total order the backends rank by, node id included: `truncate` below
+            // decides which of two equidistant hits survives at the k-th position, so
+            // sorting on distance alone made the surviving node depend on the rescore
+            // factor.
+            rescored
+                .sort_unstable_by(|a, b| a.distance.total_cmp(&b.distance).then(a.node.cmp(&b.node)));
             rescored
         } else {
             hits

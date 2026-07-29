@@ -125,15 +125,21 @@ pub(crate) mod exact {
                     distance: exact_distance(q, v, self.metric),
                 })
                 .collect();
-            // Total order including the node id, so equal distances rank
-            // deterministically rather than by whatever order insertion left.
-            hits.sort_by(|a, b| {
-                a.distance
-                    .partial_cmp(&b.distance)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then(a.node.cmp(&b.node))
-            });
-            hits.truncate(k);
+            // `total_cmp` rather than `partial_cmp`, because a NaN distance makes the
+            // latter's `unwrap_or(Equal)` non-transitive (a NaN compares equal to two
+            // values that differ), and `sort_by` panics on a comparator that is not a
+            // total order. A NaN is reachable from a Cosine norm that overflows.
+            // The node id breaks a distance tie, so equal distances rank deterministically
+            // rather than by whatever order insertion left.
+            let order =
+                |a: &Hit, b: &Hit| a.distance.total_cmp(&b.distance).then(a.node.cmp(&b.node));
+            // Selecting the k smallest first keeps this O(n + k log k) rather than sorting
+            // every stored vector to return k of them.
+            if hits.len() > k {
+                hits.select_nth_unstable_by(k - 1, order);
+                hits.truncate(k);
+            }
+            hits.sort_unstable_by(order);
             Ok(hits)
         }
     }
@@ -375,6 +381,38 @@ mod tests {
         let b = backend(VectorMetric::L2, &[(7, vec![1.0]), (3, vec![-1.0])]);
         let hits = b.search(&[0.0], 2).unwrap();
         assert_eq!(hits.iter().map(|h| h.node).collect::<Vec<_>>(), vec![3, 7]);
+    }
+
+    /// The tie-break has to survive the top-k selection, not just a full sort: `k` smaller
+    /// than the number of equidistant candidates is what decides which of them is dropped.
+    #[test]
+    fn equal_distances_rank_by_node_id_when_k_truncates_the_tie() {
+        let entries: Vec<(NodeId, Vec<f32>)> =
+            [9u64, 4, 7, 1, 6].iter().map(|n| (*n, vec![1.0])).collect();
+        let b = backend(VectorMetric::L2, &entries);
+        for k in 1..=entries.len() {
+            let hits = b.search(&[0.0], k).unwrap();
+            let expected: Vec<NodeId> = vec![1, 4, 6, 7, 9].into_iter().take(k).collect();
+            assert_eq!(
+                hits.iter().map(|h| h.node).collect::<Vec<_>>(),
+                expected,
+                "k = {k}"
+            );
+        }
+    }
+
+    /// A NaN distance makes `partial_cmp(..).unwrap_or(Equal)` non-transitive, which the
+    /// sort detects and panics on. A stored NaN is rejected at the boundary now, so this
+    /// reaches the comparator the only way still open to it: a Cosine norm that overflows
+    /// to infinity, leaving `inf / inf`.
+    #[test]
+    fn a_non_finite_distance_does_not_panic_the_ranking() {
+        let entries: Vec<(NodeId, Vec<f32>)> = (0u64..8)
+            .map(|i| (i, vec![if i % 3 == 0 { 1e30 } else { i as f32 + 1.0 }]))
+            .collect();
+        let b = backend(VectorMetric::Cosine, &entries);
+        let hits = b.search(&[1e30], 4).unwrap();
+        assert_eq!(hits.len(), 4);
     }
 
     /// Removing from the middle moves the last entry into the vacated slot, so the

@@ -51,9 +51,9 @@ ORDER BY from, to`,
       },
       {
         label: "Variable length",
-        desc: "A path of one to three hops. The relationship variable binds to the whole list of relationships traversed, so length(r) is the hop count.",
+        desc: "A path of one to three hops. The relationship variable binds to the whole list of relationships traversed, so size(r) is the hop count.",
         cypher: `MATCH (a:Person {name: 'Ada'})-[r:KNOWS*1..3]->(b:Person)
-RETURN b.name AS reached, length(r) AS hops
+RETURN b.name AS reached, size(r) AS hops
 ORDER BY hops, reached`,
       },
       {
