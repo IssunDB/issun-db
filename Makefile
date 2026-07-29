@@ -69,6 +69,25 @@ test: format doctest ## Run the tests
 	@echo "Running tests..."
 	@OMP_NUM_THREADS=$(OMP_NUM_THREADS) DEBUG_PROJ=$(DEBUG_PROJ) RUST_BACKTRACE=$(RUST_BACKTRACE) cargo test --lib --bins --tests --workspace -- --nocapture
 
+.PHONY: test-backends
+test-backends: ## Run the per-crate suites against the non-default storage and vector backends
+	@echo "Vector: exact index with LMDB..."
+	@OMP_NUM_THREADS=$(OMP_NUM_THREADS) cargo test -p issundb-vector --no-default-features --features lmdb
+	@echo "Vector: exact index with the in-memory store (the wasm configuration)..."
+	@OMP_NUM_THREADS=$(OMP_NUM_THREADS) cargo test -p issundb-vector --no-default-features
+	@echo "Core: in-memory storage backend..."
+	@OMP_NUM_THREADS=$(OMP_NUM_THREADS) cargo test -p issundb-core --no-default-features
+	@echo "Linting the libraries in those configurations (the default lint run never sees them)..."
+	@cargo clippy -p issundb-vector --no-default-features -- -D warnings -D clippy::unwrap_used -D clippy::expect_used
+	@cargo clippy -p issundb-core --no-default-features -- -D warnings -D clippy::unwrap_used -D clippy::expect_used
+	@echo "Checking that the facade drops usearch and LMDB without default features..."
+	@LEAKED=$$(cargo tree -p issundb --no-default-features 2>/dev/null | grep -iE "usearch|heed" || true); \
+	if [ -n "$$LEAKED" ]; then \
+		echo "A sibling crate re-enabled a default feature:"; echo "$$LEAKED" | sed 's/^/  /'; \
+		exit 1; \
+	fi
+	@echo "All non-default backend configurations pass."
+
 .PHONY: test-conformance
 test-conformance: format ## Run the openCypher TCK conformance integration tests
 	@echo "Running openCypher TCK conformance integration tests..."

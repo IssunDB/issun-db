@@ -200,7 +200,8 @@ impl VectorIndex {
         Ok(())
     }
 
-    /// Return the `k` approximate nearest neighbors to `q` by cosine distance.
+    /// Return the `k` nearest neighbors to `q` under this graph's configured metric
+    /// (default Cosine). Approximate with `hnsw`, exact without it.
     ///
     /// Returns an empty slice when the index has no vectors or `k == 0`.
     /// `k` is silently clamped to the number of indexed vectors.
@@ -212,10 +213,9 @@ impl VectorIndex {
         }
     }
 
-    /// Return up to `k` approximate nearest neighbors to `q` that satisfy
-    /// `predicate`.
+    /// Return up to `k` nearest neighbors to `q` that satisfy `predicate`.
     ///
-    /// The predicate is evaluated during the HNSW traversal, so the search keeps
+    /// The predicate is evaluated during the traversal, so the search keeps
     /// expanding until it has `k` matching neighbors or exhausts the reachable
     /// graph. Unlike post-filtering a fixed over-fetch, this does not silently
     /// truncate the result set when the filter is selective.
@@ -280,6 +280,12 @@ pub trait VectorGraphExt {
     /// `VectorError::AlreadyConfigured`. Re-applying the identical configuration
     /// is a no-op. When no graph configuration is set, the index defaults to
     /// `Cosine` and `Float32`.
+    ///
+    /// A build without `hnsw` accepts a non-`Float32` quantization and persists it, but
+    /// cannot honor it: that backend keeps the raw `f32`, so the memory reduction the
+    /// quantization names does not happen. The tag is still recorded rather than rejected,
+    /// because it is honored by any later build that does have `hnsw` opening the same
+    /// directory.
     fn configure_vector_index(&self, opts: VectorIndexOptions) -> Result<(), VectorError>;
 
     /// Change the metric and quantization and rebuild the index from the
@@ -301,19 +307,20 @@ pub trait VectorGraphExt {
     /// Remove the embedding for `n` from the index and from persistent storage.
     fn remove_vector(&self, n: NodeId) -> Result<(), VectorError>;
 
-    /// Return the `k` approximate nearest neighbors to `q` by cosine distance.
+    /// Return the `k` nearest neighbors to `q` under this graph's configured metric
+    /// (default Cosine). Approximate with `hnsw`, exact without it.
     ///
     /// Returns `VectorError::EmptyIndex` when the graph holds no embeddings at
     /// all, so a caller can distinguish "no semantic matches" from "there is
     /// nothing to search".
     fn vector_search(&self, q: &[f32], k: usize) -> Result<Vec<Hit>, VectorError>;
 
-    /// Return the `opts.k` approximate nearest neighbors that satisfy the label
-    /// and property filters in `opts`.
+    /// Return the `opts.k` nearest neighbors that satisfy the label and property
+    /// filters in `opts`.
     ///
     /// When neither `opts.label` nor `opts.properties` is set the call is
     /// identical to `vector_search(q, opts.k)`. When a filter is set, it is
-    /// applied during the HNSW traversal through a predicate, so the search
+    /// applied during the traversal through a predicate, so the search
     /// keeps expanding until it has `opts.k` matching neighbors rather than
     /// post-filtering a fixed over-fetch (which silently under-returns for
     /// selective filters). A node matches when it carries `opts.label` (if set)
@@ -434,13 +441,16 @@ impl VectorGraphExt for Graph {
         }
 
         let index_quantization = arc.0.opts.quantization;
-        let rescore_factor =
-            opts.rescore_factor
-                .unwrap_or(if index_quantization != VectorQuantization::Float32 {
-                    2
-                } else {
-                    1
-                });
+        // Rescoring re-reads and re-decodes `2k` stored vectors to recompute distances at
+        // full precision, which is only worth it against a backend that lost precision.
+        // The exact backend keeps the raw `f32` and already ranks through `exact_distance`,
+        // so a persisted quantization tag there would buy bit-identical distances for a
+        // second pass over storage.
+        let backend_quantizes =
+            cfg!(feature = "hnsw") && index_quantization != VectorQuantization::Float32;
+        let rescore_factor = opts
+            .rescore_factor
+            .unwrap_or(if backend_quantizes { 2 } else { 1 });
 
         let fetch_k = if rescore_factor > 1 {
             opts.k.saturating_mul(rescore_factor)
@@ -559,8 +569,9 @@ impl VectorGraphExt for Graph {
             // decides which of two equidistant hits survives at the k-th position, so
             // sorting on distance alone made the surviving node depend on the rescore
             // factor.
-            rescored
-                .sort_unstable_by(|a, b| a.distance.total_cmp(&b.distance).then(a.node.cmp(&b.node)));
+            rescored.sort_unstable_by(|a, b| {
+                a.distance.total_cmp(&b.distance).then(a.node.cmp(&b.node))
+            });
             rescored
         } else {
             hits
@@ -919,6 +930,22 @@ mod tests {
 
         let hits = graph.vector_search(&[1.0f32, 0.0], 100).unwrap();
         assert_eq!(hits.len(), 2);
+    }
+
+    /// A stored non-finite component yields a NaN distance at every later search, which no
+    /// ranking can order, so it is refused rather than persisted.
+    #[test]
+    fn upsert_vector_rejects_a_non_finite_component() {
+        let (_dir, graph) = open_tmp();
+        let n = graph.add_node("N", &json!({})).unwrap();
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let err = graph.upsert_vector(n, &[1.0, bad]).unwrap_err();
+            assert!(
+                err.to_string().contains("not finite"),
+                "expected a non-finite rejection, got {err}"
+            );
+        }
+        graph.upsert_vector(n, &[1.0, 2.0]).unwrap();
     }
 
     #[test]

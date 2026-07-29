@@ -417,9 +417,9 @@ mod tests {
 
     /// Removing from the middle moves the last entry into the vacated slot, so the
     /// slot map has to be repaired for the entry that moved. If it is not, the map
-    /// points at another node's vector and a search answers with it — silently, with
-    /// no length change and no error. This interleaves removals with re-upserts and
-    /// then asks, per surviving node, whether its own vector comes back.
+    /// points at another node's vector and a search answers with it silently, with no
+    /// length change and no error. This interleaves removals with re-upserts and then
+    /// asks, per surviving node, whether its own vector comes back.
     #[test]
     fn removals_from_the_middle_keep_every_node_pointing_at_its_own_vector() {
         // Node `i` gets the one-dimensional vector `[i]`, so a search at `[i]` must
@@ -530,6 +530,38 @@ mod tests {
         assert!((l2.search(&[0.0, 0.0], 1).unwrap()[0].distance - 25.0).abs() < 1e-6);
     }
 
+    /// The two backends must report the same distance convention, and `vector_search_with`
+    /// is why: a rescored hit whose stored bytes are missing keeps its backend-reported
+    /// distance while its neighbors get `exact_distance` values, and the two are then sorted
+    /// into one list. If usearch ever reported cosine similarity where `exact_distance`
+    /// reports `1 - cos`, or plain L2 where it reports the square, that mixed list would
+    /// sort wrongly with nothing to catch it. This mirrors the assertions above against the
+    /// backend actually built when the feature is on.
+    #[cfg(feature = "hnsw")]
+    #[test]
+    fn the_hnsw_backend_reports_the_same_convention_as_exact_distance() {
+        fn hnsw(metric: VectorMetric, node: NodeId, v: &[f32]) -> f32 {
+            let mut b = super::hnsw::HnswBackend::new(v.len(), &opts(metric))
+                .expect("the hnsw backend builds");
+            b.upsert(node, v).expect("upsert");
+            b.search(v, 1).expect("search")[0].distance
+        }
+        for (metric, stored) in [
+            (VectorMetric::Cosine, vec![1.0f32, 0.0]),
+            (VectorMetric::Dot, vec![2.0f32, 0.0]),
+            (VectorMetric::L2, vec![3.0f32, 4.0]),
+        ] {
+            // Queried at the stored vector itself, so both sides compute over identical
+            // inputs and any difference is the convention rather than approximation.
+            let approximate = hnsw(metric, 1, &stored);
+            let exact = crate::index::exact_distance(&stored, &stored, metric);
+            assert!(
+                (approximate - exact).abs() < 1e-5,
+                "{metric:?}: hnsw reported {approximate}, exact_distance {exact}"
+            );
+        }
+    }
+
     /// Measurement, not an assertion: rebuild and query cost of the exact backend.
     ///
     /// Run with
@@ -541,20 +573,10 @@ mod tests {
     /// distance per stored vector, so the answer depends on the dimension count and the
     /// latency budget, not on anything here.
     ///
-    /// Measured on a 12-thread x86-64 machine, release build, at the four dimensions
-    /// below: rebuild 0.9 ms at 10 k vectors, 4.0 ms at 40 k, 13.5 ms at 160 k, and a
-    /// query 24 / 95 / 360 us across the same sizes. Both are linear, as the slot map
-    /// intends.
-    ///
-    /// Before that map each `upsert` scanned the vector list, and the same rebuild
-    /// measured 21.4 ms at 10 k, 80.7 ms at 20 k and 334.6 ms at 40 k: quadratic, and
-    /// roughly 80x slower by 40 k. Extrapolating that curve is what made a 1 M-vector
-    /// graph take minutes to open, since the index is rebuilt from the persisted
-    /// embeddings on every `Graph::open`.
-    ///
-    /// Note the dimension count when reading the query figure: it is four here, and a
-    /// real embedding is 384 or 768, so multiply by about a hundred before comparing
-    /// against a latency budget.
+    /// The recorded figures live in `crates/issundb-vector/AGENTS.md` beside the other
+    /// rebuild costs, because nothing runs this by default and numbers kept here would rot
+    /// silently. Read the query figure against the dimension count it uses, four, where a
+    /// real embedding is 384 or 768.
     #[test]
     #[ignore = "measurement: prints exact-backend rebuild and query timings"]
     fn exact_backend_cost() {

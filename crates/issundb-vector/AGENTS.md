@@ -54,7 +54,10 @@ on by default:
 - Only `ExactBackend`'s *query* is linear. Insertion and removal are `O(1)` through a `node -> slot` map, because those are the operations a rebuild performs and the
   index rebuilds from stored embeddings on every `Graph::open`; a scan there made the rebuild quadratic (roughly 80x slower by 40 k vectors). A removal
   `swap_remove`s and repairs the moved entry's slot, which is safe only because the search sorts by `(distance, node)` and so never depends on vector order.
-  `exact_backend_cost` (ignored by default) is the harness for the exact-versus-approximate decision.
+  `exact_backend_cost` (ignored by default) is the harness for the exact-versus-approximate decision. Its recorded figures, on a 12-thread x86-64 machine at
+  four dimensions in a release build: rebuild 0.9 ms at 10 k vectors, 4.0 ms at 40 k, and 13.5 ms at 160 k, with a query of 24, 95, and 360 us across the same
+  sizes, both linear. Before the slot map the same rebuild measured 21.4 ms at 10 k, 80.7 ms at 20 k, and 334.6 ms at 40 k. Scale the query figure by the real
+  dimension count, since 384 or 768 rather than four is what a caller will have.
 - Without `hnsw`: `ExactBackend`, a pure-Rust scan. It is exact rather than approximate, ranks through the same `exact_distance` the rescore pass uses, and
   breaks distance ties by node id so a top-k is deterministic. It ignores `quantization`, keeping the raw `f32`, and its query cost is linear in the vector
   count.
@@ -67,7 +70,7 @@ Rules for changing this:
   dead-code warning; construct it in a test instead.
 - The whole suite must pass in both configurations. Note that plain `--no-default-features` no longer isolates this crate's own dimension: `lmdb` is a default
   feature too now, so it also swaps the storage backend for the non-persistent one. The three commands that matter are `cargo test -p issundb-vector` (HNSW,
-  LMDB), `cargo test -p issundb-vector --no-default-features --features lmdb` (exact index, LMDB — the one that covers this crate's storage integration), and
+  LMDB), `cargo test -p issundb-vector --no-default-features --features lmdb` (exact index with LMDB, the one that covers this crate's storage integration), and
   `cargo test -p issundb-vector --no-default-features` (exact index, in-memory store, which is the wasm configuration). A test that genuinely depends on
   approximate behavior or on quantization belongs behind `#[cfg(feature = "hnsw")]`; one that reopens the graph belongs behind `#[cfg(feature = "lmdb")]`, and
   the four reopen tests here already are.
@@ -84,22 +87,19 @@ These constraints are the reason `HnswBackend::upsert` looks the way it does. Th
 
 ## The Cold-start Pattern in `get_or_init_cache`
 
-`get_or_init_cache` builds the in-memory HNSW index from LMDB on first use:
+`get_or_init_cache` builds the in-memory index from storage on first use, and it is one call:
+`graph.get_or_init_extension_with(..)`, whose initializer loads the persisted configuration and then every embedding. Do not hand-roll the locking
+around it. The helper owns the double-checked insert, and the initializer deliberately runs *without* the `extensions` lock held, which is what makes
+reading from storage there safe.
 
-1. Call `graph.get_extension::<VectorIndexCache>()` under no lock. If present, return it immediately.
-2. Call `graph.vector_bytes()` **before** acquiring the `extensions` lock. This avoids holding both the LMDB read lock and the extensions lock
-   simultaneously.
-3. Build a fresh `VectorIndex` and populate it from the loaded bytes.
-4. Acquire the `extensions` lock and do a second existence check (double-check idiom) before inserting, to prevent overwriting an index that was
-   concurrently initialized by another thread.
-
-Never call `graph.vector_bytes()` or any `Graph` method while holding the `extensions` mutex.
+That ordering is the rule to preserve: never call `graph.vector_bytes()`, or any other `Graph` method, while holding the `extensions` mutex.
 
 ## `VectorSearchOptions` Filters
 
-When `opts.label` or `opts.properties` are set, the filter is evaluated **during** the HNSW traversal, not after it. `vector_search_with` builds a
-predicate over `NodeId` and hands it to `VectorIndex::search_filtered`, which calls usearch's `filtered_search`. A node matches when it carries
-`opts.label` (if set) and every entry in `opts.properties` (if set) equals the node's value for that property.
+When `opts.label` or `opts.properties` are set, the filter is evaluated **during** the traversal, not after it. `vector_search_with` builds a predicate
+over `NodeId` and hands it to `VectorIndex::search_filtered`, which reaches the backend's own filtered search: usearch's `filtered_search` with `hnsw`,
+and the scan's `keep` predicate without it. A node matches when it carries `opts.label` (if set) and every entry in `opts.properties` (if set) equals the
+node's value for that property.
 
 Do not replace this with a post-filter over a fixed over-fetch. Over-fetching a constant multiple of `k` and then discarding non-matching hits
 silently under-returns for a selective filter: the traversal stops after `k * factor` candidates whether or not any of them match, so a filter that
