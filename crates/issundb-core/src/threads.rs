@@ -31,6 +31,19 @@ pub(crate) const MAX_THREADS: usize = 64;
 /// is measured lazily: `available_parallelism` is a syscall, and this resolves once
 /// per kernel pass.
 pub(crate) fn resolve(programmatic: i32) -> usize {
+    // A target with no threads gets one worker whatever anyone asked for. Every
+    // parallel pass takes a serial branch at one worker, so this is what keeps a
+    // caller's `set_thread_count(4)` from reaching `std::thread::scope` where a spawn
+    // is a runtime failure. The unconfigured case already resolved to one here (
+    // `available_parallelism` reports an error and falls back), so only an explicit
+    // override was dangerous, which is exactly the case a clamp catches and a
+    // fallback does not.
+    #[cfg(target_family = "wasm")]
+    {
+        let _ = programmatic;
+        return 1;
+    }
+    #[cfg(not(target_family = "wasm"))]
     resolve_from_lazy(
         programmatic,
         std::env::var("ISSUNDB_NUM_THREADS").ok().as_deref(),

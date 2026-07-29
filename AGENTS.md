@@ -94,7 +94,8 @@ modules according to this map.
       property the snapshot does not carry reads that property from storage per call. `label_propagation` is the one exception, walking
       `all_neighbors` per node per iteration instead, which is why it needs no gate and is far more expensive than its siblings. Where a result's sequence is observable the kernel fixes it deliberately:
       a traversal reports reached nodes in ascending dense (so ascending node id) order, each frontier is sorted, and Brandes accumulates over sources
-      and predecessors in that order, so a betweenness total is reproducible rather than merely close.
+      and predecessors in that order, so a betweenness total is reproducible rather than merely close. No depth-first kernel recurses over graph structure,
+      because a stack overflow aborts the process instead of returning an error; `dfs` is the sole exception, bounded by its `u8` hop count.
     - `src/graph/txn.rs`: `ReadTxn` and `WriteTxn` delegation impls and transaction tests.
     - `src/csr.rs`: in-memory CSR snapshot (outgoing arrays plus a transposed incoming view with per-edge type and edge ids), rebuilt in the
       background and swapped via `arc-swap`. Also owns the `GraphDelta` buffer captured on the write path (whose only consumers are the property

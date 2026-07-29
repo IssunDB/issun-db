@@ -300,6 +300,12 @@ impl Graph {
     }
 
     /// Depth-first search over the contiguous CSR snapshot arrays.
+    ///
+    /// The one depth-first kernel here that is still recursive, and deliberately so:
+    /// `hops` is a `u8`, so the recursion is bounded at 255 frames whatever the graph
+    /// looks like. The others had no such bound and are iterative for the reason on
+    /// [`Graph::detect_cycle_kernel`]. Widening `hops` would remove the bound and this
+    /// would need converting too.
     pub(in crate::graph) fn dfs_kernel(
         &self,
         snap: &CsrSnapshot,
@@ -347,29 +353,49 @@ impl Graph {
     }
 
     /// Directed cycle detection by three-color DFS over the CSR snapshot arrays.
+    ///
+    /// Iterative, with the search stack on the heap. The depth of a DFS is the length
+    /// of the current path, so a recursive version needs one call frame per node on a
+    /// chain and aborts the *process* on a stack overflow rather than returning an
+    /// error — a query cannot be allowed to do that. Every kernel here that walks
+    /// depth-first is written this way for that reason.
     pub(in crate::graph) fn detect_cycle_kernel(&self, snap: &CsrSnapshot) -> Result<bool, Error> {
+        const WHITE: u8 = 0;
+        const GRAY: u8 = 1;
+        const BLACK: u8 = 2;
+
         let n = snap.dense_to_id.len();
-        let mut state = vec![0u8; n]; // 0 = White, 1 = Gray, 2 = Black
+        let mut state = vec![WHITE; n];
+        // Each frame is a node plus how far through its row the search has gone, which
+        // is what the recursive form kept implicitly in the loop counter of each frame.
+        let mut stack: Vec<(usize, usize)> = Vec::new();
 
-        fn has_cycle(snap: &CsrSnapshot, u: usize, state: &mut Vec<u8>) -> bool {
-            state[u] = 1; // Gray
-
-            let start = snap.row_ptr[u];
-            let end = snap.row_ptr[u + 1];
-            for k in start..end {
-                let v = snap.col_idx[k] as usize;
-                if state[v] == 1 || (state[v] == 0 && has_cycle(snap, v, state)) {
-                    return true;
-                }
+        for root in 0..n {
+            if state[root] != WHITE {
+                continue;
             }
+            state[root] = GRAY;
+            stack.push((root, snap.row_ptr[root]));
 
-            state[u] = 2; // Black
-            false
-        }
-
-        for u in 0..n {
-            if state[u] == 0 && has_cycle(snap, u, &mut state) {
-                return Ok(true);
+            while let Some(&mut (u, ref mut cursor)) = stack.last_mut() {
+                if *cursor < snap.row_ptr[u + 1] {
+                    let v = snap.col_idx[*cursor] as usize;
+                    *cursor += 1;
+                    match state[v] {
+                        // An edge back to a node still on the current path closes a
+                        // cycle. Black is a finished node, which is reachable again
+                        // without forming one.
+                        GRAY => return Ok(true),
+                        WHITE => {
+                            state[v] = GRAY;
+                            stack.push((v, snap.row_ptr[v]));
+                        }
+                        _ => {}
+                    }
+                } else {
+                    state[u] = BLACK;
+                    stack.pop();
+                }
             }
         }
 
@@ -377,6 +403,12 @@ impl Graph {
     }
 
     /// All simple paths between `src` and `dst` over the CSR snapshot arrays.
+    ///
+    /// Iterative for the reason on [`Graph::detect_cycle_kernel`]: the search depth is
+    /// the path length, so recursion put one frame per node on the stack. The number
+    /// of paths can still be exponential in the graph — that is the question's shape,
+    /// not this implementation's — but the *stack* is now bounded by the longest path
+    /// and lives on the heap.
     pub(in crate::graph) fn all_paths_kernel(
         &self,
         snap: &CsrSnapshot,
@@ -384,41 +416,68 @@ impl Graph {
         dst: NodeId,
     ) -> Result<Vec<Vec<NodeId>>, Error> {
         let mut paths = Vec::new();
+        self.walk_simple_paths(snap, src, dst, |path| paths.push(path.to_vec()));
+        Ok(paths)
+    }
+
+    /// Enumerate every simple path from `src` to `dst`, calling `emit` with each.
+    ///
+    /// Shared by `all_paths` and `longest_path`, which differ only in what they keep.
+    /// Neighbors are walked in row order and a path is emitted the moment `dst` is
+    /// reached, so the sequence matches the depth-first recursion this replaced.
+    fn walk_simple_paths(
+        &self,
+        snap: &CsrSnapshot,
+        src: NodeId,
+        dst: NodeId,
+        mut emit: impl FnMut(&[NodeId]),
+    ) {
+        // The source counts as reached before any edge is walked, which is what makes
+        // `all_paths(a, a)` one empty-length path rather than none.
+        if src == dst {
+            emit(&[src]);
+            return;
+        }
+        let Some(&src_dense) = snap.id_to_dense.get(&src) else {
+            return;
+        };
+
         let mut current_path = vec![src];
-        let mut visited = AHashSet::new();
-        visited.insert(src);
+        let mut visited = AHashSet::from_iter([src]);
+        // Frame: the node being expanded and how far through its row we are. The dense
+        // index is carried so a step costs no hash lookup.
+        let mut stack: Vec<(u32, usize)> = vec![(src_dense, snap.row_ptr[src_dense as usize])];
 
-        fn find_paths(
-            snap: &CsrSnapshot,
-            u: NodeId,
-            dst: NodeId,
-            visited: &mut AHashSet<NodeId>,
-            current_path: &mut Vec<NodeId>,
-            paths: &mut Vec<Vec<NodeId>>,
-        ) {
-            if u == dst {
-                paths.push(current_path.clone());
-                return;
-            }
-
-            if let Some(&u_dense) = snap.id_to_dense.get(&u) {
-                let start = snap.row_ptr[u_dense as usize];
-                let end = snap.row_ptr[u_dense as usize + 1];
-                for k in start..end {
-                    let neighbor = snap.dense_to_id[snap.col_idx[k] as usize];
-                    if !visited.contains(&neighbor) {
-                        visited.insert(neighbor);
-                        current_path.push(neighbor);
-                        find_paths(snap, neighbor, dst, visited, current_path, paths);
-                        current_path.pop();
-                        visited.remove(&neighbor);
+        while let Some(&mut (u_dense, ref mut cursor)) = stack.last_mut() {
+            if *cursor >= snap.row_ptr[u_dense as usize + 1] {
+                stack.pop();
+                // The root's entry belongs to the caller's `current_path`, so it is
+                // never unwound; every deeper node is.
+                if !stack.is_empty() {
+                    if let Some(left) = current_path.pop() {
+                        visited.remove(&left);
                     }
                 }
+                continue;
             }
+            let neighbor_dense = snap.col_idx[*cursor];
+            *cursor += 1;
+            let neighbor = snap.dense_to_id[neighbor_dense as usize];
+            if visited.contains(&neighbor) {
+                continue;
+            }
+            if neighbor == dst {
+                // Reaching the destination ends this path without extending past it,
+                // matching the recursion's check on entry.
+                current_path.push(neighbor);
+                emit(&current_path);
+                current_path.pop();
+                continue;
+            }
+            visited.insert(neighbor);
+            current_path.push(neighbor);
+            stack.push((neighbor_dense, snap.row_ptr[neighbor_dense as usize]));
         }
-
-        find_paths(snap, src, dst, &mut visited, &mut current_path, &mut paths);
-        Ok(paths)
     }
 
     /// Every unweighted shortest path between `src` and `dst`.
@@ -443,56 +502,72 @@ impl Graph {
             return Ok(vec![]);
         }
 
-        let mut paths = Vec::new();
-        let mut current_path = vec![dst];
-
-        fn reconstruct(
-            graph: &Graph,
-            snap: &CsrSnapshot,
-            u: NodeId,
-            src: NodeId,
-            levels: &[u32],
-            current_path: &mut Vec<NodeId>,
-            paths: &mut Vec<Vec<NodeId>>,
-        ) -> Result<(), Error> {
-            if u == src {
-                let mut p = current_path.clone();
-                p.reverse();
-                paths.push(p);
-                return Ok(());
+        // Walk back from `dst` over the shortest-path DAG, iteratively: the depth is the
+        // path length, so recursion needed a frame per hop (see
+        // [`Graph::detect_cycle_kernel`]).
+        //
+        // A frame holds its node's admissible predecessors rather than a cursor into
+        // storage, because the predecessors come from an LMDB read per node and are
+        // filtered before use. Two filters apply:
+        //
+        // - one hop closer to the source, which is what makes the walk follow shortest
+        //   paths rather than any path;
+        // - distinct *predecessors*, not incoming edges. `adj_entries` yields one entry
+        //   per edge, so two edges from the same predecessor would emit the same node
+        //   sequence twice. A path is a sequence of nodes, so that is one path; the
+        //   betweenness kernel counts distinct pairs for the same reason and the two must
+        //   agree about what a shortest path is. Deduplication needs a set rather than a
+        //   check against the previous entry, since `in_adj` is `DUPSORT` over `AdjEntry`
+        //   whose byte layout puts `edge_type` ahead of `other`: one predecessor reached
+        //   by two relationship types is separated by every entry whose type sorts
+        //   between them.
+        let admissible = |node: NodeId| -> Result<Vec<NodeId>, Error> {
+            let Some(&dense) = snap.id_to_dense.get(&node) else {
+                return Ok(Vec::new());
+            };
+            let cur_level = levels[dense as usize];
+            if cur_level == UNREACHED {
+                return Ok(Vec::new());
             }
-
-            if let Some(&u_dense) = snap.id_to_dense.get(&u) {
-                let cur_level = levels[u_dense as usize];
-                if cur_level == UNREACHED {
-                    return Ok(());
-                }
-                // Walk distinct predecessors, not incoming edges. `adj_entries` yields
-                // one entry per edge, so two edges from the same predecessor would
-                // recurse twice and emit the same node sequence twice. A path is a
-                // sequence of nodes, so that is one path; the betweenness kernel counts
-                // distinct predecessor pairs for the same reason, and the two must agree
-                // about what a shortest path is.
-                //
-                // A set, not a comparison against the previous entry: `in_adj` is
-                // `DUPSORT` over `AdjEntry`, whose byte layout puts `edge_type` ahead of
-                // `other`, so one predecessor reached by two different relationship types
-                // is separated by every entry whose type sorts between them.
-                let mut seen: AHashSet<NodeId> = AHashSet::new();
-                for ne in graph.adj_entries(u, false)? {
-                    if let Some(&pred) = snap.id_to_dense.get(&ne.node) {
-                        if levels[pred as usize] == cur_level - 1 && seen.insert(ne.node) {
-                            current_path.push(ne.node);
-                            reconstruct(graph, snap, ne.node, src, levels, current_path, paths)?;
-                            current_path.pop();
-                        }
+            let mut seen: AHashSet<NodeId> = AHashSet::new();
+            let mut preds = Vec::new();
+            for ne in self.adj_entries(node, false)? {
+                if let Some(&pred) = snap.id_to_dense.get(&ne.node) {
+                    if levels[pred as usize] == cur_level - 1 && seen.insert(ne.node) {
+                        preds.push(ne.node);
                     }
                 }
             }
-            Ok(())
+            Ok(preds)
+        };
+
+        let mut paths = Vec::new();
+        // `current_path` runs destination-first and is reversed on emit, as the
+        // recursion did.
+        let mut current_path = vec![dst];
+        let mut stack: Vec<(Vec<NodeId>, usize)> = vec![(admissible(dst)?, 0)];
+
+        while let Some((preds, cursor)) = stack.last_mut() {
+            if *cursor >= preds.len() {
+                stack.pop();
+                if !stack.is_empty() {
+                    current_path.pop();
+                }
+                continue;
+            }
+            let pred = preds[*cursor];
+            *cursor += 1;
+            current_path.push(pred);
+            if pred == src {
+                let mut found = current_path.clone();
+                found.reverse();
+                paths.push(found);
+                current_path.pop();
+                continue;
+            }
+            stack.push((admissible(pred)?, 0));
         }
 
-        reconstruct(self, snap, dst, src, &levels, &mut current_path, &mut paths)?;
         Ok(paths)
     }
 
@@ -704,54 +779,15 @@ impl Graph {
         src: NodeId,
         dst: NodeId,
     ) -> Result<Option<Vec<NodeId>>, Error> {
+        // Same enumeration as `all_paths`, keeping only the longest. Strictly greater,
+        // so the first path of a given length wins and the choice among equal-length
+        // paths stays the depth-first one.
         let mut max_path: Option<Vec<NodeId>> = None;
-        let mut current_path = vec![src];
-        let mut visited = AHashSet::new();
-        visited.insert(src);
-
-        fn find_longest(
-            snap: &CsrSnapshot,
-            u: NodeId,
-            dst: NodeId,
-            visited: &mut AHashSet<NodeId>,
-            current_path: &mut Vec<NodeId>,
-            max_path: &mut Option<Vec<NodeId>>,
-        ) {
-            if u == dst {
-                if let Some(max) = max_path.as_ref() {
-                    if current_path.len() > max.len() {
-                        *max_path = Some(current_path.clone());
-                    }
-                } else {
-                    *max_path = Some(current_path.clone());
-                }
-                return;
+        self.walk_simple_paths(snap, src, dst, |path| {
+            if max_path.as_ref().is_none_or(|best| path.len() > best.len()) {
+                max_path = Some(path.to_vec());
             }
-
-            if let Some(&u_dense) = snap.id_to_dense.get(&u) {
-                let start = snap.row_ptr[u_dense as usize];
-                let end = snap.row_ptr[u_dense as usize + 1];
-                for k in start..end {
-                    let neighbor = snap.dense_to_id[snap.col_idx[k] as usize];
-                    if !visited.contains(&neighbor) {
-                        visited.insert(neighbor);
-                        current_path.push(neighbor);
-                        find_longest(snap, neighbor, dst, visited, current_path, max_path);
-                        current_path.pop();
-                        visited.remove(&neighbor);
-                    }
-                }
-            }
-        }
-
-        find_longest(
-            snap,
-            src,
-            dst,
-            &mut visited,
-            &mut current_path,
-            &mut max_path,
-        );
+        });
         Ok(max_path)
     }
 }
@@ -964,5 +1000,82 @@ mod multigraph_tests {
 
         let paths = g.all_shortest_paths(nodes[0], nodes[3]).unwrap();
         assert_eq!(paths.len(), 2, "one path per distinct route: {paths:?}");
+    }
+}
+
+#[cfg(test)]
+mod deep_graph_tests {
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    use crate::{DegreeDirection, Graph};
+
+    /// Every depth-first kernel must survive a graph deeper than the call stack.
+    ///
+    /// These were recursive, one frame per node on the current path, so a long chain
+    /// overflowed the stack — and a Rust stack overflow aborts the *process*, so a
+    /// single query could take down a server rather than returning an error. This runs
+    /// them on a thread with a 1 MiB stack, which is `wasm32-unknown-unknown`'s default
+    /// and about an eighth of a native main thread, over a chain far longer than that
+    /// many frames would fit. A regression here does not fail politely: it kills the
+    /// test binary, which is the same bargain `near_budget_queries_run_on_a_small_stack`
+    /// makes in `issundb-cypher`.
+    #[test]
+    fn depth_first_kernels_survive_a_chain_deeper_than_the_stack() {
+        const CHAIN: usize = 20_000;
+
+        let handle = std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                let dir = TempDir::new().unwrap();
+                let g = Graph::open(dir.path(), 1).unwrap();
+                let ids: Vec<_> = g
+                    .update(|txn| {
+                        let ids: Vec<_> = (0..CHAIN)
+                            .map(|_| txn.add_node("N", &json!({})).unwrap())
+                            .collect();
+                        for w in ids.windows(2) {
+                            txn.add_edge(w[0], w[1], "R", &json!({})).unwrap();
+                        }
+                        Ok(ids)
+                    })
+                    .unwrap();
+                g.rebuild_csr().unwrap();
+
+                let first = ids[0];
+                let last = ids[CHAIN - 1];
+
+                // Tarjan: every node is its own component on a chain.
+                assert_eq!(g.strongly_connected_components().unwrap().len(), CHAIN);
+                // Three-color DFS over the whole graph.
+                assert!(!g.detect_cycle().unwrap(), "a chain is acyclic");
+                // Simple-path enumeration, and the backward shortest-path walk: on a
+                // chain there is exactly one route end to end, of full length.
+                assert_eq!(g.all_paths(first, last).unwrap().len(), 1);
+                assert_eq!(g.longest_path(first, last).unwrap().unwrap().len(), CHAIN);
+                let shortest = g.all_shortest_paths(first, last).unwrap();
+                assert_eq!(shortest.len(), 1);
+                assert_eq!(shortest[0].len(), CHAIN);
+
+                // A closing edge makes it cyclic, which the same walk must now report.
+                g.add_edge(last, first, "R", &json!({})).unwrap();
+                g.rebuild_csr().unwrap();
+                assert!(g.detect_cycle().unwrap(), "the closed chain is a cycle");
+                assert_eq!(
+                    g.strongly_connected_components().unwrap().len(),
+                    CHAIN,
+                    "still one entry per node, now all in one component"
+                );
+
+                // A sanity check that the graph is the shape intended, so the
+                // assertions above cannot pass over an empty snapshot.
+                assert_eq!(
+                    g.degree_centrality(DegreeDirection::Out).unwrap()[&first],
+                    1
+                );
+            })
+            .expect("spawn a small-stack thread");
+
+        handle.join().expect("no kernel may overflow the stack");
     }
 }

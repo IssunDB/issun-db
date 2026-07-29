@@ -186,6 +186,18 @@ impl Graph {
     }
 
     /// Strongly connected components (Tarjan) over the contiguous CSR arrays.
+    ///
+    /// Iterative, for the reason given on [`Graph::detect_cycle_kernel`]: Tarjan is a
+    /// depth-first search, so recursion put one call frame per node on the current path
+    /// and a long chain aborted the process instead of returning.
+    ///
+    /// The translation keeps the recursive algorithm exactly, including the order
+    /// components are emitted, because that order is what assigns the component ids: a
+    /// component is emitted when its root finishes, so ids still ascend in
+    /// root-completion order. What was the recursion's implicit per-frame state is now
+    /// explicit — the node, and how far through its row the search has gone — and the
+    /// `lowlink` propagation that happened on return from a call now happens when a
+    /// frame is popped, against the frame beneath it.
     pub(in crate::graph) fn strongly_connected_components_kernel(
         &self,
         snap: &CsrSnapshot,
@@ -195,72 +207,75 @@ impl Graph {
             return Ok(HashMap::new());
         }
 
-        struct Env<'a> {
-            snap: &'a CsrSnapshot,
-            index: usize,
-            indices: Vec<Option<usize>>,
-            lowlinks: Vec<usize>,
-            on_stack: Vec<bool>,
-            stack: Vec<usize>,
-            components: HashMap<NodeId, u64>,
-            next_comp_id: u64,
-        }
+        let mut index = 0usize;
+        let mut indices: Vec<Option<usize>> = vec![None; n];
+        let mut lowlinks = vec![0usize; n];
+        let mut on_stack = vec![false; n];
+        // Tarjan's own stack of nodes awaiting assignment, distinct from the search
+        // stack below.
+        let mut pending: Vec<usize> = Vec::with_capacity(n);
+        let mut components: HashMap<NodeId, u64> = HashMap::with_capacity(n);
+        let mut next_comp_id = 0u64;
+        let mut search: Vec<(usize, usize)> = Vec::new();
 
-        let mut env = Env {
-            snap,
-            index: 0,
-            indices: vec![None; n],
-            lowlinks: vec![0; n],
-            on_stack: vec![false; n],
-            stack: Vec::with_capacity(n),
-            components: HashMap::with_capacity(n),
-            next_comp_id: 0,
-        };
+        for root in 0..n {
+            if indices[root].is_some() {
+                continue;
+            }
+            indices[root] = Some(index);
+            lowlinks[root] = index;
+            index += 1;
+            pending.push(root);
+            on_stack[root] = true;
+            search.push((root, snap.row_ptr[root]));
 
-        fn strongconnect(u: usize, env: &mut Env) {
-            env.indices[u] = Some(env.index);
-            env.lowlinks[u] = env.index;
-            env.index += 1;
-            env.stack.push(u);
-            env.on_stack[u] = true;
+            while let Some(&mut (u, ref mut cursor)) = search.last_mut() {
+                if *cursor < snap.row_ptr[u + 1] {
+                    let v = snap.col_idx[*cursor] as usize;
+                    *cursor += 1;
+                    match indices[v] {
+                        None => {
+                            // Descend. The `lowlinks[u] = min(lowlinks[u], lowlinks[v])`
+                            // the recursion ran after the call happens when this frame
+                            // is popped.
+                            indices[v] = Some(index);
+                            lowlinks[v] = index;
+                            index += 1;
+                            pending.push(v);
+                            on_stack[v] = true;
+                            search.push((v, snap.row_ptr[v]));
+                        }
+                        Some(iv) if on_stack[v] => {
+                            lowlinks[u] = lowlinks[u].min(iv);
+                        }
+                        // Already assigned to a finished component: not part of this one.
+                        Some(_) => {}
+                    }
+                    continue;
+                }
 
-            let start = env.snap.row_ptr[u];
-            let end = env.snap.row_ptr[u + 1];
-            for k in start..end {
-                let v = env.snap.col_idx[k] as usize;
-                if env.indices[v].is_none() {
-                    strongconnect(v, env);
-                    env.lowlinks[u] = std::cmp::min(env.lowlinks[u], env.lowlinks[v]);
-                } else if env.on_stack[v] {
-                    if let Some(iv) = env.indices[v] {
-                        env.lowlinks[u] = std::cmp::min(env.lowlinks[u], iv);
+                // `u` is finished.
+                search.pop();
+                if let Some(&(parent, _)) = search.last() {
+                    lowlinks[parent] = lowlinks[parent].min(lowlinks[u]);
+                }
+                if Some(lowlinks[u]) == indices[u] {
+                    let comp_id = next_comp_id;
+                    next_comp_id += 1;
+                    while let Some(w) = pending.pop() {
+                        on_stack[w] = false;
+                        if let Some(&node_id) = snap.dense_to_id.get(w) {
+                            components.insert(node_id, comp_id);
+                        }
+                        if w == u {
+                            break;
+                        }
                     }
                 }
             }
-
-            if Some(env.lowlinks[u]) == env.indices[u] {
-                let comp_id = env.next_comp_id;
-                env.next_comp_id += 1;
-
-                while let Some(w) = env.stack.pop() {
-                    env.on_stack[w] = false;
-                    if let Some(&node_id) = env.snap.dense_to_id.get(w) {
-                        env.components.insert(node_id, comp_id);
-                    }
-                    if w == u {
-                        break;
-                    }
-                }
-            }
         }
 
-        for u in 0..n {
-            if env.indices[u].is_none() {
-                strongconnect(u, &mut env);
-            }
-        }
-
-        Ok(env.components)
+        Ok(components)
     }
 
     /// Betweenness centrality (Brandes) over the CSR snapshot, unnormalized and

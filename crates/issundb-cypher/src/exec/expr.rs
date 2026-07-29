@@ -1878,11 +1878,15 @@ pub(super) fn eval_function_call<B: Bindings>(
             if !args.is_empty() {
                 return Err("timestamp() requires exactly 0 arguments".into());
             }
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_err(|e| e.to_string())?
-                .as_millis() as i64;
-            Ok(serde_json::Value::Number(now.into()))
+            // The statement clock, not `SystemTime::now()`, for two reasons. It is the
+            // one clock source in this file, so `timestamp()` and `datetime()` in the
+            // same statement can no longer disagree about when "now" is, which is also
+            // what Cypher expects of a statement's temporal functions. And it is the
+            // source that exists on every target: `SystemTime::now()` panics outright
+            // on `wasm32-unknown-unknown`, where chrono reads the host clock instead.
+            Ok(serde_json::Value::Number(
+                statement_now().timestamp_millis().into(),
+            ))
         }
         "coalesce" => {
             for arg in args {
@@ -2393,16 +2397,17 @@ pub(super) fn eval_function_call<B: Bindings>(
             use std::cell::Cell;
             use std::collections::hash_map::DefaultHasher;
             use std::hash::{Hash, Hasher};
-            use std::time::SystemTime;
             thread_local! {
                 static COUNTER: Cell<u64> = const { Cell::new(0) };
             }
             let mut h = DefaultHasher::new();
-            SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .subsec_nanos()
-                .hash(&mut h);
+            // Seeded from the statement clock rather than `SystemTime::now()`, which
+            // panics on `wasm32-unknown-unknown`. The clock only varies the sequence
+            // between statements; what makes successive calls within one statement
+            // differ is the counter below, which was already true when this read the
+            // wall clock, since two calls a few nanoseconds apart hashed the same
+            // value.
+            statement_now().timestamp_subsec_nanos().hash(&mut h);
             // Mix with thread id and a thread-local counter for uniqueness within the same nanosecond.
             std::thread::current().id().hash(&mut h);
             let count = COUNTER.with(|c| {

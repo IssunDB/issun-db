@@ -225,6 +225,12 @@ Two rules matter when adding or changing one, because both have been silently vi
   the `First`, `Plus`, `break`-after-first, and `Min` duplicate rules of the matrix formulation that preceded this code, and each has a test pinning it.
   A row length is not a degree and a row scan is not a transition probability: decide which convention a new kernel wants and say so in a comment. Note
   that the NetworkX oracle cannot catch a mistake here, because its corpus is simple graphs.
+- No depth-first kernel may recurse over graph structure. A DFS's depth is the length of the current path, so recursion needs one call frame per node on a chain,
+  and a Rust stack overflow aborts the *process* rather than returning an `Error` — a single query would take down a server. `detect_cycle`,
+  `strongly_connected_components`, `all_paths`, `longest_path`, and the `all_shortest_paths` backward walk all carry their search stack on the heap for this
+  reason, with the node plus a cursor into its row where the recursion kept a loop counter. `dfs` is the one exception and only because `hops: u8` bounds it at
+  255 frames; widening that argument means converting it too. `deep_graph_tests` pins all of this by running the kernels on a thread with a 1 MiB stack
+  (`wasm32-unknown-unknown`'s default) over a 20 000-node chain, and a regression there aborts the test binary rather than failing politely.
 - Where a result's sequence is observable, fix it deliberately. A traversal reports reached nodes in ascending dense (so ascending node id) order, each
   frontier is sorted before it is consumed, so a `max_nodes` cap keeps the lowest-numbered nodes rather than whichever the traversal happened to reach
   first. Brandes accumulates over sources and predecessors in that same order, which is what makes a betweenness total reproducible run to run rather
