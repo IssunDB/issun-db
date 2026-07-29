@@ -13,7 +13,7 @@ impl Graph {
 
     pub(super) fn nodes_by_label_impl(
         &self,
-        rtxn: &heed::RoTxn,
+        rtxn: &crate::storage::RoTxn,
         label: &str,
     ) -> Result<Vec<NodeId>, Error> {
         let label_id = {
@@ -73,7 +73,7 @@ impl Graph {
 
     pub(super) fn edges_by_type_impl(
         &self,
-        rtxn: &heed::RoTxn,
+        rtxn: &crate::storage::RoTxn,
         etype: &str,
     ) -> Result<Vec<EdgeId>, Error> {
         let type_id = {
@@ -116,7 +116,7 @@ impl Graph {
 
     pub(super) fn label_name_impl(
         &self,
-        rtxn: &heed::RoTxn,
+        rtxn: &crate::storage::RoTxn,
         id: LabelId,
     ) -> Result<Option<String>, Error> {
         self.meta_reverse_lookup_impl(rtxn, "label:", id)
@@ -133,7 +133,7 @@ impl Graph {
 
     pub(super) fn type_name_impl(
         &self,
-        rtxn: &heed::RoTxn,
+        rtxn: &crate::storage::RoTxn,
         id: TypeId,
     ) -> Result<Option<String>, Error> {
         self.meta_reverse_lookup_impl(rtxn, "type:", id)
@@ -141,7 +141,7 @@ impl Graph {
 
     pub(super) fn prop_key_name_impl(
         &self,
-        rtxn: &heed::RoTxn,
+        rtxn: &crate::storage::RoTxn,
         id: PropKeyId,
     ) -> Result<Option<String>, Error> {
         self.meta_reverse_lookup_impl(rtxn, "prop_key:", id)
@@ -154,7 +154,7 @@ impl Graph {
     /// with the edge itself.
     pub(super) fn write_edge_index_entries(
         &self,
-        wtxn: &mut heed::RwTxn,
+        wtxn: &mut crate::storage::RwTxn,
         edge_id: EdgeId,
         type_id: TypeId,
         etype: &str,
@@ -219,7 +219,7 @@ impl Graph {
     #[allow(clippy::too_many_arguments)]
     fn check_edge_property_unique(
         &self,
-        wtxn: &heed::RwTxn,
+        wtxn: &crate::storage::RwTxn,
         type_id: TypeId,
         etype: &str,
         prop_key_id: PropKeyId,
@@ -269,7 +269,7 @@ impl Graph {
 
     pub(super) fn delete_edge_index_entries(
         &self,
-        wtxn: &mut heed::RwTxn,
+        wtxn: &mut crate::storage::RwTxn,
         edge_id: EdgeId,
         record: &EdgeRecord,
     ) -> Result<(), Error> {
@@ -312,7 +312,7 @@ impl Graph {
 
     pub(super) fn node_count_by_label_impl(
         &self,
-        rtxn: &heed::RoTxn,
+        rtxn: &crate::storage::RoTxn,
         label: &str,
     ) -> Result<u64, Error> {
         let meta_key = format!("label:{label}");
@@ -335,7 +335,7 @@ impl Graph {
 
     pub(super) fn edge_count_by_type_impl(
         &self,
-        rtxn: &heed::RoTxn,
+        rtxn: &crate::storage::RoTxn,
         etype: &str,
     ) -> Result<u64, Error> {
         let meta_key = format!("type:{etype}");
@@ -352,7 +352,7 @@ impl Graph {
 
     pub(super) fn meta_reverse_lookup_impl(
         &self,
-        rtxn: &heed::RoTxn,
+        rtxn: &crate::storage::RoTxn,
         prefix: &str,
         id: u32,
     ) -> Result<Option<String>, Error> {
@@ -372,7 +372,7 @@ impl Graph {
 
     pub(super) fn get_active_node_indexes(
         &self,
-        rtxn: &heed::RoTxn,
+        rtxn: &crate::storage::RoTxn,
         label_id: LabelId,
     ) -> Result<Vec<(PropKeyId, u8)>, Error> {
         let prefix = format!("idx_meta:node:l:{label_id}:p:");
@@ -392,7 +392,7 @@ impl Graph {
 
     pub(super) fn get_active_edge_indexes(
         &self,
-        rtxn: &heed::RoTxn,
+        rtxn: &crate::storage::RoTxn,
         type_id: TypeId,
     ) -> Result<Vec<(PropKeyId, u8)>, Error> {
         let prefix = format!("idx_meta:edge:t:{type_id}:p:");
@@ -440,7 +440,7 @@ impl Graph {
 
     pub(super) fn create_node_index_impl(
         &self,
-        wtxn: &mut heed::RwTxn,
+        wtxn: &mut crate::storage::RwTxn,
         label: &str,
         property: &str,
         flags: u8,
@@ -540,7 +540,7 @@ impl Graph {
 
     pub(super) fn drop_node_index_impl(
         &self,
-        wtxn: &mut heed::RwTxn,
+        wtxn: &mut crate::storage::RwTxn,
         label: &str,
         property: &str,
         flags: u8,
@@ -614,7 +614,7 @@ impl Graph {
 
     pub(super) fn create_edge_index_impl(
         &self,
-        wtxn: &mut heed::RwTxn,
+        wtxn: &mut crate::storage::RwTxn,
         etype: &str,
         property: &str,
         flags: u8,
@@ -713,7 +713,7 @@ impl Graph {
 
     pub(super) fn drop_edge_index_impl(
         &self,
-        wtxn: &mut heed::RwTxn,
+        wtxn: &mut crate::storage::RwTxn,
         etype: &str,
         property: &str,
         flags: u8,
@@ -757,7 +757,7 @@ impl Graph {
 
     pub(super) fn nodes_by_property_impl(
         &self,
-        rtxn: &heed::RoTxn,
+        rtxn: &crate::storage::RoTxn,
         label: &str,
         property: &str,
         val: PropValue,
@@ -821,7 +821,7 @@ impl Graph {
     /// the stored property value directly, preserving ascending ID order.
     fn scan_label_for_property_eq(
         &self,
-        rtxn: &heed::RoTxn,
+        rtxn: &crate::storage::RoTxn,
         label: &str,
         property: &str,
         val: &serde_json::Value,
@@ -847,7 +847,7 @@ impl Graph {
     #[allow(clippy::too_many_arguments)]
     fn scan_label_for_property_str_range(
         &self,
-        rtxn: &heed::RoTxn,
+        rtxn: &crate::storage::RoTxn,
         label: &str,
         property: &str,
         min_val: Option<PropValue>,
@@ -912,7 +912,7 @@ impl Graph {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn nodes_by_property_range_impl(
         &self,
-        rtxn: &heed::RoTxn,
+        rtxn: &crate::storage::RoTxn,
         label: &str,
         property: &str,
         min_val: Option<PropValue>,
@@ -1034,7 +1034,7 @@ impl Graph {
 
     pub(super) fn has_node_property_index_impl(
         &self,
-        rtxn: &heed::RoTxn,
+        rtxn: &crate::storage::RoTxn,
         label: &str,
         property: &str,
     ) -> Result<bool, Error> {
@@ -1082,7 +1082,7 @@ impl Graph {
 
     pub(super) fn edges_by_property_impl(
         &self,
-        rtxn: &heed::RoTxn,
+        rtxn: &crate::storage::RoTxn,
         etype: &str,
         property: &str,
         val: PropValue,
@@ -1142,7 +1142,7 @@ impl Graph {
     /// stored property value directly, preserving ascending ID order.
     fn scan_type_for_property_eq(
         &self,
-        rtxn: &heed::RoTxn,
+        rtxn: &crate::storage::RoTxn,
         etype: &str,
         property: &str,
         val: &serde_json::Value,
@@ -1164,7 +1164,7 @@ impl Graph {
     /// `edges_by_property_range_impl`. See `scan_label_for_property_str_range`.
     fn scan_type_for_property_str_range(
         &self,
-        rtxn: &heed::RoTxn,
+        rtxn: &crate::storage::RoTxn,
         etype: &str,
         property: &str,
         min_val: Option<PropValue>,
@@ -1210,7 +1210,7 @@ impl Graph {
 
     pub(super) fn edges_by_property_range_impl(
         &self,
-        rtxn: &heed::RoTxn,
+        rtxn: &crate::storage::RoTxn,
         etype: &str,
         property: &str,
         min_val: Option<PropValue>,

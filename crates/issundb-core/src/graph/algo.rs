@@ -668,6 +668,16 @@ impl Graph {
     /// exceeds the saving, which also keeps unit tests deterministic and off the
     /// thread pool entirely.
     pub(super) fn kernel_threads(&self, work: usize) -> usize {
+        // The override is consulted here, ahead of the cap, and not left to
+        // `parallel_threads`. A test that forces sixteen workers is asking to exercise
+        // a sixteen-way split; capping it to four first would quietly turn the
+        // above-cap cases of `count_linear_paths_parallel_matches_serial` into
+        // repetitions of the four-worker case, so the split they exist to cover would
+        // never run and their assertion messages would name a worker count that never
+        // happened.
+        if let Some(forced) = Self::forced_threads() {
+            return forced;
+        }
         // A counting pass streams adjacency arrays, so it saturates memory
         // bandwidth long before it saturates compute, and past its peak extra
         // workers add traffic and coordination without adding throughput. Measured
@@ -677,10 +687,23 @@ impl Graph {
         // be spent in full here: cap the split at the peak.
         //
         // The cap is calibrated on one machine. Re-measure the curve on hardware
-        // with a different memory subsystem before treating four as general; the
-        // test override bypasses it so a test can still drive more workers.
+        // with a different memory subsystem before treating four as general.
         const MAX_SCAN_THREADS: usize = 4;
         self.parallel_threads(work).min(MAX_SCAN_THREADS)
+    }
+
+    /// The worker count a test has forced, if any.
+    ///
+    /// Both resolvers check this before applying any cap of their own, so a forced
+    /// count means exactly what it says at either call site.
+    fn forced_threads() -> Option<usize> {
+        #[cfg(test)]
+        {
+            let forced = FORCE_KERNEL_THREADS.with(|f| f.get());
+            return (forced > 0).then_some(forced);
+        }
+        #[cfg(not(test))]
+        None
     }
 
     /// Threads for a pass whose cost is arithmetic per source rather than a stream
@@ -696,12 +719,8 @@ impl Graph {
         const MIN_PARALLEL_WORK: usize = 1 << 18;
         // Tests force the split on graphs far below the threshold, so the
         // parallel reduction is exercised rather than only its fallback.
-        #[cfg(test)]
-        {
-            let forced = FORCE_KERNEL_THREADS.with(|f| f.get());
-            if forced > 0 {
-                return forced;
-            }
+        if let Some(forced) = Self::forced_threads() {
+            return forced;
         }
         if work < MIN_PARALLEL_WORK {
             return 1;
@@ -950,7 +969,7 @@ impl Graph {
     /// uncommitted edges.
     pub(super) fn all_neighbors_impl(
         &self,
-        txn: &heed::RoTxn,
+        txn: &crate::storage::RoTxn,
         node: NodeId,
     ) -> Result<Vec<DirectedNeighborEntry>, Error> {
         let mut neighbors = Vec::new();
@@ -1122,16 +1141,27 @@ impl Graph {
     /// every process that ever loads data.
     fn weighted_snapshot(&self) -> Result<Arc<CsrSnapshot>, Error> {
         self.csr_cache.request_weights();
-        let installed = self.csr_cache.snapshot.load_full();
-        if !self.csr_cache.snapshot_is_stale() && installed.edge_weight.is_some() {
-            return Ok(installed);
+        // Staleness first, pointer second. Loading first and then asking whether the
+        // *cache* is stale answers about whatever is installed now, not about the
+        // pointer in hand: a refresh landing between the two would let a superseded
+        // snapshot pass a check that described its replacement. This order can only
+        // reject a snapshot that just became current, which costs a rebuild and never
+        // a wrong answer, and it matches `with_snapshot`'s gate-then-load.
+        if !self.csr_cache.snapshot_is_stale() {
+            let installed = self.csr_cache.snapshot.load_full();
+            if installed.edge_weight.is_some() {
+                return Ok(installed);
+            }
         }
         let _maint = self.csr_cache.maintenance.lock();
         // Re-check under the lock: another maintenance pass may have refreshed while
-        // this thread waited.
-        let installed = self.csr_cache.snapshot.load_full();
-        if !self.csr_cache.snapshot_is_stale() && installed.edge_weight.is_some() {
-            return Ok(installed);
+        // this thread waited. Safe in either order here, since every installer holds
+        // this lock, but kept the same way round for one rule rather than two.
+        if !self.csr_cache.snapshot_is_stale() {
+            let installed = self.csr_cache.snapshot.load_full();
+            if installed.edge_weight.is_some() {
+                return Ok(installed);
+            }
         }
         let built_gen = self.csr_cache.current_gen();
         let snap = Arc::new(CsrSnapshot::build_weighted(&self.storage)?);
@@ -1179,7 +1209,10 @@ impl Graph {
         self.all_nodes_impl(&rtxn)
     }
 
-    pub(super) fn all_nodes_impl(&self, rtxn: &heed::RoTxn) -> Result<Vec<NodeId>, Error> {
+    pub(super) fn all_nodes_impl(
+        &self,
+        rtxn: &crate::storage::RoTxn,
+    ) -> Result<Vec<NodeId>, Error> {
         let mut ids = self
             .storage
             .nodes
@@ -1220,55 +1253,70 @@ impl Graph {
         if self.csr_cache.note_dirty_n(count as u64) {
             let cache = Arc::clone(&self.csr_cache);
             let storage = Arc::clone(&self.storage);
+            // A target with no threads (`wasm32-unknown-unknown`, and WASI without
+            // the threads proposal) cannot spawn: `std::thread::spawn` there is a
+            // runtime failure, not a compile error, so an unguarded spawn would turn
+            // the thousandth write into a panic. Run the pass inline instead. It is
+            // the same work in the same order, only on the writer's thread, and such
+            // a target has no other thread to contend with. Inline is safe with the
+            // write lock still held, because a pass takes `maintenance` and never the
+            // write lock.
+            #[cfg(target_family = "wasm")]
+            {
+                Self::run_compaction_passes(&cache, &storage);
+            }
+            #[cfg(not(target_family = "wasm"))]
             std::thread::spawn(move || {
-                // Rebuild until the dirty count drops below the threshold: writes
-                // that commit while a rebuild runs keep the count above zero, and
-                // `install` retains the claim and asks for another pass so the
-                // snapshot does not silently lag behind LMDB.
-                loop {
-                    // Hold the maintenance lock across the whole pass (build plus
-                    // install), reacquiring it each iteration so a foreground
-                    // maintenance pass can interleave between passes. This serializes
-                    // against any other rebuild, so two passes cannot install over
-                    // each other.
-                    let _maint = cache.maintenance.lock();
-                    // Capture the generation before reading LMDB; writes that
-                    // commit during the build leave the snapshot stale until the
-                    // next pass, which the dirty-count loop already drives.
-                    let built_gen = cache.current_gen();
-                    let built = if cache.wants_weights() {
-                        CsrSnapshot::build_weighted(&storage)
-                    } else {
-                        CsrSnapshot::build(&storage)
-                    };
-                    match built {
-                        Ok(snap) => {
-                            let again = cache.install(snap, built_gen);
-                            if !again {
-                                break;
-                            }
-                        }
-                        Err(_) => {
-                            // Nothing was installed, so `snapshot_gen` did not advance
-                            // and the snapshot still reports itself stale: the next
-                            // gated read rebuilds in the foreground and surfaces the
-                            // error to its caller. Releasing the claim without
-                            // clearing the dirty count is deliberate, so a later
-                            // commit retries this pass rather than leaving compaction
-                            // permanently disowned.
-                            cache.cancel_rebuild();
-                            break;
-                        }
+                Self::run_compaction_passes(&cache, &storage);
+            });
+        }
+    }
+
+    /// Rebuild until the dirty count drops below the threshold: writes that commit
+    /// while a rebuild runs keep the count above zero, and `install` retains the
+    /// claim and asks for another pass so the snapshot does not silently lag behind
+    /// LMDB.
+    fn run_compaction_passes(cache: &CsrCache, storage: &Storage) {
+        loop {
+            // Hold the maintenance lock across the whole pass (build plus install),
+            // reacquiring it each iteration so a foreground maintenance pass can
+            // interleave between passes. This serializes against any other rebuild,
+            // so two passes cannot install over each other.
+            let _maint = cache.maintenance.lock();
+            // Capture the generation before reading LMDB; writes that commit during
+            // the build leave the snapshot stale until the next pass, which the
+            // dirty-count loop already drives.
+            let built_gen = cache.current_gen();
+            let built = if cache.wants_weights() {
+                CsrSnapshot::build_weighted(storage)
+            } else {
+                CsrSnapshot::build(storage)
+            };
+            match built {
+                Ok(snap) => {
+                    let again = cache.install(snap, built_gen);
+                    if !again {
+                        break;
                     }
                 }
-            });
+                Err(_) => {
+                    // Nothing was installed, so `snapshot_gen` did not advance and the
+                    // snapshot still reports itself stale: the next gated read
+                    // rebuilds in the foreground and surfaces the error to its caller.
+                    // Releasing the claim without clearing the dirty count is
+                    // deliberate, so a later commit retries this pass rather than
+                    // leaving compaction permanently disowned.
+                    cache.cancel_rebuild();
+                    break;
+                }
+            }
         }
     }
 
     /// Append one `AdjEntry` as a new LMDB duplicate value: O(log n), no blob read.
     pub(super) fn append_adj(
         &self,
-        wtxn: &mut heed::RwTxn,
+        wtxn: &mut crate::storage::RwTxn,
         node: NodeId,
         other: NodeId,
         edge_type: u32,
@@ -1301,7 +1349,7 @@ impl Graph {
 
     pub(super) fn adj_entries_impl(
         &self,
-        rtxn: &heed::RoTxn,
+        rtxn: &crate::storage::RoTxn,
         node: NodeId,
         outgoing: bool,
     ) -> Result<Vec<NeighborEntry>, Error> {
@@ -2384,6 +2432,11 @@ mod triangle_cycle_count_tests {
     }
 }
 
+// Persistence-dependent: these close a database and reopen the same path, or copy it
+// to a file. The in-memory backend starts empty on every `open` by design (see
+// `storage::memory`), so their premise does not hold there and the gate states that
+// rather than letting them fail as though the backend were broken.
+#[cfg(feature = "lmdb")]
 #[cfg(test)]
 mod snapshot_only_gate_tests {
     use serde_json::json;

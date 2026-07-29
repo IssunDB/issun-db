@@ -18,7 +18,7 @@ use serde_json::Value;
 
 use crate::error::Error;
 use crate::schema::{EdgeId, EdgeRecord, NodeId, NodeRecord};
-use crate::storage::{lmdb::Storage, props};
+use crate::storage::{Storage, props};
 
 /// Abstracts which LMDB sub-database a column set is built from, so the same
 /// columnar machinery serves both node and edge properties. A source knows how
@@ -38,7 +38,7 @@ pub(crate) trait ColumnSource {
     /// a direct read and a column build cannot decode a record differently.
     fn get_in_txn(
         storage: &Storage,
-        rtxn: &heed::RoTxn,
+        rtxn: &crate::storage::RoTxn,
         id: Self::Id,
     ) -> Result<Option<Value>, Error>;
 
@@ -93,7 +93,7 @@ impl ColumnSource for NodeSource {
 
     fn get_in_txn(
         storage: &Storage,
-        rtxn: &heed::RoTxn,
+        rtxn: &crate::storage::RoTxn,
         id: NodeId,
     ) -> Result<Option<Value>, Error> {
         match storage.nodes.get(rtxn, &id)? {
@@ -129,7 +129,7 @@ impl ColumnSource for EdgeSource {
 
     fn get_in_txn(
         storage: &Storage,
-        rtxn: &heed::RoTxn,
+        rtxn: &crate::storage::RoTxn,
         id: EdgeId,
     ) -> Result<Option<Value>, Error> {
         match storage.edges.get(rtxn, &id)? {

@@ -9,7 +9,7 @@ use arc_swap::ArcSwap;
 use crate::{
     error::Error,
     schema::{AdjEntry, EdgeId, EdgeRecord, NodeId, TypeId},
-    storage::{lmdb::Storage, props},
+    storage::{Storage, props},
 };
 
 /// Minimum number of writes between two successive background rebuilds.
@@ -274,7 +274,7 @@ impl CsrSnapshot {
     /// weight, which a cursor-per-row fill could.
     fn load_weights(
         storage: &Storage,
-        rtxn: &heed::RoTxn,
+        rtxn: &crate::storage::RoTxn,
         row_ptr: &[usize],
         edge_id: &[EdgeId],
         id_to_dense: &AHashMap<NodeId, u32>,

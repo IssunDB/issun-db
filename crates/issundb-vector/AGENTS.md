@@ -61,9 +61,12 @@ Rules for changing this:
   as the capacity dance below, behind `upsert` rather than into the trait.
 - `ExactBackend` compiles in both configurations and has its own tests, so it cannot rot while the feature is on. Do not `cfg` it out to silence a
   dead-code warning; construct it in a test instead.
-- The whole suite must pass in both configurations: `cargo test -p issundb-vector` and `cargo test -p issundb-vector --no-default-features`. A test that
-  genuinely depends on approximate behavior or on quantization belongs behind `#[cfg(feature = "hnsw")]`; none needed it so far, because the quantization
-  test only asserts that well-separated vectors still rank correctly.
+- The whole suite must pass in both configurations. Note that plain `--no-default-features` no longer isolates this crate's own dimension: `lmdb` is a default
+  feature too now, so it also swaps the storage backend for the non-persistent one. The three commands that matter are `cargo test -p issundb-vector` (HNSW,
+  LMDB), `cargo test -p issundb-vector --no-default-features --features lmdb` (exact index, LMDB — the one that covers this crate's storage integration), and
+  `cargo test -p issundb-vector --no-default-features` (exact index, in-memory store, which is the wasm configuration). A test that genuinely depends on
+  approximate behavior or on quantization belongs behind `#[cfg(feature = "hnsw")]`; one that reopens the graph belongs behind `#[cfg(feature = "lmdb")]`, and
+  the four reopen tests here already are.
 
 ### `usearch` API Notes
 

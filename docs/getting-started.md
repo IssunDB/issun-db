@@ -7,10 +7,13 @@ It explains prerequisites, building the engine from source, and using the comman
 
 Compiling IssunDB and its native dependencies requires Rust 1.85.0 or later, along with the following system tools:
 
-- Build tools: a C/C++ compiler (such as Clang or GCC), which compiles the bundled LMDB sources and the vector index. Building with
-  `--no-default-features` drops the vector index and with it the only C++ dependency.
+- Build tools: a C/C++ compiler (such as Clang or GCC), which compiles the bundled LMDB sources and the vector index.
 
 There is nothing else to install: no CMake, no `libclang`, and no OpenMP runtime.
+
+A `--no-default-features` build needs no C or C++ toolchain at all. It selects the in-memory storage backend instead of LMDB and the pure-Rust exact vector index instead of
+HNSW, which is also the configuration that compiles for `wasm32-unknown-unknown`. That build does not persist to disk, so treat it as an embedded or browser target rather
+than a database you reopen.
 
 ## Build from Source
 

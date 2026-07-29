@@ -26,7 +26,7 @@ impl Graph {
 
     pub(super) fn add_edge_impl(
         &self,
-        wtxn: &mut heed::RwTxn,
+        wtxn: &mut crate::storage::RwTxn,
         src: NodeId,
         dst: NodeId,
         etype: &str,
@@ -94,7 +94,7 @@ impl Graph {
 
     pub(super) fn update_edge_impl(
         &self,
-        wtxn: &mut heed::RwTxn,
+        wtxn: &mut crate::storage::RwTxn,
         id: EdgeId,
         props: &impl serde::Serialize,
     ) -> Result<(), Error> {
@@ -136,7 +136,7 @@ impl Graph {
 
     pub(super) fn get_edge_impl(
         &self,
-        txn: &heed::RoTxn,
+        txn: &crate::storage::RoTxn,
         id: EdgeId,
     ) -> Result<Option<EdgeRecord>, Error> {
         match self.storage.edges.get(txn, &id)? {
@@ -166,7 +166,7 @@ impl Graph {
     /// removal, or `None` if no such edge existed.
     pub(crate) fn delete_edge_impl(
         &self,
-        wtxn: &mut heed::RwTxn,
+        wtxn: &mut crate::storage::RwTxn,
         id: EdgeId,
     ) -> Result<Option<(NodeId, NodeId)>, Error> {
         let record: EdgeRecord = match self.get_edge_impl(wtxn, id)? {
@@ -231,7 +231,7 @@ impl Graph {
 
     pub(super) fn out_neighbors_impl(
         &self,
-        rtxn: &heed::RoTxn,
+        rtxn: &crate::storage::RoTxn,
         node: NodeId,
     ) -> Result<Vec<NeighborEntry>, Error> {
         self.adj_entries_impl(rtxn, node, true)
@@ -245,7 +245,7 @@ impl Graph {
 
     pub(super) fn in_neighbors_impl(
         &self,
-        rtxn: &heed::RoTxn,
+        rtxn: &crate::storage::RoTxn,
         node: NodeId,
     ) -> Result<Vec<NeighborEntry>, Error> {
         self.adj_entries_impl(rtxn, node, false)

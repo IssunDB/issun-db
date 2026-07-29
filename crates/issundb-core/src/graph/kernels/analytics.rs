@@ -25,9 +25,24 @@ fn map_dense_range<T: Copy + Send + Default>(
     body: impl Fn(usize, &mut [T]) + Send + Sync,
 ) -> Vec<T> {
     let mut out = vec![T::default(); n];
+    fill_dense_range(&mut out, threads, body);
+    out
+}
+
+/// [`map_dense_range`] into a buffer the caller owns.
+///
+/// The split is for an iterative pass: PageRank alternates two buffers and swaps them,
+/// so it allocates twice rather than once per iteration. On a 1 M-node graph the
+/// allocating form churned 4 MB per iteration inside the hot loop.
+fn fill_dense_range<T: Copy + Send>(
+    out: &mut [T],
+    threads: usize,
+    body: impl Fn(usize, &mut [T]) + Send + Sync,
+) {
+    let n = out.len();
     if threads <= 1 || n == 0 {
-        body(0, &mut out);
-        return out;
+        body(0, out);
+        return;
     }
     let chunk = n.div_ceil(threads);
     std::thread::scope(|scope| {
@@ -49,7 +64,6 @@ fn map_dense_range<T: Copy + Send + Default>(
             }
         }
     });
-    out
 }
 
 impl Graph {
@@ -83,14 +97,14 @@ impl Graph {
             let threads = self.kernel_threads(n.saturating_add(snap.col_idx.len()));
             let base = (1.0 - damping) / n as f32;
             let mut rank = vec![1.0f32 / n as f32; n];
+            // Two buffers for the whole run rather than one allocation per iteration.
+            let mut next = vec![0.0f32; n];
 
             for _ in 0..iterations {
-                // The borrow of `rank` is scoped to the pass so the result can
-                // replace it afterwards.
-                let next = {
+                {
                     let previous = &rank;
                     let out_deg = &out_deg;
-                    map_dense_range(n, threads, move |lo, slice| {
+                    fill_dense_range(&mut next, threads, move |lo, slice| {
                         for (offset, value) in slice.iter_mut().enumerate() {
                             let j = lo + offset;
                             let mut sum = 0.0f32;
@@ -102,9 +116,9 @@ impl Graph {
                             }
                             *value = damping * sum + base;
                         }
-                    })
-                };
-                rank = next;
+                    });
+                }
+                std::mem::swap(&mut rank, &mut next);
             }
 
             Ok(snap

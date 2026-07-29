@@ -48,8 +48,8 @@ use crate::{
     error::Error,
     schema::{AdjEntry, LabelId, NodeId, TypeId},
     storage::{
+        Storage,
         ids::{get_label, get_label_count, get_type, get_type_count},
-        lmdb::Storage,
     },
 };
 
@@ -230,7 +230,7 @@ impl Graph {
     /// a question that also reads the graph resolves and reads one snapshot.
     fn resolve_label_type_in(
         &self,
-        rtxn: &heed::RoTxn,
+        rtxn: &crate::storage::RoTxn,
         label: &str,
         rel_type: &str,
     ) -> Result<Option<(LabelId, TypeId)>, Error> {
@@ -564,7 +564,7 @@ impl Graph {
     /// one.
     fn probe_schema_edge(
         &self,
-        rtxn: &heed::RoTxn,
+        rtxn: &crate::storage::RoTxn,
         src_label: LabelId,
         rel_type: TypeId,
         dst_label: LabelId,

@@ -1,6 +1,6 @@
 use crate::error::Error;
 use crate::schema::{EdgeId, LabelId, NodeId, PropKeyId, TypeId};
-use crate::storage::lmdb::Storage;
+use crate::storage::Storage;
 
 const KEY_NEXT_NODE: &str = "next_node_id";
 const KEY_NEXT_EDGE: &str = "next_edge_id";
@@ -8,7 +8,11 @@ const KEY_NEXT_LABEL: &str = "next_label_id";
 const KEY_NEXT_TYPE: &str = "next_type_id";
 const KEY_NEXT_PROP_KEY: &str = "next_prop_key_id";
 
-fn bump_counter(storage: &Storage, txn: &mut heed::RwTxn, key: &str) -> Result<u64, Error> {
+fn bump_counter(
+    storage: &Storage,
+    txn: &mut crate::storage::RwTxn,
+    key: &str,
+) -> Result<u64, Error> {
     let current = storage
         .meta
         .get(txn, key)?
@@ -24,7 +28,7 @@ fn bump_counter(storage: &Storage, txn: &mut heed::RwTxn, key: &str) -> Result<u
     Ok(current)
 }
 
-pub fn alloc_node_id(storage: &Storage, txn: &mut heed::RwTxn) -> Result<NodeId, Error> {
+pub fn alloc_node_id(storage: &Storage, txn: &mut crate::storage::RwTxn) -> Result<NodeId, Error> {
     bump_counter(storage, txn, KEY_NEXT_NODE)
 }
 
@@ -32,7 +36,7 @@ pub fn alloc_node_id(storage: &Storage, txn: &mut heed::RwTxn) -> Result<NodeId,
 /// This is an upper bound on the live node count, because it does not decrease
 /// when a node is deleted, so it is intended for planning estimates rather than
 /// exact counts. O(1): a single `meta` lookup.
-pub fn node_high_water(storage: &Storage, txn: &heed::RoTxn) -> Result<u64, Error> {
+pub fn node_high_water(storage: &Storage, txn: &crate::storage::RoTxn) -> Result<u64, Error> {
     match storage.meta.get(txn, KEY_NEXT_NODE)? {
         Some(b) => {
             let arr: [u8; 8] = b
@@ -44,14 +48,14 @@ pub fn node_high_water(storage: &Storage, txn: &heed::RoTxn) -> Result<u64, Erro
     }
 }
 
-pub fn alloc_edge_id(storage: &Storage, txn: &mut heed::RwTxn) -> Result<EdgeId, Error> {
+pub fn alloc_edge_id(storage: &Storage, txn: &mut crate::storage::RwTxn) -> Result<EdgeId, Error> {
     bump_counter(storage, txn, KEY_NEXT_EDGE)
 }
 
 /// Returns the existing `LabelId` for `name`, or allocates a new one.
 pub fn get_or_create_label(
     storage: &Storage,
-    txn: &mut heed::RwTxn,
+    txn: &mut crate::storage::RwTxn,
     name: &str,
 ) -> Result<LabelId, Error> {
     let meta_key = format!("label:{name}");
@@ -69,7 +73,7 @@ pub fn get_or_create_label(
 /// Returns the existing `TypeId` for `name`, or allocates a new one.
 pub fn get_or_create_type(
     storage: &Storage,
-    txn: &mut heed::RwTxn,
+    txn: &mut crate::storage::RwTxn,
     name: &str,
 ) -> Result<TypeId, Error> {
     let meta_key = format!("type:{name}");
@@ -87,7 +91,7 @@ pub fn get_or_create_type(
 /// Adjusts the count of a label in the meta database.
 pub fn adjust_label_count(
     storage: &Storage,
-    txn: &mut heed::RwTxn,
+    txn: &mut crate::storage::RwTxn,
     label_id: LabelId,
     delta: i64,
 ) -> Result<(), Error> {
@@ -111,7 +115,7 @@ pub fn adjust_label_count(
 /// Retrieves the count of a label from the meta database.
 pub fn get_label_count(
     storage: &Storage,
-    txn: &heed::RoTxn,
+    txn: &crate::storage::RoTxn,
     label_id: LabelId,
 ) -> Result<u64, Error> {
     let key = format!("stats:l:{label_id}");
@@ -132,7 +136,7 @@ pub fn get_label_count(
 /// Adjusts the count of an edge type in the meta database.
 pub fn adjust_type_count(
     storage: &Storage,
-    txn: &mut heed::RwTxn,
+    txn: &mut crate::storage::RwTxn,
     type_id: TypeId,
     delta: i64,
 ) -> Result<(), Error> {
@@ -154,7 +158,11 @@ pub fn adjust_type_count(
 }
 
 /// Retrieves the count of an edge type from the meta database.
-pub fn get_type_count(storage: &Storage, txn: &heed::RoTxn, type_id: TypeId) -> Result<u64, Error> {
+pub fn get_type_count(
+    storage: &Storage,
+    txn: &crate::storage::RoTxn,
+    type_id: TypeId,
+) -> Result<u64, Error> {
     let key = format!("stats:t:{type_id}");
     let count = storage
         .meta
@@ -173,7 +181,7 @@ pub fn get_type_count(storage: &Storage, txn: &heed::RoTxn, type_id: TypeId) -> 
 /// Returns the existing `PropKeyId` for `name`, or allocates a new one.
 pub fn get_or_create_prop_key(
     storage: &Storage,
-    txn: &mut heed::RwTxn,
+    txn: &mut crate::storage::RwTxn,
     name: &str,
 ) -> Result<PropKeyId, Error> {
     let meta_key = format!("prop_key:{name}");
@@ -194,7 +202,7 @@ pub fn get_or_create_prop_key(
 /// Returns the existing `LabelId` for `name` if it exists.
 pub fn get_label(
     storage: &Storage,
-    txn: &heed::RoTxn,
+    txn: &crate::storage::RoTxn,
     name: &str,
 ) -> Result<Option<LabelId>, Error> {
     let meta_key = format!("label:{name}");
@@ -208,7 +216,11 @@ pub fn get_label(
 }
 
 /// Returns the existing `TypeId` for `name` if it exists.
-pub fn get_type(storage: &Storage, txn: &heed::RoTxn, name: &str) -> Result<Option<TypeId>, Error> {
+pub fn get_type(
+    storage: &Storage,
+    txn: &crate::storage::RoTxn,
+    name: &str,
+) -> Result<Option<TypeId>, Error> {
     let meta_key = format!("type:{name}");
     if let Some(b) = storage.meta.get(txn, &meta_key)? {
         let arr: [u8; 4] = b
@@ -222,7 +234,7 @@ pub fn get_type(storage: &Storage, txn: &heed::RoTxn, name: &str) -> Result<Opti
 /// Returns the existing `PropKeyId` for `name` if it exists.
 pub fn get_prop_key(
     storage: &Storage,
-    txn: &heed::RoTxn,
+    txn: &crate::storage::RoTxn,
     name: &str,
 ) -> Result<Option<PropKeyId>, Error> {
     let meta_key = format!("prop_key:{name}");
@@ -238,7 +250,7 @@ pub fn get_prop_key(
 /// Returns the string name for a `PropKeyId` if it exists.
 pub fn get_prop_key_name(
     storage: &Storage,
-    txn: &heed::RoTxn,
+    txn: &crate::storage::RoTxn,
     id: PropKeyId,
 ) -> Result<Option<String>, Error> {
     let key = format!("prop_key_name:{id}");

@@ -27,7 +27,30 @@ These invariants must hold after every successful write transaction:
    entries for the deleted node. Failing to maintain this invariant causes `has_node_property_index` to return stale results and the Cypher optimizer
    to emit incorrect `NodeIndexScan` plans.
 
+## Storage Backends
+
+The engine is selected at compile time from the `lmdb` feature: on by default it is LMDB (`storage/lmdb.rs`), and with `--no-default-features` it is the
+in-memory backend (`storage/memory.rs`). The contract both owe is documented on `storage/mod.rs`; read that before changing either.
+
+- `heed` is named in exactly two places, both inside `storage/`. Everything else names the aliases `storage::{RoTxn, OwnedRoTxn, RwTxn}` and the twelve tables on
+  `Storage`. Do not reintroduce a `heed::` path elsewhere, and do not "simplify" the aliases away: they are what let a second backend exist at all.
+- `RoTxn` is the *parameter* alias and is deliberately the thread-local-agnostic flavour, because a write transaction derefs to it. That is what lets a write
+  path hand its `RwTxn` to a read helper, which ~90 signatures rely on. `OwnedRoTxn` is the owned flavour, used only by `ReadTxn`'s field.
+- Do not turn this into a trait. The tables hang off `Storage` which hangs off `Graph`, so a trait makes `Graph` generic over its backend and pushes that
+  parameter through every crate and the public API.
+- Three of the contract's guarantees are load-bearing rather than incidental LMDB behaviour, and a new backend that misses one breaks callers silently: key
+  order is byte order (a `u64` key is stored big-endian so byte and numeric order agree, which the CSR build relies on when it treats `out_adj` as grouped by
+  ascending node id); duplicate order is byte order (which the CSR row-reordering pass relies on); and an uncommitted transaction leaves nothing behind.
+- A read transaction opened *while* a write transaction is live must work, and must see committed state. A write statement such as `MATCH ... CREATE` does
+  exactly that. A single reader-writer lock deadlocks on it, which is why the in-memory backend is copy-on-write.
+- Anything that is a file operation belongs on `Storage`, not on `Graph`: `copy_to_file` and `restore_from_file` are there so a backend without files refuses
+  both halves rather than one. `Graph::backup` and `Graph::restore` are thin delegations.
+- The in-memory backend does not persist, so a reopen sees an empty graph. Tests whose premise is reopen or backup are gated on `#[cfg(feature = "lmdb")]` and
+  say so; a new test in that class needs the same gate.
+
 ## LMDB Lifetime Rules
+
+These apply to the LMDB backend, which is the default and the only persistent one.
 
 - Transactions must not escape the function that opened them. Open a `RoTxn` or `RwTxn`, use it, then commit (write) or drop (read) before returning.
 - `RoTxn` is cheap to create; open one per read call rather than storing it across calls.
@@ -207,9 +230,10 @@ Two rules matter when adding or changing one, because both have been silently vi
   first. Brandes accumulates over sources and predecessors in that same order, which is what makes a betweenness total reproducible run to run rather
   than merely close.
 
-## The 12 LMDB Sub-databases
+## The 12 Sub-databases
 
-All sub-databases are opened once by `Storage::open` in `storage/lmdb.rs`:
+All twelve are opened once by `Storage::open` — in `storage/lmdb.rs` for the default backend, and mirrored field for field by `storage/memory.rs`. The layout
+below is the LMDB one; a second backend has to reproduce its key encoding and ordering, not just its field names:
 
 | Name            | Key                                                        | Value                                 | Notes                                                                                                                                                                                                  |
 |-----------------|------------------------------------------------------------|---------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|

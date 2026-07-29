@@ -3,7 +3,7 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("storage: {0}")]
-    Storage(#[from] heed::Error),
+    Storage(#[from] crate::storage::StorageError),
 
     #[error("encode: {0}")]
     Encode(#[from] rmp_serde::encode::Error),

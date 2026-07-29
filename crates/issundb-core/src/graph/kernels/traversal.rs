@@ -95,6 +95,8 @@ impl Graph {
     ) -> Result<(Vec<NodeId>, bool), Error> {
         self.with_snapshot(|snap| {
             let n = snap.dense_to_id.len();
+            // No seeds asked for, or nothing to search: neither is a cap cutting
+            // anything off, so this is a complete result rather than a truncated one.
             if seeds.is_empty() || n == 0 {
                 return Ok((vec![], false));
             }
@@ -119,7 +121,10 @@ impl Graph {
                 visited += 1;
             }
             if visited == 0 {
-                return Ok((vec![], false));
+                // `truncated` rather than `false`: a cap of zero admits no seed at all,
+                // and that is a fully cut-off result, not an empty graph. Reporting it
+                // as complete is what `Subgraph::truncated` exists to prevent.
+                return Ok((vec![], truncated));
             }
             frontier.sort_unstable();
 
@@ -184,7 +189,12 @@ impl Graph {
         // CSR is readable; for a small source set the per-source LMDB
         // point reads (always fresh) are cheaper, so an interleaved
         // write-then-expand workload never pays a rebuild.
-        if self.csr_cache.snapshot_is_stale() && src_nodes.len() <= STALE_POINT_EXPAND_MAX {
+        // Asked, not re-derived: `prefers_point_expansion` is `pub` precisely so the
+        // Cypher executor can consult the same rule from another crate when it decides
+        // whether to collapse a hop. Two copies of the condition would let a change to
+        // the threshold leave this path routing by the old rule and the executor by the
+        // new one.
+        if self.prefers_point_expansion(src_nodes.len()) {
             let mut results = Vec::new();
             for &src in src_nodes {
                 let neighbors = if is_incoming {
@@ -405,6 +415,28 @@ mod tests {
         let (all, truncated) = g.bfs_multi_source(&[hub], 1, Some(5)).unwrap();
         assert_eq!(all.len(), 5);
         assert!(!truncated);
+    }
+
+    /// A cap that admits no seed at all is a fully cut-off result, not an empty
+    /// graph, so it must still report truncation. `retrieve`'s `Subgraph::truncated`
+    /// is documented to distinguish exactly these two, and an empty subgraph claiming
+    /// to be complete reads as "these nodes are unconnected".
+    #[test]
+    fn multi_source_bfs_reports_truncation_when_the_cap_admits_no_seed() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("N", &()).unwrap();
+        let b = g.add_node("N", &()).unwrap();
+        g.add_edge(a, b, "E", &()).unwrap();
+        g.rebuild_csr().unwrap();
+
+        let (nodes, truncated) = g.bfs_multi_source(&[a], 2, Some(0)).unwrap();
+        assert!(nodes.is_empty());
+        assert!(truncated, "a reachable graph cut off entirely is truncated");
+
+        // A seed that is simply absent is a different thing: nothing was cut off.
+        let (nodes, truncated) = g.bfs_multi_source(&[999_999], 2, None).unwrap();
+        assert!(nodes.is_empty());
+        assert!(!truncated, "an unknown seed is not a truncation");
     }
 
     /// Duplicate seeds must count once, or the cap and the flag would describe a

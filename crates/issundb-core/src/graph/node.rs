@@ -33,7 +33,7 @@ impl Graph {
 
     pub(super) fn add_node_impl(
         &self,
-        wtxn: &mut heed::RwTxn,
+        wtxn: &mut crate::storage::RwTxn,
         labels: &[&str],
         props: &impl Serialize,
     ) -> Result<NodeId, Error> {
@@ -76,7 +76,7 @@ impl Graph {
     /// node insertion, node update, and label addition.
     fn index_node_for_label(
         &self,
-        wtxn: &mut heed::RwTxn,
+        wtxn: &mut crate::storage::RwTxn,
         label_id: LabelId,
         label_name: &str,
         node_id: NodeId,
@@ -165,7 +165,7 @@ impl Graph {
     #[allow(clippy::too_many_arguments)]
     fn check_node_property_unique(
         &self,
-        wtxn: &heed::RwTxn,
+        wtxn: &crate::storage::RwTxn,
         label_id: LabelId,
         label_name: &str,
         prop_key_id: PropKeyId,
@@ -218,7 +218,7 @@ impl Graph {
     /// single label. Shared by node update, node deletion, and label removal.
     fn unindex_node_for_label(
         &self,
-        wtxn: &mut heed::RwTxn,
+        wtxn: &mut crate::storage::RwTxn,
         label_id: LabelId,
         node_id: NodeId,
         props_json: &serde_json::Value,
@@ -264,7 +264,7 @@ impl Graph {
 
     pub(super) fn get_node_impl(
         &self,
-        txn: &heed::RoTxn,
+        txn: &crate::storage::RoTxn,
         id: NodeId,
     ) -> Result<Option<NodeRecord>, Error> {
         match self.storage.nodes.get(txn, &id)? {
@@ -292,7 +292,7 @@ impl Graph {
 
     pub(super) fn update_node_impl(
         &self,
-        wtxn: &mut heed::RwTxn,
+        wtxn: &mut crate::storage::RwTxn,
         id: NodeId,
         props: &impl Serialize,
     ) -> Result<(), Error> {
@@ -341,7 +341,7 @@ impl Graph {
 
     pub(super) fn add_label_impl(
         &self,
-        wtxn: &mut heed::RwTxn,
+        wtxn: &mut crate::storage::RwTxn,
         id: NodeId,
         label: &str,
     ) -> Result<(), Error> {
@@ -380,7 +380,7 @@ impl Graph {
 
     pub(super) fn remove_label_impl(
         &self,
-        wtxn: &mut heed::RwTxn,
+        wtxn: &mut crate::storage::RwTxn,
         id: NodeId,
         label: &str,
     ) -> Result<(), Error> {
@@ -416,7 +416,7 @@ impl Graph {
 
     pub(super) fn node_labels_impl(
         &self,
-        rtxn: &heed::RoTxn,
+        rtxn: &crate::storage::RoTxn,
         id: NodeId,
     ) -> Result<Vec<String>, Error> {
         match self.get_node_impl(rtxn, id)? {
@@ -450,7 +450,11 @@ impl Graph {
         Ok(())
     }
 
-    pub(super) fn delete_node_impl(&self, wtxn: &mut heed::RwTxn, id: NodeId) -> Result<(), Error> {
+    pub(super) fn delete_node_impl(
+        &self,
+        wtxn: &mut crate::storage::RwTxn,
+        id: NodeId,
+    ) -> Result<(), Error> {
         let record: NodeRecord = match self.storage.nodes.get(wtxn, &id)? {
             Some(bytes) => props::decode(bytes)?,
             None => return Ok(()),

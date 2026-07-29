@@ -929,6 +929,10 @@ mod tests {
         );
     }
 
+    // Persistence-dependent: reopens the same path and expects the stored embeddings
+    // or configuration to still be there. The in-memory storage backend starts empty
+    // on every open by design, so this is gated rather than left to fail there.
+    #[cfg(feature = "lmdb")]
     #[test]
     fn vector_index_rebuilds_from_lmdb_on_reopen() {
         let dir = TempDir::new().unwrap();
@@ -1027,6 +1031,10 @@ mod tests {
         assert!(hits.iter().any(|h| h.node == blue2));
     }
 
+    // Persistence-dependent: reopens the same path and expects the stored embeddings
+    // or configuration to still be there. The in-memory storage backend starts empty
+    // on every open by design, so this is gated rather than left to fail there.
+    #[cfg(feature = "lmdb")]
     #[test]
     fn rejected_upsert_does_not_persist_and_brick_reopen() {
         // A dimension-mismatched upsert must not leave bytes in LMDB. If it did,
@@ -1051,6 +1059,10 @@ mod tests {
         assert_eq!(hits[0].node, a);
     }
 
+    // Persistence-dependent: reopens the same path and expects the stored embeddings
+    // or configuration to still be there. The in-memory storage backend starts empty
+    // on every open by design, so this is gated rather than left to fail there.
+    #[cfg(feature = "lmdb")]
     #[test]
     fn configure_vector_index_persists_metric_across_reopen() {
         let dir = TempDir::new().unwrap();
@@ -1115,6 +1127,10 @@ mod tests {
         ));
     }
 
+    // Persistence-dependent: reopens the same path and expects the stored embeddings
+    // or configuration to still be there. The in-memory storage backend starts empty
+    // on every open by design, so this is gated rather than left to fail there.
+    #[cfg(feature = "lmdb")]
     #[test]
     fn reindex_vector_index_switches_metric_on_populated_graph() {
         let dir = TempDir::new().unwrap();

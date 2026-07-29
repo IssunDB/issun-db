@@ -37,5 +37,7 @@ harness = false
 # On by default, so an ordinary build is unchanged and gets the approximate HNSW
 # index. Turning it off drops the workspace's only C++ dependency and falls back to
 # an exact scan; see `src/backend.rs` for what that costs and what it preserves.
-default = ["hnsw"]
+default = ["hnsw", "lmdb"]
 hnsw = ["dep:usearch"]
+# Forwarded to the storage backend selection in `issundb-core`.
+lmdb = ["issundb-core/lmdb"]

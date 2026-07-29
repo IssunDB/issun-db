@@ -117,6 +117,8 @@ mod tests {
         assert!(missing.is_empty());
     }
 
+    // Persistence-dependent; see the note on `storage::memory`.
+    #[cfg(feature = "lmdb")]
     #[test]
     fn label_idx_consistent_across_reopen() {
         let dir = TempDir::new().unwrap();
@@ -162,6 +164,8 @@ mod tests {
         assert_eq!(out[0].edge, eid);
     }
 
+    // Persistence-dependent; see the note on `storage::memory`.
+    #[cfg(feature = "lmdb")]
     #[test]
     fn csr_snapshot_rebuilds_correctly_on_reopen() {
         let dir = TempDir::new().unwrap();

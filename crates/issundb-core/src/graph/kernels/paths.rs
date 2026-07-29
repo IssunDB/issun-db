@@ -467,9 +467,21 @@ impl Graph {
                 if cur_level == UNREACHED {
                     return Ok(());
                 }
+                // Walk distinct predecessors, not incoming edges. `adj_entries` yields
+                // one entry per edge, so two edges from the same predecessor would
+                // recurse twice and emit the same node sequence twice. A path is a
+                // sequence of nodes, so that is one path; the betweenness kernel counts
+                // distinct predecessor pairs for the same reason, and the two must agree
+                // about what a shortest path is.
+                //
+                // A set, not a comparison against the previous entry: `in_adj` is
+                // `DUPSORT` over `AdjEntry`, whose byte layout puts `edge_type` ahead of
+                // `other`, so one predecessor reached by two different relationship types
+                // is separated by every entry whose type sorts between them.
+                let mut seen: AHashSet<NodeId> = AHashSet::new();
                 for ne in graph.adj_entries(u, false)? {
                     if let Some(&pred) = snap.id_to_dense.get(&ne.node) {
-                        if levels[pred as usize] == cur_level - 1 {
+                        if levels[pred as usize] == cur_level - 1 && seen.insert(ne.node) {
                             current_path.push(ne.node);
                             reconstruct(graph, snap, ne.node, src, levels, current_path, paths)?;
                             current_path.pop();
@@ -897,5 +909,60 @@ mod tests {
 
         let path = g.shortest_path_dijkstra(a, c).unwrap().unwrap();
         assert_eq!(path.total_weight, 4.0);
+    }
+}
+
+#[cfg(test)]
+mod multigraph_tests {
+    use tempfile::TempDir;
+
+    use crate::Graph;
+
+    /// A shortest path is a sequence of nodes, so a second edge between an already
+    /// joined pair is not a second path. The same rule is pinned for betweenness in
+    /// `kernels::analytics`, which counts distinct predecessor pairs for exactly this
+    /// reason; the two kernels must agree about what a shortest path is.
+    #[test]
+    fn all_shortest_paths_ignores_parallel_edges() {
+        let dir = TempDir::new().unwrap();
+        let g = Graph::open(dir.path(), 1).unwrap();
+        let nodes: Vec<_> = (0..4).map(|_| g.add_node("N", &()).unwrap()).collect();
+        // Diamond a->b->d and a->c->d, with b->d doubled.
+        g.add_edge(nodes[0], nodes[1], "E", &()).unwrap();
+        g.add_edge(nodes[1], nodes[3], "E", &()).unwrap();
+        g.add_edge(nodes[1], nodes[3], "E", &()).unwrap();
+        g.add_edge(nodes[0], nodes[2], "E", &()).unwrap();
+        g.add_edge(nodes[2], nodes[3], "E", &()).unwrap();
+        g.rebuild_csr().unwrap();
+
+        let paths = g.all_shortest_paths(nodes[0], nodes[3]).unwrap();
+        assert_eq!(
+            paths.len(),
+            2,
+            "two distinct shortest paths, not one per edge: {paths:?}"
+        );
+    }
+
+    /// The duplicate predecessor need not arrive consecutively. `in_adj` is `DUPSORT`
+    /// over `AdjEntry`, whose byte layout puts `edge_type` before `other`, so the same
+    /// predecessor reached by two *different* relationship types is separated by any
+    /// entry whose type sorts between them. A check against only the previous entry
+    /// misses that, which is why the dedup is a set.
+    #[test]
+    fn all_shortest_paths_dedups_a_predecessor_split_across_types() {
+        let dir = TempDir::new().unwrap();
+        let g = Graph::open(dir.path(), 1).unwrap();
+        let nodes: Vec<_> = (0..4).map(|_| g.add_node("N", &()).unwrap()).collect();
+        g.add_edge(nodes[0], nodes[1], "E", &()).unwrap();
+        g.add_edge(nodes[0], nodes[2], "E", &()).unwrap();
+        // Into d: b via type A, c via type B, then b again via type C. Ordered by type,
+        // b's two entries sit either side of c's.
+        g.add_edge(nodes[1], nodes[3], "A", &()).unwrap();
+        g.add_edge(nodes[2], nodes[3], "B", &()).unwrap();
+        g.add_edge(nodes[1], nodes[3], "C", &()).unwrap();
+        g.rebuild_csr().unwrap();
+
+        let paths = g.all_shortest_paths(nodes[0], nodes[3]).unwrap();
+        assert_eq!(paths.len(), 2, "one path per distinct route: {paths:?}");
     }
 }

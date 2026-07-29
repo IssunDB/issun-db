@@ -118,7 +118,11 @@ modules according to this map.
       Both the counting kernels' scoped threads and the analytics passes that split over nodes or sources resolve through it (`Graph::kernel_threads`),
       so the one knob has one meaning and two overlapping passes cannot each claim the whole machine. `OMP_NUM_THREADS` is honored because setting it is
       how a caller caps parallelism process-wide, including this repository's own `test` and `coverage` targets.
-    - `src/error.rs`: `Error` enum; all storage and serialization errors unify here.
+    - `src/storage/memory.rs`: the in-memory storage backend, second implementor of the contract in `storage/mod.rs`. Byte-ordered `BTreeMap` tables with
+      `BTreeSet` duplicate values, copy-on-write transactions over `ArcSwap`, and a single writer lock. It is what a target with no libc compiles, and it is
+      what holds the storage seam to something: the whole suite runs against it (883 tests across core, vector, text, retrieval, and cypher).
+    - `src/error.rs`: `Error` enum; all storage and serialization errors unify here. `Error::Storage` carries `storage::StorageError`, which is the selected
+      backend's error type, so the variant is `heed::Error` on a default build and unchanged from before the backend split.
 - `crates/issundb-cypher/`: Cypher parser, AST, logical planner, physical planner, optimizer, and executor.
     - `src/parser.rs`: Cypher parser built with the `chumsky` parser-combinator library (with a Pratt parser for operator-precedence expressions),
       covering MATCH (including inline relationship property maps and multi-label node patterns such as `(n:A:B)`), WHERE, RETURN, CREATE, SET
@@ -273,7 +277,23 @@ modules according to this map.
       `REBUILD_THRESHOLD` writes is a compaction safety net, not the freshness path; callers needing a guaranteed fresh CSR view still call
       `rebuild_csr`. Point adjacency lookups (`out_neighbors`, `in_neighbors`, `all_neighbors`) read the `out_adj` and `in_adj` stores directly through
       the transaction, never the snapshot, so they always reflect committed and in-transaction writes.
-- `Storage::open` is the only entry point for LMDB. Do not call `heed::EnvOpenOptions` from outside `crates/issundb-core/src/storage/lmdb.rs`.
+- `Storage::open` is the only entry point for the storage engine, and the engine is selected at compile time from the `lmdb` feature: on by default it is LMDB
+  (`storage/lmdb.rs`), and with `--no-default-features` it is the in-memory backend (`storage/memory.rs`). `heed` is named in exactly two places, both inside
+  `storage/`, so nothing above the storage module knows which engine it is talking to; everything else names the aliases `storage::{RoTxn, OwnedRoTxn, RwTxn}`
+  and the twelve tables on `Storage`. Do not reintroduce a `heed::` path outside `storage/`, and do not turn this into a trait: the tables hang off `Storage`
+  which hangs off `Graph`, so a trait would make `Graph` generic over its backend and push that parameter through every crate and the public API.
+  The contract a backend owes is documented on `storage/mod.rs`, and three of its guarantees are load-bearing rather than incidental: key order is byte order
+  (a `u64` key is stored big-endian so byte order and numeric order agree, which is what lets the CSR build assume `out_adj` arrives grouped by ascending node
+  id), duplicate order is byte order (which the CSR row-reordering pass depends on), and an uncommitted transaction publishes nothing. The in-memory backend is
+  copy-on-write for the third: a reader loads the published table set and a writer publishes its own copy at commit, which is also what makes a read
+  transaction opened *while* a write transaction is live legal. That is not a nicety, it is required: a `MATCH ... CREATE` statement runs its match against
+  committed state through a separate read transaction while its own write transaction is still open, and a single reader-writer lock deadlocks on exactly that.
+  The in-memory backend does not persist, so a reopen sees an empty graph; the handful of tests whose premise is reopen or backup are gated on the `lmdb`
+  feature and say so.
+- The `lmdb` feature is forwarded by every crate between the facade and core, and each of their workspace declarations carries `default-features = false`, or a
+  sibling silently re-enables LMDB for the whole graph. Verify a change to that plumbing with `cargo tree -p issundb --no-default-features | grep lmdb`, which
+  must print nothing. Note that a whole-workspace `--no-default-features` build does *not* select the in-memory backend, because `issundb-cli` and the other
+  consumer crates depend on the facade with its defaults and cargo unifies features; test the backend per crate (`cargo test -p issundb-core --no-default-features`).
 - Heavy dependencies are tracked in the workspace `Cargo.toml`. `chumsky` is an active, non-optional dependency; `usearch` is the workspace's only
   C++ dependency and sits behind the default-on `hnsw` feature. The graph algorithms are pure Rust over the CSR snapshot, so the build needs no CMake,
   no Clang, no bindgen, and no OpenMP runtime.

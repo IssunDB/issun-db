@@ -405,13 +405,13 @@ impl<'a> WriteTxn<'a> {
 
     #[doc(hidden)]
     pub fn has_node_text_index(&self, label: &str, property: &str) -> Result<bool, Error> {
-        let rtxn: &heed::RoTxn = &self.wtxn;
+        let rtxn: &crate::storage::RoTxn = &self.wtxn;
         self.graph.has_node_text_index_impl(rtxn, label, property)
     }
 
     #[doc(hidden)]
     pub fn fts_stats(&self, label: &str, property: &str) -> Result<Option<(u64, u64)>, Error> {
-        let rtxn: &heed::RoTxn = &self.wtxn;
+        let rtxn: &crate::storage::RoTxn = &self.wtxn;
         self.graph.fts_stats_impl(rtxn, label, property)
     }
 
@@ -422,7 +422,7 @@ impl<'a> WriteTxn<'a> {
         property: &str,
         node_id: NodeId,
     ) -> Result<Option<u32>, Error> {
-        let rtxn: &heed::RoTxn = &self.wtxn;
+        let rtxn: &crate::storage::RoTxn = &self.wtxn;
         self.graph.fts_doc_len_impl(rtxn, label, property, node_id)
     }
 
@@ -433,7 +433,7 @@ impl<'a> WriteTxn<'a> {
         property: &str,
         term: &str,
     ) -> Result<Vec<(NodeId, u32)>, Error> {
-        let rtxn: &heed::RoTxn = &self.wtxn;
+        let rtxn: &crate::storage::RoTxn = &self.wtxn;
         self.graph.fts_postings_impl(rtxn, label, property, term)
     }
 
@@ -452,7 +452,7 @@ impl<'a> WriteTxn<'a> {
 
     #[doc(hidden)]
     pub fn active_text_indexes(&self) -> Result<Vec<(String, String, Language)>, Error> {
-        let rtxn: &heed::RoTxn = &self.wtxn;
+        let rtxn: &crate::storage::RoTxn = &self.wtxn;
         self.graph.active_text_indexes_impl(rtxn)
     }
 }
@@ -1062,6 +1062,8 @@ mod tests {
         assert!(a2.is_ok());
     }
 
+    // Persistence-dependent; see the note on `storage::memory`.
+    #[cfg(feature = "lmdb")]
     #[test]
     fn backup_and_restore_roundtrip() {
         let dir = TempDir::new().unwrap();
@@ -1089,6 +1091,8 @@ mod tests {
         assert_eq!(props["x"], serde_json::json!(42));
     }
 
+    // Persistence-dependent; see the note on `storage::memory`.
+    #[cfg(feature = "lmdb")]
     #[test]
     fn backup_compact_and_restore_roundtrip() {
         let dir = TempDir::new().unwrap();

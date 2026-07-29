@@ -20,13 +20,12 @@ use crate::{
         NodeId, NodeRecord, PropKeyId, PropValue, TypeId, WeightedPath,
     },
     storage::{
-        fts,
+        Storage, fts,
         ids::{
             adjust_label_count, adjust_type_count, alloc_edge_id, alloc_node_id, get_label,
             get_or_create_label, get_or_create_prop_key, get_or_create_type, get_prop_key,
             get_prop_key_name, get_type,
         },
-        lmdb::Storage,
         props,
     },
 };
@@ -489,13 +488,13 @@ pub struct Graph {
 /// A read-only transaction on the graph.
 pub struct ReadTxn<'a> {
     pub(super) graph: &'a Graph,
-    pub(super) rtxn: heed::RoTxn<'a, heed::WithTls>,
+    pub(super) rtxn: crate::storage::OwnedRoTxn<'a>,
 }
 
 /// A read-write transaction on the graph.
 pub struct WriteTxn<'a> {
     pub(super) graph: &'a Graph,
-    pub(super) wtxn: heed::RwTxn<'a>,
+    pub(super) wtxn: crate::storage::RwTxn<'a>,
     pub(super) mutations_count: usize,
     /// Structural mutations staged during this transaction, flushed to the
     /// `CsrCache` only on commit so an aborted transaction records nothing.
@@ -1070,7 +1069,7 @@ impl Graph {
     /// deliberate: see [`crate::csr::CsrCache::advance_write_gen`].
     pub(super) fn commit_and_publish(
         &self,
-        wtxn: heed::RwTxn<'_>,
+        wtxn: crate::storage::RwTxn<'_>,
         count: usize,
     ) -> Result<(), Error> {
         wtxn.commit()?;
@@ -1122,11 +1121,7 @@ impl Graph {
     /// To restore, create an empty directory, copy the snapshot file to
     /// `<dir>/data.mdb`, then call `Graph::open(<dir>, map_size_gb)`.
     pub fn backup(&self, destination: &Path) -> Result<(), Error> {
-        self.storage
-            .env
-            .copy_to_path(destination, heed::CompactionOption::Disabled)
-            .map(|_| ())
-            .map_err(Error::Storage)
+        self.storage.copy_to_file(destination, false)
     }
 
     /// Same as `backup` but compacts the database during the copy.
@@ -1134,11 +1129,7 @@ impl Graph {
     /// The resulting file is smaller than a raw backup but the operation
     /// takes longer because it rewrites every live page.
     pub fn backup_compact(&self, destination: &Path) -> Result<(), Error> {
-        self.storage
-            .env
-            .copy_to_path(destination, heed::CompactionOption::Enabled)
-            .map(|_| ())
-            .map_err(Error::Storage)
+        self.storage.copy_to_file(destination, true)
     }
 
     /// Restore a backup snapshot created by `backup` or `backup_compact` into
@@ -1147,24 +1138,12 @@ impl Graph {
     /// Creates `dst_dir` if it does not exist, then copies `snapshot_file` into
     /// `dst_dir/data.mdb`. After this call succeeds the caller can open the
     /// restored database with `Graph::open(dst_dir, map_size_gb)`.
+    /// Delegates to the storage backend, which is what makes the pair symmetric: a
+    /// backend that cannot produce a snapshot (`backup`) must not claim to consume
+    /// one. Leaving the copy here meant the in-memory backend reported a successful
+    /// restore having restored nothing, while its `backup` correctly refused.
     pub fn restore(snapshot_file: &Path, dst_dir: &Path) -> Result<(), Error> {
-        let dst_file = dst_dir.join("data.mdb");
-        // Refuse a destination that already holds a database. The copy below
-        // truncates, so without this the call silently destroys whatever was there
-        // and still reports success, including the caller's own open database.
-        // The check lives here rather than in any one front end because every
-        // caller reaches the same `fs::copy`: the CLI, the Python binding's
-        // `restore`, and any library consumer of the facade.
-        if dst_file.exists() {
-            return Err(Error::InvalidArgument(format!(
-                "{} already contains a database (data.mdb); restore into a new or \
-                 empty directory rather than overwriting it",
-                dst_dir.display()
-            )));
-        }
-        std::fs::create_dir_all(dst_dir)?;
-        std::fs::copy(snapshot_file, &dst_file)?;
-        Ok(())
+        Storage::restore_from_file(snapshot_file, dst_dir)
     }
 }
 
@@ -1336,6 +1315,11 @@ mod encode_tests {
     }
 }
 
+// Persistence-dependent: these close a database and reopen the same path, or copy it
+// to a file. The in-memory backend starts empty on every `open` by design (see
+// `storage::memory`), so their premise does not hold there and the gate states that
+// rather than letting them fail as though the backend were broken.
+#[cfg(feature = "lmdb")]
 #[cfg(test)]
 mod restore_tests {
     use serde_json::json;
@@ -1483,6 +1467,11 @@ mod publish_tests {
     }
 }
 
+// Persistence-dependent: these close a database and reopen the same path, or copy it
+// to a file. The in-memory backend starts empty on every `open` by design (see
+// `storage::memory`), so their premise does not hold there and the gate states that
+// rather than letting them fail as though the backend were broken.
+#[cfg(feature = "lmdb")]
 #[cfg(test)]
 mod lazy_open_tests {
     use serde_json::json;
