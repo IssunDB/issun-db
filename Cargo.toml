@@ -18,7 +18,7 @@ rust-version = "1.85.0"
 
 
 [workspace.dependencies]
-issundb = { path = "crates/issundb", version = "0.1.0-alpha.20" }
+issundb = { path = "crates/issundb", version = "0.1.0-alpha.20", default-features = false }
 issundb-core = { path = "crates/issundb-core", version = "0.1.0-alpha.20", default-features = false }
 issundb-vector = { path = "crates/issundb-vector", version = "0.1.0-alpha.20", default-features = false }
 issundb-text = { path = "crates/issundb-text", version = "0.1.0-alpha.20", default-features = false }
@@ -37,13 +37,6 @@ crossbeam = "0.8"
 thiserror = "2"
 anyhow = "1"
 tracing = "0.1"
-# `default-features = false` here, not in each member: cargo ignores a member's
-# `default-features = false` unless the workspace declaration sets it too. The default
-# feature dropped is `runtime-rng`, which seeds ahash's hasher from the OS RNG and so
-# pulls in `getrandom`; that crate has no default backend on `wasm32-unknown-unknown`
-# and fails to compile there. Hash-flooding resistance is worth the dependency
-# natively, so every member re-enables `runtime-rng` for non-wasm targets and leaves it
-# off for wasm, which has no OS RNG to seed from anyway.
 ahash = { version = "0.8", default-features = false, features = ["std"] }
 tempfile = "3"
 proptest = "1"

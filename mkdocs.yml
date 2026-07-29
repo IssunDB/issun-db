@@ -45,6 +45,7 @@ plugins:
 nav:
   - Home: index.md
   - Getting Started: getting-started.md
+  - Playground: https://issundb.github.io/issun-db/playground/
   - Examples: examples.md
   - Cypher Support: cypher.md
   - API Reference: api-reference.md

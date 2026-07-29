@@ -92,6 +92,6 @@ site/
 node_modules/
 package-lock.json
 lcov.info
-
-# LadybugDB comparison harness build artifacts (in a detached workspace)
+*.wasm
+web/pkg/
 benchmarks/ladybugdb-compare/target/

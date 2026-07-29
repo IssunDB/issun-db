@@ -1,0 +1,14 @@
+# Raise the wasm stack from wasm-ld's 1 MiB default to 16 MiB.
+#
+# This is not a tuning preference, it is a correctness requirement for the playground.
+# The Cypher executor recurses over a query's own structure and allows a query to run
+# inline up to `SMALL_STACK_EXEC_BUDGET_KB` (about 1 MB, see issundb-cypher); past that
+# it hands the work to a large-stack thread, which a browser wasm module cannot spawn.
+# On the default 1 MiB stack those two limits coincide exactly, so a query near the
+# inline budget overflows the stack instead of running. 16 MiB gives the inline path the
+# headroom the budget assumes.
+#
+# The graph algorithms do not need this becasue every depth-first kernel carries its search
+# stack on the heap precisely so that graph depth cannot reach the call stack.
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "link-arg=-zstack-size=16777216"]

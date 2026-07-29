@@ -1599,6 +1599,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "issundb-wasm"
+version = "0.1.0-alpha.20"
+dependencies = [
+ "issundb",
+ "rmp-serde",
+ "serde_json",
+ "tempfile",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "itertools"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -10,9 +10,6 @@ homepage.workspace = true
 rust-version.workspace = true
 publish = false
 
-# The lib must be named `issundb` because that is the Python import name (the `#[pymodule]` and maturin `module-name`).
-# Only a `cdylib` is needed; the wheel consumes it and no Rust crate links this one. Emitting an `rlib` would collide
-# with the `issundb` facade crate's `libissundb.rlib` output.
 [lib]
 name = "issundb"
 crate-type = ["cdylib"]
@@ -24,6 +21,6 @@ extension-module = ["dep:pyo3", "pyo3/extension-module", "pyo3/generate-import-l
 
 [dependencies]
 pyo3 = { workspace = true, optional = true }
-issundb.workspace = true
+issundb = { workspace = true, features = ["lmdb", "hnsw"] }
 serde_json = { workspace = true }
 rmp-serde = { workspace = true }

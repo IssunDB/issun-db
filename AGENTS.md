@@ -49,8 +49,7 @@ Quick examples:
 - Use sentence case for the lead-in of a list item. Write "Seed selection: ..." not "Seed Selection: ...". Proper nouns keep their capitals.
 - Capitalize only the first part of a hyphenated compound: "Full-text Search" in a heading, "Breadth-first" at the start of a sentence, and
   "breadth-first search" elsewhere. Never write "Breadth-First".
-- Start each sentence with a capital letter, capitalize proper nouns (Rust, Cypher, LMDB), and leave common nouns lowercase in the middle
-  of a sentence.
+- Start each sentence with a capital letter, capitalize proper nouns (Rust, Cypher, LMDB), and leave common nouns lowercase in the middle of a sentence.
 - Write correct and complete sentences.
 - Avoid made-up words.
 - Do not use a colon in place of a verb. Three uses are fine: joining two clauses inside a complete sentence (the replacement the em-dash rule above
@@ -197,6 +196,21 @@ modules according to this map.
 - `crates/issundb-mcp/`: Model Context Protocol server built on the `rmcp` SDK, serving over stdio or MCP's Streamable HTTP transport. Depends only on
   `issundb`; uses `tokio`. See its Component APIs entry for the tool surface and the Host-header allowlist.
 - `crates/issundb-py/`: Python bindings via PyO3. Exposes the `IssunDB` class. Depends only on `issundb`.
+- `crates/issundb-wasm/`: browser bindings, exposing one `Playground` type that owns a single `Graph`. Depends only on `issundb`, and is the only crate
+  built for `wasm32-unknown-unknown`. It is what proves the storage-backend seam and the pure-Rust kernels actually hold: the module is built
+  `--no-default-features --features hnsw`, so storage is the in-memory backend and the vector index is the exact scan, and a regression that reintroduces
+  an LMDB or C++ dependency below the facade breaks this build rather than going unnoticed. Every method returns a JSON string, so the boundary carries one
+  type in both directions instead of a second serialization contract. The methods are split into a private logic layer returning `Result<_, String>` and a
+  thin exported layer that converts to `JsError`, because constructing a `JsError` calls a wasm-bindgen import that panics off-target, and without the
+  split none of it could be covered by `cargo test`. Reading all of a node's properties decodes the stored msgpack blob directly, as the REST node route
+  does, since every read-path method on `Graph` takes the property names to fetch and an inspector cannot know them.
+- `web/`: the playground page that loads that module: `index.html`, `app.js`, `demos.js`, and `style.css`, with the generated module in the gitignored
+  `web/pkg/`. Vanilla ES modules with no build step, and nothing is fetched from a network, so the Cypher highlighter and the force-directed layout are
+  written in `app.js` rather than pulled from a library. `demos.js` is the demo catalog, which is Cypher held inside a JavaScript file and therefore
+  invisible to every Rust test; `make playground-check` runs the whole catalog through the compiled module and fails on an error, which is how a wrong
+  procedure signature is caught. See `web/README.md` for the three build targets and what the browser configuration gives up (no persistence, one thread,
+  no `backup`/`restore`, and a 16 MB stack set by a link argument in `.cargo/config.toml` because the 1 MB default is also the engine's inline-execution
+  budget).
 - `crates/issundb-examples/`: standalone example programs. These depend only on `issundb`.
 - `crates/*/benches/`: crate-local Criterion benchmark targets (storage and write throughput, Cypher parsing and execution plus LSQB Q1-Q9 and OLTP
   reads, vector search, full-text search, and hybrid retrieval plus GraphRAG).
@@ -320,8 +334,8 @@ Target dependency direction:
 5. `issundb-cypher` may depend on public APIs from core, vector, text, and retrieval crates, but not storage internals.
 6. `issundb` composes and re-exports the stable public API.
 7. `issundb-cli` uses only the `issundb` facade.
-8. `issundb-rest`, `issundb-mcp`, and `issundb-py` must depend only on `issundb`; they must not import `issundb-core`, `issundb-vector`,
-   `issundb-text`, `issundb-retrieval`, or `issundb-cypher` directly.
+8. `issundb-rest`, `issundb-mcp`, `issundb-py`, and `issundb-wasm` must depend only on `issundb`; they must not import `issundb-core`,
+   `issundb-vector`, `issundb-text`, `issundb-retrieval`, or `issundb-cypher` directly.
 
 Lower-level crates must not know about higher-level crates.
 
@@ -677,6 +691,28 @@ Every method releases the GIL around the native engine call, so a long-running q
 Keep that invariant when adding a method: extract arguments to owned Rust values first, run the engine call and JSON serialization inside
 `Python::detach`, and never touch a Python object in the released section. The two warm-ups are the longest-running calls on this surface, so they are
 where the invariant matters most.
+
+### `issundb_wasm`
+
+Browser bindings, exposing one `Playground` that owns a single `Graph`. Depends only on `issundb`. Every method returns a JSON string, so the boundary
+carries one type in both directions rather than a second serialization contract to keep in agreement with the page.
+
+Methods: `query`, `explain`, `stats`, `graphSnapshot`, `createTextIndex`, `textSearch`, `upsertVector`, `vectorSearch`, `degrees`, and the two statics
+`version` and `isPersistent`. `query` returns `{columns, rows, statement_count, elapsed_ms}` with row-major rows, so the page renders a table knowing
+nothing about the schema, and `statement_count` is how it can say a semicolon-separated script ran more statements than the one result shown.
+`graphSnapshot` returns `{nodes, edges, truncated}` capped at `MAX_GRAPH_NODES` for legibility rather than cost, and drops an edge whose endpoint the cap
+excluded so the page never draws a line to nothing.
+
+The surface is curated the way the MCP one is, and for a related reason: this is a demonstration rather than an embedding API. It carries reads, queries,
+and the two capabilities Cypher cannot reach (full-text index creation and search, and vector upsert and search), because those are Rust extension traits
+rather than query-language features. Mutations are Cypher through `query`. `backup` and `restore` are absent, being file operations on a target with no
+filesystem.
+
+Two structural rules hold here. Methods are split into a private logic layer returning `Result<_, String>` and a thin exported layer that converts to
+`JsError`, because constructing a `JsError` calls a wasm-bindgen import that panics on a non-wasm target, so a binding building one directly could not be
+covered by `cargo test`; the tests at the bottom of `lib.rs` drive the logic layer and run in the ordinary test suite. And the wasm-bindgen CLI must be
+the exact version of the wasm-bindgen crate, or the module fails at load with a message that does not name the cause, which is why
+`make playground-build` compares the two before running.
 
 ### `issundb_core::Storage`
 

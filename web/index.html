@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>IssunDB Playground</title>
+    <meta
+      name="description"
+      content="Run IssunDB, an embedded graph database with vector and full-text search, entirely in your browser. The whole engine is compiled to WebAssembly; nothing is sent to a server."
+    />
+    <link rel="stylesheet" href="./style.css" />
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%234739c9'/%3E%3Ctext x='16' y='23' font-family='monospace' font-size='19' font-weight='bold' fill='white' text-anchor='middle'%3E一%3C/text%3E%3C/svg%3E"
+    />
+  </head>
+  <body>
+    <div class="boot" id="boot">
+      <div class="sp"></div>
+      <div>Loading the engine…</div>
+      <div style="font-size: 12px; opacity: 0.7">
+        An 8&nbsp;MB WebAssembly module. It runs in this tab; no server is involved.
+      </div>
+    </div>
+
+    <header>
+      <button class="ghost" id="toggle-side" title="Toggle sidebar">☰</button>
+      <div class="brand">
+        <span class="mark">一</span>
+        <span>IssunDB</span>
+        <small id="version"></small>
+      </div>
+      <span class="badge" id="build-badge">in-memory build</span>
+      <div class="spacer"></div>
+      <button class="ghost" id="share" title="Copy a link that reproduces this query">Share</button>
+      <button class="ghost" id="reset" title="Discard all data and re-seed the sample graph">
+        Reset data
+      </button>
+      <button class="ghost" id="theme" title="Toggle light and dark">◐</button>
+      <a
+        class="ghost"
+        href="https://github.com/habedi/issun-db"
+        target="_blank"
+        rel="noopener"
+        >GitHub</a
+      >
+    </header>
+
+    <div class="shell">
+      <aside id="side">
+        <div class="side-group">
+          <h3>Demos</h3>
+          <div id="demos"></div>
+        </div>
+        <div class="side-group">
+          <h3>Schema</h3>
+          <div id="schema"></div>
+        </div>
+        <div class="side-group">
+          <h3>History</h3>
+          <div id="history"></div>
+        </div>
+      </aside>
+
+      <main>
+        <div class="editor-wrap">
+          <div class="desc" id="desc"></div>
+          <div class="editor" id="editor-box">
+            <pre aria-hidden="true"><code id="highlight"></code></pre>
+            <textarea
+              id="editor"
+              spellcheck="false"
+              autocapitalize="off"
+              autocomplete="off"
+              aria-label="Cypher query"
+            ></textarea>
+          </div>
+          <div class="bar">
+            <button class="run" id="run">Run <kbd>⌘↵</kbd></button>
+            <button class="ghost" id="explain" title="Show the physical plan instead of running">
+              Explain
+            </button>
+            <button class="ghost" id="load-sample" title="Insert the sample social graph">
+              Sample graph
+            </button>
+            <div class="status" id="status"></div>
+          </div>
+        </div>
+
+        <div class="results">
+          <div class="tabs" role="tablist">
+            <button class="tab" role="tab" data-pane="table" aria-selected="true">
+              Table <span class="c" id="tab-rows">0</span>
+            </button>
+            <button class="tab" role="tab" data-pane="graph" aria-selected="false">Graph</button>
+            <button class="tab" role="tab" data-pane="plan" aria-selected="false">Plan</button>
+            <button class="tab" role="tab" data-pane="json" aria-selected="false">JSON</button>
+            <div class="spacer"></div>
+            <button class="ghost" id="csv" title="Download the result as CSV">CSV</button>
+            <button class="ghost" id="json-dl" title="Download the result as JSON">JSON</button>
+          </div>
+
+          <div class="pane on" id="pane-table"></div>
+
+          <div class="pane graph-pane" id="pane-graph">
+            <div class="graph-toolbar">
+              <span id="graph-count"></span>
+              <div class="legend" id="legend"></div>
+              <div class="spacer"></div>
+              <label style="display: inline-flex; align-items: center; gap: 5px">
+                <input type="checkbox" id="size-by-rank" />
+                size by PageRank
+              </label>
+              <button class="ghost" id="relayout">Re-layout</button>
+            </div>
+            <svg class="graph" id="svg"></svg>
+            <div class="inspect" id="inspect" hidden></div>
+          </div>
+
+          <div class="pane" id="pane-plan"></div>
+          <div class="pane" id="pane-json"></div>
+        </div>
+      </main>
+    </div>
+
+    <footer>
+      <span
+        >The whole engine runs in this tab, compiled to WebAssembly. Nothing leaves your
+        browser.</span
+      >
+      <div class="spacer"></div>
+      <span id="footer-note"></span>
+    </footer>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

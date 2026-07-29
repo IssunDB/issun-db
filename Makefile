@@ -30,6 +30,13 @@ NEXTEST_RETRIES ?= 2
 LADYBUGDB_DIFF_NODES ?= 5000
 LADYBUGDB_DIFF_GENERATED ?= 500
 
+# Playground (web build) parameters
+PLAYGROUND_DIR := web
+PLAYGROUND_PORT ?= 8000
+PLAYGROUND_NODE_PKG := target/playground-pkg-node
+WASM_ARTIFACT := target/wasm32-unknown-unknown/release/issundb_wasm.wasm
+WASM_BINDGEN_VERSION := 0.2.122
+
 # Default target
 .DEFAULT_GOAL := help
 
@@ -219,6 +226,56 @@ rest: ## Launch the HTTP REST API server (pass REST_PATH=<dir> db path, REST_HOS
 	@echo "Starting IssunDB REST API server at $(or $(REST_HOST),127.0.0.1):$(or $(REST_PORT),7474) (database: $(or $(REST_PATH),./issundb-data))..."
 	@RUST_BACKTRACE=$(RUST_BACKTRACE) cargo run -p issundb-rest -- --db-path $(or $(REST_PATH),./issundb-data)\
  	--host $(or $(REST_HOST),127.0.0.1) --port $(or $(REST_PORT),7474)
+
+########################################################################################
+## Playground targets (the browser build)
+########################################################################################
+
+.PHONY: playground-deps
+playground-deps: ## Install the wasm target and the matching wasm-bindgen CLI
+	@echo "Installing the wasm32-unknown-unknown target..."
+	@rustup target add wasm32-unknown-unknown
+	@echo "Installing wasm-bindgen-cli $(WASM_BINDGEN_VERSION) (must match the crate version)..."
+	@rustup toolchain install stable --profile minimal
+	@cargo +stable install --locked wasm-bindgen-cli --version $(WASM_BINDGEN_VERSION)
+
+.PHONY: playground-build
+playground-build: check-wasm-bindgen ## Build the browser module into web/pkg
+	@echo "Building issundb-wasm for wasm32-unknown-unknown (in-memory storage, exact vector index)..."
+	@cargo build -p issundb-wasm --release --target wasm32-unknown-unknown \
+		--no-default-features --features hnsw
+	@echo "Generating the JavaScript glue into $(PLAYGROUND_DIR)/pkg..."
+	@wasm-bindgen $(WASM_ARTIFACT) --out-dir $(PLAYGROUND_DIR)/pkg --target web --no-typescript
+	@ls -l $(PLAYGROUND_DIR)/pkg
+
+.PHONY: playground-check
+playground-check: check-wasm-bindgen ## Run every playground demo through the compiled module
+	@echo "Building the module for Node..."
+	@cargo build -p issundb-wasm --release --target wasm32-unknown-unknown \
+		--no-default-features --features hnsw
+	@wasm-bindgen $(WASM_ARTIFACT) --out-dir $(PLAYGROUND_NODE_PKG) --target nodejs --no-typescript
+	@echo "Running the demo catalog..."
+	@node $(SCRIPTS_DIR)/check_playground.mjs
+
+.PHONY: playground-serve
+playground-serve: ## Serve the playground at http://localhost:$(PLAYGROUND_PORT)
+	@test -f $(PLAYGROUND_DIR)/pkg/issundb_wasm.js || \
+		{ echo "No module in $(PLAYGROUND_DIR)/pkg. Run 'make playground-build' first."; exit 1; }
+	@echo "Serving $(PLAYGROUND_DIR) at http://localhost:$(PLAYGROUND_PORT) (Ctrl-C to stop)..."
+	@python3 -m http.server $(PLAYGROUND_PORT) --directory $(PLAYGROUND_DIR)
+
+.PHONY: check-wasm-bindgen
+check-wasm-bindgen:
+	@command -v wasm-bindgen >/dev/null || \
+		{ echo "wasm-bindgen not found. Run 'make playground-deps'."; exit 1; }
+	@CLI=$$(wasm-bindgen --version | awk '{print $$2}'); \
+	CRATE=$$(cargo metadata --format-version 1 | \
+		python3 -c "import sys,json; print(next(p['version'] for p in json.load(sys.stdin)['packages'] if p['name']=='wasm-bindgen'))"); \
+	if [ "$$CLI" != "$$CRATE" ]; then \
+		echo "wasm-bindgen CLI is $$CLI but the crate is $$CRATE."; \
+		echo "Run: cargo install --locked wasm-bindgen-cli --version $$CRATE"; \
+		exit 1; \
+	fi
 
 .PHONY: bench
 bench: ## Run all workspace benchmarks

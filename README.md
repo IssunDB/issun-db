@@ -12,6 +12,7 @@
 [![Docs.rs](https://img.shields.io/badge/docs-issundb-66c2a5?style=flat&labelColor=282c34&logo=docs.rs)](https://docs.rs/issundb)
 [![Documentation](https://img.shields.io/badge/docs-read-007ec6?label=docs&style=flat&labelColor=282c34&logo=readthedocs)](https://issundb.github.io/issun-db/)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-007ec6?style=flat&labelColor=282c34&logo=open-source-initiative)](https://github.com/IssunDB/issun-db)
+[![Playground](https://img.shields.io/badge/playground-browser-507ec6?style=flat&labelColor=282c34&logo=webassembly)](https://issundb.github.io/issun-db/playground/)
 
 An embedded graph database for AI applications and graph analytics
 
@@ -27,11 +28,11 @@ It can be embedded in Rust applications without a separate server, and is design
 ### Key Features
 
 * ACID transactions, property graph model, and Cypher query support
-* Graph traversal and analytics using (parallelized) sparse matrix operations
+* Fast graph traversal and analytics
 * Vectorized query execution
 * Vector, full-text, and hybrid search
 * APIs for Rust, Python, CLI, HTTP (REST), and MCP
-* Support for Linux, macOS, and Windows
+* Support for Linux, macOS, Windows, and WebAssembly
 
 > [!IMPORTANT]
 > This project is still in early development, so bugs and breaking changes are expected.
