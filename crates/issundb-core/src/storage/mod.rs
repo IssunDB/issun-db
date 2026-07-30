@@ -13,7 +13,7 @@
 //! What a backend must supply: `Storage` (with the twelve tables as public fields and
 //! an `env`), `RoTxn`, `OwnedRoTxn`, `RwTxn`, and `StorageError`. What the tables must
 //! supply is `get`, `put`, `delete`, `len`, `iter`, `prefix_iter`, `get_duplicates`,
-//! and `delete_one_duplicate` — plus the ordering and rollback guarantees documented
+//! and `delete_one_duplicate`, plus the ordering and rollback guarantees documented
 //! on `memory`, which are properties the layers above genuinely depend on rather than
 //! incidental behaviour of LMDB.
 

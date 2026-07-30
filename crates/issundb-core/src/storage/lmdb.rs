@@ -51,7 +51,7 @@ pub struct Storage {
 /// Aliased here rather than named at each of the ~90 use sites, so the engine is
 /// nameable in exactly one module. This is deliberately the thread-local-agnostic
 /// flavour, because both concrete read transactions and a write transaction deref to
-/// it — that is what lets a write path hand its `RwTxn` to a read helper. Naming a
+/// it, which is what lets a write path hand its `RwTxn` to a read helper. Naming a
 /// specific TLS flavour here instead would break every one of those calls.
 pub type RoTxn<'a> = heed::RoTxn<'a>;
 

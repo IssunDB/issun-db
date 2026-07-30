@@ -8,7 +8,11 @@
 # inline budget overflows the stack instead of running. 16 MiB gives the inline path the
 # headroom the budget assumes.
 #
-# The graph algorithms do not need this becasue every depth-first kernel carries its search
+# The graph algorithms do not need this, because every depth-first kernel carries its search
 # stack on the heap precisely so that graph depth cannot reach the call stack.
+#
+# Cargo replaces this whole list when `RUSTFLAGS` is set in the environment rather than
+# merging with it, so a job that exports `RUSTFLAGS` and then builds the playground silently
+# reverts to the 1 MiB stack. `make playground-build` checks for that.
 [target.wasm32-unknown-unknown]
 rustflags = ["-C", "link-arg=-zstack-size=16777216"]

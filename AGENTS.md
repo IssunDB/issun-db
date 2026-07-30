@@ -699,8 +699,8 @@ where the invariant matters most.
 Browser bindings, exposing one `Playground` that owns a single `Graph`. Depends only on `issundb`. Every method returns a JSON string, so the boundary
 carries one type in both directions rather than a second serialization contract to keep in agreement with the page.
 
-Methods: `query`, `explain`, `stats`, `graphSnapshot`, `createTextIndex`, `textSearch`, `upsertVector`, `vectorSearch`, `degrees`, and the two statics
-`version` and `isPersistent`. `query` returns `{columns, rows, statement_count, elapsed_ms}` with row-major rows, so the page renders a table knowing
+Methods: `query`, `explain`, `stats`, `graphSnapshot`, `createTextIndex`, `textSearch`, `upsertVector`, `vectorSearch`, and the two statics `version`
+and `isPersistent`. `query` returns `{columns, rows, statement_count, elapsed_ms}` with row-major rows, so the page renders a table knowing
 nothing about the schema, and `statement_count` is how it can say a semicolon-separated script ran more statements than the one result shown.
 `graphSnapshot` returns `{nodes, edges, truncated}` capped at `MAX_GRAPH_NODES` for legibility rather than cost, and drops an edge whose endpoint the cap
 excluded so the page never draws a line to nothing.

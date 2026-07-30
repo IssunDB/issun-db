@@ -102,7 +102,7 @@ caller's thread with `resume_unwind` rather than converted to an `Error`: `Corru
 
 `CsrSnapshot` (in `csr.rs`) is a read-only in-memory Compressed Sparse Row view of the adjacency: the outgoing arrays plus a transposed incoming view
 carrying per-edge type and edge ids, and optionally a per-edge weight. It is swapped atomically via `arc_swap::ArcSwap`. It is the only in-memory
-adjacency structure, and every algorithm kernel in `graph/kernels/` reads it — bar `label_propagation`, which walks storage per node and is noted as the
+adjacency structure, and every algorithm kernel in `graph/kernels/` reads it, bar `label_propagation`, which walks storage per node and is noted as the
 exception in that module's header.
 
 It is built at the smallest size its consumers read, and the build is memory-shaped in ways that are easy to undo by accident:
@@ -226,7 +226,7 @@ Two rules matter when adding or changing one, because both have been silently vi
   A row length is not a degree and a row scan is not a transition probability: decide which convention a new kernel wants and say so in a comment. Note
   that the NetworkX oracle cannot catch a mistake here, because its corpus is simple graphs.
 - No depth-first kernel may recurse over graph structure. A DFS's depth is the length of the current path, so recursion needs one call frame per node on a chain,
-  and a Rust stack overflow aborts the *process* rather than returning an `Error` — a single query would take down a server. `detect_cycle`,
+  and a Rust stack overflow aborts the *process* rather than returning an `Error`: a single query would take down a server. `detect_cycle`,
   `strongly_connected_components`, `all_paths`, `longest_path`, and the `all_shortest_paths` backward walk all carry their search stack on the heap for this
   reason, with the node plus a cursor into its row where the recursion kept a loop counter. `dfs` is the one exception and only because `hops: u8` bounds it at
   255 frames; widening that argument means converting it too. `deep_graph_tests` pins all of this by running the kernels on a thread with a 1 MiB stack
@@ -238,7 +238,7 @@ Two rules matter when adding or changing one, because both have been silently vi
 
 ## The 12 Sub-databases
 
-All twelve are opened once by `Storage::open` — in `storage/lmdb.rs` for the default backend, and mirrored field for field by `storage/memory.rs`. The layout
+All twelve are opened once by `Storage::open`, in `storage/lmdb.rs` for the default backend, and mirrored field for field by `storage/memory.rs`. The layout
 below is the LMDB one; a second backend has to reproduce its key encoding and ordering, not just its field names:
 
 | Name            | Key                                                        | Value                                 | Notes                                                                                                                                                                                                  |

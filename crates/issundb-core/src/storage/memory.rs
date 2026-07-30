@@ -10,17 +10,17 @@
 //! not merely to LMDB's function signatures. Three of those properties are load
 //! bearing and easy to get wrong:
 //!
-//! - **Key order is byte order.** LMDB's default comparator is `memcmp`, so every
+//! - Key order is byte order: LMDB's default comparator is `memcmp`, so every
 //!   table here is a `BTreeMap<Vec<u8>, _>` and keys are stored already encoded. A
 //!   `u64` key encodes big-endian precisely so that byte order and numeric order
 //!   agree, which is what lets `CsrSnapshot::build` assume `out_adj` arrives grouped
 //!   by ascending node id.
-//! - **Duplicate order is byte order too.** `DUPSORT` sorts the values under one key
+//! - Duplicate order is byte order too: `DUPSORT` sorts the values under one key
 //!   by `memcmp`, which is why the duplicates live in a `BTreeSet<Vec<u8>>`. The CSR
 //!   builder depends on this exact ordering: it reorders each row by edge id
 //!   *because* `AdjEntry`'s byte layout puts `edge_type` first, and that reasoning is
 //!   only correct if duplicates arrive in raw-byte order here as well.
-//! - **An aborted write leaves nothing behind.** A dropped `RwTxn` must roll back,
+//! - An aborted write leaves nothing behind: a dropped `RwTxn` must roll back,
 //!   because the engine relies on that for consistency: a failed mutation aborts
 //!   mid-transaction and expects storage untouched. A writer therefore mutates a
 //!   private copy and publishes it only at `commit`, so an abort is the absence of a
@@ -178,7 +178,7 @@ impl Val for () {
 /// engine above actually relies on rather than to be the simplest thing that stores
 /// bytes:
 ///
-/// - **A reader is never blocked and never sees a partial write.** `read_txn` loads
+/// - A reader is never blocked and never sees a partial write: `read_txn` loads
 ///   the published table set and holds it; a writer builds its own copy and publishes
 ///   it atomically at commit. That is what makes a read transaction opened *while* a
 ///   write transaction is live legal, and the engine depends on it: a write statement
@@ -186,7 +186,7 @@ impl Val for () {
 ///   separate read transaction while its own write transaction is still open. A
 ///   single reader-writer lock deadlocks on exactly that, which is how this design
 ///   was arrived at.
-/// - **One writer at a time**, as LMDB enforces, via `writer`.
+/// - One writer at a time, as LMDB enforces, via `writer`.
 ///
 /// Rollback falls out for free: an uncommitted transaction simply never publishes its
 /// copy, so there is no undo log to keep correct.

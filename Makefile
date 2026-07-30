@@ -35,7 +35,9 @@ PLAYGROUND_DIR := web
 PLAYGROUND_PORT ?= 8000
 PLAYGROUND_NODE_PKG := target/playground-pkg-node
 WASM_ARTIFACT := target/wasm32-unknown-unknown/release/issundb_wasm.wasm
-WASM_BINDGEN_VERSION := 0.2.122
+
+# The CLI and the crate must be the exact same version
+WASM_BINDGEN_CRATE_VERSION = cargo metadata --format-version 1 | python3 -c "import sys,json; print(next(p['version'] for p in json.load(sys.stdin)['packages'] if p['name']=='wasm-bindgen'))"
 
 # `hnsw` selects usearch, which is C++ and cannot build for wasm, so the exact-scan vector
 # index is what omitting it gives. One variable because two copies of this drifted once.
@@ -258,12 +260,15 @@ rest: ## Launch the HTTP REST API server (pass REST_PATH=<dir> db path, REST_HOS
 playground-deps: ## Install the wasm target and the matching wasm-bindgen CLI
 	@echo "Installing the wasm32-unknown-unknown target..."
 	@rustup target add wasm32-unknown-unknown
-	@echo "Installing wasm-bindgen-cli $(WASM_BINDGEN_VERSION) (must match the crate version)..."
+	@# Resolved from Cargo.lock rather than pinned, so this cannot install a version that
+	@# check-wasm-bindgen then rejects. On stable because the CLI's own MSRV is above ours.
 	@rustup toolchain install stable --profile minimal
-	@cargo +stable install --locked wasm-bindgen-cli --version $(WASM_BINDGEN_VERSION)
+	@VERSION=$$($(WASM_BINDGEN_CRATE_VERSION)); \
+	echo "Installing wasm-bindgen-cli $$VERSION (matching the crate)..."; \
+	cargo +stable install --locked wasm-bindgen-cli --version "$$VERSION"
 
 .PHONY: playground-build
-playground-build: check-wasm-bindgen ## Build the browser module into web/pkg
+playground-build: check-wasm-bindgen check-wasm-stack ## Build the browser module into web/pkg
 	@echo "Building issundb-wasm for wasm32-unknown-unknown (in-memory storage, exact vector index)..."
 	@$(WASM_BUILD)
 	@echo "Generating the JavaScript glue into $(PLAYGROUND_DIR)/pkg..."
@@ -271,7 +276,7 @@ playground-build: check-wasm-bindgen ## Build the browser module into web/pkg
 	@ls -l $(PLAYGROUND_DIR)/pkg
 
 .PHONY: playground-check
-playground-check: check-wasm-bindgen ## Run every playground demo through the compiled module
+playground-check: check-wasm-bindgen check-wasm-stack ## Run every playground demo through the compiled module
 	@echo "Building the module for Node..."
 	@$(WASM_BUILD)
 	@wasm-bindgen $(WASM_ARTIFACT) --out-dir $(PLAYGROUND_NODE_PKG) --target nodejs --no-typescript
@@ -285,13 +290,24 @@ playground-serve: ## Serve the playground at http://localhost:$(PLAYGROUND_PORT)
 	@echo "Serving $(PLAYGROUND_DIR) at http://localhost:$(PLAYGROUND_PORT) (Ctrl-C to stop)..."
 	@python3 -m http.server $(PLAYGROUND_PORT) --directory $(PLAYGROUND_DIR)
 
+# An exported RUSTFLAGS replaces the `[target.wasm32-unknown-unknown] rustflags` in
+# .cargo/config.toml rather than merging with it, which drops the 16 MB stack the inline
+# query budget needs and leaves a moderately nested query overflowing instead of running.
+.PHONY: check-wasm-stack
+check-wasm-stack:
+	@if [ -n "$$RUSTFLAGS" ] && ! printf '%s' "$$RUSTFLAGS" | grep -q "stack-size"; then \
+		echo "RUSTFLAGS is set and replaces .cargo/config.toml, dropping the 16 MB wasm stack:"; \
+		echo "  RUSTFLAGS=$$RUSTFLAGS"; \
+		echo "Unset it, or include: -C link-arg=-zstack-size=16777216"; \
+		exit 1; \
+	fi
+
 .PHONY: check-wasm-bindgen
 check-wasm-bindgen:
 	@command -v wasm-bindgen >/dev/null || \
 		{ echo "wasm-bindgen not found. Run 'make playground-deps'."; exit 1; }
 	@CLI=$$(wasm-bindgen --version | awk '{print $$2}'); \
-	CRATE=$$(cargo metadata --format-version 1 | \
-		python3 -c "import sys,json; print(next(p['version'] for p in json.load(sys.stdin)['packages'] if p['name']=='wasm-bindgen'))"); \
+	CRATE=$$($(WASM_BINDGEN_CRATE_VERSION)); \
 	if [ "$$CLI" != "$$CRATE" ]; then \
 		echo "wasm-bindgen CLI is $$CLI but the crate is $$CRATE."; \
 		echo "Run: cargo install --locked wasm-bindgen-cli --version $$CRATE"; \

@@ -195,7 +195,7 @@ impl Graph {
     /// components are emitted, because that order is what assigns the component ids: a
     /// component is emitted when its root finishes, so ids still ascend in
     /// root-completion order. What was the recursion's implicit per-frame state is now
-    /// explicit — the node, and how far through its row the search has gone — and the
+    /// explicit (the node, and how far through its row the search has gone) and the
     /// `lowlink` propagation that happened on return from a call now happens when a
     /// frame is popped, against the frame beneath it.
     pub(in crate::graph) fn strongly_connected_components_kernel(

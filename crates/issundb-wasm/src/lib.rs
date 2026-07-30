@@ -20,11 +20,9 @@
 //! failing cleanly.
 
 use issundb::{
-    DegreeDirection, Graph, GraphQueryExt, Language, TextGraphExt, TextIndexExt, TextSearchOptions,
-    VectorGraphExt,
+    Graph, GraphQueryExt, Language, TextGraphExt, TextIndexExt, TextSearchOptions, VectorGraphExt,
 };
 use serde_json::{Value, json};
-use std::collections::HashMap;
 use wasm_bindgen::prelude::*;
 
 /// The page draws a force simulation, which stops being readable long before it stops being
@@ -58,9 +56,9 @@ impl Playground {
     /// `statement_count` is how the page can say so rather than appearing to ignore the
     /// earlier ones.
     fn query_inner(&self, cypher: &str) -> Result<String, String> {
-        let started = js_sys_now();
+        let started = monotonic_now_ms();
         let result = self.graph.query(cypher).map_err(js_err)?;
-        let elapsed = js_sys_now() - started;
+        let elapsed = monotonic_now_ms() - started;
         let rows: Vec<Value> = result
             .records
             .into_iter()
@@ -131,19 +129,19 @@ impl Playground {
         let kept: Vec<_> = all.iter().copied().take(MAX_GRAPH_NODES).collect();
         let included: std::collections::HashSet<_> = kept.iter().copied().collect();
 
+        // One adjacency read per node, feeding both the degree and the edge rows. Reading it
+        // twice cost three full passes per redraw, since `stats` walks it again.
         let mut nodes = Vec::new();
+        let mut edges = Vec::new();
         for id in &kept {
+            let out = self.graph.out_neighbors(*id).map_err(js_err)?;
             nodes.push(json!({
                 "id": id,
                 "labels": self.graph.node_labels(*id).map_err(js_err)?,
                 "props": self.node_props(*id)?,
-                "degree": self.graph.out_neighbors(*id).map_err(js_err)?.len(),
+                "degree": out.len(),
             }));
-        }
-
-        let mut edges = Vec::new();
-        for id in &kept {
-            for neighbor in self.graph.out_neighbors(*id).map_err(js_err)? {
+            for neighbor in out {
                 // An edge to a node the cap excluded would draw as a dangling line.
                 if !included.contains(&neighbor.node) {
                     continue;
@@ -216,20 +214,6 @@ impl Playground {
         Ok(json!({ "hits": hits }).to_string())
     }
 
-    /// Exposed directly as well as through `CALL issundb.degree`, because the page sizes
-    /// vertices by degree on every redraw.
-    fn degrees_inner(&self) -> Result<String, String> {
-        let degrees: HashMap<u64, u64> = self
-            .graph
-            .degree_centrality(DegreeDirection::Both)
-            .map_err(js_err)?;
-        let mapped: serde_json::Map<String, Value> = degrees
-            .into_iter()
-            .map(|(node, degree)| (node.to_string(), json!(degree)))
-            .collect();
-        Ok(Value::Object(mapped).to_string())
-    }
-
     fn version_inner() -> String {
         env!("CARGO_PKG_VERSION").to_string()
     }
@@ -291,10 +275,6 @@ impl Playground {
             .map_err(|e| JsError::new(&e))
     }
 
-    pub fn degrees(&self) -> Result<String, JsError> {
-        self.degrees_inner().map_err(|e| JsError::new(&e))
-    }
-
     #[wasm_bindgen(js_name = version)]
     pub fn version() -> String {
         Self::version_inner()
@@ -307,11 +287,13 @@ impl Playground {
 }
 
 /// `std::time::Instant` is unimplemented on `wasm32-unknown-unknown`, so timing a query
-/// needs the host's clock.
-fn js_sys_now() -> f64 {
+/// needs the host's clock. It has to be `performance.now()` rather than `Date.now()`: the
+/// latter is whole milliseconds, so every query over a small graph timed as exactly zero,
+/// and it is not monotonic, so a clock adjustment mid-query could report a negative elapsed.
+fn monotonic_now_ms() -> f64 {
     #[cfg(target_family = "wasm")]
     {
-        js_sys_date_now()
+        js_performance_now()
     }
     #[cfg(not(target_family = "wasm"))]
     {
@@ -323,10 +305,13 @@ fn js_sys_now() -> f64 {
     }
 }
 
+// `globalThis.performance` covers both the browser and Node, and the fallback keeps the
+// binding from trapping on a host that exposes neither.
 #[cfg(target_family = "wasm")]
-#[wasm_bindgen(inline_js = "export function js_sys_date_now() { return Date.now(); }")]
+#[wasm_bindgen(inline_js = "export function js_performance_now() { \
+    return (globalThis.performance && globalThis.performance.now()) || Date.now(); }")]
 extern "C" {
-    fn js_sys_date_now() -> f64;
+    fn js_performance_now() -> f64;
 }
 
 #[cfg(test)]

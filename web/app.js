@@ -629,10 +629,14 @@ function drawGraph() {
         node.pinned = false;
         group.removeEventListener("pointermove", move);
         group.removeEventListener("pointerup", up);
+        group.removeEventListener("pointercancel", up);
+        group.removeEventListener("lostpointercapture", up);
         start();
       };
       group.addEventListener("pointermove", move);
       group.addEventListener("pointerup", up);
+      group.addEventListener("pointercancel", up);
+      group.addEventListener("lostpointercapture", up);
       inspect(node);
     });
     nodeLayer.append(group);
@@ -713,7 +717,9 @@ function download(name, mime, text) {
   anchor.href = url;
   anchor.download = name;
   anchor.click();
-  URL.revokeObjectURL(url);
+  // Firefox and Safari fetch the object URL asynchronously after the click, so revoking on
+  // this tick produces an empty download.
+  setTimeout(() => URL.revokeObjectURL(url), 0);
 }
 
 $("csv").addEventListener("click", () => {

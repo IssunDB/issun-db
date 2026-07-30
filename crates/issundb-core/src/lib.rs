@@ -253,7 +253,7 @@ mod tests {
     }
 
     #[test]
-    fn bfs_works_via_dynamic_matrix_materialization_without_manual_rebuild() {
+    fn bfs_sees_new_nodes_via_the_freshness_gate_without_a_manual_rebuild() {
         let (_dir, g) = open_tmp();
         // The freshness gate loads the newly added nodes into the CSR snapshot.
         let a = g.add_node("N", &json!({})).unwrap();

@@ -27,7 +27,9 @@ pub struct VectorSearchOptions {
     /// Rescore factor. When greater than 1, search fetches `k * rescore_factor`
     /// candidates from the index and re-ranks them by exact distance against
     /// the full-precision vectors stored in LMDB. Defaults to 2 on a quantized
-    /// index and 1 (no rescore) on a Float32 index. The default applies to
+    /// index and 1 (no rescore) on a Float32 index. Without the `hnsw` feature
+    /// the default is always 1, because that backend keeps the raw `f32` and so
+    /// has no precision to recover whatever the persisted tag says. The default applies to
     /// filtered searches too, where the over-fetch means the traversal must
     /// find `k * rescore_factor` predicate-matching candidates; pass
     /// `Some(1)` to disable rescoring for a selective filter.
@@ -45,7 +47,7 @@ impl Default for VectorSearchOptions {
     }
 }
 
-/// Distance metric for the HNSW index.
+/// Distance metric for the vector index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum VectorMetric {
     /// Cosine similarity (default).
@@ -295,7 +297,7 @@ pub trait VectorGraphExt {
     /// exist. The raw f32 embeddings are stored in LMDB independently of the
     /// metric, so they are re-indexed under `opts`; switching back to `Float32`
     /// recovers full precision from storage. This rebuilds the entire in-memory
-    /// HNSW index, so it is O(n) in the number of stored vectors and is intended
+    /// index, so it is O(n) in the number of stored vectors and is intended
     /// as an administrative operation, not a concurrent one: running it while
     /// other threads upsert may drop an in-flight write from the snapshot, which
     /// the next `Graph::open` rebuild reconciles.
@@ -335,7 +337,7 @@ pub trait VectorGraphExt {
 
     /// Return the full-precision embedding stored for `n`, or `None` when the
     /// node has no embedding. This is a point lookup against LMDB and does not
-    /// build or consult the in-memory HNSW index.
+    /// build or consult the in-memory index.
     fn node_vector(&self, n: NodeId) -> Result<Option<Vec<f32>>, VectorError>;
 
     /// Distance between two vectors under this graph's configured metric
@@ -565,10 +567,12 @@ impl VectorGraphExt for Graph {
                     None => hit,
                 });
             }
-            // Same total order the backends rank by, node id included: `truncate` below
-            // decides which of two equidistant hits survives at the k-th position, so
-            // sorting on distance alone made the surviving node depend on the rescore
-            // factor.
+            // Node id included, because `truncate` below decides which of two equidistant
+            // hits survives at the k-th position and sorting on distance alone left that to
+            // whatever order the sort happened to leave. This makes the rescored path
+            // deterministic; it does not make the whole surface so, since a `Float32` HNSW
+            // index does not rescore and usearch breaks a distance tie by its own traversal
+            // order.
             rescored.sort_unstable_by(|a, b| {
                 a.distance.total_cmp(&b.distance).then(a.node.cmp(&b.node))
             });
@@ -601,10 +605,10 @@ impl VectorGraphExt for Graph {
     }
 }
 
-/// Full-precision distance between `q` and a stored vector, matching the
-/// distance convention `usearch` reports for the same metric (squared L2,
-/// `1 - dot` for inner product) so rescored and approximate distances stay
-/// comparable.
+/// Full-precision distance between `q` and a stored vector. Both backends report this
+/// same convention for a given metric (squared L2, and `1 - dot` for inner product), which
+/// is what lets a rescored distance and an approximate one be sorted into one list;
+/// `the_hnsw_backend_reports_the_same_convention_as_exact_distance` pins it.
 pub(crate) fn exact_distance(q: &[f32], v: &[f32], metric: VectorMetric) -> f32 {
     match metric {
         VectorMetric::Cosine => {

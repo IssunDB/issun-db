@@ -357,7 +357,7 @@ impl Graph {
     /// Iterative, with the search stack on the heap. The depth of a DFS is the length
     /// of the current path, so a recursive version needs one call frame per node on a
     /// chain and aborts the *process* on a stack overflow rather than returning an
-    /// error — a query cannot be allowed to do that. Every kernel here that walks
+    /// error, and a query cannot be allowed to do that. Every kernel here that walks
     /// depth-first is written this way for that reason.
     pub(in crate::graph) fn detect_cycle_kernel(&self, snap: &CsrSnapshot) -> Result<bool, Error> {
         const WHITE: u8 = 0;
@@ -406,8 +406,8 @@ impl Graph {
     ///
     /// Iterative for the reason on [`Graph::detect_cycle_kernel`]: the search depth is
     /// the path length, so recursion put one frame per node on the stack. The number
-    /// of paths can still be exponential in the graph — that is the question's shape,
-    /// not this implementation's — but the *stack* is now bounded by the longest path
+    /// of paths can still be exponential in the graph, which is the question's shape
+    /// rather than this implementation's, but the *stack* is now bounded by the longest path
     /// and lives on the heap.
     pub(in crate::graph) fn all_paths_kernel(
         &self,
@@ -1013,7 +1013,7 @@ mod deep_graph_tests {
     /// Every depth-first kernel must survive a graph deeper than the call stack.
     ///
     /// These were recursive, one frame per node on the current path, so a long chain
-    /// overflowed the stack — and a Rust stack overflow aborts the *process*, so a
+    /// overflowed the stack, and a Rust stack overflow aborts the *process*, so a
     /// single query could take down a server rather than returning an error. This runs
     /// them on a thread with a 1 MiB stack, which is `wasm32-unknown-unknown`'s default
     /// and about an eighth of a native main thread, over a chain far longer than that

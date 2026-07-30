@@ -146,6 +146,17 @@ pub(crate) mod exact {
 
     impl VectorBackend for ExactBackend {
         fn upsert(&mut self, node: NodeId, v: &[f32]) -> Result<(), VectorError> {
+            // The HNSW backend's `add` rejects a wrong-length vector, so this has to as
+            // well, or the two backends disagree on an error case and the shared suite stops
+            // proving anything about it. Accepting one is worse than an error: `exact_distance`
+            // zips the two slices, so a short vector would score over its prefix and rank
+            // against full-length ones.
+            if v.len() != self.dims {
+                return Err(VectorError::DimensionMismatch {
+                    expected: self.dims,
+                    got: v.len(),
+                });
+            }
             match self.slots.get(&node) {
                 Some(&slot) => {
                     // Reuse the allocation rather than replacing the `Vec`, so a
@@ -381,6 +392,25 @@ mod tests {
         let b = backend(VectorMetric::L2, &[(7, vec![1.0]), (3, vec![-1.0])]);
         let hits = b.search(&[0.0], 2).unwrap();
         assert_eq!(hits.iter().map(|h| h.node).collect::<Vec<_>>(), vec![3, 7]);
+    }
+
+    /// Both backends must refuse a wrong-length vector, or the shared suite proves nothing
+    /// about the case. Accepting one is not a lesser failure: `exact_distance` zips the two
+    /// slices, so a short vector would be scored over its prefix and ranked against
+    /// full-length ones.
+    #[test]
+    fn upsert_refuses_a_vector_of_the_wrong_length() {
+        let mut b = backend(VectorMetric::L2, &[(1, vec![1.0, 2.0])]);
+        for wrong in [vec![1.0], vec![1.0, 2.0, 3.0]] {
+            let got = wrong.len();
+            match b.upsert(2, &wrong) {
+                Err(VectorError::DimensionMismatch { expected, got: g }) => {
+                    assert_eq!((expected, g), (2, got));
+                }
+                other => panic!("expected a dimension mismatch for {got} dims, got {other:?}"),
+            }
+        }
+        assert_eq!(b.len(), 1, "a refused upsert must not be stored");
     }
 
     /// The tie-break has to survive the top-k selection, not just a full sort: `k` smaller
