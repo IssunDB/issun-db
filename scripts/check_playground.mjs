@@ -17,6 +17,9 @@ const { DEMO_CATEGORIES, PROCEDURES, SAMPLE_GRAPHS, SAMPLE_SOCIAL } = await impo
   join(here, "..", "web", "demos.js")
 );
 
+// The graph each category's examples query, since none of them builds its own data any more.
+const sampleById = new Map(SAMPLE_GRAPHS.map((sample) => [sample.id, sample.cypher]));
+
 let failures = 0;
 let checked = 0;
 
@@ -56,9 +59,7 @@ for (const category of DEMO_CATEGORIES) {
     // A fresh instance per demo, so one demo's writes cannot make another pass or fail.
     const p = new Playground();
     try {
-      if (demo.cypher !== SAMPLE_SOCIAL) {
-        p.query(SAMPLE_SOCIAL);
-      }
+      p.query(sampleById.get(category.sample) ?? SAMPLE_SOCIAL);
 
       let detail;
       if (demo.explain) {

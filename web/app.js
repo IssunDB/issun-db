@@ -68,7 +68,6 @@ function highlight(src) {
 let db = null;
 let lastResult = null;
 let sim = null;
-let rankSizes = null;
 
 const HISTORY_KEY = "issundb.history";
 const SCHEME_KEY = "issundb.scheme";
@@ -82,6 +81,11 @@ const MAX_TABLE_ROWS = 1000;
 const MAX_CELL_CHARS = 200;
 // Past this a value is clipped without a tooltip, rather than putting a megabyte in an attribute.
 const MAX_TITLE_CHARS = 2000;
+
+// Every vertex is drawn at this radius. Sizing by degree restated what the edges already show, and
+// sizing by PageRank made the view depend on a whole extra pass over the graph for a difference the
+// table reports precisely anyway.
+const NODE_RADIUS = 10;
 
 // The force layout settles over an animation loop, which is motion a visitor can ask not to see.
 const REDUCED_MOTION = matchMedia("(prefers-reduced-motion: reduce)");
@@ -129,9 +133,8 @@ function readStoredEditor() {
   }
 }
 
-function setQuery(text, description = "") {
+function setQuery(text) {
   editor.value = text;
-  $("desc").textContent = description;
   syncHighlight();
   storeEditor();
   editor.focus();
@@ -142,9 +145,7 @@ let storeTimer = null;
 
 editor.addEventListener("input", () => {
   syncHighlight();
-  // The description belongs to the demo that set it, so editing the query retires it rather
-  // than leaving a caption that now describes something else.
-  $("desc").textContent = "";
+  // The follow-up belongs to the example that was loaded, so editing the query retires it.
   pendingDemo = null;
   clearTimeout(storeTimer);
   storeTimer = setTimeout(storeEditor, 400);
@@ -413,8 +414,7 @@ function showPane(name) {
   }
   if (name === "graph") {
     if (snapshotStale) loadSnapshot();
-    if (rankSizes) computeRanks().then(drawGraph, drawGraph);
-    else drawGraph();
+    drawGraph();
   }
 }
 
@@ -555,6 +555,7 @@ async function run(mode = "run") {
       rememberSetup(cypher);
     }
     await refreshGraph(mayWrite);
+    renderFooter();
 
     if (pendingDemo) {
       const demo = pendingDemo;
@@ -597,7 +598,7 @@ function formatEditor() {
     setStatus("", "Already formatted.");
     return;
   }
-  setQuery(after, $("desc").textContent);
+  setQuery(after);
   setStatus("", "Formatted.");
 }
 
@@ -606,12 +607,13 @@ $("format").addEventListener("click", formatEditor);
 // it on a database that already holds the sample adds a second copy, which the caption says.
 $("load-sample").addEventListener("click", () => {
   const sample = currentSample();
-  setQuery(
-    sample.cypher,
-    `${sample.label}. Running this on a database that already has it adds a second copy.`,
-  );
+  setQuery(sample.cypher);
   pendingDemo = null;
-  setStatus("", `Loaded the ${sample.label} sample. Press Execute Query to create it.`);
+  setStatus(
+    "",
+    `Loaded the ${sample.label} sample. Press Execute Query to create it.` +
+      " Running it on a database that already has it adds a second copy.",
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -620,7 +622,7 @@ $("load-sample").addEventListener("click", () => {
 
 // Trimmed on read as well as on write, so a longer list stored by an earlier visit is cut to the
 // limit straight away rather than only after the next query pushes an entry out.
-const MAX_HISTORY_ITEMS = 6;
+const MAX_HISTORY_ITEMS = 10;
 
 function readHistory() {
   try {
@@ -710,7 +712,7 @@ function renderProcedures(filter = "") {
     yields.className = "yd";
     yields.textContent = `yields ${proc.yields}`;
     button.append(name, yields);
-    button.addEventListener("click", () => setQuery(proc.snippet, proc.summary));
+    button.addEventListener("click", () => setQuery(proc.snippet));
     host.append(button);
   }
 }
@@ -768,15 +770,35 @@ let activeCategory = 0;
 // selecting one no longer runs it.
 let pendingDemo = null;
 
+// Every example queries a graph from Pick a Graph rather than creating one, so it can only answer
+// once that graph is loaded. The label a category names is how the page tells, out of the schema it
+// already has, and says so instead of leaving an empty table to be read as a fault.
+function graphIsLoaded(category) {
+  if (!category?.requiresLabel) return true;
+  return Boolean(lastStats?.label_counts?.[category.requiresLabel]);
+}
+
+const sampleLabel = (id) => SAMPLE_GRAPHS.find((sample) => sample.id === id)?.label ?? id;
+
 function selectDemo(index) {
-  const demo = DEMO_CATEGORIES[activeCategory]?.demos[index];
+  const category = DEMO_CATEGORIES[activeCategory];
+  const demo = category?.demos[index];
   if (!demo) return;
   for (const other of document.querySelectorAll(".demo")) {
     other.classList.toggle("active", Number(other.dataset.index) === index);
   }
-  setQuery(demo.cypher, demo.desc);
+  setQuery(demo.cypher);
   pendingDemo =
     demo.textSearch || demo.vectors || demo.thenQuery || demo.embed ? demo : null;
+
+  if (!graphIsLoaded(category)) {
+    setStatus(
+      "",
+      `Loaded "${demo.label}". It queries the ${sampleLabel(category.sample)} graph, which is not` +
+        " in the database: press Reset Graph to load it, then Execute Query.",
+    );
+    return;
+  }
   setStatus(
     "",
     demo.explain
@@ -787,7 +809,13 @@ function selectDemo(index) {
 
 function renderCategory() {
   const category = DEMO_CATEGORIES[activeCategory];
-  $("category-blurb").textContent = category.blurb;
+  // The picker follows the category, so loading the graph these examples want is one press of Reset
+  // Graph rather than a hunt through the list. Nothing runs here: this moves a dropdown.
+  const wanted = SAMPLE_GRAPHS.findIndex((sample) => sample.id === category.sample);
+  if (wanted >= 0) {
+    activeSample = wanted;
+    $("sample-graph").value = String(wanted);
+  }
   const host = $("demo-buttons");
   host.replaceChildren();
   category.demos.forEach((demo, i) => {
@@ -921,6 +949,58 @@ async function runThenQuery(cypher) {
 // Schema panel
 // ---------------------------------------------------------------------------
 
+// The counts the footer reports, from the last `stats` call. Kept rather than re-read, because
+// `stats` is a full node scan and the footer is refreshed after every run.
+let lastStats = null;
+
+// The module's exports, for the one figure only the browser knows: how much WebAssembly heap it has
+// committed. That number never falls, so it is reported beside the live one rather than instead of
+// it.
+let wasmExports = null;
+
+// Live bytes with an empty database, captured after the instance is built and before it is seeded.
+// Subtracting it is what separates the graph from the engine that holds it.
+let baselineBytes = 0;
+
+// KB below a megabyte, because a small graph is a few hundred kilobytes and reporting it as 0.1 MB
+// says less than 143 KB does.
+function bytesLabel(bytes) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1048576) return `${Math.round(bytes / 1024)} KB`;
+  return `${(bytes / 1048576).toFixed(1)} MB`;
+}
+
+function renderFooter() {
+  const note = $("footer-note");
+  const counts = lastStats
+    ? `${plural(lastStats.nodes, "node")} and ${plural(lastStats.edges, "edge")}`
+    : "";
+
+  let live = 0;
+  try {
+    live = Playground.memoryBytes();
+  } catch {
+    // A build without the counter still reports the counts.
+  }
+  const heap = wasmExports?.memory?.buffer?.byteLength ?? 0;
+  if (live === 0) {
+    note.textContent = counts;
+    note.title = "";
+    return;
+  }
+
+  // Two figures rather than three. Splitting the live total into engine and graph was the first
+  // shape this took, and it reported the same number twice: an empty database allocates a few
+  // kilobytes, so the graph is very nearly all of it. The baseline is stated in the tooltip
+  // instead, where it says that rather than implying a division that does not exist.
+  note.textContent = `${counts} · ${bytesLabel(live)} in use, ${bytesLabel(heap)} heap`;
+  note.title =
+    `IssunDB has ${bytesLabel(live)} allocated and not freed. An empty database accounts for` +
+    ` ${bytesLabel(baselineBytes)} of that, so the rest is graph data and the structures derived` +
+    ` from it. The WebAssembly heap the browser has committed is ${bytesLabel(heap)}, which only` +
+    " ever grows, so it stays above the figure in use.";
+}
+
 // Hashing the name is what keeps a vertex's color stable across redraws without a table.
 function hueOf(name) {
   let hash = 0;
@@ -955,7 +1035,8 @@ function refreshSchema() {
   $("schema").innerHTML = rows.length
     ? rows.join("")
     : '<div class="empty">Empty database. Run a CREATE.</div>';
-  $("footer-note").textContent = `${stats.nodes} nodes, ${stats.edges} relationships`;
+  lastStats = stats;
+  renderFooter();
 }
 
 // ---------------------------------------------------------------------------
@@ -997,19 +1078,7 @@ async function refreshGraph(mayWrite = true) {
   if (mayWrite) snapshotStale = true;
   if (!$("pane-graph").classList.contains("on")) return;
   if (snapshotStale) loadSnapshot();
-  if (rankSizes && mayWrite) await computeRanks();
   drawGraph();
-}
-
-async function computeRanks() {
-  try {
-    const result = JSON.parse(
-      db.query("CALL issundb.pageRank() YIELD nodeId, score RETURN nodeId, score"),
-    );
-    rankSizes = new Map(result.rows.map(([id, score]) => [id, score]));
-  } catch {
-    rankSizes = null;
-  }
 }
 
 // Velocity-Verlet, with all-pairs repulsion: at the 300-node cap that pass is cheap enough
@@ -1194,9 +1263,9 @@ function drawGraph() {
   setViewBox(svg, { x: 0, y: 0, w: width, h: height });
 
   const { nodes, edges, truncated } = snapshot;
-  $("graph-count").textContent = `${nodes.length} nodes, ${edges.length} relationships${
-    truncated ? " (capped at 300)" : ""
-  }`;
+  $("graph-count").textContent =
+    `${plural(nodes.length, "node")} and ${plural(edges.length, "edge")}` +
+    (truncated ? " (capped at 300)" : "");
 
   const { lit, groupIds, groupLabel } = resultOverlay();
 
@@ -1231,24 +1300,6 @@ function drawGraph() {
     return;
   }
 
-  // Looped rather than spread into `Math.max`: the rank map covers every node in the
-  // database, not just the drawn ones, and spreading past about 130 000 arguments raises a
-  // RangeError.
-  const maxOf = (values, floor) => {
-    let max = floor;
-    for (const value of values) if (value > max) max = value;
-    return max;
-  };
-  const maxDegree = maxOf(
-    nodes.map((n) => n.degree ?? 0),
-    1,
-  );
-  const maxRank = rankSizes ? maxOf(rankSizes.values(), 1e-9) : 1;
-  const radiusOf = (node) => {
-    if (rankSizes) return 6 + 16 * Math.sqrt((rankSizes.get(node.id) ?? 0) / maxRank);
-    return 6 + 10 * Math.sqrt((node.degree ?? 0) / maxDegree);
-  };
-
   const linkLayer = el("g");
   const nodeLayer = el("g");
   svg.append(linkLayer, nodeLayer);
@@ -1265,10 +1316,10 @@ function drawGraph() {
   const groups = nodes.map((node) => {
     const group = el("g", { class: "node" });
     const circle = el("circle", {
-      r: radiusOf(node),
+      r: NODE_RADIUS,
       fill: fillOf(node),
     });
-    const text = el("text", { "text-anchor": "middle", dy: radiusOf(node) + 12 });
+    const text = el("text", { "text-anchor": "middle", dy: NODE_RADIUS + 12 });
     text.textContent = captionOf(node);
     group.append(circle, text);
     if (lit && !lit.has(node.id)) group.classList.add("dim");
@@ -1371,8 +1422,78 @@ function inspect(node) {
   $("inspect").hidden = false;
 }
 
-$("svg").addEventListener("pointerdown", () => {
+// Zoom and pan both move the view box, which is also what Fit sets and what `toSvg` maps a pointer
+// through, so those three cannot disagree about where the graph is.
+const ZOOM_STEP = 1.25;
+
+const canvasSize = (svg) => ({ w: svg.clientWidth || 800, h: svg.clientHeight || 500 });
+
+// `focal` is the world point to hold still, so a wheel zoom keeps whatever is under the pointer
+// under the pointer. Without it, zooming in on a corner walks the graph off the canvas.
+function zoomBy(factor, focal) {
+  const svg = $("svg");
+  if (!viewBox) return;
+  const { w: canvasW } = canvasSize(svg);
+  // Bounded, or a few scrolls leave an empty canvas with no way to tell which direction the graph
+  // went. The clamp is on the width and the same scale is applied to the height, so the box keeps
+  // the element's aspect ratio and nothing is letterboxed.
+  const clamped = Math.min(Math.max(viewBox.w * factor, canvasW / 8), canvasW * 4);
+  const scale = clamped / viewBox.w;
+  const point = focal ?? {
+    x: viewBox.x + viewBox.w / 2,
+    y: viewBox.y + viewBox.h / 2,
+  };
+  setViewBox(svg, {
+    x: point.x - (point.x - viewBox.x) * scale,
+    y: point.y - (point.y - viewBox.y) * scale,
+    w: viewBox.w * scale,
+    h: viewBox.h * scale,
+  });
+}
+
+$("zoom-in").addEventListener("click", () => zoomBy(1 / ZOOM_STEP));
+$("zoom-out").addEventListener("click", () => zoomBy(ZOOM_STEP));
+
+$("svg").addEventListener(
+  "wheel",
+  (e) => {
+    // Claimed rather than shared: the page scrolls as a document, and a wheel over the canvas that
+    // both zoomed and scrolled the page would be unusable. Hence a non-passive listener.
+    e.preventDefault();
+    zoomBy(e.deltaY > 0 ? ZOOM_STEP : 1 / ZOOM_STEP, toSvg($("svg"), e));
+  },
+  { passive: false },
+);
+
+$("svg").addEventListener("pointerdown", (e) => {
   $("inspect").hidden = true;
+  // A vertex has its own drag handler and stops propagation; this is the guard for anything that
+  // does not, so a pan cannot start on top of a node.
+  if (e.target.closest(".node")) return;
+
+  const svg = $("svg");
+  const from = viewBox ? { ...viewBox } : null;
+  if (!from) return;
+  svg.setPointerCapture(e.pointerId);
+
+  const move = (ev) => {
+    // Measured against the box the drag started from rather than the current one, or the pan chases
+    // itself: each move would be applied to a box the previous move had already shifted.
+    const rect = svg.getBoundingClientRect();
+    const dx = ((ev.clientX - e.clientX) * from.w) / rect.width;
+    const dy = ((ev.clientY - e.clientY) * from.h) / rect.height;
+    setViewBox(svg, { x: from.x - dx, y: from.y - dy, w: from.w, h: from.h });
+  };
+  const up = () => {
+    svg.removeEventListener("pointermove", move);
+    svg.removeEventListener("pointerup", up);
+    svg.removeEventListener("pointercancel", up);
+    svg.removeEventListener("lostpointercapture", up);
+  };
+  svg.addEventListener("pointermove", move);
+  svg.addEventListener("pointerup", up);
+  svg.addEventListener("pointercancel", up);
+  svg.addEventListener("lostpointercapture", up);
 });
 // The layout keeps every vertex inside the canvas, so this only ever zooms in. That is the
 // direction worth having: a handful of nodes otherwise sit in the middle of a mostly empty
@@ -1421,18 +1542,6 @@ $("relayout").addEventListener("click", () => {
   for (const node of snapshot.nodes) node.x = undefined;
   drawGraph();
 });
-$("size-by-rank").addEventListener("change", async (e) => {
-  if (e.target.checked) {
-    rankSizes = new Map();
-    await computeRanks();
-    // `computeRanks` clears the map when the pass fails, so the box must not keep claiming it.
-    if (!rankSizes) e.target.checked = false;
-  } else {
-    rankSizes = null;
-  }
-  drawGraph();
-});
-
 // The layout reads the viewport size when it starts, so a resize needs a fresh one. Positions
 // survive, since only an undefined coordinate is re-seeded.
 let resizeTimer = null;
@@ -1578,7 +1687,7 @@ addEventListener("hashchange", () => {
     incoming = null;
   }
   if (!incoming) return;
-  setQuery(incoming, "A shared query.");
+  setQuery(incoming);
   run();
 });
 
@@ -1656,9 +1765,7 @@ function renderSamples() {
   });
   select.addEventListener("change", () => {
     activeSample = Number(select.value);
-    $("sample-blurb").textContent = currentSample().blurb;
   });
-  $("sample-blurb").textContent = currentSample().blurb;
 }
 
 function seed() {
@@ -1673,14 +1780,14 @@ $("reset").addEventListener("click", async () => {
   const previous = db;
   db = new Playground();
   previous?.free();
+  // After the old instance is freed, so the baseline is one empty database rather than two.
+  baselineBytes = Playground.memoryBytes();
   lastResult = null;
-  rankSizes = null;
   // The discarded writes must not keep travelling in a share link, where replaying them against
   // the fresh seed would rebuild the state Reset was clicked to get rid of.
   setupLog.length = 0;
   // Node ids restart from zero, so a carried-over position would belong to a different node.
   snapshot = { nodes: [], edges: [], truncated: false };
-  $("size-by-rank").checked = false;
   seed();
   await refreshGraph();
   setStatus("ok", `Reset. The ${currentSample().label} sample was re-seeded.`);
@@ -1694,8 +1801,9 @@ $("reset").addEventListener("click", async () => {
 async function boot() {
   applyScheme(currentScheme());
 
-  await init();
+  wasmExports = await init();
   db = new Playground();
+  baselineBytes = Playground.memoryBytes();
 
   renderPoweredBy();
   renderSamples();
@@ -1732,7 +1840,7 @@ async function boot() {
 
   const stored = shared ? "" : readStoredEditor().trim();
   if (shared) {
-    setQuery(shared, "A shared query.");
+    setQuery(shared);
   } else if (stored) {
     // No caption: the ribbon is for what an example is demonstrating, and the banner below the
     // editor already says the query was restored and not run. Three notices for one fact was two

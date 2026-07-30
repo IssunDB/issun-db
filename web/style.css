@@ -103,6 +103,13 @@
   box-sizing: border-box;
 }
 
+/* Every size below is in rem, so this one number scales the whole page. A percentage rather than a
+   pixel count, because it then still follows a reader who has changed their browser's default text
+   size instead of overriding them. 93.75% is 15px against the usual 16. */
+html {
+  font-size: 93.75%;
+}
+
 body {
   margin: 0;
   font-family: var(--md-text-font);
@@ -420,12 +427,6 @@ select.control {
   font-weight: 700;
 }
 
-.check {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-}
-
 .hint {
   margin: 0 0 8px;
   font-size: 0.75rem;
@@ -530,19 +531,6 @@ select.control {
 }
 
 /* ---------------------------------------------------------------- editor ---- */
-
-.desc {
-  padding: 9px 14px;
-  font-size: 0.82rem;
-  line-height: 1.4;
-  color: var(--md-default-fg-color--light);
-  background: color-mix(in srgb, var(--md-primary-fg-color) 7%, transparent);
-  border-bottom: 1px solid var(--line);
-}
-
-.desc:empty {
-  display: none;
-}
 
 /* The highlighted copy sits under a transparent textarea, so the caret, selection, and
  * native editing stay real. The two must therefore keep identical metrics. */
@@ -673,10 +661,6 @@ select.control {
   justify-content: center;
 }
 
-.btn-row + .hint {
-  margin-top: 9px;
-}
-
 /* ---------------------------------------------------------------- banner ---- */
 
 /* The run outcome gets its own strip between the editor and the results, rather than a line of
@@ -772,8 +756,11 @@ select.control {
   color: var(--md-default-fg-color--light);
 }
 
+/* Taller than the table needs, because the graph view lives in here and a force layout wants room.
+   A fixed height rather than a share of the viewport, since the page scrolls as a document and the
+   layout reads the element's size when it starts. */
 .panes {
-  height: 440px;
+  height: 560px;
   display: flex;
 }
 

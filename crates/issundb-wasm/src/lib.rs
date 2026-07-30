@@ -23,7 +23,60 @@ use issundb::{
     Graph, GraphQueryExt, Language, TextGraphExt, TextIndexExt, TextSearchOptions, VectorGraphExt,
 };
 use serde_json::{Value, json};
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use wasm_bindgen::prelude::*;
+
+/// Live bytes the engine has allocated and not yet freed, which the playground's footer reports.
+///
+/// A wrapper around the system allocator rather than an accounting pass over the engine's own
+/// structures, because the graph tables, the CSR snapshot, the property columns, and the full-text
+/// postings are ordinary allocations with no common owner to ask. The cost is two relaxed atomic
+/// operations per allocation, and it is paid only here: no other crate in the workspace sets a
+/// global allocator, so nothing an application links against is affected.
+struct CountingAllocator;
+
+static LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+unsafe impl GlobalAlloc for CountingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let ptr = unsafe { System.alloc(layout) };
+        if !ptr.is_null() {
+            LIVE_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
+        }
+        ptr
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        let ptr = unsafe { System.alloc_zeroed(layout) };
+        if !ptr.is_null() {
+            LIVE_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
+        }
+        ptr
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe { System.dealloc(ptr, layout) };
+        LIVE_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
+    }
+
+    /// Delegated rather than left to the default, which would allocate, copy, and free. The counter
+    /// moves by the difference, since a shrink has to subtract.
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        let next = unsafe { System.realloc(ptr, layout, new_size) };
+        if !next.is_null() {
+            if new_size >= layout.size() {
+                LIVE_BYTES.fetch_add(new_size - layout.size(), Ordering::Relaxed);
+            } else {
+                LIVE_BYTES.fetch_sub(layout.size() - new_size, Ordering::Relaxed);
+            }
+        }
+        next
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: CountingAllocator = CountingAllocator;
 
 /// The page draws a force simulation, which stops being readable long before it stops being
 /// computable, so this cap is about legibility rather than cost.
@@ -230,6 +283,14 @@ impl Playground {
             .to_string()
     }
 
+    /// Bytes the engine currently holds, live rather than reserved: the WebAssembly heap only ever
+    /// grows, so the browser's view of it says what was once needed rather than what is needed now.
+    /// It is a module-wide figure, not a per-instance one, since the allocator has no way to
+    /// attribute an allocation to a `Playground`.
+    fn memory_bytes_inner() -> usize {
+        LIVE_BYTES.load(Ordering::Relaxed)
+    }
+
     /// Whether data survives a reload, which is the same question as whether this build selected
     /// LMDB. The page no longer shows it, since the header it was reported in is now just the
     /// brand, so this exists for a caller that needs to know rather than for the footer.
@@ -301,6 +362,11 @@ impl Playground {
     #[wasm_bindgen(js_name = buildRef)]
     pub fn build_ref() -> String {
         Self::build_ref_inner()
+    }
+
+    #[wasm_bindgen(js_name = memoryBytes)]
+    pub fn memory_bytes() -> usize {
+        Self::memory_bytes_inner()
     }
 }
 
@@ -433,6 +499,23 @@ mod tests {
     #[test]
     fn the_version_is_not_blank() {
         assert!(!Playground::version_inner().trim().is_empty());
+    }
+
+    /// The footer reports a difference between two readings, so what matters is that the counter
+    /// moves with the data rather than what it says at any one moment.
+    #[test]
+    fn the_memory_counter_grows_with_the_graph_and_is_not_zero() {
+        let (_dir, p) = playground();
+        let empty = Playground::memory_bytes_inner();
+        assert!(empty > 0, "an initialized engine has allocated something");
+        p.query_inner(
+            "CREATE (a:Big {blob: 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'})",
+        )
+        .unwrap_or_default();
+        assert!(
+            Playground::memory_bytes_inner() > empty,
+            "writing a node has to raise the live figure",
+        );
     }
 
     /// Only the shape is asserted. The value depends on `ISSUNDB_BUILD_REF` at compile time, which

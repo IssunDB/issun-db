@@ -723,8 +723,11 @@ where the invariant matters most.
 Browser bindings, exposing one `Playground` that owns a single `Graph`. Depends only on `issundb`. Every method returns a JSON string, so the boundary
 carries one type in both directions rather than a second serialization contract to keep in agreement with the page.
 
-Methods: `query`, `explain`, `stats`, `graphSnapshot`, `createTextIndex`, `textSearch`, `upsertVector`, `vectorSearch`, and the three statics `version`,
-`isPersistent`, and `buildRef`. `buildRef` is the `branch@commit` the page names in its footer, read from `ISSUNDB_BUILD_REF` at compile time through
+Methods: `query`, `explain`, `stats`, `graphSnapshot`, `createTextIndex`, `textSearch`, `upsertVector`, `vectorSearch`, and the four statics `version`,
+`isPersistent`, `buildRef`, and `memoryBytes`. `memoryBytes` is live allocated bytes, from a counting `GlobalAlloc` wrapper this crate installs, which the page's
+footer reports beside the WebAssembly heap size the browser exposes. It is live rather than reserved because the wasm heap only grows, so the browser's figure
+says what was once needed; and it is module-wide rather than per-instance, because an allocator cannot attribute an allocation to a `Playground`. No other crate
+in the workspace sets a global allocator, so nothing an application links against pays the two relaxed atomics per allocation. `buildRef` is the `branch@commit` the page names in its footer, read from `ISSUNDB_BUILD_REF` at compile time through
 `option_env!` and empty without it. It is compiled in rather than fetched as a sidecar file so it cannot disagree with the module it describes, and the
 crate's `build.rs` exists only to declare `rerun-if-env-changed` for that variable, without which a cached artifact would keep reporting an earlier
 build's commit. `make playground-build` supplies it from `git`, and `docs.yml` sets it from the workflow's own refs, since

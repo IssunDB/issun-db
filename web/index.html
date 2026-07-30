@@ -77,10 +77,9 @@
             </h2>
             <div class="panel-body">
               <div class="field">
-                <label for="sample-graph">Pick Graph</label>
+                <label for="sample-graph">Pick a Graph</label>
                 <select id="sample-graph" class="control"></select>
               </div>
-              <p class="hint" id="sample-blurb"></p>
               <div class="btn-row">
                 <button class="btn accent" id="load-sample" title="Put this sample's CREATE in the editor">
                   Load Graph
@@ -89,9 +88,6 @@
                   Reset Database
                 </button>
               </div>
-              <p class="hint">
-                This build keeps everything in memory, so a reload starts over.
-              </p>
               <div class="field-label">Schema</div>
               <div id="schema"></div>
             </div>
@@ -112,7 +108,6 @@
                 <select id="demo-category" class="control"></select>
               </div>
               <div class="demo-buttons" id="demo-buttons"></div>
-              <p class="hint" id="category-blurb"></p>
               <a class="docs-link" id="category-docs" href="#" target="_blank" rel="noopener"></a>
             </div>
           </section>
@@ -138,10 +133,6 @@
                 />
               </div>
               <div class="proc-list" id="proc-list"></div>
-              <p class="hint">
-                Click one to insert a runnable call. Arguments are resolved before planning, so
-                they have to be literals rather than expressions.
-              </p>
             </div>
           </section>
 
@@ -163,7 +154,6 @@
               <h3>Cypher Editor</h3>
               <span class="hint">Press <kbd>Ctrl</kbd> + <kbd>Enter</kbd> to run</span>
             </div>
-            <div class="desc" id="desc"></div>
             <div class="editor" id="editor-box">
               <pre aria-hidden="true"><code id="highlight"></code></pre>
               <textarea
@@ -257,10 +247,17 @@
                   <span id="graph-count"></span>
                   <div class="legend" id="legend"></div>
                   <div class="spacer"></div>
-                  <label class="check">
-                    <input type="checkbox" id="size-by-rank" />
-                    size by PageRank
-                  </label>
+                  <button class="btn sm" id="zoom-out" title="Zoom out" aria-label="Zoom out">
+                    <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2.5" fill="none" aria-hidden="true">
+                      <line x1="5" y1="12" x2="19" y2="12" />
+                    </svg>
+                  </button>
+                  <button class="btn sm" id="zoom-in" title="Zoom in" aria-label="Zoom in">
+                    <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2.5" fill="none" aria-hidden="true">
+                      <line x1="12" y1="5" x2="12" y2="19" />
+                      <line x1="5" y1="12" x2="19" y2="12" />
+                    </svg>
+                  </button>
                   <button class="btn sm" id="fit" title="Zoom the view to the drawn graph">Fit</button>
                   <button class="btn sm" id="relayout">Re-layout</button>
                 </div>

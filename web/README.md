@@ -38,12 +38,12 @@ engine has something to say about it:
 `Load Graph` puts the selected sample's `CREATE` in the editor. `Reset Graph` discards everything
 and re-seeds with it, which is how the page is moved onto a different dataset. The Cypher basics and
 Graph algorithms examples query `:Person` and `:KNOWS`, so they return nothing after a reset onto one
-of the other four; the blurb beside each sample says what it contains. The GraphRAG and
-Knowledge graph examples build their own data, so those work from any state.
+of the other four. The GraphRAG and Knowledge graph examples build their own data, so those work from
+any state.
 
-None of the five carries a comment. They are data rather than documentation, and the blurb beside
-the selector is where the explanation belongs. `make playground-check` runs all five and fails one
-that parses but creates no nodes.
+None of the five carries a comment, and the sidebar carries no prose describing them: the table above
+is where that belongs, and a panel of explanations is a panel a reader has to scroll past to reach the
+controls. `make playground-check` runs all five and fails one that parses but creates no nodes.
 
 The published copy is at <https://issundb.github.io/issun-db/playground/>. The docs workflow
 builds it and copies this directory into `site/playground/` after the MkDocs build, so the
@@ -156,6 +156,20 @@ it from the workflow's refs instead, since `actions/checkout` leaves a detached 
 unset, outside a git checkout, names the version alone. The crate's `build.rs` exists only to
 declare `rerun-if-env-changed` for it, without which cargo would reuse a cached artifact and keep
 reporting an earlier build's commit.
+
+## What the Footer Reports
+
+The left end names the build; the right end reads `6 nodes and 9 edges · 32 KB in use, 19.9 MB heap`.
+
+`in use` is live bytes the engine has allocated and not freed, counted by a `GlobalAlloc` wrapper the
+`issundb-wasm` crate installs and read through `Playground.memoryBytes()`. `heap` is the WebAssembly
+linear memory the browser has committed, from `memory.buffer.byteLength` on the module's exports. The
+two differ because the wasm heap only ever grows: it settles at the high-water mark and stays there,
+so it reads well above what is in use after anything large has been loaded and reset.
+
+The tooltip adds what an empty database accounts for, which is a few kilobytes. That figure is why
+the footer shows two numbers rather than three: an earlier version split the live total into engine
+and graph, and since an empty database costs almost nothing, it was the same number printed twice.
 
 ## Sharing a Query
 
