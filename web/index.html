@@ -11,8 +11,25 @@
     <link rel="stylesheet" href="./style.css" />
     <link
       rel="icon"
-      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%234739c9'/%3E%3Ctext x='16' y='23' font-family='monospace' font-size='19' font-weight='bold' fill='white' text-anchor='middle'%3E一%3C/text%3E%3C/svg%3E"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%237e56c2'/%3E%3Ctext x='16' y='23' font-family='monospace' font-size='19' font-weight='bold' fill='white' text-anchor='middle'%3E一%3C/text%3E%3C/svg%3E"
     />
+    <script>
+      // Applied before first paint, so a dark-theme visitor never sees a white flash. The
+      // attribute name and its two values are Material for MkDocs' own, so the playground
+      // and the surrounding documentation are switched by the same vocabulary.
+      (function () {
+        var scheme = null;
+        try {
+          scheme = localStorage.getItem("issundb.scheme");
+        } catch (e) {}
+        if (!scheme) {
+          scheme = window.matchMedia("(prefers-color-scheme: dark)").matches
+            ? "slate"
+            : "default";
+        }
+        document.documentElement.setAttribute("data-md-color-scheme", scheme);
+      })();
+    </script>
   </head>
   <body>
     <div class="boot" id="boot">
@@ -24,7 +41,11 @@
     </div>
 
     <header>
-      <button class="ghost" id="toggle-side" title="Toggle sidebar">☰</button>
+      <button class="hdr" id="toggle-side" title="Toggle the sidebar" aria-label="Toggle the sidebar">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" aria-hidden="true">
+          <path d="M3 6h18v2H3V6zm0 5h18v2H3v-2zm0 5h18v2H3v-2z" />
+        </svg>
+      </button>
       <div class="brand">
         <span class="mark">一</span>
         <span>IssunDB</span>
@@ -32,34 +53,63 @@
       </div>
       <span class="badge" id="build-badge">in-memory build</span>
       <div class="spacer"></div>
-      <button class="ghost" id="share" title="Copy a link that reproduces this query">Share</button>
-      <button class="ghost" id="reset" title="Discard all data and re-seed the sample graph">
-        Reset data
+      <button class="hdr" id="share" title="Copy a link that reproduces this query">Share</button>
+      <button class="hdr" id="reset" title="Discard all data and re-seed the sample graph">
+        Reset
       </button>
-      <button class="ghost" id="theme" title="Toggle light and dark">◐</button>
-      <a
-        class="ghost"
-        href="https://github.com/habedi/issun-db"
-        target="_blank"
-        rel="noopener"
-        >GitHub</a
-      >
+      <button class="hdr" id="scheme" title="Switch between light and dark" aria-label="Switch between light and dark">
+        <svg id="scheme-icon" viewBox="0 0 24 24" width="18" height="18" fill="currentColor" aria-hidden="true"></svg>
+      </button>
+      <a class="hdr" href="../" title="Back to the documentation">Docs</a>
+      <a class="hdr" href="https://github.com/IssunDB/issun-db" target="_blank" rel="noopener">
+        GitHub
+      </a>
     </header>
 
     <div class="shell">
       <aside id="side">
-        <div class="side-group">
-          <h3>Demos</h3>
-          <div id="demos"></div>
-        </div>
-        <div class="side-group">
-          <h3>Schema</h3>
-          <div id="schema"></div>
-        </div>
-        <div class="side-group">
-          <h3>History</h3>
-          <div id="history"></div>
-        </div>
+        <section class="panel" aria-labelledby="demos-title">
+          <h2 id="demos-title">
+            <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="2" fill="none" aria-hidden="true">
+              <polygon points="12 2 2 7 12 12 22 7 12 2" />
+              <polyline points="2 17 12 22 22 17" />
+              <polyline points="2 12 12 17 22 12" />
+            </svg>
+            Demos
+          </h2>
+          <div class="panel-body">
+            <div class="field">
+              <label for="demo-category">Category</label>
+              <select id="demo-category" class="control"></select>
+            </div>
+            <p class="hint" id="category-blurb"></p>
+            <div class="demo-buttons" id="demo-buttons"></div>
+            <a class="docs-link" id="category-docs" href="#" target="_blank" rel="noopener"></a>
+          </div>
+        </section>
+
+        <section class="panel" aria-labelledby="schema-title">
+          <h2 id="schema-title">
+            <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="2" fill="none" aria-hidden="true">
+              <ellipse cx="12" cy="5" rx="9" ry="3" />
+              <path d="M3 5v14c0 1.7 4 3 9 3s9-1.3 9-3V5" />
+              <path d="M3 12c0 1.7 4 3 9 3s9-1.3 9-3" />
+            </svg>
+            Schema
+          </h2>
+          <div class="panel-body" id="schema"></div>
+        </section>
+
+        <section class="panel" aria-labelledby="history-title">
+          <h2 id="history-title">
+            <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="2" fill="none" aria-hidden="true">
+              <circle cx="12" cy="12" r="9" />
+              <polyline points="12 7 12 12 16 14" />
+            </svg>
+            History
+          </h2>
+          <div class="panel-body" id="history"></div>
+        </section>
       </aside>
 
       <main>
@@ -81,7 +131,7 @@
               Explain
             </button>
             <button class="ghost" id="load-sample" title="Insert the sample social graph">
-              Sample graph
+              Sample
             </button>
             <div class="status" id="status"></div>
           </div>
@@ -124,10 +174,9 @@
     </div>
 
     <footer>
-      <span
-        >The whole engine runs in this tab, compiled to WebAssembly. Nothing leaves your
-        browser.</span
-      >
+      <span>
+        The whole engine runs in this tab, compiled to WebAssembly. Nothing leaves your browser.
+      </span>
       <div class="spacer"></div>
       <span id="footer-note"></span>
     </footer>

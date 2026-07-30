@@ -70,7 +70,7 @@ let sim = null;
 let rankSizes = null;
 
 const HISTORY_KEY = "issundb.history";
-const THEME_KEY = "issundb.theme";
+const SCHEME_KEY = "issundb.scheme";
 
 // ---------------------------------------------------------------------------
 // Editor
@@ -281,30 +281,59 @@ function renderHistory() {
 // Demos
 // ---------------------------------------------------------------------------
 
-function renderDemos() {
-  const host = $("demos");
-  for (const category of DEMO_CATEGORIES) {
-    const wrap = document.createElement("div");
-    wrap.className = "cat";
-    wrap.innerHTML = `<h4>${esc(category.label)}</h4><p>${esc(category.blurb)}</p>`;
-    for (const demo of category.demos) {
-      const button = document.createElement("button");
-      button.className = "demo";
-      button.textContent = demo.label;
-      button.addEventListener("click", async () => {
-        for (const other of document.querySelectorAll(".demo")) {
-          other.classList.remove("active");
-        }
-        button.classList.add("active");
-        setQuery(demo.cypher, demo.desc);
-        await run(demo.explain ? "explain" : "run");
-        if (demo.textIndex) await runTextDemo(demo);
-        if (demo.vectors) await runVectorDemo();
-      });
-      wrap.append(button);
-    }
-    host.append(wrap);
+let activeCategory = 0;
+
+async function selectDemo(index) {
+  const demo = DEMO_CATEGORIES[activeCategory]?.demos[index];
+  if (!demo) return;
+  for (const other of document.querySelectorAll(".demo")) {
+    other.classList.toggle("active", Number(other.dataset.index) === index);
   }
+  setQuery(demo.cypher, demo.desc);
+  await run(demo.explain ? "explain" : "run");
+  // The two capabilities Cypher cannot express run after the demo's own statement, so one
+  // click still shows the whole feature.
+  if (demo.textIndex) await runTextDemo(demo);
+  if (demo.vectors) await runVectorDemo();
+}
+
+function renderCategory() {
+  const category = DEMO_CATEGORIES[activeCategory];
+  $("category-blurb").textContent = category.blurb;
+  const host = $("demo-buttons");
+  host.replaceChildren();
+  category.demos.forEach((demo, i) => {
+    const button = document.createElement("button");
+    button.className = "demo";
+    button.textContent = demo.label;
+    button.dataset.index = String(i);
+    button.title = demo.desc;
+    button.addEventListener("click", () => selectDemo(i));
+    host.append(button);
+  });
+  const link = $("category-docs");
+  if (category.docs) {
+    link.href = category.docs;
+    link.textContent = `Read more: ${category.label}`;
+    link.hidden = false;
+  } else {
+    link.hidden = true;
+  }
+}
+
+function renderDemos() {
+  const select = $("demo-category");
+  DEMO_CATEGORIES.forEach((category, i) => {
+    const option = document.createElement("option");
+    option.value = String(i);
+    option.textContent = category.label;
+    select.append(option);
+  });
+  select.addEventListener("change", () => {
+    activeCategory = Number(select.value);
+    renderCategory();
+  });
+  renderCategory();
 }
 
 async function runTextDemo(demo) {
@@ -395,7 +424,7 @@ function refreshSchema() {
   }
   for (const [type, n] of Object.entries(stats.type_counts ?? {})) {
     rows.push(
-      `<div class="schema-row"><span style="color:var(--ink-faint)">→</span>` +
+      `<div class="schema-row"><span style="color:var(--md-default-fg-color--light)">→</span>` +
         `<span>:${esc(type)}</span><span class="n">${n}</span></div>`,
     );
   }
@@ -577,7 +606,7 @@ function drawGraph() {
 
   if (nodes.length === 0) {
     svg.append(
-      el("text", { x: 16, y: 28, fill: "var(--ink-faint)", "font-size": "13" }),
+      el("text", { x: 16, y: 28, fill: "var(--md-default-fg-color--light)", "font-size": "13" }),
     );
     svg.lastChild.textContent = "Nothing to draw. Run a CREATE, or click Reset data.";
     return;
@@ -685,7 +714,7 @@ function inspect(node) {
   $("inspect").innerHTML =
     `<h5><i class="swatch" style="width:9px;height:9px;border-radius:3px;background:${colorOf(
       labelOf(node),
-    )}"></i>${esc(node.labels?.join(":") || "(no label)")} <span style="color:var(--ink-faint);font-family:var(--mono)">#${node.id}</span></h5>` +
+    )}"></i>${esc(node.labels?.join(":") || "(no label)")} <span style="color:var(--md-default-fg-color--light);font-family:var(--md-code-font)">#${node.id}</span></h5>` +
     (rows ? `<dl>${rows}</dl>` : '<div class="empty">No properties.</div>');
   $("inspect").hidden = false;
 }
@@ -769,23 +798,37 @@ $("share").addEventListener("click", async () => {
   }
 });
 
-function applyTheme(theme) {
-  if (theme) document.documentElement.dataset.theme = theme;
-  else delete document.documentElement.dataset.theme;
+// `default` and `slate` are Material for MkDocs' scheme names, so the playground and the
+// documentation around it are switched by the same vocabulary. The inline script in the head
+// applies the stored choice before first paint; this only handles the toggle.
+const SUN = "M12 7a5 5 0 100 10 5 5 0 000-10zM12 2v3m0 14v3M2 12h3m14 0h3M4.9 4.9l2.1 2.1m10 10l2.1 2.1m0-14.2l-2.1 2.1m-10 10l-2.1 2.1";
+const MOON = "M12 3a9 9 0 109 9c0-.5 0-1-.1-1.4A7 7 0 0112 3z";
+
+function currentScheme() {
+  return document.documentElement.getAttribute("data-md-color-scheme") === "slate"
+    ? "slate"
+    : "default";
 }
 
-$("theme").addEventListener("click", () => {
-  const dark =
-    document.documentElement.dataset.theme === "dark" ||
-    (!document.documentElement.dataset.theme &&
-      matchMedia("(prefers-color-scheme: dark)").matches);
-  const next = dark ? "light" : "dark";
-  applyTheme(next);
+function applyScheme(scheme) {
+  document.documentElement.setAttribute("data-md-color-scheme", scheme);
+  // The icon offers the scheme you would switch to, which is the convention Material uses.
+  $("scheme-icon").innerHTML =
+    `<path d="${scheme === "slate" ? SUN : MOON}" ${
+      scheme === "slate" ? 'stroke="currentColor" stroke-width="2" fill="none"' : ""
+    }/>`;
+}
+
+$("scheme").addEventListener("click", () => {
+  const next = currentScheme() === "slate" ? "default" : "slate";
+  applyScheme(next);
   try {
-    localStorage.setItem(THEME_KEY, next);
+    localStorage.setItem(SCHEME_KEY, next);
   } catch {
     // Storage being unavailable only costs the choice its persistence.
   }
+  // The graph is drawn with resolved colors rather than custom properties, so it has to be
+  // repainted for a scheme change to reach it.
   if ($("pane-graph").classList.contains("on")) drawGraph();
 });
 
@@ -814,11 +857,7 @@ $("reset").addEventListener("click", async () => {
 });
 
 async function boot() {
-  try {
-    applyTheme(localStorage.getItem(THEME_KEY));
-  } catch {
-    // No stored preference, so the system one applies.
-  }
+  applyScheme(currentScheme());
 
   await init();
   db = new Playground();
@@ -856,7 +895,7 @@ async function boot() {
 
 boot().catch((e) => {
   $("boot").innerHTML =
-    `<div style="max-width:34rem;text-align:left;font-family:var(--mono);font-size:12.5px">` +
+    `<div style="max-width:34rem;text-align:left;font-family:var(--md-code-font);font-size:12.5px">` +
     `<strong>The engine did not load.</strong><br><br>${esc(String(e))}<br><br>` +
     `The module is served as <code>web/pkg/</code>; build it with <code>make playground-build</code> ` +
     `and serve the directory over HTTP, since a module cannot be loaded from a file:// path.</div>`;

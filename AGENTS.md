@@ -210,7 +210,10 @@ modules according to this map.
   does, since every read-path method on `Graph` takes the property names to fetch and an inspector cannot know them.
 - `web/`: the playground page that loads that module: `index.html`, `app.js`, `demos.js`, and `style.css`, with the generated module in the gitignored
   `web/pkg/`. Vanilla ES modules with no build step, and nothing is fetched from a network, so the Cypher highlighter and the force-directed layout are
-  written in `app.js` rather than pulled from a library. `demos.js` is the demo catalog, which is Cypher held inside a JavaScript file and therefore
+  written in `app.js` rather than pulled from a library. It is served under the MkDocs site and styled to match it: the custom properties at the top of
+  `style.css` are Material for MkDocs' own tokens, copied from the built `palette.*.min.css` for this site's palette, and the scheme is carried on
+  `data-md-color-scheme` with Material's `default` and `slate` values. A `theme.palette` change in `mkdocs.yml` means updating that block from a fresh
+  `make docs` build rather than from the Material Design palette, since MkDocs derives its primary from the named color instead of using it directly. `demos.js` is the demo catalog, which is Cypher held inside a JavaScript file and therefore
   invisible to every Rust test; `make playground-check` runs the whole catalog through the compiled module and fails on an error, which is how a wrong
   procedure signature is caught. See `web/README.md` for the three build targets and what the browser configuration gives up (no persistence, one thread,
   no `backup`/`restore`, and a 16 MB stack set by a link argument in `.cargo/config.toml` because the 1 MB default is also the engine's inline-execution

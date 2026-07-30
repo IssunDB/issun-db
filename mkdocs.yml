@@ -45,13 +45,13 @@ plugins:
 nav:
   - Home: index.md
   - Getting Started: getting-started.md
-  - Playground: https://issundb.github.io/issun-db/playground/
   - Examples: examples.md
   - Cypher Support: cypher.md
   - API Reference: api-reference.md
   - Hybrid Retrieval: hybrid-retrieval.md
-  - Integrations: integrations.md
   - Python Integration: python.md
+  - Other Integrations: integrations.md
+  - Playground: https://issundb.github.io/issun-db/playground/
 
 markdown_extensions:
   - pymdownx.highlight:

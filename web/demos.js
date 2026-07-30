@@ -27,6 +27,7 @@ const PATH_NOTE = `// Procedure arguments are resolved before planning, so they 
 export const DEMO_CATEGORIES = [
   {
     label: "Cypher basics",
+    docs: "../cypher/",
     blurb: "Create, match, filter, aggregate, and mutate. The query layer is openCypher.",
     demos: [
       {
@@ -74,6 +75,7 @@ RETURN p.name AS name, p.city AS city, labels(p) AS labels`,
   },
   {
     label: "Graph algorithms",
+    docs: "../examples/#graph-data-science-in-cypher",
     blurb: "Called as procedures, computed over the CSR snapshot in pure Rust.",
     demos: [
       {
@@ -161,6 +163,7 @@ ORDER BY communityId, rank`,
   },
   {
     label: "Query planning",
+    docs: "../api-reference/#optimizer-statistics",
     blurb: "What the optimizer did with the query, and why. These show the plan, not rows.",
     demos: [
       {
@@ -193,6 +196,7 @@ RETURN a.name, b.name, c.name`,
   },
   {
     label: "Full-text search",
+    docs: "../examples/",
     blurb: "BM25 over an inverted index, maintained inside the same transaction as the node.",
     demos: [
       {
@@ -209,6 +213,7 @@ RETURN a.name, b.name, c.name`,
   },
   {
     label: "Vector search",
+    docs: "../api-reference/#vector-search-extensions",
     blurb: "An embedding per node, searched by exact distance in this build.",
     demos: [
       {
