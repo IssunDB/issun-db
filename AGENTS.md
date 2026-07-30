@@ -213,9 +213,15 @@ modules according to this map.
   written in `app.js` rather than pulled from a library. It is served under the MkDocs site and styled to match it: the custom properties at the top of
   `style.css` are Material for MkDocs' own tokens, copied from the built `palette.*.min.css` for this site's palette, and the scheme is carried on
   `data-md-color-scheme` with Material's `default` and `slate` values. A `theme.palette` change in `mkdocs.yml` means updating that block from a fresh
-  `make docs` build rather than from the Material Design palette, since MkDocs derives its primary from the named color instead of using it directly. `demos.js` holds the demo catalog and the
-  sidebar's procedure reference, both of which are Cypher inside a JavaScript file and therefore invisible to every Rust test; `make playground-check` runs
-  both through the compiled module and fails on an error, which is how a wrong procedure signature is caught. The procedure reference is written out by hand
+  `make docs` build rather than from the Material Design palette, since MkDocs derives its primary from the named color instead of using it directly. `demos.js` holds the demo catalog, the
+  Setup panel's five sample graphs, and the sidebar's procedure reference, all of which are Cypher inside a JavaScript file and therefore invisible to every
+  Rust test; `make playground-check` runs all three through the compiled module and fails on an error, which is how a wrong procedure signature is caught.
+  Selecting an example or a sample loads it into the editor without running it, since running a `CREATE` on click wrote to the database before the statement
+  had been read and a second click silently duplicated its data; the full-text and vector examples keep their post-statement step by holding the selected
+  example until the run. The sample graphs carry no comments, being data rather than documentation. `app.js` also holds a Cypher formatter, whose casing rule
+  is narrower than the highlighter's keyword set on purpose: uppercasing every word in that set rewrote `issundb.shortestPath` and the case-sensitive yield
+  fields `index` and `count`. It must not be able to change what a query means, which is checked by running every string in `demos.js` before and after
+  formatting and comparing the rows. The procedure reference is written out by hand
   because the engine cannot enumerate its own procedures, so that check is the only thing keeping it from drifting; it treats `ProcedureNotFound` as a failure
   even for the two retrieval entries whose empty-index error it tolerates, since a rename is exactly what that error reports.
   `docs/hooks/playground_links.py` is the MkDocs hook putting a "Run in the playground" link under a Cypher block in `docs/` marked `<!-- playground -->`,

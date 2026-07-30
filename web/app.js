@@ -3,7 +3,7 @@
 // way it would in an embedded database; "Reset data" replaces it.
 
 import init, { Playground } from "./pkg/issundb_wasm.js";
-import { DEMO_CATEGORIES, PROCEDURES, SAMPLE_SOCIAL } from "./demos.js";
+import { DEMO_CATEGORIES, PROCEDURES, SAMPLE_GRAPHS } from "./demos.js";
 
 const $ = (id) => document.getElementById(id);
 
@@ -144,6 +144,7 @@ editor.addEventListener("input", () => {
   // The description belongs to the demo that set it, so editing the query retires it rather
   // than leaving a caption that now describes something else.
   $("desc").textContent = "";
+  pendingDemo = null;
   clearTimeout(storeTimer);
   storeTimer = setTimeout(storeEditor, 400);
 });
@@ -157,6 +158,12 @@ editor.addEventListener("keydown", (e) => {
     run();
     return;
   }
+  // Shift-Alt-F, the shortcut an editor is expected to answer to.
+  if (e.altKey && e.shiftKey && (e.key === "F" || e.key === "f")) {
+    e.preventDefault();
+    formatEditor();
+    return;
+  }
   if (e.key === "Tab") {
     e.preventDefault();
     const { selectionStart: a, selectionEnd: b, value } = editor;
@@ -165,6 +172,216 @@ editor.addEventListener("keydown", (e) => {
     syncHighlight();
   }
 });
+
+// ---------------------------------------------------------------------------
+// Formatting
+// ---------------------------------------------------------------------------
+
+// Clause phrases that begin a line, longest first so `ON CREATE SET` is recognized before the `SET`
+// inside it.
+const CLAUSE_PHRASES = [
+  ["ON", "CREATE", "SET"],
+  ["ON", "MATCH", "SET"],
+  ["OPTIONAL", "MATCH"],
+  ["DETACH", "DELETE"],
+  ["ORDER", "BY"],
+  ["UNION", "ALL"],
+  ["MATCH"],
+  ["WHERE"],
+  ["WITH"],
+  ["RETURN"],
+  ["SKIP"],
+  ["LIMIT"],
+  ["CREATE"],
+  ["MERGE"],
+  ["SET"],
+  ["REMOVE"],
+  ["DELETE"],
+  ["UNWIND"],
+  ["CALL"],
+  ["YIELD"],
+  ["UNION"],
+  ["FOREACH"],
+];
+
+// The clauses whose comma-separated items are patterns rather than expressions. Breaking after each
+// comma there turns a long line into a readable list of paths; doing it in RETURN would scatter a
+// projection over as many lines as it has columns.
+const PATTERN_CLAUSES = new Set(["CREATE", "MERGE"]);
+
+// Deliberately much narrower than the highlighter's keyword set. Uppercasing everything that set
+// contains rewrote `issundb.shortestPath` to `issundb.SHORTESTPATH`, and the yield fields `index`
+// and `count` to `INDEX` and `COUNT`, all three of which are case-sensitive names rather than
+// syntax. So only operators are listed here, and a clause word is uppercased because the phrase
+// scan recognized it as one, not because it appears in a list. Function names are left alone: an
+// aggregate is conventionally lowercase, and `all(` is not the `ALL` of `UNION ALL`.
+const FORMAT_UPPERCASE = new Set([
+  "and",
+  "or",
+  "xor",
+  "not",
+  "in",
+  "is",
+  "null",
+  "true",
+  "false",
+  "distinct",
+  "as",
+  "asc",
+  "desc",
+  "ascending",
+  "descending",
+  "starts",
+  "ends",
+  "contains",
+]);
+
+const FORMAT_TOKEN = new RegExp(
+  [
+    "(\\/\\/[^\\n]*|\\/\\*[\\s\\S]*?\\*\\/)",
+    "('(?:[^'\\\\]|\\\\.)*'|\"(?:[^\"\\\\]|\\\\.)*\")",
+    "([A-Za-z_]\\w*)",
+    "(\\s+)",
+    "([^\\s])",
+  ].join("|"),
+  "g",
+);
+
+// Line breaking and keyword casing, and nothing else. Spacing within a line is left as written apart
+// from collapsing runs of whitespace, because re-spacing would have to know that the `-` in
+// `-[:KNOWS]->` and the `*` in `[r*1..3]` are not binary operators. That restraint is what makes the
+// pass safe to run on any query: it cannot change what the query means.
+function formatCypher(src) {
+  const tokens = [...src.matchAll(FORMAT_TOKEN)].map((m) => ({
+    comment: m[1],
+    string: m[2],
+    word: m[3],
+    space: m[4],
+    other: m[5],
+    text: m[0],
+  }));
+
+  // A bracket depth per token, so a clause word inside a pattern or a map is not mistaken for the
+  // start of a line, and the index of every word, so a phrase can be matched by lookahead.
+  let depth = 0;
+  const words = [];
+  tokens.forEach((token, i) => {
+    token.depth = depth;
+    if (token.other && "([{".includes(token.other)) depth += 1;
+    if (token.other && ")]}".includes(token.other)) depth -= 1;
+    if (token.word) words.push(i);
+  });
+
+  const previousWordOf = (index) => {
+    for (let j = index - 1; j >= 0; j -= 1) {
+      if (tokens[j].space || tokens[j].comment) continue;
+      return tokens[j];
+    }
+    return null;
+  };
+
+  const nextNonSpaceOf = (index) => {
+    for (let j = index + 1; j < tokens.length; j += 1) {
+      if (tokens[j].space) continue;
+      return tokens[j];
+    }
+    return null;
+  };
+
+  // `n.set` and `:Match` are names. Guarding the phrase scan and not only the casing is what stops
+  // `RETURN n.set` from being broken across two lines at the property.
+  const isQualifiedName = (index) => {
+    const previous = previousWordOf(index);
+    if (previous && (previous.other === "." || previous.other === ":")) return true;
+    return Boolean(previous && previous.word && previous.word.toLowerCase() === "as");
+  };
+
+  const upperOf = (index) => (index === undefined ? "" : tokens[index].word.toUpperCase());
+  const breakAt = new Set();
+  const consumed = new Set();
+  const phraseWords = new Set();
+  words.forEach((i, w) => {
+    if (consumed.has(i) || tokens[i].depth !== 0 || isQualifiedName(i)) return;
+    const phrase = CLAUSE_PHRASES.find((candidate) =>
+      candidate.every((word, k) => upperOf(words[w + k]) === word),
+    );
+    if (!phrase) return;
+    breakAt.add(i);
+    tokens[i].clause = phrase.join(" ");
+    phrase.forEach((_, k) => phraseWords.add(words[w + k]));
+    for (let k = 1; k < phrase.length; k += 1) consumed.add(words[w + k]);
+  });
+
+  function shouldUppercase(index) {
+    if (phraseWords.has(index)) return true;
+    if (!FORMAT_UPPERCASE.has(tokens[index].word.toLowerCase())) return false;
+    if (isQualifiedName(index)) return false;
+    // A word the phrase scan did not claim, followed by an open parenthesis, is a function name
+    // rather than an operator. A clause keyword is exempt, since `MATCH (` is still a clause.
+    const next = nextNonSpaceOf(index);
+    return !(next && next.other === "(");
+  }
+
+  let out = "";
+  let atLineStart = true;
+  let pendingSpace = false;
+  let clause = "";
+
+  const newline = () => {
+    if (!atLineStart) out += "\n";
+    atLineStart = true;
+    pendingSpace = false;
+  };
+
+  tokens.forEach((token, i) => {
+    if (token.space) {
+      pendingSpace = out.length > 0;
+      return;
+    }
+
+    // A comment runs to the end of its line, so it has to keep one to itself or it would swallow
+    // whatever the formatter put after it.
+    if (token.comment) {
+      newline();
+      out += token.text;
+      out += "\n";
+      atLineStart = true;
+      return;
+    }
+
+    if (breakAt.has(i)) {
+      newline();
+      clause = token.clause;
+    }
+
+    if (pendingSpace && !atLineStart) out += " ";
+    pendingSpace = false;
+
+    if (token.word) {
+      out += shouldUppercase(i) ? token.word.toUpperCase() : token.word;
+      atLineStart = false;
+      return;
+    }
+
+    if (token.other === ";" && token.depth === 0) {
+      out += ";\n";
+      atLineStart = true;
+      clause = "";
+      return;
+    }
+
+    if (token.other === "," && token.depth === 0 && PATTERN_CLAUSES.has(clause)) {
+      out += ",\n" + " ".repeat(clause.length + 1);
+      atLineStart = true;
+      return;
+    }
+
+    out += token.text;
+    atLineStart = false;
+  });
+
+  return out.replace(/[ \t]+$/gm, "").trim();
+}
 
 // ---------------------------------------------------------------------------
 // Status and results
@@ -337,6 +554,20 @@ async function run(mode = "run") {
       rememberSetup(cypher);
     }
     await refreshGraph(mayWrite);
+
+    if (pendingDemo) {
+      const demo = pendingDemo;
+      pendingDemo = null;
+      if (demo.embed) embedLabel(demo.embed);
+      if (demo.thenQuery) {
+        if (demo.textIndex) db.createTextIndex(demo.textIndex[0], demo.textIndex[1]);
+        await runThenQuery(demo.thenQuery);
+      } else if (demo.textSearch) {
+        await runTextDemo(demo);
+      } else if (demo.vectors) {
+        await runVectorDemo(demo.vectors);
+      }
+    }
   } catch (e) {
     // Cleared, or the export buttons would hand back the previous query's rows while the
     // table shows this one's error.
@@ -356,9 +587,31 @@ $("clear").addEventListener("click", () => {
   setQuery("");
   setStatus("", "Editor cleared.");
 });
-$("load-sample").addEventListener("click", () =>
-  setQuery(SAMPLE_SOCIAL, "The sample social graph. Running it again adds a second copy."),
-);
+
+function formatEditor() {
+  const before = editor.value;
+  if (!before.trim()) return;
+  const after = formatCypher(before);
+  if (after === before) {
+    setStatus("", "Already formatted.");
+    return;
+  }
+  setQuery(after, $("desc").textContent);
+  setStatus("", "Formatted.");
+}
+
+$("format").addEventListener("click", formatEditor);
+// Loaded into the editor rather than executed, so the statement is read before it writes. Running
+// it on a database that already holds the sample adds a second copy, which the caption says.
+$("load-sample").addEventListener("click", () => {
+  const sample = currentSample();
+  setQuery(
+    sample.cypher,
+    `${sample.label}. Running this on a database that already has it adds a second copy.`,
+  );
+  pendingDemo = null;
+  setStatus("", `Loaded the ${sample.label} sample. Press Execute Query to create it.`);
+});
 
 // ---------------------------------------------------------------------------
 // History
@@ -508,18 +761,27 @@ $("proc-search").addEventListener("input", (e) => renderProcedures(e.target.valu
 
 let activeCategory = 0;
 
-async function selectDemo(index) {
+// The example whose text is in the editor, if it has a follow-up step. Full-text search and vector
+// search are Rust extension traits rather than Cypher, so those two examples need something to
+// happen after their statement; holding the example here is what lets that still work now that
+// selecting one no longer runs it.
+let pendingDemo = null;
+
+function selectDemo(index) {
   const demo = DEMO_CATEGORIES[activeCategory]?.demos[index];
   if (!demo) return;
   for (const other of document.querySelectorAll(".demo")) {
     other.classList.toggle("active", Number(other.dataset.index) === index);
   }
   setQuery(demo.cypher, demo.desc);
-  await run(demo.explain ? "explain" : "run");
-  // The two capabilities Cypher cannot express run after the demo's own statement, so one
-  // click still shows the whole feature.
-  if (demo.textIndex) await runTextDemo(demo);
-  if (demo.vectors) await runVectorDemo();
+  pendingDemo =
+    demo.textSearch || demo.vectors || demo.thenQuery || demo.embed ? demo : null;
+  setStatus(
+    "",
+    demo.explain
+      ? `Loaded "${demo.label}". Press Explain to see the plan.`
+      : `Loaded "${demo.label}". Press Execute Query to run it.`,
+  );
 }
 
 function renderCategory() {
@@ -584,37 +846,73 @@ async function runTextDemo(demo) {
   }
 }
 
-async function runVectorDemo() {
+// Places each node of a label on a circle, so "nearest" has a meaning the table can be checked
+// against by eye. A node id is a u64, which wasm-bindgen takes as a BigInt. Returns the ids with
+// their captions, so the search that follows can name its hits.
+function embedLabel(spec) {
+  const label = spec.label ?? "Person";
+  const caption = spec.caption ?? "name";
+  const rows = JSON.parse(
+    db.query(`MATCH (n:${label}) RETURN id(n) AS id, n.${caption} AS caption ORDER BY id`),
+  ).rows;
+  rows.forEach(([id], i) => {
+    const angle = (i / Math.max(rows.length, 1)) * Math.PI * 2;
+    db.upsertVector(BigInt(id), new Float32Array([Math.cos(angle), Math.sin(angle), 0.25]));
+  });
+  return { label, rows };
+}
+
+async function runVectorDemo(spec) {
   try {
-    const people = JSON.parse(
-      db.query("MATCH (p:Person) RETURN id(p) AS id, p.name AS name ORDER BY id"),
-    ).rows;
-    if (people.length === 0) {
-      showError("No Person nodes to embed. Run the sample graph first.");
+    const { label, rows } = embedLabel(spec);
+    if (rows.length === 0) {
+      showError(`No ${label} nodes to embed. Run the example's own CREATE first.`);
       return;
     }
-    // Each person is placed on a circle, so "nearest" has a meaning the table can be
-    // checked against by eye. A node id is a u64, so the parameter is a BigInt.
-    people.forEach(([id], i) => {
-      const angle = (i / people.length) * Math.PI * 2;
-      db.upsertVector(BigInt(id), new Float32Array([Math.cos(angle), Math.sin(angle), 0.25]));
-    });
-    const query = new Float32Array([1, 0, 0.25]);
-    const { hits } = JSON.parse(db.vectorSearch(query, Math.min(5, people.length)));
-    const names = new Map(people.map(([id, name]) => [id, name]));
+    const { hits } = JSON.parse(
+      db.vectorSearch(new Float32Array([1, 0, 0.25]), Math.min(5, rows.length)),
+    );
+    const captions = new Map(rows.map(([id, caption]) => [id, caption]));
     lastResult = {
-      columns: ["rank", "node", "name", "distance"],
-      rows: hits.map((h, i) => [i + 1, h.node, names.get(h.node) ?? null, Number(h.distance.toFixed(5))]),
+      columns: ["rank", "node", "label", "distance"],
+      rows: hits.map((h, i) => [
+        i + 1,
+        h.node,
+        captions.get(h.node) ?? null,
+        Number(h.distance.toFixed(5)),
+      ]),
     };
     renderTable(lastResult);
     setStatus("ok", "Vector search finished.");
     setMeta(
       `${plural(hits.length, "neighbour")}, 4 columns.` +
-        ` Exact search over ${plural(people.length, "embedding")} for [1, 0, 0.25].`,
+        ` Exact search over ${plural(rows.length, `${label} embedding`)} for [1, 0, 0.25].`,
     );
     showPane("table");
   } catch (e) {
     showError(String(e.message ?? e));
+  }
+}
+
+// A query that needs embeddings or a text index in place before it can run, so it cannot be part of
+// the example's own statement. `issundb.retrieve.hybrid` is the case this exists for.
+async function runThenQuery(cypher) {
+  try {
+    const result = JSON.parse(db.query(cypher));
+    lastResult = result;
+    renderTable(result);
+    renderJson(result);
+    setStatus("ok", "Query finished.");
+    setMeta(
+      `${plural(result.rows.length, "row")}, ${plural(result.columns.length, "column")}.` +
+        ` Query took ${result.elapsed_ms.toFixed(2)} ms, after the example put its index and`
+        + " embeddings in place.",
+    );
+    showPane("table");
+    await refreshGraph(false);
+  } catch (e) {
+    showError(String(e.message ?? e));
+    setStatus("err", "The follow-up query failed.");
   }
 }
 
@@ -1343,8 +1641,27 @@ function renderPoweredBy() {
     " (including the queries) runs safely in your browser.";
 }
 
+let activeSample = 0;
+
+const currentSample = () => SAMPLE_GRAPHS[activeSample] ?? SAMPLE_GRAPHS[0];
+
+function renderSamples() {
+  const select = $("sample-graph");
+  SAMPLE_GRAPHS.forEach((sample, i) => {
+    const option = document.createElement("option");
+    option.value = String(i);
+    option.textContent = sample.label;
+    select.append(option);
+  });
+  select.addEventListener("change", () => {
+    activeSample = Number(select.value);
+    $("sample-blurb").textContent = currentSample().blurb;
+  });
+  $("sample-blurb").textContent = currentSample().blurb;
+}
+
 function seed() {
-  db.query(SAMPLE_SOCIAL);
+  db.query(currentSample().cypher);
   refreshSchema();
 }
 
@@ -1365,11 +1682,12 @@ $("reset").addEventListener("click", async () => {
   $("size-by-rank").checked = false;
   seed();
   await refreshGraph();
-  setStatus("ok", "Reset. The sample graph was re-seeded.");
+  setStatus("ok", `Reset. The ${currentSample().label} sample was re-seeded.`);
   setMeta("Run a query to view results.");
   showPane("table");
   $("pane-table").innerHTML =
-    '<div class="notice info">Fresh database, seeded with the sample social graph. Pick a demo on the left, or write a query.</div>';
+    `<div class="notice info">Fresh database, seeded with the ${esc(currentSample().label)} sample.` +
+    " Pick an example on the left, or write a query.</div>";
 });
 
 async function boot() {
@@ -1379,6 +1697,7 @@ async function boot() {
   db = new Playground();
 
   renderPoweredBy();
+  renderSamples();
   renderDemos();
   renderProcedures();
   renderHistory();

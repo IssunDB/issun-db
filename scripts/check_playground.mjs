@@ -13,7 +13,7 @@ const pkg = process.env.PLAYGROUND_PKG ?? join(here, "..", "target", "playground
 
 const require = createRequire(import.meta.url);
 const { Playground } = require(join(pkg, "issundb_wasm.js"));
-const { DEMO_CATEGORIES, PROCEDURES, SAMPLE_SOCIAL } = await import(
+const { DEMO_CATEGORIES, PROCEDURES, SAMPLE_GRAPHS, SAMPLE_SOCIAL } = await import(
   join(here, "..", "web", "demos.js")
 );
 
@@ -21,6 +21,33 @@ let failures = 0;
 let checked = 0;
 
 console.log(`IssunDB ${Playground.version()} (persistent: ${Playground.isPersistent()})\n`);
+
+// The Setup panel's sample graphs. Each is a `CREATE` in a JavaScript file, so nothing else can see
+// it; a typo would surface as an error the first time a visitor pressed Reset Database. Each is run
+// on its own instance and has to produce nodes, which is what catches a script that parses but
+// builds nothing.
+console.log("Sample graphs");
+
+let sampleFailures = 0;
+
+for (const sample of SAMPLE_GRAPHS) {
+  const p = new Playground();
+  try {
+    p.query(sample.cypher);
+    const stats = JSON.parse(p.stats());
+    if (stats.nodes === 0) {
+      throw new Error("the script ran but created no nodes");
+    }
+    const labels = Object.keys(stats.label_counts ?? {}).sort().join(", ");
+    console.log(
+      `  ok    ${sample.id.padEnd(12)} ${stats.nodes} nodes, ${stats.edges} relationships (${labels})`,
+    );
+  } catch (e) {
+    sampleFailures += 1;
+    console.log(`  FAIL  ${sample.id.padEnd(12)} ${String(e.message ?? e).split("\n")[0]}`);
+  }
+}
+console.log();
 
 for (const category of DEMO_CATEGORIES) {
   console.log(category.label);
@@ -45,8 +72,26 @@ for (const category of DEMO_CATEGORIES) {
         detail = `${result.rows.length} row(s), ${result.columns.length} col(s)`;
       }
 
+      // The same order the page uses: embeddings and the index go in first, then whichever
+      // display step the example declared. A node id is a u64, which wasm-bindgen takes as a
+      // BigInt.
+      const embedSpec = demo.embed ?? (demo.vectors && demo.vectors !== true ? demo.vectors : null);
+      if (embedSpec || demo.vectors) {
+        const label = embedSpec?.label ?? "Person";
+        const ids = JSON.parse(p.query(`MATCH (n:${label}) RETURN id(n) ORDER BY id(n)`))
+          .rows.map((r) => r[0]);
+        if (ids.length === 0) {
+          throw new Error(`no ${label} nodes to embed`);
+        }
+        ids.forEach((id, i) =>
+          p.upsertVector(BigInt(id), new Float32Array([Math.cos(i), Math.sin(i), 0.5])),
+        );
+        detail += `, embedded ${ids.length} ${label}`;
+      }
       if (demo.textIndex) {
         p.createTextIndex(demo.textIndex[0], demo.textIndex[1]);
+      }
+      if (demo.textSearch) {
         const hits = JSON.parse(p.textSearch(demo.textSearch, 10)).hits;
         if (hits.length === 0) {
           throw new Error(`no full-text hits for ${JSON.stringify(demo.textSearch)}`);
@@ -54,17 +99,18 @@ for (const category of DEMO_CATEGORIES) {
         detail += `, ${hits.length} text hit(s)`;
       }
       if (demo.vectors) {
-        const ids = JSON.parse(p.query("MATCH (p:Person) RETURN id(p) ORDER BY id(p)"))
-          .rows.map((r) => r[0]);
-        // A node id is a u64, which wasm-bindgen exposes as a BigInt parameter.
-        ids.forEach((id, i) =>
-          p.upsertVector(BigInt(id), new Float32Array([Math.cos(i), Math.sin(i), 0.5])),
-        );
         const hits = JSON.parse(p.vectorSearch(new Float32Array([1, 0, 0.5]), 3)).hits;
         if (hits.length === 0) {
           throw new Error("no vector hits");
         }
         detail += `, ${hits.length} vector hit(s)`;
+      }
+      if (demo.thenQuery) {
+        const after = JSON.parse(p.query(demo.thenQuery));
+        if (after.rows.length === 0) {
+          throw new Error("the follow-up query returned no rows");
+        }
+        detail += `, follow-up ${after.rows.length} row(s)`;
       }
 
       console.log(`  ok    ${demo.label.padEnd(22)} ${detail}`);
@@ -160,4 +206,8 @@ console.log(
   `${docChecked - docFailures}/${docChecked} marked doc blocks ok` +
     (docFailures ? `, ${docFailures} failed` : ""),
 );
-process.exit(failures + procFailures + docFailures ? 1 : 0);
+console.log(
+  `${SAMPLE_GRAPHS.length - sampleFailures}/${SAMPLE_GRAPHS.length} sample graphs ok` +
+    (sampleFailures ? `, ${sampleFailures} failed` : ""),
+);
+process.exit(failures + procFailures + docFailures + sampleFailures ? 1 : 0);

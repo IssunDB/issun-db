@@ -5,9 +5,44 @@ WebAssembly. There is no server component and no network call after the page loa
 database lives in the tab's memory, so every query in it is executed by the same Rust code
 an embedded application links against.
 
-It exists to make the engine's surface visible. The demo catalog covers openCypher
-queries, the ten graph algorithms, what the optimizer does with a query, full-text search,
-and vector search, each with a short note on why the result looks the way it does.
+It exists to make the engine's surface visible. The example catalog has seven categories:
+openCypher queries, the ten graph algorithms, what the optimizer does with a query, full-text
+search, vector search, and two aimed at what the engine is built for. **GraphRAG** covers ranking a
+corpus by BM25, reaching it by embedding instead of by wording, fusing both scores and expanding the
+result in one procedure call, and assembling the context a language model would be handed.
+**Knowledge graph** covers entities with typed relations, a three-hop question with a group-by, two
+researchers connected by what they write about rather than by an edge, and reach measured in hops.
+Each example carries a short note on why the result looks the way it does.
+
+Selecting an example or a sample graph puts it in the editor and stops there; nothing runs until
+Execute Query or Explain is pressed. Running a `CREATE` the moment it was clicked wrote to the
+database before the reader had seen the statement, and clicking the same example twice quietly
+added a second copy of its data. The two examples with a step Cypher cannot express, full-text
+search and vector search, keep that step: it is held against the loaded example and runs after the
+statement it depends on.
+
+## Sample Graphs
+
+The Setup panel offers five, each small enough to read at once and shaped so that one part of the
+engine has something to say about it:
+
+| Sample | What it is for |
+|---|---|
+| Social network | Weighted acquaintances. Seeded on load, and what the Examples panel queries. |
+| Article corpus | Documents, topics, and citations. The corpus for full-text search and hybrid retrieval. |
+| Org chart | A reporting tree, so variable-length hops, shortest path, and a numeric range scan. |
+| Transport network | Routes carrying a weight, a cost, and a capacity, so a weighted path differs from a shortest one. |
+| Retail co-purchase | Customers and products, so grouped counts, a price range scan, and a co-purchase join. |
+
+`Load Graph` puts the selected sample's `CREATE` in the editor. `Reset Graph` discards everything
+and re-seeds with it, which is how the page is moved onto a different dataset. The Cypher basics and
+Graph algorithms examples query `:Person` and `:KNOWS`, so they return nothing after a reset onto one
+of the other four; the blurb beside each sample says what it contains. The GraphRAG and
+Knowledge graph examples build their own data, so those work from any state.
+
+None of the five carries a comment. They are data rather than documentation, and the blurb beside
+the selector is where the explanation belongs. `make playground-check` runs all five and fails one
+that parses but creates no nodes.
 
 The published copy is at <https://issundb.github.io/issun-db/playground/>. The docs workflow
 builds it and copies this directory into `site/playground/` after the MkDocs build, so the
@@ -25,9 +60,9 @@ make playground-serve   # http://localhost:8000
 A module cannot be loaded over `file://`, so the page has to be served over HTTP. Any
 static server works; `make playground-serve` uses Python's.
 
-`make playground-check` runs every demo and every procedure snippet in `demos.js` through the
-compiled module and fails on an error. Both catalogs are Cypher inside a JavaScript file, which
-no Rust test can see, so this is what keeps a button or a reference entry from silently
+`make playground-check` runs every sample graph, demo, and procedure snippet in `demos.js` through
+the compiled module and fails on an error. All three are Cypher inside a JavaScript file, which no
+Rust test can see, so this is what keeps a button, a preset, or a reference entry from silently
 breaking. The procedure half also rejects `ProcedureNotFound` specifically, which is the failure
 a rename produces.
 
@@ -131,6 +166,25 @@ text. A generator has to encode a plus as `%2B`, since a fragment read as a quer
 literal one into a space. Both forms are applied on a fragment change as well as on load, so a
 link followed while the playground is already open is not ignored; one carrying `s` reloads, so
 its setup lands on a freshly seeded database rather than on top of the current one.
+
+## Formatting a Query
+
+`Format` in the editor footer, or Shift+Alt+F, rewrites the query's line breaks and keyword casing.
+It does two things and no more: one clause per line, with a break after each comma in a `CREATE` or
+`MERGE` pattern list, and uppercase for clause keywords and operators. Spacing inside a line is left
+as written apart from collapsing runs of whitespace, because re-spacing would have to know that the
+`-` in `-[:KNOWS]->` and the `*` in `[r*1..3]` are not binary operators.
+
+The casing rule is narrower than the highlighter's keyword set, and deliberately so. Uppercasing
+everything that set contains rewrote `issundb.shortestPath` to `issundb.SHORTESTPATH` and the yield
+fields `index` and `count` to `INDEX` and `COUNT`, which are case-sensitive names rather than syntax.
+A word is uppercased only if the clause-phrase scan recognized it or it is in a short list of
+operators, and never when it follows a `.`, a `:`, or an `AS`. A property that happens to spell a
+clause is left where it is for the same reason: `RETURN n.set` is one line, not two.
+
+Because the pass cannot change what a query means, that is testable, and it is tested: every Cypher
+string in `demos.js` is run before and after formatting on identical fresh databases, and the
+columns and rows compared. That check is what found all three casing bugs above.
 
 ## Links from the Documentation
 

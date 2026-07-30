@@ -668,6 +668,10 @@ select.control {
   justify-content: center;
 }
 
+.btn-row + .hint {
+  margin-top: 9px;
+}
+
 /* ---------------------------------------------------------------- banner ---- */
 
 /* The run outcome gets its own strip between the editor and the results, rather than a line of

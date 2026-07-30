@@ -70,18 +70,22 @@
               Setup
             </h2>
             <div class="panel-body">
-              <p class="hint">
-                A sample social graph is seeded when the page loads. This build keeps everything in
-                memory, so a reload starts over.
-              </p>
+              <div class="field">
+                <label for="sample-graph">Pick Graph</label>
+                <select id="sample-graph" class="control"></select>
+              </div>
+              <p class="hint" id="sample-blurb"></p>
               <div class="btn-row">
-                <button class="btn accent" id="load-sample" title="Insert the sample graph as a query">
-                  Load Sample
+                <button class="btn accent" id="load-sample" title="Put this sample's CREATE in the editor">
+                  Load Graph
                 </button>
-                <button class="btn" id="reset" title="Discard all data and re-seed the sample graph">
+                <button class="btn" id="reset" title="Discard all data and re-seed with this sample">
                   Reset Database
                 </button>
               </div>
+              <p class="hint">
+                This build keeps everything in memory, so a reload starts over.
+              </p>
               <div class="field-label">Schema</div>
               <div id="schema"></div>
             </div>
@@ -165,6 +169,14 @@
               ></textarea>
             </div>
             <div class="card-foot">
+              <button class="btn" id="format" title="Tidy the query's line breaks and keyword casing (Shift+Alt+F)">
+                <svg viewBox="0 0 24 24" width="15" height="15" stroke="currentColor" stroke-width="2" fill="none" aria-hidden="true">
+                  <line x1="3" y1="6" x2="21" y2="6" />
+                  <line x1="3" y1="12" x2="15" y2="12" />
+                  <line x1="3" y1="18" x2="18" y2="18" />
+                </svg>
+                Format
+              </button>
               <button class="btn" id="clear" title="Empty the editor">
                 <svg viewBox="0 0 24 24" width="15" height="15" stroke="currentColor" stroke-width="2" fill="none" aria-hidden="true">
                   <line x1="18" y1="6" x2="6" y2="18" />
