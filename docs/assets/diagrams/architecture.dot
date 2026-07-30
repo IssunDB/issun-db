@@ -101,25 +101,20 @@ digraph IssunDBArchitecture {
  // so arrows attach to the enclosing cluster, not the inner box.
  // ---------------------------------------------------------------
 
-    vector -> core [lhead = cluster_core]
-    text -> core [lhead = cluster_core]
-    retrieval -> core [lhead = cluster_core]
+    // Edges inside a cluster are drawn crate to crate, because that detail
+    // is the point: the extension crates do not all depend on each other.
     retrieval -> vector
     retrieval -> text
-    cypher -> core [lhead = cluster_core]
     cypher -> text
     cypher -> vector
     cypher -> retrieval
 
-    // One arrow stands for the facade's dependency on every extension
-    // crate, clipped at the cluster border rather than drawn four times.
+    // Edges between clusters are drawn once, border to border. Every member
+    // of the tail cluster has the dependency, so naming one crate per arrow
+    // would imply a distinction that does not exist. The representative node
+    // on each side only tells the layout engine where to route.
+    vector -> core [ltail = cluster_ext, lhead = cluster_core]
     facade -> core [ltail = cluster_facade, lhead = cluster_core]
     facade -> vector [ltail = cluster_facade, lhead = cluster_ext]
-
     cli -> facade [ltail = cluster_consumers, lhead = cluster_facade]
-    rest -> facade [ltail = cluster_consumers, lhead = cluster_facade]
-    mcp -> facade [ltail = cluster_consumers, lhead = cluster_facade]
-    py_bind -> facade [ltail = cluster_consumers, lhead = cluster_facade]
-    wasm -> facade [ltail = cluster_consumers, lhead = cluster_facade]
-    examples -> facade [ltail = cluster_consumers, lhead = cluster_facade]
 }
