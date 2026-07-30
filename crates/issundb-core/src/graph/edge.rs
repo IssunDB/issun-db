@@ -174,21 +174,16 @@ impl Graph {
             None => return Ok(None),
         };
 
-        // 1. Delete from edge property index
         self.delete_edge_index_entries(wtxn, id, &record)?;
 
-        // 2. Delete the edge record itself
         self.storage.edges.delete(wtxn, &id)?;
 
-        // 3. Delete from the type index
         self.storage
             .type_idx
             .delete(wtxn, &composite_key(record.edge_type, id))?;
 
-        // 4. Adjust the type count
         adjust_type_count(&self.storage, wtxn, record.edge_type, -1)?;
 
-        // 5. Delete from out_adj (key is src, other is dst)
         let out_entry = AdjEntry {
             edge_type: record.edge_type,
             other: record.dst,
@@ -198,7 +193,6 @@ impl Graph {
             .out_adj
             .delete_one_duplicate(wtxn, &record.src, out_entry.as_bytes())?;
 
-        // 6. Delete from in_adj (key is dst, other is src)
         let in_entry = AdjEntry {
             edge_type: record.edge_type,
             other: record.src,

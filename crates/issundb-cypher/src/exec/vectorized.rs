@@ -2602,7 +2602,6 @@ mod tests {
             "MATCH (a:Person)-[r:KNOWS]->(b:Person) WHERE r.weight > 1 RETURN b.name AS name",
             // Arithmetic inside a comparison operand.
             "MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE b.age + 1 > 2 RETURN b.name AS name",
-            // IS NULL predicate.
             "MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE b.city IS NULL RETURN b.name AS name",
             // OR predicate.
             "MATCH (a:Person)-[:KNOWS]->(b:Person) \
@@ -2611,7 +2610,6 @@ mod tests {
             "MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE a = b RETURN b.name AS name",
             // Whole-variable projection.
             "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN b",
-            // Arithmetic sort key.
             "MATCH (p:Person) RETURN p.name AS name ORDER BY p.age + 1 ASC LIMIT 2",
             // Whole-node sort key.
             "MATCH (p:Person) RETURN p.name AS name ORDER BY p LIMIT 2",
@@ -2686,7 +2684,6 @@ mod tests {
             "MATCH (a:Person)-[:KNOWS]->(b:Person) \
              RETURN b.city AS city, collect(b.name) AS names ORDER BY city",
             "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN stDev(b.age) AS sd",
-            // Group on a source property, sort descending on the count.
             "MATCH (a:Person)-[:KNOWS]->(b:Person) \
              RETURN a.city AS city, count(*) AS n ORDER BY n DESC, city",
             // Empty input drops every group. Counting a destination property
@@ -2757,7 +2754,6 @@ mod tests {
             "MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE b.age > 0 RETURN b.name AS name",
             // Source-side property predicate (pushes below the expand).
             "MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE a.age > 5 RETURN b.name AS name",
-            // Filter feeding an aggregation.
             "MATCH (a:Person)-[:KNOWS]->(b:Person) \
              WHERE b.age >= 4 RETURN b.city AS city, count(b.name) AS n ORDER BY city",
             // Equality predicate on the source: an index-scan leaf when the
@@ -2776,13 +2772,10 @@ mod tests {
         for cypher in [
             // Full-scan projection with no expansion.
             "MATCH (p:Person) RETURN p.name AS name, p.age AS age, p.city AS city",
-            // Scan-only filter plus projection.
             "MATCH (p:Person) WHERE p.age >= 4 RETURN p.name AS name",
             // Range conjuncts: an index range-scan leaf when rewritten.
             "MATCH (p:Person) WHERE p.age >= 4 AND p.age < 40 RETURN count(p) AS n",
-            // Scan-only grouped aggregation.
             "MATCH (p:Person) RETURN p.city AS city, count(*) AS n ORDER BY city",
-            // Scan-only equality.
             "MATCH (p:Person) WHERE p.city = 'oslo' RETURN p.name AS name",
             // Unlabeled scan with a filter.
             "MATCH (p) WHERE p.age <= 4 RETURN p.name AS name",
@@ -2812,16 +2805,12 @@ mod tests {
             // so ties fall back to input order.
             "MATCH (a:Person)-[:KNOWS]->(b:Person) \
              RETURN b.name AS name ORDER BY b.age DESC LIMIT 3",
-            // Sort key projected without an alias.
             "MATCH (p:Person) RETURN p.name, p.age ORDER BY p.age ASC LIMIT 2",
-            // SKIP with LIMIT, and SKIP alone.
             "MATCH (p:Person) RETURN p.name AS name ORDER BY name ASC SKIP 1 LIMIT 2",
             "MATCH (p:Person) RETURN p.name AS name ORDER BY name ASC SKIP 2",
-            // LIMIT 0.
             "MATCH (p:Person) RETURN p.name AS name ORDER BY name ASC LIMIT 0",
             // Sort key missing on some nodes (no city on cal).
             "MATCH (p:Person) RETURN p.name AS name ORDER BY p.city ASC",
-            // Filter stage under a limited sort.
             "MATCH (p:Person) WHERE p.age >= 4 \
              RETURN p.name AS name ORDER BY p.age DESC LIMIT 2",
             // Aggregate root under Sort and Limit.
@@ -2845,10 +2834,8 @@ mod tests {
              RETURN DISTINCT b.name AS name ORDER BY name ASC LIMIT 2",
             "MATCH (a:Person)-[:KNOWS]->(b:Person) \
              RETURN DISTINCT b.city AS city ORDER BY city ASC LIMIT 2",
-            // Filter stage under the limited distinct sort.
             "MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE a.age >= 4 \
              RETURN DISTINCT b.city AS city ORDER BY city ASC LIMIT 5",
-            // Scan-only pipeline.
             "MATCH (p:Person) RETURN DISTINCT p.city AS city ORDER BY city DESC LIMIT 2",
             // Two projected columns, sort on one.
             "MATCH (a:Person)-[:KNOWS]->(b:Person) \
@@ -2856,7 +2843,6 @@ mod tests {
             // SKIP with LIMIT over the deduplicated rows.
             "MATCH (a:Person)-[:KNOWS]->(b:Person) \
              RETURN DISTINCT b.name AS name ORDER BY name ASC SKIP 1 LIMIT 2",
-            // LIMIT 0.
             "MATCH (p:Person) RETURN DISTINCT p.city AS city ORDER BY city ASC LIMIT 0",
             // Missing property: cal has no city, so a null joins the dedup.
             "MATCH (p:Person) RETURN DISTINCT p.city AS city ORDER BY city ASC LIMIT 3",

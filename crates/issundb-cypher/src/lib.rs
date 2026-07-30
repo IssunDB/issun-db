@@ -131,7 +131,6 @@ mod tests {
                 }
             }
             ast::Statement::Query(q) => {
-                // Write-only pipeline form: parts include Match + Set, no RETURN items.
                 assert!(q.return_clause.items.is_empty());
                 assert!(q.parts.len() >= 2);
             }
@@ -285,7 +284,6 @@ mod tests {
         )
         .unwrap();
 
-        // Check edge is gone in the graph
         assert!(g.get_edge(eid).unwrap().is_none());
     }
 
@@ -339,7 +337,6 @@ mod tests {
 
         let params = HashMap::new();
 
-        // Match up to 3 hops from Alice
         let res = execute(
             &g,
             "MATCH (a:Person)-[:KNOWS*1..3]->(b:Person) WHERE a.name = \"Alice\" RETURN b.name AS name",
@@ -629,7 +626,6 @@ mod tests {
         );
         assert_eq!(res.records[0].values[0], json!(60000));
 
-        // And it must not appear under "Node".
         let under_node = execute(&g, "MATCH (n:Node) RETURN n.salary AS s", &params).unwrap();
         assert_eq!(
             under_node.records.len(),

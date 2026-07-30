@@ -879,11 +879,9 @@ mod tests {
         let b = g.add_node("Person", &json!({})).unwrap();
         let eid = g.add_edge(a, b, "KNOWS", &json!({})).unwrap();
 
-        // 1. Verify exists
         assert!(g.get_edge(eid).unwrap().is_some());
         assert_eq!(g.edge_count_by_type("KNOWS").unwrap(), 1);
 
-        // 2. Verify adjacency lists
         let out_neighs = g.out_neighbors(a).unwrap();
         assert_eq!(out_neighs.len(), 1);
         assert_eq!(out_neighs[0].node, b);
@@ -894,18 +892,14 @@ mod tests {
         assert_eq!(in_neighs[0].node, a);
         assert_eq!(in_neighs[0].edge, eid);
 
-        // 3. Delete the edge
         g.delete_edge(eid).unwrap();
 
-        // 4. Verify gone
         assert!(g.get_edge(eid).unwrap().is_none());
         assert_eq!(g.edge_count_by_type("KNOWS").unwrap(), 0);
 
-        // 5. Verify adjacency lists updated
         assert_eq!(g.out_neighbors(a).unwrap().len(), 0);
         assert_eq!(g.in_neighbors(b).unwrap().len(), 0);
 
-        // 6. Idempotence: delete non-existent edge
         g.delete_edge(eid).unwrap();
         assert_eq!(g.edge_count_by_type("KNOWS").unwrap(), 0);
     }
@@ -914,7 +908,6 @@ mod tests {
     fn test_node_property_secondary_index_and_scans() {
         let (_dir, g) = open_tmp();
 
-        // Add nodes
         let n1 = g
             .add_node("Person", &json!({"name": "Alice", "age": 30}))
             .unwrap();
@@ -928,10 +921,8 @@ mod tests {
             .add_node("Employee", &json!({"name": "Alice", "age": 40}))
             .unwrap();
 
-        // Create index on Person(age)
         g.create_node_property_index("Person", "age").unwrap();
 
-        // Check index exists
         assert!(g.has_node_property_index("Person", "age").unwrap());
 
         // Point queries
@@ -975,10 +966,8 @@ mod tests {
     fn test_unique_property_constraint() {
         let (_dir, g) = open_tmp();
 
-        // Create unique constraint on User(email)
         g.create_node_unique_constraint("User", "email").unwrap();
 
-        // Add first user
         let _u1 = g
             .add_node(
                 "User",
@@ -986,7 +975,6 @@ mod tests {
             )
             .unwrap();
 
-        // Add second user with duplicate email - should fail
         let res2 = g.add_node(
             "User",
             &json!({"email": "user1@example.com", "name": "User 2"}),
@@ -997,7 +985,6 @@ mod tests {
             Error::UniqueConstraintViolation { .. }
         ));
 
-        // Add second user with unique email - should succeed
         let u2 = g
             .add_node(
                 "User",
@@ -1005,7 +992,6 @@ mod tests {
             )
             .unwrap();
 
-        // Update u2 to have u1's email - should fail
         let update_res =
             g.update_node(u2, &json!({"email": "user1@example.com", "name": "User 2"}));
         assert!(update_res.is_err());
@@ -1019,15 +1005,12 @@ mod tests {
     fn test_required_property_constraint() {
         let (_dir, g) = open_tmp();
 
-        // Create required constraint on Task(title)
         g.create_node_required_constraint("Task", "title").unwrap();
 
-        // Add task with title - should succeed
         let t1 = g
             .add_node("Task", &json!({"title": "Do homework", "done": false}))
             .unwrap();
 
-        // Add task without title - should fail
         let res2 = g.add_node("Task", &json!({"done": false}));
         assert!(res2.is_err());
         assert!(matches!(
@@ -1035,7 +1018,6 @@ mod tests {
             Error::RequiredConstraintViolation { .. }
         ));
 
-        // Update t1 to remove title - should fail
         let update_res = g.update_node(t1, &json!({"done": true}));
         assert!(update_res.is_err());
         assert!(matches!(
@@ -1048,13 +1030,11 @@ mod tests {
     fn test_index_cleanup_on_delete() {
         let (_dir, g) = open_tmp();
 
-        // Create unique index on Account(number)
         g.create_node_unique_constraint("Account", "number")
             .unwrap();
 
         let a1 = g.add_node("Account", &json!({"number": "12345"})).unwrap();
 
-        // Delete a1
         g.delete_node(a1).unwrap();
 
         // Now we should be able to reuse the account number because index was cleaned up!
@@ -1070,7 +1050,6 @@ mod tests {
         let backup_file = dir.path().join("snapshot.mdb");
         let restore_dir = dir.path().join("restored");
 
-        // Write data.
         let n;
         {
             let g = Graph::open(&dir.path().join("primary"), 1).unwrap();
@@ -1099,7 +1078,6 @@ mod tests {
         let backup_file = dir.path().join("compact.mdb");
         let restore_dir = dir.path().join("restored");
 
-        // Write data, delete some of it, then take a compacted snapshot.
         let kept;
         {
             let g = Graph::open(&dir.path().join("primary"), 1).unwrap();

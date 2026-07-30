@@ -2517,7 +2517,6 @@ impl Optimizer {
                     None
                 };
 
-                // Check if the filter is a relational predicate on a LabelScan variable.
                 if let PhysicalOperator::LabelScan {
                     variable,
                     label: Some(lbl),
@@ -4959,7 +4958,6 @@ mod tests {
 
     #[test]
     fn test_filter_pushdown_basic() {
-        // Query: MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE a.age = 30 RETURN b.name AS name
         let stmt = parser::parse(
             "MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE a.age = 30 RETURN b.name AS name",
         )
@@ -5103,13 +5101,11 @@ mod tests {
             }),
         };
 
-        // Let's add a filter that references 'a' only: a.name = "Alice"
         let filter_a = FilterExpr::Eq(
             Expr::Prop("a".to_string(), "name".to_string()),
             Expr::Literal(crate::ast::Literal::Str("Alice".to_string())),
         );
 
-        // Let's add a filter that references 'b' only: b.industry = "Tech"
         let filter_b = FilterExpr::Eq(
             Expr::Prop("b".to_string(), "industry".to_string()),
             Expr::Literal(crate::ast::Literal::Str("Tech".to_string())),
@@ -5762,7 +5758,6 @@ mod tests {
 
         let rewritten = rewrite_closing_expands(plan);
 
-        // The top-level operator must now be MultiwayJoin.
         match rewritten {
             PhysicalOperator::MultiwayJoin {
                 closing_src_var,

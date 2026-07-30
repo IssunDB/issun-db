@@ -39,7 +39,6 @@ mod tests {
             .unwrap();
         let record = g.get_node(id).unwrap().expect("node should exist");
 
-        // Deserialize props back and assert
         let props: serde_json::Value = rmp_serde::from_slice(&record.props).unwrap();
         assert_eq!(props["name"], "Alice");
         assert_eq!(props["age"], 30);
@@ -201,7 +200,6 @@ mod tests {
     #[test]
     fn bfs_linear_chain_respects_hop_limit() {
         let (_dir, g) = open_tmp();
-        // Build a → b → c → d
         let a = g.add_node("N", &json!({})).unwrap();
         let b = g.add_node("N", &json!({})).unwrap();
         let c = g.add_node("N", &json!({})).unwrap();
@@ -227,7 +225,6 @@ mod tests {
     #[test]
     fn bfs_does_not_revisit_nodes_in_a_cycle() {
         let (_dir, g) = open_tmp();
-        // Build a → b → c → a  (cycle)
         let a = g.add_node("N", &json!({})).unwrap();
         let b = g.add_node("N", &json!({})).unwrap();
         let c = g.add_node("N", &json!({})).unwrap();
@@ -285,7 +282,6 @@ mod tests {
     #[test]
     fn dfs_linear_chain_pre_order_and_limit() {
         let (_dir, g) = open_tmp();
-        // Build a → b → c → d
         let a = g.add_node("N", &json!({})).unwrap();
         let b = g.add_node("N", &json!({})).unwrap();
         let c = g.add_node("N", &json!({})).unwrap();
@@ -308,7 +304,6 @@ mod tests {
     #[test]
     fn dfs_does_not_loop_on_cycle() {
         let (_dir, g) = open_tmp();
-        // Build a → b → c → a  (cycle)
         let a = g.add_node("N", &json!({})).unwrap();
         let b = g.add_node("N", &json!({})).unwrap();
         let c = g.add_node("N", &json!({})).unwrap();
@@ -328,10 +323,8 @@ mod tests {
     fn cycle_detection() {
         let (_dir, g) = open_tmp();
 
-        // Empty graph is acyclic
         assert!(!g.detect_cycle().unwrap());
 
-        // Acyclic linear graph
         let a = g.add_node("N", &json!({})).unwrap();
         let b = g.add_node("N", &json!({})).unwrap();
         let c = g.add_node("N", &json!({})).unwrap();
@@ -339,7 +332,6 @@ mod tests {
         g.add_edge(b, c, "E", &json!({})).unwrap();
         assert!(!g.detect_cycle().unwrap());
 
-        // Self loop
         let d = g.add_node("N", &json!({})).unwrap();
         g.add_edge(d, d, "E", &json!({})).unwrap();
         assert!(g.detect_cycle().unwrap());
@@ -376,12 +368,10 @@ mod tests {
 
         assert_eq!(neighbors.len(), 2);
 
-        // Neighbor b: outgoing edge
         assert_eq!(neighbors[0].node, b);
         assert_eq!(neighbors[0].edge, e1);
         assert!(neighbors[0].outgoing); // is_outgoing == true
 
-        // Neighbor c: incoming edge
         assert_eq!(neighbors[1].node, c);
         assert_eq!(neighbors[1].edge, e2);
         assert!(!neighbors[1].outgoing); // is_outgoing == false
@@ -398,7 +388,6 @@ mod tests {
         let b = g.add_node("N", &json!({})).unwrap();
         let c = g.add_node("N", &json!({})).unwrap();
 
-        // Single linear path: a → b → c
         g.add_edge(a, b, "E", &json!({})).unwrap();
         g.add_edge(b, c, "E", &json!({})).unwrap();
         g.rebuild_csr().unwrap();
@@ -406,7 +395,6 @@ mod tests {
         let paths = g.all_paths(a, c).unwrap();
         assert_eq!(paths, vec![vec![a, b, c]]);
 
-        // Add a second, parallel path: a → c
         g.add_edge(a, c, "E", &json!({})).unwrap();
         g.rebuild_csr().unwrap();
 
@@ -423,14 +411,12 @@ mod tests {
         let a = g.add_node("N", &json!({})).unwrap();
         let b = g.add_node("N", &json!({})).unwrap();
         let c = g.add_node("N", &json!({})).unwrap();
-        // Path: a → b → c, plus cycle b → a
         g.add_edge(a, b, "E", &json!({})).unwrap();
         g.add_edge(b, c, "E", &json!({})).unwrap();
         g.add_edge(b, a, "E", &json!({})).unwrap();
         g.rebuild_csr().unwrap();
 
         let paths = g.all_paths(a, c).unwrap();
-        // Should only return the simple path vec![a, b, c]
         assert_eq!(paths, vec![vec![a, b, c]]);
     }
 
@@ -442,7 +428,6 @@ mod tests {
         let c = g.add_node("N", &json!({})).unwrap();
         let d = g.add_node("N", &json!({})).unwrap();
 
-        // Two paths of length 2: a → b → d and a → c → d
         g.add_edge(a, b, "E", &json!({})).unwrap();
         g.add_edge(b, d, "E", &json!({})).unwrap();
         g.add_edge(a, c, "E", &json!({})).unwrap();
@@ -473,7 +458,6 @@ mod tests {
         let b = g.add_node("N", &json!({})).unwrap();
         let c = g.add_node("N", &json!({})).unwrap();
 
-        // Paths: a → b → c (length 2) and a → c (length 1)
         g.add_edge(a, b, "E", &json!({})).unwrap();
         g.add_edge(b, c, "E", &json!({})).unwrap();
         g.add_edge(a, c, "E", &json!({})).unwrap();
@@ -708,7 +692,6 @@ mod tests {
     #[test]
     fn harmonic_centrality_linear_chain() {
         let (_dir, g) = open_tmp();
-        // A -> B -> C
         let a = g.add_node("N", &json!({})).unwrap();
         let b = g.add_node("N", &json!({})).unwrap();
         let c = g.add_node("N", &json!({})).unwrap();
@@ -732,7 +715,6 @@ mod tests {
     #[test]
     fn harmonic_centrality_triangle_clique() {
         let (_dir, g) = open_tmp();
-        // A -> B -> C -> A
         let a = g.add_node("N", &json!({})).unwrap();
         let b = g.add_node("N", &json!({})).unwrap();
         let c = g.add_node("N", &json!({})).unwrap();
@@ -799,7 +781,6 @@ mod tests {
     #[test]
     fn betweenness_centrality_linear_chain() {
         let (_dir, g) = open_tmp();
-        // A -> B -> C
         let a = g.add_node("N", &json!({})).unwrap();
         let b = g.add_node("N", &json!({})).unwrap();
         let c = g.add_node("N", &json!({})).unwrap();
@@ -892,7 +873,6 @@ mod tests {
     #[test]
     fn strongly_connected_components_linear_chain() {
         let (_dir, g) = open_tmp();
-        // A -> B -> C
         let a = g.add_node("N", &json!({})).unwrap();
         let b = g.add_node("N", &json!({})).unwrap();
         let c = g.add_node("N", &json!({})).unwrap();
@@ -912,7 +892,6 @@ mod tests {
     #[test]
     fn strongly_connected_components_loop() {
         let (_dir, g) = open_tmp();
-        // A -> B -> C -> A
         let a = g.add_node("N", &json!({})).unwrap();
         let b = g.add_node("N", &json!({})).unwrap();
         let c = g.add_node("N", &json!({})).unwrap();
@@ -985,7 +964,6 @@ mod tests {
     #[test]
     fn degree_centrality_linear_chain() {
         let (_dir, g) = open_tmp();
-        // A -> B -> C
         let a = g.add_node("N", &json!({})).unwrap();
         let b = g.add_node("N", &json!({})).unwrap();
         let c = g.add_node("N", &json!({})).unwrap();
@@ -995,19 +973,16 @@ mod tests {
 
         g.rebuild_csr().unwrap();
 
-        // Direction::Out
         let out_scores = g.degree_centrality(DegreeDirection::Out).unwrap();
         assert_eq!(out_scores[&a], 1);
         assert_eq!(out_scores[&b], 1);
         assert_eq!(out_scores[&c], 0);
 
-        // Direction::In
         let in_scores = g.degree_centrality(DegreeDirection::In).unwrap();
         assert_eq!(in_scores[&a], 0);
         assert_eq!(in_scores[&b], 1);
         assert_eq!(in_scores[&c], 1);
 
-        // Direction::Both
         let both_scores = g.degree_centrality(DegreeDirection::Both).unwrap();
         assert_eq!(both_scores[&a], 1);
         assert_eq!(both_scores[&b], 2);
@@ -1048,7 +1023,6 @@ mod tests {
     #[test]
     fn maximum_flow_single_path_bottleneck() {
         let (_dir, g) = open_tmp();
-        // A -(10.0)-> B -(5.0)-> C
         let a = g.add_node("N", &json!({})).unwrap();
         let b = g.add_node("N", &json!({})).unwrap();
         let c = g.add_node("N", &json!({})).unwrap();
@@ -1140,7 +1114,6 @@ mod tests {
     #[test]
     fn shortest_path_top_k_linear_chain() {
         let (_dir, g) = open_tmp();
-        // A -> B -> C
         let a = g.add_node("N", &json!({})).unwrap();
         let b = g.add_node("N", &json!({})).unwrap();
         let c = g.add_node("N", &json!({})).unwrap();
@@ -1481,7 +1454,6 @@ mod tests {
         let path = g.shortest_path(a, c).unwrap().expect("path a→c must exist");
         assert_eq!(path, vec![a, b, c]);
 
-        // SSSP a→a is a trivial path.
         let trivial = g.shortest_path(a, a).unwrap().unwrap();
         assert_eq!(trivial, vec![a]);
 

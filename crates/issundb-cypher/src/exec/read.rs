@@ -203,7 +203,6 @@ pub(super) fn execute_read_query(
     // another if it ever moved between threads. See `crate::exec_mode`.
     let row_pipeline_only = crate::exec_mode::row_pipeline_only();
 
-    // 1. Compile query AST into an optimized physical plan
     let logical = LogicalPlanner::plan(query).map_err(|e| e.to_string())?;
     let physical = PhysicalPlanner::plan(&logical);
     let optimized = Optimizer::optimize_with_mode(physical, Some(graph), row_pipeline_only);
@@ -706,7 +705,6 @@ pub(crate) fn expr_display_name(expr: &Expr) -> String {
             // Use dot notation when the index is a string literal (represents property access).
             if let Expr::Literal(Literal::Str(prop)) = index.as_ref() {
                 let base = expr_display_name(expr);
-                // Wrap base in parens if it contains brackets.
                 if base.contains('[') || base.contains('(') {
                     return format!("({}).{}", base, prop);
                 }
@@ -1757,7 +1755,6 @@ fn expand_from_paths(
                 }
                 let mut new_path = path.clone();
                 new_path.bind_local(dst_var, GraphBinding::Node(neigh_node));
-                // Bind the relationship variable to the trail's relationship list.
                 new_path.bind_local(rel_var, GraphBinding::EdgeList(trail_edges));
 
                 // Build the Path object only when the pattern binds a path variable.
@@ -4231,7 +4228,6 @@ fn aggregate_all(
 ) -> Result<Vec<SlotRow>, String> {
     use std::collections::BTreeMap;
 
-    // group_key -> (group-by row, per-aggregation state Vec)
     let mut groups: BTreeMap<String, (SlotRow, Vec<AggState>)> = BTreeMap::new();
     if group_by.is_empty() {
         let states = aggregations.iter().map(|_| AggState::new()).collect();
@@ -5983,7 +5979,6 @@ mod triangle_count_exec_tests {
             // Grouped aggregation.
             "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person)-[:KNOWS]->(a) \
              RETURN b.city AS city, count(a) AS n",
-            // DISTINCT count.
             "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person)-[:KNOWS]->(a) \
              RETURN count(DISTINCT a) AS n",
             // Undirected middle hop.
@@ -6154,7 +6149,6 @@ mod path_count_exec_tests {
             "MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE b.age IS NOT NULL RETURN count(*) AS n",
             // Grouped aggregation.
             "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN b.city AS c, count(*) AS n",
-            // DISTINCT count.
             "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN count(DISTINCT a) AS n",
             // Reversed hop binds the scan node as the destination.
             "MATCH (a:Person)<-[:KNOWS]-(b:Person) RETURN count(*) AS n",

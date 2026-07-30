@@ -27,18 +27,15 @@ fn build_oltp_graph() -> (TempDir, Graph) {
     let mut posts = Vec::with_capacity(NUM_POSTS);
 
     g.update(|txn| {
-        // 1. Add Cities
         for i in 0..NUM_CITIES {
             cities.push(txn.add_node("City", &json!({ "name": format!("city{i}") }))?);
         }
-        // 2. Add Persons
         for i in 0..NUM_PERSONS {
             persons.push(txn.add_node(
                 "Person",
                 &json!({ "name": format!("p{i}"), "age": 18 + (i % 60) }),
             )?);
         }
-        // 3. Add Posts
         for i in 0..NUM_POSTS {
             posts.push(txn.add_node("Post", &json!({ "title": format!("post{i}") }))?);
         }
@@ -47,7 +44,6 @@ fn build_oltp_graph() -> (TempDir, Graph) {
     .unwrap();
 
     g.update(|txn| {
-        // 4. Connect Persons with LIVES_IN to Cities
         for i in 0..NUM_PERSONS {
             txn.add_edge(persons[i], cities[i % NUM_CITIES], "LIVES_IN", &json!({}))?;
         }

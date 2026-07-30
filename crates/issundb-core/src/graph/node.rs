@@ -472,7 +472,6 @@ impl Graph {
             adjust_label_count(&self.storage, wtxn, label_id, -1)?;
         }
 
-        // 2. Process all outgoing neighbors (out_adj)
         let mut out_edges = Vec::new();
         if let Some(iter) = self.storage.out_adj.get_duplicates(wtxn, &id)? {
             for result in iter {
@@ -490,7 +489,6 @@ impl Graph {
             if let Some(edge_rec) = self.get_edge_impl(wtxn, edge_id)? {
                 self.delete_edge_index_entries(wtxn, edge_id, &edge_rec)?;
             }
-            // Delete edge and type index
             self.storage.edges.delete(wtxn, &edge_id)?;
             self.storage
                 .type_idx
@@ -498,7 +496,6 @@ impl Graph {
 
             adjust_type_count(&self.storage, wtxn, entry.edge_type, -1)?;
 
-            // Delete the corresponding in_adj entry on the neighbor
             let in_entry = AdjEntry {
                 edge_type: entry.edge_type,
                 other: id,
@@ -509,7 +506,6 @@ impl Graph {
                 .delete_one_duplicate(wtxn, &other, in_entry.as_bytes())?;
         }
 
-        // 3. Process all incoming neighbors (in_adj)
         let mut in_edges = Vec::new();
         if let Some(iter) = self.storage.in_adj.get_duplicates(wtxn, &id)? {
             for result in iter {
@@ -527,7 +523,6 @@ impl Graph {
             if let Some(edge_rec) = self.get_edge_impl(wtxn, edge_id)? {
                 self.delete_edge_index_entries(wtxn, edge_id, &edge_rec)?;
             }
-            // Delete edge and type index
             self.storage.edges.delete(wtxn, &edge_id)?;
             self.storage
                 .type_idx
@@ -535,7 +530,6 @@ impl Graph {
 
             adjust_type_count(&self.storage, wtxn, entry.edge_type, -1)?;
 
-            // Delete the corresponding out_adj entry on the neighbor
             let out_entry = AdjEntry {
                 edge_type: entry.edge_type,
                 other: id,
@@ -546,14 +540,11 @@ impl Graph {
                 .delete_one_duplicate(wtxn, &other, out_entry.as_bytes())?;
         }
 
-        // 4. Delete the adjacency list keys themselves
         self.storage.out_adj.delete(wtxn, &id)?;
         self.storage.in_adj.delete(wtxn, &id)?;
 
-        // 5. Delete persisted vector bytes
         self.storage.vectors.delete(wtxn, &id)?;
 
-        // 6. Delete from primary nodes database
         self.storage.nodes.delete(wtxn, &id)?;
 
         Ok(())
@@ -738,7 +729,6 @@ mod tests {
             .add_node("Person", &json!({"name": "Bob", "age": 25}))
             .unwrap();
 
-        // Update age to 26.
         g.update_node(node_id, &json!({"name": "Bob", "age": 26}))
             .unwrap();
 

@@ -940,7 +940,6 @@ mod tests {
             },
         )
         .unwrap();
-        // Both a (vector hit) and b (text hit) should be in the result.
         assert!(sub.nodes.contains(&a), "vector hit a must be present");
         assert!(sub.nodes.contains(&b), "text hit b must be present");
     }

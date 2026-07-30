@@ -206,7 +206,6 @@ impl Graph {
                 .meta
                 .delete(wtxn, &fts_stats_sum_dl_key(label_id, prop_key_id))?;
 
-            // Delete postings prefix
             let mut postings_prefix = Vec::with_capacity(8);
             postings_prefix.extend_from_slice(&label_id.to_be_bytes());
             postings_prefix.extend_from_slice(&prop_key_id.to_be_bytes());
@@ -224,7 +223,6 @@ impl Graph {
                 self.storage.fts_postings.delete(wtxn, &key)?;
             }
 
-            // Delete doc lengths prefix
             let mut docs_prefix = Vec::with_capacity(8);
             docs_prefix.extend_from_slice(&label_id.to_be_bytes());
             docs_prefix.extend_from_slice(&prop_key_id.to_be_bytes());
@@ -340,7 +338,6 @@ impl Graph {
                 self.storage.fts_postings.put(wtxn, &p_key, &p_val)?;
             }
 
-            // Stats
             let n_key = fts_stats_n_key(label_id, prop_key_id);
             let sum_dl_key = fts_stats_sum_dl_key(label_id, prop_key_id);
 
@@ -405,7 +402,6 @@ impl Graph {
                     .delete_one_duplicate(wtxn, &p_key, &p_val)?;
             }
 
-            // Stats
             let n_key = fts_stats_n_key(label_id, prop_key_id);
             let sum_dl_key = fts_stats_sum_dl_key(label_id, prop_key_id);
 

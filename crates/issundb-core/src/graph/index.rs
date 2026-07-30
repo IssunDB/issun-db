@@ -169,7 +169,6 @@ impl Graph {
             if let Some(prop_name) = self.prop_key_name_impl(wtxn, prop_key_id)? {
                 let prop_val = props_json.get(&prop_name);
 
-                // 1. Required constraint check
                 if flags == 0x02
                     && (prop_val.is_none() || prop_val == Some(&serde_json::Value::Null))
                 {
@@ -181,10 +180,9 @@ impl Graph {
 
                 if let Some(val) = prop_val {
                     if val != &serde_json::Value::Null {
-                        // 2. Unique constraint check. Runs for every non-null
-                        // value, including a string too long to index (absent
-                        // from `edge_prop_idx`), which falls back to a type
-                        // scan so the constraint still holds.
+                        // Runs for every non-null value, including a string too
+                        // long to index (absent from `edge_prop_idx`), which
+                        // falls back to a type scan so the constraint still holds.
                         if flags == 0x01 {
                             self.check_edge_property_unique(
                                 wtxn,
@@ -197,7 +195,6 @@ impl Graph {
                             )?;
                         }
 
-                        // 3. Write index entry
                         if let Some(encoded) = encode_property_value(val) {
                             let idx_key =
                                 edge_prop_index_key(type_id, prop_key_id, &encoded, edge_id);

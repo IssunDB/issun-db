@@ -595,7 +595,6 @@ pub(super) fn evaluate_expr<B: Bindings>(
                     s
                 )),
                 (serde_json::Value::Array(arr), serde_json::Value::Number(n)) => {
-                    // Reject non-integer floats.
                     if n.as_i64().is_none() {
                         return Err(format!(
                             "TypeError: list index must be an integer, got Float({})",
@@ -936,7 +935,6 @@ pub(super) fn evaluate_expr<B: Bindings>(
                     } else if *val == serde_json::Value::Null {
                         Ok(serde_json::Value::Null)
                     } else {
-                        // Type error: property access on non-map scalar
                         Err(format!(
                             "TypeError: property access '{}' on non-map value {}",
                             prop, val
@@ -1232,7 +1230,6 @@ pub(super) fn eval_arithmetic(
     rv: &serde_json::Value,
     op: char,
 ) -> Result<serde_json::Value, String> {
-    // List concatenation with +
     if op == '+' {
         match (lv, rv) {
             // String + NaN concatenates the float's string form, so the NaN
@@ -1937,7 +1934,6 @@ pub(super) fn eval_function_call<B: Bindings>(
                         }
                     }
                     serde_json::Value::String(s) => {
-                        // Try parsing the string as an integer or float.
                         if let Ok(i) = s.trim().parse::<i64>() {
                             Ok(serde_json::Value::Number(i.into()))
                         } else if let Ok(f) = s.trim().parse::<f64>() {
@@ -1965,7 +1961,6 @@ pub(super) fn eval_function_call<B: Bindings>(
             match val {
                 serde_json::Value::Number(n) => Ok(float_result(n.as_f64().unwrap_or(0.0))),
                 serde_json::Value::String(s) => {
-                    // Try parsing the string as a float.
                     if let Ok(f) = s.trim().parse::<f64>() {
                         Ok(float_result(f))
                     } else {
@@ -2005,7 +2000,6 @@ pub(super) fn eval_function_call<B: Bindings>(
             if args.len() != 1 {
                 return Err("keys() requires exactly 1 argument".into());
             }
-            // Check if the arg is a node/edge binding directly.
             let bound_props = if let Expr::Prop(var, prop) = &args[0] {
                 if prop.is_empty() {
                     match path.get_binding(var.as_str()) {
@@ -2684,7 +2678,6 @@ pub(super) fn eval_function_call<B: Bindings>(
             if args.len() != 1 {
                 return Err("properties() requires exactly 1 argument".into());
             }
-            // Handle node/edge bindings directly.
             if let Expr::Prop(var, prop) = &args[0] {
                 if prop.is_empty() {
                     match path.get_binding(var.as_str()) {
@@ -3073,8 +3066,6 @@ fn naive_date_from_str(s: &str) -> Result<NaiveDate, String> {
                 }
             }
         }
-        // "YYYY-W30" (8 chars with dash+W, handled above) or "YYYY-Www" with dash
-        // Also handle "YYYY-W30" = 8 chars but contains dash and W
         _ => {}
     }
 
@@ -3139,7 +3130,6 @@ fn date_to_obj(d: NaiveDate) -> serde_json::Value {
     m.insert("dayOfQuarter".to_string(), day_of_quarter(d).into());
     m.insert("dayOfYear".to_string(), (d.ordinal() as i64).into());
     m.insert("ordinalDay".to_string(), (d.ordinal() as i64).into());
-    // ISO week fields
     let iso_week = d.iso_week();
     m.insert("week".to_string(), (iso_week.week() as i64).into());
     m.insert("weekYear".to_string(), (iso_week.year() as i64).into());
@@ -3171,7 +3161,6 @@ fn make_date(arg: serde_json::Value) -> Result<serde_json::Value, String> {
             Ok(date_to_obj(d))
         }
         serde_json::Value::Object(map) => {
-            // Check if map has a "date" key referencing another temporal value.
             if let Some(base_val) = map.get("date") {
                 let base_date = match base_val {
                     serde_json::Value::Object(bmap)
@@ -3182,7 +3171,6 @@ fn make_date(arg: serde_json::Value) -> Result<serde_json::Value, String> {
                     serde_json::Value::String(s) => naive_date_from_str(s)?,
                     _ => return Err("date() 'date' field must be a temporal value".to_string()),
                 };
-                // Apply overrides from the rest of the map
                 let d = apply_date_overrides(base_date, &map)?;
                 return Ok(date_to_obj(d));
             }
@@ -3233,14 +3221,12 @@ fn apply_date_overrides(
             .ok_or_else(|| format!("invalid quarter override: {}", quarter));
     }
 
-    // If ordinalDay override
     if let Some(ord) = get_i64("ordinalDay") {
         let year = get_i64("year").unwrap_or(base.year() as i64) as i32;
         return NaiveDate::from_yo_opt(year, ord as u32)
             .ok_or_else(|| format!("invalid ordinalDay override: {}", ord));
     }
 
-    // Calendar overrides: year, month, day
     let year = get_i64("year").unwrap_or(base.year() as i64) as i32;
     let month = get_i64("month").unwrap_or(base.month() as i64) as u32;
     let day = get_i64("day").unwrap_or(base.day() as i64) as u32;
@@ -3254,7 +3240,6 @@ fn naive_time_from_str(s: &str) -> Result<NaiveTime, String> {
 }
 
 fn parse_time_str(s: &str) -> Result<NaiveTime, String> {
-    // With colons
     if let Ok(t) = NaiveTime::parse_from_str(s, "%H:%M:%S%.f") {
         return Ok(t);
     }
@@ -3264,7 +3249,6 @@ fn parse_time_str(s: &str) -> Result<NaiveTime, String> {
     if let Ok(t) = NaiveTime::parse_from_str(s, "%H:%M") {
         return Ok(t);
     }
-    // Compact (no colons)
     if let Ok(t) = NaiveTime::parse_from_str(s, "%H%M%S%.f") {
         return Ok(t);
     }
@@ -3274,7 +3258,6 @@ fn parse_time_str(s: &str) -> Result<NaiveTime, String> {
     if let Ok(t) = NaiveTime::parse_from_str(s, "%H%M") {
         return Ok(t);
     }
-    // Hour only
     if s.len() == 2 {
         if let Ok(h) = s.parse::<u32>() {
             return NaiveTime::from_hms_opt(h, 0, 0).ok_or_else(|| format!("invalid hour: {}", h));
@@ -3368,7 +3351,6 @@ fn time_to_obj(t: NaiveTime, tz: Option<&str>, type_name: &str) -> serde_json::V
 fn tz_offset_seconds(tz: &str) -> i64 {
     // Drop an optional bracketed zone-name suffix, e.g. "+02:00[Europe/Stockholm]".
     let tz = tz.split('[').next().unwrap_or(tz);
-    // Parse "+HH:MM" or "-HH:MM" or "Z"
     if tz == "Z" {
         return 0;
     }
@@ -3564,7 +3546,6 @@ fn make_time(arg: serde_json::Value) -> Result<serde_json::Value, String> {
     match arg {
         serde_json::Value::Null => Ok(serde_json::Value::Null),
         serde_json::Value::String(s) => {
-            // Split off timezone suffix
             let (time_part, tz_part) = split_tz(&s);
             let t = naive_time_from_str(time_part)?;
             Ok(time_to_obj(t, tz_part.as_deref(), "Time"))
@@ -3611,7 +3592,6 @@ fn split_tz(s: &str) -> (&str, Option<String>) {
         if c == '+' || c == '-' {
             let tz_raw = &s[i..];
             let time_part = &s[..i];
-            // Parse the timezone offset.
             if let Some(tz) = normalize_tz(tz_raw) {
                 return (time_part, Some(with_zone(tz)));
             }
@@ -3773,7 +3753,6 @@ fn datetime_to_obj(dt: NaiveDateTime, tz: Option<&str>, type_name: &str) -> serd
 }
 
 fn naive_datetime_from_str(s: &str) -> Result<(NaiveDateTime, Option<String>), String> {
-    // Split date and time at the 'T' separator.
     let (date_str, time_str, tz) = if let Some(t_pos) = s.find('T') {
         let date_part = &s[..t_pos];
         let rest = &s[t_pos + 1..];
@@ -3917,7 +3896,6 @@ fn make_datetime(arg: serde_json::Value) -> Result<serde_json::Value, String> {
         serde_json::Value::Object(ref map)
             if map.get("__type__").and_then(|v| v.as_str()).is_some() =>
         {
-            // Temporal object → convert/reinterpret as DateTime
             let d = obj_to_naive_date(map)?;
             let t = obj_to_naive_time(map);
             let tz = map
@@ -4369,7 +4347,6 @@ pub(super) fn temporal_arithmetic(
     let lt = temporal_type(lo)?;
     let rt = temporal_type(ro)?;
 
-    // Duration ± Duration
     if lt == "Duration" && rt == "Duration" {
         let (lm, ld, ls, ln) = get_duration_fields(lo);
         let (rm, rd, rs, rn) = get_duration_fields(ro);
@@ -4393,7 +4370,6 @@ pub(super) fn temporal_arithmetic(
     None
 }
 
-// Separate non-overlapping case for Date ± Duration
 pub(super) fn temporal_arithmetic_date_duration(
     lv: &serde_json::Value,
     rv: &serde_json::Value,
@@ -5048,7 +5024,6 @@ fn temporal_truncate(
                         "hour" | "minute" | "second" | "millisecond" | "microsecond" | "nanosecond"
                     );
 
-                    // Compute the truncated date.
                     let truncated = match unit_str.as_str() {
                         "millennium" => {
                             NaiveDate::from_ymd_opt((d.year() / 1000) * 1000, 1, 1).unwrap_or(d)

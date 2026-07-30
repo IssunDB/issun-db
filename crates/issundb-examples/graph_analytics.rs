@@ -131,7 +131,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         format!("Node({:?})", id)
     };
 
-    // 3. Compute PageRank
     println!("\n--- 1. PageRank Influence Analysis ---");
     let pageranks = graph.page_rank(20, 0.85)?;
     let mut pr_sorted: Vec<_> = pageranks.into_iter().collect();
@@ -140,7 +139,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  {:<15} score = {:.6}", get_node_name(id), rank);
     }
 
-    // 4. Compute Degree Centrality
     println!("\n--- 2. Degree Centrality (Both Directions) ---");
     let degrees = graph.degree_centrality(DegreeDirection::Both)?;
     let mut deg_sorted: Vec<_> = degrees.into_iter().collect();
@@ -149,9 +147,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  {:<15} degree = {}", get_node_name(id), deg);
     }
 
-    // 5. Dijkstra Shortest Paths
     println!("\n--- 3. Dijkstra Shortest Path (Weighted) ---");
-    // Find path from Bob to Eva
     let bob_id = dev_ids["Bob"];
     let eva_id = dev_ids["Eva"];
     if let Some(weighted_path) = graph.shortest_path_dijkstra(bob_id, eva_id)? {
@@ -169,7 +165,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  No path found between Bob and Eva.");
     }
 
-    // 6. Label Propagation (Community Detection)
     println!("\n--- 4. Label Propagation Community Detection ---");
     let communities = graph.label_propagation(10)?;
     let mut community_groups: HashMap<u64, Vec<String>> = HashMap::new();
@@ -183,7 +178,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  Community {}: {:?}", comm_id, members);
     }
 
-    // 7. Connected Components
     println!("\n--- 5. Connected Components ---");
     let components = graph.connected_components()?;
     let mut component_groups: HashMap<u64, Vec<String>> = HashMap::new();

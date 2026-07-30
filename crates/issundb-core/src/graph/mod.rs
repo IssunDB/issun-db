@@ -1575,7 +1575,6 @@ mod lazy_open_tests {
             let g = reopen();
             assert_eq!(g.page_rank(5, 0.85).unwrap().len(), 80);
         }
-        // Count kernel.
         {
             let g = reopen();
             let spec = crate::PathCountSpec {

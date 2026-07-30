@@ -678,7 +678,6 @@ mod tests {
         let p2 = graph.add_node("Person", &json!({})).unwrap();
         let c0 = graph.add_node("City", &json!({})).unwrap();
 
-        // Two KNOWS edges, both leaving p0; one VISITED edge from p1 to c0.
         graph.add_edge(p0, p1, "KNOWS", &json!({})).unwrap();
         graph.add_edge(p0, p2, "KNOWS", &json!({})).unwrap();
         graph.add_edge(p1, c0, "VISITED", &json!({})).unwrap();

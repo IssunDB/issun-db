@@ -411,7 +411,6 @@ impl VectorGraphExt for Graph {
 
     fn remove_vector(&self, n: NodeId) -> Result<(), VectorError> {
         self.delete_vector_bytes(n)?;
-        // Remove from in-memory HNSW index if the cache has been built.
         if let Some(arc) = self.get_extension::<VectorIndexCache>() {
             arc.0.remove(n)?;
         }
@@ -1330,7 +1329,6 @@ mod tests {
         assert_eq!(hits[0].node, n2);
         assert_eq!(hits[1].node, n1);
 
-        // Verify the exact distances are computed and ordered correctly
         assert!(hits[0].distance < hits[1].distance);
     }
 }

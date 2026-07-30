@@ -997,14 +997,12 @@ pub(crate) fn expr_parser<'a>() -> impl Parser<'a, ParserInput<'a>, Expr, Parser
                     }))
                 },
             ),
-            // x CONTAINS y
             infix(left(15), keyword("CONTAINS"), |l, _, r, _| {
                 Expr::FunctionCall {
                     name: "__contains__".to_string(),
                     args: vec![l, r],
                 }
             }),
-            // x NOT CONTAINS y
             infix(
                 left(15),
                 keyword("NOT").then_ignore(keyword("CONTAINS")),
@@ -1015,7 +1013,6 @@ pub(crate) fn expr_parser<'a>() -> impl Parser<'a, ParserInput<'a>, Expr, Parser
                     }))
                 },
             ),
-            // x STARTS WITH y
             infix(
                 left(15),
                 keyword("STARTS").then_ignore(keyword("WITH")),
@@ -1037,7 +1034,6 @@ pub(crate) fn expr_parser<'a>() -> impl Parser<'a, ParserInput<'a>, Expr, Parser
                     }))
                 },
             ),
-            // x ENDS WITH y
             infix(
                 left(15),
                 keyword("ENDS").then_ignore(keyword("WITH")),
@@ -1061,13 +1057,11 @@ pub(crate) fn expr_parser<'a>() -> impl Parser<'a, ParserInput<'a>, Expr, Parser
             ),
             // NOT: prefix(13) so it does not consume AND(12) but does consume comparisons(14).
             prefix(13, keyword("NOT"), |_, x, _| Expr::Not(Box::new(x))),
-            // AND
             infix(left(12), keyword("AND"), |l, _, r, _| Expr::BinaryOp {
                 op: BinaryOperator::And,
                 left: Box::new(l),
                 right: Box::new(r),
             }),
-            // XOR
             infix(left(11), keyword("XOR"), |l, _, r, _| Expr::BinaryOp {
                 op: BinaryOperator::Xor,
                 left: Box::new(l),
@@ -2348,7 +2342,6 @@ pub(crate) fn validate_match_clause_variables(clauses: &[MatchClause]) -> Result
     for clause in clauses {
         let pattern = &clause.pattern;
 
-        // Check path variable conflict within a MATCH clause.
         if let Some(ref pv) = pattern.path_variable {
             if node_vars.contains(pv) || rel_vars.contains(pv) || path_vars.contains(pv) {
                 return Err(format!(
@@ -2442,7 +2435,6 @@ pub(crate) fn validate_cross_clause_variable_types(parts: &[QueryPart]) -> Resul
             for clause in clauses {
                 let pattern = &clause.pattern;
 
-                // Check path variable conflict.
                 if let Some(ref pv) = pattern.path_variable {
                     if node_vars.contains(pv) || rel_vars.contains(pv) {
                         return Err(format!(
@@ -4002,7 +3994,6 @@ fn validate_statement_undefined_vars_impl(
             if let Some(wc) = &q.where_clause {
                 validate_where_vars(wc, active)?;
             }
-            // Parts
             for part in &q.parts {
                 match part {
                     QueryPart::Match {
@@ -4120,7 +4111,6 @@ fn validate_statement_undefined_vars_impl(
                     }
                 }
             }
-            // Return clause, order by, skip, limit
             for item in &q.return_clause.items {
                 validate_expr_vars(&item.expr, active)?;
             }

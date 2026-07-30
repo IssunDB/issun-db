@@ -114,7 +114,6 @@ pub(super) fn execute_create_and_return(
                 let key = projected_key(&item.expr, &item.alias);
                 let val = evaluate_expr(txn.graph(), &bindings, &item.expr, params)
                     .map_err(as_txn_error)?;
-                // If null and there's a binding by the key name, use that.
                 let val = if val == serde_json::Value::Null {
                     if let Some(binding) = bindings.get(&key) {
                         binding_to_value(txn.graph(), Some(binding))
@@ -134,7 +133,6 @@ pub(super) fn execute_create_and_return(
                 vec![Record { values }]
             };
 
-            // Apply SKIP/LIMIT.
             let mut result_records = records;
             if let Some(skip_expr) = &stmt.skip {
                 let skip_val = evaluate_expr(txn.graph(), &PathMap::new(), skip_expr, params)
@@ -1313,7 +1311,6 @@ pub(super) fn execute_create_internal_with_context(
     let mut created_node_id = seed_id;
 
     for (rel_pat, node_pat) in &pattern.rels {
-        // Check if the target node is an existing variable.
         let target_id = if let Some(ref var) = node_pat.variable {
             if let Some(GraphBinding::Node(existing_id)) = combined_path.get(var.as_str()) {
                 // Reuse an existing node bound in this context.
