@@ -94,4 +94,5 @@ package-lock.json
 lcov.info
 *.wasm
 web/pkg/
+web/logo.svg
 benchmarks/ladybugdb-compare/target/

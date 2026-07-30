@@ -282,6 +282,7 @@ playground-build: check-wasm-bindgen check-wasm-stack ## Build the browser modul
 	@$(WASM_BUILD)
 	@echo "Generating the JavaScript glue into $(PLAYGROUND_DIR)/pkg..."
 	@wasm-bindgen $(WASM_ARTIFACT) --out-dir $(PLAYGROUND_DIR)/pkg --target web --no-typescript
+	@cp docs/assets/logo.svg $(PLAYGROUND_DIR)/logo.svg
 	@ls -l $(PLAYGROUND_DIR)/pkg
 
 .PHONY: playground-check

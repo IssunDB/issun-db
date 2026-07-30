@@ -96,13 +96,17 @@ and native controls from the light palette on both schemes.
   is renamed. The procedure list is written out by hand because the engine cannot enumerate its
   own procedures, which is why the check runs each snippet.
 - `style.css`: light and dark themes over one set of custom properties.
+- `logo.svg`: the header logo and the favicon, copied from `docs/assets/logo.svg` by
+  `make playground-build` rather than duplicated here, so the documentation stays the one place it
+  is edited. Gitignored, like `pkg/`. It is drawn with dark strokes, so the header puts it on a
+  white tile instead of recoloring it.
 - `pkg/`: the generated module. A build artifact, not checked in.
 
 ## What the Footer Reports
 
-`This playground app is powered by IssunDB (0.1.0-alpha.20; develop@4490f) compiled to
-WebAssembly, ...`, with the graph's node and relationship counts at the other end. The version is
-the crate's, and `develop@4490f` is the branch and short commit the module was built from.
+`This playground app is powered by IssunDB (0.1.0-alpha.20; develop@1f938); ...`, with the graph's
+node and relationship counts at the other end. The version is the crate's, and `develop@1f938` is
+the branch and short commit the module was built from.
 
 That stamp is compiled into the module, read from `ISSUNDB_BUILD_REF` through `option_env!`, rather
 than fetched as a sidecar JSON file, because the page makes no network call once loaded and a build

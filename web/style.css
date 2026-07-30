@@ -152,16 +152,14 @@ header {
   font-size: 15px;
 }
 
-.brand .mark {
-  display: inline-grid;
-  place-items: center;
-  width: 24px;
-  height: 24px;
+/* The documentation's logo is drawn with dark strokes, so it needs a light tile to read against
+   the primary-colored bar rather than being recolored. */
+.brand-logo {
+  flex: 0 0 auto;
   border-radius: 5px;
-  background: rgba(255, 255, 255, 0.18);
-  font-family: var(--md-code-font);
-  font-size: 13px;
-  font-weight: 700;
+  background: #fff;
+  padding: 2px;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.18);
 }
 
 /* The second word in the accent color, as the reference header does it. */
@@ -239,8 +237,8 @@ header .hdr.icon {
 }
 
 aside {
-  width: 288px;
-  flex: 0 0 288px;
+  width: 320px;
+  flex: 0 0 320px;
   display: flex;
   flex-direction: column;
   gap: 16px;
@@ -1060,8 +1058,8 @@ footer {
   }
 
   aside {
-    width: 264px;
-    flex: 0 0 264px;
+    width: 296px;
+    flex: 0 0 296px;
   }
 }
 

@@ -1339,7 +1339,7 @@ function renderPoweredBy() {
     ? `IssunDB (${Playground.version()}; ${build})`
     : `IssunDB (${Playground.version()})`;
   $("powered").textContent =
-    `This playground app is powered by ${engine} compiled to WebAssembly, and everything` +
+    `This playground app is powered by ${engine}; everything` +
     " (including the queries) runs safely in your browser.";
 }
 
