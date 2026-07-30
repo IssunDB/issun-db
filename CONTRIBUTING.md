@@ -36,8 +36,8 @@ would like to work on or if it has already been resolved.
 #### Architectural Considerations
 
 IssunDB components are organized into separate Rust crates for modularity and maintainability.
-It's very important that components are decoupled and have well-defined boundaries and clean APIs between them.
-Diagram below shows the relationship between the main components and their responsibilities:
+Components must stay decoupled, with well-defined boundaries and clean APIs between them.
+The diagram below shows the relationship between the main components and their responsibilities:
 
 <div align="center">
   <picture>

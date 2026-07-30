@@ -243,7 +243,11 @@ modules according to this map.
     - `workload`: the timed comparison. Its queries are shaped for measurement, so most return a single `count(...)`; a `DIVERGENT` verdict there is an
       attributed LadybugDB walk-semantics overcount and does not fail the run, but a `MISMATCH` does (`tests/lbug_trail_semantics.rs` pins the
       walk-versus-trail divergence). Add a correctness query to the differential corpus, not here.
-- `Cargo.toml`: workspace root with shared `[workspace.dependencies]`. All version pins live here.
+- `Cargo.toml`: workspace root with shared `[workspace.dependencies]`, 39 entries. A shared dependency belongs here and a crate should reach it with
+  `workspace = true`. The manifests have drifted from that: `serde_json` is declared independently in six crates, and `anyhow`, `rmp-serde`, `serde`,
+  and `tracing` in two each, all of them despite a root entry that those declarations bypass. A further four are pinned per crate with no root entry
+  at all (`clap` in three crates, and `axum`, `tokio`, and `tracing-subscriber` in `issundb-rest` and `issundb-mcp`), and the two `axum` pins disagree
+  on their version string. Consolidating is a manifest change nobody has made yet, so do not read the current layout as the intended one.
 - `Makefile`: developer workflow entry points.
 - Directory-scoped guides: `crates/issundb-core/AGENTS.md`, `crates/issundb-cypher/AGENTS.md`, `crates/issundb-text/AGENTS.md`, and
   `crates/issundb-vector/AGENTS.md` carry crate-specific rules that this file does not repeat (LMDB lifetime rules, the query pipeline stages, the
@@ -615,21 +619,22 @@ that build is a full node scan and holds every scalar property in memory, which 
 
 The API is self-describing: the OpenAPI 3.1 document is generated from the handler annotations (`#[utoipa::path]`) and the request and response
 `ToSchema` derives, served as JSON at `GET /v1/openapi.json` with a Scalar UI at `GET /v1/docs`. The generator crates are `utoipa` and
-`utoipa-scalar` (both MIT or Apache-2.0), pinned to the Axum 0.7 line. Because the handlers build their JSON bodies inline with `json!`, the
+`utoipa-scalar` (both MIT or Apache-2.0), on the Axum 0.8 line alongside `axum` itself, which is why the route patterns use `{id}` rather than the
+`:id` form Axum 0.7 took. Because the handlers build their JSON bodies inline with `json!`, the
 documentation-only response structs (`NodeResponse`, `EdgeResponse`, `IdResponse`, `QueryResponse`, `ExplainResponse`, `RetrieveResponse`,
 `HealthResponse`, and `ErrorResponse`) describe the response shapes and must be kept in sync with those literals. The Cypher result is documented as
 columns plus row-major records of arbitrary JSON.
 
 Routes:
 
-- `POST /v1/nodes`, `GET /v1/nodes/:id`, `PUT /v1/nodes/:id`, `DELETE /v1/nodes/:id`
-- `POST /v1/nodes/:id/labels/:label`, `DELETE /v1/nodes/:id/labels/:label` (label add and remove; both return 204, and removal is idempotent)
+- `POST /v1/nodes`, `GET /v1/nodes/{id}`, `PUT /v1/nodes/{id}`, `DELETE /v1/nodes/{id}`
+- `POST /v1/nodes/{id}/labels/{label}`, `DELETE /v1/nodes/{id}/labels/{label}` (label add and remove; both return 204, and removal is idempotent)
 - `POST /v1/nodes/batch`, `POST /v1/edges/batch` (many records in one transaction; a single-record insert costs one durable LMDB commit, so
   per-record requests are bound by commit latency, and a batch is all-or-nothing)
-- `POST /v1/edges`, `GET /v1/edges/:id`, `PUT /v1/edges/:id`, `DELETE /v1/edges/:id`
+- `POST /v1/edges`, `GET /v1/edges/{id}`, `PUT /v1/edges/{id}`, `DELETE /v1/edges/{id}`
 - `POST /v1/query` (Cypher execution), `POST /v1/explain` (query plan)
 - `POST /v1/search/text`, `POST /v1/search/vector`
-- `POST /v1/vectors` (upsert embedding), `DELETE /v1/vectors/:id` (remove embedding from the index and storage)
+- `POST /v1/vectors` (upsert embedding), `DELETE /v1/vectors/{id}` (remove embedding from the index and storage)
 - `POST /v1/retrieve` (hybrid retrieval)
 - `GET /v1/openapi.json` (OpenAPI 3.1 document), `GET /v1/docs` (Scalar UI)
 - `GET /health` (unversioned)

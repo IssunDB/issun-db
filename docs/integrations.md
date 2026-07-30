@@ -46,20 +46,20 @@ All data and query endpoints are prefixed with `/v1`.
     * Response: The generated ids in request order, e.g., `{"ids": [1, 2]}`.
     * A single-record insert costs one durable commit, so inserting a batch one request at a time is bound by commit latency rather than by the
       work. The whole batch is written under one transaction, which is also all-or-nothing: any failure rolls back every node in the request.
-* Get node: `GET /v1/nodes/:id`
+* Get node: `GET /v1/nodes/{id}`
     * Response: A JSON object containing the node's unique ID, labels, and properties.
-* Update node: `PUT /v1/nodes/:id`
+* Update node: `PUT /v1/nodes/{id}`
     * Request body:
       ```json
       {
         "props": { "name": "Bob", "age": 32 }
       }
       ```
-* Delete node: `DELETE /v1/nodes/:id`
+* Delete node: `DELETE /v1/nodes/{id}`
     * Response: `204 No Content` on successful removal.
-* Add label: `POST /v1/nodes/:id/labels/:label`
+* Add label: `POST /v1/nodes/{id}/labels/{label}`
     * Response: `204 No Content`; returns `404 Not Found` when the node does not exist.
-* Remove label: `DELETE /v1/nodes/:id/labels/:label`
+* Remove label: `DELETE /v1/nodes/{id}/labels/{label}`
     * Response: `204 No Content` (label removal is idempotent).
 
 #### Edge Operations
@@ -87,9 +87,9 @@ All data and query endpoints are prefixed with `/v1`.
       ```
     * Response: The generated ids in request order, e.g., `{"ids": [1, 2]}`.
     * As with the node batch, the whole request is one transaction and is all-or-nothing.
-* Get edge: `GET /v1/edges/:id`
+* Get edge: `GET /v1/edges/{id}`
     * Response: A JSON object containing the edge's unique ID, source/destination node IDs, type, and properties.
-* Update edge: `PUT /v1/edges/:id`
+* Update edge: `PUT /v1/edges/{id}`
     * Request body:
       ```json
       {
@@ -97,7 +97,7 @@ All data and query endpoints are prefixed with `/v1`.
       }
       ```
     * Response: `204 No Content`; returns `404 Not Found` when the edge does not exist.
-* Delete edge: `DELETE /v1/edges/:id`
+* Delete edge: `DELETE /v1/edges/{id}`
     * Response: `204 No Content` upon successful removal.
 
 #### Search and Query Operations
@@ -150,7 +150,7 @@ All data and query endpoints are prefixed with `/v1`.
       }
       ```
     * Response: Returns the node ID wrapped in a JSON object; an empty vector returns `400 Bad Request`.
-* Delete vector: `DELETE /v1/vectors/:id`
+* Delete vector: `DELETE /v1/vectors/{id}`
     * Response: `204 No Content`; removes the embedding from the index and storage.
 * Hybrid retrieval: `POST /v1/retrieve`
     * Request body (all fields are optional; provide a vector, a text query, or both to produce seed nodes):
