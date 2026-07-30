@@ -127,6 +127,21 @@ These methods are the Rust equivalents of the Cypher DDL statements in the [Cyph
 - `list_node_indexes_and_constraints() -> Result<Vec<(String, String, u8)>, Error>` and `list_edge_indexes_and_constraints() -> ...`  
   Lists the declared indexes and constraints as `(label_or_type, property, kind)` tuples, where the kind byte is `0x00` for an index, `0x01` for a unique constraint, and `0x02` for a required constraint.
 
+### Optimizer Statistics
+
+The query optimizer's cardinality statistics are built only when asked for. Nothing builds them as a side effect of running a query, because each is a full
+scan and paying for it on the first query that mentions a property or a relationship pattern was the dominant cold-start cost. A process that never calls
+these plans every relationship pattern on the global average fan-out and gets no selectivity estimates; the answers are advisory, so plans are weighted
+differently but results never change.
+
+- `materialize_edge_statistics() -> Result<(), Error>`  
+  Builds the `(label, type)` and `(src_label, type, dst_label)` tables behind the expand-ratio estimates, and upgrades the type-inference pruning pass from a budgeted probe to an exact lookup. One pass over the label index and one over the adjacency, cached until the next committed write. Cheap enough to call freely in a long-lived process.
+- `materialize_property_columns() -> Result<(), Error>`  
+  Builds the in-memory property columns, which back the selectivity estimates and zone-map pruning. This is one full node scan whose result holds every scalar node property in memory for the life of the handle, so treat it as a memory commitment rather than a warm-up.
+
+The CLI performs the first of these on every open (pass `--no-warm-statistics` to skip it), and so do the REST and MCP servers, on a background thread. The
+Python and Rust surfaces leave both to the caller.
+
 ---
 
 ## Graph Algorithms
@@ -186,9 +201,9 @@ Pathfinding, network centrality, and connectivity algorithms run over the in-mem
 
 The `VectorGraphExt` trait extends the graph with vector embedding storage and similarity search capability.
 
-The index is configured through `VectorIndexOptions`, which holds a `VectorMetric` (`Cosine`, the default, `L2`, or `Dot`) and a `VectorQuantization` (`Float32`, the default, `Float16`, or `Int8`). The configuration is persisted inside the database, so reopening rebuilds the index with the same settings. Configure the index before the first upsert: changing the metric or quantization once vectors exist returns `VectorError::AlreadyConfigured`, and `reindex_vector_index` is the explicit way to change settings afterward.
+The index is configured through `VectorIndexOptions`, which holds a `VectorMetric` (`Cosine`, the default, `L2`, or `Dot`) and a `VectorQuantization` (`Float32`, the default, `Float16`, or `Int8`). A build without the `hnsw` feature accepts and persists a quantization but cannot honor it, since its exact index keeps the raw `f32`. The configuration is persisted inside the database, so reopening rebuilds the index with the same settings. Configure the index before the first upsert: changing the metric or quantization once vectors exist returns `VectorError::AlreadyConfigured`, and `reindex_vector_index` is the explicit way to change settings afterward.
 
-`VectorSearchOptions` carries `k`, an optional exact-label filter (`label`), optional property equality filters (`properties`), and `rescore_factor`. On a quantized index a search fetches `k * rescore_factor` candidates (default factor 2) and re-ranks them by exact distance against the full-precision vectors in storage; pass `Some(1)` to disable the rescore. A `Float32` index never rescores by default.
+`VectorSearchOptions` carries `k`, an optional exact-label filter (`label`), optional property equality filters (`properties`), and `rescore_factor`. On a quantized index a search fetches `k * rescore_factor` candidates (default factor 2) and re-ranks them by exact distance against the full-precision vectors in storage; pass `Some(1)` to disable the rescore. A `Float32` index never rescores by default, and neither does a build without the `hnsw` feature, whose exact index keeps the raw `f32` and so has no precision to recover whatever quantization was configured.
 
 - `VectorGraphExt::configure_vector_index(opts: VectorIndexOptions) -> Result<(), VectorError>`  
   Configures the metric and quantization parameters for the graph's vector index.
@@ -204,7 +219,7 @@ The index is configured through `VectorIndexOptions`, which holds a `VectorMetri
 - `VectorGraphExt::vector_search_with(q: &[f32], opts: &VectorSearchOptions) -> Result<Vec<Hit>, VectorError>`  
   Retrieves the top-k nearest neighbor nodes satisfying label and property filters. Errors like `vector_search` on a graph with no embeddings.
 - `VectorGraphExt::node_vector(n: NodeId) -> Result<Option<Vec<f32>>, VectorError>`  
-  Returns the full-precision embedding stored for a node, or `None` if the node has no embedding. This performs an LMDB point lookup and does not build or consult the in-memory HNSW index.
+  Returns the full-precision embedding stored for a node, or `None` if the node has no embedding. This performs a storage point lookup and does not build or consult the in-memory index.
 - `VectorGraphExt::vector_distance(a: &[f32], b: &[f32]) -> Result<f32, VectorError>`  
   Computes the distance between two vectors under the graph's configured metric.
 

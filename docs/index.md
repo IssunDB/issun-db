@@ -5,11 +5,11 @@ IssunDB is an embedded graph database in Rust.
 ## Key Features
 
 * ACID transactions, property graph model, and Cypher query support
-* Graph traversal and analytics using (parallelized) sparse matrix operations
+* Fast graph traversal and analytics
 * Vectorized query execution
 * Vector, full-text, and hybrid search
 * APIs for Rust, Python, CLI, HTTP (REST), and MCP
-* Support for Linux, macOS, and Windows
+* Support for Linux, macOS, Windows, and WebAssembly
 
 ## Architecture Overview
 
@@ -19,7 +19,7 @@ The database is designed as a set of modular crates, establishing clear boundari
 |---------------------|-----------------------------------------------------------------------------|
 | `issundb-core`      | Storage engine, schema types, configurations, and property columns.         |
 | `issundb-vector`    | Vector embedding storage, search indexing, and quantization configurations. |
-| `issundb-text`      | Tokenizer implementation, inverted indexes, and BM25 text search scoring.   |
+| `issundb-text`      | BM25 scoring and the text query APIs.                                       |
 | `issundb-retrieval` | Multi-source hybrid retrieval, rank fusion, and graph traversal.            |
 | `issundb-cypher`    | Cypher query parser, AST definitions, planners, and executors.              |
 | `issundb`           | The primary library crate providing a unified public API.                   |
@@ -35,6 +35,7 @@ The database is designed as a set of modular crates, establishing clear boundari
 ## Documentation Sections
 
 - [Getting Started](getting-started.md): Installation, build instructions, basic CLI usage, and usage in Rust projects.
+- [Playground](https://issundb.github.io/issun-db/playground/): The whole engine compiled to WebAssembly, running in a browser.
 - [Code Examples](examples.md): Practical code examples for vector search, text search, and Cypher query execution.
 - [Cypher Support](cypher.md): The supported Cypher clauses, patterns, expressions, and functions, plus known deviations.
 - [API Reference](api-reference.md): Public Rust API reference, types, and Cypher DDL syntax.

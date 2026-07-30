@@ -35,6 +35,8 @@ Queries compose as pipelines: a sequence of clauses such as `MATCH ... WITH ... 
 - Variable-length relationships support every range form: `*`, `*n`, `*n..m`, `*n..`, `*..m`, and `*..`. A variable on a variable-length relationship always binds a list of relationships, including for `*1`.
 - Relationship uniqueness follows openCypher: within one pattern match, a node may repeat but a relationship may not.
 - Named paths (`p = (a)-[:KNOWS]->(b)`) bind path values; `nodes(p)`, `relationships(p)` (alias `rels(p)`), and `length(p)` operate on them.
+- Because a variable-length relationship variable is a list rather than a path, its hop count is `size(r)`. `length()` applies to a named path, so
+  `length(r)` on a relationship list is a type error.
 
 ## Expressions
 
