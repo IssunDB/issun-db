@@ -27,23 +27,29 @@ statement it depends on.
 The Setup panel offers five, each small enough to read at once and shaped so that one part of the
 engine has something to say about it:
 
-| Sample | What it is for |
-|---|---|
-| Social network | Weighted acquaintances. Seeded on load, and what the Examples panel queries. |
-| Article corpus | Documents, topics, and citations. The corpus for full-text search and hybrid retrieval. |
-| Org chart | A reporting tree, so variable-length hops, shortest path, and a numeric range scan. |
-| Transport network | Routes carrying a weight, a cost, and a capacity, so a weighted path differs from a shortest one. |
-| Retail co-purchase | Customers and products, so grouped counts, a price range scan, and a co-purchase join. |
+| Sample | What it is | Examples that query it |
+|---|---|---|
+| Social network | Weighted acquaintances. Seeded on load. | Cypher basics, Graph algorithms, Query planning, Vector search |
+| Article corpus | Documents, topics, and citations. | Full-text search, GraphRAG |
+| Knowledge graph | Researchers, labs, papers, and the concepts those mention. | Knowledge graph |
+| Org chart | A reporting tree, so variable-length hops, shortest path, and a numeric range scan. | |
+| Transport network | Routes carrying a weight, a cost, and a capacity, so a weighted path differs from a shortest one. | |
+| Retail co-purchase | Customers and products, so grouped counts, a price range scan, and a co-purchase join. | |
 
-`Load Graph` puts the selected sample's `CREATE` in the editor. `Reset Graph` discards everything
-and re-seeds with it, which is how the page is moved onto a different dataset. The Cypher basics and
-Graph algorithms examples query `:Person` and `:KNOWS`, so they return nothing after a reset onto one
-of the other four. The GraphRAG and Knowledge graph examples build their own data, so those work from
-any state.
+This is the only place a dataset comes from. Every example queries whatever graph is loaded rather
+than creating one, which is what keeps the two panels from being two lists of datasets: an earlier
+version had the GraphRAG and knowledge-graph examples build their own corpora, one of which
+duplicated the Article corpus sample outright.
 
-None of the five carries a comment, and the sidebar carries no prose describing them: the table above
-is where that belongs, and a panel of explanations is a panel a reader has to scroll past to reach the
-controls. `make playground-check` runs all five and fails one that parses but creates no nodes.
+`Load Graph` puts the selected sample's `CREATE` in the editor. `Reset Graph` discards everything and
+re-seeds with it. Each category names the graph it queries, so choosing a category points the picker
+at that graph, and an example whose graph is not in the database says which one to load rather than
+returning an empty table. The one example that still writes is the Cypher basics lesson on `CREATE`,
+and it makes two nodes rather than a dataset.
+
+None of the six carries a comment, and the sidebar carries no prose describing them: the table above
+is where that belongs. `make playground-check` seeds each category's own graph before running its
+examples, runs all six samples, and fails one that parses but creates no nodes.
 
 The published copy is at <https://issundb.github.io/issun-db/playground/>. The docs workflow
 builds it and copies this directory into `site/playground/` after the MkDocs build, so the
@@ -142,24 +148,25 @@ and native controls from the light palette on both schemes.
   white tile instead of recoloring it.
 - `pkg/`: the generated module. A build artifact, not checked in.
 
+## The Graph View
+
+The pane is a fixed 560px, because the page scrolls as a document and the force layout reads the
+element's size when it starts, so a share of the viewport would make the layout depend on how far down
+the page happened to be.
+
+Zoom is the `−` and `+` buttons or the wheel, and dragging the background pans. All three move the same
+view box that `Fit` sets and that pointer positions are mapped through, so a vertex drag lands where the
+pointer is at any zoom. The wheel holds the point under the cursor still, and its listener is
+non-passive: a wheel over the canvas that both zoomed and scrolled the page would be unusable. Zoom is
+bounded to a factor of eight in and four out, or a few scrolls leave an empty canvas with no clue which
+way the graph went. A redraw returns the view to the whole canvas, so a query is never answered into a
+frame computed for different data.
+
 ## What the Footer Reports
 
-`This playground app is powered by IssunDB (0.1.0-alpha.20; develop@1f938); ...`, with the graph's
-node and relationship counts at the other end. The version is the crate's, and `develop@1f938` is
-the branch and short commit the module was built from.
-
-That stamp is compiled into the module, read from `ISSUNDB_BUILD_REF` through `option_env!`, rather
-than fetched as a sidecar JSON file, so it cannot disagree with the module it describes and the
-deployed tree has one fewer file to keep in step. `make playground-build` fills it in from `git`; `docs.yml` sets
-it from the workflow's refs instead, since `actions/checkout` leaves a detached HEAD where
-`git rev-parse --abbrev-ref HEAD` answers `HEAD` rather than the branch. A build with the variable
-unset, outside a git checkout, names the version alone. The crate's `build.rs` exists only to
-declare `rerun-if-env-changed` for it, without which cargo would reuse a cached artifact and keep
-reporting an earlier build's commit.
-
-## What the Footer Reports
-
-The left end names the build; the right end reads `6 nodes and 9 edges · 32 KB in use, 19.9 MB heap`.
+The left end reads `This playground app is powered by IssunDB (0.1.0-alpha.20; develop@1f938); ...`.
+The version is the crate's, and `develop@1f938` is the branch and short commit the module was built
+from. The right end reads `6 nodes and 9 edges · 32 KB in use, 19.9 MB heap`.
 
 `in use` is live bytes the engine has allocated and not freed, counted by a `GlobalAlloc` wrapper the
 `issundb-wasm` crate installs and read through `Playground.memoryBytes()`. `heap` is the WebAssembly
@@ -170,6 +177,15 @@ so it reads well above what is in use after anything large has been loaded and r
 The tooltip adds what an empty database accounts for, which is a few kilobytes. That figure is why
 the footer shows two numbers rather than three: an earlier version split the live total into engine
 and graph, and since an empty database costs almost nothing, it was the same number printed twice.
+
+The build stamp is compiled into the module, read from `ISSUNDB_BUILD_REF` through `option_env!`, rather
+than fetched as a sidecar JSON file, so it cannot disagree with the module it describes and the
+deployed tree has one fewer file to keep in step. `make playground-build` fills it in from `git`; `docs.yml` sets
+it from the workflow's refs instead, since `actions/checkout` leaves a detached HEAD where
+`git rev-parse --abbrev-ref HEAD` answers `HEAD` rather than the branch. A build with the variable
+unset, outside a git checkout, names the version alone. The crate's `build.rs` exists only to
+declare `rerun-if-env-changed` for it, without which cargo would reuse a cached artifact and keep
+reporting an earlier build's commit.
 
 ## Sharing a Query
 

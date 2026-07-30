@@ -1242,6 +1242,17 @@ function resultOverlay() {
   };
 }
 
+// Pointer capture keeps a drag alive once the pointer leaves the element, which improves the gesture
+// rather than enabling it. It throws when the id is not an active pointer, and letting that escape
+// abandoned the gesture entirely, since the move listener is attached after this call.
+function capturePointer(element, pointerId) {
+  try {
+    element.setPointerCapture(pointerId);
+  } catch {
+    // Without capture the drag still works while the pointer stays over the element.
+  }
+}
+
 let simGeneration = 0;
 
 function drawGraph() {
@@ -1327,7 +1338,7 @@ function drawGraph() {
     group.addEventListener("pointerdown", (e) => {
       e.stopPropagation();
       node.pinned = true;
-      group.setPointerCapture(e.pointerId);
+      capturePointer(group, e.pointerId);
       const move = (ev) => {
         const point = toSvg(svg, ev);
         node.x = point.x;
@@ -1474,7 +1485,7 @@ $("svg").addEventListener("pointerdown", (e) => {
   const svg = $("svg");
   const from = viewBox ? { ...viewBox } : null;
   if (!from) return;
-  svg.setPointerCapture(e.pointerId);
+  capturePointer(svg, e.pointerId);
 
   const move = (ev) => {
     // Measured against the box the drag started from rather than the current one, or the pan chases
