@@ -353,6 +353,41 @@ select.control {
   font-style: italic;
 }
 
+.proc-list {
+  max-height: 200px;
+  overflow-y: auto;
+  margin-bottom: 8px;
+}
+
+.proc {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  padding: 4px 7px;
+  color: var(--md-default-fg-color--light);
+}
+
+.proc:hover {
+  background: var(--md-default-fg-color--lightest);
+}
+
+.proc .nm {
+  display: block;
+  font-family: var(--md-code-font);
+  font-size: 11.5px;
+  color: var(--md-typeset-a-color);
+  overflow-wrap: anywhere;
+}
+
+.proc .yd {
+  display: block;
+  font-size: 10.5px;
+  margin-top: 1px;
+}
+
 .hist {
   display: block;
   width: 100%;
@@ -854,6 +889,20 @@ footer {
   }
 }
 
+/* The force layout settles over an animation loop and the boot indicator spins, so both are
+   motion this has to answer for. `drawGraph` reads the same preference and settles the layout
+   in one pass instead of animating it. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0s !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0s !important;
+    scroll-behavior: auto !important;
+  }
+}
+
 @media (max-width: 820px) {
   aside {
     position: absolute;
@@ -861,5 +910,42 @@ footer {
     height: calc(100% - 48px);
     top: 48px;
     box-shadow: var(--md-shadow-z2);
+  }
+}
+
+@media (max-width: 600px) {
+  header {
+    gap: 6px;
+    padding: 0 8px;
+  }
+
+  /* The version and the build badge are the two header items a query never needs, and the
+     footer still reports the build. Dropping them keeps Run and the scheme toggle reachable
+     without a horizontal scroll. */
+  .brand small,
+  .badge {
+    display: none;
+  }
+
+  header .hdr {
+    padding: 6px 6px;
+    font-size: 12px;
+  }
+
+  /* `.bar` already wraps; this drops the auto margin so the status reads from the left once it
+     is on its own line rather than being pushed to the right edge. */
+  .status {
+    width: 100%;
+    margin-left: 0;
+  }
+
+  .tab {
+    padding: 7px 9px;
+    font-size: 12px;
+  }
+
+  .inspect {
+    width: auto;
+    left: 12px;
   }
 }

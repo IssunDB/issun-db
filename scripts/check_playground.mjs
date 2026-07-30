@@ -12,7 +12,7 @@ const pkg = process.env.PLAYGROUND_PKG ?? join(here, "..", "target", "playground
 
 const require = createRequire(import.meta.url);
 const { Playground } = require(join(pkg, "issundb_wasm.js"));
-const { DEMO_CATEGORIES, SAMPLE_SOCIAL } = await import(
+const { DEMO_CATEGORIES, PROCEDURES, SAMPLE_SOCIAL } = await import(
   join(here, "..", "web", "demos.js")
 );
 
@@ -74,7 +74,40 @@ for (const category of DEMO_CATEGORIES) {
   }
 }
 
+// The sidebar's procedure reference. The engine cannot enumerate its procedures, so the catalog is
+// written out by hand and this is what keeps it honest: every snippet has to reach a real procedure
+// with the yield names it claims. A `requiresVectors` entry cannot run on the sample graph, which
+// stores no embeddings, so for those the empty-index failure is accepted and anything else is not.
+// `ProcedureNotFound` is never accepted, since that is exactly the drift this exists to catch.
+console.log("\nProcedure reference");
+
+let procChecked = 0;
+let procFailures = 0;
+
+for (const proc of PROCEDURES) {
+  procChecked += 1;
+  const p = new Playground();
+  try {
+    p.query(SAMPLE_SOCIAL);
+    const result = JSON.parse(p.query(proc.snippet));
+    console.log(`  ok    ${proc.name.padEnd(34)} ${result.rows.length} row(s)`);
+  } catch (e) {
+    const message = String(e.message ?? e);
+    const tolerated = proc.requiresVectors && /vector index is empty/.test(message);
+    if (tolerated && !/ProcedureNotFound/.test(message)) {
+      console.log(`  ok    ${proc.name.padEnd(34)} resolves, needs embeddings`);
+    } else {
+      procFailures += 1;
+      console.log(`  FAIL  ${proc.name.padEnd(34)} ${message.split("\n")[0]}`);
+    }
+  }
+}
+
 console.log(
   `\n${checked - failures}/${checked} demos ok` + (failures ? `, ${failures} failed` : ""),
 );
-process.exit(failures ? 1 : 0);
+console.log(
+  `${procChecked - procFailures}/${procChecked} procedures ok` +
+    (procFailures ? `, ${procFailures} failed` : ""),
+);
+process.exit(failures + procFailures ? 1 : 0);

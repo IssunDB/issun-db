@@ -3,7 +3,7 @@
 // way it would in an embedded database; "Reset data" replaces it.
 
 import init, { Playground } from "./pkg/issundb_wasm.js";
-import { DEMO_CATEGORIES, SAMPLE_SOCIAL } from "./demos.js";
+import { DEMO_CATEGORIES, PROCEDURES, SAMPLE_SOCIAL } from "./demos.js";
 
 const $ = (id) => document.getElementById(id);
 
@@ -71,6 +71,19 @@ let rankSizes = null;
 
 const HISTORY_KEY = "issundb.history";
 const SCHEME_KEY = "issundb.scheme";
+const EDITOR_KEY = "issundb.editor";
+
+// A result is rendered as one `innerHTML` assignment, so an uncapped table is a query away from
+// locking the tab: `MATCH (a)-[*1..3]->(b) RETURN *` on a graph of any size, or anything after a
+// bulk load. The caps are on the view only. Both downloads read `lastResult`, so an export is
+// still complete, and the row counter still reports the true total.
+const MAX_TABLE_ROWS = 1000;
+const MAX_CELL_CHARS = 200;
+// Past this a value is clipped without a tooltip, rather than putting a megabyte in an attribute.
+const MAX_TITLE_CHARS = 2000;
+
+// The force layout settles over an animation loop, which is motion a visitor can ask not to see.
+const REDUCED_MOTION = matchMedia("(prefers-reduced-motion: reduce)");
 
 // ---------------------------------------------------------------------------
 // Editor
@@ -92,18 +105,47 @@ function syncHighlight() {
   syncScroll();
 }
 
+// This build keeps the graph in memory, so a reload starts from the seeded sample either way.
+// What a reload should not also discard is the query being written, which is the one thing the
+// visitor produced. Past this length it is not stored at all: the quota is per origin and shared
+// with the history, and losing the history to a pasted bulk script would be the worse trade.
+const MAX_STORED_EDITOR = 100000;
+
+function storeEditor() {
+  try {
+    if (editor.value.length > MAX_STORED_EDITOR) localStorage.removeItem(EDITOR_KEY);
+    else localStorage.setItem(EDITOR_KEY, editor.value);
+  } catch {
+    // Storage being unavailable only costs the restore.
+  }
+}
+
+function readStoredEditor() {
+  try {
+    return localStorage.getItem(EDITOR_KEY) ?? "";
+  } catch {
+    return "";
+  }
+}
+
 function setQuery(text, description = "") {
   editor.value = text;
   $("desc").textContent = description;
   syncHighlight();
+  storeEditor();
   editor.focus();
 }
+
+// Debounced rather than written per keystroke, since every write serializes the whole buffer.
+let storeTimer = null;
 
 editor.addEventListener("input", () => {
   syncHighlight();
   // The description belongs to the demo that set it, so editing the query retires it rather
   // than leaving a caption that now describes something else.
   $("desc").textContent = "";
+  clearTimeout(storeTimer);
+  storeTimer = setTimeout(storeEditor, 400);
 });
 // Scrolling only moves the backdrop. Re-running the highlighter per scroll event rebuilt
 // the whole document's markup on every frame of a drag.
@@ -150,12 +192,21 @@ for (const tab of document.querySelectorAll(".tab")) {
   tab.addEventListener("click", () => showPane(tab.dataset.pane));
 }
 
+// One long property would otherwise set the width of its whole column. The full value stays
+// reachable through the tooltip, the JSON tab, and both downloads.
+function clip(text) {
+  if (text.length <= MAX_CELL_CHARS) return esc(text);
+  const shown = `${esc(text.slice(0, MAX_CELL_CHARS))}…`;
+  if (text.length > MAX_TITLE_CHARS) return shown;
+  return `<span title="${esc(text)}">${shown}</span>`;
+}
+
 function cell(value) {
   if (value === null || value === undefined) return '<span class="null">null</span>';
-  if (typeof value === "string") return `<span class="s">${esc(value)}</span>`;
+  if (typeof value === "string") return `<span class="s">${clip(value)}</span>`;
   if (typeof value === "number") return `<span class="n">${value}</span>`;
   if (typeof value === "boolean") return `<span class="b">${value}</span>`;
-  return `<span>${esc(JSON.stringify(value))}</span>`;
+  return `<span>${clip(JSON.stringify(value))}</span>`;
 }
 
 function renderTable(result) {
@@ -170,14 +221,32 @@ function renderTable(result) {
     pane.innerHTML = `<div class="notice info">No rows. The query is valid and matched nothing.</div>`;
     return;
   }
+  const shown = result.rows.slice(0, MAX_TABLE_ROWS);
   const head = result.columns.map((c) => `<th>${esc(c)}</th>`).join("");
-  const body = result.rows
+  const body = shown
     .map(
       (row, i) =>
         `<tr><td class="rownum">${i + 1}</td>${row.map((v) => `<td>${cell(v)}</td>`).join("")}</tr>`,
     )
     .join("");
-  pane.innerHTML = `<table><thead><tr><th></th>${head}</tr></thead><tbody>${body}</tbody></table>`;
+  const capped =
+    result.rows.length > shown.length
+      ? `<div class="notice info">Showing the first ${MAX_TABLE_ROWS} of ${result.rows.length} rows. ` +
+        `The CSV and JSON downloads include every row.</div>`
+      : "";
+  pane.innerHTML =
+    `<table><thead><tr><th></th>${head}</tr></thead><tbody>${body}</tbody></table>` + capped;
+}
+
+// The JSON tab is one string too, so it takes the same cap. Values are not clipped here, since
+// this is the pane a reader opens to see a value the table clipped.
+function renderJson(result) {
+  const shown = result.rows.slice(0, MAX_TABLE_ROWS);
+  const note =
+    result.rows.length > shown.length
+      ? `// Showing the first ${MAX_TABLE_ROWS} of ${result.rows.length} rows. The JSON download includes every row.\n`
+      : "";
+  $("pane-json").innerHTML = `<pre class="json">${esc(note + JSON.stringify(shown, null, 2))}</pre>`;
 }
 
 function showError(message) {
@@ -226,7 +295,7 @@ async function run(mode = "run") {
     lastResult = result;
 
     renderTable(result);
-    $("pane-json").innerHTML = `<pre class="json">${esc(JSON.stringify(result.rows, null, 2))}</pre>`;
+    renderJson(result);
 
     try {
       $("pane-plan").innerHTML = `<pre class="plan">${esc(db.explain(cypher))}</pre>`;
@@ -249,13 +318,17 @@ async function run(mode = "run") {
     // `stats` is a full node scan and an adjacency walk. A read-only statement cannot change
     // what it reports, so only a statement that might have written is worth rescanning for.
     const mayWrite = MAY_WRITE.test(cypher);
-    if (mayWrite) refreshSchema();
+    if (mayWrite) {
+      refreshSchema();
+      rememberSetup(cypher);
+    }
     await refreshGraph(mayWrite);
   } catch (e) {
     // Cleared, or the export buttons would hand back the previous query's rows while the
     // table shows this one's error.
     lastResult = null;
-    showError(String(e.message ?? e));
+    const message = String(e.message ?? e);
+    showError(message + procedureHint(cypher, message));
     setStatus(`<span style="color:var(--err)">error</span>`);
   } finally {
     busy = false;
@@ -306,6 +379,105 @@ function renderHistory() {
     $("history").append(button);
   }
 }
+
+// ---------------------------------------------------------------------------
+// Setup log
+// ---------------------------------------------------------------------------
+
+// The write statements run this session, in order, so a share link can carry the data a query
+// needs rather than only the query. The seed is not in here: the recipient's own boot runs it,
+// and replaying it as well would hand them two copies of the sample graph.
+const setupLog = [];
+
+function rememberSetup(cypher) {
+  // The log is replayed as one semicolon-separated statement, so a statement that already ends
+  // in one would contribute an empty statement between two real ones.
+  setupLog.push(cypher.replace(/;\s*$/, ""));
+}
+
+// ---------------------------------------------------------------------------
+// Procedure reference
+// ---------------------------------------------------------------------------
+
+const procedureNames = new Set(PROCEDURES.flatMap((p) => [p.name, p.aka].filter(Boolean)));
+
+function renderProcedures(filter = "") {
+  const needle = filter.trim().toLowerCase();
+  const host = $("proc-list");
+  const matches = PROCEDURES.filter(
+    (proc) =>
+      !needle ||
+      `${proc.name} ${proc.aka ?? ""} ${proc.args} ${proc.yields} ${proc.summary}`
+        .toLowerCase()
+        .includes(needle),
+  );
+  host.replaceChildren();
+  if (matches.length === 0) {
+    host.innerHTML = '<div class="empty">No procedure matches.</div>';
+    return;
+  }
+  for (const proc of matches) {
+    const button = document.createElement("button");
+    button.className = "proc";
+    // The signature is in the tooltip rather than the row. In a sidebar this narrow a form like
+    // `issundb.pageRank([{iterations, damping}])` wraps mid-identifier, which is harder to scan
+    // than the name alone, and clicking inserts the call anyway.
+    const signature = `${proc.name}(${proc.args})`;
+    button.title = proc.aka
+      ? `${signature}\n\n${proc.summary}\n\nAlso registered as ${proc.aka}.`
+      : `${signature}\n\n${proc.summary}`;
+    const name = document.createElement("span");
+    name.className = "nm";
+    name.textContent = proc.name;
+    const yields = document.createElement("span");
+    yields.className = "yd";
+    yields.textContent = `yields ${proc.yields}`;
+    button.append(name, yields);
+    button.addEventListener("click", () => setQuery(proc.snippet, proc.summary));
+    host.append(button);
+  }
+}
+
+// Iterative over two rows, so the whole matrix is never held.
+function editDistance(a, b) {
+  let previous = Array.from({ length: b.length + 1 }, (_, j) => j);
+  for (let i = 1; i <= a.length; i += 1) {
+    const current = [i];
+    for (let j = 1; j <= b.length; j += 1) {
+      current[j] =
+        a[i - 1] === b[j - 1]
+          ? previous[j - 1]
+          : 1 + Math.min(previous[j - 1], previous[j], current[j - 1]);
+    }
+    previous = current;
+  }
+  return previous[b.length];
+}
+
+// `ProcedureNotFound` says the name is wrong without saying what was meant, and the difference is
+// usually one character of casing. The catalog is the only list of real names the page has, so a
+// suggestion is exactly as complete as the catalog is; a procedure missing from it gets no hint
+// rather than a wrong one.
+function procedureHint(cypher, message) {
+  if (!/ProcedureNotFound/.test(message)) return "";
+  for (const token of new Set(cypher.match(/\bissundb\.[A-Za-z_][\w.]*/g) ?? [])) {
+    if (procedureNames.has(token)) continue;
+    let best = null;
+    // Further than three edits apart the suggestion is noise rather than a correction.
+    let bestDistance = 4;
+    for (const name of procedureNames) {
+      const distance = editDistance(token.toLowerCase(), name.toLowerCase());
+      if (distance < bestDistance) {
+        bestDistance = distance;
+        best = name;
+      }
+    }
+    if (best) return `\n\nThere is no ${token}. Did you mean ${best}?`;
+  }
+  return "";
+}
+
+$("proc-search").addEventListener("input", (e) => renderProcedures(e.target.value));
 
 // ---------------------------------------------------------------------------
 // Demos
@@ -519,10 +691,10 @@ async function computeRanks() {
 }
 
 // Velocity-Verlet, with all-pairs repulsion: at the 300-node cap that pass is cheap enough
-// that no spatial index is worth the code it would take.
-function layout(nodes, edges, svg) {
-  const width = svg.clientWidth || 800;
-  const height = svg.clientHeight || 500;
+// that no spatial index is worth the code it would take. The canvas size is passed in rather
+// than read off the element, since the caller needs the same two numbers for the view box and
+// the two must agree or a fit is computed against a different box than the layout used.
+function layout(nodes, edges, width, height) {
   const index = new Map(nodes.map((n, i) => [n.id, i]));
   const links = edges
     .map((e) => [index.get(e.source), index.get(e.target)])
@@ -625,21 +797,58 @@ function captionOf(node) {
   return `#${node.id}`;
 }
 
-// Only these three column names are treated as node references. Guessing from the values
-// instead would light up unrelated integers.
-function highlighted() {
-  if (!lastResult) return null;
-  const columns = lastResult.columns
-    .map((c, i) => [c.toLowerCase(), i])
-    .filter(([c]) => c === "id" || c === "nodeid" || c === "node");
-  if (columns.length === 0) return null;
-  const ids = new Set();
-  for (const row of lastResult.rows) {
-    for (const [, i] of columns) {
-      if (Number.isInteger(row[i])) ids.add(row[i]);
+// Only these column names are read out of a result, in both cases because guessing from the
+// values instead would light up unrelated integers. A node reference highlights its vertex; a
+// group column beside one recolors the vertices by group, which is what makes the components and
+// communities procedures show their answer in the graph rather than only in the table.
+const NODE_COLUMNS = new Set(["id", "nodeid", "node"]);
+const GROUP_COLUMNS = new Set(["communityid", "componentid"]);
+
+// Fixed rather than hashed off the group id, so two adjacent communities get colors that can be
+// told apart instead of whatever two hashes happen to land on.
+const GROUP_PALETTE = [
+  "#7e56c2",
+  "#0b6bcb",
+  "#1c7c54",
+  "#c77700",
+  "#b3261e",
+  "#00868b",
+  "#7a5195",
+  "#556b2f",
+  "#a0522d",
+  "#3f51b5",
+];
+
+function resultOverlay() {
+  if (!lastResult) return { lit: null, groupIds: null, groupLabel: "" };
+  const lower = lastResult.columns.map((c) => c.toLowerCase());
+
+  const lit = new Set();
+  lower.forEach((name, i) => {
+    if (!NODE_COLUMNS.has(name)) return;
+    for (const row of lastResult.rows) {
+      if (Number.isInteger(row[i])) lit.add(row[i]);
     }
+  });
+
+  const nodeAt = lower.findIndex((name) => NODE_COLUMNS.has(name));
+  const groupAt = lower.findIndex((name) => GROUP_COLUMNS.has(name));
+  let groupIds = null;
+  if (nodeAt >= 0 && groupAt >= 0) {
+    groupIds = new Map();
+    for (const row of lastResult.rows) {
+      if (Number.isInteger(row[nodeAt]) && Number.isInteger(row[groupAt])) {
+        groupIds.set(row[nodeAt], row[groupAt]);
+      }
+    }
+    if (groupIds.size === 0) groupIds = null;
   }
-  return ids.size ? ids : null;
+
+  return {
+    lit: lit.size ? lit : null,
+    groupIds,
+    groupLabel: groupIds ? lastResult.columns[groupAt] : "",
+  };
 }
 
 let simGeneration = 0;
@@ -656,15 +865,41 @@ function drawGraph() {
   svg.replaceChildren();
   $("inspect").hidden = true;
 
+  // A redraw returns the view to the whole canvas, so a fit is discarded by the next query
+  // rather than silently framing a graph it was not computed for.
+  const width = svg.clientWidth || 800;
+  const height = svg.clientHeight || 500;
+  setViewBox(svg, { x: 0, y: 0, w: width, h: height });
+
   const { nodes, edges, truncated } = snapshot;
   $("graph-count").textContent = `${nodes.length} nodes, ${edges.length} relationships${
     truncated ? " (capped at 300)" : ""
   }`;
 
-  const labels = [...new Set(nodes.map(labelOf))].sort();
-  $("legend").innerHTML = labels
-    .map((l) => `<span><i style="background:${colorOf(l)}"></i>${esc(l)}</span>`)
-    .join("");
+  const { lit, groupIds, groupLabel } = resultOverlay();
+
+  // A node the result did not mention has no group, so it keeps a neutral fill rather than
+  // borrowing the color of a group it is not in.
+  const groupOrder = groupIds ? [...new Set(groupIds.values())].sort((a, b) => a - b) : [];
+  const groupColor = new Map(
+    groupOrder.map((value, i) => [value, GROUP_PALETTE[i % GROUP_PALETTE.length]]),
+  );
+  const fillOf = (node) =>
+    groupIds
+      ? (groupColor.get(groupIds.get(node.id)) ?? "var(--md-default-fg-color--lighter)")
+      : colorOf(labelOf(node));
+
+  $("legend").innerHTML = groupIds
+    ? groupOrder
+        .map(
+          (value) =>
+            `<span><i style="background:${groupColor.get(value)}"></i>${esc(groupLabel)} ${value}</span>`,
+        )
+        .join("")
+    : [...new Set(nodes.map(labelOf))]
+        .sort()
+        .map((l) => `<span><i style="background:${colorOf(l)}"></i>${esc(l)}</span>`)
+        .join("");
 
   if (nodes.length === 0) {
     svg.append(
@@ -674,7 +909,6 @@ function drawGraph() {
     return;
   }
 
-  const lit = highlighted();
   // Looped rather than spread into `Math.max`: the rank map covers every node in the
   // database, not just the drawn ones, and spreading past about 130 000 arguments raises a
   // RangeError.
@@ -710,7 +944,7 @@ function drawGraph() {
     const group = el("g", { class: "node" });
     const circle = el("circle", {
       r: radiusOf(node),
-      fill: colorOf(labelOf(node)),
+      fill: fillOf(node),
     });
     const text = el("text", { "text-anchor": "middle", dy: radiusOf(node) + 12 });
     text.textContent = captionOf(node);
@@ -760,10 +994,17 @@ function drawGraph() {
     }
   }
 
-  const tick = layout(nodes, edges, svg);
+  const tick = layout(nodes, edges, width, height);
   function start() {
     if (generation !== simGeneration) return;
     if (sim) cancelAnimationFrame(sim);
+    if (REDUCED_MOTION.matches) {
+      // Settled in one pass and painted once. The bound is where the animated form stops anyway,
+      // since alpha starts at 1, decays by 0.985 a step, and the loop ends below 0.02.
+      for (let i = 0; i < 260 && tick(); i += 1);
+      paint();
+      return;
+    }
     const step = () => {
       const running = tick();
       paint();
@@ -775,9 +1016,24 @@ function drawGraph() {
   start();
 }
 
+// The view box the graph is currently drawn through. Layout coordinates are canvas pixels, so
+// before Fit existed this was always one to one with the element and a pointer position needed no
+// conversion. It is tracked rather than read back off the attribute so a drag cannot parse a
+// string per pointer move.
+let viewBox = null;
+
+function setViewBox(svg, box) {
+  viewBox = box;
+  svg.setAttribute("viewBox", `${box.x} ${box.y} ${box.w} ${box.h}`);
+}
+
 function toSvg(svg, event) {
   const rect = svg.getBoundingClientRect();
-  return { x: event.clientX - rect.left, y: event.clientY - rect.top };
+  const box = viewBox ?? { x: 0, y: 0, w: rect.width, h: rect.height };
+  return {
+    x: box.x + ((event.clientX - rect.left) * box.w) / rect.width,
+    y: box.y + ((event.clientY - rect.top) * box.h) / rect.height,
+  };
 }
 
 function inspect(node) {
@@ -796,6 +1052,49 @@ function inspect(node) {
 $("svg").addEventListener("pointerdown", () => {
   $("inspect").hidden = true;
 });
+// The layout keeps every vertex inside the canvas, so this only ever zooms in. That is the
+// direction worth having: a handful of nodes otherwise sit in the middle of a mostly empty
+// canvas. A redraw resets the view, so there is no "unfit" to provide.
+$("fit").addEventListener("click", () => {
+  const svg = $("svg");
+  const placed = snapshot.nodes.filter((node) => node.x !== undefined);
+  if (placed.length === 0) return;
+
+  let minX = Infinity;
+  let maxX = -Infinity;
+  let minY = Infinity;
+  let maxY = -Infinity;
+  for (const node of placed) {
+    if (node.x < minX) minX = node.x;
+    if (node.x > maxX) maxX = node.x;
+    if (node.y < minY) minY = node.y;
+    if (node.y > maxY) maxY = node.y;
+  }
+  // Clears the largest radius and the caption below it, or fitting would crop the labels it is
+  // meant to bring into view.
+  const pad = 42;
+  minX -= pad;
+  maxX += pad;
+  minY -= pad;
+  maxY += pad;
+
+  // Matched to the element's own aspect ratio. A view box with a different one is letterboxed by
+  // the default `preserveAspectRatio`, so the fit would come out loose on one axis.
+  const rect = svg.getBoundingClientRect();
+  const aspect = (rect.width || 800) / (rect.height || 500);
+  let w = maxX - minX;
+  let h = maxY - minY;
+  if (w / h > aspect) h = w / aspect;
+  else w = h * aspect;
+
+  setViewBox(svg, {
+    x: (minX + maxX) / 2 - w / 2,
+    y: (minY + maxY) / 2 - h / 2,
+    w,
+    h,
+  });
+});
+
 $("relayout").addEventListener("click", () => {
   for (const node of snapshot.nodes) node.x = undefined;
   drawGraph();
@@ -877,24 +1176,90 @@ const b64url = {
     ),
 };
 
+// A fragment reaches no server, but it does have to survive being pasted, and enough clients
+// truncate a long URL that a link past this is worth declining rather than sending out broken.
+const MAX_SHARED_SETUP = 24000;
+
+// Set when the page writes its own fragment, so the `hashchange` handler below can tell an incoming
+// link from the clipboard fallback's own write.
+let ownHashWrite = false;
+
 $("share").addEventListener("click", async () => {
-  let fragment;
+  const parts = [];
   try {
-    fragment = `q=${b64url.encode(editor.value)}`;
+    parts.push(`q=${b64url.encode(editor.value)}`);
   } catch {
     // Encoding was outside the try before, so a query too large to encode rejected silently.
     setStatus('<span style="color:var(--err)">too large to put in a link</span>');
     return;
   }
+
+  // Without this the link carried the query alone, so a query over data the sender had created
+  // returned nothing for whoever opened it. The recipient's boot seeds the sample graph and then
+  // replays these, which reproduces the state exactly rather than approximating it from a
+  // snapshot: a snapshot is capped at 300 nodes and carries no relationship properties.
+  let dropped = 0;
+  if (setupLog.length > 0) {
+    let setup = "";
+    try {
+      setup = b64url.encode(setupLog.join(";\n"));
+    } catch {
+      setup = "";
+    }
+    if (setup && setup.length <= MAX_SHARED_SETUP) parts.push(`s=${setup}`);
+    else dropped = setupLog.length;
+  }
+
+  const count = dropped || setupLog.length;
+  const plural = count === 1 ? "" : "s";
+  const note = dropped
+    ? ` <span>${dropped} setup statement${plural} too large to include</span>`
+    : setupLog.length > 0
+      ? ` <span>with ${setupLog.length} setup statement${plural}</span>`
+      : "";
+
+  const fragment = parts.join("&");
   try {
     await navigator.clipboard.writeText(
       `${location.origin}${location.pathname}#${fragment}`,
     );
-    setStatus('<span class="t">link copied</span>');
+    setStatus(`<span class="t">link copied</span>${note}`);
   } catch {
+    ownHashWrite = true;
     location.hash = fragment;
-    setStatus("<span>link is in the address bar</span>");
+    setStatus(`<span>link is in the address bar</span>${note}`);
   }
+});
+
+// Changing only the fragment is a same-document navigation, so the module is not re-evaluated and
+// `boot` never sees the new link. That is the case for a shared link opened while the playground is
+// already in front of the reader, which is how a documentation page's "run this" link behaves on a
+// second click.
+addEventListener("hashchange", () => {
+  // The clipboard fallback above writes the hash itself, and treating that as an incoming link
+  // would re-run the query as a side effect of copying it.
+  if (ownHashWrite) {
+    ownHashWrite = false;
+    return;
+  }
+  const params = new URLSearchParams(location.hash.slice(1));
+  // A setup script has to be replayed against a freshly seeded database, or it lands on top of
+  // whatever is already here and adds a second copy of its data. Reloading is what gives `boot`
+  // the chance to do it in the right order.
+  if (params.get("s")) {
+    location.reload();
+    return;
+  }
+  let incoming = null;
+  try {
+    const encoded = params.get("q");
+    incoming = encoded ? b64url.decode(encoded) : params.get("cypher");
+  } catch {
+    incoming = null;
+  }
+  if (!incoming) return;
+  setQuery(incoming, "A shared query.");
+  run();
 });
 
 // `default` and `slate` are Material for MkDocs' scheme names, so the playground and the
@@ -958,6 +1323,9 @@ $("reset").addEventListener("click", async () => {
   previous?.free();
   lastResult = null;
   rankSizes = null;
+  // The discarded writes must not keep travelling in a share link, where replaying them against
+  // the fresh seed would rebuild the state Reset was clicked to get rid of.
+  setupLog.length = 0;
   // Node ids restart from zero, so a carried-over position would belong to a different node.
   snapshot = { nodes: [], edges: [], truncated: false };
   $("size-by-rank").checked = false;
@@ -984,16 +1352,41 @@ async function boot() {
     : "This build keeps everything in memory, so a reload starts over. Use the Share button to keep a query.";
 
   renderDemos();
+  renderProcedures();
   renderHistory();
   seed();
 
-  const shared = /#q=(.+)$/.exec(location.hash);
-  if (shared) {
+  // Three link forms. `q` is the Share button's base64 query and `s` its optional setup script,
+  // and `cypher` is percent-encoded plain text so a link can be written by hand or generated by a
+  // docs build. A generator has to encode a plus as %2B, since a fragment read as a query string
+  // turns a literal one into a space.
+  const params = new URLSearchParams(location.hash.slice(1));
+
+  const setup = params.get("s");
+  if (setup) {
     try {
-      setQuery(b64url.decode(shared[1]), "Shared query.");
+      db.query(b64url.decode(setup));
+      refreshSchema();
     } catch {
-      setQuery("MATCH (p:Person) RETURN p.name AS name, p.city AS city ORDER BY name");
+      // A setup script that no longer applies leaves the seeded graph in place rather than
+      // stopping the page from loading. The query it came with still runs, and reports its own
+      // error if it depended on what failed.
     }
+  }
+
+  let shared = null;
+  try {
+    const encoded = params.get("q");
+    shared = encoded ? b64url.decode(encoded) : params.get("cypher");
+  } catch {
+    shared = null;
+  }
+
+  const stored = shared ? "" : readStoredEditor().trim();
+  if (shared) {
+    setQuery(shared, "A shared query.");
+  } else if (stored) {
+    setQuery(stored, "Restored from your last visit.");
   } else {
     setQuery(
       "MATCH (a:Person)-[:KNOWS]->(b:Person)\nRETURN a.name AS from, b.name AS to\nORDER BY from, to",
@@ -1003,7 +1396,16 @@ async function boot() {
 
   await refreshGraph();
   $("boot").remove();
-  await run();
+
+  // A restored query is deliberately not run. It could be a CREATE, and running it on every
+  // reload would quietly add another copy of its data.
+  if (stored) {
+    showPane("table");
+    $("pane-table").innerHTML =
+      '<div class="notice info">Your last query is in the editor. Press ⌘↵ (or Ctrl↵) to run it.</div>';
+  } else {
+    await run();
+  }
 }
 
 boot().catch((e) => {

@@ -25,9 +25,11 @@ make playground-serve   # http://localhost:8000
 A module cannot be loaded over `file://`, so the page has to be served over HTTP. Any
 static server works; `make playground-serve` uses Python's.
 
-`make playground-check` runs every demo in `demos.js` through the compiled module and
-fails on an error. The catalog is Cypher inside a JavaScript file, which no Rust test can
-see, so this is what keeps a button from silently breaking.
+`make playground-check` runs every demo and every procedure snippet in `demos.js` through the
+compiled module and fails on an error. Both catalogs are Cypher inside a JavaScript file, which
+no Rust test can see, so this is what keeps a button or a reference entry from silently
+breaking. The procedure half also rejects `ProcedureNotFound` specifically, which is the failure
+a rename produces.
 
 ## What This Build Is
 
@@ -79,8 +81,32 @@ match the documentation exactly.
 - `app.js`: everything the page does. The Cypher highlighter and the force-directed layout
   are written here rather than pulled from a library, so the page loads nothing it does not
   contain.
-- `demos.js`: the demo catalog, checked by `make playground-check`. Each category carries a
-  `docs` link into the surrounding documentation; those are relative to `/playground/`, so
-  they break if a heading they anchor to is renamed.
+- `demos.js`: the demo catalog and the procedure reference, both checked by
+  `make playground-check`. Each demo category carries a `docs` link into the surrounding
+  documentation; those are relative to `/playground/`, so they break if a heading they anchor to
+  is renamed. The procedure list is written out by hand because the engine cannot enumerate its
+  own procedures, which is why the check runs each snippet.
 - `style.css`: light and dark themes over one set of custom properties.
 - `pkg/`: the generated module. A build artifact, not checked in.
+
+## Sharing a Query
+
+The Share button copies a link carrying the query in the fragment, so it reaches no server even
+though the page is hosted on one. It also carries the write statements run this session, under
+`s`, and the recipient's page replays them over the seeded sample graph before running the query.
+Without that a link over data the sender had created returned nothing for whoever opened it.
+Replaying the statements rather than serializing the graph is what makes it exact: a graph
+snapshot is capped at 300 nodes and carries no relationship properties.
+
+A link can also be written by hand or generated, using `#cypher=` with percent-encoded plain
+text. A generator has to encode a plus as `%2B`, since a fragment read as a query string turns a
+literal one into a space. Both forms are applied on a fragment change as well as on load, so a
+link followed while the playground is already open is not ignored; one carrying `s` reloads, so
+its setup lands on a freshly seeded database rather than on top of the current one.
+
+## What the Result Views Cap
+
+A result is rendered as one `innerHTML` assignment, so the table and the JSON pane show at most
+the first 1000 rows and the table clips a cell past 200 characters. The row counter reports the
+true total, and the CSV and JSON downloads contain every row: the caps are on the view, not on
+the result. The graph view is capped separately, at 300 nodes, in the Rust `graphSnapshot`.

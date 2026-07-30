@@ -213,9 +213,12 @@ modules according to this map.
   written in `app.js` rather than pulled from a library. It is served under the MkDocs site and styled to match it: the custom properties at the top of
   `style.css` are Material for MkDocs' own tokens, copied from the built `palette.*.min.css` for this site's palette, and the scheme is carried on
   `data-md-color-scheme` with Material's `default` and `slate` values. A `theme.palette` change in `mkdocs.yml` means updating that block from a fresh
-  `make docs` build rather than from the Material Design palette, since MkDocs derives its primary from the named color instead of using it directly. `demos.js` is the demo catalog, which is Cypher held inside a JavaScript file and therefore
-  invisible to every Rust test; `make playground-check` runs the whole catalog through the compiled module and fails on an error, which is how a wrong
-  procedure signature is caught. See `web/README.md` for the three build targets and what the browser configuration gives up (no persistence, one thread,
+  `make docs` build rather than from the Material Design palette, since MkDocs derives its primary from the named color instead of using it directly. `demos.js` holds the demo catalog and the
+  sidebar's procedure reference, both of which are Cypher inside a JavaScript file and therefore invisible to every Rust test; `make playground-check` runs
+  both through the compiled module and fails on an error, which is how a wrong procedure signature is caught. The procedure reference is written out by hand
+  because the engine cannot enumerate its own procedures, so that check is the only thing keeping it from drifting; it treats `ProcedureNotFound` as a failure
+  even for the two retrieval entries whose empty-index error it tolerates, since a rename is exactly what that error reports.
+  See `web/README.md` for the three build targets and what the browser configuration gives up (no persistence, one thread,
   no `backup`/`restore`, and a 16 MB stack set by a link argument in `.cargo/config.toml` because the 1 MB default is also the engine's inline-execution
   budget).
 - `crates/issundb-examples/`: standalone example programs. These depend only on `issundb`.

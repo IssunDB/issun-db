@@ -88,6 +88,34 @@
           </div>
         </section>
 
+        <section class="panel" aria-labelledby="procs-title">
+          <h2 id="procs-title">
+            <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="2" fill="none" aria-hidden="true">
+              <polyline points="16 18 22 12 16 6" />
+              <polyline points="8 6 2 12 8 18" />
+            </svg>
+            Procedures
+          </h2>
+          <div class="panel-body">
+            <div class="field">
+              <label for="proc-search">Search</label>
+              <input
+                id="proc-search"
+                class="control"
+                type="search"
+                placeholder="rank, path, community…"
+                autocomplete="off"
+                spellcheck="false"
+              />
+            </div>
+            <div class="proc-list" id="proc-list"></div>
+            <p class="hint">
+              Click one to insert a runnable call. Arguments are resolved before planning, so
+              they have to be literals rather than expressions.
+            </p>
+          </div>
+        </section>
+
         <section class="panel" aria-labelledby="schema-title">
           <h2 id="schema-title">
             <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="2" fill="none" aria-hidden="true">
@@ -161,6 +189,7 @@
                 <input type="checkbox" id="size-by-rank" />
                 size by PageRank
               </label>
+              <button class="ghost" id="fit" title="Zoom the view to the drawn graph">Fit</button>
               <button class="ghost" id="relayout">Re-layout</button>
             </div>
             <svg class="graph" id="svg"></svg>

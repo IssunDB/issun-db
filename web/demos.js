@@ -24,6 +24,163 @@ CREATE (ada:Person {name: 'Ada', city: 'London', age: 36}),
 const PATH_NOTE = `// Procedure arguments are resolved before planning, so they are literal ids
 // rather than expressions. 0 is Ada and 5 is Donald in the seeded sample.`;
 
+// The procedure reference the sidebar lists and searches. It lives here rather than in `app.js`
+// because `make playground-check` runs every snippet, so a renamed procedure or a wrong yield
+// name fails the build instead of reaching the page as a dead entry. The engine exposes no way
+// to enumerate its procedures at runtime, which is why the list is written out at all.
+//
+// `requiresVectors` marks the two entries the sample graph cannot satisfy, since it stores no
+// embeddings. Their snippets are still run, and still have to resolve to a real procedure; only
+// the empty-index failure is tolerated.
+export const PROCEDURES = [
+  {
+    name: "issundb.pageRank",
+    args: "[{iterations, damping}]",
+    yields: "nodeId, score",
+    summary:
+      "Ranks nodes by importance. A source spreads its rank across its edges, so parallel edges each carry mass, and dangling mass is not redistributed.",
+    snippet: `CALL issundb.pageRank({iterations: 20, damping: 0.85})
+YIELD nodeId, score
+RETURN nodeId, score
+ORDER BY score DESC`,
+  },
+  {
+    name: "issundb.betweenness",
+    args: "",
+    yields: "nodeId, score",
+    summary:
+      "How often a node lies on a shortest path between two others, by Brandes' algorithm. Unnormalized, directed, and counted over distinct pairs.",
+    snippet: `CALL issundb.betweenness()
+YIELD nodeId, score
+RETURN nodeId, score
+ORDER BY score DESC`,
+  },
+  {
+    name: "issundb.harmonic",
+    args: "",
+    yields: "nodeId, score",
+    summary:
+      "Sums the reciprocal of the shortest-path distance to every other node, so an unreachable node contributes nothing rather than infinity.",
+    snippet: `CALL issundb.harmonic()
+YIELD nodeId, score
+RETURN nodeId, score
+ORDER BY score DESC`,
+  },
+  {
+    name: "issundb.degree",
+    args: "[{direction}]",
+    yields: "nodeId, score",
+    summary:
+      "Counts distinct neighbors in one direction, so parallel edges between the same pair count once. Direction is IN, OUT, or BOTH.",
+    snippet: `CALL issundb.degree({direction: 'OUT'})
+YIELD nodeId, score
+RETURN nodeId, score
+ORDER BY score DESC`,
+  },
+  {
+    name: "issundb.wcc",
+    aka: "issundb.connectedComponents",
+    args: "",
+    yields: "nodeId, componentId",
+    summary:
+      "Weakly connected components by union-find, treating every edge as undirected. The component id is the smallest node id in the component.",
+    snippet: `CALL issundb.wcc()
+YIELD nodeId, componentId
+RETURN componentId, count(nodeId) AS size
+ORDER BY componentId`,
+  },
+  {
+    name: "issundb.scc",
+    aka: "issundb.stronglyConnectedComponents",
+    args: "",
+    yields: "nodeId, componentId",
+    summary:
+      "Strongly connected components by Tarjan's algorithm, written iteratively so graph depth cannot reach the call stack. The browser stack is small, so that matters here.",
+    snippet: `CALL issundb.scc()
+YIELD nodeId, componentId
+RETURN componentId, count(nodeId) AS size
+ORDER BY size DESC, componentId`,
+  },
+  {
+    name: "issundb.labelPropagation",
+    args: "[{maxIterations}]",
+    yields: "nodeId, communityId",
+    summary:
+      "Assigns each node the most common community among its neighbors, iterating to a fixed point. Ties break toward the smallest label, so the partition is stable run to run.",
+    snippet: `CALL issundb.labelPropagation({maxIterations: 10})
+YIELD nodeId, communityId
+RETURN nodeId, communityId
+ORDER BY communityId, nodeId`,
+  },
+  {
+    name: "issundb.communities",
+    args: "[{maxIterations, topPerCommunity}]",
+    yields: "communityId, nodeId, rank",
+    summary:
+      "Label propagation, with each community's members ranked by PageRank. topPerCommunity keeps only the leading members of each.",
+    snippet: `CALL issundb.communities({topPerCommunity: 3})
+YIELD communityId, nodeId, rank
+RETURN communityId, rank, nodeId
+ORDER BY communityId, rank`,
+  },
+  {
+    name: "issundb.shortestPath",
+    args: "source, target",
+    yields: "index, nodeId",
+    summary:
+      "Breadth-first shortest path by hop count, yielding one row per node along the path in order. An unreachable target yields no rows.",
+    snippet: `CALL issundb.shortestPath(0, 5)
+YIELD index, nodeId
+RETURN index, nodeId
+ORDER BY index`,
+  },
+  {
+    name: "issundb.dijkstra",
+    args: "source, target",
+    yields: "index, nodeId, totalWeight",
+    summary:
+      "Least-weight path from a binary heap. The weight is the first present of the weight, cost, capacity, or cap property, defaulting to 1, and totalWeight repeats on every row.",
+    snippet: `CALL issundb.dijkstra(0, 5)
+YIELD index, nodeId, totalWeight
+RETURN index, nodeId, totalWeight
+ORDER BY index`,
+  },
+  {
+    name: "issundb.triangleCount",
+    args: "",
+    yields: "count",
+    summary:
+      "Counts assignments of the directed pattern (a)->(b)->(c)->(a), so one cycle of three distinct nodes counts three times, once per rotation, as a Cypher MATCH would return it.",
+    snippet: `CALL issundb.triangleCount()
+YIELD count
+RETURN count AS triangle_rows`,
+  },
+  {
+    name: "issundb.retrieve.vector",
+    args: "queryVector [, {k, hops, maxDistance, maxNodes}]",
+    yields: "nodeId, distance",
+    summary:
+      "Vector search seeds expanded by breadth-first traversal. Lower distance is closer, and it is null for a node reached only by expansion.",
+    snippet: `CALL issundb.retrieve.vector([1.0, 0.0, 0.25], {k: 3, hops: 1})
+YIELD nodeId, distance
+RETURN nodeId, distance
+ORDER BY nodeId`,
+    requiresVectors: true,
+  },
+  {
+    name: "issundb.retrieve.hybrid",
+    args: "queryVector, queryText [, config]",
+    yields: "nodeId, score",
+    summary:
+      "Fuses vector and text relevance into one score before expanding. An empty query vector disables vector search, and an empty text query disables text search.",
+    snippet: `CALL issundb.retrieve.hybrid([1.0, 0.0, 0.25], 'graph', {vectorK: 3, textK: 3, hops: 1})
+YIELD nodeId, score
+RETURN nodeId, score
+ORDER BY nodeId`,
+    requiresVectors: true,
+  },
+];
+
 export const DEMO_CATEGORIES = [
   {
     label: "Cypher basics",
