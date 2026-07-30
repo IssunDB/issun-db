@@ -221,10 +221,9 @@ impl Playground {
     /// The `branch@commit` the module was built from, for the page's footer, or an empty string
     /// when it was not built through `make playground-build`.
     ///
-    /// Compiled in rather than fetched as a sidecar file, because the page's contract is that it
-    /// makes no network call once loaded, and a build stamp is not worth spending that on. The
-    /// build script's `rerun-if-env-changed` is what stops a cached artifact from reporting the
-    /// commit of an earlier build.
+    /// Compiled in rather than fetched as a sidecar file, so the stamp cannot disagree with the
+    /// module it describes. The build script's `rerun-if-env-changed` is what stops a cached
+    /// artifact from reporting the commit of an earlier build.
     fn build_ref_inner() -> String {
         option_env!("ISSUNDB_BUILD_REF")
             .unwrap_or_default()

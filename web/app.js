@@ -1,5 +1,6 @@
-// The IssunDB playground. Vanilla ES modules, no build step, nothing fetched from a
-// network. One `Playground` for the tab's lifetime, so data accumulates across queries the
+// The IssunDB playground. Vanilla ES modules, no build step, and no library fetched from a network;
+// the two web fonts are the page's only external request. One `Playground` for the tab's lifetime,
+// so data accumulates across queries the
 // way it would in an embedded database; "Reset data" replaces it.
 
 import init, { Playground } from "./pkg/issundb_wasm.js";
@@ -1733,7 +1734,10 @@ async function boot() {
   if (shared) {
     setQuery(shared, "A shared query.");
   } else if (stored) {
-    setQuery(stored, "Restored from your last visit.");
+    // No caption: the ribbon is for what an example is demonstrating, and the banner below the
+    // editor already says the query was restored and not run. Three notices for one fact was two
+    // too many.
+    setQuery(stored);
   } else {
     setQuery(
       "MATCH (a:Person)-[:KNOWS]->(b:Person)\nRETURN a.name AS from, b.name AS to\nORDER BY from, to",

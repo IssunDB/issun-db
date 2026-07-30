@@ -209,8 +209,9 @@ modules according to this map.
   split none of it could be covered by `cargo test`. Reading all of a node's properties decodes the stored msgpack blob directly, as the REST node route
   does, since every read-path method on `Graph` takes the property names to fetch and an inspector cannot know them.
 - `web/`: the playground page that loads that module: `index.html`, `app.js`, `demos.js`, and `style.css`, with the generated module in the gitignored
-  `web/pkg/`. Vanilla ES modules with no build step, and nothing is fetched from a network, so the Cypher highlighter and the force-directed layout are
-  written in `app.js` rather than pulled from a library. It is served under the MkDocs site and styled to match it: the custom properties at the top of
+  `web/pkg/`. Vanilla ES modules with no build step, and no library is fetched from a network, so the Cypher highlighter and the force-directed layout are
+  written in `app.js` rather than pulled from one. The page's only external request is the Google Fonts link for Inter and JetBrains Mono, which is the same
+  request `theme.font` in `mkdocs.yml` already makes for the same two families; the size scale is the reference playground's, in rem against a 1rem body. It is served under the MkDocs site and styled to match it: the custom properties at the top of
   `style.css` are Material for MkDocs' own tokens, copied from the built `palette.*.min.css` for this site's palette, and the scheme is carried on
   `data-md-color-scheme` with Material's `default` and `slate` values. A `theme.palette` change in `mkdocs.yml` means updating that block from a fresh
   `make docs` build rather than from the Material Design palette, since MkDocs derives its primary from the named color instead of using it directly. `demos.js` holds the demo catalog, the
@@ -724,9 +725,9 @@ carries one type in both directions rather than a second serialization contract 
 
 Methods: `query`, `explain`, `stats`, `graphSnapshot`, `createTextIndex`, `textSearch`, `upsertVector`, `vectorSearch`, and the three statics `version`,
 `isPersistent`, and `buildRef`. `buildRef` is the `branch@commit` the page names in its footer, read from `ISSUNDB_BUILD_REF` at compile time through
-`option_env!` and empty without it. It is compiled in rather than fetched as a sidecar file because the page's contract is that it makes no network call
-once loaded, and the crate's `build.rs` exists only to declare `rerun-if-env-changed` for that variable, without which a cached artifact would keep
-reporting an earlier build's commit. `make playground-build` supplies it from `git`, and `docs.yml` sets it from the workflow's own refs, since
+`option_env!` and empty without it. It is compiled in rather than fetched as a sidecar file so it cannot disagree with the module it describes, and the
+crate's `build.rs` exists only to declare `rerun-if-env-changed` for that variable, without which a cached artifact would keep reporting an earlier
+build's commit. `make playground-build` supplies it from `git`, and `docs.yml` sets it from the workflow's own refs, since
 `actions/checkout` leaves a detached HEAD where `rev-parse --abbrev-ref` answers `HEAD`. `query` returns `{columns, rows, statement_count, elapsed_ms}` with row-major rows, so the page renders a table knowing
 nothing about the schema, and `statement_count` is how it can say a semicolon-separated script ran more statements than the one result shown.
 `graphSnapshot` returns `{nodes, edges, truncated}` capped at `MAX_GRAPH_NODES` for legibility rather than cost, and drops an edge whose endpoint the cap

@@ -1,9 +1,10 @@
 # IssunDB Playground
 
 A single-page app that runs the whole IssunDB engine in a browser tab, compiled to
-WebAssembly. There is no server component and no network call after the page loads: the
-database lives in the tab's memory, so every query in it is executed by the same Rust code
-an embedded application links against.
+WebAssembly. There is no server component, and nothing you type, run, or create leaves the tab: the
+database lives in the tab's memory, so every query in it is executed by the same Rust code an
+embedded application links against. The page's only external request is for its two web fonts, which
+is the same request the documentation around it already makes.
 
 It exists to make the engine's surface visible. The example catalog has seven categories:
 openCypher queries, the ten graph algorithms, what the optimizer does with a query, full-text
@@ -104,10 +105,14 @@ values, run `make docs` and read them out of `site/assets/stylesheets/palette.*.
 rather than guessing from the Material Design palette, since MkDocs derives its primary from
 the named color rather than using it directly.
 
-Inter and JetBrains Mono are named first in the font stacks, as the docs use them, but are
-deliberately not fetched: the page loads nothing from a network, so a visitor without them
-installed sees the system stack. That is the one respect in which the playground does not
-match the documentation exactly.
+Inter and JetBrains Mono are fetched from Google Fonts by the link tags in `index.html`. That is the
+page's one external request, and it is the same one Material for MkDocs already makes for the same
+two families, since `theme.font` in `mkdocs.yml` names them: the playground would otherwise fall back
+to the system stack and read in a different typeface from the page a visitor arrived from.
+
+The loaded weights are 300 to 700 for Inter and 400 to 600 for JetBrains Mono. Styling outside those
+makes the browser synthesize the difference, which is why the result table's header row is 600 rather
+than 700 now that the table is set in the code face.
 
 ## Layout
 
@@ -144,8 +149,8 @@ node and relationship counts at the other end. The version is the crate's, and `
 the branch and short commit the module was built from.
 
 That stamp is compiled into the module, read from `ISSUNDB_BUILD_REF` through `option_env!`, rather
-than fetched as a sidecar JSON file, because the page makes no network call once loaded and a build
-label is not worth spending that on. `make playground-build` fills it in from `git`; `docs.yml` sets
+than fetched as a sidecar JSON file, so it cannot disagree with the module it describes and the
+deployed tree has one fewer file to keep in step. `make playground-build` fills it in from `git`; `docs.yml` sets
 it from the workflow's refs instead, since `actions/checkout` leaves a detached HEAD where
 `git rev-parse --abbrev-ref HEAD` answers `HEAD` rather than the branch. A build with the variable
 unset, outside a git checkout, names the version alone. The crate's `build.rs` exists only to
