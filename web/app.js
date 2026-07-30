@@ -79,12 +79,17 @@ const SCHEME_KEY = "issundb.scheme";
 const editor = $("editor");
 const highlightEl = $("highlight");
 
+function syncScroll() {
+  const backdrop = highlightEl.parentElement;
+  backdrop.scrollTop = editor.scrollTop;
+  backdrop.scrollLeft = editor.scrollLeft;
+}
+
 function syncHighlight() {
   // The trailing newline stops the backdrop's last line from collapsing, which would let
   // the two panes disagree by one line height at the bottom.
   highlightEl.innerHTML = highlight(editor.value) + "\n";
-  highlightEl.parentElement.scrollTop = editor.scrollTop;
-  highlightEl.parentElement.scrollLeft = editor.scrollLeft;
+  syncScroll();
 }
 
 function setQuery(text, description = "") {
@@ -94,8 +99,15 @@ function setQuery(text, description = "") {
   editor.focus();
 }
 
-editor.addEventListener("input", syncHighlight);
-editor.addEventListener("scroll", syncHighlight);
+editor.addEventListener("input", () => {
+  syncHighlight();
+  // The description belongs to the demo that set it, so editing the query retires it rather
+  // than leaving a caption that now describes something else.
+  $("desc").textContent = "";
+});
+// Scrolling only moves the backdrop. Re-running the highlighter per scroll event rebuilt
+// the whole document's markup on every frame of a drag.
+editor.addEventListener("scroll", syncScroll);
 
 editor.addEventListener("keydown", (e) => {
   if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
@@ -128,7 +140,9 @@ function showPane(name) {
     pane.classList.toggle("on", pane.id === `pane-${name}`);
   }
   if (name === "graph") {
-    drawGraph();
+    if (snapshotStale) loadSnapshot();
+    if (rankSizes) computeRanks().then(drawGraph, drawGraph);
+    else drawGraph();
   }
 }
 
@@ -176,11 +190,20 @@ function showError(message) {
 // Running
 // ---------------------------------------------------------------------------
 
+let busy = false;
+
+// Conservative on purpose: matching too often only costs a rescan, while matching too rarely
+// would leave the schema panel and the graph stale.
+const MAY_WRITE = /\b(CREATE|MERGE|SET|DELETE|DETACH|REMOVE|COPY|IMPORT|DROP)\b/i;
+
 async function run(mode = "run") {
-  if (!db) return;
+  // The disabled Run button does not cover the keyboard shortcut, the Explain button, or a
+  // demo click, so two runs could interleave and the slower one's panes would win.
+  if (!db || busy) return;
   const cypher = editor.value.trim();
   if (!cypher) return;
 
+  busy = true;
   $("run").disabled = true;
   setStatus("running…");
   // Execution is synchronous inside the module, so this is the only chance the browser gets
@@ -223,12 +246,19 @@ async function run(mode = "run") {
     );
     showPane("table");
     remember(cypher);
-    refreshSchema();
-    await refreshGraph();
+    // `stats` is a full node scan and an adjacency walk. A read-only statement cannot change
+    // what it reports, so only a statement that might have written is worth rescanning for.
+    const mayWrite = MAY_WRITE.test(cypher);
+    if (mayWrite) refreshSchema();
+    await refreshGraph(mayWrite);
   } catch (e) {
+    // Cleared, or the export buttons would hand back the previous query's rows while the
+    // table shows this one's error.
+    lastResult = null;
     showError(String(e.message ?? e));
     setStatus(`<span style="color:var(--err)">error</span>`);
   } finally {
+    busy = false;
     $("run").disabled = false;
   }
 }
@@ -439,15 +469,42 @@ function refreshSchema() {
 // ---------------------------------------------------------------------------
 
 let snapshot = { nodes: [], edges: [], truncated: false };
+let snapshotStale = true;
 
-async function refreshGraph() {
+function loadSnapshot() {
+  let next;
   try {
-    snapshot = JSON.parse(db.graphSnapshot());
+    next = JSON.parse(db.graphSnapshot());
   } catch {
-    snapshot = { nodes: [], edges: [], truncated: false };
+    next = { nodes: [], edges: [], truncated: false };
   }
-  if (rankSizes) await computeRanks();
-  if ($("pane-graph").classList.contains("on")) drawGraph();
+  // Each surviving node keeps its position, so running a query does not discard a layout the
+  // user arranged by hand or watched settle. Without this the whole graph re-seeded onto the
+  // starting circle after every statement.
+  const previous = new Map(snapshot.nodes.map((node) => [node.id, node]));
+  for (const node of next.nodes) {
+    const old = previous.get(node.id);
+    if (old && old.x !== undefined) {
+      node.x = old.x;
+      node.y = old.y;
+      node.vx = old.vx ?? 0;
+      node.vy = old.vy ?? 0;
+    }
+  }
+  snapshot = next;
+  snapshotStale = false;
+}
+
+// `mayWrite` false means only the highlighting can have changed, so the graph is redrawn
+// without paying for a fresh scan or another PageRank pass.
+async function refreshGraph(mayWrite = true) {
+  // `graphSnapshot` is a full node scan, so paying for it while the graph tab is hidden is
+  // waste. Switching to the tab loads it instead.
+  if (mayWrite) snapshotStale = true;
+  if (!$("pane-graph").classList.contains("on")) return;
+  if (snapshotStale) loadSnapshot();
+  if (rankSizes && mayWrite) await computeRanks();
+  drawGraph();
 }
 
 async function computeRanks() {
@@ -585,7 +642,12 @@ function highlighted() {
   return ids.size ? ids : null;
 }
 
+let simGeneration = 0;
+
 function drawGraph() {
+  // A drag whose pointer is released after a redraw calls the previous drawing's `start`,
+  // which would put a loop over replaced nodes back into the shared handle.
+  const generation = ++simGeneration;
   const svg = $("svg");
   if (sim) {
     cancelAnimationFrame(sim);
@@ -613,8 +675,19 @@ function drawGraph() {
   }
 
   const lit = highlighted();
-  const maxDegree = Math.max(1, ...nodes.map((n) => n.degree ?? 0));
-  const maxRank = rankSizes ? Math.max(1e-9, ...rankSizes.values()) : 1;
+  // Looped rather than spread into `Math.max`: the rank map covers every node in the
+  // database, not just the drawn ones, and spreading past about 130 000 arguments raises a
+  // RangeError.
+  const maxOf = (values, floor) => {
+    let max = floor;
+    for (const value of values) if (value > max) max = value;
+    return max;
+  };
+  const maxDegree = maxOf(
+    nodes.map((n) => n.degree ?? 0),
+    1,
+  );
+  const maxRank = rankSizes ? maxOf(rankSizes.values(), 1e-9) : 1;
   const radiusOf = (node) => {
     if (rankSizes) return 6 + 16 * Math.sqrt((rankSizes.get(node.id) ?? 0) / maxRank);
     return 6 + 10 * Math.sqrt((node.degree ?? 0) / maxDegree);
@@ -689,6 +762,7 @@ function drawGraph() {
 
   const tick = layout(nodes, edges, svg);
   function start() {
+    if (generation !== simGeneration) return;
     if (sim) cancelAnimationFrame(sim);
     const step = () => {
       const running = tick();
@@ -730,10 +804,21 @@ $("size-by-rank").addEventListener("change", async (e) => {
   if (e.target.checked) {
     rankSizes = new Map();
     await computeRanks();
+    // `computeRanks` clears the map when the pass fails, so the box must not keep claiming it.
+    if (!rankSizes) e.target.checked = false;
   } else {
     rankSizes = null;
   }
   drawGraph();
+});
+
+// The layout reads the viewport size when it starts, so a resize needs a fresh one. Positions
+// survive, since only an undefined coordinate is re-seeded.
+let resizeTimer = null;
+addEventListener("resize", () => {
+  if (!$("pane-graph").classList.contains("on")) return;
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(drawGraph, 150);
 });
 
 // ---------------------------------------------------------------------------
@@ -776,11 +861,16 @@ $("json-dl").addEventListener("click", () => {
 // The query travels in the fragment, so a shared link never reaches a server even when the
 // page is hosted on one.
 const b64url = {
-  encode: (s) =>
-    btoa(String.fromCharCode(...new TextEncoder().encode(s)))
-      .replace(/\+/g, "-")
-      .replace(/\//g, "_")
-      .replace(/=+$/, ""),
+  encode: (s) => {
+    const bytes = new TextEncoder().encode(s);
+    // Chunked rather than one spread: `String.fromCharCode(...bytes)` raises a RangeError
+    // past about 130 000 arguments, which a pasted bulk-insert script reaches.
+    let binary = "";
+    for (let i = 0; i < bytes.length; i += 0x8000) {
+      binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+    }
+    return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  },
   decode: (s) =>
     new TextDecoder().decode(
       Uint8Array.from(atob(s.replace(/-/g, "+").replace(/_/g, "/")), (c) => c.charCodeAt(0)),
@@ -788,12 +878,21 @@ const b64url = {
 };
 
 $("share").addEventListener("click", async () => {
-  const url = `${location.origin}${location.pathname}#q=${b64url.encode(editor.value)}`;
+  let fragment;
   try {
-    await navigator.clipboard.writeText(url);
+    fragment = `q=${b64url.encode(editor.value)}`;
+  } catch {
+    // Encoding was outside the try before, so a query too large to encode rejected silently.
+    setStatus('<span style="color:var(--err)">too large to put in a link</span>');
+    return;
+  }
+  try {
+    await navigator.clipboard.writeText(
+      `${location.origin}${location.pathname}#${fragment}`,
+    );
     setStatus('<span class="t">link copied</span>');
   } catch {
-    location.hash = `q=${b64url.encode(editor.value)}`;
+    location.hash = fragment;
     setStatus("<span>link is in the address bar</span>");
   }
 });
@@ -812,11 +911,18 @@ function currentScheme() {
 
 function applyScheme(scheme) {
   document.documentElement.setAttribute("data-md-color-scheme", scheme);
-  // The icon offers the scheme you would switch to, which is the convention Material uses.
-  $("scheme-icon").innerHTML =
-    `<path d="${scheme === "slate" ? SUN : MOON}" ${
-      scheme === "slate" ? 'stroke="currentColor" stroke-width="2" fill="none"' : ""
-    }/>`;
+  // Built through `createElementNS` rather than `innerHTML`, since markup assigned to an SVG
+  // element is not reliably parsed into the SVG namespace. The icon offers the scheme you
+  // would switch to, which is the convention Material uses.
+  const dark = scheme === "slate";
+  $("scheme-icon").replaceChildren(
+    el(
+      "path",
+      dark
+        ? { d: SUN, stroke: "currentColor", "stroke-width": "2", fill: "none" }
+        : { d: MOON },
+    ),
+  );
 }
 
 $("scheme").addEventListener("click", () => {
@@ -844,9 +950,16 @@ function seed() {
 }
 
 $("reset").addEventListener("click", async () => {
+  // Freed rather than abandoned. wasm-bindgen registers a finalizer, so an abandoned instance
+  // is reclaimed eventually, but until then its whole graph is still resident and wasm memory
+  // never shrinks. The new instance is built first, so a failure leaves the old one usable.
+  const previous = db;
   db = new Playground();
+  previous?.free();
   lastResult = null;
   rankSizes = null;
+  // Node ids restart from zero, so a carried-over position would belong to a different node.
+  snapshot = { nodes: [], edges: [], truncated: false };
   $("size-by-rank").checked = false;
   seed();
   await refreshGraph();

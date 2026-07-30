@@ -139,20 +139,20 @@
 
         <div class="results">
           <div class="tabs" role="tablist">
-            <button class="tab" role="tab" data-pane="table" aria-selected="true">
+            <button class="tab" role="tab" data-pane="table" aria-controls="pane-table" aria-selected="true">
               Table <span class="c" id="tab-rows">0</span>
             </button>
-            <button class="tab" role="tab" data-pane="graph" aria-selected="false">Graph</button>
-            <button class="tab" role="tab" data-pane="plan" aria-selected="false">Plan</button>
-            <button class="tab" role="tab" data-pane="json" aria-selected="false">JSON</button>
+            <button class="tab" role="tab" data-pane="graph" aria-controls="pane-graph" aria-selected="false">Graph</button>
+            <button class="tab" role="tab" data-pane="plan" aria-controls="pane-plan" aria-selected="false">Plan</button>
+            <button class="tab" role="tab" data-pane="json" aria-controls="pane-json" aria-selected="false">JSON</button>
             <div class="spacer"></div>
             <button class="ghost" id="csv" title="Download the result as CSV">CSV</button>
             <button class="ghost" id="json-dl" title="Download the result as JSON">JSON</button>
           </div>
 
-          <div class="pane on" id="pane-table"></div>
+          <div class="pane on" id="pane-table" role="tabpanel"></div>
 
-          <div class="pane graph-pane" id="pane-graph">
+          <div class="pane graph-pane" id="pane-graph" role="tabpanel">
             <div class="graph-toolbar">
               <span id="graph-count"></span>
               <div class="legend" id="legend"></div>
@@ -167,8 +167,8 @@
             <div class="inspect" id="inspect" hidden></div>
           </div>
 
-          <div class="pane" id="pane-plan"></div>
-          <div class="pane" id="pane-json"></div>
+          <div class="pane" id="pane-plan" role="tabpanel"></div>
+          <div class="pane" id="pane-json" role="tabpanel"></div>
         </div>
       </main>
     </div>

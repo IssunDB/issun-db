@@ -259,6 +259,13 @@ aside.hidden {
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--md-primary-fg-color) 22%, transparent);
 }
 
+/* The popup inherits neither the select's background nor its color on every platform, so a
+ * dark scheme could render the options as white on white. */
+select.control option {
+  background: var(--md-default-bg-color);
+  color: var(--md-default-fg-color);
+}
+
 select.control {
   appearance: none;
   background-image: linear-gradient(45deg, transparent 50%, currentColor 50%),
