@@ -89,6 +89,21 @@ match the documentation exactly.
 - `style.css`: light and dark themes over one set of custom properties.
 - `pkg/`: the generated module. A build artifact, not checked in.
 
+## What the Footer Reports
+
+`This playground app is powered by IssunDB (0.1.0-alpha.20; develop@4490f) compiled to
+WebAssembly, ...`, with the graph's node and relationship counts at the other end. The version is
+the crate's, and `develop@4490f` is the branch and short commit the module was built from.
+
+That stamp is compiled into the module, read from `ISSUNDB_BUILD_REF` through `option_env!`, rather
+than fetched as a sidecar JSON file, because the page makes no network call once loaded and a build
+label is not worth spending that on. `make playground-build` fills it in from `git`; `docs.yml` sets
+it from the workflow's refs instead, since `actions/checkout` leaves a detached HEAD where
+`git rev-parse --abbrev-ref HEAD` answers `HEAD` rather than the branch. A build with the variable
+unset, outside a git checkout, names the version alone. The crate's `build.rs` exists only to
+declare `rerun-if-env-changed` for it, without which cargo would reuse a cached artifact and keep
+reporting an earlier build's commit.
+
 ## Sharing a Query
 
 The Share button copies a link carrying the query in the fragment, so it reaches no server even
@@ -103,6 +118,20 @@ text. A generator has to encode a plus as `%2B`, since a fragment read as a quer
 literal one into a space. Both forms are applied on a fragment change as well as on load, so a
 link followed while the playground is already open is not ignored; one carrying `s` reloads, so
 its setup lands on a freshly seeded database rather than on top of the current one.
+
+## Links from the Documentation
+
+`docs/hooks/playground_links.py` is a MkDocs hook that puts a "Run in the playground" link under a
+Cypher block marked with `<!-- playground -->` on the line before its fence. The link carries the
+block as `q` and every earlier marked block on the same page as `s`, so an example that builds on
+one above it still works.
+
+The marker is opt-in because most Cypher in the documentation cannot run here: it binds a query
+parameter, it is a CLI script rather than Cypher, or it needs stored embeddings the seeded sample
+graph does not have. Of the five Cypher blocks in `docs/examples.md`, one runs. A link landing on an
+error is worse than no link, so marking a block is a claim that it runs, and
+`make playground-check` holds you to it: every marked block is executed against the seeded graph and
+has to return at least one row.
 
 ## What the Result Views Cap
 

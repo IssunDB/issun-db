@@ -215,6 +215,7 @@ query, so `nodeId` joins back to the matched nodes through `id()`.
 
 The following Cypher query calculates PageRank scores and returns node names:
 
+<!-- playground -->
 ```cypher
 CALL issundb.pageRank({iterations: 20, damping: 0.85}) YIELD nodeId, score
 MATCH (p:Person) WHERE id(p) = nodeId

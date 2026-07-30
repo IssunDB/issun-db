@@ -346,9 +346,14 @@ $("load-sample").addEventListener("click", () =>
 // History
 // ---------------------------------------------------------------------------
 
+// Trimmed on read as well as on write, so a longer list stored by an earlier visit is cut to the
+// limit straight away rather than only after the next query pushes an entry out.
+const MAX_HISTORY_ITEMS = 6;
+
 function readHistory() {
   try {
-    return JSON.parse(localStorage.getItem(HISTORY_KEY) ?? "[]");
+    const stored = JSON.parse(localStorage.getItem(HISTORY_KEY) ?? "[]");
+    return Array.isArray(stored) ? stored.slice(0, MAX_HISTORY_ITEMS) : [];
   } catch {
     return [];
   }
@@ -358,7 +363,7 @@ function remember(cypher) {
   const history = readHistory().filter((q) => q !== cypher);
   history.unshift(cypher);
   try {
-    localStorage.setItem(HISTORY_KEY, JSON.stringify(history.slice(0, 25)));
+    localStorage.setItem(HISTORY_KEY, JSON.stringify(history.slice(0, MAX_HISTORY_ITEMS)));
   } catch {
     // A browser refusing storage must not fail the query.
   }
@@ -1309,6 +1314,19 @@ $("toggle-side").addEventListener("click", () => $("side").classList.toggle("hid
 // Boot
 // ---------------------------------------------------------------------------
 
+// The build stamp comes out of the module rather than a sidecar file the page would have to fetch,
+// so it is empty for a build made outside a git checkout and the footer then names the version
+// alone.
+function renderPoweredBy() {
+  const build = Playground.buildRef();
+  const engine = build
+    ? `IssunDB (${Playground.version()}; ${build})`
+    : `IssunDB (${Playground.version()})`;
+  $("powered").textContent =
+    `This playground app is powered by ${engine} compiled to WebAssembly, and everything` +
+    " (including the queries) runs safely in your browser.";
+}
+
 function seed() {
   db.query(SAMPLE_SOCIAL);
   refreshSchema();
@@ -1343,14 +1361,7 @@ async function boot() {
   await init();
   db = new Playground();
 
-  $("version").textContent = `v${Playground.version()}`;
-  $("build-badge").textContent = Playground.isPersistent()
-    ? "persistent build"
-    : "in-memory build";
-  $("build-badge").title = Playground.isPersistent()
-    ? "This build stores data on disk."
-    : "This build keeps everything in memory, so a reload starts over. Use the Share button to keep a query.";
-
+  renderPoweredBy();
   renderDemos();
   renderProcedures();
   renderHistory();

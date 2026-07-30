@@ -218,8 +218,22 @@ impl Playground {
         env!("CARGO_PKG_VERSION").to_string()
     }
 
-    /// So the page can say whether data survives a reload rather than leaving a visitor to
-    /// discover it.
+    /// The `branch@commit` the module was built from, for the page's footer, or an empty string
+    /// when it was not built through `make playground-build`.
+    ///
+    /// Compiled in rather than fetched as a sidecar file, because the page's contract is that it
+    /// makes no network call once loaded, and a build stamp is not worth spending that on. The
+    /// build script's `rerun-if-env-changed` is what stops a cached artifact from reporting the
+    /// commit of an earlier build.
+    fn build_ref_inner() -> String {
+        option_env!("ISSUNDB_BUILD_REF")
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// Whether data survives a reload, which is the same question as whether this build selected
+    /// LMDB. The page no longer shows it, since the header it was reported in is now just the
+    /// brand, so this exists for a caller that needs to know rather than for the footer.
     fn is_persistent_inner() -> bool {
         cfg!(feature = "lmdb")
     }
@@ -283,6 +297,11 @@ impl Playground {
     #[wasm_bindgen(js_name = isPersistent)]
     pub fn is_persistent() -> bool {
         Self::is_persistent_inner()
+    }
+
+    #[wasm_bindgen(js_name = buildRef)]
+    pub fn build_ref() -> String {
+        Self::build_ref_inner()
     }
 }
 
@@ -409,5 +428,23 @@ mod tests {
     fn a_query_error_becomes_a_js_exception_rather_than_a_panic() {
         let (_dir, p) = playground();
         assert!(p.query_inner("MATCH ( RETURN").is_err());
+    }
+
+    /// The footer names the version, so an empty one would read as `IssunDB ()`.
+    #[test]
+    fn the_version_is_not_blank() {
+        assert!(!Playground::version_inner().trim().is_empty());
+    }
+
+    /// Only the shape is asserted. The value depends on `ISSUNDB_BUILD_REF` at compile time, which
+    /// `cargo test` does not set, so pinning it to a branch would fail everywhere but a
+    /// `make playground-build` tree.
+    #[test]
+    fn the_build_ref_is_either_empty_or_a_branch_and_commit() {
+        let build = Playground::build_ref_inner();
+        assert!(
+            build.is_empty() || build.contains('@'),
+            "a non-empty build ref is `branch@commit`, got {build:?}",
+        );
     }
 }

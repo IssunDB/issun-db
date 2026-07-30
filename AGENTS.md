@@ -218,6 +218,10 @@ modules according to this map.
   both through the compiled module and fails on an error, which is how a wrong procedure signature is caught. The procedure reference is written out by hand
   because the engine cannot enumerate its own procedures, so that check is the only thing keeping it from drifting; it treats `ProcedureNotFound` as a failure
   even for the two retrieval entries whose empty-index error it tolerates, since a rename is exactly what that error reports.
+  `docs/hooks/playground_links.py` is the MkDocs hook putting a "Run in the playground" link under a Cypher block in `docs/` marked `<!-- playground -->`,
+  carrying the block as `q` and the page's earlier marked blocks as `s`. The marker is opt-in because most documented Cypher cannot run in the playground
+  (a query parameter, a CLI script, or embeddings the seeded graph lacks), so marking a block asserts that it runs, and `make playground-check` executes
+  every marked block and fails one returning no rows.
   See `web/README.md` for the three build targets and what the browser configuration gives up (no persistence, one thread,
   no `backup`/`restore`, and a 16 MB stack set by a link argument in `.cargo/config.toml` because the 1 MB default is also the engine's inline-execution
   budget).
@@ -712,8 +716,12 @@ where the invariant matters most.
 Browser bindings, exposing one `Playground` that owns a single `Graph`. Depends only on `issundb`. Every method returns a JSON string, so the boundary
 carries one type in both directions rather than a second serialization contract to keep in agreement with the page.
 
-Methods: `query`, `explain`, `stats`, `graphSnapshot`, `createTextIndex`, `textSearch`, `upsertVector`, `vectorSearch`, and the two statics `version`
-and `isPersistent`. `query` returns `{columns, rows, statement_count, elapsed_ms}` with row-major rows, so the page renders a table knowing
+Methods: `query`, `explain`, `stats`, `graphSnapshot`, `createTextIndex`, `textSearch`, `upsertVector`, `vectorSearch`, and the three statics `version`,
+`isPersistent`, and `buildRef`. `buildRef` is the `branch@commit` the page names in its footer, read from `ISSUNDB_BUILD_REF` at compile time through
+`option_env!` and empty without it. It is compiled in rather than fetched as a sidecar file because the page's contract is that it makes no network call
+once loaded, and the crate's `build.rs` exists only to declare `rerun-if-env-changed` for that variable, without which a cached artifact would keep
+reporting an earlier build's commit. `make playground-build` supplies it from `git`, and `docs.yml` sets it from the workflow's own refs, since
+`actions/checkout` leaves a detached HEAD where `rev-parse --abbrev-ref` answers `HEAD`. `query` returns `{columns, rows, statement_count, elapsed_ms}` with row-major rows, so the page renders a table knowing
 nothing about the schema, and `statement_count` is how it can say a semicolon-separated script ran more statements than the one result shown.
 `graphSnapshot` returns `{nodes, edges, truncated}` capped at `MAX_GRAPH_NODES` for legibility rather than cost, and drops an edge whose endpoint the cap
 excluded so the page never draws a line to nothing.

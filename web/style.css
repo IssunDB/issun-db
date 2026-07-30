@@ -145,23 +145,6 @@ header {
   transform: translateY(2px);
 }
 
-.brand small {
-  font-weight: 400;
-  opacity: 0.72;
-  font-family: var(--md-code-font);
-  font-size: 11px;
-}
-
-.badge {
-  font-size: 11px;
-  font-family: var(--md-code-font);
-  padding: 2px 8px;
-  border-radius: 999px;
-  background: rgba(255, 255, 255, 0.16);
-  color: var(--md-primary-bg-color);
-  white-space: nowrap;
-}
-
 .spacer {
   flex: 1;
 }
@@ -919,11 +902,10 @@ footer {
     padding: 0 8px;
   }
 
-  /* The version and the build badge are the two header items a query never needs, and the
-     footer still reports the build. Dropping them keeps Run and the scheme toggle reachable
-     without a horizontal scroll. */
-  .brand small,
-  .badge {
+  /* The brand is the one header item a query never needs, and the footer names the build anyway.
+     Dropping the word keeps Share, Reset, and the scheme toggle reachable without a horizontal
+     scroll; the mark stays, so the header is still identifiable. */
+  .brand span:not(.mark) {
     display: none;
   }
 
@@ -947,5 +929,12 @@ footer {
   .inspect {
     width: auto;
     left: 12px;
+  }
+
+  /* The footer sentence needs more than one line at this width, and without wrapping the graph
+     counts beside it would be squeezed to nothing. */
+  footer {
+    flex-wrap: wrap;
+    gap: 2px 12px;
   }
 }

@@ -41,6 +41,9 @@ jobs:
           echo "Installing wasm-bindgen-cli $VERSION"
           cargo +stable install --locked wasm-bindgen-cli --version "$VERSION"
 
+      - name: Stamp the playground build
+        run: echo "ISSUNDB_BUILD_REF=${GITHUB_REF_NAME}@${GITHUB_SHA:0:5}" >> "$GITHUB_ENV"
+
       - name: Check the playground demo catalog
         run: make playground-check
 

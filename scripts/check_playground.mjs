@@ -6,6 +6,7 @@
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { readdirSync, readFileSync } from "node:fs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const pkg = process.env.PLAYGROUND_PKG ?? join(here, "..", "target", "playground-pkg-node");
@@ -103,6 +104,51 @@ for (const proc of PROCEDURES) {
   }
 }
 
+// Cypher blocks in `docs/` marked `<!-- playground -->`, which `docs/hooks/playground_links.py`
+// turns into a "Run in the playground" link. The marker is a claim that the block runs against the
+// seeded sample graph, and nothing else checks it, so an example edited into a parameter or a
+// procedure rename would ship as a link that lands on an error. Each block runs with the earlier
+// marked blocks on its own page replayed first, which is the order the generated link produces.
+console.log("\nMarked documentation blocks");
+
+const MARKED_BLOCK = /^<!--[ \t]*playground[ \t]*-->\n```cypher\n([\s\S]*?)^```$/gm;
+const docsDir = join(here, "..", "docs");
+
+let docChecked = 0;
+let docFailures = 0;
+
+for (const file of readdirSync(docsDir).filter((f) => f.endsWith(".md")).sort()) {
+  const markdown = readFileSync(join(docsDir, file), "utf8");
+  const blocks = [...markdown.matchAll(MARKED_BLOCK)].map((m) => m[1].trim());
+  const earlier = [];
+  for (const [i, block] of blocks.entries()) {
+    docChecked += 1;
+    const label = `${file}#${i + 1}`;
+    const p = new Playground();
+    try {
+      p.query(SAMPLE_SOCIAL);
+      if (earlier.length > 0) {
+        p.query(earlier.join(";\n"));
+      }
+      const result = JSON.parse(p.query(block));
+      // A block that runs but matches nothing is a link to an empty table, which reads as the
+      // playground being broken rather than as the example being about something else.
+      if (result.rows.length === 0) {
+        throw new Error("no rows against the seeded sample graph");
+      }
+      console.log(`  ok    ${label.padEnd(28)} ${result.rows.length} row(s)`);
+    } catch (e) {
+      docFailures += 1;
+      console.log(`  FAIL  ${label.padEnd(28)} ${String(e.message ?? e).split("\n")[0]}`);
+    }
+    earlier.push(block);
+  }
+}
+
+if (docChecked === 0) {
+  console.log("  none marked");
+}
+
 console.log(
   `\n${checked - failures}/${checked} demos ok` + (failures ? `, ${failures} failed` : ""),
 );
@@ -110,4 +156,8 @@ console.log(
   `${procChecked - procFailures}/${procChecked} procedures ok` +
     (procFailures ? `, ${procFailures} failed` : ""),
 );
-process.exit(failures + procFailures ? 1 : 0);
+console.log(
+  `${docChecked - docFailures}/${docChecked} marked doc blocks ok` +
+    (docFailures ? `, ${docFailures} failed` : ""),
+);
+process.exit(failures + procFailures + docFailures ? 1 : 0);
