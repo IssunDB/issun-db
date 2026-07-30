@@ -36,8 +36,8 @@ a rename produces.
 The module is built with `--no-default-features`, which selects the two pure-Rust backends:
 
 - Storage is the in-memory backend, because LMDB needs a filesystem and memory mapping
-  that `wasm32-unknown-unknown` does not have. Nothing survives a reload, which the page
-  states in the header rather than leaving a visitor to discover.
+  that `wasm32-unknown-unknown` does not have. Nothing survives a reload, which the Setup panel
+  says rather than leaving a visitor to discover it.
 - The vector index is the exact-scan backend, since the `hnsw` feature selects `usearch`,
   which is C++ and fails the wasm build in `cxx`. Results are the true nearest neighbors
   rather than approximate ones, so the demo is honest, just not sublinear.
@@ -75,6 +75,15 @@ installed sees the system stack. That is the one respect in which the playground
 match the documentation exactly.
 
 ## Layout
+
+The page is one centered column: a sidebar of four cards (Setup, Examples, Procedures, and Query
+History) beside a main column of three (the Cypher editor, a status banner, and the results). It is
+deliberately modelled on the Onager playground, which shares this project's Material palette, so the
+two read as the same family of tool. Two structural details follow from that model. The page scrolls
+as a document rather than the panels scrolling inside a fixed viewport, so the results card carries a
+fixed-height pane instead of stretching, which also gives the graph view a defined box to lay out
+in. And `color-scheme` is declared per palette, because without it the browser draws its scrollbars
+and native controls from the light palette on both schemes.
 
 - `index.html`: the page. The inline script in `<head>` applies the stored scheme before
   first paint, so a dark-theme visitor never sees a white flash.

@@ -170,9 +170,21 @@ editor.addEventListener("keydown", (e) => {
 // Status and results
 // ---------------------------------------------------------------------------
 
-function setStatus(html) {
-  $("status").innerHTML = html;
+// The banner carries one short sentence and a state. A detailed error stays in the table pane,
+// where it can be several lines long and can carry the did-you-mean hint; the banner only says
+// that the run failed. `kind` is "", "busy", "ok", or "err".
+function setStatus(kind, text) {
+  const banner = $("status");
+  banner.className = kind ? `banner ${kind}` : "banner";
+  banner.innerHTML =
+    kind === "busy" ? `<span class="sp"></span><span>${esc(text)}</span>` : esc(text);
 }
+
+function setMeta(text) {
+  $("result-meta").textContent = text;
+}
+
+const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
 
 function showPane(name) {
   for (const tab of document.querySelectorAll(".tab")) {
@@ -211,7 +223,7 @@ function cell(value) {
 
 function renderTable(result) {
   const pane = $("pane-table");
-  $("tab-rows").textContent = result.rows.length;
+  setMeta(`${plural(result.rows.length, "row")}, ${plural(result.columns.length, "column")}.`);
   if (result.columns.length === 0) {
     pane.innerHTML =
       '<div class="notice info">The statement returned no columns. Writes report nothing unless the statement ends in RETURN.</div>';
@@ -251,7 +263,7 @@ function renderJson(result) {
 
 function showError(message) {
   $("pane-table").innerHTML = `<div class="notice err">${esc(message)}</div>`;
-  $("tab-rows").textContent = "0";
+  setMeta("No results.");
   showPane("table");
 }
 
@@ -274,7 +286,7 @@ async function run(mode = "run") {
 
   busy = true;
   $("run").disabled = true;
-  setStatus("running…");
+  setStatus("busy", "Running…");
   // Execution is synchronous inside the module, so this is the only chance the browser gets
   // to paint the disabled button before the thread blocks.
   await new Promise((r) => setTimeout(r, 0));
@@ -283,7 +295,8 @@ async function run(mode = "run") {
     if (mode === "explain") {
       const plan = db.explain(cypher);
       $("pane-plan").innerHTML = `<pre class="plan">${esc(plan)}</pre>`;
-      setStatus(`<span class="t">plan</span>`);
+      setStatus("ok", "Plan generated.");
+      setMeta("Physical plan. The query was not executed.");
       showPane("plan");
       remember(cypher);
       return;
@@ -306,12 +319,13 @@ async function run(mode = "run") {
 
     const multi =
       result.statement_count > 1
-        ? ` <span>${result.statement_count} statements, showing the last</span>`
+        ? ` ${result.statement_count} statements ran; this is the last one's result.`
         : "";
-    setStatus(
-      `<span class="t">${result.rows.length} row${result.rows.length === 1 ? "" : "s"}</span>` +
-        ` <span>${result.elapsed_ms.toFixed(2)} ms engine</span>` +
-        ` <span>${wall.toFixed(1)} ms total</span>${multi}`,
+    setStatus("ok", "Query finished.");
+    setMeta(
+      `${plural(result.rows.length, "row")}, ${plural(result.columns.length, "column")}.` +
+        ` Query took ${result.elapsed_ms.toFixed(2)} ms` +
+        ` (${wall.toFixed(1)} ms including the round trip).${multi}`,
     );
     showPane("table");
     remember(cypher);
@@ -329,7 +343,7 @@ async function run(mode = "run") {
     lastResult = null;
     const message = String(e.message ?? e);
     showError(message + procedureHint(cypher, message));
-    setStatus(`<span style="color:var(--err)">error</span>`);
+    setStatus("err", "Query failed.");
   } finally {
     busy = false;
     $("run").disabled = false;
@@ -338,6 +352,10 @@ async function run(mode = "run") {
 
 $("run").addEventListener("click", () => run());
 $("explain").addEventListener("click", () => run("explain"));
+$("clear").addEventListener("click", () => {
+  setQuery("");
+  setStatus("", "Editor cleared.");
+});
 $("load-sample").addEventListener("click", () =>
   setQuery(SAMPLE_SOCIAL, "The sample social graph. Running it again adds a second copy."),
 );
@@ -555,10 +573,10 @@ async function runTextDemo(demo) {
     }
     lastResult = { columns: ["node", "title", "bm25", "field"], rows };
     renderTable(lastResult);
-    setStatus(
-      `<span class="t">${rows.length} hit${rows.length === 1 ? "" : "s"}</span>` +
-        ` <span>full-text index on ${label}.${property}</span>` +
-        ` <span>query "${esc(demo.textSearch)}"</span>`,
+    setStatus("ok", "Full-text search finished.");
+    setMeta(
+      `${plural(rows.length, "hit")}, 4 columns.` +
+        ` BM25 over the ${label}.${property} index for "${demo.textSearch}".`,
     );
     showPane("table");
   } catch (e) {
@@ -589,10 +607,10 @@ async function runVectorDemo() {
       rows: hits.map((h, i) => [i + 1, h.node, names.get(h.node) ?? null, Number(h.distance.toFixed(5))]),
     };
     renderTable(lastResult);
-    setStatus(
-      `<span class="t">${hits.length} neighbour${hits.length === 1 ? "" : "s"}</span>` +
-        ` <span>${people.length} embeddings, exact search</span>` +
-        ` <span>query [1, 0, 0.25]</span>`,
+    setStatus("ok", "Vector search finished.");
+    setMeta(
+      `${plural(hits.length, "neighbour")}, 4 columns.` +
+        ` Exact search over ${plural(people.length, "embedding")} for [1, 0, 0.25].`,
     );
     showPane("table");
   } catch (e) {
@@ -1195,7 +1213,7 @@ $("share").addEventListener("click", async () => {
     parts.push(`q=${b64url.encode(editor.value)}`);
   } catch {
     // Encoding was outside the try before, so a query too large to encode rejected silently.
-    setStatus('<span style="color:var(--err)">too large to put in a link</span>');
+    setStatus("err", "The query is too large to put in a link.");
     return;
   }
 
@@ -1215,12 +1233,10 @@ $("share").addEventListener("click", async () => {
     else dropped = setupLog.length;
   }
 
-  const count = dropped || setupLog.length;
-  const plural = count === 1 ? "" : "s";
   const note = dropped
-    ? ` <span>${dropped} setup statement${plural} too large to include</span>`
+    ? ` ${plural(dropped, "setup statement")} were too large to include.`
     : setupLog.length > 0
-      ? ` <span>with ${setupLog.length} setup statement${plural}</span>`
+      ? ` It carries ${plural(setupLog.length, "setup statement")}.`
       : "";
 
   const fragment = parts.join("&");
@@ -1228,11 +1244,11 @@ $("share").addEventListener("click", async () => {
     await navigator.clipboard.writeText(
       `${location.origin}${location.pathname}#${fragment}`,
     );
-    setStatus(`<span class="t">link copied</span>${note}`);
+    setStatus("ok", `Link copied.${note}`);
   } catch {
     ownHashWrite = true;
     location.hash = fragment;
-    setStatus(`<span>link is in the address bar</span>${note}`);
+    setStatus("", `The link is in the address bar.${note}`);
   }
 });
 
@@ -1349,7 +1365,8 @@ $("reset").addEventListener("click", async () => {
   $("size-by-rank").checked = false;
   seed();
   await refreshGraph();
-  setStatus('<span class="t">reset</span> <span>sample graph re-seeded</span>');
+  setStatus("ok", "Reset. The sample graph was re-seeded.");
+  setMeta("Run a query to view results.");
   showPane("table");
   $("pane-table").innerHTML =
     '<div class="notice info">Fresh database, seeded with the sample social graph. Pick a demo on the left, or write a query.</div>';
@@ -1412,6 +1429,8 @@ async function boot() {
   // reload would quietly add another copy of its data.
   if (stored) {
     showPane("table");
+    setStatus("", "Your last query was restored. It has not been run.");
+    setMeta("Run a query to view results.");
     $("pane-table").innerHTML =
       '<div class="notice info">Your last query is in the editor. Press ⌘↵ (or Ctrl↵) to run it.</div>';
   } else {
