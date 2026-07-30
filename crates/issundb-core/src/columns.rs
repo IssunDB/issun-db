@@ -731,7 +731,9 @@ fn compute_prop_stats(col: &PropColumn) -> Option<PropStats> {
             _ => runs.push((v.clone(), 1)),
         }
     }
-    runs.sort_by(|a, b| b.1.cmp(&a.1));
+    // Descending by count, and stable, so equal counts keep the ascending value order
+    // `vals` arrived in. That order is observable through `mcvs`.
+    runs.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
     runs.truncate(MCV_LIMIT);
 
     Some(PropStats {

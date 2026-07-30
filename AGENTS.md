@@ -758,8 +758,16 @@ Implementation using red-green TDD:
 6. `make format` before every commit.
 7. Update of `README.md` or `docs/` if behavior or workflow changed.
 
+Clippy is pinned to the MSRV, in `lints.yml`, and that pin is load-bearing: a current clippy reports about fifteen further lints in `issundb-cypher` that
+the pinned one does not, so they land all at once whenever the MSRV moves. Two consequences. A lint step belongs in `lints.yml` beside `make lint`, never in
+`tests.yml`, whose jobs run on stable and would therefore gate on a different lint set than the one the project chose; `make lint-backends` is there for
+exactly that reason. And a clean local `make lint` says nothing about a newer clippy, so run `cargo +stable clippy` before adding a lint gate rather than
+after CI does it.
+
 Additional validation when relevant:
 
+- `make test-backends` for a storage or vector backend change, and `make lint-backends` alongside it. The default run always selects LMDB and usearch, so
+  neither the in-memory backend nor the exact vector index is otherwise exercised as the selected backend.
 - `make bench` for performance-sensitive storage changes.
 - `make test-conformance` for Cypher conformance coverage.
 - `make bench-ladybugdb` for cross-engine performance comparison and differential correctness checks on the Cypher execution path.

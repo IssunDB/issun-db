@@ -9,21 +9,16 @@ pub type TypeId = u32;
 pub type PropKeyId = u32;
 
 /// Supported languages for Full-Text Search indexing and stemming.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum Language {
+    #[default]
     English = 1,
     Spanish = 2,
     French = 3,
     German = 4,
     Italian = 5,
     Portuguese = 6,
-}
-
-impl Default for Language {
-    fn default() -> Self {
-        Self::English
-    }
 }
 
 impl Language {

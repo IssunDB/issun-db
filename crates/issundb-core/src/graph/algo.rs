@@ -700,7 +700,7 @@ impl Graph {
         #[cfg(test)]
         {
             let forced = FORCE_KERNEL_THREADS.with(|f| f.get());
-            return (forced > 0).then_some(forced);
+            (forced > 0).then_some(forced)
         }
         #[cfg(not(test))]
         None
