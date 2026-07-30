@@ -775,7 +775,7 @@ select.control {
    A fixed height rather than a share of the viewport, since the page scrolls as a document and the
    layout reads the element's size when it starts. */
 .panes {
-  height: 640px;
+  height: 580px;
   display: flex;
 }
 

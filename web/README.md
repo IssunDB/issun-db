@@ -150,7 +150,7 @@ and native controls from the light palette on both schemes.
 
 ## The Graph View
 
-The pane is a fixed 560px, because the page scrolls as a document and the force layout reads the
+The pane is a fixed 580px, because the page scrolls as a document and the force layout reads the
 element's size when it starts, so a share of the viewport would make the layout depend on how far down
 the page happened to be.
 
@@ -186,6 +186,16 @@ it from the workflow's refs instead, since `actions/checkout` leaves a detached 
 unset, outside a git checkout, names the version alone. The crate's `build.rs` exists only to
 declare `rerun-if-env-changed` for it, without which cargo would reuse a cached artifact and keep
 reporting an earlier build's commit.
+
+## Taking a Query Out and Bringing One Back
+
+`Download` saves the editor as `issundb-query.cypher`, and `Load` replaces it from a `.cypher`, `.cql`,
+`.cyp`, or `.txt` file. A loaded file is put in the editor and nothing more, like every other way text
+arrives there.
+
+A file over 512 KB is refused with its size in the message rather than loaded. The cap is not about
+the engine, which would take far more: it is the highlighter, which rebuilds the whole document's
+markup on every change, so a file that was never meant to be edited would stall the tab.
 
 ## Sharing a Query
 

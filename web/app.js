@@ -590,6 +590,40 @@ $("clear").addEventListener("click", () => {
   setStatus("", "Editor cleared.");
 });
 
+// Generous for a query and small enough that the highlighter, which rebuilds the whole document's
+// markup on each change, does not stall the tab on a file that was never meant to be edited.
+const MAX_LOADED_FILE = 512 * 1024;
+
+$("load").addEventListener("click", () => $("load-file").click());
+
+$("load-file").addEventListener("change", async (e) => {
+  const file = e.target.files?.[0];
+  // Cleared so choosing the same file twice fires the event again.
+  e.target.value = "";
+  if (!file) return;
+  if (file.size > MAX_LOADED_FILE) {
+    setStatus("err", `${file.name} is ${Math.round(file.size / 1024)} KB; the editor takes 512 KB.`);
+    return;
+  }
+  try {
+    setQuery(await file.text());
+    pendingDemo = null;
+    setStatus("", `Loaded ${file.name}. Press Execute Query to run it.`);
+  } catch {
+    setStatus("err", `${file.name} could not be read.`);
+  }
+});
+
+$("download").addEventListener("click", () => {
+  const cypher = editor.value;
+  if (!cypher.trim()) {
+    setStatus("", "Nothing to download: the editor is empty.");
+    return;
+  }
+  download("issundb-query.cypher", "text/plain;charset=utf-8", cypher);
+  setStatus("", "Saved issundb-query.cypher.");
+});
+
 function formatEditor() {
   const before = editor.value;
   if (!before.trim()) return;
