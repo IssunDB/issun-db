@@ -11,7 +11,8 @@ homepage.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-heed.workspace = true
+ahash = { workspace = true }
+heed = { workspace = true, optional = true }
 byteorder.workspace = true
 zerocopy.workspace = true
 rmp-serde.workspace = true
@@ -21,14 +22,21 @@ parking_lot.workspace = true
 arc-swap.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-ahash.workspace = true
-issundb-graphblas = { workspace = true }
 rust-stemmers.workspace = true
 unicode-segmentation.workspace = true
 deepsize.workspace = true
 
+# See the `ahash` note in the workspace `Cargo.toml`: `runtime-rng` is re-enabled off
+# wasm, and left off for wasm so `getrandom` stays out of that build.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+ahash = { workspace = true, features = ["runtime-rng"] }
+
 [features]
-default = []
+default = ["lmdb"]
+# The persistent storage backend. On by default; turning it off selects the
+# in-memory backend in `storage::memory`, which is what a target with no libc can
+# compile (LMDB is C and is a memory-mapped file). See `storage/mod.rs`.
+lmdb = ["dep:heed"]
 
 [dev-dependencies]
 tempfile.workspace = true

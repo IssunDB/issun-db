@@ -206,7 +206,6 @@ fn test_cypher_index_scan_integration() {
 
     let (_dir, g) = open_tmp();
 
-    // 1. Create nodes
     g.add_node("Person", &json!({"name": "Alice", "age": 30}))
         .unwrap();
     g.add_node("Person", &json!({"name": "Bob", "age": 25}))
@@ -214,17 +213,13 @@ fn test_cypher_index_scan_integration() {
     g.add_node("Person", &json!({"name": "Charlie", "age": 30}))
         .unwrap();
 
-    // 2. Create index on Person(age)
     g.create_node_property_index("Person", "age").unwrap();
 
-    // 3. Rebuild CSR
     g.rebuild_csr().unwrap();
 
-    // 4. Run Cypher query filtering on age
     let q = "MATCH (p:Person) WHERE p.age = 30 RETURN p.name AS name";
     let res = g.query(q).unwrap();
 
-    // 5. Assert result
     assert_eq!(res.columns, vec!["name".to_string()]);
     let mut names: Vec<String> = res
         .records
@@ -241,10 +236,8 @@ fn test_facade_full_text_search_integration() {
 
     let (_dir, g) = open_tmp();
 
-    // Create a node property text index
     g.create_text_index("Movie", "synopsis").unwrap();
 
-    // Insert some nodes
     let m1 = g
         .add_node(
             "Movie",
@@ -501,7 +494,6 @@ fn test_facade_explain_integration() {
 fn test_facade_property_indexes_and_constraints_integration() {
     let (_dir, g) = open_tmp();
 
-    // 1. Create property index
     g.create_node_property_index("Person", "age").unwrap();
 
     let a = g
@@ -512,13 +504,11 @@ fn test_facade_property_indexes_and_constraints_integration() {
         .unwrap();
     g.rebuild_csr().unwrap();
 
-    // 2. nodes_by_property point query
     let p30 = g
         .nodes_by_property("Person", "age", PropValue::Int(30))
         .unwrap();
     assert_eq!(p30, vec![a]);
 
-    // 3. nodes_by_property_range query
     let pr = g
         .nodes_by_property_range(
             "Person",
@@ -533,14 +523,12 @@ fn test_facade_property_indexes_and_constraints_integration() {
     assert!(pr.contains(&a));
     assert!(pr.contains(&b));
 
-    // 4. Unique constraint
     g.create_node_unique_constraint("User", "email").unwrap();
     g.add_node("User", &json!({ "email": "alice@example.com" }))
         .unwrap();
     let duplicate = g.add_node("User", &json!({ "email": "alice@example.com" }));
     assert!(duplicate.is_err());
 
-    // 5. Required constraint
     g.create_node_required_constraint("Task", "title").unwrap();
     let task_err = g.add_node("Task", &json!({ "done": false }));
     assert!(task_err.is_err());
@@ -552,7 +540,7 @@ fn test_set_thread_count() {
     // Test setting to 2 threads
     g.set_thread_count(2).unwrap();
 
-    // Add nodes and rebuild matrices to verify it runs with the thread configuration
+    // Add nodes and rebuild the snapshot to verify it runs with the thread configuration
     let _a = g.add_node("Person", &json!({ "name": "Alice" })).unwrap();
     g.rebuild_csr().unwrap();
 

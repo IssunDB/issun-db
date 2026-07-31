@@ -30,6 +30,25 @@ NEXTEST_RETRIES ?= 2
 LADYBUGDB_DIFF_NODES ?= 5000
 LADYBUGDB_DIFF_GENERATED ?= 500
 
+# Playground (web build) parameters
+PLAYGROUND_DIR := web
+PLAYGROUND_PORT ?= 8000
+PLAYGROUND_NODE_PKG := target/playground-pkg-node
+WASM_ARTIFACT := target/wasm32-unknown-unknown/release/issundb_wasm.wasm
+
+# The CLI and the crate must be the exact same version
+WASM_BINDGEN_CRATE_VERSION = cargo metadata --format-version 1 | python3 -c "import sys,json; print(next(p['version'] for p in json.load(sys.stdin)['packages'] if p['name']=='wasm-bindgen'))"
+
+# The `branch@commit` the playground footer reports, compiled into the module rather than fetched
+# as a sidecar file, since the page makes no network call once loaded. Overridable so CI can stamp
+# a build from the workflow's own refs, and empty outside a git checkout, where the footer then
+# reports the version alone.
+ISSUNDB_BUILD_REF ?= $(shell b=$$(git rev-parse --abbrev-ref HEAD 2>/dev/null); c=$$(git rev-parse --short=5 HEAD 2>/dev/null); if [ -n "$$b" ] && [ -n "$$c" ]; then echo "$$b@$$c"; fi)
+
+# `hnsw` selects usearch, which is C++ and cannot build for wasm, so the exact-scan vector
+# index is what omitting it gives. One variable because two copies of this drifted once.
+WASM_BUILD := ISSUNDB_BUILD_REF="$(ISSUNDB_BUILD_REF)" cargo build -p issundb-wasm --release --target wasm32-unknown-unknown --no-default-features
+
 # Default target
 .DEFAULT_GOAL := help
 
@@ -57,6 +76,22 @@ doctest: ## Run documentation tests (code examples in comments)
 test: format doctest ## Run the tests
 	@echo "Running tests..."
 	@OMP_NUM_THREADS=$(OMP_NUM_THREADS) DEBUG_PROJ=$(DEBUG_PROJ) RUST_BACKTRACE=$(RUST_BACKTRACE) cargo test --lib --bins --tests --workspace -- --nocapture
+
+.PHONY: test-backends
+test-backends: ## Run the per-crate suites against the non-default storage and vector backends
+	@echo "Vector: exact index with LMDB..."
+	@OMP_NUM_THREADS=$(OMP_NUM_THREADS) cargo test -p issundb-vector --no-default-features --features lmdb
+	@echo "Vector: exact index with the in-memory store (the wasm configuration)..."
+	@OMP_NUM_THREADS=$(OMP_NUM_THREADS) cargo test -p issundb-vector --no-default-features
+	@echo "Core: in-memory storage backend..."
+	@OMP_NUM_THREADS=$(OMP_NUM_THREADS) cargo test -p issundb-core --no-default-features
+	@echo "Checking that the facade drops usearch and LMDB without default features..."
+	@LEAKED=$$(cargo tree -p issundb --no-default-features 2>/dev/null | grep -iE "usearch|heed" || true); \
+	if [ -n "$$LEAKED" ]; then \
+		echo "A sibling crate re-enabled a default feature:"; echo "$$LEAKED" | sed 's/^/  /'; \
+		exit 1; \
+	fi
+	@echo "All non-default backend configurations pass."
 
 .PHONY: test-conformance
 test-conformance: format ## Run the openCypher TCK conformance integration tests
@@ -114,9 +149,7 @@ clean: ## Remove generated and temporary files
 install-snap: ## Install a few dependencies using Snapcraft
 	@echo "Installing the snap package..."
 	@sudo apt-get update
-	@# cmake, clang, and libclang build the GraphBLAS submodule (issundb-graphblas-sys);
-	@# patchelf lets maturin set the libgomp rpath when packaging the Python wheel.
-	@sudo apt-get install -y snapd graphviz wget cmake clang libclang-dev patchelf
+	@sudo apt-get install -y snapd graphviz wget
 	@sudo snap refresh
 	@sudo snap install rustup --classic
 
@@ -145,9 +178,11 @@ lint: format ## Run the linters
 	@echo "Linting Rust files..."
 	@DEBUG_PROJ=$(DEBUG_PROJ) cargo clippy -- -D warnings -D clippy::unwrap_used -D clippy::expect_used
 
-.PHONY: check-graphblas-pin
-check-graphblas-pin: ## Verify the GraphBLAS pin is consistent (across build.rs, the submodule, and .gitmodules)
-	@./scripts/check_graphblas_pin.sh
+.PHONY: lint-backends
+lint-backends: ## Lint the libraries with the non-default storage and vector backends selected
+	@echo "Linting the in-memory storage and exact vector index configurations..."
+	@cargo clippy -p issundb-core --no-default-features -- -D warnings -D clippy::unwrap_used -D clippy::expect_used
+	@cargo clippy -p issundb-vector --no-default-features -- -D warnings -D clippy::unwrap_used -D clippy::expect_used
 
 .PHONY: publish
 publish: ## Publish the package to crates.io (requires CARGO_REGISTRY_TOKEN to be set)
@@ -225,6 +260,69 @@ rest: ## Launch the HTTP REST API server (pass REST_PATH=<dir> db path, REST_HOS
 	@echo "Starting IssunDB REST API server at $(or $(REST_HOST),127.0.0.1):$(or $(REST_PORT),7474) (database: $(or $(REST_PATH),./issundb-data))..."
 	@RUST_BACKTRACE=$(RUST_BACKTRACE) cargo run -p issundb-rest -- --db-path $(or $(REST_PATH),./issundb-data)\
  	--host $(or $(REST_HOST),127.0.0.1) --port $(or $(REST_PORT),7474)
+
+########################################################################################
+## Playground targets (the browser build)
+########################################################################################
+
+.PHONY: playground-deps
+playground-deps: ## Install the wasm target and the matching wasm-bindgen CLI
+	@echo "Installing the wasm32-unknown-unknown target..."
+	@rustup target add wasm32-unknown-unknown
+	@# Resolved from Cargo.lock rather than pinned, so this cannot install a version that
+	@# check-wasm-bindgen then rejects. On stable because the CLI's own MSRV is above ours.
+	@rustup toolchain install stable --profile minimal
+	@VERSION=$$($(WASM_BINDGEN_CRATE_VERSION)); \
+	echo "Installing wasm-bindgen-cli $$VERSION (matching the crate)..."; \
+	cargo +stable install --locked wasm-bindgen-cli --version "$$VERSION"
+
+.PHONY: playground-build
+playground-build: check-wasm-bindgen check-wasm-stack ## Build the browser module into web/pkg
+	@echo "Building issundb-wasm for wasm32-unknown-unknown (in-memory storage, exact vector index)..."
+	@$(WASM_BUILD)
+	@echo "Generating the JavaScript glue into $(PLAYGROUND_DIR)/pkg..."
+	@wasm-bindgen $(WASM_ARTIFACT) --out-dir $(PLAYGROUND_DIR)/pkg --target web --no-typescript
+	@cp docs/assets/logo.svg $(PLAYGROUND_DIR)/logo.svg
+	@ls -l $(PLAYGROUND_DIR)/pkg
+
+.PHONY: playground-check
+playground-check: check-wasm-bindgen check-wasm-stack ## Run every playground demo through the compiled module
+	@echo "Building the module for Node..."
+	@$(WASM_BUILD)
+	@wasm-bindgen $(WASM_ARTIFACT) --out-dir $(PLAYGROUND_NODE_PKG) --target nodejs --no-typescript
+	@echo "Running the demo catalog..."
+	@node $(SCRIPTS_DIR)/check_playground.mjs
+
+.PHONY: playground-serve
+playground-serve: ## Serve the playground at http://localhost:$(PLAYGROUND_PORT)
+	@test -f $(PLAYGROUND_DIR)/pkg/issundb_wasm.js || \
+		{ echo "No module in $(PLAYGROUND_DIR)/pkg. Run 'make playground-build' first."; exit 1; }
+	@echo "Serving $(PLAYGROUND_DIR) at http://localhost:$(PLAYGROUND_PORT) (Ctrl-C to stop)..."
+	@python3 -m http.server $(PLAYGROUND_PORT) --directory $(PLAYGROUND_DIR)
+
+# An exported RUSTFLAGS replaces the `[target.wasm32-unknown-unknown] rustflags` in
+# .cargo/config.toml rather than merging with it, which drops the 16 MB stack the inline
+# query budget needs and leaves a moderately nested query overflowing instead of running.
+.PHONY: check-wasm-stack
+check-wasm-stack:
+	@if [ -n "$$RUSTFLAGS" ] && ! printf '%s' "$$RUSTFLAGS" | grep -q "stack-size"; then \
+		echo "RUSTFLAGS is set and replaces .cargo/config.toml, dropping the 16 MB wasm stack:"; \
+		echo "  RUSTFLAGS=$$RUSTFLAGS"; \
+		echo "Unset it, or include: -C link-arg=-zstack-size=16777216"; \
+		exit 1; \
+	fi
+
+.PHONY: check-wasm-bindgen
+check-wasm-bindgen:
+	@command -v wasm-bindgen >/dev/null || \
+		{ echo "wasm-bindgen not found. Run 'make playground-deps'."; exit 1; }
+	@CLI=$$(wasm-bindgen --version | awk '{print $$2}'); \
+	CRATE=$$($(WASM_BINDGEN_CRATE_VERSION)); \
+	if [ "$$CLI" != "$$CRATE" ]; then \
+		echo "wasm-bindgen CLI is $$CLI but the crate is $$CRATE."; \
+		echo "Run: cargo install --locked wasm-bindgen-cli --version $$CRATE"; \
+		exit 1; \
+	fi
 
 .PHONY: bench
 bench: ## Run all workspace benchmarks

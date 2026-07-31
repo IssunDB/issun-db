@@ -42,6 +42,10 @@ extra:
 plugins:
   - search
 
+hooks:
+  # Adds a "Run in the playground" link under each Cypher block marked `<!-- playground -->`.
+  - docs/hooks/playground_links.py
+
 nav:
   - Home: index.md
   - Getting Started: getting-started.md
@@ -49,8 +53,9 @@ nav:
   - Cypher Support: cypher.md
   - API Reference: api-reference.md
   - Hybrid Retrieval: hybrid-retrieval.md
-  - Integrations: integrations.md
   - Python Integration: python.md
+  - Other Integrations: integrations.md
+  - Playground: https://issundb.github.io/issun-db/playground/
 
 markdown_extensions:
   - pymdownx.highlight:

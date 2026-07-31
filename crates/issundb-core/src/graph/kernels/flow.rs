@@ -1,10 +1,11 @@
 use super::*;
 
 impl Graph {
-    /// Minimum/Maximum Spanning Forest (MSF) optimized over contiguous CSR snapshot arrays.
-    pub(in crate::graph) fn spanning_forest_graphblas(
+    /// Minimum or maximum spanning forest (MSF) over the contiguous CSR snapshot
+    /// arrays. The weight comes from `weight_property`, read per edge from storage,
+    /// so this needs no weighted snapshot.
+    pub(in crate::graph) fn spanning_forest_kernel(
         &self,
-        _m: &MatrixSet,
         snap: &CsrSnapshot,
         weight_property: &str,
         maximum: bool,
@@ -86,10 +87,10 @@ impl Graph {
         Ok(forest)
     }
 
-    /// Edmonds-Karp Maximum Flow algorithm utilizing contiguous CSR snapshot arrays.
-    pub(in crate::graph) fn maximum_flow_graphblas(
+    /// Edmonds-Karp maximum flow over the contiguous CSR snapshot arrays. The
+    /// capacity comes from `capacity_property`, read per edge from storage.
+    pub(in crate::graph) fn maximum_flow_kernel(
         &self,
-        _m: &MatrixSet,
         snap: &CsrSnapshot,
         source: NodeId,
         sink: NodeId,

@@ -1,7 +1,7 @@
 //! In-memory property columns for the read path.
 //!
 //! `ColumnsCache` holds one typed column per node property name, indexed by a
-//! self-contained dense node mapping (the same pattern as `MatrixSet`). It is
+//! self-contained dense node mapping (the same pattern as the CSR snapshot). It is
 //! built lazily from one full scan of the `nodes` sub-database and kept fresh
 //! by a post-commit delta: added and updated nodes are re-read individually,
 //! node deletion forces a full rebuild because it reshuffles nothing here but
@@ -18,7 +18,7 @@ use serde_json::Value;
 
 use crate::error::Error;
 use crate::schema::{EdgeId, EdgeRecord, NodeId, NodeRecord};
-use crate::storage::{lmdb::Storage, props};
+use crate::storage::{Storage, props};
 
 /// Abstracts which LMDB sub-database a column set is built from, so the same
 /// columnar machinery serves both node and edge properties. A source knows how
@@ -38,7 +38,7 @@ pub(crate) trait ColumnSource {
     /// a direct read and a column build cannot decode a record differently.
     fn get_in_txn(
         storage: &Storage,
-        rtxn: &heed::RoTxn,
+        rtxn: &crate::storage::RoTxn,
         id: Self::Id,
     ) -> Result<Option<Value>, Error>;
 
@@ -93,7 +93,7 @@ impl ColumnSource for NodeSource {
 
     fn get_in_txn(
         storage: &Storage,
-        rtxn: &heed::RoTxn,
+        rtxn: &crate::storage::RoTxn,
         id: NodeId,
     ) -> Result<Option<Value>, Error> {
         match storage.nodes.get(rtxn, &id)? {
@@ -129,7 +129,7 @@ impl ColumnSource for EdgeSource {
 
     fn get_in_txn(
         storage: &Storage,
-        rtxn: &heed::RoTxn,
+        rtxn: &crate::storage::RoTxn,
         id: EdgeId,
     ) -> Result<Option<Value>, Error> {
         match storage.edges.get(rtxn, &id)? {
@@ -731,7 +731,9 @@ fn compute_prop_stats(col: &PropColumn) -> Option<PropStats> {
             _ => runs.push((v.clone(), 1)),
         }
     }
-    runs.sort_by(|a, b| b.1.cmp(&a.1));
+    // Descending by count, and stable, so equal counts keep the ascending value order
+    // `vals` arrived in. That order is observable through `mcvs`.
+    runs.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
     runs.truncate(MCV_LIMIT);
 
     Some(PropStats {

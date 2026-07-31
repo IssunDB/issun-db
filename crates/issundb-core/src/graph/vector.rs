@@ -50,7 +50,7 @@ impl Graph {
 
     pub(super) fn put_vector_bytes_impl(
         &self,
-        wtxn: &mut heed::RwTxn,
+        wtxn: &mut crate::storage::RwTxn,
         n: NodeId,
         bytes: &[u8],
     ) -> Result<(), Error> {
@@ -70,7 +70,7 @@ impl Graph {
 
     pub(super) fn delete_vector_bytes_impl(
         &self,
-        wtxn: &mut heed::RwTxn,
+        wtxn: &mut crate::storage::RwTxn,
         n: NodeId,
     ) -> Result<(), Error> {
         self.storage.vectors.delete(wtxn, &n)?;
@@ -86,7 +86,7 @@ impl Graph {
 
     pub(super) fn vector_bytes_impl(
         &self,
-        rtxn: &heed::RoTxn,
+        rtxn: &crate::storage::RoTxn,
     ) -> Result<Vec<(NodeId, Vec<u8>)>, Error> {
         let mut out = Vec::new();
         for result in self.storage.vectors.iter(rtxn)? {
@@ -105,7 +105,7 @@ impl Graph {
 
     pub(super) fn get_vector_bytes_impl(
         &self,
-        rtxn: &heed::RoTxn,
+        rtxn: &crate::storage::RoTxn,
         n: NodeId,
     ) -> Result<Option<Vec<u8>>, Error> {
         Ok(self.storage.vectors.get(rtxn, &n)?.map(|b| b.to_vec()))

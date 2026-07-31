@@ -364,7 +364,6 @@ fn wand_top_k(
                 }
             }
 
-            // Advance all cursors that were pointing to pivot_doc.
             for cursor in &mut cursors {
                 if cursor.current() == Some(pivot_doc) {
                     cursor.advance();
@@ -557,7 +556,6 @@ impl TextGraphExt for Graph {
                 // a subset of every term's postings, and deriving IDF from it
                 // would weight rare and common query terms identically.
                 let n_term = postings.len() as f32;
-                // Apply boolean pre-filter if requested.
                 if let Some(ref filter) = candidate_filter {
                     postings.retain(|(id, _)| filter.contains(*id));
                     if postings.is_empty() {
@@ -894,7 +892,6 @@ mod tests {
             "Expected IndexNotFound error when index is not created yet"
         );
 
-        // 3. Create index and verify existence
         assert!(!graph.has_node_text_index("Movie", "description")?);
         graph.create_node_text_index("Movie", "description")?;
         assert!(graph.has_node_text_index("Movie", "description")?);
@@ -916,7 +913,6 @@ mod tests {
         let hits_multi = graph.text_search("spaceship battle", &opts)?;
         assert_eq!(hits_multi[0].node, n2);
 
-        // 6. Update mutation: update n3 to include space terms.
         graph.update_node(
             n3,
             &json!({
@@ -929,13 +925,11 @@ mod tests {
         let found_n3 = hits_updated.iter().any(|h| h.node == n3);
         assert!(found_n3, "Updated node should be found in new search");
 
-        // 7. Delete mutation: n1 should disappear from results.
         graph.delete_node(n1)?;
         let hits_after_delete = graph.text_search("space", &opts)?;
         let found_n1 = hits_after_delete.iter().any(|h| h.node == n1);
         assert!(!found_n1, "Deleted node should not be found in search");
 
-        // 8. Global search across all active indexes.
         graph.create_node_text_index("Movie", "title")?;
         let global_opts = TextSearchOptions {
             label: None,
@@ -946,7 +940,6 @@ mod tests {
         let global_hits = graph.text_search("odyssey titanic", &global_opts)?;
         assert!(!global_hits.is_empty());
 
-        // 9. Drop index and verify cleanup.
         graph.drop_node_text_index("Movie", "description")?;
         assert!(!graph.has_node_text_index("Movie", "description")?);
         let err_after_drop = graph.text_search("spaceship", &opts).unwrap_err();
@@ -1085,7 +1078,6 @@ mod tests {
         let temp = TempDir::new()?;
         let graph = Graph::open(temp.path(), 1)?;
 
-        // Index a document with diacritics.
         let n = graph.add_node("Doc", &json!({ "text": "café résumé über" }))?;
         graph.create_node_text_index("Doc", "text")?;
 
@@ -1148,22 +1140,18 @@ mod tests {
         let temp = TempDir::new()?;
         let graph = Graph::open(temp.path(), 1)?;
 
-        // Ensure initially we have no text indexes
         assert!(!graph.has_text_index("Doc", "body")?);
         assert!(graph.list_text_indexes()?.is_empty());
 
-        // Create an index
         graph.create_text_index("Doc", "body")?;
         assert!(graph.has_text_index("Doc", "body")?);
 
-        // List indexes and check
         let list = graph.list_text_indexes()?;
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].0, "Doc");
         assert_eq!(list[0].1, "body");
         assert_eq!(list[0].2, Language::English); // Default language
 
-        // Create another index with a specific language
         graph.create_text_index_with_language("Doc", "title", Language::German)?;
         assert!(graph.has_text_index("Doc", "title")?);
 

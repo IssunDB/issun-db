@@ -64,7 +64,6 @@ fn conformance_body() -> Result<(), String> {
 
     let filter = std::env::var("ISSUNDB_CONFORMANCE_FILTER").ok();
 
-    // Collect all .feature files recursively.
     let feature_files: Vec<PathBuf> = WalkDir::new(&features_root)
         .into_iter()
         .filter_map(|e| e.ok())
@@ -890,7 +889,6 @@ fn run_scenario(scenario: &Scenario) -> Result<(), String> {
     let temp_dir = tempfile::TempDir::new().map_err(|e| e.to_string())?;
     let graph = issundb::Graph::open(temp_dir.path(), 1).map_err(|e| e.to_string())?;
 
-    // Run setup queries; skip the scenario if any setup fails.
     for setup_query in &scenario.setup_queries {
         if setup_query.trim().is_empty() {
             continue;

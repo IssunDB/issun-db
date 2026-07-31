@@ -46,7 +46,68 @@ pub struct Storage {
     pub meta: Database<Str, Bytes>, // string key → bytes
 }
 
+/// A read transaction as a *parameter*: what a function that only reads accepts.
+///
+/// Aliased here rather than named at each of the ~90 use sites, so the engine is
+/// nameable in exactly one module. This is deliberately the thread-local-agnostic
+/// flavour, because both concrete read transactions and a write transaction deref to
+/// it, which is what lets a write path hand its `RwTxn` to a read helper. Naming a
+/// specific TLS flavour here instead would break every one of those calls.
+pub type RoTxn<'a> = heed::RoTxn<'a>;
+
+/// A read transaction as an *owned value*, held across calls by `ReadTxn`.
+///
+/// Distinct from [`RoTxn`] because an owned transaction has to name whether it is
+/// thread-local; `env.read_txn()` returns this flavour, and it derefs to `RoTxn`.
+pub type OwnedRoTxn<'a> = heed::RoTxn<'a, heed::WithTls>;
+
+/// A write transaction on the storage engine.
+pub type RwTxn<'a> = heed::RwTxn<'a>;
+
+/// The error type [`crate::error::Error::Storage`] carries for this backend.
+pub type StorageError = heed::Error;
+
 impl Storage {
+    /// Copy the whole database to a single file, optionally compacting as it goes.
+    ///
+    /// Lives here so the compaction flag, which is an engine concept, is not named
+    /// by the facade method that offers it.
+    pub fn copy_to_file(&self, destination: &Path, compact: bool) -> Result<(), Error> {
+        let option = if compact {
+            heed::CompactionOption::Enabled
+        } else {
+            heed::CompactionOption::Disabled
+        };
+        self.env
+            .copy_to_path(destination, option)
+            .map(|_| ())
+            .map_err(Error::Storage)
+    }
+
+    /// Copy a snapshot file into `dst_dir` as a database this backend can open.
+    ///
+    /// An associated function rather than a method: a restore happens before there is
+    /// anything open to restore into.
+    pub fn restore_from_file(snapshot_file: &Path, dst_dir: &Path) -> Result<(), Error> {
+        let dst_file = dst_dir.join("data.mdb");
+        // Refuse a destination that already holds a database. The copy below
+        // truncates, so without this the call silently destroys whatever was there
+        // and still reports success, including the caller's own open database.
+        // The check lives here rather than in any one front end because every
+        // caller reaches the same `fs::copy`: the CLI, the Python binding's
+        // `restore`, and any library consumer of the facade.
+        if dst_file.exists() {
+            return Err(Error::InvalidArgument(format!(
+                "{} already contains a database (data.mdb); restore into a new or \
+                 empty directory rather than overwriting it",
+                dst_dir.display()
+            )));
+        }
+        std::fs::create_dir_all(dst_dir)?;
+        std::fs::copy(snapshot_file, &dst_file)?;
+        Ok(())
+    }
+
     pub fn open(path: &Path, map_size_gb: usize) -> Result<Self, Error> {
         std::fs::create_dir_all(path)?;
 

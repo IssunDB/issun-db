@@ -172,7 +172,6 @@ impl LogicalPlanner {
                 "failed to generate MATCH plan".to_string(),
             ))?;
 
-            // Apply WHERE clause if present
             if let Some(ref where_clause) = query.where_clause {
                 let filter_expr = match where_clause {
                     WhereClause::Eq(l, r) => FilterExpr::Eq(l.clone(), r.clone()),
@@ -530,7 +529,6 @@ impl LogicalPlanner {
             current_plan.unwrap_or(LogicalOperator::SingleRow)
         };
 
-        // Split RETURN items into group-by keys and aggregations.
         let (group_by_items, agg_items, rewritten_return_items) = split_return_items(query);
         let mut agg_items = agg_items;
 
@@ -570,7 +568,6 @@ impl LogicalPlanner {
             }
         }
 
-        // Insert Aggregate operator when at least one aggregation is present.
         if !agg_items.is_empty() {
             plan = LogicalOperator::Aggregate {
                 input: Box::new(plan),
@@ -746,7 +743,6 @@ impl LogicalPlanner {
             };
             prior_rel_vars.push(rel_var.clone());
 
-            // Apply inline properties filter on relationship if specified.
             if let Some(ref props) = rel_pat.properties {
                 for (k, v) in props {
                     plan = LogicalOperator::Filter {
@@ -759,7 +755,6 @@ impl LogicalPlanner {
                 }
             }
 
-            // Filter target node by each of its labels.
             for label in &node_pat.labels {
                 plan = LogicalOperator::Filter {
                     input: Box::new(plan),
@@ -767,7 +762,6 @@ impl LogicalPlanner {
                 };
             }
 
-            // Apply inline properties filter on target node.
             if let Some(ref props) = node_pat.properties {
                 for (k, v) in props {
                     plan = LogicalOperator::Filter {

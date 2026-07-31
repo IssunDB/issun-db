@@ -2531,7 +2531,6 @@ mod tests {
         assert_eq!(rows, vec![vec![serde_json::json!("Mark")]]);
     }
 
-    // Helper: run a bare `RETURN <expr> AS v` and return the single scalar value.
     fn scalar(graph: &Graph, expr: &str) -> serde_json::Value {
         let cypher = format!("RETURN {} AS v", expr);
         let rows = run(graph, &cypher);
@@ -3161,7 +3160,6 @@ mod tests {
         );
     }
 
-    // Date plus or minus a duration ignores the duration's time component entirely.
     #[test]
     fn date_plus_duration_ignores_time_component() {
         let (_dir, graph) = setup_graph();
@@ -3188,7 +3186,6 @@ mod tests {
         );
     }
 
-    // Time arithmetic keeps the zone offset.
     #[test]
     fn time_minus_duration_keeps_offset() {
         let (_dir, graph) = setup_graph();
@@ -3253,7 +3250,6 @@ mod tests {
         );
     }
 
-    // A fractional day cascades into the time component.
     #[test]
     fn duration_construct_fractional_day_cascades() {
         let (_dir, graph) = setup_graph();
@@ -3263,7 +3259,6 @@ mod tests {
         );
     }
 
-    // A fractional minute cascades into seconds.
     #[test]
     fn duration_construct_fractional_minute_cascades() {
         let (_dir, graph) = setup_graph();
@@ -5193,7 +5188,6 @@ mod tests {
     fn merge_on_create_set_does_not_affect_existing_nodes() {
         let (_dir, graph) = setup_graph();
         let params = HashMap::new();
-        // Create an existing Bob.
         execute(&graph, "CREATE (b:Person {name: 'Bob', age: 40})", &params).unwrap();
 
         // MERGE a relationship between a new Alice (absent) and Bob (name: 'Bob').
@@ -5205,7 +5199,6 @@ mod tests {
         )
         .unwrap();
 
-        // Verify the original Bob's age remains 40.
         let r1 = execute(
             &graph,
             "MATCH (b:Person {name: 'Bob', age: 40}) RETURN b.name AS name",
@@ -5214,7 +5207,6 @@ mod tests {
         .unwrap();
         assert_eq!(r1.records.len(), 1);
 
-        // Verify the new Bob's age is 50.
         let r2 = execute(
             &graph,
             "MATCH (b:Person {name: 'Bob', age: 50}) RETURN b.name AS name",
@@ -5230,7 +5222,6 @@ mod tests {
         let (tempdir, graph) = setup_graph();
         let params = HashMap::new();
 
-        // 1. Test CSV Import
         let csv_path = tempdir.path().join("users.csv");
         {
             let mut file = std::fs::File::create(&csv_path).unwrap();
@@ -5262,7 +5253,6 @@ mod tests {
             ]
         );
 
-        // Query and verify CSV nodes
         let query_verify_csv = "MATCH (n:Person) RETURN n.name, n.age, n.active ORDER BY n.name";
         let res_verify = execute(&graph, query_verify_csv, &params).unwrap();
         assert_eq!(res_verify.records.len(), 3);
@@ -5291,7 +5281,6 @@ mod tests {
             ]
         );
 
-        // 2. Test JSONL Import
         let jsonl_path = tempdir.path().join("users.jsonl");
         {
             let mut file = std::fs::File::create(&jsonl_path).unwrap();
@@ -5303,7 +5292,6 @@ mod tests {
         let res_jsonl = execute(&graph, &query_jsonl, &params).unwrap();
         assert_eq!(res_jsonl.records[0].values[2], serde_json::json!(2));
 
-        // Query and verify JSONL nodes
         let query_verify_jsonl = "MATCH (n:Person) WHERE n.name = 'David' OR n.name = 'Eve' RETURN n.name, n.age ORDER BY n.name";
         let res_verify_j = execute(&graph, query_verify_jsonl, &params).unwrap();
         assert_eq!(res_verify_j.records.len(), 2);
@@ -5579,7 +5567,6 @@ mod tests {
         .unwrap();
         execute(&graph, "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) CREATE (a)-[:KNOWS {since: 2020}]->(b)", &params).unwrap();
 
-        // Export database to Parquet
         let export_dir = tempdir.path().join("parquet_export");
         let export_query = format!(
             "EXPORT DATABASE '{}' WITH {{format: 'parquet'}}",
@@ -5591,7 +5578,6 @@ mod tests {
             serde_json::Value::Bool(true)
         );
 
-        // Let's create a fresh new graph to import into
         let (_, graph2) = setup_graph();
 
         // Import the database from the exported directory
@@ -5607,7 +5593,6 @@ mod tests {
         );
         assert_eq!(res_import.records.len(), 2);
 
-        // Verify the imported nodes and properties
         let verify_query = "MATCH (n:Person) RETURN n.name, n.age, n.active ORDER BY n.name";
         let res_verify = execute(&graph2, verify_query, &params).unwrap();
         assert_eq!(res_verify.records.len(), 2);
@@ -5628,7 +5613,6 @@ mod tests {
             ]
         );
 
-        // Verify the imported relationship
         let verify_rel = "MATCH (a:Person)-[r:KNOWS]->(b:Person) RETURN a.name, b.name, r.since";
         let res_verify_rel = execute(&graph2, verify_rel, &params).unwrap();
         assert_eq!(res_verify_rel.records.len(), 1);

@@ -30,7 +30,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("IssunDB Concurrent Operations Showcase");
     println!("======================================\n");
 
-    // Initialize with some seed data
     let sensor_a = graph.add_node(
         "Sensor",
         &json!({ "id": "A", "status": "active", "reading": 22.5 }),

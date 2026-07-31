@@ -9,7 +9,7 @@
 //!   3. Runs PageRank and prints the top-3 nodes by score.
 //!   4. Runs connected_components and prints the component count.
 //!   5. Runs betweenness_centrality and prints the top-3 nodes.
-//!   6. Runs a Cypher BFS-range query from Alice.
+//!   6. Runs a variable-length Cypher traversal from Alice (`KNOWS*1..3`).
 
 use std::collections::HashMap;
 

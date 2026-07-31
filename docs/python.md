@@ -138,14 +138,15 @@ Here is a quick reference of the methods available on the `IssunDB` class:
 * `IssunDB(path: str, map_size_gb: Optional[int] = None)`: Opens or creates a database at `path`. `map_size_gb` defaults to 1 and is a hard ceiling on
   how large the database may grow, not an allocation. There is no resize path: once the data exceeds it every write fails until the database is
   reopened with a larger value, which is safe and keeps the existing data. Size it for the eventual database rather than the current one.
-* `set_thread_count(n: int) -> None`: Sets the thread count for parallel GraphBLAS operations (set `0` for default).
+* `set_thread_count(n: int) -> None`: Sets the thread count for the parallel read passes (set `0` for default).
+* `materialize_edge_statistics() -> None`: Builds the optimizer's edge-level cardinality statistics. Nothing builds them as a side effect of a query, so a process that never calls this plans every relationship pattern on the global average fan-out. One pass over the label index and the adjacency, measured at 226 ms over 300 K nodes.
+* `materialize_property_columns() -> None`: Builds the in-memory property columns behind the selectivity estimates. This is a full node scan (1355 ms over the same graph) and holds every scalar node property in memory for the life of the object, so it is a memory commitment rather than a warm-up.
 
 ### Node and Edge CRUD
 
 > [!NOTE]
 > Every `props` argument must be a JSON object. Valid JSON that is not an object (an array, a number, a string) raises `ValueError`: a property bag
 > is a map, and a non-object would be stored but no property read or predicate could ever see it.
-
 
 * `add_node(labels: Union[str, List[str]], props: str) -> int`: Adds a node and returns its unique ID.
 * `add_nodes(items: Iterable[Tuple[Union[str, List[str]], str]]) -> List[int]`: Adds many nodes in one transaction and returns their IDs in order.

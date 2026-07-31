@@ -50,7 +50,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang pkg-config libssl-dev
+          sudo apt-get install -y pkg-config libssl-dev
 
       - name: Install cargo-nextest and cargo-llvm-cov
         uses: taiki-e/install-action@v2
@@ -84,6 +84,9 @@ jobs:
           ISSUNDB_CONFORMANCE_MAX_FAILURES: '30'
         run: cargo test -p issundb --test conformance -- --nocapture
 
+      - name: Run the suites against the non-default storage and vector backends
+        run: make test-backends
+
       - name: Upload coverage reports to Codecov
         uses: codecov/codecov-action@v5
         with:
@@ -111,7 +114,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang pkg-config libssl-dev
+          sudo apt-get install -y pkg-config libssl-dev
 
       - name: Check that the workspace compiles on the MSRV
         run: cargo check --workspace --all-targets --locked

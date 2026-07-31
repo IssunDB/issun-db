@@ -19,7 +19,24 @@ issundb-retrieval.workspace = true
 serde_json = "1"
 
 [features]
-default = []
+default = ["hnsw", "lmdb"]
+hnsw = [
+    "issundb-vector/hnsw",
+    "issundb-cypher/hnsw",
+    "issundb-retrieval/hnsw",
+]
+# Forwarded to the storage backend selection in `issundb-core`. Every crate between
+# here and core has to relay it, and each of their workspace declarations carries
+# `default-features = false`, or a sibling silently re-enables LMDB for the whole
+# graph. Verify with `cargo tree -p issundb --no-default-features | grep lmdb`,
+# which must print nothing.
+lmdb = [
+    "issundb-core/lmdb",
+    "issundb-vector/lmdb",
+    "issundb-text/lmdb",
+    "issundb-cypher/lmdb",
+    "issundb-retrieval/lmdb",
+]
 
 [dev-dependencies]
 tempfile.workspace = true

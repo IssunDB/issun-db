@@ -68,10 +68,9 @@ pub fn retrieve(graph: &Graph, q: &[f32], k: usize, hops: u8) -> Result<Subgraph
 
 /// Full retrieve with configurable options.
 ///
-/// GraphBLAS SpMV k-hop expansion for hybrid retrieval.
-///
-/// Runs multi-source SpMV BFS from the filtered seed nodes up to `hops` hops.
-/// Stops early or caps the results if `max_nodes` is specified and exceeded.
+/// Runs a multi-source breadth-first search from the filtered seed nodes up to
+/// `hops` hops, stopping early or capping the result when `max_nodes` is set and
+/// reached.
 pub fn retrieve_with(
     graph: &Graph,
     q: &[f32],
@@ -97,12 +96,11 @@ pub fn retrieve_with(
         });
     }
 
-    let (node_list, truncated) =
-        graph.bfs_multi_source_graphblas(&seeds, opts.hops, opts.max_nodes)?;
+    let (node_list, truncated) = graph.bfs_multi_source(&seeds, opts.hops, opts.max_nodes)?;
     let node_set: AHashSet<NodeId> = node_list.into_iter().collect();
 
     // Keep only scores whose seed node actually appears in the BFS result.
-    // `bfs_multi_source_graphblas` guarantees this when every seed is present in
+    // `bfs_multi_source` guarantees this when every seed is present in
     // the CSR snapshot; this retain is a defensive guard to ensure
     // `scores.keys() ⊆ nodes` even if that invariant is ever broken upstream.
     scores.retain(|n, _| node_set.contains(n));
@@ -303,8 +301,7 @@ pub fn retrieve_hybrid(
     }
 
     // ---- BFS expansion -----------------------------------------------------
-    let (node_list, truncated) =
-        graph.bfs_multi_source_graphblas(&seeds, opts.hops, opts.max_nodes)?;
+    let (node_list, truncated) = graph.bfs_multi_source(&seeds, opts.hops, opts.max_nodes)?;
     let node_set: AHashSet<NodeId> = node_list.into_iter().collect();
 
     let mut scores: AHashMap<NodeId, f32> = fused;
@@ -568,13 +565,13 @@ mod tests {
         assert!(sub2.scores.contains_key(&d));
     }
 
-    // --- retrieve_with (GraphBLAS) ---
+    // --- retrieve_with ---
     //
-    // Each test calls `rebuild_csr()` after graph mutations so the GraphBLAS
-    // adjacency matrix is current before retrieve_with is invoked.
+    // Each test calls `rebuild_csr()` after graph mutations so the
+    // CSR snapshot is current before retrieve_with is invoked.
 
     #[test]
-    fn graphblas_retrieve_k_hop_expansion() {
+    fn retrieve_k_hop_expansion() {
         let (_dir, g) = open_tmp();
         let a = g.add_node("N", &json!({})).unwrap();
         let b = g.add_node("N", &json!({})).unwrap();
@@ -600,7 +597,7 @@ mod tests {
     }
 
     #[test]
-    fn graphblas_retrieve_hops_zero_returns_only_seed() {
+    fn retrieve_hops_zero_returns_only_seed() {
         let (_dir, g) = open_tmp();
         let a = g.add_node("N", &json!({})).unwrap();
         let b = g.add_node("N", &json!({})).unwrap();
@@ -625,7 +622,7 @@ mod tests {
     }
 
     #[test]
-    fn graphblas_retrieve_scores_keys_are_subset_of_nodes() {
+    fn retrieve_scores_keys_are_subset_of_nodes() {
         let (_dir, g) = open_tmp();
         let a = g.add_node("N", &json!({})).unwrap();
         let b = g.add_node("N", &json!({})).unwrap();
@@ -657,7 +654,7 @@ mod tests {
     }
 
     #[test]
-    fn graphblas_retrieve_edges_connect_only_nodes_in_subgraph() {
+    fn retrieve_edges_connect_only_nodes_in_subgraph() {
         let (_dir, g) = open_tmp();
         // Chain: a to b to c to d; seed is a (hops=1 includes {a, b}).
         let a = g.add_node("N", &json!({})).unwrap();
@@ -694,7 +691,7 @@ mod tests {
     }
 
     #[test]
-    fn graphblas_retrieve_max_distance_filters_far_seeds() {
+    fn retrieve_max_distance_filters_far_seeds() {
         let (_dir, g) = open_tmp();
         let a = g.add_node("N", &json!({})).unwrap();
         let b = g.add_node("N", &json!({})).unwrap();
@@ -722,7 +719,7 @@ mod tests {
     }
 
     #[test]
-    fn graphblas_retrieve_max_nodes_caps_subgraph() {
+    fn retrieve_max_nodes_caps_subgraph() {
         let (_dir, g) = open_tmp();
         // Star: a to b, c, d, e
         let a = g.add_node("N", &json!({})).unwrap();
@@ -758,7 +755,7 @@ mod tests {
     }
 
     #[test]
-    fn graphblas_retrieve_scores_contain_seed_distances() {
+    fn retrieve_scores_contain_seed_distances() {
         let (_dir, g) = open_tmp();
         let a = g.add_node("N", &json!({})).unwrap();
         g.upsert_vector(a, &[1.0f32, 0.0]).unwrap();
@@ -784,7 +781,7 @@ mod tests {
     }
 
     #[test]
-    fn graphblas_retrieve_empty_vector_index_is_an_error() {
+    fn retrieve_with_over_an_empty_vector_index_is_an_error() {
         let (_dir, g) = open_tmp();
         g.rebuild_csr().unwrap();
 
@@ -799,9 +796,9 @@ mod tests {
     }
 
     #[test]
-    fn graphblas_retrieve_multiple_seeds_each_expand_independently() {
+    fn retrieve_multiple_seeds_each_expand_independently() {
         let (_dir, g) = open_tmp();
-        // Mirrors the non-graphblas variant: two disconnected chains
+        // Two disconnected chains
         // a to b to c; d to e to f, with vectors on a and d.
         let a = g.add_node("N", &json!({})).unwrap();
         let b = g.add_node("N", &json!({})).unwrap();
@@ -943,7 +940,6 @@ mod tests {
             },
         )
         .unwrap();
-        // Both a (vector hit) and b (text hit) should be in the result.
         assert!(sub.nodes.contains(&a), "vector hit a must be present");
         assert!(sub.nodes.contains(&b), "text hit b must be present");
     }

@@ -11,11 +11,11 @@ homepage.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+ahash = { workspace = true }
 issundb-core.workspace = true
 issundb-text.workspace = true
 issundb-vector.workspace = true
 issundb-retrieval.workspace = true
-ahash.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 chumsky = { workspace = true, features = ["pratt"] }
@@ -50,3 +50,18 @@ harness = false
 [[bench]]
 name = "oltp_transaction"
 harness = false
+
+# See the `ahash` note in the workspace `Cargo.toml`: `runtime-rng` is re-enabled off
+# wasm, and left off for wasm so `getrandom` stays out of that build.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+ahash = { workspace = true, features = ["runtime-rng"] }
+
+[features]
+default = ["hnsw", "lmdb"]
+hnsw = ["issundb-vector/hnsw", "issundb-retrieval/hnsw"]
+lmdb = [
+    "issundb-core/lmdb",
+    "issundb-vector/lmdb",
+    "issundb-text/lmdb",
+    "issundb-retrieval/lmdb",
+]

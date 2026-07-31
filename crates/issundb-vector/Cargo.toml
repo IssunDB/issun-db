@@ -15,7 +15,7 @@ autobenches = false
 issundb-core.workspace = true
 tracing.workspace = true
 parking_lot.workspace = true
-usearch.workspace = true
+usearch = { workspace = true, optional = true }
 thiserror.workspace = true
 serde_json.workspace = true
 
@@ -32,3 +32,12 @@ harness = false
 [[bench]]
 name = "se_vector_search"
 harness = false
+
+[features]
+# On by default, so an ordinary build is unchanged and gets the approximate HNSW
+# index. Turning it off drops the workspace's only C++ dependency and falls back to
+# an exact scan; see `src/backend.rs` for what that costs and what it preserves.
+default = ["hnsw", "lmdb"]
+hnsw = ["dep:usearch"]
+# Forwarded to the storage backend selection in `issundb-core`.
+lmdb = ["issundb-core/lmdb"]

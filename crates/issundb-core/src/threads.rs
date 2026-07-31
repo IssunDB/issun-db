@@ -1,12 +1,11 @@
 //! One resolution of the thread budget, shared by every parallel consumer.
 //!
-//! Two things run in parallel inside the engine: the GraphBLAS OpenMP pool that
-//! backs the matrix algorithms, and the scoped-thread reductions in the counting
-//! kernels. Both are configured by the same knob ([`crate::Graph::set_thread_count`]
-//! and `ISSUNDB_NUM_THREADS`), so both must resolve it the same way. Resolving it
-//! twice let the same value mean two different things: with nothing configured the
-//! matrices took one thread while a kernel pass took the whole machine, and the
-//! two pools could oversubscribe each other.
+//! Two things run in parallel inside the engine: the scoped-thread reductions in
+//! the counting kernels, and the analytics passes that split over nodes or sources.
+//! Both are configured by the same knob ([`crate::Graph::set_thread_count`] and
+//! `ISSUNDB_NUM_THREADS`), so both must resolve it the same way. Resolving it twice
+//! would let the same value mean two different things, and let the two spend the
+//! machine's parallelism twice over when they overlap.
 
 /// Upper bound on threads any single pass will use, so a misconfigured value
 /// cannot spawn an unbounded pool.
@@ -19,10 +18,10 @@ pub(crate) const MAX_THREADS: usize = 64;
 /// 1. `programmatic`: the value [`crate::Graph::set_thread_count`] stored, when
 ///    positive. Zero means "unset", which is what that method documents.
 /// 2. `ISSUNDB_NUM_THREADS`: this engine's own environment override.
-/// 3. `OMP_NUM_THREADS`: the ecosystem-standard cap. Honored because GraphBLAS's
-///    pool is an OpenMP pool, and because setting it is how a caller (including
-///    this repository's own coverage job) caps that pool; resolving it here keeps
-///    an explicit `set_global_threads` call from overriding a cap set deliberately.
+/// 3. `OMP_NUM_THREADS`: the ecosystem-standard cap. Honored because setting it is
+///    how a caller (including this repository's own coverage job) caps parallelism
+///    across a whole process, and a caller that set it deliberately should not have
+///    to learn a second variable for this engine.
 /// 4. The machine's available parallelism.
 ///
 /// The result is clamped to `1..=MAX_THREADS`, so a caller never has to handle a
@@ -32,6 +31,19 @@ pub(crate) const MAX_THREADS: usize = 64;
 /// is measured lazily: `available_parallelism` is a syscall, and this resolves once
 /// per kernel pass.
 pub(crate) fn resolve(programmatic: i32) -> usize {
+    // A target with no threads gets one worker whatever anyone asked for. Every
+    // parallel pass takes a serial branch at one worker, so this is what keeps a
+    // caller's `set_thread_count(4)` from reaching `std::thread::scope` where a spawn
+    // is a runtime failure. The unconfigured case already resolved to one here (
+    // `available_parallelism` reports an error and falls back), so only an explicit
+    // override was dangerous, which is exactly the case a clamp catches and a
+    // fallback does not.
+    #[cfg(target_family = "wasm")]
+    {
+        let _ = programmatic;
+        return 1;
+    }
+    #[cfg(not(target_family = "wasm"))]
     resolve_from_lazy(
         programmatic,
         std::env::var("ISSUNDB_NUM_THREADS").ok().as_deref(),

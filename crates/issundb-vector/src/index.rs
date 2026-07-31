@@ -1,9 +1,9 @@
 use std::cell::RefCell;
 use std::sync::Arc;
 
+use crate::backend::{VectorBackend, new_backend};
 use parking_lot::RwLock;
 use tracing::instrument;
-use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
 
 use crate::error::VectorError;
 use issundb_core::{Graph, NodeId};
@@ -27,7 +27,9 @@ pub struct VectorSearchOptions {
     /// Rescore factor. When greater than 1, search fetches `k * rescore_factor`
     /// candidates from the index and re-ranks them by exact distance against
     /// the full-precision vectors stored in LMDB. Defaults to 2 on a quantized
-    /// index and 1 (no rescore) on a Float32 index. The default applies to
+    /// index and 1 (no rescore) on a Float32 index. Without the `hnsw` feature
+    /// the default is always 1, because that backend keeps the raw `f32` and so
+    /// has no precision to recover whatever the persisted tag says. The default applies to
     /// filtered searches too, where the over-fetch means the traversal must
     /// find `k * rescore_factor` predicate-matching candidates; pass
     /// `Some(1)` to disable rescoring for a selective filter.
@@ -45,7 +47,7 @@ impl Default for VectorSearchOptions {
     }
 }
 
-/// Distance metric for the HNSW index.
+/// Distance metric for the vector index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum VectorMetric {
     /// Cosine similarity (default).
@@ -113,10 +115,15 @@ pub struct VectorIndexOptions {
 
 enum Inner {
     Empty,
-    Ready { index: Index, dims: usize },
+    Ready {
+        index: Box<dyn VectorBackend>,
+        dims: usize,
+    },
 }
 
-/// An in-memory HNSW vector index using the `usearch` library.
+/// An in-memory vector index over whichever backend this crate was compiled with
+/// (see [`crate::backend`]): an approximate HNSW index by default, an exact scan
+/// without the `hnsw` feature.
 ///
 /// Internal building block for the `VectorGraphExt` implementation on `Graph`.
 /// It holds no persistence of its own, so it is not part of the public surface;
@@ -161,20 +168,8 @@ impl VectorIndex {
         let mut guard = self.inner.write();
         match &mut *guard {
             Inner::Empty => {
-                let opts = IndexOptions {
-                    dimensions: dims,
-                    metric: metric_to_usearch(self.opts.metric),
-                    quantization: quantization_to_usearch(self.opts.quantization),
-                    ..Default::default()
-                };
-                let index =
-                    Index::new(&opts).map_err(|e| VectorError::IndexFault(e.to_string()))?;
-                index
-                    .reserve(64)
-                    .map_err(|e| VectorError::IndexFault(e.to_string()))?;
-                index
-                    .add(node, v)
-                    .map_err(|e| VectorError::IndexFault(e.to_string()))?;
+                let mut index = new_backend(dims, &self.opts)?;
+                index.upsert(node, v)?;
                 *guard = Inner::Ready { index, dims };
             }
             Inner::Ready { index, dims: d } => {
@@ -184,20 +179,7 @@ impl VectorIndex {
                         got: dims,
                     });
                 }
-                if index.contains(node) {
-                    index
-                        .remove(node)
-                        .map_err(|e| VectorError::IndexFault(e.to_string()))?;
-                }
-                if index.size() >= index.capacity() {
-                    let new_cap = (index.capacity() * 2).max(64);
-                    index
-                        .reserve(new_cap)
-                        .map_err(|e| VectorError::IndexFault(e.to_string()))?;
-                }
-                index
-                    .add(node, v)
-                    .map_err(|e| VectorError::IndexFault(e.to_string()))?;
+                index.upsert(node, v)?;
             }
         }
         Ok(())
@@ -207,7 +189,7 @@ impl VectorIndex {
     pub fn is_empty(&self) -> bool {
         match &*self.inner.read() {
             Inner::Empty => true,
-            Inner::Ready { index, .. } => index.size() == 0,
+            Inner::Ready { index, .. } => index.len() == 0,
         }
     }
 
@@ -215,16 +197,13 @@ impl VectorIndex {
     pub fn remove(&self, node: NodeId) -> Result<(), VectorError> {
         let mut guard = self.inner.write();
         if let Inner::Ready { index, .. } = &mut *guard {
-            if index.contains(node) {
-                index
-                    .remove(node)
-                    .map_err(|e| VectorError::IndexFault(e.to_string()))?;
-            }
+            index.remove(node)?;
         }
         Ok(())
     }
 
-    /// Return the `k` approximate nearest neighbors to `q` by cosine distance.
+    /// Return the `k` nearest neighbors to `q` under this graph's configured metric
+    /// (default Cosine). Approximate with `hnsw`, exact without it.
     ///
     /// Returns an empty slice when the index has no vectors or `k == 0`.
     /// `k` is silently clamped to the number of indexed vectors.
@@ -232,34 +211,13 @@ impl VectorIndex {
         let guard = self.inner.read();
         match &*guard {
             Inner::Empty => Ok(vec![]),
-            Inner::Ready { index, dims } => {
-                if q.len() != *dims {
-                    return Err(VectorError::DimensionMismatch {
-                        expected: *dims,
-                        got: q.len(),
-                    });
-                }
-                if k == 0 || index.size() == 0 {
-                    return Ok(vec![]);
-                }
-                let actual_k = k.min(index.size());
-                let matches = index
-                    .search::<f32>(q, actual_k)
-                    .map_err(|e| VectorError::IndexFault(e.to_string()))?;
-                Ok(matches
-                    .keys
-                    .iter()
-                    .zip(matches.distances.iter())
-                    .map(|(&node, &distance)| Hit { node, distance })
-                    .collect())
-            }
+            Inner::Ready { index, .. } => index.search(q, k),
         }
     }
 
-    /// Return up to `k` approximate nearest neighbors to `q` that satisfy
-    /// `predicate`.
+    /// Return up to `k` nearest neighbors to `q` that satisfy `predicate`.
     ///
-    /// The predicate is evaluated during the HNSW traversal, so the search keeps
+    /// The predicate is evaluated during the traversal, so the search keeps
     /// expanding until it has `k` matching neighbors or exhausts the reachable
     /// graph. Unlike post-filtering a fixed over-fetch, this does not silently
     /// truncate the result set when the filter is selective.
@@ -275,27 +233,7 @@ impl VectorIndex {
         let guard = self.inner.read();
         match &*guard {
             Inner::Empty => Ok(vec![]),
-            Inner::Ready { index, dims } => {
-                if q.len() != *dims {
-                    return Err(VectorError::DimensionMismatch {
-                        expected: *dims,
-                        got: q.len(),
-                    });
-                }
-                if k == 0 || index.size() == 0 {
-                    return Ok(vec![]);
-                }
-                let actual_k = k.min(index.size());
-                let matches = index
-                    .filtered_search::<f32, _>(q, actual_k, predicate)
-                    .map_err(|e| VectorError::IndexFault(e.to_string()))?;
-                Ok(matches
-                    .keys
-                    .iter()
-                    .zip(matches.distances.iter())
-                    .map(|(&node, &distance)| Hit { node, distance })
-                    .collect())
-            }
+            Inner::Ready { index, .. } => index.search_filtered(q, k, &predicate),
         }
     }
 }
@@ -305,6 +243,15 @@ fn encode_vector(v: &[f32]) -> Result<Vec<u8>, VectorError> {
         return Err(VectorError::IndexFault(
             "embedding must not be empty".into(),
         ));
+    }
+    // A NaN or infinity would be stored and then produce a NaN distance at every search,
+    // which no ranking can order meaningfully, so it is rejected at the boundary rather
+    // than silently poisoning every later query.
+    if let Some(position) = v.iter().position(|f| !f.is_finite()) {
+        return Err(VectorError::IndexFault(format!(
+            "embedding component {position} is not finite ({})",
+            v[position]
+        )));
     }
     Ok(v.iter().flat_map(|f| f.to_le_bytes()).collect())
 }
@@ -335,6 +282,12 @@ pub trait VectorGraphExt {
     /// `VectorError::AlreadyConfigured`. Re-applying the identical configuration
     /// is a no-op. When no graph configuration is set, the index defaults to
     /// `Cosine` and `Float32`.
+    ///
+    /// A build without `hnsw` accepts a non-`Float32` quantization and persists it, but
+    /// cannot honor it: that backend keeps the raw `f32`, so the memory reduction the
+    /// quantization names does not happen. The tag is still recorded rather than rejected,
+    /// because it is honored by any later build that does have `hnsw` opening the same
+    /// directory.
     fn configure_vector_index(&self, opts: VectorIndexOptions) -> Result<(), VectorError>;
 
     /// Change the metric and quantization and rebuild the index from the
@@ -344,7 +297,7 @@ pub trait VectorGraphExt {
     /// exist. The raw f32 embeddings are stored in LMDB independently of the
     /// metric, so they are re-indexed under `opts`; switching back to `Float32`
     /// recovers full precision from storage. This rebuilds the entire in-memory
-    /// HNSW index, so it is O(n) in the number of stored vectors and is intended
+    /// index, so it is O(n) in the number of stored vectors and is intended
     /// as an administrative operation, not a concurrent one: running it while
     /// other threads upsert may drop an in-flight write from the snapshot, which
     /// the next `Graph::open` rebuild reconciles.
@@ -356,19 +309,20 @@ pub trait VectorGraphExt {
     /// Remove the embedding for `n` from the index and from persistent storage.
     fn remove_vector(&self, n: NodeId) -> Result<(), VectorError>;
 
-    /// Return the `k` approximate nearest neighbors to `q` by cosine distance.
+    /// Return the `k` nearest neighbors to `q` under this graph's configured metric
+    /// (default Cosine). Approximate with `hnsw`, exact without it.
     ///
     /// Returns `VectorError::EmptyIndex` when the graph holds no embeddings at
     /// all, so a caller can distinguish "no semantic matches" from "there is
     /// nothing to search".
     fn vector_search(&self, q: &[f32], k: usize) -> Result<Vec<Hit>, VectorError>;
 
-    /// Return the `opts.k` approximate nearest neighbors that satisfy the label
-    /// and property filters in `opts`.
+    /// Return the `opts.k` nearest neighbors that satisfy the label and property
+    /// filters in `opts`.
     ///
     /// When neither `opts.label` nor `opts.properties` is set the call is
     /// identical to `vector_search(q, opts.k)`. When a filter is set, it is
-    /// applied during the HNSW traversal through a predicate, so the search
+    /// applied during the traversal through a predicate, so the search
     /// keeps expanding until it has `opts.k` matching neighbors rather than
     /// post-filtering a fixed over-fetch (which silently under-returns for
     /// selective filters). A node matches when it carries `opts.label` (if set)
@@ -383,7 +337,7 @@ pub trait VectorGraphExt {
 
     /// Return the full-precision embedding stored for `n`, or `None` when the
     /// node has no embedding. This is a point lookup against LMDB and does not
-    /// build or consult the in-memory HNSW index.
+    /// build or consult the in-memory index.
     fn node_vector(&self, n: NodeId) -> Result<Option<Vec<f32>>, VectorError>;
 
     /// Distance between two vectors under this graph's configured metric
@@ -457,7 +411,6 @@ impl VectorGraphExt for Graph {
 
     fn remove_vector(&self, n: NodeId) -> Result<(), VectorError> {
         self.delete_vector_bytes(n)?;
-        // Remove from in-memory HNSW index if the cache has been built.
         if let Some(arc) = self.get_extension::<VectorIndexCache>() {
             arc.0.remove(n)?;
         }
@@ -489,13 +442,16 @@ impl VectorGraphExt for Graph {
         }
 
         let index_quantization = arc.0.opts.quantization;
-        let rescore_factor =
-            opts.rescore_factor
-                .unwrap_or(if index_quantization != VectorQuantization::Float32 {
-                    2
-                } else {
-                    1
-                });
+        // Rescoring re-reads and re-decodes `2k` stored vectors to recompute distances at
+        // full precision, which is only worth it against a backend that lost precision.
+        // The exact backend keeps the raw `f32` and already ranks through `exact_distance`,
+        // so a persisted quantization tag there would buy bit-identical distances for a
+        // second pass over storage.
+        let backend_quantizes =
+            cfg!(feature = "hnsw") && index_quantization != VectorQuantization::Float32;
+        let rescore_factor = opts
+            .rescore_factor
+            .unwrap_or(if backend_quantizes { 2 } else { 1 });
 
         let fetch_k = if rescore_factor > 1 {
             opts.k.saturating_mul(rescore_factor)
@@ -610,10 +566,14 @@ impl VectorGraphExt for Graph {
                     None => hit,
                 });
             }
+            // Node id included, because `truncate` below decides which of two equidistant
+            // hits survives at the k-th position and sorting on distance alone left that to
+            // whatever order the sort happened to leave. This makes the rescored path
+            // deterministic; it does not make the whole surface so, since a `Float32` HNSW
+            // index does not rescore and usearch breaks a distance tie by its own traversal
+            // order.
             rescored.sort_unstable_by(|a, b| {
-                a.distance
-                    .partial_cmp(&b.distance)
-                    .unwrap_or(std::cmp::Ordering::Equal)
+                a.distance.total_cmp(&b.distance).then(a.node.cmp(&b.node))
             });
             rescored
         } else {
@@ -644,11 +604,11 @@ impl VectorGraphExt for Graph {
     }
 }
 
-/// Full-precision distance between `q` and a stored vector, matching the
-/// distance convention `usearch` reports for the same metric (squared L2,
-/// `1 - dot` for inner product) so rescored and approximate distances stay
-/// comparable.
-fn exact_distance(q: &[f32], v: &[f32], metric: VectorMetric) -> f32 {
+/// Full-precision distance between `q` and a stored vector. Both backends report this
+/// same convention for a given metric (squared L2, and `1 - dot` for inner product), which
+/// is what lets a rescored distance and an approximate one be sorted into one list;
+/// `the_hnsw_backend_reports_the_same_convention_as_exact_distance` pins it.
+pub(crate) fn exact_distance(q: &[f32], v: &[f32], metric: VectorMetric) -> f32 {
     match metric {
         VectorMetric::Cosine => {
             let mut dot = 0.0;
@@ -765,22 +725,6 @@ fn decode_config(bytes: &[u8]) -> Result<VectorIndexOptions, VectorError> {
         metric,
         quantization,
     })
-}
-
-fn metric_to_usearch(m: VectorMetric) -> MetricKind {
-    match m {
-        VectorMetric::Cosine => MetricKind::Cos,
-        VectorMetric::L2 => MetricKind::L2sq,
-        VectorMetric::Dot => MetricKind::IP,
-    }
-}
-
-fn quantization_to_usearch(q: VectorQuantization) -> ScalarKind {
-    match q {
-        VectorQuantization::Float32 => ScalarKind::F32,
-        VectorQuantization::Float16 => ScalarKind::F16,
-        VectorQuantization::Int8 => ScalarKind::I8,
-    }
 }
 
 #[cfg(test)]
@@ -991,6 +935,22 @@ mod tests {
         assert_eq!(hits.len(), 2);
     }
 
+    /// A stored non-finite component yields a NaN distance at every later search, which no
+    /// ranking can order, so it is refused rather than persisted.
+    #[test]
+    fn upsert_vector_rejects_a_non_finite_component() {
+        let (_dir, graph) = open_tmp();
+        let n = graph.add_node("N", &json!({})).unwrap();
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let err = graph.upsert_vector(n, &[1.0, bad]).unwrap_err();
+            assert!(
+                err.to_string().contains("not finite"),
+                "expected a non-finite rejection, got {err}"
+            );
+        }
+        graph.upsert_vector(n, &[1.0, 2.0]).unwrap();
+    }
+
     #[test]
     fn upsert_vector_overwrites_existing_embedding() {
         let (_dir, graph) = open_tmp();
@@ -1009,6 +969,10 @@ mod tests {
         );
     }
 
+    // Persistence-dependent: reopens the same path and expects the stored embeddings
+    // or configuration to still be there. The in-memory storage backend starts empty
+    // on every open by design, so this is gated rather than left to fail there.
+    #[cfg(feature = "lmdb")]
     #[test]
     fn vector_index_rebuilds_from_lmdb_on_reopen() {
         let dir = TempDir::new().unwrap();
@@ -1107,6 +1071,10 @@ mod tests {
         assert!(hits.iter().any(|h| h.node == blue2));
     }
 
+    // Persistence-dependent: reopens the same path and expects the stored embeddings
+    // or configuration to still be there. The in-memory storage backend starts empty
+    // on every open by design, so this is gated rather than left to fail there.
+    #[cfg(feature = "lmdb")]
     #[test]
     fn rejected_upsert_does_not_persist_and_brick_reopen() {
         // A dimension-mismatched upsert must not leave bytes in LMDB. If it did,
@@ -1131,6 +1099,10 @@ mod tests {
         assert_eq!(hits[0].node, a);
     }
 
+    // Persistence-dependent: reopens the same path and expects the stored embeddings
+    // or configuration to still be there. The in-memory storage backend starts empty
+    // on every open by design, so this is gated rather than left to fail there.
+    #[cfg(feature = "lmdb")]
     #[test]
     fn configure_vector_index_persists_metric_across_reopen() {
         let dir = TempDir::new().unwrap();
@@ -1195,6 +1167,10 @@ mod tests {
         ));
     }
 
+    // Persistence-dependent: reopens the same path and expects the stored embeddings
+    // or configuration to still be there. The in-memory storage backend starts empty
+    // on every open by design, so this is gated rather than left to fail there.
+    #[cfg(feature = "lmdb")]
     #[test]
     fn reindex_vector_index_switches_metric_on_populated_graph() {
         let dir = TempDir::new().unwrap();
@@ -1353,7 +1329,6 @@ mod tests {
         assert_eq!(hits[0].node, n2);
         assert_eq!(hits[1].node, n1);
 
-        // Verify the exact distances are computed and ordered correctly
         assert!(hits[0].distance < hits[1].distance);
     }
 }

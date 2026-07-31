@@ -20,7 +20,6 @@ jobs:
   publish:
     runs-on: ubuntu-latest
 
-    # Try to publish only if the tests pass
     needs: call_tests
     if: success()
 
@@ -48,7 +47,7 @@ jobs:
           set -euo pipefail
           version="$(cargo metadata --format-version 1 --no-deps \
             | python3 -c 'import sys, json; m = json.load(sys.stdin); print(next(p["version"] for p in m["packages"] if p["name"] == "issundb"))')"
-          for crate in issundb-graphblas-sys issundb-graphblas issundb-core issundb-vector issundb-text issundb-retrieval issundb-cypher issundb; do
+          for crate in issundb-core issundb-vector issundb-text issundb-retrieval issundb-cypher issundb; do
             prefix_dir="$(printf '%s' "$crate" | cut -c1-2)/$(printf '%s' "$crate" | cut -c3-4)"
             if curl -sf "https://index.crates.io/$prefix_dir/$crate" | grep -qF "\"vers\":\"$version\""; then
               echo "Skipping $crate ($version already on crates.io)..."

@@ -62,7 +62,7 @@ impl Graph {
 
     pub(super) fn active_text_indexes_impl(
         &self,
-        rtxn: &heed::RoTxn,
+        rtxn: &crate::storage::RoTxn,
     ) -> Result<Vec<(String, String, Language)>, Error> {
         let prefix = "fts_meta:node:l:";
         let mut results = Vec::new();
@@ -94,7 +94,7 @@ impl Graph {
 
     pub(super) fn get_fts_index_language(
         &self,
-        rtxn: &heed::RoTxn,
+        rtxn: &crate::storage::RoTxn,
         label_id: LabelId,
         prop_key_id: PropKeyId,
     ) -> Result<Language, Error> {
@@ -109,7 +109,7 @@ impl Graph {
 
     pub(super) fn has_node_text_index_impl(
         &self,
-        rtxn: &heed::RoTxn,
+        rtxn: &crate::storage::RoTxn,
         label: &str,
         property: &str,
     ) -> Result<bool, Error> {
@@ -128,7 +128,7 @@ impl Graph {
 
     pub(super) fn create_node_text_index_impl(
         &self,
-        wtxn: &mut heed::RwTxn,
+        wtxn: &mut crate::storage::RwTxn,
         label: &str,
         property: &str,
         lang: Language,
@@ -189,7 +189,7 @@ impl Graph {
 
     pub(super) fn drop_node_text_index_impl(
         &self,
-        wtxn: &mut heed::RwTxn,
+        wtxn: &mut crate::storage::RwTxn,
         label: &str,
         property: &str,
     ) -> Result<(), Error> {
@@ -206,7 +206,6 @@ impl Graph {
                 .meta
                 .delete(wtxn, &fts_stats_sum_dl_key(label_id, prop_key_id))?;
 
-            // Delete postings prefix
             let mut postings_prefix = Vec::with_capacity(8);
             postings_prefix.extend_from_slice(&label_id.to_be_bytes());
             postings_prefix.extend_from_slice(&prop_key_id.to_be_bytes());
@@ -224,7 +223,6 @@ impl Graph {
                 self.storage.fts_postings.delete(wtxn, &key)?;
             }
 
-            // Delete doc lengths prefix
             let mut docs_prefix = Vec::with_capacity(8);
             docs_prefix.extend_from_slice(&label_id.to_be_bytes());
             docs_prefix.extend_from_slice(&prop_key_id.to_be_bytes());
@@ -244,7 +242,7 @@ impl Graph {
 
     pub(super) fn active_text_indexes_for_label(
         &self,
-        rtxn: &heed::RoTxn,
+        rtxn: &crate::storage::RoTxn,
         label_id: LabelId,
     ) -> Result<Vec<PropKeyId>, Error> {
         let prefix = format!("fts_meta:node:l:{label_id}:p:");
@@ -262,14 +260,14 @@ impl Graph {
 
     pub(super) fn index_node_fts(
         &self,
-        wtxn: &mut heed::RwTxn,
+        wtxn: &mut crate::storage::RwTxn,
         node_id: NodeId,
         label_id: LabelId,
         props_json: &serde_json::Value,
     ) -> Result<(), Error> {
         // Collect read-side data before taking a mutable borrow.
         let adds: Vec<(PropKeyId, String)> = {
-            let rtxn: &heed::RoTxn = wtxn;
+            let rtxn: &crate::storage::RoTxn = wtxn;
             let active_prop_keys = self.active_text_indexes_for_label(rtxn, label_id)?;
             let mut out = Vec::new();
             for prop_key_id in active_prop_keys {
@@ -289,14 +287,14 @@ impl Graph {
 
     pub(super) fn delete_node_fts(
         &self,
-        wtxn: &mut heed::RwTxn,
+        wtxn: &mut crate::storage::RwTxn,
         node_id: NodeId,
         label_id: LabelId,
         props_json: &serde_json::Value,
     ) -> Result<(), Error> {
         // Collect read-side data before taking a mutable borrow.
         let removes: Vec<(PropKeyId, String)> = {
-            let rtxn: &heed::RoTxn = wtxn;
+            let rtxn: &crate::storage::RoTxn = wtxn;
             let active_prop_keys = self.active_text_indexes_for_label(rtxn, label_id)?;
             let mut out = Vec::new();
             for prop_key_id in active_prop_keys {
@@ -316,14 +314,14 @@ impl Graph {
 
     pub(super) fn add_node_prop_fts_entry(
         &self,
-        wtxn: &mut heed::RwTxn,
+        wtxn: &mut crate::storage::RwTxn,
         node_id: NodeId,
         label_id: LabelId,
         prop_key_id: PropKeyId,
         text: &str,
     ) -> Result<(), Error> {
         let lang = {
-            let rtxn: &heed::RoTxn = wtxn;
+            let rtxn: &crate::storage::RoTxn = wtxn;
             self.get_fts_index_language(rtxn, label_id, prop_key_id)?
         };
         let terms = fts::tokenize(text, lang);
@@ -340,7 +338,6 @@ impl Graph {
                 self.storage.fts_postings.put(wtxn, &p_key, &p_val)?;
             }
 
-            // Stats
             let n_key = fts_stats_n_key(label_id, prop_key_id);
             let sum_dl_key = fts_stats_sum_dl_key(label_id, prop_key_id);
 
@@ -381,7 +378,7 @@ impl Graph {
 
     pub(super) fn remove_node_prop_fts_entry(
         &self,
-        wtxn: &mut heed::RwTxn,
+        wtxn: &mut crate::storage::RwTxn,
         node_id: NodeId,
         label_id: LabelId,
         prop_key_id: PropKeyId,
@@ -393,7 +390,7 @@ impl Graph {
             self.storage.fts_docs.delete(wtxn, &d_key)?;
 
             let lang = {
-                let rtxn: &heed::RoTxn = wtxn;
+                let rtxn: &crate::storage::RoTxn = wtxn;
                 self.get_fts_index_language(rtxn, label_id, prop_key_id)?
             };
             let terms = fts::tokenize(text, lang);
@@ -405,7 +402,6 @@ impl Graph {
                     .delete_one_duplicate(wtxn, &p_key, &p_val)?;
             }
 
-            // Stats
             let n_key = fts_stats_n_key(label_id, prop_key_id);
             let sum_dl_key = fts_stats_sum_dl_key(label_id, prop_key_id);
 
@@ -455,7 +451,7 @@ impl Graph {
 
     pub(super) fn fts_stats_impl(
         &self,
-        rtxn: &heed::RoTxn,
+        rtxn: &crate::storage::RoTxn,
         label: &str,
         property: &str,
     ) -> Result<Option<(u64, u64)>, Error> {
@@ -513,7 +509,7 @@ impl Graph {
 
     pub(super) fn fts_doc_len_impl(
         &self,
-        rtxn: &heed::RoTxn,
+        rtxn: &crate::storage::RoTxn,
         label: &str,
         property: &str,
         node_id: NodeId,
@@ -553,7 +549,7 @@ impl Graph {
 
     pub(super) fn fts_postings_impl(
         &self,
-        rtxn: &heed::RoTxn,
+        rtxn: &crate::storage::RoTxn,
         label: &str,
         property: &str,
         term: &str,

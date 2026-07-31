@@ -52,7 +52,7 @@ pub struct RetrieveOptions {
 To combine vector search and full-text search with graph expansion, use `retrieve_hybrid`:
 
 - `retrieve_hybrid(graph: &Graph, q: &[f32], text_query: &str, opts: &HybridRetrieveOptions) -> Result<Subgraph, RetrievalError>`  
-  Identifies seeds from both index types, fuses their ranks, and expands the neighborhood using GraphBLAS operations. When neither search would run
+  Identifies seeds from both index types, fuses their ranks, and expands the neighborhood by multi-source traversal. When neither search would run
   (both inputs empty or both k values zero) it returns `RetrievalError::NoQuery`.
 
 Every retrieve function returns a `Subgraph` with `nodes`, `edges`, `scores`, and `truncated`. The `truncated` flag is true when the `max_nodes` cap

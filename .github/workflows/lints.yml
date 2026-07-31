@@ -46,13 +46,16 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang pkg-config libssl-dev
+          sudo apt-get install -y pkg-config libssl-dev
 
       - name: Check formatting
         run: make format-check
 
-      - name: Check GraphBLAS pin consistency
-        run: make check-graphblas-pin
-
       - name: Run linters
         run: make lint
+
+      # The default run always selects LMDB and usearch, so these two configurations are
+      # otherwise never linted. Kept in this workflow rather than with the backend tests
+      # because clippy is pinned to the MSRV here, and a newer clippy reports different lints.
+      - name: Run linters against the non-default backends
+        run: make lint-backends

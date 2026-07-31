@@ -49,7 +49,7 @@ jobs:
           working-directory: crates/issundb-py
           args: --release --out dist
           before-script-linux: |
-            dnf install -y clang cmake gcc gcc-c++
+            dnf install -y gcc gcc-c++
 
       - name: Upload wheels as artifacts
         uses: actions/upload-artifact@v4
@@ -73,10 +73,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # macOS ARM64 (Apple Silicon)
           - os: macos-14
             target: aarch64-apple-darwin
-          # Windows x86_64
           - os: windows-latest
             target: x86_64-pc-windows-msvc
 
@@ -96,11 +94,6 @@ jobs:
         with:
           toolchain: '1.85.0'
           targets: ${{ matrix.target }}
-
-      - name: Install dependencies (macOS)
-        run: |
-          brew install libomp
-        if: startsWith(matrix.os, 'macos-')
 
       - name: Configure macOS linker workaround
         if: matrix.os == 'macos-14'

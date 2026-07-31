@@ -439,7 +439,7 @@ impl PyGraph {
         })
     }
 
-    /// Set the GraphBLAS thread count (0 restores default behavior).
+    /// Set the thread count for the parallel read passes (0 restores default behavior).
     fn set_thread_count(&self, py: Python<'_>, n: i32) -> PyResult<()> {
         py.detach(|| self.graph.set_thread_count(n)).map_err(rt)
     }

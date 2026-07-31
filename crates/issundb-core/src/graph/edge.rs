@@ -19,7 +19,6 @@ impl Graph {
         let mut wtxn = self.storage.env.write_txn()?;
         let edge_id = self.add_edge_impl(&mut wtxn, src, dst, etype, props)?;
         self.commit_and_publish(wtxn, 1)?;
-        self.csr_cache.record_added_edge(src, dst);
         self.edge_columns.record_touched(edge_id);
         self.maybe_spawn_rebuild();
         Ok(edge_id)
@@ -27,7 +26,7 @@ impl Graph {
 
     pub(super) fn add_edge_impl(
         &self,
-        wtxn: &mut heed::RwTxn,
+        wtxn: &mut crate::storage::RwTxn,
         src: NodeId,
         dst: NodeId,
         etype: &str,
@@ -82,8 +81,8 @@ impl Graph {
         self.update_edge_impl(&mut wtxn, id, props)?;
         // Publishing matters even though no adjacency changed. A property change can
         // alter an edge's weight (`weight`/`cost`/`capacity`/`cap`), which the CSR
-        // snapshot and the derived weight and PageRank matrices bake in, and those
-        // matrices have no incremental maintenance. Advancing the generation here is
+        // snapshot's per-edge weights bake in, and those have no incremental
+        // maintenance. Advancing the generation here is
         // what marks them stale so the next `ensure_csr_fresh` rebuilds before a
         // weighted algorithm reads them; without it `shortest_path_dijkstra` and
         // friends serve the pre-update weight.
@@ -95,7 +94,7 @@ impl Graph {
 
     pub(super) fn update_edge_impl(
         &self,
-        wtxn: &mut heed::RwTxn,
+        wtxn: &mut crate::storage::RwTxn,
         id: EdgeId,
         props: &impl serde::Serialize,
     ) -> Result<(), Error> {
@@ -137,7 +136,7 @@ impl Graph {
 
     pub(super) fn get_edge_impl(
         &self,
-        txn: &heed::RoTxn,
+        txn: &crate::storage::RoTxn,
         id: EdgeId,
     ) -> Result<Option<EdgeRecord>, Error> {
         match self.storage.edges.get(txn, &id)? {
@@ -154,8 +153,7 @@ impl Graph {
         let mut wtxn = self.storage.env.write_txn()?;
         let endpoints = self.delete_edge_impl(&mut wtxn, id)?;
         self.commit_and_publish(wtxn, 1)?;
-        if let Some((src, dst)) = endpoints {
-            self.csr_cache.record_removed_edge(src, dst);
+        if endpoints.is_some() {
             // The deletion reshuffles the dense edge mapping; force a rebuild.
             self.edge_columns.record_force_full();
         }
@@ -168,7 +166,7 @@ impl Graph {
     /// removal, or `None` if no such edge existed.
     pub(crate) fn delete_edge_impl(
         &self,
-        wtxn: &mut heed::RwTxn,
+        wtxn: &mut crate::storage::RwTxn,
         id: EdgeId,
     ) -> Result<Option<(NodeId, NodeId)>, Error> {
         let record: EdgeRecord = match self.get_edge_impl(wtxn, id)? {
@@ -176,21 +174,16 @@ impl Graph {
             None => return Ok(None),
         };
 
-        // 1. Delete from edge property index
         self.delete_edge_index_entries(wtxn, id, &record)?;
 
-        // 2. Delete the edge record itself
         self.storage.edges.delete(wtxn, &id)?;
 
-        // 3. Delete from the type index
         self.storage
             .type_idx
             .delete(wtxn, &composite_key(record.edge_type, id))?;
 
-        // 4. Adjust the type count
         adjust_type_count(&self.storage, wtxn, record.edge_type, -1)?;
 
-        // 5. Delete from out_adj (key is src, other is dst)
         let out_entry = AdjEntry {
             edge_type: record.edge_type,
             other: record.dst,
@@ -200,7 +193,6 @@ impl Graph {
             .out_adj
             .delete_one_duplicate(wtxn, &record.src, out_entry.as_bytes())?;
 
-        // 6. Delete from in_adj (key is dst, other is src)
         let in_entry = AdjEntry {
             edge_type: record.edge_type,
             other: record.src,
@@ -225,7 +217,7 @@ impl Graph {
     /// it lags writes until the background rebuild runs, so serving point
     /// lookups from it would return deleted edges, hide newly added ones, and
     /// disagree with [`Self::in_neighbors`]. The snapshot remains the basis for
-    /// the GraphBLAS matrix algorithms, which have explicit snapshot semantics.
+    /// the CSR snapshot algorithms, which have explicit snapshot semantics.
     pub fn out_neighbors(&self, node: NodeId) -> Result<Vec<NeighborEntry>, Error> {
         let rtxn = self.storage.env.read_txn()?;
         self.out_neighbors_impl(&rtxn, node)
@@ -233,7 +225,7 @@ impl Graph {
 
     pub(super) fn out_neighbors_impl(
         &self,
-        rtxn: &heed::RoTxn,
+        rtxn: &crate::storage::RoTxn,
         node: NodeId,
     ) -> Result<Vec<NeighborEntry>, Error> {
         self.adj_entries_impl(rtxn, node, true)
@@ -247,7 +239,7 @@ impl Graph {
 
     pub(super) fn in_neighbors_impl(
         &self,
-        rtxn: &heed::RoTxn,
+        rtxn: &crate::storage::RoTxn,
         node: NodeId,
     ) -> Result<Vec<NeighborEntry>, Error> {
         self.adj_entries_impl(rtxn, node, false)

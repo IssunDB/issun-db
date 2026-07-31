@@ -13,7 +13,6 @@ impl Graph {
         let mut wtxn = self.storage.env.write_txn()?;
         let id = self.add_node_impl(&mut wtxn, &[label], props)?;
         self.commit_and_publish(wtxn, 1)?;
-        self.csr_cache.record_added_node(id);
         self.prop_columns.record_touched(id);
         self.maybe_spawn_rebuild();
         Ok(id)
@@ -27,7 +26,6 @@ impl Graph {
         let mut wtxn = self.storage.env.write_txn()?;
         let id = self.add_node_impl(&mut wtxn, labels, props)?;
         self.commit_and_publish(wtxn, 1)?;
-        self.csr_cache.record_added_node(id);
         self.prop_columns.record_touched(id);
         self.maybe_spawn_rebuild();
         Ok(id)
@@ -35,7 +33,7 @@ impl Graph {
 
     pub(super) fn add_node_impl(
         &self,
-        wtxn: &mut heed::RwTxn,
+        wtxn: &mut crate::storage::RwTxn,
         labels: &[&str],
         props: &impl Serialize,
     ) -> Result<NodeId, Error> {
@@ -78,7 +76,7 @@ impl Graph {
     /// node insertion, node update, and label addition.
     fn index_node_for_label(
         &self,
-        wtxn: &mut heed::RwTxn,
+        wtxn: &mut crate::storage::RwTxn,
         label_id: LabelId,
         label_name: &str,
         node_id: NodeId,
@@ -167,7 +165,7 @@ impl Graph {
     #[allow(clippy::too_many_arguments)]
     fn check_node_property_unique(
         &self,
-        wtxn: &heed::RwTxn,
+        wtxn: &crate::storage::RwTxn,
         label_id: LabelId,
         label_name: &str,
         prop_key_id: PropKeyId,
@@ -220,7 +218,7 @@ impl Graph {
     /// single label. Shared by node update, node deletion, and label removal.
     fn unindex_node_for_label(
         &self,
-        wtxn: &mut heed::RwTxn,
+        wtxn: &mut crate::storage::RwTxn,
         label_id: LabelId,
         node_id: NodeId,
         props_json: &serde_json::Value,
@@ -266,7 +264,7 @@ impl Graph {
 
     pub(super) fn get_node_impl(
         &self,
-        txn: &heed::RoTxn,
+        txn: &crate::storage::RoTxn,
         id: NodeId,
     ) -> Result<Option<NodeRecord>, Error> {
         match self.storage.nodes.get(txn, &id)? {
@@ -294,7 +292,7 @@ impl Graph {
 
     pub(super) fn update_node_impl(
         &self,
-        wtxn: &mut heed::RwTxn,
+        wtxn: &mut crate::storage::RwTxn,
         id: NodeId,
         props: &impl Serialize,
     ) -> Result<(), Error> {
@@ -343,7 +341,7 @@ impl Graph {
 
     pub(super) fn add_label_impl(
         &self,
-        wtxn: &mut heed::RwTxn,
+        wtxn: &mut crate::storage::RwTxn,
         id: NodeId,
         label: &str,
     ) -> Result<(), Error> {
@@ -382,7 +380,7 @@ impl Graph {
 
     pub(super) fn remove_label_impl(
         &self,
-        wtxn: &mut heed::RwTxn,
+        wtxn: &mut crate::storage::RwTxn,
         id: NodeId,
         label: &str,
     ) -> Result<(), Error> {
@@ -418,7 +416,7 @@ impl Graph {
 
     pub(super) fn node_labels_impl(
         &self,
-        rtxn: &heed::RoTxn,
+        rtxn: &crate::storage::RoTxn,
         id: NodeId,
     ) -> Result<Vec<String>, Error> {
         match self.get_node_impl(rtxn, id)? {
@@ -443,19 +441,20 @@ impl Graph {
         let mut wtxn = self.storage.env.write_txn()?;
         self.delete_node_impl(&mut wtxn, id)?;
         self.commit_and_publish(wtxn, 1)?;
-        // A node deletion reshuffles the sorted dense-index mapping, so the next
-        // matrix refresh must rebuild fully rather than patch incrementally. The
-        // deletion also cascades to every incident edge, so the edge property
-        // columns must rebuild too; without this a deleted edge stays readable
+        // A node deletion cascades to every incident edge, so the edge property
+        // columns must rebuild; without this a deleted edge stays readable
         // through `edge_prop_json` and the vectorized executor's edge reads.
-        self.csr_cache.mark_force_full();
         self.prop_columns.record_force_full();
         self.edge_columns.record_force_full();
         self.maybe_spawn_rebuild();
         Ok(())
     }
 
-    pub(super) fn delete_node_impl(&self, wtxn: &mut heed::RwTxn, id: NodeId) -> Result<(), Error> {
+    pub(super) fn delete_node_impl(
+        &self,
+        wtxn: &mut crate::storage::RwTxn,
+        id: NodeId,
+    ) -> Result<(), Error> {
         let record: NodeRecord = match self.storage.nodes.get(wtxn, &id)? {
             Some(bytes) => props::decode(bytes)?,
             None => return Ok(()),
@@ -473,7 +472,6 @@ impl Graph {
             adjust_label_count(&self.storage, wtxn, label_id, -1)?;
         }
 
-        // 2. Process all outgoing neighbors (out_adj)
         let mut out_edges = Vec::new();
         if let Some(iter) = self.storage.out_adj.get_duplicates(wtxn, &id)? {
             for result in iter {
@@ -491,7 +489,6 @@ impl Graph {
             if let Some(edge_rec) = self.get_edge_impl(wtxn, edge_id)? {
                 self.delete_edge_index_entries(wtxn, edge_id, &edge_rec)?;
             }
-            // Delete edge and type index
             self.storage.edges.delete(wtxn, &edge_id)?;
             self.storage
                 .type_idx
@@ -499,7 +496,6 @@ impl Graph {
 
             adjust_type_count(&self.storage, wtxn, entry.edge_type, -1)?;
 
-            // Delete the corresponding in_adj entry on the neighbor
             let in_entry = AdjEntry {
                 edge_type: entry.edge_type,
                 other: id,
@@ -510,7 +506,6 @@ impl Graph {
                 .delete_one_duplicate(wtxn, &other, in_entry.as_bytes())?;
         }
 
-        // 3. Process all incoming neighbors (in_adj)
         let mut in_edges = Vec::new();
         if let Some(iter) = self.storage.in_adj.get_duplicates(wtxn, &id)? {
             for result in iter {
@@ -528,7 +523,6 @@ impl Graph {
             if let Some(edge_rec) = self.get_edge_impl(wtxn, edge_id)? {
                 self.delete_edge_index_entries(wtxn, edge_id, &edge_rec)?;
             }
-            // Delete edge and type index
             self.storage.edges.delete(wtxn, &edge_id)?;
             self.storage
                 .type_idx
@@ -536,7 +530,6 @@ impl Graph {
 
             adjust_type_count(&self.storage, wtxn, entry.edge_type, -1)?;
 
-            // Delete the corresponding out_adj entry on the neighbor
             let out_entry = AdjEntry {
                 edge_type: entry.edge_type,
                 other: id,
@@ -547,14 +540,11 @@ impl Graph {
                 .delete_one_duplicate(wtxn, &other, out_entry.as_bytes())?;
         }
 
-        // 4. Delete the adjacency list keys themselves
         self.storage.out_adj.delete(wtxn, &id)?;
         self.storage.in_adj.delete(wtxn, &id)?;
 
-        // 5. Delete persisted vector bytes
         self.storage.vectors.delete(wtxn, &id)?;
 
-        // 6. Delete from primary nodes database
         self.storage.nodes.delete(wtxn, &id)?;
 
         Ok(())
@@ -739,7 +729,6 @@ mod tests {
             .add_node("Person", &json!({"name": "Bob", "age": 25}))
             .unwrap();
 
-        // Update age to 26.
         g.update_node(node_id, &json!({"name": "Bob", "age": 26}))
             .unwrap();
 

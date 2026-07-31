@@ -12,7 +12,6 @@ use zerocopy::{FromBytes, IntoBytes};
 
 use ahash::{AHashMap, AHashSet};
 
-use crate::matrices::{MatrixKinds, MatrixSet};
 use crate::{
     csr::{CsrCache, CsrSnapshot},
     error::Error,
@@ -21,13 +20,12 @@ use crate::{
         NodeId, NodeRecord, PropKeyId, PropValue, TypeId, WeightedPath,
     },
     storage::{
-        fts,
+        Storage, fts,
         ids::{
             adjust_label_count, adjust_type_count, alloc_edge_id, alloc_node_id, get_label,
             get_or_create_label, get_or_create_prop_key, get_or_create_type, get_prop_key,
             get_prop_key_name, get_type,
         },
-        lmdb::Storage,
         props,
     },
 };
@@ -35,8 +33,8 @@ use crate::{
 pub mod algo;
 pub mod edge;
 pub mod fts_mod;
-pub mod graphblas;
 pub mod index;
+pub mod kernels;
 pub mod node;
 pub mod stats;
 pub mod txn;
@@ -466,7 +464,6 @@ pub struct Graph {
     pub(super) storage: Arc<Storage>,
     pub(super) _write_lock: Arc<ReentrantMutex<()>>,
     pub(super) csr_cache: Arc<CsrCache>,
-    pub(super) matrices: Arc<parking_lot::RwLock<Option<MatrixSet>>>,
     pub(super) prop_columns: Arc<crate::columns::ColumnsCache<crate::columns::NodeSource>>,
     pub(super) edge_columns: Arc<crate::columns::ColumnsCache<crate::columns::EdgeSource>>,
     /// Per-`(label, type)` edge frequencies backing the optimizer's per-source-label
@@ -491,13 +488,13 @@ pub struct Graph {
 /// A read-only transaction on the graph.
 pub struct ReadTxn<'a> {
     pub(super) graph: &'a Graph,
-    pub(super) rtxn: heed::RoTxn<'a, heed::WithTls>,
+    pub(super) rtxn: crate::storage::OwnedRoTxn<'a>,
 }
 
 /// A read-write transaction on the graph.
 pub struct WriteTxn<'a> {
     pub(super) graph: &'a Graph,
-    pub(super) wtxn: heed::RwTxn<'a>,
+    pub(super) wtxn: crate::storage::RwTxn<'a>,
     pub(super) mutations_count: usize,
     /// Structural mutations staged during this transaction, flushed to the
     /// `CsrCache` only on commit so an aborted transaction records nothing.
@@ -573,23 +570,18 @@ impl Graph {
         // never read it back; remove the stale artifact if one is present.
         let _ = std::fs::remove_file(path.join("csr_snapshot.bin"));
         let storage = Arc::new(storage);
-        // Opening builds nothing. The CSR snapshot and the GraphBLAS matrices
-        // are materialized by the freshness gates (`ensure_snapshot_fresh`,
-        // `ensure_matrix_view`, and `ensure_csr_fresh`) when a consumer that
-        // needs them first runs, and every such consumer already calls its gate.
-        // Building them here instead cost one full edge scan plus a full matrix
-        // materialization on every open, which is time a workload of point
-        // lookups, property reads, or point adjacency never uses: those paths
-        // read LMDB directly. On a large database that eager work dominates the
-        // whole session's latency (roughly 26 s to open a 1 M-node, 14 M-edge
-        // graph), and it is repaid on every reopen.
+        // Opening builds nothing. The CSR snapshot is built by the freshness gate
+        // (`ensure_snapshot_fresh`) when a consumer that needs it first runs, and
+        // every such consumer already calls that gate. Building it here instead cost
+        // a full edge scan on every open, which is time a workload of point lookups,
+        // property reads, or point adjacency never uses: those paths read LMDB
+        // directly. On a large database that eager work dominated the whole session's
+        // latency, and it was repaid on every reopen.
         let csr_cache = Arc::new(CsrCache::new_unbuilt());
-        let matrices = Arc::new(parking_lot::RwLock::new(None));
         Ok(Self {
             storage,
             _write_lock: Arc::new(ReentrantMutex::new(())),
             csr_cache,
-            matrices,
             prop_columns: Arc::new(crate::columns::ColumnsCache::default()),
             edge_columns: Arc::new(crate::columns::ColumnsCache::default()),
             edge_fanout: Arc::new(parking_lot::Mutex::new(None)),
@@ -599,31 +591,19 @@ impl Graph {
         })
     }
 
-    /// Set the thread count for GraphBLAS matrix computations, overriding the
+    /// Set the thread count for the parallel read passes, overriding the
     /// `ISSUNDB_NUM_THREADS` environment variable. Set to 0 to restore the default
     /// behavior, which resolves through `threads::resolve`: `ISSUNDB_NUM_THREADS`,
-    /// then `OMP_NUM_THREADS`, then the machine's parallelism. Every parallel
-    /// consumer (the GraphBLAS pool and the counting kernels) shares that
-    /// resolution, so this one knob has one meaning.
+    /// then `OMP_NUM_THREADS`, then the machine's parallelism.
+    ///
+    /// Every parallel consumer (the counting kernels and the analytics passes that
+    /// split over nodes or sources) shares that resolution, so this one knob has one
+    /// meaning. There is no pool to configure: each pass resolves the budget when it
+    /// starts and spawns scoped threads for its own duration, so a call here takes
+    /// effect on the next pass and never fails.
     pub fn set_thread_count(&self, n: i32) -> Result<(), Error> {
         self.n_threads
             .store(n, std::sync::atomic::Ordering::Release);
-        // `MatrixSet::materialize` reads this value and applies it when it builds
-        // the matrices, which is also the call that initializes the GraphBLAS
-        // context. Setting the live thread pool is therefore only possible once
-        // that has happened: before the first materialization GraphBLAS is not
-        // initialized and setting a global option fails. Since `open` no longer
-        // materializes eagerly, a caller that configures threads up front hits
-        // exactly that window, so the stored value carries the setting instead.
-        if self.matrices.read().is_some() {
-            // Resolve rather than forward `n`: zero means "restore the default",
-            // which this method documents, and only `threads::resolve` knows what
-            // that is. Resolving also clamps, so the live pool cannot diverge from
-            // what the next materialization would pick.
-            let resolved = crate::threads::resolve(n) as i32;
-            issundb_graphblas::set_global_threads(resolved)
-                .map_err(|e| Error::GraphBLAS(e.to_string()))?;
-        }
         Ok(())
     }
 
@@ -1033,25 +1013,16 @@ impl Graph {
                 // write is one atomic increment wide rather than the width of
                 // the batch. See `CsrCache::advance_write_gen`.
                 self.commit_and_publish(wtxn, mutations_count)?;
-                // Column bookkeeping next, then the structural delta.
+                // Column bookkeeping next. The CSR snapshot needs nothing here: the
+                // generation bump above is what tells a reader its snapshot lags, and
+                // the refresh rebuilds from storage rather than from a delta.
                 //
-                // Whichever of the two publishes runs second is blind for as long as
-                // the first takes, and neither ordering escapes that: the two share
-                // `added_nodes`, so one of them has to copy it rather than move it,
-                // and on a large batch that copy is the window. Ordering only picks
-                // which gate pays. The columns go first because `node_prop_json`
-                // documents that its result reflects committed state, which is a
-                // per-call promise; `ensure_matrix_view` gates on the delta alone
-                // (gating it on the generation would force a full rebuild after
-                // every write, since only a full rebuild advances `matrices_gen`)
-                // and makes no equivalent promise, and this is its pre-existing
-                // exposure rather than a new one.
-                //
-                // Closing it properly is the read-isolation question, not an
-                // ordering one: a reader that pinned one generation of every cache
-                // for the length of a statement would not care what order these two
-                // ran in. Until then the generation bump above, which happens first
-                // and is a single atomic, is what the gates that can see it use.
+                // The columns are still a window: for as long as this bookkeeping
+                // takes, a reader can see committed data through a column set that
+                // has not absorbed it. Closing that properly is the read-isolation
+                // question, not an ordering one. Until then the generation bump,
+                // which happens first and is a single atomic, is what the snapshot
+                // gate reads.
                 if delta.force_full {
                     self.prop_columns.record_force_full();
                 } else {
@@ -1062,13 +1033,12 @@ impl Graph {
                 // cascade to edges) reshuffles the dense edge mapping, so fall
                 // back to a full rebuild; otherwise patch the added and
                 // updated edges in.
-                if delta.force_full || !delta.removed_edges.is_empty() {
+                if delta.force_full || delta.removed_edge {
                     self.edge_columns.record_force_full();
                 } else {
                     self.edge_columns.record_touched_many(&delta.added_edge_ids);
                     self.edge_columns.record_touched_many(&delta.updated_edges);
                 }
-                self.csr_cache.record_batch(&delta);
                 if mutations_count > 0 {
                     self.maybe_spawn_rebuild_n(mutations_count);
                 }
@@ -1099,7 +1069,7 @@ impl Graph {
     /// deliberate: see [`crate::csr::CsrCache::advance_write_gen`].
     pub(super) fn commit_and_publish(
         &self,
-        wtxn: heed::RwTxn<'_>,
+        wtxn: crate::storage::RwTxn<'_>,
         count: usize,
     ) -> Result<(), Error> {
         wtxn.commit()?;
@@ -1122,76 +1092,22 @@ impl Graph {
     /// loads or when tests need a consistent read view before the threshold
     /// has been crossed.
     ///
-    /// Rebuilds a fresh snapshot plus the boolean adjacency matrices, which is what
-    /// expansion and all but two algorithms read. It deliberately does *not* build the
-    /// PageRank or weighted matrices. This is the call every
-    /// bulk load makes (`COPY ... FROM` and `IMPORT DATABASE` both end with it), and
-    /// because a rebuild never downgrades an installed tier, asking for weights here
-    /// would pin every process that ever loads data to the weighted matrices and the
-    /// extra `edges` scan for the rest of its life, whether or not anything asks a
-    /// weighted question. The two consumers that need more upgrade through their own
-    /// gate on first use. (Those two are `page_rank` and `shortest_path_dijkstra`.)
+    /// It deliberately does not *ask* for per-edge weights, though it keeps loading
+    /// them once something else has. This is the call every bulk load makes (`COPY
+    /// ... FROM` and `IMPORT DATABASE` both end with it), and because the request is
+    /// sticky, asking here would pin every process that ever loads data to the extra
+    /// `edges` scan for the rest of its life, whether or not anything asks a
+    /// weighted question. The one consumer that needs them
+    /// (`shortest_path_dijkstra`) asks through its own gate on first use.
     #[instrument(skip(self))]
     pub fn rebuild_csr(&self) -> Result<(), Error> {
-        // Serialize against every other maintenance path (incremental applies,
-        // snapshot-only refreshes, and the background rebuild) so no two run
-        // concurrently and an incremental drain cannot race this install.
+        // Serialize against every other maintenance path (a foreground refresh and
+        // the background rebuild) so no two run concurrently.
         let _maint = self.csr_cache.maintenance.lock();
-        self.rebuild_csr_locked(MatrixKinds::ADJACENCY)
-    }
-
-    /// Full CSR-snapshot and matrix rebuild from LMDB, materializing `tier`. The
-    /// caller must already hold `csr_cache.maintenance`; the public
-    /// [`Graph::rebuild_csr`] acquires it. Kept separate so the freshness gates,
-    /// which already hold the lock, do not deadlock on the non-reentrant mutex.
-    ///
-    /// The request is unioned with what the installed matrices already carry: a
-    /// rebuild triggered by one consumer must not strip a matrix another consumer
-    /// asked for, or a workload alternating the two would rebuild twice per write
-    /// instead of once.
-    pub(super) fn rebuild_csr_locked(&self, kinds: MatrixKinds) -> Result<(), Error> {
-        let kinds = self
-            .matrices
-            .read()
-            .as_ref()
-            .map(|m| m.kinds().union(kinds))
-            .unwrap_or(kinds);
-        // Capture the generation before reading LMDB so writes that land during
-        // the build leave the snapshot conservatively stale.
+        // Capture the generation before reading LMDB so writes that land during the
+        // build leave the snapshot conservatively stale.
         let built_gen = self.csr_cache.current_gen();
-        // Clear the delta before reading LMDB: writes that commit during the
-        // build land in the emptied delta and are re-applied incrementally later
-        // (idempotently) rather than lost.
-        self.csr_cache.clear_delta();
-        // From here on a failure has to put the drained delta's work back, or the caches
-        // report themselves current while neither advanced: `clear_delta` above already
-        // emptied the buffer that `ensure_matrix_view` gates on, so `mark_force_full` on
-        // each fallible step is the request for the rebuild this attempt did not finish.
-        // Only the weight matrix needs the per-edge weights, and they cost a second
-        // full scan of `edges`; the PageRank matrix is built from the row boundaries.
-        let mut snap = if kinds.needs_weights() {
-            CsrSnapshot::build_weighted(&self.storage)
-        } else {
-            CsrSnapshot::build(&self.storage)
-        }
-        .inspect_err(|_| self.csr_cache.mark_force_full())?;
-        let m = MatrixSet::materialize(
-            &snap,
-            kinds,
-            self.n_threads.load(std::sync::atomic::Ordering::Acquire),
-        )
-        .inspect_err(|_| self.csr_cache.mark_force_full())?;
-        // The weights have served their only purpose. `MatrixSet::materialize` is the
-        // sole reader, so keeping them on the installed snapshot would hold eight bytes
-        // per edge (111 MB on a 13.9 M-edge graph) for the life of that snapshot with
-        // nothing able to read it. A later weighted rebuild loads them again.
-        snap.edge_weight = None;
-        // Install the matrices and the snapshot together under the matrices write
-        // lock so a reader holding `matrices.read()` never observes a matrix from
-        // one generation paired with a snapshot from another (the snapshot store
-        // inside `install_full` cannot interleave with a held read guard).
-        let mut guard = self.matrices.write();
-        *guard = Some(m);
+        let snap = self.build_snapshot()?;
         self.csr_cache.install_full(snap, built_gen);
         Ok(())
     }
@@ -1205,11 +1121,7 @@ impl Graph {
     /// To restore, create an empty directory, copy the snapshot file to
     /// `<dir>/data.mdb`, then call `Graph::open(<dir>, map_size_gb)`.
     pub fn backup(&self, destination: &Path) -> Result<(), Error> {
-        self.storage
-            .env
-            .copy_to_path(destination, heed::CompactionOption::Disabled)
-            .map(|_| ())
-            .map_err(Error::Storage)
+        self.storage.copy_to_file(destination, false)
     }
 
     /// Same as `backup` but compacts the database during the copy.
@@ -1217,11 +1129,7 @@ impl Graph {
     /// The resulting file is smaller than a raw backup but the operation
     /// takes longer because it rewrites every live page.
     pub fn backup_compact(&self, destination: &Path) -> Result<(), Error> {
-        self.storage
-            .env
-            .copy_to_path(destination, heed::CompactionOption::Enabled)
-            .map(|_| ())
-            .map_err(Error::Storage)
+        self.storage.copy_to_file(destination, true)
     }
 
     /// Restore a backup snapshot created by `backup` or `backup_compact` into
@@ -1230,24 +1138,12 @@ impl Graph {
     /// Creates `dst_dir` if it does not exist, then copies `snapshot_file` into
     /// `dst_dir/data.mdb`. After this call succeeds the caller can open the
     /// restored database with `Graph::open(dst_dir, map_size_gb)`.
+    /// Delegates to the storage backend, which is what makes the pair symmetric: a
+    /// backend that cannot produce a snapshot (`backup`) must not claim to consume
+    /// one. Leaving the copy here meant the in-memory backend reported a successful
+    /// restore having restored nothing, while its `backup` correctly refused.
     pub fn restore(snapshot_file: &Path, dst_dir: &Path) -> Result<(), Error> {
-        let dst_file = dst_dir.join("data.mdb");
-        // Refuse a destination that already holds a database. The copy below
-        // truncates, so without this the call silently destroys whatever was there
-        // and still reports success, including the caller's own open database.
-        // The check lives here rather than in any one front end because every
-        // caller reaches the same `fs::copy`: the CLI, the Python binding's
-        // `restore`, and any library consumer of the facade.
-        if dst_file.exists() {
-            return Err(Error::InvalidArgument(format!(
-                "{} already contains a database (data.mdb); restore into a new or \
-                 empty directory rather than overwriting it",
-                dst_dir.display()
-            )));
-        }
-        std::fs::create_dir_all(dst_dir)?;
-        std::fs::copy(snapshot_file, &dst_file)?;
-        Ok(())
+        Storage::restore_from_file(snapshot_file, dst_dir)
     }
 }
 
@@ -1419,6 +1315,11 @@ mod encode_tests {
     }
 }
 
+// Persistence-dependent: these close a database and reopen the same path, or copy it
+// to a file. The in-memory backend starts empty on every `open` by design (see
+// `storage::memory`), so their premise does not hold there and the gate states that
+// rather than letting them fail as though the backend were broken.
+#[cfg(feature = "lmdb")]
 #[cfg(test)]
 mod restore_tests {
     use serde_json::json;
@@ -1566,6 +1467,11 @@ mod publish_tests {
     }
 }
 
+// Persistence-dependent: these close a database and reopen the same path, or copy it
+// to a file. The in-memory backend starts empty on every `open` by design (see
+// `storage::memory`), so their premise does not hold there and the gate states that
+// rather than letting them fail as though the backend were broken.
+#[cfg(feature = "lmdb")]
 #[cfg(test)]
 mod lazy_open_tests {
     use serde_json::json;
@@ -1574,8 +1480,8 @@ mod lazy_open_tests {
     use super::Graph;
     use crate::schema::NodeId;
 
-    /// Populate a graph, force the CSR and matrices to materialize, then close
-    /// it. Returns the directory so the caller can reopen the same path.
+    /// Populate a graph, force the CSR snapshot to build, then close it. Returns
+    /// the directory so the caller can reopen the same path.
     fn seeded_dir() -> (TempDir, Vec<NodeId>) {
         let dir = TempDir::new().unwrap();
         let ids = {
@@ -1591,26 +1497,25 @@ mod lazy_open_tests {
                     .unwrap();
             }
             g.add_edge(ids[0], ids[40], "LIKES", &json!({})).unwrap();
-            // Touch an algorithm so this handle definitely materialized both.
+            // Touch an algorithm so this handle definitely built the snapshot.
             g.bfs(ids[0], 2).unwrap();
-            assert!(g.matrices.read().is_some(), "seed handle must materialize");
+            assert!(
+                !g.csr_cache.snapshot_is_stale(),
+                "seed handle must build the snapshot"
+            );
             ids
         };
         (dir, ids)
     }
 
-    /// Opening an existing database does no CSR scan and no GraphBLAS
-    /// materialization. Both are the freshness gates' job, so a workload that
-    /// only reads properties or point adjacency never pays for them.
+    /// Opening an existing database does no CSR scan. That is the freshness gate's
+    /// job, so a workload that only reads properties or point adjacency never pays
+    /// for it.
     #[test]
-    fn open_defers_the_csr_and_matrix_build() {
+    fn open_defers_the_csr_build() {
         let (dir, _ids) = seeded_dir();
         let g = Graph::open(dir.path(), 1).unwrap();
 
-        assert!(
-            g.matrices.read().is_none(),
-            "open must not materialize the GraphBLAS matrices"
-        );
         assert_eq!(
             g.csr_cache.snapshot.load().dense_to_id.len(),
             0,
@@ -1640,18 +1545,14 @@ mod lazy_open_tests {
         // so this goes through `ensure_snapshot_fresh`.
         {
             let g = reopen();
-            let wide = g
-                .expand_spmv_graphblas(&ids, Some("FOLLOWS"), false)
-                .unwrap();
+            let wide = g.expand_bulk(&ids, Some("FOLLOWS"), false).unwrap();
             assert_eq!(wide.len(), 80, "every ring edge must expand");
         }
         // Typed expansion under the cutoff, which reads LMDB point adjacency
         // directly and needs no snapshot at all.
         {
             let g = reopen();
-            let narrow = g
-                .expand_spmv_graphblas(&ids[..4], Some("FOLLOWS"), false)
-                .unwrap();
+            let narrow = g.expand_bulk(&ids[..4], Some("FOLLOWS"), false).unwrap();
             assert_eq!(narrow.len(), 4);
         }
         // Matrix-view consumer. Traversal is untyped, so one hop from `ids[0]`
@@ -1674,7 +1575,6 @@ mod lazy_open_tests {
             let g = reopen();
             assert_eq!(g.page_rank(5, 0.85).unwrap().len(), 80);
         }
-        // Count kernel.
         {
             let g = reopen();
             let spec = crate::PathCountSpec {
@@ -1691,21 +1591,20 @@ mod lazy_open_tests {
         }
     }
 
-    /// The first gated consumer materializes the matrices, so the deferral is
-    /// a delay rather than a permanent absence.
+    /// The first gated consumer builds the snapshot, so the deferral is a delay
+    /// rather than a permanent absence.
     #[test]
-    fn first_algorithm_materializes_what_open_skipped() {
+    fn first_algorithm_builds_what_open_skipped() {
         let (dir, ids) = seeded_dir();
         let g = Graph::open(dir.path(), 1).unwrap();
-        assert!(g.matrices.read().is_none());
+        assert!(g.csr_cache.snapshot_is_stale());
 
         assert_eq!(g.bfs(ids[0], 1).unwrap().len(), 3);
 
         assert!(
-            g.matrices.read().is_some(),
-            "the matrix-view gate must materialize on first use"
+            !g.csr_cache.snapshot_is_stale(),
+            "the snapshot gate must build on first use"
         );
-        assert!(!g.csr_cache.snapshot_is_stale());
     }
 
     /// Reopening an empty database is also lazy, and every consumer reports
@@ -1717,7 +1616,6 @@ mod lazy_open_tests {
             Graph::open(dir.path(), 1).unwrap();
         }
         let g = Graph::open(dir.path(), 1).unwrap();
-        assert!(g.matrices.read().is_none());
         assert!(g.all_nodes().unwrap().is_empty());
         assert!(g.connected_components().unwrap().is_empty());
         assert!(g.page_rank(3, 0.85).unwrap().is_empty());

@@ -146,7 +146,6 @@ fn build_graphrag_graph() -> (TempDir, Graph) {
         })
         .unwrap();
 
-    // 3. Create full-text index on the Entity nodes
     graph.create_node_text_index("Entity", "body").unwrap();
     graph.rebuild_csr().unwrap();
 
@@ -290,7 +289,6 @@ fn bench_global_search_pagerank(c: &mut Criterion) {
 
     c.bench_function("graphrag_global_search_pagerank", |b| {
         b.iter(|| {
-            // 1. Identify global community anchors using PageRank
             let pr = graph.page_rank(10, 0.85).unwrap();
             let mut sorted_nodes: Vec<NodeId> = pr.keys().copied().collect();
             sorted_nodes.sort_by(|x, y| pr[y].total_cmp(&pr[x]).then_with(|| x.cmp(y)));
@@ -298,11 +296,9 @@ fn bench_global_search_pagerank(c: &mut Criterion) {
             // Take the top 5 central entities
             let anchors = &sorted_nodes[0..5];
 
-            // 2. Expand their 1-hop neighborhoods
-            let (node_list, _) = graph.bfs_multi_source_graphblas(anchors, 1, None).unwrap();
+            let (node_list, _) = graph.bfs_multi_source(anchors, 1, None).unwrap();
             let node_set: std::collections::HashSet<NodeId> = node_list.into_iter().collect();
 
-            // 3. Extract subgraph edges connecting those nodes
             let mut edges = Vec::new();
             for &nid in &node_set {
                 if let Ok(neighbors) = graph.out_neighbors(nid) {
@@ -314,7 +310,6 @@ fn bench_global_search_pagerank(c: &mut Criterion) {
                 }
             }
 
-            // 4. Construct subgraph scores using PageRank
             let mut scores = HashMap::new();
             for &nid in &node_set {
                 if let Some(&score) = pr.get(&nid) {
@@ -329,7 +324,6 @@ fn bench_global_search_pagerank(c: &mut Criterion) {
                 truncated: false,
             };
 
-            // 5. Serialize global context
             let context = serialize_subgraph(black_box(&graph), &sub);
             black_box(context);
         });

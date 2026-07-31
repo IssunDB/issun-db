@@ -329,15 +329,16 @@ impl<'a> WriteTxn<'a> {
     pub fn delete_node(&mut self, id: NodeId) -> Result<(), Error> {
         self.graph.delete_node_impl(&mut self.wtxn, id)?;
         self.mutations_count += 1;
-        // A node deletion reshuffles the sorted dense-index mapping, so the next
-        // refresh must rebuild fully rather than patch incrementally.
+        // A node deletion cascades to every incident edge, so the property columns
+        // rebuild rather than patch. The CSR snapshot needs no flag: it is rebuilt
+        // whole, and the committed-write generation is what marks it stale.
         self.delta.force_full = true;
         Ok(())
     }
 
     pub fn delete_edge(&mut self, id: EdgeId) -> Result<(), Error> {
-        if let Some((src, dst)) = self.graph.delete_edge_impl(&mut self.wtxn, id)? {
-            self.delta.removed_edges.push((src, dst));
+        if self.graph.delete_edge_impl(&mut self.wtxn, id)?.is_some() {
+            self.delta.removed_edge = true;
         }
         self.mutations_count += 1;
         Ok(())
@@ -354,7 +355,6 @@ impl<'a> WriteTxn<'a> {
             .graph
             .add_edge_impl(&mut self.wtxn, src, dst, etype, props)?;
         self.mutations_count += 1;
-        self.delta.added_edges.push((src, dst));
         self.delta.added_edge_ids.push(edge_id);
         Ok(edge_id)
     }
@@ -405,13 +405,13 @@ impl<'a> WriteTxn<'a> {
 
     #[doc(hidden)]
     pub fn has_node_text_index(&self, label: &str, property: &str) -> Result<bool, Error> {
-        let rtxn: &heed::RoTxn = &self.wtxn;
+        let rtxn: &crate::storage::RoTxn = &self.wtxn;
         self.graph.has_node_text_index_impl(rtxn, label, property)
     }
 
     #[doc(hidden)]
     pub fn fts_stats(&self, label: &str, property: &str) -> Result<Option<(u64, u64)>, Error> {
-        let rtxn: &heed::RoTxn = &self.wtxn;
+        let rtxn: &crate::storage::RoTxn = &self.wtxn;
         self.graph.fts_stats_impl(rtxn, label, property)
     }
 
@@ -422,7 +422,7 @@ impl<'a> WriteTxn<'a> {
         property: &str,
         node_id: NodeId,
     ) -> Result<Option<u32>, Error> {
-        let rtxn: &heed::RoTxn = &self.wtxn;
+        let rtxn: &crate::storage::RoTxn = &self.wtxn;
         self.graph.fts_doc_len_impl(rtxn, label, property, node_id)
     }
 
@@ -433,7 +433,7 @@ impl<'a> WriteTxn<'a> {
         property: &str,
         term: &str,
     ) -> Result<Vec<(NodeId, u32)>, Error> {
-        let rtxn: &heed::RoTxn = &self.wtxn;
+        let rtxn: &crate::storage::RoTxn = &self.wtxn;
         self.graph.fts_postings_impl(rtxn, label, property, term)
     }
 
@@ -452,7 +452,7 @@ impl<'a> WriteTxn<'a> {
 
     #[doc(hidden)]
     pub fn active_text_indexes(&self) -> Result<Vec<(String, String, Language)>, Error> {
-        let rtxn: &heed::RoTxn = &self.wtxn;
+        let rtxn: &crate::storage::RoTxn = &self.wtxn;
         self.graph.active_text_indexes_impl(rtxn)
     }
 }
@@ -613,23 +613,23 @@ mod tests {
         .unwrap();
     }
 
-    // --- bfs_multi_source_graphblas ---
+    // --- bfs_multi_source ---
     //
-    // Each test calls `rebuild_csr()` after mutating the graph so the GraphBLAS
-    // adjacency matrix reflects the inserted edges before BFS is invoked.
+    // Each test calls `rebuild_csr()` after mutating the graph so the
+    // CSR snapshot reflects the inserted edges before BFS is invoked.
 
     #[test]
-    fn graphblas_multi_source_empty_seeds_returns_empty() {
+    fn multi_source_empty_seeds_returns_empty() {
         let (_dir, g) = open_tmp();
         g.add_node("N", &json!({})).unwrap();
         g.rebuild_csr().unwrap();
-        let (result, truncated) = g.bfs_multi_source_graphblas(&[], 2, None).unwrap();
+        let (result, truncated) = g.bfs_multi_source(&[], 2, None).unwrap();
         assert!(result.is_empty());
         assert!(!truncated);
     }
 
     #[test]
-    fn graphblas_multi_source_hops_zero_returns_only_seeds() {
+    fn multi_source_hops_zero_returns_only_seeds() {
         let (_dir, g) = open_tmp();
         let a = g.add_node("N", &json!({})).unwrap();
         let b = g.add_node("N", &json!({})).unwrap();
@@ -637,14 +637,14 @@ mod tests {
         g.add_edge(a, c, "E", &json!({})).unwrap();
         g.rebuild_csr().unwrap();
 
-        let (mut result, _) = g.bfs_multi_source_graphblas(&[a, b], 0, None).unwrap();
+        let (mut result, _) = g.bfs_multi_source(&[a, b], 0, None).unwrap();
         result.sort_unstable();
         assert_eq!(result, vec![a, b]);
         assert!(!result.contains(&c));
     }
 
     #[test]
-    fn graphblas_multi_source_expands_to_correct_depth() {
+    fn multi_source_expands_to_correct_depth() {
         let (_dir, g) = open_tmp();
         // Chain: a → b → c → d
         let a = g.add_node("N", &json!({})).unwrap();
@@ -656,13 +656,13 @@ mod tests {
         g.add_edge(c, d, "E", &json!({})).unwrap();
         g.rebuild_csr().unwrap();
 
-        let (r1, _) = g.bfs_multi_source_graphblas(&[a], 1, None).unwrap();
+        let (r1, _) = g.bfs_multi_source(&[a], 1, None).unwrap();
         assert!(r1.contains(&a));
         assert!(r1.contains(&b));
         assert!(!r1.contains(&c));
         assert!(!r1.contains(&d));
 
-        let (r2, _) = g.bfs_multi_source_graphblas(&[a], 2, None).unwrap();
+        let (r2, _) = g.bfs_multi_source(&[a], 2, None).unwrap();
         assert!(r2.contains(&a));
         assert!(r2.contains(&b));
         assert!(r2.contains(&c));
@@ -670,7 +670,7 @@ mod tests {
     }
 
     #[test]
-    fn graphblas_multi_source_max_nodes_cap_respected() {
+    fn multi_source_max_nodes_cap_respected() {
         let (_dir, g) = open_tmp();
         // Star + tail: a → b, c, d; b → e
         let a = g.add_node("N", &json!({})).unwrap();
@@ -684,7 +684,7 @@ mod tests {
         g.add_edge(b, e, "E", &json!({})).unwrap();
         g.rebuild_csr().unwrap();
 
-        let (result, truncated) = g.bfs_multi_source_graphblas(&[a], 2, Some(3)).unwrap();
+        let (result, truncated) = g.bfs_multi_source(&[a], 2, Some(3)).unwrap();
         assert!(
             result.len() <= 3,
             "expected at most 3 nodes, got {}",
@@ -694,7 +694,7 @@ mod tests {
     }
 
     #[test]
-    fn graphblas_multi_source_cap_covering_all_reachable_is_not_truncated() {
+    fn multi_source_cap_covering_all_reachable_is_not_truncated() {
         let (_dir, g) = open_tmp();
         // Chain: a → b; exactly two reachable nodes at hops=1.
         let a = g.add_node("N", &json!({})).unwrap();
@@ -702,7 +702,7 @@ mod tests {
         g.add_edge(a, b, "E", &json!({})).unwrap();
         g.rebuild_csr().unwrap();
 
-        let (result, truncated) = g.bfs_multi_source_graphblas(&[a], 2, Some(2)).unwrap();
+        let (result, truncated) = g.bfs_multi_source(&[a], 2, Some(2)).unwrap();
         assert_eq!(result.len(), 2);
         assert!(
             !truncated,
@@ -711,18 +711,18 @@ mod tests {
     }
 
     #[test]
-    fn graphblas_multi_source_seed_cap_reports_truncation() {
+    fn multi_source_seed_cap_reports_truncation() {
         let (_dir, g) = open_tmp();
         let a = g.add_node("N", &json!({})).unwrap();
         let b = g.add_node("N", &json!({})).unwrap();
         g.rebuild_csr().unwrap();
 
-        let (result, truncated) = g.bfs_multi_source_graphblas(&[a, b], 0, Some(1)).unwrap();
+        let (result, truncated) = g.bfs_multi_source(&[a, b], 0, Some(1)).unwrap();
         assert_eq!(result.len(), 1);
         assert!(truncated, "the cap dropped seed b");
 
         // A duplicate seed within the cap is not truncation.
-        let (result, truncated) = g.bfs_multi_source_graphblas(&[a, a], 0, Some(1)).unwrap();
+        let (result, truncated) = g.bfs_multi_source(&[a, a], 0, Some(1)).unwrap();
         assert_eq!(result, vec![a]);
         assert!(
             !truncated,
@@ -731,7 +731,7 @@ mod tests {
     }
 
     #[test]
-    fn graphblas_multi_source_two_seeds_union_disconnected_components() {
+    fn multi_source_two_seeds_union_disconnected_components() {
         let (_dir, g) = open_tmp();
         // Two disconnected chains: a → b; c → d
         let a = g.add_node("N", &json!({})).unwrap();
@@ -742,7 +742,7 @@ mod tests {
         g.add_edge(c, d, "E", &json!({})).unwrap();
         g.rebuild_csr().unwrap();
 
-        let (result, _) = g.bfs_multi_source_graphblas(&[a, c], 1, None).unwrap();
+        let (result, _) = g.bfs_multi_source(&[a, c], 1, None).unwrap();
         assert!(result.contains(&a));
         assert!(result.contains(&b));
         assert!(result.contains(&c));
@@ -750,7 +750,7 @@ mod tests {
     }
 
     #[test]
-    fn graphblas_multi_source_deduplicates_shared_neighbors() {
+    fn multi_source_deduplicates_shared_neighbors() {
         let (_dir, g) = open_tmp();
         // a → c; b → c; c must appear once.
         let a = g.add_node("N", &json!({})).unwrap();
@@ -760,29 +760,30 @@ mod tests {
         g.add_edge(b, c, "E", &json!({})).unwrap();
         g.rebuild_csr().unwrap();
 
-        let (result, _) = g.bfs_multi_source_graphblas(&[a, b], 1, None).unwrap();
+        let (result, _) = g.bfs_multi_source(&[a, b], 1, None).unwrap();
         let count_c = result.iter().filter(|&&n| n == c).count();
         assert_eq!(count_c, 1);
         assert_eq!(result.len(), 3); // a, b, c
     }
 
     #[test]
-    fn graphblas_multi_source_handles_newly_added_seeds_via_dynamic_materialization() {
+    fn multi_source_handles_newly_added_seeds_via_dynamic_materialization() {
         let (_dir, g) = open_tmp();
-        // Seed a is in the CSR; b is added after rebuild_csr (making snapshot/matrices stale).
-        // The function must detect the new nodes, dynamically rebuild the CSR/matrices, and run successfully.
+        // Seed a is in the CSR; b is added after rebuild_csr, making the snapshot
+        // stale. The gate must notice and refresh before the search runs.
         let a = g.add_node("N", &json!({})).unwrap();
         let c = g.add_node("N", &json!({})).unwrap();
         g.add_edge(a, c, "E", &json!({})).unwrap();
         g.rebuild_csr().unwrap();
 
-        // b is inserted AFTER rebuild, so it makes the existing MatrixSet stale.
+        // b is inserted AFTER rebuild, so it makes the installed snapshot stale.
         let b = g.add_node("N", &json!({})).unwrap();
         let d = g.add_node("N", &json!({})).unwrap();
         g.add_edge(b, d, "E", &json!({})).unwrap();
 
-        // Both seeds must appear in the result; d must be reachable from b via the dynamically rematerialized matrices.
-        let (result, _) = g.bfs_multi_source_graphblas(&[a, b], 1, None).unwrap();
+        // Both seeds must appear in the result; d must be reachable from b through
+        // the refreshed snapshot.
+        let (result, _) = g.bfs_multi_source(&[a, b], 1, None).unwrap();
         assert!(result.contains(&a), "seed a must be present");
         assert!(result.contains(&b), "seed b must be present");
         assert!(result.contains(&c), "c reachable from a");
@@ -878,11 +879,9 @@ mod tests {
         let b = g.add_node("Person", &json!({})).unwrap();
         let eid = g.add_edge(a, b, "KNOWS", &json!({})).unwrap();
 
-        // 1. Verify exists
         assert!(g.get_edge(eid).unwrap().is_some());
         assert_eq!(g.edge_count_by_type("KNOWS").unwrap(), 1);
 
-        // 2. Verify adjacency lists
         let out_neighs = g.out_neighbors(a).unwrap();
         assert_eq!(out_neighs.len(), 1);
         assert_eq!(out_neighs[0].node, b);
@@ -893,18 +892,14 @@ mod tests {
         assert_eq!(in_neighs[0].node, a);
         assert_eq!(in_neighs[0].edge, eid);
 
-        // 3. Delete the edge
         g.delete_edge(eid).unwrap();
 
-        // 4. Verify gone
         assert!(g.get_edge(eid).unwrap().is_none());
         assert_eq!(g.edge_count_by_type("KNOWS").unwrap(), 0);
 
-        // 5. Verify adjacency lists updated
         assert_eq!(g.out_neighbors(a).unwrap().len(), 0);
         assert_eq!(g.in_neighbors(b).unwrap().len(), 0);
 
-        // 6. Idempotence: delete non-existent edge
         g.delete_edge(eid).unwrap();
         assert_eq!(g.edge_count_by_type("KNOWS").unwrap(), 0);
     }
@@ -913,7 +908,6 @@ mod tests {
     fn test_node_property_secondary_index_and_scans() {
         let (_dir, g) = open_tmp();
 
-        // Add nodes
         let n1 = g
             .add_node("Person", &json!({"name": "Alice", "age": 30}))
             .unwrap();
@@ -927,10 +921,8 @@ mod tests {
             .add_node("Employee", &json!({"name": "Alice", "age": 40}))
             .unwrap();
 
-        // Create index on Person(age)
         g.create_node_property_index("Person", "age").unwrap();
 
-        // Check index exists
         assert!(g.has_node_property_index("Person", "age").unwrap());
 
         // Point queries
@@ -974,10 +966,8 @@ mod tests {
     fn test_unique_property_constraint() {
         let (_dir, g) = open_tmp();
 
-        // Create unique constraint on User(email)
         g.create_node_unique_constraint("User", "email").unwrap();
 
-        // Add first user
         let _u1 = g
             .add_node(
                 "User",
@@ -985,7 +975,6 @@ mod tests {
             )
             .unwrap();
 
-        // Add second user with duplicate email - should fail
         let res2 = g.add_node(
             "User",
             &json!({"email": "user1@example.com", "name": "User 2"}),
@@ -996,7 +985,6 @@ mod tests {
             Error::UniqueConstraintViolation { .. }
         ));
 
-        // Add second user with unique email - should succeed
         let u2 = g
             .add_node(
                 "User",
@@ -1004,7 +992,6 @@ mod tests {
             )
             .unwrap();
 
-        // Update u2 to have u1's email - should fail
         let update_res =
             g.update_node(u2, &json!({"email": "user1@example.com", "name": "User 2"}));
         assert!(update_res.is_err());
@@ -1018,15 +1005,12 @@ mod tests {
     fn test_required_property_constraint() {
         let (_dir, g) = open_tmp();
 
-        // Create required constraint on Task(title)
         g.create_node_required_constraint("Task", "title").unwrap();
 
-        // Add task with title - should succeed
         let t1 = g
             .add_node("Task", &json!({"title": "Do homework", "done": false}))
             .unwrap();
 
-        // Add task without title - should fail
         let res2 = g.add_node("Task", &json!({"done": false}));
         assert!(res2.is_err());
         assert!(matches!(
@@ -1034,7 +1018,6 @@ mod tests {
             Error::RequiredConstraintViolation { .. }
         ));
 
-        // Update t1 to remove title - should fail
         let update_res = g.update_node(t1, &json!({"done": true}));
         assert!(update_res.is_err());
         assert!(matches!(
@@ -1047,13 +1030,11 @@ mod tests {
     fn test_index_cleanup_on_delete() {
         let (_dir, g) = open_tmp();
 
-        // Create unique index on Account(number)
         g.create_node_unique_constraint("Account", "number")
             .unwrap();
 
         let a1 = g.add_node("Account", &json!({"number": "12345"})).unwrap();
 
-        // Delete a1
         g.delete_node(a1).unwrap();
 
         // Now we should be able to reuse the account number because index was cleaned up!
@@ -1061,13 +1042,14 @@ mod tests {
         assert!(a2.is_ok());
     }
 
+    // Persistence-dependent; see the note on `storage::memory`.
+    #[cfg(feature = "lmdb")]
     #[test]
     fn backup_and_restore_roundtrip() {
         let dir = TempDir::new().unwrap();
         let backup_file = dir.path().join("snapshot.mdb");
         let restore_dir = dir.path().join("restored");
 
-        // Write data.
         let n;
         {
             let g = Graph::open(&dir.path().join("primary"), 1).unwrap();
@@ -1088,13 +1070,14 @@ mod tests {
         assert_eq!(props["x"], serde_json::json!(42));
     }
 
+    // Persistence-dependent; see the note on `storage::memory`.
+    #[cfg(feature = "lmdb")]
     #[test]
     fn backup_compact_and_restore_roundtrip() {
         let dir = TempDir::new().unwrap();
         let backup_file = dir.path().join("compact.mdb");
         let restore_dir = dir.path().join("restored");
 
-        // Write data, delete some of it, then take a compacted snapshot.
         let kept;
         {
             let g = Graph::open(&dir.path().join("primary"), 1).unwrap();

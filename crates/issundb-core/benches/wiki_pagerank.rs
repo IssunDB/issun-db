@@ -123,7 +123,6 @@ fn load_snap(data_dir: &str) -> BenchState {
         pairs.push((fr, to));
     }
 
-    // Insert one node per unique article ID, then insert edges.
     let mut id_map: HashMap<i64, u64> = HashMap::new();
     let mut written = 0;
     while written < pairs.len() {

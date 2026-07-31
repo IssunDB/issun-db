@@ -614,7 +614,7 @@ enum ReplCommand {
     #[command(name = ":version")]
     Version,
 
-    /// Set the thread count for GraphBLAS matrix computations (e.g., `:threads 4`)
+    /// Set the thread count for the parallel read passes (e.g., `:threads 4`)
     #[command(name = ":threads")]
     Threads {
         /// Number of threads (0 to restore default behavior)
@@ -638,7 +638,7 @@ const HELP_TEXT: &str = r#"
 Database Control
   :open <path> [map_size_gb]           Open or reopen a database at the given path (e.g., :open ./issundb-data 2)
   :close                               Close the open database without exiting the CLI
-  :threads <count>                     Set the thread count for GraphBLAS computations (e.g., :threads 4)
+  :threads <count>                     Set the thread count for parallel read passes (e.g., :threads 4)
 
 Scripting and Parameters
   :run <file>                          Execute a script file (multi-line Cypher statements end with ;), stopping at the first failing command (e.g., :run ./setup.txt)
@@ -886,7 +886,6 @@ fn main() {
     };
     rl.set_helper(Some(ReplHelper::new()));
 
-    // Load persistent history.
     if let Some(ref hp) = history_path() {
         let _ = rl.load_history(hp);
     }
@@ -1131,7 +1130,6 @@ fn handle(state: &mut State, line: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
-    // Check if the command requires an open database.
     let needs_db = !matches!(
         cmd,
         ReplCommand::Open { .. }
@@ -2271,7 +2269,6 @@ fn format_query_result(qr: &issundb::QueryResult, color: bool) -> String {
         return out;
     }
 
-    // Header.
     let header = qr.columns.join("\t");
     let divider = "-".repeat(header.len().max(40));
     if color {
@@ -3776,21 +3773,16 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let mut state = State::new(None, None, 1, true, false);
 
-        // 1. Open database via REPL command
         let open_cmd = format!(":open {}", temp.path().display());
         assert!(handle(&mut state, &open_cmd));
         assert!(state.graph.is_some());
 
-        // 2. Add node via REPL command
         assert!(handle(&mut state, "add-node Person {\"name\": \"Alice\"}"));
 
-        // 3. Query node
         assert!(handle(&mut state, "MATCH (n:Person) RETURN n.name"));
 
-        // 4. Algorithm command
         assert!(handle(&mut state, "pagerank"));
 
-        // 4a. Export and Import database via Cypher queries
         let export_path = temp.path().join("cli_export");
         let export_cmd = format!(
             "EXPORT DATABASE '{}' WITH {{format: 'parquet'}}",
@@ -3804,17 +3796,14 @@ mod tests {
         let import_cmd = format!("IMPORT DATABASE '{}'", export_path.display());
         assert!(handle(&mut state, &import_cmd));
 
-        // 4b. Configure vector index
         assert!(handle(&mut state, "configure-vec l2 float16"));
 
-        // 4c. Create FTS index with custom language, then list it
         assert!(handle(
             &mut state,
             "text-index create Person name --lang german"
         ));
         assert!(handle(&mut state, "text-index list"));
 
-        // 4d. Multi-label node creation via colon-separated labels.
         assert!(handle(
             &mut state,
             "add-node Person:Admin {\"name\": \"Bob\"}"
@@ -3822,7 +3811,6 @@ mod tests {
         // Both labels must be queryable.
         assert!(handle(&mut state, "MATCH (n:Admin) RETURN n.name"));
 
-        // 4e. Vector upsert, then filtered nearest-neighbor search.
         assert!(handle(&mut state, "upsert-vec 1 0.1 0.2 0.3"));
         assert!(handle(&mut state, "vsearch 5 0.1 0.2 0.3 --label Person"));
         assert!(handle(
@@ -3830,13 +3818,11 @@ mod tests {
             "vsearch 5 0.1 0.2 0.3 --props {\"name\":\"Alice\"}"
         ));
 
-        // 4f. Hybrid retrieval with text seeds.
         assert!(handle(
             &mut state,
             "retrieve 5 2 0.1 0.2 0.3 --text Bob --text-label Person --text-prop name"
         ));
 
-        // 4g. Backup then restore into a fresh directory.
         let snap = temp.path().join("snap.db");
         assert!(handle(&mut state, &format!(":backup {}", snap.display())));
         let restored = temp.path().join("restored");
@@ -3853,7 +3839,6 @@ mod tests {
         assert!(state.graph.is_none());
         assert!(handle(&mut state, ":close"));
 
-        // 5. Quit command should return false
         assert!(!handle(&mut state, "quit"));
     }
 

@@ -34,7 +34,6 @@ fn main() {
         panic!("expected exactly 5 Person nodes");
     };
 
-    // One Company node.
     let company_id = g
         .add_node(
             "Company",

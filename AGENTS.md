@@ -23,7 +23,7 @@ Priorities, in order:
 - Keep all mutable state inside `Graph` and `Storage`; do not introduce module-level `static mut` or `lazy_static` globals for runtime state.
 - Writes are serialized via the `parking_lot::ReentrantMutex<()>` write lock on `Graph`; LMDB enforces the same constraint at the storage level. Do
   not bypass either.
-- Add comments only when they clarify a non-obvious storage invariant, an LMDB lifetime constraint, or a GraphBLAS semiring choice.
+- Add comments only when they clarify a non-obvious storage invariant, an LMDB lifetime constraint, or an algorithm kernel's ordering or duplicate-handling rule.
 - Maintain the permissive license boundary of the workspace (MIT or Apache-2.0). Do not add dependencies or statically link libraries with copyleft,
   weak copyleft, or source-available licenses (such as GPL, MPL, or SSPL). Keep comparison or benchmarking harnesses that link to such external
   engines excluded from the root Cargo workspace.
@@ -43,14 +43,15 @@ Quick examples:
 - Do not use em dashes. Restructure the sentence, or use a colon or semicolon instead.
 - Avoid colorful adjectives and adverbs. Write "adjacency query" not "blazing adjacency query".
 - Prefer noun phrases for checklist items over imperative verbs. Write "temp directory teardown" not "tear down the temp directory".
-- Headings in Markdown files must be in title case: "Build from Source" not "Build from source". Minor words (a, an, the, and, but, or, for, in, on,
-  at, to, by, of) stay lowercase unless they are the first word.
+- Headings in Markdown files must be in title case: "Build from Source" not "Build from source". Minor words stay lowercase unless they are the first
+  word: the articles (a, an, the), the coordinating conjunctions (and, but, or, nor, so, yet, for), and the short prepositions (in, on, at, to, by, of,
+  up, as, from, with, into, over). The example above is why the prepositions are named: "from" has to be lowercase for "Build from Source" to be
+  correct, and an earlier version of this rule listed only through "of", which made its own example a violation.
 - Do not bold the lead-in of a list item. Write "Vector and set similarity: ..." not "**Vector and set similarity**: ...".
 - Use sentence case for the lead-in of a list item. Write "Seed selection: ..." not "Seed Selection: ...". Proper nouns keep their capitals.
 - Capitalize only the first part of a hyphenated compound: "Full-text Search" in a heading, "Breadth-first" at the start of a sentence, and
   "breadth-first search" elsewhere. Never write "Breadth-First".
-- Start each sentence with a capital letter, capitalize proper nouns (Rust, Cypher, LMDB, GraphBLAS), and leave common nouns lowercase in the middle
-  of a sentence.
+- Start each sentence with a capital letter, capitalize proper nouns (Rust, Cypher, LMDB), and leave common nouns lowercase in the middle of a sentence.
 - Write correct and complete sentences.
 - Avoid made-up words.
 - Do not use a colon in place of a verb. Three uses are fine: joining two clauses inside a complete sentence (the replacement the em-dash rule above
@@ -89,17 +90,23 @@ modules according to this map.
     - `src/graph/fts_mod.rs`: full-text search index lifecycle and FTS storage primitives.
     - `src/graph/vector.rs`: vector byte storage helpers.
     - `src/graph/algo.rs`: public algorithm dispatch methods and internal traversal helpers.
-    - `src/graph/graphblas/`: GraphBLAS algorithm implementations split by family: `traversal.rs`, `analytics.rs`, `paths.rs`, and `flow.rs`.
+    - `src/graph/kernels/`: graph algorithm implementations over the CSR snapshot, split by family: `traversal.rs`, `analytics.rs`, `paths.rs`, and
+      `flow.rs`. Almost every kernel reads the snapshot and nothing else, so one gate (`Graph::with_snapshot`) covers them; a kernel needing a per-edge
+      property the snapshot does not carry reads that property from storage per call. `label_propagation` is the one exception, walking
+      `all_neighbors` per node per iteration instead, which is why it needs no gate and is far more expensive than its siblings. Where a result's sequence is observable the kernel fixes it deliberately:
+      a traversal reports reached nodes in ascending dense (so ascending node id) order, each frontier is sorted, and Brandes accumulates over sources
+      and predecessors in that order, so a betweenness total is reproducible rather than merely close. No depth-first kernel recurses over graph structure,
+      because a stack overflow aborts the process instead of returning an error; `dfs` is the sole exception, bounded by its `u8` hop count.
     - `src/graph/txn.rs`: `ReadTxn` and `WriteTxn` delegation impls and transaction tests.
     - `src/csr.rs`: in-memory CSR snapshot (outgoing arrays plus a transposed incoming view with per-edge type and edge ids), rebuilt in the
-      background and swapped via `arc-swap`. Also owns the `GraphDelta` buffer captured on the write path and the `write_gen`/`snapshot_gen`
-      generation counters that drive incremental matrix maintenance and on-demand CSR refresh. The adjacency is read from `out_adj`, whose 20-byte
+      background and swapped via `arc-swap`. Also owns the `GraphDelta` buffer captured on the write path (whose only consumers are the property
+      column caches) and the `write_gen`/`snapshot_gen` generation counters that drive on-demand CSR refresh. The adjacency is read from `out_adj`, whose 20-byte
       `AdjEntry` carries every field the arrays hold, already grouped by source in ascending key order, so the build decodes no `EdgeRecord` and copies
       no property blob. Entries go straight into the flat arrays, counting each row as it goes: a per-node `Vec` staged first, as this once did, cost
       one allocation per node and left 3.3 GB resident for 620 MB of live arrays on a 1 M-node, 13.9 M-edge graph, because a million freed small chunks
       are holes the allocator cannot return. Because `DUPSORT` orders duplicates by their raw little-endian bytes, each row is then reordered by
       ascending edge id, which is the order every consumer has always seen and which `load_weights` binary-searches. The per-entry `edge_weight` is
-      `Option`, built only by `build_weighted`, since a weight lives in the edge's property blob and only Dijkstra's matrix reads one.
+      `Option`, built only by `build_weighted`, since a weight lives in the edge's property blob and only Dijkstra reads one.
     - `src/columns.rs`: in-memory property columns for the read path. One typed column (`Int`, `Float`, `Bool`, dictionary-encoded `Str`, or the
       exact-semantics `Json` fallback) per node property, built lazily from one full node scan and kept fresh by a post-commit delta (node deletion
       forces a rebuild). Read through `Graph::node_prop_json`. Also owns the lazily computed per-property statistics (`PropStats`: bounds, an
@@ -108,27 +115,16 @@ modules according to this map.
       from storage (`should_serve_directly`), and the advisory statistics never do (`with_existing_mut` rather than `with_fresh`).
     - `src/histogram.rs`: equi-depth histogram over property values with equality and range selectivity estimates; backs `PropStats`. Nothing here is
       persisted.
-    - `src/matrices.rs`: GraphBLAS matrix materialization from the CSR snapshot, plus `MatrixSet::apply_delta` for incremental in-place maintenance
-      (resize plus per-element set and drop) and the self-contained `dense_to_id`/`id_to_dense` mapping the matrix-view consumers read. `MatrixKinds`
-      is which optional matrices a consumer needs, as a *set* rather than an ordering: `ADJACENCY` (the empty set) is the two boolean matrices,
-      `PAGE_RANK` adds `page_rank_matrix` (derived from the CSR row boundaries, so an unweighted snapshot serves it), and `WEIGHTED` adds `weight_matrix`,
-      the only thing that needs the per-edge weights and so the second `edges` scan that loads them. The two are independent, with exactly one consumer
-      each (`page_rank` and `shortest_path_dijkstra`), which is why neither implies the other: any ordering between them makes asking for one build both,
-      which cost PageRank a scan it does not need and Dijkstra a 167 MB matrix it never reads. Requests combine with `union` and a requirement is a
-      `contains` test. So `page_rank_matrix` and `weight_matrix` are `Option`, the set is stored on the `MatrixSet` rather than inferred from which of
-      them is present, a weighted rebuild releases `snap.edge_weight` once the matrix is built (the matrix is its only reader),
-      and every matrix is built over the same coordinates, so the two index arrays are built once and passed to each build with their roles
-      swapped for a transpose, one value array at a time (`Matrix::from_arrays`); staging four triple buffers and two coordinate hash maps instead, as
-      this once did, cost 2.7 GB above the finished matrices. Duplicate handling belongs to the build's reducer (`First` for the boolean union, `Plus`
-      for the PageRank transition probabilities of parallel edges, and `Min` for the weight matrix, which models the cheapest connection), not to a
-      deduplicating map.
     - `src/threads.rs`: the one resolution of the thread budget every parallel consumer shares (`threads::resolve`). Precedence is the programmatic
       override from `set_thread_count`, then `ISSUNDB_NUM_THREADS`, then `OMP_NUM_THREADS`, then the machine's parallelism, clamped to `MAX_THREADS`.
-      Both the GraphBLAS pool (`MatrixSet::materialize`) and the counting kernels' scoped threads (`Graph::kernel_threads`) resolve through it, so the one
-      knob has one meaning; resolving it in two places previously made an unset configuration mean one thread for the matrices and the whole machine for a
-      kernel pass, letting the two pools oversubscribe each other. `OMP_NUM_THREADS` is honored because the GraphBLAS pool is an OpenMP pool and capping
-      it is how this repository's own `test` and `coverage` targets keep the pools in check.
-    - `src/error.rs`: `Error` enum; all storage and serialization errors unify here.
+      Both the counting kernels' scoped threads and the analytics passes that split over nodes or sources resolve through it (`Graph::kernel_threads`),
+      so the one knob has one meaning and two overlapping passes cannot each claim the whole machine. `OMP_NUM_THREADS` is honored because setting it is
+      how a caller caps parallelism process-wide, including this repository's own `test` and `coverage` targets.
+    - `src/storage/memory.rs`: the in-memory storage backend, second implementor of the contract in `storage/mod.rs`. Byte-ordered `BTreeMap` tables with
+      `BTreeSet` duplicate values, copy-on-write transactions over `ArcSwap`, and a single writer lock. It is what a target with no libc compiles, and it is
+      what holds the storage seam to something: the whole suite runs against it (893 tests across core, vector, text, retrieval, and cypher).
+    - `src/error.rs`: `Error` enum; all storage and serialization errors unify here. `Error::Storage` carries `storage::StorageError`, which is the selected
+      backend's error type, so the variant is `heed::Error` on a default build and unchanged from before the backend split.
 - `crates/issundb-cypher/`: Cypher parser, AST, logical planner, physical planner, optimizer, and executor.
     - `src/parser.rs`: Cypher parser built with the `chumsky` parser-combinator library (with a Pratt parser for operator-precedence expressions),
       covering MATCH (including inline relationship property maps and multi-label node patterns such as `(n:A:B)`), WHERE, RETURN, CREATE, SET
@@ -173,15 +169,14 @@ modules according to this map.
       node property lookups are already served by the always-on auto-index; a relationship `CREATE INDEX` provisions the property index.
     - `src/exec/copy.rs`: bulk data administration execution (`COPY ... FROM`, `EXPORT DATABASE`, and `IMPORT DATABASE`).
     - `src/exec/row.rs`: the positional row representation (`SlotRow` and `SlotSchema`) the row pipeline binds variables through.
-- `crates/issundb-graphblas-sys/`: raw FFI bindings to the Apache-2.0 SuiteSparse:GraphBLAS C library, vendored as the `external/GraphBLAS` git
-  submodule (pinned to v10.3.1) and built from source by `build.rs` as a position-independent static library with a dynamically linked OpenMP runtime
-  (`libgomp`). Bindings are generated by `bindgen`. `cargo package` never descends into submodules, so `build.rs` resolves the source in priority
-  order (the `ISSUNDB_GRAPHBLAS_SRC` override, then the submodule, then the pinned tarball downloaded into `OUT_DIR` and checksum-verified): the
-  in-repo build uses the submodule with no network, while a crates.io build fetches the pinned source.
-- `crates/issundb-graphblas/`: minimal safe wrapper over the GraphBLAS operations the engine uses (typed `Matrix`/`Vector` over `i32`/`f32`/`f64`,
-  build from triples, `mxv` over predefined semirings, `ewise_add` over predefined monoids, and the descriptor flags). Depends only on
-  `issundb-graphblas-sys`. `issundb-core` reaches GraphBLAS exclusively through this crate.
-- `crates/issundb-vector/`: vector index abstraction, vector metadata, vector storage integration, and vector search APIs.
+- `crates/issundb-vector/`: vector index abstraction, vector metadata, vector storage integration, and vector search APIs. The index itself sits behind
+  `backend.rs`, which selects one at compile time from the `hnsw` feature: on by default it is `usearch`, the workspace's only C++ dependency, and with
+  `--no-default-features` it is an exact scan in pure Rust. The fallback is not a stub. It returns the true nearest neighbors under the same distance
+  conventions (`exact_distance`, shared with the rescore pass), so the crate's whole suite passes either way; what it gives up is the sublinear query and
+  `quantization`, which it ignores because it keeps the raw `f32`. The feature is forwarded by every crate that reaches this one (`issundb-cypher`,
+  `issundb-retrieval`, and the `issundb` facade), and the workspace declarations of those three carry `default-features = false` so that
+  `--no-default-features` on the facade actually reaches the bottom of the graph rather than being re-enabled by a sibling. Verify a change to this
+  plumbing with `cargo tree -p issundb --no-default-features | grep usearch`, which must print nothing.
 - `crates/issundb-text/`: text query APIs and ranking. Tokenization and the inverted-index storage are *not* here: they live in
   `issundb-core` (`graph/fts_mod.rs` and `storage/fts.rs`), because the write path is in core and the FTS postings are maintained inside the same
   write transaction as the node record (`index_node_for_label` on insert and update, `delete_node_fts` on delete). A tokenizer in this crate could not
@@ -203,6 +198,43 @@ modules according to this map.
 - `crates/issundb-mcp/`: Model Context Protocol server built on the `rmcp` SDK, serving over stdio or MCP's Streamable HTTP transport. Depends only on
   `issundb`; uses `tokio`. See its Component APIs entry for the tool surface and the Host-header allowlist.
 - `crates/issundb-py/`: Python bindings via PyO3. Exposes the `IssunDB` class. Depends only on `issundb`.
+- `crates/issundb-wasm/`: browser bindings, exposing one `Playground` type that owns a single `Graph`. Depends only on `issundb`, and is the only crate
+  built for `wasm32-unknown-unknown`. It is what proves the storage-backend seam and the pure-Rust kernels actually hold: the module is built
+  `--no-default-features`, so storage is the in-memory backend and the vector index is the exact scan, and a regression that reintroduces an LMDB or C++
+  dependency below the facade breaks this build rather than going unnoticed. Do not add `--features hnsw` to that build, which reads like it selects the
+  index and in fact selects `usearch`: the wasm build then fails compiling `cxx`. `make playground-check` is where that was caught, so keep the flags in
+  the `WASM_BUILD` variable rather than repeating them per target. Every method returns a JSON string, so the boundary carries one
+  type in both directions instead of a second serialization contract. The methods are split into a private logic layer returning `Result<_, String>` and a
+  thin exported layer that converts to `JsError`, because constructing a `JsError` calls a wasm-bindgen import that panics off-target, and without the
+  split none of it could be covered by `cargo test`. Reading all of a node's properties decodes the stored msgpack blob directly, as the REST node route
+  does, since every read-path method on `Graph` takes the property names to fetch and an inspector cannot know them.
+- `web/`: the playground page that loads that module: `index.html`, `app.js`, `demos.js`, and `style.css`, with the generated module in the gitignored
+  `web/pkg/`. Vanilla ES modules with no build step, and no library is fetched from a network, so the Cypher highlighter and the force-directed layout are
+  written in `app.js` rather than pulled from one. The page's only external request is the Google Fonts link for Inter and JetBrains Mono, which is the same
+  request `theme.font` in `mkdocs.yml` already makes for the same two families; the size scale is the reference playground's, in rem against a 1rem body. It is served under the MkDocs site and styled to match it: the custom properties at the top of
+  `style.css` are Material for MkDocs' own tokens, copied from the built `palette.*.min.css` for this site's palette, and the scheme is carried on
+  `data-md-color-scheme` with Material's `default` and `slate` values. A `theme.palette` change in `mkdocs.yml` means updating that block from a fresh
+  `make docs` build rather than from the Material Design palette, since MkDocs derives its primary from the named color instead of using it directly. `demos.js` holds the example catalog, the
+  Setup panel's six sample graphs, and the sidebar's procedure reference, all of which are Cypher inside a JavaScript file and therefore invisible to every
+  Rust test; `make playground-check` runs all three through the compiled module and fails on an error, which is how a wrong procedure signature is caught.
+  A sample graph is the only place a dataset lives: every example queries whatever is loaded rather than creating its own, each category names the graph it
+  queries through `sample` and the label that proves it is loaded through `requiresLabel`, and the check seeds that graph before running the category. The one
+  exception is the Cypher basics lesson on `CREATE`, which writes two nodes.
+  Selecting an example or a sample loads it into the editor without running it, since running a `CREATE` on click wrote to the database before the statement
+  had been read and a second click silently duplicated its data; the full-text and vector examples keep their post-statement step by holding the selected
+  example until the run. The sample graphs carry no comments, being data rather than documentation. `app.js` also holds a Cypher formatter, whose casing rule
+  is narrower than the highlighter's keyword set on purpose: uppercasing every word in that set rewrote `issundb.shortestPath` and the case-sensitive yield
+  fields `index` and `count`. It must not be able to change what a query means, which is checked by running every string in `demos.js` before and after
+  formatting and comparing the rows. The procedure reference is written out by hand
+  because the engine cannot enumerate its own procedures, so that check is the only thing keeping it from drifting; it treats `ProcedureNotFound` as a failure
+  even for the two retrieval entries whose empty-index error it tolerates, since a rename is exactly what that error reports.
+  `docs/hooks/playground_links.py` is the MkDocs hook putting a "Run in the playground" link under a Cypher block in `docs/` marked `<!-- playground -->`,
+  carrying the block as `q` and the page's earlier marked blocks as `s`. The marker is opt-in because most documented Cypher cannot run in the playground
+  (a query parameter, a CLI script, or embeddings the seeded graph lacks), so marking a block asserts that it runs, and `make playground-check` executes
+  every marked block and fails one returning no rows.
+  See `web/README.md` for the three build targets and what the browser configuration gives up (no persistence, one thread,
+  no `backup`/`restore`, and a 16 MB stack set by a link argument in `.cargo/config.toml` because the 1 MB default is also the engine's inline-execution
+  budget).
 - `crates/issundb-examples/`: standalone example programs. These depend only on `issundb`.
 - `crates/*/benches/`: crate-local Criterion benchmark targets (storage and write throughput, Cypher parsing and execution plus LSQB Q1-Q9 and OLTP
   reads, vector search, full-text search, and hybrid retrieval plus GraphRAG).
@@ -228,7 +260,11 @@ modules according to this map.
     - `workload`: the timed comparison. Its queries are shaped for measurement, so most return a single `count(...)`; a `DIVERGENT` verdict there is an
       attributed LadybugDB walk-semantics overcount and does not fail the run, but a `MISMATCH` does (`tests/lbug_trail_semantics.rs` pins the
       walk-versus-trail divergence). Add a correctness query to the differential corpus, not here.
-- `Cargo.toml`: workspace root with shared `[workspace.dependencies]`. All version pins live here.
+- `Cargo.toml`: workspace root with shared `[workspace.dependencies]`, 39 entries. A shared dependency belongs here and a crate should reach it with
+  `workspace = true`. The manifests have drifted from that: `serde_json` is declared independently in six crates, and `anyhow`, `rmp-serde`, `serde`,
+  and `tracing` in two each, all of them despite a root entry that those declarations bypass. A further four are pinned per crate with no root entry
+  at all (`clap` in three crates, and `axum`, `tokio`, and `tracing-subscriber` in `issundb-rest` and `issundb-mcp`), and the two `axum` pins disagree
+  on their version string. Consolidating is a manifest change nobody has made yet, so do not read the current layout as the intended one.
 - `Makefile`: developer workflow entry points.
 - Directory-scoped guides: `crates/issundb-core/AGENTS.md`, `crates/issundb-cypher/AGENTS.md`, `crates/issundb-text/AGENTS.md`, and
   `crates/issundb-vector/AGENTS.md` carry crate-specific rules that this file does not repeat (LMDB lifetime rules, the query pipeline stages, the
@@ -266,61 +302,68 @@ modules according to this map.
   LMDB's 511-byte key limit. `encode_property_value` declines a string longer than `MAX_INDEXED_STRING_LEN` (480 bytes, conservative), leaving that
   value out of the index; the property is still stored, and equality lookups (`nodes_by_property`, `edges_by_property`) fall back to a label or type
   scan that compares the stored value directly, so results stay correct. Long text belongs in a full-text index, not a property index.
-- The GraphBLAS matrices (`MatrixSet`) and the CSR snapshot back the GraphBLAS algorithms, pattern matching, and multi-source expansion. They are kept
-  fresh through four gates rather than a single periodic rebuild, and each builds the least its consumer reads: what a gate declines to build is the
-  saving, so a gate that materialized more than it needs would be indistinguishable except in memory. The write path records a structural delta (added
-  nodes, added edges, and removed edges, plus a `force_full` flag set on any node deletion).
-    - `Graph::open` builds neither: it installs an empty snapshot through `CsrCache::new_unbuilt` and leaves `matrices` as `None`, so the gates below
-      do the first build when a consumer that needs one runs. A workload of point lookups, property reads, or small typed expansions never builds
-      either structure, because those paths read LMDB directly. The unbuilt cache starts `write_gen` at 1 with both installed generations at 0 so it
-      reports stale; a placeholder that claimed to be current would make typed expansion read zero rows out of the empty snapshot. Do not reintroduce
-      an eager build in `open`: it costs one full edge scan plus a full matrix materialization on every open (roughly 26 seconds for a 1 M-node,
-      14 M-edge graph) and is repaid on every reopen.
-    - Pure-adjacency consumers (`bfs`, `bfs_multi_source`, untyped expansion, `degree_centrality`, and `connected_components`) call
-      `ensure_matrix_view`, which applies the delta in place, falling back to a rebuild of the boolean adjacency alone when a node was deleted.
-    - CSR-array and hybrid consumers (`dfs`, the path searches, the flow algorithms, and the remaining centralities) call `ensure_csr_fresh`, which
-      rebuilds the snapshot and the boolean adjacency on demand, gated by the `write_gen` versus `snapshot_gen` counter; when the snapshot is already fresh it still
-      drains the pending delta into the matrices.
-    - `page_rank` gates on `MatrixKinds::PAGE_RANK` (through `ensure_page_rank_matrix`, which its public `page_rank_graphblas` calls itself) and
-      `shortest_path_dijkstra` on `MatrixKinds::WEIGHTED` (through `with_weighted_matrix_view`), the latter being the only gate whose snapshot carries
-      weights. What the matrices carry is a separate condition from the generation, because a set materialized for an adjacency consumer is current at its
-      generation and still carries neither optional matrix. A rebuild unions the request with what is installed rather than replacing it, or a workload
-      alternating two consumers would rebuild twice per write; the cost is that one weighted call keeps that matrix for the life of the process, which is
-      also why `Graph::rebuild_csr` asks for neither optional matrix: it is what every bulk load calls, so asking for weights there would pin every
-      process that loads data.
-    - Typed bulk expansion calls `ensure_snapshot_fresh`, which rebuilds only the snapshot (no GraphBLAS materialization); for a small source set over
-      a stale snapshot it skips the gate and reads per-source LMDB adjacency.
-      The background rebuild after `REBUILD_THRESHOLD` writes is a compaction safety net, not the freshness path; callers needing a guaranteed fresh
-      CSR view still call `rebuild_csr`. Point adjacency lookups (`out_neighbors`, `in_neighbors`, `all_neighbors`) read the `out_adj` and `in_adj`
-      stores directly through the transaction, never the snapshot, so they always reflect committed and in-transaction writes.
-- `Storage::open` is the only entry point for LMDB. Do not call `heed::EnvOpenOptions` from outside `crates/issundb-core/src/storage/lmdb.rs`.
-- Heavy dependencies are tracked in the workspace `Cargo.toml`. `usearch` and `chumsky` are active, non-optional dependencies. GraphBLAS is reached
-  through the in-house permissive crates `issundb-graphblas` and `issundb-graphblas-sys`. Building requires the submodule
-  (`git submodule update --init external/GraphBLAS`) plus CMake and Clang.
-- Async is not used in the core engine. LMDB and GraphBLAS are synchronous. `tokio` is an optional dependency for server mode only; do not add
-  `.await` inside `issundb-core`.
-- Parallelism has exactly two consumers, and both resolve their thread count through `threads::resolve` (see the module map): the GraphBLAS OpenMP pool,
-  and the scoped-thread reductions in the counting kernels, which split a pass only above `MIN_PARALLEL_WORK` items so a small pass and a unit test stay
-  serial and deterministic. Writes are never parallel: they serialize on the `ReentrantMutex` write lock and on LMDB's single writer.
-- GraphBLAS initializes a process-global context and OpenMP thread pool on first use (`GrB_init`) and never finalizes it. Under `cargo nextest`
-  (process-per-test, used by `make coverage`) every process pays this cost, so on small CI runners the thread pools oversubscribe and a GraphBLAS call
-  can fail intermittently. The coverage job pins `OMP_NUM_THREADS=1` and sets `NEXTEST_RETRIES=2` to compensate.
+- The CSR snapshot backs the graph algorithms, pattern matching, and multi-source expansion. It is kept fresh on demand rather than by a periodic
+  rebuild, through one gate: `Graph::ensure_snapshot_fresh`, reached by `Graph::with_snapshot`. Every algorithm kernel reads the snapshot and nothing
+  else, so there is one freshness condition, the installed `snapshot_gen` against the committed `write_gen`.
+    - `Graph::open` builds nothing: it installs an empty snapshot through `CsrCache::new_unbuilt`, so the gate does the first build when a consumer that
+      needs one runs. A workload of point lookups, property reads, or small typed expansions never builds it, because those paths read LMDB directly.
+      The unbuilt cache starts `write_gen` at 1 with `snapshot_gen` at 0 so it reports stale; a placeholder that claimed to be current would make typed
+      expansion read zero rows out of the empty snapshot. Do not reintroduce an eager build in `open`: it costs a full edge scan on every open and is
+      repaid on every reopen.
+    - `shortest_path_dijkstra` is the one consumer needing more than the adjacency, and it goes through `Graph::with_weighted_snapshot`. Per-edge weights
+      cost a second full scan of `edges`, so what the snapshot carries is a separate condition from its generation: an unweighted snapshot is current at
+      its generation and still has no weights. The request is sticky (`CsrCache::request_weights`), or a workload alternating Dijkstra with anything else
+      would rebuild twice per write; the cost is eight bytes per edge held once anything asks a weighted question, which is also why `Graph::rebuild_csr`
+      does not ask: every bulk load calls it, so asking there would pin the weights in every process that loads data.
+    - Typed bulk expansion goes through the same gate; for a small source set over a stale snapshot it skips the gate entirely and reads per-source LMDB
+      adjacency (`STALE_POINT_EXPAND_MAX`), so an interleaved write-then-expand workload never pays a rebuild. The background rebuild after
+      `REBUILD_THRESHOLD` writes is a compaction safety net, not the freshness path; callers needing a guaranteed fresh CSR view still call
+      `rebuild_csr`. Point adjacency lookups (`out_neighbors`, `in_neighbors`, `all_neighbors`) read the `out_adj` and `in_adj` stores directly through
+      the transaction, never the snapshot, so they always reflect committed and in-transaction writes.
+- `Storage::open` is the only entry point for the storage engine, and the engine is selected at compile time from the `lmdb` feature: on by default it is LMDB
+  (`storage/lmdb.rs`), and with `--no-default-features` it is the in-memory backend (`storage/memory.rs`). `heed` is named in exactly two places, both inside
+  `storage/`, so nothing above the storage module knows which engine it is talking to; everything else names the aliases `storage::{RoTxn, OwnedRoTxn, RwTxn}`
+  and the twelve tables on `Storage`. Do not reintroduce a `heed::` path outside `storage/`, and do not turn this into a trait: the tables hang off `Storage`
+  which hangs off `Graph`, so a trait would make `Graph` generic over its backend and push that parameter through every crate and the public API.
+  The contract a backend owes is documented on `storage/mod.rs`, and three of its guarantees are load-bearing rather than incidental: key order is byte order
+  (a `u64` key is stored big-endian so byte order and numeric order agree, which is what lets the CSR build assume `out_adj` arrives grouped by ascending node
+  id), duplicate order is byte order (which the CSR row-reordering pass depends on), and an uncommitted transaction publishes nothing. The in-memory backend is
+  copy-on-write for the third: a reader loads the published table set and a writer publishes its own copy at commit, which is also what makes a read
+  transaction opened *while* a write transaction is live legal. That is not a nicety, it is required: a `MATCH ... CREATE` statement runs its match against
+  committed state through a separate read transaction while its own write transaction is still open, and a single reader-writer lock deadlocks on exactly that.
+  The in-memory backend does not persist, so a reopen sees an empty graph; the handful of tests whose premise is reopen or backup are gated on the `lmdb`
+  feature and say so.
+- The `lmdb` feature is forwarded by every crate between the facade and core, and each of their workspace declarations carries `default-features = false`, or a
+  sibling silently re-enables LMDB for the whole graph. Verify a change to that plumbing with `cargo tree -p issundb --no-default-features | grep lmdb`, which
+  must print nothing. Note that a whole-workspace `--no-default-features` build does *not* select the in-memory backend, because `issundb-cli` and the other
+  consumer crates depend on the facade with its defaults and cargo unifies features; test the backend per crate (`cargo test -p issundb-core --no-default-features`).
+- Heavy dependencies are tracked in the workspace `Cargo.toml`. `chumsky` is an active, non-optional dependency; `usearch` is the workspace's only
+  C++ dependency and sits behind the default-on `hnsw` feature. The graph algorithms are pure Rust over the CSR snapshot, so the build needs no CMake,
+  no Clang, no bindgen, and no OpenMP runtime.
+- Async is not used in the core engine. LMDB is synchronous. `tokio` is an optional dependency for server mode only; do not add `.await` inside
+  `issundb-core`.
+- Parallelism has two consumers, and both resolve their thread count through `threads::resolve` (see the module map): the scoped-thread reductions in
+  the counting kernels, and the analytics passes that split over nodes (PageRank) or over sources (betweenness and harmonic centrality). Both split a
+  pass only above `MIN_PARALLEL_WORK` items, so a small pass and a unit test stay serial and deterministic. The budget is then capped by regime, which is
+  why there are two resolvers: `Graph::kernel_threads` caps at `MAX_SCAN_THREADS` because a pass streaming the adjacency arrays (a counting kernel, or
+  PageRank) saturates memory bandwidth before compute and gets *slower* past that point, while `Graph::parallel_threads` leaves the budget uncapped for
+  the all-pairs passes, whose cost is arithmetic per source out of per-worker buffers. PageRank and harmonic centrality write disjoint output chunks and
+  are therefore split-invariant; betweenness sums per-worker partials, so the last bits of a total depend on the worker count. Writes are never parallel:
+  they serialize on the `ReentrantMutex` write lock and on LMDB's single writer.
 
 ## Dependency Boundaries
 
 Target dependency direction:
 
-0. `issundb-graphblas-sys` (raw GraphBLAS FFI) sits at the bottom; `issundb-graphblas` (safe wrapper) depends only on it. Neither depends on any
-   other workspace crate. `issundb-core` reaches GraphBLAS only through `issundb-graphblas`.
-1. `issundb-core` may depend on `issundb-graphblas`, but not on vector, text, retrieval, Cypher, bindings, server, or CLI crates.
+1. `issundb-core` sits at the bottom. It must not depend on the vector, text, retrieval, Cypher, bindings, server, or CLI crates.
 2. `issundb-vector` may depend on `issundb-core`, but not on text, retrieval, Cypher, bindings, server, or CLI crates.
 3. `issundb-text` may depend on `issundb-core`, but not on vector, retrieval, Cypher, bindings, server, or CLI crates.
 4. `issundb-retrieval` may depend on `issundb-core`, `issundb-vector`, and `issundb-text`.
 5. `issundb-cypher` may depend on public APIs from core, vector, text, and retrieval crates, but not storage internals.
 6. `issundb` composes and re-exports the stable public API.
 7. `issundb-cli` uses only the `issundb` facade.
-8. `issundb-rest`, `issundb-mcp`, and `issundb-py` must depend only on `issundb`; they must not import `issundb-core`, `issundb-vector`,
-   `issundb-text`, `issundb-retrieval`, or `issundb-cypher` directly.
+8. `issundb-rest`, `issundb-mcp`, `issundb-py`, and `issundb-wasm` must depend only on `issundb`; they must not import `issundb-core`,
+   `issundb-vector`, `issundb-text`, `issundb-retrieval`, or `issundb-cypher` directly.
 
 Lower-level crates must not know about higher-level crates.
 
@@ -405,20 +448,34 @@ The read-path and statistics methods carry non-obvious semantics:
   counter; the emptiness shortcut asks `label_idx` instead, so a prune never rests on a counter being exact. A decided verdict is memoized against the
   write generation, because the pass that asks runs on every execution (there is no plan cache) and would otherwise re-walk the graph per query.
 - `label_filter(nodes, label) -> Result<Vec<NodeId>, Error>`: subset of `nodes` carrying `label`, via one `label_idx` point lookup per candidate.
-- `set_thread_count(n: i32) -> Result<(), Error>`: sets the GraphBLAS thread count, overriding the `ISSUNDB_NUM_THREADS` environment variable (0
-  restores default behavior, resolved by `threads::resolve`). The count is stored and applied by `MatrixSet::materialize`, which is also what initializes the GraphBLAS context, so a
-  call made before the matrices exist takes effect at the next materialization rather than reaching GraphBLAS immediately. Since `Graph::open` no longer
-  materializes eagerly, that is the normal case for a caller configuring threads up front; setting a global option on an uninitialized context would
-  fail.
+- `set_thread_count(n: i32) -> Result<(), Error>`: sets the thread count for the parallel read passes, overriding the `ISSUNDB_NUM_THREADS`
+  environment variable (0 restores default behavior, resolved by `threads::resolve`). There is no pool to configure: each pass resolves the budget when
+  it starts and spawns scoped threads for its own duration, so the call stores the value, takes effect on the next pass, and cannot fail.
 
-Graph algorithms have self-describing signatures over `NodeId` and `EdgeId`: `bfs`, `dfs`, `shortest_path`, `all_paths`, `all_shortest_paths`,
+Graph algorithms have self-describing signatures over `NodeId` and `EdgeId`: `bfs`, `bfs_multi_source`, `expand_bulk`, `dfs`, `shortest_path`, `all_paths`, `all_shortest_paths`,
 `longest_path`, `shortest_path_top_k`, `page_rank`, `connected_components`, `strongly_connected_components`, `detect_cycle`, `label_propagation`,
-`degree_centrality`, `betweenness_centrality`, `harmonic_centrality`, `spanning_forest`, `maximum_flow`, and `all_neighbors`. Five carry behavior worth
-pinning:
+`degree_centrality`, `betweenness_centrality`, `harmonic_centrality`, `spanning_forest`, `maximum_flow`, and `all_neighbors`. Several carry behavior
+worth pinning:
 
 - `shortest_path_dijkstra(src, dst) -> Result<Option<WeightedPath>, Error>`: edge weight is the first present of the `weight`, `cost`, `capacity`, or
   `cap` property, default `1.0`; the source is fixed, so unlike `shortest_path_top_k` and `spanning_forest` this method takes no weight-property
-  argument.
+  argument. Relaxation is Dijkstra's over a binary heap, which needs non-negative weights; a weight comes from a property, so a negative one is a data
+  condition rather than a bug and the pass falls back to a bounded label-correcting relaxation when the snapshot reports any (`has_negative_weight`,
+  decided once at build time so a point query does not scan every weight). A reachable negative *cycle* has no shortest path and is reported as
+  `Error::InvalidArgument`. Parallel edges need no special handling, since relaxing each keeps the cheapest.
+- `connected_components() -> Result<HashMap<NodeId, u64>, Error>`: the component id is the smallest *node id* in the component. Only the induced
+  partition is contractual, so compare membership rather than depending on the numbering.
+- `betweenness_centrality() -> Result<HashMap<NodeId, f64>, Error>`: unnormalized and directed, and counts distinct pairs: two parallel edges are one
+  shortest path, so crediting both would inflate the path counts and every dependency downstream of them.
+- `degree_centrality(direction) -> Result<HashMap<NodeId, u64>, Error>`: the number of *distinct* neighbors in that direction. Parallel edges between the
+  same pair count once, `Both` is the distinct out-neighbors plus the distinct in-neighbors, and a self-loop counts in each direction. This is the
+  boolean-adjacency semantics of the SpMV formulation it replaced, kept deliberately: a plain row length would count parallel edges separately and
+  silently change the score on a multigraph.
+- `page_rank(iterations, damping) -> Result<HashMap<NodeId, f32>, Error>`: power iteration where a source spreads its rank over its *edges*, so parallel
+  edges do each carry mass, which is the opposite of the distinct-neighbor rule above and is why the two are pinned separately. Dangling-node mass is not
+  redistributed, so ranks do not sum to 1; `tests/oracle.rs` compares against NetworkX over a corpus restricted to graphs with no dangling nodes for
+  exactly that reason. The accumulation reads the incoming rows, so each output entry is a sum over one node's in-edges, which is what makes the pass
+  parallel over disjoint output chunks and independent of the worker count.
 - `count_triangle_cycles(spec: &TriangleCountSpec) -> Result<u64, Error>`: assignment count of the directed triangle pattern
   `(a)-[t1]->(b)-[t2]->(c)-[t3]->(a)` with optional per-hop relationship types and per-variable labels, following Cypher MATCH row semantics including
   relationship uniqueness; the Cypher optimizer lowers grouping-free `count` aggregates over that pattern to this kernel via the `TriangleCount`
@@ -517,8 +574,8 @@ outside `issundb`.
   structural effect (a brand-new node becoming visible to a label scan): those read through the committed-only `label_idx`/CSR snapshot, not the
   still-open transaction, so `CREATE (a:Foo) WITH a MATCH (m:Foo) RETURN count(m)` does not count `a` until the statement commits.
 
-The executor resolves patterns through the physical plan. Untyped expansion uses GraphBLAS SpMV; typed expansion reads the CSR snapshot in bulk behind
-`ensure_snapshot_fresh`, falling back to per-source LMDB point reads when the snapshot is stale and the source set is small. Key optimizer behaviors,
+The executor resolves patterns through the physical plan. Both typed and untyped expansion read the CSR snapshot in bulk behind
+`ensure_snapshot_fresh` (`Graph::expand_bulk`), falling back to per-source LMDB point reads when the snapshot is stale and the source set is small. Key optimizer behaviors,
 each navigable by the named symbol:
 
 - Top-level `AND` conjunctions in WHERE split so each conjunct pushes down to its own lowest binder.
@@ -564,7 +621,7 @@ HTTP REST API server built on Axum and Tokio. Depends only on `issundb`; must no
 Data and query routes are versioned under a `/v1` prefix. `GET /health` stays unversioned so infrastructure probes do not track the API version; its
 body reports the crate `version` and the current `api` version.
 
-REST exposes the data plane and retrieval only. Index administration (vector index configuration, text index create/drop/list), GraphBLAS thread
+REST exposes the data plane and retrieval only. Index administration (vector index configuration, text index create/drop/list), thread
 control, and backup/restore are intentionally absent: provisioning and host operations are done through the CLI or the Python surface, not over HTTP.
 
 Startup spawns `Graph::materialize_edge_statistics` on a detached thread, so the optimizer's expand-ratio estimates and exact type-inference pruning become
@@ -579,21 +636,22 @@ that build is a full node scan and holds every scalar property in memory, which 
 
 The API is self-describing: the OpenAPI 3.1 document is generated from the handler annotations (`#[utoipa::path]`) and the request and response
 `ToSchema` derives, served as JSON at `GET /v1/openapi.json` with a Scalar UI at `GET /v1/docs`. The generator crates are `utoipa` and
-`utoipa-scalar` (both MIT or Apache-2.0), pinned to the Axum 0.7 line. Because the handlers build their JSON bodies inline with `json!`, the
+`utoipa-scalar` (both MIT or Apache-2.0), on the Axum 0.8 line alongside `axum` itself, which is why the route patterns use `{id}` rather than the
+`:id` form Axum 0.7 took. Because the handlers build their JSON bodies inline with `json!`, the
 documentation-only response structs (`NodeResponse`, `EdgeResponse`, `IdResponse`, `QueryResponse`, `ExplainResponse`, `RetrieveResponse`,
 `HealthResponse`, and `ErrorResponse`) describe the response shapes and must be kept in sync with those literals. The Cypher result is documented as
 columns plus row-major records of arbitrary JSON.
 
 Routes:
 
-- `POST /v1/nodes`, `GET /v1/nodes/:id`, `PUT /v1/nodes/:id`, `DELETE /v1/nodes/:id`
-- `POST /v1/nodes/:id/labels/:label`, `DELETE /v1/nodes/:id/labels/:label` (label add and remove; both return 204, and removal is idempotent)
+- `POST /v1/nodes`, `GET /v1/nodes/{id}`, `PUT /v1/nodes/{id}`, `DELETE /v1/nodes/{id}`
+- `POST /v1/nodes/{id}/labels/{label}`, `DELETE /v1/nodes/{id}/labels/{label}` (label add and remove; both return 204, and removal is idempotent)
 - `POST /v1/nodes/batch`, `POST /v1/edges/batch` (many records in one transaction; a single-record insert costs one durable LMDB commit, so
   per-record requests are bound by commit latency, and a batch is all-or-nothing)
-- `POST /v1/edges`, `GET /v1/edges/:id`, `PUT /v1/edges/:id`, `DELETE /v1/edges/:id`
+- `POST /v1/edges`, `GET /v1/edges/{id}`, `PUT /v1/edges/{id}`, `DELETE /v1/edges/{id}`
 - `POST /v1/query` (Cypher execution), `POST /v1/explain` (query plan)
 - `POST /v1/search/text`, `POST /v1/search/vector`
-- `POST /v1/vectors` (upsert embedding), `DELETE /v1/vectors/:id` (remove embedding from the index and storage)
+- `POST /v1/vectors` (upsert embedding), `DELETE /v1/vectors/{id}` (remove embedding from the index and storage)
 - `POST /v1/retrieve` (hybrid retrieval)
 - `GET /v1/openapi.json` (OpenAPI 3.1 document), `GET /v1/docs` (Scalar UI)
 - `GET /health` (unversioned)
@@ -663,6 +721,35 @@ Keep that invariant when adding a method: extract arguments to owned Rust values
 `Python::detach`, and never touch a Python object in the released section. The two warm-ups are the longest-running calls on this surface, so they are
 where the invariant matters most.
 
+### `issundb_wasm`
+
+Browser bindings, exposing one `Playground` that owns a single `Graph`. Depends only on `issundb`. Every method returns a JSON string, so the boundary
+carries one type in both directions rather than a second serialization contract to keep in agreement with the page.
+
+Methods: `query`, `explain`, `stats`, `graphSnapshot`, `createTextIndex`, `textSearch`, `upsertVector`, `vectorSearch`, and the four statics `version`,
+`isPersistent`, `buildRef`, and `memoryBytes`. `memoryBytes` is live allocated bytes, from a counting `GlobalAlloc` wrapper this crate installs, which the page's
+footer reports beside the WebAssembly heap size the browser exposes. It is live rather than reserved because the wasm heap only grows, so the browser's figure
+says what was once needed; and it is module-wide rather than per-instance, because an allocator cannot attribute an allocation to a `Playground`. No other crate
+in the workspace sets a global allocator, so nothing an application links against pays the two relaxed atomics per allocation. `buildRef` is the `branch@commit` the page names in its footer, read from `ISSUNDB_BUILD_REF` at compile time through
+`option_env!` and empty without it. It is compiled in rather than fetched as a sidecar file so it cannot disagree with the module it describes, and the
+crate's `build.rs` exists only to declare `rerun-if-env-changed` for that variable, without which a cached artifact would keep reporting an earlier
+build's commit. `make playground-build` supplies it from `git`, and `docs.yml` sets it from the workflow's own refs, since
+`actions/checkout` leaves a detached HEAD where `rev-parse --abbrev-ref` answers `HEAD`. `query` returns `{columns, rows, statement_count, elapsed_ms}` with row-major rows, so the page renders a table knowing
+nothing about the schema, and `statement_count` is how it can say a semicolon-separated script ran more statements than the one result shown.
+`graphSnapshot` returns `{nodes, edges, truncated}` capped at `MAX_GRAPH_NODES` for legibility rather than cost, and drops an edge whose endpoint the cap
+excluded so the page never draws a line to nothing.
+
+The surface is curated the way the MCP one is, and for a related reason: this is a demonstration rather than an embedding API. It carries reads, queries,
+and the two capabilities Cypher cannot reach (full-text index creation and search, and vector upsert and search), because those are Rust extension traits
+rather than query-language features. Mutations are Cypher through `query`. `backup` and `restore` are absent, being file operations on a target with no
+filesystem.
+
+Two structural rules hold here. Methods are split into a private logic layer returning `Result<_, String>` and a thin exported layer that converts to
+`JsError`, because constructing a `JsError` calls a wasm-bindgen import that panics on a non-wasm target, so a binding building one directly could not be
+covered by `cargo test`; the tests at the bottom of `lib.rs` drive the logic layer and run in the ordinary test suite. And the wasm-bindgen CLI must be
+the exact version of the wasm-bindgen crate, or the module fails at load with a message that does not name the cause, which is why
+`make playground-build` compares the two before running.
+
 ### `issundb_core::Storage`
 
 Internal to `issundb-core`. Owns the LMDB environment and twelve sub-databases: `nodes`, `edges`, `out_adj`, `in_adj`, `label_idx`, `type_idx`,
@@ -700,8 +787,16 @@ Implementation using red-green TDD:
 6. `make format` before every commit.
 7. Update of `README.md` or `docs/` if behavior or workflow changed.
 
+Clippy is pinned to the MSRV, in `lints.yml`, and that pin is load-bearing: a current clippy reports about fifteen further lints in `issundb-cypher` that
+the pinned one does not, so they land all at once whenever the MSRV moves. Two consequences. A lint step belongs in `lints.yml` beside `make lint`, never in
+`tests.yml`, whose jobs run on stable and would therefore gate on a different lint set than the one the project chose; `make lint-backends` is there for
+exactly that reason. And a clean local `make lint` says nothing about a newer clippy, so run `cargo +stable clippy` before adding a lint gate rather than
+after CI does it.
+
 Additional validation when relevant:
 
+- `make test-backends` for a storage or vector backend change, and `make lint-backends` alongside it. The default run always selects LMDB and usearch, so
+  neither the in-memory backend nor the exact vector index is otherwise exercised as the selected backend.
 - `make bench` for performance-sensitive storage changes.
 - `make test-conformance` for Cypher conformance coverage.
 - `make bench-ladybugdb` for cross-engine performance comparison and differential correctness checks on the Cypher execution path.

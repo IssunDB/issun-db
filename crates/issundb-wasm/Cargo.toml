@@ -1,0 +1,29 @@
+[package]
+name = "issundb-wasm"
+description = "WebAssembly bindings for IssunDB (for the playground web app)"
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+issundb = { workspace = true, default-features = false }
+rmp-serde.workspace = true
+serde_json.workspace = true
+wasm-bindgen = "0.2.100"
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[features]
+default = ["hnsw", "lmdb"]
+hnsw = ["issundb/hnsw"]
+lmdb = ["issundb/lmdb"]

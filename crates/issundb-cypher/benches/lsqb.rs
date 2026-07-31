@@ -38,22 +38,18 @@ fn build_lsqb_graph() -> (TempDir, Graph) {
     let mut comments = Vec::with_capacity(NUM_COMMENTS);
 
     g.update(|txn| {
-        // 1. Add Cities
         for i in 0..NUM_CITIES {
             cities.push(txn.add_node("City", &json!({ "name": format!("city{i}") }))?);
         }
-        // 2. Add Persons
         for i in 0..NUM_PERSONS {
             persons.push(txn.add_node(
                 "Person",
                 &json!({ "name": format!("p{i}"), "age": 18 + (i % 60) }),
             )?);
         }
-        // 3. Add Posts
         for i in 0..NUM_POSTS {
             posts.push(txn.add_node("Post", &json!({ "title": format!("post{i}") }))?);
         }
-        // 4. Add Comments
         for i in 0..NUM_COMMENTS {
             comments.push(txn.add_node("Comment", &json!({ "content": format!("comment{i}") }))?);
         }
@@ -93,7 +89,6 @@ fn build_lsqb_graph() -> (TempDir, Graph) {
     .unwrap();
 
     g.update(|txn| {
-        // 8. Connect Posts with HAS_CREATOR to Persons.
         for i in 0..NUM_POSTS {
             txn.add_edge(
                 posts[i],

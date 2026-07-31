@@ -71,7 +71,6 @@ pub(super) fn execute_copy_internal(
     params: &HashMap<String, Value>,
     id_map: &mut HashMap<u64, u64>,
 ) -> Result<CopyOutcome, String> {
-    // 1. Evaluate options
     let eval_opt =
         |expr: &Expr| -> Option<Value> { evaluate_expr(graph, &PathMap::new(), expr, params).ok() };
 
@@ -99,7 +98,6 @@ pub(super) fn execute_copy_internal(
         }
     }
 
-    // 2. Open and parse file
     let inferred_format = format.unwrap_or_else(|| {
         let path = Path::new(&stmt.filepath);
         match path.extension().and_then(|ext| ext.to_str()) {
@@ -645,7 +643,6 @@ pub(super) fn execute_export_db(
         }
     }
 
-    // Write schema.cypher
     let schema_path = dir.join("schema.cypher");
     let mut schema_file =
         File::create(&schema_path).map_err(|e| format!("failed to create schema file: {}", e))?;
@@ -704,7 +701,6 @@ pub(super) fn execute_export_db(
         }
     }
 
-    // Write index.cypher (for text indexes)
     let index_path = dir.join("index.cypher");
     let mut index_file =
         File::create(&index_path).map_err(|e| format!("failed to create index file: {}", e))?;
@@ -720,7 +716,6 @@ pub(super) fn execute_export_db(
         .map_err(|e| e.to_string())?;
     }
 
-    // Write copy.cypher
     let copy_path = dir.join("copy.cypher");
     let mut copy_file =
         File::create(&copy_path).map_err(|e| format!("failed to create copy file: {}", e))?;
@@ -782,7 +777,6 @@ pub(super) fn execute_import_db(
         ));
     }
 
-    // 1. Read and execute schema.cypher
     let schema_path = dir.join("schema.cypher");
     if schema_path.is_file() {
         let content = std::fs::read_to_string(&schema_path)
@@ -796,7 +790,6 @@ pub(super) fn execute_import_db(
         }
     }
 
-    // 2. Read and execute copy.cypher with shared id mapping
     let copy_path = dir.join("copy.cypher");
     let mut id_map = HashMap::new();
     let mut records = Vec::new();
@@ -842,7 +835,6 @@ pub(super) fn execute_import_db(
         }
     }
 
-    // 3. Read and execute index.cypher
     let index_path = dir.join("index.cypher");
     if index_path.is_file() {
         let content = std::fs::read_to_string(&index_path)

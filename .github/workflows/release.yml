@@ -57,9 +57,6 @@ jobs:
             - `issundb-rest`: IssunDB with a REST API server
             - `issundb-mcp`: IssunDB with an MCP server
 
-            Note that the binaries need a working OpenMP runtime to work on your system.
-            That means that typically `libgomp` on Linux, `libomp` on macOS, and `vcomp` on Windows, should be installed on your system.
-
             ### Container Image
 
             The same release is published as a container image to GHCR:
@@ -116,20 +113,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential clang cmake pkg-config libssl-dev
-
-      - name: Install macOS dependencies
-        if: runner.os == 'macOS'
-        # libomp is the OpenMP runtime Apple Clang links GraphBLAS against;
-        # cmake and clang (libclang for bindgen) ship with the runner image.
-        run: brew install libomp
-
-      - name: Point bindgen at the runner's libclang (Windows)
-        if: runner.os == 'Windows'
-        # cmake ships with the Windows runner; the MSVC OpenMP runtime (vcomp)
-        # comes with the Visual Studio build tools. bindgen needs libclang from
-        # the preinstalled LLVM.
-        run: echo "LIBCLANG_PATH=$env:ProgramFiles\LLVM\bin" >> $env:GITHUB_ENV
+          sudo apt-get install -y build-essential pkg-config libssl-dev
 
       - name: Configure macOS linker workaround
         if: matrix.runner == 'macos-14'

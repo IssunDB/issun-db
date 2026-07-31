@@ -7,9 +7,13 @@ It explains prerequisites, building the engine from source, and using the comman
 
 Compiling IssunDB and its native dependencies requires Rust 1.85.0 or later, along with the following system tools:
 
-- Build tools: CMake and a C/C++ compiler (such as Clang or GCC) to compile the SuiteSparse:GraphBLAS static library.
-- FFI bindings: `libclang`, which `bindgen` uses to build the raw GraphBLAS wrappers.
-- OpenMP runtime: This resolves to `libgomp` (bundled with GCC) on Linux, `libomp` on macOS (`brew install libomp`), and `vcomp` (usually part of the MSVC runtime) on Windows.
+- Build tools: a C/C++ compiler (such as Clang or GCC), which compiles the bundled LMDB sources and the vector index.
+
+There is nothing else to install: no CMake, no `libclang`, and no OpenMP runtime.
+
+A `--no-default-features` build needs no C or C++ toolchain at all. It selects the in-memory storage backend instead of LMDB and the pure-Rust exact vector index instead of
+HNSW, which is also the configuration that compiles for `wasm32-unknown-unknown`. That build does not persist to disk, so treat it as an embedded or browser target rather
+than a database you reopen.
 
 ## Build from Source
 
@@ -65,7 +69,7 @@ The REPL supports meta commands (prefixed with `:`) to manage the session, take 
 | `:import-nodes`   | `:import-nodes /path/to/nodes.csv Label`        | Bulk-import nodes from a CSV or Parquet file whose columns become properties.                                             |
 | `:import-edges`   | `:import-edges /path/to/edges.csv Src Dst Type` | Bulk-import edges from a two-column CSV or Parquet file of domain keys.                                                   |
 | `:explain`        | `:explain MATCH (n) RETURN n`                   | Explain the physical plan of a Cypher query.                                                                              |
-| `:threads`        | `:threads 4`                                    | Set the GraphBLAS thread count, with 0 restoring the default.                                                             |
+| `:threads`        | `:threads 4`                                    | Set the thread count for the parallel read passes, with 0 restoring the default.                                          |
 | `:version`        | `:version`                                      | Show the IssunDB version.                                                                                                 |
 | `help`            | `help`                                          | Show the built-in command list.                                                                                           |
 | `quit`            | `quit`                                          | Exit the CLI (alias `exit`).                                                                                              |
@@ -116,7 +120,7 @@ To use IssunDB as an embedded database in a Rust project, add the `issundb` libr
 
 ```toml
 [dependencies]
-issundb = "0.1.0-alpha.17"   # Match the version published on crates.io
+issundb = "0.1.0-alpha.20"   # Match the version published on crates.io
 serde_json = "1.0"           # Used to construct property maps
 ```
 

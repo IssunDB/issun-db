@@ -3,7 +3,7 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("storage: {0}")]
-    Storage(#[from] heed::Error),
+    Storage(#[from] crate::storage::StorageError),
 
     #[error("encode: {0}")]
     Encode(#[from] rmp_serde::encode::Error),
@@ -28,9 +28,6 @@ pub enum Error {
 
     #[error("vector index: {0}")]
     Vector(String),
-
-    #[error("graphblas: {0}")]
-    GraphBLAS(String),
 
     #[error(
         "unique constraint violation: node/edge with label/type {0} already has property '{1}' with value {2}"
