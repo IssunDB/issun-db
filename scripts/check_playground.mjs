@@ -16,6 +16,7 @@ const { Playground } = require(join(pkg, "issundb_wasm.js"));
 const { DEMO_CATEGORIES, FUNCTIONS, PROCEDURES, SAMPLE_GRAPHS, SAMPLE_SOCIAL } = await import(
   join(here, "..", "web", "demos.js")
 );
+const { formatCypher } = await import(join(here, "..", "web", "format.js"));
 
 // The graph each category's examples query, since none of them builds its own data any more.
 const sampleById = new Map(SAMPLE_GRAPHS.map((sample) => [sample.id, sample.cypher]));
@@ -178,6 +179,66 @@ for (const fn of FUNCTIONS) {
   }
 }
 
+// The formatter, which rewrites a query in the editor at the press of a button and must therefore
+// be incapable of changing what that query means. Casing is the sharp edge: uppercasing every word
+// the highlighter treats as a keyword once rewrote `issundb.shortestPath` and the case-sensitive
+// yield fields `index` and `count`. Nothing but this loop stands between such a rule and the page.
+//
+// Every catalog string is run twice on two fresh databases, once as written and once formatted, and
+// the two results must agree. A string that errors as written is skipped rather than failed: the
+// other passes above own that verdict, and the two entries needing embeddings error by design.
+console.log("\nFormatter round trip");
+
+const formatterCorpus = [
+  ...SAMPLE_GRAPHS.map((s) => [`sample:${s.id}`, s.cypher]),
+  ...DEMO_CATEGORIES.flatMap((c) =>
+    c.demos.map((d, i) => [`demo:${c.label}#${i + 1}`, d.cypher]).filter(([, q]) => q),
+  ),
+  ...PROCEDURES.map((p) => [`proc:${p.name}`, p.snippet]),
+  ...FUNCTIONS.map((f) => [`fn:${f.name}`, f.snippet]),
+];
+
+let fmtChecked = 0;
+let fmtFailures = 0;
+let fmtSkipped = 0;
+
+// Row order is not guaranteed by a query without ORDER BY, and formatting cannot change it anyway,
+// so the comparison sorts. What it is looking for is a changed row *set*.
+const rowsOf = (cypher) => {
+  const p = new Playground();
+  p.query(SAMPLE_SOCIAL);
+  const result = JSON.parse(p.query(cypher));
+  return JSON.stringify([result.columns, [...result.rows].map((r) => JSON.stringify(r)).sort()]);
+};
+
+for (const [label, cypher] of formatterCorpus) {
+  let before;
+  try {
+    before = rowsOf(cypher);
+  } catch {
+    fmtSkipped += 1;
+    continue;
+  }
+  fmtChecked += 1;
+  const formatted = formatCypher(cypher);
+  let after;
+  try {
+    after = rowsOf(formatted);
+  } catch (e) {
+    fmtFailures += 1;
+    console.log(`  FAIL  ${label.padEnd(38)} formatted query errors: ${String(e.message ?? e).split("\n")[0]}`);
+    continue;
+  }
+  if (before !== after) {
+    fmtFailures += 1;
+    console.log(`  FAIL  ${label.padEnd(38)} formatting changed the result`);
+  }
+}
+console.log(
+  `  ${fmtChecked - fmtFailures}/${fmtChecked} strings unchanged by formatting` +
+    (fmtSkipped ? `, ${fmtSkipped} skipped (error as written)` : ""),
+);
+
 // Cypher blocks in `docs/` marked `<!-- playground -->`, which `docs/hooks/playground_links.py`
 // turns into a "Run in the playground" link. The marker is a claim that the block runs against the
 // seeded sample graph, and nothing else checks it, so an example edited into a parameter or a
@@ -241,4 +302,6 @@ console.log(
   `${SAMPLE_GRAPHS.length - sampleFailures}/${SAMPLE_GRAPHS.length} sample graphs ok` +
     (sampleFailures ? `, ${sampleFailures} failed` : ""),
 );
-process.exit(failures + procFailures + fnFailures + docFailures + sampleFailures ? 1 : 0);
+process.exit(
+  failures + procFailures + fnFailures + fmtFailures + docFailures + sampleFailures ? 1 : 0,
+);

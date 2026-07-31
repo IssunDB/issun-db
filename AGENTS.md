@@ -82,11 +82,8 @@ modules according to this map.
     - `src/graph/stats.rs`: high-order cardinality statistics and the data-graph schema for the optimizer. Owns the `(label, type)` edge-frequency
       table behind `estimate_expand_fanout` and the realized `(src_label, type, dst_label)` triples behind `estimate_expand_fanout_to` and
       `schema_has_edge`, built by one pass over `label_idx` and one over `out_adj` (neither decodes a record, since a `NodeRecord` or `EdgeRecord`
-      decode also copies a property blob this table never reads) and cached against the committed-write generation. Nothing builds it as a side effect
-      of a query, and the generation check gates use rather than refresh: a table from an earlier generation is ignored, never trusted. The two fan-out
-      estimates are advisory and fall back to the global average without it, so only `Graph::materialize_edge_statistics` builds it. `schema_has_edge`
-      is not advisory (the optimizer drops rows on a negative), so it never depends on the table existing: with no current table it probes `label_idx`
-      and the adjacency directly under `SCHEMA_PROBE_BUDGET`, settling on the first matching edge and reporting `None` when the budget runs out.
+      decode also copies a property blob this table never reads) and cached against the committed-write generation. What may build the table, and what
+      `schema_has_edge` does without one, is stated once, with those methods under Component APIs.
     - `src/graph/fts_mod.rs`: full-text search index lifecycle and FTS storage primitives.
     - `src/graph/vector.rs`: vector byte storage helpers.
     - `src/graph/algo.rs`: public algorithm dispatch methods and internal traversal helpers.
@@ -111,8 +108,7 @@ modules according to this map.
       exact-semantics `Json` fallback) per node property, built lazily from one full node scan and kept fresh by a post-commit delta (node deletion
       forces a rebuild). Read through `Graph::node_prop_json`. Also owns the lazily computed per-property statistics (`PropStats`: bounds, an
       equi-depth histogram, and the most common values) that back the selectivity estimates, invalidated by the post-commit patch. Which readers may
-      cause the build is deliberate, because the build is one full scan: a gather larger than `SMALL_GATHER_MAX` does, a smaller one is served straight
-      from storage (`should_serve_directly`), and the advisory statistics never do (`with_existing_mut` rather than `with_fresh`).
+      cause that one full scan is a deliberate rule rather than an accident, and it is stated once, with the read-path methods under Component APIs.
     - `src/histogram.rs`: equi-depth histogram over property values with equality and range selectivity estimates; backs `PropStats`. Nothing here is
       persisted.
     - `src/threads.rs`: the one resolution of the thread budget every parallel consumer shares (`threads::resolve`). Precedence is the programmatic
@@ -122,7 +118,7 @@ modules according to this map.
       how a caller caps parallelism process-wide, including this repository's own `test` and `coverage` targets.
     - `src/storage/memory.rs`: the in-memory storage backend, second implementor of the contract in `storage/mod.rs`. Byte-ordered `BTreeMap` tables with
       `BTreeSet` duplicate values, copy-on-write transactions over `ArcSwap`, and a single writer lock. It is what a target with no libc compiles, and it is
-      what holds the storage seam to something: the whole suite runs against it (893 tests across core, vector, text, retrieval, and cypher).
+      what holds the storage seam to something: the whole suite runs against it, across core, vector, text, retrieval, and cypher.
     - `src/error.rs`: `Error` enum; all storage and serialization errors unify here. `Error::Storage` carries `storage::StorageError`, which is the selected
       backend's error type, so the variant is `heed::Error` on a default build and unchanged from before the backend split.
 - `crates/issundb-cypher/`: Cypher parser, AST, logical planner, physical planner, optimizer, and executor.
@@ -224,10 +220,11 @@ modules according to this map.
   exception is the Cypher basics lesson on `CREATE`, which writes two nodes.
   Selecting an example or a sample loads it into the editor without running it, since running a `CREATE` on click wrote to the database before the statement
   had been read and a second click silently duplicated its data; the full-text and vector examples keep their post-statement step by holding the selected
-  example until the run. The sample graphs carry no comments, being data rather than documentation. `app.js` also holds a Cypher formatter, whose casing rule
+  example until the run. The sample graphs carry no comments, being data rather than documentation. `format.js` holds the Cypher formatter, whose casing rule
   is narrower than the highlighter's keyword set on purpose: uppercasing every word in that set rewrote `issundb.shortestPath` and the case-sensitive yield
-  fields `index` and `count`. It must not be able to change what a query means, which is checked by running every string in `demos.js` before and after
-  formatting and comparing the rows. The procedure reference is written out by hand
+  fields `index` and `count`. It must not be able to change what a query means, which `make playground-check` enforces by running every catalog string on two
+  fresh databases, as written and formatted, and comparing the row sets. That is why the formatter is its own module rather than part of `app.js`, which
+  touches the DOM at import and so cannot be loaded by the checker. The procedure and function references are written out by hand
   because the engine cannot enumerate its own procedures, so that check is the only thing keeping it from drifting; it treats `ProcedureNotFound` as a failure
   even for the two retrieval entries whose empty-index error it tolerates, since a rename is exactly what that error reports.
   `docs/hooks/playground_links.py` is the MkDocs hook putting a "Run in the playground" link under a Cypher block in `docs/` marked `<!-- playground -->`,
@@ -381,11 +378,8 @@ Lower-level crates must not know about higher-level crates.
 The central coordination type. All graph operations go through `Graph`; do not call `Storage` directly from outside `issundb-core`.
 `Graph::open(path: &Path, map_size_gb: usize) -> Result<Self, Error>` is the only constructor.
 
-Node and edge CRUD, accessors, and registry lookups have self-describing signatures; read them from the source rather than this file. Methods:
-`add_node`, `add_node_multi`, `get_node`, `update_node`, `delete_node`, `add_label`, `remove_label`, `node_labels`, `add_edge`, `get_edge`,
-`update_edge`, `delete_edge`, `out_neighbors`, `in_neighbors`, `node_has_relationships`, `nodes_by_label`, `edges_by_type`, `all_nodes`, `label_name`,
-`type_name`, `list_node_indexes_and_constraints`, `list_edge_indexes_and_constraints`, `node_count_by_label`, `edge_count_by_type`,
-`put_vector_bytes`, `vector_bytes`, and `rebuild_csr`.
+Node and edge CRUD, accessors, and registry lookups have self-describing signatures; read them from the source rather than this file. Only the
+methods below carry behavior the signature does not show.
 
 The read-path and statistics methods carry non-obvious semantics:
 
@@ -414,7 +408,8 @@ The read-path and statistics methods carry non-obvious semantics:
   property's equi-depth histogram.
 - `estimate_equality_selectivity(prop, val) -> Result<Option<f64>, Error>`: estimated fraction of non-null values equal to `val`, exact for the most
   common values and histogram-estimated otherwise; both feed the optimizer's selectivity-aware `Filter` plan weight.
-- Those three readers are advisory, and none of them builds the property columns: each also returns `None` when the columns do not exist yet, leaving
+- Those three readers are advisory, and none of them builds the property columns (`with_existing_mut` rather than `with_fresh`): each also returns
+  `None` when the columns do not exist yet, leaving
   the caller on its default plan weight or declining to prune. Forcing a build for them made the first query mentioning any property pay one full node
   scan (measured at roughly 1.3 seconds on an 800 K-node graph), which was the dominant cold-start latency, and the answer only weights a choice.
   A caller that needs statistics on a cold graph must materialize the columns first, and `Graph::materialize_property_columns` is how: no small read
@@ -459,11 +454,8 @@ The read-path and statistics methods carry non-obvious semantics:
   environment variable (0 restores default behavior, resolved by `threads::resolve`). There is no pool to configure: each pass resolves the budget when
   it starts and spawns scoped threads for its own duration, so the call stores the value, takes effect on the next pass, and cannot fail.
 
-Graph algorithms have self-describing signatures over `NodeId` and `EdgeId`: `bfs`, `bfs_multi_source`, `expand_bulk`, `dfs`, `shortest_path`, `all_paths`, `all_shortest_paths`,
-`longest_path`, `shortest_path_top_k`, `page_rank`, `connected_components`, `strongly_connected_components`, `detect_cycle`, `label_propagation`,
-`louvain`, `degree_centrality`, `betweenness_centrality`, `harmonic_centrality`, `closeness_centrality`, `eigenvector_centrality`,
-`katz_centrality`, `clustering_coefficient`, `link_prediction_score`, `spanning_forest`, `maximum_flow`, and `all_neighbors`. Several carry behavior
-worth pinning:
+The graph algorithms are the public methods of `graph/algo.rs`, with signatures over `NodeId` and `EdgeId` that read for themselves. Several carry
+behavior a signature cannot show, and those are pinned here:
 
 - `shortest_path_dijkstra(src, dst) -> Result<Option<WeightedPath>, Error>`: edge weight is the first present of the `weight`, `cost`, `capacity`, or
   `cap` property, default `1.0`; the source is fixed, so unlike `shortest_path_top_k` and `spanning_forest` this method takes no weight-property

@@ -182,7 +182,7 @@ saw is not.
 
 The left end reads `This playground app is powered by IssunDB (0.1.0-alpha.20; develop@1f938); ...`.
 The version is the crate's, and `develop@1f938` is the branch and short commit the module was built
-from. The right end reads `6 nodes and 9 edges · 32 KB in use, 19.9 MB heap`.
+from. The right end reads `| 6 nodes and 9 edges | 32 KB in use | 19.9 MB heap |`.
 
 `in use` is live bytes the engine has allocated and not freed, counted by a `GlobalAlloc` wrapper the
 `issundb-wasm` crate installs and read through `Playground.memoryBytes()`. `heap` is the WebAssembly
@@ -243,9 +243,11 @@ A word is uppercased only if the clause-phrase scan recognized it or it is in a 
 operators, and never when it follows a `.`, a `:`, or an `AS`. A property that happens to spell a
 clause is left where it is for the same reason: `RETURN n.set` is one line, not two.
 
-Because the pass cannot change what a query means, that is testable, and it is tested: every Cypher
-string in `demos.js` is run before and after formatting on identical fresh databases, and the
-columns and rows compared. That check is what found all three casing bugs above.
+Because the pass cannot change what a query means, that is testable, and `make playground-check`
+tests it: every Cypher string in the catalog is run on two fresh databases, once as written and once
+formatted, and the column and row sets compared. Reintroducing any of the three casing bugs above
+fails it. The formatter lives in `format.js` rather than `app.js` so the checker can import it,
+since `app.js` touches the DOM at import time and a Node process has none.
 
 ## Links from the Documentation
 
