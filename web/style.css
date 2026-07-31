@@ -862,19 +862,22 @@ pre.json {
   min-height: 100%;
 }
 
+/* Flat on every side, as the banner is. The state is carried by a faint tint and a tinted border
+   rather than a coloured rule down one edge. Both variants share this rule, so flattening only the
+   error one would have left the informational one with a bar that read as an accident. */
 .notice {
   margin: 14px;
   padding: 12px 14px;
-  border-radius: 4px;
+  border: 1px solid var(--line);
+  border-radius: var(--control-radius);
   font-size: 0.85rem;
   line-height: 1.55;
-  border-left: 4px solid;
   box-shadow: var(--md-shadow-z1);
 }
 
 .notice.err {
-  background: color-mix(in srgb, var(--err) 10%, transparent);
-  border-left-color: var(--err);
+  background: color-mix(in srgb, var(--err) 8%, var(--card-bg));
+  border-color: color-mix(in srgb, var(--err) 30%, var(--line));
   color: var(--md-default-fg-color);
   font-family: var(--md-code-font);
   font-size: 0.82rem;
@@ -882,8 +885,8 @@ pre.json {
 }
 
 .notice.info {
-  background: color-mix(in srgb, var(--md-primary-fg-color) 8%, transparent);
-  border-left-color: var(--md-primary-fg-color);
+  background: color-mix(in srgb, var(--md-primary-fg-color) 6%, var(--card-bg));
+  border-color: color-mix(in srgb, var(--md-primary-fg-color) 24%, var(--line));
   color: var(--md-default-fg-color--light);
 }
 
