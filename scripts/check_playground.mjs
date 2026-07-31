@@ -13,7 +13,7 @@ const pkg = process.env.PLAYGROUND_PKG ?? join(here, "..", "target", "playground
 
 const require = createRequire(import.meta.url);
 const { Playground } = require(join(pkg, "issundb_wasm.js"));
-const { DEMO_CATEGORIES, PROCEDURES, SAMPLE_GRAPHS, SAMPLE_SOCIAL } = await import(
+const { DEMO_CATEGORIES, FUNCTIONS, PROCEDURES, SAMPLE_GRAPHS, SAMPLE_SOCIAL } = await import(
   join(here, "..", "web", "demos.js")
 );
 
@@ -151,6 +151,33 @@ for (const proc of PROCEDURES) {
   }
 }
 
+// The function catalog, checked exactly as the procedures are. A function is called in an
+// expression rather than through CALL, so its snippet is an ordinary query, and the same loop
+// works: what matters is that the name resolves and the snippet runs. An `UnknownFunction` is the
+// drift this catches, the way `ProcedureNotFound` is above.
+console.log("\nFunction reference");
+
+let fnChecked = 0;
+let fnFailures = 0;
+
+for (const fn of FUNCTIONS) {
+  fnChecked += 1;
+  const p = new Playground();
+  try {
+    p.query(SAMPLE_SOCIAL);
+    const result = JSON.parse(p.query(fn.snippet));
+    if (result.rows.length === 0) {
+      fnFailures += 1;
+      console.log(`  FAIL  ${fn.name.padEnd(38)} returned no rows`);
+    } else {
+      console.log(`  ok    ${fn.name.padEnd(38)} ${result.rows.length} row(s)`);
+    }
+  } catch (e) {
+    fnFailures += 1;
+    console.log(`  FAIL  ${fn.name.padEnd(38)} ${String(e.message ?? e).split("\n")[0]}`);
+  }
+}
+
 // Cypher blocks in `docs/` marked `<!-- playground -->`, which `docs/hooks/playground_links.py`
 // turns into a "Run in the playground" link. The marker is a claim that the block runs against the
 // seeded sample graph, and nothing else checks it, so an example edited into a parameter or a
@@ -204,6 +231,9 @@ console.log(
     (procFailures ? `, ${procFailures} failed` : ""),
 );
 console.log(
+  `${fnChecked - fnFailures}/${fnChecked} functions ok` + (fnFailures ? `, ${fnFailures} failed` : ""),
+);
+console.log(
   `${docChecked - docFailures}/${docChecked} marked doc blocks ok` +
     (docFailures ? `, ${docFailures} failed` : ""),
 );
@@ -211,4 +241,4 @@ console.log(
   `${SAMPLE_GRAPHS.length - sampleFailures}/${SAMPLE_GRAPHS.length} sample graphs ok` +
     (sampleFailures ? `, ${sampleFailures} failed` : ""),
 );
-process.exit(failures + procFailures + docFailures + sampleFailures ? 1 : 0);
+process.exit(failures + procFailures + fnFailures + docFailures + sampleFailures ? 1 : 0);

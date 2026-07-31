@@ -208,8 +208,10 @@ modules according to this map.
   thin exported layer that converts to `JsError`, because constructing a `JsError` calls a wasm-bindgen import that panics off-target, and without the
   split none of it could be covered by `cargo test`. Reading all of a node's properties decodes the stored msgpack blob directly, as the REST node route
   does, since every read-path method on `Graph` takes the property names to fetch and an inspector cannot know them.
-- `web/`: the playground page that loads that module: `index.html`, `app.js`, `demos.js`, and `style.css`, with the generated module in the gitignored
-  `web/pkg/`. Vanilla ES modules with no build step, and no library is fetched from a network, so the Cypher highlighter and the force-directed layout are
+- `web/`: the playground page that loads that module: `index.html`, `app.js`, `worker.js`, `demos.js`, and `style.css`, with the generated module in the
+  gitignored `web/pkg/`. The engine runs in `worker.js` and the page reaches it only by message, so a query never blocks the tab; that is also why
+  cancelling a query terminates the worker and replays the sample plus the setup log, since a WebAssembly call has no interruption point and the graph
+  dies with the thread that held it. Vanilla ES modules with no build step, and no library is fetched from a network, so the Cypher highlighter and the force-directed layout are
   written in `app.js` rather than pulled from one. The page's only external request is the Google Fonts link for Inter and JetBrains Mono, which is the same
   request `theme.font` in `mkdocs.yml` already makes for the same two families; the size scale is the reference playground's, in rem against a 1rem body. It is served under the MkDocs site and styled to match it: the custom properties at the top of
   `style.css` are Material for MkDocs' own tokens, copied from the built `palette.*.min.css` for this site's palette, and the scheme is carried on

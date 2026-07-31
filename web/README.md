@@ -27,14 +27,14 @@ statement it depends on.
 The Setup panel offers five, each small enough to read at once and shaped so that one part of the
 engine has something to say about it:
 
-| Sample | What it is | Examples that query it |
-|---|---|---|
-| Social network | Weighted acquaintances. Seeded on load. | Cypher basics, Graph algorithms, Query planning, Vector search |
-| Article corpus | Documents, topics, and citations. | Full-text search, GraphRAG |
-| Knowledge graph | Researchers, labs, papers, and the concepts those mention. | Knowledge graph |
-| Org chart | A reporting tree, so variable-length hops, shortest path, and a numeric range scan. | |
-| Transport network | Routes carrying a weight, a cost, and a capacity, so a weighted path differs from a shortest one. | |
-| Retail co-purchase | Customers and products, so grouped counts, a price range scan, and a co-purchase join. | |
+| Sample             | What it is                                                                                        | Examples that query it                                         |
+|--------------------|---------------------------------------------------------------------------------------------------|----------------------------------------------------------------|
+| Social network     | Weighted acquaintances. Seeded on load.                                                           | Cypher basics, Graph algorithms, Query planning, Vector search |
+| Article corpus     | Documents, topics, and citations.                                                                 | Full-text search, GraphRAG                                     |
+| Knowledge graph    | Researchers, labs, papers, and the concepts those mention.                                        | Knowledge graph                                                |
+| Org chart          | A reporting tree, so variable-length hops, shortest path, and a numeric range scan.               |                                                                |
+| Transport network  | Routes carrying a weight, a cost, and a capacity, so a weighted path differs from a shortest one. |                                                                |
+| Retail co-purchase | Customers and products, so grouped counts, a price range scan, and a co-purchase join.            |                                                                |
 
 This is the only place a dataset comes from. Every example queries whatever graph is loaded rather
 than creating one, which is what keeps the two panels from being two lists of datasets: an earlier
@@ -67,8 +67,8 @@ make playground-serve   # http://localhost:8000
 A module cannot be loaded over `file://`, so the page has to be served over HTTP. Any
 static server works; `make playground-serve` uses Python's.
 
-`make playground-check` runs every sample graph, demo, and procedure snippet in `demos.js` through
-the compiled module and fails on an error. All three are Cypher inside a JavaScript file, which no
+`make playground-check` runs every sample graph, demo, procedure, and function snippet in
+`demos.js` through the compiled module and fails on an error. All three are Cypher inside a JavaScript file, which no
 Rust test can see, so this is what keeps a button, a preset, or a reference entry from silently
 breaking. The procedure half also rejects `ProcedureNotFound` specifically, which is the failure
 a rename produces.
@@ -133,13 +133,15 @@ and native controls from the light palette on both schemes.
 
 - `index.html`: the page. The inline script in `<head>` applies the stored scheme before
   first paint, so a dark-theme visitor never sees a white flash.
-- `app.js`: everything the page does. The Cypher highlighter and the force-directed layout
-  are written here rather than pulled from a library, so the page loads nothing it does not
-  contain.
-- `demos.js`: the demo catalog and the procedure reference, both checked by
+- `app.js`: everything the page does except run the engine. The Cypher highlighter, the
+  autocomplete, the plan tree, and the force-directed layout are written here rather than pulled
+  from a library, so the page loads nothing it does not contain.
+- `worker.js`: the engine. It owns the wasm module and the graph, and the page reaches it only by
+  message, so a query never blocks the tab. See "Cancelling a Query" for what that costs.
+- `demos.js`: the demo catalog and the procedure and function references, all checked by
   `make playground-check`. Each demo category carries a `docs` link into the surrounding
   documentation; those are relative to `/playground/`, so they break if a heading they anchor to
-  is renamed. The procedure list is written out by hand because the engine cannot enumerate its
+  is renamed. Both reference lists are written out by hand because the engine cannot enumerate its
   own procedures, which is why the check runs each snippet.
 - `style.css`: light and dark themes over one set of custom properties.
 - `logo.svg`: the header logo and the favicon, copied from `docs/assets/logo.svg` by
@@ -161,6 +163,20 @@ non-passive: a wheel over the canvas that both zoomed and scrolled the page woul
 bounded to a factor of eight in and four out, or a few scrolls leave an empty canvas with no clue which
 way the graph went. A redraw returns the view to the whole canvas, so a query is never answered into a
 frame computed for different data.
+
+## Cancelling a Query
+
+The engine runs in `worker.js`, so a long query leaves the page responsive and a Cancel button
+appears beside Execute. Pressing it terminates the worker, which is the only way to stop a
+WebAssembly call: there is no interruption point for a message to be handled at, so nothing short of
+killing the thread will do.
+
+The graph lives in the worker and therefore dies with it. Cancelling is still recoverable rather
+than destructive, because the page immediately starts a fresh worker, re-seeds the sample, and
+replays every statement it recorded as setup, which is the same log a share link carries. A query
+that only read loses nothing. One that had already written is reapplied from that log, so anything
+typed straight into the editor and run is restored, while a write made by a statement the page never
+saw is not.
 
 ## What the Footer Reports
 

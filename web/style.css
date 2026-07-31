@@ -16,530 +16,530 @@
 
 :root,
 [data-md-color-scheme="default"] {
-  --md-hue: 225deg;
+    --md-hue: 225deg;
 
-  --md-default-fg-color: #000000de;
-  --md-default-fg-color--light: #0000008a;
-  --md-default-fg-color--lighter: #00000052;
-  --md-default-fg-color--lightest: #00000012;
-  --md-default-bg-color: #fff;
+    --md-default-fg-color: #000000de;
+    --md-default-fg-color--light: #0000008a;
+    --md-default-fg-color--lighter: #00000052;
+    --md-default-fg-color--lightest: #00000012;
+    --md-default-bg-color: #fff;
 
-  --md-code-fg-color: #36464e;
-  --md-code-bg-color: #f5f5f5;
+    --md-code-fg-color: #36464e;
+    --md-code-bg-color: #f5f5f5;
 
-  --md-primary-fg-color: #7e56c2;
-  --md-primary-fg-color--light: #9574cd;
-  --md-primary-fg-color--dark: #673ab6;
-  --md-primary-bg-color: #fff;
+    --md-primary-fg-color: #7e56c2;
+    --md-primary-fg-color--light: #9574cd;
+    --md-primary-fg-color--dark: #673ab6;
+    --md-primary-bg-color: #fff;
 
-  --md-accent-fg-color: #fa0;
-  --md-typeset-a-color: var(--md-primary-fg-color);
+    --md-accent-fg-color: #fa0;
+    --md-typeset-a-color: var(--md-primary-fg-color);
 
-  --md-shadow-z1: 0 0.2rem 0.5rem #0000000d, 0 0 0.05rem #0000001a;
-  --md-shadow-z2: 0 0.2rem 0.5rem #0000001a, 0 0 0.05rem #00000040;
+    --md-shadow-z1: 0 0.2rem 0.5rem #0000000d, 0 0 0.05rem #0000001a;
+    --md-shadow-z2: 0 0.2rem 0.5rem #0000001a, 0 0 0.05rem #00000040;
 
-  --md-text-font: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial,
+    --md-text-font: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial,
     sans-serif;
-  --md-code-font: "JetBrains Mono", ui-monospace, "SF Mono", "Cascadia Mono", Menlo,
+    --md-code-font: "JetBrains Mono", ui-monospace, "SF Mono", "Cascadia Mono", Menlo,
     Consolas, monospace;
 
-  --ok: #1c7c54;
-  --err: #b3261e;
-  --panel-bg: var(--md-default-bg-color);
-  --line: var(--md-default-fg-color--lightest);
+    --ok: #1c7c54;
+    --err: #b3261e;
+    --panel-bg: var(--md-default-bg-color);
+    --line: var(--md-default-fg-color--lightest);
 
-  --syn-kw: #7e56c2;
-  --syn-fn: #0b6bcb;
-  --syn-str: #0f7b4f;
-  --syn-num: #b5480c;
-  --syn-com: var(--md-default-fg-color--light);
-  --syn-lbl: #b1176b;
-  --syn-op: var(--md-default-fg-color--light);
+    --syn-kw: #7e56c2;
+    --syn-fn: #0b6bcb;
+    --syn-str: #0f7b4f;
+    --syn-num: #b5480c;
+    --syn-com: var(--md-default-fg-color--light);
+    --syn-lbl: #b1176b;
+    --syn-op: var(--md-default-fg-color--light);
 
-  /* The layout is a set of cards on a page, so the page and a card need different
-     backgrounds. Material's own palette has only one, hence these two. */
-  /* Every button, select, and input shares these, so a row of them lines up instead of each one
-     being sized by its own padding. `min-height` rather than `height`, so a label that wraps grows
-     the control instead of being clipped by it. */
-  --control-h: 34px;
-  --control-h-sm: 27px;
-  --control-radius: 6px;
+    /* The layout is a set of cards on a page, so the page and a card need different
+       backgrounds. Material's own palette has only one, hence these two. */
+    /* Every button, select, and input shares these, so a row of them lines up instead of each one
+       being sized by its own padding. `min-height` rather than `height`, so a label that wraps grows
+       the control instead of being clipped by it. */
+    --control-h: 34px;
+    --control-h-sm: 27px;
+    --control-radius: 6px;
 
-  --page-bg: hsla(var(--md-hue), 16%, 96%, 1);
-  --card-bg: #fff;
-  --soft-bg: hsla(var(--md-hue), 16%, 97%, 1);
-  --accent-fg: #6d4200;
+    --page-bg: hsla(var(--md-hue), 16%, 96%, 1);
+    --card-bg: #fff;
+    --soft-bg: hsla(var(--md-hue), 16%, 97%, 1);
+    --accent-fg: #6d4200;
 
-  /* Without this the browser draws its scrollbars, and the form controls it renders natively,
-     from the light palette regardless of the scheme, which on the dark scheme puts white bars
-     down the side of every scrolling panel. */
-  color-scheme: light;
+    /* Without this the browser draws its scrollbars, and the form controls it renders natively,
+       from the light palette regardless of the scheme, which on the dark scheme puts white bars
+       down the side of every scrolling panel. */
+    color-scheme: light;
 }
 
 [data-md-color-scheme="slate"] {
-  --md-default-fg-color: hsla(var(--md-hue), 15%, 90%, 0.82);
-  --md-default-fg-color--light: hsla(var(--md-hue), 15%, 90%, 0.56);
-  --md-default-fg-color--lighter: hsla(var(--md-hue), 15%, 90%, 0.32);
-  --md-default-fg-color--lightest: hsla(var(--md-hue), 15%, 90%, 0.12);
-  --md-default-bg-color: hsla(var(--md-hue), 15%, 14%, 1);
+    --md-default-fg-color: hsla(var(--md-hue), 15%, 90%, 0.82);
+    --md-default-fg-color--light: hsla(var(--md-hue), 15%, 90%, 0.56);
+    --md-default-fg-color--lighter: hsla(var(--md-hue), 15%, 90%, 0.32);
+    --md-default-fg-color--lightest: hsla(var(--md-hue), 15%, 90%, 0.12);
+    --md-default-bg-color: hsla(var(--md-hue), 15%, 14%, 1);
 
-  --md-code-fg-color: hsla(var(--md-hue), 18%, 86%, 0.82);
-  --md-code-bg-color: hsla(var(--md-hue), 15%, 18%, 1);
+    --md-code-fg-color: hsla(var(--md-hue), 18%, 86%, 0.82);
+    --md-code-bg-color: hsla(var(--md-hue), 15%, 18%, 1);
 
-  --md-typeset-a-color: #a47bea;
+    --md-typeset-a-color: #a47bea;
 
-  --ok: #5fd39b;
-  --err: #f2867d;
-  --panel-bg: hsla(var(--md-hue), 15%, 18%, 1);
+    --ok: #5fd39b;
+    --err: #f2867d;
+    --panel-bg: hsla(var(--md-hue), 15%, 18%, 1);
 
-  --syn-kw: #c4a7ff;
-  --syn-fn: #7cc4ff;
-  --syn-str: #7ddba4;
-  --syn-num: #ffb27a;
-  --syn-lbl: #ff9ecb;
+    --syn-kw: #c4a7ff;
+    --syn-fn: #7cc4ff;
+    --syn-str: #7ddba4;
+    --syn-num: #ffb27a;
+    --syn-lbl: #ff9ecb;
 
-  --page-bg: hsla(var(--md-hue), 15%, 11%, 1);
-  --card-bg: hsla(var(--md-hue), 15%, 15%, 1);
-  --soft-bg: hsla(var(--md-hue), 15%, 18%, 1);
-  --accent-fg: #ffc65c;
+    --page-bg: hsla(var(--md-hue), 15%, 11%, 1);
+    --card-bg: hsla(var(--md-hue), 15%, 15%, 1);
+    --soft-bg: hsla(var(--md-hue), 15%, 18%, 1);
+    --accent-fg: #ffc65c;
 
-  color-scheme: dark;
+    color-scheme: dark;
 }
 
 * {
-  box-sizing: border-box;
+    box-sizing: border-box;
 }
 
 /* Every size below is in rem, so this one number scales the whole page. A percentage rather than a
    pixel count, because it then still follows a reader who has changed their browser's default text
    size instead of overriding them. 93.75% is 15px against the usual 16. */
 html {
-  font-size: 93.75%;
+    font-size: 93.75%;
 }
 
 body {
-  margin: 0;
-  font-family: var(--md-text-font);
-  font-size: 1rem;
-  line-height: 1.5;
-  color: var(--md-default-fg-color);
-  background: var(--page-bg);
-  height: 100vh;
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
+    margin: 0;
+    font-family: var(--md-text-font);
+    font-size: 1rem;
+    line-height: 1.5;
+    color: var(--md-default-fg-color);
+    background: var(--page-bg);
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
 }
 
 button,
 select,
 input {
-  font: inherit;
-  color: inherit;
+    font: inherit;
+    color: inherit;
 }
 
 button {
-  cursor: pointer;
+    cursor: pointer;
 }
 
 a {
-  color: var(--md-typeset-a-color);
+    color: var(--md-typeset-a-color);
 }
 
 /* ---------------------------------------------------------------- header ---- */
 
 /* Material's header is a solid primary bar with `--md-primary-bg-color` text. */
 header {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 0 14px;
-  height: 48px;
-  flex: 0 0 auto;
-  background: var(--md-primary-fg-color);
-  color: var(--md-primary-bg-color);
-  box-shadow: var(--md-shadow-z1);
-  z-index: 10;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 0 14px;
+    height: 48px;
+    flex: 0 0 auto;
+    background: var(--md-primary-fg-color);
+    color: var(--md-primary-bg-color);
+    box-shadow: var(--md-shadow-z1);
+    z-index: 10;
 }
 
 .brand {
-  display: flex;
-  align-items: center;
-  gap: 9px;
-  font-weight: 700;
-  letter-spacing: -0.02em;
-  font-size: 1.25rem;
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    font-size: 1.25rem;
 }
 
 /* The documentation's logo is drawn with dark strokes, so it needs a light tile to read against
    the primary-colored bar rather than being recolored. */
 .brand-logo {
-  flex: 0 0 auto;
-  border-radius: 5px;
-  background: #fff;
-  padding: 2px;
-  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.18);
+    flex: 0 0 auto;
+    border-radius: 5px;
+    background: #fff;
+    padding: 2px;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.18);
 }
 
 /* The second word in the accent color, as the reference header does it. */
 .brand-sub {
-  color: var(--md-accent-fg-color);
-  font-weight: 700;
+    color: var(--md-accent-fg-color);
+    font-weight: 700;
 }
 
 .spacer {
-  flex: 1;
+    flex: 1;
 }
 
 .site-nav {
-  display: flex;
-  align-items: center;
-  gap: 4px;
+    display: flex;
+    align-items: center;
+    gap: 4px;
 }
 
 header .hdr,
 .site-nav a {
-  background: none;
-  border: 0;
-  border-radius: 4px;
-  padding: 6px 9px;
-  color: var(--md-primary-bg-color);
-  opacity: 0.88;
-  font-size: 1rem;
-  font-weight: 500;
-  text-decoration: none;
-  transition: background 0.12s, opacity 0.12s;
+    background: none;
+    border: 0;
+    border-radius: 4px;
+    padding: 6px 9px;
+    color: var(--md-primary-bg-color);
+    opacity: 0.88;
+    font-size: 1rem;
+    font-weight: 500;
+    text-decoration: none;
+    transition: background 0.12s, opacity 0.12s;
 }
 
 header .hdr:hover,
 .site-nav a:hover {
-  background: rgba(255, 255, 255, 0.14);
-  opacity: 1;
+    background: rgba(255, 255, 255, 0.14);
+    opacity: 1;
 }
 
 #toggle-side {
-  display: none;
+    display: none;
 }
 
 /* A circle with a hairline ring, which is what distinguishes the icon controls from the
    text links beside them. */
 header .hdr.icon {
-  display: inline-grid;
-  place-items: center;
-  width: 32px;
-  height: 32px;
-  padding: 0;
-  border-radius: 999px;
-  border: 1px solid rgba(255, 255, 255, 0.28);
+    display: inline-grid;
+    place-items: center;
+    width: 32px;
+    height: 32px;
+    padding: 0;
+    border-radius: 999px;
+    border: 1px solid rgba(255, 255, 255, 0.28);
 }
 
 /* ----------------------------------------------------------------- shell ---- */
 
 .shell {
-  flex: 1;
-  display: flex;
-  min-height: 0;
-  overflow-y: auto;
-  overflow-x: hidden;
+    flex: 1;
+    display: flex;
+    min-height: 0;
+    overflow-y: auto;
+    overflow-x: hidden;
 }
 
 /* The whole app is one centered column rather than edge to edge, so on a wide display the
    editor stays a readable width instead of stretching across it. */
 .wrap {
-  flex: 1;
-  display: flex;
-  align-items: flex-start;
-  gap: 16px;
-  width: 100%;
-  max-width: 1280px;
-  margin: 0 auto;
-  padding: 16px;
+    flex: 1;
+    display: flex;
+    align-items: flex-start;
+    gap: 16px;
+    width: 100%;
+    max-width: 1280px;
+    margin: 0 auto;
+    padding: 16px;
 }
 
 aside {
-  width: 320px;
-  flex: 0 0 320px;
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
+    width: 320px;
+    flex: 0 0 320px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
 }
 
 aside.hidden {
-  display: none;
+    display: none;
 }
 
 /* -------------------------------------------------------- cards and panels ---- */
 
 .panel,
 .card {
-  background: var(--card-bg);
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  box-shadow: var(--md-shadow-z1);
+    background: var(--card-bg);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    box-shadow: var(--md-shadow-z1);
 }
 
 .panel {
-  flex: 0 0 auto;
-  padding-bottom: 14px;
+    flex: 0 0 auto;
+    padding-bottom: 14px;
 }
 
 .panel > h2,
 .card-head {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin: 0;
-  padding: 11px 14px;
-  border-bottom: 1px solid var(--line);
-  font-size: 0.95rem;
-  font-weight: 600;
-  letter-spacing: 0.05em;
-  text-transform: uppercase;
-  color: var(--md-default-fg-color--light);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 0;
+    padding: 11px 14px;
+    border-bottom: 1px solid var(--line);
+    font-size: 0.95rem;
+    font-weight: 600;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: var(--md-default-fg-color--light);
 }
 
 .panel > h2 svg {
-  flex: 0 0 auto;
-  opacity: 0.8;
+    flex: 0 0 auto;
+    opacity: 0.8;
 }
 
 .panel-body {
-  padding: 12px 14px 0;
+    padding: 12px 14px 0;
 }
 
 .field-label {
-  font-size: 0.82rem;
-  font-weight: 600;
-  color: var(--md-default-fg-color--light);
-  margin: 12px 0 5px;
+    font-size: 0.82rem;
+    font-weight: 600;
+    color: var(--md-default-fg-color--light);
+    margin: 12px 0 5px;
 }
 
 /* --------------------------------------------------------------- main area ---- */
 
 main {
-  flex: 1;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
 }
 
 .card {
-  display: flex;
-  flex-direction: column;
-  min-height: 0;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
 }
 
 .card-head h3 {
-  margin: 0;
-  font-size: 1rem;
-  font-weight: 600;
-  letter-spacing: 0.05em;
-  text-transform: uppercase;
-  color: var(--md-default-fg-color);
+    margin: 0;
+    font-size: 1rem;
+    font-weight: 600;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: var(--md-default-fg-color);
 }
 
 .card-head .hint {
-  margin: 0 0 0 auto;
-  text-transform: none;
-  letter-spacing: 0;
-  font-weight: 400;
+    margin: 0 0 0 auto;
+    text-transform: none;
+    letter-spacing: 0;
+    font-weight: 400;
 }
 
 .card-foot {
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 8px;
-  padding: 10px 14px;
-  border-top: 1px solid var(--line);
-  flex-wrap: wrap;
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 8px;
+    padding: 10px 14px;
+    border-top: 1px solid var(--line);
+    flex-wrap: wrap;
 }
 
 .field {
-  margin-bottom: 10px;
+    margin-bottom: 10px;
 }
 
 .field label {
-  display: block;
-  font-size: 0.82rem;
-  font-weight: 600;
-  color: var(--md-default-fg-color--light);
-  margin-bottom: 4px;
+    display: block;
+    font-size: 0.82rem;
+    font-weight: 600;
+    color: var(--md-default-fg-color--light);
+    margin-bottom: 4px;
 }
 
 .control {
-  width: 100%;
-  min-height: var(--control-h);
-  background: var(--md-default-bg-color);
-  color: var(--md-default-fg-color);
-  border: 1px solid var(--md-default-fg-color--lighter);
-  border-radius: var(--control-radius);
-  padding: 0 10px;
-  font-size: 0.9rem;
+    width: 100%;
+    min-height: var(--control-h);
+    background: var(--md-default-bg-color);
+    color: var(--md-default-fg-color);
+    border: 1px solid var(--md-default-fg-color--lighter);
+    border-radius: var(--control-radius);
+    padding: 0 10px;
+    font-size: 0.9rem;
 }
 
 .control:focus {
-  outline: none;
-  border-color: var(--md-primary-fg-color);
-  box-shadow: 0 0 0 2px color-mix(in srgb, var(--md-primary-fg-color) 22%, transparent);
+    outline: none;
+    border-color: var(--md-primary-fg-color);
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--md-primary-fg-color) 22%, transparent);
 }
 
 /* The popup inherits neither the select's background nor its color on every platform, so a
  * dark scheme could render the options as white on white. */
 select.control option {
-  background: var(--md-default-bg-color);
-  color: var(--md-default-fg-color);
+    background: var(--md-default-bg-color);
+    color: var(--md-default-fg-color);
 }
 
 select.control {
-  appearance: none;
-  background-image: linear-gradient(45deg, transparent 50%, currentColor 50%),
+    appearance: none;
+    background-image: linear-gradient(45deg, transparent 50%, currentColor 50%),
     linear-gradient(135deg, currentColor 50%, transparent 50%);
-  background-position: calc(100% - 15px) 52%, calc(100% - 10px) 52%;
-  background-size: 5px 5px, 5px 5px;
-  background-repeat: no-repeat;
-  padding-right: 28px;
-  cursor: pointer;
+    background-position: calc(100% - 15px) 52%, calc(100% - 10px) 52%;
+    background-size: 5px 5px, 5px 5px;
+    background-repeat: no-repeat;
+    padding-right: 28px;
+    cursor: pointer;
 }
 
 /* Two columns of bordered boxes, as the reference sidebar has them: a category's worth of
    examples stays visible without scrolling past it. */
 .demo-buttons {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 6px;
-  margin-bottom: 10px;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 6px;
+    margin-bottom: 10px;
 }
 
 .demo {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  text-align: center;
-  min-height: var(--control-h);
-  background: var(--card-bg);
-  border: 1px solid var(--md-default-fg-color--lighter);
-  border-radius: var(--control-radius);
-  padding: 4px 6px;
-  font-size: 0.82rem;
-  line-height: 1.3;
-  color: var(--md-default-fg-color--light);
-  transition: border-color 0.12s, color 0.12s, background 0.12s;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    min-height: var(--control-h);
+    background: var(--card-bg);
+    border: 1px solid var(--md-default-fg-color--lighter);
+    border-radius: var(--control-radius);
+    padding: 4px 6px;
+    font-size: 0.82rem;
+    line-height: 1.3;
+    color: var(--md-default-fg-color--light);
+    transition: border-color 0.12s, color 0.12s, background 0.12s;
 }
 
 .demo:hover {
-  border-color: var(--md-primary-fg-color);
-  color: var(--md-typeset-a-color);
+    border-color: var(--md-primary-fg-color);
+    color: var(--md-typeset-a-color);
 }
 
 .demo.active {
-  background: color-mix(in srgb, var(--md-primary-fg-color) 12%, transparent);
-  border-color: color-mix(in srgb, var(--md-primary-fg-color) 40%, transparent);
-  color: var(--md-typeset-a-color);
-  font-weight: 700;
+    background: color-mix(in srgb, var(--md-primary-fg-color) 12%, transparent);
+    border-color: color-mix(in srgb, var(--md-primary-fg-color) 40%, transparent);
+    color: var(--md-typeset-a-color);
+    font-weight: 700;
 }
 
 .hint {
-  margin: 0 0 8px;
-  font-size: 0.75rem;
-  line-height: 1.5;
-  color: var(--md-default-fg-color--light);
+    margin: 0 0 8px;
+    font-size: 0.75rem;
+    line-height: 1.5;
+    color: var(--md-default-fg-color--light);
 }
 
 .docs-link {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  font-size: 0.82rem;
-  text-decoration: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 0.82rem;
+    text-decoration: none;
 }
 
 .docs-link:hover {
-  text-decoration: underline;
+    text-decoration: underline;
 }
 
 .schema-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 3px 0;
-  font-size: 0.75rem;
-  font-family: var(--md-code-font);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 3px 0;
+    font-size: 0.75rem;
+    font-family: var(--md-code-font);
 }
 
 .schema-row .swatch {
-  width: 9px;
-  height: 9px;
-  border-radius: 2px;
-  flex: 0 0 auto;
+    width: 9px;
+    height: 9px;
+    border-radius: 2px;
+    flex: 0 0 auto;
 }
 
 .schema-row .n {
-  margin-left: auto;
-  color: var(--md-default-fg-color--light);
-  font-size: 0.75rem;
+    margin-left: auto;
+    color: var(--md-default-fg-color--light);
+    font-size: 0.75rem;
 }
 
 .empty {
-  font-size: 0.8rem;
-  color: var(--md-default-fg-color--light);
-  font-style: italic;
+    font-size: 0.8rem;
+    color: var(--md-default-fg-color--light);
+    font-style: italic;
 }
 
 .proc-list {
-  max-height: 200px;
-  overflow-y: auto;
-  margin-bottom: 8px;
+    max-height: 200px;
+    overflow-y: auto;
+    margin-bottom: 8px;
 }
 
 .proc {
-  display: block;
-  width: 100%;
-  text-align: left;
-  background: none;
-  border: 1px solid transparent;
-  border-radius: 4px;
-  padding: 4px 7px;
-  color: var(--md-default-fg-color--light);
+    display: block;
+    width: 100%;
+    text-align: left;
+    background: none;
+    border: 1px solid transparent;
+    border-radius: 4px;
+    padding: 4px 7px;
+    color: var(--md-default-fg-color--light);
 }
 
 .proc:hover {
-  background: var(--md-default-fg-color--lightest);
+    background: var(--md-default-fg-color--lightest);
 }
 
 .proc .nm {
-  display: block;
-  font-family: var(--md-code-font);
-  font-size: 0.75rem;
-  color: var(--md-typeset-a-color);
-  overflow-wrap: anywhere;
+    display: block;
+    font-family: var(--md-code-font);
+    font-size: 0.75rem;
+    color: var(--md-typeset-a-color);
+    overflow-wrap: anywhere;
 }
 
 .proc .yd {
-  display: block;
-  font-size: 0.7rem;
-  margin-top: 1px;
+    display: block;
+    font-size: 0.7rem;
+    margin-top: 1px;
 }
 
 .hist {
-  display: block;
-  width: 100%;
-  text-align: left;
-  background: none;
-  border: 0;
-  border-radius: 4px;
-  padding: 5px 7px;
-  font-family: var(--md-code-font);
-  font-size: 0.75rem;
-  color: var(--md-default-fg-color--light);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+    display: block;
+    width: 100%;
+    text-align: left;
+    background: none;
+    border: 0;
+    border-radius: 4px;
+    padding: 5px 7px;
+    font-family: var(--md-code-font);
+    font-size: 0.75rem;
+    color: var(--md-default-fg-color--light);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
 }
 
 .hist:hover {
-  background: var(--md-default-fg-color--lightest);
-  color: var(--md-default-fg-color);
+    background: var(--md-default-fg-color--lightest);
+    color: var(--md-default-fg-color);
 }
 
 /* ---------------------------------------------------------------- editor ---- */
@@ -547,132 +547,251 @@ select.control {
 /* The highlighted copy sits under a transparent textarea, so the caret, selection, and
  * native editing stay real. The two must therefore keep identical metrics. */
 .editor {
-  position: relative;
-  height: 352px;
-  min-height: 90px;
-  resize: vertical;
-  overflow: hidden;
-  margin: 14px;
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  background: var(--md-code-bg-color);
+    position: relative;
+    height: 352px;
+    min-height: 90px;
+    resize: vertical;
+    overflow: hidden;
+    margin: 14px;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    background: var(--md-code-bg-color);
 }
 
 .editor pre,
 .editor textarea {
-  position: absolute;
-  inset: 0;
-  margin: 0;
-  padding: 12px 14px;
-  border: 0;
-  background: transparent;
-  font-family: var(--md-code-font);
-  font-size: 0.92rem;
-  line-height: 1.5;
-  tab-size: 2;
-  white-space: pre-wrap;
-  overflow-wrap: break-word;
-  overflow: auto;
+    position: absolute;
+    inset: 0;
+    margin: 0;
+    padding: 12px 14px;
+    border: 0;
+    background: transparent;
+    font-family: var(--md-code-font);
+    font-size: 0.92rem;
+    line-height: 1.5;
+    tab-size: 2;
+    white-space: pre-wrap;
+    overflow-wrap: break-word;
+    overflow: auto;
 }
 
 .editor pre {
-  pointer-events: none;
-  color: var(--md-code-fg-color);
+    pointer-events: none;
+    color: var(--md-code-fg-color);
 }
 
 .editor textarea {
-  color: transparent;
-  caret-color: var(--md-primary-fg-color);
-  resize: none;
-  outline: none;
+    color: transparent;
+    caret-color: var(--md-primary-fg-color);
+    resize: none;
+    outline: none;
 }
 
 .editor textarea::selection {
-  background: color-mix(in srgb, var(--md-primary-fg-color) 28%, transparent);
+    background: color-mix(in srgb, var(--md-primary-fg-color) 28%, transparent);
 }
 
-.tok-kw { color: var(--syn-kw); font-weight: 600; }
-.tok-fn { color: var(--syn-fn); }
-.tok-str { color: var(--syn-str); }
-.tok-num { color: var(--syn-num); }
-.tok-com { color: var(--syn-com); font-style: italic; }
-.tok-lbl { color: var(--syn-lbl); }
-.tok-op { color: var(--syn-op); }
+.tok-kw {
+    color: var(--syn-kw);
+    font-weight: 600;
+}
+
+.tok-fn {
+    color: var(--syn-fn);
+}
+
+.tok-str {
+    color: var(--syn-str);
+}
+
+.tok-num {
+    color: var(--syn-num);
+}
+
+.tok-com {
+    color: var(--syn-com);
+    font-style: italic;
+}
+
+.tok-lbl {
+    color: var(--syn-lbl);
+}
+
+.tok-op {
+    color: var(--syn-op);
+}
 
 /* --------------------------------------------------------------- buttons ---- */
 
 /* One shape for every button: outlined by default, filled for the primary action and for the
    one amber action, and a smaller variant for the toolbars. */
 .btn {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 7px;
-  min-height: var(--control-h);
-  background: var(--card-bg);
-  border: 1px solid var(--md-default-fg-color--lighter);
-  border-radius: var(--control-radius);
-  padding: 0 13px;
-  color: var(--md-default-fg-color--light);
-  font-size: 0.9rem;
-  font-weight: 600;
-  text-decoration: none;
-  white-space: nowrap;
-  transition: border-color 0.12s, color 0.12s, background 0.12s;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 7px;
+    min-height: var(--control-h);
+    background: var(--card-bg);
+    border: 1px solid var(--md-default-fg-color--lighter);
+    border-radius: var(--control-radius);
+    padding: 0 13px;
+    color: var(--md-default-fg-color--light);
+    font-size: 0.9rem;
+    font-weight: 600;
+    text-decoration: none;
+    white-space: nowrap;
+    transition: border-color 0.12s, color 0.12s, background 0.12s;
 }
 
 .btn:hover {
-  border-color: var(--md-primary-fg-color);
-  color: var(--md-typeset-a-color);
+    border-color: var(--md-primary-fg-color);
+    color: var(--md-typeset-a-color);
 }
 
 .btn svg {
-  flex: 0 0 auto;
+    flex: 0 0 auto;
 }
 
 .btn.primary {
-  background: var(--md-primary-fg-color);
-  border-color: var(--md-primary-fg-color);
-  color: #fff;
-  box-shadow: var(--md-shadow-z1);
+    background: var(--md-primary-fg-color);
+    border-color: var(--md-primary-fg-color);
+    color: #fff;
+    box-shadow: var(--md-shadow-z1);
 }
 
 .btn.primary:hover {
-  background: var(--md-primary-fg-color--light);
-  border-color: var(--md-primary-fg-color--light);
-  color: #fff;
+    background: var(--md-primary-fg-color--light);
+    border-color: var(--md-primary-fg-color--light);
+    color: #fff;
 }
 
 .btn.accent {
-  background: var(--md-accent-fg-color);
-  border-color: var(--md-accent-fg-color);
-  color: rgba(0, 0, 0, 0.82);
+    background: var(--md-accent-fg-color);
+    border-color: var(--md-accent-fg-color);
+    color: rgba(0, 0, 0, 0.82);
 }
 
 .btn.accent:hover {
-  filter: brightness(1.06);
-  color: rgba(0, 0, 0, 0.82);
+    filter: brightness(1.06);
+    color: rgba(0, 0, 0, 0.82);
+}
+
+/* Inside the editor box, which is the positioning context, so the popup scrolls away with a
+   resized editor instead of floating over the page. */
+.ac {
+    position: absolute;
+    z-index: 20;
+    min-width: 240px;
+    max-width: min(420px, 90%);
+    max-height: 220px;
+    overflow-y: auto;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    background: var(--card-bg);
+    box-shadow: var(--md-shadow-z2, 0 4px 16px rgba(0, 0, 0, 0.18));
+}
+
+.ac-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 5px 10px;
+    font-family: var(--md-code-font);
+    font-size: 0.8rem;
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+.ac-row.on,
+.ac-row:hover {
+    background: color-mix(in srgb, var(--md-primary-fg-color) 14%, transparent);
+}
+
+.ac-kind {
+    flex: none;
+    min-width: 44px;
+    padding: 1px 5px;
+    border-radius: 3px;
+    font-size: 0.66rem;
+    text-align: center;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    background: var(--md-code-bg-color);
+    color: var(--md-default-fg-color--light);
+}
+
+.ac-kind.label,
+.ac-kind.type {
+    color: var(--md-primary-fg-color);
+}
+
+.ac-kind.proc,
+.ac-kind.fn {
+    color: var(--md-accent-fg-color);
+}
+
+.ac-text {
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.chips {
+    display: flex;
+    gap: 6px;
+    margin-bottom: 8px;
+}
+
+.chip {
+    flex: 1;
+    padding: 4px 8px;
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    background: transparent;
+    color: var(--md-default-fg-color--light);
+    font-family: inherit;
+    font-size: 0.74rem;
+    cursor: pointer;
+}
+
+.chip:hover {
+    border-color: var(--md-primary-fg-color);
+}
+
+.chip[aria-pressed="true"] {
+    background: color-mix(in srgb, var(--md-primary-fg-color) 14%, transparent);
+    border-color: var(--md-primary-fg-color);
+    color: var(--md-default-fg-color);
+}
+
+.btn.danger {
+    background: color-mix(in srgb, var(--err) 12%, var(--card-bg));
+    border-color: color-mix(in srgb, var(--err) 42%, var(--line));
+    color: var(--err);
+}
+
+.btn.danger:hover {
+    background: color-mix(in srgb, var(--err) 20%, var(--card-bg));
 }
 
 .btn:disabled {
-  opacity: 0.55;
-  cursor: progress;
+    opacity: 0.55;
+    cursor: progress;
 }
 
 .btn.sm {
-  min-height: var(--control-h-sm);
-  padding: 0 10px;
-  font-size: 0.8rem;
+    min-height: var(--control-h-sm);
+    padding: 0 10px;
+    font-size: 0.8rem;
 }
 
 .btn-row {
-  display: flex;
-  gap: 8px;
+    display: flex;
+    gap: 8px;
 }
 
 .btn-row .btn {
-  flex: 1;
-  justify-content: center;
+    flex: 1;
+    justify-content: center;
 }
 
 /* ---------------------------------------------------------------- banner ---- */
@@ -682,470 +801,548 @@ select.control {
 /* No coloured rule down the left edge. The state is carried by a faint tint and by the wording; a
    dark red or green bar beside the text was the loudest thing on the page for the least it said. */
 .banner {
-  flex: 0 0 auto;
-  padding: 9px 14px;
-  border: 1px solid var(--line);
-  border-radius: var(--control-radius);
-  background: var(--card-bg);
-  font-size: 0.9rem;
-  font-weight: 500;
-  color: var(--md-default-fg-color--light);
-  display: flex;
-  align-items: center;
-  gap: 9px;
+    flex: 0 0 auto;
+    padding: 9px 14px;
+    border: 1px solid var(--line);
+    border-radius: var(--control-radius);
+    background: var(--card-bg);
+    font-size: 0.9rem;
+    font-weight: 500;
+    color: var(--md-default-fg-color--light);
+    display: flex;
+    align-items: center;
+    gap: 9px;
 }
 
 .banner:empty {
-  display: none;
+    display: none;
 }
 
 .banner.ok {
-  background: color-mix(in srgb, var(--ok) 7%, var(--card-bg));
-  border-color: color-mix(in srgb, var(--ok) 26%, var(--line));
-  color: var(--md-default-fg-color);
+    background: color-mix(in srgb, var(--ok) 7%, var(--card-bg));
+    border-color: color-mix(in srgb, var(--ok) 26%, var(--line));
+    color: var(--md-default-fg-color);
 }
 
 .banner.err {
-  background: color-mix(in srgb, var(--err) 8%, var(--card-bg));
-  border-color: color-mix(in srgb, var(--err) 30%, var(--line));
-  color: var(--md-default-fg-color);
+    background: color-mix(in srgb, var(--err) 8%, var(--card-bg));
+    border-color: color-mix(in srgb, var(--err) 30%, var(--line));
+    color: var(--md-default-fg-color);
 }
 
 .banner.busy {
-  border-color: color-mix(in srgb, var(--md-primary-fg-color) 26%, var(--line));
+    border-color: color-mix(in srgb, var(--md-primary-fg-color) 26%, var(--line));
 }
 
 .banner .sp {
-  width: 13px;
-  height: 13px;
-  border-radius: 999px;
-  border: 2px solid var(--md-default-fg-color--lightest);
-  border-top-color: var(--md-primary-fg-color);
-  animation: spin 0.7s linear infinite;
-  flex: 0 0 auto;
+    width: 13px;
+    height: 13px;
+    border-radius: 999px;
+    border: 2px solid var(--md-default-fg-color--lightest);
+    border-top-color: var(--md-primary-fg-color);
+    animation: spin 0.7s linear infinite;
+    flex: 0 0 auto;
 }
 
 /* --------------------------------------------------------------- results ---- */
 
 .results {
-  flex: 0 0 auto;
+    flex: 0 0 auto;
 }
 
 .tabs {
-  gap: 4px;
-  padding: 8px 10px;
-  flex-wrap: wrap;
+    gap: 4px;
+    padding: 8px 10px;
+    flex-wrap: wrap;
 }
 
 .tab {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  background: none;
-  border: 1px solid transparent;
-  border-radius: 6px;
-  padding: 5px 10px;
-  font-size: 0.85rem;
-  font-weight: 600;
-  letter-spacing: 0.01em;
-  text-transform: none;
-  color: var(--md-default-fg-color--light);
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    background: none;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    padding: 5px 10px;
+    font-size: 0.85rem;
+    font-weight: 600;
+    letter-spacing: 0.01em;
+    text-transform: none;
+    color: var(--md-default-fg-color--light);
 }
 
 .tab:hover {
-  color: var(--md-default-fg-color);
-  background: var(--md-default-fg-color--lightest);
+    color: var(--md-default-fg-color);
+    background: var(--md-default-fg-color--lightest);
 }
 
 .tab[aria-selected="true"] {
-  color: var(--md-typeset-a-color);
-  border-color: color-mix(in srgb, var(--md-primary-fg-color) 40%, transparent);
-  background: color-mix(in srgb, var(--md-primary-fg-color) 12%, transparent);
+    color: var(--md-typeset-a-color);
+    border-color: color-mix(in srgb, var(--md-primary-fg-color) 40%, transparent);
+    background: color-mix(in srgb, var(--md-primary-fg-color) 12%, transparent);
 }
 
 .result-meta {
-  flex: 0 0 auto;
-  padding: 8px 14px;
-  border-bottom: 1px solid var(--line);
-  font-size: 0.8rem;
-  color: var(--md-default-fg-color--light);
+    flex: 0 0 auto;
+    padding: 8px 14px;
+    border-bottom: 1px solid var(--line);
+    font-size: 0.8rem;
+    color: var(--md-default-fg-color--light);
 }
 
 /* Taller than the table needs, because the graph view lives in here and a force layout wants room.
    A fixed height rather than a share of the viewport, since the page scrolls as a document and the
    layout reads the element's size when it starts. */
 .panes {
-  height: 580px;
-  display: flex;
+    height: 580px;
+    display: flex;
 }
 
 .pane {
-  flex: 1;
-  min-width: 0;
-  min-height: 0;
-  overflow: auto;
-  display: none;
+    flex: 1;
+    min-width: 0;
+    min-height: 0;
+    overflow: auto;
+    display: none;
 }
 
 .pane.on {
-  display: block;
+    display: block;
 }
 
 .pane.graph-pane.on {
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
 }
 
 table {
-  border-collapse: collapse;
-  width: max-content;
-  min-width: 100%;
-  font-family: var(--md-code-font);
-  font-size: 0.82rem;
+    border-collapse: collapse;
+    width: max-content;
+    min-width: 100%;
+    font-family: var(--md-code-font);
+    font-size: 0.82rem;
 }
 
 thead th {
-  position: sticky;
-  top: 0;
-  z-index: 1;
-  background: var(--md-code-bg-color);
-  border-bottom: 1px solid var(--md-default-fg-color--lighter);
-  text-align: left;
-  padding: 8px 12px;
-  font-weight: 600;
-  font-size: 0.72rem;
-  letter-spacing: 0.05em;
-  text-transform: uppercase;
-  color: var(--md-default-fg-color--light);
-  white-space: nowrap;
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    background: var(--md-code-bg-color);
+    border-bottom: 1px solid var(--md-default-fg-color--lighter);
+    text-align: left;
+    padding: 8px 12px;
+    font-weight: 600;
+    font-size: 0.72rem;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: var(--md-default-fg-color--light);
+    white-space: nowrap;
 }
 
 tbody td {
-  padding: 6px 12px;
-  border-bottom: 1px solid var(--line);
-  font-family: var(--md-code-font);
-  vertical-align: top;
-  max-width: 460px;
-  overflow-wrap: anywhere;
+    padding: 6px 12px;
+    border-bottom: 1px solid var(--line);
+    font-family: var(--md-code-font);
+    vertical-align: top;
+    max-width: 460px;
+    overflow-wrap: anywhere;
 }
 
 tbody tr:hover td {
-  background: var(--md-default-fg-color--lightest);
+    background: var(--md-default-fg-color--lightest);
 }
 
 td .null {
-  color: var(--md-default-fg-color--lighter);
-  font-style: italic;
+    color: var(--md-default-fg-color--lighter);
+    font-style: italic;
 }
 
-td .s { color: var(--syn-str); }
-td .n { color: var(--syn-num); }
-td .b { color: var(--syn-kw); }
+td .s {
+    color: var(--syn-str);
+}
+
+td .n {
+    color: var(--syn-num);
+}
+
+td .b {
+    color: var(--syn-kw);
+}
 
 .rownum {
-  color: var(--md-default-fg-color--lighter);
-  text-align: right;
-  user-select: none;
+    color: var(--md-default-fg-color--lighter);
+    text-align: right;
+    user-select: none;
+}
+
+/* The plan tree. Depth is carried by a custom property on the row rather than by nesting, because
+   the engine renders the plan as flat indented lines and rebuilding a DOM hierarchy from them would
+   add a parser with nothing to show for it. */
+.plan-summary {
+    padding: 12px 14px;
+    border-bottom: 1px solid var(--line);
+    font-size: 0.82rem;
+    color: var(--md-default-fg-color--light);
+}
+
+.plan-tree {
+    margin: 0;
+    padding: 10px 14px;
+    list-style: none;
+}
+
+.plan-node {
+    position: relative;
+    padding: 3px 0 3px calc(var(--depth) * 18px + 16px);
+    font-family: var(--md-code-font);
+    font-size: 0.82rem;
+    line-height: 1.6;
+}
+
+.plan-badge {
+    position: absolute;
+    left: calc(var(--depth) * 18px + 2px);
+    top: 0.72em;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--md-default-fg-color--lighter);
+}
+
+.plan-badge.kernel {
+    background: var(--md-accent-fg-color);
+}
+
+.plan-badge.index {
+    background: var(--md-primary-fg-color);
+}
+
+.plan-badge.pruned {
+    background: var(--err);
+}
+
+.plan-op {
+    font-weight: 600;
+    color: var(--md-default-fg-color);
+}
+
+.plan-op.kernel {
+    color: var(--md-accent-fg-color);
+}
+
+.plan-detail {
+    color: var(--md-default-fg-color--light);
+}
+
+.plan-raw {
+    border-top: 1px solid var(--line);
+}
+
+.plan-raw > summary {
+    padding: 10px 14px;
+    font-size: 0.8rem;
+    color: var(--md-default-fg-color--light);
+    cursor: pointer;
 }
 
 pre.plan,
 pre.json {
-  margin: 0;
-  padding: 14px;
-  font-family: var(--md-code-font);
-  font-size: 0.82rem;
-  line-height: 1.65;
-  white-space: pre;
-  color: var(--md-code-fg-color);
-  background: var(--md-code-bg-color);
-  min-height: 100%;
+    margin: 0;
+    padding: 14px;
+    font-family: var(--md-code-font);
+    font-size: 0.82rem;
+    line-height: 1.65;
+    white-space: pre;
+    color: var(--md-code-fg-color);
+    background: var(--md-code-bg-color);
+    min-height: 100%;
 }
 
 /* Flat on every side, as the banner is. The state is carried by a faint tint and a tinted border
    rather than a coloured rule down one edge. Both variants share this rule, so flattening only the
    error one would have left the informational one with a bar that read as an accident. */
 .notice {
-  margin: 14px;
-  padding: 12px 14px;
-  border: 1px solid var(--line);
-  border-radius: var(--control-radius);
-  font-size: 0.85rem;
-  line-height: 1.55;
-  box-shadow: var(--md-shadow-z1);
+    margin: 14px;
+    padding: 12px 14px;
+    border: 1px solid var(--line);
+    border-radius: var(--control-radius);
+    font-size: 0.85rem;
+    line-height: 1.55;
+    box-shadow: var(--md-shadow-z1);
 }
 
 .notice.err {
-  background: color-mix(in srgb, var(--err) 8%, var(--card-bg));
-  border-color: color-mix(in srgb, var(--err) 30%, var(--line));
-  color: var(--md-default-fg-color);
-  font-family: var(--md-code-font);
-  font-size: 0.82rem;
-  white-space: pre-wrap;
+    background: color-mix(in srgb, var(--err) 8%, var(--card-bg));
+    border-color: color-mix(in srgb, var(--err) 30%, var(--line));
+    color: var(--md-default-fg-color);
+    font-family: var(--md-code-font);
+    font-size: 0.82rem;
+    white-space: pre-wrap;
 }
 
 .notice.info {
-  background: color-mix(in srgb, var(--md-primary-fg-color) 6%, var(--card-bg));
-  border-color: color-mix(in srgb, var(--md-primary-fg-color) 24%, var(--line));
-  color: var(--md-default-fg-color--light);
+    background: color-mix(in srgb, var(--md-primary-fg-color) 6%, var(--card-bg));
+    border-color: color-mix(in srgb, var(--md-primary-fg-color) 24%, var(--line));
+    color: var(--md-default-fg-color--light);
 }
 
 /* ----------------------------------------------------------- graph view ---- */
 
 .graph-toolbar {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 7px 14px;
-  border-bottom: 1px solid var(--line);
-  background: var(--card-bg);
-  flex: 0 0 auto;
-  font-size: 0.75rem;
-  color: var(--md-default-fg-color--light);
-  flex-wrap: wrap;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 7px 14px;
+    border-bottom: 1px solid var(--line);
+    background: var(--card-bg);
+    flex: 0 0 auto;
+    font-size: 0.75rem;
+    color: var(--md-default-fg-color--light);
+    flex-wrap: wrap;
 }
 
 .legend {
-  display: flex;
-  gap: 10px;
-  flex-wrap: wrap;
-  align-items: center;
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+    align-items: center;
 }
 
 .legend span {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  font-family: var(--md-code-font);
-  font-size: 0.75rem;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-family: var(--md-code-font);
+    font-size: 0.75rem;
 }
 
 .legend i {
-  width: 9px;
-  height: 9px;
-  border-radius: 999px;
+    width: 9px;
+    height: 9px;
+    border-radius: 999px;
 }
 
 svg.graph {
-  flex: 1;
-  min-height: 0;
-  width: 100%;
-  display: block;
-  cursor: grab;
-  background: var(--md-code-bg-color);
+    flex: 1;
+    min-height: 0;
+    width: 100%;
+    display: block;
+    cursor: grab;
+    background: var(--md-code-bg-color);
 }
 
 svg.graph:active {
-  cursor: grabbing;
+    cursor: grabbing;
 }
 
 svg.graph line {
-  stroke: var(--md-default-fg-color--lighter);
+    stroke: var(--md-default-fg-color--lighter);
 }
 
 svg.graph .node circle {
-  stroke: var(--md-code-bg-color);
-  stroke-width: 1.5;
-  cursor: pointer;
+    stroke: var(--md-code-bg-color);
+    stroke-width: 1.5;
+    cursor: pointer;
 }
 
 svg.graph .node text {
-  font-family: var(--md-text-font);
-  font-size: 11px;
-  font-weight: 600;
-  fill: var(--md-default-fg-color);
-  paint-order: stroke;
-  stroke: var(--md-code-bg-color);
-  stroke-width: 3px;
-  pointer-events: none;
-  user-select: none;
+    font-family: var(--md-text-font);
+    font-size: 11px;
+    font-weight: 600;
+    fill: var(--md-default-fg-color);
+    paint-order: stroke;
+    stroke: var(--md-code-bg-color);
+    stroke-width: 3px;
+    pointer-events: none;
+    user-select: none;
 }
 
 svg.graph .node.dim {
-  opacity: 0.25;
+    opacity: 0.25;
 }
 
 .inspect {
-  position: absolute;
-  right: 12px;
-  bottom: 12px;
-  width: 250px;
-  max-height: 46%;
-  overflow: auto;
-  background: var(--panel-bg);
-  border: 1px solid var(--line);
-  border-radius: 4px;
-  box-shadow: var(--md-shadow-z2);
-  padding: 10px 12px;
-  font-size: 0.8rem;
+    position: absolute;
+    right: 12px;
+    bottom: 12px;
+    width: 250px;
+    max-height: 46%;
+    overflow: auto;
+    background: var(--panel-bg);
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    box-shadow: var(--md-shadow-z2);
+    padding: 10px 12px;
+    font-size: 0.8rem;
 }
 
 .inspect h5 {
-  margin: 0 0 6px;
-  font-size: 0.8rem;
-  display: flex;
-  align-items: center;
-  gap: 6px;
+    margin: 0 0 6px;
+    font-size: 0.8rem;
+    display: flex;
+    align-items: center;
+    gap: 6px;
 }
 
 .inspect dl {
-  margin: 0;
-  display: grid;
-  grid-template-columns: auto 1fr;
-  gap: 2px 9px;
-  font-family: var(--md-code-font);
-  font-size: 0.75rem;
+    margin: 0;
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 2px 9px;
+    font-family: var(--md-code-font);
+    font-size: 0.75rem;
 }
 
 .inspect dt {
-  color: var(--md-default-fg-color--light);
+    color: var(--md-default-fg-color--light);
 }
 
 .inspect dd {
-  margin: 0;
-  overflow-wrap: anywhere;
+    margin: 0;
+    overflow-wrap: anywhere;
 }
 
 .graph-pane {
-  position: relative;
+    position: relative;
 }
 
 /* ---------------------------------------------------------------- footer ---- */
 
 footer {
-  flex: 0 0 auto;
-  padding: 7px 16px;
-  border-top: 1px solid var(--line);
-  background: var(--card-bg);
-  font-size: 0.8rem;
-  color: var(--md-default-fg-color--light);
-  display: flex;
-  gap: 12px;
-  align-items: center;
+    flex: 0 0 auto;
+    padding: 7px 16px;
+    border-top: 1px solid var(--line);
+    background: var(--card-bg);
+    font-size: 0.8rem;
+    color: var(--md-default-fg-color--light);
+    display: flex;
+    gap: 12px;
+    align-items: center;
 }
 
 .boot {
-  position: fixed;
-  inset: 0;
-  display: grid;
-  place-items: center;
-  align-content: center;
-  background: var(--md-default-bg-color);
-  z-index: 50;
-  gap: 12px;
-  text-align: center;
-  color: var(--md-default-fg-color--light);
+    position: fixed;
+    inset: 0;
+    display: grid;
+    place-items: center;
+    align-content: center;
+    background: var(--md-default-bg-color);
+    z-index: 50;
+    gap: 12px;
+    text-align: center;
+    color: var(--md-default-fg-color--light);
 }
 
 .boot .sp {
-  width: 26px;
-  height: 26px;
-  border-radius: 999px;
-  border: 2.5px solid var(--md-default-fg-color--lightest);
-  border-top-color: var(--md-primary-fg-color);
-  animation: spin 0.7s linear infinite;
-  margin: 0 auto;
+    width: 26px;
+    height: 26px;
+    border-radius: 999px;
+    border: 2.5px solid var(--md-default-fg-color--lightest);
+    border-top-color: var(--md-primary-fg-color);
+    animation: spin 0.7s linear infinite;
+    margin: 0 auto;
 }
 
 @keyframes spin {
-  to {
-    transform: rotate(360deg);
-  }
+    to {
+        transform: rotate(360deg);
+    }
 }
 
 /* The force layout settles over an animation loop and the boot indicator spins, so both are
    motion this has to answer for. `drawGraph` reads the same preference and settles the layout
    in one pass instead of animating it. */
 @media (prefers-reduced-motion: reduce) {
-  *,
-  *::before,
-  *::after {
-    animation-duration: 0s !important;
-    animation-iteration-count: 1 !important;
-    transition-duration: 0s !important;
-    scroll-behavior: auto !important;
-  }
+    *,
+    *::before,
+    *::after {
+        animation-duration: 0s !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0s !important;
+        scroll-behavior: auto !important;
+    }
 }
 
 @media (max-width: 1080px) {
-  .wrap {
-    gap: 12px;
-    padding: 12px;
-  }
+    .wrap {
+        gap: 12px;
+        padding: 12px;
+    }
 
-  aside {
-    width: 296px;
-    flex: 0 0 296px;
-  }
+    aside {
+        width: 296px;
+        flex: 0 0 296px;
+    }
 }
 
 @media (max-width: 820px) {
-  #toggle-side {
-    display: inline-grid;
-  }
+    #toggle-side {
+        display: inline-grid;
+    }
 
-  /* Overlaid rather than beside the editor. It carries the page background because the panels
-     inside it are cards with gaps between them, so without one the editor shows through. */
-  aside {
-    position: absolute;
-    z-index: 20;
-    top: 48px;
-    height: calc(100% - 48px);
-    width: 300px;
-    flex: 0 0 300px;
-    padding: 12px;
-    background: var(--page-bg);
-    box-shadow: var(--md-shadow-z2);
-  }
+    /* Overlaid rather than beside the editor. It carries the page background because the panels
+       inside it are cards with gaps between them, so without one the editor shows through. */
+    aside {
+        position: absolute;
+        z-index: 20;
+        top: 48px;
+        height: calc(100% - 48px);
+        width: 300px;
+        flex: 0 0 300px;
+        padding: 12px;
+        background: var(--page-bg);
+        box-shadow: var(--md-shadow-z2);
+    }
 }
 
 @media (max-width: 600px) {
-  header {
-    gap: 6px;
-    padding: 0 8px;
-  }
+    header {
+        gap: 6px;
+        padding: 0 8px;
+    }
 
-  /* The brand text is the one header item a query never needs, and the footer names the build
-     anyway. Dropping it keeps the nav links and the scheme toggle reachable without a horizontal
-     scroll; the mark stays, so the header is still identifiable. */
-  .brand-name {
-    display: none;
-  }
+    /* The brand text is the one header item a query never needs, and the footer names the build
+       anyway. Dropping it keeps the nav links and the scheme toggle reachable without a horizontal
+       scroll; the mark stays, so the header is still identifiable. */
+    .brand-name {
+        display: none;
+    }
 
-  header .hdr {
-    padding: 6px 6px;
-    font-size: 0.85rem;
-  }
+    header .hdr {
+        padding: 6px 6px;
+        font-size: 0.85rem;
+    }
 
-  .wrap {
-    padding: 8px;
-    gap: 8px;
-  }
+    .wrap {
+        padding: 8px;
+        gap: 8px;
+    }
 
-  /* Every action fits on one row at a wider width; here they wrap instead of being clipped. */
-  .card-foot {
-    justify-content: stretch;
-  }
+    /* Every action fits on one row at a wider width; here they wrap instead of being clipped. */
+    .card-foot {
+        justify-content: stretch;
+    }
 
-  .card-foot .btn {
-    flex: 1;
-    justify-content: center;
-  }
+    .card-foot .btn {
+        flex: 1;
+        justify-content: center;
+    }
 
-  .tab {
-    padding: 7px 9px;
-    font-size: 0.8rem;
-  }
+    .tab {
+        padding: 7px 9px;
+        font-size: 0.8rem;
+    }
 
-  .inspect {
-    width: auto;
-    left: 12px;
-  }
+    .inspect {
+        width: auto;
+        left: 12px;
+    }
 
-  /* The footer sentence needs more than one line at this width, and without wrapping the graph
-     counts beside it would be squeezed to nothing. */
-  footer {
-    flex-wrap: wrap;
-    gap: 2px 12px;
-  }
+    /* The footer sentence needs more than one line at this width, and without wrapping the graph
+       counts beside it would be squeezed to nothing. */
+    footer {
+        flex-wrap: wrap;
+        gap: 2px 12px;
+    }
 }
