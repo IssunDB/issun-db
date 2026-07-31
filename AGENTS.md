@@ -333,6 +333,11 @@ modules according to this map.
   committed state through a separate read transaction while its own write transaction is still open, and a single reader-writer lock deadlocks on exactly that.
   The in-memory backend does not persist, so a reopen sees an empty graph; the handful of tests whose premise is reopen or backup are gated on the `lmdb`
   feature and say so.
+- `issundb-cli`, `issundb-rest`, and `issundb-mcp` relay `lmdb` and `hnsw` to the facade rather than naming them on the dependency, the way `issundb-wasm`
+  already did, so a binary can be built without the C vector index. That is not hypothetical: `usearch` pulls in `numkong`, whose C dispatch files fail to
+  compile for `aarch64-pc-windows-msvc` with `winnt.h` reporting "No Target Architecture", so `release.yml` builds that one target with
+  `--no-default-features --features lmdb` and its binaries use the exact-scan index. Do not put `features = ["lmdb", "hnsw"]` back on those dependencies:
+  it makes the feature unselectable from the command line, which is what had to be undone to get that target building.
 - The `lmdb` feature is forwarded by every crate between the facade and core, and each of their workspace declarations carries `default-features = false`, or a
   sibling silently re-enables LMDB for the whole graph. Verify a change to that plumbing with `cargo tree -p issundb --no-default-features | grep lmdb`, which
   must print nothing. Note that a whole-workspace `--no-default-features` build does *not* select the in-memory backend, because `issundb-cli` and the other
