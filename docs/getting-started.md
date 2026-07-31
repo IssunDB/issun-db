@@ -5,7 +5,7 @@ It explains prerequisites, building the engine from source, and using the comman
 
 ## Prerequisites
 
-Compiling IssunDB and its native dependencies requires Rust 1.85.0 or later, along with the following system tools:
+Compiling IssunDB and its dependencies needs Rust 1.85.0 or later, along with the following system tools:
 
 - Build tools: a C/C++ compiler (such as Clang or GCC), which compiles the bundled LMDB sources and the vector index.
 
@@ -120,7 +120,7 @@ To use IssunDB as an embedded database in a Rust project, add the `issundb` libr
 
 ```toml
 [dependencies]
-issundb = "0.1.0-alpha.20"   # Match the version published on crates.io
+issundb = "0.1.0-alpha.21"   # Match the version published on crates.io
 serde_json = "1.0"           # Used to construct property maps
 ```
 

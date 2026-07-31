@@ -229,7 +229,7 @@ ORDER BY score DESC, a.name, b.name LIMIT 5`,
         args: "vectorA, vectorB",
         yields: "number",
         summary:
-            "Cosine distance between two numeric vectors. Subtract from 1 for cosine similarity; a length mismatch is null.",
+            "Cosine distance between two embeddings. Either argument may be a node, which resolves to its stored embedding, or a literal vector. Subtract from 1 for cosine similarity; a length mismatch is null.",
         snippet: `RETURN issundb.distance.cosine([1.0, 0.0], [1.0, 0.0]) AS d,
        1 - issundb.distance.cosine([1.0, 0.0], [0.0, 1.0]) AS similarity`,
     },
@@ -237,7 +237,8 @@ ORDER BY score DESC, a.name, b.name LIMIT 5`,
         name: "issundb.distance.euclidean",
         args: "vectorA, vectorB",
         yields: "number",
-        summary: "Straight-line distance between two numeric vectors.",
+        summary:
+      "Straight-line distance between two embeddings, each either a node or a literal vector.",
         snippet: `RETURN issundb.distance.euclidean([0.0, 0.0], [3.0, 4.0]) AS d`,
     },
     {

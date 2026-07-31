@@ -81,6 +81,8 @@ The temporal constructors `date`, `time`, `localtime`, `datetime`, `localdatetim
 - `SET n = {map}` and `SET n += {map}`: assign properties individually with `SET n.prop = value`.
 - `CALL { ... }` subqueries and `EXISTS { ... }` subqueries: `CALL` is procedure invocation only, and `exists()` is a scalar null check.
 - `shortestPath(...)` and `allShortestPaths(...)` pattern functions: use the `shortest_path` and `all_shortest_paths` methods on the `Graph` API instead.
+- Pattern predicates in `WHERE` (`WHERE (a)-[:KNOWS]->(b)`, `WHERE NOT (a)-->(b)`). A pattern is matched, not tested, so express the positive case as
+  an additional `MATCH` and the negative case as an anti-join: `OPTIONAL MATCH (a)-[r:KNOWS]->(b) WITH a, b, r WHERE r IS NULL`.
 - Map projections (`n{.name, .age}`).
 - `MANDATORY MATCH`.
 
