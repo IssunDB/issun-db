@@ -597,6 +597,51 @@ ORDER BY communityId, rank`,
         ],
     },
     {
+        label: "Link prediction",
+        sample: "social",
+        requiresLabel: "Person",
+        docs: "../api-reference/#link-prediction",
+        demos: [
+            {
+                label: "Mutual connections",
+                desc: "How many neighbors two people share, and the same count as a ratio of their combined neighborhood. The neighborhood is undirected and distinct, so who pointed at whom does not matter and a repeated edge counts once.",
+                cypher: `MATCH (a:Person), (b:Person)
+WHERE id(a) < id(b)
+RETURN a.name AS a, b.name AS b,
+       issundb.link.commonNeighbors(a, b) AS mutual,
+       issundb.link.jaccard(a, b) AS jaccard
+ORDER BY mutual DESC, a, b`,
+            },
+            {
+                label: "Who might know whom",
+                desc: "The same score, but only for pairs not already connected, which is the question link prediction actually answers. Scoring an existing edge highly proves nothing, so the known pairs are collected first and excluded.",
+                cypher: `MATCH (x:Person)-[:KNOWS]->(y:Person)
+WITH collect(toString(id(x)) + '>' + toString(id(y))) AS links
+MATCH (a:Person), (b:Person)
+WHERE id(a) < id(b)
+  AND NOT toString(id(a)) + '>' + toString(id(b)) IN links
+  AND NOT toString(id(b)) + '>' + toString(id(a)) IN links
+RETURN a.name AS a, b.name AS b,
+       issundb.link.commonNeighbors(a, b) AS mutual,
+       issundb.link.adamicAdar(a, b) AS score
+ORDER BY score DESC, a, b`,
+            },
+            {
+                label: "The metrics disagree",
+                desc: "All five on the same pairs. Adamic-Adar and resource allocation discount a neighbor everybody shares, jaccard normalizes by neighborhood size, and preferential attachment ignores shared neighbors entirely: it multiplies the two degrees, so it ranks busy pairs highly even with nothing in common.",
+                cypher: `MATCH (a:Person), (b:Person)
+WHERE id(a) < id(b)
+RETURN a.name AS a, b.name AS b,
+       issundb.link.commonNeighbors(a, b) AS common,
+       issundb.link.jaccard(a, b) AS jaccard,
+       issundb.link.adamicAdar(a, b) AS adamicAdar,
+       issundb.link.resourceAllocation(a, b) AS resourceAlloc,
+       issundb.link.preferentialAttachment(a, b) AS prefAttach
+ORDER BY adamicAdar DESC, prefAttach DESC, a, b`,
+            },
+        ],
+    },
+    {
         label: "Query planning",
         sample: "social",
         requiresLabel: "Person",

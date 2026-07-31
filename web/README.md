@@ -164,6 +164,20 @@ bounded to a factor of eight in and four out, or a few scrolls leave an empty ca
 way the graph went. A redraw returns the view to the whole canvas, so a query is never answered into a
 frame computed for different data.
 
+## How a Category Knows Its Data
+
+A demo category names the graph it queries through `sample` and the label that proves that graph is loaded through `requiresLabel`, so the Examples
+panel can tell you to load the right sample instead of running a query against the wrong one. `make playground-check` seeds that graph before running
+the category, which is what lets every example query whatever is loaded rather than creating its own data.
+
+## The Binding Layer
+
+`crates/issundb-wasm` exposes one `Playground` type and every method returns a JSON string, so the boundary carries one type in both directions rather
+than a second serialization contract. The methods are split into a private logic layer returning `Result<_, String>` and a thin exported layer that
+converts to `JsError`, because constructing a `JsError` calls a wasm-bindgen import that panics off-target; without the split none of it could be
+covered by `cargo test`. The build flags live in the `WASM_BUILD` variable in the Makefile rather than being repeated per target, since
+`--features hnsw` reads like it selects the index and in fact selects `usearch`, which fails to compile `cxx` for wasm.
+
 ## Cancelling a Query
 
 The engine runs in `worker.js`, so a long query leaves the page responsive and a Cancel button

@@ -66,6 +66,10 @@ Quick examples:
 This map describes the current structure and the target decoupled crate boundaries. Do not invent modules that do not yet exist, but do place new
 modules according to this map.
 
+An entry says what a module owns and where a new thing belongs. It does not explain how the module works: that lives in the crate's own `AGENTS.md`,
+named at the end of this section, and a public method's contract lives under Component APIs. Keep it that way when you edit. This section had grown a
+second copy of both, so the same rule was stated in three places and the copies had begun to disagree.
+
 - `crates/issundb-core/`: storage engine. Public surface is `Graph` and the schema types.
     - `src/bin/gen_testdata.rs`: the `gen_testdata` binary that regenerates the versioned LMDB storage-format snapshot (works with `make testdata`).
     - `src/schema.rs`: `NodeId`, `EdgeId`, `LabelId`, `TypeId`, `AdjEntry`, `NodeRecord`, and `EdgeRecord`. `NodeRecord` holds `labels: Vec<LabelId>`
@@ -79,62 +83,33 @@ modules according to this map.
     - `src/graph/node.rs`: node CRUD (`add_node`, `get_node`, `update_node`, `delete_node`).
     - `src/graph/edge.rs`: edge CRUD and adjacency (`add_edge`, `get_edge`, `delete_edge`, `out_neighbors`, `in_neighbors`, `node_has_relationships`).
     - `src/graph/index.rs`: label and type indexes, property indexes, constraints, and property scan methods.
-    - `src/graph/stats.rs`: high-order cardinality statistics and the data-graph schema for the optimizer. Owns the `(label, type)` edge-frequency
-      table behind `estimate_expand_fanout` and the realized `(src_label, type, dst_label)` triples behind `estimate_expand_fanout_to` and
-      `schema_has_edge`, built by one pass over `label_idx` and one over `out_adj` (neither decodes a record, since a `NodeRecord` or `EdgeRecord`
-      decode also copies a property blob this table never reads) and cached against the committed-write generation. What may build the table, and what
-      `schema_has_edge` does without one, is stated once, with those methods under Component APIs.
+    - `src/graph/stats.rs`: high-order cardinality statistics and the data-graph schema for the optimizer, behind `estimate_expand_fanout`,
+      `estimate_expand_fanout_to`, and `schema_has_edge`. What may build the table, and what a negative means, are in the crate guide under
+      "Schema Statistics" and with those methods under Component APIs.
     - `src/graph/fts_mod.rs`: full-text search index lifecycle and FTS storage primitives.
     - `src/graph/vector.rs`: vector byte storage helpers.
     - `src/graph/algo.rs`: public algorithm dispatch methods and internal traversal helpers.
     - `src/graph/kernels/`: graph algorithm implementations over the CSR snapshot, split by family: `traversal.rs`, `analytics.rs`, `paths.rs`, and
-      `flow.rs`. Almost every kernel reads the snapshot and nothing else, so one gate (`Graph::with_snapshot`) covers them; a kernel needing a per-edge
-      property the snapshot does not carry reads that property from storage per call. `label_propagation` is the one exception, walking
-      `all_neighbors` per node per iteration instead, which is why it needs no gate and is far more expensive than its siblings. Where a result's sequence is observable the kernel fixes it deliberately:
-      a traversal reports reached nodes in ascending dense (so ascending node id) order, each frontier is sorted, and Brandes accumulates over sources
-      and predecessors in that order, so a betweenness total is reproducible rather than merely close. No depth-first kernel recurses over graph structure,
-      because a stack overflow aborts the process instead of returning an error; `dfs` is the sole exception, bounded by its `u8` hop count.
+      `flow.rs`. The one freshness gate they share, the ordering guarantees, and the no-recursion rule are in the crate guide under
+      "Algorithm Kernels".
     - `src/graph/txn.rs`: `ReadTxn` and `WriteTxn` delegation impls and transaction tests.
-    - `src/csr.rs`: in-memory CSR snapshot (outgoing arrays plus a transposed incoming view with per-edge type and edge ids), rebuilt in the
-      background and swapped via `arc-swap`. Also owns the `GraphDelta` buffer captured on the write path (whose only consumers are the property
-      column caches) and the `write_gen`/`snapshot_gen` generation counters that drive on-demand CSR refresh. The adjacency is read from `out_adj`, whose 20-byte
-      `AdjEntry` carries every field the arrays hold, already grouped by source in ascending key order, so the build decodes no `EdgeRecord` and copies
-      no property blob. Entries go straight into the flat arrays, counting each row as it goes: a per-node `Vec` staged first, as this once did, cost
-      one allocation per node and left 3.3 GB resident for 620 MB of live arrays on a 1 M-node, 13.9 M-edge graph, because a million freed small chunks
-      are holes the allocator cannot return. Because `DUPSORT` orders duplicates by their raw little-endian bytes, each row is then reordered by
-      ascending edge id, which is the order every consumer has always seen and which `load_weights` binary-searches. The per-entry `edge_weight` is
-      `Option`, built only by `build_weighted`, since a weight lives in the edge's property blob and only Dijkstra reads one.
-    - `src/columns.rs`: in-memory property columns for the read path. One typed column (`Int`, `Float`, `Bool`, dictionary-encoded `Str`, or the
-      exact-semantics `Json` fallback) per node property, built lazily from one full node scan and kept fresh by a post-commit delta (node deletion
-      forces a rebuild). Read through `Graph::node_prop_json`. Also owns the lazily computed per-property statistics (`PropStats`: bounds, an
-      equi-depth histogram, and the most common values) that back the selectivity estimates, invalidated by the post-commit patch. Which readers may
-      cause that one full scan is a deliberate rule rather than an accident, and it is stated once, with the read-path methods under Component APIs.
+    - `src/csr.rs`: the in-memory CSR snapshot, its transposed incoming view, the `GraphDelta` write buffer, and the generation counters that drive
+      on-demand refresh. How it is built from `out_adj`, why no per-node `Vec` is staged, and the row-ordering rule are in the crate guide under
+      "CSR Snapshot Vs. LMDB Adjacency".
+    - `src/columns.rs`: in-memory typed property columns for the read path, plus the per-property statistics behind the selectivity estimates. Which
+      readers cause the one full scan that builds them is in the crate guide under "In-memory Property Columns".
     - `src/histogram.rs`: equi-depth histogram over property values with equality and range selectivity estimates; backs `PropStats`. Nothing here is
       persisted.
-    - `src/threads.rs`: the one resolution of the thread budget every parallel consumer shares (`threads::resolve`). Precedence is the programmatic
-      override from `set_thread_count`, then `ISSUNDB_NUM_THREADS`, then `OMP_NUM_THREADS`, then the machine's parallelism, clamped to `MAX_THREADS`.
-      Both the counting kernels' scoped threads and the analytics passes that split over nodes or sources resolve through it (`Graph::kernel_threads`),
-      so the one knob has one meaning and two overlapping passes cannot each claim the whole machine. `OMP_NUM_THREADS` is honored because setting it is
-      how a caller caps parallelism process-wide, including this repository's own `test` and `coverage` targets.
+    - `src/threads.rs`: the one resolution of the thread budget every parallel consumer shares (`threads::resolve`). Precedence, the clamp, and why
+      `OMP_NUM_THREADS` is honored are in the crate guide under "Thread Count".
     - `src/storage/memory.rs`: the in-memory storage backend, second implementor of the contract in `storage/mod.rs`. Byte-ordered `BTreeMap` tables with
       `BTreeSet` duplicate values, copy-on-write transactions over `ArcSwap`, and a single writer lock. It is what a target with no libc compiles, and it is
       what holds the storage seam to something: the whole suite runs against it, across core, vector, text, retrieval, and cypher.
     - `src/error.rs`: `Error` enum; all storage and serialization errors unify here. `Error::Storage` carries `storage::StorageError`, which is the selected
       backend's error type, so the variant is `heed::Error` on a default build and unchanged from before the backend split.
 - `crates/issundb-cypher/`: Cypher parser, AST, logical planner, physical planner, optimizer, and executor.
-    - `src/parser.rs`: Cypher parser built with the `chumsky` parser-combinator library (with a Pratt parser for operator-precedence expressions),
-      covering MATCH (including inline relationship property maps and multi-label node patterns such as `(n:A:B)`), WHERE, RETURN, CREATE, SET
-      (property and label assignment), REMOVE (label and property), and DELETE/DETACH DELETE over arbitrary expression targets. An iterative
-      token-stream scan (`scan_nesting`) rejects genuinely pathological input (thousands of levels) with a parse error before any AST is built.
-      Realistic deep input is kept safe by running on large stacks: a deep parse runs on a dedicated large-stack thread, and a query whose nesting
-      exceeds `SMALL_STACK_EXEC_BUDGET_KB` has its execution dispatched to a large-stack thread by `execute_with_procedures`. Shallow queries, the
-      common case, parse and execute inline on the caller stack.
-      Building the combinator graph costs more than consuming the tokens, and for a small query more than executing it, so the executor's entry point
-      (`parse_with_exec_depth`) serves repeated query text from a bounded thread-local cache of `Arc<Statement>` and returns the same allocation.
-      Parsing reads no graph state, no parameters, and no clock, so the cached outcome (including a parse error, and including the nesting-depth
-      rejection) is always valid and the cache needs no invalidation. `parse` is the uncached entry point: it always does the work, which keeps the
-      `parse` benchmarks a regression guard on the parser itself. Query text over `PARSE_CACHE_MAX_QUERY_LEN` is parsed but not stored, so many large
-      unique statements cannot grow the cache by their length.
+    - `src/parser.rs`: Cypher parser built with the `chumsky` parser-combinator library, with a Pratt parser for operator precedence. The nesting
+      scan, the large-stack dispatch, and the parse cache are in the crate guide under "Parser Structure Rules".
     - `src/ast.rs`: AST node types.
     - `src/plan/`: logical planner, physical planner, optimizer, and statistics helpers.
     - `src/procedure.rs`: the `ProcedureRegistry` a caller passes to `query_with_procedures`, plus the argument and yield types a procedure sees.
@@ -143,21 +118,8 @@ modules according to this map.
     - `src/exec/mod.rs`: public entry points (`execute`, `explain`), shared type definitions, and tests.
     - `src/exec/read.rs`: `execute_physical` and read-path helpers (`evaluate_where`, `evaluate_sort_key`, `json_to_prop_value`,
       `filter_over_expand_batch`, and `multiway_join_rows`, the last shared by the materializing and streaming `MultiwayJoin` paths).
-    - `src/exec/vectorized.rs`: columnar fast path for the final projection or aggregation over a linear chain of up to `MAX_VEC_HOPS` directed
-      single hops. A structural recognizer matches `[Limit]? [Sort]? [Distinct]? Project [Aggregate]? Stage* (Expand(directed single hop)
-      Stage*){0,MAX_VEC_HOPS} Leaf` with single-property expressions, executing column-at-a-time (bulk expansion via `Graph::node_props_json_table`
-      and group-by-code aggregation via `Graph::node_prop_group_codes`). A multi-hop chain is recognized only when every hop carries a distinct
-      relationship type, so relationship uniqueness is vacuous; a repeated type or a chain longer than `MAX_VEC_HOPS` falls back. A non-distinct
-      `count` over the terminal variable that feeds no group key collapses the final hop (`execute_collapsed_count`). The collapse counts each source's
-      qualifying neighbors through `Graph::typed_neighbor_counts`, so the final hop costs no triple per traversed edge and no hash lookup per edge: a
-      terminal filter that is a label test goes straight into the spec, and a terminal property comparison is resolved into a `neighbor_allow` set by
-      running those exact stages over the label's whole node set (`resolve_terminal_allow`). That resolution is gated on the sources' `adjacency_span`
-      reaching half the label count, so a selective hop over a large label keeps the expansion fallback instead of paying for a full label pass, and it
-      is speculative: it evaluates predicates over a superset of the real neighbors, so a stage that errors there declines to the fallback rather than
-      raising. Two shapes route to the fallback regardless: a multi-type hop, because `Expand::rel_type` carries the raw pattern text (`"F|G"`) and the
-      kernel resolves one registered type; and a stale snapshot with at most `STALE_POINT_EXPAND_MAX` sources (`Graph::prefers_point_expansion`), because
-      the kernel would rebuild the whole snapshot where the fallback serves those sources from per-source adjacency. The recognizer sees through a `Distinct` because the caller deduplicates. Any unrecognized shape falls back to the row pipeline, so
-      correctness never depends on the recognizer.
+    - `src/exec/vectorized.rs`: columnar fast path for a final projection or aggregation over a linear chain of directed single hops. Exactly which
+      shapes it accepts, and the two that always fall back, are in the crate guide under "Vectorized Aggregate and Columnar Fast Path".
     - `src/exec/factorize.rs`: `FactorizedRecordGroup` (shared `Arc<PathMap>` prefix plus per-row extensions) and `filter_refs_in_expr`.
     - `src/exec/expr.rs`: expression evaluation (`evaluate_expr`, `eval_binary_op`, `eval_arithmetic`, `eval_function_call`).
     - `src/exec/write.rs`: mutation execution (`execute_create`, `execute_set`, `execute_delete`, `execute_merge`).
@@ -165,14 +127,10 @@ modules according to this map.
       node property lookups are already served by the always-on auto-index; a relationship `CREATE INDEX` provisions the property index.
     - `src/exec/copy.rs`: bulk data administration execution (`COPY ... FROM`, `EXPORT DATABASE`, and `IMPORT DATABASE`).
     - `src/exec/row.rs`: the positional row representation (`SlotRow` and `SlotSchema`) the row pipeline binds variables through.
-- `crates/issundb-vector/`: vector index abstraction, vector metadata, vector storage integration, and vector search APIs. The index itself sits behind
-  `backend.rs`, which selects one at compile time from the `hnsw` feature: on by default it is `usearch`, the workspace's only C++ dependency, and with
-  `--no-default-features` it is an exact scan in pure Rust. The fallback is not a stub. It returns the true nearest neighbors under the same distance
-  conventions (`exact_distance`, shared with the rescore pass), so the crate's whole suite passes either way; what it gives up is the sublinear query and
-  `quantization`, which it ignores because it keeps the raw `f32`. The feature is forwarded by every crate that reaches this one (`issundb-cypher`,
-  `issundb-retrieval`, and the `issundb` facade), and the workspace declarations of those three carry `default-features = false` so that
-  `--no-default-features` on the facade actually reaches the bottom of the graph rather than being re-enabled by a sibling. Verify a change to this
-  plumbing with `cargo tree -p issundb --no-default-features | grep usearch`, which must print nothing.
+- `crates/issundb-vector/`: vector index abstraction, vector metadata, vector storage integration, and vector search APIs. The index sits behind
+  `backend.rs`, selected at compile time from the default-on `hnsw` feature: `usearch`, the workspace's only C++ dependency, or a pure-Rust exact scan.
+  The fallback is exact rather than a stub, which is what lets one suite prove both. The feature plumbing that makes `--no-default-features` actually
+  reach the bottom of the graph is under Architecture Constraints; the rest is in the crate guide under "The Backend Seam".
 - `crates/issundb-text/`: text query APIs and ranking. Tokenization and the inverted-index storage are *not* here: they live in
   `issundb-core` (`graph/fts_mod.rs` and `storage/fts.rs`), because the write path is in core and the FTS postings are maintained inside the same
   write transaction as the node record (`index_node_for_label` on insert and update, `delete_node_fts` on delete). A tokenizer in this crate could not
@@ -195,45 +153,18 @@ modules according to this map.
   `issundb`; uses `tokio`. See its Component APIs entry for the tool surface and the Host-header allowlist.
 - `crates/issundb-py/`: Python bindings via PyO3. Exposes the `IssunDB` class. Depends only on `issundb`.
 - `crates/issundb-wasm/`: browser bindings, exposing one `Playground` type that owns a single `Graph`. Depends only on `issundb`, and is the only crate
-  built for `wasm32-unknown-unknown`. It is what proves the storage-backend seam and the pure-Rust kernels actually hold: the module is built
-  `--no-default-features`, so storage is the in-memory backend and the vector index is the exact scan, and a regression that reintroduces an LMDB or C++
-  dependency below the facade breaks this build rather than going unnoticed. Do not add `--features hnsw` to that build, which reads like it selects the
-  index and in fact selects `usearch`: the wasm build then fails compiling `cxx`. `make playground-check` is where that was caught, so keep the flags in
-  the `WASM_BUILD` variable rather than repeating them per target. Every method returns a JSON string, so the boundary carries one
-  type in both directions instead of a second serialization contract. The methods are split into a private logic layer returning `Result<_, String>` and a
-  thin exported layer that converts to `JsError`, because constructing a `JsError` calls a wasm-bindgen import that panics off-target, and without the
-  split none of it could be covered by `cargo test`. Reading all of a node's properties decodes the stored msgpack blob directly, as the REST node route
-  does, since every read-path method on `Graph` takes the property names to fetch and an inspector cannot know them.
-- `web/`: the playground page that loads that module: `index.html`, `app.js`, `worker.js`, `demos.js`, and `style.css`, with the generated module in the
-  gitignored `web/pkg/`. The engine runs in `worker.js` and the page reaches it only by message, so a query never blocks the tab; that is also why
-  cancelling a query terminates the worker and replays the sample plus the setup log, since a WebAssembly call has no interruption point and the graph
-  dies with the thread that held it. Vanilla ES modules with no build step, and no library is fetched from a network, so the Cypher highlighter and the force-directed layout are
-  written in `app.js` rather than pulled from one. The page's only external request is the Google Fonts link for Inter and JetBrains Mono, which is the same
-  request `theme.font` in `mkdocs.yml` already makes for the same two families; the size scale is the reference playground's, in rem against a 1rem body. It is served under the MkDocs site and styled to match it: the custom properties at the top of
-  `style.css` are Material for MkDocs' own tokens, copied from the built `palette.*.min.css` for this site's palette, and the scheme is carried on
-  `data-md-color-scheme` with Material's `default` and `slate` values. A `theme.palette` change in `mkdocs.yml` means updating that block from a fresh
-  `make docs` build rather than from the Material Design palette, since MkDocs derives its primary from the named color instead of using it directly. `demos.js` holds the example catalog, the
-  Setup panel's six sample graphs, and the sidebar's procedure reference, all of which are Cypher inside a JavaScript file and therefore invisible to every
-  Rust test; `make playground-check` runs all three through the compiled module and fails on an error, which is how a wrong procedure signature is caught.
-  A sample graph is the only place a dataset lives: every example queries whatever is loaded rather than creating its own, each category names the graph it
-  queries through `sample` and the label that proves it is loaded through `requiresLabel`, and the check seeds that graph before running the category. The one
-  exception is the Cypher basics lesson on `CREATE`, which writes two nodes.
-  Selecting an example or a sample loads it into the editor without running it, since running a `CREATE` on click wrote to the database before the statement
-  had been read and a second click silently duplicated its data; the full-text and vector examples keep their post-statement step by holding the selected
-  example until the run. The sample graphs carry no comments, being data rather than documentation. `format.js` holds the Cypher formatter, whose casing rule
-  is narrower than the highlighter's keyword set on purpose: uppercasing every word in that set rewrote `issundb.shortestPath` and the case-sensitive yield
-  fields `index` and `count`. It must not be able to change what a query means, which `make playground-check` enforces by running every catalog string on two
-  fresh databases, as written and formatted, and comparing the row sets. That is why the formatter is its own module rather than part of `app.js`, which
-  touches the DOM at import and so cannot be loaded by the checker. The procedure and function references are written out by hand
-  because the engine cannot enumerate its own procedures, so that check is the only thing keeping it from drifting; it treats `ProcedureNotFound` as a failure
-  even for the two retrieval entries whose empty-index error it tolerates, since a rename is exactly what that error reports.
-  `docs/hooks/playground_links.py` is the MkDocs hook putting a "Run in the playground" link under a Cypher block in `docs/` marked `<!-- playground -->`,
-  carrying the block as `q` and the page's earlier marked blocks as `s`. The marker is opt-in because most documented Cypher cannot run in the playground
-  (a query parameter, a CLI script, or embeddings the seeded graph lacks), so marking a block asserts that it runs, and `make playground-check` executes
-  every marked block and fails one returning no rows.
-  See `web/README.md` for the three build targets and what the browser configuration gives up (no persistence, one thread,
-  no `backup`/`restore`, and a 16 MB stack set by a link argument in `.cargo/config.toml` because the 1 MB default is also the engine's inline-execution
-  budget).
+  built for `wasm32-unknown-unknown`. It is what proves the storage-backend seam and the pure-Rust kernels hold: the module is built
+  `--no-default-features`, so a regression that reintroduces an LMDB or C++ dependency below the facade breaks this build rather than going unnoticed.
+  Do not add `--features hnsw` to that build, which reads like it selects the index and in fact selects `usearch`, whereupon the wasm build fails
+  compiling `cxx`. The binding conventions and the build flags are in `web/README.md`.
+- `web/`: the playground page that loads that module: `index.html`, `app.js`, `worker.js`, `format.js`, `demos.js`, and `style.css`, with the generated
+  module in the gitignored `web/pkg/`. Vanilla ES modules with no build step and no library fetched from a network, served under the MkDocs site and
+  styled to match it. The engine runs in `worker.js` and the page reaches it only by message, so a query never blocks the tab; cancelling therefore
+  terminates the worker and replays the sample plus the setup log, since a WebAssembly call has no interruption point and the graph dies with the
+  thread. `demos.js` holds the example catalog, the sample graphs, and the procedure and function references, all of which are Cypher inside a
+  JavaScript file and therefore invisible to every Rust test; `make playground-check` runs them all, plus the formatter round trip, and fails on an
+  error. That check is the only thing keeping the hand-written references from drifting. Everything else about the page, including the theme tokens,
+  the graph view, sharing, and what the browser build gives up, is in `web/README.md`.
 - `crates/issundb-examples/`: standalone example programs. These depend only on `issundb`.
 - `crates/*/benches/`: crate-local Criterion benchmark targets (storage and write throughput, Cypher parsing and execution plus LSQB Q1-Q9 and OLTP
   reads, vector search, full-text search, and hybrid retrieval plus GraphRAG).
@@ -266,9 +197,10 @@ modules according to this map.
   on their version string. Consolidating is a manifest change nobody has made yet, so do not read the current layout as the intended one.
 - `Makefile`: developer workflow entry points.
 - Directory-scoped guides: `crates/issundb-core/AGENTS.md`, `crates/issundb-cypher/AGENTS.md`, `crates/issundb-text/AGENTS.md`, and
-  `crates/issundb-vector/AGENTS.md` carry crate-specific rules that this file does not repeat (LMDB lifetime rules, the query pipeline stages, the
-  tokenization order, the HNSW lock ordering). Read the one covering the crate being changed, and update it in the same patch when its subject changes:
-  being unreferenced from here is what let several of them drift behind the code.
+  `crates/issundb-vector/AGENTS.md` carry the crate-specific rules this file does not repeat: LMDB lifetime rules, the write-lock contract, the CSR
+  freshness gate, the property columns, the schema statistics, the query pipeline stages, what the vectorized recognizer accepts, the tokenization
+  order, and the HNSW lock ordering. Read the one covering the crate being changed, and update it in the same patch when its subject changes: being
+  unreferenced from here is what let several of them drift behind the code. `web/README.md` plays the same role for the playground page.
 
 ## Testing Layout Rules
 
@@ -337,6 +269,8 @@ modules according to this map.
   compile for `aarch64-pc-windows-msvc` with `winnt.h` reporting "No Target Architecture", so `release.yml` builds that one target with
   `--no-default-features --features lmdb` and its binaries use the exact-scan index. Do not put `features = ["lmdb", "hnsw"]` back on those dependencies:
   it makes the feature unselectable from the command line, which is what had to be undone to get that target building.
+- The `hnsw` feature is forwarded the same way, and each intermediate workspace declaration carries `default-features = false` for the same reason.
+  Verify a change to that plumbing with `cargo tree -p issundb --no-default-features | grep usearch`, which must print nothing.
 - The `lmdb` feature is forwarded by every crate between the facade and core, and each of their workspace declarations carries `default-features = false`, or a
   sibling silently re-enables LMDB for the whole graph. Verify a change to that plumbing with `cargo tree -p issundb --no-default-features | grep lmdb`, which
   must print nothing. Note that a whole-workspace `--no-default-features` build does *not* select the in-memory backend, because `issundb-cli` and the other

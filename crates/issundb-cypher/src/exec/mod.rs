@@ -139,7 +139,9 @@ pub fn execute_with_procedures(
     // the parser flags such depth, run the whole statement on a large-stack
     // thread. The statement clock is thread-local, so it is installed inside the
     // worker, not on the caller. Shallow queries (the common case) execute inline.
-    if exec_needs_large_stack {
+    // The same threadless-target exception the parser makes, for the same reason: there is no
+    // worker to dispatch to, and the 16 MiB wasm stack is already the mitigation.
+    if exec_needs_large_stack && !cfg!(target_family = "wasm") {
         // Both the statement clock and the row-pipeline-only switch are
         // thread-local, and a fresh thread starts from neither this thread's
         // setting nor an installed clock, so both are installed inside the worker.
