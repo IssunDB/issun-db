@@ -27,6 +27,8 @@ Keep each concern in its own file. Do not call `Graph` methods from `parser.rs`,
 
 ## Parser Structure Rules
 
+The grammar covers multi-label node patterns such as `(n:A:B)` and inline relationship property maps.
+
 The parser is built with the `chumsky` parser-combinator library, in two phases. Phase 1 lexes the query text into a token stream. Phase 2 builds the
 combinator graph, with operator precedence expressed through chumsky's Pratt parser (`chumsky::pratt::{infix, left, postfix, prefix}`) rather than a
 hand-written descent chain.
@@ -42,6 +44,9 @@ hand-written descent chain.
 - Deep nesting is handled by stack budget, not by recursion limits inside the grammar. An iterative token-stream scan (`scan_nesting`) rejects
   genuinely pathological input before any AST is built, a deep parse runs on a dedicated large-stack thread, and a query whose nesting exceeds
   `SMALL_STACK_EXEC_BUDGET_KB` has its execution dispatched to a large-stack thread by `execute_with_procedures`.
+
+Query text longer than `PARSE_CACHE_MAX_QUERY_LEN` is parsed but not cached, so many large unique statements cannot grow the parse cache by their
+length.
 
 ## AST Immutability Policy
 
@@ -151,6 +156,25 @@ Both aggregate roots read properties from the in-memory columnar store (see "In-
 of every referenced `(variable, property)` column per query rather than a point read per row. Every vectorized shape must be covered by a differential
 test that asserts byte-identical columns and records against the row pipeline (`assert_matches_row_path` and the `*_matches_row_path` tests in
 `exec/vectorized.rs`); add one whenever you widen `recognize`.
+
+### What `recognize` Accepts
+
+The structural pattern is `[Limit]? [Sort]? [Distinct]? Project [Aggregate]? Stage* (Expand(directed single hop) Stage*){0,MAX_VEC_HOPS} Leaf` with
+single-property expressions, executed column-at-a-time: bulk expansion through `Graph::node_props_json_table` and group-by-code aggregation through
+`Graph::node_prop_group_codes`. A multi-hop chain qualifies only when every hop carries a distinct relationship type, which makes relationship uniqueness
+vacuous; a repeated type, or a chain longer than `MAX_VEC_HOPS`, falls back. The recognizer sees through a `Distinct` because the caller deduplicates.
+
+A non-distinct `count` over the terminal variable that feeds no group key collapses the final hop (`execute_collapsed_count`), counting each source's
+qualifying neighbors through `Graph::typed_neighbor_counts` so the last hop costs no triple per traversed edge and no hash lookup per edge. A terminal
+filter that is a label test goes into the spec directly; a terminal property comparison is resolved into a `neighbor_allow` set by running those exact
+stages over the label's whole node set (`resolve_terminal_allow`). That resolution is gated on the sources' `adjacency_span` reaching half the label
+count, so a selective hop over a large label keeps the expansion fallback rather than paying for a full label pass, and it is speculative: it evaluates
+predicates over a superset of the real neighbors, so a stage that errors there declines to the fallback rather than raising.
+
+Two shapes route to the fallback whatever else holds. A multi-type hop does, because `Expand::rel_type` carries the raw pattern text (`"F|G"`) while
+the kernel resolves one registered type. And a stale snapshot with at most `STALE_POINT_EXPAND_MAX` sources does
+(`Graph::prefers_point_expansion`), because the kernel would rebuild the whole snapshot where the fallback serves those sources from per-source
+adjacency.
 
 **Group-key identity invariant** (binds both executors): grouping by a bare node or edge variable (`Expr::Prop(var, "")`) keys on the element id, not
 its materialized property bag, and the group row keeps the `Node` or `Edge` binding rather than a materialized `Scalar`. The row pipeline's

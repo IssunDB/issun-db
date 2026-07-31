@@ -281,6 +281,7 @@ playground-build: check-wasm-bindgen check-wasm-stack ## Build the browser modul
 	@echo "Building issundb-wasm for wasm32-unknown-unknown (in-memory storage, exact vector index)..."
 	@$(WASM_BUILD)
 	@echo "Generating the JavaScript glue into $(PLAYGROUND_DIR)/pkg..."
+	@rm -rf $(PLAYGROUND_DIR)/pkg
 	@wasm-bindgen $(WASM_ARTIFACT) --out-dir $(PLAYGROUND_DIR)/pkg --target web --no-typescript
 	@cp docs/assets/logo.svg $(PLAYGROUND_DIR)/logo.svg
 	@ls -l $(PLAYGROUND_DIR)/pkg
@@ -289,6 +290,7 @@ playground-build: check-wasm-bindgen check-wasm-stack ## Build the browser modul
 playground-check: check-wasm-bindgen check-wasm-stack ## Run every playground demo through the compiled module
 	@echo "Building the module for Node..."
 	@$(WASM_BUILD)
+	@rm -rf $(PLAYGROUND_NODE_PKG)
 	@wasm-bindgen $(WASM_ARTIFACT) --out-dir $(PLAYGROUND_NODE_PKG) --target nodejs --no-typescript
 	@echo "Running the demo catalog..."
 	@node $(SCRIPTS_DIR)/check_playground.mjs
@@ -298,7 +300,9 @@ playground-serve: ## Serve the playground at http://localhost:$(PLAYGROUND_PORT)
 	@test -f $(PLAYGROUND_DIR)/pkg/issundb_wasm.js || \
 		{ echo "No module in $(PLAYGROUND_DIR)/pkg. Run 'make playground-build' first."; exit 1; }
 	@echo "Serving $(PLAYGROUND_DIR) at http://localhost:$(PLAYGROUND_PORT) (Ctrl-C to stop)..."
-	@python3 -m http.server $(PLAYGROUND_PORT) --directory $(PLAYGROUND_DIR)
+	@python3 -c 'import functools, http.server as h; \
+		C = type("C", (h.SimpleHTTPRequestHandler,), {"end_headers": lambda s: (s.send_header("Cache-Control", "no-store"), h.SimpleHTTPRequestHandler.end_headers(s))}); \
+		h.test(HandlerClass=functools.partial(C, directory="$(PLAYGROUND_DIR)"), port=$(PLAYGROUND_PORT))'
 
 # An exported RUSTFLAGS replaces the `[target.wasm32-unknown-unknown] rustflags` in
 # .cargo/config.toml rather than merging with it, which drops the 16 MB stack the inline

@@ -51,6 +51,33 @@ pub enum DegreeDirection {
     Both,
 }
 
+/// Which score [`Graph::link_prediction_score`] computes for a pair of nodes.
+///
+/// All five read the graph as undirected over distinct neighbors, the same
+/// neighborhood [`Graph::clustering_coefficient`] uses, so a pair joined by several
+/// edges is one neighbor and direction never matters. A higher score means the pair
+/// is more likely to become connected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum LinkPredictionMetric {
+    /// How many neighbors the two nodes share.
+    CommonNeighbors,
+    /// Shared neighbors over the size of the combined neighborhood, so a pair of
+    /// low-degree nodes is not penalized against a pair of hubs. Zero when neither
+    /// node has a neighbor.
+    Jaccard,
+    /// Shared neighbors weighted by `1 / ln(degree)`, so a neighbor that everyone
+    /// shares counts for little. A shared neighbor of degree one contributes nothing,
+    /// since `ln(1)` is zero and the term is undefined rather than large.
+    AdamicAdar,
+    /// Shared neighbors weighted by `1 / degree`, which penalizes popular neighbors
+    /// harder than Adamic-Adar does.
+    ResourceAllocation,
+    /// The product of the two degrees, on the theory that busy nodes attract more
+    /// edges. This one ignores shared neighbors entirely, so it scores pairs that
+    /// have nothing in common.
+    PreferentialAttachment,
+}
+
 /// Pattern description for [`Graph::count_triangle_cycles`]: the directed
 /// cycle `(a)-[t1]->(b)-[t2]->(c)-[t3]->(a)` with an optional relationship
 /// type per hop and an optional label per node variable. `None` means

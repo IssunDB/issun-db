@@ -147,6 +147,10 @@ the freshness path.
 - A kernel that needs a per-edge property the snapshot does not carry reads it from storage per call. That is deliberate for the weight-*property*
   algorithms (`spanning_forest`, `shortest_path_top_k`, `maximum_flow`), which take the property name as an argument: there is no fixed key to preload.
 
+- The snapshot is published through `arc-swap` and paired with two counters, `write_gen` and `snapshot_gen`, whose comparison is the freshness
+  condition every consumer tests. The write path also fills a `GraphDelta` buffer, whose only consumers are the property column caches; the CSR itself
+  is rebuilt rather than patched.
+
 ## In-memory Property Columns
 
 `columns.rs` holds a typed, in-memory columnar view of scalar properties used as the hot read path for property gathers and aggregations.
@@ -155,6 +159,9 @@ It is derived from LMDB, like the CSR snapshot, and follows the same write-LMDB-
 - `PropColumns<S: ColumnSource>` stores one typed column per property (Int, Float, Bool, dict-encoded Str, or a JSON fallback) over a dense
   `id -> index` map. `NodeSource` and `EdgeSource` implement `ColumnSource`, so nodes and edges share one generic store; `Graph` holds
   `prop_columns: ColumnsCache<NodeSource>` and `edge_columns: ColumnsCache<EdgeSource>`.
+- A column is `Int`, `Float`, `Bool`, a dictionary-encoded `Str`, or the exact-semantics `Json` fallback, and single-property reads come through
+  `Graph::node_prop_json`. The per-property statistics (`PropStats`: bounds, an equi-depth histogram, and the most common values) are computed lazily
+  beside the columns and invalidated by the same post-commit patch.
 - `ColumnsCache<S>` builds lazily from one full `scan_all`, but a read does not necessarily cause that build, and the distinction is deliberate. A
   request for at most `SMALL_GATHER_MAX` entities is served as point reads straight from storage while the columns are absent
   (`should_serve_directly`), because building every column is one full scan and that is the wrong answer to a request for a handful of entities. Those

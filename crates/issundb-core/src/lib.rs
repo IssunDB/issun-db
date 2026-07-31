@@ -9,8 +9,8 @@ pub(crate) mod threads;
 
 pub use error::Error;
 pub use graph::{
-    DegreeDirection, Graph, GroupedDegreeSpec, NeighborCountSpec, PathCountSpec, ReadTxn,
-    TriangleCountSpec, WriteTxn,
+    DegreeDirection, Graph, GroupedDegreeSpec, LinkPredictionMetric, NeighborCountSpec,
+    PathCountSpec, ReadTxn, TriangleCountSpec, WriteTxn,
 };
 pub use schema::{
     DirectedNeighborEntry, EdgeId, EdgeRecord, LabelId, Language, NeighborEntry, NodeId,

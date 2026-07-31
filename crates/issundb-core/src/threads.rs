@@ -9,6 +9,10 @@
 
 /// Upper bound on threads any single pass will use, so a misconfigured value
 /// cannot spawn an unbounded pool.
+///
+/// Absent on a threadless target for the same reason [`resolve_from_lazy`] is: nothing
+/// there can reach a clamp that only the resolved paths apply.
+#[cfg(any(not(target_family = "wasm"), test))]
 pub(crate) const MAX_THREADS: usize = 64;
 
 /// Resolve the thread count for a parallel pass.
@@ -71,6 +75,12 @@ fn resolve_from(
 
 /// [`resolve_from`] with the machine count behind a closure, so a configured
 /// value never pays for measuring the machine.
+///
+/// Compiled out on a threadless target, where [`resolve`] answers 1 before any of this
+/// precedence is reachable. The gate is the fix rather than an `allow(dead_code)`,
+/// because a blanket allow here would also hide a genuinely orphaned resolver later;
+/// `test` is included so the precedence stays covered wherever the suite runs.
+#[cfg(any(not(target_family = "wasm"), test))]
 fn resolve_from_lazy(
     programmatic: i32,
     issundb_env: Option<&str>,

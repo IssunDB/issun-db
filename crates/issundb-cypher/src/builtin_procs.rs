@@ -44,6 +44,17 @@ const PAGE_RANK_ITERATIONS: u32 = 20;
 const PAGE_RANK_DAMPING: f32 = 0.85;
 /// Default label-propagation iteration cap.
 const LABEL_PROP_ITERATIONS: usize = 20;
+/// Default iteration cap for the power-iteration centralities (eigenvector and Katz).
+/// Both stop early once they converge, so this only bounds the pathological case.
+const POWER_ITERATION_MAX: u32 = 100;
+/// Default convergence threshold on the L2 change between successive iterations.
+const POWER_ITERATION_TOLERANCE: f64 = 1e-6;
+/// Default Katz attenuation. Convergence needs `alpha` below the reciprocal of the
+/// largest eigenvalue, which depends on the data, so the default is deliberately
+/// small enough to be safe on the graphs a caller is likely to try it on first.
+const KATZ_ALPHA: f64 = 0.1;
+/// Default Katz baseline, the score every node receives before any walk reaches it.
+const KATZ_BETA: f64 = 1.0;
 
 /// Build the concrete [`Procedure`] for a built-in `issundb.*` name by running it
 /// against `graph`.
@@ -75,12 +86,19 @@ pub fn build(graph: &Graph, name: &str, args: &[Value]) -> Result<Option<Procedu
 fn build_algorithm(graph: &Graph, name: &str, args: &[Value]) -> Result<Option<Procedure>, String> {
     let parameterized = matches!(
         name,
-        "issundb.pageRank" | "issundb.degree" | "issundb.labelPropagation"
+        "issundb.pageRank"
+            | "issundb.degree"
+            | "issundb.labelPropagation"
+            | "issundb.eigenvector"
+            | "issundb.katz"
     );
     let parameterless = matches!(
         name,
         "issundb.betweenness"
             | "issundb.harmonic"
+            | "issundb.closeness"
+            | "issundb.clusteringCoefficient"
+            | "issundb.louvain"
             | "issundb.connectedComponents"
             | "issundb.wcc"
             | "issundb.stronglyConnectedComponents"
@@ -127,6 +145,49 @@ fn build_algorithm(graph: &Graph, name: &str, args: &[Value]) -> Result<Option<P
             "score",
             float_rows(graph.harmonic_centrality().map_err(proc_err)?.into_iter()),
         ),
+        "issundb.closeness" => (
+            "score",
+            float_rows(graph.closeness_centrality().map_err(proc_err)?.into_iter()),
+        ),
+        "issundb.clusteringCoefficient" => (
+            "score",
+            float_rows(
+                graph
+                    .clustering_coefficient()
+                    .map_err(proc_err)?
+                    .into_iter(),
+            ),
+        ),
+        "issundb.eigenvector" => {
+            let iterations =
+                cfg_usize(name, cfg, "iterations", POWER_ITERATION_MAX as usize)? as u32;
+            let tolerance = cfg_f64(name, cfg, "tolerance", POWER_ITERATION_TOLERANCE)?;
+            (
+                "score",
+                float_rows(
+                    graph
+                        .eigenvector_centrality(iterations, tolerance)
+                        .map_err(proc_err)?
+                        .into_iter(),
+                ),
+            )
+        }
+        "issundb.katz" => {
+            let alpha = cfg_f64(name, cfg, "alpha", KATZ_ALPHA)?;
+            let beta = cfg_f64(name, cfg, "beta", KATZ_BETA)?;
+            let iterations =
+                cfg_usize(name, cfg, "iterations", POWER_ITERATION_MAX as usize)? as u32;
+            let tolerance = cfg_f64(name, cfg, "tolerance", POWER_ITERATION_TOLERANCE)?;
+            (
+                "score",
+                float_rows(
+                    graph
+                        .katz_centrality(alpha, beta, iterations, tolerance)
+                        .map_err(proc_err)?
+                        .into_iter(),
+                ),
+            )
+        }
         "issundb.degree" => {
             let direction = parse_degree_direction(name, cfg)?;
             (
@@ -164,6 +225,10 @@ fn build_algorithm(graph: &Graph, name: &str, args: &[Value]) -> Result<Option<P
                 ),
             )
         }
+        "issundb.louvain" => (
+            "communityId",
+            int_rows(graph.louvain().map_err(proc_err)?.into_iter()),
+        ),
         _ => unreachable!("name was checked against the built-in sets above"),
     };
 
@@ -424,6 +489,17 @@ fn cfg_f32(proc: &str, cfg: Option<&Value>, key: &str, default: f32) -> Result<f
     }
 }
 
+/// Read an optional `f64` configuration field, falling back to `default`.
+fn cfg_f64(proc: &str, cfg: Option<&Value>, key: &str, default: f64) -> Result<f64, String> {
+    match cfg_field(proc, cfg, key)? {
+        None => Ok(default),
+        Some(Value::Number(n)) => n
+            .as_f64()
+            .ok_or_else(|| cfg_type_err(proc, key, "a number")),
+        Some(_) => Err(cfg_type_err(proc, key, "a number")),
+    }
+}
+
 /// Read an optional string configuration field (`None` when absent).
 fn cfg_opt_string(proc: &str, cfg: Option<&Value>, key: &str) -> Result<Option<String>, String> {
     match cfg_field(proc, cfg, key)? {
@@ -621,8 +697,22 @@ fn build_communities(
     let cfg = args.first();
     let max_iterations = cfg_usize(name, cfg, "maxIterations", LABEL_PROP_ITERATIONS)?;
     let top = cfg_opt_usize(name, cfg, "topPerCommunity")?;
+    // Label propagation stays the default so an existing query keeps its partition.
+    // Louvain usually separates better, particularly where communities are joined by
+    // a few edges, which is the case label propagation tends to merge.
+    let algorithm = cfg_opt_string(name, cfg, "algorithm")?;
 
-    let communities = graph.label_propagation(max_iterations).map_err(proc_err)?;
+    let communities = match algorithm.as_deref() {
+        None | Some("labelPropagation") => {
+            graph.label_propagation(max_iterations).map_err(proc_err)?
+        }
+        Some("louvain") => graph.louvain().map_err(proc_err)?,
+        Some(other) => {
+            return Err(format!(
+                "{name}() algorithm must be 'labelPropagation' or 'louvain', got '{other}'"
+            ));
+        }
+    };
     let ranks = graph
         .page_rank(PAGE_RANK_ITERATIONS, PAGE_RANK_DAMPING)
         .map_err(proc_err)?;
@@ -748,6 +838,120 @@ mod tests {
         .unwrap();
         assert_eq!(res.columns, vec!["nodeId".to_string(), "score".to_string()]);
         assert_eq!(res.records.len(), 3);
+    }
+
+    /// The four centralities ported from Graphina all yield the same
+    /// `(nodeId, score)` shape as the existing ones, so a caller can swap between
+    /// them without changing the surrounding query.
+    #[test]
+    fn ported_centralities_yield_a_scored_row_per_node() {
+        let (_d, g) = triangle();
+        let params = HashMap::new();
+        for call in [
+            "issundb.closeness()",
+            "issundb.clusteringCoefficient()",
+            "issundb.eigenvector()",
+            "issundb.katz()",
+        ] {
+            let res = execute(
+                &g,
+                &format!("CALL {call} YIELD nodeId, score RETURN nodeId, score"),
+                &params,
+            )
+            .unwrap_or_else(|e| panic!("{call} failed: {e}"));
+            assert_eq!(res.columns, vec!["nodeId".to_string(), "score".to_string()]);
+            assert_eq!(res.records.len(), 3, "{call}");
+        }
+    }
+
+    /// Every node of a directed triangle reaches both others at total distance 3, so
+    /// closeness is `(2/3) * (2/2)` for all three. This pins the value through the
+    /// procedure layer, not just the kernel.
+    #[test]
+    fn closeness_reports_the_expected_value_through_cypher() {
+        let (_d, g) = triangle();
+        let params = HashMap::new();
+        let res = execute(
+            &g,
+            "CALL issundb.closeness() YIELD score RETURN score ORDER BY score",
+            &params,
+        )
+        .unwrap();
+        for record in &res.records {
+            let score = record.values[0].as_f64().unwrap();
+            assert!((score - 2.0 / 3.0).abs() < 1e-12, "{score}");
+        }
+    }
+
+    /// The power-iteration centralities take a configuration map, and an unknown or
+    /// mistyped field must be rejected rather than silently ignored.
+    #[test]
+    fn power_iteration_centralities_accept_configuration() {
+        let (_d, g) = triangle();
+        let params = HashMap::new();
+        let res = execute(
+            &g,
+            "CALL issundb.katz({alpha: 0.05, beta: 2.0, iterations: 50}) \
+             YIELD nodeId, score RETURN count(*) AS c",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(res.records[0].values[0], serde_json::json!(3));
+
+        let err = execute(
+            &g,
+            "CALL issundb.eigenvector({tolerance: 'nope'}) YIELD nodeId RETURN nodeId",
+            &params,
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("tolerance"), "{err}");
+    }
+
+    /// Louvain yields the same `(nodeId, communityId)` shape as label propagation, and
+    /// on a directed triangle both must put all three nodes together.
+    #[test]
+    fn louvain_yields_a_community_per_node() {
+        let (_d, g) = triangle();
+        let params = HashMap::new();
+        let res = execute(
+            &g,
+            "CALL issundb.louvain() YIELD nodeId, communityId RETURN nodeId, communityId",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(
+            res.columns,
+            vec!["nodeId".to_string(), "communityId".to_string()]
+        );
+        assert_eq!(res.records.len(), 3);
+        let ids: std::collections::HashSet<_> =
+            res.records.iter().map(|r| r.values[1].clone()).collect();
+        assert_eq!(ids.len(), 1, "a triangle is one community");
+    }
+
+    /// `communities` can be driven by either algorithm, and an unknown name is an
+    /// error rather than a silent fallback to the default.
+    #[test]
+    fn communities_selects_its_algorithm() {
+        let (_d, g) = triangle();
+        let params = HashMap::new();
+        for algorithm in ["labelPropagation", "louvain"] {
+            let res = execute(
+                &g,
+                &format!("CALL issundb.communities({{algorithm: '{algorithm}'}}) YIELD nodeId"),
+                &params,
+            )
+            .unwrap_or_else(|e| panic!("{algorithm}: {e}"));
+            assert_eq!(res.records.len(), 3, "{algorithm}");
+        }
+
+        let err = execute(
+            &g,
+            "CALL issundb.communities({algorithm: 'infomap'}) YIELD nodeId",
+            &params,
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("infomap"), "{err}");
     }
 
     #[test]

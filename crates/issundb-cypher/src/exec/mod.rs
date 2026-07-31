@@ -139,7 +139,9 @@ pub fn execute_with_procedures(
     // the parser flags such depth, run the whole statement on a large-stack
     // thread. The statement clock is thread-local, so it is installed inside the
     // worker, not on the caller. Shallow queries (the common case) execute inline.
-    if exec_needs_large_stack {
+    // The same threadless-target exception the parser makes, for the same reason: there is no
+    // worker to dispatch to, and the 16 MiB wasm stack is already the mitigation.
+    if exec_needs_large_stack && !cfg!(target_family = "wasm") {
         // Both the statement clock and the row-pipeline-only switch are
         // thread-local, and a fresh thread starts from neither this thread's
         // setting nor an installed clock, so both are installed inside the worker.
@@ -1095,6 +1097,96 @@ mod tests {
             scalar("RETURN issundb.distance.cosine([1.0], [1.0, 2.0]) AS s"),
             serde_json::Value::Null
         );
+    }
+
+    /// The `issundb.link.*` family scores how likely two nodes are to become
+    /// connected, from their neighborhoods in the graph. They are functions rather
+    /// than procedures precisely so they can see `a` and `b` bound by a `MATCH`,
+    /// which a `CALL` cannot: its arguments are evaluated against no bindings.
+    ///
+    /// The fixture is a bowtie. `a` and `b` share the two hub neighbors `h1` and
+    /// `h2`, so every value below is computable by hand.
+    #[test]
+    fn link_prediction_scalar_functions() {
+        let params = HashMap::new();
+        let dir = TempDir::new().unwrap();
+        let graph = Graph::open(dir.path(), 1).unwrap();
+        execute(
+            &graph,
+            "CREATE (a:P {n:'a'}), (b:P {n:'b'}), (h1:P {n:'h1'}), (h2:P {n:'h2'}), (x:P {n:'x'}),
+                    (a)-[:K]->(h1), (a)-[:K]->(h2),
+                    (b)-[:K]->(h1), (b)-[:K]->(h2),
+                    (h1)-[:K]->(x)",
+            &params,
+        )
+        .unwrap();
+        graph.rebuild_csr().unwrap();
+
+        let pair = |f: &str| -> f64 {
+            let q = format!("MATCH (a:P {{n:'a'}}), (b:P {{n:'b'}}) RETURN {f}(a, b) AS s");
+            execute(&graph, &q, &params).unwrap().records[0].values[0]
+                .as_f64()
+                .unwrap()
+        };
+
+        // a and b share exactly h1 and h2.
+        assert_eq!(pair("issundb.link.commonNeighbors"), 2.0);
+        // Neighborhoods are both {h1, h2}, so intersection and union are both 2.
+        assert!((pair("issundb.link.jaccard") - 1.0).abs() < 1e-12);
+        // Degrees are 2 and 2, so the product is 4.
+        assert_eq!(pair("issundb.link.preferentialAttachment"), 4.0);
+        // h1 is joined to a, b, and x, so degree 3; h2 to a and b, so degree 2.
+        let expected_ra = 1.0 / 3.0 + 1.0 / 2.0;
+        assert!((pair("issundb.link.resourceAllocation") - expected_ra).abs() < 1e-12);
+        let expected_aa = 1.0 / 3.0f64.ln() + 1.0 / 2.0f64.ln();
+        assert!((pair("issundb.link.adamicAdar") - expected_aa).abs() < 1e-12);
+
+        // Node ids work as well as node values, and null propagates.
+        let scalar = |q: &str| -> serde_json::Value {
+            execute(&graph, q, &params).unwrap().records[0].values[0].clone()
+        };
+        assert_eq!(
+            scalar("RETURN issundb.link.commonNeighbors(null, 1) AS s"),
+            serde_json::Value::Null
+        );
+        // A node that does not exist shares nothing rather than failing the query.
+        assert_eq!(
+            scalar("RETURN issundb.link.commonNeighbors(0, 999999) AS s")
+                .as_f64()
+                .unwrap(),
+            0.0
+        );
+    }
+
+    /// The point of a function over a procedure: it runs once per row, so a single
+    /// query can rank many candidate pairs against one anchor.
+    #[test]
+    fn link_prediction_scores_every_row() {
+        let params = HashMap::new();
+        let dir = TempDir::new().unwrap();
+        let graph = Graph::open(dir.path(), 1).unwrap();
+        execute(
+            &graph,
+            "CREATE (a:P {n:'a'}), (b:P {n:'b'}), (c:P {n:'c'}), (h:P {n:'h'}),
+                    (a)-[:K]->(h), (b)-[:K]->(h), (c)-[:K]->(h), (a)-[:K]->(b)",
+            &params,
+        )
+        .unwrap();
+        graph.rebuild_csr().unwrap();
+
+        let res = execute(
+            &graph,
+            "MATCH (a:P {n:'a'}), (other:P) WHERE other.n <> 'a'
+             RETURN other.n AS n, issundb.link.commonNeighbors(a, other) AS score
+             ORDER BY score DESC, n",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(res.records.len(), 3);
+        // b and c both share h with a; h shares b and c with a through its own edges.
+        for record in &res.records {
+            assert!(record.values[1].as_f64().unwrap() >= 1.0);
+        }
     }
 
     /// Run `setup` then `query`, returning the single scalar value of the one expected row.

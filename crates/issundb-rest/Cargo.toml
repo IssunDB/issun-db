@@ -15,8 +15,13 @@ name = "issundb-rest"
 path = "src/main.rs"
 doc = false
 
+[features]
+default = ["lmdb", "hnsw"]
+lmdb = ["issundb/lmdb"]
+hnsw = ["issundb/hnsw"]
+
 [dependencies]
-issundb = { workspace = true, features = ["lmdb", "hnsw"] }
+issundb = { workspace = true }
 axum = "0.8.9"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }

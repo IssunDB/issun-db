@@ -3549,6 +3549,11 @@ fn is_known_function(name: &str) -> bool {
             | "issundb.distance.euclidean"
             | "issundb.similarity.jaccard"
             | "issundb.similarity.overlap"
+            | "issundb.link.commonneighbors"
+            | "issundb.link.jaccard"
+            | "issundb.link.adamicadar"
+            | "issundb.link.resourceallocation"
+            | "issundb.link.preferentialattachment"
     )
 }
 
@@ -5823,7 +5828,14 @@ fn parse_uncached(cypher: &str) -> Result<(Statement, bool), CypherError> {
     let inline = nesting.bracket_case <= INLINE_BRACKET_CASE_DEPTH
         && nesting.op <= INLINE_OP_DEPTH
         && nesting.union <= INLINE_UNION_DEPTH;
-    let stmt = if inline {
+    // A target with no threads has nowhere to hand the work, so it parses inline whatever the
+    // depth. That is not a silent downgrade of the guarantee: `.cargo/config.toml` raises the wasm
+    // stack to 16 MiB precisely because this path cannot spawn, which is sixteen times the stack
+    // the inline thresholds are calibrated against. Refusing instead would make every query past
+    // the inline budget unparseable in a browser, which is worse than parsing it on a stack chosen
+    // for the purpose. A genuinely pathological input is still rejected before here, by
+    // `scan_nesting`.
+    let stmt = if inline || cfg!(target_family = "wasm") {
         run()?
     } else {
         std::thread::scope(|scope| {

@@ -57,6 +57,14 @@ jobs:
             - `issundb-rest`: IssunDB with a REST API server
             - `issundb-mcp`: IssunDB with an MCP server
 
+            ### A Note on the Windows ARM64 Build
+
+            The `windows-arm64` binaries are built without the `hnsw` feature, because the C SIMD
+            library behind it does not compile for that target. Vector search there is an exact
+            scan: it returns the true nearest neighbors rather than approximate ones, so recall is
+            higher, but the search is linear in the number of vectors instead of sublinear and
+            quantization is ignored. Every other platform uses the HNSW index. Nothing else differs.
+
             ### Container Image
 
             The same release is published as a container image to GHCR:
@@ -95,7 +103,19 @@ jobs:
             runner: windows-11-arm
             archive_ext: zip
             content_type: application/zip
-            cflags: "-DNK_TARGET_HASWELL=0 -DNK_TARGET_SKYLAKE=0 -DNK_TARGET_ICELAKE=0 -DNK_TARGET_GENOA=0 -DNK_TARGET_DIAMOND=0 -DNK_TARGET_SAPPHIRE=0 -DNK_TARGET_SAPPHIREAMX=0 -DNK_TARGET_GRANITEAMX=0 -DNK_TARGET_TURIN=0 -DNK_TARGET_ALDER=0 -DNK_TARGET_SIERRA=0"
+            # `usearch` pulls in `numkong`, whose C dispatch files fail to compile for
+            # aarch64-pc-windows-msvc: `winnt.h` reports "No Target Architecture", meaning the
+            # compiler it is driven with defines none of the `_M_*` architecture macros. The
+            # `-DNK_TARGET_*=0` flags that used to be set here were a no-op, since numkong's own
+            # build script already sets every one of them to 0 on this target.
+            #
+            # So this target is built without `hnsw`, which drops usearch and numkong from the
+            # graph entirely and selects the pure-Rust exact vector index. That index returns the
+            # true nearest neighbors under the same distance conventions, so results are exact
+            # rather than approximate; what it gives up is the sublinear search and quantization.
+            # Remove this once numkong builds here, and the target goes back to HNSW with no other
+            # change.
+            build_flags: "--no-default-features --features lmdb"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -120,10 +140,7 @@ jobs:
         run: echo "RUSTFLAGS=-C link-arg=-Wl,-ld_classic" >> $GITHUB_ENV
 
       - name: Build release binaries
-        run: cargo build --release -p issundb-cli -p issundb-rest -p issundb-mcp
-        env:
-          CFLAGS_aarch64_pc_windows_msvc: ${{ matrix.cflags || '' }}
-          CFLAGS_aarch64-pc-windows-msvc: ${{ matrix.cflags || '' }}
+        run: cargo build --release -p issundb-cli -p issundb-rest -p issundb-mcp ${{ matrix.build_flags || '' }}
 
       - name: Package release asset (Unix)
         if: runner.os != 'Windows'
