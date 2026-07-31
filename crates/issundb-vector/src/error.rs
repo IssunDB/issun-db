@@ -22,6 +22,11 @@ pub enum VectorError {
     #[error("invalid vector configuration: {0}")]
     InvalidConfig(String),
 
+    #[error(
+        "node {0} does not exist: create the node before giving it an embedding, or the vector is left for whichever node is later allocated that id"
+    )]
+    NodeNotFound(u64),
+
     #[error("underlying storage error: {0}")]
     Storage(#[from] issundb_core::Error),
 }

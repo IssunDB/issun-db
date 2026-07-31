@@ -227,6 +227,9 @@ The index is configured through `VectorIndexOptions`, which holds a `VectorMetri
 - `VectorGraphExt::reindex_vector_index(opts: VectorIndexOptions) -> Result<(), VectorError>`  
   Changes the metric and quantization settings and rebuilds the index from the persisted embeddings.
 - `VectorGraphExt::upsert_vector(n: NodeId, v: &[f32]) -> Result<(), VectorError>`  
+  Stores the embedding for an existing node. A node that does not exist is rejected with
+  `VectorError::NodeNotFound`, because node ids are handed out monotonically and a vector written
+  ahead of its node would be inherited by whichever node is later allocated that id.  
   Associates a float vector embedding with a node.
 - `VectorGraphExt::remove_vector(n: NodeId) -> Result<(), VectorError>`  
   Removes the embedding for a node from both the index and storage.

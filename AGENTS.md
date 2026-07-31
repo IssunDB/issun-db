@@ -460,7 +460,10 @@ Vector search crate. Owns vector index abstractions, vector metadata, vector sto
 - `VectorGraphExt::reindex_vector_index(opts) -> Result<(), VectorError>`: changes the metric or quantization on a populated graph and rebuilds the
   index from the persisted embeddings. The stored vectors are raw, metric-agnostic f32, so they re-index under any metric; this is O(n) and is an
   administrative operation, not a concurrent one.
-- `VectorGraphExt::upsert_vector(n, v) -> Result<(), VectorError>`
+- `VectorGraphExt::upsert_vector(n, v) -> Result<(), VectorError>`: rejects a node that does not exist with `VectorError::NodeNotFound`. Node ids are
+  handed out monotonically, so a vector accepted ahead of its node is not inert: the next node allocated that id inherits it and answers a search at
+  distance zero having never been embedded, which nothing downstream can detect. `remove_vector` stays permissive, so a database written before the
+  check can still be cleaned up.
 - Searching a graph with no stored embeddings returns `VectorError::EmptyIndex` rather than an empty hit list, so a caller can distinguish "no
   semantic matches" from "there is nothing to search". The Cypher `VectorTopK` operator maps that error to zero rows, keeping MATCH semantics.
 - `VectorGraphExt::remove_vector(n) -> Result<(), VectorError>`: removes the embedding from both memory and storage.

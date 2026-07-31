@@ -394,6 +394,17 @@ impl VectorGraphExt for Graph {
 
     #[instrument(skip(self, v), fields(node = %n, dims = v.len()))]
     fn upsert_vector(&self, n: NodeId, v: &[f32]) -> Result<(), VectorError> {
+        // Reject an embedding for an id no node holds. Node ids are handed out monotonically, so a
+        // vector written ahead of its node is not inert: the next node allocated that id inherits
+        // it and answers a search at distance zero, having never been embedded. Nothing downstream
+        // could detect that, because a stored vector carries no evidence of who it was meant for.
+        //
+        // The cost is one key probe per upsert, inside a call that already opens a write
+        // transaction and rebuilds an index entry. `remove_vector` stays permissive on purpose, so
+        // a database that already holds such a vector can still be cleaned up.
+        if !self.node_exists(n)? {
+            return Err(VectorError::NodeNotFound(n));
+        }
         let bytes = encode_vector(v)?;
         // Validate against (and update) the in-memory index BEFORE persisting to
         // LMDB. `upsert` rejects empty or dimension-mismatched embeddings, so
@@ -738,6 +749,69 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let graph = Graph::open(dir.path(), 1).unwrap();
         (dir, graph)
+    }
+
+    /// An embedding for an id no node holds is refused.
+    ///
+    /// Regression: it used to be accepted, and because node ids are handed out monotonically, the
+    /// next node created with that id inherited it. The node below is never embedded and yet
+    /// answered a search at distance zero, with no error at any layer.
+    #[test]
+    fn a_vector_for_a_node_that_does_not_exist_is_refused() {
+        let (_dir, graph) = open_tmp();
+        let alice = graph
+            .add_node("Person", &json!({ "name": "Alice" }))
+            .unwrap();
+        graph.upsert_vector(alice, &[1.0, 0.0]).unwrap();
+
+        // The very next id, which no node holds yet.
+        let future = alice + 1;
+        let err = graph.upsert_vector(future, &[0.0, 1.0]).unwrap_err();
+        assert!(
+            matches!(err, VectorError::NodeNotFound(id) if id == future),
+            "expected NodeNotFound, got {err:?}"
+        );
+
+        // Bob takes that id and must own no embedding.
+        let bob = graph.add_node("Person", &json!({ "name": "Bob" })).unwrap();
+        assert_eq!(bob, future);
+        let hits = graph.vector_search(&[0.0, 1.0], 5).unwrap();
+        assert!(
+            hits.iter().all(|h| h.node != bob),
+            "a node that was never embedded must not appear in a vector search: {hits:?}"
+        );
+    }
+
+    /// The rejection happens before anything is written, so a refused upsert leaves neither an
+    /// index entry nor a stored vector behind. Checking after the fact is what a partial write
+    /// would defeat.
+    #[test]
+    fn a_refused_vector_reaches_neither_the_index_nor_storage() {
+        let (_dir, graph) = open_tmp();
+        let real = graph.add_node("N", &json!({})).unwrap();
+        graph.upsert_vector(real, &[1.0, 0.0]).unwrap();
+
+        assert!(graph.upsert_vector(real + 99, &[0.0, 1.0]).is_err());
+        let stored = graph.vector_bytes().unwrap();
+        assert!(
+            stored.iter().all(|(id, _)| *id != real + 99),
+            "the refused vector must not be in storage: {:?}",
+            stored.iter().map(|(id, _)| *id).collect::<Vec<_>>()
+        );
+        let hits = graph.vector_search(&[0.0, 1.0], 5).unwrap();
+        assert_eq!(hits.len(), 1, "only the one real embedding: {hits:?}");
+        assert_eq!(hits[0].node, real);
+    }
+
+    /// Removal stays permissive, which is the escape hatch for a database written before the check
+    /// existed: a caller has to be able to delete a vector whose node is already gone.
+    #[test]
+    fn removing_a_vector_for_a_missing_node_is_not_an_error() {
+        let (_dir, graph) = open_tmp();
+        let node = graph.add_node("N", &json!({})).unwrap();
+        graph.upsert_vector(node, &[1.0, 0.0]).unwrap();
+        graph.delete_node(node).unwrap();
+        graph.remove_vector(node).unwrap();
     }
 
     #[test]
