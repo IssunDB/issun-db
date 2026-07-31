@@ -32,7 +32,7 @@ pub fn alloc_node_id(storage: &Storage, txn: &mut crate::storage::RwTxn) -> Resu
     bump_counter(storage, txn, KEY_NEXT_NODE)
 }
 
-/// Reads the node-id high-water mark: the number of node IDs ever allocated.
+/// Reads the node-id high-water mark, the number of node IDs ever allocated.
 /// This is an upper bound on the live node count, because it does not decrease
 /// when a node is deleted, so it is intended for planning estimates rather than
 /// exact counts. O(1): a single `meta` lookup.

@@ -2114,7 +2114,7 @@ fn build_hash_table(
     hash_table
 }
 
-/// The equi-join key for one row: the canonical binding key (see
+/// Builds the equi-join key for one row from the canonical binding key (see
 /// [`canonical_binding_key`]) of each common variable, so numeric equivalence
 /// (`1` and `1.0`) matches on the join key just as it does for grouping and
 /// DISTINCT. Returns `None` when any common variable is unbound, so a row that
@@ -2759,15 +2759,15 @@ const STREAM_BATCH: usize = 256;
 /// short-circuits any pipelined input, and a `Sort` directly under a `Limit`
 /// keeps only the top rows.
 enum RowStream {
-    /// Lazy label scan: candidate ids are fetched once on the first pull, then
+    /// Scans a label lazily. Candidate ids are fetched once on the first pull, then
     /// emitted `STREAM_BATCH` at a time so an upstream `LIMIT` never forces the
     /// whole label into rows.
     LabelScan {
         variable: String,
         label: Option<String>,
-        /// SIP restriction: when `Some`, only these node ids are emitted (the
-        /// scan is intersected with the build side of an enclosing streaming
-        /// hash join).
+        /// Restricts the scan by sideways information passing. When `Some`, only
+        /// these node ids are emitted, intersecting the scan with the build side of
+        /// an enclosing streaming hash join.
         allowed: Option<HashSet<NodeId>>,
         ids: Option<std::vec::IntoIter<NodeId>>,
     },
@@ -2804,8 +2804,8 @@ enum RowStream {
         /// True when the pattern used a `*` range, so `rel_var` binds the list of
         /// relationships along the trail rather than a single relationship.
         is_var_length: bool,
-        /// Holds expansion output beyond `STREAM_BATCH`: one input row can fan
-        /// out to many neighbors, so the overflow is buffered and served on
+        /// Holds expansion output beyond `STREAM_BATCH`, because one input row can
+        /// fan out to many neighbors, so the overflow is buffered and served on
         /// later pulls before the next input batch is fetched.
         buf: std::collections::VecDeque<SlotRow>,
     },
@@ -2818,7 +2818,7 @@ enum RowStream {
     HashJoin {
         build_op: Box<PhysicalOperator>,
         probe_op: Box<PhysicalOperator>,
-        /// `Some` for a left-outer join: probe rows with no match are null-filled.
+        /// Is `Some` for a left-outer join, where probe rows with no match are null-filled.
         null_vars: Option<Vec<String>>,
         /// Built lazily on the first pull (build side materialized + hashed,
         /// probe stream constructed with SIP applied).
@@ -2881,7 +2881,7 @@ enum RowStream {
         expression: FilterExpr,
         buf: std::collections::VecDeque<SlotRow>,
     },
-    /// Blocking sort: drains `input` fully on the first pull, sorts it (or keeps
+    /// Sorts, blocking. Drains `input` fully on the first pull, sorts it (or keeps
     /// the top `bound` rows), then emits the result in batches. A `Sort` directly
     /// under a `Limit` gets `bound = Some(skip + count)` for a top-N selection.
     Sort {
@@ -2890,7 +2890,7 @@ enum RowStream {
         bound: Option<usize>,
         out: Option<std::vec::IntoIter<SlotRow>>,
     },
-    /// Streaming DISTINCT: a stateful pass-through emitting each row whose dedup
+    /// Deduplicates as a stateful pass-through, emitting each row whose dedup
     /// key has not been seen, so an upstream `LIMIT` can short-circuit. `keys`
     /// narrows the dedup key to those binding names; `None` keys the full row.
     Distinct {
@@ -2898,7 +2898,7 @@ enum RowStream {
         keys: Option<Vec<String>>,
         seen: HashSet<String>,
     },
-    /// Blocking aggregate: drains and folds `input` on the first pull, then emits
+    /// Aggregates, blocking. Drains and folds `input` on the first pull, then emits
     /// the grouped rows in batches.
     Aggregate {
         input: Box<RowStream>,
@@ -2906,8 +2906,8 @@ enum RowStream {
         aggregations: Vec<(AggFn, Expr, String)>,
         out: Option<std::vec::IntoIter<SlotRow>>,
     },
-    /// OPTIONAL MATCH: forwards `input` rows; if the entire input is empty, emits
-    /// exactly one null-filled row for the pattern variables.
+    /// Implements OPTIONAL MATCH. Forwards `input` rows; if the entire input is
+    /// empty, emits exactly one null-filled row for the pattern variables.
     OptionalMatch {
         input: Box<RowStream>,
         null_vars: Vec<String>,
@@ -2941,8 +2941,9 @@ enum RowStream {
         rows: Vec<Vec<serde_json::Value>>,
         buf: std::collections::VecDeque<SlotRow>,
     },
-    /// SKIP/LIMIT: drops the first `skip` rows then emits up to `count`, returning
-    /// empty (stopping upstream pulls) once `count` rows are emitted.
+    /// Applies SKIP and LIMIT, dropping the first `skip` rows then emitting up to
+    /// `count`, and returning empty (stopping upstream pulls) once `count` rows are
+    /// emitted.
     Limit {
         input: Box<RowStream>,
         skip: usize,
@@ -2951,8 +2952,8 @@ enum RowStream {
         emitted: usize,
         validated: bool,
     },
-    /// A write clause executed over the input. Blocking: the input is drained
-    /// fully and the writes applied before any row is emitted, so `DELETE` sees
+    /// A write clause executed over the input. It blocks, draining the input
+    /// fully and applying the writes before any row is emitted, so `DELETE` sees
     /// the whole result and a trailing `LIMIT` cannot skip writes.
     WritePart {
         input: Box<RowStream>,
@@ -2981,8 +2982,8 @@ struct HashJoinState {
     probe: Box<RowStream>,
 }
 
-/// Build the `RowStream` for `op`. Total over `PhysicalOperator`: every operator
-/// maps to a variant. Leaves other than `LabelScan` become a `Materialized` node
+/// Build the `RowStream` for `op`. This is total over `PhysicalOperator`, since every
+/// operator maps to a variant. Leaves other than `LabelScan` become a `Materialized` node
 /// that calls `eval_leaf` once on the first pull.
 fn build_stream(op: &PhysicalOperator) -> RowStream {
     build_stream_with_sip(op, &HashMap::new())
@@ -4199,8 +4200,8 @@ impl AggState {
     }
 }
 
-/// The output column name of a group-by item: its alias when present,
-/// otherwise the canonical display form of the expression. Shared by the
+/// Returns the output column name of a group-by item, which is its alias when
+/// present and otherwise the canonical display form of the expression. Shared by the
 /// row-at-a-time and vectorized aggregate folds so group rows bind under
 /// identical keys.
 pub(super) fn group_by_column_name(expr: &Expr, alias: &Option<String>) -> String {

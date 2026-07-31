@@ -5,7 +5,7 @@
 use serde_json::Value;
 use std::cmp::Ordering;
 
-/// One slice of the value distribution: a closed range with its row count.
+/// One slice of the value distribution, a closed range with its row count.
 #[derive(Debug, Clone)]
 pub(crate) struct HistogramBucket {
     /// Lower bound (inclusive).

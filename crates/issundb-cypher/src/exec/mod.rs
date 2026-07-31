@@ -1158,8 +1158,8 @@ mod tests {
         );
     }
 
-    /// The point of a function over a procedure: it runs once per row, so a single
-    /// query can rank many candidate pairs against one anchor.
+    /// This is the point of a function over a procedure. It runs once per row, so a
+    /// single query can rank many candidate pairs against one anchor.
     #[test]
     fn link_prediction_scores_every_row() {
         let params = HashMap::new();
@@ -1911,8 +1911,8 @@ mod tests {
     // `parse_multi_clause_chaining` in parser.rs), routed through
     // `execute_read_query`'s write-parts path, not `execute_pipeline`.
 
-    /// Repro 1: a unique-constraint failure on the second CREATE in one
-    /// statement must roll back the first CREATE's node too.
+    /// A unique-constraint failure on the second CREATE in one statement must roll
+    /// back the first CREATE's node too.
     #[test]
     fn create_create_rolls_back_first_node_when_second_violates_constraint() {
         let params = HashMap::new();
@@ -1942,8 +1942,8 @@ mod tests {
         );
     }
 
-    /// Repro 2: an error in the RETURN expression (division by zero) after a
-    /// same-statement `CREATE ... WITH ...` must roll back the CREATE.
+    /// An error in the RETURN expression (division by zero) after a same-statement
+    /// `CREATE ... WITH ...` must roll back the CREATE.
     #[test]
     fn create_with_return_error_rolls_back_the_create() {
         let params = HashMap::new();
@@ -1964,7 +1964,7 @@ mod tests {
         );
     }
 
-    /// Regression: the ordinary, non-failing `CREATE ... RETURN` path (with
+    /// The ordinary, non-failing `CREATE ... RETURN` path (with
     /// and without an intervening `WITH`, and a sibling pattern referencing
     /// another pattern's just-created property) must keep working; this is
     /// the shape most at risk from deferring commit to make the above atomic.
@@ -5233,8 +5233,8 @@ mod tests {
         assert!(rows.is_empty(), "expected no rows, got {}", rows.len());
     }
 
-    /// Multi-MATCH with an Expand on the probe side: SIP must thread through
-    /// the Expand and restrict its inner LabelScan, then the expansion must
+    /// On a multi-MATCH with an Expand on the probe side, SIP must thread through
+    /// the Expand and restrict its inner LabelScan, and the expansion must then
     /// produce only edges reachable from the SIP-filtered nodes.
     #[test]
     fn sip_probe_side_expand_correctness() {

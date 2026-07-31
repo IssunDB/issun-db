@@ -402,8 +402,8 @@ fn subgraph_rows(sub: Subgraph, higher_is_better: bool) -> Vec<Vec<Value>> {
         .collect()
 }
 
-/// Parse a query-vector argument: a JSON list of numbers, or null/empty for an
-/// absent vector (disables vector search in the hybrid form).
+/// Parse a query-vector argument, which is a JSON list of numbers, or null/empty for
+/// an absent vector (disabling vector search in the hybrid form).
 fn parse_vector(proc: &str, v: &Value) -> Result<Vec<f32>, String> {
     match v {
         Value::Null => Ok(Vec::new()),
@@ -642,7 +642,7 @@ fn build_dijkstra(graph: &Graph, args: &[Value]) -> Result<Procedure, String> {
     })
 }
 
-/// `issundb.triangleCount([{relTypes, labels}])`. Yields a single `(count)` row:
+/// `issundb.triangleCount([{relTypes, labels}])`. Yields a single `(count)` row holding
 /// the number of directed triangle cycles `(a)->(b)->(c)->(a)`, optionally
 /// constrained by per-hop relationship types and per-variable labels (each a list
 /// of up to three strings, with `null` entries left unconstrained).
@@ -1000,7 +1000,7 @@ mod tests {
     use issundb_vector::VectorGraphExt;
     use serde_json::{Value, json};
 
-    /// A small graph for retrieval: a chain `a -> b -> c` where `a` and `b` are
+    /// Builds a small graph for retrieval, a chain `a -> b -> c` where `a` and `b` are
     /// `Doc` nodes with a `body` text property and vectors, and `a`'s vector
     /// points along the first axis. A `body` text index is created. The CSR
     /// snapshot is rebuilt so BFS expansion sees the edges.

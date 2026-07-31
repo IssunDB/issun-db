@@ -425,7 +425,7 @@ impl Graph {
         .map(Option::flatten)
     }
 
-    /// Destination-label-aware fan-out: the average number of `dst_label`
+    /// Estimates the destination-label-aware fan-out, the average number of `dst_label`
     /// neighbors reached by expanding edges of `rel_type` from a node carrying
     /// `src_label` (or the symmetric in-direction when `incoming`).
     ///

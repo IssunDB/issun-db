@@ -275,7 +275,7 @@ impl Graph {
 
     /// Whether a node with this id exists.
     ///
-    /// A key probe, not a read: [`Graph::get_node`] decodes the record, which also copies the
+    /// A key probe rather than a read. [`Graph::get_node`] decodes the record, which also copies the
     /// node's whole property blob, and a caller asking only whether the id is live should not pay
     /// for that. This is the check a writer runs per item, so the difference is the point.
     pub fn node_exists(&self, id: NodeId) -> Result<bool, Error> {

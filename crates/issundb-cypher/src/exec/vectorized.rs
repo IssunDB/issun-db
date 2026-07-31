@@ -124,8 +124,8 @@ struct VecSortKey<'a> {
 enum VecLeaf<'a> {
     /// Ids come from `nodes_by_label` (or `all_nodes`), ascending.
     LabelScan { label: Option<&'a str> },
-    /// `NodeByIdSeek`, `NodeIndexScan`, or `NodeRangeScan`: ids come from the
-    /// row pipeline's own leaf evaluator, preserving its order and checks.
+    /// Covers `NodeByIdSeek`, `NodeIndexScan`, and `NodeRangeScan`, whose ids come
+    /// from the row pipeline's own leaf evaluator, preserving its order and checks.
     Seek(&'a PhysicalOperator),
 }
 
@@ -894,8 +894,8 @@ fn props_table(graph: &Graph, ids: &[NodeId], props: &[&str]) -> Result<Vec<Vec<
         })
 }
 
-/// Edge counterpart of [`props_table`]: bulk row-major gather of edge `props`
-/// for each edge id in `ids`, through the in-memory edge property columns.
+/// Gathers edge `props` for each edge id in `ids` row-major through the in-memory
+/// edge property columns, the edge counterpart of [`props_table`].
 fn edge_props_table(
     graph: &Graph,
     ids: &[EdgeId],
@@ -1044,9 +1044,9 @@ fn cmp_keeps(structured: bool, op: CmpOp, lv: &Value, rv: &Value) -> bool {
     }
 }
 
-/// Bulk label-membership set for `ids`: a label smaller than the column comes
-/// from one `label_idx` prefix scan, a larger one from point lookups on the
-/// distinct ids.
+/// Builds the label-membership set for `ids` in bulk. A label smaller than the
+/// column comes from one `label_idx` prefix scan, a larger one from point lookups
+/// on the distinct ids.
 fn label_pass_set(
     graph: &Graph,
     ids: &[NodeId],
@@ -3577,8 +3577,8 @@ mod tests {
         }
     }
 
-    /// The benchmark's `interest_gender_by_city` shape: two `MATCH` clauses that
-    /// share the pivot `p`. After the join-to-expand rewrite it plans as a
+    /// Exercises the benchmark's `interest_gender_by_city` shape, two `MATCH` clauses
+    /// that share the pivot `p`. After the join-to-expand rewrite it plans as a
     /// linear two-hop chain anchored at the selective interest index scan, so it
     /// takes the columnar path and matches the row pipeline exactly.
     #[test]

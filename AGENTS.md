@@ -440,8 +440,8 @@ behavior a signature cannot show, and those are pinned here:
   per-neighbor property predicate itself and hands the kernel the surviving ids, so a filtered count stays a kernel call. This is the kernel behind the
   Cypher executor's terminal count-collapse; a source absent from the snapshot counts zero rather than erroring.
 - `prefers_point_expansion(sources) -> bool`: whether a typed expansion over `sources` many source nodes should read per-source LMDB adjacency instead of
-  refreshing the CSR snapshot, true only when the snapshot is stale and the source set is at most `STALE_POINT_EXPAND_MAX`. Advisory: both routes return
-  the same rows, so a caller ignoring it is correct but may rebuild a whole snapshot to serve a handful of sources. It is public because the Cypher
+  refreshing the CSR snapshot, true only when the snapshot is stale and the source set is at most `STALE_POINT_EXPAND_MAX`. The answer is advisory, since both
+  routes return the same rows, so a caller ignoring it is correct but may rebuild a whole snapshot to serve a handful of sources. It is public because the Cypher
   executor's collapse decision needs it from another crate.
 - `adjacency_span(sources, incoming) -> Result<u64, Error>`: total length of `sources`' adjacency rows in one direction, measured over the *installed*
   CSR snapshot. It reads two array elements per source and no edge, and deliberately does not refresh: it exists so a caller can size an expansion before

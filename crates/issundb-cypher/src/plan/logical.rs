@@ -107,8 +107,8 @@ pub enum LogicalOperator {
         skip: usize,
         count: usize,
     },
-    /// Optional match: evaluate inner plan; if it produces no rows, emit one
-    /// null-filled row for each pattern variable in `null_vars`.
+    /// Evaluates the inner plan for an optional match; if it produces no rows, emits
+    /// one null-filled row for each pattern variable in `null_vars`.
     OptionalMatch {
         input: Box<LogicalOperator>,
         null_vars: Vec<String>,

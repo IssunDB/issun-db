@@ -753,8 +753,8 @@ mod tests {
 
     /// An embedding for an id no node holds is refused.
     ///
-    /// Regression: it used to be accepted, and because node ids are handed out monotonically, the
-    /// next node created with that id inherited it. The node below is never embedded and yet
+    /// This used to be accepted, and because node ids are handed out monotonically, the next node
+    /// created with that id inherited it. The node below is never embedded and yet
     /// answered a search at distance zero, with no error at any layer.
     #[test]
     fn a_vector_for_a_node_that_does_not_exist_is_refused() {

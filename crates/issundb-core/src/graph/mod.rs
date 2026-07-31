@@ -78,7 +78,7 @@ pub enum LinkPredictionMetric {
     PreferentialAttachment,
 }
 
-/// Pattern description for [`Graph::count_triangle_cycles`]: the directed
+/// Describes the pattern [`Graph::count_triangle_cycles`] counts, the directed
 /// cycle `(a)-[t1]->(b)-[t2]->(c)-[t3]->(a)` with an optional relationship
 /// type per hop and an optional label per node variable. `None` means
 /// unconstrained.
@@ -90,7 +90,7 @@ pub struct TriangleCountSpec<'a> {
     pub labels: [Option<&'a str>; 3],
 }
 
-/// Pattern description for [`Graph::count_linear_paths`]: an open directed
+/// Describes the pattern [`Graph::count_linear_paths`] counts, an open directed
 /// path of one or two hops, `(v0)-[t1]->(v1)` or
 /// `(v0)-[t1]->(v1)-[t2]->(v2)`, with an optional relationship type per hop
 /// and an optional label per node variable. `None` means unconstrained.
@@ -116,7 +116,7 @@ pub struct PathCountSpec<'a> {
     pub vertex_allow: Vec<Option<Vec<NodeId>>>,
 }
 
-/// Pattern description for [`Graph::grouped_edge_counts`]: count typed edges
+/// Describes the pattern [`Graph::grouped_edge_counts`] counts, typed edges
 /// grouped by one endpoint. With `group_is_dst`, edges are grouped by their
 /// destination and the source is the counted endpoint (in-degree per
 /// destination); otherwise edges are grouped by their source and the
@@ -148,8 +148,8 @@ pub struct GroupedDegreeSpec<'a> {
     pub counted_nonnull_prop: Option<&'a str>,
 }
 
-/// Pattern description for [`Graph::typed_neighbor_counts`]: per-source counts
-/// of typed neighbors across one hop. `incoming` follows incoming edges instead
+/// Describes the pattern [`Graph::typed_neighbor_counts`] counts, the typed
+/// neighbors of each source across one hop. `incoming` follows incoming edges instead
 /// of outgoing ones. A neighbor qualifies when it carries every label in
 /// `neighbor_labels` (an empty slice is unconstrained) and, when
 /// `neighbor_allow` is present, is a member of that set; it adds to the counted
@@ -485,7 +485,7 @@ pub(super) fn fts_stats_sum_dl_key(label_id: LabelId, prop_key_id: PropKeyId) ->
     format!("fts_stats:node:l:{label_id}:p:{prop_key_id}:sum_dl")
 }
 
-/// The graph database handle. Cheap to clone: all state is behind `Arc`.
+/// The graph database handle. It is cheap to clone, since all state is behind `Arc`.
 #[derive(Clone)]
 pub struct Graph {
     pub(super) storage: Arc<Storage>,
@@ -670,8 +670,8 @@ impl Graph {
         })
     }
 
-    /// Bulk form of [`Graph::node_prop_json`]: gather `props` for each id in
-    /// `ids` through the in-memory property columns, row-major (`out[i][j]` is
+    /// Gathers `props` for each id in `ids` through the in-memory property columns,
+    /// the bulk form of [`Graph::node_prop_json`], row-major (`out[i][j]` is
     /// `props[j]` on `ids[i]`). One columns refresh covers the whole gather,
     /// and each id resolves to its dense index once. A missing property reads
     /// as `Value::Null`; a nonexistent node is [`Error::NodeNotFound`].
@@ -700,8 +700,8 @@ impl Graph {
             .with_fresh(&self.storage, |cols| cols.props_table(ids, props))?
     }
 
-    /// Single-property column form of [`Graph::node_props_json_table`]:
-    /// `out[i]` is the value of `prop` on `ids[i]`, as one flat vector, so a
+    /// Gathers one property as a flat column, the single-property form of
+    /// [`Graph::node_props_json_table`]. `out[i]` is the value of `prop` on `ids[i]`, so a
     /// bulk single-property gather does not pay one row vector allocation per
     /// id. A missing property reads as `Value::Null`; a nonexistent node is
     /// [`Error::NodeNotFound`].

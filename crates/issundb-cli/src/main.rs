@@ -2407,8 +2407,8 @@ fn index_kind(flags: u8) -> &'static str {
 }
 
 /// Sum of the file sizes directly inside an LMDB directory (`data.mdb` and
-/// `lock.mdb`). Returns `None` when the directory cannot be read. Not recursive:
-/// an LMDB environment keeps its files flat in the directory.
+/// `lock.mdb`). Returns `None` when the directory cannot be read. It is not recursive,
+/// because an LMDB environment keeps its files flat in the directory.
 fn dir_size(dir: &Path) -> Option<u64> {
     let mut total = 0u64;
     for entry in fs::read_dir(dir).ok()? {
@@ -2787,7 +2787,7 @@ impl std::fmt::Display for ImportFailure {
     }
 }
 
-/// Streaming body of `:import-nodes`: rows are read one at a time and flushed
+/// Runs the streaming body of `:import-nodes`, reading rows one at a time and flushing
 /// every `batch_size` rows, so at most one batch is in memory. Returns the
 /// inserted row count. `batch_size` is a parameter so tests can exercise the
 /// batch boundary cheaply.
@@ -2963,8 +2963,8 @@ fn insert_edge_batch(
     Ok(())
 }
 
-/// Streaming body of `:import-edges`: key pairs are read one at a time and
-/// flushed every `batch_size` pairs, so at most one batch is in memory.
+/// Runs the streaming body of `:import-edges`, reading key pairs one at a time and
+/// flushing every `batch_size` pairs, so at most one batch is in memory.
 /// `batch_size` is a parameter so tests can exercise the batch boundary
 /// cheaply.
 fn import_edges_stream(

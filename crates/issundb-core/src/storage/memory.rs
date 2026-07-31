@@ -46,7 +46,7 @@ use crate::error::Error;
 
 /// Failure modes of the in-memory backend.
 ///
-/// Deliberately small: most of what can go wrong with a real engine (I/O, a full
+/// Deliberately small, because most of what can go wrong with a real engine (I/O, a full
 /// map, a corrupt page) cannot happen here, and inventing variants for those would
 /// suggest this backend can report conditions it never encounters.
 #[derive(Debug, thiserror::Error)]
@@ -63,7 +63,7 @@ pub enum MemoryError {
 /// The error type [`crate::error::Error::Storage`] carries for this backend.
 pub type StorageError = MemoryError;
 
-/// One table: encoded key to the set of encoded values stored under it.
+/// One table, mapping an encoded key to the set of encoded values stored under it.
 ///
 /// A non-duplicate table keeps at most one value per key; the shared shape avoids a
 /// second code path whose ordering could drift from the duplicate one.
@@ -171,8 +171,8 @@ impl Val for () {
     fn decode(_: &[u8]) {}
 }
 
-/// The storage environment: the published tables, plus the lock that admits one
-/// writer at a time.
+/// The storage environment, holding the published tables plus the lock that admits
+/// one writer at a time.
 ///
 /// The concurrency model is copy-on-write, chosen to match the two properties the
 /// engine above actually relies on rather than to be the simplest thing that stores
@@ -242,7 +242,7 @@ impl Env {
 
 /// A read transaction: one published table set, held for the transaction's life.
 ///
-/// Also the read *view* of a write transaction: [`RwTxn`] contains one of these and
+/// Also serves as the read *view* of a write transaction, since [`RwTxn`] contains one and
 /// derefs to it, so every read method below accepts either, which is what lets a write
 /// path pass its own transaction to a read helper and see its uncommitted writes. The
 /// LMDB backend gets that property from heed's deref chain, and the ~90 signatures
@@ -264,7 +264,7 @@ impl RoTxn<'_> {
 /// same name. This backend needs no distinct type for it.
 pub type OwnedRoTxn<'e> = RoTxn<'e>;
 
-/// A write transaction: a private working copy plus the writer lock.
+/// A write transaction, holding a private working copy plus the writer lock.
 pub struct RwTxn<'e> {
     inner: RoTxn<'e>,
     published: Arc<ArcSwap<Tables>>,
@@ -538,7 +538,7 @@ impl Storage {
         })
     }
 
-    /// Unsupported: a backup is a copy of a file, and this backend has none.
+    /// Unsupported, because a backup is a copy of a file and this backend has none.
     pub fn copy_to_file(&self, _destination: &Path, _compact: bool) -> Result<(), Error> {
         Err(Error::Storage(MemoryError::Unsupported("backup")))
     }

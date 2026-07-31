@@ -411,7 +411,7 @@ impl CsrCache {
 
     /// Ask for per-edge weights on every snapshot built from here on.
     ///
-    /// Sticky, and deliberately so: without it an unweighted refresh would strip
+    /// Sticky, and deliberately so, because without it an unweighted refresh would strip
     /// the weights and the next weighted query would rebuild from storage again, so
     /// a workload alternating Dijkstra with any other algorithm would rebuild twice
     /// per write. See `Graph::weighted_snapshot` for the memory this trades away.

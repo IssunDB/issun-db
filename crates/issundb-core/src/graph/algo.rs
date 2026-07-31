@@ -1057,7 +1057,7 @@ impl Graph {
 
     /// Computes the eigenvector centrality for all nodes by power iteration.
     ///
-    /// Bounded rather than fallible: it stops early once the L2 change falls below
+    /// Bounded rather than fallible, it stops early once the L2 change falls below
     /// `tolerance` and otherwise returns the estimate after `iterations` rounds. See
     /// [`Graph::eigenvector_centrality_kernel`].
     pub fn eigenvector_centrality(
@@ -1587,8 +1587,8 @@ mod snapshot_freshness_tests {
         assert_eq!(cc_gated, cc_full, "components: gated vs forced rebuild");
     }
 
-    /// Freshness: a traversal reflects an edge, and a brand-new node reached through
-    /// a new edge, with no explicit `rebuild_csr` between the write and the read.
+    /// A traversal must reflect an edge, and a brand-new node reached through a new
+    /// edge, with no explicit `rebuild_csr` between the write and the read.
     #[test]
     fn traversals_reflect_writes_without_an_explicit_rebuild() {
         let dir = TempDir::new().unwrap();
