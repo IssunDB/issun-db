@@ -59,11 +59,11 @@ jobs:
 
             ### A Note on the Windows ARM64 Build
 
-            The `windows-arm64` binaries are built without the `hnsw` feature, because the C SIMD
-            library behind it does not compile for that target. Vector search there is an exact
-            scan: it returns the true nearest neighbors rather than approximate ones, so recall is
-            higher, but the search is linear in the number of vectors instead of sublinear and
-            quantization is ignored. Every other platform uses the HNSW index. Nothing else differs.
+            The `windows-arm64` binaries are built without the `hnsw` feature because the C SIMD library it depends on
+            does not compile for that target. Vector search there is an exact scan, which means it returns the true
+            nearest neighbors rather than approximate ones, so recall is higher, but the search is linear in the number
+            of vectors instead of sublinear and quantization is ignored. Every other platform uses the HNSW index.
+            So, nothing else differs between `windows-arm64` build and other builds.
 
             ### Container Image
 
