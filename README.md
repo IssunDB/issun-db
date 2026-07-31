@@ -46,7 +46,7 @@ To use IssunDB in your Rust project, add the dependency to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-issundb = "0.1.0-alpha.21"
+issundb = "0.1.0-alpha.22"
 serde_json = "1.0"
 ```
 
