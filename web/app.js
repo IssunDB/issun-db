@@ -790,6 +790,9 @@ function procedureHint(cypher, message) {
   return "";
 }
 
+// The count comes from the catalog rather than the markup, which carried a stale 13 for as long as
+// the catalog had more than that.
+$("proc-search").placeholder = `Search ${PROCEDURES.length} procedures…`;
 $("proc-search").addEventListener("input", (e) => renderProcedures(e.target.value));
 
 // ---------------------------------------------------------------------------
