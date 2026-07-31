@@ -459,7 +459,8 @@ The read-path and statistics methods carry non-obvious semantics:
 
 Graph algorithms have self-describing signatures over `NodeId` and `EdgeId`: `bfs`, `bfs_multi_source`, `expand_bulk`, `dfs`, `shortest_path`, `all_paths`, `all_shortest_paths`,
 `longest_path`, `shortest_path_top_k`, `page_rank`, `connected_components`, `strongly_connected_components`, `detect_cycle`, `label_propagation`,
-`degree_centrality`, `betweenness_centrality`, `harmonic_centrality`, `spanning_forest`, `maximum_flow`, and `all_neighbors`. Several carry behavior
+`louvain`, `degree_centrality`, `betweenness_centrality`, `harmonic_centrality`, `closeness_centrality`, `eigenvector_centrality`,
+`katz_centrality`, `clustering_coefficient`, `link_prediction_score`, `spanning_forest`, `maximum_flow`, and `all_neighbors`. Several carry behavior
 worth pinning:
 
 - `shortest_path_dijkstra(src, dst) -> Result<Option<WeightedPath>, Error>`: edge weight is the first present of the `weight`, `cost`, `capacity`, or
@@ -481,6 +482,24 @@ worth pinning:
   redistributed, so ranks do not sum to 1; `tests/oracle.rs` compares against NetworkX over a corpus restricted to graphs with no dangling nodes for
   exactly that reason. The accumulation reads the incoming rows, so each output entry is a sum over one node's in-edges, which is what makes the pass
   parallel over disjoint output chunks and independent of the worker count.
+- The algorithms ported from Graphina (`closeness_centrality`, `eigenvector_centrality`, `katz_centrality`, `clustering_coefficient`, `louvain`, and
+  `link_prediction_score`) each had to take a position on parallel edges, because Graphina's graph type is simple and collapses them, so its
+  implementations carry no answer to inherit. There are three rules, and which one applies follows from what the score means rather than from taste.
+  `eigenvector_centrality` and `katz_centrality` count every edge, like `page_rank`, since each edge is a distinct path for influence to flow along.
+  `clustering_coefficient` and `link_prediction_score` count *distinct* neighbors, like `degree_centrality`: both are ratios over neighbor sets, and the
+  coefficient in particular is bounded by 1, so counting a parallel edge twice would push it above its own maximum. `louvain` weights an edge by its
+  multiplicity, because modularity is defined over edge weight and a pair joined five times genuinely is more strongly tied.
+- `closeness_centrality() -> Result<HashMap<NodeId, f64>, Error>`: Wasserman-Faust closeness, `(reachable / total_distance) * (reachable / (n - 1))` over
+  hop distances, sharing the per-source breadth-first pass of `harmonic_centrality`. The second factor is what keeps the score usable on a disconnected
+  graph, where a plain reciprocal mean distance would rank a node in a two-node component above a well-connected node in a large one.
+- `eigenvector_centrality(iterations, tolerance)` and `katz_centrality(alpha, beta, iterations, tolerance)`: power iterations that are bounded rather than
+  fallible. Each stops early on convergence and otherwise returns the estimate after the iteration budget, following `page_rank` rather than erroring on a
+  slowly converging graph. Katz needs `alpha` below the reciprocal of the largest eigenvalue, which is a property of the data; above it the series diverges
+  and the bounded loop returns a large, meaningless, finite answer.
+- `louvain() -> Result<HashMap<NodeId, u64>, Error>`: modularity optimization with level coarsening, naming each community after the smallest node id it
+  contains, as `connected_components` does. It is the one analytics pass that is deliberately serial: local moving is order-dependent by construction, so
+  splitting it over workers would make the partition depend on the worker count. It is a strict upgrade on `label_propagation` for quality and separates
+  communities joined by a few edges, which label propagation merges.
 - `count_triangle_cycles(spec: &TriangleCountSpec) -> Result<u64, Error>`: assignment count of the directed triangle pattern
   `(a)-[t1]->(b)-[t2]->(c)-[t3]->(a)` with optional per-hop relationship types and per-variable labels, following Cypher MATCH row semantics including
   relationship uniqueness; the Cypher optimizer lowers grouping-free `count` aggregates over that pattern to this kernel via the `TriangleCount`

@@ -3549,6 +3549,11 @@ fn is_known_function(name: &str) -> bool {
             | "issundb.distance.euclidean"
             | "issundb.similarity.jaccard"
             | "issundb.similarity.overlap"
+            | "issundb.link.commonneighbors"
+            | "issundb.link.jaccard"
+            | "issundb.link.adamicadar"
+            | "issundb.link.resourceallocation"
+            | "issundb.link.preferentialattachment"
     )
 }
 

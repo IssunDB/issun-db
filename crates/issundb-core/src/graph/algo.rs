@@ -1048,6 +1048,68 @@ impl Graph {
         self.with_snapshot(|snap| self.betweenness_centrality_kernel(snap))
     }
 
+    /// Computes the closeness centrality for all nodes, in the Wasserman-Faust form
+    /// that stays meaningful on a disconnected graph. See
+    /// [`Graph::closeness_centrality_kernel`].
+    pub fn closeness_centrality(&self) -> Result<HashMap<NodeId, f64>, Error> {
+        self.with_snapshot(|snap| self.closeness_centrality_kernel(snap))
+    }
+
+    /// Computes the eigenvector centrality for all nodes by power iteration.
+    ///
+    /// Bounded rather than fallible: it stops early once the L2 change falls below
+    /// `tolerance` and otherwise returns the estimate after `iterations` rounds. See
+    /// [`Graph::eigenvector_centrality_kernel`].
+    pub fn eigenvector_centrality(
+        &self,
+        iterations: u32,
+        tolerance: f64,
+    ) -> Result<HashMap<NodeId, f64>, Error> {
+        self.with_snapshot(|snap| self.eigenvector_centrality_kernel(snap, iterations, tolerance))
+    }
+
+    /// Computes the Katz centrality for all nodes.
+    ///
+    /// `alpha` must be below the reciprocal of the largest eigenvalue or the series
+    /// diverges; see [`Graph::katz_centrality_kernel`] for what happens if it is not.
+    pub fn katz_centrality(
+        &self,
+        alpha: f64,
+        beta: f64,
+        iterations: u32,
+        tolerance: f64,
+    ) -> Result<HashMap<NodeId, f64>, Error> {
+        self.with_snapshot(|snap| {
+            self.katz_centrality_kernel(snap, alpha, beta, iterations, tolerance)
+        })
+    }
+
+    /// Computes the local clustering coefficient for all nodes, reading the graph as
+    /// undirected over distinct neighbors. See
+    /// [`Graph::clustering_coefficient_kernel`].
+    pub fn clustering_coefficient(&self) -> Result<HashMap<NodeId, f64>, Error> {
+        self.with_snapshot(|snap| self.clustering_coefficient_kernel(snap))
+    }
+
+    /// Detects communities by the Louvain method, returning the community of every
+    /// node. The community id is the smallest node id it contains, and only the
+    /// induced partition is contractual. See [`Graph::louvain_kernel`].
+    pub fn louvain(&self) -> Result<HashMap<NodeId, u64>, Error> {
+        self.with_snapshot(|snap| self.louvain_kernel(snap))
+    }
+
+    /// Scores how likely `a` and `b` are to become connected, under one of the
+    /// neighborhood heuristics. A node the snapshot does not know scores zero rather
+    /// than erroring. See [`Graph::link_prediction_kernel`].
+    pub fn link_prediction_score(
+        &self,
+        a: NodeId,
+        b: NodeId,
+        metric: LinkPredictionMetric,
+    ) -> Result<f64, Error> {
+        self.with_snapshot(|snap| Ok(self.link_prediction_kernel(snap, a, b, metric)))
+    }
+
     /// Computes the strongly connected components (SCC) of the graph using Tarjan's algorithm.
     pub fn strongly_connected_components(&self) -> Result<HashMap<NodeId, u64>, Error> {
         self.with_snapshot(|snap| self.strongly_connected_components_kernel(snap))

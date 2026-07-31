@@ -177,6 +177,23 @@ Pathfinding, network centrality, and connectivity algorithms run over the in-mem
   Computes the betweenness centrality score for all nodes.
 - `harmonic_centrality() -> Result<HashMap<NodeId, f64>, Error>`  
   Computes the harmonic centrality score for all nodes.
+- `closeness_centrality() -> Result<HashMap<NodeId, f64>, Error>`  
+  Computes closeness centrality in the Wasserman-Faust form, which scales by the fraction of the graph a node reaches and so stays
+  meaningful on a disconnected graph.
+- `eigenvector_centrality(iterations: u32, tolerance: f64) -> Result<HashMap<NodeId, f64>, Error>`  
+  Computes eigenvector centrality by power iteration, stopping early on convergence. Scores are magnitudes scaled to sum to the node
+  count.
+- `katz_centrality(alpha: f64, beta: f64, iterations: u32, tolerance: f64) -> Result<HashMap<NodeId, f64>, Error>`  
+  Computes Katz centrality, which gives every node the `beta` baseline and attenuates each walk by `alpha`. Convergence needs `alpha`
+  below the reciprocal of the largest eigenvalue.
+- `clustering_coefficient() -> Result<HashMap<NodeId, f64>, Error>`  
+  Computes the local clustering coefficient, reading the graph as undirected over distinct neighbors.
+- `louvain() -> Result<HashMap<NodeId, u64>, Error>`  
+  Detects communities by the Louvain method. The community id is the smallest node id in the community, and only the induced partition
+  is contractual.
+- `link_prediction_score(a: NodeId, b: NodeId, metric: LinkPredictionMetric) -> Result<f64, Error>`  
+  Scores how likely two nodes are to become connected, by common neighbors, Jaccard, Adamic-Adar, resource allocation, or preferential
+  attachment.
 
 ### Connectivity and Flow
 
@@ -302,8 +319,23 @@ Graph data science procedures can be executed through the query interface using 
 - `CALL issundb.betweenness()` and `CALL issundb.harmonic()` yield `(nodeId, score)`. Both take no arguments.
 - `CALL issundb.degree({direction})` yields `(nodeId, score)`, where `direction` is `'IN'`, `'OUT'`, or `'BOTH'` (the default).
 - `CALL issundb.connectedComponents()` (alias `issundb.wcc`) and `CALL issundb.stronglyConnectedComponents()` (alias `issundb.scc`) yield `(nodeId, componentId)`.
+- `CALL issundb.closeness()` and `CALL issundb.clusteringCoefficient()` yield `(nodeId, score)`. Both take no arguments.
+- `CALL issundb.eigenvector({iterations, tolerance})` and `CALL issundb.katz({alpha, beta, iterations, tolerance})` yield `(nodeId, score)`. Both stop early on convergence and never fail on a slow graph; the configuration map is optional.
 - `CALL issundb.labelPropagation({maxIterations})` yields `(nodeId, communityId)`.
-- `CALL issundb.communities({maxIterations, topPerCommunity})` yields `(communityId, nodeId, rank)`, partitioning by label propagation and ranking each community by PageRank.
+- `CALL issundb.louvain()` yields `(nodeId, communityId)`. It separates communities joined by a few edges, which label propagation tends to merge.
+- `CALL issundb.communities({maxIterations, topPerCommunity, algorithm})` yields `(communityId, nodeId, rank)`, ranking each community by PageRank. The `algorithm` field selects `'labelPropagation'` (the default) or `'louvain'`.
+
+### Link Prediction
+
+Pairwise scores are scalar functions rather than procedures, because a `CALL` evaluates its arguments against no bindings and runs once per
+statement, so it can never see the two nodes a `MATCH` bound. Each takes two nodes or node ids, reads the neighborhood as undirected over
+distinct neighbors, and returns null when either argument is null.
+
+- `issundb.link.commonNeighbors(a, b)` counts the neighbors the two nodes share.
+- `issundb.link.jaccard(a, b)` divides shared neighbors by the size of the combined neighborhood.
+- `issundb.link.adamicAdar(a, b)` weights each shared neighbor by `1 / ln(degree)`; a shared neighbor of degree one contributes nothing.
+- `issundb.link.resourceAllocation(a, b)` weights each shared neighbor by `1 / degree`.
+- `issundb.link.preferentialAttachment(a, b)` multiplies the two degrees, ignoring shared neighbors entirely.
 
 ### Pathfinding
 

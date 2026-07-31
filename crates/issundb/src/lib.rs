@@ -32,8 +32,8 @@
 // method whose argument type cannot be named from here is not callable.
 pub use issundb_core::{
     DegreeDirection, DirectedNeighborEntry, EdgeId, EdgeRecord, Error, Graph, GroupedDegreeSpec,
-    LabelId, Language, NeighborCountSpec, NeighborEntry, NodeId, NodeRecord, PathCountSpec,
-    PropValue, ReadTxn, TriangleCountSpec, TypeId, WeightedPath, WriteTxn,
+    LabelId, Language, LinkPredictionMetric, NeighborCountSpec, NeighborEntry, NodeId, NodeRecord,
+    PathCountSpec, PropValue, ReadTxn, TriangleCountSpec, TypeId, WeightedPath, WriteTxn,
 };
 pub use issundb_cypher::{
     CypherError, CypherType, Procedure, ProcedureRegistry, QueryResult, Record,

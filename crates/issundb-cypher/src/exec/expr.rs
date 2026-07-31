@@ -4,6 +4,7 @@ use chrono::{
     Datelike, Duration, NaiveDate, NaiveDateTime, NaiveTime, Offset, TimeZone, Timelike, Weekday,
 };
 use chrono_tz::Tz;
+use issundb_core::LinkPredictionMetric;
 use issundb_vector::VectorGraphExt;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -1522,6 +1523,66 @@ fn eval_set_metric<B: Bindings>(
     })
 }
 
+/// Resolve a link-prediction argument to a node id.
+///
+/// A node value resolves to its id and an integer to itself, so both
+/// `issundb.link.jaccard(a, b)` over matched nodes and `issundb.link.jaccard(1, 2)`
+/// over literal ids work. `null` resolves to `None` so the caller can propagate
+/// Cypher null semantics rather than raising.
+fn resolve_node_arg<B: Bindings>(
+    graph: &Graph,
+    path: &B,
+    name: &str,
+    expr: &Expr,
+    params: &HashMap<String, serde_json::Value>,
+) -> Result<Option<u64>, String> {
+    match evaluate_expr(graph, path, expr, params)? {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::Object(map)
+            if map.get("__type__").and_then(|t| t.as_str()) == Some("__Node__") =>
+        {
+            map.get("id")
+                .and_then(|v| v.as_u64())
+                .map(Some)
+                .ok_or_else(|| format!("{name}() node argument has no id"))
+        }
+        serde_json::Value::Number(n) => n
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| format!("{name}() node id must be a non-negative integer")),
+        _ => Err(format!("{name}() arguments must be nodes or node ids")),
+    }
+}
+
+/// Evaluate one of the `issundb.link.*` neighborhood link-prediction scores.
+///
+/// These are functions rather than procedures because a `CALL` evaluates its
+/// arguments against no bindings and runs once per statement, so it could never see
+/// the `a` and `b` of a `MATCH`. A pairwise score has to run per row.
+fn eval_link_metric<B: Bindings>(
+    graph: &Graph,
+    path: &B,
+    name: &str,
+    args: &[Expr],
+    params: &HashMap<String, serde_json::Value>,
+    metric: LinkPredictionMetric,
+) -> Result<serde_json::Value, String> {
+    if args.len() != 2 {
+        return Err(format!("{name}() requires exactly 2 arguments"));
+    }
+    let a = resolve_node_arg(graph, path, name, &args[0], params)?;
+    let b = resolve_node_arg(graph, path, name, &args[1], params)?;
+    match (a, b) {
+        (Some(a), Some(b)) => {
+            let score = graph
+                .link_prediction_score(a, b, metric)
+                .map_err(|e| format!("{name}(): {e}"))?;
+            Ok(serde_json::Value::from(score))
+        }
+        _ => Ok(serde_json::Value::Null),
+    }
+}
+
 pub(super) fn eval_function_call<B: Bindings>(
     graph: &Graph,
     path: &B,
@@ -1636,6 +1697,50 @@ pub(super) fn eval_function_call<B: Bindings>(
         "issundb.similarity.jaccard" => {
             eval_set_metric(graph, path, name, args, params, jaccard_similarity, |s| s)
         }
+        // Neighborhood link prediction, distinct from the `similarity` family above:
+        // those compare two value sets a caller supplies, these compare the two
+        // nodes' neighborhoods in the graph. `name` has already been lowercased, so
+        // these arms carry no camel case even though a query may write it.
+        "issundb.link.commonneighbors" => eval_link_metric(
+            graph,
+            path,
+            name,
+            args,
+            params,
+            LinkPredictionMetric::CommonNeighbors,
+        ),
+        "issundb.link.jaccard" => eval_link_metric(
+            graph,
+            path,
+            name,
+            args,
+            params,
+            LinkPredictionMetric::Jaccard,
+        ),
+        "issundb.link.adamicadar" => eval_link_metric(
+            graph,
+            path,
+            name,
+            args,
+            params,
+            LinkPredictionMetric::AdamicAdar,
+        ),
+        "issundb.link.resourceallocation" => eval_link_metric(
+            graph,
+            path,
+            name,
+            args,
+            params,
+            LinkPredictionMetric::ResourceAllocation,
+        ),
+        "issundb.link.preferentialattachment" => eval_link_metric(
+            graph,
+            path,
+            name,
+            args,
+            params,
+            LinkPredictionMetric::PreferentialAttachment,
+        ),
         "issundb.similarity.overlap" => {
             eval_set_metric(graph, path, name, args, params, overlap_similarity, |s| s)
         }

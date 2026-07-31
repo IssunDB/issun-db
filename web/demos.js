@@ -232,12 +232,67 @@ RETURN nodeId, communityId
 ORDER BY communityId, nodeId`,
   },
   {
+    name: "issundb.closeness",
+    args: "",
+    yields: "nodeId, score",
+    summary:
+      "Reciprocal mean distance to every reachable node, scaled by the fraction of the graph reached, so a node in a small component does not outscore a well-connected one.",
+    snippet: `CALL issundb.closeness()
+YIELD nodeId, score
+RETURN nodeId, score
+ORDER BY score DESC`,
+  },
+  {
+    name: "issundb.eigenvector",
+    args: "[{iterations, tolerance}]",
+    yields: "nodeId, score",
+    summary:
+      "Ranks a node by how important the nodes pointing at it are, by power iteration. Scores are magnitudes scaled to sum to the node count.",
+    snippet: `CALL issundb.eigenvector({iterations: 100})
+YIELD nodeId, score
+RETURN nodeId, score
+ORDER BY score DESC`,
+  },
+  {
+    name: "issundb.katz",
+    args: "[{alpha, beta, iterations, tolerance}]",
+    yields: "nodeId, score",
+    summary:
+      "Sums the walks reaching a node, attenuating a walk of length k by alpha^k, plus a beta baseline every node receives. Unlike eigenvector centrality it scores a node with no incoming edges.",
+    snippet: `CALL issundb.katz({alpha: 0.1, beta: 1.0})
+YIELD nodeId, score
+RETURN nodeId, score
+ORDER BY score DESC`,
+  },
+  {
+    name: "issundb.clusteringCoefficient",
+    args: "",
+    yields: "nodeId, score",
+    summary:
+      "The fraction of a node's neighbor pairs that are themselves connected, read as undirected over distinct neighbors so the score stays within 0 and 1.",
+    snippet: `CALL issundb.clusteringCoefficient()
+YIELD nodeId, score
+RETURN nodeId, score
+ORDER BY score DESC`,
+  },
+  {
+    name: "issundb.louvain",
+    args: "",
+    yields: "nodeId, communityId",
+    summary:
+      "Community detection by modularity optimization with coarsening. Separates communities joined by a few edges, which label propagation tends to merge. The community id is the smallest node id it contains.",
+    snippet: `CALL issundb.louvain()
+YIELD nodeId, communityId
+RETURN nodeId, communityId
+ORDER BY communityId, nodeId`,
+  },
+  {
     name: "issundb.communities",
-    args: "[{maxIterations, topPerCommunity}]",
+    args: "[{maxIterations, topPerCommunity, algorithm}]",
     yields: "communityId, nodeId, rank",
     summary:
-      "Label propagation, with each community's members ranked by PageRank. topPerCommunity keeps only the leading members of each.",
-    snippet: `CALL issundb.communities({topPerCommunity: 3})
+      "A partition with each community's members ranked by PageRank. algorithm selects labelPropagation (the default) or louvain, and topPerCommunity keeps only the leading members of each.",
+    snippet: `CALL issundb.communities({topPerCommunity: 3, algorithm: 'louvain'})
 YIELD communityId, nodeId, rank
 RETURN communityId, rank, nodeId
 ORDER BY communityId, rank`,
