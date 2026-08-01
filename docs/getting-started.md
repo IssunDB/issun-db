@@ -9,11 +9,10 @@ Compiling IssunDB and its dependencies needs Rust 1.85.0 or later, along with on
 
 - Build tools: a C/C++ compiler (such as Clang or GCC), which compiles the bundled LMDB sources and the vector index.
 
-There is nothing else to install: no CMake, no `libclang`, and no OpenMP runtime.
-
-A `--no-default-features` build needs no C or C++ toolchain at all. It selects the in-memory storage backend instead of LMDB and the pure-Rust exact vector index instead of
-HNSW, which is also the configuration that compiles for `wasm32-unknown-unknown`. That build does not persist to disk, so treat it as an embedded or browser target rather
-than a database you reopen.
+A `--no-default-features` build needs no C or C++ toolchain at all.
+It selects the in-memory storage backend instead of LMDB and the pure-Rust exact vector index instead of
+HNSW, which is also the configuration that compiles for `wasm32-unknown-unknown`.
+That build does not persist to disk, so treat it as an embedded or browser target rather than a database you reopen.
 
 ## Build from Source
 
@@ -120,8 +119,8 @@ To use IssunDB as an embedded database in a Rust project, add the `issundb` libr
 
 ```toml
 [dependencies]
-issundb = "0.1.0-alpha.21"   # Match the version published on crates.io
-serde_json = "1.0"           # Used to construct property maps
+issundb = "0.1.0-alpha.24"   # Update to match the latest version on Crates.io
+serde_json = "1.0"           # This is used to construct property maps
 ```
 
 Alternatively, point to a local workspace path:
