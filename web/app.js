@@ -1969,8 +1969,7 @@ $("toggle-side").addEventListener("click", () => $("side").classList.toggle("hid
 function renderPoweredBy({version, build}) {
     const named = build ? `IssunDB (${version}; ${build})` : `IssunDB (${version})`;
     $("powered").textContent =
-        `This playground app is powered by ${named}; everything` +
-        " (including the queries) runs safely in your browser.";
+        `This playground app is powered by ${named}; everything runs safely in your browser.`;
 }
 
 let activeSample = 0;
@@ -2058,14 +2057,10 @@ async function boot() {
     if (shared) {
         setQuery(shared);
     } else if (stored) {
-        // No caption: the ribbon is for what an example is demonstrating, and the banner below the
-        // editor already says the query was restored and not run. Three notices for one fact was two
-        // too many.
         setQuery(stored);
     } else {
         setQuery(
             "MATCH (a:Person)-[:KNOWS]->(b:Person)\nRETURN a.name AS from, b.name AS to\nORDER BY from, to",
-            "A starting query over the seeded sample graph. Press ⌘↵ (or Ctrl↵) to run it.",
         );
     }
 
@@ -2073,13 +2068,13 @@ async function boot() {
     $("boot").remove();
 
     // A restored query is deliberately not run. It could be a CREATE, and running it on every
-    // reload would quietly add another copy of its data.
+    // reload would quietly add another copy of its data. The banner is the whole announcement: the
+    // results pane stays empty because the editor header already carries the shortcut that runs it,
+    // and the query is visibly sitting in the editor.
     if (stored) {
         showPane("table");
         setStatus("", "Your last query was restored. It has not been run.");
         setMeta("Run a query to view results.");
-        $("pane-table").innerHTML =
-            '<div class="notice info">Your last query is in the editor. Press ⌘↵ (or Ctrl↵) to run it.</div>';
     } else {
         await run();
     }
