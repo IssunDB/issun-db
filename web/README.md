@@ -122,7 +122,7 @@ than 700 now that the table is set in the code face.
 
 ## Layout
 
-The page is one centered column: a sidebar of four cards (Setup, Examples, Procedures, and Query
+The page is one centered column: a sidebar of four cards (Setup, Examples, Reference, and Query
 History) beside a main column of three (the Cypher editor, a status banner, and the results). It is
 deliberately modelled on the Onager playground, which shares this project's Material palette, so the
 two read as the same family of tool. Two structural details follow from that model. The page scrolls
@@ -163,6 +163,21 @@ non-passive: a wheel over the canvas that both zoomed and scrolled the page woul
 bounded to a factor of eight in and four out, or a few scrolls leave an empty canvas with no clue which
 way the graph went. A redraw returns the view to the whole canvas, so a query is never answered into a
 frame computed for different data.
+
+## Procedures and Functions Are Listed Apart
+
+The Reference panel lists procedures first and functions after, with no heading between them, since
+the sidebar is too narrow for one naming the calling convention. Each row carries the difference in
+its suffix instead, "yields" for a procedure and "returns" for a function. The distinction decides
+how a caller may write the thing. A procedure is invoked with `CALL ... YIELD`
+and produces rows; a function is called inside an expression and produces one value. Only the
+function can see a variable a `MATCH` bound, because `CALL` evaluates its arguments against no
+bindings and runs once per statement rather than once per row. That is why the neighborhood
+link-prediction scores are functions: `MATCH (a), (b) CALL issundb.link.jaccard(id(a), id(b))`
+cannot be expressed, while `RETURN issundb.link.jaccard(a, b)` scores every row.
+
+Guessing wrong fails loudly in either direction, as an unknown procedure or an unknown function,
+which is why the two are listed apart rather than interleaved by name.
 
 ## How a Category Knows Its Data
 

@@ -871,54 +871,55 @@ const REFERENCE = [
     ...FUNCTIONS.map((entry) => ({...entry, kind: "function"})),
 ];
 
-let referenceKind = "all";
-
+// One list, procedures before functions, rather than a filter control. The split is not
+// cosmetic: a procedure is invoked with CALL and yields rows, a function is called inside an
+// expression and returns one value, and only a function can see a variable a MATCH bound, because
+// CALL evaluates its arguments against no bindings. Each row carries that in its "yields" or
+// "returns" suffix.
 function renderProcedures(filter = "") {
     const needle = filter.trim().toLowerCase();
     const host = $("proc-list");
     const matches = REFERENCE.filter(
         (entry) =>
-            (referenceKind === "all" || entry.kind === referenceKind) &&
-            (!needle ||
-                `${entry.name} ${entry.aka ?? ""} ${entry.args} ${entry.yields} ${entry.summary}`
-                    .toLowerCase()
-                    .includes(needle)),
+            !needle ||
+            `${entry.name} ${entry.aka ?? ""} ${entry.args} ${entry.yields} ${entry.summary}`
+                .toLowerCase()
+                .includes(needle),
     );
     host.replaceChildren();
     if (matches.length === 0) {
         host.innerHTML = '<div class="empty">Nothing matches.</div>';
         return;
     }
-    for (const entry of matches) {
-        const button = document.createElement("button");
-        button.className = "proc";
-        // The signature is in the tooltip rather than the row. In a sidebar this narrow a form like
-        // `issundb.pageRank([{iterations, damping}])` wraps mid-identifier, which is harder to scan
-        // than the name alone, and clicking inserts the call anyway.
-        const signature = `${entry.name}(${entry.args})`;
-        button.title = entry.aka
-            ? `${signature}\n\n${entry.summary}\n\nAlso registered as ${entry.aka}.`
-            : `${signature}\n\n${entry.summary}`;
-        const name = document.createElement("span");
-        name.className = "nm";
-        name.textContent = entry.name;
-        const yields = document.createElement("span");
-        yields.className = "yd";
-        yields.textContent = entry.kind === "function" ? `returns ${entry.yields}` : `yields ${entry.yields}`;
-        button.append(name, yields);
-        button.addEventListener("click", () => setQuery(entry.snippet));
-        host.append(button);
+
+    // Procedures first, then functions, with no heading between them: the sidebar is too narrow
+    // for one naming the calling convention. Each row already ends in "yields" for a procedure or
+    // "returns" for a function, which carries the same distinction in the space available.
+    for (const kind of ["procedure", "function"]) {
+        for (const entry of matches.filter((e) => e.kind === kind)) host.append(referenceRow(entry));
     }
 }
 
-for (const chip of document.querySelectorAll("#proc-kind .chip")) {
-    chip.addEventListener("click", () => {
-        referenceKind = chip.dataset.kind;
-        for (const other of document.querySelectorAll("#proc-kind .chip")) {
-            other.setAttribute("aria-pressed", String(other === chip));
-        }
-        renderProcedures($("proc-search").value);
-    });
+function referenceRow(entry) {
+    const button = document.createElement("button");
+    button.className = "proc";
+    // The signature is in the tooltip rather than the row. In a sidebar this narrow a form like
+    // `issundb.pageRank([{iterations, damping}])` wraps mid-identifier, which is harder to scan
+    // than the name alone, and clicking inserts the call anyway.
+    const signature = `${entry.name}(${entry.args})`;
+    button.title = entry.aka
+        ? `${signature}\n\n${entry.summary}\n\nAlso registered as ${entry.aka}.`
+        : `${signature}\n\n${entry.summary}`;
+    const name = document.createElement("span");
+    name.className = "nm";
+    name.textContent = entry.name;
+    const yields = document.createElement("span");
+    yields.className = "yd";
+    yields.textContent =
+        entry.kind === "function" ? `returns ${entry.yields}` : `yields ${entry.yields}`;
+    button.append(name, yields);
+    button.addEventListener("click", () => setQuery(entry.snippet));
+    return button;
 }
 
 // Iterative over two rows, so the whole matrix is never held.
@@ -960,9 +961,9 @@ function procedureHint(cypher, message) {
     return "";
 }
 
-// The count comes from the catalog rather than the markup, which carried a stale 13 for as long as
-// the catalog had more than that.
-$("proc-search").placeholder = `Search ${PROCEDURES.length} procedures…`;
+// The count comes from the catalogs rather than the markup, which carried a stale number for as
+// long as the catalog had more than that, then undercounted again when functions were added.
+$("proc-search").placeholder = `Search ${REFERENCE.length} procedures and functions…`;
 $("proc-search").addEventListener("input", (e) => renderProcedures(e.target.value));
 
 // ---------------------------------------------------------------------------

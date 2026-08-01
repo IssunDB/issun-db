@@ -106,6 +106,15 @@
     color-scheme: dark;
 }
 
+/* An author `display` beats the user-agent rule behind `[hidden]` at equal specificity, so any
+   component that sets its own `display` silently ignores the attribute. `.btn` sets
+   `display: inline-flex`, which left the hidden Cancel button on screen at full size, disabled, and
+   wearing the `progress` cursor from `.btn:disabled`. Global rather than per-component, because the
+   next component to set `display` would hit exactly this. */
+[hidden] {
+    display: none !important;
+}
+
 * {
     box-sizing: border-box;
 }
@@ -733,34 +742,6 @@ select.control {
 .ac-text {
     overflow: hidden;
     text-overflow: ellipsis;
-}
-
-.chips {
-    display: flex;
-    gap: 6px;
-    margin-bottom: 8px;
-}
-
-.chip {
-    flex: 1;
-    padding: 4px 8px;
-    border: 1px solid var(--line);
-    border-radius: 999px;
-    background: transparent;
-    color: var(--md-default-fg-color--light);
-    font-family: inherit;
-    font-size: 0.74rem;
-    cursor: pointer;
-}
-
-.chip:hover {
-    border-color: var(--md-primary-fg-color);
-}
-
-.chip[aria-pressed="true"] {
-    background: color-mix(in srgb, var(--md-primary-fg-color) 14%, transparent);
-    border-color: var(--md-primary-fg-color);
-    color: var(--md-default-fg-color);
 }
 
 .btn.danger {
