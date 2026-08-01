@@ -380,6 +380,10 @@ impl PropColumn {
 
     /// Restore the interning `lookup` from `dict` after a cache file load, which
     /// skips it as derivable. A no-op on every other variant.
+    ///
+    /// Cache files are an LMDB-only structure, so without that feature nothing
+    /// loads a column set from bytes and this has no caller.
+    #[cfg(feature = "lmdb")]
     pub(crate) fn rebuild_lookup(&mut self) {
         if let Self::Str { dict, lookup, .. } = self {
             *lookup = dict
@@ -456,6 +460,9 @@ pub(crate) struct PropColumns<S: ColumnSource> {
     stats: AHashMap<String, Option<PropStats>>,
 }
 
+/// The cache file's view of a column set. Compiled only with `lmdb`, because the
+/// files live beside the LMDB database and nothing else reads or writes them.
+#[cfg(feature = "lmdb")]
 impl<S: ColumnSource<Id = u64>> PropColumns<S> {
     /// Assemble a column set from a cache file's payload: the dense mapping's
     /// inverse and every string column's interning table are derived rather
