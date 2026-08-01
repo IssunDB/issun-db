@@ -69,12 +69,23 @@ const CANCELLED = "The query was cancelled.";
 // log a share link carries.
 async function cancelRunningQuery() {
     worker.terminate();
+    // `ready` is what gates a new query, and the fresh worker has not booted yet. Without this a
+    // run started between the rejection below and the replay finishing would reach a worker whose
+    // database is still null, or one seeded but not yet replayed.
+    ready = false;
     for (const entry of pending.values()) entry.reject(new Error(CANCELLED));
     pending.clear();
     spawnWorker();
-    await engine.boot();
-    await engine.query(currentSample().cypher);
-    if (setupLog.length > 0) await engine.query(setupLog.join(";\n"));
+    try {
+        await engine.boot();
+        // `loadedSample`, not the picker: the dropdown and the examples category both move the
+        // picker without touching the database, so restoring what the picker points at would hand
+        // back a graph this session never had and replay the setup log onto it.
+        await engine.query(SAMPLE_GRAPHS[loadedSample].cypher);
+        if (setupLog.length > 0) await engine.query(setupScript());
+    } finally {
+        ready = true;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -107,8 +118,17 @@ const TOKEN = new RegExp(
     "g",
 );
 
+// Quotes are escaped because `clip` puts this output inside a double-quoted `title`
+// attribute. Without them a cell value carrying a quote closes the attribute and the rest of the
+// value is parsed as markup, which a share link turns into someone else's problem rather than the
+// sender's.
 const esc = (s) =>
-    s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    s
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
 
 function highlight(src) {
     let out = "";
@@ -216,6 +236,10 @@ function readStoredEditor() {
 
 function setQuery(text) {
     editor.value = text;
+    // Replacing the query abandons any example waiting for its follow-up, the same way typing
+    // does. Without this a demo selected but never run fired after whatever query replaced it,
+    // appending an embedding pass or a text search the reader never asked for.
+    pendingDemo = null;
     syncHighlight();
     storeEditor();
     editor.focus();
@@ -589,6 +613,14 @@ function parsePlan(text) {
 // preformatted text.
 let planText = "";
 
+// The Plan pane when the result did not come from a plan (an extension-trait search) or the
+// statement has none. Without this the pane kept the previous query's plan beside the new result.
+function clearPlan() {
+    planText = "";
+    $("pane-plan").innerHTML =
+        '<div class="notice info">No plan: this result did not come from a query plan.</div>';
+}
+
 function renderPlan(text) {
     planText = text;
     const rows = parsePlan(text);
@@ -840,7 +872,11 @@ const MAX_HISTORY_ITEMS = 10;
 function readHistory() {
     try {
         const stored = JSON.parse(localStorage.getItem(HISTORY_KEY) ?? "[]");
-        return Array.isArray(stored) ? stored.slice(0, MAX_HISTORY_ITEMS) : [];
+        if (!Array.isArray(stored)) return [];
+        // Entries are filtered rather than trusted, because the key is shared with whatever else
+        // this origin stores and `renderHistory` runs during boot: one non-string entry threw
+        // there and left the reader looking at "the engine did not load" on every visit.
+        return stored.filter((q) => typeof q === "string").slice(0, MAX_HISTORY_ITEMS);
     } catch {
         return [];
     }
@@ -885,6 +921,13 @@ function rememberSetup(cypher) {
     // The log is replayed as one semicolon-separated statement, so a statement that already ends
     // in one would contribute an empty statement between two real ones.
     setupLog.push(cypher.replace(/;\s*$/, ""));
+}
+
+// The recorded statements as one script. Each separator goes on its own line because a line
+// comment runs to the end of its line: a statement ending in `// note` would otherwise swallow the
+// `;` that follows it on the same line and merge itself with the next statement.
+function setupScript() {
+    return setupLog.join("\n;\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -1102,6 +1145,8 @@ async function runTextDemo(demo) {
         }
         lastResult = {columns: ["node", "title", "bm25", "field"], rows};
         renderTable(lastResult);
+        renderJson(lastResult);
+        clearPlan();
         setStatus("ok", "Full-text search finished.");
         setMeta(
             `${plural(rows.length, "hit")}, 4 columns.` +
@@ -1150,6 +1195,8 @@ async function runVectorDemo(spec) {
             ]),
         };
         renderTable(lastResult);
+        renderJson(lastResult);
+        clearPlan();
         setStatus("ok", "Vector search finished.");
         setMeta(
             `${plural(hits.length, "neighbor")}, 4 columns.` +
@@ -1288,7 +1335,10 @@ async function loadSnapshot() {
     try {
         next = JSON.parse(await engine.graphSnapshot());
     } catch {
-        next = {nodes: [], edges: [], truncated: false};
+        // Keep the graph that is already drawn and stay stale, so the next visit retries. Storing
+        // an empty graph as though it were the answer drew "nothing to draw" over a populated
+        // database, and clearing the flag meant nothing ever asked again.
+        return;
     }
     // Each surviving node keeps its position, so running a query does not discard a layout the
     // user arranged by hand or watched settle. Without this the whole graph re-seeded onto the
@@ -2507,6 +2557,7 @@ const b64url = {
 // A fragment reaches no server, but it does have to survive being pasted, and enough clients
 // truncate a long URL that a link past this is worth declining rather than sending out broken.
 const MAX_SHARED_SETUP = 24000;
+const MAX_SHARED_QUERY = 24000;
 
 // Set when the page writes its own fragment, so the `hashchange` handler below can tell an incoming
 // link from the clipboard fallback's own write.
@@ -2515,7 +2566,15 @@ let ownHashWrite = false;
 $("share").addEventListener("click", async () => {
     const parts = [];
     try {
-        parts.push(`q=${b64url.encode(editor.value)}`);
+        const encoded = b64url.encode(editor.value);
+        // Capped for the reason the setup script is: a link past this is truncated by enough
+        // clients that sending it is worse than declining. The Load button accepts files far
+        // larger than any link can carry.
+        if (encoded.length > MAX_SHARED_QUERY) {
+            setStatus("err", "The query is too large to put in a link.");
+            return;
+        }
+        parts.push(`q=${encoded}`);
     } catch {
         // Encoding was outside the try before, so a query too large to encode rejected silently.
         setStatus("err", "The query is too large to put in a link.");
@@ -2530,13 +2589,18 @@ $("share").addEventListener("click", async () => {
     if (setupLog.length > 0) {
         let setup = "";
         try {
-            setup = b64url.encode(setupLog.join(";\n"));
+            setup = b64url.encode(setupScript());
         } catch {
             setup = "";
         }
         if (setup && setup.length <= MAX_SHARED_SETUP) parts.push(`s=${setup}`);
         else dropped = setupLog.length;
     }
+
+    // The sample the database actually holds. Without it the recipient's boot seeds the first
+    // sample whatever the sender was working on, so a query written against another one matched
+    // nothing and a setup script replayed onto the wrong base graph.
+    if (loadedSample !== 0) parts.push(`g=${encodeURIComponent(SAMPLE_GRAPHS[loadedSample].id)}`);
 
     const note = dropped
         ? ` ${plural(dropped, "setup statement")} were too large to include.`
@@ -2553,6 +2617,12 @@ $("share").addEventListener("click", async () => {
     } catch {
         ownHashWrite = true;
         location.hash = fragment;
+        // Writing a fragment identical to the current one fires no `hashchange`, so the flag would
+        // stay raised and swallow the next genuine incoming link. Clearing it on the next task
+        // covers both cases: the event, if there is one, has already run by then.
+        setTimeout(() => {
+            ownHashWrite = false;
+        }, 0);
         setStatus("", `The link is in the address bar.${note}`);
     }
 });
@@ -2624,9 +2694,24 @@ $("scheme").addEventListener("click", () => {
     } catch {
         // Storage being unavailable only costs the choice its persistence.
     }
-    // The graph is drawn with resolved colors rather than custom properties, so it has to be
-    // repainted for a scheme change to reach it.
-    if ($("pane-graph").classList.contains("on")) drawGraph();
+    // Vertex and edge colors come partly from custom properties, which follow the scheme on their
+    // own, and partly from values resolved at draw time, which do not, so the picture is redrawn.
+    // The framing is put back afterwards: a redraw returns the view to the whole canvas, and
+    // losing a zoom, a pan, or a fit to a scheme toggle is not something the reader asked for.
+    if ($("pane-graph").classList.contains("on")) {
+        const framing = viewBox;
+        const wasAdjusted = viewAdjusted;
+        // A pinned inspector is a panel the reader opened and is reading, so the repaint puts it
+        // back through the same path the inspector's own actions use. An unpinned selection is
+        // just whatever the pointer was passing over, and restoring that would reopen a panel
+        // nobody asked for.
+        if (pinnedSelection && selectedId !== null) reselectId = selectedId;
+        drawGraph();
+        if (framing && wasAdjusted) {
+            setViewBox($("svg"), framing);
+            viewAdjusted = true;
+        }
+    }
 });
 
 $("toggle-side").addEventListener("click", () => $("side").classList.toggle("hidden"));
@@ -2644,7 +2729,13 @@ function renderPoweredBy({version, build}) {
         `This playground app is powered by ${named}; everything runs safely in your browser.`;
 }
 
+// What the picker points at, which the sample dropdown and the examples category both move
+// without touching the database.
 let activeSample = 0;
+
+// What the database actually holds, moved only by a seed. Cancel and a share link both describe a
+// database rather than a dropdown, so they read this one.
+let loadedSample = 0;
 
 const currentSample = () => SAMPLE_GRAPHS[activeSample] ?? SAMPLE_GRAPHS[0];
 
@@ -2663,10 +2754,28 @@ function renderSamples() {
 
 async function seed() {
     await engine.query(currentSample().cypher);
+    loadedSample = activeSample;
     await refreshSchema();
 }
 
+let resetting = false;
+
 $("reset").addEventListener("click", async () => {
+    // Two presses would post two resets and two seeds, and the second seed lands on the first
+    // one's data: a fresh database holding the sample twice, which is what the button exists to
+    // avoid.
+    if (resetting || busy) return;
+    resetting = true;
+    try {
+        await resetDatabase();
+    } catch (e) {
+        setStatus("err", `Reset failed: ${String(e.message ?? e)}`);
+    } finally {
+        resetting = false;
+    }
+});
+
+async function resetDatabase() {
     ({baseline: baselineBytes} = await engine.reset());
     lastResult = null;
     // The discarded writes must not keep travelling in a share link, where replaying them against
@@ -2682,7 +2791,7 @@ $("reset").addEventListener("click", async () => {
     $("pane-table").innerHTML =
         `<div class="notice info">Fresh database, seeded with the ${esc(currentSample().label)} sample.` +
         " Pick an example on the left, or write a query.</div>";
-});
+}
 
 async function boot() {
     applyScheme(currentScheme());
@@ -2697,18 +2806,35 @@ async function boot() {
     renderDemos();
     renderProcedures();
     renderHistory();
-    await seed();
 
-    // Three link forms. `q` is the Share button's base64 query and `s` its optional setup script,
-    // and `cypher` is percent-encoded plain text so a link can be written by hand or generated by a
-    // docs build. A generator has to encode a plus as %2B, since a fragment read as a query string
-    // turns a literal one into a space.
+    // Four link forms. `q` is the Share button's base64 query, `s` its optional setup script, and
+    // `g` the sample graph the sender had loaded; `cypher` is percent-encoded plain text so a link
+    // can be written by hand or generated by a docs build. A generator has to encode a plus as
+    // %2B, since a fragment read as a query string turns a literal one into a space.
     const params = new URLSearchParams(location.hash.slice(1));
+
+    // Selected before seeding, so a setup script replays onto the graph it was recorded against.
+    const wantedSample = params.get("g");
+    if (wantedSample) {
+        const index = SAMPLE_GRAPHS.findIndex((sample) => sample.id === wantedSample);
+        if (index >= 0) {
+            activeSample = index;
+            $("sample-graph").value = String(index);
+        }
+    }
+    await seed();
 
     const setup = params.get("s");
     if (setup) {
         try {
-            await engine.query(b64url.decode(setup));
+            const script = b64url.decode(setup);
+            await engine.query(script);
+            // Recorded as this session's setup, or the state the link carried would live only in
+            // the database: cancelling would replay an empty log and silently discard it, and
+            // passing the link on would drop it for the next reader.
+            for (const statement of script.split(/\n;\n|;/)) {
+                if (statement.trim()) rememberSetup(statement.trim());
+            }
             await refreshSchema();
         } catch {
             // A setup script that no longer applies leaves the seeded graph in place rather than

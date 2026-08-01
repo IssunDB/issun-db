@@ -427,7 +427,8 @@ fn monotonic_now_ms() -> f64 {
 // binding from trapping on a host that exposes neither.
 #[cfg(target_family = "wasm")]
 #[wasm_bindgen(inline_js = "export function js_performance_now() { \
-    return (globalThis.performance && globalThis.performance.now()) || Date.now(); }")]
+    return (globalThis.performance && typeof globalThis.performance.now === 'function') \
+        ? globalThis.performance.now() : Date.now(); }")]
 extern "C" {
     fn js_performance_now() -> f64;
 }

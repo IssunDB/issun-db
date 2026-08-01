@@ -516,7 +516,7 @@ RETURN p.name AS name, p.city AS city, labels(p) AS labels`,
         demos: [
             {
                 label: "PageRank",
-                desc: "Ranks nodes by importance, and sizes the vertices in the graph view. A source spreads its rank across its edges, so parallel edges each carry mass.",
+                desc: "Ranks nodes by importance. A source spreads its rank across its edges, so parallel edges each carry mass.",
                 cypher: `CALL issundb.pageRank({iterations: 20, damping: 0.85})
 YIELD nodeId, score
 MATCH (p) WHERE id(p) = nodeId

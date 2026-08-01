@@ -65,10 +65,16 @@ const FORMAT_UPPERCASE = new Set([
     "contains",
 ]);
 
+// A backticked identifier and a `$parameter` are single tokens rather than a stray delimiter
+// followed by bare words. Lexing them apart let the phrase scan claim the words inside: a property
+// named `` `order by` `` was broken across a line and uppercased into a different property, and a
+// parameter named `$limit` became a stray `$` plus a `LIMIT` clause. Both changed what the query
+// meant, which is the one thing this pass must never do.
 const FORMAT_TOKEN = new RegExp(
     [
         "(\\/\\/[^\\n]*|\\/\\*[\\s\\S]*?\\*\\/)",
-        "('(?:[^'\\\\]|\\\\.)*'|\"(?:[^\"\\\\]|\\\\.)*\")",
+        "('(?:[^'\\\\]|\\\\.)*'|\"(?:[^\"\\\\]|\\\\.)*\"|`(?:[^`\\\\]|\\\\.)*`)",
+        "(\\$(?:[A-Za-z_]\\w*|`(?:[^`\\\\]|\\\\.)*`))",
         "([A-Za-z_]\\w*)",
         "(\\s+)",
         "([^\\s])",
@@ -84,9 +90,10 @@ export function formatCypher(src) {
     const tokens = [...src.matchAll(FORMAT_TOKEN)].map((m) => ({
         comment: m[1],
         string: m[2],
-        word: m[3],
-        space: m[4],
-        other: m[5],
+        param: m[3],
+        word: m[4],
+        space: m[5],
+        other: m[6],
         text: m[0],
     }));
 
