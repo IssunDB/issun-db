@@ -847,7 +847,7 @@ dependencies = [
 
 [[package]]
 name = "issundb"
-version = "0.1.0-alpha.22"
+version = "0.1.0-alpha.23"
 dependencies = [
  "issundb-core",
  "issundb-cypher",
@@ -859,7 +859,7 @@ dependencies = [
 
 [[package]]
 name = "issundb-core"
-version = "0.1.0-alpha.22"
+version = "0.1.0-alpha.23"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -879,7 +879,7 @@ dependencies = [
 
 [[package]]
 name = "issundb-cypher"
-version = "0.1.0-alpha.22"
+version = "0.1.0-alpha.23"
 dependencies = [
  "ahash",
  "arrow-array",
@@ -902,7 +902,7 @@ dependencies = [
 
 [[package]]
 name = "issundb-retrieval"
-version = "0.1.0-alpha.22"
+version = "0.1.0-alpha.23"
 dependencies = [
  "ahash",
  "issundb-core",
@@ -913,7 +913,7 @@ dependencies = [
 
 [[package]]
 name = "issundb-text"
-version = "0.1.0-alpha.22"
+version = "0.1.0-alpha.23"
 dependencies = [
  "issundb-core",
  "roaring",
@@ -922,7 +922,7 @@ dependencies = [
 
 [[package]]
 name = "issundb-vector"
-version = "0.1.0-alpha.22"
+version = "0.1.0-alpha.23"
 dependencies = [
  "issundb-core",
  "parking_lot",
