@@ -988,8 +988,8 @@ impl Optimizer {
         Some((fanout_to / dst_count as f64).clamp(0.0, 1.0))
     }
 
-    /// Type inference: replace each typed `Expand` between two labeled endpoints
-    /// that the data schema does not connect with a zero-row operator, so a
+    /// Infers from the data schema, replacing each typed `Expand` between two labeled
+    /// endpoints the schema does not connect with a zero-row operator, so a
     /// provably empty pattern never scans storage.
     ///
     /// Guarded on two fronts so it can only ever drop rows that the query could
@@ -3143,7 +3143,7 @@ impl Optimizer {
     }
 
     /// Return true when a predicate is statically, unconditionally true and can be
-    /// dropped. Conservative: only literal-`true` and equality or inequality of two
+    /// dropped. It is conservative: only literal-`true` and equality or inequality of two
     /// identical-form literals are recognized; false or unknown predicates are not
     /// touched (folding a false predicate to "drop" would change results).
     fn is_trivially_true(f: &FilterExpr) -> bool {
@@ -3170,8 +3170,8 @@ impl Optimizer {
     }
 
     /// Whether two literals are definitely unequal under openCypher value
-    /// equality, so a `<>` between them is unconditionally true. Conservative:
-    /// any comparison with NULL, a list, or two operands of unrelated kinds
+    /// equality, so a `<>` between them is unconditionally true. It is conservative,
+    /// since any comparison with NULL, a list, or two operands of unrelated kinds
     /// returns false (the predicate is kept and evaluated at runtime).
     fn literals_definitely_unequal(a: &Literal, b: &Literal) -> bool {
         match (a, b) {
@@ -3980,7 +3980,7 @@ fn peel_one_haslabel(op: &PhysicalOperator) -> (Option<(&str, &str)>, &PhysicalO
 
 /// Match the exact triangle-count plan shape and build its replacement.
 ///
-/// Required shape, bottom-up: `LabelScan a`, `Expand a->b` (single-hop,
+/// The shape required, bottom-up, is `LabelScan a`, `Expand a->b` (single-hop,
 /// directed, no path), optional `HasLabel` on `b`, `Expand b->c` (same
 /// restrictions, unique against hop 1), optional `HasLabel` on `c`,
 /// `MultiwayJoin` closing `c->a` (directed, unique against both hops), and an
@@ -4465,7 +4465,7 @@ fn rewrite_grouped_degree(op: PhysicalOperator) -> PhysicalOperator {
 
 /// Match the grouped-degree plan shape and build its replacement.
 ///
-/// Required shape, top-down: an `Aggregate` with at least one group key and
+/// The shape required, top-down, is an `Aggregate` with at least one group key and
 /// exactly one non-distinct `count` aggregation; then a single directed forward
 /// `Expand`; then a `LabelScan` (optionally under a run of single-variable
 /// constraints on the source). Every group key must be a property read on the
@@ -4833,7 +4833,7 @@ fn merge_scan_label(scan: Option<String>, has_label: Option<String>) -> Option<O
 /// Match the one-hop or two-hop path-count plan shape and build its
 /// replacement.
 ///
-/// Required shape, top-down: an `Aggregate` with no grouping whose only
+/// The shape required, top-down, is an `Aggregate` with no grouping whose only
 /// aggregation is a non-distinct `count(*)` or `count(var)` over a pattern
 /// variable; then a directed, single forward `Expand`; then either a
 /// `LabelScan` (one hop) or a second directed forward `Expand` whose

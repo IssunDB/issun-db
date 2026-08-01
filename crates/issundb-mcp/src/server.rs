@@ -246,7 +246,8 @@ pub struct HybridRetrieveArgs {
     pub max_distance: Option<f32>,
     /// Optional hard cap on total subgraph nodes returned.
     pub max_nodes: Option<usize>,
-    /// Fusion strategy: 'rrf' (Reciprocal Rank Fusion) or 'weighted_sum' (defaults to 'rrf').
+    /// Selects the fusion strategy, either 'rrf' (Reciprocal Rank Fusion) or
+    /// 'weighted_sum'. Defaults to 'rrf'.
     pub fusion_strategy: Option<String>,
     /// Constant parameter for 'rrf' strategy (defaults to 60).
     pub rrf_k: Option<u32>,
@@ -963,7 +964,7 @@ mod tests {
         );
     }
 
-    /// Edge counterpart: `expect_type` rejects a type mismatch.
+    /// The edge counterpart, where `expect_type` rejects a type mismatch.
     #[tokio::test]
     async fn get_edge_expect_type_rejects_wrong_type() {
         let (mcp, _dir) = fresh();

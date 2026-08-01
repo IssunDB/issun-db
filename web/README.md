@@ -19,12 +19,12 @@ Selecting an example or a sample graph puts it in the editor and stops there; no
 Execute Query or Explain is pressed. Running a `CREATE` the moment it was clicked wrote to the
 database before the reader had seen the statement, and clicking the same example twice quietly
 added a second copy of its data. The two examples with a step Cypher cannot express, full-text
-search and vector search, keep that step: it is held against the loaded example and runs after the
+search and vector search, keep that step which is held against the loaded example and runs after the
 statement it depends on.
 
 ## Sample Graphs
 
-The Setup panel offers five, each small enough to read at once and shaped so that one part of the
+The Setup panel offers six, each small enough to read at once and shaped so that one part of the
 engine has something to say about it:
 
 | Sample             | What it is                                                                                        | Examples that query it                                         |
@@ -122,9 +122,9 @@ than 700 now that the table is set in the code face.
 
 ## Layout
 
-The page is one centered column: a sidebar of four cards (Setup, Examples, Procedures, and Query
+The page is one centered column: a sidebar of four cards (Setup, Examples, Reference, and Query
 History) beside a main column of three (the Cypher editor, a status banner, and the results). It is
-deliberately modelled on the Onager playground, which shares this project's Material palette, so the
+deliberately modeled on the Onager playground, which shares this project's Material palette, so the
 two read as the same family of tool. Two structural details follow from that model. The page scrolls
 as a document rather than the panels scrolling inside a fixed viewport, so the results card carries a
 fixed-height pane instead of stretching, which also gives the graph view a defined box to lay out
@@ -137,7 +137,7 @@ and native controls from the light palette on both schemes.
   autocomplete, the plan tree, and the force-directed layout are written here rather than pulled
   from a library, so the page loads nothing it does not contain.
 - `worker.js`: the engine. It owns the wasm module and the graph, and the page reaches it only by
-  message, so a query never blocks the tab. See "Cancelling a Query" for what that costs.
+  message, so a query never blocks the tab. See "Canceling a Query" for what that costs.
 - `demos.js`: the demo catalog and the procedure and function references, all checked by
   `make playground-check`. Each demo category carries a `docs` link into the surrounding
   documentation; those are relative to `/playground/`, so they break if a heading they anchor to
@@ -164,6 +164,139 @@ bounded to a factor of eight in and four out, or a few scrolls leave an empty ca
 way the graph went. A redraw returns the view to the whole canvas, so a query is never answered into a
 frame computed for different data.
 
+An edge is a path rather than a line, which is what lets one element carry the three shapes a directed
+multigraph needs. It ends in an arrowhead, pulled back off the target's rim along the curve's own
+tangent so the head sits on the circle rather than under it. Edges sharing a pair of vertices are
+slotted onto separate curves, measured perpendicular to the chord from the lower node id so the two
+halves of a reciprocal pair land on opposite sides; a self-loop, which has no chord to bend, is a
+teardrop above its vertex. Before this the view drew a directed multigraph as an undirected simple one:
+`(a)-[:R]->(b)` and its reverse were one grey line, a second edge between the same pair was invisible
+underneath the first, and a self-loop was a line of zero length, which is to say nothing at all.
+
+Relationship type colors the edge, but only when there is more than one type in view. One type is the
+common case and coloring it says nothing, so a single-type graph keeps the neutral stroke; past one,
+the color is what tells a `BOUGHT` from a `SIMILAR_TO`. Each type also gets its own arrowhead marker,
+because a marker cannot inherit the stroke of the path referencing it.
+
+The layout runs in a world that is a multiple of the canvas, sized by the square root of the vertex
+count. Every vertex used to be clamped inside the element, so a hundred were packed into the rectangle
+six had and whatever structure they held came out as a blob; a ring lattice drew as a ball. Anything up
+to roughly sixty vertices returns a multiple of one and is laid out exactly as before. Past that the
+graph is laid out beyond the canvas and fitted once when it settles, since it would otherwise be drawn
+mostly off-screen with no sign there was more; a deliberate zoom, pan, or Fit before it settles cancels
+that, so the automatic frame cannot overrule one the visitor chose.
+
+Captions are counter-scaled against the view box so a fitted graph keeps them at the size they were
+drawn for, and above forty-five vertices only the best-connected keep one. A hundred captions at one
+size is a wall of text rather than a labeling. The rest are not removed, only made transparent, so
+hovering a vertex brings its own back.
+
+Hovering a vertex selects it: the inspector opens on it and it takes a ring, without waiting for a
+click. Hovering also fades everything that is not the vertex or next to it, which is a different class
+from the dimming a result overlay applies, so the two compose: a hover inside a highlighted result
+still shows which vertices the result lit. The selected ring is spelled out for the hovering case as
+well, because the neighbor rule is one class more specific and a selected vertex otherwise wore the
+neighbor stroke instead of its own.
+
+Selection waits for the pointer to rest, and nothing changes it while the pointer is over the
+inspector. Both are needed, and the second does not subsume the first: the straight line from a
+vertex to the panel's `Focus` button crosses whatever lies between them, so switching on entry left
+the panel showing the last vertex passed over by the time the pointer arrived, and `Focus` acted on
+that one instead. A measurement put it at six vertices crossed on a ninety-vertex lattice, which
+selected `#31` for a pointer that started on `#43`. A glide spends well under the dwell on each vertex it crosses;
+resting on one still feels immediate.
+
+A click pins the selection outright, so hovering elsewhere afterwards leaves the panel alone. Moving
+off a vertex leaves the panel where it is rather than closing it, so a reading is not interrupted by
+the pointer drifting; clicking the background unpins and clears.
+
+## Narrowing and Growing the View
+
+`Focus`, on the inspector, narrows the view to a vertex and what is within two hops of it, over the
+drawn graph rather than the database. `Result only`, in the toolbar, draws just the vertices the last
+result mentioned. Both are rules, which is the limit of what they can be: any vertex a rule excludes
+needs the rule relaxed for every other vertex too.
+
+`Expand` and `Dismiss` are the per-vertex override, so a neighborhood can be grown one vertex at a
+time and anything uninteresting taken back out. Expanding reveals a vertex's undrawn neighbors in
+either direction and says how many there are on the button, so a vertex whose neighbors are all drawn
+offers a disabled button rather than one that does nothing. The focus root always reads that way, since
+every neighbor of the root is one hop inside the ball; the vertices worth expanding are the ones on
+its rim. Revealing overrides an earlier dismissal, or expanding towards a dismissed vertex would
+silently do nothing. A revealed vertex is placed in a ring around the vertex that revealed it rather
+than seeded on the layout's starting circle, so the expansion reads as growth from where it happened.
+What can be revealed is bounded by the snapshot rather than by the database, so this surfaces what the
+300-vertex cap already kept and never more.
+
+The inspector stays open on the vertex an action came from, because exploring is a run of expansions
+from one vertex and closing the panel after each would mean hovering the same vertex back open every
+time. `Show all` undoes focus, expansion, and dismissal together, and appears whenever any of the three
+is in effect. All of them report what they removed in the count beside the legend, so a narrowed view is
+never mistaken for the whole graph.
+
+## Finding a Vertex
+
+The toolbar's find box matches a vertex's caption, its labels, and its `#id`, which are the three
+handles the page gives a vertex; searching every property would find vertices whose match is nowhere
+visible. Matches keep full opacity and take an accent ring while everything else fades, and a match
+whose caption density had suppressed gets it back. The count beside the box reads matches over drawn
+vertices, and the box takes an error border on zero rather than leaving a typo looking like an empty
+graph. Pressing Enter frames the matches, which is the half of finding that highlighting alone does not
+do: on a graph large enough to need the box, a match can be highlighted well outside the view.
+
+Matching repaints classes rather than redrawing, because a redraw restarts the simulation and searching
+a graph should not rearrange it. The highlight is held in page state rather than read off the input, so
+a redraw from any other cause reapplies it instead of losing it.
+
+## Exporting the Picture
+
+`PNG` and `SVG` download the current view, framed exactly as it is on screen. A downloaded picture is
+opened where neither the stylesheet nor the custom properties it reads exist, so every property the
+graph is actually drawn with is resolved off the live element and written onto a copy as an attribute.
+Three details make that hold up:
+
+- A value equal to the parent's is dropped rather than repeated. Writing all of them on every element
+  made a twenty-six vertex graph a 68 KB file, most of it the page's font stack restated on each circle;
+  diffing brings the same graph to 22 KB. The root element is exempt and writes the whole set, since
+  diffing it would compare against the enclosing HTML and let the file inherit a font it no longer has.
+- A translucent color computes to `rgba(r, g, b, a)`, which is a CSS color rather than a value an SVG
+  presentation attribute is required to accept. A browser takes it; Inkscape drops the declaration and
+  paints black, which turned the exported captions from light text on a dark canvas into unreadable dark
+  text on one. Each is split into the opaque color and the matching `-opacity` attribute.
+- The canvas color is a CSS background, which a rasterizer composites onto nothing, so an explicit
+  rectangle carries it instead. Without it a dark-theme export is dark text on transparency.
+
+A hover or a find in progress is a state of the page rather than of the picture, so both classes come
+off for the duration of the read; leaving them on baked their dimming into the file. The PNG is
+rasterized through the same document at twice the drawn size, so it stays legible dropped into a
+document at its natural width.
+
+## What the Graph View Draws
+
+The view draws at most 300 vertices, and they are the best-connected 300 rather than the oldest. `all_nodes` returns
+ascending id, so taking the first 300 kept insertion order: a visitor who built a large graph and then
+added the interesting part could not see the part they added. Degree needs both directions, since a
+vertex everything points at has no outgoing edges at all. The ranking reads adjacency for every vertex,
+so it runs only when there is a choice to make; under the cap the whole graph is drawn and no extra
+pass happens, which is every graph the samples build. An edge whose other endpoint the cap excluded is
+dropped, so the view never draws a line to nothing, and the count says `capped at 300` whenever the cap
+is in play.
+
+## Procedures and Functions Are Listed Apart
+
+The Reference panel lists procedures first and functions after, with no heading between them, since
+the sidebar is too narrow for one naming the calling convention. Each row carries the difference in
+its suffix instead, "yields" for a procedure and "returns" for a function. The distinction decides
+how a caller may write the thing. A procedure is invoked with `CALL ... YIELD`
+and produces rows; a function is called inside an expression and produces one value. Only the
+function can see a variable a `MATCH` bound, because `CALL` evaluates its arguments against no
+bindings and runs once per statement rather than once per row. That is why the neighborhood
+link-prediction scores are functions: `MATCH (a), (b) CALL issundb.link.jaccard(id(a), id(b))`
+cannot be expressed, while `RETURN issundb.link.jaccard(a, b)` scores every row.
+
+Guessing wrong fails loudly in either direction, as an unknown procedure or an unknown function,
+which is why the two are listed apart rather than interleaved by name.
+
 ## How a Category Knows Its Data
 
 A demo category names the graph it queries through `sample` and the label that proves that graph is loaded through `requiresLabel`, so the Examples
@@ -178,14 +311,14 @@ converts to `JsError`, because constructing a `JsError` calls a wasm-bindgen imp
 covered by `cargo test`. The build flags live in the `WASM_BUILD` variable in the Makefile rather than being repeated per target, since
 `--features hnsw` reads like it selects the index and in fact selects `usearch`, which fails to compile `cxx` for wasm.
 
-## Cancelling a Query
+## Canceling a Query
 
 The engine runs in `worker.js`, so a long query leaves the page responsive and a Cancel button
 appears beside Execute. Pressing it terminates the worker, which is the only way to stop a
 WebAssembly call: there is no interruption point for a message to be handled at, so nothing short of
 killing the thread will do.
 
-The graph lives in the worker and therefore dies with it. Cancelling is still recoverable rather
+The graph lives in the worker and therefore dies with it. Canceling is still recoverable rather
 than destructive, because the page immediately starts a fresh worker, re-seeds the sample, and
 replays every statement it recorded as setup, which is the same log a share link carries. A query
 that only read loses nothing. One that had already written is reapplied from that log, so anything
@@ -209,7 +342,7 @@ the footer shows two numbers rather than three: an earlier version split the liv
 and graph, and since an empty database costs almost nothing, it was the same number printed twice.
 
 The build stamp is compiled into the module, read from `ISSUNDB_BUILD_REF` through `option_env!`, rather
-than fetched as a sidecar JSON file, so it cannot disagree with the module it describes and the
+than fetched as a separate JSON file, so it cannot disagree with the module it describes and the
 deployed tree has one fewer file to keep in step. `make playground-build` fills it in from `git`; `docs.yml` sets
 it from the workflow's refs instead, since `actions/checkout` leaves a detached HEAD where
 `git rev-parse --abbrev-ref HEAD` answers `HEAD` rather than the branch. A build with the variable

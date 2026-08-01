@@ -522,7 +522,7 @@ struct PathsCase {
     /// `(src, dst, paths)` for reachable pairs: the set of all simple paths as
     /// node-index lists, sorted.
     all_paths: Vec<(usize, usize, Vec<Vec<usize>>)>,
-    /// `(src, dst, node_count)`: number of nodes on the longest simple path.
+    /// Holds `(src, dst, node_count)`, the number of nodes on the longest simple path.
     longest: Vec<(usize, usize, usize)>,
 }
 

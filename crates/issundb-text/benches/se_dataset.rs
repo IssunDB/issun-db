@@ -25,7 +25,7 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 /// Embedding dimensionality of each vector in the dataset.
 pub const DIMS: usize = 768;
 
-/// One Stack Exchange post: text fields plus one projected embedding vector.
+/// One Stack Exchange post, holding text fields plus one projected embedding vector.
 pub struct Row {
     pub id: i64,
     pub title: String,

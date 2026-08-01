@@ -129,7 +129,7 @@ fn return_star_names_its_columns_on_every_path() {
     }
 }
 
-/// The same shape over an empty graph: a grouping-free aggregate must still emit
+/// The same shape over an empty graph, where a grouping-free aggregate must still emit
 /// its one row, with the star-expanded column name, on whichever path answers.
 #[test]
 fn return_star_over_an_empty_graph_agrees() {

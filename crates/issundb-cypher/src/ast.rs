@@ -298,7 +298,7 @@ pub enum Expr {
         expr: Box<Expr>,
         index: Box<Expr>,
     },
-    /// `expr[start..end]`: list slice (start and end are optional).
+    /// Slices a list, `expr[start..end]`, where start and end are optional.
     Slice {
         expr: Box<Expr>,
         start: Option<Box<Expr>>,
@@ -331,7 +331,7 @@ pub enum Expr {
         list: Box<Expr>,
         expression: Box<Expr>,
     },
-    /// `variable:Label`: boolean check whether the node has the given label.
+    /// Tests whether a node has a label, `variable:Label`.
     HasLabel {
         variable: String,
         label: String,

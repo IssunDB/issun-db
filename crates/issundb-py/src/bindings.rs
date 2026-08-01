@@ -472,10 +472,25 @@ impl PyGraph {
     /// Note the cost, which is larger than its sibling's in both directions: one
     /// full scan of every node record, and the resulting columns hold every scalar
     /// node property in memory for the life of the graph handle. On a large graph
-    /// that is a deliberate memory commitment, which is why nothing makes it for
-    /// you.
+    /// that is a deliberate memory commitment, which is why no query makes it for
+    /// you. The one exception is a bulk import (`COPY ... FROM` or `IMPORT
+    /// DATABASE` through `query`), which builds and persists the columns at the
+    /// end, so a process that just imported already has them.
     fn materialize_property_columns(&self, py: Python<'_>) -> PyResult<()> {
         py.detach(|| self.graph.materialize_property_columns())
+            .map_err(rt)
+    }
+
+    /// Build the in-memory edge property columns, now.
+    ///
+    /// The edge counterpart of `materialize_property_columns`. It shares the
+    /// contract and the warning: one full scan of every edge record, and the
+    /// columns hold every scalar edge property in memory for the life of the
+    /// graph handle. Worth it for a workload of edge-property
+    /// aggregations; not worth it for one that never reads edge properties in
+    /// bulk.
+    fn materialize_edge_property_columns(&self, py: Python<'_>) -> PyResult<()> {
+        py.detach(|| self.graph.materialize_edge_property_columns())
             .map_err(rt)
     }
 

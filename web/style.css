@@ -106,6 +106,15 @@
     color-scheme: dark;
 }
 
+/* An author `display` beats the user-agent rule behind `[hidden]` at equal specificity, so any
+   component that sets its own `display` silently ignores the attribute. `.btn` sets
+   `display: inline-flex`, which left the hidden Cancel button on screen at full size, disabled, and
+   wearing the `progress` cursor from `.btn:disabled`. Global rather than per-component, because the
+   next component to set `display` would hit exactly this. */
+[hidden] {
+    display: none !important;
+}
+
 * {
     box-sizing: border-box;
 }
@@ -735,34 +744,6 @@ select.control {
     text-overflow: ellipsis;
 }
 
-.chips {
-    display: flex;
-    gap: 6px;
-    margin-bottom: 8px;
-}
-
-.chip {
-    flex: 1;
-    padding: 4px 8px;
-    border: 1px solid var(--line);
-    border-radius: 999px;
-    background: transparent;
-    color: var(--md-default-fg-color--light);
-    font-family: inherit;
-    font-size: 0.74rem;
-    cursor: pointer;
-}
-
-.chip:hover {
-    border-color: var(--md-primary-fg-color);
-}
-
-.chip[aria-pressed="true"] {
-    background: color-mix(in srgb, var(--md-primary-fg-color) 14%, transparent);
-    border-color: var(--md-primary-fg-color);
-    color: var(--md-default-fg-color);
-}
-
 .btn.danger {
     background: color-mix(in srgb, var(--err) 12%, var(--card-bg));
     border-color: color-mix(in srgb, var(--err) 42%, var(--line));
@@ -980,10 +961,17 @@ td .b {
    the engine renders the plan as flat indented lines and rebuilding a DOM hierarchy from them would
    add a parser with nothing to show for it. */
 .plan-summary {
-    padding: 12px 14px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 9px 14px;
     border-bottom: 1px solid var(--line);
     font-size: 0.82rem;
     color: var(--md-default-fg-color--light);
+}
+
+.plan-summary > span {
+    flex: 1;
 }
 
 .plan-tree {
@@ -1035,18 +1023,6 @@ td .b {
     color: var(--md-default-fg-color--light);
 }
 
-.plan-raw {
-    border-top: 1px solid var(--line);
-}
-
-.plan-raw > summary {
-    padding: 10px 14px;
-    font-size: 0.8rem;
-    color: var(--md-default-fg-color--light);
-    cursor: pointer;
-}
-
-pre.plan,
 pre.json {
     margin: 0;
     padding: 14px;
@@ -1136,24 +1112,160 @@ svg.graph:active {
     cursor: grabbing;
 }
 
-svg.graph line {
-    stroke: var(--md-default-fg-color--lighter);
+/* Counter-scaled against the view box, so a fitted graph keeps its strokes and captions at the size
+   they were drawn for instead of shrinking with it. The arrowhead follows because a marker sized in
+   `strokeWidth` units scales with the path that references it. */
+svg.graph .edge {
+    stroke-width: calc(1.4px * var(--gscale, 1));
+}
+
+svg.graph .node circle {
+    stroke-width: calc(1.5px * var(--gscale, 1));
+}
+
+svg.graph .node text {
+    font-size: calc(11px * var(--gscale, 1));
+    stroke-width: calc(3px * var(--gscale, 1));
+}
+
+/* A caption suppressed by density is not removed, so hovering its vertex can bring it back. */
+svg.graph .node .cap.quiet {
+    opacity: 0;
+}
+
+svg.graph.hovering .node.near .cap.quiet {
+    opacity: 1;
+}
+
+/* Hover fades everything that is not the vertex or next to it. A separate class from `dim`, so a
+   hover inside a highlighted result still shows which vertices the result lit. */
+svg.graph.hovering .node:not(.near),
+svg.graph.hovering .edge:not(.near) {
+    opacity: 0.1;
+}
+
+svg.graph.hovering .node.near circle {
+    stroke: var(--md-default-fg-color--light);
+}
+
+/* The selected vertex is the one the inspector is showing, so it keeps its ring whether or not a
+   hover is in progress, and stays visible when the hover fade dims everything around it. The
+   hovering form is spelled out because the `.near` rule above it is one class more specific, and
+   without it a selected vertex wore the neighbor stroke instead of its own. */
+svg.graph .node.selected circle,
+svg.graph.hovering .node.selected circle {
+    stroke: var(--md-primary-fg-color);
+    stroke-width: calc(3px * var(--gscale, 1));
+}
+
+svg.graph.hovering .node.selected {
+    opacity: 1;
+}
+
+/* A find fades what it did not match, the way a hover fades what is not adjacent. The two compose,
+   so hovering inside a find keeps both readings; a vertex that is both a match and adjacent is
+   simply not faded by either. `.match` is spelled out against the hover rule for the reason the
+   selected ring is: `.hovering .node:not(.near)` would otherwise dim a match the pointer is not on,
+   which is every match except one. */
+svg.graph.searching .node:not(.match),
+svg.graph.searching .edge {
+    opacity: 0.12;
+}
+
+svg.graph.searching .node.match,
+svg.graph.hovering.searching .node.match {
+    opacity: 1;
+}
+
+svg.graph.searching .node.match circle {
+    stroke: var(--md-accent-fg-color);
+    stroke-width: calc(3px * var(--gscale, 1));
+}
+
+/* A match is worth reading, so its caption comes back even where density had suppressed it. */
+svg.graph.searching .node.match .cap.quiet {
+    opacity: 1;
+}
+
+.graph-find {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 0 8px;
+    height: 26px;
+    border: 1px solid var(--line);
+    border-radius: var(--control-radius);
+    background: var(--md-default-bg-color);
+    color: var(--md-default-fg-color--light);
+}
+
+.graph-find:focus-within {
+    border-color: var(--md-primary-fg-color);
+}
+
+.graph-find.miss {
+    border-color: var(--err);
+}
+
+.graph-find input {
+    width: 116px;
+    border: 0;
+    outline: 0;
+    padding: 0;
+    background: none;
+    font: inherit;
+    color: var(--md-default-fg-color);
+}
+
+#search-count {
+    font-family: var(--md-code-font);
+    font-size: 0.7rem;
+    font-variant-numeric: tabular-nums;
+    color: var(--md-default-fg-color--light);
+}
+
+.legend i.rel {
+    width: 14px;
+    height: 3px;
+    border-radius: 2px;
+}
+
+.toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 0.75rem;
+    color: var(--md-default-fg-color--light);
+    cursor: pointer;
+    user-select: none;
+}
+
+/* Three buttons, so they get a row of their own rather than floating beside the title. Above the
+   properties rather than below them, because the panel scrolls once a vertex carries more than a
+   few and actions at the bottom would scroll out of reach. */
+.inspect-actions {
+    display: flex;
+    gap: 6px;
+    margin: 0 0 8px;
+}
+
+.inspect-actions .btn {
+    flex: 1;
+    justify-content: center;
+    padding-inline: 6px;
 }
 
 svg.graph .node circle {
     stroke: var(--md-code-bg-color);
-    stroke-width: 1.5;
     cursor: pointer;
 }
 
 svg.graph .node text {
     font-family: var(--md-text-font);
-    font-size: 11px;
     font-weight: 600;
     fill: var(--md-default-fg-color);
     paint-order: stroke;
     stroke: var(--md-code-bg-color);
-    stroke-width: 3px;
     pointer-events: none;
     user-select: none;
 }

@@ -10,7 +10,7 @@ use crate::error::Error;
 
 /// All LMDB sub-databases for IssunDB.
 ///
-/// `out_adj` and `in_adj` use `DUPSORT + DUPFIXED`: each duplicate value is
+/// `out_adj` and `in_adj` use `DUPSORT + DUPFIXED`, so each duplicate value is
 /// one raw `AdjEntry` (20 bytes). A single `put` adds one entry in O(log n);
 /// no read-modify-write of a blob is needed.
 ///

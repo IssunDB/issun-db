@@ -179,7 +179,7 @@ impl Playground {
     fn graph_snapshot_inner(&self) -> Result<String, String> {
         let all = self.graph.all_nodes().map_err(js_err)?;
         let truncated = all.len() > MAX_GRAPH_NODES;
-        let kept: Vec<_> = all.iter().copied().take(MAX_GRAPH_NODES).collect();
+        let kept = self.nodes_worth_drawing(&all)?;
         let included: std::collections::HashSet<_> = kept.iter().copied().collect();
 
         // One adjacency read per node, feeding both the degree and the edge rows. Reading it
@@ -208,6 +208,40 @@ impl Playground {
             }
         }
         Ok(json!({ "nodes": nodes, "edges": edges, "truncated": truncated }).to_string())
+    }
+
+    /// The at most [`MAX_GRAPH_NODES`] vertices the view draws, chosen by total degree.
+    ///
+    /// Taking the first `MAX_GRAPH_NODES` of `all_nodes` kept the lowest ids, which is insertion
+    /// order: a visitor who built a large graph and then added the interesting part could not see
+    /// the part they added. Degree is the cheapest ranking that answers "which of these is
+    /// structurally worth a pixel", and it needs both directions, since a vertex everything points
+    /// at has no outgoing edges at all.
+    ///
+    /// The ranking pass reads adjacency for every vertex, so it runs only when there is a choice to
+    /// make. Under the cap the whole graph is drawn and the answer is `all_nodes` unchanged, which
+    /// is every graph the samples build.
+    fn nodes_worth_drawing(&self, all: &[u64]) -> Result<Vec<u64>, String> {
+        if all.len() <= MAX_GRAPH_NODES {
+            return Ok(all.to_vec());
+        }
+        let mut ranked: Vec<(usize, u64)> = all
+            .iter()
+            .map(|id| {
+                let out = self.graph.out_neighbors(*id).map_err(js_err)?.len();
+                let incoming = self.graph.in_neighbors(*id).map_err(js_err)?.len();
+                Ok((out + incoming, *id))
+            })
+            .collect::<Result<_, String>>()?;
+        // Descending by degree, then ascending by id, so a graph with many equal degrees draws the
+        // same vertices on every redraw rather than whichever order the sort happened to leave.
+        ranked.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        ranked.truncate(MAX_GRAPH_NODES);
+        // Back into id order, because the edge pass below relies on nothing else but a caller
+        // reading the node list does.
+        let mut kept: Vec<u64> = ranked.into_iter().map(|(_, id)| id).collect();
+        kept.sort_unstable();
+        Ok(kept)
     }
 
     /// Every property of one node. The read-path methods on `Graph` all take the property
@@ -274,7 +308,7 @@ impl Playground {
     /// The `branch@commit` the module was built from, for the page's footer, or an empty string
     /// when it was not built through `make playground-build`.
     ///
-    /// Compiled in rather than fetched as a sidecar file, so the stamp cannot disagree with the
+    /// Compiled in rather than fetched as a separate file, so the stamp cannot disagree with the
     /// module it describes. The build script's `rerun-if-env-changed` is what stops a cached
     /// artifact from reporting the commit of an earlier build.
     fn build_ref_inner() -> String {
@@ -393,7 +427,8 @@ fn monotonic_now_ms() -> f64 {
 // binding from trapping on a host that exposes neither.
 #[cfg(target_family = "wasm")]
 #[wasm_bindgen(inline_js = "export function js_performance_now() { \
-    return (globalThis.performance && globalThis.performance.now()) || Date.now(); }")]
+    return (globalThis.performance && typeof globalThis.performance.now === 'function') \
+        ? globalThis.performance.now() : Date.now(); }")]
 extern "C" {
     fn js_performance_now() -> f64;
 }
@@ -466,6 +501,61 @@ mod tests {
         let edge = &snap["edges"][0];
         assert!(ids.contains(&edge["source"].as_u64().unwrap()));
         assert!(ids.contains(&edge["target"].as_u64().unwrap()));
+    }
+
+    /// Over the cap the view keeps the best-connected vertices, not the oldest. Taking the first
+    /// `MAX_GRAPH_NODES` of `all_nodes` kept the lowest ids, so a visitor who built a large graph
+    /// and then added the interesting part could not see the part they added.
+    #[test]
+    fn graph_snapshot_keeps_the_highest_degree_nodes_over_the_cap() {
+        let (_dir, p) = playground();
+        // Enough isolated vertices to pass the cap, then one hub joined to the newest of them, so
+        // the hub and its neighbors are the highest ids as well as the highest degrees. Under the
+        // old rule every one of them was cut.
+        p.query_inner(&format!(
+            "UNWIND range(1, {}) AS i CREATE (:Filler {{i: i}})",
+            MAX_GRAPH_NODES + 60
+        ))
+        .unwrap();
+        p.query_inner("CREATE (h:Hub {name: 'hub'})").unwrap();
+        p.query_inner(&format!(
+            "MATCH (h:Hub), (f:Filler) WHERE f.i > {} CREATE (h)-[:R]->(f)",
+            MAX_GRAPH_NODES + 40
+        ))
+        .unwrap();
+
+        let snap: Value = serde_json::from_str(&p.graph_snapshot_inner().unwrap()).unwrap();
+        assert_eq!(snap["truncated"], json!(true));
+        let nodes = snap["nodes"].as_array().unwrap();
+        assert_eq!(nodes.len(), MAX_GRAPH_NODES);
+
+        // The hub has the highest degree in the graph and is the last id allocated, so it is the
+        // one vertex the previous rule was guaranteed to drop.
+        let labels: Vec<&str> = nodes
+            .iter()
+            .filter_map(|n| n["labels"][0].as_str())
+            .collect();
+        assert!(
+            labels.contains(&"Hub"),
+            "the most connected vertex must be drawn"
+        );
+        // Its neighbors came with it, so the hub is not drawn as an isolated dot.
+        assert!(
+            !snap["edges"].as_array().unwrap().is_empty(),
+            "the hub's edges must survive with it"
+        );
+    }
+
+    /// Under the cap the ranking pass is skipped and the whole graph is drawn, which is every graph
+    /// the samples build.
+    #[test]
+    fn graph_snapshot_draws_everything_under_the_cap() {
+        let (_dir, p) = playground();
+        p.query_inner("UNWIND range(1, 40) AS i CREATE (:N {i: i})")
+            .unwrap();
+        let snap: Value = serde_json::from_str(&p.graph_snapshot_inner().unwrap()).unwrap();
+        assert_eq!(snap["truncated"], json!(false));
+        assert_eq!(snap["nodes"].as_array().unwrap().len(), 40);
     }
 
     /// Asking `node_prop_json` for a property named `"*"` returned null for every node, which

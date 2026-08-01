@@ -9,7 +9,7 @@ These invariants must hold after every successful write transaction:
 
 1. Adjacency consistency. For every edge `(src → dst)` stored in `out_adj` under key `src`, a matching `AdjEntry` must exist in `in_adj` under key
    `dst`, and vice versa. Both entries encode the same `EdgeId`, `TypeId`, and the other node. Never write one side without writing the other in the
-   same`RwTxn`.
+   same `RwTxn`.
 
 2. ID monotonicity. `NodeId` and `EdgeId` are allocated by `alloc_node_id` and `alloc_edge_id` in `storage/ids.rs`, which increment a `u64`
    counter stored in the `meta` sub-database. These counters must only ever increase. Never reset, reuse, or manually write a counter key outside
@@ -34,11 +34,11 @@ in-memory backend (`storage/memory.rs`). The contract both owe is documented on 
 
 - `heed` is named in exactly two places, both inside `storage/`. Everything else names the aliases `storage::{RoTxn, OwnedRoTxn, RwTxn}` and the twelve tables on
   `Storage`. Do not reintroduce a `heed::` path elsewhere, and do not "simplify" the aliases away: they are what let a second backend exist at all.
-- `RoTxn` is the *parameter* alias and is deliberately the thread-local-agnostic flavour, because a write transaction derefs to it. That is what lets a write
-  path hand its `RwTxn` to a read helper, which ~90 signatures rely on. `OwnedRoTxn` is the owned flavour, used only by `ReadTxn`'s field.
+- `RoTxn` is the *parameter* alias and is deliberately the thread-local-agnostic flavor, because a write transaction derefs to it. That is what lets a write
+  path hand its `RwTxn` to a read helper, which ~90 signatures rely on. `OwnedRoTxn` is the owned flavor, used only by `ReadTxn`'s field.
 - Do not turn this into a trait. The tables hang off `Storage` which hangs off `Graph`, so a trait makes `Graph` generic over its backend and pushes that
   parameter through every crate and the public API.
-- Three of the contract's guarantees are load-bearing rather than incidental LMDB behaviour, and a new backend that misses one breaks callers silently: key
+- Three of the contract's guarantees are load-bearing rather than incidental LMDB behavior, and a new backend that misses one breaks callers silently: key
   order is byte order (a `u64` key is stored big-endian so byte and numeric order agree, which the CSR build relies on when it treats `out_adj` as grouped by
   ascending node id); duplicate order is byte order (which the CSR row-reordering pass relies on); and an uncommitted transaction leaves nothing behind.
 - A read transaction opened *while* a write transaction is live must work, and must see committed state. A write statement such as `MATCH ... CREATE` does
@@ -132,6 +132,13 @@ It is built at the smallest size its consumers read, and the build is memory-sha
 Rebuilds happen on demand through the freshness gates below; the background rebuild after `REBUILD_THRESHOLD` writes is a compaction safety net, not
 the freshness path.
 
+A full build first tries the on-disk cache file (`cache_file.rs`, `lmdb` feature only): `build_snapshot` loads the flat arrays sequentially when the file's
+persisted commit generation (`storage/ids.rs`, `commit_gen`, advanced inside every mutating transaction through `commit_and_publish`) matches storage,
+and falls through to the scan on any mismatch, truncation, or checksum failure. `Graph::rebuild_csr` is the only save site, chosen because every bulk
+load ends there; the gate's per-write refreshes never write a file. The generation is captured before a build or save, so a write landing mid-pass
+leaves the result conservatively stale rather than falsely fresh. The cache file changes where a full build's bytes come from and nothing about the
+within-process freshness rules.
+
 - Always write to LMDB first. The CSR snapshot is derived from LMDB, not the other way around.
 - Use LMDB adjacency databases (`out_adj`, `in_adj`) for correctness-critical reads: single-node neighbor lookups, existence checks, and anything
   inside a transaction.
@@ -181,6 +188,13 @@ It is derived from LMDB, like the CSR snapshot, and follows the same write-LMDB-
   (see `issundb-cypher/AGENTS.md`).
 - This store is a cache, never the source of truth. Any new write path that changes a scalar property must record a delta against both `prop_columns`
   and `edge_columns` as applicable, the same way it updates `node_prop_idx`.
+- A full build tries the columns cache file first (`cache_file.rs`, `lmdb` feature only), generation-checked the same way the CSR cache file is;
+  `Graph::materialize_property_columns` is the node columns' save site, `Graph::materialize_edge_property_columns` the edge columns', and a repeat at
+  an unchanged generation skips the rewrite. The cache file skips each string column's interning map and the statistics, both derivable;
+  `PropColumn::rebuild_lookup` restores the former on load.
+- `Graph::nodes_prop_cmp_mask` is the typed predicate evaluation over these columns: a comparison filter's per-row outcome computed against the native
+  column storage, declining (`Ok(None)`) on a small cold request or a `Json` column so the caller falls back to boxed comparison. Its semantics are
+  pinned by `typed_cmp_mask_follows_cypher_scalar_semantics`; change that test only together with the boxed comparison it mirrors.
 
 ## Schema Statistics
 
@@ -224,7 +238,7 @@ The kernels live in `graph/kernels/`, split by family: `traversal.rs` (BFS and b
 label propagation), `paths.rs` (the shortest-path family and the simple-path searches), and `flow.rs` (spanning forest and maximum flow). Each is plain
 Rust over the CSR arrays.
 
-Two rules matter when adding or changing one, because both have been silently violated before:
+Three rules matter when adding or changing one, because each has been silently violated before:
 
 - Duplicate handling is per algorithm, and the conventions disagree. `degree_centrality` counts *distinct* neighbors, so parallel edges collapse;
   `page_rank` spreads a source's rank over its *edges*, so parallel edges each carry mass; `betweenness_centrality` counts distinct pairs, because two
@@ -238,8 +252,8 @@ Two rules matter when adding or changing one, because both have been silently vi
   reason, with the node plus a cursor into its row where the recursion kept a loop counter. `dfs` is the one exception and only because `hops: u8` bounds it at
   255 frames; widening that argument means converting it too. `deep_graph_tests` pins all of this by running the kernels on a thread with a 1 MiB stack
   (`wasm32-unknown-unknown`'s default) over a 20 000-node chain, and a regression there aborts the test binary rather than failing politely.
-- Where a result's sequence is observable, fix it deliberately. A traversal reports reached nodes in ascending dense (so ascending node id) order, each
-  frontier is sorted before it is consumed, so a `max_nodes` cap keeps the lowest-numbered nodes rather than whichever the traversal happened to reach
+- Where a result's sequence is observable, fix it deliberately. A traversal reports reached nodes in ascending dense (so ascending node id) order, and
+  each frontier is sorted before it is consumed, so a `max_nodes` cap keeps the lowest-numbered nodes rather than whichever the traversal happened to reach
   first. Brandes accumulates over sources and predecessors in that same order, which is what makes a betweenness total reproducible run to run rather
   than merely close.
 
@@ -261,7 +275,7 @@ below is the LMDB one; a second backend has to reproduce its key encoding and or
 | `fts_postings`  | `(LabelId, PropKeyId, term)` variable (DUPSORT + DUPFIXED) | 12 B `(NodeId BE, frequency BE)`      | Inverted posting lists for full-text search.                                                                                                                                                           |
 | `fts_docs`      | 16 B `(LabelId, PropKeyId, NodeId BE)`                     | 4 B `u32 BE` doc length               | Per-document term count for BM25.                                                                                                                                                                      |
 | `vectors`       | `u64 BE` (NodeId)                                          | raw `f32` bytes (little-endian)       | Persistent vector embeddings.                                                                                                                                                                          |
-| `meta`          | `Str` key                                                  | `Bytes` value                         | Counters, label/type registries, FTS stats.                                                                                                                                                            |
+| `meta`          | `Str` key                                                  | `Bytes` value                         | Counters (the persisted commit generation `commit_gen` included), label/type registries, FTS stats.                                                                                                                                                            |
 
 `DUPSORT + DUPFIXED` databases require all duplicate values under a key to be the same byte length; `AdjEntry` is 20 bytes and FTS posting values are
 12 bytes.

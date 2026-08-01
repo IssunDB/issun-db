@@ -57,6 +57,15 @@ pub(super) fn execute_copy(
     graph
         .rebuild_csr()
         .map_err(|e| format!("failed to rebuild CSR after import: {}", e))?;
+    // A bulk load also pays the node property column build, which persists the
+    // columns cache file beside the CSR one, so a later process's first
+    // aggregation loads both instead of scanning. The columns' memory in this
+    // process is the price, and a bulk load is the one caller entitled to that
+    // decision: it just declared the graph worth ingesting whole, unlike a
+    // server start or a query, neither of which warms columns.
+    graph
+        .materialize_property_columns()
+        .map_err(|e| format!("failed to build property columns after import: {}", e))?;
 
     Ok(QueryResult {
         statement_count: 1,
@@ -108,122 +117,38 @@ pub(super) fn execute_copy_internal(
     });
 
     let mut count = 0usize;
-    let mut entries = Vec::new();
-    let mut headers_found = Vec::new();
+    let mut source = RowSource::open(&stmt.filepath, &inferred_format, has_header, delimiter)?;
 
-    if inferred_format == "parquet" {
-        entries = read_parquet_entries(Path::new(&stmt.filepath))?;
-    } else if inferred_format == "jsonl" {
-        let file = File::open(&stmt.filepath)
-            .map_err(|e| format!("failed to open file '{}': {}", stmt.filepath, e))?;
-        let reader = BufReader::new(file);
-        for (i, line_res) in reader.lines().enumerate() {
-            let line = line_res.map_err(|e| format!("error reading line {}: {}", i + 1, e))?;
-            if line.trim().is_empty() {
-                continue;
-            }
-            let val: Value = serde_json::from_str(&line)
-                .map_err(|e| format!("JSON parse error on line {}: {}", i + 1, e))?;
-
-            // Rows are flat: metadata under the underscore-prefixed keys and
-            // user properties at the top level, exactly as EXPORT writes them.
-            // A user property named `props` is an ordinary property, so no
-            // nested-object flattening happens here.
-            let obj = val
-                .as_object()
-                .ok_or_else(|| format!("line {}: JSONL row must be a JSON object", i + 1))?
-                .clone();
-            entries.push(obj);
-        }
-    } else {
-        // CSV format
-        let file = File::open(&stmt.filepath)
-            .map_err(|e| format!("failed to open file '{}': {}", stmt.filepath, e))?;
-        let reader = BufReader::new(file);
-        let mut lines = reader.lines().enumerate();
-        let mut headers = Vec::new();
-
-        if has_header {
-            if let Some((_, line_res)) = lines.next() {
-                let line = line_res.map_err(|e| format!("failed to read CSV header: {}", e))?;
-                headers = parse_csv_line(&line, delimiter);
-            } else {
-                return Err("CSV file is empty".to_string());
-            }
-        }
-
-        for (i, line_res) in lines {
-            let line = line_res.map_err(|e| format!("error reading CSV line {}: {}", i + 1, e))?;
-            if line.trim().is_empty() {
-                continue;
-            }
-            let cols = parse_csv_line_quoted(&line, delimiter);
-            if headers.is_empty() {
-                headers = (0..cols.len()).map(|idx| format!("col{}", idx)).collect();
-            }
-
-            let mut props = serde_json::Map::new();
-            for (j, header) in headers.iter().enumerate() {
-                let (val_str, quoted) = cols
-                    .get(j)
-                    .map(|(s, q)| (s.as_str(), *q))
-                    .unwrap_or(("", false));
-                // A quoted cell was a string on export: it imports verbatim
-                // (the string "true" stays a string, "" stays an empty
-                // string), except quoted JSON text, the export form of a list
-                // or map. An unquoted cell is null or a scalar to infer.
-                let val = if quoted {
-                    if (val_str.starts_with('[') && val_str.ends_with(']'))
-                        || (val_str.starts_with('{') && val_str.ends_with('}'))
-                    {
-                        serde_json::from_str(val_str)
-                            .unwrap_or_else(|_| Value::String(val_str.to_owned()))
-                    } else {
-                        Value::String(val_str.to_owned())
-                    }
-                } else if val_str.is_empty() {
-                    Value::Null
-                } else if let Ok(n) = val_str.parse::<i64>() {
-                    Value::Number(n.into())
-                } else if let Ok(f) = val_str.parse::<f64>() {
-                    serde_json::json!(f)
-                } else if val_str.eq_ignore_ascii_case("true") {
-                    Value::Bool(true)
-                } else if val_str.eq_ignore_ascii_case("false") {
-                    Value::Bool(false)
-                } else if (val_str.starts_with('[') && val_str.ends_with(']'))
-                    || (val_str.starts_with('{') && val_str.ends_with('}'))
-                {
-                    serde_json::from_str(val_str)
-                        .unwrap_or_else(|_| Value::String(val_str.to_owned()))
-                } else {
-                    // An unquoted bare word in a hand-authored file.
-                    Value::String(val_str.to_owned())
-                };
-                props.insert(header.clone(), val);
-            }
-            entries.push(props);
-        }
-        headers_found = headers;
-    }
+    // The first row is pulled ahead of the transaction because classification
+    // reads it; every later row streams straight into the transaction, so an
+    // import holds one decoded row (plus, for parquet, one record batch)
+    // rather than the whole file. Materializing every row first put the entire
+    // file on the heap as JSON maps, a multi-gigabyte transient at bulk-load
+    // scale that the allocator then retained for the life of the process.
+    let first = match source.next_row() {
+        None => None,
+        Some(Ok(obj)) => Some(obj),
+        Some(Err(msg)) => return Err(msg),
+    };
+    let headers_found = source.csv_headers().unwrap_or(&[]);
 
     // 3. Determine if it is a relationship import. Only the underscore-prefixed
     // metadata keys classify: a node whose user properties happen to be named
     // `from` and `to` must import as a node, not as an edge file.
     let is_relationship = if inferred_format == "csv" {
         headers_found.contains(&"_from".to_string()) && headers_found.contains(&"_to".to_string())
-    } else if let Some(first) = entries.first() {
+    } else if let Some(first) = &first {
         first.contains_key("_from") && first.contains_key("_to")
     } else {
         false
     };
 
-    if entries.is_empty() {
+    let Some(first) = first else {
         return Ok(CopyOutcome {
             count: 0,
             is_relationship,
         });
-    }
+    };
 
     // A row shape with bare `from` and `to` keys and no node metadata key is
     // almost certainly an edge file written for the pre-rename key contract,
@@ -239,12 +164,10 @@ pub(super) fn execute_copy_internal(
                 && !headers_found
                     .iter()
                     .any(|h| node_metadata_keys.contains(&h.as_str()))
-        } else if let Some(first) = entries.first() {
+        } else {
             first.contains_key("from")
                 && first.contains_key("to")
                 && !node_metadata_keys.iter().any(|k| first.contains_key(*k))
-        } else {
-            false
         };
         if legacy_edge_shape {
             return Err(format!(
@@ -256,91 +179,292 @@ pub(super) fn execute_copy_internal(
         }
     }
 
+    // A row that fails to read or decode mid-transaction rolls the whole
+    // transaction back, so a bad line imports nothing, exactly as the
+    // materialize-first form behaved; its message is carried out here so the
+    // caller sees the parse error itself rather than a wrapped storage error.
+    let mut row_error: Option<String> = None;
+
     if is_relationship {
-        graph
-            .update(|txn| {
-                for obj in &entries {
-                    let from_raw = obj
-                        .get("_from")
-                        .and_then(|v| v.as_u64())
-                        .ok_or_else(|| custom_err("missing or invalid _from ID"))?;
-
-                    let to_raw = obj
-                        .get("_to")
-                        .and_then(|v| v.as_u64())
-                        .ok_or_else(|| custom_err("missing or invalid _to ID"))?;
-
-                    let from_id = *id_map.get(&from_raw).unwrap_or(&from_raw);
-                    let to_id = *id_map.get(&to_raw).unwrap_or(&to_raw);
-
-                    let etype_val = obj.get("_type").or_else(|| obj.get("_etype"));
-
-                    let etype = etype_val.and_then(|v| v.as_str()).unwrap_or(&stmt.target);
-
-                    // Only the prefixed metadata keys are stripped; a user
-                    // property named `type`, `from`, or `to` survives.
-                    let mut props_filtered = serde_json::Map::new();
-                    for (k, v) in obj {
-                        if k != "_from" && k != "_to" && k != "_type" && k != "_etype" {
-                            props_filtered.insert(k.clone(), v.clone());
+        let mut pending = Some(first);
+        let imported = graph.update(|txn| {
+            loop {
+                let mut obj = match pending.take() {
+                    Some(obj) => obj,
+                    None => match source.next_row() {
+                        None => break,
+                        Some(Ok(obj)) => obj,
+                        Some(Err(msg)) => {
+                            row_error = Some(msg);
+                            return Err(custom_err("import row failed"));
                         }
-                    }
+                    },
+                };
+                let from_raw = obj
+                    .get("_from")
+                    .and_then(|v| v.as_u64())
+                    .ok_or_else(|| custom_err("missing or invalid _from ID"))?;
 
-                    txn.add_edge(from_id, to_id, etype, &Value::Object(props_filtered))?;
-                    count += 1;
-                }
-                Ok(())
-            })
-            .map_err(|e| format!("relationship import failed: {}", e))?;
+                let to_raw = obj
+                    .get("_to")
+                    .and_then(|v| v.as_u64())
+                    .ok_or_else(|| custom_err("missing or invalid _to ID"))?;
+
+                let from_id = *id_map.get(&from_raw).unwrap_or(&from_raw);
+                let to_id = *id_map.get(&to_raw).unwrap_or(&to_raw);
+
+                // Only the prefixed metadata keys are stripped; a user
+                // property named `type`, `from`, or `to` survives. The row is
+                // owned, so stripping is removal in place rather than a copy
+                // of every surviving key and value.
+                obj.remove("_from");
+                obj.remove("_to");
+                let etype_val = obj.remove("_type").or_else(|| obj.remove("_etype"));
+                let etype = etype_val
+                    .as_ref()
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&stmt.target);
+
+                txn.add_edge(from_id, to_id, etype, &Value::Object(obj))?;
+                count += 1;
+            }
+            Ok(())
+        });
+        if let Some(msg) = row_error {
+            return Err(msg);
+        }
+        imported.map_err(|e| format!("relationship import failed: {}", e))?;
     } else {
-        graph
-            .update(|txn| {
-                for obj in &entries {
-                    let old_id = obj.get("_id").and_then(|v| v.as_u64());
-
-                    // Labels come only from the prefixed metadata key. A
-                    // present-but-empty `_labels` (a zero-label node's export)
-                    // imports as zero labels, not as the COPY target label.
-                    let labels = if let Some(labels_val) =
-                        obj.get("_labels").or_else(|| obj.get("_label"))
-                    {
-                        if let Some(arr) = labels_val.as_array() {
-                            arr.iter().filter_map(|v| v.as_str()).collect::<Vec<&str>>()
-                        } else if let Some(s) = labels_val.as_str() {
-                            s.split([':', ';'])
-                                .filter(|s| !s.is_empty())
-                                .collect::<Vec<&str>>()
-                        } else {
-                            Vec::new()
+        let mut pending = Some(first);
+        let imported = graph.update(|txn| {
+            loop {
+                let mut obj = match pending.take() {
+                    Some(obj) => obj,
+                    None => match source.next_row() {
+                        None => break,
+                        Some(Ok(obj)) => obj,
+                        Some(Err(msg)) => {
+                            row_error = Some(msg);
+                            return Err(custom_err("import row failed"));
                         }
+                    },
+                };
+                let old_id = obj.get("_id").and_then(|v| v.as_u64());
+
+                // Only the prefixed metadata keys are stripped; a user
+                // property named `labels`, `label`, or `id` survives.
+                obj.remove("_id");
+                let labels_val = obj.remove("_labels");
+                let label_val = obj.remove("_label");
+
+                // Labels come only from the prefixed metadata key. A
+                // present-but-empty `_labels` (a zero-label node's export)
+                // imports as zero labels, not as the COPY target label.
+                let labels = if let Some(labels_val) = labels_val.as_ref().or(label_val.as_ref()) {
+                    if let Some(arr) = labels_val.as_array() {
+                        arr.iter().filter_map(|v| v.as_str()).collect::<Vec<&str>>()
+                    } else if let Some(s) = labels_val.as_str() {
+                        s.split([':', ';'])
+                            .filter(|s| !s.is_empty())
+                            .collect::<Vec<&str>>()
                     } else {
-                        vec![stmt.target.as_str()]
-                    };
-
-                    // Only the prefixed metadata keys are stripped; a user
-                    // property named `labels`, `label`, or `id` survives.
-                    let mut props_filtered = serde_json::Map::new();
-                    for (k, v) in obj {
-                        if k != "_id" && k != "_labels" && k != "_label" {
-                            props_filtered.insert(k.clone(), v.clone());
-                        }
+                        Vec::new()
                     }
+                } else {
+                    vec![stmt.target.as_str()]
+                };
 
-                    let new_id = txn.add_node_multi(&labels, &Value::Object(props_filtered))?;
-                    if let Some(old) = old_id {
-                        id_map.insert(old, new_id);
-                    }
-                    count += 1;
+                let new_id = txn.add_node_multi(&labels, &Value::Object(obj))?;
+                if let Some(old) = old_id {
+                    id_map.insert(old, new_id);
                 }
-                Ok(())
-            })
-            .map_err(|e| format!("node import failed: {}", e))?;
+                count += 1;
+            }
+            Ok(())
+        });
+        if let Some(msg) = row_error {
+            return Err(msg);
+        }
+        imported.map_err(|e| format!("node import failed: {}", e))?;
     }
 
     Ok(CopyOutcome {
         count,
         is_relationship,
     })
+}
+
+/// A streaming source of import rows, one decoded row at a time. What it
+/// yields is exactly what the materialize-first reader produced per row; only
+/// the lifetime differs, one row (plus one Arrow record batch for parquet)
+/// instead of the whole file.
+enum RowSource {
+    Jsonl {
+        lines: std::iter::Enumerate<std::io::Lines<BufReader<File>>>,
+    },
+    Csv {
+        lines: std::iter::Enumerate<std::io::Lines<BufReader<File>>>,
+        headers: Vec<String>,
+        delimiter: char,
+    },
+    Parquet {
+        reader: parquet::arrow::arrow_reader::ParquetRecordBatchReader,
+        pending: std::collections::VecDeque<serde_json::Map<String, Value>>,
+    },
+}
+
+impl RowSource {
+    fn open(
+        filepath: &str,
+        format: &str,
+        has_header: bool,
+        delimiter: char,
+    ) -> Result<Self, String> {
+        if format == "parquet" {
+            use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+            let file = File::open(filepath)
+                .map_err(|e| format!("failed to open file {}: {}", filepath, e))?;
+            let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+                .map_err(|e| format!("failed to create reader builder: {}", e))?
+                .build()
+                .map_err(|e| format!("failed to build reader: {}", e))?;
+            return Ok(Self::Parquet {
+                reader,
+                pending: std::collections::VecDeque::new(),
+            });
+        }
+        let file = File::open(filepath)
+            .map_err(|e| format!("failed to open file '{}': {}", filepath, e))?;
+        let mut lines = BufReader::new(file).lines().enumerate();
+        if format == "jsonl" {
+            return Ok(Self::Jsonl { lines });
+        }
+        let mut headers = Vec::new();
+        if has_header {
+            if let Some((_, line_res)) = lines.next() {
+                let line = line_res.map_err(|e| format!("failed to read CSV header: {}", e))?;
+                headers = parse_csv_line(&line, delimiter);
+            } else {
+                return Err("CSV file is empty".to_string());
+            }
+        }
+        Ok(Self::Csv {
+            lines,
+            headers,
+            delimiter,
+        })
+    }
+
+    /// The CSV header names, for the caller's edge-versus-node classification;
+    /// `None` for the other formats, whose classification reads the first row.
+    fn csv_headers(&self) -> Option<&[String]> {
+        match self {
+            Self::Csv { headers, .. } => Some(headers),
+            _ => None,
+        }
+    }
+
+    fn next_row(&mut self) -> Option<Result<serde_json::Map<String, Value>, String>> {
+        match self {
+            Self::Jsonl { lines } => {
+                for (i, line_res) in lines.by_ref() {
+                    let line = match line_res {
+                        Ok(line) => line,
+                        Err(e) => return Some(Err(format!("error reading line {}: {}", i + 1, e))),
+                    };
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    // Rows are flat: metadata under the underscore-prefixed
+                    // keys and user properties at the top level, exactly as
+                    // EXPORT writes them. A user property named `props` is an
+                    // ordinary property, so no nested-object flattening
+                    // happens here.
+                    return Some(match serde_json::from_str::<Value>(&line) {
+                        Ok(Value::Object(obj)) => Ok(obj),
+                        Ok(_) => Err(format!("line {}: JSONL row must be a JSON object", i + 1)),
+                        Err(e) => Err(format!("JSON parse error on line {}: {}", i + 1, e)),
+                    });
+                }
+                None
+            }
+            Self::Csv {
+                lines,
+                headers,
+                delimiter,
+            } => {
+                for (i, line_res) in lines.by_ref() {
+                    let line = match line_res {
+                        Ok(line) => line,
+                        Err(e) => {
+                            return Some(Err(format!("error reading CSV line {}: {}", i + 1, e)));
+                        }
+                    };
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    let cols = parse_csv_line_quoted(&line, *delimiter);
+                    if headers.is_empty() {
+                        *headers = (0..cols.len()).map(|idx| format!("col{}", idx)).collect();
+                    }
+                    let mut props = serde_json::Map::new();
+                    for (j, header) in headers.iter().enumerate() {
+                        let (val_str, quoted) = cols
+                            .get(j)
+                            .map(|(s, q)| (s.as_str(), *q))
+                            .unwrap_or(("", false));
+                        props.insert(header.clone(), csv_cell_value(val_str, quoted));
+                    }
+                    return Some(Ok(props));
+                }
+                None
+            }
+            Self::Parquet { reader, pending } => loop {
+                if let Some(obj) = pending.pop_front() {
+                    return Some(Ok(obj));
+                }
+                let batch = match reader.next()? {
+                    Ok(batch) => batch,
+                    Err(e) => return Some(Err(format!("failed to read record batch: {}", e))),
+                };
+                match parquet_batch_rows(&batch) {
+                    Ok(rows) => *pending = rows,
+                    Err(e) => return Some(Err(e)),
+                }
+            },
+        }
+    }
+}
+
+/// One CSV cell decoded to its imported value. A quoted cell was a string on
+/// export: it imports verbatim (the string "true" stays a string, "" stays an
+/// empty string), except quoted JSON text, the export form of a list or map.
+/// An unquoted cell is null or a scalar to infer.
+fn csv_cell_value(val_str: &str, quoted: bool) -> Value {
+    let looks_like_json = (val_str.starts_with('[') && val_str.ends_with(']'))
+        || (val_str.starts_with('{') && val_str.ends_with('}'));
+    if quoted {
+        if looks_like_json {
+            serde_json::from_str(val_str).unwrap_or_else(|_| Value::String(val_str.to_owned()))
+        } else {
+            Value::String(val_str.to_owned())
+        }
+    } else if val_str.is_empty() {
+        Value::Null
+    } else if let Ok(n) = val_str.parse::<i64>() {
+        Value::Number(n.into())
+    } else if let Ok(f) = val_str.parse::<f64>() {
+        serde_json::json!(f)
+    } else if val_str.eq_ignore_ascii_case("true") {
+        Value::Bool(true)
+    } else if val_str.eq_ignore_ascii_case("false") {
+        Value::Bool(false)
+    } else if looks_like_json {
+        serde_json::from_str(val_str).unwrap_or_else(|_| Value::String(val_str.to_owned()))
+    } else {
+        // An unquoted bare word in a hand-authored file.
+        Value::String(val_str.to_owned())
+    }
 }
 
 pub(super) fn execute_export_db(
@@ -798,7 +922,7 @@ pub(super) fn execute_import_db(
             File::open(&copy_path).map_err(|e| format!("failed to open copy.cypher: {}", e))?;
         let reader = BufReader::new(file);
 
-        for line_res in reader.lines() {
+        for (i, line_res) in reader.lines().enumerate() {
             let line =
                 line_res.map_err(|e| format!("failed to read line from copy.cypher: {}", e))?;
             let trimmed = line.trim();
@@ -807,8 +931,12 @@ pub(super) fn execute_import_db(
             }
             let cypher_stmt = trimmed.strip_suffix(';').unwrap_or(trimmed);
 
+            // The diagnostic reproduces the statement under a caret, so quoting it
+            // here as well would print it twice and prefix "parse error" twice. The
+            // line of `copy.cypher` is the one thing the diagnostic cannot know, and
+            // is the only file-relative number in the message.
             let parsed = crate::parser::parse(cypher_stmt)
-                .map_err(|e| format!("parse error on copy line '{}': {}", cypher_stmt, e))?;
+                .map_err(|e| format!("copy.cypher line {}: {}", i + 1, e))?;
 
             if let crate::ast::Statement::Copy(ref copy_stmt) = parsed {
                 let resolved_filepath = if Path::new(&copy_stmt.filepath).is_absolute() {
@@ -848,10 +976,16 @@ pub(super) fn execute_import_db(
         }
     }
 
-    // 4. Rebuild CSR snapshot once at the end of the entire import process.
+    // 4. Rebuild CSR snapshot once at the end of the entire import process,
+    // and build the node property columns with it; see `execute_copy` for the
+    // policy. Both persist their cache files, so the imported database reopens
+    // without either scan.
     graph
         .rebuild_csr()
         .map_err(|e| format!("failed to rebuild CSR after import: {}", e))?;
+    graph
+        .materialize_property_columns()
+        .map_err(|e| format!("failed to build property columns after import: {}", e))?;
 
     // One row per COPY statement, so a file that ingested zero rows or
     // classified unexpectedly is visible to the caller.
@@ -1205,48 +1339,38 @@ fn write_parquet_file(path: &Path, batch: &arrow_array::RecordBatch) -> Result<(
     Ok(())
 }
 
-fn read_parquet_entries(path: &Path) -> Result<Vec<serde_json::Map<String, Value>>, String> {
-    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-    let file =
-        File::open(path).map_err(|e| format!("failed to open file {}: {}", path.display(), e))?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
-        .map_err(|e| format!("failed to create reader builder: {}", e))?;
-    let reader = builder
-        .build()
-        .map_err(|e| format!("failed to build reader: {}", e))?;
+/// One Arrow record batch decoded to import rows. The batch is the streaming
+/// unit for parquet, bounded by the reader's batch size rather than the file.
+fn parquet_batch_rows(
+    batch: &arrow_array::RecordBatch,
+) -> Result<std::collections::VecDeque<serde_json::Map<String, Value>>, String> {
+    let schema = batch.schema();
+    let num_rows = batch.num_rows();
+    let num_cols = batch.num_columns();
 
-    let mut entries = Vec::new();
-    for batch_res in reader {
-        let batch = batch_res.map_err(|e| format!("failed to read record batch: {}", e))?;
-        let schema = batch.schema();
-        let num_rows = batch.num_rows();
-        let num_cols = batch.num_columns();
-
-        for row in 0..num_rows {
-            let mut obj = serde_json::Map::new();
-            for col in 0..num_cols {
-                let field = schema.field(col);
-                let array = batch.column(col);
-                // A column flagged as JSON text (mixed-type or complex values
-                // on export) decodes each cell back to its exact value.
-                let val = if field.metadata().get(PARQUET_JSON_META).map(String::as_str)
-                    == Some("true")
-                {
-                    use arrow_array::cast::AsArray;
-                    if array.is_null(row) {
-                        Value::Null
-                    } else {
-                        let text = array.as_string::<i32>().value(row);
-                        serde_json::from_str(text)
-                            .unwrap_or_else(|_| Value::String(text.to_owned()))
-                    }
+    let mut entries = std::collections::VecDeque::with_capacity(num_rows);
+    for row in 0..num_rows {
+        let mut obj = serde_json::Map::new();
+        for col in 0..num_cols {
+            let field = schema.field(col);
+            let array = batch.column(col);
+            // A column flagged as JSON text (mixed-type or complex values
+            // on export) decodes each cell back to its exact value.
+            let val = if field.metadata().get(PARQUET_JSON_META).map(String::as_str) == Some("true")
+            {
+                use arrow_array::cast::AsArray;
+                if array.is_null(row) {
+                    Value::Null
                 } else {
-                    arrow_to_json_value(array, row)?
-                };
-                obj.insert(field.name().clone(), val);
-            }
-            entries.push(obj);
+                    let text = array.as_string::<i32>().value(row);
+                    serde_json::from_str(text).unwrap_or_else(|_| Value::String(text.to_owned()))
+                }
+            } else {
+                arrow_to_json_value(array, row)?
+            };
+            obj.insert(field.name().clone(), val);
         }
+        entries.push_back(obj);
     }
     Ok(entries)
 }

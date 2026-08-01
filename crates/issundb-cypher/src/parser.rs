@@ -1,5 +1,6 @@
 use crate::ast::*;
 use crate::error::CypherError;
+use chumsky::error::{RichPattern, RichReason};
 use chumsky::input::MappedInput;
 use chumsky::pratt::{infix, left, postfix, prefix};
 use chumsky::prelude::*;
@@ -52,6 +53,70 @@ pub(crate) enum Tok {
     RBrace,  // }
     LBrack,  // [
     RBrack,  // ]
+}
+
+impl std::fmt::Display for Tok {
+    /// Write the token as it would have been spelled in the source, so a
+    /// diagnostic quotes what the author typed rather than the parser's own
+    /// representation of it.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Tok::Integer(v) => write!(f, "{v}"),
+            Tok::Float(v) => write!(f, "{v}"),
+            Tok::Str(s) => write!(f, "'{s}'"),
+            Tok::Param(n) => write!(f, "${n}"),
+            Tok::Ident(n) => write!(f, "{n}"),
+            // `Ne` accepts two spellings and keeps neither, so it reports the
+            // openCypher one.
+            Tok::Ne => f.write_str("<>"),
+            Tok::Eq => f.write_str("="),
+            Tok::Lt => f.write_str("<"),
+            Tok::Gt => f.write_str(">"),
+            Tok::Le => f.write_str("<="),
+            Tok::Ge => f.write_str(">="),
+            Tok::RegexEq => f.write_str("=~"),
+            Tok::Arrow => f.write_str("->"),
+            Tok::LArrow => f.write_str("<-"),
+            Tok::Plus => f.write_str("+"),
+            Tok::Minus => f.write_str("-"),
+            Tok::Star => f.write_str("*"),
+            Tok::Slash => f.write_str("/"),
+            Tok::Percent => f.write_str("%"),
+            Tok::Caret => f.write_str("^"),
+            Tok::Dot => f.write_str("."),
+            Tok::DotDot => f.write_str(".."),
+            Tok::Comma => f.write_str(","),
+            Tok::Colon => f.write_str(":"),
+            Tok::Semi => f.write_str(";"),
+            Tok::Pipe => f.write_str("|"),
+            Tok::LParen => f.write_str("("),
+            Tok::RParen => f.write_str(")"),
+            Tok::LBrace => f.write_str("{"),
+            Tok::RBrace => f.write_str("}"),
+            Tok::LBrack => f.write_str("["),
+            Tok::RBrack => f.write_str("]"),
+        }
+    }
+}
+
+impl Tok {
+    /// The word naming this token's kind in an "unexpected ..." line, or `None`
+    /// for punctuation and operators, where the symbol alone reads better than
+    /// a noun in front of it.
+    fn noun(&self) -> Option<&'static str> {
+        match self {
+            Tok::Integer(_) | Tok::Float(_) => Some("number"),
+            Tok::Str(_) => Some("string"),
+            Tok::Param(_) => Some("parameter"),
+            // The lexer keeps a keyword in the identifier slot, so the two are
+            // told apart here by name. Only clause keywords are covered, which
+            // are the ones that turn up in an unexpected position; a stray `AS`
+            // still reads as an identifier.
+            Tok::Ident(n) if is_clause_keyword(n) => Some("keyword"),
+            Tok::Ident(_) => Some("identifier"),
+            _ => None,
+        }
+    }
 }
 
 type ParserInput<'a> = MappedInput<'a, Tok, SimpleSpan, &'a [(Tok, SimpleSpan)]>;
@@ -1077,6 +1142,7 @@ pub(crate) fn expr_parser<'a>() -> impl Parser<'a, ParserInput<'a>, Expr, Parser
 
         pratt
     })
+    .labelled("an expression")
 }
 
 // ─── Phase 3: Structural Graph Patterns ───────────────────────────────────────
@@ -5780,16 +5846,205 @@ pub(crate) fn parse_with_exec_depth(cypher: &str) -> Result<(Arc<Statement>, boo
     parsed
 }
 
+// ─── Diagnostics ──────────────────────────────────────────────────────────────
+
+/// Longest source line reproduced in full beneath a diagnostic. A longer line is
+/// windowed around the caret: the terminal wraps it otherwise, which puts the
+/// caret row under the wrong text and makes the diagnostic worse than no snippet.
+const MAX_DIAGNOSTIC_LINE: usize = 96;
+
+/// Most alternatives an "expected" list may name before it is dropped entirely.
+///
+/// Dropped rather than truncated. The alternatives are sorted for determinism, so
+/// a truncation keeps whichever six sort first, and at a position expecting
+/// dozens of tokens that prefix is arbitrary: the lexer's list of every character
+/// that could open a token begins "`!`, `\"`, `$`, `%`, `'`, `(`", which describes
+/// the grammar rather than the mistake. A short list is specific and worth
+/// printing; a long one is worth nothing, and the caret still marks the spot.
+const MAX_EXPECTED_LISTED: usize = 6;
+
+/// Where a byte offset falls in the source. Lines and columns are 1-based.
+struct Position {
+    line: usize,
+    /// Counted in characters, not bytes, so the caret lands under the character
+    /// it refers to whatever is on the line above it.
+    column: usize,
+    /// Byte range of the line holding the offset, its terminator excluded.
+    line_span: std::ops::Range<usize>,
+}
+
+fn locate(src: &str, offset: usize) -> Position {
+    // An error path must not panic on a slice boundary, so an offset landing
+    // inside a multi-byte character walks back to the start of it.
+    let mut offset = offset.min(src.len());
+    while offset > 0 && !src.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    let start = src[..offset].rfind('\n').map_or(0, |i| i + 1);
+    let end = src[offset..].find('\n').map_or(src.len(), |i| offset + i);
+    Position {
+        line: src[..start].matches('\n').count() + 1,
+        column: src[start..offset].chars().count() + 1,
+        line_span: start..end,
+    }
+}
+
+/// Render one diagnostic as a summary, a position, and the offending line with a
+/// caret under the span.
+fn render_snippet(src: &str, span: std::ops::Range<usize>, summary: &str, label: &str) -> String {
+    let pos = locate(src, span.start);
+    // A tab becomes one space so the caret row, which counts characters, stays
+    // aligned with the line above it whatever the terminal's tab stops are.
+    let line: Vec<char> = src[pos.line_span.clone()]
+        .replace('\t', " ")
+        .chars()
+        .collect();
+
+    let caret_at = pos.column - 1;
+    let end = locate(src, span.end.max(span.start));
+    let caret_width = if end.line == pos.line {
+        (end.column - pos.column).max(1)
+    } else {
+        line.len().saturating_sub(caret_at).max(1)
+    };
+
+    // Window a long line around the caret rather than from the left, or a caret
+    // far along the line is cut away by the very truncation meant to show it.
+    let (line, caret_at) = if line.len() > MAX_DIAGNOSTIC_LINE {
+        let from = caret_at.saturating_sub(MAX_DIAGNOSTIC_LINE / 3);
+        let to = (from + MAX_DIAGNOSTIC_LINE).min(line.len());
+        let mut windowed = String::new();
+        if from > 0 {
+            windowed.push('…');
+        }
+        windowed.extend(&line[from..to]);
+        if to < line.len() {
+            windowed.push('…');
+        }
+        let shift = usize::from(from > 0);
+        (windowed, caret_at - from + shift)
+    } else {
+        (line.iter().collect::<String>(), caret_at)
+    };
+
+    // A single-line query has no line worth numbering, and the number is worse
+    // than absent: a caller parsing one statement out of a larger file prints its
+    // own line number beside this one, and two numbers counted from different
+    // origins read as a contradiction. Where the query genuinely spans lines the
+    // number is named "query line", for the same reason: it counts the text
+    // handed to the parser, never the file that text came from.
+    let multiline = src.contains('\n');
+    let number = if multiline {
+        pos.line.to_string()
+    } else {
+        String::new()
+    };
+    let gutter = " ".repeat(number.len().max(1));
+    let position = if multiline {
+        format!("query line {}, column {}", pos.line, pos.column)
+    } else {
+        format!("column {}", pos.column)
+    };
+    let caret_row = format!(
+        "{}{}{}",
+        " ".repeat(caret_at),
+        "^".repeat(
+            caret_width
+                .min(line.chars().count().saturating_sub(caret_at))
+                .max(1)
+        ),
+        if label.is_empty() {
+            String::new()
+        } else {
+            format!(" {label}")
+        },
+    );
+    format!(
+        "{summary}\n{gutter}--> {position}\n{gutter} |\n{number:>width$} | {line}\n{gutter} | {caret_row}",
+        width = gutter.len(),
+    )
+}
+
+fn render_pattern<T: std::fmt::Display>(pattern: &RichPattern<'_, T>) -> String {
+    match pattern {
+        RichPattern::Token(t) => format!("`{}`", **t),
+        RichPattern::Label(l) => l.to_string(),
+        RichPattern::Identifier(s) => format!("`{s}`"),
+        RichPattern::Any => "more input".to_string(),
+        RichPattern::SomethingElse => "something else".to_string(),
+        RichPattern::EndOfInput => "end of input".to_string(),
+        // `RichPattern` is non-exhaustive, so a variant added upstream lands here
+        // rather than breaking the build.
+        _ => "something else".to_string(),
+    }
+}
+
+/// Join alternatives into an English list, with the Oxford comma the writing
+/// style calls for.
+fn join_alternatives(items: &[String]) -> String {
+    match items {
+        [] => String::new(),
+        [only] => only.clone(),
+        [a, b] => format!("{a} or {b}"),
+        [rest @ .., last] => format!("{}, or {last}", rest.join(", ")),
+    }
+}
+
+/// Render chumsky's errors as compiler-style diagnostics against the source.
+///
+/// `describe` names what was found, which is the one part that differs between
+/// the character stream the lexer reads and the token stream the parser reads.
+fn render_rich<T: std::fmt::Display>(
+    src: &str,
+    errs: &[Rich<'_, T>],
+    describe: impl Fn(&T) -> String,
+) -> String {
+    errs.iter()
+        .map(|e| {
+            let at_end = e.found().is_none();
+            let summary = match e.reason() {
+                RichReason::Custom(msg) => msg.clone(),
+                RichReason::ExpectedFound { .. } => match e.found() {
+                    Some(found) => describe(found),
+                    None => "unexpected end of input: the statement is incomplete".to_string(),
+                },
+            };
+
+            let mut alts: Vec<String> = e.expected().map(render_pattern).collect();
+            alts.sort();
+            alts.dedup();
+            // The catch-all carries nothing next to a named alternative, and on
+            // its own it is what produced the "expected something else" this
+            // rendering exists to replace.
+            alts.retain(|a| a != "something else");
+            // Past the last token almost anything is grammatical, which chumsky
+            // reports as the catch-all. "Expected more input" under a caret at the
+            // end of the query repeats the summary; a concrete alternative there
+            // (the quote closing a string, say) is worth keeping.
+            if at_end {
+                alts.retain(|a| a != "more input");
+            }
+
+            let label = if alts.is_empty() || alts.len() > MAX_EXPECTED_LISTED {
+                String::new()
+            } else {
+                format!("expected {}", join_alternatives(&alts))
+            };
+
+            let span = e.span();
+            render_snippet(src, span.start..span.end, &summary, &label)
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
 /// Parse a Cypher query string and report its execution stack requirement,
 /// always doing the work. `parse_with_exec_depth` wraps this with the cache.
 fn parse_uncached(cypher: &str) -> Result<(Statement, bool), CypherError> {
     let tokens = lexer().parse(cypher).into_result().map_err(|errs| {
-        let msg = errs
-            .into_iter()
-            .map(|e| e.to_string())
-            .collect::<Vec<_>>()
-            .join("; ");
-        CypherError::Parse(msg)
+        CypherError::Parse(render_rich(cypher, &errs, |c: &char| {
+            format!("unexpected character `{c}`")
+        }))
     })?;
 
     let nesting = scan_nesting(&tokens);
@@ -5812,12 +6067,10 @@ fn parse_uncached(cypher: &str) -> Result<(Statement, bool), CypherError> {
             .parse(stream)
             .into_result()
             .map_err(|errs| {
-                let msg = errs
-                    .into_iter()
-                    .map(|e| format!("{:?}", e))
-                    .collect::<Vec<_>>()
-                    .join("; ");
-                CypherError::Parse(msg)
+                CypherError::Parse(render_rich(cypher, &errs, |t: &Tok| match t.noun() {
+                    Some(noun) => format!("unexpected {noun} `{t}`"),
+                    None => format!("unexpected `{t}`"),
+                }))
             })?;
 
         expand_star_items(&mut statement);
@@ -6667,5 +6920,255 @@ mod tests {
             nesting.op
         );
         assert!(parse(&format!("RETURN {chain} AS x")).is_err());
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+
+    /// Errors are rendered against the source, so a test reads the whole message.
+    fn message(cypher: &str) -> String {
+        parse(cypher).unwrap_err().to_string()
+    }
+
+    /// The offending token is named as it was written, not as the lexer
+    /// represents it, and the position is a line and column rather than a byte
+    /// offset. This is the case that prompted the rendering: it used to read
+    /// "found 'Integer(4)' at 797..798 expected something else".
+    #[test]
+    fn an_unexpected_token_is_quoted_with_its_position() {
+        let msg = message("MATCH (n) RETURN n.name, 4 5");
+        assert!(msg.contains("unexpected number `5`"), "{msg}");
+        assert!(msg.contains("column 28"), "{msg}");
+        assert!(
+            !msg.contains("Integer("),
+            "the token debug form must not leak: {msg}"
+        );
+        assert!(!msg.contains("27..28"), "a byte span must not leak: {msg}");
+    }
+
+    /// The snippet reproduces the offending line and marks the span beneath it.
+    /// A single-line query carries no line number: a caller parsing one statement
+    /// out of a larger file prints its own line beside this one, and two numbers
+    /// counted from different origins read as a contradiction.
+    #[test]
+    fn a_single_line_query_is_located_by_column_alone() {
+        let msg = message("MATCH (n) RETURN n.name, 4 5");
+        let lines: Vec<&str> = msg.lines().collect();
+        assert_eq!(lines[0], "parse error: unexpected number `5`");
+        assert_eq!(lines[1], " --> column 28");
+        assert_eq!(lines[2], "  |");
+        assert_eq!(lines[3], "  | MATCH (n) RETURN n.name, 4 5");
+        assert_eq!(
+            lines[4],
+            "  |                            ^ expected end of input"
+        );
+        // The caret sits under the character the column names.
+        let caret = lines[4].find('^').unwrap();
+        assert_eq!(lines[3].as_bytes()[caret], b'5');
+        assert!(!msg.contains("line 1"), "no line number is invented: {msg}");
+    }
+
+    /// A query spanning several lines reports the line the error is on, and
+    /// reproduces only that line.
+    #[test]
+    fn a_multiline_query_reports_the_offending_line() {
+        let msg =
+            message("MATCH (n:Person)\nWHERE n.age > 30\nRETURN n.name, 4 5\nORDER BY n.name");
+        assert!(msg.contains(" --> query line 3, column 18"), "{msg}");
+        assert!(msg.contains("3 | RETURN n.name, 4 5"), "{msg}");
+        assert!(
+            !msg.contains("MATCH (n:Person)"),
+            "only the failing line is shown: {msg}"
+        );
+    }
+
+    /// The caret covers the whole token, not just its first character, so a
+    /// multi-character token is marked for its full width.
+    #[test]
+    fn the_caret_spans_the_whole_token() {
+        let msg = message("UNWIND [1,2 RETURN x");
+        assert!(msg.contains("unexpected keyword `RETURN`"), "{msg}");
+        assert!(
+            msg.contains("^^^^^^"),
+            "the caret covers all six characters: {msg}"
+        );
+    }
+
+    /// A lexer fault names the character. The parser and the lexer share one
+    /// rendering, so this also pins that the lexer path reaches it.
+    #[test]
+    fn an_unlexable_character_is_named() {
+        let msg = message("MATCH (n) RETURN n#");
+        assert!(msg.contains("unexpected character `#`"), "{msg}");
+        assert!(msg.contains(" --> column 19"), "{msg}");
+    }
+
+    /// Running out of input says so, rather than reporting a token that is not
+    /// there.
+    #[test]
+    fn end_of_input_is_reported_as_an_incomplete_statement() {
+        let msg = message("MATCH (n) RETURN");
+        assert!(
+            msg.contains("unexpected end of input: the statement is incomplete"),
+            "{msg}"
+        );
+        // "expected more input" would only repeat the summary.
+        assert!(!msg.contains("more input"), "{msg}");
+    }
+
+    /// A short list of alternatives is specific enough to print. An unterminated
+    /// string is the case that earns it: the quote is the fix.
+    #[test]
+    fn a_short_expected_list_is_printed() {
+        let msg = message("MATCH (n) WHERE n.x = 'unterminated RETURN n");
+        assert!(msg.contains("expected `'` or `\\`"), "{msg}");
+    }
+
+    /// A long list is dropped rather than truncated. At an unlexable character
+    /// every token opener is an alternative, and the first six alphabetically
+    /// describe the grammar rather than the mistake.
+    #[test]
+    fn a_long_expected_list_is_dropped() {
+        let msg = message("MATCH (n) RETURN n#");
+        // Not `contains("expected")`, which "unexpected" satisfies.
+        assert!(!msg.contains("expected `"), "{msg}");
+        assert!(!msg.contains("or 22 more"), "{msg}");
+    }
+
+    /// A line too wide for a terminal is windowed around the caret, or the
+    /// truncation meant to show the error cuts the error away.
+    #[test]
+    fn a_long_line_is_windowed_around_the_caret() {
+        let padding = (0..40)
+            .map(|i| format!("n.p{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let msg = message(&format!("MATCH (n) RETURN {padding} 4"));
+        let snippet = msg.lines().nth(3).unwrap();
+        assert!(snippet.contains('…'), "the line is elided: {msg}");
+        assert!(snippet.chars().count() <= MAX_DIAGNOSTIC_LINE + 8, "{msg}");
+        // The caret still lands on the offending token. Both rows carry a gutter
+        // of the same width, so the caret's column indexes straight into the
+        // snippet; counted in characters, since the elision is multi-byte.
+        let caret_row = msg.lines().nth(4).unwrap();
+        let caret = caret_row.chars().position(|c| c == '^').unwrap();
+        assert_eq!(snippet.chars().nth(caret), Some('4'), "{msg}");
+    }
+
+    /// Positions are 1-based, count characters rather than bytes, and a caret
+    /// under a line holding multi-byte characters lands on the right one.
+    #[test]
+    fn positions_count_characters_not_bytes() {
+        let src = "α β\nγδ x";
+        let at_x = src.find('x').unwrap();
+        let pos = locate(src, at_x);
+        assert_eq!((pos.line, pos.column), (2, 4));
+        assert_eq!(&src[pos.line_span.clone()], "γδ x");
+        // The first line, for contrast, and the very start of the input.
+        assert_eq!((locate(src, 0).line, locate(src, 0).column), (1, 1));
+    }
+
+    /// An offset landing inside a multi-byte character walks back to its start
+    /// rather than panicking on the slice.
+    #[test]
+    fn an_offset_inside_a_character_does_not_panic() {
+        let src = "αβγ";
+        for offset in 0..=src.len() + 4 {
+            let pos = locate(src, offset);
+            assert_eq!(pos.line, 1);
+            assert!(pos.column >= 1);
+        }
+    }
+
+    /// Alternatives are joined with the Oxford comma the writing style requires.
+    #[test]
+    fn alternatives_are_joined_with_an_oxford_comma() {
+        let one = ["`a`".to_string()];
+        let two = ["`a`".to_string(), "`b`".to_string()];
+        let three = ["`a`".to_string(), "`b`".to_string(), "`c`".to_string()];
+        assert_eq!(join_alternatives(&one), "`a`");
+        assert_eq!(join_alternatives(&two), "`a` or `b`");
+        assert_eq!(join_alternatives(&three), "`a`, `b`, or `c`");
+        assert_eq!(join_alternatives(&[]), "");
+    }
+
+    /// Every token renders as its source spelling, so no diagnostic can quote a
+    /// token in the parser's own notation.
+    #[test]
+    fn tokens_render_as_they_were_written() {
+        assert_eq!(Tok::Integer(4).to_string(), "4");
+        assert_eq!(Tok::Float(1.5).to_string(), "1.5");
+        assert_eq!(Tok::Str("a".into()).to_string(), "'a'");
+        assert_eq!(Tok::Param("x".into()).to_string(), "$x");
+        assert_eq!(Tok::Ident("RETURN".into()).to_string(), "RETURN");
+        assert_eq!(Tok::Arrow.to_string(), "->");
+        assert_eq!(Tok::DotDot.to_string(), "..");
+        assert_eq!(Tok::Ne.to_string(), "<>");
+    }
+
+    /// A multi-line query names its line "query line", so a caller printing a
+    /// file line beside the diagnostic cannot be read as contradicting it. The
+    /// CLI does exactly that, and its own number counts a different thing.
+    #[test]
+    fn a_multiline_position_says_which_text_it_counts() {
+        let msg = message("MATCH (n)\nRETURN n.name, 4 5");
+        assert!(msg.contains("query line 2"), "{msg}");
+        // Never a bare "line N", which reads as a file line.
+        assert!(!msg.contains("--> line "), "{msg}");
+    }
+
+    /// The gutter is numbered only when there is more than one line to tell
+    /// apart, and the caret row lines up with the snippet in both shapes.
+    #[test]
+    fn the_gutter_is_numbered_only_for_a_multiline_query() {
+        for (query, gutter) in [
+            ("MATCH (n) RETURN n.name, 4 5", "  | "),
+            ("MATCH (n)\nRETURN n.name, 4 5", "2 | "),
+        ] {
+            let msg = message(query);
+            let lines: Vec<&str> = msg.lines().collect();
+            assert!(lines[3].starts_with(gutter), "{msg}");
+            // The snippet and the caret row share a gutter width, so a caret
+            // column indexes straight into the line above it.
+            assert_eq!(lines[3].find('|'), lines[4].find('|'), "{msg}");
+            let caret = lines[4].find('^').unwrap();
+            assert_eq!(lines[3].as_bytes()[caret], b'5', "{msg}");
+        }
+    }
+
+    /// A clause keyword in an unexpected position is called a keyword. Reporting
+    /// `RETURN` as an identifier suggests the parser took it for a name.
+    #[test]
+    fn a_misplaced_clause_keyword_is_called_a_keyword() {
+        assert_eq!(Tok::Ident("RETURN".into()).noun(), Some("keyword"));
+        assert_eq!(Tok::Ident("person".into()).noun(), Some("identifier"));
+        assert_eq!(Tok::Comma.noun(), None);
+    }
+
+    proptest::proptest! {
+        /// Rendering runs on the error path, so a panic there replaces a syntax
+        /// error with a crash. No input may panic, at any offset.
+        #[test]
+        fn rendering_never_panics(src in ".{0,80}", start in 0usize..120, len in 0usize..20) {
+            let summary = "unexpected thing";
+            let out = render_snippet(&src, start..start + len, summary, "expected other things");
+            proptest::prop_assert!(out.starts_with(summary));
+            // A single-line source is located by column alone, so only the
+            // position marker itself is universal.
+            proptest::prop_assert!(out.contains("--> "));
+        }
+
+        /// Parsing arbitrary text either succeeds or produces a rendered
+        /// diagnostic; it never panics and never leaks a byte span.
+        #[test]
+        fn arbitrary_input_yields_a_rendered_diagnostic(src in "[a-zA-Z0-9 ().,:\\[\\]{}$'*+-]{0,60}") {
+            if let Err(e) = parse(&src) {
+                let msg = e.to_string();
+                proptest::prop_assert!(!msg.contains("Integer("), "{}", msg);
+                proptest::prop_assert!(!msg.contains("Ident("), "{}", msg);
+            }
+        }
     }
 }

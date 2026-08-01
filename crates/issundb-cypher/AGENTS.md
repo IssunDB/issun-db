@@ -48,6 +48,35 @@ hand-written descent chain.
 Query text longer than `PARSE_CACHE_MAX_QUERY_LEN` is parsed but not cached, so many large unique statements cannot grow the parse cache by their
 length.
 
+### Parse Diagnostics
+
+Both phases report through `render_rich`, which turns chumsky's `Rich` errors into a compiler-style diagnostic: a summary naming what was found, the
+position, the offending source line, and a caret under the span. Neither phase may format a `Rich` with `Debug`, which is what produced the
+`found 'Integer(4)' at 797..798 expected something else` this replaced.
+
+A position never reads as a file position, because the parser is handed a query and not a file, and the callers that hold both print their own number
+beside this one. A single-line query is located by column alone and its snippet gutter is blank, so nothing on the line can be mistaken for a file
+line; a query genuinely spanning lines says "query line N", naming what it counts. Do not reintroduce a bare "line N". The callers that depend on this
+are `issundb-cli`, which prints `path:N` for the file line a script statement starts on, and `execute_import_db`, which prints `copy.cypher line N`.
+
+Neither caller may renumber a diagnostic onto its file, however tempting: the CLI's statement text is not a faithful slice, since `segment_script`
+trims continuation lines (which moves columns) and gives every statement split from one buffer the same start line (which moves lines). A renumbered
+position would be confidently wrong, which is worse than one that is honestly relative.
+
+- `Tok` carries a `Display` writing each token as it was spelled in the source, so a diagnostic quotes the author's text rather than the parser's
+  representation of it. A new token variant needs an arm, and the compiler requires one.
+- `Tok::noun` supplies the word in front of the quote ("number", "string", "keyword"), and `None` for punctuation, where the symbol alone reads
+  better. Keywords are told from identifiers by `is_clause_keyword`, since the lexer keeps both in `Tok::Ident`; a non-clause keyword therefore reads
+  as an identifier.
+- An expected list is printed only when it names at most `MAX_EXPECTED_LISTED` alternatives, and is otherwise dropped rather than truncated. The
+  alternatives are sorted for determinism, so a truncation would keep whichever sort first, and at an unlexable character that prefix is every
+  punctuation mark the grammar can open a token with.
+- Positions count characters, not bytes, and `locate` walks back off a mid-character offset instead of panicking. Rendering runs on the error path, so
+  a panic there turns a syntax error into a crash; `rendering_never_panics` covers that with a proptest.
+- The expected set chumsky reports is empty at most positions, because the grammar labels almost nothing. `expr_parser` is labelled, which is what
+  supplies "expected an expression" after a bare `WHERE`. Labeling more of the grammar is the way to improve these messages further, one construct at
+  a time, since a label replaces the expected set for every failure inside the parser it is attached to.
+
 ## AST Immutability Policy
 
 - All AST node types derive `Clone` and `PartialEq`. They are produced once by the parser and treated as read-only thereafter.
@@ -176,8 +205,8 @@ the kernel resolves one registered type. And a stale snapshot with at most `STAL
 (`Graph::prefers_point_expansion`), because the kernel would rebuild the whole snapshot where the fallback serves those sources from per-source
 adjacency.
 
-**Group-key identity invariant** (binds both executors): grouping by a bare node or edge variable (`Expr::Prop(var, "")`) keys on the element id, not
-its materialized property bag, and the group row keeps the `Node` or `Edge` binding rather than a materialized `Scalar`. The row pipeline's
+Grouping by a bare node or edge variable (`Expr::Prop(var, "")`) keys on the element id, not its materialized property bag, and the group row keeps
+the `Node` or `Edge` binding rather than a materialized `Scalar`. This identity invariant binds both executors. The row pipeline's
 `aggregate_all` fold and the vectorized aggregate both depend on this. Serializing a whole node to a JSON object per input row to build the group key
 is an O(rows x properties) cliff (it regressed RE24 by roughly 5x), and re-materializing the entity as a `Scalar` forces downstream property reads off
 the columnar fast path. Do not reduce either fold back to `evaluate_expr(...).to_string()` for a node or edge group key.

@@ -78,7 +78,7 @@ pub enum LinkPredictionMetric {
     PreferentialAttachment,
 }
 
-/// Pattern description for [`Graph::count_triangle_cycles`]: the directed
+/// Describes the pattern [`Graph::count_triangle_cycles`] counts, the directed
 /// cycle `(a)-[t1]->(b)-[t2]->(c)-[t3]->(a)` with an optional relationship
 /// type per hop and an optional label per node variable. `None` means
 /// unconstrained.
@@ -90,7 +90,7 @@ pub struct TriangleCountSpec<'a> {
     pub labels: [Option<&'a str>; 3],
 }
 
-/// Pattern description for [`Graph::count_linear_paths`]: an open directed
+/// Describes the pattern [`Graph::count_linear_paths`] counts, an open directed
 /// path of one or two hops, `(v0)-[t1]->(v1)` or
 /// `(v0)-[t1]->(v1)-[t2]->(v2)`, with an optional relationship type per hop
 /// and an optional label per node variable. `None` means unconstrained.
@@ -116,7 +116,7 @@ pub struct PathCountSpec<'a> {
     pub vertex_allow: Vec<Option<Vec<NodeId>>>,
 }
 
-/// Pattern description for [`Graph::grouped_edge_counts`]: count typed edges
+/// Describes the pattern [`Graph::grouped_edge_counts`] counts, typed edges
 /// grouped by one endpoint. With `group_is_dst`, edges are grouped by their
 /// destination and the source is the counted endpoint (in-degree per
 /// destination); otherwise edges are grouped by their source and the
@@ -148,8 +148,8 @@ pub struct GroupedDegreeSpec<'a> {
     pub counted_nonnull_prop: Option<&'a str>,
 }
 
-/// Pattern description for [`Graph::typed_neighbor_counts`]: per-source counts
-/// of typed neighbors across one hop. `incoming` follows incoming edges instead
+/// Describes the pattern [`Graph::typed_neighbor_counts`] counts, the typed
+/// neighbors of each source across one hop. `incoming` follows incoming edges instead
 /// of outgoing ones. A neighbor qualifies when it carries every label in
 /// `neighbor_labels` (an empty slice is unconstrained) and, when
 /// `neighbor_allow` is present, is a member of that set; it adds to the counted
@@ -485,7 +485,7 @@ pub(super) fn fts_stats_sum_dl_key(label_id: LabelId, prop_key_id: PropKeyId) ->
     format!("fts_stats:node:l:{label_id}:p:{prop_key_id}:sum_dl")
 }
 
-/// The graph database handle. Cheap to clone: all state is behind `Arc`.
+/// The graph database handle. It is cheap to clone, since all state is behind `Arc`.
 #[derive(Clone)]
 pub struct Graph {
     pub(super) storage: Arc<Storage>,
@@ -503,6 +503,19 @@ pub struct Graph {
     /// statistics table means walking the graph, so a decided verdict is remembered
     /// until a write invalidates the generation. See [`crate::graph::stats`].
     pub(super) schema_probes: Arc<parking_lot::Mutex<SchemaProbeMemo>>,
+    /// Cached id-indexed group codes, one shared array per grouped property,
+    /// valid for exactly one write generation, which is what lets a grouped
+    /// bulk aggregation read one array cell per row instead of interning one
+    /// value per row per query. See [`crate::columns::IdGroupCodes`].
+    pub(super) group_codes_by_id: Arc<parking_lot::Mutex<crate::columns::IdGroupCodesCache>>,
+    /// Cached full label scans for the committed-read path, one shared sorted id
+    /// vector per label, valid for exactly one write generation. Filters, the
+    /// vectorized executor, and the counting kernels each enumerate a whole
+    /// label per query, and with no plan cache the same label is rescanned
+    /// through LMDB on every execution; this pins that scan until a committed
+    /// write moves the generation. Transaction-scoped label reads bypass it,
+    /// because an open write transaction must see its own uncommitted labels.
+    pub(super) label_scans: Arc<parking_lot::Mutex<index::LabelScanCache>>,
     pub(super) n_threads: Arc<std::sync::atomic::AtomicI32>,
     /// Type-erased extension cache. Higher-level crates attach caches (e.g. the
     /// HNSW vector index) to a Graph without creating a circular dependency,
@@ -613,6 +626,10 @@ impl Graph {
             edge_columns: Arc::new(crate::columns::ColumnsCache::default()),
             edge_fanout: Arc::new(parking_lot::Mutex::new(None)),
             schema_probes: Arc::new(parking_lot::Mutex::new((0, AHashMap::new()))),
+            group_codes_by_id: Arc::new(parking_lot::Mutex::new(
+                crate::columns::IdGroupCodesCache::default(),
+            )),
+            label_scans: Arc::new(parking_lot::Mutex::new(index::LabelScanCache::default())),
             n_threads: Arc::new(std::sync::atomic::AtomicI32::new(0)),
             extensions: Arc::new(parking_lot::Mutex::new(AHashMap::new())),
         })
@@ -670,8 +687,8 @@ impl Graph {
         })
     }
 
-    /// Bulk form of [`Graph::node_prop_json`]: gather `props` for each id in
-    /// `ids` through the in-memory property columns, row-major (`out[i][j]` is
+    /// Gathers `props` for each id in `ids` through the in-memory property columns,
+    /// the bulk form of [`Graph::node_prop_json`], row-major (`out[i][j]` is
     /// `props[j]` on `ids[i]`). One columns refresh covers the whole gather,
     /// and each id resolves to its dense index once. A missing property reads
     /// as `Value::Null`; a nonexistent node is [`Error::NodeNotFound`].
@@ -700,8 +717,8 @@ impl Graph {
             .with_fresh(&self.storage, |cols| cols.props_table(ids, props))?
     }
 
-    /// Single-property column form of [`Graph::node_props_json_table`]:
-    /// `out[i]` is the value of `prop` on `ids[i]`, as one flat vector, so a
+    /// Gathers one property as a flat column, the single-property form of
+    /// [`Graph::node_props_json_table`]. `out[i]` is the value of `prop` on `ids[i]`, so a
     /// bulk single-property gather does not pay one row vector allocation per
     /// id. A missing property reads as `Value::Null`; a nonexistent node is
     /// [`Error::NodeNotFound`].
@@ -777,6 +794,32 @@ impl Graph {
         })
     }
 
+    /// Evaluate `prop <op> rhs` for each of `ids` directly against the typed
+    /// in-memory property column, one keep flag per id in input order, without
+    /// materializing a `Value` per row. The semantics are exactly the outcome a
+    /// Cypher comparison filter keeps a row on; see
+    /// [`crate::columns::PropColumns::cmp_mask`] for the three rules. A
+    /// nonexistent node is [`Error::NodeNotFound`].
+    ///
+    /// `Ok(None)` declines, and the caller falls back to gathering and
+    /// comparing boxed values: a small request on a cold graph must not build
+    /// every column (the same size test the property gathers apply), and a
+    /// mixed-kind `Json` fallback column has no typed storage to compare
+    /// against.
+    pub fn nodes_prop_cmp_mask(
+        &self,
+        ids: &[NodeId],
+        prop: &str,
+        op: crate::columns::PropCmp,
+        rhs: &serde_json::Value,
+    ) -> Result<Option<Vec<bool>>, Error> {
+        if self.prop_columns.should_serve_directly(ids.len()) {
+            return Ok(None);
+        }
+        self.prop_columns
+            .with_fresh(&self.storage, |cols| cols.cmp_mask(ids, prop, op, rhs))?
+    }
+
     /// Build the in-memory property columns now, if they are not built already.
     ///
     /// Every reader either serves a small request without them or, for the advisory
@@ -791,7 +834,26 @@ impl Graph {
     /// unconditionally, so "call it and discard the result" was the idiom for
     /// warming the columns. Grouping now follows the same size test as the other
     /// readers, and warming them is this call.
+    /// It is also the columns cache file's save site (the counterpart of
+    /// `rebuild_csr` for the CSR cache file): materializing persists the built
+    /// set next to the LMDB files, so a later process loads it instead of
+    /// scanning, and a repeat at an unchanged generation rewrites nothing. No
+    /// lazy build saves, so a read-only workload never writes a file as a side
+    /// effect of a query.
     pub fn materialize_property_columns(&self) -> Result<(), Error> {
+        #[cfg(feature = "lmdb")]
+        {
+            // Captured before the build, so a write landing during it leaves
+            // the saved file conservatively stale rather than falsely fresh.
+            let persisted_gen = {
+                let rtxn = self.storage.env.read_txn()?;
+                crate::storage::ids::commit_gen(&self.storage, &rtxn)?
+            };
+            self.prop_columns.with_fresh(&self.storage, |cols| {
+                let _ = crate::cache_file::save_columns(&self.storage, cols, persisted_gen);
+            })
+        }
+        #[cfg(not(feature = "lmdb"))]
         self.prop_columns.with_fresh(&self.storage, |_| ())
     }
 
@@ -835,6 +897,73 @@ impl Graph {
         }
         self.prop_columns
             .with_fresh(&self.storage, |cols| cols.group_codes(ids, prop))?
+    }
+
+    /// The id-indexed form of [`Graph::node_prop_group_codes`], one shared
+    /// array over every node, `codes[node_id]` the node's group code under
+    /// exact value identity and [`crate::columns::ID_GROUP_ABSENT`] where no
+    /// such node exists, plus one representative value per code. Cached per
+    /// write generation and shared, so a grouped bulk aggregation pays the
+    /// value interning once per generation and one array read per row per
+    /// query afterward. Building it costs one pass over every node (and the
+    /// full column build when the columns are absent), so a caller with a
+    /// small row set wants [`Graph::node_prop_group_codes`] instead.
+    pub fn node_prop_group_codes_by_id(
+        &self,
+        prop: &str,
+    ) -> Result<std::sync::Arc<crate::columns::IdGroupCodes>, Error> {
+        let mut cache = self.group_codes_by_id.lock();
+        let generation = self.csr_cache.current_gen();
+        if cache.generation != generation {
+            cache.by_prop.clear();
+            cache.generation = generation;
+        }
+        if let Some(hit) = cache.by_prop.get(prop) {
+            return Ok(hit.clone());
+        }
+        let built = self.prop_columns.with_fresh(&self.storage, |cols| {
+            let (dense_codes, reps) = cols.group_codes(&cols.dense_to_id, prop)?;
+            let span = cols
+                .dense_to_id
+                .iter()
+                .copied()
+                .max()
+                .map_or(0, |m| m as usize + 1);
+            let mut codes = vec![crate::columns::ID_GROUP_ABSENT; span];
+            for (dense, &id) in cols.dense_to_id.iter().enumerate() {
+                codes[id as usize] = dense_codes[dense];
+            }
+            Ok::<_, Error>(crate::columns::IdGroupCodes {
+                codes,
+                reps: std::sync::Arc::new(reps),
+            })
+        })??;
+        let arc = std::sync::Arc::new(built);
+        cache.by_prop.insert(prop.to_string(), arc.clone());
+        Ok(arc)
+    }
+
+    /// Build the in-memory edge property columns now, if they are not built
+    /// already: the edge counterpart of [`Graph::materialize_property_columns`],
+    /// with the same contract. Nothing builds the edge columns as a side effect
+    /// of a small workload, so this is the deliberate warm-up, and it is the
+    /// edge columns cache file's save site; a repeat at an unchanged generation
+    /// rewrites nothing.
+    pub fn materialize_edge_property_columns(&self) -> Result<(), Error> {
+        #[cfg(feature = "lmdb")]
+        {
+            // Captured before the build, so a write landing during it leaves
+            // the saved file conservatively stale rather than falsely fresh.
+            let persisted_gen = {
+                let rtxn = self.storage.env.read_txn()?;
+                crate::storage::ids::commit_gen(&self.storage, &rtxn)?
+            };
+            self.edge_columns.with_fresh(&self.storage, |cols| {
+                let _ = crate::cache_file::save_columns(&self.storage, cols, persisted_gen);
+            })
+        }
+        #[cfg(not(feature = "lmdb"))]
+        self.edge_columns.with_fresh(&self.storage, |_| ())
     }
 
     // ------------------------------------------------------------------
@@ -1096,9 +1225,17 @@ impl Graph {
     /// deliberate: see [`crate::csr::CsrCache::advance_write_gen`].
     pub(super) fn commit_and_publish(
         &self,
-        wtxn: crate::storage::RwTxn<'_>,
+        mut wtxn: crate::storage::RwTxn<'_>,
         count: usize,
     ) -> Result<(), Error> {
+        // The persisted generation advances inside the transaction, so it is
+        // atomic with the mutations it describes; it is what lets a later
+        // process decide whether an on-disk derived structure (the CSR
+        // cache file) still reflects storage, which the in-memory counter below
+        // cannot, since that one restarts with the process.
+        if count > 0 {
+            crate::storage::ids::bump_commit_gen(&self.storage, &mut wtxn)?;
+        }
         wtxn.commit()?;
         self.csr_cache.advance_write_gen(count as u64);
         Ok(())
@@ -1134,7 +1271,22 @@ impl Graph {
         // Capture the generation before reading LMDB so writes that land during the
         // build leave the snapshot conservatively stale.
         let built_gen = self.csr_cache.current_gen();
+        // The persisted generation, captured before the build for the same
+        // conservative reason: a write landing mid-build moves the persisted
+        // counter past the value stamped into the cache file, so the file reads as
+        // stale rather than claiming a freshness it does not have.
+        #[cfg(feature = "lmdb")]
+        let persisted_gen = {
+            let rtxn = self.storage.env.read_txn()?;
+            crate::storage::ids::commit_gen(&self.storage, &rtxn)?
+        };
         let snap = self.build_snapshot()?;
+        // This is the one save site, chosen because every bulk load ends here:
+        // the freshness gate's per-write refreshes must not pay a file write per
+        // rebuild. A failed save is ignored; the cache file is a cache, and the
+        // stale or absent file it leaves behind is refused on load.
+        #[cfg(feature = "lmdb")]
+        let _ = crate::cache_file::save_csr(self.storage.env.path(), &snap, persisted_gen);
         self.csr_cache.install_full(snap, built_gen);
         Ok(())
     }

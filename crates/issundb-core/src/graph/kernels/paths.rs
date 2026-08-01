@@ -404,7 +404,7 @@ impl Graph {
 
     /// All simple paths between `src` and `dst` over the CSR snapshot arrays.
     ///
-    /// Iterative for the reason on [`Graph::detect_cycle_kernel`]: the search depth is
+    /// Iterative for the reason on [`Graph::detect_cycle_kernel`], since the search depth is
     /// the path length, so recursion put one frame per node on the stack. The number
     /// of paths can still be exponential in the graph, which is the question's shape
     /// rather than this implementation's, but the *stack* is now bounded by the longest path

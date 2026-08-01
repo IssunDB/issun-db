@@ -244,7 +244,7 @@ fn execute_union(
 
     if left_result.columns != right_result.columns {
         return Err(format!(
-            "SyntaxError: UNION column mismatch — left {:?}, right {:?}",
+            "SyntaxError: UNION column mismatch; left {:?}, right {:?}",
             left_result.columns, right_result.columns
         ));
     }
@@ -1158,8 +1158,8 @@ mod tests {
         );
     }
 
-    /// The point of a function over a procedure: it runs once per row, so a single
-    /// query can rank many candidate pairs against one anchor.
+    /// This is the point of a function over a procedure. It runs once per row, so a
+    /// single query can rank many candidate pairs against one anchor.
     #[test]
     fn link_prediction_scores_every_row() {
         let params = HashMap::new();
@@ -1911,8 +1911,8 @@ mod tests {
     // `parse_multi_clause_chaining` in parser.rs), routed through
     // `execute_read_query`'s write-parts path, not `execute_pipeline`.
 
-    /// Repro 1: a unique-constraint failure on the second CREATE in one
-    /// statement must roll back the first CREATE's node too.
+    /// A unique-constraint failure on the second CREATE in one statement must roll
+    /// back the first CREATE's node too.
     #[test]
     fn create_create_rolls_back_first_node_when_second_violates_constraint() {
         let params = HashMap::new();
@@ -1942,8 +1942,8 @@ mod tests {
         );
     }
 
-    /// Repro 2: an error in the RETURN expression (division by zero) after a
-    /// same-statement `CREATE ... WITH ...` must roll back the CREATE.
+    /// An error in the RETURN expression (division by zero) after a same-statement
+    /// `CREATE ... WITH ...` must roll back the CREATE.
     #[test]
     fn create_with_return_error_rolls_back_the_create() {
         let params = HashMap::new();
@@ -1964,7 +1964,7 @@ mod tests {
         );
     }
 
-    /// Regression: the ordinary, non-failing `CREATE ... RETURN` path (with
+    /// The ordinary, non-failing `CREATE ... RETURN` path (with
     /// and without an intervening `WITH`, and a sibling pattern referencing
     /// another pattern's just-created property) must keep working; this is
     /// the shape most at risk from deferring commit to make the above atomic.
@@ -5233,8 +5233,8 @@ mod tests {
         assert!(rows.is_empty(), "expected no rows, got {}", rows.len());
     }
 
-    /// Multi-MATCH with an Expand on the probe side: SIP must thread through
-    /// the Expand and restrict its inner LabelScan, then the expansion must
+    /// On a multi-MATCH with an Expand on the probe side, SIP must thread through
+    /// the Expand and restrict its inner LabelScan, and the expansion must then
     /// produce only edges reachable from the SIP-filtered nodes.
     #[test]
     fn sip_probe_side_expand_correctness() {
@@ -5397,6 +5397,71 @@ mod tests {
         );
     }
 
+    /// A bulk load persists both cache files: the CSR one through its
+    /// `rebuild_csr` and the node columns one through the materialize the
+    /// import pays deliberately, so the imported database reopens without
+    /// either scan. The file names are the storage layer's contract
+    /// (`crates/issundb-core/src/cache_file.rs`).
+    #[cfg(feature = "lmdb")]
+    #[test]
+    fn a_copy_import_persists_the_cache_files() {
+        use std::io::Write;
+        let (tempdir, graph) = setup_graph();
+        let params = HashMap::new();
+
+        let jsonl_path = tempdir.path().join("people.jsonl");
+        {
+            let mut file = std::fs::File::create(&jsonl_path).unwrap();
+            writeln!(file, "{{\"name\": \"Ada\", \"age\": 36}}").unwrap();
+        }
+        let query = format!("COPY Person FROM '{}'", jsonl_path.display());
+        execute(&graph, &query, &params).unwrap();
+
+        assert!(
+            tempdir.path().join("csr.cache").exists(),
+            "the import must persist the CSR cache file"
+        );
+        assert!(
+            tempdir.path().join("node_columns.cache").exists(),
+            "the import must persist the node columns cache file"
+        );
+    }
+
+    /// A parse error midway through a file must import nothing and surface the
+    /// parse error itself. Rows now stream into the one transaction as they
+    /// decode, so this is the rollback contract the materialize-first reader
+    /// provided by never opening a transaction: a bad line rolls back the rows
+    /// before it, and the caller sees the line-numbered message rather than a
+    /// wrapped storage error.
+    #[test]
+    fn a_bad_row_mid_file_imports_nothing_and_names_the_line() {
+        use std::io::Write;
+        let (tempdir, graph) = setup_graph();
+        let params = HashMap::new();
+
+        let jsonl_path = tempdir.path().join("broken.jsonl");
+        {
+            let mut file = std::fs::File::create(&jsonl_path).unwrap();
+            writeln!(file, "{{\"name\": \"Ada\"}}").unwrap();
+            writeln!(file, "{{\"name\": \"Bob\"}}").unwrap();
+            writeln!(file, "not json at all").unwrap();
+        }
+
+        let query = format!("COPY Person FROM '{}'", jsonl_path.display());
+        let err = execute(&graph, &query, &params).unwrap_err().to_string();
+        assert!(
+            err.contains("JSON parse error on line 3"),
+            "the parse error must name the line, got: {err}"
+        );
+
+        let count = execute(&graph, "MATCH (p:Person) RETURN count(p)", &params).unwrap();
+        assert_eq!(
+            count.records[0].values[0],
+            serde_json::json!(0),
+            "the rows before the bad line must roll back"
+        );
+    }
+
     #[test]
     fn test_copy_retains_user_id_property() {
         use std::io::Write;
@@ -5506,6 +5571,45 @@ mod tests {
                 serde_json::json!("relationships"),
                 serde_json::json!(1)
             ]
+        );
+    }
+
+    /// A malformed statement in copy.cypher is reported against that file's line
+    /// number, and the parse diagnostic below it speaks for itself. The statement
+    /// is quoted once, under the caret, rather than a second time in the wrapper,
+    /// and "parse error" appears once rather than twice.
+    #[test]
+    fn test_import_database_reports_the_copy_cypher_line() {
+        let (tempdir, graph) = setup_graph();
+        let params = HashMap::new();
+
+        let import_dir = tempdir.path().join("import_bad_copy");
+        std::fs::create_dir(&import_dir).unwrap();
+        // A comment and a blank line precede the fault, and both are skipped by
+        // the reader. The count must still name line 3, or the number would be an
+        // index into the statements rather than into the file.
+        std::fs::write(
+            import_dir.join("copy.cypher"),
+            "// a comment\n\nCOPY FOLLOWS FROM 'x.jsonl' 4;\n",
+        )
+        .unwrap();
+
+        let err = execute(
+            &graph,
+            &format!("IMPORT DATABASE '{}'", import_dir.display()),
+            &params,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("copy.cypher line 3"), "{err}");
+        assert!(err.contains("unexpected number `4`"), "{err}");
+        assert!(err.contains('^'), "the caret marks the statement: {err}");
+        assert_eq!(err.matches("parse error").count(), 1, "{err}");
+        assert_eq!(
+            err.matches("COPY FOLLOWS").count(),
+            1,
+            "the statement is quoted once, under the caret: {err}"
         );
     }
 

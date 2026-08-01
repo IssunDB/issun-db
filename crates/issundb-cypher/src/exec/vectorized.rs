@@ -124,8 +124,8 @@ struct VecSortKey<'a> {
 enum VecLeaf<'a> {
     /// Ids come from `nodes_by_label` (or `all_nodes`), ascending.
     LabelScan { label: Option<&'a str> },
-    /// `NodeByIdSeek`, `NodeIndexScan`, or `NodeRangeScan`: ids come from the
-    /// row pipeline's own leaf evaluator, preserving its order and checks.
+    /// Covers `NodeByIdSeek`, `NodeIndexScan`, and `NodeRangeScan`, whose ids come
+    /// from the row pipeline's own leaf evaluator, preserving its order and checks.
     Seek(&'a PhysicalOperator),
 }
 
@@ -894,8 +894,8 @@ fn props_table(graph: &Graph, ids: &[NodeId], props: &[&str]) -> Result<Vec<Vec<
         })
 }
 
-/// Edge counterpart of [`props_table`]: bulk row-major gather of edge `props`
-/// for each edge id in `ids`, through the in-memory edge property columns.
+/// Gathers edge `props` for each edge id in `ids` row-major through the in-memory
+/// edge property columns, the edge counterpart of [`props_table`].
 fn edge_props_table(
     graph: &Graph,
     ids: &[EdgeId],
@@ -1044,32 +1044,30 @@ fn cmp_keeps(structured: bool, op: CmpOp, lv: &Value, rv: &Value) -> bool {
     }
 }
 
-/// Bulk label-membership set for `ids`: a label smaller than the column comes
-/// from one `label_idx` prefix scan, a larger one from point lookups on the
+/// Builds the per-row label-membership mask for `ids` in bulk. A label smaller
+/// than the column is tested by binary search against the cached sorted label
+/// scan (no per-query set build), a larger one by point lookups on the
 /// distinct ids.
-fn label_pass_set(
-    graph: &Graph,
-    ids: &[NodeId],
-    label: &str,
-) -> Result<ahash::AHashSet<NodeId>, String> {
+fn label_keep_mask(graph: &Graph, ids: &[NodeId], label: &str) -> Result<Vec<bool>, String> {
     let label_count = graph
         .node_count_by_label(label)
         .map_err(|e| e.to_string())? as usize;
     if label_count <= ids.len() {
-        Ok(graph
-            .nodes_by_label(label)
-            .map_err(|e| e.to_string())?
-            .into_iter()
+        let members = graph.nodes_by_label_arc(label).map_err(|e| e.to_string())?;
+        Ok(ids
+            .iter()
+            .map(|id| members.binary_search(id).is_ok())
             .collect())
     } else {
         let mut distinct = ids.to_vec();
         distinct.sort_unstable();
         distinct.dedup();
-        Ok(graph
+        let pass: ahash::AHashSet<NodeId> = graph
             .label_filter(&distinct, label)
             .map_err(|e| e.to_string())?
             .into_iter()
-            .collect())
+            .collect();
+        Ok(ids.iter().map(|id| pass.contains(id)).collect())
     }
 }
 
@@ -1092,9 +1090,7 @@ fn apply_stage(
     let mask: Vec<bool> = match stage {
         VecStage::HasLabel { var, label } => {
             let col = col_of(chain_vars, var).ok_or("vectorized: unbound stage variable")?;
-            let ids = cols.ids_of(col);
-            let pass = label_pass_set(graph, ids, label)?;
-            ids.iter().map(|id| pass.contains(id)).collect()
+            label_keep_mask(graph, cols.ids_of(col), label)?
         }
         VecStage::Cmp {
             structured,
@@ -1106,6 +1102,10 @@ fn apply_stage(
                 try_prune_comparison(graph, lhs, rhs, *op, params, schema, chain_vars, cols)
             {
                 pruned_mask
+            } else if let Some(typed_mask) =
+                try_typed_cmp_mask(graph, lhs, rhs, *op, params, schema, chain_vars, cols)?
+            {
+                typed_mask
             } else {
                 let lv = resolve_operand(graph, lhs, params, schema, chain_vars, cols)?;
                 let rv = resolve_operand(graph, rhs, params, schema, chain_vars, cols)?;
@@ -1117,6 +1117,55 @@ fn apply_stage(
     };
     cols.compact(&mask);
     Ok(())
+}
+
+/// Evaluate a property-versus-constant comparison directly against the typed
+/// in-memory property column, one keep flag per row, skipping the boxed
+/// per-row gather entirely. `Ok(None)` declines and the boxed path runs:
+/// the stage compares two property reads, the graph declines (a small request
+/// on a cold graph, or a mixed-kind `Json` column), or the operand shape is
+/// anything else.
+///
+/// The `structured` flag plays no part here because the two comparison forms
+/// agree on everything a typed column can hold: scalar against scalar
+/// constant, where null fails every operator and a kind mismatch passes only
+/// `Ne`. The forms differ only on values a typed column excludes (the NaN
+/// sentinel and other non-scalar shapes fall to the `Json` column, which
+/// declines).
+#[allow(clippy::too_many_arguments)]
+fn try_typed_cmp_mask(
+    graph: &Graph,
+    lhs: &VecOperand<'_>,
+    rhs: &VecOperand<'_>,
+    op: CmpOp,
+    params: &HashMap<String, Value>,
+    schema: &std::sync::Arc<SlotSchema>,
+    chain_vars: &[&str],
+    cols: &IdCols,
+) -> Result<Option<Vec<bool>>, String> {
+    let (var, prop, const_expr, flipped) = match (lhs, rhs) {
+        (VecOperand::Col { var, prop }, VecOperand::Const(expr)) => (var, prop, expr, false),
+        (VecOperand::Const(expr), VecOperand::Col { var, prop }) => (var, prop, expr, true),
+        _ => return Ok(None),
+    };
+    let col = col_of(chain_vars, var).ok_or("vectorized: unbound stage variable")?;
+    use issundb_core::PropCmp;
+    // A constant on the left mirrors the operator: `c < n.prop` is `n.prop > c`.
+    let core_op = match (op, flipped) {
+        (CmpOp::Eq, _) => PropCmp::Eq,
+        (CmpOp::Ne, _) => PropCmp::Ne,
+        (CmpOp::Lt, false) | (CmpOp::Gt, true) => PropCmp::Lt,
+        (CmpOp::Gt, false) | (CmpOp::Lt, true) => PropCmp::Gt,
+        (CmpOp::Le, false) | (CmpOp::Ge, true) => PropCmp::Le,
+        (CmpOp::Ge, false) | (CmpOp::Le, true) => PropCmp::Ge,
+    };
+    let const_val = evaluate_expr(graph, &SlotRow::empty(schema.clone()), const_expr, params)?;
+    graph
+        .nodes_prop_cmp_mask(cols.ids_of(col), prop, core_op, &const_val)
+        .map_err(|e| match e {
+            issundb_core::Error::NodeNotFound(id) => format!("node not found: {}", id),
+            other => other.to_string(),
+        })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1536,14 +1585,16 @@ pub(super) fn try_execute_vectorized(
                 let Some((col, prop)) = prop_read(expr, &p.chain_vars) else {
                     return Ok(None);
                 };
-                group_codes.push(graph.node_prop_group_codes(&id_cols[col], prop).map_err(
-                    |e| match e {
-                        issundb_core::Error::NodeNotFound(id) => {
-                            format!("node not found: {}", id)
-                        }
-                        other => other.to_string(),
-                    },
-                )?);
+                let (codes, reps) =
+                    graph
+                        .node_prop_group_codes(&id_cols[col], prop)
+                        .map_err(|e| match e {
+                            issundb_core::Error::NodeNotFound(id) => {
+                                format!("node not found: {}", id)
+                            }
+                            other => other.to_string(),
+                        })?;
+                group_codes.push((codes, std::sync::Arc::new(reps)));
             }
             // Merge codes whose representatives are canonically equal so grouping
             // matches the row pipeline's numeric equivalence.
@@ -1978,6 +2029,39 @@ fn expanded_neighbor_tallies(
     Ok(out)
 }
 
+/// Row count from which the collapsed count's grouping and tallies switch to
+/// the id-indexed forms. Below it the per-request forms win: the id-indexed
+/// group codes cost one interning pass over every node on first use per write
+/// generation, and the scattered tally array costs memory proportional to the
+/// highest source id, both of which a small row set should not pay.
+const DENSE_GROUP_MIN_ROWS: usize = 65_536;
+
+/// One group-key column, the per-row codes plus the shared representative
+/// values.
+type GroupKeyCol = (Vec<u32>, std::sync::Arc<Vec<Value>>);
+
+/// The per-row group codes of `ids` read out of the shared id-indexed array
+/// for `prop`, or `None` when any id has no slot there (the array lags a
+/// concurrent write; the caller falls back to the per-request form, which
+/// reports such an id exactly as the boxed path would).
+fn id_indexed_codes(
+    graph: &Graph,
+    ids: &[NodeId],
+    prop: &str,
+) -> Result<Option<GroupKeyCol>, String> {
+    let by_id = graph
+        .node_prop_group_codes_by_id(prop)
+        .map_err(|e| e.to_string())?;
+    let mut codes = Vec::with_capacity(ids.len());
+    for &id in ids {
+        match by_id.codes.get(id as usize) {
+            Some(&c) if c != issundb_core::ID_GROUP_ABSENT => codes.push(c),
+            _ => return Ok(None),
+        }
+    }
+    Ok(Some((codes, by_id.reps.clone())))
+}
+
 /// Execute a recognized aggregate pipeline whose single `count` is over the
 /// chain's terminal variable, collapsing the final hop.
 ///
@@ -2107,17 +2191,37 @@ fn execute_collapsed_count(
         Some(t) => t,
         None => expanded_neighbor_tallies(graph, p, tc, last, &distinct, terminal, params, schema)?,
     };
-    // Per-source tallies are positional over `distinct`, which is sorted, so a
-    // pre-row resolves its source by binary search.
+    // Per-source tallies are positional over `distinct`, which is sorted. A
+    // bulk source set scatters them into an id-indexed array first, so the
+    // per-row resolution is one array read; a small one keeps the binary
+    // search, whose cost a few rows never notice and whose memory is nothing.
+    let tally_by_id: Option<Vec<(u64, u64)>> = if distinct.len() >= DENSE_GROUP_MIN_ROWS {
+        let span = distinct.last().map_or(0, |&m| m as usize + 1);
+        let mut arr = vec![(0u64, 0u64); span];
+        for (i, &s) in distinct.iter().enumerate() {
+            arr[s as usize] = tallies[i];
+        }
+        Some(arr)
+    } else {
+        None
+    };
     let tally_of = |src: NodeId| -> (u64, u64) {
-        match distinct.binary_search(&src) {
-            Ok(i) => tallies[i],
-            Err(_) => (0, 0),
+        match &tally_by_id {
+            Some(arr) => arr.get(src as usize).copied().unwrap_or((0, 0)),
+            None => match distinct.binary_search(&src) {
+                Ok(i) => tallies[i],
+                Err(_) => (0, 0),
+            },
         }
     };
 
     // Group the pre-rows by the group-by value codes (all group keys read
     // pre-row columns; the terminal is excluded by the collapse eligibility).
+    // A bulk row set reads each row's code out of the shared id-indexed array
+    // (one value-interning pass per property per write generation, see
+    // `Graph::node_prop_group_codes_by_id`) instead of interning one value per
+    // row per query; a small one takes the per-request form, which never
+    // builds whole-graph state.
     let mut group_codes = Vec::with_capacity(group_by.len());
     for (expr, _) in group_by.iter() {
         let (col, prop) =
@@ -2125,11 +2229,22 @@ fn execute_collapsed_count(
         if col >= cols.cols.len() {
             return Err("vectorized: collapse group key over the terminal".into());
         }
-        group_codes.push(
-            graph
-                .node_prop_group_codes(&cols.cols[col], prop)
-                .map_err(|e| e.to_string())?,
-        );
+        let ids = &cols.cols[col];
+        let dense = if n >= DENSE_GROUP_MIN_ROWS {
+            id_indexed_codes(graph, ids, prop)?
+        } else {
+            None
+        };
+        let entry = match dense {
+            Some(entry) => entry,
+            None => {
+                let (codes, reps) = graph
+                    .node_prop_group_codes(ids, prop)
+                    .map_err(|e| e.to_string())?;
+                (codes, std::sync::Arc::new(reps))
+            }
+        };
+        group_codes.push(entry);
     }
     // Merge codes whose representatives are canonically equal so grouping matches
     // the row pipeline's numeric equivalence (`1` == `1.0`).
@@ -2147,11 +2262,14 @@ fn execute_collapsed_count(
     }
 
     // Fold each pre-row's weight into its group; a source with no qualifying
-    // neighbor contributes no row, hence no group.
-    let mut slot_by_key: ahash::AHashMap<u64, usize> = ahash::AHashMap::new();
-    let mut groups: Vec<(Vec<u32>, u64)> = Vec::new();
+    // neighbor contributes no row, hence no group. A group is its composite
+    // strided key plus a count, nothing per-group is allocated in the fold; the
+    // per-key codes are recovered from the key on emission, which touches only
+    // the groups that survive the count window.
+    let mut slot_by_key: ahash::AHashMap<u64, u32> = ahash::AHashMap::new();
+    let mut groups: Vec<(u64, u64)> = Vec::new();
     if group_by.is_empty() {
-        groups.push((Vec::new(), 0));
+        groups.push((0, 0));
     }
     for i in 0..n {
         let (qualifying, counted) = tally_of(src_col[i]);
@@ -2173,13 +2291,13 @@ fn execute_collapsed_count(
                 key += codes[i] as u64 * strides[k];
             }
             *slot_by_key.entry(key).or_insert_with(|| {
-                let codes = group_codes.iter().map(|(codes, _)| codes[i]).collect();
-                groups.push((codes, 0));
-                groups.len() - 1
-            })
+                groups.push((key, 0));
+                (groups.len() - 1) as u32
+            }) as usize
         };
         groups[slot].1 += add;
     }
+    drop(slot_by_key);
 
     // Finalize each group, ordered by the same serialized key the row
     // pipeline's BTreeMap fold orders by.
@@ -2216,11 +2334,12 @@ fn execute_collapsed_count(
 
     let mut keyed_rows = Vec::with_capacity(emitted.len());
     for g in emitted {
-        let (codes, cnt) = &groups[g];
+        let (key, cnt) = &groups[g];
         let mut gb = SlotRow::empty(schema.clone());
         let mut key_parts = Vec::with_capacity(group_cols.len());
         for (k, col) in group_cols.iter().enumerate() {
-            let rep = &group_codes[k].1[codes[k] as usize];
+            let code = (key / strides[k]) % group_codes[k].1.len().max(1) as u64;
+            let rep = &group_codes[k].1[code as usize];
             key_parts.push(canonical_cell_key(rep));
             gb.bind_local(col, GraphBinding::Scalar(rep.clone()));
         }
@@ -2365,6 +2484,49 @@ mod tests {
                 panic!("one path errored for: {cypher}\nfast: {fast:?}\nslow: {slow:?}")
             }
         }
+    }
+
+    /// Above `DENSE_GROUP_MIN_ROWS` pre-rows the collapsed count reads its
+    /// group codes out of the shared id-indexed array and its tallies out of a
+    /// scattered array; below it the per-request forms serve. The row pipeline
+    /// is the oracle for the dense forms, which no small fixture reaches, so
+    /// this fixture is deliberately sized past the threshold.
+    #[test]
+    fn collapsed_count_dense_grouping_matches_row_path() {
+        let dir = TempDir::new().unwrap();
+        let g = Graph::open(dir.path(), 1).unwrap();
+        let persons = DENSE_GROUP_MIN_ROWS + 500;
+        g.update(|txn| {
+            let cities: Vec<_> = (0..3)
+                .map(|i| txn.add_node("City", &json!({ "name": format!("c{i}") })))
+                .collect::<Result<_, _>>()?;
+            let mut ids = Vec::with_capacity(persons);
+            for i in 0..persons {
+                // A duplicated id value every 1000 persons, so grouping by
+                // value genuinely merges nodes rather than being one group per
+                // node; a person with no id at all exercises the null group.
+                let p = if i % 5000 == 4999 {
+                    txn.add_node("Person", &json!({}))?
+                } else {
+                    txn.add_node("Person", &json!({ "id": i % 65_000 }))?
+                };
+                txn.add_edge(p, cities[i % 3], "LIVES_IN", &json!({}))?;
+                ids.push(p);
+            }
+            for i in 1..persons {
+                // Skewed follower counts, so the count window has real work.
+                txn.add_edge(ids[i], ids[i % 100], "FOLLOWS", &json!({}))?;
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        assert_matches_row_path(
+            &g,
+            "MATCH (f:Person)-[:FOLLOWS]->(p:Person)-[:LIVES_IN]->(c:City) \
+             RETURN p.id AS id, count(f.id) AS num, c.name AS city \
+             ORDER BY num DESC, id LIMIT 5",
+        );
     }
 
     /// A group-by over a property that mixes integer and float representations of
@@ -3577,8 +3739,8 @@ mod tests {
         }
     }
 
-    /// The benchmark's `interest_gender_by_city` shape: two `MATCH` clauses that
-    /// share the pivot `p`. After the join-to-expand rewrite it plans as a
+    /// Exercises the benchmark's `interest_gender_by_city` shape, two `MATCH` clauses
+    /// that share the pivot `p`. After the join-to-expand rewrite it plans as a
     /// linear two-hop chain anchored at the selective interest index scan, so it
     /// takes the columnar path and matches the row pipeline exactly.
     #[test]

@@ -13,7 +13,7 @@ const EIGENVECTOR_MIN_NORM: f64 = 1e-10;
 /// that a defect in the merge condition cannot turn into a non-terminating query.
 const LOUVAIN_MAX_LEVELS: usize = 32;
 
-/// One level of the Louvain hierarchy: an undirected weighted graph in CSR form.
+/// Holds one level of the Louvain hierarchy as an undirected weighted graph in CSR form.
 ///
 /// Every edge appears in both endpoints' rows, so a scan over all rows visits each
 /// edge twice. Self-loops are held apart from the rows so the neighbor scan never has
@@ -119,7 +119,7 @@ impl LouvainLevel {
         }
     }
 
-    /// Louvain's first phase: repeatedly move each node into the neighboring
+    /// Runs Louvain's first phase, repeatedly moving each node into the neighboring
     /// community that most increases modularity, until a full sweep moves nobody.
     ///
     /// Returns the community index of every node, not yet renumbered.
@@ -204,7 +204,7 @@ impl LouvainLevel {
         community
     }
 
-    /// Louvain's second phase: contract each community into a single node.
+    /// Runs Louvain's second phase, contracting each community into a single node.
     ///
     /// Communities are renumbered by the ascending dense index of their smallest
     /// member, so the coarse graph's node order is a deterministic function of the
@@ -498,7 +498,7 @@ impl Graph {
 
     /// Strongly connected components (Tarjan) over the contiguous CSR arrays.
     ///
-    /// Iterative, for the reason given on [`Graph::detect_cycle_kernel`]: Tarjan is a
+    /// Iterative, for the reason given on [`Graph::detect_cycle_kernel`]. Tarjan is a
     /// depth-first search, so recursion put one call frame per node on the current path
     /// and a long chain aborted the process instead of returning.
     ///
@@ -735,8 +735,8 @@ impl Graph {
             .collect())
     }
 
-    /// Harmonic centrality: for each node, the sum of the reciprocals of its
-    /// shortest-path distances to every node it can reach.
+    /// Sums, for each node, the reciprocals of its shortest-path distances to every
+    /// node it can reach.
     ///
     /// One breadth-first pass per source, each contributing `1 / hop` per node
     /// reached at that hop. Sources are independent and each writes only its own
@@ -781,8 +781,7 @@ impl Graph {
             .collect())
     }
 
-    /// Degree centrality: the number of *distinct* neighbors in the requested
-    /// direction.
+    /// Counts the *distinct* neighbors of each node in the requested direction.
     ///
     /// Parallel edges between the same pair count once, and `Both` is the distinct
     /// out-neighbors plus the distinct in-neighbors, so a node joined to one
@@ -906,7 +905,7 @@ impl Graph {
     /// Distance is hop count over outgoing edges rather than a weighted path length,
     /// the same convention [`Graph::harmonic_centrality_kernel`] uses, whose
     /// per-source breadth-first pass this shares. The two differ only in what they
-    /// accumulate: harmonic sums `1 / hop` and so needs no reachability correction,
+    /// accumulate, since harmonic sums `1 / hop` and so needs no reachability correction,
     /// while closeness sums the distances and does.
     ///
     /// The Wasserman-Faust factor is what makes the score usable on a disconnected

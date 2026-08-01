@@ -28,7 +28,7 @@ pub trait StatsProvider {
         None
     }
 
-    /// Destination-label-aware refinement of [`StatsProvider::expand_fanout`]:
+    /// Refines [`StatsProvider::expand_fanout`] by destination label, giving
     /// the average number of `dst_label` neighbors reached when expanding
     /// `rel_type` from a `src_label` node. `None` when no per-triple estimate is
     /// available.
