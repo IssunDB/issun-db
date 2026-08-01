@@ -74,7 +74,7 @@ position would be confidently wrong, which is worse than one that is honestly re
 - Positions count characters, not bytes, and `locate` walks back off a mid-character offset instead of panicking. Rendering runs on the error path, so
   a panic there turns a syntax error into a crash; `rendering_never_panics` covers that with a proptest.
 - The expected set chumsky reports is empty at most positions, because the grammar labels almost nothing. `expr_parser` is labelled, which is what
-  supplies "expected an expression" after a bare `WHERE`. Labelling more of the grammar is the way to improve these messages further, one construct at
+  supplies "expected an expression" after a bare `WHERE`. Labeling more of the grammar is the way to improve these messages further, one construct at
   a time, since a label replaces the expected set for every failure inside the parser it is attached to.
 
 ## AST Immutability Policy
@@ -205,8 +205,8 @@ the kernel resolves one registered type. And a stale snapshot with at most `STAL
 (`Graph::prefers_point_expansion`), because the kernel would rebuild the whole snapshot where the fallback serves those sources from per-source
 adjacency.
 
-**Group-key identity invariant** (binds both executors): grouping by a bare node or edge variable (`Expr::Prop(var, "")`) keys on the element id, not
-its materialized property bag, and the group row keeps the `Node` or `Edge` binding rather than a materialized `Scalar`. The row pipeline's
+Grouping by a bare node or edge variable (`Expr::Prop(var, "")`) keys on the element id, not its materialized property bag, and the group row keeps
+the `Node` or `Edge` binding rather than a materialized `Scalar`. This identity invariant binds both executors. The row pipeline's
 `aggregate_all` fold and the vectorized aggregate both depend on this. Serializing a whole node to a JSON object per input row to build the group key
 is an O(rows x properties) cliff (it regressed RE24 by roughly 5x), and re-materializing the entity as a `Scalar` forces downstream property reads off
 the columnar fast path. Do not reduce either fold back to `evaluate_expr(...).to_string()` for a node or edge group key.

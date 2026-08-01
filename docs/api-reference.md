@@ -111,6 +111,12 @@ Property values are represented by the `PropValue` enum with the variants `Bool`
   Returns the edges of the type whose property equals the value. Edge properties are indexed only while a relationship property index exists, so create one first.
 - `edges_by_property_range(etype: &str, property: &str, min_val: Option<PropValue>, max_val: Option<PropValue>) -> Result<Vec<EdgeId>, Error>`  
   Range form of the edge lookup; both bounds are inclusive.
+- `nodes_by_label_arc(label: &str) -> Result<Arc<Vec<NodeId>>, Error>`  
+  The label scan without the copy: a shared sorted id vector served from a per-write-generation cache, so repeated scans of one label between writes cost nothing. `nodes_by_label` delegates here.
+- `nodes_prop_cmp_mask(ids: &[NodeId], prop: &str, op: PropCmp, rhs: &Value) -> Result<Option<Vec<bool>>, Error>`  
+  Evaluates `prop <op> rhs` per id directly against the typed in-memory property column, one keep flag per id, with no boxed value per row. `Ok(None)` declines (a small request on a cold graph, or a mixed-kind column), and the caller falls back to comparing materialized values.
+- `node_prop_group_codes_by_id(prop: &str) -> Result<Arc<IdGroupCodes>, Error>`  
+  One shared array over every node, `codes[node_id]` the node's group code under exact value identity and `ID_GROUP_ABSENT` where no such node exists, cached per write generation; the bulk grouping path behind grouped aggregations.
 
 ### Index and Constraint Management
 
@@ -129,18 +135,22 @@ These methods are the Rust equivalents of the Cypher DDL statements in the [Cyph
 
 ### Optimizer Statistics
 
-The query optimizer's cardinality statistics are built only when asked for. Nothing builds them as a side effect of running a query, because each is a full
-scan and paying for it on the first query that mentions a property or a relationship pattern was the dominant cold-start cost. A process that never calls
-these plans every relationship pattern on the global average fan-out and gets no selectivity estimates; the answers are advisory, so plans are weighted
-differently but results never change.
+The query optimizer's cardinality statistics are built only when asked for. No ordinary query builds them as a side effect, because each is a full scan
+and paying for it on the first query that mentions a property or a relationship pattern was the dominant cold-start cost; the one exception is a bulk
+import (`COPY ... FROM` or `IMPORT DATABASE`), which ends by building and persisting the node property columns. A process that never calls these plans
+every relationship pattern on the global average fan-out and gets no selectivity estimates; the answers are advisory, so plans are weighted differently
+but results never change.
 
 - `materialize_edge_statistics() -> Result<(), Error>`  
   Builds the `(label, type)` and `(src_label, type, dst_label)` tables behind the expand-ratio estimates, and upgrades the type-inference pruning pass from a budgeted probe to an exact lookup. One pass over the label index and one over the adjacency, cached until the next committed write. Cheap enough to call freely in a long-lived process.
 - `materialize_property_columns() -> Result<(), Error>`  
-  Builds the in-memory property columns, which back the selectivity estimates and zone-map pruning. This is one full node scan whose result holds every scalar node property in memory for the life of the handle, so treat it as a memory commitment rather than a warm-up.
+  Builds the in-memory property columns, which back the selectivity estimates and zone-map pruning. This is one full node scan whose result holds every scalar node property in memory for the life of the handle, so treat it as a memory commitment rather than a warm-up. It also persists the built set as a cache file beside the LMDB files, so a later process's build loads it instead of scanning, and a repeat at an unchanged write generation rewrites nothing.
+- `materialize_edge_property_columns() -> Result<(), Error>`  
+  The edge counterpart, with the same contract and its own cache file: one full edge scan, and the columns hold every scalar edge property in memory for the life of the handle.
 
 The CLI performs the first of these on every open (pass `--no-warm-statistics` to skip it), and so do the REST and MCP servers, on a background thread. The
-Python and Rust surfaces leave both to the caller.
+Python and Rust surfaces leave the warm-ups to the caller, with one exception: a bulk import (`COPY ... FROM` or `IMPORT DATABASE`) ends by building and
+persisting the node property columns, so a process that just imported already has them.
 
 ---
 
@@ -229,8 +239,7 @@ The index is configured through `VectorIndexOptions`, which holds a `VectorMetri
 - `VectorGraphExt::upsert_vector(n: NodeId, v: &[f32]) -> Result<(), VectorError>`  
   Stores the embedding for an existing node. A node that does not exist is rejected with
   `VectorError::NodeNotFound`, because node ids are handed out monotonically and a vector written
-  ahead of its node would be inherited by whichever node is later allocated that id.  
-  Associates a float vector embedding with a node.
+  ahead of its node would be inherited by whichever node is later allocated that id.
 - `VectorGraphExt::remove_vector(n: NodeId) -> Result<(), VectorError>`  
   Removes the embedding for a node from both the index and storage.
 - `VectorGraphExt::vector_search(q: &[f32], k: usize) -> Result<Vec<Hit>, VectorError>`  

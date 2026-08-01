@@ -1,6 +1,6 @@
 use super::*;
 
-/// Cached committed-state label scans for one write generation: the shared
+/// Cached committed-state label scans for one write generation, the shared
 /// sorted id vector per label behind [`Graph::nodes_by_label_arc`]. `gen` is
 /// the [`crate::csr::CsrCache`] write generation the entries reflect; a
 /// mismatch discards them all, so an entry can never outlive the commit that
@@ -21,8 +21,8 @@ impl Graph {
         Ok(self.nodes_by_label_arc(label)?.as_ref().clone())
     }
 
-    /// [`Graph::nodes_by_label`] without the copy: the shared, cached scan
-    /// result, in ascending ID order. Repeated reads of one label within one
+    /// [`Graph::nodes_by_label`] without the copy, serving the shared, cached
+    /// scan result in ascending ID order. Repeated reads of one label within one
     /// write generation serve the same vector; any committed write invalidates
     /// the whole cache.
     ///

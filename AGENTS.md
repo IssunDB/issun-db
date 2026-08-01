@@ -105,8 +105,8 @@ second copy of both, so the same rule was stated in three places and the copies 
     - `src/cache_file.rs`: the on-disk cache files for the CSR snapshot and the property columns, compiled only under the `lmdb` feature. Each file records
       the persisted commit generation it was built at (`storage/ids.rs`, `commit_gen`, advanced inside every mutating transaction), and a load is
       refused on any mismatch, truncation, or checksum failure, so a bad file degrades to the ordinary rebuild. The save sites are deliberate and
-      narrow: `Graph::rebuild_csr` saves the CSR cache file (every bulk load ends there), and `Graph::materialize_property_columns` saves the node
-      columns cache file; no lazy build writes a file as a side effect of a query.
+      narrow: `Graph::rebuild_csr` saves the CSR cache file (every bulk load ends there), and `Graph::materialize_property_columns` and
+      `Graph::materialize_edge_property_columns` save the node and edge columns cache files; no lazy build writes a file as a side effect of a query.
     - `src/storage/memory.rs`: the in-memory storage backend, second implementor of the contract in `storage/mod.rs`. Byte-ordered `BTreeMap` tables with
       `BTreeSet` duplicate values, copy-on-write transactions over `ArcSwap`, and a single writer lock. It is what a target with no libc compiles, and it is
       what holds the storage seam to something: the whole suite runs against it, across core, vector, text, retrieval, and cypher.
@@ -699,9 +699,10 @@ optional `language`), `drop_text_index`, `list_text_indexes`, `has_text_index`, 
 whole batch under one `Graph::update` transaction. A single-record insert costs one durable LMDB commit, so a Python loop over `add_node` is bound by
 commit latency rather than by the work; the batch form is the ingestion path. Both are all-or-nothing: any failure rolls back the whole batch.
 
-`materialize_edge_statistics` and `materialize_property_columns` are the two deliberate warm-ups. Nothing builds either structure as a side effect of a
-query, so a Python process that never calls them plans every relationship pattern on the global average fan-out and gets no selectivity estimates; they are
-exposed because a Python caller otherwise has no way to ask. They are not equal in cost: the edge statistics are one pass over the label index and the
+`materialize_edge_statistics`, `materialize_property_columns`, and `materialize_edge_property_columns` are the deliberate warm-ups. No ordinary query
+builds these structures as a side effect, so a Python process that never calls them plans every relationship pattern on the global average fan-out and gets
+no selectivity estimates; they are exposed because a Python caller otherwise has no way to ask. The one exception is a bulk import run through `query`
+(`COPY ... FROM` or `IMPORT DATABASE`), which ends by building and persisting the node property columns. They are not equal in cost: the edge statistics are one pass over the label index and the
 adjacency (measured at 226 ms over 300 K nodes), while the property columns are a full node scan whose result holds every scalar node property in memory
 for the life of the object (1355 ms over the same graph). Call the first freely in a long-lived process; treat the second as a memory commitment.
 

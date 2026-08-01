@@ -504,9 +504,9 @@ pub struct Graph {
     /// until a write invalidates the generation. See [`crate::graph::stats`].
     pub(super) schema_probes: Arc<parking_lot::Mutex<SchemaProbeMemo>>,
     /// Cached id-indexed group codes, one shared array per grouped property,
-    /// valid for exactly one write generation: what lets a grouped bulk
-    /// aggregation read one array cell per row instead of interning one value
-    /// per row per query. See [`crate::columns::IdGroupCodes`].
+    /// valid for exactly one write generation, which is what lets a grouped
+    /// bulk aggregation read one array cell per row instead of interning one
+    /// value per row per query. See [`crate::columns::IdGroupCodes`].
     pub(super) group_codes_by_id: Arc<parking_lot::Mutex<crate::columns::IdGroupCodesCache>>,
     /// Cached full label scans for the committed-read path, one shared sorted id
     /// vector per label, valid for exactly one write generation. Filters, the
@@ -899,7 +899,7 @@ impl Graph {
             .with_fresh(&self.storage, |cols| cols.group_codes(ids, prop))?
     }
 
-    /// The id-indexed form of [`Graph::node_prop_group_codes`]: one shared
+    /// The id-indexed form of [`Graph::node_prop_group_codes`], one shared
     /// array over every node, `codes[node_id]` the node's group code under
     /// exact value identity and [`crate::columns::ID_GROUP_ABSENT`] where no
     /// such node exists, plus one representative value per code. Cached per

@@ -509,7 +509,7 @@ mod tests {
     fn graph_snapshot_keeps_the_highest_degree_nodes_over_the_cap() {
         let (_dir, p) = playground();
         // Enough isolated vertices to pass the cap, then one hub joined to the newest of them, so
-        // the hub and its neighbours are the highest ids as well as the highest degrees. Under the
+        // the hub and its neighbors are the highest ids as well as the highest degrees. Under the
         // old rule every one of them was cut.
         p.query_inner(&format!(
             "UNWIND range(1, {}) AS i CREATE (:Filler {{i: i}})",
@@ -538,7 +538,7 @@ mod tests {
             labels.contains(&"Hub"),
             "the most connected vertex must be drawn"
         );
-        // Its neighbours came with it, so the hub is not drawn as an isolated dot.
+        // Its neighbors came with it, so the hub is not drawn as an isolated dot.
         assert!(
             !snap["edges"].as_array().unwrap().is_empty(),
             "the hub's edges must survive with it"

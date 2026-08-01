@@ -40,7 +40,7 @@ WASM_ARTIFACT := target/wasm32-unknown-unknown/release/issundb_wasm.wasm
 WASM_BINDGEN_CRATE_VERSION = cargo metadata --format-version 1 | python3 -c "import sys,json; print(next(p['version'] for p in json.load(sys.stdin)['packages'] if p['name']=='wasm-bindgen'))"
 
 # The `branch@commit` the playground footer reports, compiled into the module rather than fetched
-# as a sidecar file, since the page makes no network call once loaded. Overridable so CI can stamp
+# as a separate file, since the page makes no network call once loaded. Overridable so CI can stamp
 # a build from the workflow's own refs, and empty outside a git checkout, where the footer then
 # reports the version alone.
 ISSUNDB_BUILD_REF ?= $(shell b=$$(git rev-parse --abbrev-ref HEAD 2>/dev/null); c=$$(git rev-parse --short=5 HEAD 2>/dev/null); if [ -n "$$b" ] && [ -n "$$c" ]; then echo "$$b@$$c"; fi)

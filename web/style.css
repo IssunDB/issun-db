@@ -1151,7 +1151,7 @@ svg.graph.hovering .node.near circle {
 /* The selected vertex is the one the inspector is showing, so it keeps its ring whether or not a
    hover is in progress, and stays visible when the hover fade dims everything around it. The
    hovering form is spelled out because the `.near` rule above it is one class more specific, and
-   without it a selected vertex wore the neighbour stroke instead of its own. */
+   without it a selected vertex wore the neighbor stroke instead of its own. */
 svg.graph .node.selected circle,
 svg.graph.hovering .node.selected circle {
     stroke: var(--md-primary-fg-color);

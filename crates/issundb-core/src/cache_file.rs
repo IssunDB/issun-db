@@ -1,22 +1,25 @@
-//! On-disk cache file for the CSR snapshot.
+//! On-disk cache files for the CSR snapshot and the property columns.
 //!
-//! A cold process pays a full adjacency scan to build the first CSR snapshot,
-//! which on a large graph dominates the first aggregation's latency. The
-//! cache file persists a built snapshot's flat arrays next to the LMDB files, so
-//! a later process loads them sequentially instead of rebuilding. LMDB stays
-//! the source of truth: the file records the persisted commit generation it
-//! was built at (see [`crate::storage::ids::commit_gen`]), and a load is
-//! refused on any mismatch, so a stale, truncated, corrupt, or foreign file
-//! degrades to the ordinary rebuild rather than a wrong answer.
+//! A cold process pays a full adjacency scan to build the first CSR snapshot
+//! and a full record scan to build a column set, which on a large graph
+//! dominate the first aggregation's latency. Each cache file persists the
+//! built structure next to the LMDB files, so a later process loads it
+//! sequentially instead of rebuilding. LMDB stays the source of truth: every
+//! file records the persisted commit generation it was built at (see
+//! [`crate::storage::ids::commit_gen`]), and a load is refused on any
+//! mismatch, so a stale, truncated, corrupt, or foreign file degrades to the
+//! ordinary rebuild rather than a wrong answer.
 //!
-//! Writing happens on [`crate::graph::Graph::rebuild_csr`] only, the call
-//! every bulk load ends with. The freshness gate's per-write refreshes do not
-//! save, so a write-heavy session never pays a cache file write per rebuild.
+//! The save sites are deliberate and narrow: [`crate::graph::Graph::rebuild_csr`]
+//! saves the CSR file, and the two column materialize methods save theirs. The
+//! freshness gate's per-write refreshes never save, so a write-heavy session
+//! never pays a file write per rebuild.
 //!
-//! The format is little-endian: a magic tag, the generation, flags, the two
-//! array lengths, the arrays themselves in a fixed order, and a 64-bit
+//! The CSR format is little-endian: a magic tag, the generation, flags, the
+//! two array lengths, the arrays themselves in a fixed order, and a 64-bit
 //! checksum folded over every preceding byte. The `id_to_dense` map is not
-//! stored; it is rebuilt from `dense_to_id` on load.
+//! stored; it is rebuilt from `dense_to_id` on load. The columns files carry
+//! a msgpack payload behind the same header and checksum discipline.
 
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
@@ -215,8 +218,8 @@ pub(crate) fn save_csr(dir: &Path, snap: &CsrSnapshot, commit_gen: u64) -> Resul
 /// Load the cache file if it exists and reflects `expected_gen`, carrying weights
 /// when `want_weights` asks for them. `None` on a missing, stale, truncated,
 /// corrupt, or version-mismatched file, and on an unweighted cache file when
-/// weights are wanted: every refusal means "build from storage instead", never
-/// an error, because the cache file is a cache and storage can always answer.
+/// weights are wanted. Every refusal means "build from storage instead", never
+/// an error, because the file is a cache and storage can always answer.
 pub(crate) fn load_csr(dir: &Path, expected_gen: u64, want_weights: bool) -> Option<CsrSnapshot> {
     let file = File::open(csr_path(dir)).ok()?;
     let mut r = SumReader {

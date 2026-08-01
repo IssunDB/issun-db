@@ -2036,7 +2036,8 @@ fn expanded_neighbor_tallies(
 /// highest source id, both of which a small row set should not pay.
 const DENSE_GROUP_MIN_ROWS: usize = 65_536;
 
-/// One group-key column: per-row codes plus the shared representative values.
+/// One group-key column, the per-row codes plus the shared representative
+/// values.
 type GroupKeyCol = (Vec<u32>, std::sync::Arc<Vec<Value>>);
 
 /// The per-row group codes of `ids` read out of the shared id-indexed array

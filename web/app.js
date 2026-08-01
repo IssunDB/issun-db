@@ -63,7 +63,7 @@ const CANCELLED = "The query was cancelled.";
 
 // Terminating the worker is the only way to stop a running query, because a wasm call has no
 // interruption point for a message to be handled at. The graph lives in the worker, so it dies with
-// it, and the replay below is what makes cancelling recoverable rather than destructive: the sample
+// it, and the replay below is what makes canceling recoverable rather than destructive: the sample
 // is re-seeded and every statement the page recorded as setup is applied again. A query that only
 // read loses nothing; one that had already written is reapplied from `setupLog`, which is the same
 // log a share link carries.
@@ -164,7 +164,7 @@ const ARROW_GAP = 4;
 const LOOP_SIZE = 18;
 
 // Every vertex is captioned below this many; above it only the best-connected are, and the rest
-// appear on hover. A hundred captions at one size is a wall of text rather than a labelling.
+// appear on hover. A hundred captions at one size is a wall of text rather than a labeling.
 const LABEL_ALL_MAX = 45;
 const LABEL_TOP = 18;
 
@@ -752,7 +752,7 @@ function setBusy(value) {
 $("cancel").addEventListener("click", async () => {
     if (!busy) return;
     $("cancel").disabled = true;
-    setStatus("busy", "Cancelling…");
+    setStatus("busy", "Canceling…");
     try {
         await cancelRunningQuery();
         await refreshSchema();
@@ -1152,7 +1152,7 @@ async function runVectorDemo(spec) {
         renderTable(lastResult);
         setStatus("ok", "Vector search finished.");
         setMeta(
-            `${plural(hits.length, "neighbour")}, 4 columns.` +
+            `${plural(hits.length, "neighbor")}, 4 columns.` +
             ` Exact search over ${plural(rows.length, `${label} embedding`)} for [1, 0, 0.25].`,
         );
         showPane("table");
@@ -1542,8 +1542,8 @@ let hoverTimer = null;
 // cannot be replaced by whatever is underneath it. Cleared on leaving, so hovering keeps working.
 let overPanel = false;
 
-// Focus narrows the view to one vertex's neighbourhood. The ball is taken over the drawn graph
-// rather than the database, so on a capped snapshot it is a neighbourhood within what was drawn;
+// Focus narrows the view to one vertex's neighborhood. The ball is taken over the drawn graph
+// rather than the database, so on a capped snapshot it is a neighborhood within what was drawn;
 // the count in the toolbar already says when the cap is in play.
 let focusRoot = null;
 const FOCUS_HOPS = 2;
@@ -1554,7 +1554,7 @@ let resultOnly = false;
 
 // Focus and Result only narrow the view by a rule, which is all there was: any vertex the rule
 // excluded needed the rule relaxed for every other vertex too. These two are the per-vertex
-// override, so a neighbourhood can be grown one vertex at a time and anything uninteresting taken
+// override, so a neighborhood can be grown one vertex at a time and anything uninteresting taken
 // back out. Both hold ids rather than vertices, so a vertex a later query deletes drops out of the
 // view by itself.
 const revealed = new Set();
@@ -1576,7 +1576,7 @@ let reselectId = null;
 
 // Undirected adjacency over the drawn edges. Focus wants the context around a vertex, and following
 // only the outgoing side would hide whatever points at it, which is usually the interesting half.
-function neighbourhood(edges, root, hops) {
+function neighborhood(edges, root, hops) {
     const near = new Map();
     const link = (from, to) => {
         const list = near.get(from);
@@ -1615,7 +1615,7 @@ function visibleGraph() {
         }
     }
     if (focusRoot !== null && nodes.some((node) => node.id === focusRoot)) {
-        const ball = neighbourhood(edges, focusRoot, FOCUS_HOPS);
+        const ball = neighborhood(edges, focusRoot, FOCUS_HOPS);
         nodes = nodes.filter((node) => ball.has(node.id));
         edges = edges.filter((e) => ball.has(e.source) && ball.has(e.target));
     }
@@ -1632,10 +1632,10 @@ function visibleGraph() {
     };
 }
 
-// Snapshot neighbours of `id` in either direction that the view is not currently drawing. The
+// Snapshot neighbors of `id` in either direction that the view is not currently drawing. The
 // snapshot is the capped scan and not the database, so this can only ever surface what the cap
 // already kept; the toolbar count is what says the cap is in play.
-function hiddenNeighbours(id) {
+function hiddenNeighbors(id) {
     const shown = new Set(drawn.nodes.map((node) => node.id));
     const out = new Set();
     for (const e of snapshot.edges) {
@@ -1652,14 +1652,14 @@ function hiddenNeighbours(id) {
 const REVEAL_RING = 70;
 
 function expandFrom(id) {
-    const fresh = hiddenNeighbours(id);
+    const fresh = hiddenNeighbors(id);
     if (fresh.size === 0) return 0;
     const root = snapshot.nodes.find((node) => node.id === id);
     const byId = new Map(snapshot.nodes.map((node) => [node.id, node]));
     let i = 0;
     for (const other of fresh) {
         revealed.add(other);
-        // Revealing overrides an earlier dismissal, or expanding a vertex whose neighbour was
+        // Revealing overrides an earlier dismissal, or expanding a vertex whose neighbor was
         // dismissed would silently do nothing and read as a broken button.
         dismissed.delete(other);
         const node = byId.get(other);
@@ -1885,7 +1885,7 @@ function drawGraph() {
         return path;
     });
 
-    // Above the density where captions stop being a labelling and become a wall of text, only the
+    // Above the density where captions stop being a labeling and become a wall of text, only the
     // best-connected keep one; the rest appear when a vertex is hovered.
     const quietCaptions = nodes.length > LABEL_ALL_MAX;
     const loud = new Set(
@@ -2095,7 +2095,7 @@ function inspect(node) {
     const rows = props
         .map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(JSON.stringify(v))}</dd>`)
         .join("");
-    const more = hiddenNeighbours(node.id).size;
+    const more = hiddenNeighbors(node.id).size;
     $("inspect").innerHTML =
         `<h5><i class="swatch" style="width:9px;height:9px;border-radius:3px;background:${colorOf(
             labelOf(node),
@@ -2103,8 +2103,8 @@ function inspect(node) {
         `<div class="inspect-actions">` +
         `<button class="btn sm" id="expand-node"${more === 0 ? " disabled" : ""} title="${
             more === 0
-                ? "Every neighbour of this vertex is already drawn"
-                : `Add this vertex's ${plural(more, "undrawn neighbour")} to the view`
+                ? "Every neighbor of this vertex is already drawn"
+                : `Add this vertex's ${plural(more, "undrawn neighbor")} to the view`
         }">Expand${more === 0 ? "" : ` ${more}`}</button>` +
         `<button class="btn sm" id="focus-node" title="Show only this vertex and what is within ${FOCUS_HOPS} hops of it">Focus</button>` +
         `<button class="btn sm" id="dismiss-node" title="Take this vertex out of the view">Dismiss</button>` +
@@ -2119,7 +2119,7 @@ function inspect(node) {
         const grew = expandFrom(node.id);
         reselectId = node.id;
         drawGraph();
-        setStatus("ok", `Revealed ${plural(grew, "neighbour")} of #${node.id}.`);
+        setStatus("ok", `Revealed ${plural(grew, "neighbor")} of #${node.id}.`);
     });
     $("dismiss-node").addEventListener("click", () => {
         dismissed.add(node.id);
@@ -2635,7 +2635,7 @@ $("toggle-side").addEventListener("click", () => $("side").classList.toggle("hid
 // Boot
 // ---------------------------------------------------------------------------
 
-// The build stamp comes out of the module rather than a sidecar file the page would have to fetch,
+// The build stamp comes out of the module rather than a separate file the page would have to fetch,
 // so it is empty for a build made outside a git checkout and the footer then names the version
 // alone.
 function renderPoweredBy({version, build}) {

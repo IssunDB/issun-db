@@ -5,7 +5,7 @@ It explains prerequisites, building the engine from source, and using the comman
 
 ## Prerequisites
 
-Compiling IssunDB and its dependencies needs Rust 1.85.0 or later, along with the following system tools:
+Compiling IssunDB and its dependencies needs Rust 1.85.0 or later, along with one system tool:
 
 - Build tools: a C/C++ compiler (such as Clang or GCC), which compiles the bundled LMDB sources and the vector index.
 

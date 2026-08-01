@@ -244,7 +244,7 @@ fn execute_union(
 
     if left_result.columns != right_result.columns {
         return Err(format!(
-            "SyntaxError: UNION column mismatch — left {:?}, right {:?}",
+            "SyntaxError: UNION column mismatch; left {:?}, right {:?}",
             left_result.columns, right_result.columns
         ));
     }

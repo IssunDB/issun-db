@@ -497,8 +497,11 @@ class IssunDB:
 
         Costs one full scan of every node record, and the resulting columns hold
         every scalar node property in memory for the life of this object. On a
-        large graph that is a deliberate memory commitment, which is why nothing
-        makes it for you.
+        large graph that is a deliberate memory commitment, which is why no query
+        makes it for you. The one exception is a bulk import (``COPY ... FROM`` or
+        ``IMPORT DATABASE`` through :meth:`query`), which builds and persists the
+        columns at the end; the build also writes a cache file beside the LMDB
+        files, so a later process loads the columns instead of scanning.
 
         Raises:
             RuntimeError: If the columns cannot be built.
@@ -508,10 +511,10 @@ class IssunDB:
     def materialize_edge_property_columns(self) -> None:
         """Build the in-memory edge property columns, now.
 
-        The edge counterpart of :meth:`materialize_property_columns`, with the
-        same contract and the same warning: one full scan of every edge record,
-        and the columns hold every scalar edge property in memory for the life
-        of this object. Worth it for a workload of edge-property aggregations;
+        The edge counterpart of :meth:`materialize_property_columns`. It shares
+        the contract and the warning: one full scan of every edge record, and
+        the columns hold every scalar edge property in memory for the life of
+        this object. Worth it for a workload of edge-property aggregations;
         not worth it for one that never reads edge properties in bulk.
 
         Raises:

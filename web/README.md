@@ -24,7 +24,7 @@ statement it depends on.
 
 ## Sample Graphs
 
-The Setup panel offers five, each small enough to read at once and shaped so that one part of the
+The Setup panel offers six, each small enough to read at once and shaped so that one part of the
 engine has something to say about it:
 
 | Sample             | What it is                                                                                        | Examples that query it                                         |
@@ -124,7 +124,7 @@ than 700 now that the table is set in the code face.
 
 The page is one centered column: a sidebar of four cards (Setup, Examples, Reference, and Query
 History) beside a main column of three (the Cypher editor, a status banner, and the results). It is
-deliberately modelled on the Onager playground, which shares this project's Material palette, so the
+deliberately modeled on the Onager playground, which shares this project's Material palette, so the
 two read as the same family of tool. Two structural details follow from that model. The page scrolls
 as a document rather than the panels scrolling inside a fixed viewport, so the results card carries a
 fixed-height pane instead of stretching, which also gives the graph view a defined box to lay out
@@ -137,7 +137,7 @@ and native controls from the light palette on both schemes.
   autocomplete, the plan tree, and the force-directed layout are written here rather than pulled
   from a library, so the page loads nothing it does not contain.
 - `worker.js`: the engine. It owns the wasm module and the graph, and the page reaches it only by
-  message, so a query never blocks the tab. See "Cancelling a Query" for what that costs.
+  message, so a query never blocks the tab. See "Canceling a Query" for what that costs.
 - `demos.js`: the demo catalog and the procedure and function references, all checked by
   `make playground-check`. Each demo category carries a `docs` link into the surrounding
   documentation; those are relative to `/playground/`, so they break if a heading they anchor to
@@ -188,22 +188,22 @@ that, so the automatic frame cannot overrule one the visitor chose.
 
 Captions are counter-scaled against the view box so a fitted graph keeps them at the size they were
 drawn for, and above forty-five vertices only the best-connected keep one. A hundred captions at one
-size is a wall of text rather than a labelling. The rest are not removed, only made transparent, so
+size is a wall of text rather than a labeling. The rest are not removed, only made transparent, so
 hovering a vertex brings its own back.
 
 Hovering a vertex selects it: the inspector opens on it and it takes a ring, without waiting for a
 click. Hovering also fades everything that is not the vertex or next to it, which is a different class
 from the dimming a result overlay applies, so the two compose: a hover inside a highlighted result
 still shows which vertices the result lit. The selected ring is spelled out for the hovering case as
-well, because the neighbour rule is one class more specific and a selected vertex otherwise wore the
-neighbour stroke instead of its own.
+well, because the neighbor rule is one class more specific and a selected vertex otherwise wore the
+neighbor stroke instead of its own.
 
 Selection waits for the pointer to rest, and nothing changes it while the pointer is over the
 inspector. Both are needed, and the second does not subsume the first: the straight line from a
 vertex to the panel's `Focus` button crosses whatever lies between them, so switching on entry left
 the panel showing the last vertex passed over by the time the pointer arrived, and `Focus` acted on
-that one instead. Measured at six vertices crossed on a ninety-vertex lattice, which selected `#31`
-for a pointer that started on `#43`. A glide spends well under the dwell on each vertex it crosses;
+that one instead. A measurement put it at six vertices crossed on a ninety-vertex lattice, which
+selected `#31` for a pointer that started on `#43`. A glide spends well under the dwell on each vertex it crosses;
 resting on one still feels immediate.
 
 A click pins the selection outright, so hovering elsewhere afterwards leaves the panel alone. Moving
@@ -217,11 +217,11 @@ drawn graph rather than the database. `Result only`, in the toolbar, draws just 
 result mentioned. Both are rules, which is the limit of what they can be: any vertex a rule excludes
 needs the rule relaxed for every other vertex too.
 
-`Expand` and `Dismiss` are the per-vertex override, so a neighbourhood can be grown one vertex at a
-time and anything uninteresting taken back out. Expanding reveals a vertex's undrawn neighbours in
-either direction and says how many there are on the button, so a vertex whose neighbours are all drawn
+`Expand` and `Dismiss` are the per-vertex override, so a neighborhood can be grown one vertex at a
+time and anything uninteresting taken back out. Expanding reveals a vertex's undrawn neighbors in
+either direction and says how many there are on the button, so a vertex whose neighbors are all drawn
 offers a disabled button rather than one that does nothing. The focus root always reads that way, since
-every neighbour of the root is one hop inside the ball; the vertices worth expanding are the ones on
+every neighbor of the root is one hop inside the ball; the vertices worth expanding are the ones on
 its rim. Revealing overrides an earlier dismissal, or expanding towards a dismissed vertex would
 silently do nothing. A revealed vertex is placed in a ring around the vertex that revealed it rather
 than seeded on the layout's starting circle, so the expansion reads as growth from where it happened.
@@ -273,7 +273,7 @@ document at its natural width.
 
 ## What the Graph View Draws
 
-At most 300 vertices, and they are the best-connected 300 rather than the oldest. `all_nodes` returns
+The view draws at most 300 vertices, and they are the best-connected 300 rather than the oldest. `all_nodes` returns
 ascending id, so taking the first 300 kept insertion order: a visitor who built a large graph and then
 added the interesting part could not see the part they added. Degree needs both directions, since a
 vertex everything points at has no outgoing edges at all. The ranking reads adjacency for every vertex,
@@ -311,14 +311,14 @@ converts to `JsError`, because constructing a `JsError` calls a wasm-bindgen imp
 covered by `cargo test`. The build flags live in the `WASM_BUILD` variable in the Makefile rather than being repeated per target, since
 `--features hnsw` reads like it selects the index and in fact selects `usearch`, which fails to compile `cxx` for wasm.
 
-## Cancelling a Query
+## Canceling a Query
 
 The engine runs in `worker.js`, so a long query leaves the page responsive and a Cancel button
 appears beside Execute. Pressing it terminates the worker, which is the only way to stop a
 WebAssembly call: there is no interruption point for a message to be handled at, so nothing short of
 killing the thread will do.
 
-The graph lives in the worker and therefore dies with it. Cancelling is still recoverable rather
+The graph lives in the worker and therefore dies with it. Canceling is still recoverable rather
 than destructive, because the page immediately starts a fresh worker, re-seeds the sample, and
 replays every statement it recorded as setup, which is the same log a share link carries. A query
 that only read loses nothing. One that had already written is reapplied from that log, so anything
@@ -342,7 +342,7 @@ the footer shows two numbers rather than three: an earlier version split the liv
 and graph, and since an empty database costs almost nothing, it was the same number printed twice.
 
 The build stamp is compiled into the module, read from `ISSUNDB_BUILD_REF` through `option_env!`, rather
-than fetched as a sidecar JSON file, so it cannot disagree with the module it describes and the
+than fetched as a separate JSON file, so it cannot disagree with the module it describes and the
 deployed tree has one fewer file to keep in step. `make playground-build` fills it in from `git`; `docs.yml` sets
 it from the workflow's refs instead, since `actions/checkout` leaves a detached HEAD where
 `git rev-parse --abbrev-ref HEAD` answers `HEAD` rather than the branch. A build with the variable

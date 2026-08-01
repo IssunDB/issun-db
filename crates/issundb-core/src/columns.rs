@@ -185,7 +185,7 @@ const STR_NULL: u32 = u32::MAX;
 pub const ID_GROUP_ABSENT: u32 = u32::MAX;
 
 /// Dense group codes of one property, indexed by node id rather than by a
-/// request's position: `codes[node_id]` is the node's group code under exact
+/// request's position. `codes[node_id]` is the node's group code under exact
 /// value identity, [`ID_GROUP_ABSENT`] where no such node exists, and `reps`
 /// holds one representative value per code. Built once per write generation by
 /// [`crate::Graph::node_prop_group_codes_by_id`] and shared, so a grouped
@@ -488,8 +488,8 @@ impl<S: ColumnSource<Id = u64>> PropColumns<S> {
         })
     }
 
-    /// The cache file payload view of this column set: the dense mapping and the
-    /// columns in name order, so a save is deterministic.
+    /// The cache file payload view of this column set, the dense mapping and
+    /// the columns in name order, so a save is deterministic.
     pub(crate) fn cache_file_parts(&self) -> (&Vec<u64>, Vec<(&String, &PropColumn)>) {
         let mut cols: Vec<(&String, &PropColumn)> = self.cols.iter().collect();
         cols.sort_by_key(|(name, _)| *name);
@@ -864,8 +864,8 @@ impl<S: ColumnSource> PropColumns<S> {
         Ok(Some(mask))
     }
 
-    /// The kind-mismatch mask: `keeps` for a present value, false for null or
-    /// missing.
+    /// The kind-mismatch mask, which is `keeps` for a present value and false
+    /// for a null or missing one.
     fn presence_mask(
         &self,
         ids: &[S::Id],

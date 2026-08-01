@@ -140,7 +140,8 @@ Here is a quick reference of the methods available on the `IssunDB` class:
   reopened with a larger value, which is safe and keeps the existing data. Size it for the eventual database rather than the current one.
 * `set_thread_count(n: int) -> None`: Sets the thread count for the parallel read passes (set `0` for default).
 * `materialize_edge_statistics() -> None`: Builds the optimizer's edge-level cardinality statistics. Nothing builds them as a side effect of a query, so a process that never calls this plans every relationship pattern on the global average fan-out. One pass over the label index and the adjacency, measured at 226 ms over 300 K nodes.
-* `materialize_property_columns() -> None`: Builds the in-memory property columns behind the selectivity estimates. This is a full node scan (1355 ms over the same graph) and holds every scalar node property in memory for the life of the object, so it is a memory commitment rather than a warm-up.
+* `materialize_property_columns() -> None`: Builds the in-memory property columns behind the selectivity estimates. This is a full node scan (1355 ms over the same graph) and holds every scalar node property in memory for the life of the object, so it is a memory commitment rather than a warm-up. The build persists a cache file beside the LMDB files, so a later process loads the columns instead of scanning, and a bulk import (`COPY ... FROM` or `IMPORT DATABASE` through `query`) performs this build itself at the end.
+* `materialize_edge_property_columns() -> None`: The edge counterpart, with the same contract and its own cache file: one full edge scan, and the columns hold every scalar edge property in memory for the life of the object.
 
 ### Node and Edge CRUD
 
