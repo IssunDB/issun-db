@@ -54,8 +54,5 @@ jobs:
       - name: Run linters
         run: make lint
 
-      # The default run always selects LMDB and usearch, so these two configurations are
-      # otherwise never linted. Kept in this workflow rather than with the backend tests
-      # because clippy is pinned to the MSRV here, and a newer clippy reports different lints.
       - name: Run linters against the non-default backends
         run: make lint-backends

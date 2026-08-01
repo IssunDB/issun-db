@@ -103,18 +103,6 @@ jobs:
             runner: windows-11-arm
             archive_ext: zip
             content_type: application/zip
-            # `usearch` pulls in `numkong`, whose C dispatch files fail to compile for
-            # aarch64-pc-windows-msvc: `winnt.h` reports "No Target Architecture", meaning the
-            # compiler it is driven with defines none of the `_M_*` architecture macros. The
-            # `-DNK_TARGET_*=0` flags that used to be set here were a no-op, since numkong's own
-            # build script already sets every one of them to 0 on this target.
-            #
-            # So this target is built without `hnsw`, which drops usearch and numkong from the
-            # graph entirely and selects the pure-Rust exact vector index. That index returns the
-            # true nearest neighbors under the same distance conventions, so results are exact
-            # rather than approximate; what it gives up is the sublinear search and quantization.
-            # Remove this once numkong builds here, and the target goes back to HNSW with no other
-            # change.
             build_flags: "--no-default-features --features lmdb"
     steps:
       - name: Checkout repository
@@ -222,9 +210,6 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/${{ env.OWNER_LC }}/issundb
-          # `latest` is reserved for actual tag pushes; manual workflow_dispatch
-          # runs publish under `develop` instead so they cannot overwrite a
-          # released image.
           tags: |
             type=raw,value=latest,enable=${{ github.ref_type == 'tag' }}
             type=raw,value=develop,enable=${{ github.event_name == 'workflow_dispatch' }}
