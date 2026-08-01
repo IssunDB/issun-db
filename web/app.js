@@ -583,7 +583,14 @@ function parsePlan(text) {
     return rows;
 }
 
+// The rendered tree carries every line the engine emits, but it carries depth as CSS padding, so a
+// selection copied out of it pastes as a flat list of operators. This is what the Copy button sends
+// to the clipboard, and it is the reason the pane no longer shows the same plan a second time as
+// preformatted text.
+let planText = "";
+
 function renderPlan(text) {
+    planText = text;
     const rows = parsePlan(text);
     const host = $("pane-plan");
     if (rows.length === 0) {
@@ -610,11 +617,22 @@ function renderPlan(text) {
     if (pruned) summary += " One branch was proved empty and will not run.";
 
     host.innerHTML =
-        `<div class="plan-summary">${esc(summary)}</div>` +
-        `<ul class="plan-tree">${body}</ul>` +
-        `<details class="plan-raw"><summary>Plan as text</summary>` +
-        `<pre class="plan">${esc(text)}</pre></details>`;
+        `<div class="plan-summary"><span>${esc(summary)}</span>` +
+        `<button class="btn sm" id="copy-plan" title="Copy the plan as indented text">Copy</button></div>` +
+        `<ul class="plan-tree">${body}</ul>`;
 }
+
+// Delegated, because the button is rebuilt with the pane on every explain and binding it inside
+// `renderPlan` would add a listener per query.
+$("pane-plan").addEventListener("click", async (e) => {
+    if (!e.target.closest("#copy-plan")) return;
+    try {
+        await navigator.clipboard.writeText(planText);
+        setStatus("ok", "Plan copied.");
+    } catch {
+        setStatus("err", "The browser would not give the page access to the clipboard.");
+    }
+});
 
 function showError(message) {
     $("pane-table").innerHTML = `<div class="notice err">${esc(message)}</div>`;

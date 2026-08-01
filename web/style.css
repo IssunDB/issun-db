@@ -961,10 +961,17 @@ td .b {
    the engine renders the plan as flat indented lines and rebuilding a DOM hierarchy from them would
    add a parser with nothing to show for it. */
 .plan-summary {
-    padding: 12px 14px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 9px 14px;
     border-bottom: 1px solid var(--line);
     font-size: 0.82rem;
     color: var(--md-default-fg-color--light);
+}
+
+.plan-summary > span {
+    flex: 1;
 }
 
 .plan-tree {
@@ -1016,18 +1023,6 @@ td .b {
     color: var(--md-default-fg-color--light);
 }
 
-.plan-raw {
-    border-top: 1px solid var(--line);
-}
-
-.plan-raw > summary {
-    padding: 10px 14px;
-    font-size: 0.8rem;
-    color: var(--md-default-fg-color--light);
-    cursor: pointer;
-}
-
-pre.plan,
 pre.json {
     margin: 0;
     padding: 14px;
