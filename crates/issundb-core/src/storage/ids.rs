@@ -40,6 +40,9 @@ pub fn alloc_node_id(storage: &Storage, txn: &mut crate::storage::RwTxn) -> Resu
 /// record the generation it was built at and a later process can decide whether
 /// it still reflects storage. Zero on a database that predates the counter,
 /// which is also what a cache file built before any write records.
+/// Read only by the cache files, which are an LMDB-only structure; the counter
+/// itself is advanced under either backend, so the write path does not fork.
+#[cfg(feature = "lmdb")]
 pub fn commit_gen(storage: &Storage, txn: &crate::storage::RoTxn) -> Result<u64, Error> {
     match storage.meta.get(txn, KEY_COMMIT_GEN)? {
         Some(b) => {
