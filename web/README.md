@@ -16,9 +16,10 @@ researchers connected by what they write about rather than by an edge, and reach
 Each example carries a short note on why the result looks the way it does.
 
 Selecting an example or a sample graph puts it in the editor and stops there; nothing runs until
-Execute Query or Explain is pressed. Running a `CREATE` the moment it was clicked wrote to the
+Execute Query or Explain is pressed. Running a write the moment it was clicked wrote to the
 database before the reader had seen the statement, and clicking the same example twice quietly
-added a second copy of its data. The two examples with a step Cypher cannot express, full-text
+added a second copy of its data. The samples no longer can, being idempotent, but an example that
+writes still does. The two examples with a step Cypher cannot express, full-text
 search and vector search, keep that step: it is held against the loaded example and runs after the
 statement it depends on.
 
@@ -41,8 +42,12 @@ than creating one, which is what keeps the two panels from being two lists of da
 version had the GraphRAG and knowledge-graph examples build their own corpora, one of which
 duplicated the Article corpus sample outright.
 
-`Load Graph` puts the selected sample's `CREATE` in the editor. `Reset Graph` discards everything and
-re-seeds with it. Each category names the graph it queries, so choosing a category points the picker
+`Load Graph` puts the selected sample's script in the editor. `Reset Graph` discards everything and
+re-seeds with it. A sample is a run of `MERGE` clauses, one per node and one per relationship, so
+executing one twice leaves the same graph rather than a second disconnected copy. The page seeds the
+social graph on load, which makes pressing Execute on it the second run and not the first, so this
+is the difference between a demonstration and a trap. `MERGE` matches on every inline property,
+which is why each node carries its whole property map. Each category names the graph it queries, so choosing a category points the picker
 at that graph, and an example whose graph is not in the database says which one to load rather than
 returning an empty table. The one example that still writes is the Cypher basics lesson on `CREATE`,
 and it makes two nodes rather than a dataset.

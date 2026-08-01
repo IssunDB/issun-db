@@ -787,7 +787,8 @@ function formatEditor() {
 
 $("format").addEventListener("click", formatEditor);
 // Loaded into the editor rather than executed, so the statement is read before it writes. Running
-// it on a database that already holds the sample adds a second copy, which the caption says.
+// it twice is harmless, since a sample is a script of `MERGE` clauses, but reading before writing is
+// the point.
 $("load-sample").addEventListener("click", () => {
     const sample = currentSample();
     setQuery(sample.cypher);
@@ -795,7 +796,7 @@ $("load-sample").addEventListener("click", () => {
     setStatus(
         "",
         `Loaded the ${sample.label} sample. Press Execute Query to create it.` +
-        " Running it on a database that already has it adds a second copy.",
+        " It merges, so running it on a database that already has it changes nothing.",
     );
 });
 
