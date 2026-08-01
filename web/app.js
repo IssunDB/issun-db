@@ -156,6 +156,18 @@ const MAX_TITLE_CHARS = 2000;
 // table reports precisely anyway.
 const NODE_RADIUS = 10;
 
+// Edges are paths rather than lines, so one element covers a straight hop, the curve that tells two
+// edges between the same pair apart, and a self-loop. `EDGE_CURVE` is the gap between the curves of
+// a parallel or reciprocal group, and `ARROW_GAP` clears the arrowhead off the target's rim.
+const EDGE_CURVE = 22;
+const ARROW_GAP = 4;
+const LOOP_SIZE = 18;
+
+// Every vertex is captioned below this many; above it only the best-connected are, and the rest
+// appear on hover. A hundred captions at one size is a wall of text rather than a labelling.
+const LABEL_ALL_MAX = 45;
+const LABEL_TOP = 18;
+
 // The force layout settles over an animation loop, which is motion a visitor can ask not to see.
 const REDUCED_MOTION = matchMedia("(prefers-reduced-motion: reduce)");
 
@@ -1293,20 +1305,39 @@ async function refreshGraph(mayWrite = true) {
 // that no spatial index is worth the code it would take. The canvas size is passed in rather
 // than read off the element, since the caller needs the same two numbers for the view box and
 // the two must agree or a fit is computed against a different box than the layout used.
+// How much larger than the canvas the layout's world is. The clamp in the tick used to hold every
+// vertex inside the element, so a hundred nodes were packed into the same rectangle as six and any
+// structure they had came out as a blob. The world is what grows with the graph; the canvas reaches
+// it through Fit and the zoom, which is what those are for.
+//
+// A multiple of the canvas rather than an absolute size, so the world keeps the element's aspect
+// ratio and a small graph gets exactly the rectangle it always had. Anything up to roughly sixty
+// vertices returns 1 and is laid out as before.
+function worldScale(nodes, width, height) {
+    const room = Math.sqrt(Math.max(nodes.length, 1)) * 62;
+    return Math.max(1, room / Math.min(width, height));
+}
+
 function layout(nodes, edges, width, height) {
     const index = new Map(nodes.map((n, i) => [n.id, i]));
     const links = edges
         .map((e) => [index.get(e.source), index.get(e.target)])
         .filter(([a, b]) => a !== undefined && b !== undefined);
 
+    const scale = worldScale(nodes, width, height);
+    const worldW = width * scale;
+    const worldH = height * scale;
+    const cx = width / 2;
+    const cy = height / 2;
+
     for (const [i, node] of nodes.entries()) {
         if (node.x === undefined) {
             // Seeded on a circle rather than at random, so a re-layout of the same graph is
             // reproducible and the first frame is never a knot at the centre.
             const angle = (i / Math.max(nodes.length, 1)) * Math.PI * 2;
-            const radius = Math.min(width, height) * 0.32;
-            node.x = width / 2 + Math.cos(angle) * radius;
-            node.y = height / 2 + Math.sin(angle) * radius;
+            const radius = Math.min(worldW, worldH) * 0.36;
+            node.x = cx + Math.cos(angle) * radius;
+            node.y = cy + Math.sin(angle) * radius;
             node.vx = 0;
             node.vy = 0;
         }
@@ -1357,9 +1388,15 @@ function layout(nodes, edges, width, height) {
             b.vx -= fx;
             b.vy -= fy;
         }
+        // Weakened as the world grows, or the pull to the centre overwhelms the repulsion at the
+        // far edge of a large layout and undoes the room the world was widened to provide.
+        const pull = 0.006 / scale;
+        const halfW = worldW / 2;
+        const halfH = worldH / 2;
+        const margin = 26;
         for (const node of nodes) {
-            node.vx += (width / 2 - node.x) * 0.006;
-            node.vy += (height / 2 - node.y) * 0.006;
+            node.vx += (cx - node.x) * pull;
+            node.vy += (cy - node.y) * pull;
             if (node.pinned) {
                 node.vx = 0;
                 node.vy = 0;
@@ -1369,9 +1406,8 @@ function layout(nodes, edges, width, height) {
             node.vy *= 0.82;
             node.x += node.vx * alpha;
             node.y += node.vy * alpha;
-            const margin = 26;
-            node.x = Math.max(margin, Math.min(width - margin, node.x));
-            node.y = Math.max(margin, Math.min(height - margin, node.y));
+            node.x = Math.max(cx - halfW + margin, Math.min(cx + halfW - margin, node.x));
+            node.y = Math.max(cy - halfH + margin, Math.min(cy + halfH - margin, node.y));
         }
         return alpha > 0.02;
     };
@@ -1463,6 +1499,131 @@ function capturePointer(element, pointerId) {
 
 let simGeneration = 0;
 
+// What is actually on screen: the snapshot narrowed by the focus and result-only controls. Fit, the
+// drag handlers, and the hover highlight all read this rather than the snapshot, or they would
+// frame and move vertices that are not drawn.
+let drawn = {nodes: [], edges: []};
+
+// Set by any deliberate view change, so the automatic fit a layout wider than the canvas needs
+// cannot undo a zoom the visitor just made.
+let viewAdjusted = false;
+
+// Focus narrows the view to one vertex's neighbourhood. The ball is taken over the drawn graph
+// rather than the database, so on a capped snapshot it is a neighbourhood within what was drawn;
+// the count in the toolbar already says when the cap is in play.
+let focusRoot = null;
+const FOCUS_HOPS = 2;
+
+// Draw only the vertices the last result mentioned. Off by default, since the dimming overlay
+// already answers "which of these did my query touch" without discarding the context around them.
+let resultOnly = false;
+
+// Undirected adjacency over the drawn edges. Focus wants the context around a vertex, and following
+// only the outgoing side would hide whatever points at it, which is usually the interesting half.
+function neighbourhood(edges, root, hops) {
+    const near = new Map();
+    const link = (from, to) => {
+        const list = near.get(from);
+        if (list) list.push(to);
+        else near.set(from, [to]);
+    };
+    for (const e of edges) {
+        link(e.source, e.target);
+        link(e.target, e.source);
+    }
+    const ball = new Set([root]);
+    let frontier = [root];
+    for (let hop = 0; hop < hops; hop += 1) {
+        const next = [];
+        for (const id of frontier) {
+            for (const other of near.get(id) ?? []) {
+                if (!ball.has(other)) {
+                    ball.add(other);
+                    next.push(other);
+                }
+            }
+        }
+        frontier = next;
+    }
+    return ball;
+}
+
+function visibleGraph() {
+    let {nodes, edges} = snapshot;
+    if (resultOnly) {
+        const {lit} = resultOverlay();
+        if (lit) {
+            nodes = nodes.filter((node) => lit.has(node.id));
+            const kept = new Set(nodes.map((node) => node.id));
+            edges = edges.filter((e) => kept.has(e.source) && kept.has(e.target));
+        }
+    }
+    if (focusRoot !== null && nodes.some((node) => node.id === focusRoot)) {
+        const ball = neighbourhood(edges, focusRoot, FOCUS_HOPS);
+        nodes = nodes.filter((node) => ball.has(node.id));
+        edges = edges.filter((e) => ball.has(e.source) && ball.has(e.target));
+    }
+    return {nodes, edges};
+}
+
+// Slot each edge within its unordered pair, so parallel and reciprocal edges are drawn on separate
+// curves instead of one exactly on top of another. Two `SIMILAR_TO` edges between the same pair of
+// products were one line before this, and a directed graph that draws `a->b` and `b->a` identically
+// is not showing its direction at all.
+function edgeSlots(edges) {
+    const groups = new Map();
+    for (const e of edges) {
+        const key = e.source < e.target ? `${e.source}|${e.target}` : `${e.target}|${e.source}`;
+        const list = groups.get(key);
+        if (list) list.push(e);
+        else groups.set(key, [e]);
+    }
+    const slots = new Map();
+    for (const list of groups.values()) {
+        list.forEach((e, index) => slots.set(e, {index, count: list.length}));
+    }
+    return slots;
+}
+
+// The path for one edge, with both ends pulled back off the vertex rims so the arrowhead sits on
+// the target's edge rather than under it.
+function edgePath(a, b, {index, count}) {
+    if (a === b) {
+        // A self-loop has no chord to bend, so it is a teardrop above the vertex, widened per slot
+        // so two loops on one vertex read as two. Nothing drew at all for these before.
+        const size = LOOP_SIZE * (1 + index * 0.6);
+        return (
+            `M ${a.x - NODE_RADIUS * 0.7} ${a.y - NODE_RADIUS * 0.7}` +
+            ` C ${a.x - size * 1.7} ${a.y - size * 2.7},` +
+            ` ${a.x + size * 1.7} ${a.y - size * 2.7},` +
+            ` ${a.x + NODE_RADIUS * 0.75} ${a.y - NODE_RADIUS * 0.6}`
+        );
+    }
+    const dx = b.x - a.x;
+    const dy = b.y - a.y;
+    const len = Math.hypot(dx, dy) || 0.01;
+    // The perpendicular is measured from the lower node id, so the two halves of a reciprocal pair
+    // offset the same way and therefore land on opposite sides of the chord.
+    const flip = a.id < b.id ? 1 : -1;
+    const offset = count > 1 ? (index - (count - 1) / 2) * EDGE_CURVE * flip : 0;
+    const cx = (a.x + b.x) / 2 + (-dy / len) * offset;
+    const cy = (a.y + b.y) / 2 + (dx / len) * offset;
+
+    // Pulled back along the curve's own tangent at each end, which for a quadratic is the direction
+    // to the control point. Using the chord instead leaves the arrow off the rim on a curved edge.
+    const inX = b.x - cx;
+    const inY = b.y - cy;
+    const inLen = Math.hypot(inX, inY) || 0.01;
+    const outX = cx - a.x;
+    const outY = cy - a.y;
+    const outLen = Math.hypot(outX, outY) || 0.01;
+    const back = NODE_RADIUS + ARROW_GAP;
+    return (
+        `M ${a.x + (outX / outLen) * NODE_RADIUS} ${a.y + (outY / outLen) * NODE_RADIUS}` +
+        ` Q ${cx} ${cy} ${b.x - (inX / inLen) * back} ${b.y - (inY / inLen) * back}`
+    );
+}
+
 function drawGraph() {
     // A drag whose pointer is released after a redraw calls the previous drawing's `start`,
     // which would put a loop over replaced nodes back into the shared handle.
@@ -1473,6 +1634,7 @@ function drawGraph() {
         sim = null;
     }
     svg.replaceChildren();
+    svg.classList.remove("hovering");
     $("inspect").hidden = true;
 
     // A redraw returns the view to the whole canvas, so a fit is discarded by the next query
@@ -1480,11 +1642,16 @@ function drawGraph() {
     const width = svg.clientWidth || 800;
     const height = svg.clientHeight || 500;
     setViewBox(svg, {x: 0, y: 0, w: width, h: height});
+    viewAdjusted = false;
 
-    const {nodes, edges, truncated} = snapshot;
+    const {nodes, edges} = visibleGraph();
+    drawn = {nodes, edges};
+    const hidden = snapshot.nodes.length - nodes.length;
     $("graph-count").textContent =
         `${plural(nodes.length, "node")} and ${plural(edges.length, "edge")}` +
-        (truncated ? " (capped at 300)" : "");
+        (snapshot.truncated ? " (capped at 300)" : "") +
+        (hidden > 0 ? `, ${hidden} hidden` : "");
+    $("clear-focus").hidden = focusRoot === null;
 
     const {lit, groupIds, groupLabel} = resultOverlay();
 
@@ -1499,17 +1666,37 @@ function drawGraph() {
             ? (groupColor.get(groupIds.get(node.id)) ?? "var(--md-default-fg-color--lighter)")
             : colorOf(labelOf(node));
 
-    $("legend").innerHTML = groupIds
-        ? groupOrder
-            .map(
+    // One type is the common case and colouring it says nothing, so a single-type graph keeps the
+    // neutral stroke it always had. Past one, the colour is the only thing telling a `BOUGHT` from
+    // a `SIMILAR_TO`, both of which used to draw as the same grey line.
+    const edgeTypes = [...new Set(edges.map((e) => e.type ?? ""))].sort();
+    const manyTypes = edgeTypes.length > 1;
+    const edgeColor = new Map(
+        edgeTypes.map((type) => [
+            type,
+            manyTypes ? `hsl(${hueOf(type)} 52% 44%)` : "var(--md-default-fg-color--lighter)",
+        ]),
+    );
+    const markerId = new Map(edgeTypes.map((type, i) => [type, `arrow${i}`]));
+
+    $("legend").innerHTML = (groupIds
+            ? groupOrder.map(
                 (value) =>
                     `<span><i style="background:${groupColor.get(value)}"></i>${esc(groupLabel)} ${value}</span>`,
             )
-            .join("")
-        : [...new Set(nodes.map(labelOf))]
-            .sort()
-            .map((l) => `<span><i style="background:${colorOf(l)}"></i>${esc(l)}</span>`)
-            .join("");
+            : [...new Set(nodes.map(labelOf))]
+                .sort()
+                .map((l) => `<span><i style="background:${colorOf(l)}"></i>${esc(l)}</span>`)
+    )
+        .concat(
+            manyTypes
+                ? edgeTypes.map(
+                    (t) =>
+                        `<span><i class="rel" style="background:${edgeColor.get(t)}"></i>${esc(t)}</span>`,
+                )
+                : [],
+        )
+        .join("");
 
     if (nodes.length === 0) {
         svg.append(
@@ -1520,33 +1707,91 @@ function drawGraph() {
                 "font-size": "13"
             }),
         );
-        svg.lastChild.textContent = "Nothing to draw. Run a CREATE, or click Reset data.";
+        svg.lastChild.textContent = snapshot.nodes.length
+            ? "Nothing to draw under the current filter. Clear focus, or turn off Result only."
+            : "Nothing to draw. Run a CREATE, or click Reset data.";
         return;
     }
+
+    // One marker per edge colour. A marker cannot inherit the stroke of the path that references
+    // it, so a shared arrowhead would be one colour while its edges were several.
+    const defs = el("defs");
+    for (const [type, id] of markerId) {
+        const marker = el("marker", {
+            id,
+            viewBox: "0 0 10 10",
+            refX: "10",
+            refY: "5",
+            markerWidth: "5",
+            markerHeight: "5",
+            orient: "auto",
+        });
+        marker.append(el("path", {d: "M 0 0 L 10 5 L 0 10 z", fill: edgeColor.get(type)}));
+        defs.append(marker);
+    }
+    svg.append(defs);
 
     const linkLayer = el("g");
     const nodeLayer = el("g");
     svg.append(linkLayer, nodeLayer);
 
     const byId = new Map(nodes.map((n) => [n.id, n]));
-    const lines = edges.map((e) => {
-        const line = el("line", {"stroke-width": 1.2});
-        line.dataset.source = e.source;
-        line.dataset.target = e.target;
-        linkLayer.append(line);
-        return line;
+    const slots = edgeSlots(edges);
+    const degree = new Map();
+    for (const e of edges) {
+        degree.set(e.source, (degree.get(e.source) ?? 0) + 1);
+        degree.set(e.target, (degree.get(e.target) ?? 0) + 1);
+    }
+
+    const paths = edges.map((e) => {
+        const type = e.type ?? "";
+        const path = el("path", {
+            class: "edge",
+            fill: "none",
+            stroke: edgeColor.get(type),
+            "marker-end": `url(#${markerId.get(type)})`,
+        });
+        path.dataset.source = e.source;
+        path.dataset.target = e.target;
+        if (e.type) {
+            const title = el("title");
+            title.textContent = e.type;
+            path.append(title);
+        }
+        linkLayer.append(path);
+        return path;
     });
+
+    // Above the density where captions stop being a labelling and become a wall of text, only the
+    // best-connected keep one; the rest appear when a vertex is hovered.
+    const quietCaptions = nodes.length > LABEL_ALL_MAX;
+    const loud = new Set(
+        quietCaptions
+            ? [...nodes]
+                .sort((a, b) => (degree.get(b.id) ?? 0) - (degree.get(a.id) ?? 0))
+                .slice(0, LABEL_TOP)
+                .map((n) => n.id)
+            : nodes.map((n) => n.id),
+    );
 
     const groups = nodes.map((node) => {
         const group = el("g", {class: "node"});
+        group.dataset.id = node.id;
         const circle = el("circle", {
             r: NODE_RADIUS,
             fill: fillOf(node),
         });
-        const text = el("text", {"text-anchor": "middle", dy: NODE_RADIUS + 12});
+        const text = el("text", {
+            class: loud.has(node.id) ? "cap" : "cap quiet",
+            "text-anchor": "middle",
+            dy: NODE_RADIUS + 12,
+        });
         text.textContent = captionOf(node);
         group.append(circle, text);
         if (lit && !lit.has(node.id)) group.classList.add("dim");
+
+        group.addEventListener("pointerenter", () => setHover(node.id));
+        group.addEventListener("pointerleave", () => setHover(null));
 
         group.addEventListener("pointerdown", (e) => {
             e.stopPropagation();
@@ -1576,15 +1821,34 @@ function drawGraph() {
         return group;
     });
 
+    const groupById = new Map(nodes.map((node, i) => [node.id, groups[i]]));
+
+    // Hovering one vertex fades everything that is not it or next to it. This is a separate class
+    // from the result overlay's `dim` so the two compose: a hover inside a highlighted result still
+    // shows which vertices the result lit.
+    function setHover(id) {
+        for (const g of groups) g.classList.remove("near");
+        for (const p of paths) p.classList.remove("near");
+        if (id === null) {
+            svg.classList.remove("hovering");
+            return;
+        }
+        groupById.get(id)?.classList.add("near");
+        for (const [i, e] of edges.entries()) {
+            if (e.source !== id && e.target !== id) continue;
+            paths[i].classList.add("near");
+            groupById.get(e.source)?.classList.add("near");
+            groupById.get(e.target)?.classList.add("near");
+        }
+        svg.classList.add("hovering");
+    }
+
     function paint() {
-        for (const line of lines) {
-            const a = byId.get(Number(line.dataset.source));
-            const b = byId.get(Number(line.dataset.target));
+        for (const [i, path] of paths.entries()) {
+            const a = byId.get(Number(path.dataset.source));
+            const b = byId.get(Number(path.dataset.target));
             if (!a || !b) continue;
-            line.setAttribute("x1", a.x);
-            line.setAttribute("y1", a.y);
-            line.setAttribute("x2", b.x);
-            line.setAttribute("y2", b.y);
+            path.setAttribute("d", edgePath(a, b, slots.get(edges[i])));
         }
         for (const [i, group] of groups.entries()) {
             group.setAttribute("transform", `translate(${nodes[i].x} ${nodes[i].y})`);
@@ -1592,6 +1856,13 @@ function drawGraph() {
     }
 
     const tick = layout(nodes, edges, width, height);
+    // A world wider than the canvas is drawn mostly off-screen until something frames it, and the
+    // visitor has no way to know there is more out there. Only when it settles, and only if the
+    // view has not been touched since the redraw.
+    const needsFit = worldScale(nodes, width, height) > 1;
+    const settle = () => {
+        if (needsFit && !viewAdjusted) fitToGraph();
+    };
 
     function start() {
         if (generation !== simGeneration) return;
@@ -1601,12 +1872,18 @@ function drawGraph() {
             // since alpha starts at 1, decays by 0.985 a step, and the loop ends below 0.02.
             for (let i = 0; i < 260 && tick(); i += 1) ;
             paint();
+            settle();
             return;
         }
         const step = () => {
             const running = tick();
             paint();
-            sim = running ? requestAnimationFrame(step) : null;
+            if (running) {
+                sim = requestAnimationFrame(step);
+            } else {
+                sim = null;
+                settle();
+            }
         };
         sim = requestAnimationFrame(step);
     }
@@ -1624,6 +1901,11 @@ let viewBox = null;
 function setViewBox(svg, box) {
     viewBox = box;
     svg.setAttribute("viewBox", `${box.x} ${box.y} ${box.w} ${box.h}`);
+    // Published so captions and strokes can divide it back out and hold their size on screen. A
+    // fitted graph otherwise renders its labels at whatever fraction of a pixel the fit implies,
+    // which is the state the fit was supposed to rescue it from. One write per view change rather
+    // than one per element per frame.
+    svg.style.setProperty("--gscale", String(box.w / (svg.clientWidth || 800)));
 }
 
 function toSvg(svg, event) {
@@ -1641,11 +1923,16 @@ function inspect(node) {
         .map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(JSON.stringify(v))}</dd>`)
         .join("");
     $("inspect").innerHTML =
+        `<button class="btn sm focus-btn" id="focus-node" title="Show only this vertex and what is within ${FOCUS_HOPS} hops of it">Focus</button>` +
         `<h5><i class="swatch" style="width:9px;height:9px;border-radius:3px;background:${colorOf(
             labelOf(node),
         )}"></i>${esc(node.labels?.join(":") || "(no label)")} <span style="color:var(--md-default-fg-color--light);font-family:var(--md-code-font)">#${node.id}</span></h5>` +
         (rows ? `<dl>${rows}</dl>` : '<div class="empty">No properties.</div>');
     $("inspect").hidden = false;
+    $("focus-node").addEventListener("click", () => {
+        focusRoot = node.id;
+        drawGraph();
+    });
 }
 
 // Zoom and pan both move the view box, which is also what Fit sets and what `toSvg` maps a pointer
@@ -1659,6 +1946,7 @@ const canvasSize = (svg) => ({w: svg.clientWidth || 800, h: svg.clientHeight || 
 function zoomBy(factor, focal) {
     const svg = $("svg");
     if (!viewBox) return;
+    viewAdjusted = true;
     const {w: canvasW} = canvasSize(svg);
     // Bounded, or a few scrolls leave an empty canvas with no way to tell which direction the graph
     // went. The clamp is on the width and the same scale is applied to the height, so the box keeps
@@ -1700,6 +1988,7 @@ $("svg").addEventListener("pointerdown", (e) => {
     const svg = $("svg");
     const from = viewBox ? {...viewBox} : null;
     if (!from) return;
+    viewAdjusted = true;
     capturePointer(svg, e.pointerId);
 
     const move = (ev) => {
@@ -1724,9 +2013,13 @@ $("svg").addEventListener("pointerdown", (e) => {
 // The layout keeps every vertex inside the canvas, so this only ever zooms in. That is the
 // direction worth having: a handful of nodes otherwise sit in the middle of a mostly empty
 // canvas. A redraw resets the view, so there is no "unfit" to provide.
-$("fit").addEventListener("click", () => {
+// Framing the drawn graph, shared by the Fit button and the automatic fit a layout wider than the
+// canvas needs. Before the world grew with the graph this only ever zoomed in, since every vertex
+// was clamped inside the element; now a large graph is laid out beyond the canvas and this is the
+// only thing that brings it into view.
+function fitToGraph() {
     const svg = $("svg");
-    const placed = snapshot.nodes.filter((node) => node.x !== undefined);
+    const placed = drawn.nodes.filter((node) => node.x !== undefined);
     if (placed.length === 0) return;
 
     let minX = Infinity;
@@ -1762,6 +2055,21 @@ $("fit").addEventListener("click", () => {
         w,
         h,
     });
+}
+
+$("fit").addEventListener("click", () => {
+    viewAdjusted = true;
+    fitToGraph();
+});
+
+$("clear-focus").addEventListener("click", () => {
+    focusRoot = null;
+    drawGraph();
+});
+
+$("result-only").addEventListener("change", (e) => {
+    resultOnly = e.target.checked;
+    drawGraph();
 });
 
 $("relayout").addEventListener("click", () => {

@@ -1117,24 +1117,74 @@ svg.graph:active {
     cursor: grabbing;
 }
 
-svg.graph line {
-    stroke: var(--md-default-fg-color--lighter);
+/* Counter-scaled against the view box, so a fitted graph keeps its strokes and captions at the size
+   they were drawn for instead of shrinking with it. The arrowhead follows because a marker sized in
+   `strokeWidth` units scales with the path that references it. */
+svg.graph .edge {
+    stroke-width: calc(1.4px * var(--gscale, 1));
+}
+
+svg.graph .node circle {
+    stroke-width: calc(1.5px * var(--gscale, 1));
+}
+
+svg.graph .node text {
+    font-size: calc(11px * var(--gscale, 1));
+    stroke-width: calc(3px * var(--gscale, 1));
+}
+
+/* A caption suppressed by density is not removed, so hovering its vertex can bring it back. */
+svg.graph .node .cap.quiet {
+    opacity: 0;
+}
+
+svg.graph.hovering .node.near .cap.quiet {
+    opacity: 1;
+}
+
+/* Hover fades everything that is not the vertex or next to it. A separate class from `dim`, so a
+   hover inside a highlighted result still shows which vertices the result lit. */
+svg.graph.hovering .node:not(.near),
+svg.graph.hovering .edge:not(.near) {
+    opacity: 0.1;
+}
+
+svg.graph.hovering .node.near circle {
+    stroke: var(--md-default-fg-color--light);
+}
+
+.legend i.rel {
+    width: 14px;
+    height: 3px;
+    border-radius: 2px;
+}
+
+.toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 0.75rem;
+    color: var(--md-default-fg-color--light);
+    cursor: pointer;
+    user-select: none;
+}
+
+.focus-btn {
+    float: right;
+    margin: -2px 0 0 8px;
 }
 
 svg.graph .node circle {
     stroke: var(--md-code-bg-color);
-    stroke-width: 1.5;
     cursor: pointer;
 }
 
 svg.graph .node text {
     font-family: var(--md-text-font);
-    font-size: 11px;
     font-weight: 600;
     fill: var(--md-default-fg-color);
     paint-order: stroke;
     stroke: var(--md-code-bg-color);
-    stroke-width: 3px;
     pointer-events: none;
     user-select: none;
 }

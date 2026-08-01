@@ -169,6 +169,51 @@ bounded to a factor of eight in and four out, or a few scrolls leave an empty ca
 way the graph went. A redraw returns the view to the whole canvas, so a query is never answered into a
 frame computed for different data.
 
+An edge is a path rather than a line, which is what lets one element carry the three shapes a directed
+multigraph needs. It ends in an arrowhead, pulled back off the target's rim along the curve's own
+tangent so the head sits on the circle rather than under it. Edges sharing a pair of vertices are
+slotted onto separate curves, measured perpendicular to the chord from the lower node id so the two
+halves of a reciprocal pair land on opposite sides; a self-loop, which has no chord to bend, is a
+teardrop above its vertex. Before this the view drew a directed multigraph as an undirected simple one:
+`(a)-[:R]->(b)` and its reverse were one grey line, a second edge between the same pair was invisible
+underneath the first, and a self-loop was a line of zero length, which is to say nothing at all.
+
+Relationship type colors the edge, but only when there is more than one type in view. One type is the
+common case and coloring it says nothing, so a single-type graph keeps the neutral stroke; past one,
+the color is what tells a `BOUGHT` from a `SIMILAR_TO`. Each type also gets its own arrowhead marker,
+because a marker cannot inherit the stroke of the path referencing it.
+
+The layout runs in a world that is a multiple of the canvas, sized by the square root of the vertex
+count. Every vertex used to be clamped inside the element, so a hundred were packed into the rectangle
+six had and whatever structure they held came out as a blob; a ring lattice drew as a ball. Anything up
+to roughly sixty vertices returns a multiple of one and is laid out exactly as before. Past that the
+graph is laid out beyond the canvas and fitted once when it settles, since it would otherwise be drawn
+mostly off-screen with no sign there was more; a deliberate zoom, pan, or Fit before it settles cancels
+that, so the automatic frame cannot overrule one the visitor chose.
+
+Captions are counter-scaled against the view box so a fitted graph keeps them at the size they were
+drawn for, and above forty-five vertices only the best-connected keep one. A hundred captions at one
+size is a wall of text rather than a labelling. The rest are not removed, only made transparent, so
+hovering a vertex brings its own back.
+
+Hovering fades everything that is not the vertex or next to it. That is a different class from the
+dimming a result overlay applies, so the two compose: a hover inside a highlighted result still shows
+which vertices the result lit. `Focus`, on the inspector, narrows the view to a vertex and what is
+within two hops of it, over the drawn graph rather than the database; `Clear focus` returns.
+`Result only` draws just the vertices the last result mentioned. Both report what they removed in the
+count beside the legend, so a filtered view is never mistaken for the whole graph.
+
+## What the Graph View Draws
+
+At most 300 vertices, and they are the best-connected 300 rather than the oldest. `all_nodes` returns
+ascending id, so taking the first 300 kept insertion order: a visitor who built a large graph and then
+added the interesting part could not see the part they added. Degree needs both directions, since a
+vertex everything points at has no outgoing edges at all. The ranking reads adjacency for every vertex,
+so it runs only when there is a choice to make; under the cap the whole graph is drawn and no extra
+pass happens, which is every graph the samples build. An edge whose other endpoint the cap excluded is
+dropped, so the view never draws a line to nothing, and the count says `capped at 300` whenever the cap
+is in play.
+
 ## Procedures and Functions Are Listed Apart
 
 The Reference panel lists procedures first and functions after, with no heading between them, since
