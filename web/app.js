@@ -799,8 +799,7 @@ function formatEditor() {
 
 $("format").addEventListener("click", formatEditor);
 // Loaded into the editor rather than executed, so the statement is read before it writes. Running
-// it twice is harmless, since a sample is a script of `MERGE` clauses, but reading before writing is
-// the point.
+// it on a database that already holds the sample adds a second copy, which the caption says.
 $("load-sample").addEventListener("click", () => {
     const sample = currentSample();
     setQuery(sample.cypher);
@@ -808,7 +807,7 @@ $("load-sample").addEventListener("click", () => {
     setStatus(
         "",
         `Loaded the ${sample.label} sample. Press Execute Query to create it.` +
-        " It merges, so running it on a database that already has it changes nothing.",
+        " Running it on a database that already has it adds a second copy.",
     );
 });
 
@@ -1508,6 +1507,23 @@ let drawn = {nodes: [], edges: []};
 // cannot undo a zoom the visitor just made.
 let viewAdjusted = false;
 
+// The vertex the inspector is showing. Hovering sets it; clicking pins it so that moving the pointer
+// on, including to the inspector's own Focus button, leaves the panel where it was.
+let selectedId = null;
+let pinnedSelection = false;
+
+// Hover selects only once the pointer has rested on a vertex. Switching on entry made the panel
+// unusable on a dense graph: the straight line from a vertex to the inspector's Focus button crosses
+// whatever lies between them, so by the time the pointer arrived the panel was showing the last
+// vertex it passed over and Focus acted on that one instead. Measured at six vertices crossed on a
+// ninety-vertex lattice. A glide spends well under this on each; parking on one still feels instant.
+const HOVER_INTENT_MS = 160;
+let hoverTimer = null;
+
+// Nothing changes the selection while the pointer is over the inspector, so a panel being read
+// cannot be replaced by whatever is underneath it. Cleared on leaving, so hovering keeps working.
+let overPanel = false;
+
 // Focus narrows the view to one vertex's neighbourhood. The ball is taken over the drawn graph
 // rather than the database, so on a capped snapshot it is a neighbourhood within what was drawn;
 // the count in the toolbar already says when the cap is in play.
@@ -1636,6 +1652,9 @@ function drawGraph() {
     svg.replaceChildren();
     svg.classList.remove("hovering");
     $("inspect").hidden = true;
+    clearTimeout(hoverTimer);
+    selectedId = null;
+    pinnedSelection = false;
 
     // A redraw returns the view to the whole canvas, so a fit is discarded by the next query
     // rather than silently framing a graph it was not computed for.
@@ -1790,11 +1809,21 @@ function drawGraph() {
         group.append(circle, text);
         if (lit && !lit.has(node.id)) group.classList.add("dim");
 
-        group.addEventListener("pointerenter", () => setHover(node.id));
-        group.addEventListener("pointerleave", () => setHover(null));
+        group.addEventListener("pointerenter", () => {
+            clearTimeout(hoverTimer);
+            hoverTimer = setTimeout(() => {
+                setHover(node.id);
+                select(node, false);
+            }, HOVER_INTENT_MS);
+        });
+        group.addEventListener("pointerleave", () => {
+            clearTimeout(hoverTimer);
+            setHover(null);
+        });
 
         group.addEventListener("pointerdown", (e) => {
             e.stopPropagation();
+            select(node, true);
             node.pinned = true;
             capturePointer(group, e.pointerId);
             const move = (ev) => {
@@ -1815,13 +1844,29 @@ function drawGraph() {
             group.addEventListener("pointerup", up);
             group.addEventListener("pointercancel", up);
             group.addEventListener("lostpointercapture", up);
-            inspect(node);
         });
         nodeLayer.append(group);
         return group;
     });
 
     const groupById = new Map(nodes.map((node, i) => [node.id, groups[i]]));
+
+    // Hovering selects: the inspector opens on the vertex under the pointer rather than waiting for
+    // a click. A click pins that selection, which is what makes the inspector reachable at all,
+    // since crossing another vertex on the way to the panel would otherwise replace what the panel
+    // is showing before the pointer arrived. Clicking the background unpins and clears.
+    function select(node, pin) {
+        if ((pinnedSelection || overPanel) && !pin) return;
+        pinnedSelection = pin;
+        if (selectedId !== node.id) {
+            groupById.get(selectedId)?.classList.remove("selected");
+            selectedId = node.id;
+            groupById.get(node.id)?.classList.add("selected");
+            inspect(node);
+        } else if (pin) {
+            groupById.get(node.id)?.classList.add("selected");
+        }
+    }
 
     // Hovering one vertex fades everything that is not it or next to it. This is a separate class
     // from the result overlay's `dim` so the two compose: a hover inside a highlighted result still
@@ -1981,6 +2026,11 @@ $("svg").addEventListener(
 
 $("svg").addEventListener("pointerdown", (e) => {
     $("inspect").hidden = true;
+    if (selectedId !== null) {
+        $("svg").querySelector(".node.selected")?.classList.remove("selected");
+        selectedId = null;
+    }
+    pinnedSelection = false;
     // A vertex has its own drag handler and stops propagation; this is the guard for anything that
     // does not, so a pan cannot start on top of a node.
     if (e.target.closest(".node")) return;
@@ -2060,6 +2110,14 @@ function fitToGraph() {
 $("fit").addEventListener("click", () => {
     viewAdjusted = true;
     fitToGraph();
+});
+
+$("inspect").addEventListener("pointerenter", () => {
+    overPanel = true;
+    clearTimeout(hoverTimer);
+});
+$("inspect").addEventListener("pointerleave", () => {
+    overPanel = false;
 });
 
 $("clear-focus").addEventListener("click", () => {

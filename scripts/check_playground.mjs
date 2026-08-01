@@ -26,16 +26,10 @@ let checked = 0;
 
 console.log(`IssunDB ${Playground.version()} (persistent: ${Playground.isPersistent()})\n`);
 
-// The Setup panel's sample graphs. Each is a script in a JavaScript file, so nothing else can see
+// The Setup panel's sample graphs. Each is a `CREATE` in a JavaScript file, so nothing else can see
 // it; a typo would surface as an error the first time a visitor pressed Reset Database. Each is run
 // on its own instance and has to produce nodes, which is what catches a script that parses but
 // builds nothing.
-//
-// Then run again on the same instance, because every sample is written as `MERGE` clauses so that a
-// second run leaves the graph as it was. The page seeds a sample on load, which makes pressing
-// Execute on a loaded one the second run rather than the first, so a sample that slipped back to
-// `CREATE` would silently double the dataset under the visitor. Nothing else can catch that: the
-// scripts are invisible to every Rust test, and one run cannot tell the two apart.
 console.log("Sample graphs");
 
 let sampleFailures = 0;
@@ -47,14 +41,6 @@ for (const sample of SAMPLE_GRAPHS) {
     const stats = JSON.parse(p.stats());
     if (stats.nodes === 0) {
       throw new Error("the script ran but created no nodes");
-    }
-    p.query(sample.cypher);
-    const again = JSON.parse(p.stats());
-    if (again.nodes !== stats.nodes || again.edges !== stats.edges) {
-      throw new Error(
-        `a second run is not idempotent: ${stats.nodes} nodes and ${stats.edges} relationships` +
-          ` became ${again.nodes} and ${again.edges}`,
-      );
     }
     const labels = Object.keys(stats.label_counts ?? {}).sort().join(", ");
     console.log(

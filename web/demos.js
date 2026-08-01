@@ -4,37 +4,29 @@
 // catalog through the compiled module and fails on an error. The first draft of this file had
 // the wrong yield names and the wrong argument form for every procedure.
 
-export const SAMPLE_SOCIAL = `MERGE (ada:Person {name: 'Ada', city: 'London', age: 36})
-MERGE (grace:Person {name: 'Grace', city: 'New York', age: 45})
-MERGE (alan:Person {name: 'Alan', city: 'London', age: 41})
-MERGE (edsger:Person {name: 'Edsger', city: 'Amsterdam', age: 52})
-MERGE (barbara:Person {name: 'Barbara', city: 'New York', age: 38})
-MERGE (donald:Person {name: 'Donald', city: 'Chicago', age: 60})
-MERGE (ada)-[:KNOWS {since: 1936, weight: 4}]->(alan)
-MERGE (alan)-[:KNOWS {since: 1938, weight: 1}]->(grace)
-MERGE (grace)-[:KNOWS {since: 1952, weight: 2}]->(barbara)
-MERGE (barbara)-[:KNOWS {since: 1960, weight: 3}]->(donald)
-MERGE (donald)-[:KNOWS {since: 1968, weight: 1}]->(edsger)
-MERGE (edsger)-[:KNOWS {since: 1972, weight: 5}]->(ada)
-MERGE (ada)-[:KNOWS {since: 1940, weight: 9}]->(grace)
-MERGE (alan)-[:KNOWS {since: 1945, weight: 2}]->(barbara)
-MERGE (grace)-[:KNOWS {since: 1955, weight: 3}]->(ada)`;
+export const SAMPLE_SOCIAL = `CREATE (ada:Person {name: 'Ada', city: 'London', age: 36}),
+       (grace:Person {name: 'Grace', city: 'New York', age: 45}),
+       (alan:Person {name: 'Alan', city: 'London', age: 41}),
+       (edsger:Person {name: 'Edsger', city: 'Amsterdam', age: 52}),
+       (barbara:Person {name: 'Barbara', city: 'New York', age: 38}),
+       (donald:Person {name: 'Donald', city: 'Chicago', age: 60}),
+       (ada)-[:KNOWS {since: 1936, weight: 4}]->(alan),
+       (alan)-[:KNOWS {since: 1938, weight: 1}]->(grace),
+       (grace)-[:KNOWS {since: 1952, weight: 2}]->(barbara),
+       (barbara)-[:KNOWS {since: 1960, weight: 3}]->(donald),
+       (donald)-[:KNOWS {since: 1968, weight: 1}]->(edsger),
+       (edsger)-[:KNOWS {since: 1972, weight: 5}]->(ada),
+       (ada)-[:KNOWS {since: 1940, weight: 9}]->(grace),
+       (alan)-[:KNOWS {since: 1945, weight: 2}]->(barbara),
+       (grace)-[:KNOWS {since: 1955, weight: 3}]->(ada)`;
 
 const PATH_NOTE = `// Procedure arguments are resolved before planning, so they are literal ids
 // rather than expressions. 0 is Ada and 5 is Donald in the seeded sample.`;
 
-// The Setup panel's sample graphs. Each is a self-contained script, small enough to read in one
+// The Setup panel's sample graphs. Each is a self-contained `CREATE`, small enough to read in one
 // screen and shaped so that one part of the engine has something to say about it. `make
 // playground-check` runs every one of them, since a script living in a JavaScript file is invisible
 // to every Rust test.
-//
-// Every clause is a `MERGE` rather than a `CREATE`, one per node and one per relationship, so
-// running a sample twice leaves the same graph rather than a second disconnected copy of it. That
-// costs the samples nothing as a demonstration and removes the trap: the page seeds one on load, so
-// pressing Execute on a loaded sample is the second run, not the first. A `MERGE` matches on every
-// inline property, which is why each node carries its full property map in the clause that creates
-// it. Node ids stay stable because the clauses run in order and a re-run creates nothing, which
-// `PATH_NOTE` and the two path demos depend on.
 //
 // The social graph is first because it is what the page seeds on load and what the Examples panel
 // queries; the other four replace it when Reset Database is pressed with one of them selected.
@@ -47,107 +39,107 @@ export const SAMPLE_GRAPHS = [
     {
         id: "articles",
         label: "Article corpus",
-        cypher: `MERGE (a1:Article {title: 'Graph databases', year: 2019,
-  body: 'A graph database stores nodes and relationships instead of tables and joins.'})
-MERGE (a2:Article {title: 'Vector search', year: 2021,
-  body: 'Approximate nearest neighbour search finds similar embeddings quickly.'})
-MERGE (a3:Article {title: 'Query planning', year: 2020,
-  body: 'A planner chooses a join order using cardinality statistics gathered from the graph.'})
-MERGE (a4:Article {title: 'Transactions', year: 2018,
-  body: 'ACID transactions keep the graph and its indexes consistent under concurrent writes.'})
-MERGE (a5:Article {title: 'Hybrid retrieval', year: 2023,
-  body: 'Fusing vector similarity with full-text relevance retrieves better context for a language model.'})
-MERGE (t1:Topic {name: 'storage'})
-MERGE (t2:Topic {name: 'search'})
-MERGE (t3:Topic {name: 'optimizer'})
-MERGE (a1)-[:ABOUT]->(t1)
-MERGE (a4)-[:ABOUT]->(t1)
-MERGE (a2)-[:ABOUT]->(t2)
-MERGE (a5)-[:ABOUT]->(t2)
-MERGE (a3)-[:ABOUT]->(t3)
-MERGE (a1)-[:CITES]->(a4)
-MERGE (a3)-[:CITES]->(a1)
-MERGE (a5)-[:CITES]->(a2)
-MERGE (a5)-[:CITES]->(a3)`,
+        cypher: `CREATE (a1:Article {title: 'Graph databases', year: 2019,
+         body: 'A graph database stores nodes and relationships instead of tables and joins.'}),
+       (a2:Article {title: 'Vector search', year: 2021,
+         body: 'Approximate nearest neighbour search finds similar embeddings quickly.'}),
+       (a3:Article {title: 'Query planning', year: 2020,
+         body: 'A planner chooses a join order using cardinality statistics gathered from the graph.'}),
+       (a4:Article {title: 'Transactions', year: 2018,
+         body: 'ACID transactions keep the graph and its indexes consistent under concurrent writes.'}),
+       (a5:Article {title: 'Hybrid retrieval', year: 2023,
+         body: 'Fusing vector similarity with full-text relevance retrieves better context for a language model.'}),
+       (t1:Topic {name: 'storage'}),
+       (t2:Topic {name: 'search'}),
+       (t3:Topic {name: 'optimizer'}),
+       (a1)-[:ABOUT]->(t1),
+       (a4)-[:ABOUT]->(t1),
+       (a2)-[:ABOUT]->(t2),
+       (a5)-[:ABOUT]->(t2),
+       (a3)-[:ABOUT]->(t3),
+       (a1)-[:CITES]->(a4),
+       (a3)-[:CITES]->(a1),
+       (a5)-[:CITES]->(a2),
+       (a5)-[:CITES]->(a3)`,
     },
     {
         id: "org",
         label: "Org chart",
-        cypher: `MERGE (rin:Employee {name: 'Rin', title: 'CEO', level: 1})
-MERGE (sato:Employee {name: 'Sato', title: 'CTO', level: 2})
-MERGE (mori:Employee {name: 'Mori', title: 'CFO', level: 2})
-MERGE (kaito:Employee {name: 'Kaito', title: 'Engineering Manager', level: 3})
-MERGE (yuki:Employee {name: 'Yuki', title: 'Staff Engineer', level: 4})
-MERGE (hana:Employee {name: 'Hana', title: 'Engineer', level: 5})
-MERGE (taro:Employee {name: 'Taro', title: 'Controller', level: 3})
-MERGE (sato)-[:REPORTS_TO]->(rin)
-MERGE (mori)-[:REPORTS_TO]->(rin)
-MERGE (kaito)-[:REPORTS_TO]->(sato)
-MERGE (yuki)-[:REPORTS_TO]->(kaito)
-MERGE (hana)-[:REPORTS_TO]->(yuki)
-MERGE (taro)-[:REPORTS_TO]->(mori)`,
+        cypher: `CREATE (rin:Employee {name: 'Rin', title: 'CEO', level: 1}),
+       (sato:Employee {name: 'Sato', title: 'CTO', level: 2}),
+       (mori:Employee {name: 'Mori', title: 'CFO', level: 2}),
+       (kaito:Employee {name: 'Kaito', title: 'Engineering Manager', level: 3}),
+       (yuki:Employee {name: 'Yuki', title: 'Staff Engineer', level: 4}),
+       (hana:Employee {name: 'Hana', title: 'Engineer', level: 5}),
+       (taro:Employee {name: 'Taro', title: 'Controller', level: 3}),
+       (sato)-[:REPORTS_TO]->(rin),
+       (mori)-[:REPORTS_TO]->(rin),
+       (kaito)-[:REPORTS_TO]->(sato),
+       (yuki)-[:REPORTS_TO]->(kaito),
+       (hana)-[:REPORTS_TO]->(yuki),
+       (taro)-[:REPORTS_TO]->(mori)`,
     },
     {
         id: "transport",
         label: "Transport network",
-        cypher: `MERGE (tokyo:City {name: 'Tokyo', country: 'Japan'})
-MERGE (nagoya:City {name: 'Nagoya', country: 'Japan'})
-MERGE (kyoto:City {name: 'Kyoto', country: 'Japan'})
-MERGE (osaka:City {name: 'Osaka', country: 'Japan'})
-MERGE (fukuoka:City {name: 'Fukuoka', country: 'Japan'})
-MERGE (sapporo:City {name: 'Sapporo', country: 'Japan'})
-MERGE (tokyo)-[:ROUTE {weight: 350, cost: 11300, capacity: 1300}]->(nagoya)
-MERGE (nagoya)-[:ROUTE {weight: 140, cost: 5600, capacity: 900}]->(kyoto)
-MERGE (kyoto)-[:ROUTE {weight: 40, cost: 1400, capacity: 700}]->(osaka)
-MERGE (tokyo)-[:ROUTE {weight: 500, cost: 14500, capacity: 1100}]->(osaka)
-MERGE (osaka)-[:ROUTE {weight: 480, cost: 15400, capacity: 600}]->(fukuoka)
-MERGE (tokyo)-[:ROUTE {weight: 830, cost: 25000, capacity: 400}]->(sapporo)`,
+        cypher: `CREATE (tokyo:City {name: 'Tokyo', country: 'Japan'}),
+       (nagoya:City {name: 'Nagoya', country: 'Japan'}),
+       (kyoto:City {name: 'Kyoto', country: 'Japan'}),
+       (osaka:City {name: 'Osaka', country: 'Japan'}),
+       (fukuoka:City {name: 'Fukuoka', country: 'Japan'}),
+       (sapporo:City {name: 'Sapporo', country: 'Japan'}),
+       (tokyo)-[:ROUTE {weight: 350, cost: 11300, capacity: 1300}]->(nagoya),
+       (nagoya)-[:ROUTE {weight: 140, cost: 5600, capacity: 900}]->(kyoto),
+       (kyoto)-[:ROUTE {weight: 40, cost: 1400, capacity: 700}]->(osaka),
+       (tokyo)-[:ROUTE {weight: 500, cost: 14500, capacity: 1100}]->(osaka),
+       (osaka)-[:ROUTE {weight: 480, cost: 15400, capacity: 600}]->(fukuoka),
+       (tokyo)-[:ROUTE {weight: 830, cost: 25000, capacity: 400}]->(sapporo)`,
     },
     {
         id: "retail",
         label: "Retail co-purchase",
-        cypher: `MERGE (aiko:Customer {name: 'Aiko'})
-MERGE (ben:Customer {name: 'Ben'})
-MERGE (chie:Customer {name: 'Chie'})
-MERGE (keyboard:Product {name: 'Mechanical keyboard', price: 129, category: 'peripherals'})
-MERGE (monitor:Product {name: 'Ultrawide monitor', price: 749, category: 'displays'})
-MERGE (dock:Product {name: 'USB-C dock', price: 199, category: 'peripherals'})
-MERGE (lamp:Product {name: 'Desk lamp', price: 59, category: 'lighting'})
-MERGE (aiko)-[:BOUGHT {rating: 5}]->(keyboard)
-MERGE (aiko)-[:BOUGHT {rating: 4}]->(dock)
-MERGE (ben)-[:BOUGHT {rating: 5}]->(keyboard)
-MERGE (ben)-[:BOUGHT {rating: 3}]->(monitor)
-MERGE (chie)-[:BOUGHT {rating: 4}]->(monitor)
-MERGE (chie)-[:BOUGHT {rating: 5}]->(lamp)
-MERGE (keyboard)-[:SIMILAR_TO]->(dock)
-MERGE (dock)-[:SIMILAR_TO]->(keyboard)
-MERGE (monitor)-[:SIMILAR_TO]->(lamp)`,
+        cypher: `CREATE (aiko:Customer {name: 'Aiko'}),
+       (ben:Customer {name: 'Ben'}),
+       (chie:Customer {name: 'Chie'}),
+       (keyboard:Product {name: 'Mechanical keyboard', price: 129, category: 'peripherals'}),
+       (monitor:Product {name: 'Ultrawide monitor', price: 749, category: 'displays'}),
+       (dock:Product {name: 'USB-C dock', price: 199, category: 'peripherals'}),
+       (lamp:Product {name: 'Desk lamp', price: 59, category: 'lighting'}),
+       (aiko)-[:BOUGHT {rating: 5}]->(keyboard),
+       (aiko)-[:BOUGHT {rating: 4}]->(dock),
+       (ben)-[:BOUGHT {rating: 5}]->(keyboard),
+       (ben)-[:BOUGHT {rating: 3}]->(monitor),
+       (chie)-[:BOUGHT {rating: 4}]->(monitor),
+       (chie)-[:BOUGHT {rating: 5}]->(lamp),
+       (keyboard)-[:SIMILAR_TO]->(dock),
+       (dock)-[:SIMILAR_TO]->(keyboard),
+       (monitor)-[:SIMILAR_TO]->(lamp)`,
     },
     {
         id: "knowledge",
         label: "Knowledge graph",
-        cypher: `MERGE (ada:Researcher {name: 'Ada Ito'})
-MERGE (bo:Researcher {name: 'Bo Chen'})
-MERGE (cai:Researcher {name: 'Cai Rossi'})
-MERGE (lab1:Lab {name: 'Retrieval Group', city: 'Kyoto'})
-MERGE (lab2:Lab {name: 'Systems Group', city: 'Zurich'})
-MERGE (p1:Paper {title: 'Fusing text and vector relevance', year: 2023})
-MERGE (p2:Paper {title: 'Adjacency layouts for traversal', year: 2022})
-MERGE (p3:Paper {title: 'Grounding answers in a graph', year: 2024})
-MERGE (c1:Concept {name: 'retrieval augmented generation'})
-MERGE (c2:Concept {name: 'nearest neighbour search'})
-MERGE (c3:Concept {name: 'query planning'})
-MERGE (ada)-[:WORKS_IN]->(lab1)
-MERGE (bo)-[:WORKS_IN]->(lab2)
-MERGE (cai)-[:WORKS_IN]->(lab1)
-MERGE (ada)-[:AUTHORED]->(p1)
-MERGE (cai)-[:AUTHORED]->(p1)
-MERGE (bo)-[:AUTHORED]->(p2)
-MERGE (ada)-[:AUTHORED]->(p3)
-MERGE (p1)-[:MENTIONS]->(c1)
-MERGE (p1)-[:MENTIONS]->(c2)
-MERGE (p3)-[:MENTIONS]->(c1)
-MERGE (p2)-[:MENTIONS]->(c3)`,
+        cypher: `CREATE (ada:Researcher {name: 'Ada Ito'}),
+       (bo:Researcher {name: 'Bo Chen'}),
+       (cai:Researcher {name: 'Cai Rossi'}),
+       (lab1:Lab {name: 'Retrieval Group', city: 'Kyoto'}),
+       (lab2:Lab {name: 'Systems Group', city: 'Zurich'}),
+       (p1:Paper {title: 'Fusing text and vector relevance', year: 2023}),
+       (p2:Paper {title: 'Adjacency layouts for traversal', year: 2022}),
+       (p3:Paper {title: 'Grounding answers in a graph', year: 2024}),
+       (c1:Concept {name: 'retrieval augmented generation'}),
+       (c2:Concept {name: 'nearest neighbour search'}),
+       (c3:Concept {name: 'query planning'}),
+       (ada)-[:WORKS_IN]->(lab1),
+       (bo)-[:WORKS_IN]->(lab2),
+       (cai)-[:WORKS_IN]->(lab1),
+       (ada)-[:AUTHORED]->(p1),
+       (cai)-[:AUTHORED]->(p1),
+       (bo)-[:AUTHORED]->(p2),
+       (ada)-[:AUTHORED]->(p3),
+       (p1)-[:MENTIONS]->(c1),
+       (p1)-[:MENTIONS]->(c2),
+       (p3)-[:MENTIONS]->(c1),
+       (p2)-[:MENTIONS]->(c3)`,
     },
 ];
 
