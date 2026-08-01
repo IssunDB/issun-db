@@ -9,7 +9,7 @@ mod schema;
 pub(crate) mod storage;
 pub(crate) mod threads;
 
-pub use columns::PropCmp;
+pub use columns::{ID_GROUP_ABSENT, IdGroupCodes, PropCmp};
 pub use error::Error;
 pub use graph::{
     DegreeDirection, Graph, GroupedDegreeSpec, LinkPredictionMetric, NeighborCountSpec,

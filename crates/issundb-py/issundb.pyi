@@ -505,6 +505,20 @@ class IssunDB:
         """
         ...
 
+    def materialize_edge_property_columns(self) -> None:
+        """Build the in-memory edge property columns, now.
+
+        The edge counterpart of :meth:`materialize_property_columns`, with the
+        same contract and the same warning: one full scan of every edge record,
+        and the columns hold every scalar edge property in memory for the life
+        of this object. Worth it for a workload of edge-property aggregations;
+        not worth it for one that never reads edge properties in bulk.
+
+        Raises:
+            RuntimeError: If the columns cannot be built.
+        """
+        ...
+
     def backup(self, path: str) -> None:
         """Write a hot backup of the database to ``path``.
 

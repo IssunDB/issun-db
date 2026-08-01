@@ -479,6 +479,19 @@ impl PyGraph {
             .map_err(rt)
     }
 
+    /// Build the in-memory edge property columns, now.
+    ///
+    /// The edge counterpart of `materialize_property_columns`, with the same
+    /// contract and the same warning: one full scan of every edge record, and
+    /// the columns hold every scalar edge property in memory for the life of
+    /// the graph handle. Worth it for a workload of edge-property
+    /// aggregations; not worth it for one that never reads edge properties in
+    /// bulk.
+    fn materialize_edge_property_columns(&self, py: Python<'_>) -> PyResult<()> {
+        py.detach(|| self.graph.materialize_edge_property_columns())
+            .map_err(rt)
+    }
+
     /// Execute a hybrid retrieval (GraphRAG) query combining vector search, text
     /// search, and relationship expansion. Returns a JSON object
     /// `{"nodes", "edges", "scores", "truncated"}`, where `truncated` is true when

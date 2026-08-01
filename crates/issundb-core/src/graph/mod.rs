@@ -503,6 +503,11 @@ pub struct Graph {
     /// statistics table means walking the graph, so a decided verdict is remembered
     /// until a write invalidates the generation. See [`crate::graph::stats`].
     pub(super) schema_probes: Arc<parking_lot::Mutex<SchemaProbeMemo>>,
+    /// Cached id-indexed group codes, one shared array per grouped property,
+    /// valid for exactly one write generation: what lets a grouped bulk
+    /// aggregation read one array cell per row instead of interning one value
+    /// per row per query. See [`crate::columns::IdGroupCodes`].
+    pub(super) group_codes_by_id: Arc<parking_lot::Mutex<crate::columns::IdGroupCodesCache>>,
     /// Cached full label scans for the committed-read path, one shared sorted id
     /// vector per label, valid for exactly one write generation. Filters, the
     /// vectorized executor, and the counting kernels each enumerate a whole
@@ -621,6 +626,9 @@ impl Graph {
             edge_columns: Arc::new(crate::columns::ColumnsCache::default()),
             edge_fanout: Arc::new(parking_lot::Mutex::new(None)),
             schema_probes: Arc::new(parking_lot::Mutex::new((0, AHashMap::new()))),
+            group_codes_by_id: Arc::new(parking_lot::Mutex::new(
+                crate::columns::IdGroupCodesCache::default(),
+            )),
             label_scans: Arc::new(parking_lot::Mutex::new(index::LabelScanCache::default())),
             n_threads: Arc::new(std::sync::atomic::AtomicI32::new(0)),
             extensions: Arc::new(parking_lot::Mutex::new(AHashMap::new())),
@@ -889,6 +897,73 @@ impl Graph {
         }
         self.prop_columns
             .with_fresh(&self.storage, |cols| cols.group_codes(ids, prop))?
+    }
+
+    /// The id-indexed form of [`Graph::node_prop_group_codes`]: one shared
+    /// array over every node, `codes[node_id]` the node's group code under
+    /// exact value identity and [`crate::columns::ID_GROUP_ABSENT`] where no
+    /// such node exists, plus one representative value per code. Cached per
+    /// write generation and shared, so a grouped bulk aggregation pays the
+    /// value interning once per generation and one array read per row per
+    /// query afterward. Building it costs one pass over every node (and the
+    /// full column build when the columns are absent), so a caller with a
+    /// small row set wants [`Graph::node_prop_group_codes`] instead.
+    pub fn node_prop_group_codes_by_id(
+        &self,
+        prop: &str,
+    ) -> Result<std::sync::Arc<crate::columns::IdGroupCodes>, Error> {
+        let mut cache = self.group_codes_by_id.lock();
+        let generation = self.csr_cache.current_gen();
+        if cache.generation != generation {
+            cache.by_prop.clear();
+            cache.generation = generation;
+        }
+        if let Some(hit) = cache.by_prop.get(prop) {
+            return Ok(hit.clone());
+        }
+        let built = self.prop_columns.with_fresh(&self.storage, |cols| {
+            let (dense_codes, reps) = cols.group_codes(&cols.dense_to_id, prop)?;
+            let span = cols
+                .dense_to_id
+                .iter()
+                .copied()
+                .max()
+                .map_or(0, |m| m as usize + 1);
+            let mut codes = vec![crate::columns::ID_GROUP_ABSENT; span];
+            for (dense, &id) in cols.dense_to_id.iter().enumerate() {
+                codes[id as usize] = dense_codes[dense];
+            }
+            Ok::<_, Error>(crate::columns::IdGroupCodes {
+                codes,
+                reps: std::sync::Arc::new(reps),
+            })
+        })??;
+        let arc = std::sync::Arc::new(built);
+        cache.by_prop.insert(prop.to_string(), arc.clone());
+        Ok(arc)
+    }
+
+    /// Build the in-memory edge property columns now, if they are not built
+    /// already: the edge counterpart of [`Graph::materialize_property_columns`],
+    /// with the same contract. Nothing builds the edge columns as a side effect
+    /// of a small workload, so this is the deliberate warm-up, and it is the
+    /// edge columns cache file's save site; a repeat at an unchanged generation
+    /// rewrites nothing.
+    pub fn materialize_edge_property_columns(&self) -> Result<(), Error> {
+        #[cfg(feature = "lmdb")]
+        {
+            // Captured before the build, so a write landing during it leaves
+            // the saved file conservatively stale rather than falsely fresh.
+            let persisted_gen = {
+                let rtxn = self.storage.env.read_txn()?;
+                crate::storage::ids::commit_gen(&self.storage, &rtxn)?
+            };
+            self.edge_columns.with_fresh(&self.storage, |cols| {
+                let _ = crate::cache_file::save_columns(&self.storage, cols, persisted_gen);
+            })
+        }
+        #[cfg(not(feature = "lmdb"))]
+        self.edge_columns.with_fresh(&self.storage, |_| ())
     }
 
     // ------------------------------------------------------------------

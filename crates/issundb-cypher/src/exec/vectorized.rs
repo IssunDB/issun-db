@@ -1585,14 +1585,16 @@ pub(super) fn try_execute_vectorized(
                 let Some((col, prop)) = prop_read(expr, &p.chain_vars) else {
                     return Ok(None);
                 };
-                group_codes.push(graph.node_prop_group_codes(&id_cols[col], prop).map_err(
-                    |e| match e {
-                        issundb_core::Error::NodeNotFound(id) => {
-                            format!("node not found: {}", id)
-                        }
-                        other => other.to_string(),
-                    },
-                )?);
+                let (codes, reps) =
+                    graph
+                        .node_prop_group_codes(&id_cols[col], prop)
+                        .map_err(|e| match e {
+                            issundb_core::Error::NodeNotFound(id) => {
+                                format!("node not found: {}", id)
+                            }
+                            other => other.to_string(),
+                        })?;
+                group_codes.push((codes, std::sync::Arc::new(reps)));
             }
             // Merge codes whose representatives are canonically equal so grouping
             // matches the row pipeline's numeric equivalence.
@@ -2027,6 +2029,38 @@ fn expanded_neighbor_tallies(
     Ok(out)
 }
 
+/// Row count from which the collapsed count's grouping and tallies switch to
+/// the id-indexed forms. Below it the per-request forms win: the id-indexed
+/// group codes cost one interning pass over every node on first use per write
+/// generation, and the scattered tally array costs memory proportional to the
+/// highest source id, both of which a small row set should not pay.
+const DENSE_GROUP_MIN_ROWS: usize = 65_536;
+
+/// One group-key column: per-row codes plus the shared representative values.
+type GroupKeyCol = (Vec<u32>, std::sync::Arc<Vec<Value>>);
+
+/// The per-row group codes of `ids` read out of the shared id-indexed array
+/// for `prop`, or `None` when any id has no slot there (the array lags a
+/// concurrent write; the caller falls back to the per-request form, which
+/// reports such an id exactly as the boxed path would).
+fn id_indexed_codes(
+    graph: &Graph,
+    ids: &[NodeId],
+    prop: &str,
+) -> Result<Option<GroupKeyCol>, String> {
+    let by_id = graph
+        .node_prop_group_codes_by_id(prop)
+        .map_err(|e| e.to_string())?;
+    let mut codes = Vec::with_capacity(ids.len());
+    for &id in ids {
+        match by_id.codes.get(id as usize) {
+            Some(&c) if c != issundb_core::ID_GROUP_ABSENT => codes.push(c),
+            _ => return Ok(None),
+        }
+    }
+    Ok(Some((codes, by_id.reps.clone())))
+}
+
 /// Execute a recognized aggregate pipeline whose single `count` is over the
 /// chain's terminal variable, collapsing the final hop.
 ///
@@ -2156,17 +2190,37 @@ fn execute_collapsed_count(
         Some(t) => t,
         None => expanded_neighbor_tallies(graph, p, tc, last, &distinct, terminal, params, schema)?,
     };
-    // Per-source tallies are positional over `distinct`, which is sorted, so a
-    // pre-row resolves its source by binary search.
+    // Per-source tallies are positional over `distinct`, which is sorted. A
+    // bulk source set scatters them into an id-indexed array first, so the
+    // per-row resolution is one array read; a small one keeps the binary
+    // search, whose cost a few rows never notice and whose memory is nothing.
+    let tally_by_id: Option<Vec<(u64, u64)>> = if distinct.len() >= DENSE_GROUP_MIN_ROWS {
+        let span = distinct.last().map_or(0, |&m| m as usize + 1);
+        let mut arr = vec![(0u64, 0u64); span];
+        for (i, &s) in distinct.iter().enumerate() {
+            arr[s as usize] = tallies[i];
+        }
+        Some(arr)
+    } else {
+        None
+    };
     let tally_of = |src: NodeId| -> (u64, u64) {
-        match distinct.binary_search(&src) {
-            Ok(i) => tallies[i],
-            Err(_) => (0, 0),
+        match &tally_by_id {
+            Some(arr) => arr.get(src as usize).copied().unwrap_or((0, 0)),
+            None => match distinct.binary_search(&src) {
+                Ok(i) => tallies[i],
+                Err(_) => (0, 0),
+            },
         }
     };
 
     // Group the pre-rows by the group-by value codes (all group keys read
     // pre-row columns; the terminal is excluded by the collapse eligibility).
+    // A bulk row set reads each row's code out of the shared id-indexed array
+    // (one value-interning pass per property per write generation, see
+    // `Graph::node_prop_group_codes_by_id`) instead of interning one value per
+    // row per query; a small one takes the per-request form, which never
+    // builds whole-graph state.
     let mut group_codes = Vec::with_capacity(group_by.len());
     for (expr, _) in group_by.iter() {
         let (col, prop) =
@@ -2174,11 +2228,22 @@ fn execute_collapsed_count(
         if col >= cols.cols.len() {
             return Err("vectorized: collapse group key over the terminal".into());
         }
-        group_codes.push(
-            graph
-                .node_prop_group_codes(&cols.cols[col], prop)
-                .map_err(|e| e.to_string())?,
-        );
+        let ids = &cols.cols[col];
+        let dense = if n >= DENSE_GROUP_MIN_ROWS {
+            id_indexed_codes(graph, ids, prop)?
+        } else {
+            None
+        };
+        let entry = match dense {
+            Some(entry) => entry,
+            None => {
+                let (codes, reps) = graph
+                    .node_prop_group_codes(ids, prop)
+                    .map_err(|e| e.to_string())?;
+                (codes, std::sync::Arc::new(reps))
+            }
+        };
+        group_codes.push(entry);
     }
     // Merge codes whose representatives are canonically equal so grouping matches
     // the row pipeline's numeric equivalence (`1` == `1.0`).
@@ -2418,6 +2483,49 @@ mod tests {
                 panic!("one path errored for: {cypher}\nfast: {fast:?}\nslow: {slow:?}")
             }
         }
+    }
+
+    /// Above `DENSE_GROUP_MIN_ROWS` pre-rows the collapsed count reads its
+    /// group codes out of the shared id-indexed array and its tallies out of a
+    /// scattered array; below it the per-request forms serve. The row pipeline
+    /// is the oracle for the dense forms, which no small fixture reaches, so
+    /// this fixture is deliberately sized past the threshold.
+    #[test]
+    fn collapsed_count_dense_grouping_matches_row_path() {
+        let dir = TempDir::new().unwrap();
+        let g = Graph::open(dir.path(), 1).unwrap();
+        let persons = DENSE_GROUP_MIN_ROWS + 500;
+        g.update(|txn| {
+            let cities: Vec<_> = (0..3)
+                .map(|i| txn.add_node("City", &json!({ "name": format!("c{i}") })))
+                .collect::<Result<_, _>>()?;
+            let mut ids = Vec::with_capacity(persons);
+            for i in 0..persons {
+                // A duplicated id value every 1000 persons, so grouping by
+                // value genuinely merges nodes rather than being one group per
+                // node; a person with no id at all exercises the null group.
+                let p = if i % 5000 == 4999 {
+                    txn.add_node("Person", &json!({}))?
+                } else {
+                    txn.add_node("Person", &json!({ "id": i % 65_000 }))?
+                };
+                txn.add_edge(p, cities[i % 3], "LIVES_IN", &json!({}))?;
+                ids.push(p);
+            }
+            for i in 1..persons {
+                // Skewed follower counts, so the count window has real work.
+                txn.add_edge(ids[i], ids[i % 100], "FOLLOWS", &json!({}))?;
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        assert_matches_row_path(
+            &g,
+            "MATCH (f:Person)-[:FOLLOWS]->(p:Person)-[:LIVES_IN]->(c:City) \
+             RETURN p.id AS id, count(f.id) AS num, c.name AS city \
+             ORDER BY num DESC, id LIMIT 5",
+        );
     }
 
     /// A group-by over a property that mixes integer and float representations of

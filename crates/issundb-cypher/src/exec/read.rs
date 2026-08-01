@@ -1059,8 +1059,8 @@ pub(super) fn canonical_cell_key(v: &serde_json::Value) -> String {
 /// without a key string per row. The common case (no merge) returns the input
 /// columns unchanged.
 pub(super) fn canonicalize_group_codes(
-    group_codes: Vec<(Vec<u32>, Vec<serde_json::Value>)>,
-) -> Vec<(Vec<u32>, Vec<serde_json::Value>)> {
+    group_codes: Vec<(Vec<u32>, std::sync::Arc<Vec<serde_json::Value>>)>,
+) -> Vec<(Vec<u32>, std::sync::Arc<Vec<serde_json::Value>>)> {
     group_codes
         .into_iter()
         .map(|(codes, reps)| {
@@ -1082,7 +1082,7 @@ pub(super) fn canonicalize_group_codes(
                 ahash::AHashMap::with_capacity(reps.len());
             let mut new_reps: Vec<serde_json::Value> = Vec::with_capacity(reps.len());
             let mut old_to_new: Vec<u32> = Vec::with_capacity(reps.len());
-            for rep in &reps {
+            for rep in reps.iter() {
                 let new = *key_to_new
                     .entry(canonical_cell_key(rep))
                     .or_insert_with(|| {
@@ -1095,7 +1095,7 @@ pub(super) fn canonicalize_group_codes(
                 (codes, reps)
             } else {
                 let new_codes = codes.into_iter().map(|c| old_to_new[c as usize]).collect();
-                (new_codes, new_reps)
+                (new_codes, std::sync::Arc::new(new_reps))
             }
         })
         .collect()
@@ -1154,7 +1154,7 @@ pub(super) fn count_window_survivors(
 /// are; packing the columns into one integer by strides would overflow once the
 /// product of the per-column cardinalities passed `u64`.
 pub(super) fn combine_group_codes(
-    key_cols: &[(Vec<u32>, Vec<serde_json::Value>)],
+    key_cols: &[(Vec<u32>, std::sync::Arc<Vec<serde_json::Value>>)],
     n: usize,
 ) -> (Vec<u32>, Vec<usize>, usize) {
     // No keys at all: every row folds into one group (the grouping-free shape).
@@ -4909,9 +4909,13 @@ pub(super) fn eval_leaf(
             // not by the answer: it folds through dense integer codes (one
             // per-key column gather plus one integer pass) rather than building
             // a key string and a row per group node.
-            let key_cols: Vec<(Vec<u32>, Vec<serde_json::Value>)> = props
+            let key_cols: Vec<(Vec<u32>, std::sync::Arc<Vec<serde_json::Value>>)> = props
                 .iter()
-                .map(|prop| graph.node_prop_group_codes(&ids, prop))
+                .map(|prop| {
+                    graph
+                        .node_prop_group_codes(&ids, prop)
+                        .map(|(codes, reps)| (codes, std::sync::Arc::new(reps)))
+                })
                 .collect::<Result<_, _>>()
                 .map_err(|e: issundb_core::Error| e.to_string())?;
             let key_cols = canonicalize_group_codes(key_cols);

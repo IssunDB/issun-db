@@ -180,6 +180,31 @@ pub(crate) enum PropColumn {
 
 const STR_NULL: u32 = u32::MAX;
 
+/// The slot value in [`IdGroupCodes::codes`] for a node id that does not
+/// exist (an allocation hole, or an id past the array).
+pub const ID_GROUP_ABSENT: u32 = u32::MAX;
+
+/// Dense group codes of one property, indexed by node id rather than by a
+/// request's position: `codes[node_id]` is the node's group code under exact
+/// value identity, [`ID_GROUP_ABSENT`] where no such node exists, and `reps`
+/// holds one representative value per code. Built once per write generation by
+/// [`crate::Graph::node_prop_group_codes_by_id`] and shared, so a grouped
+/// aggregation over a bulk row set reads one array cell per row instead of
+/// interning one value per row per query.
+pub struct IdGroupCodes {
+    pub codes: Vec<u32>,
+    pub reps: std::sync::Arc<Vec<Value>>,
+}
+
+/// The per-generation cache behind [`crate::Graph::node_prop_group_codes_by_id`],
+/// one entry per grouped property, discarded whole on any committed write, the
+/// same policy as the label-scan cache.
+#[derive(Default)]
+pub(crate) struct IdGroupCodesCache {
+    pub(crate) generation: u64,
+    pub(crate) by_prop: AHashMap<String, std::sync::Arc<IdGroupCodes>>,
+}
+
 /// A comparison operator for [`PropColumns::cmp_mask`], the typed in-column
 /// predicate evaluation behind `Graph::nodes_prop_cmp_mask`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1352,6 +1377,47 @@ mod tests {
             Some(serde_json::Value::Null)
         );
         assert_eq!(g.node_prop_json(a + 999, "x").unwrap(), None);
+    }
+
+    /// The id-indexed group codes must induce the same partition and the same
+    /// representative values as the per-id form, serve repeats from the cache,
+    /// and track writes.
+    #[test]
+    fn id_indexed_group_codes_agree_with_the_per_id_form() {
+        let (_dir, g) = open_tmp();
+        let ids = vec![
+            g.add_node("N", &json!({ "v": 1 })).unwrap(),
+            g.add_node("N", &json!({ "v": 2 })).unwrap(),
+            g.add_node("N", &json!({ "v": 1 })).unwrap(),
+            g.add_node("N", &json!({})).unwrap(),
+        ];
+        materialize_columns(&g);
+
+        let by_id = g.node_prop_group_codes_by_id("v").unwrap();
+        let (codes, reps) = g.node_prop_group_codes(&ids, "v").unwrap();
+
+        // Same partition, compared through the representative values.
+        let dense_reps: Vec<_> = ids
+            .iter()
+            .map(|&id| by_id.reps[by_id.codes[id as usize] as usize].clone())
+            .collect();
+        let per_id_reps: Vec<_> = ids
+            .iter()
+            .zip(&codes)
+            .map(|(_, &c)| reps[c as usize].clone())
+            .collect();
+        assert_eq!(dense_reps, per_id_reps);
+        assert_eq!(dense_reps, vec![json!(1), json!(2), json!(1), json!(null)]);
+
+        // A repeat with no intervening write serves the cached array.
+        let again = g.node_prop_group_codes_by_id("v").unwrap();
+        assert!(std::sync::Arc::ptr_eq(&by_id, &again));
+
+        // A write invalidates, and the new node appears.
+        let e = g.add_node("N", &json!({ "v": 2 })).unwrap();
+        let fresh = g.node_prop_group_codes_by_id("v").unwrap();
+        assert!(!std::sync::Arc::ptr_eq(&by_id, &fresh));
+        assert_eq!(fresh.reps[fresh.codes[e as usize] as usize], json!(2));
     }
 
     /// The typed comparison mask must match what boxing every value and

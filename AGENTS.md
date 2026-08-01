@@ -346,9 +346,13 @@ The read-path and statistics methods carry non-obvious semantics:
   small workload, so this is the deliberate way to make the optimizer's selectivity estimates and zone-map pruning available on a cold graph, or to pay
   the one full scan up front rather than in a later bulk read. It is also the node columns cache file's save site: materializing persists the built set
   next to the LMDB files, a later process's full build loads it instead of scanning when the generations match, and a repeat at an unchanged generation
-  rewrites nothing.
+  rewrites nothing. `materialize_edge_property_columns` is the edge counterpart, with the same contract and its own cache file.
 - `node_prop_group_codes(ids, prop) -> Result<(Vec<u32>, Vec<Value>), Error>`: dense group codes under exact value identity of one property, plus one
   representative value per code; null and missing values share one `Value::Null` code.
+- `node_prop_group_codes_by_id(prop) -> Result<Arc<IdGroupCodes>, Error>`: the id-indexed form of the above, one shared array over every node
+  (`codes[node_id]`, `ID_GROUP_ABSENT` where no such node exists), cached per write generation. The value interning is paid once per generation
+  instead of once per row per query, which is what the collapsed count's bulk grouping reads; a small request wants the per-request form, which never
+  builds whole-graph state.
 - `node_prop_min_max(prop) -> Result<Option<(Value, Value)>, Error>`: bounds of one property's non-null values from the column statistics; `None` for
   a `Json` fallback column or no non-null values; backs the vectorized executor's zone-map filter pruning.
 - `estimate_range_selectivity(prop, lower, upper) -> Result<Option<f64>, Error>`: estimated fraction of non-null values inside the bounds, from the
@@ -681,7 +685,7 @@ Methods: `add_node` (accepts a single label string or a list of label strings), 
 `remove_label`, `add_edge`, `add_edges`, `get_edge`, `update_edge`, `delete_edge`, `query`, `explain`, `upsert_vector`, `remove_vector`,
 `vector_search` (with optional `label` and JSON-object `properties` filters), `configure_vector_index`, `text_search`, `create_text_index` (with
 optional `language`), `drop_text_index`, `list_text_indexes`, `has_text_index`, `retrieve_hybrid`, `set_thread_count`,
-`materialize_edge_statistics`, `materialize_property_columns`, `backup`, `backup_compact`, and `restore`.
+`materialize_edge_statistics`, `materialize_property_columns`, `materialize_edge_property_columns`, `backup`, `backup_compact`, and `restore`.
 
 `add_nodes` and `add_edges` take an iterable of `(labels, props_json)` pairs and `(src, dst, type, props_json)` tuples respectively, and write the
 whole batch under one `Graph::update` transaction. A single-record insert costs one durable LMDB commit, so a Python loop over `add_node` is bound by

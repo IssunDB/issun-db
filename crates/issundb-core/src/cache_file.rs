@@ -517,6 +517,38 @@ mod tests {
         );
     }
 
+    /// The edge columns have the same persist-and-reload contract as the node
+    /// columns, through their own file.
+    #[test]
+    fn materialize_persists_edge_columns_and_a_reopen_loads_them() {
+        use crate::columns::{ColumnSource, EdgeSource};
+
+        let dir = TempDir::new().unwrap();
+        let e;
+        {
+            let g = Graph::open(dir.path(), 1).unwrap();
+            let a = g.add_node("N", &json!({})).unwrap();
+            let b = g.add_node("N", &json!({})).unwrap();
+            e = g.add_edge(a, b, "R", &json!({ "w": 2.5 })).unwrap();
+            g.materialize_edge_property_columns().unwrap();
+            assert!(dir.path().join(EdgeSource::CACHE_FILE).exists());
+        }
+
+        let g = Graph::open(dir.path(), 1).unwrap();
+        assert!(
+            load_columns::<EdgeSource>(&g.storage).is_some(),
+            "a fresh edge columns cache file must load"
+        );
+        assert_eq!(
+            g.edge_prop_json_column(&[e], "w").unwrap(),
+            vec![json!(2.5)]
+        );
+
+        // A later write moves the generation, so the file is refused.
+        g.add_node("N", &json!({})).unwrap();
+        assert!(load_columns::<EdgeSource>(&g.storage).is_none());
+    }
+
     /// A repeated materialize at an unchanged generation must not rewrite the
     /// file.
     #[test]
