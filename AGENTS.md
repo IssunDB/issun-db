@@ -135,7 +135,10 @@ second copy of both, so the same rule was stated in three places and the copies 
     - `src/exec/copy.rs`: bulk data administration execution (`COPY ... FROM`, `EXPORT DATABASE`, and `IMPORT DATABASE`). An import streams rows into
       its one transaction as they decode (`RowSource`), holding one row (plus one Arrow record batch for parquet) rather than the whole file, and a
       row that fails mid-file rolls the transaction back. Materializing the file first put every row on the heap as JSON maps, a multi-gigabyte
-      transient at bulk-load scale that the allocator retained for the life of the process; do not reintroduce a collect-then-write pass here.
+      transient at bulk-load scale that the allocator retained for the life of the process; do not reintroduce a collect-then-write pass here. Both
+      import entry points end with `rebuild_csr` and `materialize_property_columns`, so a bulk load persists the CSR and node columns cache files and
+      the imported database reopens without either scan; a bulk load is the one caller that pays the column build deliberately, having just declared
+      the graph worth ingesting whole.
     - `src/exec/row.rs`: the positional row representation (`SlotRow` and `SlotSchema`) the row pipeline binds variables through.
 - `crates/issundb-vector/`: vector index abstraction, vector metadata, vector storage integration, and vector search APIs. The index sits behind
   `backend.rs`, selected at compile time from the default-on `hnsw` feature: `usearch`, the workspace's only C++ dependency, or a pure-Rust exact scan.
@@ -349,7 +352,9 @@ The read-path and statistics methods carry non-obvious semantics:
   small workload, so this is the deliberate way to make the optimizer's selectivity estimates and zone-map pruning available on a cold graph, or to pay
   the one full scan up front rather than in a later bulk read. It is also the node columns cache file's save site: materializing persists the built set
   next to the LMDB files, a later process's full build loads it instead of scanning when the generations match, and a repeat at an unchanged generation
-  rewrites nothing. `materialize_edge_property_columns` is the edge counterpart, with the same contract and its own cache file.
+  rewrites nothing. `materialize_edge_property_columns` is the edge counterpart, with the same contract and its own cache file. The one caller that
+  materializes without being asked is a bulk load (`COPY ... FROM` and `IMPORT DATABASE`), which pays the node column build at the end so the
+  imported database reopens warm; queries and server startup still never do.
 - `node_prop_group_codes(ids, prop) -> Result<(Vec<u32>, Vec<Value>), Error>`: dense group codes under exact value identity of one property, plus one
   representative value per code; null and missing values share one `Value::Null` code.
 - `node_prop_group_codes_by_id(prop) -> Result<Arc<IdGroupCodes>, Error>`: the id-indexed form of the above, one shared array over every node

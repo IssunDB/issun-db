@@ -5397,6 +5397,36 @@ mod tests {
         );
     }
 
+    /// A bulk load persists both cache files: the CSR one through its
+    /// `rebuild_csr` and the node columns one through the materialize the
+    /// import pays deliberately, so the imported database reopens without
+    /// either scan. The file names are the storage layer's contract
+    /// (`crates/issundb-core/src/cache_file.rs`).
+    #[cfg(feature = "lmdb")]
+    #[test]
+    fn a_copy_import_persists_the_cache_files() {
+        use std::io::Write;
+        let (tempdir, graph) = setup_graph();
+        let params = HashMap::new();
+
+        let jsonl_path = tempdir.path().join("people.jsonl");
+        {
+            let mut file = std::fs::File::create(&jsonl_path).unwrap();
+            writeln!(file, "{{\"name\": \"Ada\", \"age\": 36}}").unwrap();
+        }
+        let query = format!("COPY Person FROM '{}'", jsonl_path.display());
+        execute(&graph, &query, &params).unwrap();
+
+        assert!(
+            tempdir.path().join("csr.cache").exists(),
+            "the import must persist the CSR cache file"
+        );
+        assert!(
+            tempdir.path().join("node_columns.cache").exists(),
+            "the import must persist the node columns cache file"
+        );
+    }
+
     /// A parse error midway through a file must import nothing and surface the
     /// parse error itself. Rows now stream into the one transaction as they
     /// decode, so this is the rollback contract the materialize-first reader

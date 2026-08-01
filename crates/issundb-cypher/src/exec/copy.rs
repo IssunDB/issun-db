@@ -57,6 +57,15 @@ pub(super) fn execute_copy(
     graph
         .rebuild_csr()
         .map_err(|e| format!("failed to rebuild CSR after import: {}", e))?;
+    // A bulk load also pays the node property column build, which persists the
+    // columns cache file beside the CSR one, so a later process's first
+    // aggregation loads both instead of scanning. The columns' memory in this
+    // process is the price, and a bulk load is the one caller entitled to that
+    // decision: it just declared the graph worth ingesting whole, unlike a
+    // server start or a query, neither of which warms columns.
+    graph
+        .materialize_property_columns()
+        .map_err(|e| format!("failed to build property columns after import: {}", e))?;
 
     Ok(QueryResult {
         statement_count: 1,
@@ -967,10 +976,16 @@ pub(super) fn execute_import_db(
         }
     }
 
-    // 4. Rebuild CSR snapshot once at the end of the entire import process.
+    // 4. Rebuild CSR snapshot once at the end of the entire import process,
+    // and build the node property columns with it; see `execute_copy` for the
+    // policy. Both persist their cache files, so the imported database reopens
+    // without either scan.
     graph
         .rebuild_csr()
         .map_err(|e| format!("failed to rebuild CSR after import: {}", e))?;
+    graph
+        .materialize_property_columns()
+        .map_err(|e| format!("failed to build property columns after import: {}", e))?;
 
     // One row per COPY statement, so a file that ingested zero rows or
     // classified unexpectedly is visible to the caller.
