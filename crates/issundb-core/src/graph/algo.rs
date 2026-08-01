@@ -77,7 +77,7 @@ impl Graph {
                 Some(at) => at,
                 None => {
                     let mut mask = vec![false; n];
-                    for id in self.nodes_by_label(name)? {
+                    for &id in self.nodes_by_label_arc(name)?.iter() {
                         if let Some(&d) = snap.id_to_dense.get(&id) {
                             mask[d as usize] = true;
                         }
@@ -241,7 +241,7 @@ impl Graph {
                 Some(at) => at,
                 None => {
                     let mut mask = vec![false; n];
-                    for id in self.nodes_by_label(name)? {
+                    for &id in self.nodes_by_label_arc(name)?.iter() {
                         if let Some(&d) = snap.id_to_dense.get(&id) {
                             mask[d as usize] = true;
                         }
@@ -443,7 +443,7 @@ impl Graph {
             match label {
                 Some(name) => {
                     let mut mask = vec![false; n];
-                    for id in self.nodes_by_label(name)? {
+                    for &id in self.nodes_by_label_arc(name)?.iter() {
                         if let Some(&d) = snap.id_to_dense.get(&id) {
                             mask[d as usize] = true;
                         }
@@ -830,7 +830,7 @@ impl Graph {
         };
         for name in spec.neighbor_labels {
             let mut mask = vec![false; n];
-            for id in self.nodes_by_label(name)? {
+            for &id in self.nodes_by_label_arc(name)?.iter() {
                 if let Some(&d) = snap.id_to_dense.get(&id) {
                     mask[d as usize] = true;
                 }
@@ -1257,8 +1257,28 @@ impl Graph {
 
     /// Build a snapshot from storage, carrying weights when some consumer has asked
     /// for them. See [`Graph::weighted_snapshot`] for why that request is sticky.
+    ///
+    /// A cache file file whose persisted generation matches storage serves the
+    /// arrays sequentially instead of the full adjacency rebuild; any mismatch
+    /// falls through to the build. The generation is read before the load the
+    /// same way `rebuild_csr` reads it before the build: a write landing in
+    /// between makes the result conservatively stale at the caller's
+    /// `built_gen`, never fresher than claimed.
     pub(super) fn build_snapshot(&self) -> Result<CsrSnapshot, Error> {
-        if self.csr_cache.wants_weights() {
+        let want_weights = self.csr_cache.wants_weights();
+        #[cfg(feature = "lmdb")]
+        {
+            let persisted_gen = {
+                let rtxn = self.storage.env.read_txn()?;
+                crate::storage::ids::commit_gen(&self.storage, &rtxn)?
+            };
+            if let Some(snap) =
+                crate::cache_file::load_csr(self.storage.env.path(), persisted_gen, want_weights)
+            {
+                return Ok(snap);
+            }
+        }
+        if want_weights {
             CsrSnapshot::build_weighted(&self.storage)
         } else {
             CsrSnapshot::build(&self.storage)

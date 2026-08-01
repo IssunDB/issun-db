@@ -33,7 +33,7 @@
 pub use issundb_core::{
     DegreeDirection, DirectedNeighborEntry, EdgeId, EdgeRecord, Error, Graph, GroupedDegreeSpec,
     LabelId, Language, LinkPredictionMetric, NeighborCountSpec, NeighborEntry, NodeId, NodeRecord,
-    PathCountSpec, PropValue, ReadTxn, TriangleCountSpec, TypeId, WeightedPath, WriteTxn,
+    PathCountSpec, PropCmp, PropValue, ReadTxn, TriangleCountSpec, TypeId, WeightedPath, WriteTxn,
 };
 pub use issundb_cypher::{
     CypherError, CypherType, Procedure, ProcedureRegistry, QueryResult, Record,

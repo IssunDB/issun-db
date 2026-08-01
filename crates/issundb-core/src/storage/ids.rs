@@ -7,6 +7,7 @@ const KEY_NEXT_EDGE: &str = "next_edge_id";
 const KEY_NEXT_LABEL: &str = "next_label_id";
 const KEY_NEXT_TYPE: &str = "next_type_id";
 const KEY_NEXT_PROP_KEY: &str = "next_prop_key_id";
+const KEY_COMMIT_GEN: &str = "commit_gen";
 
 fn bump_counter(
     storage: &Storage,
@@ -30,6 +31,33 @@ fn bump_counter(
 
 pub fn alloc_node_id(storage: &Storage, txn: &mut crate::storage::RwTxn) -> Result<NodeId, Error> {
     bump_counter(storage, txn, KEY_NEXT_NODE)
+}
+
+/// The persisted committed-write generation, advanced inside every mutating
+/// transaction by [`bump_commit_gen`]. Unlike the in-memory
+/// [`crate::csr::CsrCache`] generation, which restarts with the process, this
+/// one survives a reopen, so an on-disk derived structure (the CSR cache file) can
+/// record the generation it was built at and a later process can decide whether
+/// it still reflects storage. Zero on a database that predates the counter,
+/// which is also what a cache file built before any write records.
+pub fn commit_gen(storage: &Storage, txn: &crate::storage::RoTxn) -> Result<u64, Error> {
+    match storage.meta.get(txn, KEY_COMMIT_GEN)? {
+        Some(b) => {
+            let arr: [u8; 8] = b
+                .try_into()
+                .map_err(|_| Error::Corrupt("commit_gen must be 8 bytes"))?;
+            Ok(u64::from_be_bytes(arr))
+        }
+        None => Ok(0),
+    }
+}
+
+/// Advance the persisted committed-write generation inside `txn`, so the bump
+/// is atomic with the mutations it describes: a rolled-back transaction
+/// advances nothing, and a committed one is never observed without its bump.
+pub fn bump_commit_gen(storage: &Storage, txn: &mut crate::storage::RwTxn) -> Result<(), Error> {
+    let _ = bump_counter(storage, txn, KEY_COMMIT_GEN)?;
+    Ok(())
 }
 
 /// Reads the node-id high-water mark, the number of node IDs ever allocated.

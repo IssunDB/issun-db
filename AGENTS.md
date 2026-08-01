@@ -102,6 +102,11 @@ second copy of both, so the same rule was stated in three places and the copies 
       persisted.
     - `src/threads.rs`: the one resolution of the thread budget every parallel consumer shares (`threads::resolve`). Precedence, the clamp, and why
       `OMP_NUM_THREADS` is honored are in the crate guide under "Thread Count".
+    - `src/cache_file.rs`: the on-disk cache files for the CSR snapshot and the property columns, compiled only under the `lmdb` feature. Each file records
+      the persisted commit generation it was built at (`storage/ids.rs`, `commit_gen`, advanced inside every mutating transaction), and a load is
+      refused on any mismatch, truncation, or checksum failure, so a bad file degrades to the ordinary rebuild. The save sites are deliberate and
+      narrow: `Graph::rebuild_csr` saves the CSR cache file (every bulk load ends there), and `Graph::materialize_property_columns` saves the node
+      columns cache file; no lazy build writes a file as a side effect of a query.
     - `src/storage/memory.rs`: the in-memory storage backend, second implementor of the contract in `storage/mod.rs`. Byte-ordered `BTreeMap` tables with
       `BTreeSet` duplicate values, copy-on-write transactions over `ArcSwap`, and a single writer lock. It is what a target with no libc compiles, and it is
       what holds the storage seam to something: the whole suite runs against it, across core, vector, text, retrieval, and cypher.
@@ -243,6 +248,10 @@ second copy of both, so the same rule was stated in three places and the copies 
       The unbuilt cache starts `write_gen` at 1 with `snapshot_gen` at 0 so it reports stale; a placeholder that claimed to be current would make typed
       expansion read zero rows out of the empty snapshot. Do not reintroduce an eager build in `open`: it costs a full edge scan on every open and is
       repaid on every reopen.
+    - The first build in a process serves from the CSR cache file when one is fresh (see `src/cache_file.rs` in the module map): `build_snapshot` compares
+      the file's persisted commit generation against storage and loads the arrays sequentially on a match, so a bulk-loaded graph reopens without the
+      full adjacency scan. Any mismatch falls through to the build, and the freshness rules within a process are unchanged; the cache file only replaces
+      where the bytes of a full build come from.
     - `shortest_path_dijkstra` is the one consumer needing more than the adjacency, and it goes through `Graph::with_weighted_snapshot`. Per-edge weights
       cost a second full scan of `edges`, so what the snapshot carries is a separate condition from its generation: an unweighted snapshot is current at
       its generation and still has no weights. The request is sticky (`CsrCache::request_weights`), or a workload alternating Dijkstra with anything else
@@ -335,7 +344,9 @@ The read-path and statistics methods carry non-obvious semantics:
   `group_codes`, so the narrower population is the same grouping code rather than a second implementation of it.
 - `materialize_property_columns() -> Result<(), Error>`: build the in-memory property columns now. Nothing builds them as a side effect of a
   small workload, so this is the deliberate way to make the optimizer's selectivity estimates and zone-map pruning available on a cold graph, or to pay
-  the one full scan up front rather than in a later bulk read.
+  the one full scan up front rather than in a later bulk read. It is also the node columns cache file's save site: materializing persists the built set
+  next to the LMDB files, a later process's full build loads it instead of scanning when the generations match, and a repeat at an unchanged generation
+  rewrites nothing.
 - `node_prop_group_codes(ids, prop) -> Result<(Vec<u32>, Vec<Value>), Error>`: dense group codes under exact value identity of one property, plus one
   representative value per code; null and missing values share one `Value::Null` code.
 - `node_prop_min_max(prop) -> Result<Option<(Value, Value)>, Error>`: bounds of one property's non-null values from the column statistics; `None` for
@@ -386,6 +397,15 @@ The read-path and statistics methods carry non-obvious semantics:
   counter; the emptiness shortcut asks `label_idx` instead, so a prune never rests on a counter being exact. A decided verdict is memoized against the
   write generation, because the pass that asks runs on every execution (there is no plan cache) and would otherwise re-walk the graph per query.
 - `label_filter(nodes, label) -> Result<Vec<NodeId>, Error>`: subset of `nodes` carrying `label`, via one `label_idx` point lookup per candidate.
+- `nodes_by_label_arc(label) -> Result<Arc<Vec<NodeId>>, Error>`: `nodes_by_label` without the copy, served from a per-generation cache: repeated
+  reads of one label within one write generation return the same shared vector, and any committed write discards the whole cache. `nodes_by_label`
+  delegates here, so both forms are cached; transaction-scoped label reads bypass the cache, because an open write transaction must see its own
+  uncommitted labels.
+- `nodes_prop_cmp_mask(ids, prop, op, rhs) -> Result<Option<Vec<bool>>, Error>`: the per-id outcome of `prop <op> rhs`, evaluated directly against
+  the typed property column with no boxed value per row. The semantics are the outcome a Cypher comparison filter keeps a row on: null
+  and missing values fail every operator, same-kind scalars compare natively (a mixed int and float pair through `f64`), and a kind-mismatched
+  non-null value passes only `Ne`. `Ok(None)` declines (a small request on a cold graph, or a mixed-kind `Json` column), and the caller falls back to
+  the boxed comparison; the vectorized executor's filter stages are the consumer.
 - `set_thread_count(n: i32) -> Result<(), Error>`: sets the thread count for the parallel read passes, overriding the `ISSUNDB_NUM_THREADS`
   environment variable (0 restores default behavior, resolved by `threads::resolve`). There is no pool to configure: each pass resolves the budget when
   it starts and spawns scoped threads for its own duration, so the call stores the value, takes effect on the next pass, and cannot fail.
@@ -688,7 +708,7 @@ Methods: `query`, `explain`, `stats`, `graphSnapshot`, `createTextIndex`, `textS
 footer reports beside the WebAssembly heap size the browser exposes. It is live rather than reserved because the wasm heap only grows, so the browser's figure
 says what was once needed; and it is module-wide rather than per-instance, because an allocator cannot attribute an allocation to a `Playground`. No other crate
 in the workspace sets a global allocator, so nothing an application links against pays the two relaxed atomics per allocation. `buildRef` is the `branch@commit` the page names in its footer, read from `ISSUNDB_BUILD_REF` at compile time through
-`option_env!` and empty without it. It is compiled in rather than fetched as a sidecar file so it cannot disagree with the module it describes, and the
+`option_env!` and empty without it. It is compiled in rather than fetched as a separate file so it cannot disagree with the module it describes, and the
 crate's `build.rs` exists only to declare `rerun-if-env-changed` for that variable, without which a cached artifact would keep reporting an earlier
 build's commit. `make playground-build` supplies it from `git`, and `docs.yml` sets it from the workflow's own refs, since
 `actions/checkout` leaves a detached HEAD where `rev-parse --abbrev-ref` answers `HEAD`. `query` returns `{columns, rows, statement_count, elapsed_ms}` with row-major rows, so the page renders a table knowing

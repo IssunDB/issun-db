@@ -1044,32 +1044,30 @@ fn cmp_keeps(structured: bool, op: CmpOp, lv: &Value, rv: &Value) -> bool {
     }
 }
 
-/// Builds the label-membership set for `ids` in bulk. A label smaller than the
-/// column comes from one `label_idx` prefix scan, a larger one from point lookups
-/// on the distinct ids.
-fn label_pass_set(
-    graph: &Graph,
-    ids: &[NodeId],
-    label: &str,
-) -> Result<ahash::AHashSet<NodeId>, String> {
+/// Builds the per-row label-membership mask for `ids` in bulk. A label smaller
+/// than the column is tested by binary search against the cached sorted label
+/// scan (no per-query set build), a larger one by point lookups on the
+/// distinct ids.
+fn label_keep_mask(graph: &Graph, ids: &[NodeId], label: &str) -> Result<Vec<bool>, String> {
     let label_count = graph
         .node_count_by_label(label)
         .map_err(|e| e.to_string())? as usize;
     if label_count <= ids.len() {
-        Ok(graph
-            .nodes_by_label(label)
-            .map_err(|e| e.to_string())?
-            .into_iter()
+        let members = graph.nodes_by_label_arc(label).map_err(|e| e.to_string())?;
+        Ok(ids
+            .iter()
+            .map(|id| members.binary_search(id).is_ok())
             .collect())
     } else {
         let mut distinct = ids.to_vec();
         distinct.sort_unstable();
         distinct.dedup();
-        Ok(graph
+        let pass: ahash::AHashSet<NodeId> = graph
             .label_filter(&distinct, label)
             .map_err(|e| e.to_string())?
             .into_iter()
-            .collect())
+            .collect();
+        Ok(ids.iter().map(|id| pass.contains(id)).collect())
     }
 }
 
@@ -1092,9 +1090,7 @@ fn apply_stage(
     let mask: Vec<bool> = match stage {
         VecStage::HasLabel { var, label } => {
             let col = col_of(chain_vars, var).ok_or("vectorized: unbound stage variable")?;
-            let ids = cols.ids_of(col);
-            let pass = label_pass_set(graph, ids, label)?;
-            ids.iter().map(|id| pass.contains(id)).collect()
+            label_keep_mask(graph, cols.ids_of(col), label)?
         }
         VecStage::Cmp {
             structured,
@@ -1106,6 +1102,10 @@ fn apply_stage(
                 try_prune_comparison(graph, lhs, rhs, *op, params, schema, chain_vars, cols)
             {
                 pruned_mask
+            } else if let Some(typed_mask) =
+                try_typed_cmp_mask(graph, lhs, rhs, *op, params, schema, chain_vars, cols)?
+            {
+                typed_mask
             } else {
                 let lv = resolve_operand(graph, lhs, params, schema, chain_vars, cols)?;
                 let rv = resolve_operand(graph, rhs, params, schema, chain_vars, cols)?;
@@ -1117,6 +1117,55 @@ fn apply_stage(
     };
     cols.compact(&mask);
     Ok(())
+}
+
+/// Evaluate a property-versus-constant comparison directly against the typed
+/// in-memory property column, one keep flag per row, skipping the boxed
+/// per-row gather entirely. `Ok(None)` declines and the boxed path runs:
+/// the stage compares two property reads, the graph declines (a small request
+/// on a cold graph, or a mixed-kind `Json` column), or the operand shape is
+/// anything else.
+///
+/// The `structured` flag plays no part here because the two comparison forms
+/// agree on everything a typed column can hold: scalar against scalar
+/// constant, where null fails every operator and a kind mismatch passes only
+/// `Ne`. The forms differ only on values a typed column excludes (the NaN
+/// sentinel and other non-scalar shapes fall to the `Json` column, which
+/// declines).
+#[allow(clippy::too_many_arguments)]
+fn try_typed_cmp_mask(
+    graph: &Graph,
+    lhs: &VecOperand<'_>,
+    rhs: &VecOperand<'_>,
+    op: CmpOp,
+    params: &HashMap<String, Value>,
+    schema: &std::sync::Arc<SlotSchema>,
+    chain_vars: &[&str],
+    cols: &IdCols,
+) -> Result<Option<Vec<bool>>, String> {
+    let (var, prop, const_expr, flipped) = match (lhs, rhs) {
+        (VecOperand::Col { var, prop }, VecOperand::Const(expr)) => (var, prop, expr, false),
+        (VecOperand::Const(expr), VecOperand::Col { var, prop }) => (var, prop, expr, true),
+        _ => return Ok(None),
+    };
+    let col = col_of(chain_vars, var).ok_or("vectorized: unbound stage variable")?;
+    use issundb_core::PropCmp;
+    // A constant on the left mirrors the operator: `c < n.prop` is `n.prop > c`.
+    let core_op = match (op, flipped) {
+        (CmpOp::Eq, _) => PropCmp::Eq,
+        (CmpOp::Ne, _) => PropCmp::Ne,
+        (CmpOp::Lt, false) | (CmpOp::Gt, true) => PropCmp::Lt,
+        (CmpOp::Gt, false) | (CmpOp::Lt, true) => PropCmp::Gt,
+        (CmpOp::Le, false) | (CmpOp::Ge, true) => PropCmp::Le,
+        (CmpOp::Ge, false) | (CmpOp::Le, true) => PropCmp::Ge,
+    };
+    let const_val = evaluate_expr(graph, &SlotRow::empty(schema.clone()), const_expr, params)?;
+    graph
+        .nodes_prop_cmp_mask(cols.ids_of(col), prop, core_op, &const_val)
+        .map_err(|e| match e {
+            issundb_core::Error::NodeNotFound(id) => format!("node not found: {}", id),
+            other => other.to_string(),
+        })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2147,11 +2196,14 @@ fn execute_collapsed_count(
     }
 
     // Fold each pre-row's weight into its group; a source with no qualifying
-    // neighbor contributes no row, hence no group.
-    let mut slot_by_key: ahash::AHashMap<u64, usize> = ahash::AHashMap::new();
-    let mut groups: Vec<(Vec<u32>, u64)> = Vec::new();
+    // neighbor contributes no row, hence no group. A group is its composite
+    // strided key plus a count, nothing per-group is allocated in the fold; the
+    // per-key codes are recovered from the key on emission, which touches only
+    // the groups that survive the count window.
+    let mut slot_by_key: ahash::AHashMap<u64, u32> = ahash::AHashMap::new();
+    let mut groups: Vec<(u64, u64)> = Vec::new();
     if group_by.is_empty() {
-        groups.push((Vec::new(), 0));
+        groups.push((0, 0));
     }
     for i in 0..n {
         let (qualifying, counted) = tally_of(src_col[i]);
@@ -2173,13 +2225,13 @@ fn execute_collapsed_count(
                 key += codes[i] as u64 * strides[k];
             }
             *slot_by_key.entry(key).or_insert_with(|| {
-                let codes = group_codes.iter().map(|(codes, _)| codes[i]).collect();
-                groups.push((codes, 0));
-                groups.len() - 1
-            })
+                groups.push((key, 0));
+                (groups.len() - 1) as u32
+            }) as usize
         };
         groups[slot].1 += add;
     }
+    drop(slot_by_key);
 
     // Finalize each group, ordered by the same serialized key the row
     // pipeline's BTreeMap fold orders by.
@@ -2216,11 +2268,12 @@ fn execute_collapsed_count(
 
     let mut keyed_rows = Vec::with_capacity(emitted.len());
     for g in emitted {
-        let (codes, cnt) = &groups[g];
+        let (key, cnt) = &groups[g];
         let mut gb = SlotRow::empty(schema.clone());
         let mut key_parts = Vec::with_capacity(group_cols.len());
         for (k, col) in group_cols.iter().enumerate() {
-            let rep = &group_codes[k].1[codes[k] as usize];
+            let code = (key / strides[k]) % group_codes[k].1.len().max(1) as u64;
+            let rep = &group_codes[k].1[code as usize];
             key_parts.push(canonical_cell_key(rep));
             gb.bind_local(col, GraphBinding::Scalar(rep.clone()));
         }

@@ -1,3 +1,5 @@
+#[cfg(feature = "lmdb")]
+pub(crate) mod cache_file;
 pub(crate) mod columns;
 pub(crate) mod csr;
 mod error;
@@ -7,6 +9,7 @@ mod schema;
 pub(crate) mod storage;
 pub(crate) mod threads;
 
+pub use columns::PropCmp;
 pub use error::Error;
 pub use graph::{
     DegreeDirection, Graph, GroupedDegreeSpec, LinkPredictionMetric, NeighborCountSpec,

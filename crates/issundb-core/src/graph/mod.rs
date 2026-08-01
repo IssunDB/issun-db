@@ -503,6 +503,14 @@ pub struct Graph {
     /// statistics table means walking the graph, so a decided verdict is remembered
     /// until a write invalidates the generation. See [`crate::graph::stats`].
     pub(super) schema_probes: Arc<parking_lot::Mutex<SchemaProbeMemo>>,
+    /// Cached full label scans for the committed-read path, one shared sorted id
+    /// vector per label, valid for exactly one write generation. Filters, the
+    /// vectorized executor, and the counting kernels each enumerate a whole
+    /// label per query, and with no plan cache the same label is rescanned
+    /// through LMDB on every execution; this pins that scan until a committed
+    /// write moves the generation. Transaction-scoped label reads bypass it,
+    /// because an open write transaction must see its own uncommitted labels.
+    pub(super) label_scans: Arc<parking_lot::Mutex<index::LabelScanCache>>,
     pub(super) n_threads: Arc<std::sync::atomic::AtomicI32>,
     /// Type-erased extension cache. Higher-level crates attach caches (e.g. the
     /// HNSW vector index) to a Graph without creating a circular dependency,
@@ -613,6 +621,7 @@ impl Graph {
             edge_columns: Arc::new(crate::columns::ColumnsCache::default()),
             edge_fanout: Arc::new(parking_lot::Mutex::new(None)),
             schema_probes: Arc::new(parking_lot::Mutex::new((0, AHashMap::new()))),
+            label_scans: Arc::new(parking_lot::Mutex::new(index::LabelScanCache::default())),
             n_threads: Arc::new(std::sync::atomic::AtomicI32::new(0)),
             extensions: Arc::new(parking_lot::Mutex::new(AHashMap::new())),
         })
@@ -777,6 +786,32 @@ impl Graph {
         })
     }
 
+    /// Evaluate `prop <op> rhs` for each of `ids` directly against the typed
+    /// in-memory property column, one keep flag per id in input order, without
+    /// materializing a `Value` per row. The semantics are exactly the outcome a
+    /// Cypher comparison filter keeps a row on; see
+    /// [`crate::columns::PropColumns::cmp_mask`] for the three rules. A
+    /// nonexistent node is [`Error::NodeNotFound`].
+    ///
+    /// `Ok(None)` declines, and the caller falls back to gathering and
+    /// comparing boxed values: a small request on a cold graph must not build
+    /// every column (the same size test the property gathers apply), and a
+    /// mixed-kind `Json` fallback column has no typed storage to compare
+    /// against.
+    pub fn nodes_prop_cmp_mask(
+        &self,
+        ids: &[NodeId],
+        prop: &str,
+        op: crate::columns::PropCmp,
+        rhs: &serde_json::Value,
+    ) -> Result<Option<Vec<bool>>, Error> {
+        if self.prop_columns.should_serve_directly(ids.len()) {
+            return Ok(None);
+        }
+        self.prop_columns
+            .with_fresh(&self.storage, |cols| cols.cmp_mask(ids, prop, op, rhs))?
+    }
+
     /// Build the in-memory property columns now, if they are not built already.
     ///
     /// Every reader either serves a small request without them or, for the advisory
@@ -791,7 +826,26 @@ impl Graph {
     /// unconditionally, so "call it and discard the result" was the idiom for
     /// warming the columns. Grouping now follows the same size test as the other
     /// readers, and warming them is this call.
+    /// It is also the columns cache file's save site (the counterpart of
+    /// `rebuild_csr` for the CSR cache file): materializing persists the built
+    /// set next to the LMDB files, so a later process loads it instead of
+    /// scanning, and a repeat at an unchanged generation rewrites nothing. No
+    /// lazy build saves, so a read-only workload never writes a file as a side
+    /// effect of a query.
     pub fn materialize_property_columns(&self) -> Result<(), Error> {
+        #[cfg(feature = "lmdb")]
+        {
+            // Captured before the build, so a write landing during it leaves
+            // the saved file conservatively stale rather than falsely fresh.
+            let persisted_gen = {
+                let rtxn = self.storage.env.read_txn()?;
+                crate::storage::ids::commit_gen(&self.storage, &rtxn)?
+            };
+            self.prop_columns.with_fresh(&self.storage, |cols| {
+                let _ = crate::cache_file::save_columns(&self.storage, cols, persisted_gen);
+            })
+        }
+        #[cfg(not(feature = "lmdb"))]
         self.prop_columns.with_fresh(&self.storage, |_| ())
     }
 
@@ -1096,9 +1150,17 @@ impl Graph {
     /// deliberate: see [`crate::csr::CsrCache::advance_write_gen`].
     pub(super) fn commit_and_publish(
         &self,
-        wtxn: crate::storage::RwTxn<'_>,
+        mut wtxn: crate::storage::RwTxn<'_>,
         count: usize,
     ) -> Result<(), Error> {
+        // The persisted generation advances inside the transaction, so it is
+        // atomic with the mutations it describes; it is what lets a later
+        // process decide whether an on-disk derived structure (the CSR
+        // cache file) still reflects storage, which the in-memory counter below
+        // cannot, since that one restarts with the process.
+        if count > 0 {
+            crate::storage::ids::bump_commit_gen(&self.storage, &mut wtxn)?;
+        }
         wtxn.commit()?;
         self.csr_cache.advance_write_gen(count as u64);
         Ok(())
@@ -1134,7 +1196,22 @@ impl Graph {
         // Capture the generation before reading LMDB so writes that land during the
         // build leave the snapshot conservatively stale.
         let built_gen = self.csr_cache.current_gen();
+        // The persisted generation, captured before the build for the same
+        // conservative reason: a write landing mid-build moves the persisted
+        // counter past the value stamped into the cache file, so the file reads as
+        // stale rather than claiming a freshness it does not have.
+        #[cfg(feature = "lmdb")]
+        let persisted_gen = {
+            let rtxn = self.storage.env.read_txn()?;
+            crate::storage::ids::commit_gen(&self.storage, &rtxn)?
+        };
         let snap = self.build_snapshot()?;
+        // This is the one save site, chosen because every bulk load ends here:
+        // the freshness gate's per-write refreshes must not pay a file write per
+        // rebuild. A failed save is ignored; the cache file is a cache, and the
+        // stale or absent file it leaves behind is refused on load.
+        #[cfg(feature = "lmdb")]
+        let _ = crate::cache_file::save_csr(self.storage.env.path(), &snap, persisted_gen);
         self.csr_cache.install_full(snap, built_gen);
         Ok(())
     }

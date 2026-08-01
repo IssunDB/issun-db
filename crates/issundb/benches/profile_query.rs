@@ -15,6 +15,9 @@
 //! - `PROFILE_QUERY_MAP_GB`: LMDB map size in GiB (default 2). An existing
 //!   database whose file already exceeds the map size cannot be opened, so
 //!   reusing a large graph needs this raised to at least its on-disk size.
+//! - `PROFILE_QUERY_PREPARE`: set to 1 to rebuild the CSR snapshot and
+//!   materialize the property columns before the reps, which also persists
+//!   both cache files, so a later run measures the cold path over them.
 
 use std::collections::HashSet;
 use std::time::Instant;
@@ -114,6 +117,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     } else {
         eprintln!("reusing {db_dir:?}");
+    }
+
+    if var("PROFILE_QUERY_PREPARE", 0) == 1 {
+        let start = Instant::now();
+        graph.rebuild_csr()?;
+        graph.materialize_property_columns()?;
+        eprintln!(
+            "prepared (CSR + columns, cache files saved) in {:?}",
+            start.elapsed()
+        );
     }
 
     for rep in 0..reps {

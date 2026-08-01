@@ -132,6 +132,13 @@ It is built at the smallest size its consumers read, and the build is memory-sha
 Rebuilds happen on demand through the freshness gates below; the background rebuild after `REBUILD_THRESHOLD` writes is a compaction safety net, not
 the freshness path.
 
+A full build first tries the on-disk cache file (`cache_file.rs`, `lmdb` feature only): `build_snapshot` loads the flat arrays sequentially when the file's
+persisted commit generation (`storage/ids.rs`, `commit_gen`, advanced inside every mutating transaction through `commit_and_publish`) matches storage,
+and falls through to the scan on any mismatch, truncation, or checksum failure. `Graph::rebuild_csr` is the only save site, chosen because every bulk
+load ends there; the gate's per-write refreshes never write a file. The generation is captured before a build or save, so a write landing mid-pass
+leaves the result conservatively stale rather than falsely fresh. The cache file changes where a full build's bytes come from and nothing about the
+within-process freshness rules.
+
 - Always write to LMDB first. The CSR snapshot is derived from LMDB, not the other way around.
 - Use LMDB adjacency databases (`out_adj`, `in_adj`) for correctness-critical reads: single-node neighbor lookups, existence checks, and anything
   inside a transaction.
@@ -181,6 +188,12 @@ It is derived from LMDB, like the CSR snapshot, and follows the same write-LMDB-
   (see `issundb-cypher/AGENTS.md`).
 - This store is a cache, never the source of truth. Any new write path that changes a scalar property must record a delta against both `prop_columns`
   and `edge_columns` as applicable, the same way it updates `node_prop_idx`.
+- A full build tries the columns cache file first (`cache_file.rs`, `lmdb` feature only), generation-checked the same way the CSR cache file is;
+  `Graph::materialize_property_columns` is the node columns' save site, and a repeat at an unchanged generation skips the rewrite. The cache file skips
+  each string column's interning map and the statistics, both derivable; `PropColumn::rebuild_lookup` restores the former on load.
+- `Graph::nodes_prop_cmp_mask` is the typed predicate evaluation over these columns: a comparison filter's per-row outcome computed against the native
+  column storage, declining (`Ok(None)`) on a small cold request or a `Json` column so the caller falls back to boxed comparison. Its semantics are
+  pinned by `typed_cmp_mask_follows_cypher_scalar_semantics`; change that test only together with the boxed comparison it mirrors.
 
 ## Schema Statistics
 

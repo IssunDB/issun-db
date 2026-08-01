@@ -1,5 +1,16 @@
 use super::*;
 
+/// Cached committed-state label scans for one write generation: the shared
+/// sorted id vector per label behind [`Graph::nodes_by_label_arc`]. `gen` is
+/// the [`crate::csr::CsrCache`] write generation the entries reflect; a
+/// mismatch discards them all, so an entry can never outlive the commit that
+/// invalidated it.
+#[derive(Default)]
+pub(crate) struct LabelScanCache {
+    generation: u64,
+    by_label: AHashMap<String, std::sync::Arc<Vec<NodeId>>>,
+}
+
 impl Graph {
     // ------------------------------------------------------------------
     // Secondary index queries
@@ -7,8 +18,36 @@ impl Graph {
 
     /// Returns all node IDs with the given label, in ascending ID order.
     pub fn nodes_by_label(&self, label: &str) -> Result<Vec<NodeId>, Error> {
-        let rtxn = self.storage.env.read_txn()?;
-        self.nodes_by_label_impl(&rtxn, label)
+        Ok(self.nodes_by_label_arc(label)?.as_ref().clone())
+    }
+
+    /// [`Graph::nodes_by_label`] without the copy: the shared, cached scan
+    /// result, in ascending ID order. Repeated reads of one label within one
+    /// write generation serve the same vector; any committed write invalidates
+    /// the whole cache.
+    ///
+    /// The generation is read while holding the cache lock and the scan runs
+    /// under a transaction opened after that read, so an entry can be fresher
+    /// than the generation it is filed under (a commit landing mid-scan, which
+    /// the very next read discards) but never staler: data for a generation is
+    /// committed before the counter reports it, so a transaction opened after
+    /// the counter read observes everything the stamped generation promises.
+    pub fn nodes_by_label_arc(&self, label: &str) -> Result<std::sync::Arc<Vec<NodeId>>, Error> {
+        let mut cache = self.label_scans.lock();
+        let generation = self.csr_cache.current_gen();
+        if cache.generation != generation {
+            cache.by_label.clear();
+            cache.generation = generation;
+        }
+        if let Some(hit) = cache.by_label.get(label) {
+            return Ok(hit.clone());
+        }
+        let ids = {
+            let rtxn = self.storage.env.read_txn()?;
+            std::sync::Arc::new(self.nodes_by_label_impl(&rtxn, label)?)
+        };
+        cache.by_label.insert(label.to_string(), ids.clone());
+        Ok(ids)
     }
 
     pub(super) fn nodes_by_label_impl(
@@ -1370,6 +1409,45 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let g = Graph::open(dir.path(), 1).unwrap();
         (dir, g)
+    }
+
+    /// The cached label scan must serve repeated reads of one label without
+    /// rescanning (the same shared vector back), and any committed write must
+    /// invalidate it, a label add and a label remove included, so a scan never
+    /// misses a member or reports one that is gone.
+    #[test]
+    fn label_scan_cache_serves_repeats_and_tracks_writes() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("Person", &json!({})).unwrap();
+        let b = g.add_node("Person", &json!({})).unwrap();
+        let c = g.add_node("Other", &json!({})).unwrap();
+
+        let first = g.nodes_by_label_arc("Person").unwrap();
+        assert_eq!(*first, vec![a, b]);
+        let second = g.nodes_by_label_arc("Person").unwrap();
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &second),
+            "a repeat with no intervening write must serve the cached scan"
+        );
+        // The plain form agrees with the cached one.
+        assert_eq!(g.nodes_by_label("Person").unwrap(), *first);
+
+        // A label add lands.
+        g.add_label(c, "Person").unwrap();
+        assert_eq!(*g.nodes_by_label_arc("Person").unwrap(), vec![a, b, c]);
+
+        // A label remove lands.
+        g.remove_label(c, "Person").unwrap();
+        assert_eq!(*g.nodes_by_label_arc("Person").unwrap(), vec![a, b]);
+
+        // A node delete lands.
+        g.delete_node(b).unwrap();
+        assert_eq!(*g.nodes_by_label_arc("Person").unwrap(), vec![a]);
+
+        // An unknown label is empty, and cached emptiness also tracks writes.
+        assert!(g.nodes_by_label_arc("Nope").unwrap().is_empty());
+        let d = g.add_node("Nope", &json!({})).unwrap();
+        assert_eq!(*g.nodes_by_label_arc("Nope").unwrap(), vec![d]);
     }
 
     /// A string equality lookup must match the exact value, not merely a prefix.

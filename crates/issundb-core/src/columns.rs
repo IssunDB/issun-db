@@ -28,6 +28,11 @@ pub(crate) trait ColumnSource {
     /// The entity id type (a `u64` for both nodes and edges).
     type Id: Copy + Eq + std::hash::Hash;
 
+    /// File name of this column set's on-disk cache file, next to the LMDB
+    /// files. Each source needs its own, or the node and edge cache files would
+    /// overwrite each other.
+    const CACHE_FILE: &'static str;
+
     /// Decode every entity's user properties as JSON, in storage iteration
     /// order. Each item is `(id, props_json)`.
     fn scan_all(storage: &Storage) -> Result<Vec<(Self::Id, Value)>, Error>;
@@ -80,6 +85,8 @@ pub(crate) struct NodeSource;
 impl ColumnSource for NodeSource {
     type Id = NodeId;
 
+    const CACHE_FILE: &'static str = "node_columns.cache";
+
     fn scan_all(storage: &Storage) -> Result<Vec<(NodeId, Value)>, Error> {
         let rtxn = storage.env.read_txn()?;
         let mut out = Vec::new();
@@ -116,6 +123,8 @@ pub(crate) struct EdgeSource;
 impl ColumnSource for EdgeSource {
     type Id = EdgeId;
 
+    const CACHE_FILE: &'static str = "edge_columns.cache";
+
     fn scan_all(storage: &Storage) -> Result<Vec<(EdgeId, Value)>, Error> {
         let rtxn = storage.env.read_txn()?;
         let mut out = Vec::new();
@@ -147,6 +156,11 @@ impl ColumnSource for EdgeSource {
 }
 
 /// One typed column over dense node indices.
+///
+/// The serde derives exist for the columns cache file (see [`crate::cache_file`]);
+/// `lookup` is skipped there because it is derivable from `dict`, and
+/// [`PropColumn::rebuild_lookup`] restores it after a load.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) enum PropColumn {
     Int(Vec<Option<i64>>),
     Float(Vec<Option<f64>>),
@@ -155,6 +169,7 @@ pub(crate) enum PropColumn {
     /// `u32::MAX` marks null or missing.
     Str {
         dict: Vec<String>,
+        #[serde(skip)]
         lookup: AHashMap<String, u32>,
         idx: Vec<u32>,
     },
@@ -164,6 +179,18 @@ pub(crate) enum PropColumn {
 }
 
 const STR_NULL: u32 = u32::MAX;
+
+/// A comparison operator for [`PropColumns::cmp_mask`], the typed in-column
+/// predicate evaluation behind `Graph::nodes_prop_cmp_mask`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PropCmp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
 
 /// The scalar kind of one JSON value, used to pick or degrade a column type.
 #[derive(PartialEq, Clone, Copy)]
@@ -326,6 +353,18 @@ impl PropColumn {
         }
     }
 
+    /// Restore the interning `lookup` from `dict` after a cache file load, which
+    /// skips it as derivable. A no-op on every other variant.
+    pub(crate) fn rebuild_lookup(&mut self) {
+        if let Self::Str { dict, lookup, .. } = self {
+            *lookup = dict
+                .iter()
+                .enumerate()
+                .map(|(i, s)| (s.clone(), i as u32))
+                .collect();
+        }
+    }
+
     /// The value at `dense`, or `None` for null/missing.
     pub(crate) fn get_json_opt(&self, dense: usize) -> Option<Value> {
         match self {
@@ -390,6 +429,47 @@ pub(crate) struct PropColumns<S: ColumnSource> {
     /// `None` is cached for columns with no usable stats (`Json` fallback
     /// columns and all-null columns).
     stats: AHashMap<String, Option<PropStats>>,
+}
+
+impl<S: ColumnSource<Id = u64>> PropColumns<S> {
+    /// Assemble a column set from a cache file's payload: the dense mapping's
+    /// inverse and every string column's interning table are derived rather
+    /// than stored, and the statistics start empty exactly as a built set's
+    /// do. `None` when any column's length disagrees with the dense mapping,
+    /// which marks the payload as not describing one entity set.
+    pub(crate) fn from_cache_file(
+        dense_to_id: Vec<u64>,
+        cols: Vec<(String, PropColumn)>,
+    ) -> Option<Self> {
+        let n = dense_to_id.len();
+        let mut map: AHashMap<String, PropColumn> = AHashMap::with_capacity(cols.len());
+        for (name, mut col) in cols {
+            if col.len() != n {
+                return None;
+            }
+            col.rebuild_lookup();
+            map.insert(name, col);
+        }
+        let id_to_dense = dense_to_id
+            .iter()
+            .enumerate()
+            .map(|(d, &id)| (id, d as u32))
+            .collect();
+        Some(Self {
+            id_to_dense,
+            dense_to_id,
+            cols: map,
+            stats: AHashMap::new(),
+        })
+    }
+
+    /// The cache file payload view of this column set: the dense mapping and the
+    /// columns in name order, so a save is deterministic.
+    pub(crate) fn cache_file_parts(&self) -> (&Vec<u64>, Vec<(&String, &PropColumn)>) {
+        let mut cols: Vec<(&String, &PropColumn)> = self.cols.iter().collect();
+        cols.sort_by_key(|(name, _)| *name);
+        (&self.dense_to_id, cols)
+    }
 }
 
 impl<S: ColumnSource> PropColumns<S> {
@@ -548,9 +628,15 @@ impl<S: ColumnSource> PropColumns<S> {
             })
         };
 
+        // Sizing the interning map up front spares a near-unique key column (a
+        // grouped count keyed by an id-like property) the rehashes of growing a
+        // map to one entry per row; the cap bounds the transient for a bulk
+        // request that turns out to have few groups.
+        let seen_capacity = ids.len().min(1 << 20);
+
         match col {
             PropColumn::Int(v) => {
-                let mut seen: AHashMap<i64, u32> = AHashMap::new();
+                let mut seen: AHashMap<i64, u32> = AHashMap::with_capacity(seen_capacity);
                 for &id in ids {
                     let dense =
                         *self.id_to_dense.get(&id).ok_or_else(|| S::not_found(id))? as usize;
@@ -567,7 +653,7 @@ impl<S: ColumnSource> PropColumns<S> {
                 // Keyed by bit pattern: JSON numbers cannot be NaN, and the
                 // shortest-roundtrip formatting is injective on f64, so bit
                 // identity is serialization identity.
-                let mut seen: AHashMap<u64, u32> = AHashMap::new();
+                let mut seen: AHashMap<u64, u32> = AHashMap::with_capacity(seen_capacity);
                 for &id in ids {
                     let dense =
                         *self.id_to_dense.get(&id).ok_or_else(|| S::not_found(id))? as usize;
@@ -616,7 +702,7 @@ impl<S: ColumnSource> PropColumns<S> {
             PropColumn::Json(v) => {
                 // Mixed kinds: key by the serialized value, the exact group
                 // identity the executor's string-keyed fold uses.
-                let mut seen: AHashMap<String, u32> = AHashMap::new();
+                let mut seen: AHashMap<String, u32> = AHashMap::with_capacity(seen_capacity);
                 for &id in ids {
                     let dense =
                         *self.id_to_dense.get(&id).ok_or_else(|| S::not_found(id))? as usize;
@@ -631,6 +717,142 @@ impl<S: ColumnSource> PropColumns<S> {
             }
         }
         Ok((codes, reps))
+    }
+
+    /// Evaluate `value <op> rhs` for each id's value of `prop` directly against
+    /// the typed column, one keep flag per id, without materializing a `Value`
+    /// per row. `None` declines: the column is the `Json` fallback, whose mixed
+    /// kinds need the boxed comparison. A nonexistent entity is an error, as it
+    /// is for the boxed gather.
+    ///
+    /// The semantics mirrored here are Cypher's scalar comparison, the outcome a
+    /// filter keeps a row on. Three rules cover every case a typed column can
+    /// hold. A null or missing value fails every operator, `Ne` included,
+    /// because both comparison forms evaluate a null operand to null, which is
+    /// not TRUE. Same-kind values compare natively, with a mixed int and float
+    /// pair going through `f64` exactly as the boxed path's `as_f64` fallback
+    /// does. A non-null value against a constant of any other kind (a string
+    /// against a number, or any array, object, or NaN-sentinel constant) is
+    /// unequal but unordered, so it passes `Ne` and fails everything else.
+    pub(crate) fn cmp_mask(
+        &self,
+        ids: &[S::Id],
+        prop: &str,
+        op: PropCmp,
+        rhs: &Value,
+    ) -> Result<Option<Vec<bool>>, Error> {
+        use std::cmp::Ordering;
+
+        let Some(col) = self.cols.get(prop) else {
+            // No such column: every value is null, and null fails every operator.
+            for &id in ids {
+                if !self.id_to_dense.contains_key(&id) {
+                    return Err(S::not_found(id));
+                }
+            }
+            return Ok(Some(vec![false; ids.len()]));
+        };
+
+        let keeps = |ord: Ordering| match op {
+            PropCmp::Eq => ord == Ordering::Equal,
+            PropCmp::Ne => ord != Ordering::Equal,
+            PropCmp::Lt => ord == Ordering::Less,
+            PropCmp::Le => ord != Ordering::Greater,
+            PropCmp::Gt => ord == Ordering::Greater,
+            PropCmp::Ge => ord != Ordering::Less,
+        };
+        // A null constant fails every operator; a kind-mismatched one passes
+        // only `Ne`. Both are per-row constants, so the row test reduces to
+        // presence.
+        let mismatch_keeps = if rhs.is_null() {
+            false
+        } else {
+            op == PropCmp::Ne
+        };
+
+        let dense_of = |id: S::Id| -> Result<usize, Error> {
+            Ok(*self.id_to_dense.get(&id).ok_or_else(|| S::not_found(id))? as usize)
+        };
+
+        let mask = match col {
+            PropColumn::Int(v) => match rhs {
+                Value::Number(n) => {
+                    if let Some(c) = n.as_i64() {
+                        ids.iter()
+                            .map(|&id| Ok(v[dense_of(id)?].is_some_and(|x| keeps(x.cmp(&c)))))
+                            .collect::<Result<Vec<bool>, Error>>()?
+                    } else if let Some(c) = n.as_f64() {
+                        ids.iter()
+                            .map(|&id| {
+                                Ok(v[dense_of(id)?]
+                                    .is_some_and(|x| (x as f64).partial_cmp(&c).is_some_and(keeps)))
+                            })
+                            .collect::<Result<Vec<bool>, Error>>()?
+                    } else {
+                        self.presence_mask(ids, |d| v[d].is_some(), mismatch_keeps)?
+                    }
+                }
+                _ => self.presence_mask(ids, |d| v[d].is_some(), mismatch_keeps)?,
+            },
+            PropColumn::Float(v) => match rhs {
+                // `as_f64` is how the boxed comparison reads either numeric
+                // kind, so both constant kinds funnel through it here too.
+                Value::Number(n) => {
+                    if let Some(c) = n.as_f64() {
+                        ids.iter()
+                            .map(|&id| {
+                                Ok(v[dense_of(id)?]
+                                    .is_some_and(|x| x.partial_cmp(&c).is_some_and(keeps)))
+                            })
+                            .collect::<Result<Vec<bool>, Error>>()?
+                    } else {
+                        self.presence_mask(ids, |d| v[d].is_some(), mismatch_keeps)?
+                    }
+                }
+                _ => self.presence_mask(ids, |d| v[d].is_some(), mismatch_keeps)?,
+            },
+            PropColumn::Bool(v) => match rhs {
+                Value::Bool(c) => ids
+                    .iter()
+                    .map(|&id| Ok(v[dense_of(id)?].is_some_and(|x| keeps(x.cmp(c)))))
+                    .collect::<Result<Vec<bool>, Error>>()?,
+                _ => self.presence_mask(ids, |d| v[d].is_some(), mismatch_keeps)?,
+            },
+            PropColumn::Str { dict, idx, .. } => match rhs {
+                Value::String(c) => {
+                    // One comparison per distinct dictionary entry, one array
+                    // read per row.
+                    let pass: Vec<bool> = dict.iter().map(|s| keeps(s.as_str().cmp(c))).collect();
+                    ids.iter()
+                        .map(|&id| {
+                            Ok(match idx[dense_of(id)?] {
+                                STR_NULL => false,
+                                i => pass[i as usize],
+                            })
+                        })
+                        .collect::<Result<Vec<bool>, Error>>()?
+                }
+                _ => self.presence_mask(ids, |d| idx[d] != STR_NULL, mismatch_keeps)?,
+            },
+            PropColumn::Json(_) => return Ok(None),
+        };
+        Ok(Some(mask))
+    }
+
+    /// The kind-mismatch mask: `keeps` for a present value, false for null or
+    /// missing.
+    fn presence_mask(
+        &self,
+        ids: &[S::Id],
+        present: impl Fn(usize) -> bool,
+        keeps: bool,
+    ) -> Result<Vec<bool>, Error> {
+        ids.iter()
+            .map(|&id| {
+                let dense = *self.id_to_dense.get(&id).ok_or_else(|| S::not_found(id))? as usize;
+                Ok(keeps && present(dense))
+            })
+            .collect()
     }
 
     /// Re-read `touched` node records and patch their slots in place. New
@@ -804,7 +1026,18 @@ impl<S: ColumnSource> Default for ColumnsCache<S> {
     }
 }
 
-impl<S: ColumnSource> ColumnsCache<S> {
+impl<S: ColumnSource<Id = u64>> ColumnsCache<S> {
+    /// A full build, served from the columns cache file when a fresh one exists.
+    /// The cache file is generation-checked against storage, so a load and a
+    /// build are indistinguishable to the caller; any mismatch or damage falls
+    /// through to the scan.
+    fn build_or_load(storage: &Storage) -> Result<PropColumns<S>, Error> {
+        #[cfg(feature = "lmdb")]
+        if let Some(cols) = crate::cache_file::load_columns::<S>(storage) {
+            return Ok(cols);
+        }
+        PropColumns::build(storage)
+    }
     /// Record an added or updated entity. Called post-commit.
     pub(crate) fn record_touched(&self, id: S::Id) {
         let mut p = self.pending.lock();
@@ -850,7 +1083,7 @@ impl<S: ColumnSource> ColumnsCache<S> {
             let delta = std::mem::take(&mut *self.pending.lock());
             let absorbed = match guard.as_mut() {
                 Some(cols) if !delta.force_full => cols.patch(storage, &delta.touched),
-                _ => PropColumns::build(storage).map(|cols| {
+                _ => Self::build_or_load(storage).map(|cols| {
                     *guard = Some(cols);
                     self.forget_direct_reads();
                 }),
@@ -1119,6 +1352,143 @@ mod tests {
             Some(serde_json::Value::Null)
         );
         assert_eq!(g.node_prop_json(a + 999, "x").unwrap(), None);
+    }
+
+    /// The typed comparison mask must match what boxing every value and
+    /// comparing under Cypher scalar semantics would produce: null and missing
+    /// values fail every operator, same-kind values compare natively, and a
+    /// kind-mismatched non-null value passes only `Ne`.
+    #[test]
+    fn typed_cmp_mask_follows_cypher_scalar_semantics() {
+        use super::PropCmp::*;
+        let (_dir, g) = open_tmp();
+        let n30 = g
+            .add_node("N", &json!({ "age": 30, "city": "oslo" }))
+            .unwrap();
+        let n40 = g
+            .add_node("N", &json!({ "age": 40, "city": "rome" }))
+            .unwrap();
+        let n25 = g
+            .add_node("N", &json!({ "age": 25, "city": "bern" }))
+            .unwrap();
+        let bare = g.add_node("N", &json!({ "city": "oslo" })).unwrap();
+        materialize_columns(&g);
+        let ids = [n30, n40, n25, bare];
+
+        let mask = |prop: &str, op, rhs: serde_json::Value| {
+            g.nodes_prop_cmp_mask(&ids, prop, op, &rhs)
+                .unwrap()
+                .expect("typed column must answer")
+        };
+
+        assert_eq!(mask("age", Ge, json!(30)), vec![true, true, false, false]);
+        assert_eq!(mask("age", Le, json!(30)), vec![true, false, true, false]);
+        assert_eq!(mask("age", Lt, json!(30)), vec![false, false, true, false]);
+        assert_eq!(mask("age", Gt, json!(30)), vec![false, true, false, false]);
+        assert_eq!(mask("age", Eq, json!(30)), vec![true, false, false, false]);
+        assert_eq!(mask("age", Ne, json!(30)), vec![false, true, true, false]);
+
+        // Cross-kind numeric compares go through f64, as the boxed path does.
+        assert_eq!(
+            mask("age", Ge, json!(30.5)),
+            vec![false, true, false, false]
+        );
+        assert_eq!(
+            mask("age", Eq, json!(30.0)),
+            vec![true, false, false, false]
+        );
+
+        // Dictionary strings compare per distinct dictionary entry.
+        assert_eq!(
+            mask("city", Eq, json!("oslo")),
+            vec![true, false, false, true]
+        );
+        assert_eq!(
+            mask("city", Gt, json!("bern")),
+            vec![true, true, false, true]
+        );
+
+        // A kind-mismatched constant keeps a non-null row only under `Ne`.
+        assert_eq!(
+            mask("age", Ne, json!("thirty")),
+            vec![true, true, true, false]
+        );
+        assert_eq!(mask("age", Eq, json!("thirty")), vec![false; 4]);
+        assert_eq!(mask("age", Lt, json!("thirty")), vec![false; 4]);
+        assert_eq!(
+            mask("age", Ne, json!([1, 2])),
+            vec![true, true, true, false]
+        );
+
+        // A null constant fails every operator on every row.
+        assert_eq!(mask("age", Ne, serde_json::Value::Null), vec![false; 4]);
+        assert_eq!(mask("age", Eq, serde_json::Value::Null), vec![false; 4]);
+
+        // A property with no column at all reads as null everywhere.
+        assert_eq!(mask("nope", Ne, json!(1)), vec![false; 4]);
+
+        // A nonexistent node is an error, exactly as the boxed gather reports it.
+        assert!(
+            g.nodes_prop_cmp_mask(&[bare + 999], "age", Eq, &json!(1))
+                .is_err()
+        );
+    }
+
+    /// Float columns and integer constants must compare exactly as the boxed
+    /// path's `as_f64` fallback does, and boolean columns order false before
+    /// true.
+    #[test]
+    fn typed_cmp_mask_covers_float_and_bool_columns() {
+        use super::PropCmp::*;
+        let (_dir, g) = open_tmp();
+        let a = g
+            .add_node("N", &json!({ "score": 1.5, "flag": true }))
+            .unwrap();
+        let b = g
+            .add_node("N", &json!({ "score": 2.0, "flag": false }))
+            .unwrap();
+        materialize_columns(&g);
+        let ids = [a, b];
+
+        let mask = |prop: &str, op, rhs: serde_json::Value| {
+            g.nodes_prop_cmp_mask(&ids, prop, op, &rhs)
+                .unwrap()
+                .expect("typed column must answer")
+        };
+
+        assert_eq!(mask("score", Gt, json!(1.5)), vec![false, true]);
+        assert_eq!(mask("score", Ge, json!(2)), vec![false, true]);
+        assert_eq!(mask("score", Eq, json!(2)), vec![false, true]);
+        assert_eq!(mask("flag", Eq, json!(true)), vec![true, false]);
+        assert_eq!(mask("flag", Lt, json!(true)), vec![false, true]);
+        assert_eq!(mask("flag", Ne, json!(1)), vec![true, true]);
+    }
+
+    /// A `Json` fallback column declines rather than approximating, and a small
+    /// request on a cold graph declines rather than building every column.
+    #[test]
+    fn typed_cmp_mask_declines_json_columns_and_small_cold_requests() {
+        use super::PropCmp::*;
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("N", &json!({ "mixed": 1 })).unwrap();
+        let b = g.add_node("N", &json!({ "mixed": "one" })).unwrap();
+
+        assert!(!g.prop_columns.is_built(), "cold to start");
+        assert_eq!(
+            g.nodes_prop_cmp_mask(&[a, b], "mixed", Eq, &json!(1))
+                .unwrap(),
+            None,
+            "a small request on a cold graph must decline, not build"
+        );
+        assert!(!g.prop_columns.is_built());
+
+        materialize_columns(&g);
+        assert_eq!(
+            g.nodes_prop_cmp_mask(&[a, b], "mixed", Eq, &json!(1))
+                .unwrap(),
+            None,
+            "a mixed-kind column must decline"
+        );
     }
 
     #[test]
