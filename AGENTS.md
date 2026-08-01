@@ -109,7 +109,9 @@ second copy of both, so the same rule was stated in three places and the copies 
       backend's error type, so the variant is `heed::Error` on a default build and unchanged from before the backend split.
 - `crates/issundb-cypher/`: Cypher parser, AST, logical planner, physical planner, optimizer, and executor.
     - `src/parser.rs`: Cypher parser built with the `chumsky` parser-combinator library, with a Pratt parser for operator precedence. The nesting
-      scan, the large-stack dispatch, and the parse cache are in the crate guide under "Parser Structure Rules".
+      scan, the large-stack dispatch, and the parse cache are in the crate guide under "Parser Structure Rules". It also renders parse errors as
+      compiler-style diagnostics, with a caret under the offending source line; the rules for what a diagnostic may say are in the crate guide under
+      "Parse Diagnostics".
     - `src/ast.rs`: AST node types.
     - `src/plan/`: logical planner, physical planner, optimizer, and statistics helpers.
     - `src/procedure.rs`: the `ProcedureRegistry` a caller passes to `query_with_procedures`, plus the argument and yield types a procedure sees.

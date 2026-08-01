@@ -1139,7 +1139,7 @@ async function runThenQuery(cypher) {
         lastResult = result;
         renderTable(result);
         renderJson(result);
-        setStatus("ok", "Query finished.");
+        setStatus("ok", "Query finished successfully.");
         setMeta(
             `${plural(result.rows.length, "row")}, ${plural(result.columns.length, "column")}.` +
             ` Query took ${result.elapsed_ms.toFixed(2)} ms, after the example put its index and`

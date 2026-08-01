@@ -5509,6 +5509,45 @@ mod tests {
         );
     }
 
+    /// A malformed statement in copy.cypher is reported against that file's line
+    /// number, and the parse diagnostic below it speaks for itself. The statement
+    /// is quoted once, under the caret, rather than a second time in the wrapper,
+    /// and "parse error" appears once rather than twice.
+    #[test]
+    fn test_import_database_reports_the_copy_cypher_line() {
+        let (tempdir, graph) = setup_graph();
+        let params = HashMap::new();
+
+        let import_dir = tempdir.path().join("import_bad_copy");
+        std::fs::create_dir(&import_dir).unwrap();
+        // A comment and a blank line precede the fault, and both are skipped by
+        // the reader. The count must still name line 3, or the number would be an
+        // index into the statements rather than into the file.
+        std::fs::write(
+            import_dir.join("copy.cypher"),
+            "// a comment\n\nCOPY FOLLOWS FROM 'x.jsonl' 4;\n",
+        )
+        .unwrap();
+
+        let err = execute(
+            &graph,
+            &format!("IMPORT DATABASE '{}'", import_dir.display()),
+            &params,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("copy.cypher line 3"), "{err}");
+        assert!(err.contains("unexpected number `4`"), "{err}");
+        assert!(err.contains('^'), "the caret marks the statement: {err}");
+        assert_eq!(err.matches("parse error").count(), 1, "{err}");
+        assert_eq!(
+            err.matches("COPY FOLLOWS").count(),
+            1,
+            "the statement is quoted once, under the caret: {err}"
+        );
+    }
+
     /// IMPORT DATABASE reports one row per COPY statement in copy.cypher, so
     /// a file that ingests zero rows or classifies unexpectedly is visible.
     #[test]

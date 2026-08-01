@@ -798,7 +798,7 @@ pub(super) fn execute_import_db(
             File::open(&copy_path).map_err(|e| format!("failed to open copy.cypher: {}", e))?;
         let reader = BufReader::new(file);
 
-        for line_res in reader.lines() {
+        for (i, line_res) in reader.lines().enumerate() {
             let line =
                 line_res.map_err(|e| format!("failed to read line from copy.cypher: {}", e))?;
             let trimmed = line.trim();
@@ -807,8 +807,12 @@ pub(super) fn execute_import_db(
             }
             let cypher_stmt = trimmed.strip_suffix(';').unwrap_or(trimmed);
 
+            // The diagnostic reproduces the statement under a caret, so quoting it
+            // here as well would print it twice and prefix "parse error" twice. The
+            // line of `copy.cypher` is the one thing the diagnostic cannot know, and
+            // is the only file-relative number in the message.
             let parsed = crate::parser::parse(cypher_stmt)
-                .map_err(|e| format!("parse error on copy line '{}': {}", cypher_stmt, e))?;
+                .map_err(|e| format!("copy.cypher line {}: {}", i + 1, e))?;
 
             if let crate::ast::Statement::Copy(ref copy_stmt) = parsed {
                 let resolved_filepath = if Path::new(&copy_stmt.filepath).is_absolute() {
