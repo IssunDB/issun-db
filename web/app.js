@@ -1552,6 +1552,28 @@ const FOCUS_HOPS = 2;
 // already answers "which of these did my query touch" without discarding the context around them.
 let resultOnly = false;
 
+// Focus and Result only narrow the view by a rule, which is all there was: any vertex the rule
+// excluded needed the rule relaxed for every other vertex too. These two are the per-vertex
+// override, so a neighbourhood can be grown one vertex at a time and anything uninteresting taken
+// back out. Both hold ids rather than vertices, so a vertex a later query deletes drops out of the
+// view by itself.
+const revealed = new Set();
+const dismissed = new Set();
+
+// What the find box is matching. Held here rather than read off the input, so a redraw reapplies
+// the highlight instead of losing it.
+let searchTerm = "";
+
+// Assigned by `drawGraph`, because the highlight has to reach the elements that drawing created.
+// Repainting classes is what the find box does instead of redrawing: a redraw restarts the
+// simulation, and searching a graph should not rearrange it.
+let highlightSearch = () => [];
+
+// A redraw clears the selection, which is right for a new query and wrong for an action taken from
+// the inspector. Exploring is a run of expansions from one vertex, and closing the panel after each
+// would mean hovering the same vertex back open every time.
+let reselectId = null;
+
 // Undirected adjacency over the drawn edges. Focus wants the context around a vertex, and following
 // only the outgoing side would hide whatever points at it, which is usually the interesting half.
 function neighbourhood(edges, root, hops) {
@@ -1597,7 +1619,69 @@ function visibleGraph() {
         nodes = nodes.filter((node) => ball.has(node.id));
         edges = edges.filter((e) => ball.has(e.source) && ball.has(e.target));
     }
-    return {nodes, edges};
+
+    // The overrides are applied last, so revealing wins over both rules above and dismissing wins
+    // over revealing. Edges are re-derived from the whole snapshot rather than narrowed from the
+    // set above, or a revealed vertex would arrive with no line joining it to what revealed it.
+    const shown = new Set(nodes.map((node) => node.id));
+    for (const id of revealed) shown.add(id);
+    for (const id of dismissed) shown.delete(id);
+    return {
+        nodes: snapshot.nodes.filter((node) => shown.has(node.id)),
+        edges: snapshot.edges.filter((e) => shown.has(e.source) && shown.has(e.target)),
+    };
+}
+
+// Snapshot neighbours of `id` in either direction that the view is not currently drawing. The
+// snapshot is the capped scan and not the database, so this can only ever surface what the cap
+// already kept; the toolbar count is what says the cap is in play.
+function hiddenNeighbours(id) {
+    const shown = new Set(drawn.nodes.map((node) => node.id));
+    const out = new Set();
+    for (const e of snapshot.edges) {
+        if (e.source === id && !shown.has(e.target)) out.add(e.target);
+        if (e.target === id && !shown.has(e.source)) out.add(e.source);
+    }
+    out.delete(id);
+    return out;
+}
+
+// A vertex arriving from an expansion has never been laid out, so the force pass would seed it on
+// the circle it seeds a fresh graph on, which is nowhere near the vertex that revealed it. Placed
+// in a ring around that vertex instead, so the expansion reads as growth from where it happened.
+const REVEAL_RING = 70;
+
+function expandFrom(id) {
+    const fresh = hiddenNeighbours(id);
+    if (fresh.size === 0) return 0;
+    const root = snapshot.nodes.find((node) => node.id === id);
+    const byId = new Map(snapshot.nodes.map((node) => [node.id, node]));
+    let i = 0;
+    for (const other of fresh) {
+        revealed.add(other);
+        // Revealing overrides an earlier dismissal, or expanding a vertex whose neighbour was
+        // dismissed would silently do nothing and read as a broken button.
+        dismissed.delete(other);
+        const node = byId.get(other);
+        if (node && node.x === undefined && root?.x !== undefined) {
+            const angle = (i / fresh.size) * Math.PI * 2;
+            node.x = root.x + Math.cos(angle) * REVEAL_RING;
+            node.y = root.y + Math.sin(angle) * REVEAL_RING;
+            node.vx = 0;
+            node.vy = 0;
+        }
+        i += 1;
+    }
+    return fresh.size;
+}
+
+// Matched against what the vertex shows on screen, plus its `#id`, which is the other handle the
+// page gives a vertex (the inspector titles by it, and so does every "selection stolen" report).
+// Searching every property would find vertices whose match is nowhere visible.
+function matchesSearch(node, needle) {
+    if (captionOf(node).toLowerCase().includes(needle)) return true;
+    if ((node.labels ?? []).some((l) => l.toLowerCase().includes(needle))) return true;
+    return `#${node.id}`.includes(needle);
 }
 
 // Slot each edge within its unordered pair, so parallel and reciprocal edges are drawn on separate
@@ -1688,7 +1772,7 @@ function drawGraph() {
         `${plural(nodes.length, "node")} and ${plural(edges.length, "edge")}` +
         (snapshot.truncated ? " (capped at 300)" : "") +
         (hidden > 0 ? `, ${hidden} hidden` : "");
-    $("clear-focus").hidden = focusRoot === null;
+    $("reset-view").hidden = focusRoot === null && revealed.size === 0 && dismissed.size === 0;
 
     const {lit, groupIds, groupLabel} = resultOverlay();
 
@@ -1736,6 +1820,8 @@ function drawGraph() {
         .join("");
 
     if (nodes.length === 0) {
+        highlightSearch = () => [];
+        reportSearch([]);
         svg.append(
             el("text", {
                 x: 16,
@@ -1745,7 +1831,7 @@ function drawGraph() {
             }),
         );
         svg.lastChild.textContent = snapshot.nodes.length
-            ? "Nothing to draw under the current filter. Clear focus, or turn off Result only."
+            ? "Nothing to draw under the current filter. Press Show all, or turn off Result only."
             : "Nothing to draw. Run a CREATE, or click Reset data.";
         return;
     }
@@ -1906,6 +1992,21 @@ function drawGraph() {
         svg.classList.add("hovering");
     }
 
+    // A separate class from `dim` and from `near` for the same reason those are separate from each
+    // other: a find inside a highlighted result, or with a vertex hovered, has to compose with both
+    // rather than replace either.
+    highlightSearch = () => {
+        const needle = searchTerm.trim().toLowerCase();
+        const hits = [];
+        for (const [i, group] of groups.entries()) {
+            const hit = needle !== "" && matchesSearch(nodes[i], needle);
+            group.classList.toggle("match", hit);
+            if (hit) hits.push(nodes[i]);
+        }
+        svg.classList.toggle("searching", needle !== "");
+        return hits;
+    };
+
     function paint() {
         for (const [i, path] of paths.entries()) {
             const a = byId.get(Number(path.dataset.source));
@@ -1951,7 +2052,16 @@ function drawGraph() {
         sim = requestAnimationFrame(step);
     }
 
+    if (reselectId !== null) {
+        const again = nodes.find((n) => n.id === reselectId);
+        reselectId = null;
+        // Pinned, so the panel the action came from cannot be replaced by whatever the pointer
+        // happens to be resting on when the redraw lands.
+        if (again) select(again, true);
+    }
+
     paint();
+    reportSearch(highlightSearch());
     start();
 }
 
@@ -1985,15 +2095,35 @@ function inspect(node) {
     const rows = props
         .map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(JSON.stringify(v))}</dd>`)
         .join("");
+    const more = hiddenNeighbours(node.id).size;
     $("inspect").innerHTML =
-        `<button class="btn sm focus-btn" id="focus-node" title="Show only this vertex and what is within ${FOCUS_HOPS} hops of it">Focus</button>` +
         `<h5><i class="swatch" style="width:9px;height:9px;border-radius:3px;background:${colorOf(
             labelOf(node),
         )}"></i>${esc(node.labels?.join(":") || "(no label)")} <span style="color:var(--md-default-fg-color--light);font-family:var(--md-code-font)">#${node.id}</span></h5>` +
+        `<div class="inspect-actions">` +
+        `<button class="btn sm" id="expand-node"${more === 0 ? " disabled" : ""} title="${
+            more === 0
+                ? "Every neighbour of this vertex is already drawn"
+                : `Add this vertex's ${plural(more, "undrawn neighbour")} to the view`
+        }">Expand${more === 0 ? "" : ` ${more}`}</button>` +
+        `<button class="btn sm" id="focus-node" title="Show only this vertex and what is within ${FOCUS_HOPS} hops of it">Focus</button>` +
+        `<button class="btn sm" id="dismiss-node" title="Take this vertex out of the view">Dismiss</button>` +
+        `</div>` +
         (rows ? `<dl>${rows}</dl>` : '<div class="empty">No properties.</div>');
     $("inspect").hidden = false;
     $("focus-node").addEventListener("click", () => {
         focusRoot = node.id;
+        drawGraph();
+    });
+    $("expand-node").addEventListener("click", () => {
+        const grew = expandFrom(node.id);
+        reselectId = node.id;
+        drawGraph();
+        setStatus("ok", `Revealed ${plural(grew, "neighbour")} of #${node.id}.`);
+    });
+    $("dismiss-node").addEventListener("click", () => {
+        dismissed.add(node.id);
+        revealed.delete(node.id);
         drawGraph();
     });
 }
@@ -2085,9 +2215,9 @@ $("svg").addEventListener("pointerdown", (e) => {
 // canvas needs. Before the world grew with the graph this only ever zoomed in, since every vertex
 // was clamped inside the element; now a large graph is laid out beyond the canvas and this is the
 // only thing that brings it into view.
-function fitToGraph() {
+function fitToGraph(subset = drawn.nodes) {
     const svg = $("svg");
-    const placed = drawn.nodes.filter((node) => node.x !== undefined);
+    const placed = subset.filter((node) => node.x !== undefined);
     if (placed.length === 0) return;
 
     let minX = Infinity;
@@ -2138,9 +2268,33 @@ $("inspect").addEventListener("pointerleave", () => {
     overPanel = false;
 });
 
-$("clear-focus").addEventListener("click", () => {
+$("reset-view").addEventListener("click", () => {
     focusRoot = null;
+    revealed.clear();
+    dismissed.clear();
     drawGraph();
+});
+
+function reportSearch(hits) {
+    const empty = searchTerm.trim() === "";
+    $("search-count").textContent = empty ? "" : `${hits.length}/${drawn.nodes.length}`;
+    $("graph-search").closest(".graph-find").classList.toggle("miss", !empty && hits.length === 0);
+}
+
+$("graph-search").addEventListener("input", (e) => {
+    searchTerm = e.target.value;
+    reportSearch(highlightSearch());
+});
+
+// Enter frames the matches, which is the half of finding that highlighting alone does not do: on a
+// graph large enough to need a find box, a match can be highlighted well outside the view.
+$("graph-search").addEventListener("keydown", (e) => {
+    if (e.key !== "Enter") return;
+    e.preventDefault();
+    const hits = highlightSearch();
+    if (hits.length === 0) return;
+    viewAdjusted = true;
+    fitToGraph(hits);
 });
 
 $("result-only").addEventListener("change", (e) => {
@@ -2175,6 +2329,139 @@ function download(name, mime, text) {
     // this tick produces an empty download.
     setTimeout(() => URL.revokeObjectURL(url), 0);
 }
+
+// Every property the graph is drawn with, and nothing else. A downloaded picture is opened where
+// neither the stylesheet nor the custom properties it reads exist, so each of these is resolved off
+// the live element and written onto the copy as an attribute. `--gscale` disappears with them,
+// since what it feeds is a `calc` that is already resolved by the time it is read.
+//
+// These inherit, so a value equal to the parent's is dropped rather than repeated. Writing all of
+// them on every element made a twenty-six vertex graph a 68 KB file, most of it the page's font
+// stack restated on each circle.
+const EXPORT_INHERITED = [
+    "fill",
+    "fill-opacity",
+    "stroke",
+    "stroke-width",
+    "stroke-linecap",
+    "stroke-linejoin",
+    "font-family",
+    "font-size",
+    "font-weight",
+    "text-anchor",
+    "paint-order",
+];
+
+// `opacity` does not inherit, so it is compared against its own initial value instead. This is what
+// carries the result overlay's dimming and the suppressed captions into the file.
+const EXPORT_OPACITY_DEFAULT = "1";
+
+const RGBA = /^rgba\(\s*([\d.]+)[\s,]+([\d.]+)[\s,]+([\d.]+)[\s,/]+([\d.]+)\s*\)$/;
+
+// A translucent colour computes to `rgba(r, g, b, a)`, which is a CSS colour rather than a value an
+// SVG presentation attribute is required to accept. A browser takes it; Inkscape drops the whole
+// declaration and paints black, which turned the exported captions from light text on a dark canvas
+// into unreadable dark text on one. The opaque colour plus the matching `-opacity` attribute says
+// the same thing in the form every consumer understands.
+function splitTranslucentPaint(root) {
+    for (const element of [root, ...root.querySelectorAll("*")]) {
+        for (const prop of ["fill", "stroke"]) {
+            const parts = element.getAttribute(prop)?.match(RGBA);
+            if (!parts) continue;
+            const [, r, g, b, a] = parts;
+            element.setAttribute(prop, `rgb(${r}, ${g}, ${b})`);
+            element.setAttribute(`${prop}-opacity`, a);
+        }
+    }
+}
+
+function standaloneSvg() {
+    const svg = $("svg");
+    // A hover or a find in progress is a state of the page rather than of the picture, and reading
+    // computed styles under either bakes its dimming into the file. Dropped for the read and put
+    // back, because the classes carry no information the export should keep.
+    const overlays = ["hovering", "searching"].filter((c) => svg.classList.contains(c));
+    for (const c of overlays) svg.classList.remove(c);
+
+    const clone = svg.cloneNode(true);
+    const from = [svg, ...svg.querySelectorAll("*")];
+    const to = [clone, ...clone.querySelectorAll("*")];
+    for (const [i, source] of from.entries()) {
+        const computed = getComputedStyle(source);
+        // The root writes the whole set unconditionally, establishing the baseline the rest are
+        // diffed against. Diffing it too would compare against the enclosing HTML, which already
+        // supplies the page's font, so the file would inherit that font from a stylesheet it no
+        // longer has and fall back to the renderer's default instead.
+        const inherited = i === 0 ? null : getComputedStyle(source.parentElement);
+        for (const prop of EXPORT_INHERITED) {
+            const value = computed.getPropertyValue(prop);
+            if (value && value !== inherited?.getPropertyValue(prop)) {
+                to[i].setAttribute(prop, value);
+            }
+        }
+        const opacity = computed.getPropertyValue("opacity");
+        if (opacity && opacity !== EXPORT_OPACITY_DEFAULT) to[i].setAttribute("opacity", opacity);
+    }
+    const background = getComputedStyle(svg).backgroundColor;
+    for (const c of overlays) svg.classList.add(c);
+
+    const box = viewBox ?? {x: 0, y: 0, w: svg.clientWidth || 800, h: svg.clientHeight || 500};
+    clone.removeAttribute("style");
+    clone.removeAttribute("class");
+    clone.setAttribute("xmlns", SVG_NS);
+    clone.setAttribute("width", String(Math.round(box.w)));
+    clone.setAttribute("height", String(Math.round(box.h)));
+    clone.setAttribute("viewBox", `${box.x} ${box.y} ${box.w} ${box.h}`);
+    // The canvas colour is a CSS background, which a rasterizer composites onto nothing. An explicit
+    // rectangle is what keeps a dark-theme export from being dark text on transparency.
+    clone.insertBefore(
+        el("rect", {x: box.x, y: box.y, width: box.w, height: box.h, fill: background}),
+        clone.firstChild,
+    );
+    splitTranslucentPaint(clone);
+    return {text: new XMLSerializer().serializeToString(clone), box};
+}
+
+$("svg-dl").addEventListener("click", () => {
+    if (drawn.nodes.length === 0) return;
+    download("issundb-graph.svg", "image/svg+xml", standaloneSvg().text);
+});
+
+// Twice the drawn size, so the file is legible when it is dropped into a document at its natural
+// width rather than blocky.
+const PNG_SCALE = 2;
+
+$("png").addEventListener("click", async () => {
+    if (drawn.nodes.length === 0) return;
+    const {text, box} = standaloneSvg();
+    const image = new Image();
+    try {
+        await new Promise((resolve, reject) => {
+            image.onload = resolve;
+            image.onerror = () => reject(new Error("the picture could not be rasterized"));
+            image.src = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(text)}`;
+        });
+    } catch {
+        setStatus("err", "The browser could not turn the view into a PNG. The SVG download works.");
+        return;
+    }
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.round(box.w * PNG_SCALE);
+    canvas.height = Math.round(box.h * PNG_SCALE);
+    canvas.getContext("2d").drawImage(image, 0, 0, canvas.width, canvas.height);
+    canvas.toBlob((blob) => {
+        if (!blob) {
+            setStatus("err", "The browser could not turn the view into a PNG. The SVG download works.");
+            return;
+        }
+        const url = URL.createObjectURL(blob);
+        const anchor = document.createElement("a");
+        anchor.href = url;
+        anchor.download = "issundb-graph.png";
+        anchor.click();
+        setTimeout(() => URL.revokeObjectURL(url), 0);
+    }, "image/png");
+});
 
 $("csv").addEventListener("click", () => {
     if (!lastResult?.columns.length) return;

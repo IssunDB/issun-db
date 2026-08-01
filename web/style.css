@@ -1162,6 +1162,68 @@ svg.graph.hovering .node.selected {
     opacity: 1;
 }
 
+/* A find fades what it did not match, the way a hover fades what is not adjacent. The two compose,
+   so hovering inside a find keeps both readings; a vertex that is both a match and adjacent is
+   simply not faded by either. `.match` is spelled out against the hover rule for the reason the
+   selected ring is: `.hovering .node:not(.near)` would otherwise dim a match the pointer is not on,
+   which is every match except one. */
+svg.graph.searching .node:not(.match),
+svg.graph.searching .edge {
+    opacity: 0.12;
+}
+
+svg.graph.searching .node.match,
+svg.graph.hovering.searching .node.match {
+    opacity: 1;
+}
+
+svg.graph.searching .node.match circle {
+    stroke: var(--md-accent-fg-color);
+    stroke-width: calc(3px * var(--gscale, 1));
+}
+
+/* A match is worth reading, so its caption comes back even where density had suppressed it. */
+svg.graph.searching .node.match .cap.quiet {
+    opacity: 1;
+}
+
+.graph-find {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 0 8px;
+    height: 26px;
+    border: 1px solid var(--line);
+    border-radius: var(--control-radius);
+    background: var(--md-default-bg-color);
+    color: var(--md-default-fg-color--light);
+}
+
+.graph-find:focus-within {
+    border-color: var(--md-primary-fg-color);
+}
+
+.graph-find.miss {
+    border-color: var(--err);
+}
+
+.graph-find input {
+    width: 116px;
+    border: 0;
+    outline: 0;
+    padding: 0;
+    background: none;
+    font: inherit;
+    color: var(--md-default-fg-color);
+}
+
+#search-count {
+    font-family: var(--md-code-font);
+    font-size: 0.7rem;
+    font-variant-numeric: tabular-nums;
+    color: var(--md-default-fg-color--light);
+}
+
 .legend i.rel {
     width: 14px;
     height: 3px;
@@ -1178,9 +1240,19 @@ svg.graph.hovering .node.selected {
     user-select: none;
 }
 
-.focus-btn {
-    float: right;
-    margin: -2px 0 0 8px;
+/* Three buttons, so they get a row of their own rather than floating beside the title. Above the
+   properties rather than below them, because the panel scrolls once a vertex carries more than a
+   few and actions at the bottom would scroll out of reach. */
+.inspect-actions {
+    display: flex;
+    gap: 6px;
+    margin: 0 0 8px;
+}
+
+.inspect-actions .btn {
+    flex: 1;
+    justify-content: center;
+    padding-inline: 6px;
 }
 
 svg.graph .node circle {

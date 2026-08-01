@@ -208,11 +208,68 @@ resting on one still feels immediate.
 
 A click pins the selection outright, so hovering elsewhere afterwards leaves the panel alone. Moving
 off a vertex leaves the panel where it is rather than closing it, so a reading is not interrupted by
-the pointer drifting; clicking the background unpins and clears. `Focus`, on the
-inspector, narrows the view to a vertex and what is within two hops of it, over the drawn graph rather
-than the database; `Clear focus` returns.
-`Result only` draws just the vertices the last result mentioned. Both report what they removed in the
-count beside the legend, so a filtered view is never mistaken for the whole graph.
+the pointer drifting; clicking the background unpins and clears.
+
+## Narrowing and Growing the View
+
+`Focus`, on the inspector, narrows the view to a vertex and what is within two hops of it, over the
+drawn graph rather than the database. `Result only`, in the toolbar, draws just the vertices the last
+result mentioned. Both are rules, which is the limit of what they can be: any vertex a rule excludes
+needs the rule relaxed for every other vertex too.
+
+`Expand` and `Dismiss` are the per-vertex override, so a neighbourhood can be grown one vertex at a
+time and anything uninteresting taken back out. Expanding reveals a vertex's undrawn neighbours in
+either direction and says how many there are on the button, so a vertex whose neighbours are all drawn
+offers a disabled button rather than one that does nothing. The focus root always reads that way, since
+every neighbour of the root is one hop inside the ball; the vertices worth expanding are the ones on
+its rim. Revealing overrides an earlier dismissal, or expanding towards a dismissed vertex would
+silently do nothing. A revealed vertex is placed in a ring around the vertex that revealed it rather
+than seeded on the layout's starting circle, so the expansion reads as growth from where it happened.
+What can be revealed is bounded by the snapshot rather than by the database, so this surfaces what the
+300-vertex cap already kept and never more.
+
+The inspector stays open on the vertex an action came from, because exploring is a run of expansions
+from one vertex and closing the panel after each would mean hovering the same vertex back open every
+time. `Show all` undoes focus, expansion, and dismissal together, and appears whenever any of the three
+is in effect. All of them report what they removed in the count beside the legend, so a narrowed view is
+never mistaken for the whole graph.
+
+## Finding a Vertex
+
+The toolbar's find box matches a vertex's caption, its labels, and its `#id`, which are the three
+handles the page gives a vertex; searching every property would find vertices whose match is nowhere
+visible. Matches keep full opacity and take an accent ring while everything else fades, and a match
+whose caption density had suppressed gets it back. The count beside the box reads matches over drawn
+vertices, and the box takes an error border on zero rather than leaving a typo looking like an empty
+graph. Pressing Enter frames the matches, which is the half of finding that highlighting alone does not
+do: on a graph large enough to need the box, a match can be highlighted well outside the view.
+
+Matching repaints classes rather than redrawing, because a redraw restarts the simulation and searching
+a graph should not rearrange it. The highlight is held in page state rather than read off the input, so
+a redraw from any other cause reapplies it instead of losing it.
+
+## Exporting the Picture
+
+`PNG` and `SVG` download the current view, framed exactly as it is on screen. A downloaded picture is
+opened where neither the stylesheet nor the custom properties it reads exist, so every property the
+graph is actually drawn with is resolved off the live element and written onto a copy as an attribute.
+Three details make that hold up:
+
+- A value equal to the parent's is dropped rather than repeated. Writing all of them on every element
+  made a twenty-six vertex graph a 68 KB file, most of it the page's font stack restated on each circle;
+  diffing brings the same graph to 22 KB. The root element is exempt and writes the whole set, since
+  diffing it would compare against the enclosing HTML and let the file inherit a font it no longer has.
+- A translucent color computes to `rgba(r, g, b, a)`, which is a CSS color rather than a value an SVG
+  presentation attribute is required to accept. A browser takes it; Inkscape drops the declaration and
+  paints black, which turned the exported captions from light text on a dark canvas into unreadable dark
+  text on one. Each is split into the opaque color and the matching `-opacity` attribute.
+- The canvas color is a CSS background, which a rasterizer composites onto nothing, so an explicit
+  rectangle carries it instead. Without it a dark-theme export is dark text on transparency.
+
+A hover or a find in progress is a state of the page rather than of the picture, so both classes come
+off for the duration of the read; leaving them on baked their dimming into the file. The PNG is
+rasterized through the same document at twice the drawn size, so it stays legible dropped into a
+document at its natural width.
 
 ## What the Graph View Draws
 

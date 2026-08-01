@@ -289,6 +289,16 @@
                             <span id="graph-count"></span>
                             <div class="legend" id="legend"></div>
                             <div class="spacer"></div>
+                            <label class="graph-find">
+                                <svg aria-hidden="true" fill="none" height="13" stroke="currentColor"
+                                     stroke-width="2.2" viewBox="0 0 24 24" width="13">
+                                    <circle cx="11" cy="11" r="7"/>
+                                    <line x1="16.5" x2="21" y1="16.5" y2="21"/>
+                                </svg>
+                                <input aria-label="Find a vertex by caption or label" id="graph-search"
+                                       placeholder="Find a vertex" type="search"/>
+                                <span id="search-count"></span>
+                            </label>
                             <button aria-label="Zoom out" class="btn sm" id="zoom-out" title="Zoom out">
                                 <svg aria-hidden="true" fill="none" height="14" stroke="currentColor" stroke-width="2.5"
                                      viewBox="0 0 24 24" width="14">
@@ -302,14 +312,16 @@
                                     <line x1="5" x2="19" y1="12" y2="12"/>
                                 </svg>
                             </button>
-                            <button class="btn sm" hidden id="clear-focus" title="Show the whole graph again">Clear
-                                focus
+                            <button class="btn sm" hidden id="reset-view"
+                                    title="Undo focus, expansion, and dismissal">Show all
                             </button>
                             <label class="toggle" title="Draw only the vertices the last result mentioned">
                                 <input id="result-only" type="checkbox"/>Result only
                             </label>
                             <button class="btn sm" id="fit" title="Zoom the view to the drawn graph">Fit</button>
                             <button class="btn sm" id="relayout">Re-layout</button>
+                            <button class="btn sm" id="png" title="Download the view as a PNG image">PNG</button>
+                            <button class="btn sm" id="svg-dl" title="Download the view as an SVG image">SVG</button>
                         </div>
                         <svg class="graph" id="svg"></svg>
                         <div class="inspect" hidden id="inspect"></div>
