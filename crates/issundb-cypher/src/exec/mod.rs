@@ -5397,6 +5397,41 @@ mod tests {
         );
     }
 
+    /// A parse error midway through a file must import nothing and surface the
+    /// parse error itself. Rows now stream into the one transaction as they
+    /// decode, so this is the rollback contract the materialize-first reader
+    /// provided by never opening a transaction: a bad line rolls back the rows
+    /// before it, and the caller sees the line-numbered message rather than a
+    /// wrapped storage error.
+    #[test]
+    fn a_bad_row_mid_file_imports_nothing_and_names_the_line() {
+        use std::io::Write;
+        let (tempdir, graph) = setup_graph();
+        let params = HashMap::new();
+
+        let jsonl_path = tempdir.path().join("broken.jsonl");
+        {
+            let mut file = std::fs::File::create(&jsonl_path).unwrap();
+            writeln!(file, "{{\"name\": \"Ada\"}}").unwrap();
+            writeln!(file, "{{\"name\": \"Bob\"}}").unwrap();
+            writeln!(file, "not json at all").unwrap();
+        }
+
+        let query = format!("COPY Person FROM '{}'", jsonl_path.display());
+        let err = execute(&graph, &query, &params).unwrap_err().to_string();
+        assert!(
+            err.contains("JSON parse error on line 3"),
+            "the parse error must name the line, got: {err}"
+        );
+
+        let count = execute(&graph, "MATCH (p:Person) RETURN count(p)", &params).unwrap();
+        assert_eq!(
+            count.records[0].values[0],
+            serde_json::json!(0),
+            "the rows before the bad line must roll back"
+        );
+    }
+
     #[test]
     fn test_copy_retains_user_id_property() {
         use std::io::Write;

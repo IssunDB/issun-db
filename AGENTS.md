@@ -132,7 +132,10 @@ second copy of both, so the same rule was stated in three places and the copies 
     - `src/exec/write.rs`: mutation execution (`execute_create`, `execute_set`, `execute_delete`, `execute_merge`).
     - `src/exec/ddl.rs`: DDL execution (`execute_create_index`, `execute_drop_index`). A node `CREATE INDEX` provisions the full-text index, because
       node property lookups are already served by the always-on auto-index; a relationship `CREATE INDEX` provisions the property index.
-    - `src/exec/copy.rs`: bulk data administration execution (`COPY ... FROM`, `EXPORT DATABASE`, and `IMPORT DATABASE`).
+    - `src/exec/copy.rs`: bulk data administration execution (`COPY ... FROM`, `EXPORT DATABASE`, and `IMPORT DATABASE`). An import streams rows into
+      its one transaction as they decode (`RowSource`), holding one row (plus one Arrow record batch for parquet) rather than the whole file, and a
+      row that fails mid-file rolls the transaction back. Materializing the file first put every row on the heap as JSON maps, a multi-gigabyte
+      transient at bulk-load scale that the allocator retained for the life of the process; do not reintroduce a collect-then-write pass here.
     - `src/exec/row.rs`: the positional row representation (`SlotRow` and `SlotSchema`) the row pipeline binds variables through.
 - `crates/issundb-vector/`: vector index abstraction, vector metadata, vector storage integration, and vector search APIs. The index sits behind
   `backend.rs`, selected at compile time from the default-on `hnsw` feature: `usearch`, the workspace's only C++ dependency, or a pure-Rust exact scan.
