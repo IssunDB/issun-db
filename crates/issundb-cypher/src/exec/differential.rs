@@ -270,6 +270,277 @@ fn multi_type_counts_agree_with_the_row_pipeline() {
     }
 }
 
+/// Every built-in procedure, run through both executors over the same graph.
+///
+/// A procedure is answered by one kernel rather than by two competing paths, so
+/// what this pins is not the kernel's arithmetic (`issundb`'s `tests/oracle.rs`
+/// compares those against NetworkX) but everything wrapped around it: argument
+/// resolution before planning, the `YIELD` projection, and whatever the
+/// optimizer does to the query the `CALL` sits inside. That surrounding shape is
+/// exactly where a fast path can claim a plan and answer differently, which is
+/// what the multi-type counts above turned out to be, so every procedure is
+/// listed rather than a representative few.
+///
+/// `PROCEDURE_COVERAGE` below is checked against the engine's own dispatch, so a
+/// procedure added without a case here fails rather than passing unnoticed.
+const PROCEDURE_COVERAGE: &[&str] = &[
+    "issundb.pageRank",
+    "issundb.betweenness",
+    "issundb.harmonic",
+    "issundb.closeness",
+    "issundb.degree",
+    "issundb.eigenvector",
+    "issundb.katz",
+    "issundb.clusteringCoefficient",
+    "issundb.louvain",
+    "issundb.labelPropagation",
+    "issundb.communities",
+    "issundb.connectedComponents",
+    "issundb.wcc",
+    "issundb.stronglyConnectedComponents",
+    "issundb.scc",
+    "issundb.shortestPath",
+    "issundb.dijkstra",
+    "issundb.triangleCount",
+    "issundb.retrieve.vector",
+    "issundb.retrieve.hybrid",
+];
+
+#[test]
+fn every_procedure_agrees_across_the_paths() {
+    let (_dir, g) = fixture();
+    // `ada` is 0 and `dot` is 3: the fixture allocates them in that order, and a
+    // procedure argument is resolved before planning, so it has to be a literal.
+    for cypher in [
+        "CALL issundb.pageRank({iterations: 10, damping: 0.85}) YIELD nodeId, score \
+         RETURN nodeId, score ORDER BY nodeId",
+        "CALL issundb.betweenness() YIELD nodeId, score RETURN nodeId, score ORDER BY nodeId",
+        "CALL issundb.harmonic() YIELD nodeId, score RETURN nodeId, score ORDER BY nodeId",
+        "CALL issundb.closeness() YIELD nodeId, score RETURN nodeId, score ORDER BY nodeId",
+        "CALL issundb.degree({direction: 'OUT'}) YIELD nodeId, score \
+         RETURN nodeId, score ORDER BY nodeId",
+        "CALL issundb.degree({direction: 'IN'}) YIELD nodeId, score \
+         RETURN nodeId, score ORDER BY nodeId",
+        "CALL issundb.degree({direction: 'BOTH'}) YIELD nodeId, score \
+         RETURN nodeId, score ORDER BY nodeId",
+        "CALL issundb.eigenvector({iterations: 20, tolerance: 0.000001}) YIELD nodeId, score \
+         RETURN nodeId, score ORDER BY nodeId",
+        "CALL issundb.katz({alpha: 0.1, beta: 1.0, iterations: 20, tolerance: 0.000001}) \
+         YIELD nodeId, score RETURN nodeId, score ORDER BY nodeId",
+        "CALL issundb.clusteringCoefficient() YIELD nodeId, score \
+         RETURN nodeId, score ORDER BY nodeId",
+        "CALL issundb.louvain() YIELD nodeId, communityId \
+         RETURN communityId, count(nodeId) AS n ORDER BY communityId",
+        "CALL issundb.labelPropagation({maxIterations: 10}) YIELD nodeId, communityId \
+         RETURN communityId, count(nodeId) AS n ORDER BY communityId",
+        "CALL issundb.communities({topPerCommunity: 2}) YIELD communityId, nodeId, rank \
+         RETURN communityId, rank, nodeId ORDER BY communityId, rank, nodeId",
+        "CALL issundb.connectedComponents() YIELD nodeId, componentId \
+         RETURN componentId, count(nodeId) AS n ORDER BY componentId",
+        "CALL issundb.wcc() YIELD nodeId, componentId \
+         RETURN componentId, count(nodeId) AS n ORDER BY componentId",
+        "CALL issundb.stronglyConnectedComponents() YIELD nodeId, componentId \
+         RETURN componentId, count(nodeId) AS n ORDER BY componentId",
+        "CALL issundb.scc() YIELD nodeId, componentId \
+         RETURN componentId, count(nodeId) AS n ORDER BY componentId",
+        "CALL issundb.shortestPath(0, 3) YIELD nodeId, index RETURN nodeId, index ORDER BY index",
+        "CALL issundb.dijkstra(0, 3) YIELD nodeId, index, totalWeight \
+         RETURN nodeId, index, totalWeight ORDER BY index",
+        "CALL issundb.triangleCount() YIELD count RETURN count",
+        // No embeddings and no text index on this fixture, so both of these fail.
+        // Included deliberately: the two paths owe the same error, and an error
+        // that appeared on one path only would be its own defect.
+        "CALL issundb.retrieve.vector([1.0, 0.0, 0.25], {k: 2, hops: 1}) YIELD nodeId, distance \
+         RETURN nodeId, distance ORDER BY nodeId",
+        "CALL issundb.retrieve.hybrid([1.0, 0.0, 0.25], 'ada', {vectorK: 2, textK: 2, hops: 1}) \
+         YIELD nodeId, score RETURN nodeId, score ORDER BY nodeId",
+        // A procedure inside a larger query, where the surrounding shape is what
+        // a fast path can claim.
+        "CALL issundb.degree({direction: 'OUT'}) YIELD nodeId, score \
+         MATCH (p:Person) WHERE id(p) = nodeId \
+         RETURN p.name AS name, score ORDER BY score DESC, name",
+        "CALL issundb.pageRank({iterations: 5, damping: 0.85}) YIELD nodeId, score \
+         MATCH (p:Person) WHERE id(p) = nodeId \
+         RETURN p.city AS city, count(*) AS n ORDER BY city",
+    ] {
+        assert_paths_agree(&g, cypher);
+    }
+}
+
+/// The procedure list above has to keep up with the engine.
+///
+/// `builtin_procs::build` is what decides whether a name is a built-in, so asking
+/// it directly is the one check that cannot drift: a name in the coverage list
+/// that the engine has dropped or renamed fails here rather than sitting in the
+/// corpus untested. The playground's own catalog is checked separately, by
+/// `make playground-check`.
+#[test]
+fn the_procedure_coverage_list_matches_the_engine() {
+    let (_dir, g) = fixture();
+    for name in PROCEDURE_COVERAGE {
+        // An empty argument list is enough to tell "no such procedure" (`Ok(None)`)
+        // from "known, and these arguments are wrong" (`Err`), which is all this
+        // asks.
+        let resolved = crate::builtin_procs::build(&g, name, &[]);
+        assert!(
+            !matches!(resolved, Ok(None)),
+            "{name} is in the coverage list but the engine does not resolve it",
+        );
+    }
+}
+
+/// Every built-in function, run through both executors.
+///
+/// The graph-reading functions (the `issundb.link.*` family) are evaluated per
+/// row, so the row set the surrounding query produces is what decides how often
+/// they run, and that row set is exactly what a fast path rewrites. The pure
+/// value functions carry no graph at all and are here for completeness, since a
+/// projection over them is still a plan a rewrite can touch.
+#[test]
+fn every_function_agrees_across_the_paths() {
+    let (_dir, g) = fixture();
+    for cypher in [
+        // Neighborhood link prediction over every ordered pair.
+        "MATCH (a:Person), (b:Person) WHERE id(a) < id(b) \
+         RETURN a.name AS a, b.name AS b, issundb.link.commonNeighbors(a, b) AS v \
+         ORDER BY a, b",
+        "MATCH (a:Person), (b:Person) WHERE id(a) < id(b) \
+         RETURN a.name AS a, b.name AS b, issundb.link.jaccard(a, b) AS v ORDER BY a, b",
+        "MATCH (a:Person), (b:Person) WHERE id(a) < id(b) \
+         RETURN a.name AS a, b.name AS b, issundb.link.adamicAdar(a, b) AS v ORDER BY a, b",
+        "MATCH (a:Person), (b:Person) WHERE id(a) < id(b) \
+         RETURN a.name AS a, b.name AS b, issundb.link.resourceAllocation(a, b) AS v \
+         ORDER BY a, b",
+        "MATCH (a:Person), (b:Person) WHERE id(a) < id(b) \
+         RETURN a.name AS a, b.name AS b, issundb.link.preferentialAttachment(a, b) AS v \
+         ORDER BY a, b",
+        // Sorted and limited, so the top-N shapes see the function too.
+        "MATCH (a:Person), (b:Person) WHERE id(a) < id(b) \
+         RETURN a.name AS a, b.name AS b, issundb.link.adamicAdar(a, b) AS v \
+         ORDER BY v DESC, a, b LIMIT 3",
+        // Aggregated over a function, which the columnar aggregate can claim.
+        "MATCH (a:Person), (b:Person) WHERE id(a) < id(b) \
+         RETURN count(*) AS pairs, sum(issundb.link.commonNeighbors(a, b)) AS total",
+        // The pure value functions, projected per row rather than once.
+        "MATCH (p:Person) RETURN p.name AS name, \
+         issundb.similarity.jaccard([1, 2, 3], [2, 3, 4]) AS v ORDER BY name",
+        "MATCH (p:Person) RETURN p.name AS name, \
+         issundb.similarity.overlap([1, 2], [1, 2, 3, 4]) AS v ORDER BY name",
+        "MATCH (p:Person) RETURN p.name AS name, \
+         issundb.distance.cosine([1.0, 0.0], [0.0, 1.0]) AS v ORDER BY name",
+        "MATCH (p:Person) RETURN p.name AS name, \
+         issundb.distance.euclidean([3.0, 4.0], [0.0, 0.0]) AS v ORDER BY name",
+        "MATCH (p:Person) RETURN p.name AS name, \
+         vector_dist([1.0, 0.0, 0.25], [0.0, 1.0, 0.25]) AS v ORDER BY name",
+    ] {
+        assert_paths_agree(&g, cypher);
+    }
+}
+
+/// The closed-form functions against hand-computed values.
+///
+/// Path agreement says the two executors concur; it cannot say they concur on
+/// the right number. These have an answer that can be written down, so they are
+/// checked against it rather than against each other, on both paths.
+///
+/// The comparison carries a tolerance because the answers are computed rather
+/// than looked up: cosine distance is `1 - dot / (|a| * |b|)`, so two identical
+/// vectors give `1 - 0.9999999999999998`, which is `2.2e-16` and not the `0.0` a
+/// reader would write down. That is ordinary floating-point rounding rather than
+/// a defect, and demanding exact equality would pin the test to the order the
+/// arithmetic happens to be written in.
+#[test]
+fn the_value_functions_return_their_closed_forms() {
+    const TOLERANCE: f64 = 1e-12;
+    let (_dir, g) = fixture();
+    for (cypher, expected) in [
+        // |{2,3}| / |{1,2,3,4}|
+        (
+            "RETURN issundb.similarity.jaccard([1, 2, 3], [2, 3, 4]) AS v",
+            0.5,
+        ),
+        (
+            "RETURN issundb.similarity.jaccard([1, 2], [3, 4]) AS v",
+            0.0,
+        ),
+        // |{1,2}| / min(2, 4)
+        (
+            "RETURN issundb.similarity.overlap([1, 2], [1, 2, 3, 4]) AS v",
+            1.0,
+        ),
+        // Orthogonal unit vectors: cosine distance is 1 - 0.
+        (
+            "RETURN issundb.distance.cosine([1.0, 0.0], [0.0, 1.0]) AS v",
+            1.0,
+        ),
+        // Identical vectors: no distance between them.
+        (
+            "RETURN issundb.distance.cosine([1.0, 2.0], [1.0, 2.0]) AS v",
+            0.0,
+        ),
+        // Opposed vectors: the far end of the range.
+        (
+            "RETURN issundb.distance.cosine([1.0, 0.0], [-1.0, 0.0]) AS v",
+            2.0,
+        ),
+        // The 3-4-5 triangle.
+        (
+            "RETURN issundb.distance.euclidean([3.0, 4.0], [0.0, 0.0]) AS v",
+            5.0,
+        ),
+        (
+            "RETURN issundb.distance.euclidean([0.0, 0.0], [0.0, 0.0]) AS v",
+            0.0,
+        ),
+        // `vector_dist` is the cosine distance under another name, so the same
+        // orthogonal pair has to give the same answer.
+        ("RETURN vector_dist([1.0, 0.0], [0.0, 1.0]) AS v", 1.0),
+    ] {
+        for forced_row_pipeline in [false, true] {
+            let result = if forced_row_pipeline {
+                row_pipeline_execute(&g, cypher)
+            } else {
+                let _guard = crate::exec_mode::fast_paths_required();
+                execute(&g, cypher, &HashMap::new())
+            }
+            .unwrap_or_else(|e| panic!("{cypher} failed: {e}"));
+            let got = result.records[0].values[0]
+                .as_f64()
+                .unwrap_or_else(|| panic!("{cypher} did not return a number"));
+            assert!(
+                (got - expected).abs() < TOLERANCE,
+                "{cypher} (row pipeline forced: {forced_row_pipeline}): \
+                 expected {expected}, got {got}",
+            );
+        }
+    }
+}
+
+/// `issundb.triangleCount` against the pattern it lowers from.
+///
+/// The kernel and the `MATCH` form are two implementations of one definition, so
+/// they are each other's oracle: the pattern spelled out row by row is what the
+/// count means, and the row pipeline evaluates it without the kernel.
+#[test]
+fn the_triangle_procedure_agrees_with_its_pattern() {
+    let (_dir, g) = fixture();
+    let procedure = execute(
+        &g,
+        "CALL issundb.triangleCount() YIELD count RETURN count",
+        &HashMap::new(),
+    )
+    .unwrap();
+    let pattern = row_pipeline_execute(
+        &g,
+        "MATCH (a)-[t1]->(b)-[t2]->(c)-[t3]->(a) RETURN count(*) AS count",
+    )
+    .unwrap();
+    assert_eq!(
+        procedure.records[0].values[0], pattern.records[0].values[0],
+        "the triangle kernel and the pattern it lowers from must agree",
+    );
+}
+
 /// Counts grouped by one endpoint, which the `GroupedDegree` kernel claims, and
 /// the top-N window pushed into it.
 #[test]
