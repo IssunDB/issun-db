@@ -1201,6 +1201,12 @@ impl Graph {
                     shared.len() as f64 / union as f64
                 }
             }
+            // Both sums fold from `0.0` rather than using `Iterator::sum`, whose
+            // identity for a float is `-0.0`. That identity is deliberate in the
+            // standard library, since `-0.0 + x` preserves the sign of `x`, but it
+            // surfaces here: a pair with no common neighbor has an empty
+            // intersection, so the sum is the identity itself and the score reaches
+            // a caller as `-0.0` while every other metric on the same row reads `0.0`.
             LinkPredictionMetric::AdamicAdar => shared
                 .iter()
                 .filter_map(|&w| {
@@ -1209,7 +1215,7 @@ impl Graph {
                     // weight; contributing nothing is the conventional reading.
                     (degree > 1).then(|| 1.0 / (degree as f64).ln())
                 })
-                .sum(),
+                .fold(0.0, |acc, term| acc + term),
             LinkPredictionMetric::ResourceAllocation => shared
                 .iter()
                 .map(|&w| {
@@ -1220,7 +1226,7 @@ impl Graph {
                         1.0 / degree as f64
                     }
                 })
-                .sum(),
+                .fold(0.0, |acc, term| acc + term),
             // Handled above, before the intersection is built.
             LinkPredictionMetric::PreferentialAttachment => unreachable!(),
         }
@@ -1395,6 +1401,41 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let g = Graph::open(dir.path(), 1).unwrap();
         (dir, g)
+    }
+
+    /// A pair with no common neighbor scores a positive zero, like every other
+    /// metric on the same pair.
+    ///
+    /// `Iterator::sum` folds a float from `-0.0`, so the empty intersection used to
+    /// hand back a negative zero: two nodes with nothing in common reported
+    /// `-0.0` for Adamic-Adar and resource allocation while Jaccard and common
+    /// neighbors on the same pair reported `0.0`, which reads as a defect to anyone
+    /// looking at the row.
+    #[test]
+    fn a_pair_with_nothing_in_common_scores_positive_zero() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("N", &()).unwrap();
+        let b = g.add_node("N", &()).unwrap();
+        // One neighbor each, and not shared, so the intersection is empty while the
+        // neighborhoods are not.
+        let na = g.add_node("N", &()).unwrap();
+        let nb = g.add_node("N", &()).unwrap();
+        g.add_edge(a, na, "E", &()).unwrap();
+        g.add_edge(b, nb, "E", &()).unwrap();
+
+        for metric in [
+            LinkPredictionMetric::AdamicAdar,
+            LinkPredictionMetric::ResourceAllocation,
+            LinkPredictionMetric::Jaccard,
+            LinkPredictionMetric::CommonNeighbors,
+        ] {
+            let score = g.link_prediction_score(a, b, metric).unwrap();
+            assert_eq!(score, 0.0, "{metric:?} must be zero");
+            assert!(
+                score.is_sign_positive(),
+                "{metric:?} returned a negative zero",
+            );
+        }
     }
 
     /// Connect every unordered pair among `nodes` with a single directed edge.

@@ -29,7 +29,7 @@ const PATH_NOTE = `// Procedure arguments are resolved before planning, so they 
 // to every Rust test.
 //
 // The social graph is first because it is what the page seeds on load and what the Examples panel
-// queries; the other four replace it when Reset Database is pressed with one of them selected.
+// queries; the other five replace it when Reset Database is pressed with one of them selected.
 export const SAMPLE_GRAPHS = [
     {
         id: "social",
@@ -464,7 +464,7 @@ export const DEMO_CATEGORIES = [
         demos: [
             {
                 label: "Create nodes",
-                desc: "Writes nodes and a relationship in one statement, and returns what it made. Every clause of a write statement shares one transaction, so an error anywhere rolls back all of it. Pick a Graph is where a whole dataset comes from.",
+                desc: "Writes nodes and a relationship in one statement, and returns what it made. Every clause of a write statement shares one transaction, so an error anywhere rolls back all of it. To load a whole dataset instead of writing one, use Pick a Graph.",
                 cypher: `CREATE (grete:Person {name: 'Grete', city: 'Berlin', age: 34}),
        (kurt:Person {name: 'Kurt', city: 'Vienna', age: 47}),
        (grete)-[:KNOWS {since: 1931, weight: 6}]->(kurt)
@@ -500,7 +500,7 @@ RETURN p.city AS city, count(other) AS outgoing
 ORDER BY outgoing DESC, city`,
             },
             {
-                label: "Update and delete",
+                label: "Update",
                 desc: "SET assigns a property and a label; a statement's own projection sees its uncommitted writes through a pending-writes overlay.",
                 cypher: `MATCH (p:Person {name: 'Donald'})
 SET p.city = 'Palo Alto', p:Retired
@@ -533,8 +533,8 @@ RETURN p.name AS name, round(score * 100) / 100 AS betweenness
 ORDER BY betweenness DESC, name`,
             },
             {
-                label: "Degree and harmonic",
-                desc: "Two more centralities. Degree counts distinct neighbors in the chosen direction; harmonic sums the reciprocal of each shortest-path distance.",
+                label: "Degree",
+                desc: "Counts distinct neighbors in the chosen direction, so parallel edges between the same pair count once. Harmonic centrality, which sums the reciprocal of each shortest-path distance, is issundb.harmonic in the Reference panel.",
                 cypher: `CALL issundb.degree({direction: 'OUT'})
 YIELD nodeId, score
 MATCH (p) WHERE id(p) = nodeId
@@ -588,8 +588,8 @@ RETURN count AS triangle_rows`,
             },
             {
                 label: "Communities",
-                desc: "Label propagation, then each community's members ranked by PageRank. Ties break toward the smallest label, so the partition is stable run to run.",
-                cypher: `CALL issundb.communities({topPerCommunity: 3})
+                desc: "Louvain communities, then each community's members ranked by PageRank. Louvain optimizes modularity and converges, so the partition is the same every run; label propagation, the other algorithm this procedure accepts, can oscillate between two partitions on a graph this small and hand back whichever one its last iteration landed on.",
+                cypher: `CALL issundb.communities({algorithm: 'louvain', topPerCommunity: 3})
 YIELD communityId, nodeId, rank
 MATCH (p) WHERE id(p) = nodeId
 RETURN communityId, rank, p.name AS name

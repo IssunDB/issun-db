@@ -1016,6 +1016,18 @@ function editDistance(a, b) {
 // suggestion is exactly as complete as the catalog is; a procedure missing from it gets no hint
 // rather than a wrong one.
 function procedureHint(cypher, message) {
+    // The two retrieval procedures search an index the sample graphs do not fill, because
+    // embeddings are a Rust extension rather than something Cypher can write. The catalog knows
+    // which entries those are; without saying so here, a reader who clicked one out of the
+    // reference just sees the engine's complaint and has no way to know what would fix it.
+    if (/vector index is empty/.test(message)) {
+        return "\n\nThis procedure searches stored embeddings, and no sample graph carries any." +
+            " Run the Vector search example first, which embeds a label, then run this again.";
+    }
+    if (/no text indexes exist/.test(message)) {
+        return "\n\nThis procedure searches a full-text index, and none exists yet." +
+            " Run the Full-text search example first, which creates one, then run this again.";
+    }
     if (!/ProcedureNotFound/.test(message)) return "";
     for (const token of new Set(cypher.match(/\bissundb\.[A-Za-z_][\w.]*/g) ?? [])) {
         if (procedureNames.has(token)) continue;
