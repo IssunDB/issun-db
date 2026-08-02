@@ -624,6 +624,10 @@ planning on the bounded probe and the global average throughout, verified at a 1
 scan. Do not move the build back under that lock, and do not make this call synchronous again. A failure is logged and ignored, since every reader works
 without the table. `--no-warm-statistics` (or `ISSUNDB_NO_WARM_STATISTICS`) skips the scan entirely. The property columns are deliberately not warmed here:
 that build is a full node scan and holds every scalar property in memory, which is a footprint decision an operator should make, not a startup default.
+Neither server can build them at all, since index administration is not on either surface, so what they do instead is report it: the engine logs a warning
+whenever it builds the columns for want of a current cache file, and both servers default their `EnvFilter` to `info` so an operator who never set
+`RUST_LOG` still sees it. Building without a cache file is worth reporting rather than tolerating: measured on a 2.4 M-node graph it peaked at 13.4 GB
+against 4.0 GB for loading one, so the lazy build is the heavier path as well as the slower one.
 
 The API is self-describing: the OpenAPI 3.1 document is generated from the handler annotations (`#[utoipa::path]`) and the request and response
 `ToSchema` derives, served as JSON at `GET /v1/openapi.json` with a Scalar UI at `GET /v1/docs`. The generator crates are `utoipa` and

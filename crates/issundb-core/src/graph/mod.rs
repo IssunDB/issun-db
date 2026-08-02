@@ -849,12 +849,16 @@ impl Graph {
                 let rtxn = self.storage.env.read_txn()?;
                 crate::storage::ids::commit_gen(&self.storage, &rtxn)?
             };
+            let _quiet = crate::columns::MaterializingColumns::install();
             self.prop_columns.with_fresh(&self.storage, |cols| {
                 let _ = crate::cache_file::save_columns(&self.storage, cols, persisted_gen);
             })
         }
         #[cfg(not(feature = "lmdb"))]
-        self.prop_columns.with_fresh(&self.storage, |_| ())
+        {
+            let _quiet = crate::columns::MaterializingColumns::install();
+            self.prop_columns.with_fresh(&self.storage, |_| ())
+        }
     }
 
     /// Group `ids` by the exact value of `prop` through the in-memory
@@ -958,12 +962,16 @@ impl Graph {
                 let rtxn = self.storage.env.read_txn()?;
                 crate::storage::ids::commit_gen(&self.storage, &rtxn)?
             };
+            let _quiet = crate::columns::MaterializingColumns::install();
             self.edge_columns.with_fresh(&self.storage, |cols| {
                 let _ = crate::cache_file::save_columns(&self.storage, cols, persisted_gen);
             })
         }
         #[cfg(not(feature = "lmdb"))]
-        self.edge_columns.with_fresh(&self.storage, |_| ())
+        {
+            let _quiet = crate::columns::MaterializingColumns::install();
+            self.edge_columns.with_fresh(&self.storage, |_| ())
+        }
     }
 
     // ------------------------------------------------------------------
