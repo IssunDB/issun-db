@@ -680,7 +680,13 @@ client with a startup timeout can abandon it. `--no-warm-statistics` (or `ISSUND
 every open, at launch and on `:open`, and takes the same flag: a visible pause before an interactive prompt is honest, and there is no readiness contract
 to break. That pause is worth knowing the size of: measured at 3.7 s on a 1 M-node, 13.9 M-edge graph, against a 4 ms open with the flag, so a `--script`
 run of a few statements should pass it. Those two numbers come from wall-clocking the process, since `:timer` covers Cypher statements only and neither the
-warm-up nor the open is one. `:timer` (or `--timer`) is how a *query* is timed: it measures execution alone, not the row formatting, so it is comparable with
+warm-up nor the open is one. `materialize-columns` is the CLI's counterpart of `rebuild-csr` for the property columns, and the only way a
+script reaches them: nothing builds them as a side effect of a query, and `:import-nodes` does not warm them
+the way `COPY ... FROM` does, so a database loaded through the CLI could not otherwise persist a column cache
+file at all. It is worth the one scan on a graph that will be reopened: measured on a 2.4 M-node graph, a cold
+property aggregation went from 14.8 s and a 13.4 GB peak to 5.4 s and a 4.0 GB peak, because loading the
+finished columns from the file avoids the intermediates the build holds. `:timer` (or `--timer`) is how a
+*query* is timed: it measures execution alone, not the row formatting, so it is comparable with
 a timing taken around the same query in another surface. `issundb-py` deliberately does not warm on construction, because a short script should not pay a scan it may never use; it exposes
 `materialize_edge_statistics` and `materialize_property_columns` so a long-lived Python process asks for itself. A caller that measures IssunDB through the
 Python binding and does not call them is measuring the planner with its statistics unavailable, which is worth stating in any comparison, the same way an
