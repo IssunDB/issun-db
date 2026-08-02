@@ -31,6 +31,7 @@ pub(crate) trait ColumnSource {
     /// File name of this column set's on-disk cache file, next to the LMDB
     /// files. Each source needs its own, or the node and edge cache files would
     /// overwrite each other.
+    #[cfg(feature = "lmdb")]
     const CACHE_FILE: &'static str;
 
     /// Decode every entity's user properties as JSON, in storage iteration
@@ -85,6 +86,7 @@ pub(crate) struct NodeSource;
 impl ColumnSource for NodeSource {
     type Id = NodeId;
 
+    #[cfg(feature = "lmdb")]
     const CACHE_FILE: &'static str = "node_columns.cache";
 
     fn scan_all(storage: &Storage) -> Result<Vec<(NodeId, Value)>, Error> {
@@ -123,6 +125,7 @@ pub(crate) struct EdgeSource;
 impl ColumnSource for EdgeSource {
     type Id = EdgeId;
 
+    #[cfg(feature = "lmdb")]
     const CACHE_FILE: &'static str = "edge_columns.cache";
 
     fn scan_all(storage: &Storage) -> Result<Vec<(EdgeId, Value)>, Error> {
