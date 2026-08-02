@@ -12,6 +12,8 @@
 [![Docs.rs](https://img.shields.io/badge/docs-issundb-66c2a5?style=flat&labelColor=282c34&logo=docs.rs)](https://docs.rs/issundb)
 [![Documentation](https://img.shields.io/badge/docs-read-007ec6?label=docs&style=flat&labelColor=282c34&logo=readthedocs)](https://issundb.github.io/issun-db/)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-007ec6?style=flat&labelColor=282c34&logo=open-source-initiative)](https://github.com/IssunDB/issun-db)
+<br>
+[![Docker](https://img.shields.io/badge/docker-ghcr.io-007ec6?style=flat&labelColor=282c34&logo=docker)](https://github.com/IssunDB/issun-db/pkgs/container/issundb)
 [![Playground](https://img.shields.io/badge/playground-browser-507ec6?style=flat&labelColor=282c34&logo=webassembly)](https://issundb.github.io/issun-db/playground/)
 
 An embedded graph database for AI applications and graph analytics
