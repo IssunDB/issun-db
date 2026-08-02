@@ -199,7 +199,34 @@ impl Graph {
         etype: &str,
         encoded_props: &[u8],
     ) -> Result<(), Error> {
-        let active_indexes = self.get_active_edge_indexes(wtxn, type_id)?;
+        self.write_edge_index_entries_cached(wtxn, None, edge_id, type_id, etype, encoded_props)
+    }
+
+    /// As above, but the "which indexes are active for this type" question is
+    /// answered from the batch cache when one is supplied. Without it, a bulk
+    /// load pays a `format!` and a `meta` prefix scan per edge to be told, in
+    /// the overwhelmingly common case, that there are none.
+    pub(super) fn write_edge_index_entries_cached(
+        &self,
+        wtxn: &mut crate::storage::RwTxn,
+        cache: Option<&mut super::WriteBatchCache>,
+        edge_id: EdgeId,
+        type_id: TypeId,
+        etype: &str,
+        encoded_props: &[u8],
+    ) -> Result<(), Error> {
+        let active_indexes = match cache {
+            Some(c) => {
+                let cached = c.edge_indexes_or_insert(type_id, || {
+                    self.get_active_edge_indexes(wtxn, type_id)
+                })?;
+                if cached.is_empty() {
+                    return Ok(());
+                }
+                cached.to_vec()
+            }
+            None => self.get_active_edge_indexes(wtxn, type_id)?,
+        };
         if active_indexes.is_empty() {
             return Ok(());
         }

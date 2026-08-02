@@ -11,7 +11,7 @@ The Python bindings for [IssunDB](https://github.com/IssunDB/issun-db).
 ### Installation
 
 ```bash
-pip install issundb
+pip install --pre issundb
 ```
 
 ### Quickstart
