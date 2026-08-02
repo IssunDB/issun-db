@@ -231,6 +231,45 @@ fn grouping_free_counts_agree_with_the_row_pipeline() {
     }
 }
 
+/// Relationship-type alternation, which no counting kernel can express.
+///
+/// `Expand::rel_type` holds the raw pattern text, so `-[:KNOWS|LIKES]->` reaches
+/// a rewrite as the single string `"KNOWS|LIKES"`. A kernel resolves one
+/// registered type name, and that string is not one, so every lowered
+/// alternation counted zero: `PathCount` and `TriangleCount` answered `0` and
+/// `GroupedDegree` returned no rows at all, on patterns whose row form is
+/// ordinary openCypher. Each shape below is a count the planner would otherwise
+/// hand to a kernel, so this fails if a rewrite starts claiming a multi-type hop
+/// again.
+#[test]
+fn multi_type_counts_agree_with_the_row_pipeline() {
+    let (_dir, g) = fixture();
+    for cypher in [
+        // Grouping-free, the `PathCount` shape, one hop and two.
+        "MATCH (a:Person)-[:KNOWS|LIKES]->(b:Person) RETURN count(*)",
+        "MATCH (a:Person)-[r:KNOWS|LIKES]->(b:Person) RETURN count(r)",
+        "MATCH (a:Person)-[:KNOWS|LIKES]->(b) RETURN count(*)",
+        "MATCH (a:Person)-[:KNOWS|LIKES]->(b:Person)-[:LIKES]->(c:Person) RETURN count(*)",
+        "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS|LIKES]->(c:Person) RETURN count(*)",
+        "MATCH (a:Person)-[:KNOWS|LIKES]->(b:Person)-[:KNOWS|LIKES]->(c:Person) RETURN count(*)",
+        // Grouped by an endpoint, the `GroupedDegree` shape, with and without
+        // the top-N window that pushes into it.
+        "MATCH (a:Person)-[:KNOWS|LIKES]->(b:Person) RETURN b.name, count(*) ORDER BY b.name",
+        "MATCH (a:Person)-[:KNOWS|LIKES]->(b:Person) RETURN a.name, count(*) ORDER BY a.name",
+        "MATCH (a:Person)-[:KNOWS|LIKES]->(b:Person) RETURN b.name, count(*) AS c \
+         ORDER BY c DESC, b.name LIMIT 2",
+        // The closing hop of a triangle, the `TriangleCount` shape.
+        "MATCH (a:Person)-[:KNOWS|LIKES]->(b:Person)-[:KNOWS|LIKES]->(c:Person)\
+         -[:KNOWS|LIKES]->(a) RETURN count(*)",
+        "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:LIKES]->(c:Person)-[:KNOWS|LIKES]->(a) \
+         RETURN count(*)",
+        // A filtered multi-type count, so the vertex-allow pushdown is covered too.
+        "MATCH (a:Person)-[:KNOWS|LIKES]->(b:Person) WHERE a.age > 30 RETURN count(*)",
+    ] {
+        assert_paths_agree(&g, cypher);
+    }
+}
+
 /// Counts grouped by one endpoint, which the `GroupedDegree` kernel claims, and
 /// the top-N window pushed into it.
 #[test]
