@@ -1,9 +1,9 @@
 ## IssunDB for Python
 
-[![Python version](https://img.shields.io/badge/python-%3E=3.10-3776ab?style=flat&labelColor=282c34&logo=python&logoColor=ffd43b)](https://github.com/IssunDB/issun-db)
-[![PyPI version](https://img.shields.io/pypi/v/issundb?style=flat&labelColor=282c34&color=fc8d62&logo=pypi&logoColor=ffd43b)](https://pypi.org/project/issundb/)
+[![Python version](https://img.shields.io/badge/python-%3E=3.10-3776ab?style=flat&labelColor=282c34&logo=python)](https://github.com/IssunDB/issun-db)
+[![PyPI version](https://img.shields.io/pypi/v/issundb?style=flat&labelColor=282c34&color=fc8d62&logo=pypi)](https://pypi.org/project/issundb/)
 [![Documentation](https://img.shields.io/badge/docs-read-007ec6?style=flat&labelColor=282c34&logo=readthedocs)](https://issundb.github.io/issun-db/)
-[![Examples](https://img.shields.io/badge/examples-view-66c2a5?style=flat&labelColor=282c34&logo=python&logoColor=ffd43b)](https://github.com/IssunDB/issun-db/tree/main/crates/issundb-py/examples)
+[![Examples](https://img.shields.io/badge/examples-view-66c2a5?style=flat&labelColor=282c34&logo=python)](https://github.com/IssunDB/issun-db/tree/main/crates/issundb-py/examples)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-007ec6?style=flat&labelColor=282c34&logo=open-source-initiative)](https://github.com/IssunDB/issun-db)
 
 The Python bindings for [IssunDB](https://github.com/IssunDB/issun-db).
