@@ -327,6 +327,7 @@ impl<'a> WriteTxn<'a> {
     }
 
     pub fn delete_node(&mut self, id: NodeId) -> Result<(), Error> {
+        self.cache.invalidate_nodes();
         self.graph.delete_node_impl(&mut self.wtxn, id)?;
         self.mutations_count += 1;
         // A node deletion cascades to every incident edge, so the property columns
@@ -351,9 +352,9 @@ impl<'a> WriteTxn<'a> {
         etype: &str,
         props: &impl Serialize,
     ) -> Result<EdgeId, Error> {
-        let edge_id = self
-            .graph
-            .add_edge_impl(&mut self.wtxn, src, dst, etype, props)?;
+        let edge_id =
+            self.graph
+                .add_edge_cached(&mut self.wtxn, &mut self.cache, src, dst, etype, props)?;
         self.mutations_count += 1;
         self.delta.added_edge_ids.push(edge_id);
         Ok(edge_id)

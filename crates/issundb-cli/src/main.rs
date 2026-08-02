@@ -306,6 +306,11 @@ enum ReplCommand {
     #[command(name = "rebuild-csr")]
     RebuildCsr,
 
+    /// Build the in-memory property columns and persist them (e.g.,
+    /// `materialize-columns`)
+    #[command(name = "materialize-columns")]
+    MaterializeColumns,
+
     /// Show the optimized physical plan for a Cypher query (e.g., `:explain MATCH (n) RETURN n`)
     #[command(name = ":explain")]
     Explain {
@@ -656,6 +661,7 @@ Backup and Import
   :import-nodes <file> <label>         Bulk-import nodes from a CSV or Parquet file whose columns become properties (e.g., :import-nodes ./people.parquet Person)
   :import-edges <file> <src> <dst> <type>  Bulk-import edges from a 2-column CSV or Parquet file of domain keys (e.g., :import-edges ./knows.parquet Person Person KNOWS)
   rebuild-csr                          Rebuild the CSR snapshot cache
+  materialize-columns                  Build the property columns and persist them beside the database
 
 Query and Mutations
   :explain <cypher>                    Show the optimized physical plan for a Cypher query (e.g., :explain MATCH (n) RETURN n)
@@ -1661,6 +1667,24 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
             if let Some(g) = &state.graph {
                 match g.rebuild_csr() {
                     Ok(()) => println!("ok"),
+                    Err(e) => cli_eprintln!("error: {e}"),
+                }
+            }
+        }
+        // The counterpart of `rebuild-csr` for the property columns, and the only
+        // way a script reaches them: nothing builds them as a side effect of a
+        // query, and the CLI's own `:import-nodes` does not, so without this a
+        // database loaded through the CLI could never persist a column cache file
+        // however it was driven. `COPY ... FROM` and `IMPORT DATABASE` do this
+        // themselves at the end of a bulk load.
+        ReplCommand::MaterializeColumns => {
+            if let Some(g) = &state.graph {
+                let started = std::time::Instant::now();
+                match g.materialize_property_columns() {
+                    // The scan is long enough on a large graph that a bare "ok"
+                    // reads as a no-op, so the duration is reported the way the
+                    // load's other slow steps are.
+                    Ok(()) => println!("ok ({:.2?})", started.elapsed()),
                     Err(e) => cli_eprintln!("error: {e}"),
                 }
             }
@@ -3292,6 +3316,36 @@ fn arrow_to_json_value(
 
 #[cfg(test)]
 mod tests {
+    /// `materialize-columns` builds the property columns and leaves the cache
+    /// file behind, which is what makes a later process load them instead of
+    /// scanning.
+    ///
+    /// The CLI's own `:import-nodes` does not warm the columns the way Cypher's
+    /// `COPY` does, so before this command existed a database loaded through the
+    /// CLI had no way to persist them at all: the loader in the
+    /// `kaggle-knowledge-graph` project produced a `csr.cache` from its explicit
+    /// `rebuild-csr` and never a `node_columns.cache`.
+    #[cfg(feature = "lmdb")]
+    #[test]
+    fn materialize_columns_persists_the_cache_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let graph = issundb::Graph::open(dir.path(), 1).unwrap();
+        for i in 0..8 {
+            graph
+                .add_node("N", &serde_json::json!({ "n": i, "name": format!("n{i}") }))
+                .unwrap();
+        }
+        let cache = dir.path().join("node_columns.cache");
+        assert!(!cache.exists(), "nothing should have written it yet");
+
+        graph.materialize_property_columns().unwrap();
+
+        assert!(
+            cache.exists(),
+            "materialize-columns must leave a column cache file beside the database",
+        );
+    }
+
     use super::*;
     use tempfile::TempDir;
 

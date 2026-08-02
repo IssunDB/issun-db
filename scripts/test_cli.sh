@@ -98,6 +98,7 @@ IMPORT DATABASE '$TEMP_DIR/db_export'
 :import-nodes $NODES_CSV Person
 :import-edges $EDGES_CSV Person Person KNOWS
 rebuild-csr
+materialize-columns
 delete-edge 0
 delete-node 0
 :version

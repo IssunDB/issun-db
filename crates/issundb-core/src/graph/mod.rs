@@ -539,6 +539,81 @@ pub struct WriteTxn<'a> {
     /// Structural mutations staged during this transaction, flushed to the
     /// `CsrCache` only on commit so an aborted transaction records nothing.
     pub(super) delta: crate::csr::GraphDelta,
+    /// Per-transaction memo for work that is identical across the records of one
+    /// batch. See [`WriteBatchCache`].
+    pub(super) cache: WriteBatchCache,
+}
+
+/// Holds the answers that stay true for the whole of one write transaction, so
+/// that a bulk write pays for them once instead of once per record.
+///
+/// A batch of a million edges asked the same three questions a million times:
+/// what integer is this relationship type (a `format!` and a `meta` lookup),
+/// which property indexes are active for it (a `format!` and a `meta` prefix
+/// scan, paid even when there are none, which is the common case), and does this
+/// endpoint exist (a lookup in a tree the size of the graph). Measured against
+/// the storage layer, those and the id allocation were most of an edge insert:
+/// the four LMDB writes an edge performs total about 1.1 µs against a measured
+/// 4.9 µs per edge.
+///
+/// Every entry is safe for exactly one transaction and no longer. There is one
+/// writer at a time, so nothing else can change a registry or an index
+/// definition underneath this; what this transaction changes itself, it records
+/// here too. The endpoint memo is the one that can go stale from inside, since a
+/// node deleted later in the same transaction must stop counting as present, so
+/// a delete clears it.
+#[derive(Default)]
+pub(super) struct WriteBatchCache {
+    /// Relationship type name to id, including types created by this
+    /// transaction.
+    types: AHashMap<String, TypeId>,
+    /// Active edge property indexes per type, as `get_active_edge_indexes`
+    /// returns them.
+    edge_indexes: AHashMap<TypeId, Vec<(PropKeyId, u8)>>,
+    /// Node ids this transaction has already proved exist. It holds one id per
+    /// distinct endpoint the transaction touches and is released only with the
+    /// transaction, so a million-node bulk load carries roughly 18 MB of it.
+    known_nodes: AHashSet<NodeId>,
+}
+
+impl WriteBatchCache {
+    fn knows_node(&self, id: NodeId) -> bool {
+        self.known_nodes.contains(&id)
+    }
+
+    fn remember_node(&mut self, id: NodeId) {
+        self.known_nodes.insert(id);
+    }
+
+    fn type_id(&self, name: &str) -> Option<TypeId> {
+        self.types.get(name).copied()
+    }
+
+    fn remember_type(&mut self, name: &str, id: TypeId) {
+        self.types.insert(name.to_string(), id);
+    }
+
+    /// Returns the active edge indexes for `type_id`, computing them with `f` on
+    /// the first ask.
+    pub(super) fn edge_indexes_or_insert<E>(
+        &mut self,
+        type_id: TypeId,
+        f: impl FnOnce() -> Result<Vec<(PropKeyId, u8)>, E>,
+    ) -> Result<&[(PropKeyId, u8)], E> {
+        if !self.edge_indexes.contains_key(&type_id) {
+            let computed = f()?;
+            self.edge_indexes.insert(type_id, computed);
+        }
+        Ok(&self.edge_indexes[&type_id])
+    }
+
+    /// Forgets the endpoint memo. Called by any node deletion, since a node this
+    /// transaction removes must stop satisfying a later edge's existence check.
+    /// It drops every entry rather than the deleted id alone, so a batch that
+    /// interleaves deletions re-proves each endpoint against storage.
+    pub(super) fn invalidate_nodes(&mut self) {
+        self.known_nodes.clear();
+    }
 }
 
 thread_local! {
@@ -849,12 +924,16 @@ impl Graph {
                 let rtxn = self.storage.env.read_txn()?;
                 crate::storage::ids::commit_gen(&self.storage, &rtxn)?
             };
+            let _quiet = crate::columns::MaterializingColumns::install();
             self.prop_columns.with_fresh(&self.storage, |cols| {
                 let _ = crate::cache_file::save_columns(&self.storage, cols, persisted_gen);
             })
         }
         #[cfg(not(feature = "lmdb"))]
-        self.prop_columns.with_fresh(&self.storage, |_| ())
+        {
+            let _quiet = crate::columns::MaterializingColumns::install();
+            self.prop_columns.with_fresh(&self.storage, |_| ())
+        }
     }
 
     /// Group `ids` by the exact value of `prop` through the in-memory
@@ -958,12 +1037,16 @@ impl Graph {
                 let rtxn = self.storage.env.read_txn()?;
                 crate::storage::ids::commit_gen(&self.storage, &rtxn)?
             };
+            let _quiet = crate::columns::MaterializingColumns::install();
             self.edge_columns.with_fresh(&self.storage, |cols| {
                 let _ = crate::cache_file::save_columns(&self.storage, cols, persisted_gen);
             })
         }
         #[cfg(not(feature = "lmdb"))]
-        self.edge_columns.with_fresh(&self.storage, |_| ())
+        {
+            let _quiet = crate::columns::MaterializingColumns::install();
+            self.edge_columns.with_fresh(&self.storage, |_| ())
+        }
     }
 
     // ------------------------------------------------------------------
@@ -1154,6 +1237,7 @@ impl Graph {
             wtxn,
             mutations_count: 0,
             delta: crate::csr::GraphDelta::default(),
+            cache: WriteBatchCache::default(),
         };
         let _txn_guard = WriteTxnGuard::enter(self.write_txn_env_id());
         match f(&mut txn) {
@@ -1163,6 +1247,7 @@ impl Graph {
                     mutations_count,
                     delta,
                     graph: _,
+                    cache: _,
                 } = txn;
                 // Publish before any other bookkeeping, so the window in which
                 // the caches claim to be current while LMDB already holds this

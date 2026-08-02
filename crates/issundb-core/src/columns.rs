@@ -183,6 +183,34 @@ pub(crate) enum PropColumn {
 
 const STR_NULL: u32 = u32::MAX;
 
+thread_local! {
+    /// Set while a deliberate materialize is running on this thread.
+    static MATERIALIZING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn materializing_columns() -> bool {
+    MATERIALIZING.with(|f| f.get())
+}
+
+/// Marks the current thread as deliberately building the columns, so the
+/// build path stays quiet: the caller asked for the scan and is about to
+/// persist its result, which is the opposite of the situation the warning
+/// exists to report. Restores the previous value on drop, so a nested call
+/// cannot leave the flag raised.
+pub(crate) struct MaterializingColumns(bool);
+
+impl MaterializingColumns {
+    pub(crate) fn install() -> Self {
+        Self(MATERIALIZING.with(|f| f.replace(true)))
+    }
+}
+
+impl Drop for MaterializingColumns {
+    fn drop(&mut self) {
+        MATERIALIZING.with(|f| f.set(self.0));
+    }
+}
+
 /// The slot value in [`IdGroupCodes::codes`] for a node id that does not
 /// exist (an allocation hole, or an id past the array).
 pub const ID_GROUP_ABSENT: u32 = u32::MAX;
@@ -1071,6 +1099,26 @@ impl<S: ColumnSource<Id = u64>> ColumnsCache<S> {
         if let Some(cols) = crate::cache_file::load_columns::<S>(storage) {
             return Ok(cols);
         }
+        // Falling through means a full scan of every entity record, which is the
+        // expensive half of this structure: measured on a 2.4 M-node graph, the
+        // build peaked at 13.4 GB against 4.0 GB for loading a cache file, and
+        // took roughly three times as long. A process that reaches here has no
+        // usable file, so it pays that on its first bulk property read and again
+        // on every restart. Saying so is the only warning a server surface gets:
+        // neither REST nor MCP exposes a way to build the columns, so an operator
+        // who does not know this is happening has no way to notice it either.
+        //
+        // A deliberate `materialize_*` call is about to write the file, so it is
+        // not warned about; see `MaterializingColumns`.
+        if !materializing_columns() {
+            tracing::warn!(
+                entity = std::any::type_name::<S>(),
+                "building property columns from a full scan because no current \
+                 cache file exists; this repeats on every process start. Run \
+                 `materialize-columns` in the CLI, or \
+                 `materialize_property_columns()` from Python, to persist them",
+            );
+        }
         PropColumns::build(storage)
     }
     /// Record an added or updated entity. Called post-commit.
@@ -1255,6 +1303,35 @@ mod tests {
 
     use super::{ColumnsCache, DIRECT_READ_BUILD_THRESHOLD, NodeSource};
     use crate::{Graph, error::Error};
+
+    /// The materialize guard suppresses the no-cache warning for its own thread
+    /// and restores whatever was set before, including under nesting.
+    ///
+    /// The warning itself is a single `tracing::warn!` and is not asserted here:
+    /// capturing it would mean a subscriber in dev-dependencies for one line.
+    /// What can actually break is this guard, since a leaked `true` would silence
+    /// the warning for every later query on the thread, which is exactly the
+    /// case it exists to report.
+    #[test]
+    fn the_materialize_guard_suppresses_and_restores() {
+        assert!(!super::materializing_columns(), "quiet by default");
+        {
+            let _outer = super::MaterializingColumns::install();
+            assert!(super::materializing_columns());
+            {
+                let _inner = super::MaterializingColumns::install();
+                assert!(super::materializing_columns());
+            }
+            assert!(
+                super::materializing_columns(),
+                "the inner guard must restore the outer one's value, not the default",
+            );
+        }
+        assert!(
+            !super::materializing_columns(),
+            "the guard must not leak past its scope",
+        );
+    }
 
     /// A small grouped read must not build every column, and must produce exactly
     /// what the built columns would.
