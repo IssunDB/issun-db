@@ -283,6 +283,26 @@ second copy of both, so the same rule was stated in three places and the copies 
   committed state through a separate read transaction while its own write transaction is still open, and a single reader-writer lock deadlocks on exactly that.
   The in-memory backend does not persist, so a reopen sees an empty graph; the handful of tests whose premise is reopen or backup are gated on the `lmdb`
   feature and say so.
+- `Graph::update` is the transaction, and it is the only unit of atomicity the engine offers. An `Err` out of the closure rolls back everything the
+  closure wrote, LMDB supplies the isolation (a reader takes a consistent snapshot, never blocks the writer, and never observes a partial commit), and
+  the environment is opened with nothing but `map_size` and `max_dbs`. No `MDB_NOSYNC`, `MDB_NOMETASYNC`, or `MDB_WRITEMAP` is set, so a commit fsyncs
+  and an acknowledged write survives a crash. That is also why a single-record insert costs one commit's latency and why the batch forms of the binding
+  APIs exist. Do not buy write throughput by relaxing a sync flag here: durability is claimed at every surface that documents this engine, so weakening
+  it is an API change rather than a tuning change. Four boundaries qualify the guarantee, and the first three are limits rather than details.
+    - The transaction covers the node and edge records, both adjacency stores, `label_idx`, `type_idx`, both property indexes, the unique and required
+      constraints those indexes enforce, and the full-text postings. Full-text search is the deliberate exception among the secondary structures, for
+      the reason given in the `issundb-text` entry above; every other secondary structure is a cache.
+    - The transaction does not cover the vector index. `VectorGraphExt::upsert_vector` takes `&Graph`, updates the in-memory HNSW, and then opens its
+      own write transaction for the stored bytes, so an embedding can neither join a caller's `Graph::update` nor roll back with it. The ordering is
+      chosen so the surviving failure is the recoverable one: index before storage means a crash between the two loses an in-memory entry that the next
+      reopen rebuilds, where the reverse would make a rejected vector durable and brick the cold-start build. A caller needing the bytes to land
+      atomically with graph writes stages them through `WriteTxn::put_vector_bytes` and accepts that the HNSW entry is installed separately.
+    - Atomicity is per statement, not per script. There is no `BEGIN` or `COMMIT` in the Cypher grammar, so a semicolon-separated pipeline runs each
+      statement in its own `Graph::update` and a failure partway through leaves the earlier statements committed. Only a Rust caller can group several
+      operations into one transaction, which means a consumer arriving through Cypher, REST, or MCP cannot. Do not paper over this with a retry or a
+      compensating write in a consumer crate; if multi-statement transactions are wanted, they belong in the query layer as a language feature.
+    - Durability is the letter the in-memory backend gives up, as the previous entry says. Atomicity, consistency, and isolation all hold there,
+      because a writer publishes its copied table set at commit and an aborted transaction publishes nothing.
 - `issundb-cli`, `issundb-rest`, and `issundb-mcp` relay `lmdb` and `hnsw` to the facade rather than naming them on the dependency, the way `issundb-wasm`
   already did, so a binary can be built without the C vector index. That is not hypothetical: `usearch` pulls in `numkong`, whose C dispatch files fail to
   compile for `aarch64-pc-windows-msvc` with `winnt.h` reporting "No Target Architecture", so `release.yml` builds that one target with
@@ -499,7 +519,9 @@ Vector search crate. Owns vector index abstractions, vector metadata, vector sto
 - `VectorGraphExt::upsert_vector(n, v) -> Result<(), VectorError>`: rejects a node that does not exist with `VectorError::NodeNotFound`. Node ids are
   handed out monotonically, so a vector accepted ahead of its node is not inert: the next node allocated that id inherits it and answers a search at
   distance zero having never been embedded, which nothing downstream can detect. `remove_vector` stays permissive, so a database written before the
-  check can still be cleaned up.
+  check can still be cleaned up. It is not transactional with graph writes: it opens its own write transaction for the stored bytes after updating the
+  in-memory index, so it cannot be rolled back alongside a caller's `Graph::update`. The Architecture Constraints entry on `Graph::update` gives the
+  ordering and what to do when the bytes must land atomically.
 - Searching a graph with no stored embeddings returns `VectorError::EmptyIndex` rather than an empty hit list, so a caller can distinguish "no
   semantic matches" from "there is nothing to search". The Cypher `VectorTopK` operator maps that error to zero rows, keeping MATCH semantics.
 - `VectorGraphExt::remove_vector(n) -> Result<(), VectorError>`: removes the embedding from both memory and storage.
@@ -564,6 +586,12 @@ outside `issundb`.
   SET`/`ON MATCH SET`. It does not cover a `MATCH`/label-scan/index-scan *after* a write clause in the same statement observing that write's
   structural effect (a brand-new node becoming visible to a label scan): those read through the committed-only `label_idx`/CSR snapshot, not the
   still-open transaction, so `CREATE (a:Foo) WITH a MATCH (m:Foo) RETURN count(m)` does not count `a` until the statement commits.
+- The statement is where atomicity stops. The grammar has no `BEGIN` or `COMMIT`, so each top-level statement of a `Statement::Pipeline` gets its own
+  `Graph::update` in `execute_pipeline` and one that fails leaves its predecessors committed. What does cross the statement boundary is the binding
+  environment, since the pipeline threads one `shared_bindings` `PathMap` through every statement; a variable surviving into the next statement is
+  therefore no evidence that a transaction did. A caller wanting several statements to succeed or fail together has no way to ask for it through this
+  surface, which is what `statement_count` on `QueryResult` lets it at least notice. See the Architecture Constraints entry on `Graph::update` for the
+  whole transaction boundary.
 
 The executor resolves patterns through the physical plan. Both typed and untyped expansion read the CSR snapshot in bulk behind
 `ensure_snapshot_fresh` (`Graph::expand_bulk`), falling back to per-source LMDB point reads when the snapshot is stale and the source set is small. Key optimizer behaviors,
