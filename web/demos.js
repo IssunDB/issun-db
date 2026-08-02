@@ -141,6 +141,52 @@ export const SAMPLE_GRAPHS = [
        (p3)-[:MENTIONS]->(c1),
        (p2)-[:MENTIONS]->(c3)`,
     },
+    {
+        id: "corpus",
+        label: "Retrieval corpus",
+        // The one sample that arrives ready for retrieval. Everything else here is pure Cypher, but
+        // an embedding and a full-text index are Rust extension traits rather than statements, so
+        // this entry names what the page must add after the `CREATE`: `textIndex` is created and
+        // every `vectorProperty` list is upserted into the vector index. Keeping the vectors as an
+        // ordinary property is what lets a reader see, edit, and re-run the numbers the search is
+        // actually over.
+        //
+        // The ten documents sit in three deliberate clusters, so a nearest-neighbor query returns a
+        // topic rather than an arbitrary row: storage near [1, 0], search near [0, 1], and
+        // correctness near [-1, 0], with two deliberately between them.
+        textIndex: ["Doc", "body"],
+        vectorProperty: "embedding",
+        cypher: `CREATE (d1:Doc {title: 'Adjacency storage', topic: 'storage', embedding: [0.98, 0.05, 0.25],
+         body: 'A graph database stores adjacency as sorted rows so a traversal reads one range instead of joining tables.'}),
+       (d2:Doc {title: 'Compressed rows', topic: 'storage', embedding: [0.95, 0.16, 0.25],
+         body: 'Compressed sparse row layout keeps every neighbour of a node contiguous, which makes a graph traversal sequential.'}),
+       (d3:Doc {title: 'Durable writes', topic: 'storage', embedding: [0.92, -0.12, 0.25],
+         body: 'A write transaction appends to storage and commits atomically, so a reader never observes a partial graph.'}),
+       (d4:Doc {title: 'Vector search', topic: 'search', embedding: [0.10, 0.97, 0.25],
+         body: 'Nearest neighbour search over embeddings finds documents whose meaning is close even when the wording differs.'}),
+       (d5:Doc {title: 'Full-text ranking', topic: 'search', embedding: [-0.05, 0.99, 0.25],
+         body: 'BM25 ranks a document by term frequency against the corpus, so a rare word carries more relevance than a common one.'}),
+       (d6:Doc {title: 'Hybrid retrieval', topic: 'search', embedding: [0.20, 0.94, 0.25],
+         body: 'Fusing vector similarity with full-text relevance retrieves better context than either signal alone.'}),
+       (d7:Doc {title: 'Join ordering', topic: 'correctness', embedding: [-0.95, 0.10, 0.25],
+         body: 'A planner picks a join order from cardinality statistics, because the wrong order builds an intermediate nobody needs.'}),
+       (d8:Doc {title: 'Isolation levels', topic: 'correctness', embedding: [-0.90, -0.20, 0.25],
+         body: 'Snapshot isolation lets a long read run beside a writer without blocking it or observing half of its work.'}),
+       (d9:Doc {title: 'Grounded answers', topic: 'bridge', embedding: [0.70, 0.70, 0.25],
+         body: 'Grounding a language model in a graph traversal keeps an answer attached to the documents it came from.'}),
+       (d10:Doc {title: 'Traversal cost', topic: 'bridge', embedding: [0.62, -0.75, 0.25],
+         body: 'Expanding a relationship costs one adjacency read per source, so a planner prefers the smaller side of a join.'}),
+       (d1)-[:CITES]->(d2),
+       (d2)-[:CITES]->(d3),
+       (d4)-[:CITES]->(d5),
+       (d6)-[:CITES]->(d4),
+       (d6)-[:CITES]->(d5),
+       (d7)-[:CITES]->(d10),
+       (d9)-[:CITES]->(d6),
+       (d9)-[:CITES]->(d1),
+       (d10)-[:CITES]->(d2),
+       (d8)-[:CITES]->(d3)`,
+    },
 ];
 
 // The procedure reference the sidebar lists and searches. It lives here rather than in `app.js`
@@ -752,6 +798,41 @@ ORDER BY score IS NULL, score DESC, title`,
 WHERE a.title IN ['Hybrid retrieval', 'Graph databases']
 RETURN a.title AS seed, collect(cited.title) AS also_read
 ORDER BY seed`,
+            },
+        ],
+    },
+    {
+        label: "Retrieval procedures",
+        sample: "corpus",
+        requiresLabel: "Doc",
+        docs: "../hybrid-retrieval/",
+        demos: [
+            {
+                label: "Nearest documents",
+                desc: "Vector retrieval, then one hop of expansion. The query vector points at the storage cluster, so the three storage documents come back ahead of everything else. This is the sample that ships with embeddings; on any other one the procedure reports an empty index.",
+                cypher: `CALL issundb.retrieve.vector([1.0, 0.0, 0.25], {k: 3, hops: 1})
+YIELD nodeId, distance
+MATCH (d:Doc) WHERE id(d) = nodeId
+RETURN d.title AS title, d.topic AS topic, distance
+ORDER BY distance, title`,
+            },
+            {
+                label: "Fuse text and vectors",
+                desc: "Hybrid retrieval over the same corpus. The vector half points at storage and the text half asks for ranking and relevance, so the fused result carries both topics; a document reached only by expansion has no score of its own and sorts last.",
+                cypher: `CALL issundb.retrieve.hybrid([1.0, 0.0, 0.25], 'ranking relevance',
+  {vectorK: 3, textK: 3, hops: 1})
+YIELD nodeId, score
+MATCH (d:Doc) WHERE id(d) = nodeId
+RETURN d.title AS title, d.topic AS topic, score
+ORDER BY score IS NULL, score DESC, title`,
+            },
+            {
+                label: "Compare the two signals",
+                desc: "The same corpus asked twice over. Vector distance answers what a document means, and the stored embedding is an ordinary property, so editing it in Pick a Graph and re-seeding changes what comes back.",
+                cypher: `MATCH (d:Doc)
+RETURN d.topic AS topic, count(d) AS documents,
+       collect(d.title)[0] AS first_title
+ORDER BY documents DESC, topic`,
             },
         ],
     },
