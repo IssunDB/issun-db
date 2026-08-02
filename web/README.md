@@ -24,7 +24,7 @@ statement it depends on.
 
 ## Sample Graphs
 
-The Setup panel offers six, each small enough to read at once and shaped so that one part of the
+The Setup panel offers seven, each small enough to read at once and shaped so that one part of the
 engine has something to say about it:
 
 | Sample             | What it is                                                                                        | Examples that query it                                         |
@@ -35,6 +35,15 @@ engine has something to say about it:
 | Org chart          | A reporting tree, so variable-length hops, shortest path, and a numeric range scan.               |                                                                |
 | Transport network  | Routes carrying a weight, a cost, and a capacity, so a weighted path differs from a shortest one. |                                                                |
 | Retail co-purchase | Customers and products, so grouped counts, a price range scan, and a co-purchase join.            |                                                                |
+| Retrieval corpus   | Ten documents in three topic clusters, carrying both a text body and an embedding.                | Retrieval procedures                                           |
+
+The retrieval corpus is the one sample that needs more than its `CREATE`. A full-text index and an
+embedding are Rust extension traits rather than Cypher statements, so that entry names them
+(`textIndex` and `vectorProperty`) and the seed applies them: the index is created, and each node's
+embedding property is copied into the vector index. Keeping the vectors in an ordinary property is
+what lets a reader see the numbers the search runs over, edit them, and re-seed. It is also the only
+graph on which `issundb.retrieve.vector` and `issundb.retrieve.hybrid` can do anything; on every
+other sample they report an empty index, and the page says which example to run first.
 
 This is the only place a dataset comes from. Every example queries whatever graph is loaded rather
 than creating one, which is what keeps the two panels from being two lists of datasets: an earlier

@@ -1,0 +1,10559 @@
+{
+ "seed": 20260802,
+ "graphs": [
+  {
+   "id": "empty",
+   "n": 3,
+   "edges": [],
+   "link": [
+    {
+     "a": 0,
+     "b": 1,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 2,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 1,
+     "b": 2,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    }
+   ],
+   "closeness": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "clustering": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "triangleAssignments": 0
+  },
+  {
+   "id": "self_loop",
+   "n": 3,
+   "edges": [
+    [
+     0,
+     0
+    ],
+    [
+     0,
+     1
+    ],
+    [
+     1,
+     2
+    ]
+   ],
+   "link": [
+    {
+     "a": 0,
+     "b": 1,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 0,
+     "b": 2,
+     "commonNeighbors": 1.0,
+     "jaccard": 1.0,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 1,
+     "b": 2,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    }
+   ],
+   "closeness": [
+    0.6666666666666666,
+    0.5,
+    0.0
+   ],
+   "clustering": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "triangleAssignments": 0
+  },
+  {
+   "id": "parallel",
+   "n": 4,
+   "edges": [
+    [
+     0,
+     1
+    ],
+    [
+     0,
+     1
+    ],
+    [
+     1,
+     2
+    ],
+    [
+     2,
+     0
+    ]
+   ],
+   "link": [
+    {
+     "a": 0,
+     "b": 1,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.3333333333333333,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 0,
+     "b": 2,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.3333333333333333,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 0,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 1,
+     "b": 2,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.3333333333333333,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 1,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 2,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    }
+   ],
+   "closeness": [
+    0.4444444444444444,
+    0.4444444444444444,
+    0.4444444444444444,
+    0.0
+   ],
+   "clustering": [
+    1.0,
+    1.0,
+    1.0,
+    0.0
+   ],
+   "triangleAssignments": 6
+  },
+  {
+   "id": "triangle",
+   "n": 3,
+   "edges": [
+    [
+     0,
+     1
+    ],
+    [
+     1,
+     2
+    ],
+    [
+     2,
+     0
+    ]
+   ],
+   "link": [
+    {
+     "a": 0,
+     "b": 1,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.3333333333333333,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 0,
+     "b": 2,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.3333333333333333,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 1,
+     "b": 2,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.3333333333333333,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 4.0
+    }
+   ],
+   "closeness": [
+    0.6666666666666666,
+    0.6666666666666666,
+    0.6666666666666666
+   ],
+   "clustering": [
+    1.0,
+    1.0,
+    1.0
+   ],
+   "triangleAssignments": 3
+  },
+  {
+   "id": "triangle_both_ways",
+   "n": 3,
+   "edges": [
+    [
+     0,
+     1
+    ],
+    [
+     1,
+     2
+    ],
+    [
+     2,
+     0
+    ],
+    [
+     1,
+     0
+    ],
+    [
+     2,
+     1
+    ],
+    [
+     0,
+     2
+    ]
+   ],
+   "link": [
+    {
+     "a": 0,
+     "b": 1,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.3333333333333333,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 0,
+     "b": 2,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.3333333333333333,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 1,
+     "b": 2,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.3333333333333333,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 4.0
+    }
+   ],
+   "closeness": [
+    1.0,
+    1.0,
+    1.0
+   ],
+   "clustering": [
+    1.0,
+    1.0,
+    1.0
+   ],
+   "triangleAssignments": 6
+  },
+  {
+   "id": "isolated",
+   "n": 5,
+   "edges": [
+    [
+     0,
+     1
+    ],
+    [
+     1,
+     0
+    ]
+   ],
+   "link": [
+    {
+     "a": 0,
+     "b": 1,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 0,
+     "b": 2,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 1,
+     "b": 2,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 1,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 1,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 2,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 2,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 3,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    }
+   ],
+   "closeness": [
+    0.25,
+    0.25,
+    0.0,
+    0.0,
+    0.0
+   ],
+   "clustering": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+   ],
+   "triangleAssignments": 0
+  },
+  {
+   "id": "star",
+   "n": 5,
+   "edges": [
+    [
+     0,
+     1
+    ],
+    [
+     0,
+     2
+    ],
+    [
+     0,
+     3
+    ],
+    [
+     0,
+     4
+    ]
+   ],
+   "link": [
+    {
+     "a": 0,
+     "b": 1,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 0,
+     "b": 2,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 0,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 0,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 1,
+     "b": 2,
+     "commonNeighbors": 1.0,
+     "jaccard": 1.0,
+     "adamicAdar": 0.7213475204444817,
+     "resourceAllocation": 0.25,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 1,
+     "b": 3,
+     "commonNeighbors": 1.0,
+     "jaccard": 1.0,
+     "adamicAdar": 0.7213475204444817,
+     "resourceAllocation": 0.25,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 1,
+     "b": 4,
+     "commonNeighbors": 1.0,
+     "jaccard": 1.0,
+     "adamicAdar": 0.7213475204444817,
+     "resourceAllocation": 0.25,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 2,
+     "b": 3,
+     "commonNeighbors": 1.0,
+     "jaccard": 1.0,
+     "adamicAdar": 0.7213475204444817,
+     "resourceAllocation": 0.25,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 2,
+     "b": 4,
+     "commonNeighbors": 1.0,
+     "jaccard": 1.0,
+     "adamicAdar": 0.7213475204444817,
+     "resourceAllocation": 0.25,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 3,
+     "b": 4,
+     "commonNeighbors": 1.0,
+     "jaccard": 1.0,
+     "adamicAdar": 0.7213475204444817,
+     "resourceAllocation": 0.25,
+     "preferentialAttachment": 1.0
+    }
+   ],
+   "closeness": [
+    1.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+   ],
+   "clustering": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+   ],
+   "triangleAssignments": 0
+  },
+  {
+   "id": "chain",
+   "n": 5,
+   "edges": [
+    [
+     0,
+     1
+    ],
+    [
+     1,
+     2
+    ],
+    [
+     2,
+     3
+    ],
+    [
+     3,
+     4
+    ]
+   ],
+   "link": [
+    {
+     "a": 0,
+     "b": 1,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 0,
+     "b": 2,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.5,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 0,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 0,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 1,
+     "b": 2,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 1,
+     "b": 3,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.3333333333333333,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 1,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 2,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 2,
+     "b": 4,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.5,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 3,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    }
+   ],
+   "closeness": [
+    0.4,
+    0.375,
+    0.3333333333333333,
+    0.25,
+    0.0
+   ],
+   "clustering": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+   ],
+   "triangleAssignments": 0
+  },
+  {
+   "id": "k4",
+   "n": 4,
+   "edges": [
+    [
+     0,
+     1
+    ],
+    [
+     0,
+     2
+    ],
+    [
+     0,
+     3
+    ],
+    [
+     1,
+     0
+    ],
+    [
+     1,
+     2
+    ],
+    [
+     1,
+     3
+    ],
+    [
+     2,
+     0
+    ],
+    [
+     2,
+     1
+    ],
+    [
+     2,
+     3
+    ],
+    [
+     3,
+     0
+    ],
+    [
+     3,
+     1
+    ],
+    [
+     3,
+     2
+    ]
+   ],
+   "link": [
+    {
+     "a": 0,
+     "b": 1,
+     "commonNeighbors": 2.0,
+     "jaccard": 0.5,
+     "adamicAdar": 1.8204784532536746,
+     "resourceAllocation": 0.6666666666666666,
+     "preferentialAttachment": 9.0
+    },
+    {
+     "a": 0,
+     "b": 2,
+     "commonNeighbors": 2.0,
+     "jaccard": 0.5,
+     "adamicAdar": 1.8204784532536746,
+     "resourceAllocation": 0.6666666666666666,
+     "preferentialAttachment": 9.0
+    },
+    {
+     "a": 0,
+     "b": 3,
+     "commonNeighbors": 2.0,
+     "jaccard": 0.5,
+     "adamicAdar": 1.8204784532536746,
+     "resourceAllocation": 0.6666666666666666,
+     "preferentialAttachment": 9.0
+    },
+    {
+     "a": 1,
+     "b": 2,
+     "commonNeighbors": 2.0,
+     "jaccard": 0.5,
+     "adamicAdar": 1.8204784532536746,
+     "resourceAllocation": 0.6666666666666666,
+     "preferentialAttachment": 9.0
+    },
+    {
+     "a": 1,
+     "b": 3,
+     "commonNeighbors": 2.0,
+     "jaccard": 0.5,
+     "adamicAdar": 1.8204784532536746,
+     "resourceAllocation": 0.6666666666666666,
+     "preferentialAttachment": 9.0
+    },
+    {
+     "a": 2,
+     "b": 3,
+     "commonNeighbors": 2.0,
+     "jaccard": 0.5,
+     "adamicAdar": 1.8204784532536746,
+     "resourceAllocation": 0.6666666666666666,
+     "preferentialAttachment": 9.0
+    }
+   ],
+   "closeness": [
+    1.0,
+    1.0,
+    1.0,
+    1.0
+   ],
+   "clustering": [
+    1.0,
+    1.0,
+    1.0,
+    1.0
+   ],
+   "triangleAssignments": 24
+  },
+  {
+   "id": "random_0",
+   "n": 9,
+   "edges": [
+    [
+     8,
+     0
+    ],
+    [
+     3,
+     3
+    ],
+    [
+     4,
+     7
+    ],
+    [
+     4,
+     4
+    ],
+    [
+     1,
+     4
+    ],
+    [
+     3,
+     5
+    ],
+    [
+     1,
+     3
+    ]
+   ],
+   "link": [
+    {
+     "a": 0,
+     "b": 1,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 0,
+     "b": 2,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 0,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 0,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 0,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 0,
+     "b": 8,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 1,
+     "b": 2,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 1,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 1,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 1,
+     "b": 5,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.5,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 1,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 1,
+     "b": 7,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.5,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 1,
+     "b": 8,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 2,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 2,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 2,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 2,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 2,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 2,
+     "b": 8,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 3,
+     "b": 4,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.3333333333333333,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 3,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 3,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 3,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 3,
+     "b": 8,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 4,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 4,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 4,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 4,
+     "b": 8,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 5,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 5,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 5,
+     "b": 8,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 6,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 6,
+     "b": 8,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 7,
+     "b": 8,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 1.0
+    }
+   ],
+   "closeness": [
+    0.0,
+    0.3333333333333333,
+    0.0,
+    0.125,
+    0.125,
+    0.0,
+    0.0,
+    0.0,
+    0.125
+   ],
+   "clustering": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+   ],
+   "triangleAssignments": 0
+  },
+  {
+   "id": "random_1",
+   "n": 7,
+   "edges": [
+    [
+     0,
+     1
+    ],
+    [
+     3,
+     3
+    ],
+    [
+     6,
+     6
+    ],
+    [
+     6,
+     0
+    ],
+    [
+     3,
+     1
+    ],
+    [
+     5,
+     5
+    ],
+    [
+     1,
+     6
+    ],
+    [
+     2,
+     0
+    ],
+    [
+     6,
+     5
+    ],
+    [
+     4,
+     2
+    ],
+    [
+     1,
+     5
+    ],
+    [
+     1,
+     1
+    ],
+    [
+     4,
+     3
+    ]
+   ],
+   "link": [
+    {
+     "a": 0,
+     "b": 1,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.16666666666666666,
+     "adamicAdar": 0.9102392266268373,
+     "resourceAllocation": 0.3333333333333333,
+     "preferentialAttachment": 12.0
+    },
+    {
+     "a": 0,
+     "b": 2,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 0,
+     "b": 3,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.25,
+     "adamicAdar": 0.7213475204444817,
+     "resourceAllocation": 0.25,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 0,
+     "b": 4,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.25,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 0,
+     "b": 5,
+     "commonNeighbors": 2.0,
+     "jaccard": 0.6666666666666666,
+     "adamicAdar": 1.631586747071319,
+     "resourceAllocation": 0.5833333333333333,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 0,
+     "b": 6,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.2,
+     "adamicAdar": 0.7213475204444817,
+     "resourceAllocation": 0.25,
+     "preferentialAttachment": 9.0
+    },
+    {
+     "a": 1,
+     "b": 2,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.2,
+     "adamicAdar": 0.9102392266268373,
+     "resourceAllocation": 0.3333333333333333,
+     "preferentialAttachment": 8.0
+    },
+    {
+     "a": 1,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 8.0
+    },
+    {
+     "a": 1,
+     "b": 4,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.2,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 8.0
+    },
+    {
+     "a": 1,
+     "b": 5,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.2,
+     "adamicAdar": 0.9102392266268373,
+     "resourceAllocation": 0.3333333333333333,
+     "preferentialAttachment": 8.0
+    },
+    {
+     "a": 1,
+     "b": 6,
+     "commonNeighbors": 2.0,
+     "jaccard": 0.4,
+     "adamicAdar": 2.352934267515801,
+     "resourceAllocation": 0.8333333333333333,
+     "preferentialAttachment": 12.0
+    },
+    {
+     "a": 2,
+     "b": 3,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.3333333333333333,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 2,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 2,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 2,
+     "b": 6,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.25,
+     "adamicAdar": 0.9102392266268373,
+     "resourceAllocation": 0.3333333333333333,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 3,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 3,
+     "b": 5,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.3333333333333333,
+     "adamicAdar": 0.7213475204444817,
+     "resourceAllocation": 0.25,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 3,
+     "b": 6,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.25,
+     "adamicAdar": 0.7213475204444817,
+     "resourceAllocation": 0.25,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 4,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 4,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 5,
+     "b": 6,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.25,
+     "adamicAdar": 0.7213475204444817,
+     "resourceAllocation": 0.25,
+     "preferentialAttachment": 6.0
+    }
+   ],
+   "closeness": [
+    0.3,
+    0.375,
+    0.2962962962962963,
+    0.3333333333333333,
+    0.5,
+    0.0,
+    0.375
+   ],
+   "clustering": [
+    0.3333333333333333,
+    0.3333333333333333,
+    0.0,
+    0.0,
+    0.0,
+    1.0,
+    0.6666666666666666
+   ],
+   "triangleAssignments": 3
+  },
+  {
+   "id": "random_2",
+   "n": 3,
+   "edges": [
+    [
+     1,
+     1
+    ],
+    [
+     0,
+     2
+    ],
+    [
+     2,
+     0
+    ],
+    [
+     2,
+     0
+    ],
+    [
+     2,
+     2
+    ],
+    [
+     2,
+     0
+    ],
+    [
+     1,
+     2
+    ],
+    [
+     2,
+     0
+    ],
+    [
+     0,
+     1
+    ],
+    [
+     2,
+     0
+    ],
+    [
+     0,
+     0
+    ],
+    [
+     2,
+     1
+    ],
+    [
+     2,
+     2
+    ]
+   ],
+   "link": [
+    {
+     "a": 0,
+     "b": 1,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.3333333333333333,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 0,
+     "b": 2,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.3333333333333333,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 1,
+     "b": 2,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.3333333333333333,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 4.0
+    }
+   ],
+   "closeness": [
+    1.0,
+    0.6666666666666666,
+    1.0
+   ],
+   "clustering": [
+    1.0,
+    1.0,
+    1.0
+   ],
+   "triangleAssignments": 69
+  },
+  {
+   "id": "random_3",
+   "n": 7,
+   "edges": [
+    [
+     3,
+     3
+    ],
+    [
+     2,
+     4
+    ],
+    [
+     1,
+     3
+    ],
+    [
+     2,
+     6
+    ],
+    [
+     3,
+     0
+    ],
+    [
+     2,
+     2
+    ],
+    [
+     6,
+     4
+    ],
+    [
+     1,
+     5
+    ],
+    [
+     0,
+     0
+    ]
+   ],
+   "link": [
+    {
+     "a": 0,
+     "b": 1,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.5,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 0,
+     "b": 2,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 0,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 0,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 0,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 0,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 1,
+     "b": 2,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 1,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 1,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 1,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 1,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 2,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 2,
+     "b": 4,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.3333333333333333,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 2,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 2,
+     "b": 6,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.3333333333333333,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 3,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 3,
+     "b": 5,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.5,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 3,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 4,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 4,
+     "b": 6,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.3333333333333333,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 5,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    }
+   ],
+   "closeness": [
+    0.0,
+    0.375,
+    0.3333333333333333,
+    0.16666666666666666,
+    0.0,
+    0.0,
+    0.16666666666666666
+   ],
+   "clustering": [
+    0.0,
+    0.0,
+    1.0,
+    0.0,
+    1.0,
+    0.0,
+    1.0
+   ],
+   "triangleAssignments": 0
+  },
+  {
+   "id": "random_4",
+   "n": 7,
+   "edges": [
+    [
+     1,
+     5
+    ],
+    [
+     2,
+     1
+    ],
+    [
+     4,
+     4
+    ],
+    [
+     4,
+     4
+    ],
+    [
+     3,
+     6
+    ],
+    [
+     6,
+     2
+    ],
+    [
+     2,
+     2
+    ],
+    [
+     2,
+     6
+    ],
+    [
+     1,
+     4
+    ],
+    [
+     0,
+     3
+    ],
+    [
+     2,
+     0
+    ],
+    [
+     0,
+     4
+    ],
+    [
+     5,
+     1
+    ],
+    [
+     6,
+     0
+    ],
+    [
+     6,
+     1
+    ],
+    [
+     3,
+     4
+    ],
+    [
+     6,
+     0
+    ]
+   ],
+   "link": [
+    {
+     "a": 0,
+     "b": 1,
+     "commonNeighbors": 3.0,
+     "jaccard": 0.6,
+     "adamicAdar": 2.541825973698156,
+     "resourceAllocation": 0.9166666666666666,
+     "preferentialAttachment": 16.0
+    },
+    {
+     "a": 0,
+     "b": 2,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.16666666666666666,
+     "adamicAdar": 0.7213475204444817,
+     "resourceAllocation": 0.25,
+     "preferentialAttachment": 12.0
+    },
+    {
+     "a": 0,
+     "b": 3,
+     "commonNeighbors": 2.0,
+     "jaccard": 0.4,
+     "adamicAdar": 1.631586747071319,
+     "resourceAllocation": 0.5833333333333333,
+     "preferentialAttachment": 12.0
+    },
+    {
+     "a": 0,
+     "b": 4,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.16666666666666666,
+     "adamicAdar": 0.9102392266268373,
+     "resourceAllocation": 0.3333333333333333,
+     "preferentialAttachment": 12.0
+    },
+    {
+     "a": 0,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 0,
+     "b": 6,
+     "commonNeighbors": 2.0,
+     "jaccard": 0.3333333333333333,
+     "adamicAdar": 1.8204784532536746,
+     "resourceAllocation": 0.6666666666666666,
+     "preferentialAttachment": 16.0
+    },
+    {
+     "a": 1,
+     "b": 2,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.16666666666666666,
+     "adamicAdar": 0.7213475204444817,
+     "resourceAllocation": 0.25,
+     "preferentialAttachment": 12.0
+    },
+    {
+     "a": 1,
+     "b": 3,
+     "commonNeighbors": 2.0,
+     "jaccard": 0.4,
+     "adamicAdar": 1.631586747071319,
+     "resourceAllocation": 0.5833333333333333,
+     "preferentialAttachment": 12.0
+    },
+    {
+     "a": 1,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 12.0
+    },
+    {
+     "a": 1,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 1,
+     "b": 6,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.14285714285714285,
+     "adamicAdar": 0.9102392266268373,
+     "resourceAllocation": 0.3333333333333333,
+     "preferentialAttachment": 16.0
+    },
+    {
+     "a": 2,
+     "b": 3,
+     "commonNeighbors": 2.0,
+     "jaccard": 0.5,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 9.0
+    },
+    {
+     "a": 2,
+     "b": 4,
+     "commonNeighbors": 2.0,
+     "jaccard": 0.5,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 9.0
+    },
+    {
+     "a": 2,
+     "b": 5,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.3333333333333333,
+     "adamicAdar": 0.7213475204444817,
+     "resourceAllocation": 0.25,
+     "preferentialAttachment": 3.0
+    },
+    {
+     "a": 2,
+     "b": 6,
+     "commonNeighbors": 2.0,
+     "jaccard": 0.4,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 12.0
+    },
+    {
+     "a": 3,
+     "b": 4,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.2,
+     "adamicAdar": 0.7213475204444817,
+     "resourceAllocation": 0.25,
+     "preferentialAttachment": 9.0
+    },
+    {
+     "a": 3,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 3.0
+    },
+    {
+     "a": 3,
+     "b": 6,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.16666666666666666,
+     "adamicAdar": 0.7213475204444817,
+     "resourceAllocation": 0.25,
+     "preferentialAttachment": 12.0
+    },
+    {
+     "a": 4,
+     "b": 5,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.3333333333333333,
+     "adamicAdar": 0.7213475204444817,
+     "resourceAllocation": 0.25,
+     "preferentialAttachment": 3.0
+    },
+    {
+     "a": 4,
+     "b": 6,
+     "commonNeighbors": 3.0,
+     "jaccard": 0.75,
+     "adamicAdar": 2.352934267515801,
+     "resourceAllocation": 0.8333333333333333,
+     "preferentialAttachment": 12.0
+    },
+    {
+     "a": 5,
+     "b": 6,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.25,
+     "adamicAdar": 0.7213475204444817,
+     "resourceAllocation": 0.25,
+     "preferentialAttachment": 4.0
+    }
+   ],
+   "closeness": [
+    0.42857142857142855,
+    0.3333333333333333,
+    0.6666666666666666,
+    0.5454545454545454,
+    0.0,
+    0.2222222222222222,
+    0.6666666666666666
+   ],
+   "clustering": [
+    0.5,
+    0.16666666666666666,
+    0.6666666666666666,
+    0.6666666666666666,
+    0.3333333333333333,
+    0.0,
+    0.5
+   ],
+   "triangleAssignments": 9
+  },
+  {
+   "id": "random_5",
+   "n": 4,
+   "edges": [
+    [
+     1,
+     0
+    ],
+    [
+     3,
+     1
+    ],
+    [
+     3,
+     3
+    ],
+    [
+     3,
+     0
+    ],
+    [
+     3,
+     3
+    ],
+    [
+     3,
+     2
+    ],
+    [
+     3,
+     0
+    ],
+    [
+     0,
+     1
+    ],
+    [
+     2,
+     2
+    ],
+    [
+     1,
+     2
+    ],
+    [
+     2,
+     2
+    ],
+    [
+     3,
+     0
+    ]
+   ],
+   "link": [
+    {
+     "a": 0,
+     "b": 1,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.25,
+     "adamicAdar": 0.9102392266268373,
+     "resourceAllocation": 0.3333333333333333,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 0,
+     "b": 2,
+     "commonNeighbors": 2.0,
+     "jaccard": 1.0,
+     "adamicAdar": 1.8204784532536746,
+     "resourceAllocation": 0.6666666666666666,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 0,
+     "b": 3,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.25,
+     "adamicAdar": 0.9102392266268373,
+     "resourceAllocation": 0.3333333333333333,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 1,
+     "b": 2,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.25,
+     "adamicAdar": 0.9102392266268373,
+     "resourceAllocation": 0.3333333333333333,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 1,
+     "b": 3,
+     "commonNeighbors": 2.0,
+     "jaccard": 0.5,
+     "adamicAdar": 2.8853900817779268,
+     "resourceAllocation": 1.0,
+     "preferentialAttachment": 9.0
+    },
+    {
+     "a": 2,
+     "b": 3,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.25,
+     "adamicAdar": 0.9102392266268373,
+     "resourceAllocation": 0.3333333333333333,
+     "preferentialAttachment": 6.0
+    }
+   ],
+   "closeness": [
+    0.4444444444444444,
+    0.6666666666666666,
+    0.0,
+    1.0
+   ],
+   "clustering": [
+    1.0,
+    0.6666666666666666,
+    1.0,
+    0.6666666666666666
+   ],
+   "triangleAssignments": 0
+  },
+  {
+   "id": "random_6",
+   "n": 8,
+   "edges": [
+    [
+     0,
+     2
+    ],
+    [
+     1,
+     5
+    ],
+    [
+     3,
+     3
+    ],
+    [
+     7,
+     5
+    ],
+    [
+     7,
+     3
+    ],
+    [
+     5,
+     3
+    ],
+    [
+     2,
+     2
+    ],
+    [
+     3,
+     6
+    ],
+    [
+     3,
+     5
+    ],
+    [
+     1,
+     4
+    ],
+    [
+     0,
+     7
+    ],
+    [
+     3,
+     2
+    ],
+    [
+     5,
+     4
+    ],
+    [
+     5,
+     0
+    ]
+   ],
+   "link": [
+    {
+     "a": 0,
+     "b": 1,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.25,
+     "adamicAdar": 0.6213349345596119,
+     "resourceAllocation": 0.2,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 0,
+     "b": 2,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 0,
+     "b": 3,
+     "commonNeighbors": 3.0,
+     "jaccard": 0.75,
+     "adamicAdar": 2.9742692020754125,
+     "resourceAllocation": 1.0333333333333332,
+     "preferentialAttachment": 12.0
+    },
+    {
+     "a": 0,
+     "b": 4,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.25,
+     "adamicAdar": 0.6213349345596119,
+     "resourceAllocation": 0.2,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 0,
+     "b": 5,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.14285714285714285,
+     "adamicAdar": 0.9102392266268373,
+     "resourceAllocation": 0.3333333333333333,
+     "preferentialAttachment": 15.0
+    },
+    {
+     "a": 0,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 3.0
+    },
+    {
+     "a": 0,
+     "b": 7,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.2,
+     "adamicAdar": 0.6213349345596119,
+     "resourceAllocation": 0.2,
+     "preferentialAttachment": 9.0
+    },
+    {
+     "a": 1,
+     "b": 2,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 1,
+     "b": 3,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.2,
+     "adamicAdar": 0.6213349345596119,
+     "resourceAllocation": 0.2,
+     "preferentialAttachment": 8.0
+    },
+    {
+     "a": 1,
+     "b": 4,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.3333333333333333,
+     "adamicAdar": 0.6213349345596119,
+     "resourceAllocation": 0.2,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 1,
+     "b": 5,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.16666666666666666,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 10.0
+    },
+    {
+     "a": 1,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 1,
+     "b": 7,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.25,
+     "adamicAdar": 0.6213349345596119,
+     "resourceAllocation": 0.2,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 2,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 8.0
+    },
+    {
+     "a": 2,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 2,
+     "b": 5,
+     "commonNeighbors": 2.0,
+     "jaccard": 0.4,
+     "adamicAdar": 1.631586747071319,
+     "resourceAllocation": 0.5833333333333333,
+     "preferentialAttachment": 10.0
+    },
+    {
+     "a": 2,
+     "b": 6,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.5,
+     "adamicAdar": 0.7213475204444817,
+     "resourceAllocation": 0.25,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 2,
+     "b": 7,
+     "commonNeighbors": 2.0,
+     "jaccard": 0.6666666666666666,
+     "adamicAdar": 1.631586747071319,
+     "resourceAllocation": 0.5833333333333333,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 3,
+     "b": 4,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.2,
+     "adamicAdar": 0.6213349345596119,
+     "resourceAllocation": 0.2,
+     "preferentialAttachment": 8.0
+    },
+    {
+     "a": 3,
+     "b": 5,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.125,
+     "adamicAdar": 0.9102392266268373,
+     "resourceAllocation": 0.3333333333333333,
+     "preferentialAttachment": 20.0
+    },
+    {
+     "a": 3,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 3,
+     "b": 7,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.16666666666666666,
+     "adamicAdar": 0.6213349345596119,
+     "resourceAllocation": 0.2,
+     "preferentialAttachment": 12.0
+    },
+    {
+     "a": 4,
+     "b": 5,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.16666666666666666,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 10.0
+    },
+    {
+     "a": 4,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 4,
+     "b": 7,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.25,
+     "adamicAdar": 0.6213349345596119,
+     "resourceAllocation": 0.2,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 5,
+     "b": 6,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.2,
+     "adamicAdar": 0.7213475204444817,
+     "resourceAllocation": 0.25,
+     "preferentialAttachment": 5.0
+    },
+    {
+     "a": 5,
+     "b": 7,
+     "commonNeighbors": 2.0,
+     "jaccard": 0.3333333333333333,
+     "adamicAdar": 1.631586747071319,
+     "resourceAllocation": 0.5833333333333333,
+     "preferentialAttachment": 15.0
+    },
+    {
+     "a": 6,
+     "b": 7,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.3333333333333333,
+     "adamicAdar": 0.7213475204444817,
+     "resourceAllocation": 0.25,
+     "preferentialAttachment": 3.0
+    }
+   ],
+   "closeness": [
+    0.42857142857142855,
+    0.4666666666666667,
+    0.0,
+    0.5142857142857142,
+    0.0,
+    0.5714285714285714,
+    0.0,
+    0.5142857142857142
+   ],
+   "clustering": [
+    0.3333333333333333,
+    1.0,
+    0.0,
+    0.16666666666666666,
+    1.0,
+    0.3,
+    0.0,
+    0.6666666666666666
+   ],
+   "triangleAssignments": 6
+  },
+  {
+   "id": "random_7",
+   "n": 8,
+   "edges": [
+    [
+     5,
+     6
+    ],
+    [
+     5,
+     7
+    ],
+    [
+     3,
+     2
+    ],
+    [
+     6,
+     3
+    ],
+    [
+     5,
+     2
+    ],
+    [
+     3,
+     6
+    ],
+    [
+     2,
+     1
+    ],
+    [
+     6,
+     1
+    ],
+    [
+     1,
+     7
+    ],
+    [
+     2,
+     4
+    ],
+    [
+     7,
+     0
+    ],
+    [
+     1,
+     1
+    ],
+    [
+     3,
+     3
+    ],
+    [
+     1,
+     6
+    ],
+    [
+     5,
+     7
+    ],
+    [
+     3,
+     7
+    ]
+   ],
+   "link": [
+    {
+     "a": 0,
+     "b": 1,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.3333333333333333,
+     "adamicAdar": 0.7213475204444817,
+     "resourceAllocation": 0.25,
+     "preferentialAttachment": 3.0
+    },
+    {
+     "a": 0,
+     "b": 2,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 0,
+     "b": 3,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.3333333333333333,
+     "adamicAdar": 0.7213475204444817,
+     "resourceAllocation": 0.25,
+     "preferentialAttachment": 3.0
+    },
+    {
+     "a": 0,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 0,
+     "b": 5,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.3333333333333333,
+     "adamicAdar": 0.7213475204444817,
+     "resourceAllocation": 0.25,
+     "preferentialAttachment": 3.0
+    },
+    {
+     "a": 0,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 3.0
+    },
+    {
+     "a": 0,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 1,
+     "b": 2,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 12.0
+    },
+    {
+     "a": 1,
+     "b": 3,
+     "commonNeighbors": 3.0,
+     "jaccard": 1.0,
+     "adamicAdar": 2.352934267515801,
+     "resourceAllocation": 0.8333333333333333,
+     "preferentialAttachment": 9.0
+    },
+    {
+     "a": 1,
+     "b": 4,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.3333333333333333,
+     "adamicAdar": 0.7213475204444817,
+     "resourceAllocation": 0.25,
+     "preferentialAttachment": 3.0
+    },
+    {
+     "a": 1,
+     "b": 5,
+     "commonNeighbors": 3.0,
+     "jaccard": 1.0,
+     "adamicAdar": 2.352934267515801,
+     "resourceAllocation": 0.8333333333333333,
+     "preferentialAttachment": 9.0
+    },
+    {
+     "a": 1,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 9.0
+    },
+    {
+     "a": 1,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 12.0
+    },
+    {
+     "a": 2,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 12.0
+    },
+    {
+     "a": 2,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 2,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 12.0
+    },
+    {
+     "a": 2,
+     "b": 6,
+     "commonNeighbors": 3.0,
+     "jaccard": 0.75,
+     "adamicAdar": 2.730717679880512,
+     "resourceAllocation": 1.0,
+     "preferentialAttachment": 12.0
+    },
+    {
+     "a": 2,
+     "b": 7,
+     "commonNeighbors": 3.0,
+     "jaccard": 0.6,
+     "adamicAdar": 2.730717679880512,
+     "resourceAllocation": 1.0,
+     "preferentialAttachment": 16.0
+    },
+    {
+     "a": 3,
+     "b": 4,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.3333333333333333,
+     "adamicAdar": 0.7213475204444817,
+     "resourceAllocation": 0.25,
+     "preferentialAttachment": 3.0
+    },
+    {
+     "a": 3,
+     "b": 5,
+     "commonNeighbors": 3.0,
+     "jaccard": 1.0,
+     "adamicAdar": 2.352934267515801,
+     "resourceAllocation": 0.8333333333333333,
+     "preferentialAttachment": 9.0
+    },
+    {
+     "a": 3,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 9.0
+    },
+    {
+     "a": 3,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 12.0
+    },
+    {
+     "a": 4,
+     "b": 5,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.3333333333333333,
+     "adamicAdar": 0.7213475204444817,
+     "resourceAllocation": 0.25,
+     "preferentialAttachment": 3.0
+    },
+    {
+     "a": 4,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 3.0
+    },
+    {
+     "a": 4,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 5,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 9.0
+    },
+    {
+     "a": 5,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 12.0
+    },
+    {
+     "a": 6,
+     "b": 7,
+     "commonNeighbors": 3.0,
+     "jaccard": 0.75,
+     "adamicAdar": 2.730717679880512,
+     "resourceAllocation": 1.0,
+     "preferentialAttachment": 12.0
+    }
+   ],
+   "closeness": [
+    0.0,
+    0.3956043956043956,
+    0.42857142857142855,
+    0.5714285714285714,
+    0.0,
+    0.6363636363636364,
+    0.42857142857142855,
+    0.14285714285714285
+   ],
+   "clustering": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+   ],
+   "triangleAssignments": 6
+  },
+  {
+   "id": "random_8",
+   "n": 5,
+   "edges": [
+    [
+     4,
+     2
+    ],
+    [
+     3,
+     1
+    ],
+    [
+     2,
+     1
+    ],
+    [
+     2,
+     4
+    ],
+    [
+     0,
+     1
+    ],
+    [
+     0,
+     1
+    ],
+    [
+     4,
+     2
+    ],
+    [
+     3,
+     3
+    ],
+    [
+     3,
+     1
+    ],
+    [
+     2,
+     1
+    ]
+   ],
+   "link": [
+    {
+     "a": 0,
+     "b": 1,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 3.0
+    },
+    {
+     "a": 0,
+     "b": 2,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.5,
+     "adamicAdar": 0.9102392266268373,
+     "resourceAllocation": 0.3333333333333333,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 0,
+     "b": 3,
+     "commonNeighbors": 1.0,
+     "jaccard": 1.0,
+     "adamicAdar": 0.9102392266268373,
+     "resourceAllocation": 0.3333333333333333,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 0,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 1,
+     "b": 2,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 1,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 3.0
+    },
+    {
+     "a": 1,
+     "b": 4,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.3333333333333333,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 3.0
+    },
+    {
+     "a": 2,
+     "b": 3,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.5,
+     "adamicAdar": 0.9102392266268373,
+     "resourceAllocation": 0.3333333333333333,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 2,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 3,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 1.0
+    }
+   ],
+   "closeness": [
+    0.25,
+    0.0,
+    0.5,
+    0.25,
+    0.3333333333333333
+   ],
+   "clustering": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+   ],
+   "triangleAssignments": 0
+  },
+  {
+   "id": "random_9",
+   "n": 8,
+   "edges": [
+    [
+     1,
+     4
+    ],
+    [
+     3,
+     6
+    ],
+    [
+     5,
+     4
+    ],
+    [
+     4,
+     6
+    ],
+    [
+     1,
+     0
+    ],
+    [
+     3,
+     7
+    ],
+    [
+     7,
+     4
+    ],
+    [
+     1,
+     3
+    ],
+    [
+     2,
+     6
+    ]
+   ],
+   "link": [
+    {
+     "a": 0,
+     "b": 1,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 3.0
+    },
+    {
+     "a": 0,
+     "b": 2,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 0,
+     "b": 3,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.3333333333333333,
+     "adamicAdar": 0.9102392266268373,
+     "resourceAllocation": 0.3333333333333333,
+     "preferentialAttachment": 3.0
+    },
+    {
+     "a": 0,
+     "b": 4,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.25,
+     "adamicAdar": 0.9102392266268373,
+     "resourceAllocation": 0.3333333333333333,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 0,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 0,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 3.0
+    },
+    {
+     "a": 0,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 1,
+     "b": 2,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 3.0
+    },
+    {
+     "a": 1,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 9.0
+    },
+    {
+     "a": 1,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 12.0
+    },
+    {
+     "a": 1,
+     "b": 5,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.3333333333333333,
+     "adamicAdar": 0.7213475204444817,
+     "resourceAllocation": 0.25,
+     "preferentialAttachment": 3.0
+    },
+    {
+     "a": 1,
+     "b": 6,
+     "commonNeighbors": 2.0,
+     "jaccard": 0.5,
+     "adamicAdar": 1.631586747071319,
+     "resourceAllocation": 0.5833333333333333,
+     "preferentialAttachment": 9.0
+    },
+    {
+     "a": 1,
+     "b": 7,
+     "commonNeighbors": 2.0,
+     "jaccard": 0.6666666666666666,
+     "adamicAdar": 1.631586747071319,
+     "resourceAllocation": 0.5833333333333333,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 2,
+     "b": 3,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.3333333333333333,
+     "adamicAdar": 0.9102392266268373,
+     "resourceAllocation": 0.3333333333333333,
+     "preferentialAttachment": 3.0
+    },
+    {
+     "a": 2,
+     "b": 4,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.25,
+     "adamicAdar": 0.9102392266268373,
+     "resourceAllocation": 0.3333333333333333,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 2,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 2,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 3.0
+    },
+    {
+     "a": 2,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 3,
+     "b": 4,
+     "commonNeighbors": 3.0,
+     "jaccard": 0.75,
+     "adamicAdar": 3.263173494142638,
+     "resourceAllocation": 1.1666666666666665,
+     "preferentialAttachment": 12.0
+    },
+    {
+     "a": 3,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 3.0
+    },
+    {
+     "a": 3,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 9.0
+    },
+    {
+     "a": 3,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 4,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 4,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 12.0
+    },
+    {
+     "a": 4,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 8.0
+    },
+    {
+     "a": 5,
+     "b": 6,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.3333333333333333,
+     "adamicAdar": 0.7213475204444817,
+     "resourceAllocation": 0.25,
+     "preferentialAttachment": 3.0
+    },
+    {
+     "a": 5,
+     "b": 7,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.5,
+     "adamicAdar": 0.7213475204444817,
+     "resourceAllocation": 0.25,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 6,
+     "b": 7,
+     "commonNeighbors": 2.0,
+     "jaccard": 0.6666666666666666,
+     "adamicAdar": 1.631586747071319,
+     "resourceAllocation": 0.5833333333333333,
+     "preferentialAttachment": 6.0
+    }
+   ],
+   "closeness": [
+    0.0,
+    0.5102040816326531,
+    0.14285714285714285,
+    0.3214285714285714,
+    0.14285714285714285,
+    0.19047619047619047,
+    0.0,
+    0.19047619047619047
+   ],
+   "clustering": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+   ],
+   "triangleAssignments": 0
+  },
+  {
+   "id": "random_10",
+   "n": 9,
+   "edges": [
+    [
+     4,
+     6
+    ],
+    [
+     0,
+     2
+    ],
+    [
+     0,
+     3
+    ],
+    [
+     4,
+     1
+    ],
+    [
+     6,
+     8
+    ],
+    [
+     3,
+     8
+    ],
+    [
+     0,
+     2
+    ],
+    [
+     4,
+     4
+    ],
+    [
+     2,
+     5
+    ],
+    [
+     5,
+     0
+    ],
+    [
+     1,
+     0
+    ],
+    [
+     7,
+     5
+    ],
+    [
+     8,
+     6
+    ],
+    [
+     7,
+     8
+    ],
+    [
+     8,
+     0
+    ],
+    [
+     4,
+     4
+    ]
+   ],
+   "link": [
+    {
+     "a": 0,
+     "b": 1,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 10.0
+    },
+    {
+     "a": 0,
+     "b": 2,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.16666666666666666,
+     "adamicAdar": 0.9102392266268373,
+     "resourceAllocation": 0.3333333333333333,
+     "preferentialAttachment": 10.0
+    },
+    {
+     "a": 0,
+     "b": 3,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.16666666666666666,
+     "adamicAdar": 0.7213475204444817,
+     "resourceAllocation": 0.25,
+     "preferentialAttachment": 10.0
+    },
+    {
+     "a": 0,
+     "b": 4,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.16666666666666666,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 10.0
+    },
+    {
+     "a": 0,
+     "b": 5,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.14285714285714285,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 15.0
+    },
+    {
+     "a": 0,
+     "b": 6,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.16666666666666666,
+     "adamicAdar": 0.7213475204444817,
+     "resourceAllocation": 0.25,
+     "preferentialAttachment": 10.0
+    },
+    {
+     "a": 0,
+     "b": 7,
+     "commonNeighbors": 2.0,
+     "jaccard": 0.4,
+     "adamicAdar": 1.631586747071319,
+     "resourceAllocation": 0.5833333333333333,
+     "preferentialAttachment": 10.0
+    },
+    {
+     "a": 0,
+     "b": 8,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.125,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 20.0
+    },
+    {
+     "a": 1,
+     "b": 2,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.3333333333333333,
+     "adamicAdar": 0.6213349345596119,
+     "resourceAllocation": 0.2,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 1,
+     "b": 3,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.3333333333333333,
+     "adamicAdar": 0.6213349345596119,
+     "resourceAllocation": 0.2,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 1,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 1,
+     "b": 5,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.25,
+     "adamicAdar": 0.6213349345596119,
+     "resourceAllocation": 0.2,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 1,
+     "b": 6,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.3333333333333333,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 1,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 1,
+     "b": 8,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.2,
+     "adamicAdar": 0.6213349345596119,
+     "resourceAllocation": 0.2,
+     "preferentialAttachment": 8.0
+    },
+    {
+     "a": 2,
+     "b": 3,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.3333333333333333,
+     "adamicAdar": 0.6213349345596119,
+     "resourceAllocation": 0.2,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 2,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 2,
+     "b": 5,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.25,
+     "adamicAdar": 0.6213349345596119,
+     "resourceAllocation": 0.2,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 2,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 2,
+     "b": 7,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.3333333333333333,
+     "adamicAdar": 0.9102392266268373,
+     "resourceAllocation": 0.3333333333333333,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 2,
+     "b": 8,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.2,
+     "adamicAdar": 0.6213349345596119,
+     "resourceAllocation": 0.2,
+     "preferentialAttachment": 8.0
+    },
+    {
+     "a": 3,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 3,
+     "b": 5,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.25,
+     "adamicAdar": 0.6213349345596119,
+     "resourceAllocation": 0.2,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 3,
+     "b": 6,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.3333333333333333,
+     "adamicAdar": 0.7213475204444817,
+     "resourceAllocation": 0.25,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 3,
+     "b": 7,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.3333333333333333,
+     "adamicAdar": 0.7213475204444817,
+     "resourceAllocation": 0.25,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 3,
+     "b": 8,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.2,
+     "adamicAdar": 0.6213349345596119,
+     "resourceAllocation": 0.2,
+     "preferentialAttachment": 8.0
+    },
+    {
+     "a": 4,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 4,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 4,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 4,
+     "b": 8,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.2,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 8.0
+    },
+    {
+     "a": 5,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 5,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 5,
+     "b": 8,
+     "commonNeighbors": 2.0,
+     "jaccard": 0.4,
+     "adamicAdar": 2.0640299754485754,
+     "resourceAllocation": 0.7,
+     "preferentialAttachment": 12.0
+    },
+    {
+     "a": 6,
+     "b": 7,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.3333333333333333,
+     "adamicAdar": 0.7213475204444817,
+     "resourceAllocation": 0.25,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 6,
+     "b": 8,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 8.0
+    },
+    {
+     "a": 7,
+     "b": 8,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 8.0
+    }
+   ],
+   "closeness": [
+    0.3472222222222222,
+    0.30000000000000004,
+    0.20833333333333331,
+    0.2604166666666667,
+    0.3828125,
+    0.2604166666666667,
+    0.2403846153846154,
+    0.375,
+    0.3472222222222222
+   ],
+   "clustering": [
+    0.2,
+    0.0,
+    1.0,
+    1.0,
+    0.0,
+    0.3333333333333333,
+    0.0,
+    0.0,
+    0.16666666666666666
+   ],
+   "triangleAssignments": 9
+  },
+  {
+   "id": "random_11",
+   "n": 8,
+   "edges": [
+    [
+     5,
+     0
+    ],
+    [
+     1,
+     2
+    ],
+    [
+     3,
+     6
+    ],
+    [
+     1,
+     6
+    ],
+    [
+     1,
+     4
+    ],
+    [
+     5,
+     4
+    ]
+   ],
+   "link": [
+    {
+     "a": 0,
+     "b": 1,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 3.0
+    },
+    {
+     "a": 0,
+     "b": 2,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 0,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 0,
+     "b": 4,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.5,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 0,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 0,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 0,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 1,
+     "b": 2,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 3.0
+    },
+    {
+     "a": 1,
+     "b": 3,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.3333333333333333,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 3.0
+    },
+    {
+     "a": 1,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 1,
+     "b": 5,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.25,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 1,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 1,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 2,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 2,
+     "b": 4,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.5,
+     "adamicAdar": 0.9102392266268373,
+     "resourceAllocation": 0.3333333333333333,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 2,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 2,
+     "b": 6,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.5,
+     "adamicAdar": 0.9102392266268373,
+     "resourceAllocation": 0.3333333333333333,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 2,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 3,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 3,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 3,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 3,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 4,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 4,
+     "b": 6,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.3333333333333333,
+     "adamicAdar": 0.9102392266268373,
+     "resourceAllocation": 0.3333333333333333,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 4,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 5,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 5,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 6,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    }
+   ],
+   "closeness": [
+    0.0,
+    0.42857142857142855,
+    0.0,
+    0.14285714285714285,
+    0.0,
+    0.2857142857142857,
+    0.0,
+    0.0
+   ],
+   "clustering": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+   ],
+   "triangleAssignments": 0
+  },
+  {
+   "id": "random_12",
+   "n": 9,
+   "edges": [
+    [
+     1,
+     1
+    ],
+    [
+     4,
+     1
+    ],
+    [
+     7,
+     3
+    ],
+    [
+     5,
+     4
+    ],
+    [
+     6,
+     4
+    ]
+   ],
+   "link": [
+    {
+     "a": 0,
+     "b": 1,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 2,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 8,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 1,
+     "b": 2,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 1,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 1,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 3.0
+    },
+    {
+     "a": 1,
+     "b": 5,
+     "commonNeighbors": 1.0,
+     "jaccard": 1.0,
+     "adamicAdar": 0.9102392266268373,
+     "resourceAllocation": 0.3333333333333333,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 1,
+     "b": 6,
+     "commonNeighbors": 1.0,
+     "jaccard": 1.0,
+     "adamicAdar": 0.9102392266268373,
+     "resourceAllocation": 0.3333333333333333,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 1,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 1,
+     "b": 8,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 2,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 2,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 2,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 2,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 2,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 2,
+     "b": 8,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 3,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 3.0
+    },
+    {
+     "a": 3,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 3,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 3,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 3,
+     "b": 8,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 4,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 3.0
+    },
+    {
+     "a": 4,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 3.0
+    },
+    {
+     "a": 4,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 3.0
+    },
+    {
+     "a": 4,
+     "b": 8,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 5,
+     "b": 6,
+     "commonNeighbors": 1.0,
+     "jaccard": 1.0,
+     "adamicAdar": 0.9102392266268373,
+     "resourceAllocation": 0.3333333333333333,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 5,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 5,
+     "b": 8,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 6,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 6,
+     "b": 8,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 7,
+     "b": 8,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    }
+   ],
+   "closeness": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.125,
+    0.16666666666666666,
+    0.16666666666666666,
+    0.125,
+    0.0
+   ],
+   "clustering": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+   ],
+   "triangleAssignments": 0
+  },
+  {
+   "id": "random_13",
+   "n": 8,
+   "edges": [
+    [
+     2,
+     0
+    ]
+   ],
+   "link": [
+    {
+     "a": 0,
+     "b": 1,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 2,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 0,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 1,
+     "b": 2,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 1,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 1,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 1,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 1,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 1,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 2,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 2,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 2,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 2,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 2,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 3,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 3,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 3,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 3,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 4,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 4,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 4,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 5,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 5,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 6,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    }
+   ],
+   "closeness": [
+    0.0,
+    0.0,
+    0.14285714285714285,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+   ],
+   "clustering": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+   ],
+   "triangleAssignments": 0
+  },
+  {
+   "id": "random_14",
+   "n": 9,
+   "edges": [
+    [
+     4,
+     3
+    ],
+    [
+     4,
+     8
+    ],
+    [
+     3,
+     4
+    ],
+    [
+     4,
+     7
+    ],
+    [
+     5,
+     3
+    ],
+    [
+     8,
+     0
+    ],
+    [
+     3,
+     4
+    ],
+    [
+     8,
+     4
+    ],
+    [
+     0,
+     5
+    ],
+    [
+     0,
+     7
+    ],
+    [
+     1,
+     6
+    ],
+    [
+     5,
+     2
+    ],
+    [
+     0,
+     1
+    ],
+    [
+     1,
+     6
+    ],
+    [
+     6,
+     4
+    ],
+    [
+     6,
+     3
+    ],
+    [
+     2,
+     6
+    ],
+    [
+     7,
+     2
+    ]
+   ],
+   "link": [
+    {
+     "a": 0,
+     "b": 1,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 8.0
+    },
+    {
+     "a": 0,
+     "b": 2,
+     "commonNeighbors": 2.0,
+     "jaccard": 0.4,
+     "adamicAdar": 1.8204784532536746,
+     "resourceAllocation": 0.6666666666666666,
+     "preferentialAttachment": 12.0
+    },
+    {
+     "a": 0,
+     "b": 3,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.16666666666666666,
+     "adamicAdar": 0.9102392266268373,
+     "resourceAllocation": 0.3333333333333333,
+     "preferentialAttachment": 12.0
+    },
+    {
+     "a": 0,
+     "b": 4,
+     "commonNeighbors": 2.0,
+     "jaccard": 0.3333333333333333,
+     "adamicAdar": 2.352934267515801,
+     "resourceAllocation": 0.8333333333333333,
+     "preferentialAttachment": 16.0
+    },
+    {
+     "a": 0,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 12.0
+    },
+    {
+     "a": 0,
+     "b": 6,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.14285714285714285,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 16.0
+    },
+    {
+     "a": 0,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 12.0
+    },
+    {
+     "a": 0,
+     "b": 8,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 8.0
+    },
+    {
+     "a": 1,
+     "b": 2,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.25,
+     "adamicAdar": 0.7213475204444817,
+     "resourceAllocation": 0.25,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 1,
+     "b": 3,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.25,
+     "adamicAdar": 0.7213475204444817,
+     "resourceAllocation": 0.25,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 1,
+     "b": 4,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.2,
+     "adamicAdar": 0.7213475204444817,
+     "resourceAllocation": 0.25,
+     "preferentialAttachment": 8.0
+    },
+    {
+     "a": 1,
+     "b": 5,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.25,
+     "adamicAdar": 0.7213475204444817,
+     "resourceAllocation": 0.25,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 1,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 8.0
+    },
+    {
+     "a": 1,
+     "b": 7,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.25,
+     "adamicAdar": 0.7213475204444817,
+     "resourceAllocation": 0.25,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 1,
+     "b": 8,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.3333333333333333,
+     "adamicAdar": 0.7213475204444817,
+     "resourceAllocation": 0.25,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 2,
+     "b": 3,
+     "commonNeighbors": 2.0,
+     "jaccard": 0.5,
+     "adamicAdar": 1.631586747071319,
+     "resourceAllocation": 0.5833333333333333,
+     "preferentialAttachment": 9.0
+    },
+    {
+     "a": 2,
+     "b": 4,
+     "commonNeighbors": 2.0,
+     "jaccard": 0.4,
+     "adamicAdar": 1.631586747071319,
+     "resourceAllocation": 0.5833333333333333,
+     "preferentialAttachment": 12.0
+    },
+    {
+     "a": 2,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 9.0
+    },
+    {
+     "a": 2,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 12.0
+    },
+    {
+     "a": 2,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 9.0
+    },
+    {
+     "a": 2,
+     "b": 8,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 3,
+     "b": 4,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.16666666666666666,
+     "adamicAdar": 0.7213475204444817,
+     "resourceAllocation": 0.25,
+     "preferentialAttachment": 12.0
+    },
+    {
+     "a": 3,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 9.0
+    },
+    {
+     "a": 3,
+     "b": 6,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.16666666666666666,
+     "adamicAdar": 0.7213475204444817,
+     "resourceAllocation": 0.25,
+     "preferentialAttachment": 12.0
+    },
+    {
+     "a": 3,
+     "b": 7,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.2,
+     "adamicAdar": 0.7213475204444817,
+     "resourceAllocation": 0.25,
+     "preferentialAttachment": 9.0
+    },
+    {
+     "a": 3,
+     "b": 8,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.25,
+     "adamicAdar": 0.7213475204444817,
+     "resourceAllocation": 0.25,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 4,
+     "b": 5,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.16666666666666666,
+     "adamicAdar": 0.9102392266268373,
+     "resourceAllocation": 0.3333333333333333,
+     "preferentialAttachment": 12.0
+    },
+    {
+     "a": 4,
+     "b": 6,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.14285714285714285,
+     "adamicAdar": 0.9102392266268373,
+     "resourceAllocation": 0.3333333333333333,
+     "preferentialAttachment": 16.0
+    },
+    {
+     "a": 4,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 12.0
+    },
+    {
+     "a": 4,
+     "b": 8,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 8.0
+    },
+    {
+     "a": 5,
+     "b": 6,
+     "commonNeighbors": 2.0,
+     "jaccard": 0.4,
+     "adamicAdar": 1.8204784532536746,
+     "resourceAllocation": 0.6666666666666666,
+     "preferentialAttachment": 12.0
+    },
+    {
+     "a": 5,
+     "b": 7,
+     "commonNeighbors": 2.0,
+     "jaccard": 0.5,
+     "adamicAdar": 1.631586747071319,
+     "resourceAllocation": 0.5833333333333333,
+     "preferentialAttachment": 9.0
+    },
+    {
+     "a": 5,
+     "b": 8,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.25,
+     "adamicAdar": 0.7213475204444817,
+     "resourceAllocation": 0.25,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 6,
+     "b": 7,
+     "commonNeighbors": 2.0,
+     "jaccard": 0.4,
+     "adamicAdar": 1.631586747071319,
+     "resourceAllocation": 0.5833333333333333,
+     "preferentialAttachment": 12.0
+    },
+    {
+     "a": 6,
+     "b": 8,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.2,
+     "adamicAdar": 0.7213475204444817,
+     "resourceAllocation": 0.25,
+     "preferentialAttachment": 8.0
+    },
+    {
+     "a": 7,
+     "b": 8,
+     "commonNeighbors": 2.0,
+     "jaccard": 0.6666666666666666,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 6.0
+    }
+   ],
+   "closeness": [
+    0.5,
+    0.3333333333333333,
+    0.32,
+    0.34782608695652173,
+    0.5,
+    0.38095238095238093,
+    0.4,
+    0.26666666666666666,
+    0.5
+   ],
+   "clustering": [
+    0.0,
+    0.0,
+    0.0,
+    0.3333333333333333,
+    0.16666666666666666,
+    0.0,
+    0.16666666666666666,
+    0.0,
+    0.0
+   ],
+   "triangleAssignments": 0
+  },
+  {
+   "id": "random_15",
+   "n": 7,
+   "edges": [
+    [
+     6,
+     4
+    ],
+    [
+     1,
+     1
+    ],
+    [
+     1,
+     0
+    ],
+    [
+     1,
+     5
+    ],
+    [
+     0,
+     5
+    ],
+    [
+     0,
+     0
+    ],
+    [
+     1,
+     4
+    ],
+    [
+     3,
+     3
+    ],
+    [
+     2,
+     0
+    ],
+    [
+     6,
+     6
+    ],
+    [
+     3,
+     2
+    ],
+    [
+     3,
+     6
+    ],
+    [
+     6,
+     3
+    ],
+    [
+     5,
+     0
+    ],
+    [
+     4,
+     0
+    ],
+    [
+     0,
+     3
+    ],
+    [
+     5,
+     1
+    ],
+    [
+     6,
+     1
+    ]
+   ],
+   "link": [
+    {
+     "a": 0,
+     "b": 1,
+     "commonNeighbors": 2.0,
+     "jaccard": 0.2857142857142857,
+     "adamicAdar": 2.352934267515801,
+     "resourceAllocation": 0.8333333333333333,
+     "preferentialAttachment": 20.0
+    },
+    {
+     "a": 0,
+     "b": 2,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.16666666666666666,
+     "adamicAdar": 0.9102392266268373,
+     "resourceAllocation": 0.3333333333333333,
+     "preferentialAttachment": 10.0
+    },
+    {
+     "a": 0,
+     "b": 3,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.14285714285714285,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 15.0
+    },
+    {
+     "a": 0,
+     "b": 4,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.14285714285714285,
+     "adamicAdar": 0.7213475204444817,
+     "resourceAllocation": 0.25,
+     "preferentialAttachment": 15.0
+    },
+    {
+     "a": 0,
+     "b": 5,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.16666666666666666,
+     "adamicAdar": 0.7213475204444817,
+     "resourceAllocation": 0.25,
+     "preferentialAttachment": 10.0
+    },
+    {
+     "a": 0,
+     "b": 6,
+     "commonNeighbors": 3.0,
+     "jaccard": 0.6,
+     "adamicAdar": 2.541825973698156,
+     "resourceAllocation": 0.9166666666666666,
+     "preferentialAttachment": 15.0
+    },
+    {
+     "a": 1,
+     "b": 2,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.2,
+     "adamicAdar": 0.6213349345596119,
+     "resourceAllocation": 0.2,
+     "preferentialAttachment": 8.0
+    },
+    {
+     "a": 1,
+     "b": 3,
+     "commonNeighbors": 2.0,
+     "jaccard": 0.4,
+     "adamicAdar": 1.531574161186449,
+     "resourceAllocation": 0.5333333333333333,
+     "preferentialAttachment": 12.0
+    },
+    {
+     "a": 1,
+     "b": 4,
+     "commonNeighbors": 2.0,
+     "jaccard": 0.4,
+     "adamicAdar": 1.531574161186449,
+     "resourceAllocation": 0.5333333333333333,
+     "preferentialAttachment": 12.0
+    },
+    {
+     "a": 1,
+     "b": 5,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.2,
+     "adamicAdar": 0.6213349345596119,
+     "resourceAllocation": 0.2,
+     "preferentialAttachment": 8.0
+    },
+    {
+     "a": 1,
+     "b": 6,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.16666666666666666,
+     "adamicAdar": 0.9102392266268373,
+     "resourceAllocation": 0.3333333333333333,
+     "preferentialAttachment": 12.0
+    },
+    {
+     "a": 2,
+     "b": 3,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.25,
+     "adamicAdar": 0.6213349345596119,
+     "resourceAllocation": 0.2,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 2,
+     "b": 4,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.25,
+     "adamicAdar": 0.6213349345596119,
+     "resourceAllocation": 0.2,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 2,
+     "b": 5,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.3333333333333333,
+     "adamicAdar": 0.6213349345596119,
+     "resourceAllocation": 0.2,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 2,
+     "b": 6,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.25,
+     "adamicAdar": 0.9102392266268373,
+     "resourceAllocation": 0.3333333333333333,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 3,
+     "b": 4,
+     "commonNeighbors": 2.0,
+     "jaccard": 0.5,
+     "adamicAdar": 1.531574161186449,
+     "resourceAllocation": 0.5333333333333333,
+     "preferentialAttachment": 9.0
+    },
+    {
+     "a": 3,
+     "b": 5,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.25,
+     "adamicAdar": 0.6213349345596119,
+     "resourceAllocation": 0.2,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 3,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 9.0
+    },
+    {
+     "a": 4,
+     "b": 5,
+     "commonNeighbors": 2.0,
+     "jaccard": 0.6666666666666666,
+     "adamicAdar": 1.3426824550040934,
+     "resourceAllocation": 0.45,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 4,
+     "b": 6,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.2,
+     "adamicAdar": 0.7213475204444817,
+     "resourceAllocation": 0.25,
+     "preferentialAttachment": 9.0
+    },
+    {
+     "a": 5,
+     "b": 6,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.25,
+     "adamicAdar": 0.7213475204444817,
+     "resourceAllocation": 0.25,
+     "preferentialAttachment": 6.0
+    }
+   ],
+   "closeness": [
+    0.5454545454545454,
+    0.5454545454545454,
+    0.4,
+    0.5454545454545454,
+    0.42857142857142855,
+    0.5,
+    0.6666666666666666
+   ],
+   "clustering": [
+    0.3,
+    0.5,
+    1.0,
+    0.3333333333333333,
+    0.6666666666666666,
+    1.0,
+    0.3333333333333333
+   ],
+   "triangleAssignments": 18
+  },
+  {
+   "id": "random_16",
+   "n": 4,
+   "edges": [
+    [
+     0,
+     2
+    ],
+    [
+     3,
+     1
+    ],
+    [
+     2,
+     1
+    ],
+    [
+     2,
+     0
+    ]
+   ],
+   "link": [
+    {
+     "a": 0,
+     "b": 1,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.5,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 0,
+     "b": 2,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 0,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 1,
+     "b": 2,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 1,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 2,
+     "b": 3,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.5,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 2.0
+    }
+   ],
+   "closeness": [
+    0.4444444444444444,
+    0.0,
+    0.6666666666666666,
+    0.3333333333333333
+   ],
+   "clustering": [
+    0.0,
+    0.0,
+    0.0,
+    0.0
+   ],
+   "triangleAssignments": 0
+  },
+  {
+   "id": "random_17",
+   "n": 7,
+   "edges": [
+    [
+     5,
+     3
+    ],
+    [
+     1,
+     0
+    ],
+    [
+     2,
+     2
+    ]
+   ],
+   "link": [
+    {
+     "a": 0,
+     "b": 1,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 0,
+     "b": 2,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 0,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 0,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 1,
+     "b": 2,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 1,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 1,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 1,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 1,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 2,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 2,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 2,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 2,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 3,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 3,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 3,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 4,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 4,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 5,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    }
+   ],
+   "closeness": [
+    0.0,
+    0.16666666666666666,
+    0.0,
+    0.0,
+    0.0,
+    0.16666666666666666,
+    0.0
+   ],
+   "clustering": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+   ],
+   "triangleAssignments": 0
+  },
+  {
+   "id": "random_18",
+   "n": 9,
+   "edges": [
+    [
+     3,
+     7
+    ],
+    [
+     1,
+     7
+    ],
+    [
+     6,
+     5
+    ]
+   ],
+   "link": [
+    {
+     "a": 0,
+     "b": 1,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 2,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 8,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 1,
+     "b": 2,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 1,
+     "b": 3,
+     "commonNeighbors": 1.0,
+     "jaccard": 1.0,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 1,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 1,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 1,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 1,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 1,
+     "b": 8,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 2,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 2,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 2,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 2,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 2,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 2,
+     "b": 8,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 3,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 3,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 3,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 3,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 3,
+     "b": 8,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 4,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 4,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 4,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 4,
+     "b": 8,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 5,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 5,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 5,
+     "b": 8,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 6,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 6,
+     "b": 8,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 7,
+     "b": 8,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    }
+   ],
+   "closeness": [
+    0.0,
+    0.125,
+    0.0,
+    0.125,
+    0.0,
+    0.0,
+    0.125,
+    0.0,
+    0.0
+   ],
+   "clustering": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+   ],
+   "triangleAssignments": 0
+  },
+  {
+   "id": "random_19",
+   "n": 7,
+   "edges": [
+    [
+     3,
+     6
+    ],
+    [
+     5,
+     6
+    ],
+    [
+     1,
+     5
+    ],
+    [
+     1,
+     1
+    ]
+   ],
+   "link": [
+    {
+     "a": 0,
+     "b": 1,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 2,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 1,
+     "b": 2,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 1,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 1,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 1,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 1,
+     "b": 6,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.5,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 2,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 2,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 2,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 2,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 3,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 3,
+     "b": 5,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.5,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 3,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 4,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 4,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 5,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 4.0
+    }
+   ],
+   "closeness": [
+    0.0,
+    0.2222222222222222,
+    0.0,
+    0.16666666666666666,
+    0.0,
+    0.16666666666666666,
+    0.0
+   ],
+   "clustering": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+   ],
+   "triangleAssignments": 0
+  },
+  {
+   "id": "random_20",
+   "n": 4,
+   "edges": [
+    [
+     1,
+     1
+    ]
+   ],
+   "link": [
+    {
+     "a": 0,
+     "b": 1,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 2,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 1,
+     "b": 2,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 1,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 2,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    }
+   ],
+   "closeness": [
+    0.0,
+    0.0,
+    0.0,
+    0.0
+   ],
+   "clustering": [
+    0.0,
+    0.0,
+    0.0,
+    0.0
+   ],
+   "triangleAssignments": 0
+  },
+  {
+   "id": "random_21",
+   "n": 8,
+   "edges": [
+    [
+     2,
+     3
+    ],
+    [
+     3,
+     7
+    ],
+    [
+     5,
+     2
+    ],
+    [
+     7,
+     3
+    ],
+    [
+     7,
+     0
+    ]
+   ],
+   "link": [
+    {
+     "a": 0,
+     "b": 1,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 2,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 0,
+     "b": 3,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.5,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 0,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 0,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 1,
+     "b": 2,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 1,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 1,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 1,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 1,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 1,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 2,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 2,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 2,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 2,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 2,
+     "b": 7,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.3333333333333333,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 3,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 3,
+     "b": 5,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.5,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 3,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 3,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 4,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 4,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 4,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 5,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 5,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 6,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    }
+   ],
+   "closeness": [
+    0.0,
+    0.0,
+    0.21428571428571427,
+    0.19047619047619047,
+    0.0,
+    0.22857142857142856,
+    0.0,
+    0.2857142857142857
+   ],
+   "clustering": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+   ],
+   "triangleAssignments": 0
+  },
+  {
+   "id": "random_22",
+   "n": 6,
+   "edges": [
+    [
+     2,
+     0
+    ],
+    [
+     1,
+     5
+    ],
+    [
+     1,
+     0
+    ],
+    [
+     5,
+     3
+    ]
+   ],
+   "link": [
+    {
+     "a": 0,
+     "b": 1,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 0,
+     "b": 2,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 0,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 0,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 5,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.3333333333333333,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 1,
+     "b": 2,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.5,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 1,
+     "b": 3,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.5,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 1,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 1,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 2,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 2,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 2,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 3,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 3,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 4,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    }
+   ],
+   "closeness": [
+    0.0,
+    0.44999999999999996,
+    0.2,
+    0.0,
+    0.0,
+    0.2
+   ],
+   "clustering": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+   ],
+   "triangleAssignments": 0
+  },
+  {
+   "id": "random_23",
+   "n": 5,
+   "edges": [
+    [
+     1,
+     1
+    ],
+    [
+     3,
+     2
+    ],
+    [
+     2,
+     1
+    ],
+    [
+     1,
+     3
+    ],
+    [
+     1,
+     2
+    ],
+    [
+     1,
+     3
+    ],
+    [
+     1,
+     1
+    ],
+    [
+     4,
+     4
+    ],
+    [
+     1,
+     2
+    ],
+    [
+     4,
+     3
+    ],
+    [
+     1,
+     4
+    ],
+    [
+     1,
+     4
+    ],
+    [
+     3,
+     1
+    ],
+    [
+     1,
+     3
+    ],
+    [
+     1,
+     1
+    ],
+    [
+     1,
+     4
+    ]
+   ],
+   "link": [
+    {
+     "a": 0,
+     "b": 1,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 2,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 1,
+     "b": 2,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.25,
+     "adamicAdar": 0.9102392266268373,
+     "resourceAllocation": 0.3333333333333333,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 1,
+     "b": 3,
+     "commonNeighbors": 2.0,
+     "jaccard": 0.5,
+     "adamicAdar": 2.8853900817779268,
+     "resourceAllocation": 1.0,
+     "preferentialAttachment": 9.0
+    },
+    {
+     "a": 1,
+     "b": 4,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.25,
+     "adamicAdar": 0.9102392266268373,
+     "resourceAllocation": 0.3333333333333333,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 2,
+     "b": 3,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.25,
+     "adamicAdar": 0.9102392266268373,
+     "resourceAllocation": 0.3333333333333333,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 2,
+     "b": 4,
+     "commonNeighbors": 2.0,
+     "jaccard": 1.0,
+     "adamicAdar": 1.8204784532536746,
+     "resourceAllocation": 0.6666666666666666,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 3,
+     "b": 4,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.25,
+     "adamicAdar": 0.9102392266268373,
+     "resourceAllocation": 0.3333333333333333,
+     "preferentialAttachment": 6.0
+    }
+   ],
+   "closeness": [
+    0.0,
+    0.75,
+    0.44999999999999996,
+    0.5625,
+    0.44999999999999996
+   ],
+   "clustering": [
+    0.0,
+    0.6666666666666666,
+    1.0,
+    0.6666666666666666,
+    1.0
+   ],
+   "triangleAssignments": 69
+  },
+  {
+   "id": "random_24",
+   "n": 4,
+   "edges": [
+    [
+     0,
+     3
+    ],
+    [
+     2,
+     2
+    ],
+    [
+     1,
+     2
+    ],
+    [
+     3,
+     3
+    ],
+    [
+     0,
+     0
+    ],
+    [
+     1,
+     1
+    ],
+    [
+     3,
+     1
+    ],
+    [
+     0,
+     3
+    ],
+    [
+     0,
+     1
+    ],
+    [
+     2,
+     3
+    ]
+   ],
+   "link": [
+    {
+     "a": 0,
+     "b": 1,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.25,
+     "adamicAdar": 0.9102392266268373,
+     "resourceAllocation": 0.3333333333333333,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 0,
+     "b": 2,
+     "commonNeighbors": 2.0,
+     "jaccard": 1.0,
+     "adamicAdar": 1.8204784532536746,
+     "resourceAllocation": 0.6666666666666666,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 0,
+     "b": 3,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.25,
+     "adamicAdar": 0.9102392266268373,
+     "resourceAllocation": 0.3333333333333333,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 1,
+     "b": 2,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.25,
+     "adamicAdar": 0.9102392266268373,
+     "resourceAllocation": 0.3333333333333333,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 1,
+     "b": 3,
+     "commonNeighbors": 2.0,
+     "jaccard": 0.5,
+     "adamicAdar": 2.8853900817779268,
+     "resourceAllocation": 1.0,
+     "preferentialAttachment": 9.0
+    },
+    {
+     "a": 2,
+     "b": 3,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.25,
+     "adamicAdar": 0.9102392266268373,
+     "resourceAllocation": 0.3333333333333333,
+     "preferentialAttachment": 6.0
+    }
+   ],
+   "closeness": [
+    0.75,
+    0.4444444444444444,
+    0.4444444444444444,
+    0.4444444444444444
+   ],
+   "clustering": [
+    1.0,
+    0.6666666666666666,
+    1.0,
+    0.6666666666666666
+   ],
+   "triangleAssignments": 3
+  },
+  {
+   "id": "random_25",
+   "n": 6,
+   "edges": [
+    [
+     2,
+     5
+    ],
+    [
+     3,
+     3
+    ],
+    [
+     4,
+     5
+    ],
+    [
+     0,
+     1
+    ],
+    [
+     4,
+     1
+    ],
+    [
+     1,
+     0
+    ],
+    [
+     3,
+     2
+    ],
+    [
+     3,
+     0
+    ],
+    [
+     0,
+     0
+    ],
+    [
+     4,
+     0
+    ],
+    [
+     1,
+     4
+    ],
+    [
+     5,
+     4
+    ]
+   ],
+   "link": [
+    {
+     "a": 0,
+     "b": 1,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.25,
+     "adamicAdar": 0.9102392266268373,
+     "resourceAllocation": 0.3333333333333333,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 0,
+     "b": 2,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.25,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 0,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 0,
+     "b": 4,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.2,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 9.0
+    },
+    {
+     "a": 0,
+     "b": 5,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.25,
+     "adamicAdar": 0.9102392266268373,
+     "resourceAllocation": 0.3333333333333333,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 1,
+     "b": 2,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 1,
+     "b": 3,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.3333333333333333,
+     "adamicAdar": 0.9102392266268373,
+     "resourceAllocation": 0.3333333333333333,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 1,
+     "b": 4,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.25,
+     "adamicAdar": 0.9102392266268373,
+     "resourceAllocation": 0.3333333333333333,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 1,
+     "b": 5,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.3333333333333333,
+     "adamicAdar": 0.9102392266268373,
+     "resourceAllocation": 0.3333333333333333,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 2,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 2,
+     "b": 4,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.25,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 2,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 3,
+     "b": 4,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.25,
+     "adamicAdar": 0.9102392266268373,
+     "resourceAllocation": 0.3333333333333333,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 3,
+     "b": 5,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.3333333333333333,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 4,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 6.0
+    }
+   ],
+   "closeness": [
+    0.3,
+    0.44999999999999996,
+    0.35555555555555557,
+    0.5555555555555556,
+    0.6,
+    0.36
+   ],
+   "clustering": [
+    0.3333333333333333,
+    1.0,
+    0.0,
+    0.0,
+    0.3333333333333333,
+    0.0
+   ],
+   "triangleAssignments": 6
+  },
+  {
+   "id": "random_26",
+   "n": 8,
+   "edges": [
+    [
+     4,
+     6
+    ],
+    [
+     1,
+     7
+    ],
+    [
+     1,
+     5
+    ]
+   ],
+   "link": [
+    {
+     "a": 0,
+     "b": 1,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 2,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 1,
+     "b": 2,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 1,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 1,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 1,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 1,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 1,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 2,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 2,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 2,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 2,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 2,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 3,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 3,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 3,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 3,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 4,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 4,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 4,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 5,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 5,
+     "b": 7,
+     "commonNeighbors": 1.0,
+     "jaccard": 1.0,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 6,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 1.0
+    }
+   ],
+   "closeness": [
+    0.0,
+    0.2857142857142857,
+    0.0,
+    0.0,
+    0.14285714285714285,
+    0.0,
+    0.0,
+    0.0
+   ],
+   "clustering": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+   ],
+   "triangleAssignments": 0
+  },
+  {
+   "id": "random_27",
+   "n": 5,
+   "edges": [
+    [
+     1,
+     0
+    ],
+    [
+     4,
+     4
+    ],
+    [
+     1,
+     3
+    ],
+    [
+     1,
+     0
+    ],
+    [
+     4,
+     1
+    ],
+    [
+     3,
+     0
+    ],
+    [
+     1,
+     4
+    ],
+    [
+     4,
+     3
+    ],
+    [
+     3,
+     4
+    ],
+    [
+     3,
+     4
+    ],
+    [
+     4,
+     0
+    ],
+    [
+     3,
+     2
+    ],
+    [
+     4,
+     0
+    ],
+    [
+     3,
+     3
+    ],
+    [
+     0,
+     4
+    ],
+    [
+     0,
+     0
+    ],
+    [
+     0,
+     4
+    ],
+    [
+     2,
+     1
+    ]
+   ],
+   "link": [
+    {
+     "a": 0,
+     "b": 1,
+     "commonNeighbors": 2.0,
+     "jaccard": 0.4,
+     "adamicAdar": 1.631586747071319,
+     "resourceAllocation": 0.5833333333333333,
+     "preferentialAttachment": 12.0
+    },
+    {
+     "a": 0,
+     "b": 2,
+     "commonNeighbors": 2.0,
+     "jaccard": 0.6666666666666666,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 0,
+     "b": 3,
+     "commonNeighbors": 2.0,
+     "jaccard": 0.4,
+     "adamicAdar": 1.631586747071319,
+     "resourceAllocation": 0.5833333333333333,
+     "preferentialAttachment": 12.0
+    },
+    {
+     "a": 0,
+     "b": 4,
+     "commonNeighbors": 2.0,
+     "jaccard": 0.5,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 9.0
+    },
+    {
+     "a": 1,
+     "b": 2,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.2,
+     "adamicAdar": 0.7213475204444817,
+     "resourceAllocation": 0.25,
+     "preferentialAttachment": 8.0
+    },
+    {
+     "a": 1,
+     "b": 3,
+     "commonNeighbors": 3.0,
+     "jaccard": 0.6,
+     "adamicAdar": 3.263173494142638,
+     "resourceAllocation": 1.1666666666666665,
+     "preferentialAttachment": 16.0
+    },
+    {
+     "a": 1,
+     "b": 4,
+     "commonNeighbors": 2.0,
+     "jaccard": 0.4,
+     "adamicAdar": 1.631586747071319,
+     "resourceAllocation": 0.5833333333333333,
+     "preferentialAttachment": 12.0
+    },
+    {
+     "a": 2,
+     "b": 3,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.2,
+     "adamicAdar": 0.7213475204444817,
+     "resourceAllocation": 0.25,
+     "preferentialAttachment": 8.0
+    },
+    {
+     "a": 2,
+     "b": 4,
+     "commonNeighbors": 2.0,
+     "jaccard": 0.6666666666666666,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 3,
+     "b": 4,
+     "commonNeighbors": 2.0,
+     "jaccard": 0.4,
+     "adamicAdar": 1.631586747071319,
+     "resourceAllocation": 0.5833333333333333,
+     "preferentialAttachment": 12.0
+    }
+   ],
+   "closeness": [
+    0.5,
+    0.8,
+    0.5714285714285714,
+    0.8,
+    0.8
+   ],
+   "clustering": [
+    1.0,
+    0.6666666666666666,
+    1.0,
+    0.6666666666666666,
+    1.0
+   ],
+   "triangleAssignments": 66
+  },
+  {
+   "id": "random_28",
+   "n": 3,
+   "edges": [
+    [
+     1,
+     2
+    ],
+    [
+     2,
+     2
+    ],
+    [
+     2,
+     1
+    ],
+    [
+     2,
+     1
+    ],
+    [
+     2,
+     2
+    ],
+    [
+     2,
+     2
+    ],
+    [
+     1,
+     2
+    ]
+   ],
+   "link": [
+    {
+     "a": 0,
+     "b": 1,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 2,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 1,
+     "b": 2,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 1.0
+    }
+   ],
+   "closeness": [
+    0.0,
+    0.5,
+    0.5
+   ],
+   "clustering": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "triangleAssignments": 42
+  },
+  {
+   "id": "random_29",
+   "n": 7,
+   "edges": [
+    [
+     6,
+     5
+    ]
+   ],
+   "link": [
+    {
+     "a": 0,
+     "b": 1,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 2,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 1,
+     "b": 2,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 1,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 1,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 1,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 1,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 2,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 2,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 2,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 2,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 3,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 3,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 3,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 4,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 4,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 5,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 1.0
+    }
+   ],
+   "closeness": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.16666666666666666
+   ],
+   "clustering": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+   ],
+   "triangleAssignments": 0
+  },
+  {
+   "id": "random_30",
+   "n": 4,
+   "edges": [
+    [
+     2,
+     0
+    ],
+    [
+     2,
+     0
+    ],
+    [
+     2,
+     1
+    ]
+   ],
+   "link": [
+    {
+     "a": 0,
+     "b": 1,
+     "commonNeighbors": 1.0,
+     "jaccard": 1.0,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 0,
+     "b": 2,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 0,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 1,
+     "b": 2,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 1,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 2,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    }
+   ],
+   "closeness": [
+    0.0,
+    0.0,
+    0.6666666666666666,
+    0.0
+   ],
+   "clustering": [
+    0.0,
+    0.0,
+    0.0,
+    0.0
+   ],
+   "triangleAssignments": 0
+  },
+  {
+   "id": "random_31",
+   "n": 5,
+   "edges": [],
+   "link": [
+    {
+     "a": 0,
+     "b": 1,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 2,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 1,
+     "b": 2,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 1,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 1,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 2,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 2,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 3,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    }
+   ],
+   "closeness": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+   ],
+   "clustering": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+   ],
+   "triangleAssignments": 0
+  },
+  {
+   "id": "random_32",
+   "n": 5,
+   "edges": [
+    [
+     0,
+     0
+    ],
+    [
+     1,
+     4
+    ],
+    [
+     1,
+     0
+    ],
+    [
+     0,
+     1
+    ],
+    [
+     1,
+     2
+    ],
+    [
+     4,
+     1
+    ],
+    [
+     2,
+     3
+    ],
+    [
+     3,
+     1
+    ],
+    [
+     3,
+     1
+    ],
+    [
+     2,
+     0
+    ],
+    [
+     0,
+     4
+    ]
+   ],
+   "link": [
+    {
+     "a": 0,
+     "b": 1,
+     "commonNeighbors": 2.0,
+     "jaccard": 0.4,
+     "adamicAdar": 2.352934267515801,
+     "resourceAllocation": 0.8333333333333333,
+     "preferentialAttachment": 12.0
+    },
+    {
+     "a": 0,
+     "b": 2,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.2,
+     "adamicAdar": 0.7213475204444817,
+     "resourceAllocation": 0.25,
+     "preferentialAttachment": 9.0
+    },
+    {
+     "a": 0,
+     "b": 3,
+     "commonNeighbors": 2.0,
+     "jaccard": 0.6666666666666666,
+     "adamicAdar": 1.631586747071319,
+     "resourceAllocation": 0.5833333333333333,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 0,
+     "b": 4,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.25,
+     "adamicAdar": 0.7213475204444817,
+     "resourceAllocation": 0.25,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 1,
+     "b": 2,
+     "commonNeighbors": 2.0,
+     "jaccard": 0.4,
+     "adamicAdar": 2.352934267515801,
+     "resourceAllocation": 0.8333333333333333,
+     "preferentialAttachment": 12.0
+    },
+    {
+     "a": 1,
+     "b": 3,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.2,
+     "adamicAdar": 0.9102392266268373,
+     "resourceAllocation": 0.3333333333333333,
+     "preferentialAttachment": 8.0
+    },
+    {
+     "a": 1,
+     "b": 4,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.2,
+     "adamicAdar": 0.9102392266268373,
+     "resourceAllocation": 0.3333333333333333,
+     "preferentialAttachment": 8.0
+    },
+    {
+     "a": 2,
+     "b": 3,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.25,
+     "adamicAdar": 0.7213475204444817,
+     "resourceAllocation": 0.25,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 2,
+     "b": 4,
+     "commonNeighbors": 2.0,
+     "jaccard": 0.6666666666666666,
+     "adamicAdar": 1.631586747071319,
+     "resourceAllocation": 0.5833333333333333,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 3,
+     "b": 4,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.3333333333333333,
+     "adamicAdar": 0.7213475204444817,
+     "resourceAllocation": 0.25,
+     "preferentialAttachment": 4.0
+    }
+   ],
+   "closeness": [
+    0.5714285714285714,
+    0.8,
+    0.6666666666666666,
+    0.5714285714285714,
+    0.5
+   ],
+   "clustering": [
+    0.6666666666666666,
+    0.5,
+    0.6666666666666666,
+    1.0,
+    1.0
+   ],
+   "triangleAssignments": 15
+  },
+  {
+   "id": "random_33",
+   "n": 7,
+   "edges": [
+    [
+     1,
+     2
+    ],
+    [
+     5,
+     3
+    ],
+    [
+     3,
+     2
+    ],
+    [
+     5,
+     2
+    ],
+    [
+     4,
+     0
+    ],
+    [
+     3,
+     0
+    ],
+    [
+     5,
+     6
+    ],
+    [
+     1,
+     4
+    ],
+    [
+     1,
+     2
+    ],
+    [
+     3,
+     5
+    ],
+    [
+     4,
+     4
+    ],
+    [
+     5,
+     6
+    ],
+    [
+     3,
+     0
+    ],
+    [
+     4,
+     3
+    ],
+    [
+     6,
+     0
+    ]
+   ],
+   "link": [
+    {
+     "a": 0,
+     "b": 1,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.25,
+     "adamicAdar": 0.9102392266268373,
+     "resourceAllocation": 0.3333333333333333,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 0,
+     "b": 2,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.2,
+     "adamicAdar": 0.7213475204444817,
+     "resourceAllocation": 0.25,
+     "preferentialAttachment": 9.0
+    },
+    {
+     "a": 0,
+     "b": 3,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.16666666666666666,
+     "adamicAdar": 0.9102392266268373,
+     "resourceAllocation": 0.3333333333333333,
+     "preferentialAttachment": 12.0
+    },
+    {
+     "a": 0,
+     "b": 4,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.2,
+     "adamicAdar": 0.7213475204444817,
+     "resourceAllocation": 0.25,
+     "preferentialAttachment": 9.0
+    },
+    {
+     "a": 0,
+     "b": 5,
+     "commonNeighbors": 2.0,
+     "jaccard": 0.5,
+     "adamicAdar": 2.164042561333445,
+     "resourceAllocation": 0.75,
+     "preferentialAttachment": 9.0
+    },
+    {
+     "a": 0,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 1,
+     "b": 2,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 1,
+     "b": 3,
+     "commonNeighbors": 2.0,
+     "jaccard": 0.5,
+     "adamicAdar": 1.8204784532536746,
+     "resourceAllocation": 0.6666666666666666,
+     "preferentialAttachment": 8.0
+    },
+    {
+     "a": 1,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 1,
+     "b": 5,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.25,
+     "adamicAdar": 0.9102392266268373,
+     "resourceAllocation": 0.3333333333333333,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 1,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 2,
+     "b": 3,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.16666666666666666,
+     "adamicAdar": 0.9102392266268373,
+     "resourceAllocation": 0.3333333333333333,
+     "preferentialAttachment": 12.0
+    },
+    {
+     "a": 2,
+     "b": 4,
+     "commonNeighbors": 2.0,
+     "jaccard": 0.5,
+     "adamicAdar": 2.164042561333445,
+     "resourceAllocation": 0.75,
+     "preferentialAttachment": 9.0
+    },
+    {
+     "a": 2,
+     "b": 5,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.2,
+     "adamicAdar": 0.7213475204444817,
+     "resourceAllocation": 0.25,
+     "preferentialAttachment": 9.0
+    },
+    {
+     "a": 2,
+     "b": 6,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.25,
+     "adamicAdar": 0.9102392266268373,
+     "resourceAllocation": 0.3333333333333333,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 3,
+     "b": 4,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.16666666666666666,
+     "adamicAdar": 0.9102392266268373,
+     "resourceAllocation": 0.3333333333333333,
+     "preferentialAttachment": 12.0
+    },
+    {
+     "a": 3,
+     "b": 5,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.16666666666666666,
+     "adamicAdar": 0.9102392266268373,
+     "resourceAllocation": 0.3333333333333333,
+     "preferentialAttachment": 12.0
+    },
+    {
+     "a": 3,
+     "b": 6,
+     "commonNeighbors": 2.0,
+     "jaccard": 0.5,
+     "adamicAdar": 1.8204784532536746,
+     "resourceAllocation": 0.6666666666666666,
+     "preferentialAttachment": 8.0
+    },
+    {
+     "a": 4,
+     "b": 5,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.2,
+     "adamicAdar": 0.7213475204444817,
+     "resourceAllocation": 0.25,
+     "preferentialAttachment": 9.0
+    },
+    {
+     "a": 4,
+     "b": 6,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.25,
+     "adamicAdar": 0.9102392266268373,
+     "resourceAllocation": 0.3333333333333333,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 5,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 6.0
+    }
+   ],
+   "closeness": [
+    0.0,
+    0.46153846153846156,
+    0.0,
+    0.5333333333333333,
+    0.462962962962963,
+    0.5333333333333333,
+    0.16666666666666666
+   ],
+   "clustering": [
+    0.3333333333333333,
+    0.0,
+    0.3333333333333333,
+    0.3333333333333333,
+    0.3333333333333333,
+    0.3333333333333333,
+    0.0
+   ],
+   "triangleAssignments": 0
+  },
+  {
+   "id": "random_34",
+   "n": 4,
+   "edges": [
+    [
+     2,
+     2
+    ]
+   ],
+   "link": [
+    {
+     "a": 0,
+     "b": 1,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 2,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 1,
+     "b": 2,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 1,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 2,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    }
+   ],
+   "closeness": [
+    0.0,
+    0.0,
+    0.0,
+    0.0
+   ],
+   "clustering": [
+    0.0,
+    0.0,
+    0.0,
+    0.0
+   ],
+   "triangleAssignments": 0
+  },
+  {
+   "id": "random_35",
+   "n": 5,
+   "edges": [
+    [
+     0,
+     0
+    ],
+    [
+     1,
+     4
+    ],
+    [
+     4,
+     2
+    ],
+    [
+     3,
+     0
+    ],
+    [
+     4,
+     2
+    ],
+    [
+     1,
+     4
+    ]
+   ],
+   "link": [
+    {
+     "a": 0,
+     "b": 1,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 0,
+     "b": 2,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 0,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 0,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 1,
+     "b": 2,
+     "commonNeighbors": 1.0,
+     "jaccard": 1.0,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 1,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 1,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 2,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 2,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 3,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    }
+   ],
+   "closeness": [
+    0.0,
+    0.3333333333333333,
+    0.0,
+    0.25,
+    0.25
+   ],
+   "clustering": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+   ],
+   "triangleAssignments": 0
+  },
+  {
+   "id": "random_36",
+   "n": 9,
+   "edges": [
+    [
+     7,
+     8
+    ],
+    [
+     7,
+     8
+    ],
+    [
+     7,
+     5
+    ],
+    [
+     7,
+     6
+    ],
+    [
+     6,
+     3
+    ],
+    [
+     8,
+     5
+    ],
+    [
+     4,
+     1
+    ],
+    [
+     3,
+     7
+    ]
+   ],
+   "link": [
+    {
+     "a": 0,
+     "b": 1,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 2,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 8,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 1,
+     "b": 2,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 1,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 1,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 1,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 1,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 1,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 1,
+     "b": 8,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 2,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 2,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 2,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 2,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 2,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 2,
+     "b": 8,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 3,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 3,
+     "b": 5,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.3333333333333333,
+     "adamicAdar": 0.7213475204444817,
+     "resourceAllocation": 0.25,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 3,
+     "b": 6,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.3333333333333333,
+     "adamicAdar": 0.7213475204444817,
+     "resourceAllocation": 0.25,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 3,
+     "b": 7,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.2,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 8.0
+    },
+    {
+     "a": 3,
+     "b": 8,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.3333333333333333,
+     "adamicAdar": 0.7213475204444817,
+     "resourceAllocation": 0.25,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 4,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 4,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 4,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 4,
+     "b": 8,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 5,
+     "b": 6,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.3333333333333333,
+     "adamicAdar": 0.7213475204444817,
+     "resourceAllocation": 0.25,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 5,
+     "b": 7,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.2,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 8.0
+    },
+    {
+     "a": 5,
+     "b": 8,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.3333333333333333,
+     "adamicAdar": 0.7213475204444817,
+     "resourceAllocation": 0.25,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 6,
+     "b": 7,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.2,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 8.0
+    },
+    {
+     "a": 6,
+     "b": 8,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.3333333333333333,
+     "adamicAdar": 0.7213475204444817,
+     "resourceAllocation": 0.25,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 7,
+     "b": 8,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.2,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 8.0
+    }
+   ],
+   "closeness": [
+    0.0,
+    0.0,
+    0.0,
+    0.2857142857142857,
+    0.125,
+    0.0,
+    0.2222222222222222,
+    0.4,
+    0.125
+   ],
+   "clustering": [
+    0.0,
+    0.0,
+    0.0,
+    1.0,
+    0.0,
+    1.0,
+    1.0,
+    0.3333333333333333,
+    1.0
+   ],
+   "triangleAssignments": 3
+  },
+  {
+   "id": "random_37",
+   "n": 7,
+   "edges": [
+    [
+     0,
+     5
+    ],
+    [
+     6,
+     2
+    ],
+    [
+     1,
+     4
+    ],
+    [
+     1,
+     0
+    ],
+    [
+     4,
+     0
+    ]
+   ],
+   "link": [
+    {
+     "a": 0,
+     "b": 1,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.25,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 0,
+     "b": 2,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 3.0
+    },
+    {
+     "a": 0,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 4,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.25,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 0,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 3.0
+    },
+    {
+     "a": 0,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 3.0
+    },
+    {
+     "a": 1,
+     "b": 2,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 1,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 1,
+     "b": 4,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.3333333333333333,
+     "adamicAdar": 0.9102392266268373,
+     "resourceAllocation": 0.3333333333333333,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 1,
+     "b": 5,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.5,
+     "adamicAdar": 0.9102392266268373,
+     "resourceAllocation": 0.3333333333333333,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 1,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 2,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 2,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 2,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 2,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 3,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 3,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 3,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 4,
+     "b": 5,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.5,
+     "adamicAdar": 0.9102392266268373,
+     "resourceAllocation": 0.3333333333333333,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 4,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 5,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 1.0
+    }
+   ],
+   "closeness": [
+    0.16666666666666666,
+    0.375,
+    0.0,
+    0.0,
+    0.2222222222222222,
+    0.0,
+    0.16666666666666666
+   ],
+   "clustering": [
+    0.3333333333333333,
+    1.0,
+    0.0,
+    0.0,
+    1.0,
+    0.0,
+    0.0
+   ],
+   "triangleAssignments": 0
+  },
+  {
+   "id": "random_38",
+   "n": 8,
+   "edges": [
+    [
+     2,
+     1
+    ],
+    [
+     5,
+     5
+    ],
+    [
+     2,
+     1
+    ],
+    [
+     7,
+     5
+    ],
+    [
+     0,
+     0
+    ],
+    [
+     3,
+     2
+    ],
+    [
+     4,
+     3
+    ]
+   ],
+   "link": [
+    {
+     "a": 0,
+     "b": 1,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 2,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 0,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 1,
+     "b": 2,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 1,
+     "b": 3,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.5,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 1,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 1,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 1,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 1,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 2,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 2,
+     "b": 4,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.5,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 2,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 2,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 2,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 3,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 3,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 3,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 3,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 4,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 4,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 4,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 5,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    },
+    {
+     "a": 5,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 6,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 0.0
+    }
+   ],
+   "closeness": [
+    0.0,
+    0.0,
+    0.14285714285714285,
+    0.19047619047619047,
+    0.21428571428571427,
+    0.0,
+    0.0,
+    0.14285714285714285
+   ],
+   "clustering": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+   ],
+   "triangleAssignments": 0
+  },
+  {
+   "id": "random_39",
+   "n": 9,
+   "edges": [
+    [
+     3,
+     7
+    ],
+    [
+     1,
+     0
+    ],
+    [
+     8,
+     6
+    ],
+    [
+     1,
+     1
+    ],
+    [
+     7,
+     0
+    ],
+    [
+     6,
+     2
+    ],
+    [
+     1,
+     4
+    ],
+    [
+     7,
+     4
+    ],
+    [
+     5,
+     2
+    ]
+   ],
+   "link": [
+    {
+     "a": 0,
+     "b": 1,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 0,
+     "b": 2,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 0,
+     "b": 3,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.5,
+     "adamicAdar": 0.9102392266268373,
+     "resourceAllocation": 0.3333333333333333,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 0,
+     "b": 4,
+     "commonNeighbors": 2.0,
+     "jaccard": 1.0,
+     "adamicAdar": 2.352934267515801,
+     "resourceAllocation": 0.8333333333333333,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 0,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 0,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 0,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 0,
+     "b": 8,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 1,
+     "b": 2,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 1,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 1,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 1,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 1,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 1,
+     "b": 7,
+     "commonNeighbors": 2.0,
+     "jaccard": 0.6666666666666666,
+     "adamicAdar": 2.8853900817779268,
+     "resourceAllocation": 1.0,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 1,
+     "b": 8,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 2,
+     "b": 3,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 2,
+     "b": 4,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 2,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 2,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 2,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 2,
+     "b": 8,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.5,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 3,
+     "b": 4,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.5,
+     "adamicAdar": 0.9102392266268373,
+     "resourceAllocation": 0.3333333333333333,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 3,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 3,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 3,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 3.0
+    },
+    {
+     "a": 3,
+     "b": 8,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 4,
+     "b": 5,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 4,
+     "b": 6,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 4.0
+    },
+    {
+     "a": 4,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 4,
+     "b": 8,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 5,
+     "b": 6,
+     "commonNeighbors": 1.0,
+     "jaccard": 0.5,
+     "adamicAdar": 1.4426950408889634,
+     "resourceAllocation": 0.5,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 5,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 3.0
+    },
+    {
+     "a": 5,
+     "b": 8,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 1.0
+    },
+    {
+     "a": 6,
+     "b": 7,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 6.0
+    },
+    {
+     "a": 6,
+     "b": 8,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 2.0
+    },
+    {
+     "a": 7,
+     "b": 8,
+     "commonNeighbors": 0.0,
+     "jaccard": 0.0,
+     "adamicAdar": 0,
+     "resourceAllocation": 0,
+     "preferentialAttachment": 3.0
+    }
+   ],
+   "closeness": [
+    0.0,
+    0.25,
+    0.0,
+    0.22499999999999998,
+    0.0,
+    0.125,
+    0.125,
+    0.25,
+    0.16666666666666666
+   ],
+   "clustering": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+   ],
+   "triangleAssignments": 0
+  }
+ ],
+ "values": {
+  "similarity": [
+   {
+    "a": [
+     1,
+     2,
+     3
+    ],
+    "b": [
+     2,
+     3,
+     4
+    ],
+    "jaccard": 0.5,
+    "overlap": 0.6666666666666666
+   },
+   {
+    "a": [
+     1,
+     2
+    ],
+    "b": [
+     3,
+     4
+    ],
+    "jaccard": 0.0,
+    "overlap": 0.0
+   },
+   {
+    "a": [
+     1,
+     2
+    ],
+    "b": [
+     1,
+     2,
+     3,
+     4
+    ],
+    "jaccard": 0.5,
+    "overlap": 1.0
+   },
+   {
+    "a": [
+     5
+    ],
+    "b": [
+     5
+    ],
+    "jaccard": 1.0,
+    "overlap": 1.0
+   },
+   {
+    "a": [
+     1,
+     2,
+     3,
+     4
+    ],
+    "b": [
+     4,
+     3,
+     2,
+     1
+    ],
+    "jaccard": 1.0,
+    "overlap": 1.0
+   }
+  ],
+  "distance": [
+   {
+    "a": [
+     1.0,
+     0.0
+    ],
+    "b": [
+     0.0,
+     1.0
+    ],
+    "cosineDefined": true,
+    "cosine": 1.0,
+    "euclidean": 1.4142135623730951
+   },
+   {
+    "a": [
+     1.0,
+     2.0
+    ],
+    "b": [
+     1.0,
+     2.0
+    ],
+    "cosineDefined": true,
+    "cosine": 2.220446049250313e-16,
+    "euclidean": 0.0
+   },
+   {
+    "a": [
+     1.0,
+     0.0
+    ],
+    "b": [
+     -1.0,
+     0.0
+    ],
+    "cosineDefined": true,
+    "cosine": 2.0,
+    "euclidean": 2.0
+   },
+   {
+    "a": [
+     3.0,
+     4.0
+    ],
+    "b": [
+     0.0,
+     0.0
+    ],
+    "cosineDefined": false,
+    "cosine": null,
+    "euclidean": 5.0
+   },
+   {
+    "a": [
+     1.0,
+     0.0,
+     0.25
+    ],
+    "b": [
+     0.0,
+     1.0,
+     0.25
+    ],
+    "cosineDefined": true,
+    "cosine": 0.9411764705882353,
+    "euclidean": 1.4142135623730951
+   },
+   {
+    "a": [
+     0.5,
+     0.5,
+     0.5
+    ],
+    "b": [
+     0.1,
+     0.9,
+     0.2
+    ],
+    "cosineDefined": true,
+    "cosine": 0.2529126264293694,
+    "euclidean": 0.6403124065222241
+   }
+  ]
+ }
+}

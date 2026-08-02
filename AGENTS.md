@@ -175,7 +175,9 @@ second copy of both, so the same rule was stated in three places and the copies 
   styled to match it. The engine runs in `worker.js` and the page reaches it only by message, so a query never blocks the tab; cancelling therefore
   terminates the worker and replays the sample plus the setup log, since a WebAssembly call has no interruption point and the graph dies with the
   thread. `demos.js` holds the example catalog, the sample graphs, and the procedure and function references, all of which are Cypher inside a
-  JavaScript file and therefore invisible to every Rust test; `make playground-check` runs them all, plus the formatter round trip, and fails on an
+  JavaScript file and therefore invisible to every Rust test. A sample may also declare a `textIndex` and a `vectorProperty`, which the seed applies
+  after the `CREATE`, because a full-text index and an embedding are extension traits rather than statements; the retrieval corpus is the one sample
+  that does, and the only one on which `issundb.retrieve.vector` and `issundb.retrieve.hybrid` can run. `make playground-check` runs them all, plus the formatter round trip, and fails on an
   error. That check is the only thing keeping the hand-written references from drifting. Everything else about the page, including the theme tokens,
   the graph view, sharing, and what the browser build gives up, is in `web/README.md`.
 - `crates/issundb-examples/`: standalone example programs. These depend only on `issundb`.

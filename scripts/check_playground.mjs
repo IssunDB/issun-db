@@ -20,6 +20,28 @@ const { formatCypher } = await import(join(here, "..", "web", "format.js"));
 
 // The graph each category's examples query, since none of them builds its own data any more.
 const sampleById = new Map(SAMPLE_GRAPHS.map((sample) => [sample.id, sample.cypher]));
+const sampleObjectById = new Map(SAMPLE_GRAPHS.map((sample) => [sample.id, sample]));
+
+// A sample's full-text index and its embeddings are extension traits rather than statements, so a
+// seed that ran only the `CREATE` would leave the retrieval procedures with nothing to search. This
+// mirrors `applySampleSetup` in the page: keep the two in step, or this check passes on a graph the
+// reader never gets.
+function applySampleSetup(playground, sample) {
+  if (sample?.textIndex) {
+    playground.createTextIndex(sample.textIndex[0], sample.textIndex[1]);
+  }
+  if (!sample?.vectorProperty) return;
+  const rows = JSON.parse(
+    playground.query(
+      `MATCH (n) WHERE n.${sample.vectorProperty} IS NOT NULL` +
+      ` RETURN id(n) AS id, n.${sample.vectorProperty} AS embedding ORDER BY id`,
+    ),
+  ).rows;
+  for (const [id, embedding] of rows) {
+    if (!Array.isArray(embedding)) continue;
+    playground.upsertVector(BigInt(id), new Float32Array(embedding.map(Number)));
+  }
+}
 
 let failures = 0;
 let checked = 0;
@@ -61,6 +83,9 @@ for (const category of DEMO_CATEGORIES) {
     const p = new Playground();
     try {
       p.query(sampleById.get(category.sample) ?? SAMPLE_SOCIAL);
+      // The sample's own index and embeddings, before the example runs: an example over the
+      // retrieval corpus is asking the procedures to search what the sample declared.
+      applySampleSetup(p, sampleObjectById.get(category.sample));
 
       let detail;
       if (demo.explain) {
@@ -125,8 +150,9 @@ for (const category of DEMO_CATEGORIES) {
 
 // The sidebar's procedure reference. The engine cannot enumerate its procedures, so the catalog is
 // written out by hand and this is what keeps it honest: every snippet has to reach a real procedure
-// with the yield names it claims. A `requiresVectors` entry cannot run on the sample graph, which
-// stores no embeddings, so for those the empty-index failure is accepted and anything else is not.
+// with the yield names it claims. A `requiresVectors` entry is run against the retrieval corpus,
+// which ships with a text index and embeddings, so those snippets are executed rather than excused;
+// only a sample that cannot supply them falls back to accepting the empty-index failure.
 // `ProcedureNotFound` is never accepted, since that is exactly the drift this exists to catch.
 console.log("\nProcedure reference");
 
@@ -137,7 +163,9 @@ for (const proc of PROCEDURES) {
   procChecked += 1;
   const p = new Playground();
   try {
-    p.query(SAMPLE_SOCIAL);
+    const sample = proc.requiresVectors ? sampleObjectById.get("corpus") : null;
+    p.query(sample ? sample.cypher : SAMPLE_SOCIAL);
+    applySampleSetup(p, sample);
     const result = JSON.parse(p.query(proc.snippet));
     console.log(`  ok    ${proc.name.padEnd(34)} ${result.rows.length} row(s)`);
   } catch (e) {

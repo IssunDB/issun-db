@@ -4107,6 +4107,11 @@ fn try_triangle_count(op: &PhysicalOperator) -> Option<PhysicalOperator> {
         _ => return None,
     }
 
+    // Any hop naming several types puts the pattern beyond the kernel.
+    if !is_single_rel_type(t1) || !is_single_rel_type(t2) || !is_single_rel_type(closing_rel_type) {
+        return None;
+    }
+
     Some(PhysicalOperator::TriangleCount {
         rel_types: [t1.clone(), t2.clone(), closing_rel_type.clone()],
         labels: [
@@ -4178,6 +4183,21 @@ fn match_directed_expand(
     }
 }
 
+/// Whether a hop names at most one relationship type, which is what every
+/// counting kernel can resolve.
+///
+/// `Expand::rel_type` carries the raw pattern text, so an alternation such as
+/// `-[:KNOWS|WORKS_WITH]->` arrives as the single string `"KNOWS|WORKS_WITH"`.
+/// A kernel resolves one registered type name, and that string is not one, so a
+/// lowered alternation matched nothing and the query reported zero instead of
+/// its true count: a wrong answer rather than an error, on a pattern openCypher
+/// considers ordinary. The collapsed count in `exec/vectorized.rs` has always
+/// tested this before handing a hop to `typed_neighbor_counts`; the plan-level
+/// rewrites need the same test, and share it here.
+pub(super) fn is_single_rel_type(rel_type: &Option<String>) -> bool {
+    !rel_type.as_ref().is_some_and(|t| t.contains('|'))
+}
+
 fn match_forward_expand(op: &PhysicalOperator) -> Option<ForwardExpand<'_>> {
     if let PhysicalOperator::Expand {
         input,
@@ -4194,6 +4214,10 @@ fn match_forward_expand(op: &PhysicalOperator) -> Option<ForwardExpand<'_>> {
         is_var_length: false,
     } = op
     {
+        // A multi-type hop is not something the path-count kernel can express.
+        if !is_single_rel_type(rel_type) {
+            return None;
+        }
         Some((
             input.as_ref(),
             src_var,
@@ -4500,7 +4524,7 @@ fn try_grouped_degree(op: &PhysicalOperator) -> Option<PhysicalOperator> {
     let (cons_dst, exp) = peel_vertex_constraints(input.as_ref());
     let (below, src_var, _rel_var, dst_var, rel_type, unique, incoming) =
         match_directed_expand(exp)?;
-    if !unique.is_empty() || src_var == dst_var {
+    if !unique.is_empty() || src_var == dst_var || !is_single_rel_type(rel_type) {
         return None;
     }
 

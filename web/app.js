@@ -82,6 +82,9 @@ async function cancelRunningQuery() {
         // picker without touching the database, so restoring what the picker points at would hand
         // back a graph this session never had and replay the setup log onto it.
         await engine.query(SAMPLE_GRAPHS[loadedSample].cypher);
+        // The index and the embeddings are part of the sample, so a restore that skipped them would
+        // hand back a graph whose retrieval procedures no longer work.
+        await applySampleSetup(SAMPLE_GRAPHS[loadedSample]);
         if (setupLog.length > 0) await engine.query(setupScript());
     } finally {
         ready = true;
@@ -1016,6 +1019,18 @@ function editDistance(a, b) {
 // suggestion is exactly as complete as the catalog is; a procedure missing from it gets no hint
 // rather than a wrong one.
 function procedureHint(cypher, message) {
+    // The two retrieval procedures search an index the sample graphs do not fill, because
+    // embeddings are a Rust extension rather than something Cypher can write. The catalog knows
+    // which entries those are; without saying so here, a reader who clicked one out of the
+    // reference just sees the engine's complaint and has no way to know what would fix it.
+    if (/vector index is empty/.test(message)) {
+        return "\n\nThis procedure searches stored embeddings, and no sample graph carries any." +
+            " Run the Vector search example first, which embeds a label, then run this again.";
+    }
+    if (/no text indexes exist/.test(message)) {
+        return "\n\nThis procedure searches a full-text index, and none exists yet." +
+            " Run the Full-text search example first, which creates one, then run this again.";
+    }
     if (!/ProcedureNotFound/.test(message)) return "";
     for (const token of new Set(cypher.match(/\bissundb\.[A-Za-z_][\w.]*/g) ?? [])) {
         if (procedureNames.has(token)) continue;
@@ -2752,8 +2767,34 @@ function renderSamples() {
     });
 }
 
+// A sample is Cypher, but a full-text index and an embedding are Rust extension traits rather than
+// statements, so a sample that wants either names it and the seed applies it here. Without this the
+// two retrieval procedures had no sample they could run against at all: `CREATE` cannot fill a
+// vector index, so every graph the page shipped left them erroring on an empty one.
+async function applySampleSetup(sample) {
+    if (sample.textIndex) {
+        const [label, property] = sample.textIndex;
+        await engine.createTextIndex(label, property);
+    }
+    if (!sample.vectorProperty) return;
+    // The vectors live in an ordinary property so the reader can see and edit them in the sample's
+    // own `CREATE`; this copies them into the index, which is the part Cypher cannot reach.
+    const rows = JSON.parse(
+        await engine.query(
+            `MATCH (n) WHERE n.${sample.vectorProperty} IS NOT NULL` +
+            ` RETURN id(n) AS id, n.${sample.vectorProperty} AS embedding ORDER BY id`,
+        ),
+    ).rows;
+    for (const [id, embedding] of rows) {
+        if (!Array.isArray(embedding)) continue;
+        await engine.upsertVector(BigInt(id), new Float32Array(embedding.map(Number)));
+    }
+}
+
 async function seed() {
-    await engine.query(currentSample().cypher);
+    const sample = currentSample();
+    await engine.query(sample.cypher);
+    await applySampleSetup(sample);
     loadedSample = activeSample;
     await refreshSchema();
 }

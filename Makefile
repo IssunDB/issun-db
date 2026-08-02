@@ -507,6 +507,7 @@ oracle-fixtures: ## Regenerate the NetworkX oracle corpora (needs Python3 and Ne
 	@python3 $(SCRIPTS_DIR)/gen_oracle_fixtures.py crates/issundb/tests/fixtures/networkx_oracle.json
 	@python3 $(SCRIPTS_DIR)/gen_pagerank_fixtures.py crates/issundb/tests/fixtures/networkx_pagerank.json
 	@python3 $(SCRIPTS_DIR)/gen_centrality_fixtures.py crates/issundb/tests/fixtures/networkx_centrality.json
+	@python3 $(SCRIPTS_DIR)/gen_function_oracle.py crates/issundb/tests/fixtures/function_oracle.json
 	@python3 $(SCRIPTS_DIR)/gen_paths_fixtures.py crates/issundb/tests/fixtures/networkx_paths.json
 	@echo "Corpora written. Commit crates/issundb/tests/fixtures/ to record the oracle."
 

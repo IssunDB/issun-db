@@ -451,6 +451,22 @@ fn resolve_sort_keys<'a>(
 /// depends on the bound.
 const MAX_VEC_HOPS: usize = 6;
 
+/// The set of relationship types one hop accepts.
+///
+/// `Expand::rel_type` holds the raw pattern text, so an alternation arrives as
+/// the single string `"KNOWS|LIKES"`. Two hops can be filled by one edge unless
+/// these sets are disjoint, and comparing the raw text instead called `"KNOWS"`
+/// and `"KNOWS|LIKES"` different: a self-loop then filled both hops of a chain
+/// whose relationship uniqueness the columnar fan-out does not track, and the
+/// count came back one too high.
+fn rel_type_set(rel_type: &str) -> ahash::AHashSet<&str> {
+    rel_type
+        .split('|')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect()
+}
+
 /// Match `plan` against the recognized shape, or `None` for the row pipeline.
 fn recognize(plan: &PhysicalOperator) -> Option<VecPipeline<'_>> {
     // A Limit is recognized only directly above a Sort: the row pipeline's
@@ -672,9 +688,9 @@ fn recognize(plan: &PhysicalOperator) -> Option<VecPipeline<'_>> {
     }
     if expands.len() >= 2 {
         for (i, a) in expands.iter().enumerate() {
-            let ta = a.rel_type?;
+            let ta = rel_type_set(a.rel_type?);
             for b in &expands[i + 1..] {
-                if b.rel_type == Some(ta) {
+                if !ta.is_disjoint(&rel_type_set(b.rel_type?)) {
                     return None;
                 }
             }

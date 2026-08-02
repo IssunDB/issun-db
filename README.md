@@ -9,9 +9,11 @@
 [![Tests](https://img.shields.io/github/actions/workflow/status/IssunDB/issun-db/tests.yml?label=tests&style=flat&labelColor=282c34&logo=github)](https://github.com/IssunDB/issun-db/actions/workflows/tests.yml)
 [![Code Coverage](https://img.shields.io/codecov/c/github/IssunDB/issun-db?label=coverage&style=flat&labelColor=282c34&logo=codecov)](https://codecov.io/gh/IssunDB/issun-db)
 [![Crates.io](https://img.shields.io/crates/v/issundb.svg?label=crates.io&style=flat&labelColor=282c34&color=fc8d62&logo=rust)](https://crates.io/crates/issundb)
-[![Docs.rs](https://img.shields.io/badge/docs-issundb-66c2a5?style=flat&labelColor=282c34&logo=docs.rs)](https://docs.rs/issundb)
+[![Docs.rs](https://img.shields.io/badge/docs.rs-issundb-66c2a5?style=flat&labelColor=282c34&logo=docs.rs)](https://docs.rs/issundb)
 [![Documentation](https://img.shields.io/badge/docs-read-007ec6?label=docs&style=flat&labelColor=282c34&logo=readthedocs)](https://issundb.github.io/issun-db/)
+<br>
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-007ec6?style=flat&labelColor=282c34&logo=open-source-initiative)](https://github.com/IssunDB/issun-db)
+[![Docker](https://img.shields.io/badge/docker-ghcr.io-007ec6?style=flat&labelColor=282c34&logo=docker)](https://github.com/IssunDB/issun-db/pkgs/container/issundb)
 [![Playground](https://img.shields.io/badge/playground-browser-507ec6?style=flat&labelColor=282c34&logo=webassembly)](https://issundb.github.io/issun-db/playground/)
 
 An embedded graph database for AI applications and graph analytics
@@ -46,7 +48,7 @@ To use IssunDB in your Rust project, add the dependency to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-issundb = "0.1.0-alpha.24"
+issundb = "0.1.0-alpha.25"
 serde_json = "1.0"
 ```
 
