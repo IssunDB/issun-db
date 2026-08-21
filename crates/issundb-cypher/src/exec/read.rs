@@ -5626,6 +5626,71 @@ mod stream_join_tests {
         assert_eq!(sorted_rows(&rows), sorted_rows(&expected));
     }
 
+    /// A hoisted comparison filter keeps the fusion: `c.z > 0` cannot raise,
+    /// so it may run above the closing probe, and only the cycle through the
+    /// positive-valued middle destination survives.
+    #[test]
+    fn expand_intersect_hoists_comparison_filter() {
+        let _fast_paths = crate::exec_mode::fast_paths_required();
+        let (_dir, graph) = setup();
+        exec(
+            &graph,
+            "CREATE (a:A), (b:B), (cok:C {z: 1}), (cbad:C {z: 0}) \
+             CREATE (a)-[:R]->(b), (b)-[:S]->(cok), (b)-[:S]->(cbad), \
+             (cok)-[:T]->(a), (cbad)-[:T]->(a)",
+        );
+        graph.rebuild_csr().unwrap();
+        let cypher = "MATCH (a:A)-[:R]->(b:B)-[:S]->(c:C)-[:T]->(a) \
+                      WHERE c.z > 0 RETURN count(*) AS n";
+        let rendered = plan_display(&graph, cypher);
+        assert!(
+            rendered.contains("ExpandIntersect"),
+            "a comparison filter must not forfeit the fusion:\n{rendered}"
+        );
+        let rows = run_rows(&graph, cypher);
+        assert_eq!(rows, vec![vec![serde_json::json!(1)]]);
+    }
+
+    /// A filter between the closing join and the middle hop whose predicate
+    /// can raise must not ride the fusion: the row pipeline evaluates it on
+    /// the wedge row the closing probe drops and raises on the zero divisor,
+    /// so the fast path must raise identically rather than silently succeed.
+    /// The fusion therefore declines and keeps the `MultiwayJoin` with the
+    /// filter in place.
+    #[test]
+    fn expand_intersect_declines_raising_filter() {
+        let (_dir, graph) = setup();
+        exec(
+            &graph,
+            "CREATE (a:A), (b:B), (cok:C {z: 1}), (cbad:C {z: 0}) \
+             CREATE (a)-[:R]->(b), (b)-[:S]->(cok), (b)-[:S]->(cbad), (cok)-[:T]->(a)",
+        );
+        graph.rebuild_csr().unwrap();
+        let cypher = "MATCH (a:A)-[:R]->(b:B)-[:S]->(c:C)-[:T]->(a) \
+                      WHERE 1 / c.z > 0 RETURN count(*) AS n";
+        let oracle = {
+            let _row_pipeline = crate::exec_mode::RowPipelineOnly::install();
+            super::execute(&graph, cypher, &HashMap::new())
+        };
+        let oracle_err = oracle
+            .expect_err("the row pipeline raises on the zero divisor")
+            .to_string();
+        assert!(oracle_err.contains("division by zero"), "got: {oracle_err}");
+        let fast = {
+            let _fast_paths = crate::exec_mode::fast_paths_required();
+            let rendered = plan_display(&graph, cypher);
+            assert!(
+                !rendered.contains("ExpandIntersect"),
+                "a raising filter must keep MultiwayJoin:\n{rendered}"
+            );
+            super::execute(&graph, cypher, &HashMap::new())
+        };
+        let fast_err = fast
+            .expect_err("the fast path must raise where the row pipeline raises")
+            .to_string();
+        assert_eq!(fast_err, oracle_err);
+    }
+
     /// Shapes the fusion must not claim: an undirected closing hop keeps the
     /// dual-direction `MultiwayJoin`, and a named-path pattern keeps its plain
     /// closing expand.

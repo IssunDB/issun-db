@@ -916,7 +916,7 @@ pub async fn search_vector(
     request_body = UpsertVectorBody,
     responses(
         (status = 200, description = "Vector stored", body = IdResponse),
-        (status = 400, description = "Empty vector", body = ErrorResponse),
+        (status = 400, description = "Empty vector, missing node, or dimension mismatch", body = ErrorResponse),
         (status = 500, description = "Storage error", body = ErrorResponse),
     ),
 )]
@@ -930,6 +930,9 @@ pub async fn upsert_vector(
     join(tokio::task::spawn_blocking(move || {
         match graph.upsert_vector(body.id, &body.vector) {
             Ok(()) => (StatusCode::OK, Json(json!({ "id": body.id }))).into_response(),
+            Err(e @ (VectorError::NodeNotFound(_) | VectorError::DimensionMismatch { .. })) => {
+                bad_request(e).into_response()
+            }
             Err(e) => internal(e).into_response(),
         }
     }))

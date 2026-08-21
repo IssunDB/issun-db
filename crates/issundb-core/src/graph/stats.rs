@@ -492,14 +492,19 @@ impl Graph {
     /// consulted only when it matches the current write generation, so a table left
     /// behind by an earlier generation is ignored rather than trusted, and the probe
     /// reads committed state directly. Callers that prune work on this answer must
-    /// still guard against uncommitted same-statement writes, which neither path can
-    /// see.
+    /// still guard against uncommitted same-statement writes, which neither path can see.
     pub fn schema_has_edge(
         &self,
         src_label: &str,
         rel_type: &str,
         dst_label: &str,
     ) -> Result<Option<bool>, Error> {
+        // Captured before the read transaction opens, so the transaction sees at
+        // least every write this generation counts. A verdict is memoized only
+        // for this value: a write committing mid-probe moves the live generation
+        // past it, and the pre-commit verdict is then discarded rather than
+        // filed under a generation whose state it does not describe.
+        let probe_gen = self.csr_cache.current_gen();
         // One read transaction for the whole question: the name resolution and the
         // probe then read one snapshot, and a two-label-by-two-label hop opens four
         // transactions during planning rather than twelve.
@@ -527,7 +532,7 @@ impl Graph {
         }
         let verdict =
             self.probe_schema_edge(&rtxn, src_id, type_id, dst_id, SCHEMA_PROBE_BUDGET)?;
-        self.memoize_schema_probe(key, verdict);
+        self.memoize_schema_probe(key, verdict, probe_gen);
         Ok(verdict)
     }
 
@@ -544,11 +549,28 @@ impl Graph {
         guard.1.get(&key).copied()
     }
 
-    /// Remember a probe verdict against the generation it was decided under,
-    /// discarding everything remembered for an older one.
-    fn memoize_schema_probe(&self, key: (LabelId, TypeId, LabelId), verdict: Option<bool>) {
+    /// Remember a probe verdict against `probe_gen`, the generation captured
+    /// before the probe's read transaction opened, discarding everything
+    /// remembered for an older generation.
+    ///
+    /// The verdict is stored only while the live generation still equals
+    /// `probe_gen`. A write committing while the probe ran advances the live
+    /// generation, and the verdict then describes pre-commit state, so it is
+    /// discarded. Stamping it with a generation read *after* the probe used to
+    /// file a pre-commit `Some(false)` under the post-commit generation. The
+    /// optimizer's prune then dropped rows the write had realized, and kept
+    /// dropping them until the next write.
+    fn memoize_schema_probe(
+        &self,
+        key: (LabelId, TypeId, LabelId),
+        verdict: Option<bool>,
+        probe_gen: u64,
+    ) {
         let mut guard = self.schema_probes.lock();
         let generation = self.csr_cache.current_gen();
+        if generation != probe_gen {
+            return;
+        }
         if guard.0 != generation {
             guard.0 = generation;
             guard.1.clear();
@@ -1226,6 +1248,51 @@ mod tests {
             graph.schema_has_edge("Person", "KNOWS", "City").unwrap(),
             Some(true),
             "a memo from an earlier generation must not deny a realized triple"
+        );
+    }
+
+    /// A verdict probed under one generation must not be filed under a later
+    /// one. The racy interleaving is a write committing between the probe's
+    /// read transaction and the memo write; replayed here step by step, the
+    /// pre-commit `Some(false)` must be discarded rather than stored under the
+    /// post-commit generation, where `prune_unsatisfiable` would drop the rows
+    /// the write just realized until the next write.
+    #[test]
+    fn a_mid_probe_write_does_not_stamp_a_pre_commit_verdict() {
+        let (_dir, graph) = open_graph();
+        let p0 = graph.add_node("Person", &json!({})).unwrap();
+        let p1 = graph.add_node("Person", &json!({})).unwrap();
+        let c0 = graph.add_node("City", &json!({})).unwrap();
+        graph.add_edge(p0, p1, "KNOWS", &json!({})).unwrap();
+
+        let (person, knows) = graph
+            .resolve_label_type("Person", "KNOWS")
+            .unwrap()
+            .unwrap();
+        let city = graph
+            .resolve_label_type("City", "KNOWS")
+            .unwrap()
+            .unwrap()
+            .0;
+
+        // The probe runs to completion against pre-write state.
+        let probe_gen = graph.csr_cache.current_gen();
+        let verdict = {
+            let rtxn = graph.storage.env.read_txn().unwrap();
+            graph
+                .probe_schema_edge(&rtxn, person, knows, city, SCHEMA_PROBE_BUDGET)
+                .unwrap()
+        };
+        assert_eq!(verdict, Some(false));
+
+        // A write realizes the triple before the verdict reaches the memo.
+        graph.add_edge(p0, c0, "KNOWS", &json!({})).unwrap();
+        graph.memoize_schema_probe((person, knows, city), verdict, probe_gen);
+
+        assert_eq!(
+            graph.schema_has_edge("Person", "KNOWS", "City").unwrap(),
+            Some(true),
+            "the pre-commit verdict must not be served for the post-commit generation"
         );
     }
 

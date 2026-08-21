@@ -1265,20 +1265,32 @@ impl Graph {
     /// between makes the result conservatively stale at the caller's
     /// `built_gen`, never fresher than claimed.
     pub(super) fn build_snapshot(&self) -> Result<CsrSnapshot, Error> {
-        let want_weights = self.csr_cache.wants_weights();
         #[cfg(feature = "lmdb")]
         {
+            let want_weights = self.csr_cache.wants_weights();
             let persisted_gen = {
                 let rtxn = self.storage.env.read_txn()?;
                 crate::storage::ids::commit_gen(&self.storage, &rtxn)?
             };
-            if let Some(snap) =
-                crate::cache_file::load_csr(self.storage.env.path(), persisted_gen, want_weights)
-            {
+            if let Some(snap) = crate::cache_file::load_csr(
+                self.storage.env.path(),
+                self.storage.db_id,
+                persisted_gen,
+                want_weights,
+            ) {
                 return Ok(snap);
             }
         }
-        if want_weights {
+        self.build_snapshot_from_storage()
+    }
+
+    /// [`Graph::build_snapshot`] without the cache-file attempt: the full scan
+    /// of `out_adj` (and of `edges`, when weights are wanted). It is what
+    /// [`Graph::rebuild_csr`] builds from, because that method is the cache
+    /// file's save site and a rebuild that loaded the file it is about to
+    /// overwrite could never repair a wrong one.
+    pub(super) fn build_snapshot_from_storage(&self) -> Result<CsrSnapshot, Error> {
+        if self.csr_cache.wants_weights() {
             CsrSnapshot::build_weighted(&self.storage)
         } else {
             CsrSnapshot::build(&self.storage)

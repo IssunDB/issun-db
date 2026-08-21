@@ -507,6 +507,42 @@ async fn upsert_vector_empty_is_bad_request() {
 }
 
 #[tokio::test]
+async fn upsert_vector_for_missing_node_is_bad_request() {
+    let (graph, _dir) = fresh_graph();
+    let (status, body) = send(
+        &graph,
+        post(
+            "/v1/vectors",
+            json!({ "id": 999, "vector": [1.0, 0.0, 0.0] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "upsert body: {body}");
+    assert!(body["error"].is_string());
+}
+
+#[tokio::test]
+async fn upsert_vector_with_wrong_dimension_is_bad_request() {
+    let (graph, _dir) = fresh_graph();
+    let a = create_node(&graph, "Doc", json!({})).await;
+    let b = create_node(&graph, "Doc", json!({})).await;
+    let (status, _body) = send(
+        &graph,
+        post("/v1/vectors", json!({ "id": a, "vector": [1.0, 0.0, 0.0] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = send(
+        &graph,
+        post("/v1/vectors", json!({ "id": b, "vector": [1.0, 0.0] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "upsert body: {body}");
+    assert!(body["error"].is_string());
+}
+
+#[tokio::test]
 async fn retrieve_hybrid_returns_subgraph() {
     use issundb::TextIndexExt;
 

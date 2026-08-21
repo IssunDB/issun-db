@@ -4,9 +4,13 @@ use crate::error::RetrievalError;
 use ahash::{AHashMap, AHashSet};
 use issundb_core::{EdgeId, Graph, NodeId};
 use issundb_text::{TextGraphExt, TextSearchOptions};
-use issundb_vector::{VectorGraphExt, VectorSearchOptions};
+use issundb_vector::{VectorError, VectorGraphExt, VectorSearchOptions};
 
 /// A subgraph extracted by a retrieval call.
+///
+/// Expansion is undirected: each hop from a seed follows outgoing and
+/// incoming edges alike, and `edges` holds every stored edge whose two
+/// endpoints are both in `nodes`, whichever way it points.
 ///
 /// `nodes` and `edges` are deduplicated but unordered. `scores` maps each seed
 /// node to its relevance value; expansion-only nodes are absent from the map.
@@ -29,7 +33,8 @@ pub struct Subgraph {
 pub struct RetrieveOptions {
     /// Number of seed nodes returned by the vector search.
     pub k: usize,
-    /// BFS expansion depth from each seed node.
+    /// BFS expansion depth from each seed node. Each hop is undirected,
+    /// following outgoing and incoming edges alike.
     pub hops: u8,
     /// Maximum cosine distance for a vector hit to qualify as a seed.
     /// Hits with `distance > max_distance` are dropped before BFS expansion.
@@ -52,8 +57,77 @@ impl Default for RetrieveOptions {
     }
 }
 
-/// Wraps a vector search to `k` seeds and a `hops`-hop BFS expansion into one
-/// subgraph materialization.
+/// Multi-source breadth-first expansion over both edge directions.
+///
+/// Retrieval treats the graph as undirected: a seed related only through
+/// incoming edges (a chunk that MENTIONS the seeded entity) is context worth
+/// returning, so each hop follows outgoing and incoming edges alike. The cap
+/// and truncation semantics mirror `Graph::bfs_multi_source`: seeds are
+/// admitted in input order and count once each, a hop that would exceed
+/// `max_nodes` keeps the lowest node ids up to the cap, and the flag is true
+/// when the cap cut off seeds or reachable nodes. A seed no node holds
+/// contributes nothing rather than erroring.
+fn bfs_multi_source_undirected(
+    graph: &Graph,
+    seeds: &[NodeId],
+    hops: u8,
+    max_nodes: Option<usize>,
+) -> Result<(Vec<NodeId>, bool), RetrievalError> {
+    let mut visited: AHashSet<NodeId> = AHashSet::new();
+    let mut frontier: Vec<NodeId> = Vec::new();
+    let mut truncated = false;
+    for &seed in seeds {
+        if visited.contains(&seed) || !graph.node_exists(seed)? {
+            continue;
+        }
+        if max_nodes.is_some_and(|max| visited.len() >= max) {
+            truncated = true;
+            break;
+        }
+        visited.insert(seed);
+        frontier.push(seed);
+    }
+    if visited.is_empty() {
+        return Ok((Vec::new(), truncated));
+    }
+
+    for _ in 0..hops {
+        let mut discovered: AHashSet<NodeId> = AHashSet::new();
+        for incoming in [false, true] {
+            for (_, _, other) in graph.expand_bulk(&frontier, None, incoming)? {
+                if !visited.contains(&other) {
+                    discovered.insert(other);
+                }
+            }
+        }
+        if discovered.is_empty() {
+            break;
+        }
+        let mut next: Vec<NodeId> = discovered.into_iter().collect();
+        next.sort_unstable();
+        if let Some(max) = max_nodes {
+            if visited.len() >= max {
+                truncated = true;
+                break;
+            }
+            if visited.len() + next.len() > max {
+                truncated = true;
+                next.truncate(max - visited.len());
+                visited.extend(&next);
+                break;
+            }
+        }
+        visited.extend(&next);
+        frontier = next;
+    }
+
+    let mut nodes: Vec<NodeId> = visited.into_iter().collect();
+    nodes.sort_unstable();
+    Ok((nodes, truncated))
+}
+
+/// Wraps a vector search to `k` seeds and a `hops`-hop undirected BFS
+/// expansion into one subgraph materialization.
 pub fn retrieve(graph: &Graph, q: &[f32], k: usize, hops: u8) -> Result<Subgraph, RetrievalError> {
     retrieve_with(
         graph,
@@ -68,9 +142,9 @@ pub fn retrieve(graph: &Graph, q: &[f32], k: usize, hops: u8) -> Result<Subgraph
 
 /// Full retrieve with configurable options.
 ///
-/// Runs a multi-source breadth-first search from the filtered seed nodes up to
-/// `hops` hops, stopping early or capping the result when `max_nodes` is set and
-/// reached.
+/// Runs an undirected multi-source breadth-first search from the filtered seed
+/// nodes up to `hops` hops, stopping early or capping the result when
+/// `max_nodes` is set and reached.
 pub fn retrieve_with(
     graph: &Graph,
     q: &[f32],
@@ -96,30 +170,42 @@ pub fn retrieve_with(
         });
     }
 
-    let (node_list, truncated) = graph.bfs_multi_source(&seeds, opts.hops, opts.max_nodes)?;
+    let (node_list, truncated) =
+        bfs_multi_source_undirected(graph, &seeds, opts.hops, opts.max_nodes)?;
     let node_set: AHashSet<NodeId> = node_list.into_iter().collect();
 
-    // Keep only scores whose seed node actually appears in the BFS result.
-    // `bfs_multi_source` guarantees this when every seed is present in
-    // the CSR snapshot; this retain is a defensive guard to ensure
-    // `scores.keys() ⊆ nodes` even if that invariant is ever broken upstream.
+    // Keep only scores whose seed node appears in the expansion result. The
+    // expansion admits every existing seed, so this retain only matters if
+    // that ever breaks upstream.
     scores.retain(|n, _| node_set.contains(n));
 
+    let edges = induced_edges(graph, &node_set)?;
+
+    Ok(Subgraph {
+        nodes: node_set.into_iter().collect(),
+        edges,
+        scores: scores.into_iter().collect(),
+        truncated,
+    })
+}
+
+/// Every edge whose two endpoints are both in `node_set`, direction included.
+/// Walking the outgoing adjacency of each included node is enough: any edge
+/// between two included nodes has its source among them, so its incoming
+/// appearance at the other endpoint names the same edge.
+fn induced_edges(
+    graph: &Graph,
+    node_set: &AHashSet<NodeId>,
+) -> Result<Vec<EdgeId>, RetrievalError> {
     let mut edge_set: AHashSet<EdgeId> = AHashSet::new();
-    for &node in &node_set {
+    for &node in node_set {
         for ne in graph.out_neighbors(node)? {
             if node_set.contains(&ne.node) {
                 edge_set.insert(ne.edge);
             }
         }
     }
-
-    Ok(Subgraph {
-        nodes: node_set.into_iter().collect(),
-        edges: edge_set.into_iter().collect(),
-        scores: scores.into_iter().collect(),
-        truncated,
-    })
+    Ok(edge_set.into_iter().collect())
 }
 
 /// Strategy for fusing vector and text relevance scores.
@@ -153,7 +239,8 @@ pub struct HybridRetrieveOptions {
     pub text_label: Option<String>,
     /// Property to restrict the text search. `None` searches all indexed properties.
     pub text_property: Option<String>,
-    /// BFS expansion depth from each seed.
+    /// BFS expansion depth from each seed. Each hop is undirected,
+    /// following outgoing and incoming edges alike.
     pub hops: u8,
     /// Maximum cosine distance for a vector hit to qualify as a seed.
     pub max_distance: f32,
@@ -182,13 +269,17 @@ impl Default for HybridRetrieveOptions {
 }
 
 /// Merges vector search seeds with full-text search seeds, fuses their scores
-/// using `opts.fusion`, then expands via BFS.
+/// using `opts.fusion`, then expands via undirected BFS.
 ///
 /// Vector search is run when `opts.vector_k > 0` and `q` is non-empty.
 /// Text search is run when `opts.text_k > 0` and `text_query` is non-empty.
 /// Both may run simultaneously; their ranked lists are merged before BFS.
 /// When neither would run (both inputs empty or both disabled), the call
 /// returns `RetrievalError::NoQuery` instead of a silently empty subgraph.
+/// A graph with no embeddings fails the vector arm with
+/// `VectorError::EmptyIndex`; when the text arm is active that is treated as
+/// zero vector seeds, and the error propagates only when vector search is the
+/// sole active modality.
 pub fn retrieve_hybrid(
     graph: &Graph,
     q: &[f32],
@@ -206,7 +297,7 @@ pub fn retrieve_hybrid(
     let mut vec_scores: AHashMap<NodeId, f32> = AHashMap::new();
 
     if vector_active {
-        let hits = graph.vector_search_with(
+        let search = graph.vector_search_with(
             q,
             &VectorSearchOptions {
                 k: opts.vector_k,
@@ -214,12 +305,22 @@ pub fn retrieve_hybrid(
                 properties: None,
                 rescore_factor: None,
             },
-        )?;
-        for (rank, hit) in hits.iter().enumerate() {
-            if hit.distance <= opts.max_distance {
-                vec_ranks.insert(hit.node, rank);
-                vec_scores.insert(hit.node, hit.distance);
+        );
+        match search {
+            Ok(hits) => {
+                for (rank, hit) in hits.iter().enumerate() {
+                    if hit.distance <= opts.max_distance {
+                        vec_ranks.insert(hit.node, rank);
+                        vec_scores.insert(hit.node, hit.distance);
+                    }
+                }
             }
+            // An empty vector index means zero vector seeds, not a failed
+            // call, when the text arm can still serve: the contract reserves
+            // an error for a request where neither modality would run. With
+            // vector as the only active modality the error still propagates.
+            Err(VectorError::EmptyIndex) if text_active => {}
+            Err(e) => return Err(e.into()),
         }
     }
 
@@ -301,24 +402,18 @@ pub fn retrieve_hybrid(
     }
 
     // ---- BFS expansion -----------------------------------------------------
-    let (node_list, truncated) = graph.bfs_multi_source(&seeds, opts.hops, opts.max_nodes)?;
+    let (node_list, truncated) =
+        bfs_multi_source_undirected(graph, &seeds, opts.hops, opts.max_nodes)?;
     let node_set: AHashSet<NodeId> = node_list.into_iter().collect();
 
     let mut scores: AHashMap<NodeId, f32> = fused;
     scores.retain(|n, _| node_set.contains(n));
 
-    let mut edge_set: AHashSet<EdgeId> = AHashSet::new();
-    for &node in &node_set {
-        for ne in graph.out_neighbors(node)? {
-            if node_set.contains(&ne.node) {
-                edge_set.insert(ne.edge);
-            }
-        }
-    }
+    let edges = induced_edges(graph, &node_set)?;
 
     Ok(Subgraph {
         nodes: node_set.into_iter().collect(),
-        edges: edge_set.into_iter().collect(),
+        edges,
         scores: scores.into_iter().collect(),
         truncated,
     })
@@ -996,6 +1091,182 @@ mod tests {
             "b score should be 0.3, got {}",
             sub.scores[&b]
         );
+    }
+
+    /// A graph with a text index but no embeddings can still serve the text
+    /// arm: an empty vector index contributes zero vector seeds instead of
+    /// failing the whole call, because the contract reserves an error for a
+    /// call where neither modality would run.
+    #[test]
+    fn hybrid_retrieve_with_text_active_survives_an_empty_vector_index() {
+        let (_dir, g) = open_tmp();
+        let a = g
+            .add_node("Doc", &json!({"body": "quantum computing research"}))
+            .unwrap();
+        let _b = g
+            .add_node("Doc", &json!({"body": "classical music orchestra"}))
+            .unwrap();
+        g.update(|txn| txn.create_node_text_index("Doc", "body"))
+            .unwrap();
+
+        let sub = retrieve_hybrid(
+            &g,
+            &[1.0f32, 0.0],
+            "quantum",
+            &HybridRetrieveOptions {
+                vector_k: 5,
+                text_k: 5,
+                text_label: Some("Doc".into()),
+                text_property: Some("body".into()),
+                hops: 0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(sub.nodes, vec![a], "the text seed alone forms the subgraph");
+        assert!(sub.scores.contains_key(&a));
+    }
+
+    /// When the vector arm is the only active modality, an empty index is
+    /// still an error: there is no other arm to serve the call.
+    #[test]
+    fn hybrid_retrieve_vector_only_over_an_empty_index_still_errors() {
+        let (_dir, g) = open_tmp();
+        g.add_node("Doc", &json!({"body": "quantum"})).unwrap();
+        g.update(|txn| txn.create_node_text_index("Doc", "body"))
+            .unwrap();
+
+        let err = retrieve_hybrid(
+            &g,
+            &[1.0f32, 0.0],
+            "",
+            &HybridRetrieveOptions {
+                vector_k: 5,
+                text_k: 5,
+                hops: 0,
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                RetrievalError::Vector(issundb_vector::VectorError::EmptyIndex)
+            ),
+            "got {err:?}"
+        );
+    }
+
+    /// The GraphRAG shape: `(:Chunk)-[:MENTIONS]->(:Entity)`, seeded on the
+    /// entity. Expansion is undirected, so the chunk one incoming hop away is
+    /// part of the subgraph, and so is the edge into the seed.
+    #[test]
+    fn retrieve_expands_over_incoming_edges() {
+        let (_dir, g) = open_tmp();
+        let entity = g.add_node("Entity", &json!({})).unwrap();
+        let chunk = g.add_node("Chunk", &json!({})).unwrap();
+        let e = g.add_edge(chunk, entity, "MENTIONS", &json!({})).unwrap();
+        g.upsert_vector(entity, &[1.0f32, 0.0]).unwrap();
+
+        let sub = retrieve(&g, &[1.0f32, 0.0], 1, 1).unwrap();
+        let mut nodes = sub.nodes.clone();
+        nodes.sort_unstable();
+        assert_eq!(nodes, vec![entity, chunk]);
+        assert_eq!(sub.edges, vec![e], "the edge into the seed is collected");
+        assert!(!sub.truncated);
+        assert!(sub.scores.contains_key(&entity));
+        assert!(
+            !sub.scores.contains_key(&chunk),
+            "expansion-only nodes carry no score"
+        );
+    }
+
+    /// Hop depth counts undirected steps: on the chain a to b to c, a seed on
+    /// c reaches b at one hop and a at two.
+    #[test]
+    fn retrieve_expands_incoming_chain_to_depth() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("N", &json!({})).unwrap();
+        let b = g.add_node("N", &json!({})).unwrap();
+        let c = g.add_node("N", &json!({})).unwrap();
+        g.add_edge(a, b, "E", &json!({})).unwrap();
+        g.add_edge(b, c, "E", &json!({})).unwrap();
+        g.upsert_vector(c, &[1.0f32, 0.0]).unwrap();
+
+        let sub1 = retrieve(&g, &[1.0f32, 0.0], 1, 1).unwrap();
+        let mut n1 = sub1.nodes.clone();
+        n1.sort_unstable();
+        assert_eq!(n1, vec![b, c]);
+
+        let sub2 = retrieve(&g, &[1.0f32, 0.0], 1, 2).unwrap();
+        let mut n2 = sub2.nodes.clone();
+        n2.sort_unstable();
+        assert_eq!(n2, vec![a, b, c]);
+    }
+
+    /// The `max_nodes` cap and the `truncated` flag hold on the undirected
+    /// path: an incoming star larger than the cap is cut off and says so.
+    #[test]
+    fn retrieve_undirected_expansion_caps_and_reports_truncation() {
+        let (_dir, g) = open_tmp();
+        let hub = g.add_node("N", &json!({})).unwrap();
+        for _ in 0..4 {
+            let leaf = g.add_node("N", &json!({})).unwrap();
+            g.add_edge(leaf, hub, "E", &json!({})).unwrap();
+        }
+        g.upsert_vector(hub, &[1.0f32, 0.0]).unwrap();
+
+        let sub = retrieve_with(
+            &g,
+            &[1.0f32, 0.0],
+            &RetrieveOptions {
+                k: 1,
+                hops: 1,
+                max_distance: f32::MAX,
+                max_nodes: Some(3),
+            },
+        )
+        .unwrap();
+
+        assert!(sub.nodes.len() <= 3);
+        assert!(sub.nodes.contains(&hub), "the seed survives the cap");
+        assert!(
+            sub.truncated,
+            "the cap dropped reachable incoming neighbors"
+        );
+    }
+
+    /// `retrieve_hybrid` expands over both directions too: a text-seeded
+    /// entity pulls in the chunk that mentions it.
+    #[test]
+    fn hybrid_retrieve_expands_over_incoming_edges() {
+        let (_dir, g) = open_tmp();
+        let entity = g
+            .add_node("Entity", &json!({"name": "cassava root"}))
+            .unwrap();
+        let chunk = g.add_node("Chunk", &json!({})).unwrap();
+        let e = g.add_edge(chunk, entity, "MENTIONS", &json!({})).unwrap();
+        g.update(|txn| txn.create_node_text_index("Entity", "name"))
+            .unwrap();
+
+        let sub = retrieve_hybrid(
+            &g,
+            &[],
+            "cassava",
+            &HybridRetrieveOptions {
+                vector_k: 0,
+                text_k: 5,
+                hops: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let mut nodes = sub.nodes.clone();
+        nodes.sort_unstable();
+        assert_eq!(nodes, vec![entity, chunk]);
+        assert_eq!(sub.edges, vec![e]);
     }
 
     #[test]

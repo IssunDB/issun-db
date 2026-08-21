@@ -918,9 +918,19 @@ impl Graph {
     pub fn materialize_property_columns(&self) -> Result<(), Error> {
         #[cfg(feature = "lmdb")]
         {
-            // Captured before the build, so a write landing during it leaves
-            // the saved file conservatively stale rather than falsely fresh.
+            // Captured before the build, and under the write lock. Every
+            // mutation holds that lock from before its commit until after it
+            // records its touched ids. So at the capture, every commit the
+            // stamp counts has already recorded its delta, and the drain
+            // inside `with_fresh` absorbs all of them. That is the invariant
+            // the saved file needs: stamp <= absorbed content. A write landing
+            // after the capture leaves the file stale, which is safe. Reading
+            // the generation without the lock is not: it could see a commit
+            // whose touched ids were not yet recorded, stamp the file one
+            // generation ahead of its content, and a later process would load
+            // stale values as fresh.
             let persisted_gen = {
+                let _guard = self._write_lock.lock();
                 let rtxn = self.storage.env.read_txn()?;
                 crate::storage::ids::commit_gen(&self.storage, &rtxn)?
             };
@@ -1031,9 +1041,11 @@ impl Graph {
     pub fn materialize_edge_property_columns(&self) -> Result<(), Error> {
         #[cfg(feature = "lmdb")]
         {
-            // Captured before the build, so a write landing during it leaves
-            // the saved file conservatively stale rather than falsely fresh.
+            // Captured under the write lock and before the build, for the
+            // stamp <= absorbed content invariant explained in
+            // [`Graph::materialize_property_columns`].
             let persisted_gen = {
+                let _guard = self._write_lock.lock();
                 let rtxn = self.storage.env.read_txn()?;
                 crate::storage::ids::commit_gen(&self.storage, &rtxn)?
             };
@@ -1365,13 +1377,21 @@ impl Graph {
             let rtxn = self.storage.env.read_txn()?;
             crate::storage::ids::commit_gen(&self.storage, &rtxn)?
         };
-        let snap = self.build_snapshot()?;
+        // Always the full scan, never the cache-file load: this method is the
+        // file's save site, so serving the file here would write back whatever
+        // it already claimed and a wrong file could never be repaired.
+        let snap = self.build_snapshot_from_storage()?;
         // This is the one save site, chosen because every bulk load ends here:
         // the freshness gate's per-write refreshes must not pay a file write per
         // rebuild. A failed save is ignored; the cache file is a cache, and the
         // stale or absent file it leaves behind is refused on load.
         #[cfg(feature = "lmdb")]
-        let _ = crate::cache_file::save_csr(self.storage.env.path(), &snap, persisted_gen);
+        let _ = crate::cache_file::save_csr(
+            self.storage.env.path(),
+            &snap,
+            self.storage.db_id,
+            persisted_gen,
+        );
         self.csr_cache.install_full(snap, built_gen);
         Ok(())
     }
@@ -1632,6 +1652,47 @@ mod restore_tests {
         Graph::restore(&snap, &nested).unwrap();
         let restored = Graph::open(&nested, 1).unwrap();
         assert_eq!(restored.nodes_by_label("FromA").unwrap().len(), 1);
+    }
+
+    /// Restoring into a directory with leftover cache files removes them: they
+    /// describe whatever database used to live there, and the database identity
+    /// they carry means they could never serve the restored one anyway.
+    #[test]
+    fn restore_removes_leftover_cache_files() {
+        let old = TempDir::new().unwrap();
+        let snap_dir = TempDir::new().unwrap();
+        let snap = snap_dir.path().join("b.mdb");
+
+        {
+            let a = Graph::open(old.path(), 1).unwrap();
+            let n0 = a.add_node("N", &json!({ "x": 1 })).unwrap();
+            let n1 = a.add_node("N", &json!({ "x": 2 })).unwrap();
+            a.add_edge(n0, n1, "R", &json!({})).unwrap();
+            a.rebuild_csr().unwrap();
+            a.materialize_property_columns().unwrap();
+        }
+        {
+            let b_dir = TempDir::new().unwrap();
+            let b = Graph::open(b_dir.path(), 1).unwrap();
+            b.add_node("FromB", &json!({})).unwrap();
+            b.backup(&snap).unwrap();
+        }
+        // The old database goes away, its cache files stay behind.
+        std::fs::remove_file(old.path().join("data.mdb")).unwrap();
+        let _ = std::fs::remove_file(old.path().join("lock.mdb"));
+        assert!(old.path().join("csr.cache").exists());
+
+        Graph::restore(&snap, old.path()).unwrap();
+        let leftover: Vec<_> = std::fs::read_dir(old.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|ext| ext == "cache"))
+            .collect();
+        assert!(leftover.is_empty(), "leftover cache files: {leftover:?}");
+
+        let restored = Graph::open(old.path(), 1).unwrap();
+        assert_eq!(restored.nodes_by_label("FromB").unwrap().len(), 1);
     }
 }
 

@@ -973,9 +973,9 @@ dependencies = [
 
 [[package]]
 name = "lbug"
-version = "0.18.3"
+version = "0.19.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aba67c4a43a6dea1c12579a818dee3e2b44d0d80ca6eac700d992c7698cb462f"
+checksum = "a7a032d5968ac2260545e8c5cf05a123559de2c6ba2bd0dde11c0ed958dfa172"
 dependencies = [
  "cmake",
  "cxx",

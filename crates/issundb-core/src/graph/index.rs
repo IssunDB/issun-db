@@ -1,5 +1,15 @@
 use super::*;
 
+/// Human name of an index-role flags byte (0x00 index, 0x01 unique, 0x02
+/// required), for the role-conflict refusal in the create paths.
+fn index_role_name(flags: u8) -> &'static str {
+    match flags {
+        0x01 => "unique constraint",
+        0x02 => "required constraint",
+        _ => "property index",
+    }
+}
+
 /// Cached committed-state label scans for one write generation, the shared
 /// sorted id vector per label behind [`Graph::nodes_by_label_arc`]. `gen` is
 /// the [`crate::csr::CsrCache`] write generation the entries reflect; a
@@ -513,8 +523,19 @@ impl Graph {
         let meta_key = format!("idx_meta:node:l:{label_id}:p:{prop_key_id}");
 
         if let Some(existing_val) = self.storage.meta.get(wtxn, &meta_key)? {
-            if !existing_val.is_empty() && existing_val[0] == flags {
-                return Ok(());
+            if let Some(&existing) = existing_val.first() {
+                if existing == flags {
+                    return Ok(());
+                }
+                // A different role already occupies this pair. The role is one
+                // flags byte, so writing over it would silently disarm the
+                // existing index or constraint; refuse instead and name what to
+                // drop first.
+                return Err(Error::InvalidArgument(format!(
+                    "{label}.{property} already has a {}; drop it before creating a {}",
+                    index_role_name(existing),
+                    index_role_name(flags)
+                )));
             }
         }
 
@@ -687,8 +708,17 @@ impl Graph {
         let meta_key = format!("idx_meta:edge:t:{type_id}:p:{prop_key_id}");
 
         if let Some(existing_val) = self.storage.meta.get(wtxn, &meta_key)? {
-            if !existing_val.is_empty() && existing_val[0] == flags {
-                return Ok(());
+            if let Some(&existing) = existing_val.first() {
+                if existing == flags {
+                    return Ok(());
+                }
+                // Same refusal as `create_node_index_impl`: the role is one
+                // flags byte, and overwriting it disarms the existing one.
+                return Err(Error::InvalidArgument(format!(
+                    "{etype}.{property} already has a {}; drop it before creating a {}",
+                    index_role_name(existing),
+                    index_role_name(flags)
+                )));
             }
         }
 
@@ -2096,5 +2126,82 @@ mod label_filter_tests {
         assert_eq!(g.label_filter(&[a], "Admin").unwrap(), vec![a]);
         g.remove_label(a, "Admin").unwrap();
         assert!(g.label_filter(&[a], "Admin").unwrap().is_empty());
+    }
+
+    /// Creating an index over a pair that already carries a constraint must
+    /// error rather than silently replace the single flags byte, which is what
+    /// let a plain `CREATE INDEX` disarm a unique constraint.
+    #[test]
+    fn a_node_index_role_conflict_errors_and_keeps_the_constraint() {
+        use crate::error::Error;
+        let (_dir, g) = open_tmp();
+        g.add_node("Person", &json!({ "email": "a@x" })).unwrap();
+        g.create_node_unique_constraint("Person", "email").unwrap();
+
+        let err = g.create_node_property_index("Person", "email").unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)), "{err}");
+        assert!(err.to_string().contains("unique constraint"), "{err}");
+
+        // The constraint is still armed.
+        let dup = g
+            .add_node("Person", &json!({ "email": "a@x" }))
+            .unwrap_err();
+        assert!(matches!(dup, Error::UniqueConstraintViolation(..)), "{dup}");
+    }
+
+    /// The refusal covers every role pair, not only index-over-constraint: a
+    /// required constraint must not overwrite a unique one either.
+    #[test]
+    fn a_node_constraint_role_conflict_errors_in_both_directions() {
+        use crate::error::Error;
+        let (_dir, g) = open_tmp();
+        g.add_node("Person", &json!({ "email": "a@x" })).unwrap();
+        g.create_node_unique_constraint("Person", "email").unwrap();
+
+        let err = g
+            .create_node_required_constraint("Person", "email")
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)), "{err}");
+
+        g.drop_node_unique_constraint("Person", "email").unwrap();
+        g.create_node_required_constraint("Person", "email")
+            .unwrap();
+        let err = g
+            .create_node_unique_constraint("Person", "email")
+            .unwrap_err();
+        assert!(err.to_string().contains("required constraint"), "{err}");
+    }
+
+    /// Re-creating the same role stays the existing no-op.
+    #[test]
+    fn a_same_role_re_create_is_still_a_no_op() {
+        let (_dir, g) = open_tmp();
+        g.add_node("Person", &json!({ "email": "a@x" })).unwrap();
+        g.create_node_property_index("Person", "email").unwrap();
+        g.create_node_property_index("Person", "email").unwrap();
+        g.create_node_unique_constraint("Person", "age").unwrap();
+        g.create_node_unique_constraint("Person", "age").unwrap();
+    }
+
+    /// The edge path mirrors the node one: a role conflict errors and the
+    /// existing constraint stays enforced.
+    #[test]
+    fn an_edge_index_role_conflict_errors_and_keeps_the_constraint() {
+        use crate::error::Error;
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("N", &json!({})).unwrap();
+        let b = g.add_node("N", &json!({})).unwrap();
+        g.add_edge(a, b, "R", &json!({ "k": 1 })).unwrap();
+        g.create_edge_unique_constraint("R", "k").unwrap();
+
+        let err = g.create_edge_property_index("R", "k").unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)), "{err}");
+        assert!(err.to_string().contains("unique constraint"), "{err}");
+
+        let dup = g.add_edge(a, b, "R", &json!({ "k": 1 })).unwrap_err();
+        assert!(matches!(dup, Error::UniqueConstraintViolation(..)), "{dup}");
+
+        // Same role stays a no-op on edges too.
+        g.create_edge_unique_constraint("R", "k").unwrap();
     }
 }

@@ -39,6 +39,7 @@ Quick examples:
 
 ## Writing Style
 
+- Write in simple, plain English. Use short sentences and everyday words.
 - Use Oxford commas in inline lists: "a, b, and c" not "a, b, c".
 - Do not use em dashes. Restructure the sentence, or use a colon or semicolon instead.
 - Avoid colorful adjectives and adverbs. Write "adjacency query" not "blazing adjacency query".
@@ -103,9 +104,11 @@ second copy of both, so the same rule was stated in three places and the copies 
     - `src/threads.rs`: the one resolution of the thread budget every parallel consumer shares (`threads::resolve`). Precedence, the clamp, and why
       `OMP_NUM_THREADS` is honored are in the crate guide under "Thread Count".
     - `src/cache_file.rs`: the on-disk cache files for the CSR snapshot and the property columns, compiled only under the `lmdb` feature. Each file records
-      the persisted commit generation it was built at (`storage/ids.rs`, `commit_gen`, advanced inside every mutating transaction), and a load is
-      refused on any mismatch, truncation, or checksum failure, so a bad file degrades to the ordinary rebuild. The save sites are deliberate and
-      narrow: `Graph::rebuild_csr` saves the CSR cache file (every bulk load ends there), and `Graph::materialize_property_columns` and
+      the database identity (`Storage::db_id`, a random 128-bit value persisted in `meta` on first open) and the persisted commit generation it was
+      built at (`storage/ids.rs`, `commit_gen`, advanced inside every mutating transaction), and a load is refused on any mismatch, truncation,
+      oversized length claim, or checksum failure, so a bad or foreign file degrades to the ordinary rebuild. The save sites are deliberate and
+      narrow: `Graph::rebuild_csr` saves the CSR cache file (every bulk load ends there) and always builds from storage rather than loading the file
+      it is about to overwrite, and `Graph::materialize_property_columns` and
       `Graph::materialize_edge_property_columns` save the node and edge columns cache files; no lazy build writes a file as a side effect of a query.
     - `src/storage/memory.rs`: the in-memory storage backend, second implementor of the contract in `storage/mod.rs`. Byte-ordered `BTreeMap` tables with
       `BTreeSet` duplicate values, copy-on-write transactions over `ArcSwap`, and a single writer lock. It is what a target with no libc compiles, and it is
@@ -713,8 +716,8 @@ every open, at launch and on `:open`, and takes the same flag: a visible pause b
 to break. That pause is worth knowing the size of: measured at 3.7 s on a 1 M-node, 13.9 M-edge graph, against a 4 ms open with the flag, so a `--script`
 run of a few statements should pass it. Those two numbers come from wall-clocking the process, since `:timer` covers Cypher statements only and neither the
 warm-up nor the open is one. `materialize-columns` is the CLI's counterpart of `rebuild-csr` for the property columns, and the only way a
-script reaches them: nothing builds them as a side effect of a query, and `:import-nodes` does not warm them
-the way `COPY ... FROM` does, so a database loaded through the CLI could not otherwise persist a column cache
+script reaches them: it builds and persists both the node and the edge columns, because nothing builds either as a side effect of a query, and
+`:import-nodes` does not warm them the way `COPY ... FROM` does, so a database loaded through the CLI could not otherwise persist a column cache
 file at all. It is worth the one scan on a graph that will be reopened: measured on a 2.4 M-node graph, a cold
 property aggregation went from 14.8 s and a 13.4 GB peak to 5.4 s and a 4.0 GB peak, because loading the
 finished columns from the file avoids the intermediates the build holds. `:timer` (or `--timer`) is how a

@@ -3838,7 +3838,11 @@ fn rewrite_closing_expands(op: PhysicalOperator) -> PhysicalOperator {
 /// Any run of `Filter` operators between the join and the expand is hoisted
 /// above the fused operator: a filter there references only variables that
 /// stay bound, and both it and the closing probe only drop rows, so the
-/// result multiset is unchanged. The rewrite requires a directed closing hop
+/// result multiset is unchanged. The error surface must be unchanged too, so
+/// only predicates that cannot raise may hoist (`filter_cannot_raise`): a
+/// predicate that raises on a wedge row the closing probe drops would raise
+/// on the row pipeline and silently succeed here, and the fusion declines
+/// rather than reorder that. The rewrite also requires a directed closing hop
 /// and a directed, single-hop, non-path-binding expand whose destination is
 /// the closing-source variable; every other shape keeps its `MultiwayJoin`,
 /// so correctness never depends on the fusion.
@@ -3870,6 +3874,18 @@ fn rewrite_expand_intersect(op: PhysicalOperator) -> PhysicalOperator {
                         expression,
                     })
             };
+            if !filters.iter().all(filter_cannot_raise) {
+                return PhysicalOperator::MultiwayJoin {
+                    input: Box::new(rebuild(cur, filters)),
+                    closing_src_var,
+                    closing_dst_var,
+                    closing_rel_type,
+                    closing_rel_var,
+                    closing_is_incoming,
+                    closing_is_undirected: false,
+                    closing_unique_rels,
+                };
+            }
             match cur {
                 PhysicalOperator::Expand {
                     input: mid_input,
@@ -3916,6 +3932,45 @@ fn rewrite_expand_intersect(op: PhysicalOperator) -> PhysicalOperator {
             }
         }
         other => other,
+    }
+}
+
+/// True when evaluating `expression` can never raise a runtime error, so
+/// `rewrite_expand_intersect` may hoist it above the closing probe. The
+/// admitted shapes mirror `vec_stage` in `exec/vectorized.rs` exactly: a
+/// `HasLabel` test, and a comparison (in either the named-variant or the
+/// `Expr(BinaryOp)` form) whose operands are bare property reads, literals,
+/// or parameters. Anything else, arithmetic, division, and function calls
+/// included, is presumed able to raise.
+fn filter_cannot_raise(expression: &FilterExpr) -> bool {
+    fn operand_cannot_raise(expr: &Expr) -> bool {
+        match expr {
+            Expr::Prop(_, prop) => !prop.is_empty(),
+            Expr::Literal(_) | Expr::Param(_) => true,
+            _ => false,
+        }
+    }
+    match expression {
+        FilterExpr::HasLabel(_, _) => true,
+        FilterExpr::Eq(l, r)
+        | FilterExpr::Ne(l, r)
+        | FilterExpr::Lt(l, r)
+        | FilterExpr::Gt(l, r)
+        | FilterExpr::Le(l, r)
+        | FilterExpr::Ge(l, r) => operand_cannot_raise(l) && operand_cannot_raise(r),
+        FilterExpr::Expr(Expr::BinaryOp { op, left, right }) => {
+            matches!(
+                op,
+                BinaryOperator::Eq
+                    | BinaryOperator::Ne
+                    | BinaryOperator::Lt
+                    | BinaryOperator::Gt
+                    | BinaryOperator::Le
+                    | BinaryOperator::Ge
+            ) && operand_cannot_raise(left)
+                && operand_cannot_raise(right)
+        }
+        FilterExpr::Expr(_) => false,
     }
 }
 

@@ -188,6 +188,7 @@ thread_local! {
     static MATERIALIZING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+#[cfg(any(feature = "lmdb", test))]
 fn materializing_columns() -> bool {
     MATERIALIZING.with(|f| f.get())
 }
@@ -1109,14 +1110,19 @@ impl<S: ColumnSource<Id = u64>> ColumnsCache<S> {
         // who does not know this is happening has no way to notice it either.
         //
         // A deliberate `materialize_*` call is about to write the file, so it is
-        // not warned about; see `MaterializingColumns`.
+        // not warned about; see `MaterializingColumns`. The advice only makes
+        // sense where a cache file can exist at all, so the in-memory backend
+        // stays silent: it never persists, and a reopen sees an empty graph.
+        #[cfg(feature = "lmdb")]
         if !materializing_columns() {
             tracing::warn!(
                 entity = std::any::type_name::<S>(),
                 "building property columns from a full scan because no current \
                  cache file exists; this repeats on every process start. Run \
                  `materialize-columns` in the CLI, or \
-                 `materialize_property_columns()` from Python, to persist them",
+                 `materialize_property_columns()` or \
+                 `materialize_edge_property_columns()` from Python, to persist \
+                 them",
             );
         }
         PropColumns::build(storage)

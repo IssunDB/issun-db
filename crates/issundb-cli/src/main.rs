@@ -306,8 +306,8 @@ enum ReplCommand {
     #[command(name = "rebuild-csr")]
     RebuildCsr,
 
-    /// Build the in-memory property columns and persist them (e.g.,
-    /// `materialize-columns`)
+    /// Build the in-memory node and edge property columns and persist their
+    /// cache files
     #[command(name = "materialize-columns")]
     MaterializeColumns,
 
@@ -661,7 +661,7 @@ Backup and Import
   :import-nodes <file> <label>         Bulk-import nodes from a CSV or Parquet file whose columns become properties (e.g., :import-nodes ./people.parquet Person)
   :import-edges <file> <src> <dst> <type>  Bulk-import edges from a 2-column CSV or Parquet file of domain keys (e.g., :import-edges ./knows.parquet Person Person KNOWS)
   rebuild-csr                          Rebuild the CSR snapshot cache
-  materialize-columns                  Build the property columns and persist them beside the database
+  materialize-columns                  Build the node and edge property columns and persist them beside the database
 
 Query and Mutations
   :explain <cypher>                    Show the optimized physical plan for a Cypher query (e.g., :explain MATCH (n) RETURN n)
@@ -1679,14 +1679,7 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
         // themselves at the end of a bulk load.
         ReplCommand::MaterializeColumns => {
             if let Some(g) = &state.graph {
-                let started = std::time::Instant::now();
-                match g.materialize_property_columns() {
-                    // The scan is long enough on a large graph that a bare "ok"
-                    // reads as a no-op, so the duration is reported the way the
-                    // load's other slow steps are.
-                    Ok(()) => println!("ok ({:.2?})", started.elapsed()),
-                    Err(e) => cli_eprintln!("error: {e}"),
-                }
+                cmd_materialize_columns(g);
             }
         }
         ReplCommand::UpsertVec { id, values } => {
@@ -2735,6 +2728,22 @@ fn is_parquet_path(path: &str) -> bool {
 /// regardless of file size.
 const IMPORT_BATCH: usize = 50_000;
 
+/// The body of `materialize-columns`. The scan is long enough on a large graph
+/// that a bare "ok" reads as a no-op, so each step reports its duration the way
+/// the load's other slow steps do.
+fn cmd_materialize_columns(g: &Graph) {
+    let started = std::time::Instant::now();
+    match g.materialize_property_columns() {
+        Ok(()) => println!("node columns ok ({:.2?})", started.elapsed()),
+        Err(e) => cli_eprintln!("error: {e}"),
+    }
+    let started = std::time::Instant::now();
+    match g.materialize_edge_property_columns() {
+        Ok(()) => println!("edge columns ok ({:.2?})", started.elapsed()),
+        Err(e) => cli_eprintln!("error: {e}"),
+    }
+}
+
 /// Bulk-import nodes from a CSV or Parquet file whose columns become node
 /// properties.
 ///
@@ -3325,24 +3334,40 @@ mod tests {
     /// CLI had no way to persist them at all: the loader in the
     /// `kaggle-knowledge-graph` project produced a `csr.cache` from its explicit
     /// `rebuild-csr` and never a `node_columns.cache`.
+    ///
+    /// The engine warns about a columnless build for edge columns too, and names
+    /// this command as the remedy, so the command must persist both cache files.
     #[cfg(feature = "lmdb")]
     #[test]
     fn materialize_columns_persists_the_cache_file() {
         let dir = tempfile::TempDir::new().unwrap();
         let graph = issundb::Graph::open(dir.path(), 1).unwrap();
+        let mut ids = Vec::new();
         for i in 0..8 {
-            graph
+            let id = graph
                 .add_node("N", &serde_json::json!({ "n": i, "name": format!("n{i}") }))
                 .unwrap();
+            ids.push(id);
         }
-        let cache = dir.path().join("node_columns.cache");
-        assert!(!cache.exists(), "nothing should have written it yet");
+        for w in ids.windows(2) {
+            graph
+                .add_edge(w[0], w[1], "REL", &serde_json::json!({ "w": 1 }))
+                .unwrap();
+        }
+        let node_cache = dir.path().join("node_columns.cache");
+        let edge_cache = dir.path().join("edge_columns.cache");
+        assert!(!node_cache.exists(), "nothing should have written it yet");
+        assert!(!edge_cache.exists(), "nothing should have written it yet");
 
-        graph.materialize_property_columns().unwrap();
+        super::cmd_materialize_columns(&graph);
 
         assert!(
-            cache.exists(),
-            "materialize-columns must leave a column cache file beside the database",
+            node_cache.exists(),
+            "materialize-columns must leave a node column cache file beside the database",
+        );
+        assert!(
+            edge_cache.exists(),
+            "materialize-columns must leave an edge column cache file beside the database",
         );
     }
 
