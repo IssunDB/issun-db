@@ -532,6 +532,8 @@ impl Graph {
         }
         let verdict =
             self.probe_schema_edge(&rtxn, src_id, type_id, dst_id, SCHEMA_PROBE_BUDGET)?;
+        #[cfg(test)]
+        super::TestHooks::fire(&self.test_hooks.before_schema_memoize);
         self.memoize_schema_probe(key, verdict, probe_gen);
         Ok(verdict)
     }
@@ -1289,6 +1291,43 @@ mod tests {
         graph.add_edge(p0, c0, "KNOWS", &json!({})).unwrap();
         graph.memoize_schema_probe((person, knows, city), verdict, probe_gen);
 
+        assert_eq!(
+            graph.schema_has_edge("Person", "KNOWS", "City").unwrap(),
+            Some(true),
+            "the pre-commit verdict must not be served for the post-commit generation"
+        );
+    }
+
+    /// The end-to-end form of the mid-probe race above, through the public
+    /// [`Graph::schema_has_edge`] path. The test hook commits the realizing
+    /// edge in exactly the racy window, after the probe computes its verdict
+    /// and before the memo write, so the pre-commit `Some(false)` must be
+    /// discarded rather than filed under the post-commit generation.
+    #[test]
+    fn a_mid_probe_write_is_not_memoized_end_to_end() {
+        let (_dir, graph) = open_graph();
+        let p0 = graph.add_node("Person", &json!({})).unwrap();
+        let p1 = graph.add_node("Person", &json!({})).unwrap();
+        let c0 = graph.add_node("City", &json!({})).unwrap();
+        graph.add_edge(p0, p1, "KNOWS", &json!({})).unwrap();
+
+        // The hook fires with the probe's read transaction still open, which
+        // is legal: a writer never blocks on a reader, on either backend.
+        let writer = graph.clone();
+        graph
+            .test_hooks
+            .before_schema_memoize
+            .lock()
+            .replace(Box::new(move || {
+                writer.add_edge(p0, c0, "KNOWS", &json!({})).unwrap();
+            }));
+
+        // The first answer describes pre-commit state, so `Some(false)` is
+        // correct here; what must not happen is that verdict being remembered.
+        assert_eq!(
+            graph.schema_has_edge("Person", "KNOWS", "City").unwrap(),
+            Some(false)
+        );
         assert_eq!(
             graph.schema_has_edge("Person", "KNOWS", "City").unwrap(),
             Some(true),

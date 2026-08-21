@@ -336,10 +336,10 @@ fn agg_expr_eligible(expr: &Expr, chain_vars: &[&str], rel_vars: &[&str]) -> boo
 /// general aggregate only ever needs scalar property values.
 fn collect_props<'a>(expr: &'a Expr, out: &mut Vec<(&'a str, &'a str)>) {
     match expr {
-        Expr::Prop(var, prop) if !prop.is_empty() => {
-            if !out.contains(&(var.as_str(), prop.as_str())) {
-                out.push((var.as_str(), prop.as_str()));
-            }
+        Expr::Prop(var, prop)
+            if !prop.is_empty() && !out.contains(&(var.as_str(), prop.as_str())) =>
+        {
+            out.push((var.as_str(), prop.as_str()));
         }
         Expr::BinaryOp { left, right, .. } => {
             collect_props(left, out);
@@ -1523,6 +1523,7 @@ pub(super) fn try_execute_vectorized(
                 // value.
                 let mut seen: ahash::AHashSet<String> = ahash::AHashSet::new();
                 let mut survivors: Vec<usize> = Vec::new();
+                #[allow(clippy::needless_range_loop)]
                 for i in 0..n {
                     use std::fmt::Write as _;
                     let mut key = String::new();
@@ -1574,6 +1575,7 @@ pub(super) fn try_execute_vectorized(
                 .collect::<Result<_, _>>()?;
 
             let mut records = Vec::with_capacity(n);
+            #[allow(clippy::needless_range_loop)]
             for i in 0..n {
                 let mut values = Vec::with_capacity(items.len());
                 for &(col, j) in &item_cols {

@@ -103,8 +103,8 @@ fn build_graphrag_graph() -> (TempDir, Graph) {
                 vec[topic_idx * 20] = 1.0_f32;
                 vec[topic_idx * 20 + 10] = 0.5_f32;
                 let mut lcg = Lcg::new((i + 1) as u64);
-                for d in 0..DIMS {
-                    vec[d] += (lcg.unit() as f32 - 0.5) * 0.1;
+                for v in vec.iter_mut() {
+                    *v += (lcg.unit() as f32 - 0.5) * 0.1;
                 }
                 embeddings.push(vec);
                 nodes.push(nid);

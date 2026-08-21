@@ -4507,8 +4507,9 @@ mod tests {
     fn stdev_distinct_deduplicates() {
         let v = agg_scalar(&[], "UNWIND [1, 1, 2] AS x RETURN stDev(DISTINCT x) AS s");
         let got = v.as_f64().unwrap();
-        // stDev of [1, 2] is sqrt(0.5) ~ 0.7071; of [1, 1, 2] it is ~0.5774.
-        assert!((got - 0.7071).abs() < 1e-3, "got {got}");
+        // stDev of [1, 2] is sqrt(0.5); of the raw [1, 1, 2] it is ~0.5774.
+        let expected = 0.5f64.sqrt();
+        assert!((got - expected).abs() < 1e-9, "got {got}");
     }
 
     /// A pattern comprehension enforces the anchor node's label and the
@@ -6079,8 +6080,7 @@ mod tests {
     #[test]
     fn deeply_nested_query_errors_instead_of_aborting() {
         let (_dir, graph) = setup_graph();
-        let deep = std::iter::repeat("RETURN 1 AS x")
-            .take(10_000)
+        let deep = std::iter::repeat_n("RETURN 1 AS x", 10_000)
             .collect::<Vec<_>>()
             .join(" UNION ALL ");
         assert!(execute(&graph, &deep, &HashMap::new()).is_err());
@@ -6100,8 +6100,7 @@ mod tests {
         for _ in 0..12 {
             list = format!("[{}]", list);
         }
-        let and = std::iter::repeat("1 = 1")
-            .take(20)
+        let and = std::iter::repeat_n("1 = 1", 20)
             .collect::<Vec<_>>()
             .join(" AND ");
         let queries = vec![format!("RETURN {list} AS x"), format!("RETURN {and} AS x")];

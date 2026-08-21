@@ -1062,7 +1062,7 @@ fn escape_csv_string(s: &str) -> String {
 }
 
 fn custom_err(msg: &str) -> issundb_core::Error {
-    issundb_core::Error::Io(std::io::Error::new(std::io::ErrorKind::Other, msg))
+    issundb_core::Error::Io(std::io::Error::other(msg))
 }
 
 /// The Arrow column type chosen for one property, plus whether the column

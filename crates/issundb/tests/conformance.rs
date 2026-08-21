@@ -688,18 +688,19 @@ fn parse_table_cell(s: &str) -> (serde_json::Value, bool) {
     let t = s.trim();
 
     // Node / relationship display literals:
-    //   (:Label), (:L {p: v}), ()-[:T]->(), [:T], [:T {p: v}], etc.
+    //   (:Label), (:L {p: v}), ()-[:T]->(), [:T], [:T {p: v}], and the bare `()`.
     // A path display literal is wrapped in angle brackets: `<(:A)-[:T]->(:B)>`, `<()>`.
-    // IssunDB returns a structured `__Path__` object for a path, never the `<...>`
-    // string, so any expected cell carrying a path literal is a representational
-    // mismatch and the scenario is skipped. The `<...>` wrapper appears only in path
-    // literals (result cells never contain bare comparison operators and strings are
-    // quoted), so matching it cannot reclassify a passing scenario. The narrower
-    // node and relationship literal markers are deliberately not broadened to nested
-    // positions, because the runner already compares many node and relationship
-    // literals successfully (for example `()` and `[[:T]]` cells), and a broad
-    // substring match there would skip scenarios that currently pass.
+    // IssunDB returns structured values for nodes, relationships, and paths, never
+    // these display strings, so any expected cell classified here is a
+    // representational mismatch and the scenario is skipped (see the
+    // `has_node_literals` check in the runner). The `<...>` wrapper appears only in
+    // path literals (result cells never contain bare comparison operators and
+    // strings are quoted), so matching it cannot reclassify a passing scenario. The
+    // narrower node and relationship literal markers are deliberately not broadened
+    // to nested positions (a literal inside a list cell), because a broad substring
+    // match there would skip scenarios that currently pass.
     if (t.starts_with("(:") || t.starts_with("(") && t.contains(':'))
+        || t == "()"                         // bare node literal, engine returns an empty object
         || t.starts_with("()-[")
         || t.starts_with("()-[:")
         || t.starts_with("<-[")

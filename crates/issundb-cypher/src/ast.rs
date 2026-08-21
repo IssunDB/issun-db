@@ -71,6 +71,7 @@ pub struct SortItem {
 }
 
 /// A clause/part in a sequential Cypher query sequence.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum QueryPart {
     Match {

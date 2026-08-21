@@ -364,13 +364,41 @@ struct VectorIndexCache(VectorIndex);
 /// initializer without that lock). Read paths take the index `RwLock` without
 /// this mutex, which is safe because no path acquires them in the reverse
 /// order.
-struct VectorMutationLock(parking_lot::Mutex<()>);
+struct VectorMutationLock {
+    lock: parking_lot::Mutex<()>,
+    /// Test-only pause point fired in `upsert_vector` between the in-memory
+    /// index update and the storage write, so a test can hold one call open
+    /// inside that window deterministically. Instance-scoped through the graph
+    /// extension rather than global, so parallel tests cannot interfere.
+    #[cfg(test)]
+    upsert_pause: parking_lot::Mutex<Option<Box<dyn Fn() + Send>>>,
+}
+
+impl VectorMutationLock {
+    fn new() -> Self {
+        Self {
+            lock: parking_lot::Mutex::new(()),
+            #[cfg(test)]
+            upsert_pause: parking_lot::Mutex::new(None),
+        }
+    }
+
+    #[cfg(test)]
+    fn pause_after_index_update(&self) {
+        // Take the hook before running it, so it fires once and never runs
+        // while the slot's mutex is held: a hook that parks would otherwise
+        // deadlock the test thread trying to clear or replace the slot.
+        let hook = self.upsert_pause.lock().take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+}
 
 /// Return this graph's vector mutation lock, creating it on first use.
 fn mutation_lock(graph: &Graph) -> Arc<VectorMutationLock> {
-    let lock: Result<_, std::convert::Infallible> = graph.get_or_init_extension_with(|| {
-        Ok(Arc::new(VectorMutationLock(parking_lot::Mutex::new(()))))
-    });
+    let lock: Result<_, std::convert::Infallible> =
+        graph.get_or_init_extension_with(|| Ok(Arc::new(VectorMutationLock::new())));
     match lock {
         Ok(lock) => lock,
         Err(never) => match never {},
@@ -383,7 +411,7 @@ impl VectorGraphExt for Graph {
         // and the cache swap one step: an upsert cannot land between them and
         // be indexed under the configuration this call replaces.
         let lock = mutation_lock(self);
-        let _guard = lock.0.lock();
+        let _guard = lock.lock.lock();
         // Compare against the EFFECTIVE config: when nothing is persisted the
         // active configuration is the lazily built default, so re-applying that
         // default (or any already-active config) is a no-op, as documented, not
@@ -415,7 +443,7 @@ impl VectorGraphExt for Graph {
         // and removes, so the snapshot read from storage cannot miss a
         // mutation that landed between the scan and the cache swap.
         let lock = mutation_lock(self);
-        let _guard = lock.0.lock();
+        let _guard = lock.lock.lock();
         // Rebuild the index from the stored raw embeddings FIRST, then persist
         // the new configuration and swap the cache. Building before persisting
         // means a mid-rebuild failure leaves BOTH the previous cache and the
@@ -443,7 +471,7 @@ impl VectorGraphExt for Graph {
         // concurrent call for the same node cannot leave the index ranking by
         // one embedding while storage holds another.
         let lock = mutation_lock(self);
-        let _guard = lock.0.lock();
+        let _guard = lock.lock.lock();
         if !self.node_exists(n)? {
             return Err(VectorError::NodeNotFound(n));
         }
@@ -458,6 +486,8 @@ impl VectorGraphExt for Graph {
         // consistently, so it is the safe ordering.
         let arc = get_or_init_cache(self)?;
         arc.0.upsert(n, v)?;
+        #[cfg(test)]
+        lock.pause_after_index_update();
         self.put_vector_bytes(n, &bytes)?;
         Ok(())
     }
@@ -471,7 +501,7 @@ impl VectorGraphExt for Graph {
         // entry the next reopen rebuilds, where the reverse would leave a live
         // index entry whose stored bytes are gone.
         let lock = mutation_lock(self);
-        let _guard = lock.0.lock();
+        let _guard = lock.lock.lock();
         let arc = get_or_init_cache(self)?;
         arc.0.remove(n)?;
         self.delete_vector_bytes(n)?;
@@ -1422,6 +1452,65 @@ mod tests {
                 Err(e) => panic!("unexpected error: {e:?}"),
             },
         }
+    }
+
+    /// Deterministic form of the race the hammer test above cannot hit on
+    /// demand. The test-only pause hook parks the first upsert inside the
+    /// window between its index update and its storage write; a second upsert
+    /// for the same node then runs to completion before the first is released.
+    /// The mutation lock makes the second call wait, so index and storage
+    /// agree; without it the first call finishes by writing v1 to storage
+    /// while the index already ranks by v2.
+    #[test]
+    fn interleaved_upserts_for_one_node_leave_index_and_storage_agreeing() {
+        use std::sync::mpsc;
+
+        let (_dir, graph) = open_tmp();
+        let n = graph.add_node("N", &json!({})).unwrap();
+        let graph = Arc::new(graph);
+
+        let lock = mutation_lock(&graph);
+        let (parked_tx, parked_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        *lock.upsert_pause.lock() = Some(Box::new(move || {
+            parked_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        }));
+
+        let v1 = [1.0f32, 0.0];
+        let v2 = [0.0f32, 1.0];
+
+        let t1 = {
+            let g = Arc::clone(&graph);
+            std::thread::spawn(move || g.upsert_vector(n, &v1).unwrap())
+        };
+        parked_rx.recv().unwrap();
+
+        // The hook was taken when it fired, so the second upsert does not
+        // park too.
+        let t2 = {
+            let g = Arc::clone(&graph);
+            std::thread::spawn(move || g.upsert_vector(n, &v2).unwrap())
+        };
+        // Ordering help only: give T2 time to reach the mutation lock (or, in
+        // the broken shape, to complete inside the window) before releasing
+        // T1. T1 must be released from here, because under the fixed code it
+        // parks while holding the mutation lock and T2 blocks on it, so
+        // waiting on T2 first would deadlock.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        release_tx.send(()).unwrap();
+        t1.join().unwrap();
+        t2.join().unwrap();
+
+        let stored = graph.node_vector(n).unwrap().expect("bytes must exist");
+        let hits = graph.vector_search(&stored, 1).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].node, n);
+        assert!(
+            hits[0].distance < 1e-4,
+            "the index ranks by a different embedding than storage holds, distance {}",
+            hits[0].distance
+        );
     }
 
     #[test]

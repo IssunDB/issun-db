@@ -2957,7 +2957,7 @@ enum RowStream {
     /// the whole result and a trailing `LIMIT` cannot skip writes.
     WritePart {
         input: Box<RowStream>,
-        part: crate::ast::QueryPart,
+        part: Box<crate::ast::QueryPart>,
         out: Option<std::vec::IntoIter<SlotRow>>,
     },
 }

@@ -117,7 +117,7 @@ pub enum LogicalOperator {
     /// for each row produced by the input plan; new bindings are added to the PathMap.
     WritePart {
         input: Box<LogicalOperator>,
-        part: crate::ast::QueryPart,
+        part: Box<crate::ast::QueryPart>,
     },
     /// A resolved `CALL` clause. For each input row the operator emits one output
     /// row per entry in `rows`, binding `output_vars` to the corresponding cells.
@@ -518,7 +518,7 @@ impl LogicalPlanner {
                         let p = current_plan.unwrap_or(LogicalOperator::SingleRow);
                         current_plan = Some(LogicalOperator::WritePart {
                             input: Box::new(p),
-                            part: write_part.clone(),
+                            part: Box::new(write_part.clone()),
                         });
                     }
                 }
@@ -1106,10 +1106,11 @@ fn extract_and_replace_aggs(
 
 fn collect_ord_aggs(expr: &Expr, set: &mut std::collections::HashSet<String>) {
     match expr {
-        Expr::Prop(col, prop) => {
-            if (col.starts_with("_ord_agg_") || col.starts_with("_ret_agg_")) && prop.is_empty() {
-                set.insert(col.clone());
-            }
+        Expr::Prop(col, prop)
+            if (col.starts_with("_ord_agg_") || col.starts_with("_ret_agg_"))
+                && prop.is_empty() =>
+        {
+            set.insert(col.clone());
         }
         Expr::BinaryOp { left, right, .. } => {
             collect_ord_aggs(left, set);

@@ -523,6 +523,45 @@ pub struct Graph {
     /// `get_or_init_extension_with` methods. Keys are `std::any::TypeId`; values
     /// are `Arc<dyn Any + Send + Sync>`.
     pub(crate) extensions: Arc<parking_lot::Mutex<AHashMap<StdTypeId, Box<dyn Any + Send + Sync>>>>,
+    /// Test-only injection points; see [`TestHooks`]. Never compiled into a
+    /// release build.
+    #[cfg(test)]
+    pub(super) test_hooks: Arc<TestHooks>,
+}
+
+/// One test-only injection point: a closure the test installs, fired at most
+/// once at its call site.
+#[cfg(test)]
+pub(super) type HookSlot = parking_lot::Mutex<Option<Box<dyn Fn() + Send>>>;
+
+/// Test-only injection points for the race-condition tests. Instance-scoped,
+/// so parallel tests over their own `TempDir` graphs cannot interfere. Each
+/// hook fires at most once: [`TestHooks::fire`] takes the closure out before
+/// calling it, so a hook that writes back into the graph cannot re-trigger
+/// itself, and later passes through the same site run unhooked.
+#[cfg(test)]
+#[derive(Default)]
+pub(super) struct TestHooks {
+    /// Fires inside [`Graph::update`] after `commit_and_publish` and before
+    /// the column bookkeeping, while the write lock is still held. This is
+    /// the window the columns stamp race needs: the persisted generation has
+    /// moved, and the touched ids are not yet in the pending buffer.
+    pub(super) after_commit_before_column_bookkeeping: HookSlot,
+    /// Fires inside [`Graph::schema_has_edge`] after the probe computes its
+    /// verdict and before `memoize_schema_probe`. This is the window the memo
+    /// race needs: a write committing here makes the verdict describe
+    /// pre-commit state.
+    pub(super) before_schema_memoize: HookSlot,
+}
+
+#[cfg(test)]
+impl TestHooks {
+    pub(super) fn fire(slot: &HookSlot) {
+        let hook = slot.lock().take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
 }
 
 /// A read-only transaction on the graph.
@@ -707,6 +746,8 @@ impl Graph {
             label_scans: Arc::new(parking_lot::Mutex::new(index::LabelScanCache::default())),
             n_threads: Arc::new(std::sync::atomic::AtomicI32::new(0)),
             extensions: Arc::new(parking_lot::Mutex::new(AHashMap::new())),
+            #[cfg(test)]
+            test_hooks: Arc::new(TestHooks::default()),
         })
     }
 
@@ -1266,6 +1307,8 @@ impl Graph {
                 // write is one atomic increment wide rather than the width of
                 // the batch. See `CsrCache::advance_write_gen`.
                 self.commit_and_publish(wtxn, mutations_count)?;
+                #[cfg(test)]
+                TestHooks::fire(&self.test_hooks.after_commit_before_column_bookkeeping);
                 // Column bookkeeping next. The CSR snapshot needs nothing here: the
                 // generation bump above is what tells a reader its snapshot lags, and
                 // the refresh rebuilds from storage rather than from a delta.
@@ -1693,6 +1736,88 @@ mod restore_tests {
 
         let restored = Graph::open(old.path(), 1).unwrap();
         assert_eq!(restored.nodes_by_label("FromB").unwrap().len(), 1);
+    }
+}
+
+// Reopening the same directory is the observable half of the race, so the test
+// needs the persistent backend.
+#[cfg(test)]
+#[cfg(feature = "lmdb")]
+mod stamp_race_tests {
+    use std::sync::mpsc;
+
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    use super::Graph;
+
+    /// The columns cache file must never be stamped ahead of its content.
+    ///
+    /// The interleaving under test: a writer commits, and a concurrent
+    /// materialize reads the bumped persisted generation before the writer
+    /// records its touched ids into the columns' pending buffer. Capturing the
+    /// generation without the write lock let the materialize refresh against
+    /// an empty pending buffer, save pre-write column values, and stamp them
+    /// with the post-write generation; a reopened graph then loaded the file
+    /// as fresh and served the pre-write value. The hook parks the writer in
+    /// exactly that window. Under the fixed code the materialize blocks on the
+    /// write lock instead, so it absorbs the write before saving.
+    #[test]
+    fn a_concurrent_materialize_does_not_stamp_the_cache_file_ahead_of_its_content() {
+        let dir = TempDir::new().unwrap();
+        let node;
+        {
+            let g = Graph::open(dir.path(), 1).unwrap();
+            node = g.add_node("Person", &json!({ "v": 1 })).unwrap();
+            // Build and persist the columns first, so the racing materialize
+            // refreshes through the pending buffer rather than a full scan,
+            // which would read the committed value and hide the race.
+            g.materialize_property_columns().unwrap();
+
+            let (reached_tx, reached_rx) = mpsc::channel::<()>();
+            let (release_tx, release_rx) = mpsc::channel::<()>();
+            g.test_hooks
+                .after_commit_before_column_bookkeeping
+                .lock()
+                .replace(Box::new(move || {
+                    reached_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                }));
+
+            let writer = {
+                let g = g.clone();
+                std::thread::spawn(move || {
+                    g.update(|txn| txn.update_node(node, &json!({ "v": 2 })))
+                        .unwrap();
+                })
+            };
+            // The writer has committed and is parked before its column
+            // bookkeeping, still holding the write lock.
+            reached_rx.recv().unwrap();
+            let materializer = {
+                let g = g.clone();
+                std::thread::spawn(move || g.materialize_property_columns().unwrap())
+            };
+            // Ordering help only, not correctness: give the materializer a
+            // moment to reach the generation capture before the writer is
+            // released. Under the fixed code it blocks there on the write
+            // lock; under the racy ordering it completes its save here.
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            release_tx.send(()).unwrap();
+            writer.join().unwrap();
+            materializer.join().unwrap();
+        }
+
+        let g = Graph::open(dir.path(), 1).unwrap();
+        // A full build serves from the cache file when its stamp matches the
+        // persisted generation, which is exactly the load a stamp ahead of
+        // its content poisons.
+        g.materialize_property_columns().unwrap();
+        assert_eq!(
+            g.node_prop_json(node, "v").unwrap(),
+            Some(json!(2)),
+            "the reopened graph must serve the committed value through the loaded columns"
+        );
     }
 }
 

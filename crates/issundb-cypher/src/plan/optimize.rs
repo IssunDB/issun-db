@@ -2102,51 +2102,41 @@ impl Optimizer {
                 items,
                 is_barrier,
             } => {
-                if *is_barrier {
-                    for (expr, alias) in items {
-                        let output_var = if let Some(a) = alias {
-                            a.clone()
-                        } else {
-                            match expr {
-                                Expr::Prop(var, prop) => {
-                                    if prop.is_empty() {
-                                        var.clone()
-                                    } else {
-                                        format!("{}.{}", var, prop)
-                                    }
-                                }
-                                Expr::Literal(lit) => lit.to_string(),
-                                Expr::Param(p) => format!("${}", p),
-                                Expr::CountStar => "count(*)".to_string(),
-                                Expr::Agg(_, _) => "agg".to_string(),
-                                _ => "expr".to_string(),
-                            }
-                        };
-                        vars.insert(output_var);
-                    }
-                } else {
+                // A `WITH *` item is the star sentinel, which carries every
+                // upstream variable through the barrier rather than binding a
+                // name of its own. Naming it (the old `_ => "expr"` fallback)
+                // replaced the barrier's whole bound set with a placeholder,
+                // so `join_common_vars` found no shared variables and a join
+                // above the barrier degraded to a cross product.
+                let has_star = items
+                    .iter()
+                    .any(|(expr, _)| crate::parser::is_star_expr(expr));
+                if !*is_barrier || has_star {
                     Self::collect_bound_vars(input, vars);
-                    for (expr, alias) in items {
-                        let output_var = if let Some(a) = alias {
-                            a.clone()
-                        } else {
-                            match expr {
-                                Expr::Prop(var, prop) => {
-                                    if prop.is_empty() {
-                                        var.clone()
-                                    } else {
-                                        format!("{}.{}", var, prop)
-                                    }
-                                }
-                                Expr::Literal(lit) => lit.to_string(),
-                                Expr::Param(p) => format!("${}", p),
-                                Expr::CountStar => "count(*)".to_string(),
-                                Expr::Agg(_, _) => "agg".to_string(),
-                                _ => "expr".to_string(),
-                            }
-                        };
-                        vars.insert(output_var);
+                }
+                for (expr, alias) in items {
+                    if crate::parser::is_star_expr(expr) {
+                        continue;
                     }
+                    let output_var = if let Some(a) = alias {
+                        a.clone()
+                    } else {
+                        match expr {
+                            Expr::Prop(var, prop) => {
+                                if prop.is_empty() {
+                                    var.clone()
+                                } else {
+                                    format!("{}.{}", var, prop)
+                                }
+                            }
+                            Expr::Literal(lit) => lit.to_string(),
+                            Expr::Param(p) => format!("${}", p),
+                            Expr::CountStar => "count(*)".to_string(),
+                            Expr::Agg(_, _) => "agg".to_string(),
+                            _ => "expr".to_string(),
+                        }
+                    };
+                    vars.insert(output_var);
                 }
             }
             PhysicalOperator::HashJoin { left, right } => {
@@ -2195,7 +2185,7 @@ impl Optimizer {
             PhysicalOperator::WritePart { input, part } => {
                 Self::collect_bound_vars(input, vars);
                 // Add variables from CREATE patterns so that downstream operators can reference them.
-                match part {
+                match part.as_ref() {
                     crate::ast::QueryPart::Create { patterns } => {
                         for p in patterns {
                             if let Some(ref v) = p.node.variable {
@@ -3589,6 +3579,7 @@ fn rewrite_join_to_expand(op: PhysicalOperator) -> PhysicalOperator {
 /// bare `LabelScan(v)` whose `v` is the only variable shared with `driver`,
 /// return the chain grafted onto `driver`. Otherwise return the two operators
 /// unchanged so the caller can try the other orientation or keep the join.
+#[allow(clippy::result_large_err)]
 fn try_graft_join(
     driver: PhysicalOperator,
     chain: PhysicalOperator,
@@ -4292,7 +4283,7 @@ fn match_forward_expand(op: &PhysicalOperator) -> Option<ForwardExpand<'_>> {
 fn count_arg_is_nonnull(expr: &Expr, vars: &[&String]) -> bool {
     match expr {
         Expr::CountStar => true,
-        Expr::Prop(v, p) if p.is_empty() => vars.iter().any(|x| *x == v),
+        Expr::Prop(v, p) if p.is_empty() => vars.contains(&v),
         _ => false,
     }
 }
@@ -5627,7 +5618,7 @@ mod tests {
         // The same impossible pattern under a write part must NOT be pruned.
         let writing_plan = PhysicalOperator::WritePart {
             input: Box::new(impossible()),
-            part: crate::ast::QueryPart::Create { patterns: vec![] },
+            part: Box::new(crate::ast::QueryPart::Create { patterns: vec![] }),
         };
         let optimized = Optimizer::optimize(writing_plan, Some(&SchemaStats));
         let plan_text = crate::plan::physical::format_physical_plan(&optimized, 0);
@@ -6630,6 +6621,103 @@ mod tests {
         assert!(
             contains_hashjoin(&rewritten),
             "an OPTIONAL MATCH join must be preserved: {rewritten:?}"
+        );
+    }
+
+    /// A barrier `WITH *` carries every upstream variable through, so the
+    /// bound set of the barrier Project must be the input's bound set, not the
+    /// placeholder name of the star sentinel. Losing it made `join_common_vars`
+    /// find no shared variables and degraded the join to a cross product.
+    #[test]
+    fn with_star_barrier_keeps_upstream_bound_vars() {
+        let star = Expr::FunctionCall {
+            name: "__star__".to_string(),
+            args: vec![],
+        };
+        let input = PhysicalOperator::HashJoin {
+            left: Box::new(scan("a", Some("A"))),
+            right: Box::new(scan("b", Some("B"))),
+        };
+        let project = PhysicalOperator::Project {
+            input: Box::new(input),
+            items: vec![(star, None)],
+            is_barrier: true,
+        };
+        let bound = Optimizer::bound_vars(&project);
+        assert!(bound.contains("a"), "bound set lost `a`: {bound:?}");
+        assert!(bound.contains("b"), "bound set lost `b`: {bound:?}");
+        assert!(
+            !bound.contains("expr"),
+            "the star sentinel must not bind a placeholder: {bound:?}"
+        );
+    }
+
+    /// `WITH *, a AS c` binds the upstream variables and the new alias. The
+    /// parser expands the mixed form, but the collector must not depend on
+    /// that.
+    #[test]
+    fn with_star_barrier_keeps_explicit_aliases_too() {
+        let star = Expr::FunctionCall {
+            name: "__star__".to_string(),
+            args: vec![],
+        };
+        let input = PhysicalOperator::HashJoin {
+            left: Box::new(scan("a", Some("A"))),
+            right: Box::new(scan("b", Some("B"))),
+        };
+        let project = PhysicalOperator::Project {
+            input: Box::new(input),
+            items: vec![
+                (star, None),
+                (
+                    Expr::Prop("a".to_string(), String::new()),
+                    Some("c".to_string()),
+                ),
+            ],
+            is_barrier: true,
+        };
+        let bound = Optimizer::bound_vars(&project);
+        for var in ["a", "b", "c"] {
+            assert!(bound.contains(var), "bound set lost `{var}`: {bound:?}");
+        }
+    }
+
+    /// End-to-end repro: an OPTIONAL MATCH after `WITH *` must equi-join on the
+    /// shared variables. With the star sentinel collapsing the barrier's bound
+    /// set to a placeholder, the join found no common variables and returned
+    /// the cross product (4 rows) instead of the 2 matching pairs.
+    #[test]
+    fn optional_match_after_with_star_joins_on_shared_vars() {
+        use issundb_core::Graph;
+        let dir = tempfile::TempDir::new().unwrap();
+        let graph = Graph::open(dir.path(), 1).unwrap();
+        let a1 = graph.add_node("A", &serde_json::json!({})).unwrap();
+        let a2 = graph.add_node("A", &serde_json::json!({})).unwrap();
+        let b1 = graph.add_node("B", &serde_json::json!({})).unwrap();
+        graph.add_edge(a1, b1, "T", &serde_json::json!({})).unwrap();
+        graph.add_edge(a2, b1, "T", &serde_json::json!({})).unwrap();
+
+        let count = |q: &str| {
+            let result = crate::exec::execute(&graph, q, &HashMap::new()).unwrap();
+            result.records[0].values[0].as_i64().unwrap()
+        };
+        assert_eq!(
+            count("MATCH (a:A) MATCH (b:B) WITH a, b OPTIONAL MATCH (a)-[:T]->(b) RETURN count(*)"),
+            2,
+            "explicit WITH control"
+        );
+        assert_eq!(
+            count("MATCH (a:A) MATCH (b:B) WITH * OPTIONAL MATCH (a)-[:T]->(b) RETURN count(*)"),
+            2,
+            "WITH * must join on a and b, not cross-product"
+        );
+        assert_eq!(
+            count(
+                "MATCH (a:A) MATCH (b:B) WITH *, a AS c \
+                 OPTIONAL MATCH (c)-[:T]->(b) RETURN count(*)"
+            ),
+            2,
+            "WITH *, a AS c must keep the upstream variables and bind c"
         );
     }
 }

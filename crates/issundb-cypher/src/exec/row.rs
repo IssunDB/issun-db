@@ -190,7 +190,7 @@ impl SlotSchema {
             }
             WritePart { input, part } => {
                 self.collect(input);
-                match part {
+                match part.as_ref() {
                     crate::ast::QueryPart::Create { patterns } => {
                         for p in patterns {
                             self.bind_pattern(p);

@@ -158,7 +158,7 @@ pub enum PhysicalOperator {
     /// Binds new nodes or edges from CREATE into the PathMap and passes each row downstream.
     WritePart {
         input: Box<PhysicalOperator>,
-        part: crate::ast::QueryPart,
+        part: Box<crate::ast::QueryPart>,
     },
     /// A resolved `CALL`: emit one output row per entry in `rows` for each input
     /// row, binding `output_vars` to the corresponding cells.
@@ -712,7 +712,7 @@ pub fn format_physical_plan(op: &PhysicalOperator, depth: usize) -> String {
             buf.push_str(&format_physical_plan(input, depth + 1));
         }
         PhysicalOperator::WritePart { input, part } => {
-            let part_name = match part {
+            let part_name = match part.as_ref() {
                 crate::ast::QueryPart::Create { .. } => "Create",
                 crate::ast::QueryPart::Merge { .. } => "Merge",
                 crate::ast::QueryPart::Set { .. } => "Set",

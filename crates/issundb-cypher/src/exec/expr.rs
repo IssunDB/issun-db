@@ -5141,7 +5141,7 @@ fn temporal_truncate(
                         }
                         "year" => NaiveDate::from_ymd_opt(d.year(), 1, 1).unwrap_or(d),
                         "quarter" => {
-                            let q_month = ((d.month0() / 3) * 3 + 1) as u32;
+                            let q_month = (d.month0() / 3) * 3 + 1;
                             NaiveDate::from_ymd_opt(d.year(), q_month, 1).unwrap_or(d)
                         }
                         "month" => NaiveDate::from_ymd_opt(d.year(), d.month(), 1).unwrap_or(d),

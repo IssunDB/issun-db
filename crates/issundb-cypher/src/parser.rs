@@ -949,7 +949,7 @@ pub(crate) fn expr_parser<'a>() -> impl Parser<'a, ParserInput<'a>, Expr, Parser
         //  18: ^  (left-assoc)
         //  19: unary -  (prefix; binds tighter than ^, so -3^2 = (-3)^2 = 9)
 
-        let pratt = postfixed_atom.pratt((
+        postfixed_atom.pratt((
             // Unary minus at 19, one above ^ (18): chumsky's prefix(P) lets infix(left(P))
             // bind into its operand, so unary minus must sit ABOVE ^ for openCypher's
             // "numeric unary negative takes precedence over exponentiation" (-3^2 = 9).
@@ -1138,9 +1138,7 @@ pub(crate) fn expr_parser<'a>() -> impl Parser<'a, ParserInput<'a>, Expr, Parser
                 left: Box::new(l),
                 right: Box::new(r),
             }),
-        ));
-
-        pratt
+        ))
     })
     .labelled("an expression")
 }
@@ -2760,6 +2758,9 @@ fn with_output_scope(items: &[ReturnItem]) -> Option<std::collections::HashSet<S
 /// projection) or a never-defined variable raises a compile-time `UndefinedVariable` error.
 fn validate_order_by_scope(parts: &[QueryPart]) -> Result<(), String> {
     let mut bound: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // True after a `YIELD *` whose outputs are not yet resolved: the CALL binds
+    // an unknown but nonempty set of variables, so scope checks must not reject.
+    let mut unknown_scope = false;
     for part in parts {
         match part {
             QueryPart::Match { match_clauses, .. }
@@ -2781,6 +2782,24 @@ fn validate_order_by_scope(parts: &[QueryPart]) -> Result<(), String> {
                     collect_pattern_vars(&m.pattern, &mut bound);
                 }
             }
+            QueryPart::Call {
+                yields,
+                yield_star,
+                resolved,
+                ..
+            } => {
+                if let Some(items) = yields {
+                    for (name, alias) in items {
+                        bound.insert(alias.clone().unwrap_or_else(|| name.clone()));
+                    }
+                }
+                if *yield_star {
+                    match resolved {
+                        Some(r) => bound.extend(r.output_vars.iter().cloned()),
+                        None => unknown_scope = true,
+                    }
+                }
+            }
             QueryPart::With {
                 items, order_by, ..
             } => {
@@ -2792,7 +2811,7 @@ fn validate_order_by_scope(parts: &[QueryPart]) -> Result<(), String> {
                     }
                     if let Some(missing) = refs
                         .iter()
-                        .find(|v| !bound.contains(*v) && !out.contains(*v))
+                        .find(|v| !unknown_scope && !bound.contains(*v) && !out.contains(*v))
                     {
                         return Err(format!(
                             "SyntaxError(UndefinedVariable): variable '{}' referenced in \
@@ -2813,6 +2832,29 @@ fn validate_order_by_scope(parts: &[QueryPart]) -> Result<(), String> {
                 let has_with_agg = with_has_agg || order_by_has_agg;
                 if has_with_agg {
                     if let Some(ob) = order_by {
+                        // After an aggregating WITH, an aggregation in ORDER BY
+                        // must itself appear in a projected item: a fresh
+                        // aggregation's argument refers to variables the
+                        // projection has already taken out of scope.
+                        if order_by_has_agg {
+                            let mut projected_aggs = Vec::new();
+                            for item in items {
+                                collect_agg_exprs(&item.expr, &mut projected_aggs);
+                            }
+                            for si in &ob.items {
+                                let mut order_aggs = Vec::new();
+                                collect_agg_exprs(&si.expr, &mut order_aggs);
+                                if order_aggs.iter().any(|a| !projected_aggs.contains(a)) {
+                                    return Err(
+                                        "SyntaxError(UndefinedVariable): an aggregation in \
+                                         ORDER BY must also be a projected expression of the \
+                                         aggregating WITH"
+                                            .to_string(),
+                                    );
+                                }
+                            }
+                        }
+
                         let grouping_keys = get_grouping_keys(items);
                         let aliases: std::collections::HashSet<String> =
                             items.iter().filter_map(|item| item.alias.clone()).collect();
@@ -2842,7 +2884,10 @@ fn validate_order_by_scope(parts: &[QueryPart]) -> Result<(), String> {
                 // Apply the WITH scope barrier: the output scope replaces the input scope,
                 // except for `WITH *`, which keeps upstream variables and adds any aliases.
                 match output {
-                    Some(out) => bound = out,
+                    Some(out) => {
+                        bound = out;
+                        unknown_scope = false;
+                    }
                     None => {
                         for item in items {
                             if let Some(a) = &item.alias {
@@ -2911,6 +2956,86 @@ fn expr_has_aggregation(expr: &Expr) -> bool {
             list, predicate, ..
         } => expr_has_aggregation(list) || expr_has_aggregation(predicate),
         _ => false,
+    }
+}
+
+/// Collect every aggregation subexpression (`Expr::Agg` or `Expr::CountStar`)
+/// in `expr`, without descending into an aggregation's own argument.
+fn collect_agg_exprs(expr: &Expr, out: &mut Vec<Expr>) {
+    match expr {
+        Expr::CountStar | Expr::Agg(_, _) => out.push(expr.clone()),
+        Expr::BinaryOp { left, right, .. } => {
+            collect_agg_exprs(left, out);
+            collect_agg_exprs(right, out);
+        }
+        Expr::Not(inner) | Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
+            collect_agg_exprs(inner, out);
+        }
+        Expr::FunctionCall { args, .. } => {
+            for arg in args {
+                collect_agg_exprs(arg, out);
+            }
+        }
+        Expr::Case {
+            subject,
+            arms,
+            else_expr,
+        } => {
+            if let Some(s) = subject {
+                collect_agg_exprs(s, out);
+            }
+            for arm in arms {
+                collect_agg_exprs(&arm.when, out);
+                collect_agg_exprs(&arm.then, out);
+            }
+            if let Some(e) = else_expr {
+                collect_agg_exprs(e, out);
+            }
+        }
+        Expr::Subscript { expr, index } => {
+            collect_agg_exprs(expr, out);
+            collect_agg_exprs(index, out);
+        }
+        Expr::Slice { expr, start, end } => {
+            collect_agg_exprs(expr, out);
+            if let Some(s) = start {
+                collect_agg_exprs(s, out);
+            }
+            if let Some(e) = end {
+                collect_agg_exprs(e, out);
+            }
+        }
+        Expr::ListComprehension {
+            list,
+            predicate,
+            transform,
+            ..
+        } => {
+            collect_agg_exprs(list, out);
+            if let Some(p) = predicate {
+                collect_agg_exprs(p, out);
+            }
+            if let Some(t) = transform {
+                collect_agg_exprs(t, out);
+            }
+        }
+        Expr::Reduce {
+            initial,
+            list,
+            expression,
+            ..
+        } => {
+            collect_agg_exprs(initial, out);
+            collect_agg_exprs(list, out);
+            collect_agg_exprs(expression, out);
+        }
+        Expr::Quantifier {
+            list, predicate, ..
+        } => {
+            collect_agg_exprs(list, out);
+            collect_agg_exprs(predicate, out);
+        }
+        _ => {}
     }
 }
 
@@ -3068,6 +3193,9 @@ fn get_grouping_keys(items: &[crate::ast::ReturnItem]) -> std::collections::Hash
 
 fn validate_query_order_by(query: &Query) -> Result<(), String> {
     let mut bound = std::collections::HashSet::new();
+    // True after a `YIELD *` whose outputs are not yet resolved: the CALL binds
+    // an unknown but nonempty set of variables, so scope checks must not reject.
+    let mut unknown_scope = false;
     for part in &query.parts {
         match part {
             QueryPart::Match { match_clauses, .. }
@@ -3089,10 +3217,31 @@ fn validate_query_order_by(query: &Query) -> Result<(), String> {
                     collect_pattern_vars(&m.pattern, &mut bound);
                 }
             }
+            QueryPart::Call {
+                yields,
+                yield_star,
+                resolved,
+                ..
+            } => {
+                if let Some(items) = yields {
+                    for (name, alias) in items {
+                        bound.insert(alias.clone().unwrap_or_else(|| name.clone()));
+                    }
+                }
+                if *yield_star {
+                    match resolved {
+                        Some(r) => bound.extend(r.output_vars.iter().cloned()),
+                        None => unknown_scope = true,
+                    }
+                }
+            }
             QueryPart::With { items, .. } => {
                 let output = with_output_scope(items);
                 match output {
-                    Some(out) => bound = out,
+                    Some(out) => {
+                        bound = out;
+                        unknown_scope = false;
+                    }
                     None => {
                         for item in items {
                             if let Some(a) = &item.alias {
@@ -3108,7 +3257,7 @@ fn validate_query_order_by(query: &Query) -> Result<(), String> {
 
     let is_return_star =
         query.return_clause.items.len() == 1 && is_star_item(&query.return_clause.items[0]);
-    if is_return_star && bound.is_empty() {
+    if is_return_star && bound.is_empty() && !unknown_scope {
         return Err(
             "SyntaxError(NoVariablesInScope): RETURN * without variables in scope is not allowed"
                 .to_string(),
@@ -3135,7 +3284,7 @@ fn validate_query_order_by(query: &Query) -> Result<(), String> {
         }
         if let Some(missing) = refs
             .iter()
-            .find(|v| !bound.contains(*v) && !out.contains(*v))
+            .find(|v| !unknown_scope && !bound.contains(*v) && !out.contains(*v))
         {
             return Err(format!(
                 "SyntaxError(UndefinedVariable): variable '{}' referenced in ORDER BY is not in scope",
@@ -4971,7 +5120,7 @@ fn check_expr_non_agg(
         return Ok(());
     }
 
-    if matches!(expr, Expr::Prop(_, _)) && grouping_exprs.iter().any(|&ge| ge == expr) {
+    if matches!(expr, Expr::Prop(_, _)) && grouping_exprs.contains(&expr) {
         return Ok(());
     }
 
@@ -4992,13 +5141,13 @@ fn check_expr_non_agg(
     }
 
     match expr {
-        Expr::HasLabel { variable, .. } => {
-            if !grouping_aliases.contains(variable) && !local_vars.contains(variable) {
-                return Err(format!(
-                    "SyntaxError(AmbiguousAggregationExpression): variable '{}' is not a grouping key",
-                    variable
-                ));
-            }
+        Expr::HasLabel { variable, .. }
+            if !grouping_aliases.contains(variable) && !local_vars.contains(variable) =>
+        {
+            return Err(format!(
+                "SyntaxError(AmbiguousAggregationExpression): variable '{}' is not a grouping key",
+                variable
+            ));
         }
         Expr::BinaryOp { left, right, .. } => {
             check_expr_non_agg(left, grouping_exprs, grouping_aliases, local_vars)?;
@@ -6665,8 +6814,7 @@ mod tests {
     /// chained operators, map literals, and `FOREACH` bodies).
     #[test]
     fn deeply_nested_queries_are_rejected_not_aborted() {
-        let union = std::iter::repeat("RETURN 1 AS x")
-            .take(10_000)
+        let union = std::iter::repeat_n("RETURN 1 AS x", 10_000)
             .collect::<Vec<_>>()
             .join(" UNION ALL ");
         assert!(parse(&union).is_err());
@@ -6683,8 +6831,7 @@ mod tests {
         }
         assert!(parse(&format!("RETURN {case} AS x")).is_err());
 
-        let and = std::iter::repeat("m.x = 1")
-            .take(5000)
+        let and = std::iter::repeat_n("m.x = 1", 5000)
             .collect::<Vec<_>>()
             .join(" AND ");
         assert!(parse(&format!("MATCH (m) WHERE {and} RETURN m")).is_err());
@@ -6739,13 +6886,11 @@ mod tests {
     /// deep; the nesting guard accepts it.
     #[test]
     fn flat_operator_chains_parse() {
-        let and = std::iter::repeat("m.x = 1")
-            .take(600)
+        let and = std::iter::repeat_n("m.x = 1", 600)
             .collect::<Vec<_>>()
             .join(" AND ");
         assert!(parse(&format!("MATCH (m) WHERE {and} RETURN m")).is_ok());
-        let sum = std::iter::repeat("1")
-            .take(1000)
+        let sum = std::iter::repeat_n("1", 1000)
             .collect::<Vec<_>>()
             .join(" + ");
         assert!(parse(&format!("RETURN {sum} AS s")).is_ok());
@@ -6909,8 +7054,7 @@ mod tests {
 
         // A chain whose weighted operator cost exceeds the maximum budget.
         let n = MAX_NESTING_COST_KB / OP_COST_KB + 50;
-        let chain = std::iter::repeat("1")
-            .take(n + 1)
+        let chain = std::iter::repeat_n("1", n + 1)
             .collect::<Vec<_>>()
             .join(" - ");
         let nesting = scan_nesting(&lex(&format!("RETURN {chain} AS x")));
@@ -6920,6 +7064,120 @@ mod tests {
             nesting.op
         );
         assert!(parse(&format!("RETURN {chain} AS x")).is_err());
+    }
+
+    // --- CALL YIELD scope in RETURN * validation ---
+
+    /// A `CALL ... YIELD` binds its yield fields (or their aliases) into scope,
+    /// so a following `RETURN *` is not an empty projection.
+    #[test]
+    fn call_yield_binds_scope_for_return_star() {
+        assert!(parse("CALL issundb.pageRank() YIELD nodeId, score RETURN *").is_ok());
+        assert!(parse("CALL issundb.pageRank() YIELD nodeId AS n, score AS s RETURN *").is_ok());
+    }
+
+    /// A `YIELD *` has unresolved outputs at parse time, so the scope is
+    /// unknown but nonempty, and `RETURN *` after it must not be rejected.
+    #[test]
+    fn call_yield_star_permits_return_star() {
+        assert!(parse("CALL issundb.pageRank() YIELD * RETURN *").is_ok());
+    }
+
+    /// A yield alias is a variable in scope for a later WITH and its ORDER BY.
+    #[test]
+    fn call_yield_alias_is_in_scope_downstream() {
+        assert!(
+            parse("CALL issundb.pageRank() YIELD nodeId AS n, score AS s RETURN * ORDER BY s")
+                .is_ok()
+        );
+        assert!(
+            parse(
+                "CALL issundb.pageRank() YIELD nodeId, score WITH nodeId AS n ORDER BY score \
+             RETURN n"
+            )
+            .is_ok()
+        );
+    }
+
+    /// A genuinely empty scope still rejects `RETURN *`.
+    #[test]
+    fn return_star_with_empty_scope_still_errors() {
+        let err = parse("RETURN *").err().unwrap().to_string();
+        assert!(err.contains("NoVariablesInScope"), "{err}");
+    }
+
+    /// The yield scope holds through execution: a `RETURN *` after `YIELD`
+    /// projects the yield columns for every result row.
+    #[test]
+    fn call_yield_return_star_executes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let g = issundb_core::Graph::open(dir.path(), 1).unwrap();
+        let params = HashMap::new();
+        crate::exec::execute(&g, "CREATE (a:N), (b:N), (a)-[:T]->(b)", &params).unwrap();
+        g.rebuild_csr().unwrap();
+        let res = crate::exec::execute(
+            &g,
+            "CALL issundb.pageRank() YIELD nodeId, score RETURN *",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(res.records.len(), 2);
+        // An in-query `YIELD *` passes the parse-time scope check and is
+        // rejected by the executor with its own message, not by a spurious
+        // `NoVariablesInScope` at parse time.
+        let err = crate::exec::execute(&g, "CALL issundb.pageRank() YIELD * RETURN *", &params)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("YIELD *"), "{err}");
+    }
+
+    // --- Aggregations in a WITH ORDER BY ---
+
+    /// TCK WithOrderBy4 [13] and [14]: an aggregation in the ORDER BY of an
+    /// aggregating WITH must itself be a projected expression, because a fresh
+    /// aggregation's argument refers to variables no longer in scope.
+    #[test]
+    fn with_order_by_rejects_a_non_projected_aggregation() {
+        let err = parse(
+            "MATCH (a:A) WITH a, a.num + a.num2 AS sum \
+             WITH a.num2 % 3 AS mod, min(sum) AS min ORDER BY sum(sum) LIMIT 2 \
+             RETURN mod, min",
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(err.contains("UndefinedVariable"), "{err}");
+
+        let err = parse(
+            "MATCH (a:A) WITH a.num2 % 3 AS mod, min(a.num + a.num2) AS min \
+             ORDER BY sum(a.num + a.num2) LIMIT 2 RETURN mod, min",
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(err.contains("UndefinedVariable"), "{err}");
+    }
+
+    /// TCK WithOrderBy4 [11], [12], and [16] through [18]: an ORDER BY beside an
+    /// aggregating WITH may use a projected aggregation (verbatim or through its
+    /// alias), grouping keys, and expressions over both.
+    #[test]
+    fn with_order_by_accepts_projected_aggregations() {
+        for query in [
+            "MATCH (a:A) WITH a.num2 % 3 AS mod, sum(a.num + a.num2) AS sum \
+             ORDER BY sum(a.num + a.num2) LIMIT 2 RETURN mod, sum",
+            "MATCH (a:A) WITH a.num2 % 3 AS mod, sum(a.num + a.num2) AS sum \
+             ORDER BY sum LIMIT 2 RETURN mod, sum",
+            "MATCH (person) WITH avg(person.age) AS avgAge \
+             ORDER BY $age + avg(person.age) - 1000 RETURN avgAge",
+            "MATCH (me:Person)--(you:Person) WITH me.age AS age, count(you.age) AS cnt \
+             ORDER BY age, age + count(you.age) RETURN age",
+            "MATCH (me:Person)--(you:Person) WITH me.age AS age, count(you.age) AS cnt \
+             ORDER BY me.age + count(you.age) RETURN age",
+        ] {
+            assert!(parse(query).is_ok(), "{query}");
+        }
     }
 }
 

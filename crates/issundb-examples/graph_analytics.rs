@@ -142,7 +142,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n--- 2. Degree Centrality (Both Directions) ---");
     let degrees = graph.degree_centrality(DegreeDirection::Both)?;
     let mut deg_sorted: Vec<_> = degrees.into_iter().collect();
-    deg_sorted.sort_by(|a, b| b.1.cmp(&a.1));
+    deg_sorted.sort_by_key(|entry| std::cmp::Reverse(entry.1));
     for (id, deg) in deg_sorted {
         println!("  {:<15} degree = {}", get_node_name(id), deg);
     }

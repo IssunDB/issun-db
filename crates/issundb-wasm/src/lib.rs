@@ -22,7 +22,7 @@
 use issundb::{
     Graph, GraphQueryExt, Language, TextGraphExt, TextIndexExt, TextSearchOptions, VectorGraphExt,
 };
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use wasm_bindgen::prelude::*;
@@ -598,14 +598,22 @@ mod tests {
         let (_dir, p) = playground();
         let empty = Playground::memory_bytes_inner();
         assert!(empty > 0, "an initialized engine has allocated something");
-        p.query_inner(
-            "CREATE (a:Big {blob: 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'})",
-        )
-        .unwrap_or_default();
-        assert!(
-            Playground::memory_bytes_inner() > empty,
-            "writing a node has to raise the live figure",
-        );
+        // The counter is module wide, so a sibling test freeing memory between
+        // the two readings can mask a small write. Retry with a doubling live
+        // blob until this test's own allocations outweigh anything a sibling
+        // can free in the window.
+        let mut grew = false;
+        for attempt in 0..8 {
+            let before = Playground::memory_bytes_inner();
+            let blob = "x".repeat(1 << (16 + attempt));
+            p.query_inner(&format!("CREATE (:Big {{blob: '{blob}'}})"))
+                .unwrap_or_default();
+            if Playground::memory_bytes_inner() > before {
+                grew = true;
+                break;
+            }
+        }
+        assert!(grew, "writing nodes has to raise the live figure");
     }
 
     /// Only the shape is asserted. The value depends on `ISSUNDB_BUILD_REF` at compile time, which

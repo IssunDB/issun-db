@@ -1698,14 +1698,13 @@ mod snapshot_freshness_tests {
 
         const THREADS: usize = 6;
         const ROUNDS: usize = 50;
-        let mut expected = N;
         for r in 0..ROUNDS {
             // Attach a fresh node directly to `start`, so the reachable set grows by
             // exactly one and the expected count stays deterministic. Each round
             // leaves the snapshot stale, so the readers race on the refresh.
             let leaf = g.add_node("N", &json!({ "leaf": r })).unwrap();
             g.add_edge(start, leaf, "R", &json!({})).unwrap();
-            expected += 1;
+            let expected = N + r + 1;
 
             let barrier = Barrier::new(THREADS);
             std::thread::scope(|s| {
