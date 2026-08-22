@@ -171,8 +171,8 @@ second copy of both, so the same rule was stated in three places and the copies 
 - `crates/issundb-wasm/`: browser bindings, exposing one `Playground` type that owns a single `Graph`. Depends only on `issundb`, and is the only crate
   built for `wasm32-unknown-unknown`. It is what proves the storage-backend seam and the pure-Rust kernels hold: the module is built
   `--no-default-features`, so a regression that reintroduces an LMDB or C++ dependency below the facade breaks this build rather than going unnoticed.
-  Do not add `--features hnsw` to that build, which reads like it selects the index and in fact selects `usearch`, whereupon the wasm build fails
-  compiling `cxx`. The binding conventions and the build flags are in `web/README.md`.
+  Do not add `--features hnsw` to that build. It looks like it selects the index, but it actually selects `usearch`, causing the WebAssembly
+  build to fail while compiling `cxx`. The binding conventions and the build flags are in `web/README.md`.
 - `web/`: the playground page that loads that module: `index.html`, `app.js`, `worker.js`, `format.js`, `demos.js`, and `style.css`, with the generated
   module in the gitignored `web/pkg/`. Vanilla ES modules with no build step and no library fetched from a network, served under the MkDocs site and
   styled to match it. The engine runs in `worker.js` and the page reaches it only by message, so a query never blocks the tab; cancelling therefore

@@ -180,7 +180,7 @@ slotted onto separate curves, measured perpendicular to the chord from the lower
 halves of a reciprocal pair land on opposite sides; a self-loop, which has no chord to bend, is a
 teardrop above its vertex. Before this the view drew a directed multigraph as an undirected simple one:
 `(a)-[:R]->(b)` and its reverse were one grey line, a second edge between the same pair was invisible
-underneath the first, and a self-loop was a line of zero length, which is to say nothing at all.
+underneath the first, and a self-loop was a line of zero length, which meant nothing was visible at all.
 
 Relationship type colors the edge, but only when there is more than one type in view. One type is the
 common case and coloring it says nothing, so a single-type graph keeps the neutral stroke; past one,
