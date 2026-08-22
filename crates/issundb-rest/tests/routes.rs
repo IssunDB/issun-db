@@ -346,6 +346,23 @@ async fn cypher_query_returns_columns_and_records() {
 }
 
 #[tokio::test]
+async fn whole_entity_projection_is_a_display_literal() {
+    // Pins the result contract: a whole node projects as an openCypher
+    // display-literal string, not a property map. Changing this shape is an
+    // API break for every consumer of /v1/query.
+    let (graph, _dir) = fresh_graph();
+    create_node(&graph, "Person", json!({ "name": "Ada" })).await;
+
+    let (status, body) = send(
+        &graph,
+        post("/v1/query", json!({ "query": "MATCH (n:Person) RETURN n" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "query body: {body}");
+    assert_eq!(body["records"], json!([["(:Person {name: 'Ada'})"]]));
+}
+
+#[tokio::test]
 async fn cypher_query_with_params() {
     let (graph, _dir) = fresh_graph();
     create_node(&graph, "Person", json!({ "name": "Ada" })).await;
