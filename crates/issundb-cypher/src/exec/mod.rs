@@ -2295,6 +2295,246 @@ mod tests {
         assert_eq!(res.records[0].values[0], serde_json::json!("[:R {w: 1}]"));
     }
 
+    /// `SET n = {map}` replaces the whole property record: keys absent from
+    /// the map are removed, null-valued keys are omitted, and an empty map
+    /// clears every property.
+    #[test]
+    fn set_all_properties_replaces_record() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+        graph
+            .add_node("X", &serde_json::json!({"name": "A", "name2": "B"}))
+            .unwrap();
+
+        let res = execute(
+            &graph,
+            "MATCH (n:X) SET n = {name: 'B', name2: null, baz: 'C'} RETURN n",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(
+            res.records[0].values[0],
+            serde_json::json!("(:X {baz: 'C', name: 'B'})")
+        );
+
+        let res = execute(&graph, "MATCH (n:X) SET n = { } RETURN n", &params).unwrap();
+        assert_eq!(res.records[0].values[0], serde_json::json!("(:X)"));
+    }
+
+    /// `SET n += {map}` merges: existing keys keep their values unless the
+    /// map overwrites them, a null value removes its key, and an empty map is
+    /// a no-op.
+    #[test]
+    fn set_all_properties_merges_record() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+        graph
+            .add_node("X", &serde_json::json!({"name": "A", "name2": "B"}))
+            .unwrap();
+
+        let res = execute(
+            &graph,
+            "MATCH (n:X) SET n += {name2: 'C', extra: 1} RETURN n",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(
+            res.records[0].values[0],
+            serde_json::json!("(:X {extra: 1, name2: 'C', name: 'A'})")
+        );
+
+        let res = execute(
+            &graph,
+            "MATCH (n:X) SET n += {extra: null} RETURN n",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(
+            res.records[0].values[0],
+            serde_json::json!("(:X {name2: 'C', name: 'A'})")
+        );
+
+        let res = execute(&graph, "MATCH (n:X) SET n += { } RETURN n", &params).unwrap();
+        assert_eq!(
+            res.records[0].values[0],
+            serde_json::json!("(:X {name2: 'C', name: 'A'})")
+        );
+    }
+
+    /// A null target (an `OPTIONAL MATCH` miss) makes a whole-entity SET a
+    /// no-op rather than an error, for both forms.
+    #[test]
+    fn set_all_properties_null_target_is_noop() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+
+        let res = execute(
+            &graph,
+            "OPTIONAL MATCH (a:DoesNotExist) SET a = {num: 42} RETURN a",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(res.records[0].values[0], serde_json::Value::Null);
+
+        let res = execute(
+            &graph,
+            "OPTIONAL MATCH (a:DoesNotExist) SET a += {num: 42} RETURN a",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(res.records[0].values[0], serde_json::Value::Null);
+    }
+
+    /// Whole-entity SET targets relationships too, and `SET r = a` copies a
+    /// bound entity's properties.
+    #[test]
+    fn set_all_properties_on_edge_and_entity_copy() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+        let a = graph
+            .add_node("A", &serde_json::json!({"name": "A"}))
+            .unwrap();
+        let b = graph.add_node("B", &serde_json::json!({})).unwrap();
+        graph
+            .add_edge(a, b, "TYPE", &serde_json::json!({"old": 1}))
+            .unwrap();
+        graph.rebuild_csr().unwrap();
+
+        let res = execute(
+            &graph,
+            "MATCH (a:A)-[r:TYPE]->() SET r = a RETURN r",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(
+            res.records[0].values[0],
+            serde_json::json!("[:TYPE {name: 'A'}]")
+        );
+
+        let res = execute(
+            &graph,
+            "MATCH ()-[r:TYPE]->() SET r += {w: 2} RETURN r",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(
+            res.records[0].values[0],
+            serde_json::json!("[:TYPE {name: 'A', w: 2}]")
+        );
+    }
+
+    /// Parameter maps drive both whole-entity forms.
+    #[test]
+    fn set_all_properties_from_parameter() {
+        let (_dir, graph) = setup_graph();
+        graph
+            .add_node("X", &serde_json::json!({"name": "A"}))
+            .unwrap();
+        let mut params = HashMap::new();
+        params.insert("props".to_string(), serde_json::json!({"num": 5}));
+
+        let res = execute(&graph, "MATCH (n:X) SET n += $props RETURN n", &params).unwrap();
+        assert_eq!(
+            res.records[0].values[0],
+            serde_json::json!("(:X {name: 'A', num: 5})")
+        );
+
+        let res = execute(&graph, "MATCH (n:X) SET n = $props RETURN n", &params).unwrap();
+        assert_eq!(res.records[0].values[0], serde_json::json!("(:X {num: 5})"));
+    }
+
+    /// A whole-entity SET with a non-map right-hand side is an error.
+    #[test]
+    fn set_all_properties_non_map_errors() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+        graph.add_node("X", &serde_json::json!({})).unwrap();
+
+        assert!(execute(&graph, "MATCH (n:X) SET n = 5", &params).is_err());
+        assert!(execute(&graph, "MATCH (n:X) SET n += [1, 2]", &params).is_err());
+    }
+
+    /// A replace in the same statement supersedes earlier writes in the
+    /// pending overlay: a later projection sees the replaced record, not a
+    /// merge with what the statement wrote before.
+    #[test]
+    fn set_all_properties_overlay_supersedes() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+
+        let res = execute(
+            &graph,
+            "CREATE (n:X {a: 1}) SET n = {b: 2} RETURN n.a, n.b",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(res.records[0].values[0], serde_json::Value::Null);
+        assert_eq!(res.records[0].values[1], serde_json::json!(2));
+    }
+
+    /// The replace goes through the core update machinery, so the auto-index
+    /// serves the new value and no longer serves the old one.
+    #[test]
+    fn set_all_properties_updates_property_index() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+        graph
+            .add_node("X", &serde_json::json!({"name": "A"}))
+            .unwrap();
+
+        execute(&graph, "MATCH (n:X) SET n = {name: 'B'}", &params).unwrap();
+
+        let res = execute(&graph, "MATCH (n:X {name: 'B'}) RETURN count(n)", &params).unwrap();
+        assert_eq!(res.records[0].values[0], serde_json::json!(1));
+        let res = execute(&graph, "MATCH (n:X {name: 'A'}) RETURN count(n)", &params).unwrap();
+        assert_eq!(res.records[0].values[0], serde_json::json!(0));
+    }
+
+    /// The constraint interaction is pinned rather than accidental: clearing
+    /// a required property with `SET n = {}` errors and rolls back, and a
+    /// unique-constrained property may move to a fresh value but not onto a
+    /// value another node holds.
+    #[test]
+    fn set_all_properties_respects_constraints() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+        graph.create_node_required_constraint("R", "name").unwrap();
+        graph
+            .add_node("R", &serde_json::json!({"name": "A"}))
+            .unwrap();
+        assert!(execute(&graph, "MATCH (n:R) SET n = {}", &params).is_err());
+        let res = execute(&graph, "MATCH (n:R {name: 'A'}) RETURN count(n)", &params).unwrap();
+        assert_eq!(res.records[0].values[0], serde_json::json!(1));
+
+        graph.create_node_unique_constraint("U", "code").unwrap();
+        graph
+            .add_node("U", &serde_json::json!({"code": 1}))
+            .unwrap();
+        graph
+            .add_node("U", &serde_json::json!({"code": 2}))
+            .unwrap();
+        assert!(execute(&graph, "MATCH (n:U {code: 2}) SET n = {code: 3}", &params).is_ok());
+        assert!(execute(&graph, "MATCH (n:U {code: 3}) SET n += {code: 1}", &params).is_err());
+    }
+
+    /// A whole-entity SET inside a FOREACH body substitutes the loop variable
+    /// through the map expression.
+    #[test]
+    fn set_all_properties_in_foreach_substitutes_loop_var() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+        graph.add_node("X", &serde_json::json!({})).unwrap();
+
+        execute(
+            &graph,
+            "FOREACH (x IN [7] | MATCH (n:X) SET n += {v: x})",
+            &params,
+        )
+        .unwrap();
+        let res = execute(&graph, "MATCH (n:X) RETURN n.v", &params).unwrap();
+        assert_eq!(res.records[0].values[0], serde_json::json!(7));
+    }
+
     /// A bare CREATE statement inside a semicolon-separated pipeline goes
     /// through `execute_pipeline`'s dedicated Create arm; a sibling pattern
     /// referencing an earlier pattern's just-created property must resolve

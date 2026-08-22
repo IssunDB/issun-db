@@ -1816,10 +1816,16 @@ pub(super) fn query_parser(
 
 // ─── Phase 5: Write & Mutation Clauses ────────────────────────────────────────
 
-/// Parses individual items in a `SET` update: `n.prop = expr`
+/// Parses individual items in a `SET` update: `n.prop = expr`,
+/// `(n).prop = expr`, `n = expr`, `n += expr`, and `n:Label`.
 fn set_item<'a>() -> impl Parser<'a, ParserInput<'a>, SetItem, ParserError<'a>> + Clone {
-    // SET n.prop = expr
-    let property = identifier()
+    // SET n.prop = expr, with an optionally parenthesized target variable
+    // (`SET (n).prop = expr` selects the target with a simple expression).
+    let target_var = choice((
+        identifier(),
+        identifier().delimited_by(sym(Tok::LParen), sym(Tok::RParen)),
+    ));
+    let property = target_var
         .then_ignore(sym(Tok::Dot))
         .then(identifier())
         .then_ignore(sym(Tok::Eq))
@@ -1828,6 +1834,18 @@ fn set_item<'a>() -> impl Parser<'a, ParserInput<'a>, SetItem, ParserError<'a>> 
             variable,
             property,
             expr,
+        });
+
+    // SET n = expr (replace) or SET n += expr (merge). `+=` arrives as the
+    // two tokens `+` and `=`.
+    let all_properties = identifier()
+        .then(sym(Tok::Plus).or_not())
+        .then_ignore(sym(Tok::Eq))
+        .then(expr_parser())
+        .map(|((variable, plus), expr)| SetItem::AllProperties {
+            variable,
+            expr,
+            merge: plus.is_some(),
         });
 
     // SET n:Label or SET n:Label1:Label2
@@ -1841,7 +1859,7 @@ fn set_item<'a>() -> impl Parser<'a, ParserInput<'a>, SetItem, ParserError<'a>> 
         )
         .map(|(variable, labels)| SetItem::Labels { variable, labels });
 
-    choice((property, labels))
+    choice((property, all_properties, labels))
 }
 
 /// Parses the target of a schema DDL statement: either a node pattern
@@ -4218,8 +4236,11 @@ fn check_pattern_predicate_placement(stmt: &Statement) -> Result<(), String> {
     };
     let check_set_items = |items: &[SetItem]| -> Result<(), String> {
         for si in items {
-            if let SetItem::Property { expr, .. } = si {
-                check_no_pattern_predicate(expr)?;
+            match si {
+                SetItem::Property { expr, .. } | SetItem::AllProperties { expr, .. } => {
+                    check_no_pattern_predicate(expr)?;
+                }
+                SetItem::Labels { .. } => {}
             }
         }
         Ok(())
@@ -4333,8 +4354,11 @@ fn check_query_part_exprs(
         }
         QueryPart::Set { items } => {
             for si in items {
-                if let SetItem::Property { expr, .. } = si {
-                    check_expr_size_on_path(expr, path_vars, node_vars, rel_vars)?;
+                match si {
+                    SetItem::Property { expr, .. } | SetItem::AllProperties { expr, .. } => {
+                        check_expr_size_on_path(expr, path_vars, node_vars, rel_vars)?;
+                    }
+                    SetItem::Labels { .. } => {}
                 }
             }
         }
@@ -4412,8 +4436,11 @@ fn validate_set_item_vars(
             item.variable()
         ));
     }
-    if let SetItem::Property { expr, .. } = item {
-        validate_expr_vars(expr, active)?;
+    match item {
+        SetItem::Property { expr, .. } | SetItem::AllProperties { expr, .. } => {
+            validate_expr_vars(expr, active)?;
+        }
+        SetItem::Labels { .. } => {}
     }
     Ok(())
 }
@@ -6697,6 +6724,98 @@ mod tests {
                 assert_eq!(labels, &vec!["Foo".to_string(), "Bar".to_string()]);
             }
             other => panic!("expected label set item, got {other:?}"),
+        }
+    }
+
+    /// `SET n = {map}` parses to a replacing `SetItem::AllProperties`, and
+    /// `SET n += {map}` to a merging one.
+    #[test]
+    fn parse_set_all_properties() {
+        let extract = |query: &str| -> Vec<SetItem> {
+            let stmt = parse(query).unwrap();
+            match stmt {
+                Statement::Set(s) => s.set_items,
+                Statement::Query(q) => q
+                    .parts
+                    .into_iter()
+                    .find_map(|p| match p {
+                        QueryPart::Set { items } => Some(items),
+                        _ => None,
+                    })
+                    .expect("no SET part"),
+                other => panic!("unexpected statement: {other:?}"),
+            }
+        };
+
+        let items = extract("MATCH (n) SET n = {name: 'A'}");
+        assert_eq!(items.len(), 1);
+        match &items[0] {
+            SetItem::AllProperties {
+                variable, merge, ..
+            } => {
+                assert_eq!(variable, "n");
+                assert!(!merge);
+            }
+            other => panic!("expected all-properties set item, got {other:?}"),
+        }
+
+        let items = extract("MATCH (n) SET n += {name: 'A'}");
+        match &items[0] {
+            SetItem::AllProperties {
+                variable, merge, ..
+            } => {
+                assert_eq!(variable, "n");
+                assert!(merge);
+            }
+            other => panic!("expected all-properties set item, got {other:?}"),
+        }
+
+        // The right-hand side may be any expression, including a bound
+        // variable whose properties are copied.
+        let items = extract("MATCH (a), (b) SET a = b");
+        match &items[0] {
+            SetItem::AllProperties { expr, merge, .. } => {
+                assert_eq!(expr, &Expr::Prop("b".to_string(), String::new()));
+                assert!(!merge);
+            }
+            other => panic!("expected all-properties set item, got {other:?}"),
+        }
+
+        // A mixed item list keeps each item's own form.
+        let items = extract("MATCH (n) SET n.p = 1, n += {q: 2}, n:Foo");
+        assert!(matches!(&items[0], SetItem::Property { .. }));
+        assert!(matches!(
+            &items[1],
+            SetItem::AllProperties { merge: true, .. }
+        ));
+        assert!(matches!(&items[2], SetItem::Labels { .. }));
+    }
+
+    /// `SET (n).p = v` selects the target with a parenthesized simple
+    /// expression and parses to an ordinary `SetItem::Property`.
+    #[test]
+    fn parse_set_parenthesized_property_target() {
+        let stmt = parse("MATCH (n) SET (n).name = 'neo4j'").unwrap();
+        let items = match stmt {
+            Statement::Set(s) => s.set_items,
+            Statement::Query(q) => q
+                .parts
+                .into_iter()
+                .find_map(|p| match p {
+                    QueryPart::Set { items } => Some(items),
+                    _ => None,
+                })
+                .expect("no SET part"),
+            other => panic!("unexpected statement: {other:?}"),
+        };
+        match &items[0] {
+            SetItem::Property {
+                variable, property, ..
+            } => {
+                assert_eq!(variable, "n");
+                assert_eq!(property, "name");
+            }
+            other => panic!("expected property set item, got {other:?}"),
         }
     }
 

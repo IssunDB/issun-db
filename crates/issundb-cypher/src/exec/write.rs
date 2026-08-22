@@ -939,6 +939,15 @@ fn subst_loop_var_set_item(item: &SetItem, var: &str) -> SetItem {
             property: property.clone(),
             expr: subst_loop_var_expr(expr, var),
         },
+        SetItem::AllProperties {
+            variable,
+            expr,
+            merge,
+        } => SetItem::AllProperties {
+            variable: variable.clone(),
+            expr: subst_loop_var_expr(expr, var),
+            merge: *merge,
+        },
         other => other.clone(),
     }
 }
@@ -1258,8 +1267,99 @@ pub(super) fn apply_set_item(
                 }
             }
         }
+        SetItem::AllProperties {
+            variable,
+            expr,
+            merge,
+        } => {
+            let target = resolve_set_target(path, variable)?;
+            if matches!(target, SetTarget::Skip) {
+                return Ok(());
+            }
+            let entries = set_map_entries(txn.graph(), path, expr, params)?;
+            match target {
+                SetTarget::Node(nid) => {
+                    let mut props = if *merge {
+                        let record = txn
+                            .get_node(nid)
+                            .map_err(|e| e.to_string())?
+                            .ok_or_else(|| format!("node not found: {}", nid))?;
+                        let stored: serde_json::Value =
+                            rmp_serde::from_slice(&record.props).map_err(|e| e.to_string())?;
+                        match stored {
+                            serde_json::Value::Object(obj) => obj,
+                            _ => serde_json::Map::new(),
+                        }
+                    } else {
+                        serde_json::Map::new()
+                    };
+                    for (key, val) in entries {
+                        if val.is_null() {
+                            props.remove(&key);
+                        } else {
+                            props.insert(key, val);
+                        }
+                    }
+                    let props = serde_json::Value::Object(props);
+                    txn.update_node(nid, &props).map_err(|e| e.to_string())?;
+                    super::expr::PendingWrites::update_node_props(txn, nid, props);
+                }
+                SetTarget::Edge(eid) => {
+                    let mut props = if *merge {
+                        let record = txn
+                            .get_edge(eid)
+                            .map_err(|e| e.to_string())?
+                            .ok_or_else(|| format!("edge not found: {}", eid))?;
+                        let stored: serde_json::Value =
+                            rmp_serde::from_slice(&record.props).map_err(|e| e.to_string())?;
+                        match stored {
+                            serde_json::Value::Object(obj) => obj,
+                            _ => serde_json::Map::new(),
+                        }
+                    } else {
+                        serde_json::Map::new()
+                    };
+                    for (key, val) in entries {
+                        if val.is_null() {
+                            props.remove(&key);
+                        } else {
+                            props.insert(key, val);
+                        }
+                    }
+                    let props = serde_json::Value::Object(props);
+                    txn.update_edge(eid, &props).map_err(|e| e.to_string())?;
+                    super::expr::PendingWrites::update_edge_props(txn, eid, props);
+                }
+                SetTarget::Skip => unreachable!(),
+            }
+        }
     }
     Ok(())
+}
+
+/// Evaluate a whole-entity SET right-hand side to its map entries. A bound
+/// node or relationship contributes its property map; anything that is not a
+/// map or a graph element is an error.
+fn set_map_entries(
+    graph: &Graph,
+    path: &PathMap,
+    expr: &Expr,
+    params: &HashMap<String, serde_json::Value>,
+) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    let value = evaluate_expr(graph, path, expr, params)?;
+    match value {
+        serde_json::Value::Object(mut obj) => match obj.get("__type__").and_then(|t| t.as_str()) {
+            Some("__Node__") | Some("__Edge__") => match obj.remove("properties") {
+                Some(serde_json::Value::Object(props)) => Ok(props),
+                _ => Ok(serde_json::Map::new()),
+            },
+            _ => Ok(obj),
+        },
+        other => Err(format!(
+            "SET expects a map or a graph element, not {}",
+            other
+        )),
+    }
 }
 
 /// Create a node pattern with properties evaluated using an expression context (PathMap).

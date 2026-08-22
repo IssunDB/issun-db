@@ -462,13 +462,23 @@ pub enum SetItem {
         variable: String,
         labels: Vec<String>,
     },
+    /// `SET n = expr` (replace the whole property record) or `SET n += expr`
+    /// (merge into it). The expression must evaluate to a map or to a bound
+    /// node or relationship, whose properties are copied.
+    AllProperties {
+        variable: String,
+        expr: Expr,
+        merge: bool,
+    },
 }
 
 impl SetItem {
     /// The variable this item updates.
     pub fn variable(&self) -> &str {
         match self {
-            SetItem::Property { variable, .. } | SetItem::Labels { variable, .. } => variable,
+            SetItem::Property { variable, .. }
+            | SetItem::Labels { variable, .. }
+            | SetItem::AllProperties { variable, .. } => variable,
         }
     }
 }
