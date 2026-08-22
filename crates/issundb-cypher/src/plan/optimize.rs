@@ -2389,6 +2389,38 @@ impl Optimizer {
                 inner.remove(variable);
                 vars.extend(inner);
             }
+            // A pattern predicate introduces no bindings, so every named variable
+            // in it, and everything its inline property maps reference, is an
+            // outer reference. Collecting them all is what lets filter pushdown
+            // place the predicate below its lowest binder.
+            Expr::PatternPredicate { pattern } => {
+                if let Some(v) = &pattern.node.variable {
+                    vars.insert(v.clone());
+                }
+                if let Some(props) = &pattern.node.properties {
+                    for e in props.values() {
+                        Self::collect_expr_vars(e, vars);
+                    }
+                }
+                for (rel, node) in &pattern.rels {
+                    if let Some(v) = &rel.variable {
+                        vars.insert(v.clone());
+                    }
+                    if let Some(v) = &node.variable {
+                        vars.insert(v.clone());
+                    }
+                    if let Some(props) = &rel.properties {
+                        for e in props.values() {
+                            Self::collect_expr_vars(e, vars);
+                        }
+                    }
+                    if let Some(props) = &node.properties {
+                        for e in props.values() {
+                            Self::collect_expr_vars(e, vars);
+                        }
+                    }
+                }
+            }
             // The anchor node is an outer reference; the relationship, target-node, and
             // path variables are local bindings, so they are excluded.
             Expr::PatternComprehension {

@@ -1284,6 +1284,9 @@ fn rewrite_expr_with_aliases(expr: &mut Expr, projections: &[(Expr, String)]) {
             }
             rewrite_expr_with_aliases(transform, projections);
         }
+        // A pattern predicate names graph variables directly; like a pattern
+        // comprehension's pattern, those names are not alias positions.
+        Expr::PatternPredicate { .. } => {}
         Expr::HasLabel { .. } => {}
     }
 }

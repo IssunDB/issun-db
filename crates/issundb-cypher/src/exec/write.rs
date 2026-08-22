@@ -874,6 +874,9 @@ fn subst_loop_var_expr(expr: &Expr, var: &str) -> Expr {
                     .map(|t| if shadowed { t.clone() } else { sub_box(t) }),
             }
         }
+        E::PatternPredicate { pattern } => E::PatternPredicate {
+            pattern: Box::new(subst_loop_var_pattern(pattern, var)),
+        },
         E::PatternComprehension {
             pattern,
             predicate,

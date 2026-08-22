@@ -739,6 +739,7 @@ pub(crate) fn expr_display_name(expr: &Expr) -> String {
             s.push(']');
             s
         }
+        Expr::PatternPredicate { pattern } => pattern_display_name(pattern),
         Expr::PatternComprehension {
             pattern,
             predicate,

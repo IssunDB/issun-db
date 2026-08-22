@@ -441,6 +441,184 @@ mod tests {
         graph.add_node("Person", &props).unwrap()
     }
 
+    /// The TCK pattern-predicate fixture: `(a:A)-[:REL1]->(b:B)`,
+    /// `(b)-[:REL2]->(a)`, `(a)-[:REL3]->(c:C)`, and `(a)-[:REL1]->(d:D)`,
+    /// with a `name` property naming each node.
+    fn setup_pattern_predicate_graph(graph: &Graph) {
+        let a = graph
+            .add_node("A", &serde_json::json!({"name": "a"}))
+            .unwrap();
+        let b = graph
+            .add_node("B", &serde_json::json!({"name": "b"}))
+            .unwrap();
+        let c = graph
+            .add_node("C", &serde_json::json!({"name": "c"}))
+            .unwrap();
+        let d = graph
+            .add_node("D", &serde_json::json!({"name": "d"}))
+            .unwrap();
+        let none = serde_json::json!({});
+        graph.add_edge(a, b, "REL1", &none).unwrap();
+        graph.add_edge(b, a, "REL2", &none).unwrap();
+        graph.add_edge(a, c, "REL3", &none).unwrap();
+        graph.add_edge(a, d, "REL1", &none).unwrap();
+        graph.rebuild_csr().unwrap();
+    }
+
+    fn names(res: &QueryResult) -> Vec<String> {
+        let mut out: Vec<String> = res
+            .records
+            .iter()
+            .map(|r| {
+                r.values
+                    .iter()
+                    .map(|v| v.as_str().unwrap_or_default().to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// A typed outgoing pattern predicate keeps only the rows with at least
+    /// one matching assignment.
+    #[test]
+    fn pattern_predicate_filters_on_typed_outgoing_hop() {
+        let (_dir, graph) = setup_graph();
+        setup_pattern_predicate_graph(&graph);
+        let res = execute(
+            &graph,
+            "MATCH (n) WHERE (n)-[:REL1]->() RETURN n.name AS name",
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(names(&res), vec!["a"]);
+    }
+
+    /// An untyped undirected pattern predicate matches every node with any
+    /// relationship, and the incoming form matches targets only.
+    #[test]
+    fn pattern_predicate_directions() {
+        let (_dir, graph) = setup_graph();
+        setup_pattern_predicate_graph(&graph);
+        let res = execute(
+            &graph,
+            "MATCH (n) WHERE (n)-[]-() RETURN n.name AS name",
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(names(&res), vec!["a", "b", "c", "d"]);
+        let res = execute(
+            &graph,
+            "MATCH (n) WHERE (n)<-[:REL1]-() RETURN n.name AS name",
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(names(&res), vec!["b", "d"]);
+    }
+
+    /// `NOT` over a pattern predicate keeps the rows with no matching
+    /// assignment.
+    #[test]
+    fn pattern_predicate_under_not() {
+        let (_dir, graph) = setup_graph();
+        setup_pattern_predicate_graph(&graph);
+        let res = execute(
+            &graph,
+            "MATCH (n) WHERE NOT (n)-[:REL2]-() RETURN n.name AS name",
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(names(&res), vec!["c", "d"]);
+    }
+
+    /// An inline property map on the target node restricts the match.
+    #[test]
+    fn pattern_predicate_with_property_map() {
+        let (_dir, graph) = setup_graph();
+        setup_pattern_predicate_graph(&graph);
+        let res = execute(
+            &graph,
+            "MATCH (n) WHERE (n)-[:REL1]->({name: 'd'}) RETURN n.name AS name",
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(names(&res), vec!["a"]);
+    }
+
+    /// Both endpoints bound: the predicate joins two scans on connectivity.
+    #[test]
+    fn pattern_predicate_with_bound_endpoints() {
+        let (_dir, graph) = setup_graph();
+        setup_pattern_predicate_graph(&graph);
+        let res = execute(
+            &graph,
+            "MATCH (n), (m) WHERE (n)-[:REL1]->(m) RETURN n.name AS n, m.name AS m",
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(names(&res), vec!["a,b", "a,d"]);
+    }
+
+    /// Two pattern predicates compose under AND and OR.
+    #[test]
+    fn pattern_predicate_in_conjunction_and_disjunction() {
+        let (_dir, graph) = setup_graph();
+        setup_pattern_predicate_graph(&graph);
+        let res = execute(
+            &graph,
+            "MATCH (n) WHERE (n)-[:REL1]-() AND (n)-[:REL3]-() RETURN n.name AS name",
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(names(&res), vec!["a"]);
+        let res = execute(
+            &graph,
+            "MATCH (n) WHERE (n)-[:REL1]-() OR (n)-[:REL2]-() RETURN n.name AS name",
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(names(&res), vec!["a", "b", "d"]);
+    }
+
+    /// `exists(pattern)` is the function form of the pattern predicate: it is
+    /// the pattern's existence, not the non-nullness of its boolean value.
+    #[test]
+    fn pattern_predicate_inside_exists_function() {
+        let (_dir, graph) = setup_graph();
+        setup_pattern_predicate_graph(&graph);
+        let res = execute(
+            &graph,
+            "MATCH (n) WHERE exists((n)-[:REL1]->()) RETURN n.name AS name",
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(names(&res), vec!["a"]);
+        let res = execute(
+            &graph,
+            "MATCH (n) WHERE NOT exists((n)-[:REL2]-()) RETURN n.name AS name",
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(names(&res), vec!["c", "d"]);
+    }
+
+    /// A variable-length arm follows trail semantics: `*2` from the fixture
+    /// reaches b and d over two distinct REL1 edges through a.
+    #[test]
+    fn pattern_predicate_variable_length() {
+        let (_dir, graph) = setup_graph();
+        setup_pattern_predicate_graph(&graph);
+        let res = execute(
+            &graph,
+            "MATCH (n) WHERE (n)-[:REL1*2]-() RETURN n.name AS name",
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(names(&res), vec!["b", "d"]);
+    }
+
     /// An unwound variable used as a graph element raises VariableTypeConflict.
     /// CREATE already enforced this; MERGE must be consistent rather than
     /// silently mishandling the value binding (which anchored the pattern on the

@@ -748,6 +748,31 @@ pub(super) fn evaluate_expr<B: Bindings>(
             transform,
             params,
         ),
+        // A pattern predicate is an existence test over the same expansion the
+        // pattern comprehension runs: true when at least one assignment of the
+        // pattern exists. A null or missing anchor makes the predicate null,
+        // so both the plain and the negated form reject the row.
+        Expr::PatternPredicate { pattern } => {
+            if let Some(anchor) = &pattern.node.variable {
+                match path.get_binding(anchor) {
+                    None | Some(GraphBinding::Scalar(serde_json::Value::Null)) => {
+                        return Ok(serde_json::Value::Null);
+                    }
+                    _ => {}
+                }
+            }
+            let matches = super::read::eval_pattern_comprehension(
+                graph,
+                &path.to_path_map(),
+                pattern,
+                None,
+                &Expr::Literal(crate::ast::Literal::Bool(true)),
+                params,
+            )?;
+            Ok(serde_json::Value::Bool(
+                matches.as_array().is_some_and(|a| !a.is_empty()),
+            ))
+        }
         Expr::Reduce {
             accumulator,
             initial,
@@ -1878,6 +1903,12 @@ pub(super) fn eval_function_call<B: Bindings>(
         "exists" => {
             if args.len() != 1 {
                 return Err("exists() requires exactly 1 argument".into());
+            }
+            // `exists(pattern)` is the function form of the pattern predicate:
+            // the answer is the pattern's existence value itself (true, false,
+            // or null on a null anchor), not the non-nullness of that boolean.
+            if matches!(&args[0], Expr::PatternPredicate { .. }) {
+                return evaluate_expr(graph, path, &args[0], params);
             }
             let val = evaluate_expr(graph, path, &args[0], params)?;
             Ok(serde_json::Value::Bool(val != serde_json::Value::Null))

@@ -324,6 +324,15 @@ pub enum Expr {
         predicate: Option<Box<Expr>>,
         transform: Box<Expr>,
     },
+    /// A relationship pattern used as a boolean predicate, for example
+    /// `WHERE (n)-[:T]->()`. The value is true when at least one assignment
+    /// of the pattern exists, under the usual relationship-uniqueness rule.
+    /// The pattern introduces no bindings: every named variable in it must
+    /// already be bound in the enclosing scope, and it is only legal inside a
+    /// WHERE clause.
+    PatternPredicate {
+        pattern: Box<Pattern>,
+    },
     /// `reduce(accumulator = initial, variable IN list | expression)`
     Reduce {
         accumulator: String,

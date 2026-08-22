@@ -795,6 +795,29 @@ pub(crate) fn expr_parser<'a>() -> impl Parser<'a, ParserInput<'a>, Expr, Parser
                 expression: Box::new(expression),
             });
 
+        // A relationship pattern in expression position: `(n)-[:T]->()`, a
+        // boolean predicate that is true when at least one match exists. At
+        // least one relationship arm is required, so a parenthesized variable
+        // `(n)` and an arithmetic form such as `(a) - [x]` keep parsing as
+        // ordinary expressions through the alternatives below. It is tried
+        // before `paren_expr` because both open with `(` and a failed pattern
+        // backtracks, while a committed `paren_expr` cannot recover the arms.
+        let pattern_predicate = node_pattern(expr.clone())
+            .then(
+                relationship_pattern(expr.clone())
+                    .then(node_pattern(expr.clone()))
+                    .repeated()
+                    .at_least(1)
+                    .collect::<Vec<(RelationshipPattern, NodePattern)>>(),
+            )
+            .map(|(node, rels)| Expr::PatternPredicate {
+                pattern: Box::new(Pattern {
+                    node,
+                    rels,
+                    path_variable: None,
+                }),
+            });
+
         let atom_choices = choice((
             count_star,
             quantifier_expr,
@@ -811,6 +834,7 @@ pub(crate) fn expr_parser<'a>() -> impl Parser<'a, ParserInput<'a>, Expr, Parser
             lit_expr,
             param_expr,
             var_expr,
+            pattern_predicate,
             paren_expr,
         ));
 
@@ -2659,6 +2683,37 @@ fn collect_expr_vars(expr: &Expr, out: &mut std::collections::HashSet<String>) {
             inner.remove(variable);
             out.extend(inner);
         }
+        // A pattern predicate introduces no bindings, so every named variable in
+        // it is a free reference to the outer scope, and its inline property maps
+        // may reference further variables.
+        Expr::PatternPredicate { pattern } => {
+            if let Some(v) = &pattern.node.variable {
+                out.insert(v.clone());
+            }
+            if let Some(props) = &pattern.node.properties {
+                for e in props.values() {
+                    collect_expr_vars(e, out);
+                }
+            }
+            for (rel, node) in &pattern.rels {
+                if let Some(v) = &rel.variable {
+                    out.insert(v.clone());
+                }
+                if let Some(v) = &node.variable {
+                    out.insert(v.clone());
+                }
+                if let Some(props) = &rel.properties {
+                    for e in props.values() {
+                        collect_expr_vars(e, out);
+                    }
+                }
+                if let Some(props) = &node.properties {
+                    for e in props.values() {
+                        collect_expr_vars(e, out);
+                    }
+                }
+            }
+        }
         // The anchor node references an outer variable and is collected as free. The
         // relationship, target-node, and path variables are bound locally, so they are
         // removed from whatever the predicate, transform, and inline property expressions
@@ -3116,6 +3171,10 @@ fn collect_non_agg_props_in_expr(expr: &Expr, props: &mut Vec<(String, String)>)
             collect_non_agg_props_in_expr(list, props);
             collect_non_agg_props_in_expr(predicate, props);
         }
+        // A pattern predicate is legal only inside a WHERE clause, so it never
+        // reaches a projection this collector inspects; it contributes no
+        // grouping property reads.
+        Expr::PatternPredicate { .. } => {}
         // A pattern comprehension depends only on its anchor (an outer variable) and
         // on whatever its predicate, transform, and inline properties reference from
         // the outer scope; its own relationship, target-node, and path variables are
@@ -4025,6 +4084,212 @@ fn check_statement_exprs(
     Ok(())
 }
 
+/// True when the expression contains a pattern predicate anywhere, including
+/// inside comprehension and quantifier subtrees.
+fn expr_contains_pattern_predicate(e: &Expr) -> bool {
+    let any_props = |props: &Option<HashMap<String, Expr>>| {
+        props
+            .as_ref()
+            .is_some_and(|m| m.values().any(expr_contains_pattern_predicate))
+    };
+    match e {
+        Expr::PatternPredicate { .. } => true,
+        Expr::Literal(_)
+        | Expr::Param(_)
+        | Expr::CountStar
+        | Expr::Prop(_, _)
+        | Expr::HasLabel { .. } => false,
+        Expr::Agg(_, inner) | Expr::IsNull(inner) | Expr::IsNotNull(inner) | Expr::Not(inner) => {
+            expr_contains_pattern_predicate(inner)
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            expr_contains_pattern_predicate(left) || expr_contains_pattern_predicate(right)
+        }
+        Expr::FunctionCall { args, .. } => args.iter().any(expr_contains_pattern_predicate),
+        Expr::Case {
+            subject,
+            arms,
+            else_expr,
+        } => {
+            subject
+                .as_deref()
+                .is_some_and(expr_contains_pattern_predicate)
+                || arms.iter().any(|a| {
+                    expr_contains_pattern_predicate(&a.when)
+                        || expr_contains_pattern_predicate(&a.then)
+                })
+                || else_expr
+                    .as_deref()
+                    .is_some_and(expr_contains_pattern_predicate)
+        }
+        Expr::Subscript { expr, index } => {
+            expr_contains_pattern_predicate(expr) || expr_contains_pattern_predicate(index)
+        }
+        Expr::Slice { expr, start, end } => {
+            expr_contains_pattern_predicate(expr)
+                || start
+                    .as_deref()
+                    .is_some_and(expr_contains_pattern_predicate)
+                || end.as_deref().is_some_and(expr_contains_pattern_predicate)
+        }
+        Expr::ListComprehension {
+            list,
+            predicate,
+            transform,
+            ..
+        } => {
+            expr_contains_pattern_predicate(list)
+                || predicate
+                    .as_deref()
+                    .is_some_and(expr_contains_pattern_predicate)
+                || transform
+                    .as_deref()
+                    .is_some_and(expr_contains_pattern_predicate)
+        }
+        Expr::PatternComprehension {
+            pattern,
+            predicate,
+            transform,
+        } => {
+            predicate
+                .as_deref()
+                .is_some_and(expr_contains_pattern_predicate)
+                || expr_contains_pattern_predicate(transform)
+                || any_props(&pattern.node.properties)
+                || pattern
+                    .rels
+                    .iter()
+                    .any(|(rel, node)| any_props(&rel.properties) || any_props(&node.properties))
+        }
+        Expr::Reduce {
+            initial,
+            list,
+            expression,
+            ..
+        } => {
+            expr_contains_pattern_predicate(initial)
+                || expr_contains_pattern_predicate(list)
+                || expr_contains_pattern_predicate(expression)
+        }
+        Expr::Quantifier {
+            list, predicate, ..
+        } => expr_contains_pattern_predicate(list) || expr_contains_pattern_predicate(predicate),
+    }
+}
+
+const PATTERN_PREDICATE_PLACEMENT_ERROR: &str =
+    "SyntaxError: a pattern expression may only be used as a predicate in a WHERE clause";
+
+/// Reject a pattern predicate in a non-WHERE expression position.
+fn check_no_pattern_predicate(e: &Expr) -> Result<(), String> {
+    if expr_contains_pattern_predicate(e) {
+        return Err(PATTERN_PREDICATE_PLACEMENT_ERROR.to_string());
+    }
+    Ok(())
+}
+
+/// A pattern used as an expression is legal only as a predicate in a WHERE
+/// clause. Everywhere else (a RETURN or WITH projection, ORDER BY, SKIP and
+/// LIMIT, UNWIND, the right-hand side of SET, and a FOREACH list) it is a
+/// syntax error, even nested inside function calls.
+fn check_pattern_predicate_placement(stmt: &Statement) -> Result<(), String> {
+    let check_return = |rc: &ReturnClause| -> Result<(), String> {
+        for ri in &rc.items {
+            check_no_pattern_predicate(&ri.expr)?;
+        }
+        Ok(())
+    };
+    let check_order_skip_limit = |order_by: &Option<OrderBy>,
+                                  skip: &Option<Expr>,
+                                  limit: &Option<Expr>|
+     -> Result<(), String> {
+        if let Some(ob) = order_by {
+            for si in &ob.items {
+                check_no_pattern_predicate(&si.expr)?;
+            }
+        }
+        if let Some(e) = skip {
+            check_no_pattern_predicate(e)?;
+        }
+        if let Some(e) = limit {
+            check_no_pattern_predicate(e)?;
+        }
+        Ok(())
+    };
+    let check_set_items = |items: &[SetItem]| -> Result<(), String> {
+        for si in items {
+            if let SetItem::Property { expr, .. } = si {
+                check_no_pattern_predicate(expr)?;
+            }
+        }
+        Ok(())
+    };
+    match stmt {
+        Statement::Query(q) => {
+            check_return(&q.return_clause)?;
+            check_order_skip_limit(&q.order_by, &q.skip, &q.limit)?;
+            for part in &q.parts {
+                match part {
+                    QueryPart::With {
+                        items,
+                        order_by,
+                        skip,
+                        limit,
+                        ..
+                    } => {
+                        for ri in items {
+                            check_no_pattern_predicate(&ri.expr)?;
+                        }
+                        check_order_skip_limit(order_by, skip, limit)?;
+                    }
+                    QueryPart::Unwind { expr, .. } => check_no_pattern_predicate(expr)?,
+                    QueryPart::Set { items } => check_set_items(items)?,
+                    _ => {}
+                }
+            }
+        }
+        Statement::Set(s) => check_set_items(&s.set_items)?,
+        Statement::SetAndReturn(sr) => {
+            check_set_items(&sr.set_items)?;
+            check_return(&sr.return_clause)?;
+            check_order_skip_limit(&sr.order_by, &sr.skip, &sr.limit)?;
+        }
+        Statement::CreateAndReturn(cr) => {
+            check_return(&cr.return_clause)?;
+            check_order_skip_limit(&cr.order_by, &cr.skip, &cr.limit)?;
+        }
+        Statement::MergeAndReturn(mr) => {
+            check_return(&mr.return_clause)?;
+            check_order_skip_limit(&mr.order_by, &mr.skip, &mr.limit)?;
+        }
+        Statement::DeleteAndReturn(dr) => {
+            check_return(&dr.return_clause)?;
+            check_order_skip_limit(&dr.order_by, &dr.skip, &dr.limit)?;
+        }
+        Statement::RemoveAndReturn(rr) => {
+            check_return(&rr.return_clause)?;
+            check_order_skip_limit(&rr.order_by, &rr.skip, &rr.limit)?;
+        }
+        Statement::Union(u) => {
+            check_pattern_predicate_placement(&u.left)?;
+            check_pattern_predicate_placement(&u.right)?;
+        }
+        Statement::Foreach(f) => {
+            check_no_pattern_predicate(&f.list)?;
+            for s in &f.body {
+                check_pattern_predicate_placement(s)?;
+            }
+        }
+        Statement::Pipeline(stmts) => {
+            for s in stmts {
+                check_pattern_predicate_placement(s)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 fn check_query_part_exprs(
     part: &QueryPart,
     path_vars: &std::collections::HashSet<String>,
@@ -4596,6 +4861,7 @@ fn validate_statement(stmt: &Statement) -> Result<(), String> {
     let mut rel_vars = std::collections::HashSet::new();
     collect_node_and_rel_vars_in_stmt(stmt, &mut node_vars, &mut rel_vars);
     check_statement_exprs(stmt, &path_vars, &node_vars, &rel_vars)?;
+    check_pattern_predicate_placement(stmt)?;
 
     match stmt {
         Statement::Query(q) => {
@@ -7393,6 +7659,113 @@ mod diagnostic_tests {
             assert_eq!(lines[3].find('|'), lines[4].find('|'), "{msg}");
             let caret = lines[4].find('^').unwrap();
             assert_eq!(lines[3].as_bytes()[caret], b'5', "{msg}");
+        }
+    }
+
+    // --- Pattern predicates in WHERE ---
+
+    /// A relationship pattern in a WHERE position parses to a
+    /// `PatternPredicate` expression carrying the pattern.
+    #[test]
+    fn parse_pattern_predicate_in_where() {
+        let stmt = parse("MATCH (n) WHERE (n)-[:T]->() RETURN n").unwrap();
+        let Statement::Query(q) = stmt else {
+            panic!("expected query");
+        };
+        let Some(WhereClause::Expr(Expr::PatternPredicate { pattern })) = q.where_clause else {
+            panic!("expected a pattern predicate, got {:?}", q.where_clause);
+        };
+        assert_eq!(pattern.node.variable.as_deref(), Some("n"));
+        assert_eq!(pattern.rels.len(), 1);
+        let (rel, target) = &pattern.rels[0];
+        assert_eq!(rel.rel_type.as_deref(), Some("T"));
+        assert!(!rel.is_incoming);
+        assert!(!rel.is_undirected);
+        assert!(target.variable.is_none());
+        assert!(pattern.path_variable.is_none());
+    }
+
+    /// Every direction, a multi-type arm, an inline property map, a chained
+    /// hop, and a variable-length arm all parse in WHERE position.
+    #[test]
+    fn parse_pattern_predicate_forms() {
+        for q in [
+            "MATCH (n) WHERE (n)-->() RETURN n",
+            "MATCH (n) WHERE (n)<--() RETURN n",
+            "MATCH (n) WHERE (n)--() RETURN n",
+            "MATCH (n) WHERE (n)<-[:T]-() RETURN n",
+            "MATCH (n) WHERE (n)-[:T|S]-() RETURN n",
+            "MATCH (n) WHERE (n)-[:T {k: 1}]->({name: 'x'}) RETURN n",
+            "MATCH (n) WHERE (n)-[:T]->()<-[:S]-() RETURN n",
+            "MATCH (n) WHERE (n)-[:T*]->() RETURN n",
+            "MATCH (n) WHERE (n)-[:T*2]-() RETURN n",
+            "MATCH (n) WHERE NOT (n)-[:T]-() RETURN n",
+            "MATCH (n) WHERE (n)-[:T]-() AND (n)-[:S]-() RETURN n",
+            "MATCH (n) WHERE (n)-[:T]-() OR (n)-[:S]-() RETURN n",
+            "MATCH (n), (m) WHERE (n)-[:T]->(m) RETURN n, m",
+        ] {
+            assert!(parse(q).is_ok(), "should parse: {q}");
+        }
+    }
+
+    /// Subtraction of a list from a parenthesized variable is arithmetic, not
+    /// a pattern: the pattern alternative requires a relationship arm.
+    #[test]
+    fn parse_paren_minus_list_stays_subtraction() {
+        let stmt = parse("WITH 1 AS a RETURN (a) - [1] AS x").unwrap();
+        let Statement::Query(q) = stmt else {
+            panic!("expected query");
+        };
+        assert!(matches!(
+            &q.return_clause.items[0].expr,
+            Expr::BinaryOp {
+                op: BinaryOperator::Sub,
+                ..
+            }
+        ));
+    }
+
+    /// A bare parenthesized variable in WHERE stays an ordinary expression;
+    /// it must not become a pattern predicate.
+    #[test]
+    fn parse_bare_paren_variable_is_not_a_pattern() {
+        let stmt = parse("MATCH (n) WHERE (n) RETURN n").unwrap();
+        let Statement::Query(q) = stmt else {
+            panic!("expected query");
+        };
+        assert!(
+            !matches!(
+                q.where_clause,
+                Some(WhereClause::Expr(Expr::PatternPredicate { .. }))
+            ),
+            "bare (n) must not parse as a pattern predicate"
+        );
+    }
+
+    /// A pattern predicate introduces no bindings, so a variable named inside
+    /// it that is not bound outside is an undefined variable.
+    #[test]
+    fn pattern_predicate_rejects_new_variables() {
+        for q in [
+            "MATCH (n) WHERE (n)-[r]->() RETURN n",
+            "MATCH (n) WHERE (n)-[]->(a) RETURN n",
+            "MATCH (n) WHERE (n)-[r:REL]->(a {num: 5}) RETURN n",
+        ] {
+            assert!(parse(q).is_err(), "should reject new variable: {q}");
+        }
+    }
+
+    /// A pattern expression outside a WHERE clause is a syntax error: in a
+    /// RETURN or WITH projection, and in the right-hand side of SET, even
+    /// nested inside function calls.
+    #[test]
+    fn pattern_predicate_outside_where_is_rejected() {
+        for q in [
+            "MATCH (n) RETURN (n)-[]->()",
+            "MATCH (n) WITH (n)-[]->() AS x RETURN x",
+            "MATCH (n) SET n.prop = head(nodes(head((n)-[:REL]->()))).foo",
+        ] {
+            assert!(parse(q).is_err(), "should reject pattern here: {q}");
         }
     }
 
