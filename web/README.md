@@ -56,9 +56,9 @@ at that graph, and an example whose graph is not in the database says which one 
 returning an empty table. The one example that still writes is the Cypher basics lesson on `CREATE`,
 and it makes two nodes rather than a dataset.
 
-None of the six carries a comment, and the sidebar carries no prose describing them: the table above
+None of the seven carries a comment, and the sidebar carries no prose describing them: the table above
 is where that belongs. `make playground-check` seeds each category's own graph before running its
-examples, runs all six samples, and fails one that parses but creates no nodes.
+examples, runs all seven samples, and fails one that parses but creates no nodes.
 
 The published copy is at <https://issundb.github.io/issun-db/playground/>. The docs workflow
 builds it and copies this directory into `site/playground/` after the MkDocs build, so the

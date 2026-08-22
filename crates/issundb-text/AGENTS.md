@@ -5,8 +5,9 @@ everywhere and are not repeated here.
 
 ## Tokenization Pipeline
 
-The tokenizer currently lives in `crates/issundb-core/src/storage/fts.rs` (the `tokenize` function), pending the target decoupling that moves it into
-this crate. Every string is processed through the following stages, applied in this exact order at both **index time** and **query time**:
+The tokenizer lives in `crates/issundb-core/src/storage/fts.rs` (the `tokenize` function), because the write path is in core and full-text index
+postings are maintained transactionally alongside node records; this crate tokenizes queries through core so that indexing and querying cannot disagree.
+Every string is processed through the following stages, applied in this exact order at both **index time** and **query time**:
 
 1. `fold_ascii`: normalize diacritics and accented characters to their ASCII base forms (e.g., `é → e`, `ü → u`). This ensures that queries
    without diacritics match documents indexed with them.

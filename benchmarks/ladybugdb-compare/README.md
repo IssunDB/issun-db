@@ -128,6 +128,7 @@ thread.
 
 - Loading data differs structurally for the two databases. LadybugDB bulk-loads via `COPY FROM` CSV; IssunDB inserts per record through `add_node` and
   `add_edge`. Both are timed and reported, but they measure different ingestion models.
-- LadybugDB defaults to WALK semantics for variable-length patterns (a relationship may repeat within a path); the harness pins
-  `recursive_pattern_semantic = 'TRAIL'` so both databases use the openCypher path semantics on identical query strings.
+- LadybugDB evaluates WALK semantics for relationship patterns (a relationship may repeat within a match), and its
+  `recursive_pattern_semantic = 'TRAIL'` setting is inert in the pinned build. The harness compensates with the trail oracle
+  in the differential pass so walk-versus-trail divergences are attributed rather than treated as IssunDB failures.
 - `rebuild_csr` runs once after the IssunDB load so queries start from a fresh snapshot, matching steady-state operation.
