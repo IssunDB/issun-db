@@ -333,6 +333,18 @@ pub enum Expr {
     PatternPredicate {
         pattern: Box<Pattern>,
     },
+    /// `EXISTS { ... }`: an existential subquery, true when at least one
+    /// assignment of the pattern satisfies the predicate. The body is either
+    /// the simple form (`EXISTS { (n)-->(m) [WHERE pred] }`) or the full form
+    /// (`EXISTS { MATCH (n)-->(m) [WHERE pred] RETURN expr }`); the parser
+    /// discards the projection because existence does not depend on it.
+    /// Unlike a pattern predicate, the pattern does introduce bindings: a
+    /// variable the outer scope does not bind is local to the subquery, and
+    /// one it does bind is a correlated reference.
+    ExistsSubquery {
+        pattern: Box<Pattern>,
+        predicate: Option<Box<Expr>>,
+    },
     /// `reduce(accumulator = initial, variable IN list | expression)`
     Reduce {
         accumulator: String,

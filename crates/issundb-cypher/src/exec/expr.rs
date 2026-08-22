@@ -835,6 +835,62 @@ pub(super) fn evaluate_expr<B: Bindings>(
                 matches.as_array().is_some_and(|a| !a.is_empty()),
             ))
         }
+        // An existential subquery is true when at least one assignment of its
+        // pattern satisfies the body's WHERE clause. Variables the outer scope
+        // binds are correlated references and the rest bind locally, which is
+        // the pattern comprehension's scoping, so the body runs through the
+        // same expansion. The one case the comprehension cannot seed is an
+        // anchor the outer scope does not bind: that anchor is a local
+        // variable, so every node is a candidate, and the comprehension
+        // re-checks the anchor's own labels and inline properties per
+        // candidate. The result is always a boolean, never null: an anchor
+        // bound to null, or to a non-node value, simply matches nothing.
+        Expr::ExistsSubquery { pattern, predicate } => {
+            let true_expr = Expr::Literal(crate::ast::Literal::Bool(true));
+            let mut pat = (**pattern).clone();
+            let anchor = match pat.node.variable.clone() {
+                Some(v) => v,
+                None => {
+                    let name = "__exists_anchor".to_string();
+                    pat.node.variable = Some(name.clone());
+                    name
+                }
+            };
+            let outer = path.to_path_map();
+            if outer.contains_key(&anchor) {
+                let matches = super::read::eval_pattern_comprehension(
+                    graph,
+                    &outer,
+                    &pat,
+                    predicate.as_deref(),
+                    &true_expr,
+                    params,
+                )?;
+                return Ok(serde_json::Value::Bool(
+                    matches.as_array().is_some_and(|a| !a.is_empty()),
+                ));
+            }
+            let candidates = match pat.node.labels.first() {
+                Some(label) => graph.nodes_by_label(label).map_err(|e| e.to_string())?,
+                None => graph.all_nodes().map_err(|e| e.to_string())?,
+            };
+            let mut seeded = outer;
+            for nid in candidates {
+                seeded.insert(anchor.clone(), GraphBinding::Node(nid));
+                let matches = super::read::eval_pattern_comprehension(
+                    graph,
+                    &seeded,
+                    &pat,
+                    predicate.as_deref(),
+                    &true_expr,
+                    params,
+                )?;
+                if matches.as_array().is_some_and(|a| !a.is_empty()) {
+                    return Ok(serde_json::Value::Bool(true));
+                }
+            }
+            Ok(serde_json::Value::Bool(false))
+        }
         Expr::Reduce {
             accumulator,
             initial,

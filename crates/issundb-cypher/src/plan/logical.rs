@@ -1287,6 +1287,13 @@ fn rewrite_expr_with_aliases(expr: &mut Expr, projections: &[(Expr, String)]) {
         // A pattern predicate names graph variables directly; like a pattern
         // comprehension's pattern, those names are not alias positions.
         Expr::PatternPredicate { .. } => {}
+        // An existential subquery's pattern names graph variables directly;
+        // only its WHERE clause holds expressions an alias can appear in.
+        Expr::ExistsSubquery { predicate, .. } => {
+            if let Some(p) = predicate {
+                rewrite_expr_with_aliases(p, projections);
+            }
+        }
         Expr::HasLabel { .. } => {}
     }
 }

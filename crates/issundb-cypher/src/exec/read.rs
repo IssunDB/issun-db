@@ -746,6 +746,15 @@ pub(crate) fn expr_display_name(expr: &Expr) -> String {
             s
         }
         Expr::PatternPredicate { pattern } => pattern_display_name(pattern),
+        Expr::ExistsSubquery { pattern, predicate } => {
+            let mut s = String::from("exists { ");
+            s.push_str(&pattern_display_name(pattern));
+            if let Some(p) = predicate {
+                s.push_str(&format!(" WHERE {}", expr_display_name(p)));
+            }
+            s.push_str(" }");
+            s
+        }
         Expr::PatternComprehension {
             pattern,
             predicate,

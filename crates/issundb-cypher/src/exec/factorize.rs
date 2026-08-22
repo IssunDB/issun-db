@@ -195,6 +195,42 @@ fn collect_expr_vars(expr: &Expr, vars: &mut HashSet<String>) {
                 }
             }
         }
+        // An existential subquery binds a pattern variable locally only when the
+        // outer scope does not already bind it, which this walker cannot know.
+        // Over-reporting is the safe direction here: a name that is really local
+        // merely forces the per-row fallback, while under-reporting a correlated
+        // destination variable would evaluate the filter once per source row.
+        Expr::ExistsSubquery { pattern, predicate } => {
+            if let Some(v) = &pattern.node.variable {
+                vars.insert(v.clone());
+            }
+            if let Some(props) = &pattern.node.properties {
+                for e in props.values() {
+                    collect_expr_vars(e, vars);
+                }
+            }
+            for (rel, node) in &pattern.rels {
+                if let Some(v) = &rel.variable {
+                    vars.insert(v.clone());
+                }
+                if let Some(v) = &node.variable {
+                    vars.insert(v.clone());
+                }
+                if let Some(props) = &rel.properties {
+                    for e in props.values() {
+                        collect_expr_vars(e, vars);
+                    }
+                }
+                if let Some(props) = &node.properties {
+                    for e in props.values() {
+                        collect_expr_vars(e, vars);
+                    }
+                }
+            }
+            if let Some(p) = predicate {
+                collect_expr_vars(p, vars);
+            }
+        }
         // The anchor node is an outer reference; the relationship, target-node, and path
         // variables are local bindings. Insert the anchor, then collect from the predicate
         // and transform with the local bindings removed.

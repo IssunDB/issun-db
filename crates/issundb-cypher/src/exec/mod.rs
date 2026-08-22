@@ -619,6 +619,210 @@ mod tests {
         assert_eq!(names(&res), vec!["b", "d"]);
     }
 
+    // --- Existential subqueries ---
+
+    /// The TCK existential-subquery fixture: `(a:A {prop: 1})-[:R]->(b:B {prop: 1})`,
+    /// `(a)-[:R]->(c:C {prop: 2})`, and `(a)-[:R]->(d:D {prop: 3})`.
+    fn setup_exists_graph(graph: &Graph) {
+        let a = graph
+            .add_node("A", &serde_json::json!({"prop": 1}))
+            .unwrap();
+        let b = graph
+            .add_node("B", &serde_json::json!({"prop": 1}))
+            .unwrap();
+        let c = graph
+            .add_node("C", &serde_json::json!({"prop": 2}))
+            .unwrap();
+        let d = graph
+            .add_node("D", &serde_json::json!({"prop": 3}))
+            .unwrap();
+        let none = serde_json::json!({});
+        graph.add_edge(a, b, "R", &none).unwrap();
+        graph.add_edge(a, c, "R", &none).unwrap();
+        graph.add_edge(a, d, "R", &none).unwrap();
+        graph.rebuild_csr().unwrap();
+    }
+
+    fn props(res: &QueryResult) -> Vec<i64> {
+        let mut out: Vec<i64> = res
+            .records
+            .iter()
+            .map(|r| r.values[0].as_i64().unwrap())
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
+    /// A simple subquery keeps only the rows with at least one assignment;
+    /// only `a` has outgoing edges.
+    #[test]
+    fn exists_subquery_simple() {
+        let (_dir, graph) = setup_graph();
+        setup_exists_graph(&graph);
+        let res = execute(
+            &graph,
+            "MATCH (n) WHERE exists { (n)-->() } RETURN n.prop AS p",
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(props(&res), vec![1]);
+    }
+
+    /// A body-level WHERE correlates the outer `n` with the local `m`.
+    #[test]
+    fn exists_subquery_with_where() {
+        let (_dir, graph) = setup_graph();
+        setup_exists_graph(&graph);
+        let res = execute(
+            &graph,
+            "MATCH (n) WHERE exists { (n)-->(m) WHERE n.prop = m.prop } RETURN n.prop AS p",
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(props(&res), vec![1]);
+    }
+
+    /// A relationship type with no edges matches nothing, with and without a
+    /// body-level WHERE over the local relationship variable.
+    #[test]
+    fn exists_subquery_not_existing_pattern() {
+        let (_dir, graph) = setup_graph();
+        setup_exists_graph(&graph);
+        for q in [
+            "MATCH (n) WHERE exists { (n)-[:NA]->() } RETURN n.prop AS p",
+            "MATCH (n) WHERE exists { (n)-[r]->() WHERE type(r) = 'NA' } RETURN n.prop AS p",
+        ] {
+            let res = execute(&graph, q, &HashMap::new()).unwrap();
+            assert_eq!(props(&res), Vec::<i64>::new(), "{q}");
+        }
+    }
+
+    /// NOT inverts the existence test; `b`, `c`, and `d` have no outgoing edges.
+    #[test]
+    fn exists_subquery_negated() {
+        let (_dir, graph) = setup_graph();
+        setup_exists_graph(&graph);
+        let res = execute(
+            &graph,
+            "MATCH (n) WHERE NOT exists { (n)-->() } RETURN n.prop AS p",
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(props(&res), vec![1, 2, 3]);
+    }
+
+    /// The full form (`MATCH ... RETURN true`) is the simple form's equal.
+    #[test]
+    fn exists_subquery_full_form() {
+        let (_dir, graph) = setup_graph();
+        setup_exists_graph(&graph);
+        let res = execute(
+            &graph,
+            "MATCH (n) WHERE exists { MATCH (n)-->() RETURN true } RETURN n.prop AS p",
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(props(&res), vec![1]);
+    }
+
+    /// A nested subquery whose outer body anchors on a variable bound nowhere
+    /// outside: `m` is local to the outer body, and the inner subquery
+    /// correlates both `n` and `m`.
+    #[test]
+    fn exists_subquery_nested_with_local_anchor() {
+        let (_dir, graph) = setup_graph();
+        setup_exists_graph(&graph);
+        let res = execute(
+            &graph,
+            "MATCH (n) WHERE exists { MATCH (m) WHERE exists { (n)-[]->(m) \
+             WHERE n.prop = m.prop } RETURN true } RETURN n.prop AS p",
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(props(&res), vec![1]);
+    }
+
+    /// A nested full subquery whose inner pattern anchors on a local variable
+    /// and correlates two outer variables, plus the pattern-predicate form of
+    /// the same body.
+    #[test]
+    fn exists_subquery_nested_full() {
+        let (_dir, graph) = setup_graph();
+        setup_exists_graph(&graph);
+        for q in [
+            "MATCH (n) WHERE exists { MATCH (m) WHERE exists { \
+             MATCH (l)<-[:R]-(n)-[:R]->(m) RETURN true } RETURN true } RETURN n.prop AS p",
+            "MATCH (n) WHERE exists { MATCH (m) WHERE exists { MATCH (l) WHERE \
+             (l)<-[:R]-(n)-[:R]->(m) RETURN true } RETURN true } RETURN n.prop AS p",
+        ] {
+            let res = execute(&graph, q, &HashMap::new()).unwrap();
+            assert_eq!(props(&res), vec![1], "{q}");
+        }
+    }
+
+    /// In a RETURN position the subquery is an ordinary boolean expression.
+    #[test]
+    fn exists_subquery_in_return_position() {
+        let (_dir, graph) = setup_graph();
+        setup_exists_graph(&graph);
+        let res = execute(
+            &graph,
+            "MATCH (n:A) RETURN exists { (n)-->() } AS x",
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(res.records[0].values[0], serde_json::json!(true));
+        let res = execute(
+            &graph,
+            "MATCH (n:B) RETURN exists { (n)-->() } AS x",
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(res.records[0].values[0], serde_json::json!(false));
+    }
+
+    /// An empty graph matches nothing; a body over it is false, not an error.
+    #[test]
+    fn exists_subquery_on_empty_graph() {
+        let (_dir, graph) = setup_graph();
+        let node = graph.add_node("A", &serde_json::json!({})).unwrap();
+        let _ = node;
+        graph.rebuild_csr().unwrap();
+        let res = execute(
+            &graph,
+            "MATCH (n) WHERE exists { MATCH (m)-->(l) RETURN true } RETURN n",
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(res.records.len(), 0);
+    }
+
+    /// The subquery is a filter expression, so both execution modes must
+    /// return the same rows.
+    #[test]
+    fn exists_subquery_matches_row_pipeline() {
+        let (_dir, graph) = setup_graph();
+        setup_exists_graph(&graph);
+        let queries = [
+            "MATCH (n) WHERE exists { (n)-->(m) WHERE n.prop = m.prop } RETURN n.prop AS p",
+            "MATCH (n) WHERE NOT exists { (n)-[:NA]->() } RETURN n.prop AS p",
+            "MATCH (n) WHERE exists { MATCH (m) WHERE exists { (n)-[]->(m) \
+             WHERE n.prop = m.prop } RETURN true } RETURN n.prop AS p",
+        ];
+        for q in queries {
+            let fast = {
+                let _guard = crate::exec_mode::fast_paths_required();
+                execute(&graph, q, &HashMap::new()).unwrap()
+            };
+            let row = {
+                let _guard = crate::exec_mode::RowPipelineOnly::install();
+                execute(&graph, q, &HashMap::new()).unwrap()
+            };
+            assert_eq!(fast.columns, row.columns, "{q}");
+            assert_eq!(props(&fast), props(&row), "{q}");
+        }
+    }
+
     /// An unwound variable used as a graph element raises VariableTypeConflict.
     /// CREATE already enforced this; MERGE must be consistent rather than
     /// silently mishandling the value binding (which anchored the pattern on the

@@ -2421,6 +2421,43 @@ impl Optimizer {
                     }
                 }
             }
+            // An existential subquery binds a pattern variable locally only when
+            // the outer scope does not already bind it, which this walker cannot
+            // know. Over-reporting is the safe direction for filter pushdown: a
+            // correlated variable keeps the filter above its binder, and a name
+            // bound nowhere leaves the filter wrapped above the root, where every
+            // correlated variable is in scope.
+            Expr::ExistsSubquery { pattern, predicate } => {
+                if let Some(v) = &pattern.node.variable {
+                    vars.insert(v.clone());
+                }
+                if let Some(props) = &pattern.node.properties {
+                    for e in props.values() {
+                        Self::collect_expr_vars(e, vars);
+                    }
+                }
+                for (rel, node) in &pattern.rels {
+                    if let Some(v) = &rel.variable {
+                        vars.insert(v.clone());
+                    }
+                    if let Some(v) = &node.variable {
+                        vars.insert(v.clone());
+                    }
+                    if let Some(props) = &rel.properties {
+                        for e in props.values() {
+                            Self::collect_expr_vars(e, vars);
+                        }
+                    }
+                    if let Some(props) = &node.properties {
+                        for e in props.values() {
+                            Self::collect_expr_vars(e, vars);
+                        }
+                    }
+                }
+                if let Some(p) = predicate {
+                    Self::collect_expr_vars(p, vars);
+                }
+            }
             // The anchor node is an outer reference; the relationship, target-node, and
             // path variables are local bindings, so they are excluded.
             Expr::PatternComprehension {

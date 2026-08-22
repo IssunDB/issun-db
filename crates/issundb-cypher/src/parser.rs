@@ -795,6 +795,48 @@ pub(crate) fn expr_parser<'a>() -> impl Parser<'a, ParserInput<'a>, Expr, Parser
                 expression: Box::new(expression),
             });
 
+        // `EXISTS { ... }`: an existential subquery, distinguished from the
+        // `exists(...)` function by the brace. The body is a pattern, in the
+        // simple form (`pattern [WHERE pred]`) or the full form
+        // (`MATCH pattern [WHERE pred] RETURN expr`); the projection is
+        // discarded because existence does not depend on it. The full form
+        // requires the RETURN, so a write clause after the MATCH fails to
+        // parse, which is the InvalidClauseComposition the TCK expects. A map
+        // literal after `exists` never reaches this alternative, because the
+        // body must open with `MATCH` or a node pattern; `exists {a: 1}` stays
+        // the parse error it always was.
+        let exists_body_pattern = node_pattern(expr.clone())
+            .then(
+                relationship_pattern(expr.clone())
+                    .then(node_pattern(expr.clone()))
+                    .repeated()
+                    .collect::<Vec<(RelationshipPattern, NodePattern)>>(),
+            )
+            .map(|(node, rels)| Pattern {
+                node,
+                rels,
+                path_variable: None,
+            });
+
+        let exists_where = keyword("WHERE").ignore_then(expr.clone()).or_not();
+
+        let exists_full = keyword("MATCH")
+            .ignore_then(exists_body_pattern.clone())
+            .then(exists_where.clone())
+            .then_ignore(keyword("RETURN"))
+            .then_ignore(expr.clone());
+
+        let exists_simple = exists_body_pattern.then(exists_where);
+
+        let exists_subquery = keyword("EXISTS")
+            .ignore_then(sym(Tok::LBrace))
+            .ignore_then(choice((exists_full, exists_simple)))
+            .then_ignore(sym(Tok::RBrace))
+            .map(|(pattern, predicate)| Expr::ExistsSubquery {
+                pattern: Box::new(pattern),
+                predicate: predicate.map(Box::new),
+            });
+
         // A relationship pattern in expression position: `(n)-[:T]->()`, a
         // boolean predicate that is true when at least one match exists. At
         // least one relationship arm is required, so a parenthesized variable
@@ -820,6 +862,7 @@ pub(crate) fn expr_parser<'a>() -> impl Parser<'a, ParserInput<'a>, Expr, Parser
 
         let atom_choices = choice((
             count_star,
+            exists_subquery,
             quantifier_expr,
             case_expr,
             list_expr,
@@ -2732,6 +2775,41 @@ fn collect_expr_vars(expr: &Expr, out: &mut std::collections::HashSet<String>) {
                 }
             }
         }
+        // An existential subquery, unlike a pattern predicate, binds its pattern
+        // variables: one the outer scope does not bind is local to the subquery,
+        // so no pattern variable may be reported as free, or the scope validators
+        // would raise a false UndefinedVariable for a body-local variable. Only
+        // what the predicate and the inline property maps reference beyond the
+        // pattern's own variables is free.
+        Expr::ExistsSubquery { pattern, predicate } => {
+            let mut local = std::collections::HashSet::new();
+            collect_pattern_vars(pattern, &mut local);
+            let mut inner = std::collections::HashSet::new();
+            if let Some(p) = predicate {
+                collect_expr_vars(p, &mut inner);
+            }
+            if let Some(props) = &pattern.node.properties {
+                for e in props.values() {
+                    collect_expr_vars(e, &mut inner);
+                }
+            }
+            for (rel, node) in &pattern.rels {
+                if let Some(props) = &rel.properties {
+                    for e in props.values() {
+                        collect_expr_vars(e, &mut inner);
+                    }
+                }
+                if let Some(props) = &node.properties {
+                    for e in props.values() {
+                        collect_expr_vars(e, &mut inner);
+                    }
+                }
+            }
+            for v in &local {
+                inner.remove(v);
+            }
+            out.extend(inner);
+        }
         // The anchor node references an outer variable and is collected as free. The
         // relationship, target-node, and path variables are bound locally, so they are
         // removed from whatever the predicate, transform, and inline property expressions
@@ -3193,6 +3271,36 @@ fn collect_non_agg_props_in_expr(expr: &Expr, props: &mut Vec<(String, String)>)
         // reaches a projection this collector inspects; it contributes no
         // grouping property reads.
         Expr::PatternPredicate { .. } => {}
+        // An existential subquery contributes only what its predicate and inline
+        // properties reference from the outer scope; every pattern variable may
+        // be a local binding, so none is a grouping property read.
+        Expr::ExistsSubquery { pattern, predicate } => {
+            let mut local = std::collections::HashSet::new();
+            collect_pattern_vars(pattern, &mut local);
+            let mut inner = Vec::new();
+            if let Some(p) = predicate {
+                collect_non_agg_props_in_expr(p, &mut inner);
+            }
+            if let Some(ps) = &pattern.node.properties {
+                for e in ps.values() {
+                    collect_non_agg_props_in_expr(e, &mut inner);
+                }
+            }
+            for (rel, node) in &pattern.rels {
+                if let Some(ps) = &rel.properties {
+                    for e in ps.values() {
+                        collect_non_agg_props_in_expr(e, &mut inner);
+                    }
+                }
+                if let Some(ps) = &node.properties {
+                    for e in ps.values() {
+                        collect_non_agg_props_in_expr(e, &mut inner);
+                    }
+                }
+            }
+            inner.retain(|(v, _)| !local.contains(v));
+            props.extend(inner);
+        }
         // A pattern comprehension depends only on its anchor (an outer variable) and
         // on whatever its predicate, transform, and inline properties reference from
         // the outer scope; its own relationship, target-node, and path variables are
@@ -4132,6 +4240,10 @@ fn expr_contains_pattern_predicate(e: &Expr) -> bool {
     };
     match e {
         Expr::PatternPredicate { .. } => true,
+        // An existential subquery is a scalar boolean expression, legal in any
+        // expression position, and its own WHERE clause is a WHERE position, so
+        // a pattern predicate inside it is legal too; do not recurse.
+        Expr::ExistsSubquery { .. } => false,
         Expr::Literal(_)
         | Expr::Param(_)
         | Expr::CountStar
@@ -7902,6 +8014,105 @@ mod diagnostic_tests {
         ] {
             assert!(parse(q).is_err(), "should reject pattern here: {q}");
         }
+    }
+
+    // --- Existential subqueries ---
+
+    /// `exists { pattern }` in WHERE parses to an `ExistsSubquery` expression
+    /// carrying the pattern and no predicate.
+    #[test]
+    fn parse_exists_subquery_simple() {
+        let stmt = parse("MATCH (n) WHERE exists { (n)-->(m) } RETURN n").unwrap();
+        let Statement::Query(q) = stmt else {
+            panic!("expected query");
+        };
+        let Some(WhereClause::Expr(Expr::ExistsSubquery { pattern, predicate })) = q.where_clause
+        else {
+            panic!("expected an existential subquery, got {:?}", q.where_clause);
+        };
+        assert_eq!(pattern.node.variable.as_deref(), Some("n"));
+        assert_eq!(pattern.rels.len(), 1);
+        assert_eq!(pattern.rels[0].1.variable.as_deref(), Some("m"));
+        assert!(predicate.is_none());
+    }
+
+    /// The simple and full forms, a body-level WHERE, nesting, boolean
+    /// combinators, a RETURN position, and both keyword spellings all parse.
+    #[test]
+    fn parse_exists_subquery_forms() {
+        for q in [
+            "MATCH (n) WHERE exists { (n)-->(m) WHERE n.prop = m.prop } RETURN n",
+            "MATCH (n) WHERE exists { (n)-[r]->() WHERE type(r) = 'NA' } RETURN n",
+            "MATCH (n) WHERE exists { MATCH (n)-->() RETURN true } RETURN n",
+            "MATCH (n) WHERE EXISTS { MATCH (n)-[:R]->(m) RETURN true } RETURN n",
+            "MATCH (n) WHERE NOT exists { (n)-->() } RETURN n",
+            "MATCH (n) WHERE exists { (n)-->() } AND exists { (n)<--() } RETURN n",
+            "MATCH (n) WHERE exists { (n)-->() } OR exists { (n)<--() } RETURN n",
+            "MATCH (n) RETURN exists { (n)-->() } AS x",
+            "MATCH (n) WHERE exists { MATCH (m) WHERE exists { (n)-[]->(m) \
+             WHERE n.prop = m.prop } RETURN true } RETURN n",
+            "MATCH (n) WHERE exists { MATCH (m) WHERE exists { \
+             MATCH (l)<-[:R]-(n)-[:R]->(m) RETURN true } RETURN true } RETURN n",
+            "MATCH (n) WHERE exists { MATCH (m) WHERE exists { MATCH (l) WHERE \
+             (l)<-[:R]-(n)-[:R]->(m) RETURN true } RETURN true } RETURN n",
+        ] {
+            assert!(parse(q).is_ok(), "should parse: {q}\n{:?}", parse(q).err());
+        }
+    }
+
+    /// `exists` followed by a map literal is not a subquery; it stays the
+    /// parse error it always was, so the brace form is unambiguous.
+    #[test]
+    fn parse_exists_before_map_literal_stays_an_error() {
+        assert!(parse("RETURN exists {a: 1} AS x").is_err());
+        assert!(parse("MATCH (n) WHERE exists {a: 1} RETURN n").is_err());
+    }
+
+    /// The `exists(...)` function forms are unaffected by the brace form.
+    #[test]
+    fn parse_exists_function_forms_survive() {
+        assert!(parse("MATCH (n) WHERE exists(n.prop) RETURN n").is_ok());
+        assert!(parse("MATCH (n) WHERE exists((n)-->()) RETURN n").is_ok());
+    }
+
+    /// A write clause inside an existential subquery is a compile-time error.
+    #[test]
+    fn parse_exists_subquery_rejects_write_clauses() {
+        assert!(
+            parse("MATCH (n) WHERE exists { MATCH (n)-->(m) SET m.prop = 'fail' } RETURN n")
+                .is_err()
+        );
+        assert!(parse("MATCH (n) WHERE exists { MATCH (n)-->(m) DELETE m } RETURN n").is_err());
+    }
+
+    /// A multi-clause body (WITH, aggregation) is not supported and must be
+    /// rejected at parse time rather than silently misread.
+    #[test]
+    fn parse_exists_subquery_rejects_multi_clause_bodies() {
+        assert!(
+            parse(
+                "MATCH (n) WHERE exists { MATCH (n)-->(m) WITH n, count(*) AS c \
+             WHERE c = 3 RETURN true } RETURN n"
+            )
+            .is_err()
+        );
+    }
+
+    /// Variables the subquery pattern introduces bind locally, so the scope
+    /// validators must not raise UndefinedVariable for them; a WHERE reference
+    /// outside both the pattern and the outer scope stays undefined.
+    #[test]
+    fn exists_subquery_local_variables_are_in_scope() {
+        assert!(parse("MATCH (n) WHERE exists { (n)-->(m) WHERE m.prop = 1 } RETURN n").is_ok());
+        assert!(
+            parse("MATCH (n) WHERE exists { (n)-[r]->(m) WHERE type(r) = 'T' } RETURN n").is_ok()
+        );
+        let err =
+            parse("MATCH (n) WHERE exists { (n)-->(m) WHERE q.prop = 1 } RETURN n").unwrap_err();
+        assert!(
+            err.to_string().contains("UndefinedVariable"),
+            "expected UndefinedVariable, got: {err}"
+        );
     }
 
     /// A clause keyword in an unexpected position is called a keyword. Reporting

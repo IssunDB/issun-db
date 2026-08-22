@@ -893,6 +893,10 @@ fn subst_loop_var_expr(expr: &Expr, var: &str) -> Expr {
             predicate: predicate.as_ref().map(|p| sub_box(p)),
             transform: sub_box(transform),
         },
+        E::ExistsSubquery { pattern, predicate } => E::ExistsSubquery {
+            pattern: Box::new(subst_loop_var_pattern(pattern, var)),
+            predicate: predicate.as_ref().map(|p| sub_box(p)),
+        },
         E::Reduce {
             accumulator,
             initial,
