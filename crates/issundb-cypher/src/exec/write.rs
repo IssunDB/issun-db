@@ -439,17 +439,22 @@ pub(super) fn delete_over_paths_in(
     }
 
     // Relationships first: clears edges that connect nodes also being deleted
-    // in the same clause.
+    // in the same clause. Every deletion is recorded in the pending-writes
+    // overlay, so a later property, label, or key read of the entity in this
+    // same statement raises instead of serving the committed value.
     for eid in &edges {
         txn.delete_edge(*eid).map_err(|e| e.to_string())?;
+        expr::PendingWrites::record_deleted_edge(*eid);
     }
     for nid in &nodes {
         if detach {
             for ne in txn.out_neighbors(*nid).map_err(|e| e.to_string())? {
                 txn.delete_edge(ne.edge).map_err(|e| e.to_string())?;
+                expr::PendingWrites::record_deleted_edge(ne.edge);
             }
             for ne in txn.in_neighbors(*nid).map_err(|e| e.to_string())? {
                 txn.delete_edge(ne.edge).map_err(|e| e.to_string())?;
+                expr::PendingWrites::record_deleted_edge(ne.edge);
             }
         } else if !txn
             .out_neighbors(*nid)
@@ -463,6 +468,7 @@ pub(super) fn delete_over_paths_in(
             return Err(DELETE_CONNECTED_NODE_MSG.to_string());
         }
         txn.delete_node(*nid).map_err(|e| e.to_string())?;
+        expr::PendingWrites::record_deleted_node(*nid);
     }
     Ok(())
 }
@@ -478,23 +484,15 @@ pub(super) fn execute_delete_and_return(
     // One transaction covers the RETURN pass, the binding pass, and the
     // delete itself, so no concurrent writer can slip in between the rows
     // reported by RETURN and the rows actually deleted, and a failing delete
-    // (a still-connected node without DETACH) leaves nothing behind. The two
-    // read passes run before any write in this transaction, so their reads of
-    // committed state are exactly the statement's snapshot.
+    // (a still-connected node without DETACH) leaves nothing behind. Both
+    // read passes read committed state (the deletes stay uncommitted until
+    // this transaction ends), but the RETURN pass runs after the delete so a
+    // property, label, or key read of a deleted entity raises through the
+    // deletion marks in the pending-writes overlay instead of serving the
+    // committed value.
     graph
         .update(|txn| {
-            let return_query = Query {
-                match_clauses: stmt.match_clauses.clone(),
-                where_clause: stmt.where_clause.clone(),
-                return_clause: stmt.return_clause.clone(),
-                parts: Vec::new(),
-                order_by: stmt.order_by.clone(),
-                skip: stmt.skip.clone(),
-                limit: stmt.limit.clone(),
-            };
-            let return_result =
-                execute_read_query(graph, &return_query, params, None).map_err(as_txn_error)?;
-
+            let _pending = expr::PendingWrites::install();
             let binding_query = Query {
                 match_clauses: stmt.match_clauses.clone(),
                 where_clause: stmt.where_clause.clone(),
@@ -529,7 +527,16 @@ pub(super) fn execute_delete_and_return(
             delete_over_paths_in(txn, &bound_paths, &stmt.targets, stmt.detach, params)
                 .map_err(as_txn_error)?;
 
-            Ok(return_result)
+            let return_query = Query {
+                match_clauses: stmt.match_clauses.clone(),
+                where_clause: stmt.where_clause.clone(),
+                return_clause: stmt.return_clause.clone(),
+                parts: Vec::new(),
+                order_by: stmt.order_by.clone(),
+                skip: stmt.skip.clone(),
+                limit: stmt.limit.clone(),
+            };
+            execute_read_query(graph, &return_query, params, None).map_err(as_txn_error)
         })
         .map_err(unwrap_txn_error)
 }
@@ -1156,6 +1163,32 @@ pub(super) fn apply_set_items(
     Ok(())
 }
 
+/// Reject a per-property SET value openCypher declares unstorable: a list
+/// containing a map at any nesting depth (TCK Set1 [10], InvalidPropertyType).
+/// This check lives in the Cypher layer on purpose: the engine's property
+/// model is arbitrary JSON, and the native surfaces (`Graph::add_node`, REST,
+/// and Python) deliberately accept any JSON value, so the storage layer must
+/// not enforce a query-language rule. A bare map stays storable here too,
+/// because the temporal values evaluate to maps and no TCK scenario forbids
+/// one.
+fn check_settable_property_value(property: &str, value: &serde_json::Value) -> Result<(), String> {
+    fn list_contains_map(value: &serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::Array(items) => items
+                .iter()
+                .any(|item| item.is_object() || list_contains_map(item)),
+            _ => false,
+        }
+    }
+    if list_contains_map(value) {
+        return Err(format!(
+            "TypeError: InvalidPropertyType: cannot set property '{}' to a list containing a map",
+            property
+        ));
+    }
+    Ok(())
+}
+
 /// An element a SET/REMOVE item resolves to: a node, an edge, or nothing
 /// (a null or unbound variable, which makes the operation a no-op).
 enum SetTarget {
@@ -1219,6 +1252,7 @@ pub(super) fn apply_set_item(
             expr,
         } => {
             let new_val = evaluate_expr(txn.graph(), path, expr, params)?;
+            check_settable_property_value(property, &new_val)?;
             match resolve_set_target(path, variable)? {
                 SetTarget::Node(nid) => {
                     let record = txn

@@ -6655,4 +6655,159 @@ mod tests {
             .unwrap();
         handle.join().unwrap();
     }
+
+    // --- Reads of deleted entities (TCK Return2 [14]-[17]) ---
+
+    /// Returning a property of a node deleted earlier in the same statement is
+    /// a runtime error, not a stale read of the old value.
+    #[test]
+    fn returning_property_of_deleted_node_errors() {
+        let (_dir, graph) = setup_graph();
+        graph.add_node("N", &serde_json::json!({"num": 0})).unwrap();
+        let res = execute(&graph, "MATCH (n) DELETE n RETURN n.num", &HashMap::new());
+        assert!(res.is_err(), "expected a deleted-entity error, got {res:?}");
+    }
+
+    /// Returning the labels of a deleted node is a runtime error.
+    #[test]
+    fn returning_labels_of_deleted_node_errors() {
+        let (_dir, graph) = setup_graph();
+        graph.add_node("A", &serde_json::json!({})).unwrap();
+        let res = execute(
+            &graph,
+            "MATCH (n) DELETE n RETURN labels(n)",
+            &HashMap::new(),
+        );
+        assert!(res.is_err(), "expected a deleted-entity error, got {res:?}");
+    }
+
+    /// Returning a property of a deleted relationship is a runtime error.
+    #[test]
+    fn returning_property_of_deleted_relationship_errors() {
+        let (_dir, graph) = setup_graph();
+        let a = graph.add_node("A", &serde_json::json!({})).unwrap();
+        let b = graph.add_node("B", &serde_json::json!({})).unwrap();
+        graph
+            .add_edge(a, b, "T", &serde_json::json!({"num": 0}))
+            .unwrap();
+        let res = execute(
+            &graph,
+            "MATCH ()-[r]->() DELETE r RETURN r.num",
+            &HashMap::new(),
+        );
+        assert!(res.is_err(), "expected a deleted-entity error, got {res:?}");
+    }
+
+    /// A relationship deleted by DETACH DELETE of its endpoint is deleted too,
+    /// so reading its property afterward is a runtime error.
+    #[test]
+    fn returning_property_of_detach_deleted_relationship_errors() {
+        let (_dir, graph) = setup_graph();
+        let a = graph.add_node("A", &serde_json::json!({})).unwrap();
+        let b = graph.add_node("B", &serde_json::json!({})).unwrap();
+        graph
+            .add_edge(a, b, "T", &serde_json::json!({"num": 0}))
+            .unwrap();
+        let res = execute(
+            &graph,
+            "MATCH (a:A)-[r]->() DETACH DELETE a RETURN r.num",
+            &HashMap::new(),
+        );
+        assert!(res.is_err(), "expected a deleted-entity error, got {res:?}");
+    }
+
+    /// The type of a deleted relationship stays readable (TCK Return2 [14]).
+    #[test]
+    fn returning_type_of_deleted_relationship_succeeds() {
+        let (_dir, graph) = setup_graph();
+        let a = graph.add_node("A", &serde_json::json!({})).unwrap();
+        let b = graph.add_node("B", &serde_json::json!({})).unwrap();
+        graph.add_edge(a, b, "T", &serde_json::json!({})).unwrap();
+        let res = execute(
+            &graph,
+            "MATCH ()-[r]->() DELETE r RETURN type(r)",
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(res.records[0].values[0], serde_json::json!("T"));
+    }
+
+    /// A property read of an entity the statement did not delete still works,
+    /// so the deletion marks are per entity, not per statement.
+    #[test]
+    fn returning_property_of_undeleted_node_after_delete_succeeds() {
+        let (_dir, graph) = setup_graph();
+        graph.add_node("A", &serde_json::json!({"num": 1})).unwrap();
+        graph.add_node("B", &serde_json::json!({"num": 2})).unwrap();
+        let res = execute(
+            &graph,
+            "MATCH (a:A) MATCH (b:B) DELETE a RETURN b.num",
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(res.records[0].values[0], serde_json::json!(2));
+    }
+
+    /// Deletion marks are statement-scoped: a later statement in a pipeline
+    /// reads fresh data without any stale mark from an earlier delete.
+    #[test]
+    fn deletion_marks_do_not_leak_into_later_pipeline_statements() {
+        let (_dir, graph) = setup_graph();
+        graph.add_node("A", &serde_json::json!({"num": 1})).unwrap();
+        graph.add_node("B", &serde_json::json!({"num": 2})).unwrap();
+        let res = execute(
+            &graph,
+            "MATCH (a:A) DELETE a; MATCH (b:B) RETURN b.num",
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(res.records[0].values[0], serde_json::json!(2));
+    }
+
+    // --- Invalid property types on SET (TCK Set1 [10]) ---
+
+    /// Setting a list of maps as a property is a runtime type error.
+    #[test]
+    fn set_list_of_maps_property_errors() {
+        let (_dir, graph) = setup_graph();
+        let res = execute(
+            &graph,
+            "CREATE (a) SET a.maplist = [{num: 1}]",
+            &HashMap::new(),
+        );
+        assert!(
+            res.is_err(),
+            "expected an invalid-property error, got {res:?}"
+        );
+    }
+
+    /// The same check fires on the standalone MATCH ... SET statement form.
+    #[test]
+    fn set_statement_list_of_maps_property_errors() {
+        let (_dir, graph) = setup_graph();
+        graph.add_node("N", &serde_json::json!({})).unwrap();
+        let res = execute(
+            &graph,
+            "MATCH (a:N) SET a.maplist = [[{num: 1}]]",
+            &HashMap::new(),
+        );
+        assert!(
+            res.is_err(),
+            "expected an invalid-property error, got {res:?}"
+        );
+    }
+
+    /// A scalar list stays a valid property value.
+    #[test]
+    fn set_scalar_list_property_succeeds() {
+        let (_dir, graph) = setup_graph();
+        graph.add_node("N", &serde_json::json!({})).unwrap();
+        let res = execute(
+            &graph,
+            "MATCH (a:N) SET a.nums = [1, 2, 3] RETURN a.nums",
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(res.records[0].values[0], serde_json::json!([1, 2, 3]));
+    }
 }

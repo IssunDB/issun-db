@@ -3856,6 +3856,14 @@ fn check_expr_size_on_path(
     rel_vars: &std::collections::HashSet<String>,
 ) -> Result<(), String> {
     match expr {
+        // A path is a value, not an entity with properties, so a property
+        // access on a path variable is a compile-time error.
+        Expr::Prop(var, prop) if !prop.is_empty() && path_vars.contains(var) => {
+            return Err(format!(
+                "SyntaxError(InvalidArgumentType): property access on path variable '{}' is not allowed",
+                var
+            ));
+        }
         Expr::FunctionCall { name, args } => {
             // A surviving 2^63 marker is a standalone positive literal out of the
             // i64 range (it is only valid when negated, which rewrites the marker).
@@ -4010,6 +4018,18 @@ fn check_where_clause(
             check_expr_size_on_path(r, path_vars, node_vars, rel_vars)?;
         }
         WhereClause::Expr(e) => {
+            // A predicate that is nothing but a node or relationship variable
+            // (bare or parenthesized; both parse to the same bare reference)
+            // has no boolean value, so it is a compile-time error. A variable
+            // bound to a value by WITH or UNWIND stays legal.
+            if let Expr::Prop(var, prop) = e {
+                if prop.is_empty() && (node_vars.contains(var) || rel_vars.contains(var)) {
+                    return Err(format!(
+                        "SyntaxError(InvalidArgumentType): node or relationship variable '{}' cannot be used as a predicate",
+                        var
+                    ));
+                }
+            }
             check_expr_size_on_path(e, path_vars, node_vars, rel_vars)?;
         }
     }
@@ -7845,19 +7865,15 @@ mod diagnostic_tests {
     }
 
     /// A bare parenthesized variable in WHERE stays an ordinary expression;
-    /// it must not become a pattern predicate.
+    /// it must not become a pattern predicate. The query is rejected, but by
+    /// the bare-entity-predicate validation over the ordinary expression, not
+    /// by the pattern-predicate grammar.
     #[test]
     fn parse_bare_paren_variable_is_not_a_pattern() {
-        let stmt = parse("MATCH (n) WHERE (n) RETURN n").unwrap();
-        let Statement::Query(q) = stmt else {
-            panic!("expected query");
-        };
+        let err = parse("MATCH (n) WHERE (n) RETURN n").unwrap_err();
         assert!(
-            !matches!(
-                q.where_clause,
-                Some(WhereClause::Expr(Expr::PatternPredicate { .. }))
-            ),
-            "bare (n) must not parse as a pattern predicate"
+            err.to_string().contains("cannot be used as a predicate"),
+            "bare (n) must reach the predicate validation, got: {err}"
         );
     }
 
@@ -7920,5 +7936,44 @@ mod diagnostic_tests {
                 proptest::prop_assert!(!msg.contains("Ident("), "{}", msg);
             }
         }
+    }
+
+    // --- Path variable property access (TCK MatchWhere1 [14]) ---
+
+    /// A property access on a path variable is a compile-time error: a path is
+    /// a value, not an entity with properties.
+    #[test]
+    fn path_variable_property_access_is_a_parse_error() {
+        assert!(parse("MATCH (n) MATCH r = (n)-[*]->() WHERE r.name = 'apa' RETURN r").is_err());
+        assert!(parse("MATCH p = (n)-->() RETURN p.name").is_err());
+    }
+
+    /// Path variables stay legal in the positions that take a path value.
+    #[test]
+    fn path_variable_value_positions_still_parse() {
+        assert!(parse("MATCH p = (n)-->(x) WHERE length(p) = 10 RETURN x").is_ok());
+        assert!(parse("MATCH p = (n)-->(x) RETURN p").is_ok());
+        // A non-path variable named like a path keeps its property access.
+        assert!(parse("MATCH (r) WHERE r.name = 'apa' RETURN r").is_ok());
+    }
+
+    // --- Bare entity variable as a predicate (TCK Pattern1 [11]) ---
+
+    /// A bare node or relationship variable is not a predicate, parenthesized
+    /// or not.
+    #[test]
+    fn bare_entity_variable_predicate_is_a_parse_error() {
+        assert!(parse("MATCH (n) WHERE (n) RETURN n").is_err());
+        assert!(parse("MATCH (n) WHERE n RETURN n").is_err());
+        assert!(parse("MATCH ()-[r]->() WHERE r RETURN r").is_err());
+    }
+
+    /// Boolean-valued variables and properties stay legal in WHERE.
+    #[test]
+    fn boolean_valued_where_predicates_still_parse() {
+        assert!(parse("MATCH (n) WITH n.flag AS b WHERE b RETURN b").is_ok());
+        assert!(parse("UNWIND [true, false] AS b WITH b WHERE b RETURN b").is_ok());
+        assert!(parse("MATCH (n) WHERE n.flag RETURN n").is_ok());
+        assert!(parse("MATCH (n) WHERE (n)-[]->() RETURN n").is_ok());
     }
 }

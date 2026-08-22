@@ -249,10 +249,16 @@ pub(super) fn execute_read_query(
     // single-hop expansion executes column-at-a-time and produces the result
     // records directly. Any other shape (and every write query) takes the row
     // pipeline below.
+    // An installed pending-writes overlay means an enclosing write statement
+    // (the RETURN pass of a DELETE ... RETURN) is running this read: the
+    // columnar path gathers properties in bulk without consulting the
+    // overlay, so it would serve a deleted entity's committed value instead
+    // of raising.
     if !has_write_parts
         && !row_pipeline_only
         && !return_clause_has_star
         && !query.return_clause.items.is_empty()
+        && !expr::pending_writes_active()
     {
         if let Some(mut records) = super::vectorized::try_execute_vectorized(
             graph,
