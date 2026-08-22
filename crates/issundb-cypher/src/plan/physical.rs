@@ -30,12 +30,12 @@ pub enum PhysicalOperator {
         expr: Expr,
         variable: String,
     },
-    /// Scan nodes by label: binds `variable` to nodes matching `label`.
+    /// Scans nodes by label, binding `variable` to nodes matching `label`.
     LabelScan {
         variable: String,
         label: Option<String>,
     },
-    /// Seek a single node by its internal id: binds `variable` to the node whose
+    /// Seeks a single node by its internal ID, binding `variable` to the node whose
     /// id equals `id_value`, if it exists (and matches `label` when present).
     ///
     /// Emitted by the optimizer when a `WHERE id(n) = <const>` predicate sits over
@@ -45,7 +45,7 @@ pub enum PhysicalOperator {
         label: Option<String>,
         id_value: Expr,
     },
-    /// Scan nodes using a property index: binds `variable` to nodes matching `label` and `property` value.
+    /// Scans nodes using a property index, binding `variable` to nodes matching `label` and `property` value.
     NodeIndexScan {
         variable: String,
         label: String,
@@ -69,7 +69,7 @@ pub enum PhysicalOperator {
         property: Option<String>,
         key: Expr,
     },
-    /// Scan nodes using a property range index: binds `variable` to nodes where `property` falls
+    /// Scans nodes using a property range index, binding `variable` to nodes where `property` falls
     /// within [`lo`, `hi`] (inclusive/exclusive per the flags). At least one bound must be `Some`.
     NodeRangeScan {
         variable: String,
@@ -80,8 +80,8 @@ pub enum PhysicalOperator {
         hi: Option<Expr>,
         hi_inclusive: bool,
     },
-    /// Expand relationships: starts from `src_var`, traverses relationship `rel_type`
-    /// in direction `is_incoming` up to range bounds, and binds relationship to `rel_var`
+    /// Expands relationships starting from `src_var`, traversing relationship `rel_type`
+    /// in direction `is_incoming` up to range bounds, and binding relationship to `rel_var`
     /// and target to `dst_var`.
     Expand {
         input: Box<PhysicalOperator>,
@@ -160,8 +160,8 @@ pub enum PhysicalOperator {
         input: Box<PhysicalOperator>,
         part: Box<crate::ast::QueryPart>,
     },
-    /// A resolved `CALL`: emit one output row per entry in `rows` for each input
-    /// row, binding `output_vars` to the corresponding cells.
+    /// Emits one output row per entry in `rows` for each input row in a resolved
+    /// `CALL`, binding `output_vars` to the corresponding cells.
     ProcedureCall {
         input: Box<PhysicalOperator>,
         output_vars: Vec<String>,

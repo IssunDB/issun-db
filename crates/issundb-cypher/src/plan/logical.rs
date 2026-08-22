@@ -25,13 +25,13 @@ pub enum LogicalOperator {
         expr: Expr,
         variable: String,
     },
-    /// Scan nodes by label: binds `variable` to nodes matching `label`.
+    /// Scans nodes by label, binding `variable` to nodes matching `label`.
     LabelScan {
         variable: String,
         label: Option<String>,
     },
-    /// Expand relationships: starts from `src_var`, traverses relationship `rel_type`
-    /// in direction `is_incoming` up to range bounds, and binds relationship to `rel_var`
+    /// Expands relationships starting from `src_var`, traversing relationship `rel_type`
+    /// in direction `is_incoming` up to range bounds, and binding relationship to `rel_var`
     /// and target to `dst_var`.
     Expand {
         input: Box<LogicalOperator>,
@@ -40,13 +40,13 @@ pub enum LogicalOperator {
         dst_var: String,
         rel_type: Option<String>,
         is_incoming: bool,
-        /// When true the relationship has no direction: traverse both outgoing and
-        /// incoming edges and deduplicate results.
+        /// When true the relationship has no direction, traversing both outgoing and
+        /// incoming edges and deduplicating results.
         is_undirected: bool,
         min_hops: usize,
         max_hops: usize,
         /// Relationship variables bound by earlier hops of the same pattern.
-        /// openCypher relationship uniqueness: this hop must not bind a
+        /// Under openCypher relationship uniqueness, this hop must not bind a
         /// relationship already bound to one of these variables. Uniqueness is
         /// scoped to a single pattern, so separate MATCH clauses may reuse a relationship.
         unique_rels: Vec<String>,

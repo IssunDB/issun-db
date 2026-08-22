@@ -2537,7 +2537,7 @@ mod snapshot_only_gate_tests {
 
     use crate::{Graph, GroupedDegreeSpec, PathCountSpec, TriangleCountSpec, schema::NodeId};
 
-    /// A triangle plus a disjoint two-edge chain, closed and reopened so the
+    /// A triangle plus a disjoint two-edge chain, closed, and reopened so the
     /// handle starts with nothing materialized. Every expected count below is
     /// non-zero, so reading an empty snapshot fails the assertion rather than
     /// coincidentally matching.

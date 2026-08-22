@@ -358,7 +358,7 @@ struct VectorIndexCache(VectorIndex);
 /// `reindex_vector_index` swaps the cache and a lock inside the swapped value
 /// could not cover the swap itself.
 ///
-/// Lock ordering: this mutex is acquired first, before the index's internal
+/// This mutex is acquired first in the lock ordering, before the index's internal
 /// `RwLock` and before any storage transaction, and never while the
 /// `extensions` mutex is held (`get_or_init_extension_with` runs its
 /// initializer without that lock). Read paths take the index `RwLock` without

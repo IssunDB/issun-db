@@ -446,7 +446,7 @@ enum ReplCommand {
         etype: String,
     },
 
-    /// Display database and graph statistics: on-disk size, node and edge
+    /// Display database and graph statistics: on-disk size, node, and edge
     /// counts, per-label and per-type breakdowns, indexes, constraints, text
     /// indexes, and vector count (e.g., `stats`)
     #[command(name = "stats")]

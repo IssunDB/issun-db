@@ -999,8 +999,8 @@ pub(super) fn binding_to_value(
     }
 }
 
-/// Materialize result records for `items` from projected rows: one
-/// `binding_to_value` read per cell, by each item's canonical projected key.
+/// Materializes result records for `items` from projected rows, performing one
+/// `binding_to_value` read per cell by each item's canonical projected key.
 /// The keys are derived once, not per row.
 pub(super) fn rows_to_records(
     graph: &Graph,

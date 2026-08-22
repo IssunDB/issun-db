@@ -189,7 +189,7 @@ fn conformance_body() -> Result<(), String> {
     );
     if total_failed > max_failures {
         return Err(format!(
-            "{} TCK scenario(s) failed, above the tolerated budget of {} — see output above",
+            "{} TCK scenario(s) failed, above the tolerated budget of {}: see output above",
             total_failed, max_failures
         ));
     }

@@ -46,7 +46,7 @@ Any mismatch fails the run and prints the first differing row.
 This corpus is deliberately separate from the timed workload. That workload is shaped for measurement, so most of its queries return a single
 `count(...)`, and a scalar count is a weak differential signal: it cannot see wrong row content, wrong column names, wrong row multiplicity, or two
 errors that cancel. The differential corpus returns the rows themselves, and covers projections over a bounded slice of the label scan, range and
-string predicates, disjunction and negation, one hop in both directions, two fixed hops with and without `DISTINCT`, expand-into,
+string predicates, disjunction, and negation, one hop in both directions, two fixed hops with and without `DISTINCT`, expand-into,
 and grouped aggregation (which emits one row per group, so a wrong group key or per-group tally is visible where a single total would hide it).
 
 Two invariants keep it cheap to extend, and a unit test pins both:

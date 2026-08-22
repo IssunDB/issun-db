@@ -22,7 +22,7 @@
 use issundb::{
     Graph, GraphQueryExt, Language, TextGraphExt, TextIndexExt, TextSearchOptions, VectorGraphExt,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use wasm_bindgen::prelude::*;

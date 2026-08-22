@@ -8,7 +8,7 @@ pub type LabelId = u32;
 pub type TypeId = u32;
 pub type PropKeyId = u32;
 
-/// Supported languages for Full-Text Search indexing and stemming.
+/// Supported languages for Full-text Search indexing and stemming.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum Language {

@@ -1459,7 +1459,7 @@ fn jaccard_similarity(a: &[serde_json::Value], b: &[serde_json::Value]) -> f64 {
     }
 }
 
-/// Overlap (Szymkiewicz–Simpson) similarity of two sets: intersection over the
+/// Overlap (Szymkiewicz-Simpson) similarity of two sets: intersection over the
 /// smaller set, in `[0, 1]` (higher is more similar). A degenerate empty set
 /// yields `0.0`.
 fn overlap_similarity(a: &[serde_json::Value], b: &[serde_json::Value]) -> f64 {

@@ -280,7 +280,7 @@ impl Ord for OrderedF32 {
 /// WAND skips documents whose maximum possible score (sum of per-term upper
 /// bounds for terms that still have the document in their future) cannot
 /// exceed the current k-th best score threshold. This typically eliminates
-/// 90–99 % of full BM25 evaluations compared to exhaustive scoring.
+/// 90 to 99 % of full BM25 evaluations compared to exhaustive scoring.
 fn wand_top_k(
     mut cursors: Vec<PostingCursor>,
     k: usize,
