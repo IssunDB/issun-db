@@ -1665,6 +1665,75 @@ mod tests {
         assert_eq!(v, serde_json::json!(3));
     }
 
+    /// Whole-entity result values use the openCypher display-literal form, so
+    /// labels and relationship types are visible in the result JSON: a node is
+    /// `(:A:B {k: v})`, a relationship is `[:T {k: v}]`, and a path is
+    /// `<(:A)-[:T]->(:B)>` with the arrow carrying the stored edge direction.
+    #[test]
+    fn whole_entity_values_use_display_literal_form() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+        execute(
+            &graph,
+            "CREATE (:A:B {name: 'x', n: 1, f: 1.5})-[:T {num: 1}]->(:C)",
+            &params,
+        )
+        .unwrap();
+        graph.rebuild_csr().unwrap();
+
+        let node = "(:A:B {f: 1.5, n: 1, name: 'x'})";
+        let rel = "[:T {num: 1}]";
+
+        let rows = run(&graph, "MATCH (a:A) RETURN a");
+        assert_eq!(rows[0][0], serde_json::json!(node));
+
+        let rows = run(&graph, "MATCH (:A)-[r:T]->() RETURN r");
+        assert_eq!(rows[0][0], serde_json::json!(rel));
+
+        // A var-length relationship variable is the list of relationship
+        // display strings along the trail.
+        let rows = run(&graph, "MATCH (:A)-[r:T*1..1]->() RETURN r");
+        assert_eq!(rows[0][0], serde_json::json!([rel]));
+
+        // The path arrow follows the stored edge direction even when the
+        // pattern traverses the edge backwards.
+        let rows = run(&graph, "MATCH p = (:A)-[:T]->(:C) RETURN p");
+        assert_eq!(
+            rows[0][0],
+            serde_json::json!(format!("<{node}-{rel}->(:C)>"))
+        );
+        let rows = run(&graph, "MATCH p = (:C)<-[:T]-(:A) RETURN p");
+        assert_eq!(
+            rows[0][0],
+            serde_json::json!(format!("<(:C)<-{rel}-{node}>"))
+        );
+
+        // A zero-length path is a single node in angle brackets.
+        let rows = run(&graph, "MATCH p = (:C) RETURN p");
+        assert_eq!(rows[0][0], serde_json::json!("<(:C)>"));
+
+        // Entities nested in lists and maps take the same form.
+        let rows = run(&graph, "MATCH (a:A)-[r:T]->() RETURN [a, r]");
+        assert_eq!(rows[0][0], serde_json::json!([node, rel]));
+        let rows = run(&graph, "MATCH (a:A) RETURN {m: a}");
+        assert_eq!(rows[0][0], serde_json::json!({ "m": node }));
+        let rows = run(&graph, "MATCH (a:A) RETURN collect(a)");
+        assert_eq!(rows[0][0], serde_json::json!([node]));
+    }
+
+    /// A temporal property inside a whole-entity display literal renders as
+    /// its canonical string, matching how the same value projects on its own,
+    /// rather than leaking the internal temporal object.
+    #[test]
+    fn temporal_property_in_display_literal_renders_canonical_string() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+        execute(&graph, "CREATE (:A {date: date('1910-05-06')})", &params).unwrap();
+        graph.rebuild_csr().unwrap();
+        let rows = run(&graph, "MATCH (a:A) RETURN a");
+        assert_eq!(rows[0][0], serde_json::json!("(:A {date: '1910-05-06'})"));
+    }
+
     // Helper: run a simple Cypher and return all records.
     fn run(graph: &Graph, cypher: &str) -> Vec<Vec<serde_json::Value>> {
         let params = HashMap::new();
@@ -2028,12 +2097,15 @@ mod tests {
         // A just-created node projected whole: must not error (the node is
         // not committed yet), and must carry the fresh properties.
         let res = execute(&graph, "CREATE (n:Foo {a: 1}) WITH n RETURN n", &params).unwrap();
-        assert_eq!(res.records[0].values[0]["a"], serde_json::json!(1));
+        assert_eq!(res.records[0].values[0], serde_json::json!("(:Foo {a: 1})"));
 
         // A SET in the same statement: the projected node reflects the new
         // value, not the pre-SET committed record.
         let res = execute(&graph, "MATCH (n:Foo) SET n.x = 5 WITH n RETURN n", &params).unwrap();
-        assert_eq!(res.records[0].values[0]["x"], serde_json::json!(5));
+        assert_eq!(
+            res.records[0].values[0],
+            serde_json::json!("(:Foo {a: 1, x: 5})")
+        );
 
         // Edge counterpart: a just-created relationship projected whole.
         let res = execute(
@@ -2042,7 +2114,7 @@ mod tests {
             &params,
         )
         .unwrap();
-        assert_eq!(res.records[0].values[0]["w"], serde_json::json!(1));
+        assert_eq!(res.records[0].values[0], serde_json::json!("[:R {w: 1}]"));
     }
 
     /// A bare CREATE statement inside a semicolon-separated pipeline goes

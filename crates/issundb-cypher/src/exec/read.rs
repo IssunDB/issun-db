@@ -870,6 +870,12 @@ fn format_cypher_value(v: &serde_json::Value) -> String {
             format!("[{}]", items.join(", "))
         }
         serde_json::Value::Object(map) => {
+            // A temporal value renders as its canonical string, matching how
+            // the same value projects on its own, rather than leaking the
+            // internal temporal object.
+            if let Some(serde_json::Value::String(s)) = map.get("__str__") {
+                return format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"));
+            }
             let mut items: Vec<String> = map
                 .iter()
                 .map(|(k, v)| format!("{}: {}", k, format_cypher_value(v)))
@@ -932,6 +938,49 @@ fn format_edge_literal_string(graph: &Graph, eid: EdgeId) -> String {
     type_str
 }
 
+/// Render a `__Path__` sentinel as an openCypher path display literal, for
+/// example `<(:A)-[:T]->(:B)>`. The arrow of each hop carries the stored edge
+/// direction, recovered by comparing the relationship's `startNode` against the
+/// node the traversal arrived from, so a pattern that walked an edge backwards
+/// still displays the edge as it exists in the graph.
+fn format_path_literal(graph: &Graph, map: &serde_json::Map<String, serde_json::Value>) -> String {
+    let empty = Vec::new();
+    let nodes = match map.get("nodes") {
+        Some(serde_json::Value::Array(n)) => n,
+        _ => &empty,
+    };
+    let rels = match map.get("relationships") {
+        Some(serde_json::Value::Array(r)) => r,
+        _ => &empty,
+    };
+    let node_id = |v: &serde_json::Value| v.get("id").and_then(|i| i.as_i64());
+    let mut out = String::from("<");
+    for (i, node) in nodes.iter().enumerate() {
+        if let Some(id) = node_id(node) {
+            out.push_str(&format_node_literal(graph, id as u64));
+        }
+        if let Some(rel) = rels.get(i) {
+            let rel_str = rel
+                .get("id")
+                .and_then(|i| i.as_i64())
+                .map(|id| format!("[{}]", format_edge_literal_string(graph, id as u64)))
+                .unwrap_or_default();
+            let forward = rel.get("startNode").and_then(|s| s.as_i64()) == node_id(node);
+            if forward {
+                out.push('-');
+                out.push_str(&rel_str);
+                out.push_str("->");
+            } else {
+                out.push_str("<-");
+                out.push_str(&rel_str);
+                out.push('-');
+            }
+        }
+    }
+    out.push('>');
+    out
+}
+
 pub(super) fn unpack_sentinels(graph: &Graph, val: serde_json::Value) -> serde_json::Value {
     match val {
         serde_json::Value::Object(map) => {
@@ -945,11 +994,11 @@ pub(super) fn unpack_sentinels(graph: &Graph, val: serde_json::Value) -> serde_j
                 } else if t == "__Edge__" {
                     if let Some(id_val) = map.get("id").and_then(|i| i.as_i64()) {
                         let id = id_val as u64;
-                        let formatted = format_edge_literal_string(graph, id);
-                        return serde_json::Value::Array(vec![serde_json::Value::String(
-                            formatted,
-                        )]);
+                        let formatted = format!("[{}]", format_edge_literal_string(graph, id));
+                        return serde_json::Value::String(formatted);
                     }
+                } else if t == "__Path__" {
+                    return serde_json::Value::String(format_path_literal(graph, &map));
                 }
             }
             serde_json::Value::Object(
@@ -981,18 +1030,29 @@ pub(super) fn binding_to_value(
     match binding {
         None => Ok(serde_json::Value::Null),
         Some(GraphBinding::Scalar(v)) => Ok(unpack_sentinels(graph, v.clone())),
-        Some(GraphBinding::Node(id)) => Ok((*expr::node_props(graph, *id)?
-            .ok_or_else(|| format!("node not found: {}", id))?)
-        .clone()),
-        Some(GraphBinding::Edge(id)) => Ok((*expr::edge_props(graph, *id)?
-            .ok_or_else(|| format!("edge not found: {}", id))?)
-        .clone()),
+        Some(GraphBinding::Node(id)) => {
+            // Existence check first: the display formatter degrades a missing
+            // node to `()` rather than erroring.
+            expr::node_props(graph, *id)?.ok_or_else(|| format!("node not found: {}", id))?;
+            Ok(serde_json::Value::String(format_node_literal(graph, *id)))
+        }
+        Some(GraphBinding::Edge(id)) => {
+            expr::edge_props(graph, *id)?.ok_or_else(|| format!("edge not found: {}", id))?;
+            Ok(serde_json::Value::String(format!(
+                "[{}]",
+                format_edge_literal_string(graph, *id)
+            )))
+        }
         // A variable-length relationship variable surfaces as the list of
-        // relationship objects along the trail, matching `relationships(p)`.
+        // relationship display literals along the trail, matching
+        // `relationships(p)`.
         Some(GraphBinding::EdgeList(ids)) => {
             let mut arr = Vec::with_capacity(ids.len());
             for &eid in ids {
-                arr.push(get_edge_representation(graph, eid)?);
+                arr.push(unpack_sentinels(
+                    graph,
+                    get_edge_representation(graph, eid)?,
+                ));
             }
             Ok(serde_json::Value::Array(arr))
         }

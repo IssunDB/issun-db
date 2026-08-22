@@ -118,10 +118,12 @@ fn conformance_body() -> Result<(), String> {
                     entry.0 += 1;
                 }
                 Ok(Err(ref e)) if e.starts_with("__skip__:") => {
+                    eprintln!("SKIPPED [{category}] {name}\n        {e}");
                     entry.2 += 1;
                 }
                 Ok(Err(ref e)) if e.starts_with("setup query failed:") => {
                     // Setup failure means we cannot run the scenario; count as skipped.
+                    eprintln!("SKIPPED [{category}] {name}\n        {e}");
                     entry.2 += 1;
                 }
                 Ok(Err(e)) => {
@@ -220,8 +222,10 @@ enum Assertion {
         ignore_list_order: bool,
         columns: Vec<String>,
         rows: Vec<Vec<serde_json::Value>>,
-        /// True when at least one cell contained a node/rel display literal.
-        has_node_literals: bool,
+        /// The first cell whose text looks like a display literal the literal
+        /// parser does not support, if any; the runner skips the scenario and
+        /// names the form.
+        unsupported_literal: Option<String>,
     },
     /// `Then the result should be empty`
     Empty,
@@ -494,12 +498,12 @@ fn build_scenario(
                         continue;
                     }
                     let key = row[0].trim();
-                    let raw_val = row[1].trim();
+                    let raw_val = unescape_gherkin_cell(row[1].trim());
                     // Skip unexpanded substitution placeholders like <elt>.
                     if key.is_empty() || (raw_val.starts_with('<') && raw_val.ends_with('>')) {
                         continue;
                     }
-                    params.insert(key.to_string(), parse_table_value(raw_val));
+                    params.insert(key.to_string(), parse_table_value(&raw_val));
                 }
             }
             continue;
@@ -579,13 +583,13 @@ fn assertion_from_step(value: &str, table: Option<&gherkin::Table>) -> Assertion
     if value.contains("result should be") {
         let ordered = value.contains("in order") && !value.contains("any order");
         let ignore_list_order = value.contains("ignoring element order for lists");
-        let (columns, rows, has_node_literals) = parse_gherkin_result_table(table);
+        let (columns, rows, unsupported_literal) = parse_gherkin_result_table(table);
         return Assertion::Rows {
             ordered,
             ignore_list_order,
             columns,
             rows,
-            has_node_literals,
+            unsupported_literal,
         };
     }
     if value.contains("should be raised") {
@@ -594,13 +598,14 @@ fn assertion_from_step(value: &str, table: Option<&gherkin::Table>) -> Assertion
     Assertion::None
 }
 
-/// Parse a `gherkin::Table` into columns, rows, and a node literal flag.
+/// Parse a `gherkin::Table` into columns, rows, and the first unsupported
+/// display-literal cell, if any.
 fn parse_gherkin_result_table(
     table: Option<&gherkin::Table>,
-) -> (Vec<String>, Vec<Vec<serde_json::Value>>, bool) {
+) -> (Vec<String>, Vec<Vec<serde_json::Value>>, Option<String>) {
     let mut columns: Vec<String> = Vec::new();
     let mut rows: Vec<Vec<serde_json::Value>> = Vec::new();
-    let mut has_node_literals = false;
+    let mut unsupported_literal: Option<String> = None;
 
     if let Some(t) = table {
         if let Some(first_row) = t.rows.first() {
@@ -608,9 +613,9 @@ fn parse_gherkin_result_table(
             for row_cells in t.rows.iter().skip(1) {
                 let mut parsed_row = Vec::new();
                 for cell in row_cells {
-                    let (val, is_node) = parse_table_cell(cell);
-                    if is_node {
-                        has_node_literals = true;
+                    let (val, unsupported) = parse_table_cell(&unescape_gherkin_cell(cell));
+                    if unsupported_literal.is_none() {
+                        unsupported_literal = unsupported;
                     }
                     parsed_row.push(val);
                 }
@@ -619,7 +624,7 @@ fn parse_gherkin_result_table(
         }
     }
 
-    (columns, rows, has_node_literals)
+    (columns, rows, unsupported_literal)
 }
 
 /// Parse a procedure signature such as
@@ -667,7 +672,12 @@ fn parse_procedure(sig: &str, table_rows: &[Vec<String>]) -> Option<issundb::Pro
     let rows: Vec<Vec<serde_json::Value>> = table_rows
         .iter()
         .skip(1)
-        .map(|cells| cells.iter().map(|c| parse_table_value(c)).collect())
+        .map(|cells| {
+            cells
+                .iter()
+                .map(|c| parse_table_value(&unescape_gherkin_cell(c.trim())))
+                .collect()
+        })
         .collect();
 
     Some(issundb::Procedure {
@@ -682,40 +692,297 @@ fn parse_procedure(sig: &str, table_rows: &[Vec<String>]) -> Option<issundb::Pro
 // Table cell parsing
 // ---------------------------------------------------------------------------
 
-/// Parse a single table cell value.
-/// Returns `(value, is_node_literal)`.
-fn parse_table_cell(s: &str) -> (serde_json::Value, bool) {
-    let t = s.trim();
+/// Undo Gherkin data-table cell escaping. The `gherkin` crate hands cells over
+/// verbatim, so `\\`, `\|`, and `\n` (the three escapes the Gherkin table
+/// syntax defines) reach the harness still escaped. Any other backslash
+/// sequence (for example the Cypher escape `\'`) passes through unchanged.
+fn unescape_gherkin_cell(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('\\') => out.push('\\'),
+            Some('|') => out.push('|'),
+            Some('n') => out.push('\n'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
 
-    // Node / relationship display literals:
-    //   (:Label), (:L {p: v}), ()-[:T]->(), [:T], [:T {p: v}], and the bare `()`.
-    // A path display literal is wrapped in angle brackets: `<(:A)-[:T]->(:B)>`, `<()>`.
-    // IssunDB returns structured values for nodes, relationships, and paths, never
-    // these display strings, so any expected cell classified here is a
-    // representational mismatch and the scenario is skipped (see the
-    // `has_node_literals` check in the runner). The `<...>` wrapper appears only in
-    // path literals (result cells never contain bare comparison operators and
-    // strings are quoted), so matching it cannot reclassify a passing scenario. The
-    // narrower node and relationship literal markers are deliberately not broadened
-    // to nested positions (a literal inside a list cell), because a broad substring
-    // match there would skip scenarios that currently pass.
-    if (t.starts_with("(:") || t.starts_with("(") && t.contains(':'))
-        || t == "()"                         // bare node literal, engine returns an empty object
-        || t.starts_with("()-[")
-        || t.starts_with("()-[:")
-        || t.starts_with("<-[")
-        || t.starts_with("[:")               // relationship literal [:TYPE] or [:TYPE {...}]
-        || (t.starts_with('[') && t.contains("->"))
-        || (t.starts_with('<') && t.ends_with('>'))
-    // path literal <(:A)-[:T]->(:B)>, <()>
-    {
-        return (serde_json::Value::String(t.to_string()), true);
+// ---------------------------------------------------------------------------
+// Display-literal parsing
+// ---------------------------------------------------------------------------
+//
+// TCK result tables express nodes, relationships, and paths as openCypher
+// display literals: `(:A:B {k: v})`, `[:T {k: v}]`, `<(:A)-[:T]->(:B)>`.
+// IssunDB's query results use the same display grammar for whole-entity
+// values, so one parser serves both sides. Each literal parses into a
+// canonical structural value (labels as a sorted list, properties as a typed
+// map, path hops with an explicit direction), and the runner compares those
+// structures: label order and property order are irrelevant, list order and
+// path direction are significant, and an integer property never equals its
+// float twin.
+
+/// Parse a display literal into its canonical structural value. Returns `None`
+/// when `t` is not a node, relationship, or path display literal.
+fn parse_entity_literal(t: &str) -> Option<serde_json::Value> {
+    if t.starts_with('<') && t.ends_with('>') {
+        parse_path_literal(t)
+    } else if t.starts_with('(') && t.ends_with(')') {
+        parse_node_literal(t)
+    } else if t.starts_with('[') && t.ends_with(']') {
+        parse_rel_literal(t)
+    } else {
+        None
+    }
+}
+
+/// Canonical node value: `{"__entity__": "node", "labels": [...sorted],
+/// "properties": {...}}`.
+fn parse_node_literal(t: &str) -> Option<serde_json::Value> {
+    let inner = t.strip_prefix('(')?.strip_suffix(')')?.trim();
+    let (labels, props) = parse_labels_and_props(inner, usize::MAX)?;
+    let mut labels: Vec<serde_json::Value> =
+        labels.into_iter().map(serde_json::Value::String).collect();
+    labels.sort_by_key(|l| l.to_string());
+    let mut m = serde_json::Map::new();
+    m.insert(
+        "__entity__".to_string(),
+        serde_json::Value::String("node".to_string()),
+    );
+    m.insert("labels".to_string(), serde_json::Value::Array(labels));
+    m.insert("properties".to_string(), props);
+    Some(serde_json::Value::Object(m))
+}
+
+/// Canonical relationship value: `{"__entity__": "relationship", "type": "T",
+/// "properties": {...}}`. Requires a leading `:TYPE`, which is what tells a
+/// relationship literal apart from a plain list cell.
+fn parse_rel_literal(t: &str) -> Option<serde_json::Value> {
+    let inner = t.strip_prefix('[')?.strip_suffix(']')?.trim();
+    if !inner.starts_with(':') {
+        return None;
+    }
+    let (mut types, props) = parse_labels_and_props(inner, 1)?;
+    let mut m = serde_json::Map::new();
+    m.insert(
+        "__entity__".to_string(),
+        serde_json::Value::String("relationship".to_string()),
+    );
+    m.insert("type".to_string(), serde_json::Value::String(types.pop()?));
+    m.insert("properties".to_string(), props);
+    Some(serde_json::Value::Object(m))
+}
+
+/// Shared body parser for node and relationship literals: zero or more
+/// `:Name` segments (at most `max_names`), then an optional `{...}` property
+/// map that must extend to the end of the body.
+fn parse_labels_and_props(
+    body: &str,
+    max_names: usize,
+) -> Option<(Vec<String>, serde_json::Value)> {
+    let mut rest = body;
+    let mut names = Vec::new();
+    while let Some(after) = rest.strip_prefix(':') {
+        if names.len() == max_names {
+            return None;
+        }
+        let end = after
+            .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .unwrap_or(after.len());
+        if end == 0 {
+            return None;
+        }
+        names.push(after[..end].to_string());
+        rest = &after[end..];
+    }
+    let rest = rest.trim();
+    let props = if rest.is_empty() {
+        serde_json::Value::Object(serde_json::Map::new())
+    } else if rest.starts_with('{') && rest.ends_with('}') {
+        match parse_table_value(rest) {
+            v @ serde_json::Value::Object(_) => v,
+            _ => return None,
+        }
+    } else {
+        return None;
+    };
+    Some((names, props))
+}
+
+/// Canonical path value: `{"__entity__": "path", "nodes": [...], "rels": [...],
+/// "dirs": [...]}` where `dirs[i]` is `"->"` or `"<-"` for the hop between
+/// `nodes[i]` and `nodes[i + 1]`. Direction is part of the value, so a path
+/// only equals another path traversing its edges the same way.
+fn parse_path_literal(t: &str) -> Option<serde_json::Value> {
+    let inner = t.strip_prefix('<')?.strip_suffix('>')?.trim();
+    let mut nodes = Vec::new();
+    let mut rels = Vec::new();
+    let mut dirs = Vec::new();
+
+    let mut rest = inner;
+    loop {
+        if !rest.starts_with('(') {
+            return None;
+        }
+        let close = matching_close(rest, '(', ')')?;
+        nodes.push(parse_node_literal(&rest[..=close])?);
+        rest = rest[close + 1..].trim_start();
+        if rest.is_empty() {
+            break;
+        }
+
+        let incoming = rest.starts_with("<-");
+        rest = rest
+            .strip_prefix("<-")
+            .or_else(|| rest.strip_prefix('-'))?
+            .trim_start();
+        if !rest.starts_with('[') {
+            return None;
+        }
+        let close = matching_close(rest, '[', ']')?;
+        rels.push(parse_rel_literal(&rest[..=close])?);
+        rest = rest[close + 1..].trim_start();
+        if incoming {
+            rest = rest.strip_prefix('-')?.trim_start();
+            dirs.push(serde_json::Value::String("<-".to_string()));
+        } else {
+            rest = rest.strip_prefix("->")?.trim_start();
+            dirs.push(serde_json::Value::String("->".to_string()));
+        }
     }
 
-    (parse_table_value(t), false)
+    let mut m = serde_json::Map::new();
+    m.insert(
+        "__entity__".to_string(),
+        serde_json::Value::String("path".to_string()),
+    );
+    m.insert("nodes".to_string(), serde_json::Value::Array(nodes));
+    m.insert("rels".to_string(), serde_json::Value::Array(rels));
+    m.insert("dirs".to_string(), serde_json::Value::Array(dirs));
+    Some(serde_json::Value::Object(m))
+}
+
+/// Index of the `close` delimiter matching the `open` at position 0,
+/// respecting nesting and quoted strings.
+fn matching_close(s: &str, open: char, close: char) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut in_sq = false;
+    let mut in_dq = false;
+    let mut escaped = false;
+    for (i, c) in s.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' if in_sq || in_dq => escaped = true,
+            '\'' if !in_dq => in_sq = !in_sq,
+            '"' if !in_sq => in_dq = !in_dq,
+            c if c == open && !in_sq && !in_dq => depth += 1,
+            c if c == close && !in_sq && !in_dq => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Replace every string that parses as a display literal with its canonical
+/// structural value, recursively. Applied to both the expected and the actual
+/// rows, so the comparison stays symmetric: a genuine string that happens to
+/// look like a literal canonicalizes identically on both sides.
+fn canonicalize_value(v: serde_json::Value) -> serde_json::Value {
+    match v {
+        serde_json::Value::String(s) => match parse_entity_literal(&s) {
+            Some(canon) => canon,
+            None => serde_json::Value::String(s),
+        },
+        serde_json::Value::Array(arr) => {
+            serde_json::Value::Array(arr.into_iter().map(canonicalize_value).collect())
+        }
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.into_iter()
+                .map(|(k, v)| (k, canonicalize_value(v)))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+/// Parse a single table cell value. Returns the parsed value plus the text of
+/// the first nested token that looks like a display literal the parser does
+/// not support, so the runner can skip the scenario with a reason naming the
+/// form.
+fn parse_table_cell(s: &str) -> (serde_json::Value, Option<String>) {
+    let t = s.trim();
+    (parse_table_value(t), unsupported_literal_in(t))
+}
+
+/// The first literal-shaped token in `t` (recursing through list and map
+/// syntax) that the display-literal parser declined, for example a path
+/// written without its angle brackets (`()-[:T]->()`). Comparing such a token
+/// as a plain string would be a silent representational mismatch, so the
+/// scenario is skipped instead, with the form named. Quoted strings are
+/// genuine strings and are never flagged.
+fn unsupported_literal_in(t: &str) -> Option<String> {
+    let t = t.trim();
+    if parse_entity_literal(t).is_some() {
+        return None;
+    }
+    if (t.starts_with('\'') && t.ends_with('\'')) || (t.starts_with('"') && t.ends_with('"')) {
+        return None;
+    }
+    if t.starts_with('[') && t.ends_with(']') {
+        let inner = t[1..t.len() - 1].trim();
+        if inner.is_empty() {
+            return None;
+        }
+        return split_table_list(inner)
+            .iter()
+            .find_map(|item| unsupported_literal_in(item));
+    }
+    if t.starts_with('{') && t.ends_with('}') {
+        let inner = t[1..t.len() - 1].trim();
+        return split_table_list(inner).iter().find_map(|entry| {
+            let entry = entry.trim();
+            entry
+                .find(':')
+                .and_then(|colon| unsupported_literal_in(entry[colon + 1..].trim()))
+        });
+    }
+    let literal_shaped = t.starts_with("(:")
+        || (t.starts_with('(') && t.contains(':'))
+        || t.starts_with("()-[")
+        || t.starts_with("<-[")
+        || t.starts_with(':')
+        || (t.starts_with('<') && t.ends_with('>'));
+    if literal_shaped {
+        return Some(t.to_string());
+    }
+    None
 }
 
 fn parse_table_value(trimmed: &str) -> serde_json::Value {
+    // Display literals may nest inside list and map cells, for example
+    // `[[:REL {num: 1}], [:REL {num: 2}]]`. Trying the literal parser first is
+    // what keeps a relationship literal from being misread as a list.
+    if let Some(canon) = parse_entity_literal(trimmed) {
+        return canon;
+    }
     if trimmed.eq_ignore_ascii_case("null") {
         return serde_json::Value::Null;
     }
@@ -941,14 +1208,13 @@ fn run_scenario(scenario: &Scenario) -> Result<(), String> {
             ignore_list_order,
             columns,
             rows: expected_rows,
-            has_node_literals,
+            unsupported_literal,
         } => {
-            // Skip scenarios whose expected output contains node/rel display literals because
-            // IssunDB returns node IDs, not display strings.
-            if *has_node_literals {
-                return Err(
-                    "__skip__: result table contains node/relationship display literals".into(),
-                );
+            if let Some(form) = unsupported_literal {
+                return Err(format!(
+                    "__skip__: unsupported display literal form: {}",
+                    form
+                ));
             }
 
             let res = exec_result.map_err(|e| e.to_string())?;
@@ -960,12 +1226,25 @@ fn run_scenario(scenario: &Scenario) -> Result<(), String> {
                 ));
             }
 
+            // Both sides pass through `canonicalize_value`, which turns
+            // display-literal strings into comparable structures; the expected
+            // rows already parsed literal cells, so this canonicalizes only
+            // the quoted strings that happen to look like literals, keeping
+            // the comparison symmetric.
             let mut actual_rows: Vec<Vec<serde_json::Value>> = res
                 .records
                 .into_iter()
-                .map(|r| r.values.into_iter().map(normalize_value).collect())
+                .map(|r| {
+                    r.values
+                        .into_iter()
+                        .map(|v| canonicalize_value(normalize_value(v)))
+                        .collect()
+                })
                 .collect();
-            let mut exp = expected_rows.clone();
+            let mut exp: Vec<Vec<serde_json::Value>> = expected_rows
+                .iter()
+                .map(|r| r.iter().map(|v| canonicalize_value(v.clone())).collect())
+                .collect();
 
             if *ignore_list_order {
                 fn sort_lists_in_value(v: &mut serde_json::Value) {
@@ -1046,5 +1325,131 @@ fn normalize_value(v: serde_json::Value) -> serde_json::Value {
             serde_json::Value::Array(arr.into_iter().map(normalize_value).collect())
         }
         other => other,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Display-literal parser and comparator tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod literal_tests {
+    use super::*;
+
+    fn cell(s: &str) -> serde_json::Value {
+        let (v, unsupported) = parse_table_cell(s);
+        assert!(unsupported.is_none(), "cell {s:?} flagged unsupported");
+        v
+    }
+
+    #[test]
+    fn node_literal_labels_are_order_insensitive() {
+        assert_eq!(cell("(:A:B {name: 'x'})"), cell("(:B:A {name: 'x'})"));
+    }
+
+    #[test]
+    fn node_literal_properties_are_order_insensitive() {
+        assert_eq!(cell("(:A {a: 1, b: 2})"), cell("(:A {b: 2, a: 1})"));
+    }
+
+    #[test]
+    fn node_literal_int_and_float_properties_stay_distinct() {
+        assert_ne!(cell("(:A {v: 1})"), cell("(:A {v: 1.0})"));
+    }
+
+    #[test]
+    fn bare_node_literal_parses() {
+        assert_eq!(cell("()"), cell("(  )"));
+        assert_ne!(cell("()"), cell("(:A)"));
+    }
+
+    #[test]
+    fn labelless_node_literal_with_properties_parses() {
+        assert_eq!(cell("({num: 1})"), cell("( {num: 1} )"));
+        assert_ne!(cell("({num: 1})"), cell("()"));
+    }
+
+    #[test]
+    fn relationship_literal_parses_and_lists_do_not() {
+        assert_eq!(cell("[:T {num: 1}]"), cell("[:T {num: 1}]"));
+        assert_ne!(cell("[:T]"), cell("[:U]"));
+        // A plain list is a list, not a relationship literal.
+        assert_eq!(cell("[]"), serde_json::json!([]));
+        assert_eq!(cell("[1, 2]"), serde_json::json!([1, 2]));
+    }
+
+    #[test]
+    fn literals_nest_inside_list_cells() {
+        let v = cell("[[:REL {num: 1}], [:REL {num: 2}]]");
+        let arr = v.as_array().expect("list cell");
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0], cell("[:REL {num: 1}]"));
+        assert_eq!(arr[1], cell("[:REL {num: 2}]"));
+        assert_ne!(arr[0], arr[1]);
+    }
+
+    #[test]
+    fn path_literal_direction_is_significant() {
+        assert_eq!(cell("<(:A)-[:T]->(:B)>"), cell("<(:A)-[:T]->(:B)>"));
+        assert_ne!(cell("<(:A)-[:T]->(:B)>"), cell("<(:A)<-[:T]-(:B)>"));
+        assert_ne!(cell("<(:A)-[:T]->(:B)>"), cell("<(:B)-[:T]->(:A)>"));
+    }
+
+    #[test]
+    fn zero_length_path_literal_parses() {
+        assert_eq!(cell("<()>"), cell("<()>"));
+        assert_ne!(cell("<()>"), cell("()"));
+    }
+
+    #[test]
+    fn engine_display_strings_canonicalize_like_expected_cells() {
+        let actual = canonicalize_value(serde_json::Value::String(
+            "(:B:A {f: 1.5, n: 1, name: 'x'})".to_string(),
+        ));
+        assert_eq!(actual, cell("(:A:B {name: 'x', n: 1, f: 1.5})"));
+        let path = canonicalize_value(serde_json::Value::String(
+            "<(:A)-[:T {num: 1}]->(:C)>".to_string(),
+        ));
+        assert_eq!(path, cell("<(:A)-[:T {num: 1}]->(:C)>"));
+    }
+
+    #[test]
+    fn quoted_string_property_values_survive_literal_parsing() {
+        let expected = cell("(:A {name: 'a, b: 1'})");
+        let actual = canonicalize_value(serde_json::Value::String(
+            "(:A {name: 'a, b: 1'})".to_string(),
+        ));
+        assert_eq!(expected, actual);
+        assert_ne!(expected, cell("(:A {name: 'other'})"));
+    }
+
+    #[test]
+    fn unsupported_literal_forms_are_flagged_not_mangled() {
+        let (_, unsupported) = parse_table_cell("()-[:T]->()");
+        assert!(unsupported.is_some());
+        // The same form nested inside a list cell is flagged too.
+        let (_, unsupported) = parse_table_cell("[()-[:T]->()]");
+        assert!(unsupported.is_some());
+    }
+
+    #[test]
+    fn path_literals_nest_inside_list_cells() {
+        let v = cell("[<(:A)-[:T]->(:B)>]");
+        let arr = v.as_array().expect("list cell");
+        assert_eq!(arr[0], cell("<(:A)-[:T]->(:B)>"));
+    }
+
+    #[test]
+    fn quoted_strings_with_arrows_are_not_literals() {
+        assert_eq!(cell("['name->foo']"), serde_json::json!(["name->foo"]));
+    }
+
+    #[test]
+    fn gherkin_cell_unescape_handles_backslash_pipe_and_newline() {
+        assert_eq!(unescape_gherkin_cell(r"'a\\b'"), r"'a\b'");
+        assert_eq!(unescape_gherkin_cell(r"a\|b"), "a|b");
+        assert_eq!(unescape_gherkin_cell(r"a\nb"), "a\nb");
+        // The Cypher escape in `'\''` is not a Gherkin escape; it passes through.
+        assert_eq!(unescape_gherkin_cell(r"'\''"), r"'\''");
     }
 }
