@@ -280,7 +280,7 @@ impl Ord for OrderedF32 {
 /// WAND skips documents whose maximum possible score (sum of per-term upper
 /// bounds for terms that still have the document in their future) cannot
 /// exceed the current k-th best score threshold. This typically eliminates
-/// 90–99 % of full BM25 evaluations compared to exhaustive scoring.
+/// 90 to 99 % of full BM25 evaluations compared to exhaustive scoring.
 fn wand_top_k(
     mut cursors: Vec<PostingCursor>,
     k: usize,
@@ -1210,7 +1210,8 @@ mod tests {
 
             // Shared per-term data (postings, idf, qtf) so the oracle and the
             // cursors score identically. qtf is fixed at 1 (each query term once).
-            let mut term_data: Vec<(Vec<(NodeId, u32)>, f32, f32)> = Vec::new();
+            type TermData = (Vec<(NodeId, u32)>, f32, f32);
+            let mut term_data: Vec<TermData> = Vec::new();
             for term in &terms {
                 let postings: Vec<(NodeId, u32)> = term
                     .iter()

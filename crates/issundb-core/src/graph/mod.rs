@@ -523,6 +523,45 @@ pub struct Graph {
     /// `get_or_init_extension_with` methods. Keys are `std::any::TypeId`; values
     /// are `Arc<dyn Any + Send + Sync>`.
     pub(crate) extensions: Arc<parking_lot::Mutex<AHashMap<StdTypeId, Box<dyn Any + Send + Sync>>>>,
+    /// Test-only injection points; see [`TestHooks`]. Never compiled into a
+    /// release build.
+    #[cfg(test)]
+    pub(super) test_hooks: Arc<TestHooks>,
+}
+
+/// One test-only injection point: a closure the test installs, fired at most
+/// once at its call site.
+#[cfg(test)]
+pub(super) type HookSlot = parking_lot::Mutex<Option<Box<dyn Fn() + Send>>>;
+
+/// Test-only injection points for the race-condition tests. Instance-scoped,
+/// so parallel tests over their own `TempDir` graphs cannot interfere. Each
+/// hook fires at most once: [`TestHooks::fire`] takes the closure out before
+/// calling it, so a hook that writes back into the graph cannot re-trigger
+/// itself, and later passes through the same site run unhooked.
+#[cfg(test)]
+#[derive(Default)]
+pub(super) struct TestHooks {
+    /// Fires inside [`Graph::update`] after `commit_and_publish` and before
+    /// the column bookkeeping, while the write lock is still held. This is
+    /// the window the columns stamp race needs: the persisted generation has
+    /// moved, and the touched ids are not yet in the pending buffer.
+    pub(super) after_commit_before_column_bookkeeping: HookSlot,
+    /// Fires inside [`Graph::schema_has_edge`] after the probe computes its
+    /// verdict and before `memoize_schema_probe`. This is the window the memo
+    /// race needs: a write committing here makes the verdict describe
+    /// pre-commit state.
+    pub(super) before_schema_memoize: HookSlot,
+}
+
+#[cfg(test)]
+impl TestHooks {
+    pub(super) fn fire(slot: &HookSlot) {
+        let hook = slot.lock().take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
 }
 
 /// A read-only transaction on the graph.
@@ -539,6 +578,81 @@ pub struct WriteTxn<'a> {
     /// Structural mutations staged during this transaction, flushed to the
     /// `CsrCache` only on commit so an aborted transaction records nothing.
     pub(super) delta: crate::csr::GraphDelta,
+    /// Per-transaction memo for work that is identical across the records of one
+    /// batch. See [`WriteBatchCache`].
+    pub(super) cache: WriteBatchCache,
+}
+
+/// Holds the answers that stay true for the whole of one write transaction, so
+/// that a bulk write pays for them once instead of once per record.
+///
+/// A batch of a million edges asked the same three questions a million times:
+/// what integer is this relationship type (a `format!` and a `meta` lookup),
+/// which property indexes are active for it (a `format!` and a `meta` prefix
+/// scan, paid even when there are none, which is the common case), and does this
+/// endpoint exist (a lookup in a tree the size of the graph). Measured against
+/// the storage layer, those and the id allocation were most of an edge insert:
+/// the four LMDB writes an edge performs total about 1.1 µs against a measured
+/// 4.9 µs per edge.
+///
+/// Every entry is safe for exactly one transaction and no longer. There is one
+/// writer at a time, so nothing else can change a registry or an index
+/// definition underneath this; what this transaction changes itself, it records
+/// here too. The endpoint memo is the one that can go stale from inside, since a
+/// node deleted later in the same transaction must stop counting as present, so
+/// a delete clears it.
+#[derive(Default)]
+pub(super) struct WriteBatchCache {
+    /// Relationship type name to id, including types created by this
+    /// transaction.
+    types: AHashMap<String, TypeId>,
+    /// Active edge property indexes per type, as `get_active_edge_indexes`
+    /// returns them.
+    edge_indexes: AHashMap<TypeId, Vec<(PropKeyId, u8)>>,
+    /// Node ids this transaction has already proved exist. It holds one id per
+    /// distinct endpoint the transaction touches and is released only with the
+    /// transaction, so a million-node bulk load carries roughly 18 MB of it.
+    known_nodes: AHashSet<NodeId>,
+}
+
+impl WriteBatchCache {
+    fn knows_node(&self, id: NodeId) -> bool {
+        self.known_nodes.contains(&id)
+    }
+
+    fn remember_node(&mut self, id: NodeId) {
+        self.known_nodes.insert(id);
+    }
+
+    fn type_id(&self, name: &str) -> Option<TypeId> {
+        self.types.get(name).copied()
+    }
+
+    fn remember_type(&mut self, name: &str, id: TypeId) {
+        self.types.insert(name.to_string(), id);
+    }
+
+    /// Returns the active edge indexes for `type_id`, computing them with `f` on
+    /// the first ask.
+    pub(super) fn edge_indexes_or_insert<E>(
+        &mut self,
+        type_id: TypeId,
+        f: impl FnOnce() -> Result<Vec<(PropKeyId, u8)>, E>,
+    ) -> Result<&[(PropKeyId, u8)], E> {
+        if !self.edge_indexes.contains_key(&type_id) {
+            let computed = f()?;
+            self.edge_indexes.insert(type_id, computed);
+        }
+        Ok(&self.edge_indexes[&type_id])
+    }
+
+    /// Forgets the endpoint memo. Called by any node deletion, since a node this
+    /// transaction removes must stop satisfying a later edge's existence check.
+    /// It drops every entry rather than the deleted id alone, so a batch that
+    /// interleaves deletions re-proves each endpoint against storage.
+    pub(super) fn invalidate_nodes(&mut self) {
+        self.known_nodes.clear();
+    }
 }
 
 thread_local! {
@@ -632,6 +746,8 @@ impl Graph {
             label_scans: Arc::new(parking_lot::Mutex::new(index::LabelScanCache::default())),
             n_threads: Arc::new(std::sync::atomic::AtomicI32::new(0)),
             extensions: Arc::new(parking_lot::Mutex::new(AHashMap::new())),
+            #[cfg(test)]
+            test_hooks: Arc::new(TestHooks::default()),
         })
     }
 
@@ -843,18 +959,32 @@ impl Graph {
     pub fn materialize_property_columns(&self) -> Result<(), Error> {
         #[cfg(feature = "lmdb")]
         {
-            // Captured before the build, so a write landing during it leaves
-            // the saved file conservatively stale rather than falsely fresh.
+            // Captured before the build, and under the write lock. Every
+            // mutation holds that lock from before its commit until after it
+            // records its touched ids. So at the capture, every commit the
+            // stamp counts has already recorded its delta, and the drain
+            // inside `with_fresh` absorbs all of them. That is the invariant
+            // the saved file needs: stamp <= absorbed content. A write landing
+            // after the capture leaves the file stale, which is safe. Reading
+            // the generation without the lock is not: it could see a commit
+            // whose touched ids were not yet recorded, stamp the file one
+            // generation ahead of its content, and a later process would load
+            // stale values as fresh.
             let persisted_gen = {
+                let _guard = self._write_lock.lock();
                 let rtxn = self.storage.env.read_txn()?;
                 crate::storage::ids::commit_gen(&self.storage, &rtxn)?
             };
+            let _quiet = crate::columns::MaterializingColumns::install();
             self.prop_columns.with_fresh(&self.storage, |cols| {
                 let _ = crate::cache_file::save_columns(&self.storage, cols, persisted_gen);
             })
         }
         #[cfg(not(feature = "lmdb"))]
-        self.prop_columns.with_fresh(&self.storage, |_| ())
+        {
+            let _quiet = crate::columns::MaterializingColumns::install();
+            self.prop_columns.with_fresh(&self.storage, |_| ())
+        }
     }
 
     /// Group `ids` by the exact value of `prop` through the in-memory
@@ -952,18 +1082,24 @@ impl Graph {
     pub fn materialize_edge_property_columns(&self) -> Result<(), Error> {
         #[cfg(feature = "lmdb")]
         {
-            // Captured before the build, so a write landing during it leaves
-            // the saved file conservatively stale rather than falsely fresh.
+            // Captured under the write lock and before the build, for the
+            // stamp <= absorbed content invariant explained in
+            // [`Graph::materialize_property_columns`].
             let persisted_gen = {
+                let _guard = self._write_lock.lock();
                 let rtxn = self.storage.env.read_txn()?;
                 crate::storage::ids::commit_gen(&self.storage, &rtxn)?
             };
+            let _quiet = crate::columns::MaterializingColumns::install();
             self.edge_columns.with_fresh(&self.storage, |cols| {
                 let _ = crate::cache_file::save_columns(&self.storage, cols, persisted_gen);
             })
         }
         #[cfg(not(feature = "lmdb"))]
-        self.edge_columns.with_fresh(&self.storage, |_| ())
+        {
+            let _quiet = crate::columns::MaterializingColumns::install();
+            self.edge_columns.with_fresh(&self.storage, |_| ())
+        }
     }
 
     // ------------------------------------------------------------------
@@ -1154,6 +1290,7 @@ impl Graph {
             wtxn,
             mutations_count: 0,
             delta: crate::csr::GraphDelta::default(),
+            cache: WriteBatchCache::default(),
         };
         let _txn_guard = WriteTxnGuard::enter(self.write_txn_env_id());
         match f(&mut txn) {
@@ -1163,12 +1300,15 @@ impl Graph {
                     mutations_count,
                     delta,
                     graph: _,
+                    cache: _,
                 } = txn;
                 // Publish before any other bookkeeping, so the window in which
                 // the caches claim to be current while LMDB already holds this
                 // write is one atomic increment wide rather than the width of
                 // the batch. See `CsrCache::advance_write_gen`.
                 self.commit_and_publish(wtxn, mutations_count)?;
+                #[cfg(test)]
+                TestHooks::fire(&self.test_hooks.after_commit_before_column_bookkeeping);
                 // Column bookkeeping next. The CSR snapshot needs nothing here: the
                 // generation bump above is what tells a reader its snapshot lags, and
                 // the refresh rebuilds from storage rather than from a delta.
@@ -1280,13 +1420,21 @@ impl Graph {
             let rtxn = self.storage.env.read_txn()?;
             crate::storage::ids::commit_gen(&self.storage, &rtxn)?
         };
-        let snap = self.build_snapshot()?;
+        // Always the full scan, never the cache-file load: this method is the
+        // file's save site, so serving the file here would write back whatever
+        // it already claimed and a wrong file could never be repaired.
+        let snap = self.build_snapshot_from_storage()?;
         // This is the one save site, chosen because every bulk load ends here:
         // the freshness gate's per-write refreshes must not pay a file write per
         // rebuild. A failed save is ignored; the cache file is a cache, and the
         // stale or absent file it leaves behind is refused on load.
         #[cfg(feature = "lmdb")]
-        let _ = crate::cache_file::save_csr(self.storage.env.path(), &snap, persisted_gen);
+        let _ = crate::cache_file::save_csr(
+            self.storage.env.path(),
+            &snap,
+            self.storage.db_id,
+            persisted_gen,
+        );
         self.csr_cache.install_full(snap, built_gen);
         Ok(())
     }
@@ -1547,6 +1695,129 @@ mod restore_tests {
         Graph::restore(&snap, &nested).unwrap();
         let restored = Graph::open(&nested, 1).unwrap();
         assert_eq!(restored.nodes_by_label("FromA").unwrap().len(), 1);
+    }
+
+    /// Restoring into a directory with leftover cache files removes them: they
+    /// describe whatever database used to live there, and the database identity
+    /// they carry means they could never serve the restored one anyway.
+    #[test]
+    fn restore_removes_leftover_cache_files() {
+        let old = TempDir::new().unwrap();
+        let snap_dir = TempDir::new().unwrap();
+        let snap = snap_dir.path().join("b.mdb");
+
+        {
+            let a = Graph::open(old.path(), 1).unwrap();
+            let n0 = a.add_node("N", &json!({ "x": 1 })).unwrap();
+            let n1 = a.add_node("N", &json!({ "x": 2 })).unwrap();
+            a.add_edge(n0, n1, "R", &json!({})).unwrap();
+            a.rebuild_csr().unwrap();
+            a.materialize_property_columns().unwrap();
+        }
+        {
+            let b_dir = TempDir::new().unwrap();
+            let b = Graph::open(b_dir.path(), 1).unwrap();
+            b.add_node("FromB", &json!({})).unwrap();
+            b.backup(&snap).unwrap();
+        }
+        // The old database goes away, its cache files stay behind.
+        std::fs::remove_file(old.path().join("data.mdb")).unwrap();
+        let _ = std::fs::remove_file(old.path().join("lock.mdb"));
+        assert!(old.path().join("csr.cache").exists());
+
+        Graph::restore(&snap, old.path()).unwrap();
+        let leftover: Vec<_> = std::fs::read_dir(old.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|ext| ext == "cache"))
+            .collect();
+        assert!(leftover.is_empty(), "leftover cache files: {leftover:?}");
+
+        let restored = Graph::open(old.path(), 1).unwrap();
+        assert_eq!(restored.nodes_by_label("FromB").unwrap().len(), 1);
+    }
+}
+
+// Reopening the same directory is the observable half of the race, so the test
+// needs the persistent backend.
+#[cfg(test)]
+#[cfg(feature = "lmdb")]
+mod stamp_race_tests {
+    use std::sync::mpsc;
+
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    use super::Graph;
+
+    /// The columns cache file must never be stamped ahead of its content.
+    ///
+    /// The interleaving under test: a writer commits, and a concurrent
+    /// materialize reads the bumped persisted generation before the writer
+    /// records its touched ids into the columns' pending buffer. Capturing the
+    /// generation without the write lock let the materialize refresh against
+    /// an empty pending buffer, save pre-write column values, and stamp them
+    /// with the post-write generation; a reopened graph then loaded the file
+    /// as fresh and served the pre-write value. The hook parks the writer in
+    /// exactly that window. Under the fixed code the materialize blocks on the
+    /// write lock instead, so it absorbs the write before saving.
+    #[test]
+    fn a_concurrent_materialize_does_not_stamp_the_cache_file_ahead_of_its_content() {
+        let dir = TempDir::new().unwrap();
+        let node;
+        {
+            let g = Graph::open(dir.path(), 1).unwrap();
+            node = g.add_node("Person", &json!({ "v": 1 })).unwrap();
+            // Build and persist the columns first, so the racing materialize
+            // refreshes through the pending buffer rather than a full scan,
+            // which would read the committed value and hide the race.
+            g.materialize_property_columns().unwrap();
+
+            let (reached_tx, reached_rx) = mpsc::channel::<()>();
+            let (release_tx, release_rx) = mpsc::channel::<()>();
+            g.test_hooks
+                .after_commit_before_column_bookkeeping
+                .lock()
+                .replace(Box::new(move || {
+                    reached_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                }));
+
+            let writer = {
+                let g = g.clone();
+                std::thread::spawn(move || {
+                    g.update(|txn| txn.update_node(node, &json!({ "v": 2 })))
+                        .unwrap();
+                })
+            };
+            // The writer has committed and is parked before its column
+            // bookkeeping, still holding the write lock.
+            reached_rx.recv().unwrap();
+            let materializer = {
+                let g = g.clone();
+                std::thread::spawn(move || g.materialize_property_columns().unwrap())
+            };
+            // Ordering help only, not correctness: give the materializer a
+            // moment to reach the generation capture before the writer is
+            // released. Under the fixed code it blocks there on the write
+            // lock; under the racy ordering it completes its save here.
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            release_tx.send(()).unwrap();
+            writer.join().unwrap();
+            materializer.join().unwrap();
+        }
+
+        let g = Graph::open(dir.path(), 1).unwrap();
+        // A full build serves from the cache file when its stamp matches the
+        // persisted generation, which is exactly the load a stamp ahead of
+        // its content poisons.
+        g.materialize_property_columns().unwrap();
+        assert_eq!(
+            g.node_prop_json(node, "v").unwrap(),
+            Some(json!(2)),
+            "the reopened graph must serve the committed value through the loaded columns"
+        );
     }
 }
 

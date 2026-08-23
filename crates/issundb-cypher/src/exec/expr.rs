@@ -123,6 +123,12 @@ pub(crate) struct PendingEdgeInfo {
 struct PendingWritesState {
     nodes: HashMap<NodeId, PendingNodeInfo>,
     edges: HashMap<EdgeId, PendingEdgeInfo>,
+    // Entities deleted earlier in this same statement. A property, label, or
+    // key read of a marked entity is a runtime error (openCypher
+    // DeletedEntityAccess); reading the type of a deleted relationship stays
+    // legal, so `type()` deliberately does not consult these.
+    deleted_nodes: std::collections::HashSet<NodeId>,
+    deleted_edges: std::collections::HashSet<EdgeId>,
 }
 
 /// Guard that installs an empty pending-writes overlay for one write-containing
@@ -232,6 +238,27 @@ impl PendingWrites {
         Self::record_node_rc(id, labels, props);
     }
 
+    /// Mark a node as deleted by this statement, dropping any earlier overlay
+    /// entry so nothing serves its stale properties.
+    pub(crate) fn record_deleted_node(id: NodeId) {
+        PENDING_WRITES.with(|c| {
+            if let Some(s) = c.borrow_mut().as_mut() {
+                s.nodes.remove(&id);
+                s.deleted_nodes.insert(id);
+            }
+        });
+    }
+
+    /// Edge counterpart to [`PendingWrites::record_deleted_node`].
+    pub(crate) fn record_deleted_edge(id: EdgeId) {
+        PENDING_WRITES.with(|c| {
+            if let Some(s) = c.borrow_mut().as_mut() {
+                s.edges.remove(&id);
+                s.deleted_edges.insert(id);
+            }
+        });
+    }
+
     /// Remove a label from a node's overlay entry (`REMOVE n:Label`), same
     /// first-appearance handling as [`PendingWrites::add_label`].
     pub(crate) fn remove_label(txn: &issundb_core::WriteTxn, id: NodeId, label: &str) {
@@ -279,6 +306,41 @@ pub(crate) fn pending_node(id: NodeId) -> Option<PendingNodeInfo> {
 /// Edge counterpart to [`pending_node`].
 pub(crate) fn pending_edge(id: EdgeId) -> Option<PendingEdgeInfo> {
     PENDING_WRITES.with(|c| c.borrow().as_ref().and_then(|s| s.edges.get(&id).cloned()))
+}
+
+/// Whether a pending-writes overlay is installed on this thread. The columnar
+/// fast path reads properties in bulk without consulting the overlay, so a
+/// read query executed inside a write statement (the RETURN pass of a
+/// DELETE ... RETURN) must decline it.
+pub(crate) fn pending_writes_active() -> bool {
+    PENDING_WRITES.with(|c| c.borrow().is_some())
+}
+
+/// Whether this statement already deleted the node.
+pub(crate) fn node_is_deleted(id: NodeId) -> bool {
+    PENDING_WRITES.with(|c| {
+        c.borrow()
+            .as_ref()
+            .is_some_and(|s| s.deleted_nodes.contains(&id))
+    })
+}
+
+/// Whether this statement already deleted the edge.
+pub(crate) fn edge_is_deleted(id: EdgeId) -> bool {
+    PENDING_WRITES.with(|c| {
+        c.borrow()
+            .as_ref()
+            .is_some_and(|s| s.deleted_edges.contains(&id))
+    })
+}
+
+/// The runtime error for reading a property, label, or key of an entity this
+/// statement deleted. `kind` is "node" or "relationship".
+pub(crate) fn deleted_entity_error(kind: &str, id: u64) -> String {
+    format!(
+        "EntityNotFound: DeletedEntityAccess: {} {} was deleted in this statement",
+        kind, id
+    )
 }
 
 fn pending_node_props(id: NodeId) -> Option<Rc<serde_json::Value>> {
@@ -748,6 +810,87 @@ pub(super) fn evaluate_expr<B: Bindings>(
             transform,
             params,
         ),
+        // A pattern predicate is an existence test over the same expansion the
+        // pattern comprehension runs: true when at least one assignment of the
+        // pattern exists. A null or missing anchor makes the predicate null,
+        // so both the plain and the negated form reject the row.
+        Expr::PatternPredicate { pattern } => {
+            if let Some(anchor) = &pattern.node.variable {
+                match path.get_binding(anchor) {
+                    None | Some(GraphBinding::Scalar(serde_json::Value::Null)) => {
+                        return Ok(serde_json::Value::Null);
+                    }
+                    _ => {}
+                }
+            }
+            let matches = super::read::eval_pattern_comprehension(
+                graph,
+                &path.to_path_map(),
+                pattern,
+                None,
+                &Expr::Literal(crate::ast::Literal::Bool(true)),
+                params,
+            )?;
+            Ok(serde_json::Value::Bool(
+                matches.as_array().is_some_and(|a| !a.is_empty()),
+            ))
+        }
+        // An existential subquery is true when at least one assignment of its
+        // pattern satisfies the body's WHERE clause. Variables the outer scope
+        // binds are correlated references and the rest bind locally, which is
+        // the pattern comprehension's scoping, so the body runs through the
+        // same expansion. The one case the comprehension cannot seed is an
+        // anchor the outer scope does not bind: that anchor is a local
+        // variable, so every node is a candidate, and the comprehension
+        // re-checks the anchor's own labels and inline properties per
+        // candidate. The result is always a boolean, never null: an anchor
+        // bound to null, or to a non-node value, simply matches nothing.
+        Expr::ExistsSubquery { pattern, predicate } => {
+            let true_expr = Expr::Literal(crate::ast::Literal::Bool(true));
+            let mut pat = (**pattern).clone();
+            let anchor = match pat.node.variable.clone() {
+                Some(v) => v,
+                None => {
+                    let name = "__exists_anchor".to_string();
+                    pat.node.variable = Some(name.clone());
+                    name
+                }
+            };
+            let outer = path.to_path_map();
+            if outer.contains_key(&anchor) {
+                let matches = super::read::eval_pattern_comprehension(
+                    graph,
+                    &outer,
+                    &pat,
+                    predicate.as_deref(),
+                    &true_expr,
+                    params,
+                )?;
+                return Ok(serde_json::Value::Bool(
+                    matches.as_array().is_some_and(|a| !a.is_empty()),
+                ));
+            }
+            let candidates = match pat.node.labels.first() {
+                Some(label) => graph.nodes_by_label(label).map_err(|e| e.to_string())?,
+                None => graph.all_nodes().map_err(|e| e.to_string())?,
+            };
+            let mut seeded = outer;
+            for nid in candidates {
+                seeded.insert(anchor.clone(), GraphBinding::Node(nid));
+                let matches = super::read::eval_pattern_comprehension(
+                    graph,
+                    &seeded,
+                    &pat,
+                    predicate.as_deref(),
+                    &true_expr,
+                    params,
+                )?;
+                if matches.as_array().is_some_and(|a| !a.is_empty()) {
+                    return Ok(serde_json::Value::Bool(true));
+                }
+            }
+            Ok(serde_json::Value::Bool(false))
+        }
         Expr::Reduce {
             accumulator,
             initial,
@@ -827,6 +970,8 @@ pub(super) fn evaluate_expr<B: Bindings>(
                         );
                         m.insert("properties".to_string(), (*actual_json).clone());
                         Ok(serde_json::Value::Object(m))
+                    } else if node_is_deleted(*node_id) {
+                        Err(deleted_entity_error("node", *node_id))
                     } else if let Some(pending) = pending_node_props(*node_id) {
                         // A node written earlier in this same still-open write
                         // transaction: `PropColumns` (below) only refreshes
@@ -889,6 +1034,8 @@ pub(super) fn evaluate_expr<B: Bindings>(
                         );
                         m.insert("properties".to_string(), props_json);
                         Ok(serde_json::Value::Object(m))
+                    } else if edge_is_deleted(*edge_id) {
+                        Err(deleted_entity_error("relationship", *edge_id))
                     } else if let Some(pending) = pending_edge_props(*edge_id) {
                         // Same reasoning as the node case above.
                         Ok(pending
@@ -909,6 +1056,9 @@ pub(super) fn evaluate_expr<B: Bindings>(
                         if obj.get("__type__").and_then(|t| t.as_str()) == Some("__Node__") {
                             if let Some(id_val) = obj.get("id").and_then(|i| i.as_i64()) {
                                 let node_id = id_val as u64;
+                                if node_is_deleted(node_id) {
+                                    return Err(deleted_entity_error("node", node_id));
+                                }
                                 let actual_json = node_props(graph, node_id)?
                                     .ok_or_else(|| format!("node not found: {}", node_id))?;
                                 Ok(actual_json
@@ -921,6 +1071,9 @@ pub(super) fn evaluate_expr<B: Bindings>(
                         } else if obj.get("__type__").and_then(|t| t.as_str()) == Some("__Edge__") {
                             if let Some(id_val) = obj.get("id").and_then(|i| i.as_i64()) {
                                 let edge_id = id_val as u64;
+                                if edge_is_deleted(edge_id) {
+                                    return Err(deleted_entity_error("relationship", edge_id));
+                                }
                                 let actual_json = edge_props(graph, edge_id)?
                                     .ok_or_else(|| format!("edge not found: {}", edge_id))?;
                                 Ok(actual_json
@@ -1459,7 +1612,7 @@ fn jaccard_similarity(a: &[serde_json::Value], b: &[serde_json::Value]) -> f64 {
     }
 }
 
-/// Overlap (Szymkiewicz–Simpson) similarity of two sets: intersection over the
+/// Overlap (Szymkiewicz-Simpson) similarity of two sets: intersection over the
 /// smaller set, in `[0, 1]` (higher is more similar). A degenerate empty set
 /// yields `0.0`.
 fn overlap_similarity(a: &[serde_json::Value], b: &[serde_json::Value]) -> f64 {
@@ -1879,6 +2032,12 @@ pub(super) fn eval_function_call<B: Bindings>(
             if args.len() != 1 {
                 return Err("exists() requires exactly 1 argument".into());
             }
+            // `exists(pattern)` is the function form of the pattern predicate:
+            // the answer is the pattern's existence value itself (true, false,
+            // or null on a null anchor), not the non-nullness of that boolean.
+            if matches!(&args[0], Expr::PatternPredicate { .. }) {
+                return evaluate_expr(graph, path, &args[0], params);
+            }
             let val = evaluate_expr(graph, path, &args[0], params)?;
             Ok(serde_json::Value::Bool(val != serde_json::Value::Null))
         }
@@ -2109,6 +2268,9 @@ pub(super) fn eval_function_call<B: Bindings>(
                 if prop.is_empty() {
                     match path.get_binding(var.as_str()) {
                         Some(GraphBinding::Node(nid)) => {
+                            if node_is_deleted(*nid) {
+                                return Err(deleted_entity_error("node", *nid));
+                            }
                             if let Some(p) = pending_node_props(*nid) {
                                 Some((*p).clone())
                             } else if let Ok(Some(record)) = graph.get_node(*nid) {
@@ -2118,6 +2280,9 @@ pub(super) fn eval_function_call<B: Bindings>(
                             }
                         }
                         Some(GraphBinding::Edge(eid)) => {
+                            if edge_is_deleted(*eid) {
+                                return Err(deleted_entity_error("relationship", *eid));
+                            }
                             if let Some(p) = pending_edge_props(*eid) {
                                 Some((*p).clone())
                             } else if let Ok(Some(record)) = graph.get_edge(*eid) {
@@ -2599,6 +2764,9 @@ pub(super) fn eval_function_call<B: Bindings>(
                         .and_then(|i| i.as_i64())
                         .ok_or("labels(): malformed node value")?
                         as u64;
+                    if node_is_deleted(nid) {
+                        return Err(deleted_entity_error("node", nid));
+                    }
                     if pending_node(nid).is_none()
                         && graph.get_node(nid).map_err(|e| e.to_string())?.is_none()
                     {
@@ -2787,6 +2955,9 @@ pub(super) fn eval_function_call<B: Bindings>(
                 if prop.is_empty() {
                     match path.get_binding(var.as_str()) {
                         Some(GraphBinding::Node(nid)) => {
+                            if node_is_deleted(*nid) {
+                                return Err(deleted_entity_error("node", *nid));
+                            }
                             if let Some(p) = pending_node_props(*nid) {
                                 return Ok((*p).clone());
                             }
@@ -2796,6 +2967,9 @@ pub(super) fn eval_function_call<B: Bindings>(
                             }
                         }
                         Some(GraphBinding::Edge(eid)) => {
+                            if edge_is_deleted(*eid) {
+                                return Err(deleted_entity_error("relationship", *eid));
+                            }
                             if let Some(p) = pending_edge_props(*eid) {
                                 return Ok((*p).clone());
                             }
@@ -5141,7 +5315,7 @@ fn temporal_truncate(
                         }
                         "year" => NaiveDate::from_ymd_opt(d.year(), 1, 1).unwrap_or(d),
                         "quarter" => {
-                            let q_month = ((d.month0() / 3) * 3 + 1) as u32;
+                            let q_month = (d.month0() / 3) * 3 + 1;
                             NaiveDate::from_ymd_opt(d.year(), q_month, 1).unwrap_or(d)
                         }
                         "month" => NaiveDate::from_ymd_opt(d.year(), d.month(), 1).unwrap_or(d),

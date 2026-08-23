@@ -24,9 +24,36 @@ impl Graph {
         Ok(edge_id)
     }
 
+    /// Adds an edge exactly as `add_edge_impl` does, answering the per-record
+    /// registry and index lookups from `cache` once the first record of a
+    /// transaction has paid for them.
+    pub(super) fn add_edge_cached(
+        &self,
+        wtxn: &mut crate::storage::RwTxn,
+        cache: &mut super::WriteBatchCache,
+        src: NodeId,
+        dst: NodeId,
+        etype: &str,
+        props: &impl Serialize,
+    ) -> Result<EdgeId, Error> {
+        self.add_edge_inner(wtxn, Some(cache), src, dst, etype, props)
+    }
+
     pub(super) fn add_edge_impl(
         &self,
         wtxn: &mut crate::storage::RwTxn,
+        src: NodeId,
+        dst: NodeId,
+        etype: &str,
+        props: &impl Serialize,
+    ) -> Result<EdgeId, Error> {
+        self.add_edge_inner(wtxn, None, src, dst, etype, props)
+    }
+
+    fn add_edge_inner(
+        &self,
+        wtxn: &mut crate::storage::RwTxn,
+        mut cache: Option<&mut super::WriteBatchCache>,
         src: NodeId,
         dst: NodeId,
         etype: &str,
@@ -38,19 +65,35 @@ impl Graph {
         // consistency. Reads see writes earlier in this same transaction, so a
         // node created before the edge in one `update` batch is visible. This
         // check runs before any write, so a rejected edge leaves no partial state.
-        if self.storage.nodes.get(wtxn, &src)?.is_none() {
-            return Err(Error::NodeNotFound(src));
-        }
-        if self.storage.nodes.get(wtxn, &dst)?.is_none() {
-            return Err(Error::NodeNotFound(dst));
+        for endpoint in [src, dst] {
+            // A node proved present earlier in this transaction stays present,
+            // unless the transaction itself deletes one, which clears the memo.
+            if cache.as_deref().is_some_and(|c| c.knows_node(endpoint)) {
+                continue;
+            }
+            if self.storage.nodes.get(wtxn, &endpoint)?.is_none() {
+                return Err(Error::NodeNotFound(endpoint));
+            }
+            if let Some(c) = cache.as_deref_mut() {
+                c.remember_node(endpoint);
+            }
         }
 
-        let type_id = get_or_create_type(&self.storage, wtxn, etype)?;
+        let type_id = match cache.as_deref().and_then(|c| c.type_id(etype)) {
+            Some(id) => id,
+            None => {
+                let id = get_or_create_type(&self.storage, wtxn, etype)?;
+                if let Some(c) = cache.as_deref_mut() {
+                    c.remember_type(etype, id);
+                }
+                id
+            }
+        };
         let edge_id = alloc_edge_id(&self.storage, wtxn)?;
         let encoded_props = props::encode(props)?;
 
         // Validate constraints and populate indexes
-        self.write_edge_index_entries(wtxn, edge_id, type_id, etype, &encoded_props)?;
+        self.write_edge_index_entries_cached(wtxn, cache, edge_id, type_id, etype, &encoded_props)?;
 
         let record = EdgeRecord {
             src,
@@ -270,6 +313,92 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let g = Graph::open(dir.path(), 1).unwrap();
         (dir, g)
+    }
+
+    /// A node deleted inside a batch must stop satisfying a later edge's
+    /// endpoint check in that same batch.
+    ///
+    /// The batch cache memoizes "this endpoint exists" so a bulk load does not
+    /// re-probe the node tree per edge, and that memo is the one entry a
+    /// transaction can invalidate from the inside. Without the clear on delete,
+    /// the edge below would be written against a node that is gone, leaving the
+    /// dangling adjacency the existence check exists to prevent.
+    #[test]
+    fn a_delete_invalidates_the_batch_endpoint_memo() {
+        let (_dir, g) = open_tmp();
+        let outcome = g.update(|txn| {
+            let a = txn.add_node("N", &serde_json::json!({}))?;
+            let b = txn.add_node("N", &serde_json::json!({}))?;
+            // Proves both endpoints and fills the memo.
+            txn.add_edge(a, b, "R", &serde_json::json!({}))?;
+            txn.delete_node(b)?;
+            // Must be rejected on the strength of storage, not the memo.
+            let second = txn.add_edge(a, b, "R", &serde_json::json!({}));
+            assert!(
+                matches!(second, Err(Error::NodeNotFound(id)) if id == b),
+                "an edge to a node deleted in this batch must be rejected, got {second:?}",
+            );
+            Ok(())
+        });
+        assert!(outcome.is_ok(), "the batch itself should succeed");
+    }
+
+    /// Every edge of a batch must reach the type's property index, not only the
+    /// first one.
+    ///
+    /// The first edge computes the active index list and the rest read it back
+    /// from the batch cache, so this is the path on which a mistake would drop
+    /// index entries silently: the edges themselves would still be written, and
+    /// only a later lookup would come up short.
+    #[test]
+    fn a_batched_edge_after_the_first_still_reaches_the_property_index() {
+        let (_dir, g) = open_tmp();
+        g.create_edge_property_index("R", "k").unwrap();
+        let (first, second) = g
+            .update(|txn| {
+                let a = txn.add_node("N", &serde_json::json!({}))?;
+                let b = txn.add_node("N", &serde_json::json!({}))?;
+                let first = txn.add_edge(a, b, "R", &serde_json::json!({ "k": 1 }))?;
+                let second = txn.add_edge(a, b, "R", &serde_json::json!({ "k": 2 }))?;
+                Ok((first, second))
+            })
+            .unwrap();
+
+        assert_eq!(
+            g.edges_by_property("R", "k", PropValue::Int(1)).unwrap(),
+            vec![first],
+            "the first edge of the batch must be findable through the index"
+        );
+        assert_eq!(
+            g.edges_by_property("R", "k", PropValue::Int(2)).unwrap(),
+            vec![second],
+            "the second edge of the batch must be findable through the index"
+        );
+    }
+
+    /// A unique constraint must hold between two edges of the same batch, where
+    /// the second one reads the active index list back from the batch cache
+    /// rather than from `meta`.
+    #[test]
+    fn a_batched_edge_after_the_first_still_enforces_a_unique_constraint() {
+        let (_dir, g) = open_tmp();
+        g.create_edge_unique_constraint("R", "k").unwrap();
+        let outcome = g.update(|txn| {
+            let a = txn.add_node("N", &serde_json::json!({}))?;
+            let b = txn.add_node("N", &serde_json::json!({}))?;
+            txn.add_edge(a, b, "R", &serde_json::json!({ "k": 1 }))?;
+            txn.add_edge(a, b, "R", &serde_json::json!({ "k": 1 }))?;
+            Ok(())
+        });
+
+        assert!(
+            matches!(outcome, Err(Error::UniqueConstraintViolation(..))),
+            "a duplicate value inside one batch must be rejected, got {outcome:?}"
+        );
+        assert!(
+            g.edges_by_type("R").unwrap().is_empty(),
+            "the rejected batch must leave no edge behind"
+        );
     }
 
     /// `add_edge` must reject an endpoint that does not exist, so a

@@ -231,6 +231,26 @@ fn grouping_free_counts_agree_with_the_row_pipeline() {
     }
 }
 
+/// Existential subqueries used as filters, correlated and with local anchors,
+/// so a fast path that claims the enclosing plan still evaluates the subquery
+/// like the row pipeline does.
+#[test]
+fn existential_subqueries_agree_with_the_row_pipeline() {
+    let (_dir, g) = fixture();
+    for cypher in [
+        "MATCH (a:Person) WHERE exists { (a)-[:KNOWS]->(b) } RETURN a.name ORDER BY a.name",
+        "MATCH (a:Person) WHERE exists { (a)-[:KNOWS]->(b:Person) WHERE b.age > 30 } \
+         RETURN a.name ORDER BY a.name",
+        "MATCH (a:Person) WHERE NOT exists { (a)-[:LIKES]->() } RETURN a.name ORDER BY a.name",
+        "MATCH (a:Person)-[:KNOWS]->(b) WHERE exists { (b)-[:LIKES]->(c) } RETURN count(*)",
+        "MATCH (a:Person) WHERE exists { MATCH (m:Robot) WHERE exists { (a)-[:KNOWS]->(m) } \
+         RETURN true } RETURN a.name ORDER BY a.name",
+        "MATCH (a:Person) RETURN a.name, exists { (a)-[:KNOWS]->() } AS has ORDER BY a.name",
+    ] {
+        assert_paths_agree(&g, cypher);
+    }
+}
+
 /// Relationship-type alternation, which no counting kernel can express.
 ///
 /// `Expand::rel_type` holds the raw pattern text, so `-[:KNOWS|LIKES]->` reaches

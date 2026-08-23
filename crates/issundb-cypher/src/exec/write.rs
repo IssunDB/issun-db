@@ -439,17 +439,22 @@ pub(super) fn delete_over_paths_in(
     }
 
     // Relationships first: clears edges that connect nodes also being deleted
-    // in the same clause.
+    // in the same clause. Every deletion is recorded in the pending-writes
+    // overlay, so a later property, label, or key read of the entity in this
+    // same statement raises instead of serving the committed value.
     for eid in &edges {
         txn.delete_edge(*eid).map_err(|e| e.to_string())?;
+        expr::PendingWrites::record_deleted_edge(*eid);
     }
     for nid in &nodes {
         if detach {
             for ne in txn.out_neighbors(*nid).map_err(|e| e.to_string())? {
                 txn.delete_edge(ne.edge).map_err(|e| e.to_string())?;
+                expr::PendingWrites::record_deleted_edge(ne.edge);
             }
             for ne in txn.in_neighbors(*nid).map_err(|e| e.to_string())? {
                 txn.delete_edge(ne.edge).map_err(|e| e.to_string())?;
+                expr::PendingWrites::record_deleted_edge(ne.edge);
             }
         } else if !txn
             .out_neighbors(*nid)
@@ -463,6 +468,7 @@ pub(super) fn delete_over_paths_in(
             return Err(DELETE_CONNECTED_NODE_MSG.to_string());
         }
         txn.delete_node(*nid).map_err(|e| e.to_string())?;
+        expr::PendingWrites::record_deleted_node(*nid);
     }
     Ok(())
 }
@@ -478,23 +484,15 @@ pub(super) fn execute_delete_and_return(
     // One transaction covers the RETURN pass, the binding pass, and the
     // delete itself, so no concurrent writer can slip in between the rows
     // reported by RETURN and the rows actually deleted, and a failing delete
-    // (a still-connected node without DETACH) leaves nothing behind. The two
-    // read passes run before any write in this transaction, so their reads of
-    // committed state are exactly the statement's snapshot.
+    // (a still-connected node without DETACH) leaves nothing behind. Both
+    // read passes read committed state (the deletes stay uncommitted until
+    // this transaction ends), but the RETURN pass runs after the delete so a
+    // property, label, or key read of a deleted entity raises through the
+    // deletion marks in the pending-writes overlay instead of serving the
+    // committed value.
     graph
         .update(|txn| {
-            let return_query = Query {
-                match_clauses: stmt.match_clauses.clone(),
-                where_clause: stmt.where_clause.clone(),
-                return_clause: stmt.return_clause.clone(),
-                parts: Vec::new(),
-                order_by: stmt.order_by.clone(),
-                skip: stmt.skip.clone(),
-                limit: stmt.limit.clone(),
-            };
-            let return_result =
-                execute_read_query(graph, &return_query, params, None).map_err(as_txn_error)?;
-
+            let _pending = expr::PendingWrites::install();
             let binding_query = Query {
                 match_clauses: stmt.match_clauses.clone(),
                 where_clause: stmt.where_clause.clone(),
@@ -529,7 +527,16 @@ pub(super) fn execute_delete_and_return(
             delete_over_paths_in(txn, &bound_paths, &stmt.targets, stmt.detach, params)
                 .map_err(as_txn_error)?;
 
-            Ok(return_result)
+            let return_query = Query {
+                match_clauses: stmt.match_clauses.clone(),
+                where_clause: stmt.where_clause.clone(),
+                return_clause: stmt.return_clause.clone(),
+                parts: Vec::new(),
+                order_by: stmt.order_by.clone(),
+                skip: stmt.skip.clone(),
+                limit: stmt.limit.clone(),
+            };
+            execute_read_query(graph, &return_query, params, None).map_err(as_txn_error)
         })
         .map_err(unwrap_txn_error)
 }
@@ -874,6 +881,9 @@ fn subst_loop_var_expr(expr: &Expr, var: &str) -> Expr {
                     .map(|t| if shadowed { t.clone() } else { sub_box(t) }),
             }
         }
+        E::PatternPredicate { pattern } => E::PatternPredicate {
+            pattern: Box::new(subst_loop_var_pattern(pattern, var)),
+        },
         E::PatternComprehension {
             pattern,
             predicate,
@@ -882,6 +892,10 @@ fn subst_loop_var_expr(expr: &Expr, var: &str) -> Expr {
             pattern: Box::new(subst_loop_var_pattern(pattern, var)),
             predicate: predicate.as_ref().map(|p| sub_box(p)),
             transform: sub_box(transform),
+        },
+        E::ExistsSubquery { pattern, predicate } => E::ExistsSubquery {
+            pattern: Box::new(subst_loop_var_pattern(pattern, var)),
+            predicate: predicate.as_ref().map(|p| sub_box(p)),
         },
         E::Reduce {
             accumulator,
@@ -935,6 +949,15 @@ fn subst_loop_var_set_item(item: &SetItem, var: &str) -> SetItem {
             variable: variable.clone(),
             property: property.clone(),
             expr: subst_loop_var_expr(expr, var),
+        },
+        SetItem::AllProperties {
+            variable,
+            expr,
+            merge,
+        } => SetItem::AllProperties {
+            variable: variable.clone(),
+            expr: subst_loop_var_expr(expr, var),
+            merge: *merge,
         },
         other => other.clone(),
     }
@@ -1144,6 +1167,32 @@ pub(super) fn apply_set_items(
     Ok(())
 }
 
+/// Reject a per-property SET value openCypher declares unstorable: a list
+/// containing a map at any nesting depth (TCK Set1 [10], InvalidPropertyType).
+/// This check lives in the Cypher layer on purpose: the engine's property
+/// model is arbitrary JSON, and the native surfaces (`Graph::add_node`, REST,
+/// and Python) deliberately accept any JSON value, so the storage layer must
+/// not enforce a query-language rule. A bare map stays storable here too,
+/// because the temporal values evaluate to maps and no TCK scenario forbids
+/// one.
+fn check_settable_property_value(property: &str, value: &serde_json::Value) -> Result<(), String> {
+    fn list_contains_map(value: &serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::Array(items) => items
+                .iter()
+                .any(|item| item.is_object() || list_contains_map(item)),
+            _ => false,
+        }
+    }
+    if list_contains_map(value) {
+        return Err(format!(
+            "TypeError: InvalidPropertyType: cannot set property '{}' to a list containing a map",
+            property
+        ));
+    }
+    Ok(())
+}
+
 /// An element a SET/REMOVE item resolves to: a node, an edge, or nothing
 /// (a null or unbound variable, which makes the operation a no-op).
 enum SetTarget {
@@ -1207,6 +1256,7 @@ pub(super) fn apply_set_item(
             expr,
         } => {
             let new_val = evaluate_expr(txn.graph(), path, expr, params)?;
+            check_settable_property_value(property, &new_val)?;
             match resolve_set_target(path, variable)? {
                 SetTarget::Node(nid) => {
                     let record = txn
@@ -1255,8 +1305,99 @@ pub(super) fn apply_set_item(
                 }
             }
         }
+        SetItem::AllProperties {
+            variable,
+            expr,
+            merge,
+        } => {
+            let target = resolve_set_target(path, variable)?;
+            if matches!(target, SetTarget::Skip) {
+                return Ok(());
+            }
+            let entries = set_map_entries(txn.graph(), path, expr, params)?;
+            match target {
+                SetTarget::Node(nid) => {
+                    let mut props = if *merge {
+                        let record = txn
+                            .get_node(nid)
+                            .map_err(|e| e.to_string())?
+                            .ok_or_else(|| format!("node not found: {}", nid))?;
+                        let stored: serde_json::Value =
+                            rmp_serde::from_slice(&record.props).map_err(|e| e.to_string())?;
+                        match stored {
+                            serde_json::Value::Object(obj) => obj,
+                            _ => serde_json::Map::new(),
+                        }
+                    } else {
+                        serde_json::Map::new()
+                    };
+                    for (key, val) in entries {
+                        if val.is_null() {
+                            props.remove(&key);
+                        } else {
+                            props.insert(key, val);
+                        }
+                    }
+                    let props = serde_json::Value::Object(props);
+                    txn.update_node(nid, &props).map_err(|e| e.to_string())?;
+                    super::expr::PendingWrites::update_node_props(txn, nid, props);
+                }
+                SetTarget::Edge(eid) => {
+                    let mut props = if *merge {
+                        let record = txn
+                            .get_edge(eid)
+                            .map_err(|e| e.to_string())?
+                            .ok_or_else(|| format!("edge not found: {}", eid))?;
+                        let stored: serde_json::Value =
+                            rmp_serde::from_slice(&record.props).map_err(|e| e.to_string())?;
+                        match stored {
+                            serde_json::Value::Object(obj) => obj,
+                            _ => serde_json::Map::new(),
+                        }
+                    } else {
+                        serde_json::Map::new()
+                    };
+                    for (key, val) in entries {
+                        if val.is_null() {
+                            props.remove(&key);
+                        } else {
+                            props.insert(key, val);
+                        }
+                    }
+                    let props = serde_json::Value::Object(props);
+                    txn.update_edge(eid, &props).map_err(|e| e.to_string())?;
+                    super::expr::PendingWrites::update_edge_props(txn, eid, props);
+                }
+                SetTarget::Skip => unreachable!(),
+            }
+        }
     }
     Ok(())
+}
+
+/// Evaluate a whole-entity SET right-hand side to its map entries. A bound
+/// node or relationship contributes its property map; anything that is not a
+/// map or a graph element is an error.
+fn set_map_entries(
+    graph: &Graph,
+    path: &PathMap,
+    expr: &Expr,
+    params: &HashMap<String, serde_json::Value>,
+) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    let value = evaluate_expr(graph, path, expr, params)?;
+    match value {
+        serde_json::Value::Object(mut obj) => match obj.get("__type__").and_then(|t| t.as_str()) {
+            Some("__Node__") | Some("__Edge__") => match obj.remove("properties") {
+                Some(serde_json::Value::Object(props)) => Ok(props),
+                _ => Ok(serde_json::Map::new()),
+            },
+            _ => Ok(obj),
+        },
+        other => Err(format!(
+            "SET expects a map or a graph element, not {}",
+            other
+        )),
+    }
 }
 
 /// Create a node pattern with properties evaluated using an expression context (PathMap).

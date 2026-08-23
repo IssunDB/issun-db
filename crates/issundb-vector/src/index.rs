@@ -298,9 +298,8 @@ pub trait VectorGraphExt {
     /// metric, so they are re-indexed under `opts`; switching back to `Float32`
     /// recovers full precision from storage. This rebuilds the entire in-memory
     /// index, so it is O(n) in the number of stored vectors and is intended
-    /// as an administrative operation, not a concurrent one: running it while
-    /// other threads upsert may drop an in-flight write from the snapshot, which
-    /// the next `Graph::open` rebuild reconciles.
+    /// as an administrative operation. It is serialized against concurrent
+    /// upserts and removes, which block for the duration of the rebuild.
     fn reindex_vector_index(&self, opts: VectorIndexOptions) -> Result<(), VectorError>;
 
     /// Persist `v` under `n`.
@@ -350,8 +349,69 @@ pub trait VectorGraphExt {
 /// Key type used to store the persistent HNSW cache in `Graph::extensions`.
 struct VectorIndexCache(VectorIndex);
 
+/// Serializes every vector mutation's two steps: the in-memory index update
+/// and the storage write. Without it, two calls for one node can interleave so
+/// the index ranks by one embedding while storage holds the other (poisoning
+/// the rescore pass and the next cold-start rebuild), or a remove racing an
+/// upsert leaves an index entry whose stored bytes are gone. It is its own
+/// extension rather than a field on `VectorIndexCache`, because
+/// `reindex_vector_index` swaps the cache and a lock inside the swapped value
+/// could not cover the swap itself.
+///
+/// This mutex is acquired first in the lock ordering, before the index's internal
+/// `RwLock` and before any storage transaction, and never while the
+/// `extensions` mutex is held (`get_or_init_extension_with` runs its
+/// initializer without that lock). Read paths take the index `RwLock` without
+/// this mutex, which is safe because no path acquires them in the reverse
+/// order.
+struct VectorMutationLock {
+    lock: parking_lot::Mutex<()>,
+    /// Test-only pause point fired in `upsert_vector` between the in-memory
+    /// index update and the storage write, so a test can hold one call open
+    /// inside that window deterministically. Instance-scoped through the graph
+    /// extension rather than global, so parallel tests cannot interfere.
+    #[cfg(test)]
+    upsert_pause: parking_lot::Mutex<Option<Box<dyn Fn() + Send>>>,
+}
+
+impl VectorMutationLock {
+    fn new() -> Self {
+        Self {
+            lock: parking_lot::Mutex::new(()),
+            #[cfg(test)]
+            upsert_pause: parking_lot::Mutex::new(None),
+        }
+    }
+
+    #[cfg(test)]
+    fn pause_after_index_update(&self) {
+        // Take the hook before running it, so it fires once and never runs
+        // while the slot's mutex is held: a hook that parks would otherwise
+        // deadlock the test thread trying to clear or replace the slot.
+        let hook = self.upsert_pause.lock().take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+}
+
+/// Return this graph's vector mutation lock, creating it on first use.
+fn mutation_lock(graph: &Graph) -> Arc<VectorMutationLock> {
+    let lock: Result<_, std::convert::Infallible> =
+        graph.get_or_init_extension_with(|| Ok(Arc::new(VectorMutationLock::new())));
+    match lock {
+        Ok(lock) => lock,
+        Err(never) => match never {},
+    }
+}
+
 impl VectorGraphExt for Graph {
     fn configure_vector_index(&self, opts: VectorIndexOptions) -> Result<(), VectorError> {
+        // The mutation lock keeps the emptiness check, the persisted config,
+        // and the cache swap one step: an upsert cannot land between them and
+        // be indexed under the configuration this call replaces.
+        let lock = mutation_lock(self);
+        let _guard = lock.lock.lock();
         // Compare against the EFFECTIVE config: when nothing is persisted the
         // active configuration is the lazily built default, so re-applying that
         // default (or any already-active config) is a no-op, as documented, not
@@ -379,6 +439,11 @@ impl VectorGraphExt for Graph {
     }
 
     fn reindex_vector_index(&self, opts: VectorIndexOptions) -> Result<(), VectorError> {
+        // The mutation lock serializes the rebuild against concurrent upserts
+        // and removes, so the snapshot read from storage cannot miss a
+        // mutation that landed between the scan and the cache swap.
+        let lock = mutation_lock(self);
+        let _guard = lock.lock.lock();
         // Rebuild the index from the stored raw embeddings FIRST, then persist
         // the new configuration and swap the cache. Building before persisting
         // means a mid-rebuild failure leaves BOTH the previous cache and the
@@ -402,6 +467,11 @@ impl VectorGraphExt for Graph {
         // The cost is one key probe per upsert, inside a call that already opens a write
         // transaction and rebuilds an index entry. `remove_vector` stays permissive on purpose, so
         // a database that already holds such a vector can still be cleaned up.
+        // The mutation lock spans the index update and the storage write, so a
+        // concurrent call for the same node cannot leave the index ranking by
+        // one embedding while storage holds another.
+        let lock = mutation_lock(self);
+        let _guard = lock.lock.lock();
         if !self.node_exists(n)? {
             return Err(VectorError::NodeNotFound(n));
         }
@@ -416,15 +486,25 @@ impl VectorGraphExt for Graph {
         // consistently, so it is the safe ordering.
         let arc = get_or_init_cache(self)?;
         arc.0.upsert(n, v)?;
+        #[cfg(test)]
+        lock.pause_after_index_update();
         self.put_vector_bytes(n, &bytes)?;
         Ok(())
     }
 
     fn remove_vector(&self, n: NodeId) -> Result<(), VectorError> {
+        // Same invariant as `upsert_vector`: the mutation lock spans the index
+        // update and the storage write. The cache is initialized rather than
+        // merely peeked at, or a cold-start build racing this call could
+        // re-admit the entry from bytes this call is about to delete. Index
+        // first, then storage: a failure between the two loses an in-memory
+        // entry the next reopen rebuilds, where the reverse would leave a live
+        // index entry whose stored bytes are gone.
+        let lock = mutation_lock(self);
+        let _guard = lock.lock.lock();
+        let arc = get_or_init_cache(self)?;
+        arc.0.remove(n)?;
         self.delete_vector_bytes(n)?;
-        if let Some(arc) = self.get_extension::<VectorIndexCache>() {
-            arc.0.remove(n)?;
-        }
         Ok(())
     }
 
@@ -1318,6 +1398,119 @@ mod tests {
         for h in handles {
             h.join().unwrap();
         }
+    }
+
+    /// Concurrent upserts and removes for one node must leave the in-memory
+    /// index and the stored bytes in agreement. The specific survivor is
+    /// whichever call serialized last, so the assertion is agreement, not a
+    /// particular value: a stored embedding must be the one the index ranks by
+    /// (distance zero to itself), and removed bytes must not leave a live
+    /// index entry behind.
+    #[test]
+    fn concurrent_upsert_and_remove_leave_index_and_storage_agreeing() {
+        let (_dir, graph) = open_tmp();
+        let n = graph.add_node("N", &json!({})).unwrap();
+        let graph = Arc::new(graph);
+
+        let mut handles = vec![];
+        for t in 0..4u32 {
+            let g = Arc::clone(&graph);
+            handles.push(std::thread::spawn(move || {
+                for i in 0..50u32 {
+                    if (t + i) % 5 == 0 {
+                        g.remove_vector(n).unwrap();
+                    } else {
+                        // Distinct unit vectors: any two differ by well over
+                        // 1e-3 in cosine distance, so a mismatch between the
+                        // indexed and the stored embedding is measurable.
+                        let angle = ((t * 50 + i) % 7) as f32 * 0.2;
+                        g.upsert_vector(n, &[angle.cos(), angle.sin()]).unwrap();
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        match graph.node_vector(n).unwrap() {
+            Some(stored) => {
+                let hits = graph.vector_search(&stored, 1).unwrap();
+                assert_eq!(hits.len(), 1);
+                assert_eq!(hits[0].node, n);
+                assert!(
+                    hits[0].distance < 1e-4,
+                    "the index must rank by the embedding storage holds, got distance {}",
+                    hits[0].distance
+                );
+            }
+            None => match graph.vector_search(&[1.0f32, 0.0], 1) {
+                Err(VectorError::EmptyIndex) => {}
+                Ok(hits) => {
+                    panic!("the index holds an entry whose stored bytes were removed: {hits:?}")
+                }
+                Err(e) => panic!("unexpected error: {e:?}"),
+            },
+        }
+    }
+
+    /// Deterministic form of the race the hammer test above cannot hit on
+    /// demand. The test-only pause hook parks the first upsert inside the
+    /// window between its index update and its storage write; a second upsert
+    /// for the same node then runs to completion before the first is released.
+    /// The mutation lock makes the second call wait, so index and storage
+    /// agree; without it the first call finishes by writing v1 to storage
+    /// while the index already ranks by v2.
+    #[test]
+    fn interleaved_upserts_for_one_node_leave_index_and_storage_agreeing() {
+        use std::sync::mpsc;
+
+        let (_dir, graph) = open_tmp();
+        let n = graph.add_node("N", &json!({})).unwrap();
+        let graph = Arc::new(graph);
+
+        let lock = mutation_lock(&graph);
+        let (parked_tx, parked_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        *lock.upsert_pause.lock() = Some(Box::new(move || {
+            parked_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        }));
+
+        let v1 = [1.0f32, 0.0];
+        let v2 = [0.0f32, 1.0];
+
+        let t1 = {
+            let g = Arc::clone(&graph);
+            std::thread::spawn(move || g.upsert_vector(n, &v1).unwrap())
+        };
+        parked_rx.recv().unwrap();
+
+        // The hook was taken when it fired, so the second upsert does not
+        // park too.
+        let t2 = {
+            let g = Arc::clone(&graph);
+            std::thread::spawn(move || g.upsert_vector(n, &v2).unwrap())
+        };
+        // Ordering help only: give T2 time to reach the mutation lock (or, in
+        // the broken shape, to complete inside the window) before releasing
+        // T1. T1 must be released from here, because under the fixed code it
+        // parks while holding the mutation lock and T2 blocks on it, so
+        // waiting on T2 first would deadlock.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        release_tx.send(()).unwrap();
+        t1.join().unwrap();
+        t2.join().unwrap();
+
+        let stored = graph.node_vector(n).unwrap().expect("bytes must exist");
+        let hits = graph.vector_search(&stored, 1).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].node, n);
+        assert!(
+            hits[0].distance < 1e-4,
+            "the index ranks by a different embedding than storage holds, distance {}",
+            hits[0].distance
+        );
     }
 
     #[test]

@@ -741,11 +741,9 @@ mod tests {
         let a = g.add_node("Person", &json!({ "name": "Alice" })).unwrap();
         let b = g.add_node("Person", &json!({ "name": "Bob" })).unwrap();
         let c = g.add_node("Person", &json!({ "name": "Carol" })).unwrap();
-        let e1 = g
-            .add_edge(a, b, "KNOWS", &json!({ "since": 2020 }))
+        g.add_edge(a, b, "KNOWS", &json!({ "since": 2020 }))
             .unwrap();
-        let e2 = g
-            .add_edge(b, c, "KNOWS", &json!({ "since": 2021 }))
+        g.add_edge(b, c, "KNOWS", &json!({ "since": 2021 }))
             .unwrap();
         g.rebuild_csr().unwrap();
 
@@ -762,12 +760,9 @@ mod tests {
             .as_array()
             .expect("r must be a list");
         assert_eq!(list.len(), 2, "two hops means two relationships");
-        // Each element is a relationship object carrying its edge id.
-        let ids: Vec<i64> = list
-            .iter()
-            .map(|v| v.get("id").and_then(|i| i.as_i64()).expect("edge id"))
-            .collect();
-        assert_eq!(ids, vec![e1 as i64, e2 as i64]);
+        // Each element is a relationship display literal, in trail order.
+        assert_eq!(list[0], json!("[:KNOWS {since: 2020}]"));
+        assert_eq!(list[1], json!("[:KNOWS {since: 2021}]"));
         // size(r) reports the hop count.
         assert_eq!(res.records[0].values[1], json!(2));
 
@@ -819,8 +814,7 @@ mod tests {
         let (_dir, g) = open_tmp();
         let a = g.add_node("Person", &json!({ "name": "Alice" })).unwrap();
         let b = g.add_node("Person", &json!({ "name": "Bob" })).unwrap();
-        let e = g
-            .add_edge(a, b, "KNOWS", &json!({ "since": 2020 }))
+        g.add_edge(a, b, "KNOWS", &json!({ "since": 2020 }))
             .unwrap();
         g.rebuild_csr().unwrap();
         let params = HashMap::new();
@@ -832,8 +826,9 @@ mod tests {
             &params,
         )
         .unwrap();
-        assert!(
-            plain.records[0].values[0].is_object(),
+        assert_eq!(
+            plain.records[0].values[0],
+            json!("[:KNOWS {since: 2020}]"),
             "a plain [r] hop binds a single relationship, not a list"
         );
 
@@ -847,11 +842,7 @@ mod tests {
                 .as_array()
                 .unwrap_or_else(|| panic!("{pattern}: r must be a list"));
             assert_eq!(list.len(), 1, "{pattern}: length-one list");
-            assert_eq!(
-                list[0].get("id").and_then(|i| i.as_i64()),
-                Some(e as i64),
-                "{pattern}"
-            );
+            assert_eq!(list[0], json!("[:KNOWS {since: 2020}]"), "{pattern}");
             assert_eq!(
                 res.records[0].values[1],
                 json!(1),

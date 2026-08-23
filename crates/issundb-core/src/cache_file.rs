@@ -15,11 +15,15 @@
 //! freshness gate's per-write refreshes never save, so a write-heavy session
 //! never pays a file write per rebuild.
 //!
-//! The CSR format is little-endian: a magic tag, the generation, flags, the
-//! two array lengths, the arrays themselves in a fixed order, and a 64-bit
-//! checksum folded over every preceding byte. The `id_to_dense` map is not
-//! stored; it is rebuilt from `dense_to_id` on load. The columns files carry
-//! a msgpack payload behind the same header and checksum discipline.
+//! The CSR format is little-endian: a magic tag, the 128-bit database
+//! identity (see [`crate::storage::Storage::db_id`]), the generation, flags,
+//! the two array lengths, the arrays themselves in a fixed order, and a
+//! 64-bit checksum folded over every preceding byte. The `id_to_dense` map is
+//! not stored; it is rebuilt from `dense_to_id` on load. The columns files
+//! carry a msgpack payload behind the same header and checksum discipline.
+//! The identity is what refuses a file left behind by a different database at
+//! a coincidentally matching generation, which a restore into a directory
+//! with leftover cache files would otherwise serve.
 
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
@@ -28,7 +32,7 @@ use std::path::{Path, PathBuf};
 use crate::csr::CsrSnapshot;
 use crate::error::Error;
 
-const MAGIC: &[u8; 8] = b"ISSNCSR1";
+const MAGIC: &[u8; 8] = b"ISSNCSR2";
 const FLAG_WEIGHTED: u64 = 1;
 const FLAG_NEGATIVE_WEIGHT: u64 = 2;
 
@@ -174,7 +178,12 @@ fn csr_path(dir: &Path) -> PathBuf {
 /// Persist `snap` for `commit_gen`, atomically: the bytes go to a temp file in
 /// the same directory and the rename publishes them, so a crash mid-write
 /// leaves either the previous cache file or none, never a torn one.
-pub(crate) fn save_csr(dir: &Path, snap: &CsrSnapshot, commit_gen: u64) -> Result<(), Error> {
+pub(crate) fn save_csr(
+    dir: &Path,
+    snap: &CsrSnapshot,
+    db_id: [u8; 16],
+    commit_gen: u64,
+) -> Result<(), Error> {
     let tmp = dir.join("csr.cache.tmp");
     let write = || -> std::io::Result<()> {
         let mut w = SumWriter {
@@ -182,6 +191,7 @@ pub(crate) fn save_csr(dir: &Path, snap: &CsrSnapshot, commit_gen: u64) -> Resul
             sum: Fnv::new(),
         };
         w.put(MAGIC)?;
+        w.put(&db_id)?;
         w.put_u64(commit_gen)?;
         let mut flags = 0u64;
         if snap.edge_weight.is_some() {
@@ -215,13 +225,44 @@ pub(crate) fn save_csr(dir: &Path, snap: &CsrSnapshot, commit_gen: u64) -> Resul
     Ok(())
 }
 
-/// Load the cache file if it exists and reflects `expected_gen`, carrying weights
-/// when `want_weights` asks for them. `None` on a missing, stale, truncated,
-/// corrupt, or version-mismatched file, and on an unweighted cache file when
-/// weights are wanted. Every refusal means "build from storage instead", never
-/// an error, because the file is a cache and storage can always answer.
-pub(crate) fn load_csr(dir: &Path, expected_gen: u64, want_weights: bool) -> Option<CsrSnapshot> {
+/// Total bytes a CSR cache file with `n` nodes and `e` edges must hold, or
+/// `None` when the arithmetic overflows, which no real file can cause. The
+/// lengths come from the file itself and feed `Vec::with_capacity` before the
+/// checksum can vouch for them, so a corrupt length field has to be refused
+/// against the file's actual size instead of trusted into an allocation that
+/// panics ("capacity overflow") or aborts the process.
+fn csr_file_len(n: u64, e: u64, weighted: bool) -> Option<u64> {
+    // Header (magic, db id, generation, flags, and the two lengths) plus the
+    // trailing checksum.
+    let mut total = 8u64 + 16 + 8 + 8 + 8 + 8 + 8;
+    // `dense_to_id`, the two `(n + 1)`-long row-pointer arrays, `edge_id`, and
+    // `in_edge_id` are 8 bytes per element; the four type and column arrays
+    // are 4 bytes per element.
+    let u64_elems = n
+        .checked_add(n.checked_add(1)?.checked_mul(2)?)?
+        .checked_add(e.checked_mul(2)?)?;
+    total = total.checked_add(u64_elems.checked_mul(8)?)?;
+    total = total.checked_add(e.checked_mul(4)?.checked_mul(4)?)?;
+    if weighted {
+        total = total.checked_add(e.checked_mul(8)?)?;
+    }
+    Some(total)
+}
+
+/// Load the cache file if it exists, carries `db_id`, and reflects
+/// `expected_gen`, carrying weights when `want_weights` asks for them. `None`
+/// on a missing, stale, truncated, corrupt, foreign, or version-mismatched
+/// file, and on an unweighted cache file when weights are wanted. Every
+/// refusal means "build from storage instead", never an error, because the
+/// file is a cache and storage can always answer.
+pub(crate) fn load_csr(
+    dir: &Path,
+    db_id: [u8; 16],
+    expected_gen: u64,
+    want_weights: bool,
+) -> Option<CsrSnapshot> {
     let file = File::open(csr_path(dir)).ok()?;
+    let file_len = file.metadata().ok()?.len();
     let mut r = SumReader {
         inner: BufReader::new(file),
         sum: Fnv::new(),
@@ -229,6 +270,9 @@ pub(crate) fn load_csr(dir: &Path, expected_gen: u64, want_weights: bool) -> Opt
     let read = |r: &mut SumReader<BufReader<File>>| -> std::io::Result<Option<CsrSnapshot>> {
         let magic = r.get::<8>()?;
         if &magic != MAGIC {
+            return Ok(None);
+        }
+        if r.get::<16>()? != db_id {
             return Ok(None);
         }
         let file_gen = r.get_u64()?;
@@ -240,8 +284,16 @@ pub(crate) fn load_csr(dir: &Path, expected_gen: u64, want_weights: bool) -> Opt
         if want_weights && !weighted {
             return Ok(None);
         }
-        let n = r.get_u64()? as usize;
-        let e = r.get_u64()? as usize;
+        let n64 = r.get_u64()?;
+        let e64 = r.get_u64()?;
+        // Before any allocation: the claimed lengths must fit the bytes the
+        // file actually has.
+        match csr_file_len(n64, e64, weighted) {
+            Some(required) if required <= file_len => {}
+            _ => return Ok(None),
+        }
+        let n = n64 as usize;
+        let e = e64 as usize;
         let dense_to_id = r.get_u64s(n)?;
         let row_ptr = r.get_usizes(n + 1)?;
         let col_idx = r.get_u32s(e)?;
@@ -281,7 +333,7 @@ pub(crate) fn load_csr(dir: &Path, expected_gen: u64, want_weights: bool) -> Opt
     read(&mut r).ok().flatten()
 }
 
-const COL_MAGIC: &[u8; 8] = b"ISSNCOL1";
+const COL_MAGIC: &[u8; 8] = b"ISSNCOL2";
 
 /// The msgpack shape of a columns cache file payload; the borrowed form writes
 /// and the owned form reads, so a save never clones a column.
@@ -297,18 +349,19 @@ struct ColumnsPayload {
     cols: Vec<(String, crate::columns::PropColumn)>,
 }
 
-/// The generation an existing cache file file claims, or `None` when there is no
-/// readable header. Lets a save skip rewriting a file that already reflects
-/// the current generation.
-fn cache_file_gen(path: &Path) -> Option<u64> {
+/// The generation an existing cache file claims, or `None` when there is no
+/// readable header or the file belongs to another database. Lets a save skip
+/// rewriting a file that already reflects the current generation, without a
+/// foreign file's coincidental generation ever qualifying for the skip.
+fn cache_file_gen(path: &Path, db_id: [u8; 16]) -> Option<u64> {
     let mut r = BufReader::new(File::open(path).ok()?);
-    let mut header = [0u8; 16];
+    let mut header = [0u8; 32];
     r.read_exact(&mut header).ok()?;
-    if &header[..8] != COL_MAGIC {
+    if &header[..8] != COL_MAGIC || header[8..24] != db_id {
         return None;
     }
     let mut gen_bytes = [0u8; 8];
-    gen_bytes.copy_from_slice(&header[8..]);
+    gen_bytes.copy_from_slice(&header[24..]);
     Some(u64::from_le_bytes(gen_bytes))
 }
 
@@ -323,7 +376,7 @@ pub(crate) fn save_columns<S: crate::columns::ColumnSource<Id = u64>>(
 ) -> Result<(), Error> {
     let dir = storage.env.path();
     let path = dir.join(S::CACHE_FILE);
-    if cache_file_gen(&path) == Some(commit_gen) {
+    if cache_file_gen(&path, storage.db_id) == Some(commit_gen) {
         return Ok(());
     }
     let tmp = dir.join(format!("{}.tmp", S::CACHE_FILE));
@@ -338,6 +391,7 @@ pub(crate) fn save_columns<S: crate::columns::ColumnSource<Id = u64>>(
             sum: Fnv::new(),
         };
         w.put(COL_MAGIC).map_err(Error::Io)?;
+        w.put(&storage.db_id).map_err(Error::Io)?;
         w.put_u64(commit_gen).map_err(Error::Io)?;
         rmp_serde::encode::write(&mut w, &payload)?;
         let sum = w.sum.0;
@@ -368,6 +422,9 @@ pub(crate) fn load_columns<S: crate::columns::ColumnSource<Id = u64>>(
     };
     let magic = r.get::<8>().ok()?;
     if &magic != COL_MAGIC {
+        return None;
+    }
+    if r.get::<16>().ok()? != storage.db_id {
         return None;
     }
     if r.get_u64().ok()? != expected_gen {
@@ -570,6 +627,116 @@ mod tests {
         assert_eq!(before, after, "an unchanged generation must skip the save");
     }
 
+    /// A corrupt length field must refuse the load rather than feed the file's
+    /// claim into `Vec::with_capacity`, where `u64::MAX` panics with "capacity
+    /// overflow" and 2^40 aborts the process on allocation failure. The graph
+    /// then answers from the ordinary rebuild.
+    #[test]
+    fn a_corrupt_length_field_is_refused_without_allocating() {
+        let byte_offset_of_n = MAGIC.len() + 16 + 8 + 8;
+        for corrupt_len in [u64::MAX, 1u64 << 40] {
+            let dir = TempDir::new().unwrap();
+            let (a, b);
+            {
+                let g = Graph::open(dir.path(), 1).unwrap();
+                a = g.add_node("N", &json!({})).unwrap();
+                b = g.add_node("N", &json!({})).unwrap();
+                g.add_edge(a, b, "R", &json!({})).unwrap();
+                g.rebuild_csr().unwrap();
+            }
+            let p = csr_path(dir.path());
+            let mut bytes = std::fs::read(&p).unwrap();
+            bytes[byte_offset_of_n..byte_offset_of_n + 8]
+                .copy_from_slice(&corrupt_len.to_le_bytes());
+            std::fs::write(&p, bytes).unwrap();
+
+            let g = Graph::open(dir.path(), 1).unwrap();
+            let path = g.shortest_path(a, b).unwrap();
+            assert_eq!(path, Some(vec![a, b]), "length {corrupt_len}");
+        }
+    }
+
+    /// A cache file left behind by one database must not serve another whose
+    /// persisted generation happens to match, which is what a restore into a
+    /// directory with leftover cache files produces. The file carries the
+    /// database identity, so the foreign file is refused and adjacency comes
+    /// from storage.
+    #[test]
+    fn a_cache_file_from_another_database_is_refused() {
+        let dir1 = TempDir::new().unwrap();
+        let dir2 = TempDir::new().unwrap();
+        let (a, b, c);
+        {
+            // Five commits: three nodes, one edge, one dummy update.
+            let g = Graph::open(dir1.path(), 1).unwrap();
+            a = g.add_node("N", &json!({})).unwrap();
+            b = g.add_node("N", &json!({})).unwrap();
+            c = g.add_node("N", &json!({})).unwrap();
+            g.add_edge(a, b, "R", &json!({})).unwrap();
+            g.update_node(a, &json!({ "x": 1 })).unwrap();
+            g.rebuild_csr().unwrap();
+        }
+        {
+            // Five commits as well, so both databases sit at one persisted
+            // generation, but the adjacency differs: a path a -> b -> c exists
+            // here and not in the first database.
+            let g = Graph::open(dir2.path(), 1).unwrap();
+            let a2 = g.add_node("N", &json!({})).unwrap();
+            let b2 = g.add_node("N", &json!({})).unwrap();
+            let c2 = g.add_node("N", &json!({})).unwrap();
+            g.add_edge(a2, b2, "R", &json!({})).unwrap();
+            g.add_edge(b2, c2, "R", &json!({})).unwrap();
+            assert_eq!((a2, b2, c2), (a, b, c));
+        }
+        // The second database's file lands in the first one's directory, with
+        // the first one's cache file still there.
+        std::fs::remove_file(dir1.path().join("data.mdb")).unwrap();
+        let _ = std::fs::remove_file(dir1.path().join("lock.mdb"));
+        std::fs::copy(dir2.path().join("data.mdb"), dir1.path().join("data.mdb")).unwrap();
+
+        let g = Graph::open(dir1.path(), 1).unwrap();
+        assert_eq!(
+            g.shortest_path(a, c).unwrap(),
+            Some(vec![a, b, c]),
+            "the foreign cache file must not serve the old database's adjacency"
+        );
+    }
+
+    /// `Graph::rebuild_csr` is the save site, so it must rebuild from storage
+    /// rather than load the file it is about to overwrite. A wrong file that
+    /// claims the current generation could otherwise never be repaired.
+    #[test]
+    fn rebuild_csr_rebuilds_from_storage_not_the_cache_file() {
+        let dir = TempDir::new().unwrap();
+        let g = Graph::open(dir.path(), 1).unwrap();
+        let a = g.add_node("N", &json!({})).unwrap();
+        let b = g.add_node("N", &json!({})).unwrap();
+        let c = g.add_node("N", &json!({})).unwrap();
+        g.add_edge(a, b, "R", &json!({})).unwrap();
+        let stale_snap = CsrSnapshot::build(&g.storage).unwrap();
+        g.add_edge(b, c, "R", &json!({})).unwrap();
+        // A file that claims the current generation while missing the last
+        // edge, which is what a torn or misdirected save would leave behind.
+        let persisted_gen = {
+            let rtxn = g.storage.env.read_txn().unwrap();
+            crate::storage::ids::commit_gen(&g.storage, &rtxn).unwrap()
+        };
+        save_csr(dir.path(), &stale_snap, g.storage.db_id, persisted_gen).unwrap();
+
+        g.rebuild_csr().unwrap();
+        assert_eq!(
+            g.shortest_path(a, c).unwrap(),
+            Some(vec![a, b, c]),
+            "rebuild_csr must not answer from the cache file"
+        );
+
+        // The rebuild also repaired the file: a fresh process loads the fixed
+        // arrays and sees the edge.
+        drop(g);
+        let g = Graph::open(dir.path(), 1).unwrap();
+        assert_eq!(g.shortest_path(a, c).unwrap(), Some(vec![a, b, c]));
+    }
+
     /// The exact arrays survive a save and load, weights included.
     #[test]
     fn arrays_round_trip_exactly() {
@@ -583,10 +750,18 @@ mod tests {
 
         let snap = CsrSnapshot::build_weighted(&g.storage).unwrap();
         let out = TempDir::new().unwrap();
-        save_csr(out.path(), &snap, 7).unwrap();
+        let db_id = g.storage.db_id;
+        save_csr(out.path(), &snap, db_id, 7).unwrap();
 
-        assert!(load_csr(out.path(), 8, false).is_none(), "wrong generation");
-        let loaded = load_csr(out.path(), 7, true).expect("fresh and weighted");
+        assert!(
+            load_csr(out.path(), db_id, 8, false).is_none(),
+            "wrong generation"
+        );
+        assert!(
+            load_csr(out.path(), [0xAB; 16], 7, false).is_none(),
+            "wrong database identity"
+        );
+        let loaded = load_csr(out.path(), db_id, 7, true).expect("fresh and weighted");
         assert_eq!(loaded.row_ptr, snap.row_ptr);
         assert_eq!(loaded.col_idx, snap.col_idx);
         assert_eq!(loaded.edge_type, snap.edge_type);
@@ -602,6 +777,6 @@ mod tests {
         assert_eq!(loaded.id_to_dense, snap.id_to_dense);
 
         // An unweighted ask accepts a weighted cache file.
-        assert!(load_csr(out.path(), 7, false).is_some());
+        assert!(load_csr(out.path(), db_id, 7, false).is_some());
     }
 }

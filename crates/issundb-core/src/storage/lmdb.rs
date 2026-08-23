@@ -44,6 +44,13 @@ pub struct Storage {
 
     // Metadata + counters
     pub meta: Database<Str, Bytes>, // string key → bytes
+
+    /// Random 128-bit database identity, created once on first open and
+    /// persisted in `meta`. The cache files record it, so a file built beside
+    /// one database is refused by any other, even at a matching commit
+    /// generation: the generation is a per-database counter, and two databases
+    /// with equal commit counts are indistinguishable by it alone.
+    pub db_id: [u8; 16],
 }
 
 /// A read transaction as a *parameter*: what a function that only reads accepts.
@@ -104,6 +111,16 @@ impl Storage {
             )));
         }
         std::fs::create_dir_all(dst_dir)?;
+        // Leftover cache files describe whatever database used to live here,
+        // not the one being restored. The database identity they carry already
+        // gets them refused on load; removing them as well keeps the restored
+        // directory from holding files that can never serve it.
+        for entry in std::fs::read_dir(dst_dir)? {
+            let path = entry?.path();
+            if path.extension().is_some_and(|ext| ext == "cache") {
+                std::fs::remove_file(&path)?;
+            }
+        }
         std::fs::copy(snapshot_file, &dst_file)?;
         Ok(())
     }
@@ -152,7 +169,18 @@ impl Storage {
         let fts_docs = env.create_database(&mut wtxn, Some("fts_docs"))?;
 
         let vectors = env.create_database(&mut wtxn, Some("vectors"))?;
-        let meta = env.create_database(&mut wtxn, Some("meta"))?;
+        let meta: Database<Str, Bytes> = env.create_database(&mut wtxn, Some("meta"))?;
+
+        let db_id = match meta.get(&wtxn, DB_ID_KEY)? {
+            Some(bytes) => bytes
+                .try_into()
+                .map_err(|_| Error::Corrupt("db_id must be 16 bytes"))?,
+            None => {
+                let id = generate_db_id();
+                meta.put(&mut wtxn, DB_ID_KEY, &id)?;
+                id
+            }
+        };
 
         wtxn.commit()?;
 
@@ -170,6 +198,31 @@ impl Storage {
             fts_docs,
             vectors,
             meta,
+            db_id,
         })
     }
+}
+
+const DB_ID_KEY: &str = "db_id";
+
+/// A fresh 128-bit database identity. It needs uniqueness across databases,
+/// not cryptographic strength, so it mixes the process's randomly seeded
+/// `RandomState` hashers with the clock instead of pulling in a randomness
+/// dependency.
+fn generate_db_id() -> [u8; 16] {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut id = [0u8; 16];
+    for (i, chunk) in id.chunks_mut(8).enumerate() {
+        let mut hasher = RandomState::new().build_hasher();
+        hasher.write_u128(nanos);
+        hasher.write_usize(i);
+        chunk.copy_from_slice(&hasher.finish().to_le_bytes());
+    }
+    id
 }

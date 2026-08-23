@@ -795,8 +795,74 @@ pub(crate) fn expr_parser<'a>() -> impl Parser<'a, ParserInput<'a>, Expr, Parser
                 expression: Box::new(expression),
             });
 
+        // `EXISTS { ... }`: an existential subquery, distinguished from the
+        // `exists(...)` function by the brace. The body is a pattern, in the
+        // simple form (`pattern [WHERE pred]`) or the full form
+        // (`MATCH pattern [WHERE pred] RETURN expr`); the projection is
+        // discarded because existence does not depend on it. The full form
+        // requires the RETURN, so a write clause after the MATCH fails to
+        // parse, which is the InvalidClauseComposition the TCK expects. A map
+        // literal after `exists` never reaches this alternative, because the
+        // body must open with `MATCH` or a node pattern; `exists {a: 1}` stays
+        // the parse error it always was.
+        let exists_body_pattern = node_pattern(expr.clone())
+            .then(
+                relationship_pattern(expr.clone())
+                    .then(node_pattern(expr.clone()))
+                    .repeated()
+                    .collect::<Vec<(RelationshipPattern, NodePattern)>>(),
+            )
+            .map(|(node, rels)| Pattern {
+                node,
+                rels,
+                path_variable: None,
+            });
+
+        let exists_where = keyword("WHERE").ignore_then(expr.clone()).or_not();
+
+        let exists_full = keyword("MATCH")
+            .ignore_then(exists_body_pattern.clone())
+            .then(exists_where.clone())
+            .then_ignore(keyword("RETURN"))
+            .then_ignore(expr.clone());
+
+        let exists_simple = exists_body_pattern.then(exists_where);
+
+        let exists_subquery = keyword("EXISTS")
+            .ignore_then(sym(Tok::LBrace))
+            .ignore_then(choice((exists_full, exists_simple)))
+            .then_ignore(sym(Tok::RBrace))
+            .map(|(pattern, predicate)| Expr::ExistsSubquery {
+                pattern: Box::new(pattern),
+                predicate: predicate.map(Box::new),
+            });
+
+        // A relationship pattern in expression position: `(n)-[:T]->()`, a
+        // boolean predicate that is true when at least one match exists. At
+        // least one relationship arm is required, so a parenthesized variable
+        // `(n)` and an arithmetic form such as `(a) - [x]` keep parsing as
+        // ordinary expressions through the alternatives below. It is tried
+        // before `paren_expr` because both open with `(` and a failed pattern
+        // backtracks, while a committed `paren_expr` cannot recover the arms.
+        let pattern_predicate = node_pattern(expr.clone())
+            .then(
+                relationship_pattern(expr.clone())
+                    .then(node_pattern(expr.clone()))
+                    .repeated()
+                    .at_least(1)
+                    .collect::<Vec<(RelationshipPattern, NodePattern)>>(),
+            )
+            .map(|(node, rels)| Expr::PatternPredicate {
+                pattern: Box::new(Pattern {
+                    node,
+                    rels,
+                    path_variable: None,
+                }),
+            });
+
         let atom_choices = choice((
             count_star,
+            exists_subquery,
             quantifier_expr,
             case_expr,
             list_expr,
@@ -811,6 +877,7 @@ pub(crate) fn expr_parser<'a>() -> impl Parser<'a, ParserInput<'a>, Expr, Parser
             lit_expr,
             param_expr,
             var_expr,
+            pattern_predicate,
             paren_expr,
         ));
 
@@ -949,7 +1016,7 @@ pub(crate) fn expr_parser<'a>() -> impl Parser<'a, ParserInput<'a>, Expr, Parser
         //  18: ^  (left-assoc)
         //  19: unary -  (prefix; binds tighter than ^, so -3^2 = (-3)^2 = 9)
 
-        let pratt = postfixed_atom.pratt((
+        postfixed_atom.pratt((
             // Unary minus at 19, one above ^ (18): chumsky's prefix(P) lets infix(left(P))
             // bind into its operand, so unary minus must sit ABOVE ^ for openCypher's
             // "numeric unary negative takes precedence over exponentiation" (-3^2 = 9).
@@ -1138,9 +1205,7 @@ pub(crate) fn expr_parser<'a>() -> impl Parser<'a, ParserInput<'a>, Expr, Parser
                 left: Box::new(l),
                 right: Box::new(r),
             }),
-        ));
-
-        pratt
+        ))
     })
     .labelled("an expression")
 }
@@ -1794,10 +1859,16 @@ pub(super) fn query_parser(
 
 // ─── Phase 5: Write & Mutation Clauses ────────────────────────────────────────
 
-/// Parses individual items in a `SET` update: `n.prop = expr`
+/// Parses individual items in a `SET` update: `n.prop = expr`,
+/// `(n).prop = expr`, `n = expr`, `n += expr`, and `n:Label`.
 fn set_item<'a>() -> impl Parser<'a, ParserInput<'a>, SetItem, ParserError<'a>> + Clone {
-    // SET n.prop = expr
-    let property = identifier()
+    // SET n.prop = expr, with an optionally parenthesized target variable
+    // (`SET (n).prop = expr` selects the target with a simple expression).
+    let target_var = choice((
+        identifier(),
+        identifier().delimited_by(sym(Tok::LParen), sym(Tok::RParen)),
+    ));
+    let property = target_var
         .then_ignore(sym(Tok::Dot))
         .then(identifier())
         .then_ignore(sym(Tok::Eq))
@@ -1806,6 +1877,18 @@ fn set_item<'a>() -> impl Parser<'a, ParserInput<'a>, SetItem, ParserError<'a>> 
             variable,
             property,
             expr,
+        });
+
+    // SET n = expr (replace) or SET n += expr (merge). `+=` arrives as the
+    // two tokens `+` and `=`.
+    let all_properties = identifier()
+        .then(sym(Tok::Plus).or_not())
+        .then_ignore(sym(Tok::Eq))
+        .then(expr_parser())
+        .map(|((variable, plus), expr)| SetItem::AllProperties {
+            variable,
+            expr,
+            merge: plus.is_some(),
         });
 
     // SET n:Label or SET n:Label1:Label2
@@ -1819,7 +1902,7 @@ fn set_item<'a>() -> impl Parser<'a, ParserInput<'a>, SetItem, ParserError<'a>> 
         )
         .map(|(variable, labels)| SetItem::Labels { variable, labels });
 
-    choice((property, labels))
+    choice((property, all_properties, labels))
 }
 
 /// Parses the target of a schema DDL statement: either a node pattern
@@ -2661,6 +2744,72 @@ fn collect_expr_vars(expr: &Expr, out: &mut std::collections::HashSet<String>) {
             inner.remove(variable);
             out.extend(inner);
         }
+        // A pattern predicate introduces no bindings, so every named variable in
+        // it is a free reference to the outer scope, and its inline property maps
+        // may reference further variables.
+        Expr::PatternPredicate { pattern } => {
+            if let Some(v) = &pattern.node.variable {
+                out.insert(v.clone());
+            }
+            if let Some(props) = &pattern.node.properties {
+                for e in props.values() {
+                    collect_expr_vars(e, out);
+                }
+            }
+            for (rel, node) in &pattern.rels {
+                if let Some(v) = &rel.variable {
+                    out.insert(v.clone());
+                }
+                if let Some(v) = &node.variable {
+                    out.insert(v.clone());
+                }
+                if let Some(props) = &rel.properties {
+                    for e in props.values() {
+                        collect_expr_vars(e, out);
+                    }
+                }
+                if let Some(props) = &node.properties {
+                    for e in props.values() {
+                        collect_expr_vars(e, out);
+                    }
+                }
+            }
+        }
+        // An existential subquery, unlike a pattern predicate, binds its pattern
+        // variables: one the outer scope does not bind is local to the subquery,
+        // so no pattern variable may be reported as free, or the scope validators
+        // would raise a false UndefinedVariable for a body-local variable. Only
+        // what the predicate and the inline property maps reference beyond the
+        // pattern's own variables is free.
+        Expr::ExistsSubquery { pattern, predicate } => {
+            let mut local = std::collections::HashSet::new();
+            collect_pattern_vars(pattern, &mut local);
+            let mut inner = std::collections::HashSet::new();
+            if let Some(p) = predicate {
+                collect_expr_vars(p, &mut inner);
+            }
+            if let Some(props) = &pattern.node.properties {
+                for e in props.values() {
+                    collect_expr_vars(e, &mut inner);
+                }
+            }
+            for (rel, node) in &pattern.rels {
+                if let Some(props) = &rel.properties {
+                    for e in props.values() {
+                        collect_expr_vars(e, &mut inner);
+                    }
+                }
+                if let Some(props) = &node.properties {
+                    for e in props.values() {
+                        collect_expr_vars(e, &mut inner);
+                    }
+                }
+            }
+            for v in &local {
+                inner.remove(v);
+            }
+            out.extend(inner);
+        }
         // The anchor node references an outer variable and is collected as free. The
         // relationship, target-node, and path variables are bound locally, so they are
         // removed from whatever the predicate, transform, and inline property expressions
@@ -2760,6 +2909,9 @@ fn with_output_scope(items: &[ReturnItem]) -> Option<std::collections::HashSet<S
 /// projection) or a never-defined variable raises a compile-time `UndefinedVariable` error.
 fn validate_order_by_scope(parts: &[QueryPart]) -> Result<(), String> {
     let mut bound: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // True after a `YIELD *` whose outputs are not yet resolved: the CALL binds
+    // an unknown but nonempty set of variables, so scope checks must not reject.
+    let mut unknown_scope = false;
     for part in parts {
         match part {
             QueryPart::Match { match_clauses, .. }
@@ -2781,6 +2933,24 @@ fn validate_order_by_scope(parts: &[QueryPart]) -> Result<(), String> {
                     collect_pattern_vars(&m.pattern, &mut bound);
                 }
             }
+            QueryPart::Call {
+                yields,
+                yield_star,
+                resolved,
+                ..
+            } => {
+                if let Some(items) = yields {
+                    for (name, alias) in items {
+                        bound.insert(alias.clone().unwrap_or_else(|| name.clone()));
+                    }
+                }
+                if *yield_star {
+                    match resolved {
+                        Some(r) => bound.extend(r.output_vars.iter().cloned()),
+                        None => unknown_scope = true,
+                    }
+                }
+            }
             QueryPart::With {
                 items, order_by, ..
             } => {
@@ -2792,7 +2962,7 @@ fn validate_order_by_scope(parts: &[QueryPart]) -> Result<(), String> {
                     }
                     if let Some(missing) = refs
                         .iter()
-                        .find(|v| !bound.contains(*v) && !out.contains(*v))
+                        .find(|v| !unknown_scope && !bound.contains(*v) && !out.contains(*v))
                     {
                         return Err(format!(
                             "SyntaxError(UndefinedVariable): variable '{}' referenced in \
@@ -2813,6 +2983,29 @@ fn validate_order_by_scope(parts: &[QueryPart]) -> Result<(), String> {
                 let has_with_agg = with_has_agg || order_by_has_agg;
                 if has_with_agg {
                     if let Some(ob) = order_by {
+                        // After an aggregating WITH, an aggregation in ORDER BY
+                        // must itself appear in a projected item: a fresh
+                        // aggregation's argument refers to variables the
+                        // projection has already taken out of scope.
+                        if order_by_has_agg {
+                            let mut projected_aggs = Vec::new();
+                            for item in items {
+                                collect_agg_exprs(&item.expr, &mut projected_aggs);
+                            }
+                            for si in &ob.items {
+                                let mut order_aggs = Vec::new();
+                                collect_agg_exprs(&si.expr, &mut order_aggs);
+                                if order_aggs.iter().any(|a| !projected_aggs.contains(a)) {
+                                    return Err(
+                                        "SyntaxError(UndefinedVariable): an aggregation in \
+                                         ORDER BY must also be a projected expression of the \
+                                         aggregating WITH"
+                                            .to_string(),
+                                    );
+                                }
+                            }
+                        }
+
                         let grouping_keys = get_grouping_keys(items);
                         let aliases: std::collections::HashSet<String> =
                             items.iter().filter_map(|item| item.alias.clone()).collect();
@@ -2842,7 +3035,10 @@ fn validate_order_by_scope(parts: &[QueryPart]) -> Result<(), String> {
                 // Apply the WITH scope barrier: the output scope replaces the input scope,
                 // except for `WITH *`, which keeps upstream variables and adds any aliases.
                 match output {
-                    Some(out) => bound = out,
+                    Some(out) => {
+                        bound = out;
+                        unknown_scope = false;
+                    }
                     None => {
                         for item in items {
                             if let Some(a) = &item.alias {
@@ -2911,6 +3107,86 @@ fn expr_has_aggregation(expr: &Expr) -> bool {
             list, predicate, ..
         } => expr_has_aggregation(list) || expr_has_aggregation(predicate),
         _ => false,
+    }
+}
+
+/// Collect every aggregation subexpression (`Expr::Agg` or `Expr::CountStar`)
+/// in `expr`, without descending into an aggregation's own argument.
+fn collect_agg_exprs(expr: &Expr, out: &mut Vec<Expr>) {
+    match expr {
+        Expr::CountStar | Expr::Agg(_, _) => out.push(expr.clone()),
+        Expr::BinaryOp { left, right, .. } => {
+            collect_agg_exprs(left, out);
+            collect_agg_exprs(right, out);
+        }
+        Expr::Not(inner) | Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
+            collect_agg_exprs(inner, out);
+        }
+        Expr::FunctionCall { args, .. } => {
+            for arg in args {
+                collect_agg_exprs(arg, out);
+            }
+        }
+        Expr::Case {
+            subject,
+            arms,
+            else_expr,
+        } => {
+            if let Some(s) = subject {
+                collect_agg_exprs(s, out);
+            }
+            for arm in arms {
+                collect_agg_exprs(&arm.when, out);
+                collect_agg_exprs(&arm.then, out);
+            }
+            if let Some(e) = else_expr {
+                collect_agg_exprs(e, out);
+            }
+        }
+        Expr::Subscript { expr, index } => {
+            collect_agg_exprs(expr, out);
+            collect_agg_exprs(index, out);
+        }
+        Expr::Slice { expr, start, end } => {
+            collect_agg_exprs(expr, out);
+            if let Some(s) = start {
+                collect_agg_exprs(s, out);
+            }
+            if let Some(e) = end {
+                collect_agg_exprs(e, out);
+            }
+        }
+        Expr::ListComprehension {
+            list,
+            predicate,
+            transform,
+            ..
+        } => {
+            collect_agg_exprs(list, out);
+            if let Some(p) = predicate {
+                collect_agg_exprs(p, out);
+            }
+            if let Some(t) = transform {
+                collect_agg_exprs(t, out);
+            }
+        }
+        Expr::Reduce {
+            initial,
+            list,
+            expression,
+            ..
+        } => {
+            collect_agg_exprs(initial, out);
+            collect_agg_exprs(list, out);
+            collect_agg_exprs(expression, out);
+        }
+        Expr::Quantifier {
+            list, predicate, ..
+        } => {
+            collect_agg_exprs(list, out);
+            collect_agg_exprs(predicate, out);
+        }
+        _ => {}
     }
 }
 
@@ -2991,6 +3267,40 @@ fn collect_non_agg_props_in_expr(expr: &Expr, props: &mut Vec<(String, String)>)
             collect_non_agg_props_in_expr(list, props);
             collect_non_agg_props_in_expr(predicate, props);
         }
+        // A pattern predicate is legal only inside a WHERE clause, so it never
+        // reaches a projection this collector inspects; it contributes no
+        // grouping property reads.
+        Expr::PatternPredicate { .. } => {}
+        // An existential subquery contributes only what its predicate and inline
+        // properties reference from the outer scope; every pattern variable may
+        // be a local binding, so none is a grouping property read.
+        Expr::ExistsSubquery { pattern, predicate } => {
+            let mut local = std::collections::HashSet::new();
+            collect_pattern_vars(pattern, &mut local);
+            let mut inner = Vec::new();
+            if let Some(p) = predicate {
+                collect_non_agg_props_in_expr(p, &mut inner);
+            }
+            if let Some(ps) = &pattern.node.properties {
+                for e in ps.values() {
+                    collect_non_agg_props_in_expr(e, &mut inner);
+                }
+            }
+            for (rel, node) in &pattern.rels {
+                if let Some(ps) = &rel.properties {
+                    for e in ps.values() {
+                        collect_non_agg_props_in_expr(e, &mut inner);
+                    }
+                }
+                if let Some(ps) = &node.properties {
+                    for e in ps.values() {
+                        collect_non_agg_props_in_expr(e, &mut inner);
+                    }
+                }
+            }
+            inner.retain(|(v, _)| !local.contains(v));
+            props.extend(inner);
+        }
         // A pattern comprehension depends only on its anchor (an outer variable) and
         // on whatever its predicate, transform, and inline properties reference from
         // the outer scope; its own relationship, target-node, and path variables are
@@ -3068,6 +3378,9 @@ fn get_grouping_keys(items: &[crate::ast::ReturnItem]) -> std::collections::Hash
 
 fn validate_query_order_by(query: &Query) -> Result<(), String> {
     let mut bound = std::collections::HashSet::new();
+    // True after a `YIELD *` whose outputs are not yet resolved: the CALL binds
+    // an unknown but nonempty set of variables, so scope checks must not reject.
+    let mut unknown_scope = false;
     for part in &query.parts {
         match part {
             QueryPart::Match { match_clauses, .. }
@@ -3089,10 +3402,31 @@ fn validate_query_order_by(query: &Query) -> Result<(), String> {
                     collect_pattern_vars(&m.pattern, &mut bound);
                 }
             }
+            QueryPart::Call {
+                yields,
+                yield_star,
+                resolved,
+                ..
+            } => {
+                if let Some(items) = yields {
+                    for (name, alias) in items {
+                        bound.insert(alias.clone().unwrap_or_else(|| name.clone()));
+                    }
+                }
+                if *yield_star {
+                    match resolved {
+                        Some(r) => bound.extend(r.output_vars.iter().cloned()),
+                        None => unknown_scope = true,
+                    }
+                }
+            }
             QueryPart::With { items, .. } => {
                 let output = with_output_scope(items);
                 match output {
-                    Some(out) => bound = out,
+                    Some(out) => {
+                        bound = out;
+                        unknown_scope = false;
+                    }
                     None => {
                         for item in items {
                             if let Some(a) = &item.alias {
@@ -3108,7 +3442,7 @@ fn validate_query_order_by(query: &Query) -> Result<(), String> {
 
     let is_return_star =
         query.return_clause.items.len() == 1 && is_star_item(&query.return_clause.items[0]);
-    if is_return_star && bound.is_empty() {
+    if is_return_star && bound.is_empty() && !unknown_scope {
         return Err(
             "SyntaxError(NoVariablesInScope): RETURN * without variables in scope is not allowed"
                 .to_string(),
@@ -3135,7 +3469,7 @@ fn validate_query_order_by(query: &Query) -> Result<(), String> {
         }
         if let Some(missing) = refs
             .iter()
-            .find(|v| !bound.contains(*v) && !out.contains(*v))
+            .find(|v| !unknown_scope && !bound.contains(*v) && !out.contains(*v))
         {
             return Err(format!(
                 "SyntaxError(UndefinedVariable): variable '{}' referenced in ORDER BY is not in scope",
@@ -3630,6 +3964,14 @@ fn check_expr_size_on_path(
     rel_vars: &std::collections::HashSet<String>,
 ) -> Result<(), String> {
     match expr {
+        // A path is a value, not an entity with properties, so a property
+        // access on a path variable is a compile-time error.
+        Expr::Prop(var, prop) if !prop.is_empty() && path_vars.contains(var) => {
+            return Err(format!(
+                "SyntaxError(InvalidArgumentType): property access on path variable '{}' is not allowed",
+                var
+            ));
+        }
         Expr::FunctionCall { name, args } => {
             // A surviving 2^63 marker is a standalone positive literal out of the
             // i64 range (it is only valid when negated, which rewrites the marker).
@@ -3784,6 +4126,18 @@ fn check_where_clause(
             check_expr_size_on_path(r, path_vars, node_vars, rel_vars)?;
         }
         WhereClause::Expr(e) => {
+            // A predicate that is nothing but a node or relationship variable
+            // (bare or parenthesized; both parse to the same bare reference)
+            // has no boolean value, so it is a compile-time error. A variable
+            // bound to a value by WITH or UNWIND stays legal.
+            if let Expr::Prop(var, prop) = e {
+                if prop.is_empty() && (node_vars.contains(var) || rel_vars.contains(var)) {
+                    return Err(format!(
+                        "SyntaxError(InvalidArgumentType): node or relationship variable '{}' cannot be used as a predicate",
+                        var
+                    ));
+                }
+            }
             check_expr_size_on_path(e, path_vars, node_vars, rel_vars)?;
         }
     }
@@ -3876,6 +4230,219 @@ fn check_statement_exprs(
     Ok(())
 }
 
+/// True when the expression contains a pattern predicate anywhere, including
+/// inside comprehension and quantifier subtrees.
+fn expr_contains_pattern_predicate(e: &Expr) -> bool {
+    let any_props = |props: &Option<HashMap<String, Expr>>| {
+        props
+            .as_ref()
+            .is_some_and(|m| m.values().any(expr_contains_pattern_predicate))
+    };
+    match e {
+        Expr::PatternPredicate { .. } => true,
+        // An existential subquery is a scalar boolean expression, legal in any
+        // expression position, and its own WHERE clause is a WHERE position, so
+        // a pattern predicate inside it is legal too; do not recurse.
+        Expr::ExistsSubquery { .. } => false,
+        Expr::Literal(_)
+        | Expr::Param(_)
+        | Expr::CountStar
+        | Expr::Prop(_, _)
+        | Expr::HasLabel { .. } => false,
+        Expr::Agg(_, inner) | Expr::IsNull(inner) | Expr::IsNotNull(inner) | Expr::Not(inner) => {
+            expr_contains_pattern_predicate(inner)
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            expr_contains_pattern_predicate(left) || expr_contains_pattern_predicate(right)
+        }
+        Expr::FunctionCall { args, .. } => args.iter().any(expr_contains_pattern_predicate),
+        Expr::Case {
+            subject,
+            arms,
+            else_expr,
+        } => {
+            subject
+                .as_deref()
+                .is_some_and(expr_contains_pattern_predicate)
+                || arms.iter().any(|a| {
+                    expr_contains_pattern_predicate(&a.when)
+                        || expr_contains_pattern_predicate(&a.then)
+                })
+                || else_expr
+                    .as_deref()
+                    .is_some_and(expr_contains_pattern_predicate)
+        }
+        Expr::Subscript { expr, index } => {
+            expr_contains_pattern_predicate(expr) || expr_contains_pattern_predicate(index)
+        }
+        Expr::Slice { expr, start, end } => {
+            expr_contains_pattern_predicate(expr)
+                || start
+                    .as_deref()
+                    .is_some_and(expr_contains_pattern_predicate)
+                || end.as_deref().is_some_and(expr_contains_pattern_predicate)
+        }
+        Expr::ListComprehension {
+            list,
+            predicate,
+            transform,
+            ..
+        } => {
+            expr_contains_pattern_predicate(list)
+                || predicate
+                    .as_deref()
+                    .is_some_and(expr_contains_pattern_predicate)
+                || transform
+                    .as_deref()
+                    .is_some_and(expr_contains_pattern_predicate)
+        }
+        Expr::PatternComprehension {
+            pattern,
+            predicate,
+            transform,
+        } => {
+            predicate
+                .as_deref()
+                .is_some_and(expr_contains_pattern_predicate)
+                || expr_contains_pattern_predicate(transform)
+                || any_props(&pattern.node.properties)
+                || pattern
+                    .rels
+                    .iter()
+                    .any(|(rel, node)| any_props(&rel.properties) || any_props(&node.properties))
+        }
+        Expr::Reduce {
+            initial,
+            list,
+            expression,
+            ..
+        } => {
+            expr_contains_pattern_predicate(initial)
+                || expr_contains_pattern_predicate(list)
+                || expr_contains_pattern_predicate(expression)
+        }
+        Expr::Quantifier {
+            list, predicate, ..
+        } => expr_contains_pattern_predicate(list) || expr_contains_pattern_predicate(predicate),
+    }
+}
+
+const PATTERN_PREDICATE_PLACEMENT_ERROR: &str =
+    "SyntaxError: a pattern expression may only be used as a predicate in a WHERE clause";
+
+/// Reject a pattern predicate in a non-WHERE expression position.
+fn check_no_pattern_predicate(e: &Expr) -> Result<(), String> {
+    if expr_contains_pattern_predicate(e) {
+        return Err(PATTERN_PREDICATE_PLACEMENT_ERROR.to_string());
+    }
+    Ok(())
+}
+
+/// A pattern used as an expression is legal only as a predicate in a WHERE
+/// clause. Everywhere else (a RETURN or WITH projection, ORDER BY, SKIP and
+/// LIMIT, UNWIND, the right-hand side of SET, and a FOREACH list) it is a
+/// syntax error, even nested inside function calls.
+fn check_pattern_predicate_placement(stmt: &Statement) -> Result<(), String> {
+    let check_return = |rc: &ReturnClause| -> Result<(), String> {
+        for ri in &rc.items {
+            check_no_pattern_predicate(&ri.expr)?;
+        }
+        Ok(())
+    };
+    let check_order_skip_limit = |order_by: &Option<OrderBy>,
+                                  skip: &Option<Expr>,
+                                  limit: &Option<Expr>|
+     -> Result<(), String> {
+        if let Some(ob) = order_by {
+            for si in &ob.items {
+                check_no_pattern_predicate(&si.expr)?;
+            }
+        }
+        if let Some(e) = skip {
+            check_no_pattern_predicate(e)?;
+        }
+        if let Some(e) = limit {
+            check_no_pattern_predicate(e)?;
+        }
+        Ok(())
+    };
+    let check_set_items = |items: &[SetItem]| -> Result<(), String> {
+        for si in items {
+            match si {
+                SetItem::Property { expr, .. } | SetItem::AllProperties { expr, .. } => {
+                    check_no_pattern_predicate(expr)?;
+                }
+                SetItem::Labels { .. } => {}
+            }
+        }
+        Ok(())
+    };
+    match stmt {
+        Statement::Query(q) => {
+            check_return(&q.return_clause)?;
+            check_order_skip_limit(&q.order_by, &q.skip, &q.limit)?;
+            for part in &q.parts {
+                match part {
+                    QueryPart::With {
+                        items,
+                        order_by,
+                        skip,
+                        limit,
+                        ..
+                    } => {
+                        for ri in items {
+                            check_no_pattern_predicate(&ri.expr)?;
+                        }
+                        check_order_skip_limit(order_by, skip, limit)?;
+                    }
+                    QueryPart::Unwind { expr, .. } => check_no_pattern_predicate(expr)?,
+                    QueryPart::Set { items } => check_set_items(items)?,
+                    _ => {}
+                }
+            }
+        }
+        Statement::Set(s) => check_set_items(&s.set_items)?,
+        Statement::SetAndReturn(sr) => {
+            check_set_items(&sr.set_items)?;
+            check_return(&sr.return_clause)?;
+            check_order_skip_limit(&sr.order_by, &sr.skip, &sr.limit)?;
+        }
+        Statement::CreateAndReturn(cr) => {
+            check_return(&cr.return_clause)?;
+            check_order_skip_limit(&cr.order_by, &cr.skip, &cr.limit)?;
+        }
+        Statement::MergeAndReturn(mr) => {
+            check_return(&mr.return_clause)?;
+            check_order_skip_limit(&mr.order_by, &mr.skip, &mr.limit)?;
+        }
+        Statement::DeleteAndReturn(dr) => {
+            check_return(&dr.return_clause)?;
+            check_order_skip_limit(&dr.order_by, &dr.skip, &dr.limit)?;
+        }
+        Statement::RemoveAndReturn(rr) => {
+            check_return(&rr.return_clause)?;
+            check_order_skip_limit(&rr.order_by, &rr.skip, &rr.limit)?;
+        }
+        Statement::Union(u) => {
+            check_pattern_predicate_placement(&u.left)?;
+            check_pattern_predicate_placement(&u.right)?;
+        }
+        Statement::Foreach(f) => {
+            check_no_pattern_predicate(&f.list)?;
+            for s in &f.body {
+                check_pattern_predicate_placement(s)?;
+            }
+        }
+        Statement::Pipeline(stmts) => {
+            for s in stmts {
+                check_pattern_predicate_placement(s)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 fn check_query_part_exprs(
     part: &QueryPart,
     path_vars: &std::collections::HashSet<String>,
@@ -3919,8 +4486,11 @@ fn check_query_part_exprs(
         }
         QueryPart::Set { items } => {
             for si in items {
-                if let SetItem::Property { expr, .. } = si {
-                    check_expr_size_on_path(expr, path_vars, node_vars, rel_vars)?;
+                match si {
+                    SetItem::Property { expr, .. } | SetItem::AllProperties { expr, .. } => {
+                        check_expr_size_on_path(expr, path_vars, node_vars, rel_vars)?;
+                    }
+                    SetItem::Labels { .. } => {}
                 }
             }
         }
@@ -3998,8 +4568,11 @@ fn validate_set_item_vars(
             item.variable()
         ));
     }
-    if let SetItem::Property { expr, .. } = item {
-        validate_expr_vars(expr, active)?;
+    match item {
+        SetItem::Property { expr, .. } | SetItem::AllProperties { expr, .. } => {
+            validate_expr_vars(expr, active)?;
+        }
+        SetItem::Labels { .. } => {}
     }
     Ok(())
 }
@@ -4447,6 +5020,7 @@ fn validate_statement(stmt: &Statement) -> Result<(), String> {
     let mut rel_vars = std::collections::HashSet::new();
     collect_node_and_rel_vars_in_stmt(stmt, &mut node_vars, &mut rel_vars);
     check_statement_exprs(stmt, &path_vars, &node_vars, &rel_vars)?;
+    check_pattern_predicate_placement(stmt)?;
 
     match stmt {
         Statement::Query(q) => {
@@ -4971,7 +5545,7 @@ fn check_expr_non_agg(
         return Ok(());
     }
 
-    if matches!(expr, Expr::Prop(_, _)) && grouping_exprs.iter().any(|&ge| ge == expr) {
+    if matches!(expr, Expr::Prop(_, _)) && grouping_exprs.contains(&expr) {
         return Ok(());
     }
 
@@ -4992,13 +5566,13 @@ fn check_expr_non_agg(
     }
 
     match expr {
-        Expr::HasLabel { variable, .. } => {
-            if !grouping_aliases.contains(variable) && !local_vars.contains(variable) {
-                return Err(format!(
-                    "SyntaxError(AmbiguousAggregationExpression): variable '{}' is not a grouping key",
-                    variable
-                ));
-            }
+        Expr::HasLabel { variable, .. }
+            if !grouping_aliases.contains(variable) && !local_vars.contains(variable) =>
+        {
+            return Err(format!(
+                "SyntaxError(AmbiguousAggregationExpression): variable '{}' is not a grouping key",
+                variable
+            ));
         }
         Expr::BinaryOp { left, right, .. } => {
             check_expr_non_agg(left, grouping_exprs, grouping_aliases, local_vars)?;
@@ -6285,6 +6859,98 @@ mod tests {
         }
     }
 
+    /// `SET n = {map}` parses to a replacing `SetItem::AllProperties`, and
+    /// `SET n += {map}` to a merging one.
+    #[test]
+    fn parse_set_all_properties() {
+        let extract = |query: &str| -> Vec<SetItem> {
+            let stmt = parse(query).unwrap();
+            match stmt {
+                Statement::Set(s) => s.set_items,
+                Statement::Query(q) => q
+                    .parts
+                    .into_iter()
+                    .find_map(|p| match p {
+                        QueryPart::Set { items } => Some(items),
+                        _ => None,
+                    })
+                    .expect("no SET part"),
+                other => panic!("unexpected statement: {other:?}"),
+            }
+        };
+
+        let items = extract("MATCH (n) SET n = {name: 'A'}");
+        assert_eq!(items.len(), 1);
+        match &items[0] {
+            SetItem::AllProperties {
+                variable, merge, ..
+            } => {
+                assert_eq!(variable, "n");
+                assert!(!merge);
+            }
+            other => panic!("expected all-properties set item, got {other:?}"),
+        }
+
+        let items = extract("MATCH (n) SET n += {name: 'A'}");
+        match &items[0] {
+            SetItem::AllProperties {
+                variable, merge, ..
+            } => {
+                assert_eq!(variable, "n");
+                assert!(merge);
+            }
+            other => panic!("expected all-properties set item, got {other:?}"),
+        }
+
+        // The right-hand side may be any expression, including a bound
+        // variable whose properties are copied.
+        let items = extract("MATCH (a), (b) SET a = b");
+        match &items[0] {
+            SetItem::AllProperties { expr, merge, .. } => {
+                assert_eq!(expr, &Expr::Prop("b".to_string(), String::new()));
+                assert!(!merge);
+            }
+            other => panic!("expected all-properties set item, got {other:?}"),
+        }
+
+        // A mixed item list keeps each item's own form.
+        let items = extract("MATCH (n) SET n.p = 1, n += {q: 2}, n:Foo");
+        assert!(matches!(&items[0], SetItem::Property { .. }));
+        assert!(matches!(
+            &items[1],
+            SetItem::AllProperties { merge: true, .. }
+        ));
+        assert!(matches!(&items[2], SetItem::Labels { .. }));
+    }
+
+    /// `SET (n).p = v` selects the target with a parenthesized simple
+    /// expression and parses to an ordinary `SetItem::Property`.
+    #[test]
+    fn parse_set_parenthesized_property_target() {
+        let stmt = parse("MATCH (n) SET (n).name = 'neo4j'").unwrap();
+        let items = match stmt {
+            Statement::Set(s) => s.set_items,
+            Statement::Query(q) => q
+                .parts
+                .into_iter()
+                .find_map(|p| match p {
+                    QueryPart::Set { items } => Some(items),
+                    _ => None,
+                })
+                .expect("no SET part"),
+            other => panic!("unexpected statement: {other:?}"),
+        };
+        match &items[0] {
+            SetItem::Property {
+                variable, property, ..
+            } => {
+                assert_eq!(variable, "n");
+                assert_eq!(property, "name");
+            }
+            other => panic!("expected property set item, got {other:?}"),
+        }
+    }
+
     /// DELETE accepts arbitrary expressions (subscripts, property access), not
     /// just bare variables, so list/map/path deletion can be planned.
     #[test]
@@ -6665,8 +7331,7 @@ mod tests {
     /// chained operators, map literals, and `FOREACH` bodies).
     #[test]
     fn deeply_nested_queries_are_rejected_not_aborted() {
-        let union = std::iter::repeat("RETURN 1 AS x")
-            .take(10_000)
+        let union = std::iter::repeat_n("RETURN 1 AS x", 10_000)
             .collect::<Vec<_>>()
             .join(" UNION ALL ");
         assert!(parse(&union).is_err());
@@ -6683,8 +7348,7 @@ mod tests {
         }
         assert!(parse(&format!("RETURN {case} AS x")).is_err());
 
-        let and = std::iter::repeat("m.x = 1")
-            .take(5000)
+        let and = std::iter::repeat_n("m.x = 1", 5000)
             .collect::<Vec<_>>()
             .join(" AND ");
         assert!(parse(&format!("MATCH (m) WHERE {and} RETURN m")).is_err());
@@ -6739,13 +7403,11 @@ mod tests {
     /// deep; the nesting guard accepts it.
     #[test]
     fn flat_operator_chains_parse() {
-        let and = std::iter::repeat("m.x = 1")
-            .take(600)
+        let and = std::iter::repeat_n("m.x = 1", 600)
             .collect::<Vec<_>>()
             .join(" AND ");
         assert!(parse(&format!("MATCH (m) WHERE {and} RETURN m")).is_ok());
-        let sum = std::iter::repeat("1")
-            .take(1000)
+        let sum = std::iter::repeat_n("1", 1000)
             .collect::<Vec<_>>()
             .join(" + ");
         assert!(parse(&format!("RETURN {sum} AS s")).is_ok());
@@ -6909,8 +7571,7 @@ mod tests {
 
         // A chain whose weighted operator cost exceeds the maximum budget.
         let n = MAX_NESTING_COST_KB / OP_COST_KB + 50;
-        let chain = std::iter::repeat("1")
-            .take(n + 1)
+        let chain = std::iter::repeat_n("1", n + 1)
             .collect::<Vec<_>>()
             .join(" - ");
         let nesting = scan_nesting(&lex(&format!("RETURN {chain} AS x")));
@@ -6920,6 +7581,120 @@ mod tests {
             nesting.op
         );
         assert!(parse(&format!("RETURN {chain} AS x")).is_err());
+    }
+
+    // --- CALL YIELD scope in RETURN * validation ---
+
+    /// A `CALL ... YIELD` binds its yield fields (or their aliases) into scope,
+    /// so a following `RETURN *` is not an empty projection.
+    #[test]
+    fn call_yield_binds_scope_for_return_star() {
+        assert!(parse("CALL issundb.pageRank() YIELD nodeId, score RETURN *").is_ok());
+        assert!(parse("CALL issundb.pageRank() YIELD nodeId AS n, score AS s RETURN *").is_ok());
+    }
+
+    /// A `YIELD *` has unresolved outputs at parse time, so the scope is
+    /// unknown but nonempty, and `RETURN *` after it must not be rejected.
+    #[test]
+    fn call_yield_star_permits_return_star() {
+        assert!(parse("CALL issundb.pageRank() YIELD * RETURN *").is_ok());
+    }
+
+    /// A yield alias is a variable in scope for a later WITH and its ORDER BY.
+    #[test]
+    fn call_yield_alias_is_in_scope_downstream() {
+        assert!(
+            parse("CALL issundb.pageRank() YIELD nodeId AS n, score AS s RETURN * ORDER BY s")
+                .is_ok()
+        );
+        assert!(
+            parse(
+                "CALL issundb.pageRank() YIELD nodeId, score WITH nodeId AS n ORDER BY score \
+             RETURN n"
+            )
+            .is_ok()
+        );
+    }
+
+    /// A genuinely empty scope still rejects `RETURN *`.
+    #[test]
+    fn return_star_with_empty_scope_still_errors() {
+        let err = parse("RETURN *").err().unwrap().to_string();
+        assert!(err.contains("NoVariablesInScope"), "{err}");
+    }
+
+    /// The yield scope holds through execution: a `RETURN *` after `YIELD`
+    /// projects the yield columns for every result row.
+    #[test]
+    fn call_yield_return_star_executes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let g = issundb_core::Graph::open(dir.path(), 1).unwrap();
+        let params = HashMap::new();
+        crate::exec::execute(&g, "CREATE (a:N), (b:N), (a)-[:T]->(b)", &params).unwrap();
+        g.rebuild_csr().unwrap();
+        let res = crate::exec::execute(
+            &g,
+            "CALL issundb.pageRank() YIELD nodeId, score RETURN *",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(res.records.len(), 2);
+        // An in-query `YIELD *` passes the parse-time scope check and is
+        // rejected by the executor with its own message, not by a spurious
+        // `NoVariablesInScope` at parse time.
+        let err = crate::exec::execute(&g, "CALL issundb.pageRank() YIELD * RETURN *", &params)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("YIELD *"), "{err}");
+    }
+
+    // --- Aggregations in a WITH ORDER BY ---
+
+    /// TCK WithOrderBy4 [13] and [14]: an aggregation in the ORDER BY of an
+    /// aggregating WITH must itself be a projected expression, because a fresh
+    /// aggregation's argument refers to variables no longer in scope.
+    #[test]
+    fn with_order_by_rejects_a_non_projected_aggregation() {
+        let err = parse(
+            "MATCH (a:A) WITH a, a.num + a.num2 AS sum \
+             WITH a.num2 % 3 AS mod, min(sum) AS min ORDER BY sum(sum) LIMIT 2 \
+             RETURN mod, min",
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(err.contains("UndefinedVariable"), "{err}");
+
+        let err = parse(
+            "MATCH (a:A) WITH a.num2 % 3 AS mod, min(a.num + a.num2) AS min \
+             ORDER BY sum(a.num + a.num2) LIMIT 2 RETURN mod, min",
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(err.contains("UndefinedVariable"), "{err}");
+    }
+
+    /// TCK WithOrderBy4 [11], [12], and [16] through [18]: an ORDER BY beside an
+    /// aggregating WITH may use a projected aggregation (verbatim or through its
+    /// alias), grouping keys, and expressions over both.
+    #[test]
+    fn with_order_by_accepts_projected_aggregations() {
+        for query in [
+            "MATCH (a:A) WITH a.num2 % 3 AS mod, sum(a.num + a.num2) AS sum \
+             ORDER BY sum(a.num + a.num2) LIMIT 2 RETURN mod, sum",
+            "MATCH (a:A) WITH a.num2 % 3 AS mod, sum(a.num + a.num2) AS sum \
+             ORDER BY sum LIMIT 2 RETURN mod, sum",
+            "MATCH (person) WITH avg(person.age) AS avgAge \
+             ORDER BY $age + avg(person.age) - 1000 RETURN avgAge",
+            "MATCH (me:Person)--(you:Person) WITH me.age AS age, count(you.age) AS cnt \
+             ORDER BY age, age + count(you.age) RETURN age",
+            "MATCH (me:Person)--(you:Person) WITH me.age AS age, count(you.age) AS cnt \
+             ORDER BY me.age + count(you.age) RETURN age",
+        ] {
+            assert!(parse(query).is_ok(), "{query}");
+        }
     }
 }
 
@@ -7138,6 +7913,208 @@ mod diagnostic_tests {
         }
     }
 
+    // --- Pattern predicates in WHERE ---
+
+    /// A relationship pattern in a WHERE position parses to a
+    /// `PatternPredicate` expression carrying the pattern.
+    #[test]
+    fn parse_pattern_predicate_in_where() {
+        let stmt = parse("MATCH (n) WHERE (n)-[:T]->() RETURN n").unwrap();
+        let Statement::Query(q) = stmt else {
+            panic!("expected query");
+        };
+        let Some(WhereClause::Expr(Expr::PatternPredicate { pattern })) = q.where_clause else {
+            panic!("expected a pattern predicate, got {:?}", q.where_clause);
+        };
+        assert_eq!(pattern.node.variable.as_deref(), Some("n"));
+        assert_eq!(pattern.rels.len(), 1);
+        let (rel, target) = &pattern.rels[0];
+        assert_eq!(rel.rel_type.as_deref(), Some("T"));
+        assert!(!rel.is_incoming);
+        assert!(!rel.is_undirected);
+        assert!(target.variable.is_none());
+        assert!(pattern.path_variable.is_none());
+    }
+
+    /// Every direction, a multi-type arm, an inline property map, a chained
+    /// hop, and a variable-length arm all parse in WHERE position.
+    #[test]
+    fn parse_pattern_predicate_forms() {
+        for q in [
+            "MATCH (n) WHERE (n)-->() RETURN n",
+            "MATCH (n) WHERE (n)<--() RETURN n",
+            "MATCH (n) WHERE (n)--() RETURN n",
+            "MATCH (n) WHERE (n)<-[:T]-() RETURN n",
+            "MATCH (n) WHERE (n)-[:T|S]-() RETURN n",
+            "MATCH (n) WHERE (n)-[:T {k: 1}]->({name: 'x'}) RETURN n",
+            "MATCH (n) WHERE (n)-[:T]->()<-[:S]-() RETURN n",
+            "MATCH (n) WHERE (n)-[:T*]->() RETURN n",
+            "MATCH (n) WHERE (n)-[:T*2]-() RETURN n",
+            "MATCH (n) WHERE NOT (n)-[:T]-() RETURN n",
+            "MATCH (n) WHERE (n)-[:T]-() AND (n)-[:S]-() RETURN n",
+            "MATCH (n) WHERE (n)-[:T]-() OR (n)-[:S]-() RETURN n",
+            "MATCH (n), (m) WHERE (n)-[:T]->(m) RETURN n, m",
+        ] {
+            assert!(parse(q).is_ok(), "should parse: {q}");
+        }
+    }
+
+    /// Subtraction of a list from a parenthesized variable is arithmetic, not
+    /// a pattern: the pattern alternative requires a relationship arm.
+    #[test]
+    fn parse_paren_minus_list_stays_subtraction() {
+        let stmt = parse("WITH 1 AS a RETURN (a) - [1] AS x").unwrap();
+        let Statement::Query(q) = stmt else {
+            panic!("expected query");
+        };
+        assert!(matches!(
+            &q.return_clause.items[0].expr,
+            Expr::BinaryOp {
+                op: BinaryOperator::Sub,
+                ..
+            }
+        ));
+    }
+
+    /// A bare parenthesized variable in WHERE stays an ordinary expression;
+    /// it must not become a pattern predicate. The query is rejected, but by
+    /// the bare-entity-predicate validation over the ordinary expression, not
+    /// by the pattern-predicate grammar.
+    #[test]
+    fn parse_bare_paren_variable_is_not_a_pattern() {
+        let err = parse("MATCH (n) WHERE (n) RETURN n").unwrap_err();
+        assert!(
+            err.to_string().contains("cannot be used as a predicate"),
+            "bare (n) must reach the predicate validation, got: {err}"
+        );
+    }
+
+    /// A pattern predicate introduces no bindings, so a variable named inside
+    /// it that is not bound outside is an undefined variable.
+    #[test]
+    fn pattern_predicate_rejects_new_variables() {
+        for q in [
+            "MATCH (n) WHERE (n)-[r]->() RETURN n",
+            "MATCH (n) WHERE (n)-[]->(a) RETURN n",
+            "MATCH (n) WHERE (n)-[r:REL]->(a {num: 5}) RETURN n",
+        ] {
+            assert!(parse(q).is_err(), "should reject new variable: {q}");
+        }
+    }
+
+    /// A pattern expression outside a WHERE clause is a syntax error: in a
+    /// RETURN or WITH projection, and in the right-hand side of SET, even
+    /// nested inside function calls.
+    #[test]
+    fn pattern_predicate_outside_where_is_rejected() {
+        for q in [
+            "MATCH (n) RETURN (n)-[]->()",
+            "MATCH (n) WITH (n)-[]->() AS x RETURN x",
+            "MATCH (n) SET n.prop = head(nodes(head((n)-[:REL]->()))).foo",
+        ] {
+            assert!(parse(q).is_err(), "should reject pattern here: {q}");
+        }
+    }
+
+    // --- Existential subqueries ---
+
+    /// `exists { pattern }` in WHERE parses to an `ExistsSubquery` expression
+    /// carrying the pattern and no predicate.
+    #[test]
+    fn parse_exists_subquery_simple() {
+        let stmt = parse("MATCH (n) WHERE exists { (n)-->(m) } RETURN n").unwrap();
+        let Statement::Query(q) = stmt else {
+            panic!("expected query");
+        };
+        let Some(WhereClause::Expr(Expr::ExistsSubquery { pattern, predicate })) = q.where_clause
+        else {
+            panic!("expected an existential subquery, got {:?}", q.where_clause);
+        };
+        assert_eq!(pattern.node.variable.as_deref(), Some("n"));
+        assert_eq!(pattern.rels.len(), 1);
+        assert_eq!(pattern.rels[0].1.variable.as_deref(), Some("m"));
+        assert!(predicate.is_none());
+    }
+
+    /// The simple and full forms, a body-level WHERE, nesting, boolean
+    /// combinators, a RETURN position, and both keyword spellings all parse.
+    #[test]
+    fn parse_exists_subquery_forms() {
+        for q in [
+            "MATCH (n) WHERE exists { (n)-->(m) WHERE n.prop = m.prop } RETURN n",
+            "MATCH (n) WHERE exists { (n)-[r]->() WHERE type(r) = 'NA' } RETURN n",
+            "MATCH (n) WHERE exists { MATCH (n)-->() RETURN true } RETURN n",
+            "MATCH (n) WHERE EXISTS { MATCH (n)-[:R]->(m) RETURN true } RETURN n",
+            "MATCH (n) WHERE NOT exists { (n)-->() } RETURN n",
+            "MATCH (n) WHERE exists { (n)-->() } AND exists { (n)<--() } RETURN n",
+            "MATCH (n) WHERE exists { (n)-->() } OR exists { (n)<--() } RETURN n",
+            "MATCH (n) RETURN exists { (n)-->() } AS x",
+            "MATCH (n) WHERE exists { MATCH (m) WHERE exists { (n)-[]->(m) \
+             WHERE n.prop = m.prop } RETURN true } RETURN n",
+            "MATCH (n) WHERE exists { MATCH (m) WHERE exists { \
+             MATCH (l)<-[:R]-(n)-[:R]->(m) RETURN true } RETURN true } RETURN n",
+            "MATCH (n) WHERE exists { MATCH (m) WHERE exists { MATCH (l) WHERE \
+             (l)<-[:R]-(n)-[:R]->(m) RETURN true } RETURN true } RETURN n",
+        ] {
+            assert!(parse(q).is_ok(), "should parse: {q}\n{:?}", parse(q).err());
+        }
+    }
+
+    /// `exists` followed by a map literal is not a subquery; it stays the
+    /// parse error it always was, so the brace form is unambiguous.
+    #[test]
+    fn parse_exists_before_map_literal_stays_an_error() {
+        assert!(parse("RETURN exists {a: 1} AS x").is_err());
+        assert!(parse("MATCH (n) WHERE exists {a: 1} RETURN n").is_err());
+    }
+
+    /// The `exists(...)` function forms are unaffected by the brace form.
+    #[test]
+    fn parse_exists_function_forms_survive() {
+        assert!(parse("MATCH (n) WHERE exists(n.prop) RETURN n").is_ok());
+        assert!(parse("MATCH (n) WHERE exists((n)-->()) RETURN n").is_ok());
+    }
+
+    /// A write clause inside an existential subquery is a compile-time error.
+    #[test]
+    fn parse_exists_subquery_rejects_write_clauses() {
+        assert!(
+            parse("MATCH (n) WHERE exists { MATCH (n)-->(m) SET m.prop = 'fail' } RETURN n")
+                .is_err()
+        );
+        assert!(parse("MATCH (n) WHERE exists { MATCH (n)-->(m) DELETE m } RETURN n").is_err());
+    }
+
+    /// A multi-clause body (WITH, aggregation) is not supported and must be
+    /// rejected at parse time rather than silently misread.
+    #[test]
+    fn parse_exists_subquery_rejects_multi_clause_bodies() {
+        assert!(
+            parse(
+                "MATCH (n) WHERE exists { MATCH (n)-->(m) WITH n, count(*) AS c \
+             WHERE c = 3 RETURN true } RETURN n"
+            )
+            .is_err()
+        );
+    }
+
+    /// Variables the subquery pattern introduces bind locally, so the scope
+    /// validators must not raise UndefinedVariable for them; a WHERE reference
+    /// outside both the pattern and the outer scope stays undefined.
+    #[test]
+    fn exists_subquery_local_variables_are_in_scope() {
+        assert!(parse("MATCH (n) WHERE exists { (n)-->(m) WHERE m.prop = 1 } RETURN n").is_ok());
+        assert!(
+            parse("MATCH (n) WHERE exists { (n)-[r]->(m) WHERE type(r) = 'T' } RETURN n").is_ok()
+        );
+        let err =
+            parse("MATCH (n) WHERE exists { (n)-->(m) WHERE q.prop = 1 } RETURN n").unwrap_err();
+        assert!(
+            err.to_string().contains("UndefinedVariable"),
+            "expected UndefinedVariable, got: {err}"
+        );
+    }
+
     /// A clause keyword in an unexpected position is called a keyword. Reporting
     /// `RETURN` as an identifier suggests the parser took it for a name.
     #[test]
@@ -7170,5 +8147,44 @@ mod diagnostic_tests {
                 proptest::prop_assert!(!msg.contains("Ident("), "{}", msg);
             }
         }
+    }
+
+    // --- Path variable property access (TCK MatchWhere1 [14]) ---
+
+    /// A property access on a path variable is a compile-time error: a path is
+    /// a value, not an entity with properties.
+    #[test]
+    fn path_variable_property_access_is_a_parse_error() {
+        assert!(parse("MATCH (n) MATCH r = (n)-[*]->() WHERE r.name = 'apa' RETURN r").is_err());
+        assert!(parse("MATCH p = (n)-->() RETURN p.name").is_err());
+    }
+
+    /// Path variables stay legal in the positions that take a path value.
+    #[test]
+    fn path_variable_value_positions_still_parse() {
+        assert!(parse("MATCH p = (n)-->(x) WHERE length(p) = 10 RETURN x").is_ok());
+        assert!(parse("MATCH p = (n)-->(x) RETURN p").is_ok());
+        // A non-path variable named like a path keeps its property access.
+        assert!(parse("MATCH (r) WHERE r.name = 'apa' RETURN r").is_ok());
+    }
+
+    // --- Bare entity variable as a predicate (TCK Pattern1 [11]) ---
+
+    /// A bare node or relationship variable is not a predicate, parenthesized
+    /// or not.
+    #[test]
+    fn bare_entity_variable_predicate_is_a_parse_error() {
+        assert!(parse("MATCH (n) WHERE (n) RETURN n").is_err());
+        assert!(parse("MATCH (n) WHERE n RETURN n").is_err());
+        assert!(parse("MATCH ()-[r]->() WHERE r RETURN r").is_err());
+    }
+
+    /// Boolean-valued variables and properties stay legal in WHERE.
+    #[test]
+    fn boolean_valued_where_predicates_still_parse() {
+        assert!(parse("MATCH (n) WITH n.flag AS b WHERE b RETURN b").is_ok());
+        assert!(parse("UNWIND [true, false] AS b WITH b WHERE b RETURN b").is_ok());
+        assert!(parse("MATCH (n) WHERE n.flag RETURN n").is_ok());
+        assert!(parse("MATCH (n) WHERE (n)-[]->() RETURN n").is_ok());
     }
 }

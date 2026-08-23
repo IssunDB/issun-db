@@ -42,7 +42,15 @@ Do not add any path that changes `dims` after initialization.
 The metric and quantization are fixed at index construction time. `configure_vector_index` therefore returns `VectorError::AlreadyConfigured` when it
 would change either one on a graph that already holds embeddings. `reindex_vector_index` is the sanctioned way to change them afterward: the stored
 vectors are raw, metric-agnostic f32, so it rebuilds the whole in-memory index from LMDB under the new configuration. That rebuild is O(n) and is an
-administrative operation, not a concurrent one.
+administrative operation; the vector mutation lock serializes it against concurrent upserts and removes, which block for its duration.
+
+## The Vector Mutation Lock
+
+Every mutation on the `VectorGraphExt` surface performs two steps: an in-memory index update and a storage write. `VectorMutationLock`, a graph
+extension holding one mutex, spans both steps in `upsert_vector`, `remove_vector`, `configure_vector_index`, and `reindex_vector_index`, so concurrent
+calls for one node cannot leave the index ranking by one embedding while storage holds another. The ordering rule: acquire the mutation lock first,
+before the index's internal `RwLock` and before any storage transaction, and never while holding the `extensions` mutex. Read paths take the index
+`RwLock` without the mutation lock, which stays safe as long as no path acquires the two in the reverse order.
 
 ## The Backend Seam
 

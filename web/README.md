@@ -56,9 +56,9 @@ at that graph, and an example whose graph is not in the database says which one 
 returning an empty table. The one example that still writes is the Cypher basics lesson on `CREATE`,
 and it makes two nodes rather than a dataset.
 
-None of the six carries a comment, and the sidebar carries no prose describing them: the table above
+None of the seven carries a comment, and the sidebar carries no prose describing them: the table above
 is where that belongs. `make playground-check` seeds each category's own graph before running its
-examples, runs all six samples, and fails one that parses but creates no nodes.
+examples, runs all seven samples, and fails one that parses but creates no nodes.
 
 The published copy is at <https://issundb.github.io/issun-db/playground/>. The docs workflow
 builds it and copies this directory into `site/playground/` after the MkDocs build, so the
@@ -180,7 +180,7 @@ slotted onto separate curves, measured perpendicular to the chord from the lower
 halves of a reciprocal pair land on opposite sides; a self-loop, which has no chord to bend, is a
 teardrop above its vertex. Before this the view drew a directed multigraph as an undirected simple one:
 `(a)-[:R]->(b)` and its reverse were one grey line, a second edge between the same pair was invisible
-underneath the first, and a self-loop was a line of zero length, which is to say nothing at all.
+underneath the first, and a self-loop was a line of zero length, which meant nothing was visible at all.
 
 Relationship type colors the edge, but only when there is more than one type in view. One type is the
 common case and coloring it says nothing, so a single-type graph keeps the neutral stroke; past one,

@@ -132,12 +132,15 @@ It is built at the smallest size its consumers read, and the build is memory-sha
 Rebuilds happen on demand through the freshness gates below; the background rebuild after `REBUILD_THRESHOLD` writes is a compaction safety net, not
 the freshness path.
 
-A full build first tries the on-disk cache file (`cache_file.rs`, `lmdb` feature only): `build_snapshot` loads the flat arrays sequentially when the file's
-persisted commit generation (`storage/ids.rs`, `commit_gen`, advanced inside every mutating transaction through `commit_and_publish`) matches storage,
-and falls through to the scan on any mismatch, truncation, or checksum failure. `Graph::rebuild_csr` is the only save site, chosen because every bulk
-load ends there; the gate's per-write refreshes never write a file. The generation is captured before a build or save, so a write landing mid-pass
-leaves the result conservatively stale rather than falsely fresh. The cache file changes where a full build's bytes come from and nothing about the
-within-process freshness rules.
+A full build first tries the on-disk cache file (`cache_file.rs`, `lmdb` feature only): `build_snapshot` loads the flat arrays sequentially when the file
+carries this database's identity (`Storage::db_id`, a random 128-bit value persisted in `meta` on first open) and its persisted commit generation
+(`storage/ids.rs`, `commit_gen`, advanced inside every mutating transaction through `commit_and_publish`) matches storage, and falls through to the scan
+on any mismatch, truncation, oversized length claim, or checksum failure. The identity is what refuses a file another database left behind at a
+coincidentally matching generation, which a restore into a directory with leftover cache files would otherwise serve; `restore_from_file` also removes
+such leftovers. `Graph::rebuild_csr` is the only save site, chosen because every bulk load ends there, and it always builds from storage rather than
+loading the file it is about to overwrite, or a wrong file could never be repaired; the gate's per-write refreshes never write a file. The generation is
+captured before a build or save, so a write landing mid-pass leaves the result conservatively stale rather than falsely fresh. The cache file changes
+where a full build's bytes come from and nothing about the within-process freshness rules.
 
 - Always write to LMDB first. The CSR snapshot is derived from LMDB, not the other way around.
 - Use LMDB adjacency databases (`out_adj`, `in_adj`) for correctness-critical reads: single-node neighbor lookups, existence checks, and anything

@@ -6,7 +6,7 @@ IssunDB provides integration servers to expose graph operations, vector search, 
 
 ## HTTP REST API
 
-The `issundb-rest` crate provides an HTTP REST server built on Axum. It serves versioned endpoints for node/edge CRUD operations, text and vector searches, and query execution.
+The `issundb-rest` crate provides an HTTP REST server built on Axum. It serves versioned endpoints for node/edge CRUD operations, text, and vector searches, and query execution.
 
 ### Start the REST Server
 

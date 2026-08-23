@@ -441,6 +441,388 @@ mod tests {
         graph.add_node("Person", &props).unwrap()
     }
 
+    /// The TCK pattern-predicate fixture: `(a:A)-[:REL1]->(b:B)`,
+    /// `(b)-[:REL2]->(a)`, `(a)-[:REL3]->(c:C)`, and `(a)-[:REL1]->(d:D)`,
+    /// with a `name` property naming each node.
+    fn setup_pattern_predicate_graph(graph: &Graph) {
+        let a = graph
+            .add_node("A", &serde_json::json!({"name": "a"}))
+            .unwrap();
+        let b = graph
+            .add_node("B", &serde_json::json!({"name": "b"}))
+            .unwrap();
+        let c = graph
+            .add_node("C", &serde_json::json!({"name": "c"}))
+            .unwrap();
+        let d = graph
+            .add_node("D", &serde_json::json!({"name": "d"}))
+            .unwrap();
+        let none = serde_json::json!({});
+        graph.add_edge(a, b, "REL1", &none).unwrap();
+        graph.add_edge(b, a, "REL2", &none).unwrap();
+        graph.add_edge(a, c, "REL3", &none).unwrap();
+        graph.add_edge(a, d, "REL1", &none).unwrap();
+        graph.rebuild_csr().unwrap();
+    }
+
+    fn names(res: &QueryResult) -> Vec<String> {
+        let mut out: Vec<String> = res
+            .records
+            .iter()
+            .map(|r| {
+                r.values
+                    .iter()
+                    .map(|v| v.as_str().unwrap_or_default().to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// A typed outgoing pattern predicate keeps only the rows with at least
+    /// one matching assignment.
+    #[test]
+    fn pattern_predicate_filters_on_typed_outgoing_hop() {
+        let (_dir, graph) = setup_graph();
+        setup_pattern_predicate_graph(&graph);
+        let res = execute(
+            &graph,
+            "MATCH (n) WHERE (n)-[:REL1]->() RETURN n.name AS name",
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(names(&res), vec!["a"]);
+    }
+
+    /// An untyped undirected pattern predicate matches every node with any
+    /// relationship, and the incoming form matches targets only.
+    #[test]
+    fn pattern_predicate_directions() {
+        let (_dir, graph) = setup_graph();
+        setup_pattern_predicate_graph(&graph);
+        let res = execute(
+            &graph,
+            "MATCH (n) WHERE (n)-[]-() RETURN n.name AS name",
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(names(&res), vec!["a", "b", "c", "d"]);
+        let res = execute(
+            &graph,
+            "MATCH (n) WHERE (n)<-[:REL1]-() RETURN n.name AS name",
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(names(&res), vec!["b", "d"]);
+    }
+
+    /// `NOT` over a pattern predicate keeps the rows with no matching
+    /// assignment.
+    #[test]
+    fn pattern_predicate_under_not() {
+        let (_dir, graph) = setup_graph();
+        setup_pattern_predicate_graph(&graph);
+        let res = execute(
+            &graph,
+            "MATCH (n) WHERE NOT (n)-[:REL2]-() RETURN n.name AS name",
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(names(&res), vec!["c", "d"]);
+    }
+
+    /// An inline property map on the target node restricts the match.
+    #[test]
+    fn pattern_predicate_with_property_map() {
+        let (_dir, graph) = setup_graph();
+        setup_pattern_predicate_graph(&graph);
+        let res = execute(
+            &graph,
+            "MATCH (n) WHERE (n)-[:REL1]->({name: 'd'}) RETURN n.name AS name",
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(names(&res), vec!["a"]);
+    }
+
+    /// Both endpoints bound: the predicate joins two scans on connectivity.
+    #[test]
+    fn pattern_predicate_with_bound_endpoints() {
+        let (_dir, graph) = setup_graph();
+        setup_pattern_predicate_graph(&graph);
+        let res = execute(
+            &graph,
+            "MATCH (n), (m) WHERE (n)-[:REL1]->(m) RETURN n.name AS n, m.name AS m",
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(names(&res), vec!["a,b", "a,d"]);
+    }
+
+    /// Two pattern predicates compose under AND and OR.
+    #[test]
+    fn pattern_predicate_in_conjunction_and_disjunction() {
+        let (_dir, graph) = setup_graph();
+        setup_pattern_predicate_graph(&graph);
+        let res = execute(
+            &graph,
+            "MATCH (n) WHERE (n)-[:REL1]-() AND (n)-[:REL3]-() RETURN n.name AS name",
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(names(&res), vec!["a"]);
+        let res = execute(
+            &graph,
+            "MATCH (n) WHERE (n)-[:REL1]-() OR (n)-[:REL2]-() RETURN n.name AS name",
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(names(&res), vec!["a", "b", "d"]);
+    }
+
+    /// `exists(pattern)` is the function form of the pattern predicate: it is
+    /// the pattern's existence, not the non-nullness of its boolean value.
+    #[test]
+    fn pattern_predicate_inside_exists_function() {
+        let (_dir, graph) = setup_graph();
+        setup_pattern_predicate_graph(&graph);
+        let res = execute(
+            &graph,
+            "MATCH (n) WHERE exists((n)-[:REL1]->()) RETURN n.name AS name",
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(names(&res), vec!["a"]);
+        let res = execute(
+            &graph,
+            "MATCH (n) WHERE NOT exists((n)-[:REL2]-()) RETURN n.name AS name",
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(names(&res), vec!["c", "d"]);
+    }
+
+    /// A variable-length arm follows trail semantics: `*2` from the fixture
+    /// reaches b and d over two distinct REL1 edges through a.
+    #[test]
+    fn pattern_predicate_variable_length() {
+        let (_dir, graph) = setup_graph();
+        setup_pattern_predicate_graph(&graph);
+        let res = execute(
+            &graph,
+            "MATCH (n) WHERE (n)-[:REL1*2]-() RETURN n.name AS name",
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(names(&res), vec!["b", "d"]);
+    }
+
+    // --- Existential subqueries ---
+
+    /// The TCK existential-subquery fixture: `(a:A {prop: 1})-[:R]->(b:B {prop: 1})`,
+    /// `(a)-[:R]->(c:C {prop: 2})`, and `(a)-[:R]->(d:D {prop: 3})`.
+    fn setup_exists_graph(graph: &Graph) {
+        let a = graph
+            .add_node("A", &serde_json::json!({"prop": 1}))
+            .unwrap();
+        let b = graph
+            .add_node("B", &serde_json::json!({"prop": 1}))
+            .unwrap();
+        let c = graph
+            .add_node("C", &serde_json::json!({"prop": 2}))
+            .unwrap();
+        let d = graph
+            .add_node("D", &serde_json::json!({"prop": 3}))
+            .unwrap();
+        let none = serde_json::json!({});
+        graph.add_edge(a, b, "R", &none).unwrap();
+        graph.add_edge(a, c, "R", &none).unwrap();
+        graph.add_edge(a, d, "R", &none).unwrap();
+        graph.rebuild_csr().unwrap();
+    }
+
+    fn props(res: &QueryResult) -> Vec<i64> {
+        let mut out: Vec<i64> = res
+            .records
+            .iter()
+            .map(|r| r.values[0].as_i64().unwrap())
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
+    /// A simple subquery keeps only the rows with at least one assignment;
+    /// only `a` has outgoing edges.
+    #[test]
+    fn exists_subquery_simple() {
+        let (_dir, graph) = setup_graph();
+        setup_exists_graph(&graph);
+        let res = execute(
+            &graph,
+            "MATCH (n) WHERE exists { (n)-->() } RETURN n.prop AS p",
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(props(&res), vec![1]);
+    }
+
+    /// A body-level WHERE correlates the outer `n` with the local `m`.
+    #[test]
+    fn exists_subquery_with_where() {
+        let (_dir, graph) = setup_graph();
+        setup_exists_graph(&graph);
+        let res = execute(
+            &graph,
+            "MATCH (n) WHERE exists { (n)-->(m) WHERE n.prop = m.prop } RETURN n.prop AS p",
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(props(&res), vec![1]);
+    }
+
+    /// A relationship type with no edges matches nothing, with and without a
+    /// body-level WHERE over the local relationship variable.
+    #[test]
+    fn exists_subquery_not_existing_pattern() {
+        let (_dir, graph) = setup_graph();
+        setup_exists_graph(&graph);
+        for q in [
+            "MATCH (n) WHERE exists { (n)-[:NA]->() } RETURN n.prop AS p",
+            "MATCH (n) WHERE exists { (n)-[r]->() WHERE type(r) = 'NA' } RETURN n.prop AS p",
+        ] {
+            let res = execute(&graph, q, &HashMap::new()).unwrap();
+            assert_eq!(props(&res), Vec::<i64>::new(), "{q}");
+        }
+    }
+
+    /// NOT inverts the existence test; `b`, `c`, and `d` have no outgoing edges.
+    #[test]
+    fn exists_subquery_negated() {
+        let (_dir, graph) = setup_graph();
+        setup_exists_graph(&graph);
+        let res = execute(
+            &graph,
+            "MATCH (n) WHERE NOT exists { (n)-->() } RETURN n.prop AS p",
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(props(&res), vec![1, 2, 3]);
+    }
+
+    /// The full form (`MATCH ... RETURN true`) is the simple form's equal.
+    #[test]
+    fn exists_subquery_full_form() {
+        let (_dir, graph) = setup_graph();
+        setup_exists_graph(&graph);
+        let res = execute(
+            &graph,
+            "MATCH (n) WHERE exists { MATCH (n)-->() RETURN true } RETURN n.prop AS p",
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(props(&res), vec![1]);
+    }
+
+    /// A nested subquery whose outer body anchors on a variable bound nowhere
+    /// outside: `m` is local to the outer body, and the inner subquery
+    /// correlates both `n` and `m`.
+    #[test]
+    fn exists_subquery_nested_with_local_anchor() {
+        let (_dir, graph) = setup_graph();
+        setup_exists_graph(&graph);
+        let res = execute(
+            &graph,
+            "MATCH (n) WHERE exists { MATCH (m) WHERE exists { (n)-[]->(m) \
+             WHERE n.prop = m.prop } RETURN true } RETURN n.prop AS p",
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(props(&res), vec![1]);
+    }
+
+    /// A nested full subquery whose inner pattern anchors on a local variable
+    /// and correlates two outer variables, plus the pattern-predicate form of
+    /// the same body.
+    #[test]
+    fn exists_subquery_nested_full() {
+        let (_dir, graph) = setup_graph();
+        setup_exists_graph(&graph);
+        for q in [
+            "MATCH (n) WHERE exists { MATCH (m) WHERE exists { \
+             MATCH (l)<-[:R]-(n)-[:R]->(m) RETURN true } RETURN true } RETURN n.prop AS p",
+            "MATCH (n) WHERE exists { MATCH (m) WHERE exists { MATCH (l) WHERE \
+             (l)<-[:R]-(n)-[:R]->(m) RETURN true } RETURN true } RETURN n.prop AS p",
+        ] {
+            let res = execute(&graph, q, &HashMap::new()).unwrap();
+            assert_eq!(props(&res), vec![1], "{q}");
+        }
+    }
+
+    /// In a RETURN position the subquery is an ordinary boolean expression.
+    #[test]
+    fn exists_subquery_in_return_position() {
+        let (_dir, graph) = setup_graph();
+        setup_exists_graph(&graph);
+        let res = execute(
+            &graph,
+            "MATCH (n:A) RETURN exists { (n)-->() } AS x",
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(res.records[0].values[0], serde_json::json!(true));
+        let res = execute(
+            &graph,
+            "MATCH (n:B) RETURN exists { (n)-->() } AS x",
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(res.records[0].values[0], serde_json::json!(false));
+    }
+
+    /// An empty graph matches nothing; a body over it is false, not an error.
+    #[test]
+    fn exists_subquery_on_empty_graph() {
+        let (_dir, graph) = setup_graph();
+        let node = graph.add_node("A", &serde_json::json!({})).unwrap();
+        let _ = node;
+        graph.rebuild_csr().unwrap();
+        let res = execute(
+            &graph,
+            "MATCH (n) WHERE exists { MATCH (m)-->(l) RETURN true } RETURN n",
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(res.records.len(), 0);
+    }
+
+    /// The subquery is a filter expression, so both execution modes must
+    /// return the same rows.
+    #[test]
+    fn exists_subquery_matches_row_pipeline() {
+        let (_dir, graph) = setup_graph();
+        setup_exists_graph(&graph);
+        let queries = [
+            "MATCH (n) WHERE exists { (n)-->(m) WHERE n.prop = m.prop } RETURN n.prop AS p",
+            "MATCH (n) WHERE NOT exists { (n)-[:NA]->() } RETURN n.prop AS p",
+            "MATCH (n) WHERE exists { MATCH (m) WHERE exists { (n)-[]->(m) \
+             WHERE n.prop = m.prop } RETURN true } RETURN n.prop AS p",
+        ];
+        for q in queries {
+            let fast = {
+                let _guard = crate::exec_mode::fast_paths_required();
+                execute(&graph, q, &HashMap::new()).unwrap()
+            };
+            let row = {
+                let _guard = crate::exec_mode::RowPipelineOnly::install();
+                execute(&graph, q, &HashMap::new()).unwrap()
+            };
+            assert_eq!(fast.columns, row.columns, "{q}");
+            assert_eq!(props(&fast), props(&row), "{q}");
+        }
+    }
+
     /// An unwound variable used as a graph element raises VariableTypeConflict.
     /// CREATE already enforced this; MERGE must be consistent rather than
     /// silently mishandling the value binding (which anchored the pattern on the
@@ -1665,6 +2047,75 @@ mod tests {
         assert_eq!(v, serde_json::json!(3));
     }
 
+    /// Whole-entity result values use the openCypher display-literal form, so
+    /// labels and relationship types are visible in the result JSON: a node is
+    /// `(:A:B {k: v})`, a relationship is `[:T {k: v}]`, and a path is
+    /// `<(:A)-[:T]->(:B)>` with the arrow carrying the stored edge direction.
+    #[test]
+    fn whole_entity_values_use_display_literal_form() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+        execute(
+            &graph,
+            "CREATE (:A:B {name: 'x', n: 1, f: 1.5})-[:T {num: 1}]->(:C)",
+            &params,
+        )
+        .unwrap();
+        graph.rebuild_csr().unwrap();
+
+        let node = "(:A:B {f: 1.5, n: 1, name: 'x'})";
+        let rel = "[:T {num: 1}]";
+
+        let rows = run(&graph, "MATCH (a:A) RETURN a");
+        assert_eq!(rows[0][0], serde_json::json!(node));
+
+        let rows = run(&graph, "MATCH (:A)-[r:T]->() RETURN r");
+        assert_eq!(rows[0][0], serde_json::json!(rel));
+
+        // A var-length relationship variable is the list of relationship
+        // display strings along the trail.
+        let rows = run(&graph, "MATCH (:A)-[r:T*1..1]->() RETURN r");
+        assert_eq!(rows[0][0], serde_json::json!([rel]));
+
+        // The path arrow follows the stored edge direction even when the
+        // pattern traverses the edge backwards.
+        let rows = run(&graph, "MATCH p = (:A)-[:T]->(:C) RETURN p");
+        assert_eq!(
+            rows[0][0],
+            serde_json::json!(format!("<{node}-{rel}->(:C)>"))
+        );
+        let rows = run(&graph, "MATCH p = (:C)<-[:T]-(:A) RETURN p");
+        assert_eq!(
+            rows[0][0],
+            serde_json::json!(format!("<(:C)<-{rel}-{node}>"))
+        );
+
+        // A zero-length path is a single node in angle brackets.
+        let rows = run(&graph, "MATCH p = (:C) RETURN p");
+        assert_eq!(rows[0][0], serde_json::json!("<(:C)>"));
+
+        // Entities nested in lists and maps take the same form.
+        let rows = run(&graph, "MATCH (a:A)-[r:T]->() RETURN [a, r]");
+        assert_eq!(rows[0][0], serde_json::json!([node, rel]));
+        let rows = run(&graph, "MATCH (a:A) RETURN {m: a}");
+        assert_eq!(rows[0][0], serde_json::json!({ "m": node }));
+        let rows = run(&graph, "MATCH (a:A) RETURN collect(a)");
+        assert_eq!(rows[0][0], serde_json::json!([node]));
+    }
+
+    /// A temporal property inside a whole-entity display literal renders as
+    /// its canonical string, matching how the same value projects on its own,
+    /// rather than leaking the internal temporal object.
+    #[test]
+    fn temporal_property_in_display_literal_renders_canonical_string() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+        execute(&graph, "CREATE (:A {date: date('1910-05-06')})", &params).unwrap();
+        graph.rebuild_csr().unwrap();
+        let rows = run(&graph, "MATCH (a:A) RETURN a");
+        assert_eq!(rows[0][0], serde_json::json!("(:A {date: '1910-05-06'})"));
+    }
+
     // Helper: run a simple Cypher and return all records.
     fn run(graph: &Graph, cypher: &str) -> Vec<Vec<serde_json::Value>> {
         let params = HashMap::new();
@@ -2028,12 +2479,15 @@ mod tests {
         // A just-created node projected whole: must not error (the node is
         // not committed yet), and must carry the fresh properties.
         let res = execute(&graph, "CREATE (n:Foo {a: 1}) WITH n RETURN n", &params).unwrap();
-        assert_eq!(res.records[0].values[0]["a"], serde_json::json!(1));
+        assert_eq!(res.records[0].values[0], serde_json::json!("(:Foo {a: 1})"));
 
         // A SET in the same statement: the projected node reflects the new
         // value, not the pre-SET committed record.
         let res = execute(&graph, "MATCH (n:Foo) SET n.x = 5 WITH n RETURN n", &params).unwrap();
-        assert_eq!(res.records[0].values[0]["x"], serde_json::json!(5));
+        assert_eq!(
+            res.records[0].values[0],
+            serde_json::json!("(:Foo {a: 1, x: 5})")
+        );
 
         // Edge counterpart: a just-created relationship projected whole.
         let res = execute(
@@ -2042,7 +2496,247 @@ mod tests {
             &params,
         )
         .unwrap();
-        assert_eq!(res.records[0].values[0]["w"], serde_json::json!(1));
+        assert_eq!(res.records[0].values[0], serde_json::json!("[:R {w: 1}]"));
+    }
+
+    /// `SET n = {map}` replaces the whole property record: keys absent from
+    /// the map are removed, null-valued keys are omitted, and an empty map
+    /// clears every property.
+    #[test]
+    fn set_all_properties_replaces_record() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+        graph
+            .add_node("X", &serde_json::json!({"name": "A", "name2": "B"}))
+            .unwrap();
+
+        let res = execute(
+            &graph,
+            "MATCH (n:X) SET n = {name: 'B', name2: null, baz: 'C'} RETURN n",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(
+            res.records[0].values[0],
+            serde_json::json!("(:X {baz: 'C', name: 'B'})")
+        );
+
+        let res = execute(&graph, "MATCH (n:X) SET n = { } RETURN n", &params).unwrap();
+        assert_eq!(res.records[0].values[0], serde_json::json!("(:X)"));
+    }
+
+    /// `SET n += {map}` merges: existing keys keep their values unless the
+    /// map overwrites them, a null value removes its key, and an empty map is
+    /// a no-op.
+    #[test]
+    fn set_all_properties_merges_record() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+        graph
+            .add_node("X", &serde_json::json!({"name": "A", "name2": "B"}))
+            .unwrap();
+
+        let res = execute(
+            &graph,
+            "MATCH (n:X) SET n += {name2: 'C', extra: 1} RETURN n",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(
+            res.records[0].values[0],
+            serde_json::json!("(:X {extra: 1, name2: 'C', name: 'A'})")
+        );
+
+        let res = execute(
+            &graph,
+            "MATCH (n:X) SET n += {extra: null} RETURN n",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(
+            res.records[0].values[0],
+            serde_json::json!("(:X {name2: 'C', name: 'A'})")
+        );
+
+        let res = execute(&graph, "MATCH (n:X) SET n += { } RETURN n", &params).unwrap();
+        assert_eq!(
+            res.records[0].values[0],
+            serde_json::json!("(:X {name2: 'C', name: 'A'})")
+        );
+    }
+
+    /// A null target (an `OPTIONAL MATCH` miss) makes a whole-entity SET a
+    /// no-op rather than an error, for both forms.
+    #[test]
+    fn set_all_properties_null_target_is_noop() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+
+        let res = execute(
+            &graph,
+            "OPTIONAL MATCH (a:DoesNotExist) SET a = {num: 42} RETURN a",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(res.records[0].values[0], serde_json::Value::Null);
+
+        let res = execute(
+            &graph,
+            "OPTIONAL MATCH (a:DoesNotExist) SET a += {num: 42} RETURN a",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(res.records[0].values[0], serde_json::Value::Null);
+    }
+
+    /// Whole-entity SET targets relationships too, and `SET r = a` copies a
+    /// bound entity's properties.
+    #[test]
+    fn set_all_properties_on_edge_and_entity_copy() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+        let a = graph
+            .add_node("A", &serde_json::json!({"name": "A"}))
+            .unwrap();
+        let b = graph.add_node("B", &serde_json::json!({})).unwrap();
+        graph
+            .add_edge(a, b, "TYPE", &serde_json::json!({"old": 1}))
+            .unwrap();
+        graph.rebuild_csr().unwrap();
+
+        let res = execute(
+            &graph,
+            "MATCH (a:A)-[r:TYPE]->() SET r = a RETURN r",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(
+            res.records[0].values[0],
+            serde_json::json!("[:TYPE {name: 'A'}]")
+        );
+
+        let res = execute(
+            &graph,
+            "MATCH ()-[r:TYPE]->() SET r += {w: 2} RETURN r",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(
+            res.records[0].values[0],
+            serde_json::json!("[:TYPE {name: 'A', w: 2}]")
+        );
+    }
+
+    /// Parameter maps drive both whole-entity forms.
+    #[test]
+    fn set_all_properties_from_parameter() {
+        let (_dir, graph) = setup_graph();
+        graph
+            .add_node("X", &serde_json::json!({"name": "A"}))
+            .unwrap();
+        let mut params = HashMap::new();
+        params.insert("props".to_string(), serde_json::json!({"num": 5}));
+
+        let res = execute(&graph, "MATCH (n:X) SET n += $props RETURN n", &params).unwrap();
+        assert_eq!(
+            res.records[0].values[0],
+            serde_json::json!("(:X {name: 'A', num: 5})")
+        );
+
+        let res = execute(&graph, "MATCH (n:X) SET n = $props RETURN n", &params).unwrap();
+        assert_eq!(res.records[0].values[0], serde_json::json!("(:X {num: 5})"));
+    }
+
+    /// A whole-entity SET with a non-map right-hand side is an error.
+    #[test]
+    fn set_all_properties_non_map_errors() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+        graph.add_node("X", &serde_json::json!({})).unwrap();
+
+        assert!(execute(&graph, "MATCH (n:X) SET n = 5", &params).is_err());
+        assert!(execute(&graph, "MATCH (n:X) SET n += [1, 2]", &params).is_err());
+    }
+
+    /// A replace in the same statement supersedes earlier writes in the
+    /// pending overlay: a later projection sees the replaced record, not a
+    /// merge with what the statement wrote before.
+    #[test]
+    fn set_all_properties_overlay_supersedes() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+
+        let res = execute(
+            &graph,
+            "CREATE (n:X {a: 1}) SET n = {b: 2} RETURN n.a, n.b",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(res.records[0].values[0], serde_json::Value::Null);
+        assert_eq!(res.records[0].values[1], serde_json::json!(2));
+    }
+
+    /// The replace goes through the core update machinery, so the auto-index
+    /// serves the new value and no longer serves the old one.
+    #[test]
+    fn set_all_properties_updates_property_index() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+        graph
+            .add_node("X", &serde_json::json!({"name": "A"}))
+            .unwrap();
+
+        execute(&graph, "MATCH (n:X) SET n = {name: 'B'}", &params).unwrap();
+
+        let res = execute(&graph, "MATCH (n:X {name: 'B'}) RETURN count(n)", &params).unwrap();
+        assert_eq!(res.records[0].values[0], serde_json::json!(1));
+        let res = execute(&graph, "MATCH (n:X {name: 'A'}) RETURN count(n)", &params).unwrap();
+        assert_eq!(res.records[0].values[0], serde_json::json!(0));
+    }
+
+    /// The constraint interaction is pinned rather than accidental: clearing
+    /// a required property with `SET n = {}` errors and rolls back, and a
+    /// unique-constrained property may move to a fresh value but not onto a
+    /// value another node holds.
+    #[test]
+    fn set_all_properties_respects_constraints() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+        graph.create_node_required_constraint("R", "name").unwrap();
+        graph
+            .add_node("R", &serde_json::json!({"name": "A"}))
+            .unwrap();
+        assert!(execute(&graph, "MATCH (n:R) SET n = {}", &params).is_err());
+        let res = execute(&graph, "MATCH (n:R {name: 'A'}) RETURN count(n)", &params).unwrap();
+        assert_eq!(res.records[0].values[0], serde_json::json!(1));
+
+        graph.create_node_unique_constraint("U", "code").unwrap();
+        graph
+            .add_node("U", &serde_json::json!({"code": 1}))
+            .unwrap();
+        graph
+            .add_node("U", &serde_json::json!({"code": 2}))
+            .unwrap();
+        assert!(execute(&graph, "MATCH (n:U {code: 2}) SET n = {code: 3}", &params).is_ok());
+        assert!(execute(&graph, "MATCH (n:U {code: 3}) SET n += {code: 1}", &params).is_err());
+    }
+
+    /// A whole-entity SET inside a FOREACH body substitutes the loop variable
+    /// through the map expression.
+    #[test]
+    fn set_all_properties_in_foreach_substitutes_loop_var() {
+        let params = HashMap::new();
+        let (_dir, graph) = setup_graph();
+        graph.add_node("X", &serde_json::json!({})).unwrap();
+
+        execute(
+            &graph,
+            "FOREACH (x IN [7] | MATCH (n:X) SET n += {v: x})",
+            &params,
+        )
+        .unwrap();
+        let res = execute(&graph, "MATCH (n:X) RETURN n.v", &params).unwrap();
+        assert_eq!(res.records[0].values[0], serde_json::json!(7));
     }
 
     /// A bare CREATE statement inside a semicolon-separated pipeline goes
@@ -4507,8 +5201,9 @@ mod tests {
     fn stdev_distinct_deduplicates() {
         let v = agg_scalar(&[], "UNWIND [1, 1, 2] AS x RETURN stDev(DISTINCT x) AS s");
         let got = v.as_f64().unwrap();
-        // stDev of [1, 2] is sqrt(0.5) ~ 0.7071; of [1, 1, 2] it is ~0.5774.
-        assert!((got - 0.7071).abs() < 1e-3, "got {got}");
+        // stDev of [1, 2] is sqrt(0.5); of the raw [1, 1, 2] it is ~0.5774.
+        let expected = 0.5f64.sqrt();
+        assert!((got - expected).abs() < 1e-9, "got {got}");
     }
 
     /// A pattern comprehension enforces the anchor node's label and the
@@ -6079,8 +6774,7 @@ mod tests {
     #[test]
     fn deeply_nested_query_errors_instead_of_aborting() {
         let (_dir, graph) = setup_graph();
-        let deep = std::iter::repeat("RETURN 1 AS x")
-            .take(10_000)
+        let deep = std::iter::repeat_n("RETURN 1 AS x", 10_000)
             .collect::<Vec<_>>()
             .join(" UNION ALL ");
         assert!(execute(&graph, &deep, &HashMap::new()).is_err());
@@ -6100,8 +6794,7 @@ mod tests {
         for _ in 0..12 {
             list = format!("[{}]", list);
         }
-        let and = std::iter::repeat("1 = 1")
-            .take(20)
+        let and = std::iter::repeat_n("1 = 1", 20)
             .collect::<Vec<_>>()
             .join(" AND ");
         let queries = vec![format!("RETURN {list} AS x"), format!("RETURN {and} AS x")];
@@ -6165,5 +6858,160 @@ mod tests {
             })
             .unwrap();
         handle.join().unwrap();
+    }
+
+    // --- Reads of deleted entities (TCK Return2 [14]-[17]) ---
+
+    /// Returning a property of a node deleted earlier in the same statement is
+    /// a runtime error, not a stale read of the old value.
+    #[test]
+    fn returning_property_of_deleted_node_errors() {
+        let (_dir, graph) = setup_graph();
+        graph.add_node("N", &serde_json::json!({"num": 0})).unwrap();
+        let res = execute(&graph, "MATCH (n) DELETE n RETURN n.num", &HashMap::new());
+        assert!(res.is_err(), "expected a deleted-entity error, got {res:?}");
+    }
+
+    /// Returning the labels of a deleted node is a runtime error.
+    #[test]
+    fn returning_labels_of_deleted_node_errors() {
+        let (_dir, graph) = setup_graph();
+        graph.add_node("A", &serde_json::json!({})).unwrap();
+        let res = execute(
+            &graph,
+            "MATCH (n) DELETE n RETURN labels(n)",
+            &HashMap::new(),
+        );
+        assert!(res.is_err(), "expected a deleted-entity error, got {res:?}");
+    }
+
+    /// Returning a property of a deleted relationship is a runtime error.
+    #[test]
+    fn returning_property_of_deleted_relationship_errors() {
+        let (_dir, graph) = setup_graph();
+        let a = graph.add_node("A", &serde_json::json!({})).unwrap();
+        let b = graph.add_node("B", &serde_json::json!({})).unwrap();
+        graph
+            .add_edge(a, b, "T", &serde_json::json!({"num": 0}))
+            .unwrap();
+        let res = execute(
+            &graph,
+            "MATCH ()-[r]->() DELETE r RETURN r.num",
+            &HashMap::new(),
+        );
+        assert!(res.is_err(), "expected a deleted-entity error, got {res:?}");
+    }
+
+    /// A relationship deleted by DETACH DELETE of its endpoint is deleted too,
+    /// so reading its property afterward is a runtime error.
+    #[test]
+    fn returning_property_of_detach_deleted_relationship_errors() {
+        let (_dir, graph) = setup_graph();
+        let a = graph.add_node("A", &serde_json::json!({})).unwrap();
+        let b = graph.add_node("B", &serde_json::json!({})).unwrap();
+        graph
+            .add_edge(a, b, "T", &serde_json::json!({"num": 0}))
+            .unwrap();
+        let res = execute(
+            &graph,
+            "MATCH (a:A)-[r]->() DETACH DELETE a RETURN r.num",
+            &HashMap::new(),
+        );
+        assert!(res.is_err(), "expected a deleted-entity error, got {res:?}");
+    }
+
+    /// The type of a deleted relationship stays readable (TCK Return2 [14]).
+    #[test]
+    fn returning_type_of_deleted_relationship_succeeds() {
+        let (_dir, graph) = setup_graph();
+        let a = graph.add_node("A", &serde_json::json!({})).unwrap();
+        let b = graph.add_node("B", &serde_json::json!({})).unwrap();
+        graph.add_edge(a, b, "T", &serde_json::json!({})).unwrap();
+        let res = execute(
+            &graph,
+            "MATCH ()-[r]->() DELETE r RETURN type(r)",
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(res.records[0].values[0], serde_json::json!("T"));
+    }
+
+    /// A property read of an entity the statement did not delete still works,
+    /// so the deletion marks are per entity, not per statement.
+    #[test]
+    fn returning_property_of_undeleted_node_after_delete_succeeds() {
+        let (_dir, graph) = setup_graph();
+        graph.add_node("A", &serde_json::json!({"num": 1})).unwrap();
+        graph.add_node("B", &serde_json::json!({"num": 2})).unwrap();
+        let res = execute(
+            &graph,
+            "MATCH (a:A) MATCH (b:B) DELETE a RETURN b.num",
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(res.records[0].values[0], serde_json::json!(2));
+    }
+
+    /// Deletion marks are statement-scoped: a later statement in a pipeline
+    /// reads fresh data without any stale mark from an earlier delete.
+    #[test]
+    fn deletion_marks_do_not_leak_into_later_pipeline_statements() {
+        let (_dir, graph) = setup_graph();
+        graph.add_node("A", &serde_json::json!({"num": 1})).unwrap();
+        graph.add_node("B", &serde_json::json!({"num": 2})).unwrap();
+        let res = execute(
+            &graph,
+            "MATCH (a:A) DELETE a; MATCH (b:B) RETURN b.num",
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(res.records[0].values[0], serde_json::json!(2));
+    }
+
+    // --- Invalid property types on SET (TCK Set1 [10]) ---
+
+    /// Setting a list of maps as a property is a runtime type error.
+    #[test]
+    fn set_list_of_maps_property_errors() {
+        let (_dir, graph) = setup_graph();
+        let res = execute(
+            &graph,
+            "CREATE (a) SET a.maplist = [{num: 1}]",
+            &HashMap::new(),
+        );
+        assert!(
+            res.is_err(),
+            "expected an invalid-property error, got {res:?}"
+        );
+    }
+
+    /// The same check fires on the standalone MATCH ... SET statement form.
+    #[test]
+    fn set_statement_list_of_maps_property_errors() {
+        let (_dir, graph) = setup_graph();
+        graph.add_node("N", &serde_json::json!({})).unwrap();
+        let res = execute(
+            &graph,
+            "MATCH (a:N) SET a.maplist = [[{num: 1}]]",
+            &HashMap::new(),
+        );
+        assert!(
+            res.is_err(),
+            "expected an invalid-property error, got {res:?}"
+        );
+    }
+
+    /// A scalar list stays a valid property value.
+    #[test]
+    fn set_scalar_list_property_succeeds() {
+        let (_dir, graph) = setup_graph();
+        graph.add_node("N", &serde_json::json!({})).unwrap();
+        let res = execute(
+            &graph,
+            "MATCH (a:N) SET a.nums = [1, 2, 3] RETURN a.nums",
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(res.records[0].values[0], serde_json::json!([1, 2, 3]));
     }
 }

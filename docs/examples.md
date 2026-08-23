@@ -188,8 +188,8 @@ fn run_algorithms(graph: &Graph) -> Result<(), Box<dyn std::error::Error>> {
 ## Graph Data Science in Cypher
 
 These analytics, pathfinding, and retrieval algorithms can also be invoked directly inside Cypher queries, feeding algorithm results directly into
-`MATCH`, `WHERE`, and `RETURN` clauses. There are two surfaces: built-in `CALL issundb.*` procedures and the `issundb.distance.*` and
-`issundb.similarity.*` scalar functions. The `gds_cypher.rs` example program is a complete, runnable tour (
+`MATCH`, `WHERE`, and `RETURN` clauses. There are two surfaces: built-in `CALL issundb.*` procedures and the `issundb.distance.*`,
+`issundb.similarity.*`, and `issundb.link.*` scalar functions. The `gds_cypher.rs` example program is a complete, runnable tour (
 `cargo run -p issundb-examples --example gds_cypher`).
 
 ### Built-in Procedures
@@ -202,11 +202,16 @@ query, so `nodeId` joins back to the matched nodes through `id()`.
 | `issundb.pageRank`                                          | `{iterations, damping}`                                                                                                               | `nodeId, score`              |
 | `issundb.betweenness`                                       | none                                                                                                                                  | `nodeId, score`              |
 | `issundb.harmonic`                                          | none                                                                                                                                  | `nodeId, score`              |
+| `issundb.closeness`                                         | none                                                                                                                                  | `nodeId, score`              |
+| `issundb.clusteringCoefficient`                             | none                                                                                                                                  | `nodeId, score`              |
 | `issundb.degree`                                            | `{direction}` with `'IN'`, `'OUT'`, or `'BOTH'`                                                                                       | `nodeId, score`              |
 | `issundb.connectedComponents` (alias `issundb.wcc`)         | none                                                                                                                                  | `nodeId, componentId`        |
 | `issundb.stronglyConnectedComponents` (alias `issundb.scc`) | none                                                                                                                                  | `nodeId, componentId`        |
+| `issundb.eigenvector`                                       | `{iterations, tolerance}`                                                                                                             | `nodeId, score`              |
+| `issundb.katz`                                              | `{alpha, beta, iterations, tolerance}`                                                                                                | `nodeId, score`              |
 | `issundb.labelPropagation`                                  | `{maxIterations}`                                                                                                                     | `nodeId, communityId`        |
-| `issundb.communities`                                       | `{maxIterations, topPerCommunity}`                                                                                                    | `communityId, nodeId, rank`  |
+| `issundb.louvain`                                           | none                                                                                                                                  | `nodeId, communityId`        |
+| `issundb.communities`                                       | `{maxIterations, topPerCommunity, algorithm}`                                                                                         | `communityId, nodeId, rank`  |
 | `issundb.shortestPath`                                      | requires `(srcId, dstId)`                                                                                                             | `index, nodeId`              |
 | `issundb.dijkstra`                                          | requires `(srcId, dstId)`                                                                                                             | `index, nodeId, totalWeight` |
 | `issundb.triangleCount`                                     | `{relTypes, labels}`                                                                                                                  | `count`                      |
@@ -256,3 +261,15 @@ RETURN issundb.distance.cosine(a, e) AS cosineDistance,
        1 - issundb.distance.cosine(a, e) AS cosineSimilarity,
        issundb.similarity.jaccard(a.skills, e.skills) AS skillJaccard
 ```
+
+### Link Prediction Functions
+
+Pairwise link prediction functions estimate how likely two nodes are to connect based on their shared graph neighborhood. Each function takes two nodes or node IDs, reads the neighborhood as undirected over distinct neighbors, and returns null when either argument is null:
+
+| Function                                    | Operates on  | Returns                           |
+|---------------------------------------------|--------------|-----------------------------------|
+| `issundb.link.commonNeighbors(a, b)`        | nodes or IDs | shared neighbor count             |
+| `issundb.link.jaccard(a, b)`                | nodes or IDs | neighborhood Jaccard coefficient  |
+| `issundb.link.adamicAdar(a, b)`             | nodes or IDs | inverse-log degree weighted score |
+| `issundb.link.resourceAllocation(a, b)`     | nodes or IDs | inverse degree weighted score     |
+| `issundb.link.preferentialAttachment(a, b)` | nodes or IDs | product of node degrees           |

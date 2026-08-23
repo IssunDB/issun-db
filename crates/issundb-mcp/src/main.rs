@@ -218,8 +218,16 @@ async fn main() -> anyhow::Result<()> {
 
     // The stdio transport owns stdout, so all diagnostics go to stderr in
     // either mode for consistency.
+    // `EnvFilter::from_default_env()` alone defaults to `error` when `RUST_LOG`
+    // is unset, which silenced everything this server says about itself,
+    // including the warning the engine emits when it is about to build the
+    // property columns from a full scan for want of a cache file. An operator
+    // who has not set `RUST_LOG` is exactly the one who needs to see that, so
+    // the default is `info` and `RUST_LOG` still overrides it.
     fmt()
-        .with_env_filter(EnvFilter::from_default_env())
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .with_writer(std::io::stderr)
         .with_ansi(false)
         .init();

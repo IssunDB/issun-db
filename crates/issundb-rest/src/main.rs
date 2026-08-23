@@ -120,7 +120,17 @@ fn spawn_statistics_warm_up(graph: Arc<Graph>) {
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    fmt().with_env_filter(EnvFilter::from_default_env()).init();
+    // `EnvFilter::from_default_env()` alone defaults to `error` when `RUST_LOG`
+    // is unset, which silenced everything this server says about itself,
+    // including the warning the engine emits when it is about to build the
+    // property columns from a full scan for want of a cache file. An operator
+    // who has not set `RUST_LOG` is exactly the one who needs to see that, so
+    // the default is `info` and `RUST_LOG` still overrides it.
+    fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .init();
 
     info!(db_path = %args.db_path.display(), "opening graph");
     let graph = Arc::new(Graph::open(&args.db_path, args.map_size_gb)?);

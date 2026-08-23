@@ -249,10 +249,16 @@ pub(super) fn execute_read_query(
     // single-hop expansion executes column-at-a-time and produces the result
     // records directly. Any other shape (and every write query) takes the row
     // pipeline below.
+    // An installed pending-writes overlay means an enclosing write statement
+    // (the RETURN pass of a DELETE ... RETURN) is running this read: the
+    // columnar path gathers properties in bulk without consulting the
+    // overlay, so it would serve a deleted entity's committed value instead
+    // of raising.
     if !has_write_parts
         && !row_pipeline_only
         && !return_clause_has_star
         && !query.return_clause.items.is_empty()
+        && !expr::pending_writes_active()
     {
         if let Some(mut records) = super::vectorized::try_execute_vectorized(
             graph,
@@ -739,6 +745,16 @@ pub(crate) fn expr_display_name(expr: &Expr) -> String {
             s.push(']');
             s
         }
+        Expr::PatternPredicate { pattern } => pattern_display_name(pattern),
+        Expr::ExistsSubquery { pattern, predicate } => {
+            let mut s = String::from("exists { ");
+            s.push_str(&pattern_display_name(pattern));
+            if let Some(p) = predicate {
+                s.push_str(&format!(" WHERE {}", expr_display_name(p)));
+            }
+            s.push_str(" }");
+            s
+        }
         Expr::PatternComprehension {
             pattern,
             predicate,
@@ -870,6 +886,12 @@ fn format_cypher_value(v: &serde_json::Value) -> String {
             format!("[{}]", items.join(", "))
         }
         serde_json::Value::Object(map) => {
+            // A temporal value renders as its canonical string, matching how
+            // the same value projects on its own, rather than leaking the
+            // internal temporal object.
+            if let Some(serde_json::Value::String(s)) = map.get("__str__") {
+                return format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"));
+            }
             let mut items: Vec<String> = map
                 .iter()
                 .map(|(k, v)| format!("{}: {}", k, format_cypher_value(v)))
@@ -932,6 +954,49 @@ fn format_edge_literal_string(graph: &Graph, eid: EdgeId) -> String {
     type_str
 }
 
+/// Render a `__Path__` sentinel as an openCypher path display literal, for
+/// example `<(:A)-[:T]->(:B)>`. The arrow of each hop carries the stored edge
+/// direction, recovered by comparing the relationship's `startNode` against the
+/// node the traversal arrived from, so a pattern that walked an edge backwards
+/// still displays the edge as it exists in the graph.
+fn format_path_literal(graph: &Graph, map: &serde_json::Map<String, serde_json::Value>) -> String {
+    let empty = Vec::new();
+    let nodes = match map.get("nodes") {
+        Some(serde_json::Value::Array(n)) => n,
+        _ => &empty,
+    };
+    let rels = match map.get("relationships") {
+        Some(serde_json::Value::Array(r)) => r,
+        _ => &empty,
+    };
+    let node_id = |v: &serde_json::Value| v.get("id").and_then(|i| i.as_i64());
+    let mut out = String::from("<");
+    for (i, node) in nodes.iter().enumerate() {
+        if let Some(id) = node_id(node) {
+            out.push_str(&format_node_literal(graph, id as u64));
+        }
+        if let Some(rel) = rels.get(i) {
+            let rel_str = rel
+                .get("id")
+                .and_then(|i| i.as_i64())
+                .map(|id| format!("[{}]", format_edge_literal_string(graph, id as u64)))
+                .unwrap_or_default();
+            let forward = rel.get("startNode").and_then(|s| s.as_i64()) == node_id(node);
+            if forward {
+                out.push('-');
+                out.push_str(&rel_str);
+                out.push_str("->");
+            } else {
+                out.push_str("<-");
+                out.push_str(&rel_str);
+                out.push('-');
+            }
+        }
+    }
+    out.push('>');
+    out
+}
+
 pub(super) fn unpack_sentinels(graph: &Graph, val: serde_json::Value) -> serde_json::Value {
     match val {
         serde_json::Value::Object(map) => {
@@ -945,11 +1010,11 @@ pub(super) fn unpack_sentinels(graph: &Graph, val: serde_json::Value) -> serde_j
                 } else if t == "__Edge__" {
                     if let Some(id_val) = map.get("id").and_then(|i| i.as_i64()) {
                         let id = id_val as u64;
-                        let formatted = format_edge_literal_string(graph, id);
-                        return serde_json::Value::Array(vec![serde_json::Value::String(
-                            formatted,
-                        )]);
+                        let formatted = format!("[{}]", format_edge_literal_string(graph, id));
+                        return serde_json::Value::String(formatted);
                     }
+                } else if t == "__Path__" {
+                    return serde_json::Value::String(format_path_literal(graph, &map));
                 }
             }
             serde_json::Value::Object(
@@ -981,26 +1046,37 @@ pub(super) fn binding_to_value(
     match binding {
         None => Ok(serde_json::Value::Null),
         Some(GraphBinding::Scalar(v)) => Ok(unpack_sentinels(graph, v.clone())),
-        Some(GraphBinding::Node(id)) => Ok((*expr::node_props(graph, *id)?
-            .ok_or_else(|| format!("node not found: {}", id))?)
-        .clone()),
-        Some(GraphBinding::Edge(id)) => Ok((*expr::edge_props(graph, *id)?
-            .ok_or_else(|| format!("edge not found: {}", id))?)
-        .clone()),
+        Some(GraphBinding::Node(id)) => {
+            // Existence check first: the display formatter degrades a missing
+            // node to `()` rather than erroring.
+            expr::node_props(graph, *id)?.ok_or_else(|| format!("node not found: {}", id))?;
+            Ok(serde_json::Value::String(format_node_literal(graph, *id)))
+        }
+        Some(GraphBinding::Edge(id)) => {
+            expr::edge_props(graph, *id)?.ok_or_else(|| format!("edge not found: {}", id))?;
+            Ok(serde_json::Value::String(format!(
+                "[{}]",
+                format_edge_literal_string(graph, *id)
+            )))
+        }
         // A variable-length relationship variable surfaces as the list of
-        // relationship objects along the trail, matching `relationships(p)`.
+        // relationship display literals along the trail, matching
+        // `relationships(p)`.
         Some(GraphBinding::EdgeList(ids)) => {
             let mut arr = Vec::with_capacity(ids.len());
             for &eid in ids {
-                arr.push(get_edge_representation(graph, eid)?);
+                arr.push(unpack_sentinels(
+                    graph,
+                    get_edge_representation(graph, eid)?,
+                ));
             }
             Ok(serde_json::Value::Array(arr))
         }
     }
 }
 
-/// Materialize result records for `items` from projected rows: one
-/// `binding_to_value` read per cell, by each item's canonical projected key.
+/// Materializes result records for `items` from projected rows, performing one
+/// `binding_to_value` read per cell by each item's canonical projected key.
 /// The keys are derived once, not per row.
 pub(super) fn rows_to_records(
     graph: &Graph,
@@ -2957,7 +3033,7 @@ enum RowStream {
     /// the whole result and a trailing `LIMIT` cannot skip writes.
     WritePart {
         input: Box<RowStream>,
-        part: crate::ast::QueryPart,
+        part: Box<crate::ast::QueryPart>,
         out: Option<std::vec::IntoIter<SlotRow>>,
     },
 }
@@ -5624,6 +5700,71 @@ mod stream_join_tests {
             serde_json::json!("z"),
         ]];
         assert_eq!(sorted_rows(&rows), sorted_rows(&expected));
+    }
+
+    /// A hoisted comparison filter keeps the fusion: `c.z > 0` cannot raise,
+    /// so it may run above the closing probe, and only the cycle through the
+    /// positive-valued middle destination survives.
+    #[test]
+    fn expand_intersect_hoists_comparison_filter() {
+        let _fast_paths = crate::exec_mode::fast_paths_required();
+        let (_dir, graph) = setup();
+        exec(
+            &graph,
+            "CREATE (a:A), (b:B), (cok:C {z: 1}), (cbad:C {z: 0}) \
+             CREATE (a)-[:R]->(b), (b)-[:S]->(cok), (b)-[:S]->(cbad), \
+             (cok)-[:T]->(a), (cbad)-[:T]->(a)",
+        );
+        graph.rebuild_csr().unwrap();
+        let cypher = "MATCH (a:A)-[:R]->(b:B)-[:S]->(c:C)-[:T]->(a) \
+                      WHERE c.z > 0 RETURN count(*) AS n";
+        let rendered = plan_display(&graph, cypher);
+        assert!(
+            rendered.contains("ExpandIntersect"),
+            "a comparison filter must not forfeit the fusion:\n{rendered}"
+        );
+        let rows = run_rows(&graph, cypher);
+        assert_eq!(rows, vec![vec![serde_json::json!(1)]]);
+    }
+
+    /// A filter between the closing join and the middle hop whose predicate
+    /// can raise must not ride the fusion: the row pipeline evaluates it on
+    /// the wedge row the closing probe drops and raises on the zero divisor,
+    /// so the fast path must raise identically rather than silently succeed.
+    /// The fusion therefore declines and keeps the `MultiwayJoin` with the
+    /// filter in place.
+    #[test]
+    fn expand_intersect_declines_raising_filter() {
+        let (_dir, graph) = setup();
+        exec(
+            &graph,
+            "CREATE (a:A), (b:B), (cok:C {z: 1}), (cbad:C {z: 0}) \
+             CREATE (a)-[:R]->(b), (b)-[:S]->(cok), (b)-[:S]->(cbad), (cok)-[:T]->(a)",
+        );
+        graph.rebuild_csr().unwrap();
+        let cypher = "MATCH (a:A)-[:R]->(b:B)-[:S]->(c:C)-[:T]->(a) \
+                      WHERE 1 / c.z > 0 RETURN count(*) AS n";
+        let oracle = {
+            let _row_pipeline = crate::exec_mode::RowPipelineOnly::install();
+            super::execute(&graph, cypher, &HashMap::new())
+        };
+        let oracle_err = oracle
+            .expect_err("the row pipeline raises on the zero divisor")
+            .to_string();
+        assert!(oracle_err.contains("division by zero"), "got: {oracle_err}");
+        let fast = {
+            let _fast_paths = crate::exec_mode::fast_paths_required();
+            let rendered = plan_display(&graph, cypher);
+            assert!(
+                !rendered.contains("ExpandIntersect"),
+                "a raising filter must keep MultiwayJoin:\n{rendered}"
+            );
+            super::execute(&graph, cypher, &HashMap::new())
+        };
+        let fast_err = fast
+            .expect_err("the fast path must raise where the row pipeline raises")
+            .to_string();
+        assert_eq!(fast_err, oracle_err);
     }
 
     /// Shapes the fusion must not claim: an undirected closing hop keeps the

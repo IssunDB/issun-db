@@ -103,6 +103,7 @@ The REPL also supports direct operations and queries to manipulate nodes and edg
 | `components`          | Find weakly connected components in the graph.                                                     |
 | `degree`              | Compute degree centrality (e.g., `degree out`).                                                    |
 | `rebuild-csr`         | Rebuild the in-memory CSR snapshot cache.                                                          |
+| `materialize-columns` | Build the in-memory node and edge property columns and persist them beside the database.           |
 | `upsert-vec`          | Attach/upsert a vector embedding on a node (e.g., `upsert-vec 1 0.1 0.2 0.3`).                     |
 | `remove-vec`          | Remove the vector embedding from a node (e.g., `remove-vec 1`).                                    |
 | `vsearch`             | Query the vector index for k-nearest neighbors (e.g., `vsearch 5 0.1 0.2 0.3`).                    |
@@ -119,7 +120,7 @@ To use IssunDB as an embedded database in a Rust project, add the `issundb` libr
 
 ```toml
 [dependencies]
-issundb = "0.1.0-alpha.24"   # Update to match the latest version on Crates.io
+issundb = "0.1.0-alpha.26"   # Update to match the latest version on Crates.io
 serde_json = "1.0"           # This is used to construct property maps
 ```
 

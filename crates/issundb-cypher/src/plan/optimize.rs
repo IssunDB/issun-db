@@ -2102,51 +2102,41 @@ impl Optimizer {
                 items,
                 is_barrier,
             } => {
-                if *is_barrier {
-                    for (expr, alias) in items {
-                        let output_var = if let Some(a) = alias {
-                            a.clone()
-                        } else {
-                            match expr {
-                                Expr::Prop(var, prop) => {
-                                    if prop.is_empty() {
-                                        var.clone()
-                                    } else {
-                                        format!("{}.{}", var, prop)
-                                    }
-                                }
-                                Expr::Literal(lit) => lit.to_string(),
-                                Expr::Param(p) => format!("${}", p),
-                                Expr::CountStar => "count(*)".to_string(),
-                                Expr::Agg(_, _) => "agg".to_string(),
-                                _ => "expr".to_string(),
-                            }
-                        };
-                        vars.insert(output_var);
-                    }
-                } else {
+                // A `WITH *` item is the star sentinel, which carries every
+                // upstream variable through the barrier rather than binding a
+                // name of its own. Naming it (the old `_ => "expr"` fallback)
+                // replaced the barrier's whole bound set with a placeholder,
+                // so `join_common_vars` found no shared variables and a join
+                // above the barrier degraded to a cross product.
+                let has_star = items
+                    .iter()
+                    .any(|(expr, _)| crate::parser::is_star_expr(expr));
+                if !*is_barrier || has_star {
                     Self::collect_bound_vars(input, vars);
-                    for (expr, alias) in items {
-                        let output_var = if let Some(a) = alias {
-                            a.clone()
-                        } else {
-                            match expr {
-                                Expr::Prop(var, prop) => {
-                                    if prop.is_empty() {
-                                        var.clone()
-                                    } else {
-                                        format!("{}.{}", var, prop)
-                                    }
-                                }
-                                Expr::Literal(lit) => lit.to_string(),
-                                Expr::Param(p) => format!("${}", p),
-                                Expr::CountStar => "count(*)".to_string(),
-                                Expr::Agg(_, _) => "agg".to_string(),
-                                _ => "expr".to_string(),
-                            }
-                        };
-                        vars.insert(output_var);
+                }
+                for (expr, alias) in items {
+                    if crate::parser::is_star_expr(expr) {
+                        continue;
                     }
+                    let output_var = if let Some(a) = alias {
+                        a.clone()
+                    } else {
+                        match expr {
+                            Expr::Prop(var, prop) => {
+                                if prop.is_empty() {
+                                    var.clone()
+                                } else {
+                                    format!("{}.{}", var, prop)
+                                }
+                            }
+                            Expr::Literal(lit) => lit.to_string(),
+                            Expr::Param(p) => format!("${}", p),
+                            Expr::CountStar => "count(*)".to_string(),
+                            Expr::Agg(_, _) => "agg".to_string(),
+                            _ => "expr".to_string(),
+                        }
+                    };
+                    vars.insert(output_var);
                 }
             }
             PhysicalOperator::HashJoin { left, right } => {
@@ -2195,7 +2185,7 @@ impl Optimizer {
             PhysicalOperator::WritePart { input, part } => {
                 Self::collect_bound_vars(input, vars);
                 // Add variables from CREATE patterns so that downstream operators can reference them.
-                match part {
+                match part.as_ref() {
                     crate::ast::QueryPart::Create { patterns } => {
                         for p in patterns {
                             if let Some(ref v) = p.node.variable {
@@ -2398,6 +2388,75 @@ impl Optimizer {
                 inner.remove(accumulator);
                 inner.remove(variable);
                 vars.extend(inner);
+            }
+            // A pattern predicate introduces no bindings, so every named variable
+            // in it, and everything its inline property maps reference, is an
+            // outer reference. Collecting them all is what lets filter pushdown
+            // place the predicate below its lowest binder.
+            Expr::PatternPredicate { pattern } => {
+                if let Some(v) = &pattern.node.variable {
+                    vars.insert(v.clone());
+                }
+                if let Some(props) = &pattern.node.properties {
+                    for e in props.values() {
+                        Self::collect_expr_vars(e, vars);
+                    }
+                }
+                for (rel, node) in &pattern.rels {
+                    if let Some(v) = &rel.variable {
+                        vars.insert(v.clone());
+                    }
+                    if let Some(v) = &node.variable {
+                        vars.insert(v.clone());
+                    }
+                    if let Some(props) = &rel.properties {
+                        for e in props.values() {
+                            Self::collect_expr_vars(e, vars);
+                        }
+                    }
+                    if let Some(props) = &node.properties {
+                        for e in props.values() {
+                            Self::collect_expr_vars(e, vars);
+                        }
+                    }
+                }
+            }
+            // An existential subquery binds a pattern variable locally only when
+            // the outer scope does not already bind it, which this walker cannot
+            // know. Over-reporting is the safe direction for filter pushdown: a
+            // correlated variable keeps the filter above its binder, and a name
+            // bound nowhere leaves the filter wrapped above the root, where every
+            // correlated variable is in scope.
+            Expr::ExistsSubquery { pattern, predicate } => {
+                if let Some(v) = &pattern.node.variable {
+                    vars.insert(v.clone());
+                }
+                if let Some(props) = &pattern.node.properties {
+                    for e in props.values() {
+                        Self::collect_expr_vars(e, vars);
+                    }
+                }
+                for (rel, node) in &pattern.rels {
+                    if let Some(v) = &rel.variable {
+                        vars.insert(v.clone());
+                    }
+                    if let Some(v) = &node.variable {
+                        vars.insert(v.clone());
+                    }
+                    if let Some(props) = &rel.properties {
+                        for e in props.values() {
+                            Self::collect_expr_vars(e, vars);
+                        }
+                    }
+                    if let Some(props) = &node.properties {
+                        for e in props.values() {
+                            Self::collect_expr_vars(e, vars);
+                        }
+                    }
+                }
+                if let Some(p) = predicate {
+                    Self::collect_expr_vars(p, vars);
+                }
             }
             // The anchor node is an outer reference; the relationship, target-node, and
             // path variables are local bindings, so they are excluded.
@@ -3589,6 +3648,7 @@ fn rewrite_join_to_expand(op: PhysicalOperator) -> PhysicalOperator {
 /// bare `LabelScan(v)` whose `v` is the only variable shared with `driver`,
 /// return the chain grafted onto `driver`. Otherwise return the two operators
 /// unchanged so the caller can try the other orientation or keep the join.
+#[allow(clippy::result_large_err)]
 fn try_graft_join(
     driver: PhysicalOperator,
     chain: PhysicalOperator,
@@ -3838,7 +3898,11 @@ fn rewrite_closing_expands(op: PhysicalOperator) -> PhysicalOperator {
 /// Any run of `Filter` operators between the join and the expand is hoisted
 /// above the fused operator: a filter there references only variables that
 /// stay bound, and both it and the closing probe only drop rows, so the
-/// result multiset is unchanged. The rewrite requires a directed closing hop
+/// result multiset is unchanged. The error surface must be unchanged too, so
+/// only predicates that cannot raise may hoist (`filter_cannot_raise`): a
+/// predicate that raises on a wedge row the closing probe drops would raise
+/// on the row pipeline and silently succeed here, and the fusion declines
+/// rather than reorder that. The rewrite also requires a directed closing hop
 /// and a directed, single-hop, non-path-binding expand whose destination is
 /// the closing-source variable; every other shape keeps its `MultiwayJoin`,
 /// so correctness never depends on the fusion.
@@ -3870,6 +3934,18 @@ fn rewrite_expand_intersect(op: PhysicalOperator) -> PhysicalOperator {
                         expression,
                     })
             };
+            if !filters.iter().all(filter_cannot_raise) {
+                return PhysicalOperator::MultiwayJoin {
+                    input: Box::new(rebuild(cur, filters)),
+                    closing_src_var,
+                    closing_dst_var,
+                    closing_rel_type,
+                    closing_rel_var,
+                    closing_is_incoming,
+                    closing_is_undirected: false,
+                    closing_unique_rels,
+                };
+            }
             match cur {
                 PhysicalOperator::Expand {
                     input: mid_input,
@@ -3916,6 +3992,45 @@ fn rewrite_expand_intersect(op: PhysicalOperator) -> PhysicalOperator {
             }
         }
         other => other,
+    }
+}
+
+/// True when evaluating `expression` can never raise a runtime error, so
+/// `rewrite_expand_intersect` may hoist it above the closing probe. The
+/// admitted shapes mirror `vec_stage` in `exec/vectorized.rs` exactly: a
+/// `HasLabel` test, and a comparison (in either the named-variant or the
+/// `Expr(BinaryOp)` form) whose operands are bare property reads, literals,
+/// or parameters. Anything else, arithmetic, division, and function calls
+/// included, is presumed able to raise.
+fn filter_cannot_raise(expression: &FilterExpr) -> bool {
+    fn operand_cannot_raise(expr: &Expr) -> bool {
+        match expr {
+            Expr::Prop(_, prop) => !prop.is_empty(),
+            Expr::Literal(_) | Expr::Param(_) => true,
+            _ => false,
+        }
+    }
+    match expression {
+        FilterExpr::HasLabel(_, _) => true,
+        FilterExpr::Eq(l, r)
+        | FilterExpr::Ne(l, r)
+        | FilterExpr::Lt(l, r)
+        | FilterExpr::Gt(l, r)
+        | FilterExpr::Le(l, r)
+        | FilterExpr::Ge(l, r) => operand_cannot_raise(l) && operand_cannot_raise(r),
+        FilterExpr::Expr(Expr::BinaryOp { op, left, right }) => {
+            matches!(
+                op,
+                BinaryOperator::Eq
+                    | BinaryOperator::Ne
+                    | BinaryOperator::Lt
+                    | BinaryOperator::Gt
+                    | BinaryOperator::Le
+                    | BinaryOperator::Ge
+            ) && operand_cannot_raise(left)
+                && operand_cannot_raise(right)
+        }
+        FilterExpr::Expr(_) => false,
     }
 }
 
@@ -4237,7 +4352,7 @@ fn match_forward_expand(op: &PhysicalOperator) -> Option<ForwardExpand<'_>> {
 fn count_arg_is_nonnull(expr: &Expr, vars: &[&String]) -> bool {
     match expr {
         Expr::CountStar => true,
-        Expr::Prop(v, p) if p.is_empty() => vars.iter().any(|x| *x == v),
+        Expr::Prop(v, p) if p.is_empty() => vars.contains(&v),
         _ => false,
     }
 }
@@ -5572,7 +5687,7 @@ mod tests {
         // The same impossible pattern under a write part must NOT be pruned.
         let writing_plan = PhysicalOperator::WritePart {
             input: Box::new(impossible()),
-            part: crate::ast::QueryPart::Create { patterns: vec![] },
+            part: Box::new(crate::ast::QueryPart::Create { patterns: vec![] }),
         };
         let optimized = Optimizer::optimize(writing_plan, Some(&SchemaStats));
         let plan_text = crate::plan::physical::format_physical_plan(&optimized, 0);
@@ -6575,6 +6690,103 @@ mod tests {
         assert!(
             contains_hashjoin(&rewritten),
             "an OPTIONAL MATCH join must be preserved: {rewritten:?}"
+        );
+    }
+
+    /// A barrier `WITH *` carries every upstream variable through, so the
+    /// bound set of the barrier Project must be the input's bound set, not the
+    /// placeholder name of the star sentinel. Losing it made `join_common_vars`
+    /// find no shared variables and degraded the join to a cross product.
+    #[test]
+    fn with_star_barrier_keeps_upstream_bound_vars() {
+        let star = Expr::FunctionCall {
+            name: "__star__".to_string(),
+            args: vec![],
+        };
+        let input = PhysicalOperator::HashJoin {
+            left: Box::new(scan("a", Some("A"))),
+            right: Box::new(scan("b", Some("B"))),
+        };
+        let project = PhysicalOperator::Project {
+            input: Box::new(input),
+            items: vec![(star, None)],
+            is_barrier: true,
+        };
+        let bound = Optimizer::bound_vars(&project);
+        assert!(bound.contains("a"), "bound set lost `a`: {bound:?}");
+        assert!(bound.contains("b"), "bound set lost `b`: {bound:?}");
+        assert!(
+            !bound.contains("expr"),
+            "the star sentinel must not bind a placeholder: {bound:?}"
+        );
+    }
+
+    /// `WITH *, a AS c` binds the upstream variables and the new alias. The
+    /// parser expands the mixed form, but the collector must not depend on
+    /// that.
+    #[test]
+    fn with_star_barrier_keeps_explicit_aliases_too() {
+        let star = Expr::FunctionCall {
+            name: "__star__".to_string(),
+            args: vec![],
+        };
+        let input = PhysicalOperator::HashJoin {
+            left: Box::new(scan("a", Some("A"))),
+            right: Box::new(scan("b", Some("B"))),
+        };
+        let project = PhysicalOperator::Project {
+            input: Box::new(input),
+            items: vec![
+                (star, None),
+                (
+                    Expr::Prop("a".to_string(), String::new()),
+                    Some("c".to_string()),
+                ),
+            ],
+            is_barrier: true,
+        };
+        let bound = Optimizer::bound_vars(&project);
+        for var in ["a", "b", "c"] {
+            assert!(bound.contains(var), "bound set lost `{var}`: {bound:?}");
+        }
+    }
+
+    /// End-to-end repro: an OPTIONAL MATCH after `WITH *` must equi-join on the
+    /// shared variables. With the star sentinel collapsing the barrier's bound
+    /// set to a placeholder, the join found no common variables and returned
+    /// the cross product (4 rows) instead of the 2 matching pairs.
+    #[test]
+    fn optional_match_after_with_star_joins_on_shared_vars() {
+        use issundb_core::Graph;
+        let dir = tempfile::TempDir::new().unwrap();
+        let graph = Graph::open(dir.path(), 1).unwrap();
+        let a1 = graph.add_node("A", &serde_json::json!({})).unwrap();
+        let a2 = graph.add_node("A", &serde_json::json!({})).unwrap();
+        let b1 = graph.add_node("B", &serde_json::json!({})).unwrap();
+        graph.add_edge(a1, b1, "T", &serde_json::json!({})).unwrap();
+        graph.add_edge(a2, b1, "T", &serde_json::json!({})).unwrap();
+
+        let count = |q: &str| {
+            let result = crate::exec::execute(&graph, q, &HashMap::new()).unwrap();
+            result.records[0].values[0].as_i64().unwrap()
+        };
+        assert_eq!(
+            count("MATCH (a:A) MATCH (b:B) WITH a, b OPTIONAL MATCH (a)-[:T]->(b) RETURN count(*)"),
+            2,
+            "explicit WITH control"
+        );
+        assert_eq!(
+            count("MATCH (a:A) MATCH (b:B) WITH * OPTIONAL MATCH (a)-[:T]->(b) RETURN count(*)"),
+            2,
+            "WITH * must join on a and b, not cross-product"
+        );
+        assert_eq!(
+            count(
+                "MATCH (a:A) MATCH (b:B) WITH *, a AS c \
+                 OPTIONAL MATCH (c)-[:T]->(b) RETURN count(*)"
+            ),
+            2,
+            "WITH *, a AS c must keep the upstream variables and bind c"
         );
     }
 }

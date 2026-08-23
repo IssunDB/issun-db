@@ -32,6 +32,17 @@ def test_query_aggregation(db):
     assert rows(result) == [[2]]
 
 
+def test_whole_entity_projection_is_a_display_literal(db):
+    """Pins the result contract: a whole node or relationship projects as an
+    openCypher display-literal string, not a property map. Changing this shape
+    is an API break for every consumer of query()."""
+    db.query("CREATE (:Person {name: 'Ada'})-[:KNOWS {since: 2020}]->(:Person {name: 'Bob'})")
+    nodes = json.loads(db.query("MATCH (n:Person {name: 'Ada'}) RETURN n"))
+    assert rows(nodes) == [["(:Person {name: 'Ada'})"]]
+    rels = json.loads(db.query("MATCH ()-[r:KNOWS]->() RETURN r"))
+    assert rows(rels) == [["[:KNOWS {since: 2020}]"]]
+
+
 def test_explain_returns_plan_text(db):
     plan = db.explain("MATCH (n:Person) RETURN n.name")
     assert isinstance(plan, str)

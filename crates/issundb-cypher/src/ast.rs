@@ -71,6 +71,7 @@ pub struct SortItem {
 }
 
 /// A clause/part in a sequential Cypher query sequence.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum QueryPart {
     Match {
@@ -323,6 +324,27 @@ pub enum Expr {
         predicate: Option<Box<Expr>>,
         transform: Box<Expr>,
     },
+    /// A relationship pattern used as a boolean predicate, for example
+    /// `WHERE (n)-[:T]->()`. The value is true when at least one assignment
+    /// of the pattern exists, under the usual relationship-uniqueness rule.
+    /// The pattern introduces no bindings: every named variable in it must
+    /// already be bound in the enclosing scope, and it is only legal inside a
+    /// WHERE clause.
+    PatternPredicate {
+        pattern: Box<Pattern>,
+    },
+    /// `EXISTS { ... }`: an existential subquery, true when at least one
+    /// assignment of the pattern satisfies the predicate. The body is either
+    /// the simple form (`EXISTS { (n)-->(m) [WHERE pred] }`) or the full form
+    /// (`EXISTS { MATCH (n)-->(m) [WHERE pred] RETURN expr }`); the parser
+    /// discards the projection because existence does not depend on it.
+    /// Unlike a pattern predicate, the pattern does introduce bindings: a
+    /// variable the outer scope does not bind is local to the subquery, and
+    /// one it does bind is a correlated reference.
+    ExistsSubquery {
+        pattern: Box<Pattern>,
+        predicate: Option<Box<Expr>>,
+    },
     /// `reduce(accumulator = initial, variable IN list | expression)`
     Reduce {
         accumulator: String,
@@ -452,13 +474,23 @@ pub enum SetItem {
         variable: String,
         labels: Vec<String>,
     },
+    /// `SET n = expr` (replace the whole property record) or `SET n += expr`
+    /// (merge into it). The expression must evaluate to a map or to a bound
+    /// node or relationship, whose properties are copied.
+    AllProperties {
+        variable: String,
+        expr: Expr,
+        merge: bool,
+    },
 }
 
 impl SetItem {
     /// The variable this item updates.
     pub fn variable(&self) -> &str {
         match self {
-            SetItem::Property { variable, .. } | SetItem::Labels { variable, .. } => variable,
+            SetItem::Property { variable, .. }
+            | SetItem::Labels { variable, .. }
+            | SetItem::AllProperties { variable, .. } => variable,
         }
     }
 }

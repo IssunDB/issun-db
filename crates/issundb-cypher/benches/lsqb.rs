@@ -271,7 +271,6 @@ fn bench_lsqb(c: &mut Criterion) {
          RETURN count(*)",
     );
 
-    drop(run);
     c.bench_function("lsqb_q7", |b| {
         b.iter(|| {
             std::hint::black_box(execute(&g, std::hint::black_box(Q7_QUERY), &params).unwrap())

@@ -25,13 +25,13 @@ pub enum LogicalOperator {
         expr: Expr,
         variable: String,
     },
-    /// Scan nodes by label: binds `variable` to nodes matching `label`.
+    /// Scans nodes by label, binding `variable` to nodes matching `label`.
     LabelScan {
         variable: String,
         label: Option<String>,
     },
-    /// Expand relationships: starts from `src_var`, traverses relationship `rel_type`
-    /// in direction `is_incoming` up to range bounds, and binds relationship to `rel_var`
+    /// Expands relationships starting from `src_var`, traversing relationship `rel_type`
+    /// in direction `is_incoming` up to range bounds, and binding relationship to `rel_var`
     /// and target to `dst_var`.
     Expand {
         input: Box<LogicalOperator>,
@@ -40,13 +40,13 @@ pub enum LogicalOperator {
         dst_var: String,
         rel_type: Option<String>,
         is_incoming: bool,
-        /// When true the relationship has no direction: traverse both outgoing and
-        /// incoming edges and deduplicate results.
+        /// When true the relationship has no direction, traversing both outgoing and
+        /// incoming edges and deduplicating results.
         is_undirected: bool,
         min_hops: usize,
         max_hops: usize,
         /// Relationship variables bound by earlier hops of the same pattern.
-        /// openCypher relationship uniqueness: this hop must not bind a
+        /// Under openCypher relationship uniqueness, this hop must not bind a
         /// relationship already bound to one of these variables. Uniqueness is
         /// scoped to a single pattern, so separate MATCH clauses may reuse a relationship.
         unique_rels: Vec<String>,
@@ -117,7 +117,7 @@ pub enum LogicalOperator {
     /// for each row produced by the input plan; new bindings are added to the PathMap.
     WritePart {
         input: Box<LogicalOperator>,
-        part: crate::ast::QueryPart,
+        part: Box<crate::ast::QueryPart>,
     },
     /// A resolved `CALL` clause. For each input row the operator emits one output
     /// row per entry in `rows`, binding `output_vars` to the corresponding cells.
@@ -518,7 +518,7 @@ impl LogicalPlanner {
                         let p = current_plan.unwrap_or(LogicalOperator::SingleRow);
                         current_plan = Some(LogicalOperator::WritePart {
                             input: Box::new(p),
-                            part: write_part.clone(),
+                            part: Box::new(write_part.clone()),
                         });
                     }
                 }
@@ -1106,10 +1106,11 @@ fn extract_and_replace_aggs(
 
 fn collect_ord_aggs(expr: &Expr, set: &mut std::collections::HashSet<String>) {
     match expr {
-        Expr::Prop(col, prop) => {
-            if (col.starts_with("_ord_agg_") || col.starts_with("_ret_agg_")) && prop.is_empty() {
-                set.insert(col.clone());
-            }
+        Expr::Prop(col, prop)
+            if (col.starts_with("_ord_agg_") || col.starts_with("_ret_agg_"))
+                && prop.is_empty() =>
+        {
+            set.insert(col.clone());
         }
         Expr::BinaryOp { left, right, .. } => {
             collect_ord_aggs(left, set);
@@ -1282,6 +1283,16 @@ fn rewrite_expr_with_aliases(expr: &mut Expr, projections: &[(Expr, String)]) {
                 rewrite_expr_with_aliases(p, projections);
             }
             rewrite_expr_with_aliases(transform, projections);
+        }
+        // A pattern predicate names graph variables directly; like a pattern
+        // comprehension's pattern, those names are not alias positions.
+        Expr::PatternPredicate { .. } => {}
+        // An existential subquery's pattern names graph variables directly;
+        // only its WHERE clause holds expressions an alias can appear in.
+        Expr::ExistsSubquery { predicate, .. } => {
+            if let Some(p) = predicate {
+                rewrite_expr_with_aliases(p, projections);
+            }
         }
         Expr::HasLabel { .. } => {}
     }

@@ -46,7 +46,7 @@ Any mismatch fails the run and prints the first differing row.
 This corpus is deliberately separate from the timed workload. That workload is shaped for measurement, so most of its queries return a single
 `count(...)`, and a scalar count is a weak differential signal: it cannot see wrong row content, wrong column names, wrong row multiplicity, or two
 errors that cancel. The differential corpus returns the rows themselves, and covers projections over a bounded slice of the label scan, range and
-string predicates, disjunction and negation, one hop in both directions, two fixed hops with and without `DISTINCT`, expand-into,
+string predicates, disjunction, and negation, one hop in both directions, two fixed hops with and without `DISTINCT`, expand-into,
 and grouped aggregation (which emits one row per group, so a wrong group key or per-group tally is visible where a single total would hide it).
 
 Two invariants keep it cheap to extend, and a unit test pins both:
@@ -128,6 +128,7 @@ thread.
 
 - Loading data differs structurally for the two databases. LadybugDB bulk-loads via `COPY FROM` CSV; IssunDB inserts per record through `add_node` and
   `add_edge`. Both are timed and reported, but they measure different ingestion models.
-- LadybugDB defaults to WALK semantics for variable-length patterns (a relationship may repeat within a path); the harness pins
-  `recursive_pattern_semantic = 'TRAIL'` so both databases use the openCypher path semantics on identical query strings.
+- LadybugDB evaluates WALK semantics for relationship patterns (a relationship may repeat within a match), and its
+  `recursive_pattern_semantic = 'TRAIL'` setting is inert in the pinned build. The harness compensates with the trail oracle
+  in the differential pass so walk-versus-trail divergences are attributed rather than treated as IssunDB failures.
 - `rebuild_csr` runs once after the IssunDB load so queries start from a fresh snapshot, matching steady-state operation.

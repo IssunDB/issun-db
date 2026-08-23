@@ -346,6 +346,23 @@ async fn cypher_query_returns_columns_and_records() {
 }
 
 #[tokio::test]
+async fn whole_entity_projection_is_a_display_literal() {
+    // Pins the result contract: a whole node projects as an openCypher
+    // display-literal string, not a property map. Changing this shape is an
+    // API break for every consumer of /v1/query.
+    let (graph, _dir) = fresh_graph();
+    create_node(&graph, "Person", json!({ "name": "Ada" })).await;
+
+    let (status, body) = send(
+        &graph,
+        post("/v1/query", json!({ "query": "MATCH (n:Person) RETURN n" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "query body: {body}");
+    assert_eq!(body["records"], json!([["(:Person {name: 'Ada'})"]]));
+}
+
+#[tokio::test]
 async fn cypher_query_with_params() {
     let (graph, _dir) = fresh_graph();
     create_node(&graph, "Person", json!({ "name": "Ada" })).await;
@@ -503,6 +520,42 @@ async fn upsert_vector_empty_is_bad_request() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"].is_string());
+}
+
+#[tokio::test]
+async fn upsert_vector_for_missing_node_is_bad_request() {
+    let (graph, _dir) = fresh_graph();
+    let (status, body) = send(
+        &graph,
+        post(
+            "/v1/vectors",
+            json!({ "id": 999, "vector": [1.0, 0.0, 0.0] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "upsert body: {body}");
+    assert!(body["error"].is_string());
+}
+
+#[tokio::test]
+async fn upsert_vector_with_wrong_dimension_is_bad_request() {
+    let (graph, _dir) = fresh_graph();
+    let a = create_node(&graph, "Doc", json!({})).await;
+    let b = create_node(&graph, "Doc", json!({})).await;
+    let (status, _body) = send(
+        &graph,
+        post("/v1/vectors", json!({ "id": a, "vector": [1.0, 0.0, 0.0] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = send(
+        &graph,
+        post("/v1/vectors", json!({ "id": b, "vector": [1.0, 0.0] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "upsert body: {body}");
     assert!(body["error"].is_string());
 }
 
