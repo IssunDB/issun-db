@@ -132,6 +132,17 @@ It is built at the smallest size its consumers read, and the build is memory-sha
 Rebuilds happen on demand through the freshness gates below; the background rebuild after `REBUILD_THRESHOLD` writes is a compaction safety net, not
 the freshness path.
 
+A refresh patches before it rebuilds. Every committing mutator hands `commit_and_publish` a `CsrChange` (the added nodes and edges with their
+endpoints and type, an `edges_updated` flag, or `full` for any removal), which `CsrCache::record_change` tags with the write generation *before* the
+advance and appends to a pending list; the tag is what lets an install drop the batches a snapshot built at generation `B` already contains (every
+batch tagged below `B`) and keep the rest. `Graph::refresh_snapshot_locked` then applies the pending additions to the installed snapshot through
+`CsrSnapshot::with_additions`, one pass over the arrays plus the transpose and no adjacency read, and builds from storage only when a batch is `full`,
+when an edge update meets a snapshot carrying weights, when the installed snapshot is the unbuilt placeholder, or when the pending edges outgrew
+`INCREMENTAL_MAX_EDGES`. Three rules keep this sound, and the proptest `incremental_refresh_matches_a_full_build_over_a_random_history` pins all of
+them against a build from storage after every refresh: a change is recorded before the generation advances, so a refresh that reads the counter finds
+every batch the counter accounts for; a patched row keeps ascending edge-id order (appended ids are normally larger, and a row is re-sorted otherwise);
+and a node id that does not sort after every existing one declines the patch, because dense indices are the rank of ascending node ids.
+
 A full build first tries the on-disk cache file (`cache_file.rs`, `lmdb` feature only): `build_snapshot` loads the flat arrays sequentially when the file
 carries this database's identity (`Storage::db_id`, a random 128-bit value persisted in `meta` on first open) and its persisted commit generation
 (`storage/ids.rs`, `commit_gen`, advanced inside every mutating transaction through `commit_and_publish`) matches storage, and falls through to the scan

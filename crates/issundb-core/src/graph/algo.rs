@@ -1177,7 +1177,7 @@ impl Graph {
 
     /// [`Graph::with_snapshot`] for the one consumer that reads per-edge weights,
     /// so the snapshot it receives is guaranteed to carry them.
-    pub(in crate::graph) fn with_weighted_snapshot<T>(
+    pub(crate) fn with_weighted_snapshot<T>(
         &self,
         f: impl FnOnce(&CsrSnapshot) -> Result<T, Error>,
     ) -> Result<T, Error> {
@@ -1225,8 +1225,47 @@ impl Graph {
                 return Ok(installed);
             }
         }
+        self.refresh_snapshot_locked(true)
+    }
+
+    /// Bring the snapshot up to the committed generation, with the maintenance
+    /// lock held by the caller, and return what was installed.
+    ///
+    /// The installed snapshot is patched with the recorded additions when every
+    /// pending change is an addition and the snapshot is a built one (carrying
+    /// weights when `want_weights`); see [`CsrSnapshot::with_additions`]. That is
+    /// the common refresh after an interleaved write, and it reads no adjacency.
+    /// Anything else, a removal, an edge update against weights, the unbuilt
+    /// placeholder, or a pending list that outgrew `INCREMENTAL_MAX_EDGES`, builds
+    /// from storage as before.
+    ///
+    /// The generation is read before the pending changes are drained, so a batch
+    /// recorded in between is applied one generation early (its commit has
+    /// already landed) and the snapshot stays conservatively stale at `built_gen`.
+    fn refresh_snapshot_locked(&self, want_weights: bool) -> Result<Arc<CsrSnapshot>, Error> {
         let built_gen = self.csr_cache.current_gen();
-        let snap = Arc::new(CsrSnapshot::build_weighted(&self.storage)?);
+        if self.csr_cache.snapshot_gen() > 0 {
+            let installed = self.csr_cache.snapshot.load_full();
+            if !want_weights || installed.edge_weight.is_some() {
+                if let Some((change, applied)) = self.csr_cache.pending_applicable() {
+                    let rtxn = self.storage.env.read_txn()?;
+                    let patched = installed.with_additions(&change, |eid| {
+                        CsrSnapshot::weight_of_edge(&self.storage, &rtxn, eid)
+                    })?;
+                    if let Some(snap) = patched {
+                        let snap = Arc::new(snap);
+                        self.csr_cache
+                            .install_incremental(Arc::clone(&snap), built_gen, applied);
+                        return Ok(snap);
+                    }
+                }
+            }
+        }
+        #[cfg(test)]
+        self.csr_cache
+            .full_builds
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let snap = Arc::new(self.build_snapshot()?);
         self.csr_cache
             .install_snapshot_shared(Arc::clone(&snap), built_gen);
         Ok(snap)
@@ -1248,9 +1287,7 @@ impl Graph {
         let _maint = self.csr_cache.maintenance.lock();
         // Re-check under the lock in case another pass already refreshed.
         if self.csr_cache.snapshot_is_stale() {
-            let built_gen = self.csr_cache.current_gen();
-            let snap = self.build_snapshot()?;
-            self.csr_cache.install_snapshot(snap, built_gen);
+            self.refresh_snapshot_locked(false)?;
         }
         Ok(())
     }
@@ -1381,6 +1418,10 @@ impl Graph {
             // the build leave the snapshot stale until the next pass, which the
             // dirty-count loop already drives.
             let built_gen = cache.current_gen();
+            #[cfg(test)]
+            cache
+                .full_builds
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let built = if cache.wants_weights() {
                 CsrSnapshot::build_weighted(storage)
             } else {

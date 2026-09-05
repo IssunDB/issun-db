@@ -331,8 +331,7 @@ impl<'a> WriteTxn<'a> {
         self.graph.delete_node_impl(&mut self.wtxn, id)?;
         self.mutations_count += 1;
         // A node deletion cascades to every incident edge, so the property columns
-        // rebuild rather than patch. The CSR snapshot needs no flag: it is rebuilt
-        // whole, and the committed-write generation is what marks it stale.
+        // and the CSR snapshot rebuild rather than patch.
         self.delta.force_full = true;
         Ok(())
     }
@@ -352,11 +351,16 @@ impl<'a> WriteTxn<'a> {
         etype: &str,
         props: &impl Serialize,
     ) -> Result<EdgeId, Error> {
-        let edge_id =
+        let (edge_id, edge_type) =
             self.graph
                 .add_edge_cached(&mut self.wtxn, &mut self.cache, src, dst, etype, props)?;
         self.mutations_count += 1;
-        self.delta.added_edge_ids.push(edge_id);
+        self.delta.added_edges.push(crate::csr::AddedEdge {
+            src,
+            dst,
+            edge_type,
+            edge_id,
+        });
         Ok(edge_id)
     }
 

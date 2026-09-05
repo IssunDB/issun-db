@@ -1359,12 +1359,23 @@ impl Graph {
                 // the caches claim to be current while LMDB already holds this
                 // write is one atomic increment wide rather than the width of
                 // the batch. See `CsrCache::advance_write_gen`.
-                self.commit_and_publish(wtxn, mutations_count)?;
+                let change = if delta.force_full || delta.removed_edge {
+                    crate::csr::CsrChange::full()
+                } else {
+                    crate::csr::CsrChange {
+                        added_nodes: delta.added_nodes.clone(),
+                        added_edges: delta.added_edges.clone(),
+                        edges_updated: !delta.updated_edges.is_empty(),
+                        full: false,
+                    }
+                };
+                self.commit_and_publish(wtxn, mutations_count, change)?;
                 #[cfg(test)]
                 TestHooks::fire(&self.test_hooks.after_commit_before_column_bookkeeping);
-                // Column bookkeeping next. The CSR snapshot needs nothing here: the
-                // generation bump above is what tells a reader its snapshot lags, and
-                // the refresh rebuilds from storage rather than from a delta.
+                // Column bookkeeping next. The CSR snapshot got its record inside
+                // `commit_and_publish`; the generation bump there is what tells a
+                // reader its snapshot lags, and the refresh either patches from
+                // the record or rebuilds from storage.
                 //
                 // The columns are still a window: for as long as this bookkeeping
                 // takes, a reader can see committed data through a column set that
@@ -1385,7 +1396,9 @@ impl Graph {
                 if delta.force_full || delta.removed_edge {
                     self.edge_columns.record_force_full();
                 } else {
-                    self.edge_columns.record_touched_many(&delta.added_edge_ids);
+                    let added_ids: Vec<EdgeId> =
+                        delta.added_edges.iter().map(|e| e.edge_id).collect();
+                    self.edge_columns.record_touched_many(&added_ids);
                     self.edge_columns.record_touched_many(&delta.updated_edges);
                 }
                 if mutations_count > 0 {
@@ -1420,6 +1433,7 @@ impl Graph {
         &self,
         mut wtxn: crate::storage::RwTxn<'_>,
         count: usize,
+        change: crate::csr::CsrChange,
     ) -> Result<(), Error> {
         // The persisted generation advances inside the transaction, so it is
         // atomic with the mutations it describes; it is what lets a later
@@ -1430,6 +1444,12 @@ impl Graph {
             crate::storage::ids::bump_commit_gen(&self.storage, &mut wtxn)?;
         }
         wtxn.commit()?;
+        // The one piece of bookkeeping that precedes the generation advance: the
+        // incremental refresh reads the counter and then drains the recorded
+        // changes, so a change the counter accounts for must already be recorded.
+        // See `CsrCache::record_change`. The cost is one mutex acquisition and a
+        // move of the change's vectors.
+        self.csr_cache.record_change(change);
         self.csr_cache.advance_write_gen(count as u64);
         Ok(())
     }
@@ -1476,6 +1496,10 @@ impl Graph {
         // Always the full scan, never the cache-file load: this method is the
         // file's save site, so serving the file here would write back whatever
         // it already claimed and a wrong file could never be repaired.
+        #[cfg(test)]
+        self.csr_cache
+            .full_builds
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let snap = self.build_snapshot_from_storage()?;
         // This is the one save site, chosen because every bulk load ends here:
         // the freshness gate's per-write refreshes must not pay a file write per

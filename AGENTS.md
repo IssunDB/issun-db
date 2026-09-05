@@ -252,7 +252,10 @@ second copy of both, so the same rule was stated in three places and the copies 
   scan that compares the stored value directly, so results stay correct. Long text belongs in a full-text index, not a property index.
 - The CSR snapshot backs the graph algorithms, pattern matching, and multi-source expansion. It is kept fresh on demand rather than by a periodic
   rebuild, through one gate: `Graph::ensure_snapshot_fresh`, reached by `Graph::with_snapshot`. Every algorithm kernel reads the snapshot and nothing
-  else, so there is one freshness condition, the installed `snapshot_gen` against the committed `write_gen`.
+  else, so there is one freshness condition, the installed `snapshot_gen` against the committed `write_gen`. A refresh after additions patches the
+  installed snapshot from the changes each commit recorded (`CsrChange`, `CsrSnapshot::with_additions`) instead of scanning the adjacency; a removal, an
+  edge update against a weighted snapshot, or a pending list past `INCREMENTAL_MAX_EDGES` builds from storage. The rules are in the crate guide under
+  "CSR Snapshot Vs. LMDB Adjacency".
     - `Graph::open` builds nothing: it installs an empty snapshot through `CsrCache::new_unbuilt`, so the gate does the first build when a consumer that
       needs one runs. A workload of point lookups, property reads, or small typed expansions never builds it, because those paths read LMDB directly.
       The unbuilt cache starts `write_gen` at 1 with `snapshot_gen` at 0 so it reports stale; a placeholder that claimed to be current would make typed
