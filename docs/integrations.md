@@ -18,6 +18,8 @@ cargo run -p issundb-rest -- --db-path /path/to/db-dir [--host 127.0.0.1] [--por
 
 The server also accepts `--map-size-gb` to set the LMDB map size (default 4). Each flag falls back to an environment variable when omitted: `ISSUNDB_DB_PATH` for the database path, `ISSUNDB_REST_HOST` for the listen address (default `127.0.0.1`), and `ISSUNDB_REST_PORT` for the port (default 7474). The server binds without TLS or authentication by design; run it behind a reverse proxy that terminates TLS and enforces access control.
 
+On startup the server builds the query optimizer's edge statistics on a background thread, so readiness is not delayed and queries issued during the scan plan on the global average fan-out until it finishes. Pass `--no-warm-statistics` (or set `ISSUNDB_NO_WARM_STATISTICS=1`) to skip that scan.
+
 ### Endpoint Reference
 
 All data and query endpoints are prefixed with `/v1`.
@@ -32,6 +34,7 @@ All data and query endpoints are prefixed with `/v1`.
         "props": { "name": "Alice", "age": 30 }
       }
       ```
+    * A multi-label node passes `"labels": ["Person", "Admin"]` instead of `label`; `props` defaults to an empty object.
     * Response: Returns the generated `NodeId` wrapped in a JSON object, e.g., `{"id": 1}`.
 * Create many nodes: `POST /v1/nodes/batch`
     * Request body:
@@ -47,7 +50,7 @@ All data and query endpoints are prefixed with `/v1`.
     * A single-record insert costs one durable commit, so inserting a batch one request at a time is bound by commit latency rather than by the
       work. The whole batch is written under one transaction, which is also all-or-nothing: any failure rolls back every node in the request.
 * Get node: `GET /v1/nodes/{id}`
-    * Response: A JSON object containing the node's unique ID, labels, and properties.
+    * Response: A JSON object with `id`, `label` (the first label), `labels` (all of them), and `props`.
 * Update node: `PUT /v1/nodes/{id}`
     * Request body:
       ```json
@@ -214,7 +217,7 @@ For remote connections, serve over streamable HTTP:
 cargo run -p issundb-mcp -- --db-path /path/to/db-dir --transport http --bind 127.0.0.1:8000
 ```
 
-The endpoint is mounted at the path given by `--http-path` (default `/mcp`). Like the REST server, the process accepts `--map-size-gb` (default 4), and the flags fall back to environment variables when omitted: `ISSUNDB_DB_PATH`, `ISSUNDB_MCP_TRANSPORT`, and `ISSUNDB_MCP_BIND`.
+The endpoint is mounted at the path given by `--http-path` (default `/mcp`). Like the REST server, the process accepts `--map-size-gb` (default 4), and the flags fall back to environment variables when omitted: `ISSUNDB_DB_PATH`, `ISSUNDB_MCP_TRANSPORT`, and `ISSUNDB_MCP_BIND`. It also warms the optimizer's edge statistics on a background thread at startup, and `--no-warm-statistics` (or `ISSUNDB_NO_WARM_STATISTICS=1`) skips that scan.
 
 The HTTP transport validates the `Host` header to block DNS rebinding attacks. The loopback names (`localhost`, `127.0.0.1`, and `::1`) and the `--bind` host are always accepted; a request with a missing or unknown `Host` receives `403 Forbidden`. When the server sits behind a reverse proxy, repeat `--allowed-host` for each public hostname the proxy forwards:
 
