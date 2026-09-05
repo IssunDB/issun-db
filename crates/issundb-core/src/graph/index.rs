@@ -137,15 +137,18 @@ impl Graph {
                 None => return Ok(vec![]),
             }
         };
-        let prefix = type_id.to_be_bytes();
-        let iter = self.storage.type_idx.prefix_iter(rtxn, &prefix)?;
+        // One pass over `edges`, which iterates in ascending edge id: the same
+        // order the dedicated type index used to give, without the 12 bytes per
+        // edge that index cost. A typed scan is a whole-type read, so the pass is
+        // proportionate to what it returns; the counting kernels and the Cypher
+        // executor never take this path (they read the CSR snapshot).
         let mut ids = Vec::new();
-        for result in iter {
-            let (key, _) = result?;
-            let id_bytes: [u8; 8] = key[4..]
-                .try_into()
-                .map_err(|_| Error::Corrupt("type_idx key has wrong length"))?;
-            ids.push(u64::from_be_bytes(id_bytes));
+        for result in self.storage.edges.iter(rtxn)? {
+            let (id, bytes) = result?;
+            let record: EdgeRecord = crate::storage::props::decode(bytes)?;
+            if record.edge_type == type_id {
+                ids.push(id);
+            }
         }
         Ok(ids)
     }

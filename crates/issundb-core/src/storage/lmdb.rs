@@ -14,8 +14,8 @@ use crate::error::Error;
 /// one raw `AdjEntry` (20 bytes). A single `put` adds one entry in O(log n);
 /// no read-modify-write of a blob is needed.
 ///
-/// `label_idx` and `type_idx` use composite keys `(u32 BE, u64 BE)` = 12 bytes
-/// for prefix-range scans by label or edge type.
+/// `label_idx` uses composite keys `(u32 BE, u64 BE)` = 12 bytes
+/// for prefix-range scans by label.
 pub struct Storage {
     pub env: Env,
 
@@ -29,7 +29,6 @@ pub struct Storage {
 
     // Secondary indexes: composite key (u32 BE, u64 BE) → ()
     pub label_idx: Database<Bytes, Unit>, // (LabelId, NodeId) → ()
-    pub type_idx: Database<Bytes, Unit>,  // (TypeId, EdgeId) → ()
 
     // Property indexes
     pub node_prop_idx: Database<Bytes, Unit>,
@@ -76,7 +75,6 @@ impl Storage {
             stat("out_adj", &self.out_adj, rtxn)?,
             stat("in_adj", &self.in_adj, rtxn)?,
             stat("label_idx", &self.label_idx, rtxn)?,
-            stat("type_idx", &self.type_idx, rtxn)?,
             stat("node_prop_idx", &self.node_prop_idx, rtxn)?,
             stat("edge_prop_idx", &self.edge_prop_idx, rtxn)?,
             stat("fts_postings", &self.fts_postings, rtxn)?,
@@ -165,7 +163,7 @@ impl Storage {
         let env = unsafe {
             EnvOpenOptions::new()
                 .map_size(map_size_gb * 1024 * 1024 * 1024)
-                .max_dbs(12)
+                .max_dbs(11)
                 .open(path)?
         };
 
@@ -189,7 +187,6 @@ impl Storage {
             .create(&mut wtxn)?;
 
         let label_idx = env.create_database(&mut wtxn, Some("label_idx"))?;
-        let type_idx = env.create_database(&mut wtxn, Some("type_idx"))?;
         let node_prop_idx = env.create_database(&mut wtxn, Some("node_prop_idx"))?;
         let edge_prop_idx = env.create_database(&mut wtxn, Some("edge_prop_idx"))?;
 
@@ -225,7 +222,6 @@ impl Storage {
             out_adj,
             in_adj,
             label_idx,
-            type_idx,
             node_prop_idx,
             edge_prop_idx,
             fts_postings,

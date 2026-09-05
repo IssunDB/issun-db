@@ -10,7 +10,7 @@
 //! and are held to the contract by the fact that the whole crate compiles and its
 //! whole test suite passes against either.
 //!
-//! What a backend must supply: `Storage` (with the twelve tables as public fields and
+//! What a backend must supply: `Storage` (with the eleven tables as public fields and
 //! an `env`), `RoTxn`, `OwnedRoTxn`, `RwTxn`, and `StorageError`. What the tables must
 //! supply is `get`, `put`, `delete`, `len`, `iter`, `prefix_iter`, `get_duplicates`,
 //! and `delete_one_duplicate`, plus the ordering and rollback guarantees documented

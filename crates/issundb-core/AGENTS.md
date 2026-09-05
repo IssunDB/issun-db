@@ -19,8 +19,9 @@ These invariants must hold after every successful write transaction:
    and `"type:<name>"` keys in `meta`. Every node or edge write must call `get_or_create_label` or `get_or_create_type` inside the same `RwTxn` that
    writes the record. Do not cache integer IDs in memory between transactions and then use them in a later transaction without verifying they exist.
 
-4. Secondary index consistency. `label_idx` and `type_idx` use composite keys `(u32 BE, u64 BE)` with `Unit` values. Every `add_node` must insert
-   its `(LabelId, NodeId)` entry, and every `delete_node` must remove it. Same rule applies to `type_idx` for edges.
+4. Secondary index consistency. `label_idx` uses composite keys `(u32 BE, u64 BE)` with `Unit` values. Every `add_node` must insert its
+   `(LabelId, NodeId)` entry, and every `delete_node` must remove it. Edges have no such index: `edges_by_type` is one filtered pass over `edges`,
+   which iterates in ascending edge id, and the per-type counters in `meta` answer the counts.
 
 5. Property index consistency. Every `add_node` must write a `node_prop_idx` entry for each non-null scalar property in `props_json`. Every
    `update_node` must delete old entries and write new ones for all changed scalar properties. Every `delete_node` must remove all `node_prop_idx`
@@ -271,9 +272,9 @@ Three rules matter when adding or changing one, because each has been silently v
   first. Brandes accumulates over sources and predecessors in that same order, which is what makes a betweenness total reproducible run to run rather
   than merely close.
 
-## The 12 Sub-databases
+## The 11 Sub-databases
 
-All twelve are opened once by `Storage::open`, in `storage/lmdb.rs` for the default backend, and mirrored field for field by `storage/memory.rs`. The layout
+All eleven are opened once by `Storage::open`, in `storage/lmdb.rs` for the default backend, and mirrored field for field by `storage/memory.rs`. The layout
 below is the LMDB one; a second backend has to reproduce its key encoding and ordering, not just its field names:
 
 | Name            | Key                                                        | Value                                 | Notes                                                                                                                                                                                                  |
@@ -283,7 +284,6 @@ below is the LMDB one; a second backend has to reproduce its key encoding and or
 | `out_adj`       | `u64 BE` (NodeId)                                          | `AdjEntry` (20 B, DUPSORT + DUPFIXED) | Outgoing adjacency; one duplicate per edge.                                                                                                                                                            |
 | `in_adj`        | `u64 BE` (NodeId)                                          | `AdjEntry` (20 B, DUPSORT + DUPFIXED) | Incoming adjacency; mirror of `out_adj`.                                                                                                                                                               |
 | `label_idx`     | `(u32 BE, u64 BE)` = 12 B composite                        | `Unit`                                | Secondary index: `(LabelId, NodeId)`.                                                                                                                                                                  |
-| `type_idx`      | `(u32 BE, u64 BE)` = 12 B composite                        | `Unit`                                | Secondary index: `(TypeId, EdgeId)`.                                                                                                                                                                   |
 | `node_prop_idx` | `(LabelId, PropKeyId, encoded_val, NodeId)` variable       | `Unit`                                | Property range index for nodes. Auto-populated for every scalar property on every `add_node` and `update_node` (semi-columnar auto-index); also used for user-created unique and required constraints. |
 | `edge_prop_idx` | `(TypeId, PropKeyId, encoded_val, EdgeId)` variable        | `Unit`                                | Property range index for edges.                                                                                                                                                                        |
 | `fts_postings`  | `(LabelId, PropKeyId, term)` variable (DUPSORT + DUPFIXED) | 12 B `(NodeId BE, frequency BE)`      | Inverted posting lists for full-text search.                                                                                                                                                           |

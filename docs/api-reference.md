@@ -99,7 +99,7 @@ The `map_size_gb` argument to `Graph::open` sets the maximum size of the LMDB me
 - `edge_count_by_type(etype: &str) -> Result<u64, Error>`  
   Returns the count of edges of the specified type.
 - `storage_table_stats() -> Result<Vec<TableStat>, Error>`  
-  Returns the entry count and size of each of the twelve storage tables (`nodes`, `edges`, `out_adj`, `in_adj`, `label_idx`, `type_idx`, `node_prop_idx`, `edge_prop_idx`, `fts_postings`, `fts_docs`, `vectors`, and `meta`). On LMDB the size is the table's pages times the page size, so the twelve sizes sum to the live data in the file without its free-page slack. The CLI's `stats` command prints this breakdown.
+  Returns the entry count and size of each of the eleven storage tables (`nodes`, `edges`, `out_adj`, `in_adj`, `label_idx`, `node_prop_idx`, `edge_prop_idx`, `fts_postings`, `fts_docs`, `vectors`, and `meta`). On LMDB the size is the table's pages times the page size, so the eleven sizes sum to the live data in the file without its free-page slack. The CLI's `stats` command prints this breakdown.
 
 ### Property Lookups
 

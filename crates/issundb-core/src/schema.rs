@@ -224,7 +224,7 @@ mod tests {
 /// Size and entry count of one storage table, from [`crate::Graph::storage_table_stats`].
 ///
 /// `bytes` is the space the table's pages occupy on the LMDB backend (branch,
-/// leaf, and overflow pages times the page size), so the twelve figures sum to
+/// leaf, and overflow pages times the page size), so the eleven figures sum to
 /// the live data in the file, free-page slack excluded. The in-memory backend
 /// reports the summed key and value lengths instead and no page count.
 #[derive(Debug, Clone, PartialEq, Eq)]

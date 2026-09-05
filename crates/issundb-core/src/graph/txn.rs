@@ -1136,7 +1136,7 @@ mod tests {
         );
     }
 
-    /// The table report names all twelve tables and counts what was written:
+    /// The table report names all eleven tables and counts what was written:
     /// a node in `nodes`, one `label_idx` entry per label, one adjacency entry
     /// per direction per edge, and one auto-index entry per scalar property
     /// *per label*, so a two-label node with two properties costs four.
@@ -1152,13 +1152,12 @@ mod tests {
         g.add_edge(b, a, "T", &serde_json::json!({})).unwrap();
         let stats = g.storage_table_stats().unwrap();
         let get = |name: &str| stats.iter().find(|t| t.name == name).unwrap();
-        assert_eq!(stats.len(), 12);
+        assert_eq!(stats.len(), 11);
         assert_eq!(get("nodes").entries, 2);
         assert_eq!(get("edges").entries, 2);
         assert_eq!(get("out_adj").entries, 2);
         assert_eq!(get("in_adj").entries, 2);
         assert_eq!(get("label_idx").entries, 3);
-        assert_eq!(get("type_idx").entries, 2);
         assert_eq!(get("node_prop_idx").entries, 5);
         assert_eq!(get("edge_prop_idx").entries, 0);
         assert!(get("nodes").bytes > 0);

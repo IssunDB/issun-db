@@ -508,9 +508,6 @@ impl Graph {
                 self.delete_edge_index_entries(wtxn, edge_id, &edge_rec)?;
             }
             self.storage.edges.delete(wtxn, &edge_id)?;
-            self.storage
-                .type_idx
-                .delete(wtxn, &composite_key(entry.edge_type, edge_id))?;
 
             adjust_type_count(&self.storage, wtxn, entry.edge_type, -1)?;
 
@@ -542,9 +539,6 @@ impl Graph {
                 self.delete_edge_index_entries(wtxn, edge_id, &edge_rec)?;
             }
             self.storage.edges.delete(wtxn, &edge_id)?;
-            self.storage
-                .type_idx
-                .delete(wtxn, &composite_key(entry.edge_type, edge_id))?;
 
             adjust_type_count(&self.storage, wtxn, entry.edge_type, -1)?;
 

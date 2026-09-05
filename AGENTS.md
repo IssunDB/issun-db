@@ -243,9 +243,12 @@ second copy of both, so the same rule was stated in three places and the copies 
 
 - Adjacency is stored as LMDB `DUPSORT + DUPFIXED`: each duplicate value under a node key is one raw `AdjEntry` (20 bytes). A single `db.put` appends
   one entry in O(log n); there is no read-modify-write of a blob.
-- Secondary indexes (`label_idx`, `type_idx`) use 12-byte composite keys `(u32 BE, u64 BE)` stored in plain LMDB databases with `Unit` values.
-  Prefix-range scans via `prefix_iter` enumerate all nodes or edges for a given label or type in ascending ID order. A multi-label node has one
-  `label_idx` entry per label it carries, so it appears in every matching label scan.
+- The label index (`label_idx`) uses 12-byte composite keys `(u32 BE, u64 BE)` stored in a plain LMDB database with `Unit` values. Prefix-range
+  scans via `prefix_iter` enumerate all nodes for a given label in ascending ID order. A multi-label node has one `label_idx` entry per label it
+  carries, so it appears in every matching label scan. There is no edge counterpart: a `type_idx` existed until 2026-09-05 and was removed because
+  its only reader was `edges_by_type`, which the `edges` table serves in the same ascending edge-id order by one filtered pass, while the index cost
+  12 bytes and one put per edge (14 percent of the live footprint on the 1 M-node benchmark graph). Per-type counts come from the `stats:t:` counters,
+  and the counting kernels and the Cypher executor read the CSR snapshot.
 - Property indexes (`node_prop_idx`, `edge_prop_idx`) embed the encoded property value inside the LMDB key, so an indexable value is bounded by
   LMDB's 511-byte key limit. `encode_property_value` declines a string longer than `MAX_INDEXED_STRING_LEN` (480 bytes, conservative), leaving that
   value out of the index; the property is still stored, and equality lookups (`nodes_by_property`, `edges_by_property`) fall back to a label or type
@@ -278,7 +281,7 @@ second copy of both, so the same rule was stated in three places and the copies 
 - `Storage::open` is the only entry point for the storage engine, and the engine is selected at compile time from the `lmdb` feature: on by default it is LMDB
   (`storage/lmdb.rs`), and with `--no-default-features` it is the in-memory backend (`storage/memory.rs`). `heed` is named in exactly two places, both inside
   `storage/`, so nothing above the storage module knows which engine it is talking to; everything else names the aliases `storage::{RoTxn, OwnedRoTxn, RwTxn}`
-  and the twelve tables on `Storage`. Do not reintroduce a `heed::` path outside `storage/`, and do not turn this into a trait: the tables hang off `Storage`
+  and the eleven tables on `Storage`. Do not reintroduce a `heed::` path outside `storage/`, and do not turn this into a trait: the tables hang off `Storage`
   which hangs off `Graph`, so a trait would make `Graph` generic over its backend and push that parameter through every crate and the public API.
   The contract a backend owes is documented on `storage/mod.rs`, and three of its guarantees are load-bearing rather than incidental: key order is byte order
   (a `u64` key is stored big-endian so byte order and numeric order agree, which is what lets the CSR build assume `out_adj` arrives grouped by ascending node
@@ -294,7 +297,7 @@ second copy of both, so the same rule was stated in three places and the copies 
   and an acknowledged write survives a crash. That is also why a single-record insert costs one commit's latency and why the batch forms of the binding
   APIs exist. Do not buy write throughput by relaxing a sync flag here: durability is claimed at every surface that documents this engine, so weakening
   it is an API change rather than a tuning change. Four boundaries qualify the guarantee, and the first three are limits rather than details.
-    - The transaction covers the node and edge records, both adjacency stores, `label_idx`, `type_idx`, both property indexes, the unique and required
+    - The transaction covers the node and edge records, both adjacency stores, `label_idx`, both property indexes, the unique and required
       constraints those indexes enforce, and the full-text postings. Full-text search is the deliberate exception among the secondary structures, for
       the reason given in the `issundb-text` entry above; every other secondary structure is a cache.
     - The transaction does not cover the vector index. `VectorGraphExt::upsert_vector` takes `&Graph`, updates the in-memory HNSW, and then opens its
@@ -426,8 +429,8 @@ The read-path and statistics methods carry non-obvious semantics:
   edge-level statistics. One pass over `label_idx` and one over `out_adj`, cached until a committed write advances the generation. It is what makes the
   expand-ratio estimates available at all, and it upgrades `schema_has_edge` from a budgeted probe to an exact lookup that also decides the questions the
   probe gives up on. A caller wanting the optimizer at full strength on a cold graph wants this and `materialize_property_columns`.
-- `storage_table_stats() -> Result<Vec<TableStat>, Error>`: size and entry count of each of the twelve storage tables, in declaration order. On LMDB
-  `bytes` is the table's pages times the page size, so the twelve sum to the live data in the file with the free-page slack excluded; the in-memory
+- `storage_table_stats() -> Result<Vec<TableStat>, Error>`: size and entry count of each of the eleven storage tables, in declaration order. On LMDB
+  `bytes` is the table's pages times the page size, so the eleven sum to the live data in the file with the free-page slack excluded; the in-memory
   backend reports summed key and value lengths and no page count. The CLI's `stats` command prints it, and it is how a footprint question is answered
   by measurement rather than arithmetic.
 - `plan_generation() -> (u64, u64, u64)`: what a cached query plan is valid for: a per-open identity nonce, the committed write generation, and a
@@ -800,7 +803,7 @@ the exact version of the wasm-bindgen crate, or the module fails at load with a 
 
 ### `issundb_core::Storage`
 
-Internal to `issundb-core`. Owns the LMDB environment and twelve sub-databases: `nodes`, `edges`, `out_adj`, `in_adj`, `label_idx`, `type_idx`,
+Internal to `issundb-core`. Owns the LMDB environment and eleven sub-databases: `nodes`, `edges`, `out_adj`, `in_adj`, `label_idx`,
 `node_prop_idx`, `edge_prop_idx`, `fts_postings`, `fts_docs`, `vectors`, and `meta`. Do not expose `Storage` through the `issundb` facade.
 
 ### `issundb_core::error::Error`

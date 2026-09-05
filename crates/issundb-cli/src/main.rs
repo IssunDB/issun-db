@@ -3714,7 +3714,7 @@ mod tests {
         assert_eq!(stats.vector_count, 1);
         // Every storage table is reported, and the record tables carry what
         // was written: three nodes, two edges, and one embedding.
-        assert_eq!(stats.tables.len(), 12);
+        assert_eq!(stats.tables.len(), 11);
         let entries = |name: &str| {
             stats
                 .tables

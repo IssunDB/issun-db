@@ -113,9 +113,6 @@ impl Graph {
         self.storage
             .edges
             .put(wtxn, &edge_id, &props::encode(&record)?)?;
-        self.storage
-            .type_idx
-            .put(wtxn, &composite_key(type_id, edge_id), &())?;
 
         self.append_adj(wtxn, src, dst, type_id, edge_id, true)?;
         self.append_adj(wtxn, dst, src, type_id, edge_id, false)?;
@@ -234,10 +231,6 @@ impl Graph {
         self.delete_edge_index_entries(wtxn, id, &record)?;
 
         self.storage.edges.delete(wtxn, &id)?;
-
-        self.storage
-            .type_idx
-            .delete(wtxn, &composite_key(record.edge_type, id))?;
 
         adjust_type_count(&self.storage, wtxn, record.edge_type, -1)?;
 
