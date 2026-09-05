@@ -820,22 +820,49 @@ pub(crate) fn expr_parser<'a>() -> impl Parser<'a, ParserInput<'a>, Expr, Parser
 
         let exists_where = keyword("WHERE").ignore_then(expr.clone()).or_not();
 
+        // A `WITH` stage between the MATCH and the RETURN turns the body into a
+        // whole query (`Expr::ExistsQuery`), which is what lets it aggregate.
+        let exists_with_stage = keyword("WITH")
+            .ignore_then(
+                return_item_with(expr.clone())
+                    .separated_by(sym(Tok::Comma))
+                    .at_least(1)
+                    .collect::<Vec<ReturnItem>>(),
+            )
+            .then(exists_where.clone());
+
         let exists_full = keyword("MATCH")
             .ignore_then(exists_body_pattern.clone())
             .then(exists_where.clone())
+            .then(
+                exists_with_stage
+                    .repeated()
+                    .collect::<Vec<(Vec<ReturnItem>, Option<Expr>)>>(),
+            )
             .then_ignore(keyword("RETURN"))
-            .then_ignore(expr.clone());
+            .then_ignore(expr.clone())
+            .map(|((pattern, predicate), stages)| {
+                if stages.is_empty() {
+                    Expr::ExistsSubquery {
+                        pattern: Box::new(pattern),
+                        predicate: predicate.map(Box::new),
+                    }
+                } else {
+                    Expr::ExistsQuery(Box::new(exists_body_query(pattern, predicate, stages)))
+                }
+            });
 
-        let exists_simple = exists_body_pattern.then(exists_where);
-
-        let exists_subquery = keyword("EXISTS")
-            .ignore_then(sym(Tok::LBrace))
-            .ignore_then(choice((exists_full, exists_simple)))
-            .then_ignore(sym(Tok::RBrace))
+        let exists_simple = exists_body_pattern
+            .then(exists_where)
             .map(|(pattern, predicate)| Expr::ExistsSubquery {
                 pattern: Box::new(pattern),
                 predicate: predicate.map(Box::new),
             });
+
+        let exists_subquery = keyword("EXISTS")
+            .ignore_then(sym(Tok::LBrace))
+            .ignore_then(choice((exists_full, exists_simple)))
+            .then_ignore(sym(Tok::RBrace));
 
         // A relationship pattern in expression position: `(n)-[:T]->()`, a
         // boolean predicate that is true when at least one match exists. At
@@ -1315,6 +1342,19 @@ fn relationship_pattern<'a>(
             properties: None,
         });
 
+    // `<-->` lexes as `<-` then `->`; it matches either direction, as the
+    // bracketed `<-[..]->` form does.
+    let bare_both = sym(Tok::LArrow)
+        .then_ignore(sym(Tok::Arrow))
+        .map(|_| RelationshipPattern {
+            variable: None,
+            rel_type: None,
+            is_incoming: false,
+            is_undirected: true,
+            range: None,
+            properties: None,
+        });
+
     let bare_other = sym(Tok::Minus).ignore_then(choice((
         sym(Tok::Arrow).to(RelationshipPattern {
             variable: None,
@@ -1396,7 +1436,7 @@ fn relationship_pattern<'a>(
             },
         );
 
-    choice((bare_inbound, bare_other, bracketed))
+    choice((bare_both, bare_inbound, bare_other, bracketed))
 }
 
 /// Parses path patterns
@@ -1424,8 +1464,16 @@ fn pattern<'a>(
 
 /// Parses a RETURN projection item: `expr AS alias` or just `expr`
 fn return_item<'a>() -> impl Parser<'a, ParserInput<'a>, ReturnItem, ParserError<'a>> + Clone {
-    expr_parser()
-        .then(keyword("AS").ignore_then(identifier()).or_not())
+    return_item_with(expr_parser())
+}
+
+/// `return_item` over a caller-supplied expression parser, for use inside the
+/// recursive expression grammar where constructing `expr_parser()` again
+/// would recurse without end.
+fn return_item_with<'a>(
+    expr: impl Parser<'a, ParserInput<'a>, Expr, ParserError<'a>> + Clone + 'a,
+) -> impl Parser<'a, ParserInput<'a>, ReturnItem, ParserError<'a>> + Clone {
+    expr.then(keyword("AS").ignore_then(identifier()).or_not())
         .map(|(expr, alias)| ReturnItem {
             expr,
             alias,
@@ -2647,11 +2695,118 @@ pub(crate) fn validate_cross_clause_variable_types(parts: &[QueryPart]) -> Resul
     Ok(())
 }
 
+/// The read query an `EXISTS { MATCH ... WITH ... RETURN ... }` body denotes.
+/// The projection is replaced by a constant, since only row existence matters,
+/// and `LIMIT 1` stops the body at the first row.
+fn exists_body_query(
+    pattern: Pattern,
+    predicate: Option<Expr>,
+    stages: Vec<(Vec<ReturnItem>, Option<Expr>)>,
+) -> Query {
+    let mut parts = vec![QueryPart::Match {
+        match_clauses: vec![MatchClause { pattern }],
+        where_clause: predicate.map(WhereClause::Expr),
+    }];
+    for (items, where_expr) in stages {
+        parts.push(QueryPart::With {
+            items,
+            where_clause: where_expr.map(WhereClause::Expr),
+            where_after: None,
+            order_by: None,
+            skip: None,
+            limit: None,
+            distinct: false,
+        });
+    }
+    Query {
+        match_clauses: Vec::new(),
+        where_clause: None,
+        return_clause: ReturnClause {
+            items: vec![ReturnItem {
+                expr: Expr::Literal(Literal::Bool(true)),
+                alias: Some("__exists".to_string()),
+                source_text: None,
+            }],
+            distinct: false,
+        },
+        parts,
+        order_by: None,
+        skip: None,
+        limit: Some(Expr::Literal(Literal::Int(1))),
+    }
+}
+
+/// Collect every variable name a query mentions, bound or referenced: the
+/// over-reporting form the optimizer's pushdown walkers want for an
+/// `Expr::ExistsQuery` body.
+pub(crate) fn collect_query_vars(query: &Query, out: &mut std::collections::HashSet<String>) {
+    fn where_vars(wc: &Option<WhereClause>, out: &mut std::collections::HashSet<String>) {
+        if let Some(wc) = wc {
+            match wc {
+                WhereClause::Eq(l, r)
+                | WhereClause::Ne(l, r)
+                | WhereClause::Lt(l, r)
+                | WhereClause::Gt(l, r)
+                | WhereClause::Le(l, r)
+                | WhereClause::Ge(l, r) => {
+                    collect_expr_vars(l, out);
+                    collect_expr_vars(r, out);
+                }
+                WhereClause::Expr(e) => collect_expr_vars(e, out),
+            }
+        }
+    }
+    for mc in &query.match_clauses {
+        collect_pattern_vars(&mc.pattern, out);
+    }
+    where_vars(&query.where_clause, out);
+    for part in &query.parts {
+        match part {
+            QueryPart::Match {
+                match_clauses,
+                where_clause,
+            }
+            | QueryPart::OptionalMatch {
+                match_clauses,
+                where_clause,
+            } => {
+                for mc in match_clauses {
+                    collect_pattern_vars(&mc.pattern, out);
+                }
+                where_vars(where_clause, out);
+            }
+            QueryPart::With {
+                items,
+                where_clause,
+                where_after,
+                ..
+            } => {
+                for item in items {
+                    collect_expr_vars(&item.expr, out);
+                    if let Some(a) = &item.alias {
+                        out.insert(a.clone());
+                    }
+                }
+                where_vars(where_clause, out);
+                where_vars(where_after, out);
+            }
+            QueryPart::Unwind { expr, variable } => {
+                collect_expr_vars(expr, out);
+                out.insert(variable.clone());
+            }
+            _ => {}
+        }
+    }
+    for item in &query.return_clause.items {
+        collect_expr_vars(&item.expr, out);
+    }
+}
+
 /// Collect the free variable names referenced in an expression. A bare variable is
 /// `Expr::Prop(name, "")` and a property access is `Expr::Prop(name, "prop")`, so both
 /// contribute `name`. Variables bound locally by list comprehensions and quantifiers are
 /// not free and are excluded.
-fn collect_expr_vars(expr: &Expr, out: &mut std::collections::HashSet<String>) {
+pub(crate) fn collect_expr_vars(expr: &Expr, out: &mut std::collections::HashSet<String>) {
     match expr {
         Expr::Prop(var, _) => {
             out.insert(var.clone());
@@ -2781,6 +2936,9 @@ fn collect_expr_vars(expr: &Expr, out: &mut std::collections::HashSet<String>) {
         // would raise a false UndefinedVariable for a body-local variable. Only
         // what the predicate and the inline property maps reference beyond the
         // pattern's own variables is free.
+        // A multi-clause body binds its own variables throughout, so nothing in
+        // it is reported as free.
+        Expr::ExistsQuery(_) => {}
         Expr::ExistsSubquery { pattern, predicate } => {
             let mut local = std::collections::HashSet::new();
             collect_pattern_vars(pattern, &mut local);
@@ -3274,6 +3432,7 @@ fn collect_non_agg_props_in_expr(expr: &Expr, props: &mut Vec<(String, String)>)
         // An existential subquery contributes only what its predicate and inline
         // properties reference from the outer scope; every pattern variable may
         // be a local binding, so none is a grouping property read.
+        Expr::ExistsQuery(_) => {}
         Expr::ExistsSubquery { pattern, predicate } => {
             let mut local = std::collections::HashSet::new();
             collect_pattern_vars(pattern, &mut local);
@@ -4243,7 +4402,7 @@ fn expr_contains_pattern_predicate(e: &Expr) -> bool {
         // An existential subquery is a scalar boolean expression, legal in any
         // expression position, and its own WHERE clause is a WHERE position, so
         // a pattern predicate inside it is legal too; do not recurse.
-        Expr::ExistsSubquery { .. } => false,
+        Expr::ExistsSubquery { .. } | Expr::ExistsQuery(_) => false,
         Expr::Literal(_)
         | Expr::Param(_)
         | Expr::CountStar
@@ -5985,14 +6144,32 @@ fn validate_value_var_conflicts(stmt: &Statement) -> Result<(), String> {
                         }
                     }
                 }
-                QueryPart::Unwind { variable, .. } => {
-                    value_vars.insert(variable.clone());
+                // An UNWIND item is a value only when every element of the
+                // list provably is; `UNWIND collect(n) AS m` yields nodes.
+                QueryPart::Unwind { expr, variable } => {
+                    if is_value_only_list(expr, &element_vars) {
+                        value_vars.insert(variable.clone());
+                    } else {
+                        element_vars.insert(variable.clone());
+                    }
                 }
                 _ => {}
             }
         }
     }
     Ok(())
+}
+
+/// True if `expr` is a list whose every element is known to be a value.
+fn is_value_only_list(expr: &Expr, element_vars: &std::collections::HashSet<String>) -> bool {
+    match expr {
+        Expr::Literal(Literal::List(_)) => true,
+        Expr::FunctionCall { name, args } if name == "__list__" => {
+            args.iter().all(|a| is_value_expr(a, element_vars))
+        }
+        Expr::FunctionCall { name, .. } if name.eq_ignore_ascii_case("range") => true,
+        _ => false,
+    }
 }
 
 /// True if `expr` denotes a value rather than a graph element. The only graph-element
@@ -6004,6 +6181,8 @@ fn is_value_expr(expr: &Expr, element_vars: &std::collections::HashSet<String>) 
         // A null binding is type-compatible with any graph element, so reusing it as
         // a node, relationship, or path variable is allowed (it matches nothing).
         Expr::Literal(Literal::Null) => false,
+        // A list element may be a graph element (`nodeList[i]`).
+        Expr::Subscript { .. } => false,
         // Functions that select among their arguments can return a node,
         // relationship, or path (e.g. `coalesce(b, c)`, `head(list)`), so their
         // result stays type-compatible with a graph-element variable.
@@ -8085,17 +8264,30 @@ mod diagnostic_tests {
         assert!(parse("MATCH (n) WHERE exists { MATCH (n)-->(m) DELETE m } RETURN n").is_err());
     }
 
-    /// A multi-clause body (WITH, aggregation) is not supported and must be
-    /// rejected at parse time rather than silently misread.
+    /// A multi-clause body (WITH stages, aggregation) parses to an
+    /// `ExistsQuery` whose body carries the MATCH and each WITH stage.
     #[test]
-    fn parse_exists_subquery_rejects_multi_clause_bodies() {
-        assert!(
-            parse(
-                "MATCH (n) WHERE exists { MATCH (n)-->(m) WITH n, count(*) AS c \
-             WHERE c = 3 RETURN true } RETURN n"
-            )
-            .is_err()
-        );
+    fn parse_exists_subquery_accepts_with_stages() {
+        let parsed = parse(
+            "MATCH (n) WHERE exists { MATCH (n)-->(m) WITH n, count(*) AS c \
+             WHERE c = 3 RETURN true } RETURN n",
+        )
+        .unwrap();
+        let Statement::Query(q) = parsed else {
+            panic!("expected a query");
+        };
+        let Some(WhereClause::Expr(Expr::ExistsQuery(body))) = q.where_clause else {
+            panic!(
+                "expected an ExistsQuery predicate, got {:?}",
+                q.where_clause
+            );
+        };
+        assert_eq!(body.parts.len(), 2);
+        assert!(matches!(body.parts[0], QueryPart::Match { .. }));
+        assert!(matches!(
+            &body.parts[1],
+            QueryPart::With { items, where_clause: Some(_), .. } if items.len() == 2
+        ));
     }
 
     /// Variables the subquery pattern introduces bind locally, so the scope

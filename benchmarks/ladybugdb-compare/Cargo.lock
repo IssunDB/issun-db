@@ -847,7 +847,7 @@ dependencies = [
 
 [[package]]
 name = "issundb"
-version = "0.1.0-alpha.26"
+version = "0.1.0-alpha.27"
 dependencies = [
  "issundb-core",
  "issundb-cypher",
@@ -859,7 +859,7 @@ dependencies = [
 
 [[package]]
 name = "issundb-core"
-version = "0.1.0-alpha.26"
+version = "0.1.0-alpha.27"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -879,7 +879,7 @@ dependencies = [
 
 [[package]]
 name = "issundb-cypher"
-version = "0.1.0-alpha.26"
+version = "0.1.0-alpha.27"
 dependencies = [
  "ahash",
  "arrow-array",
@@ -902,7 +902,7 @@ dependencies = [
 
 [[package]]
 name = "issundb-retrieval"
-version = "0.1.0-alpha.26"
+version = "0.1.0-alpha.27"
 dependencies = [
  "ahash",
  "issundb-core",
@@ -913,7 +913,7 @@ dependencies = [
 
 [[package]]
 name = "issundb-text"
-version = "0.1.0-alpha.26"
+version = "0.1.0-alpha.27"
 dependencies = [
  "issundb-core",
  "roaring",
@@ -922,7 +922,7 @@ dependencies = [
 
 [[package]]
 name = "issundb-vector"
-version = "0.1.0-alpha.26"
+version = "0.1.0-alpha.27"
 dependencies = [
  "issundb-core",
  "parking_lot",
@@ -973,9 +973,9 @@ dependencies = [
 
 [[package]]
 name = "lbug"
-version = "0.19.1"
+version = "0.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a7a032d5968ac2260545e8c5cf05a123559de2c6ba2bd0dde11c0ed958dfa172"
+checksum = "f8f69721f12ba475a701175989c1827da3517d12fe6152fdfc002d7e6c2daa11"
 dependencies = [
  "cmake",
  "cxx",
@@ -985,6 +985,7 @@ dependencies = [
  "serde_json",
  "time",
  "uuid",
+ "vcpkg",
 ]
 
 [[package]]
@@ -1834,6 +1835,12 @@ dependencies = [
  "js-sys",
  "wasm-bindgen",
 ]
+
+[[package]]
+name = "vcpkg"
+version = "0.2.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 
 [[package]]
 name = "version_check"

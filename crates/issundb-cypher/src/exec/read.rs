@@ -746,6 +746,7 @@ pub(crate) fn expr_display_name(expr: &Expr) -> String {
             s
         }
         Expr::PatternPredicate { pattern } => pattern_display_name(pattern),
+        Expr::ExistsQuery(_) => "exists { ... }".to_string(),
         Expr::ExistsSubquery { pattern, predicate } => {
             let mut s = String::from("exists { ");
             s.push_str(&pattern_display_name(pattern));
@@ -1276,17 +1277,37 @@ pub(super) fn canonical_binding_key(b: Option<&GraphBinding>) -> String {
     match b {
         Some(GraphBinding::Node(id)) => format!("@n{id}"),
         Some(GraphBinding::Edge(id)) => format!("@e{id}"),
-        Some(GraphBinding::EdgeList(ids)) => {
-            let mut key = String::from("@el");
-            for id in ids {
-                key.push('_');
-                key.push_str(&id.to_string());
-            }
-            key
-        }
-        Some(GraphBinding::Scalar(v)) => canonical_cell_key(v),
+        Some(GraphBinding::EdgeList(ids)) => edge_list_key(ids.iter().copied()),
+        // A graph element that traveled through an expression (a projected
+        // `[r1, r2]`, an unwound node) keys like its direct binding, so a join
+        // or DISTINCT over both forms sees one value.
+        Some(GraphBinding::Scalar(v)) => match super::expr::wrapped_graph_id(v) {
+            Some((true, id)) => format!("@n{id}"),
+            Some((false, id)) => format!("@e{id}"),
+            None => match v.as_array().and_then(|items| {
+                items
+                    .iter()
+                    .map(|item| match super::expr::wrapped_graph_id(item) {
+                        Some((false, id)) => Some(id),
+                        _ => None,
+                    })
+                    .collect::<Option<Vec<EdgeId>>>()
+            }) {
+                Some(ids) if !ids.is_empty() => edge_list_key(ids.into_iter()),
+                _ => canonical_cell_key(v),
+            },
+        },
         None => "@_".to_string(),
     }
+}
+
+fn edge_list_key(ids: impl Iterator<Item = EdgeId>) -> String {
+    let mut key = String::from("@el");
+    for id in ids {
+        key.push('_');
+        key.push_str(&id.to_string());
+    }
+    key
 }
 
 /// Apply RETURN DISTINCT deduplication in place, keyed by the canonical row (so
@@ -1759,11 +1780,97 @@ fn expand_from_paths(
         } else {
             // The traversed element list feeds only the Path object, so it stays
             // empty (no per-step record decodes) unless the pattern binds a path.
+            // It starts from the path accumulated up to the source, so a fixed
+            // hop before this one keeps its place in the path.
             let initial_traversed = if needs_path {
-                vec![get_node_representation(graph, src_node)?]
+                match path.get_binding(&format!("_path_{}", src_var)) {
+                    Some(GraphBinding::Scalar(v)) if path_elements_of(v).is_some() => {
+                        path_elements_of(v).unwrap_or_default()
+                    }
+                    _ => vec![get_node_representation(graph, src_node)?],
+                }
             } else {
                 Vec::new()
             };
+
+            // A relationship variable already bound to a list (`WITH [r1, r2] AS
+            // rs MATCH (a)-[rs*]->(b)`) fixes the trail: the only candidate is
+            // that exact edge sequence, walked from the source in pattern
+            // direction.
+            let required_trail: Option<Option<Vec<EdgeId>>> = match path.get_binding(rel_var) {
+                Some(GraphBinding::EdgeList(ids)) => Some(Some(ids.clone())),
+                Some(GraphBinding::Scalar(serde_json::Value::Array(items))) => Some(
+                    items
+                        .iter()
+                        .map(|v| match super::expr::wrapped_graph_id(v) {
+                            Some((false, id)) => Some(id),
+                            _ => None,
+                        })
+                        .collect::<Option<Vec<EdgeId>>>(),
+                ),
+                Some(GraphBinding::Scalar(_)) => Some(None),
+                _ => None,
+            };
+            if let Some(required) = required_trail {
+                let Some(required) = required else { continue };
+                if required.len() < min_hops || required.len() > max_hops {
+                    continue;
+                }
+                let allowed_types: Option<Vec<&str>> = rel_type.map(|t| t.split('|').collect());
+                let mut current = src_node;
+                let mut traversed = initial_traversed.clone();
+                let mut valid = true;
+                for &eid in &required {
+                    let Some(record) = graph.get_edge(eid).map_err(|e| e.to_string())? else {
+                        valid = false;
+                        break;
+                    };
+                    if let Some(types) = &allowed_types {
+                        let name = graph
+                            .type_name(record.edge_type)
+                            .map_err(|e| e.to_string())?;
+                        if !name.as_deref().is_some_and(|n| types.contains(&n)) {
+                            valid = false;
+                            break;
+                        }
+                    }
+                    let forward = record.src == current && (is_undirected || !is_incoming);
+                    let backward = record.dst == current && (is_undirected || is_incoming);
+                    let next = if forward {
+                        record.dst
+                    } else if backward {
+                        record.src
+                    } else {
+                        valid = false;
+                        break;
+                    };
+                    if needs_path {
+                        traversed.push(get_edge_representation(graph, eid)?);
+                        traversed.push(get_node_representation(graph, next)?);
+                    }
+                    current = next;
+                }
+                if !valid {
+                    continue;
+                }
+                if path
+                    .get_binding(dst_var)
+                    .is_some_and(|existing| *existing != GraphBinding::Node(current))
+                {
+                    continue;
+                }
+                let mut new_path = path.clone();
+                new_path.bind_local(dst_var, GraphBinding::Node(current));
+                new_path.bind_local(rel_var, GraphBinding::EdgeList(required));
+                if needs_path {
+                    new_path.bind_local(
+                        &format!("_path_{}", dst_var),
+                        GraphBinding::Scalar(path_from_elements(traversed)),
+                    );
+                }
+                next_paths.push(new_path);
+                continue;
+            }
             // openCypher trail semantics: a relationship may appear at most once
             // per path, nodes may repeat, and every distinct trail is one result
             // row. The per-path edge list is a Vec with a linear membership
@@ -1835,30 +1942,9 @@ fn expand_from_paths(
 
                 // Build the Path object only when the pattern binds a path variable.
                 if needs_path {
-                    let mut nodes = Vec::new();
-                    let mut relationships = Vec::new();
-                    for (idx, item) in path_elements.into_iter().enumerate() {
-                        if idx % 2 == 0 {
-                            nodes.push(item);
-                        } else {
-                            relationships.push(item);
-                        }
-                    }
-                    let mut m = serde_json::Map::new();
-                    m.insert(
-                        "__type__".to_string(),
-                        serde_json::Value::String("__Path__".to_string()),
-                    );
-                    m.insert("nodes".to_string(), serde_json::Value::Array(nodes));
-                    m.insert(
-                        "relationships".to_string(),
-                        serde_json::Value::Array(relationships),
-                    );
-                    let path_obj = serde_json::Value::Object(m);
-
                     new_path.bind_local(
                         &format!("_path_{}", dst_var),
-                        GraphBinding::Scalar(path_obj),
+                        GraphBinding::Scalar(path_from_elements(path_elements)),
                     );
                 }
                 next_paths.push(new_path);
@@ -1867,6 +1953,89 @@ fn expand_from_paths(
     }
 
     Ok(next_paths)
+}
+
+/// Bind the path variable of a written pattern (`CREATE p = ...`, `MERGE p =
+/// ...`) from the element ids the write recorded, reading each element through
+/// the pending-writes overlay so a node created in this statement renders.
+fn bind_written_path(
+    graph: &Graph,
+    row: &mut SlotRow,
+    pattern: &crate::ast::Pattern,
+) -> Result<(), String> {
+    let Some(pv) = &pattern.path_variable else {
+        return Ok(());
+    };
+    let ids_var = super::write::path_ids_var(pv);
+    let Some(GraphBinding::Scalar(ids)) = row.get_binding(&ids_var) else {
+        return Ok(());
+    };
+    let path_value = written_path_value(graph, ids)?;
+    row.bind_local(pv, GraphBinding::Scalar(path_value));
+    Ok(())
+}
+
+/// The `__Path__` value for a written pattern's recorded element ids.
+pub(super) fn written_path_value(
+    graph: &Graph,
+    ids: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let ids: Vec<u64> = ids
+        .as_array()
+        .map(|a| a.iter().filter_map(serde_json::Value::as_u64).collect())
+        .unwrap_or_default();
+    let mut elements = Vec::with_capacity(ids.len());
+    for (i, id) in ids.into_iter().enumerate() {
+        if i % 2 == 0 {
+            elements.push(get_node_representation(graph, id)?);
+        } else {
+            elements.push(get_edge_representation(graph, id)?);
+        }
+    }
+    Ok(path_from_elements(elements))
+}
+
+/// The elements of a `__Path__` value interleaved as node, relationship, node,
+/// ..., the form the variable-length walk accumulates; `None` for any other value.
+fn path_elements_of(v: &serde_json::Value) -> Option<Vec<serde_json::Value>> {
+    let m = v.as_object()?;
+    if m.get("__type__").and_then(|t| t.as_str()) != Some("__Path__") {
+        return None;
+    }
+    let nodes = m.get("nodes")?.as_array()?;
+    let rels = m.get("relationships")?.as_array()?;
+    let mut out = Vec::with_capacity(nodes.len() + rels.len());
+    for (i, n) in nodes.iter().enumerate() {
+        if i > 0 {
+            out.push(rels.get(i - 1)?.clone());
+        }
+        out.push(n.clone());
+    }
+    Some(out)
+}
+
+/// Assemble a `__Path__` value from interleaved node and relationship elements.
+fn path_from_elements(elements: Vec<serde_json::Value>) -> serde_json::Value {
+    let mut nodes = Vec::new();
+    let mut relationships = Vec::new();
+    for (idx, item) in elements.into_iter().enumerate() {
+        if idx % 2 == 0 {
+            nodes.push(item);
+        } else {
+            relationships.push(item);
+        }
+    }
+    let mut m = serde_json::Map::new();
+    m.insert(
+        "__type__".to_string(),
+        serde_json::Value::String("__Path__".to_string()),
+    );
+    m.insert("nodes".to_string(), serde_json::Value::Array(nodes));
+    m.insert(
+        "relationships".to_string(),
+        serde_json::Value::Array(relationships),
+    );
+    serde_json::Value::Object(m)
 }
 
 /// Evaluate a pattern comprehension (`[ p = (n)-->(b) WHERE pred | transform ]`).
@@ -2132,13 +2301,24 @@ fn join_roles<'a>(
     &'a PhysicalOperator,
     &'a PhysicalOperator,
     Option<&'a [String]>,
+    Option<&'a FilterExpr>,
 ) {
-    if let PhysicalOperator::OptionalMatch { input, null_vars } = left {
-        (right, input.as_ref(), Some(null_vars))
-    } else if let PhysicalOperator::OptionalMatch { input, null_vars } = right {
-        (left, input.as_ref(), Some(null_vars))
+    if let PhysicalOperator::OptionalMatch {
+        input,
+        null_vars,
+        predicate,
+    } = left
+    {
+        (right, input.as_ref(), Some(null_vars), predicate.as_ref())
+    } else if let PhysicalOperator::OptionalMatch {
+        input,
+        null_vars,
+        predicate,
+    } = right
+    {
+        (left, input.as_ref(), Some(null_vars), predicate.as_ref())
     } else {
-        (left, right, None)
+        (left, right, None, None)
     }
 }
 
@@ -2233,11 +2413,39 @@ enum JoinProbeData {
 /// order, because the build side is fully materialized before any probe row is
 /// joined.
 fn hash_join_rows(
+    graph: &Graph,
     probe_batch: Vec<SlotRow>,
     data: &JoinProbeData,
     null_vars: Option<&[String]>,
-) -> Vec<SlotRow> {
+    predicate: Option<&FilterExpr>,
+    params: &HashMap<String, serde_json::Value>,
+) -> Result<Vec<SlotRow>, String> {
     let mut out = Vec::new();
+    // Emit the matches of one probe row, or its null-filled form when none
+    // survive the optional predicate.
+    let emit = |rp: SlotRow, matches: &[SlotRow], out: &mut Vec<SlotRow>| -> Result<(), String> {
+        let mut merged_rows: Vec<SlotRow> = matches
+            .iter()
+            .map(|op| {
+                let mut merged = rp.clone();
+                merged.merge_from(op);
+                merged
+            })
+            .collect();
+        if let Some(pred) = predicate {
+            merged_rows = apply_filter(graph, merged_rows, pred, params)?;
+        }
+        if merged_rows.is_empty() {
+            if let Some(null_vars) = null_vars {
+                let mut merged = rp;
+                null_fill(&mut merged, null_vars);
+                out.push(merged);
+            }
+        } else {
+            out.extend(merged_rows);
+        }
+        Ok(())
+    };
     for rp in probe_batch {
         match data {
             JoinProbeData::Equi {
@@ -2246,37 +2454,14 @@ fn hash_join_rows(
             } => {
                 // A row missing a common var cannot join; drop it.
                 if let Some(key) = join_key(common_vars, &rp) {
-                    if let Some(matches) = hash_table.get(&key) {
-                        for op in matches {
-                            let mut merged = rp.clone();
-                            merged.merge_from(op);
-                            out.push(merged);
-                        }
-                    } else if let Some(null_vars) = null_vars {
-                        let mut merged = rp;
-                        null_fill(&mut merged, null_vars);
-                        out.push(merged);
-                    }
+                    let matches = hash_table.get(&key).map(Vec::as_slice).unwrap_or(&[]);
+                    emit(rp, matches, &mut out)?;
                 }
             }
-            JoinProbeData::Cartesian { build_rows } => {
-                if build_rows.is_empty() {
-                    if let Some(null_vars) = null_vars {
-                        let mut merged = rp;
-                        null_fill(&mut merged, null_vars);
-                        out.push(merged);
-                    }
-                } else {
-                    for op in build_rows {
-                        let mut merged = rp.clone();
-                        merged.merge_from(op);
-                        out.push(merged);
-                    }
-                }
-            }
+            JoinProbeData::Cartesian { build_rows } => emit(rp, build_rows, &mut out)?,
         }
     }
-    out
+    Ok(out)
 }
 
 /// Close a `MultiwayJoin` over one batch of child rows: bulk-expand the distinct
@@ -2696,6 +2881,20 @@ pub(super) fn project_rows(
 ) -> Result<Vec<SlotRow>, String> {
     let mut next_paths = Vec::new();
 
+    // The free variables of each computed item, so a row that no longer binds
+    // them (the group row an Aggregate emits, which carries the item under its
+    // column name instead) is read rather than re-evaluated: an expression such
+    // as a pattern comprehension evaluates to an empty result on an unbound
+    // anchor instead of failing.
+    let item_vars: Vec<std::collections::HashSet<String>> = items
+        .iter()
+        .map(|(expr, _)| {
+            let mut vars = std::collections::HashSet::new();
+            crate::parser::collect_expr_vars(expr, &mut vars);
+            vars
+        })
+        .collect();
+
     for path in child_paths {
         // RETURN * / WITH * passes all current bindings through unchanged.
         let is_star = items.len() == 1 && crate::parser::is_star_expr(&items[0].0);
@@ -2714,7 +2913,7 @@ pub(super) fn project_rows(
             path.clone()
         };
 
-        for (expr, alias) in items {
+        for (item_idx, (expr, alias)) in items.iter().enumerate() {
             let target_var = if let Some(alias_name) = alias {
                 alias_name.clone()
             } else {
@@ -2722,6 +2921,16 @@ pub(super) fn project_rows(
             };
 
             match expr {
+                _ if !item_vars[item_idx].is_empty()
+                    && item_vars[item_idx]
+                        .iter()
+                        .any(|v| path.get_binding(v).is_none())
+                    && path.get_binding(&target_var).is_some() =>
+                {
+                    if let Some(binding) = path.get_binding(&target_var) {
+                        projected_path.bind_local(&target_var, binding.clone());
+                    }
+                }
                 // For CountStar / Agg, the Aggregate operator has already placed
                 // the computed value in the row under `target_var`. Pull it
                 // directly rather than trying to re-evaluate the expression.
@@ -2745,7 +2954,7 @@ pub(super) fn project_rows(
                 }
                 _ => match evaluate_expr(graph, &path, expr, params) {
                     Ok(val) => {
-                        projected_path.bind_local(&target_var, GraphBinding::Scalar(val));
+                        projected_path.bind_local(&target_var, GraphBinding::from_value(val));
                     }
                     Err(err) => {
                         if let Some(binding) = path.get_binding(&target_var) {
@@ -2896,6 +3105,8 @@ enum RowStream {
         probe_op: Box<PhysicalOperator>,
         /// Is `Some` for a left-outer join, where probe rows with no match are null-filled.
         null_vars: Option<Vec<String>>,
+        /// The optional side's outer-variable WHERE, applied to each joined row.
+        predicate: Option<FilterExpr>,
         /// Built lazily on the first pull (build side materialized + hashed,
         /// probe stream constructed with SIP applied).
         state: Option<Box<HashJoinState>>,
@@ -3314,7 +3525,9 @@ fn build_stream_with_sip(
             aggregations: aggregations.clone(),
             out: None,
         },
-        PhysicalOperator::OptionalMatch { input, null_vars } => RowStream::OptionalMatch {
+        PhysicalOperator::OptionalMatch {
+            input, null_vars, ..
+        } => RowStream::OptionalMatch {
             input: Box::new(build_stream_with_sip(input, sip)),
             null_vars: null_vars.clone(),
             any: false,
@@ -3364,11 +3577,12 @@ fn build_stream_with_sip(
             // run time (it needs the materialized build rows), so it is built
             // lazily in `next_batch`; the outer `sip` does not propagate into a
             // nested join, matching the former `execute_with_sip`.
-            let (probe_op, build_op, null_vars) = join_roles(left, right);
+            let (probe_op, build_op, null_vars, predicate) = join_roles(left, right);
             RowStream::HashJoin {
                 build_op: Box::new(build_op.clone()),
                 probe_op: Box::new(probe_op.clone()),
                 null_vars: null_vars.map(|v| v.to_vec()),
+                predicate: predicate.cloned(),
                 state: None,
                 buf: std::collections::VecDeque::new(),
             }
@@ -3517,6 +3731,7 @@ impl RowStream {
                 build_op,
                 probe_op,
                 null_vars,
+                predicate,
                 state,
                 buf,
             } => loop {
@@ -3567,7 +3782,14 @@ impl RowStream {
                 if probe_batch.is_empty() {
                     return Ok(vec![]);
                 }
-                let rows = hash_join_rows(probe_batch, &st.data, null_vars.as_deref());
+                let rows = hash_join_rows(
+                    graph,
+                    probe_batch,
+                    &st.data,
+                    null_vars.as_deref(),
+                    predicate.as_ref(),
+                    params,
+                )?;
                 buf.extend(rows);
             },
             RowStream::MultiwayJoin {
@@ -3827,12 +4049,12 @@ impl RowStream {
                     if let serde_json::Value::Array(elems) = list_val {
                         for item in elems {
                             let mut new_path = path.clone();
-                            new_path.bind_local(variable, GraphBinding::Scalar(item));
+                            new_path.bind_local(variable, GraphBinding::from_value(item));
                             buf.push_back(new_path);
                         }
                     } else if list_val != serde_json::Value::Null {
                         let mut new_path = path.clone();
-                        new_path.bind_local(variable, GraphBinding::Scalar(list_val));
+                        new_path.bind_local(variable, GraphBinding::from_value(list_val));
                         buf.push_back(new_path);
                     }
                 }
@@ -4506,6 +4728,7 @@ fn write_part_rows(
                     for (name, binding) in created {
                         new_path.bind_local(&name, binding);
                     }
+                    bind_written_path(txn.graph(), &mut new_path, pattern)?;
                 }
                 result_paths.push(new_path);
             }
@@ -4528,6 +4751,7 @@ fn write_part_rows(
                             for (name, binding) in ext {
                                 row.bind_local(&name, binding);
                             }
+                            bind_written_path(txn.graph(), &mut row, &merge_stmt.pattern)?;
                             next.push(row);
                         }
                     }
@@ -5264,22 +5488,29 @@ pub(super) fn canonical_function_name(name: &str) -> &str {
     }
 }
 
-/// Total ordering for JSON values used by min/max aggregation.
-/// Numbers compare numerically; strings compare lexicographically.
-/// Cross-type order according to openCypher: Map < List < String < Boolean < Number < Null.
+/// Total ordering for JSON values used by ORDER BY and min/max aggregation.
+/// Numbers compare numerically; strings compare lexicographically. The
+/// cross-type order is openCypher's: Map < Node < Relationship < List < Path <
+/// temporal < String < Boolean < Number < NaN < Null.
 pub(super) fn json_cmp_total(l: &serde_json::Value, r: &serde_json::Value) -> std::cmp::Ordering {
     use serde_json::Value;
     fn type_rank(v: &Value) -> u8 {
         if crate::exec::expr::is_nan(v) {
-            return 4;
+            return 8;
         }
         match v {
-            Value::Object(_) => 0,
-            Value::Array(_) => 1,
-            Value::String(_) => 2,
-            Value::Bool(_) => 3,
-            Value::Number(_) => 4,
-            Value::Null => 5,
+            Value::Object(m) => match m.get("__type__").and_then(|t| t.as_str()) {
+                None => 0,
+                Some("__Node__") => 1,
+                Some("__Edge__") => 2,
+                Some("__Path__") => 4,
+                Some(_) => 5,
+            },
+            Value::Array(_) => 3,
+            Value::String(_) => 6,
+            Value::Bool(_) => 7,
+            Value::Number(_) => 8,
+            Value::Null => 9,
         }
     }
     let is_l_nan = crate::exec::expr::is_nan(l);
@@ -5287,12 +5518,12 @@ pub(super) fn json_cmp_total(l: &serde_json::Value, r: &serde_json::Value) -> st
     match (is_l_nan, is_r_nan) {
         (true, true) => return std::cmp::Ordering::Equal,
         (true, false) => {
-            if type_rank(r) == 4 {
+            if type_rank(r) == 8 {
                 return std::cmp::Ordering::Greater;
             }
         }
         (false, true) => {
-            if type_rank(l) == 4 {
+            if type_rank(l) == 8 {
                 return std::cmp::Ordering::Less;
             }
         }
@@ -5316,18 +5547,39 @@ pub(super) fn json_cmp_total(l: &serde_json::Value, r: &serde_json::Value) -> st
             }
         }
         (Value::String(a), Value::String(b)) => a.cmp(b),
-        (Value::Array(a), Value::Array(b)) => {
-            let min_len = a.len().min(b.len());
-            for i in 0..min_len {
-                let cmp = json_cmp_total(&a[i], &b[i]);
-                if cmp != std::cmp::Ordering::Equal {
-                    return cmp;
-                }
+        (Value::Array(a), Value::Array(b)) => json_cmp_total_lists(a, b),
+        (Value::Object(a), Value::Object(b)) => match lr {
+            // Entities order by id; a path by its nodes, then its relationships.
+            1 | 2 => a
+                .get("id")
+                .and_then(Value::as_u64)
+                .cmp(&b.get("id").and_then(Value::as_u64)),
+            4 => {
+                let part = |m: &serde_json::Map<String, Value>, k: &str| -> Vec<Value> {
+                    m.get(k)
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default()
+                };
+                json_cmp_total_lists(&part(a, "nodes"), &part(b, "nodes")).then_with(|| {
+                    json_cmp_total_lists(&part(a, "relationships"), &part(b, "relationships"))
+                })
             }
-            a.len().cmp(&b.len())
-        }
+            _ => json_cmp(l, r).unwrap_or(std::cmp::Ordering::Equal),
+        },
         _ => json_cmp(l, r).unwrap_or(std::cmp::Ordering::Equal),
     }
+}
+
+fn json_cmp_total_lists(a: &[serde_json::Value], b: &[serde_json::Value]) -> std::cmp::Ordering {
+    let min_len = a.len().min(b.len());
+    for i in 0..min_len {
+        let cmp = json_cmp_total(&a[i], &b[i]);
+        if cmp != std::cmp::Ordering::Equal {
+            return cmp;
+        }
+    }
+    a.len().cmp(&b.len())
 }
 
 /// Convert a `serde_json::Value` to a `PropValue` for property index lookups.

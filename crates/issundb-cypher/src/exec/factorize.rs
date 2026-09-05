@@ -200,6 +200,7 @@ fn collect_expr_vars(expr: &Expr, vars: &mut HashSet<String>) {
         // Over-reporting is the safe direction here: a name that is really local
         // merely forces the per-row fallback, while under-reporting a correlated
         // destination variable would evaluate the filter once per source row.
+        Expr::ExistsQuery(body) => crate::parser::collect_query_vars(body, vars),
         Expr::ExistsSubquery { pattern, predicate } => {
             if let Some(v) = &pattern.node.variable {
                 vars.insert(v.clone());

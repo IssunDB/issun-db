@@ -120,7 +120,7 @@ Property values are represented by the `PropValue` enum with the variants `Bool`
 
 ### Index and Constraint Management
 
-These methods are the Rust equivalents of the Cypher DDL statements in the [Cypher DDL Reference](#cypher-ddl-reference); each creation method validates the existing data first and fails if any element already violates the constraint.
+These methods are the Rust equivalents of the Cypher DDL statements in the [Cypher DDL Reference](#cypher-ddl-reference); each creation method validates the existing data first and fails if any element already violates the constraint. A label-and-property pair (or type-and-property pair) holds one declaration at a time: an index, a unique constraint, or a required constraint. Creating a second kind on the same pair fails with an error naming the one to drop first, and re-creating the same kind is a no-op.
 
 - `create_node_property_index(label: &str, property: &str) -> Result<(), Error>` and `drop_node_property_index(...)`  
   Declares (or removes) a node property index. Because every scalar node property is auto-indexed, the declaration mainly matters as the anchor for constraints.
@@ -205,6 +205,19 @@ Pathfinding, network centrality, and connectivity algorithms run over the in-mem
   Scores how likely two nodes are to become connected, by common neighbors, Jaccard, Adamic-Adar, resource allocation, or preferential
   attachment.
 
+### Counting Kernels
+
+These methods answer a count over a pattern without materializing its matches. The Cypher optimizer lowers the matching aggregations to them, and they are public so a Rust caller can ask the same questions directly; each takes a spec type re-exported from the facade.
+
+- `count_linear_paths(spec: &PathCountSpec) -> Result<u64, Error>`  
+  Counts the assignments of a one-hop or two-hop directed pattern with optional relationship types, labels, and per-vertex node-id allow-sets. Relationship uniqueness applies across the two hops.
+- `grouped_edge_counts(spec: &GroupedDegreeSpec) -> Result<Vec<(NodeId, u64)>, Error>`  
+  Counts typed edges grouped by one endpoint, one entry per group node with a non-zero count, in one pass over the adjacency.
+- `typed_neighbor_counts(sources: &[NodeId], spec: &NeighborCountSpec) -> Result<Vec<(u64, u64)>, Error>`  
+  Per-source `(qualifying, counted)` neighbor counts across one typed hop, in input order, reading only the sources' own adjacency rows. A source absent from the snapshot counts zero.
+- `count_triangle_cycles(spec: &TriangleCountSpec) -> Result<u64, Error>`  
+  Counts the assignments of the directed triangle pattern `(a)-[t1]->(b)-[t2]->(c)-[t3]->(a)` with optional per-hop relationship types and per-variable labels, following Cypher row semantics including relationship uniqueness.
+
 ### Connectivity and Flow
 
 - `connected_components() -> Result<HashMap<NodeId, u64>, Error>`  
@@ -217,8 +230,6 @@ Pathfinding, network centrality, and connectivity algorithms run over the in-mem
   Computes the maximum flow capacity between two nodes.
 - `detect_cycle() -> Result<bool, Error>`  
   Detects if the graph contains any cycles.
-- `count_triangle_cycles(spec: &TriangleCountSpec) -> Result<u64, Error>`  
-  Counts the total number of triangles (cycles of length 3) in the graph.
 - `label_propagation(max_iterations: usize) -> Result<HashMap<NodeId, u64>, Error>`  
   Partitions the graph into communities using the Label Propagation Algorithm.
 
@@ -405,4 +416,4 @@ Schema statements are executed through the query interface. A DDL statement targ
 - `CREATE CONSTRAINT ON ()-[r:TYPE]-() ASSERT EXISTS(r.property)`  
   Requires the property to be present and non-null on every relationship of the type.
 
-Each `CREATE CONSTRAINT` form has a matching `DROP CONSTRAINT` form with the same target and assertion. Creating a constraint validates the existing data first and fails if any element already violates it. Once in place, a constraint is checked when an element is created and when its properties are updated; a violating write fails and leaves the database unchanged.
+Each `CREATE CONSTRAINT` form has a matching `DROP CONSTRAINT` form with the same target and assertion. Creating a constraint validates the existing data first and fails if any element already violates it. Once in place, a constraint is checked when an element is created and when its properties are updated; a violating write fails and leaves the database unchanged. A relationship type and property pair holds one declaration at a time, so a property index and a constraint on the same pair are mutually exclusive; drop one before creating the other.

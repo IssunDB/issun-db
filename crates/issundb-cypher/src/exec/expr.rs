@@ -845,6 +845,37 @@ pub(super) fn evaluate_expr<B: Bindings>(
         // re-checks the anchor's own labels and inline properties per
         // candidate. The result is always a boolean, never null: an anchor
         // bound to null, or to a non-node value, simply matches nothing.
+        Expr::ExistsQuery(body) => {
+            // Run the body as its own read query, seeding every outer binding
+            // through a one-element UNWIND of a parameter so the body's MATCH
+            // starts from the outer row's nodes. A binding arrives as its JSON
+            // wrapper and is rebound as a graph element by the UNWIND.
+            let mut sub_params = params.clone();
+            let mut query = (**body).clone();
+            let mut seeds = Vec::new();
+            let mut names: Vec<String> = path.to_path_map().keys().cloned().collect();
+            names.sort();
+            for name in names {
+                if super::read::is_internal_var(&name) {
+                    continue;
+                }
+                let value = evaluate_expr(
+                    graph,
+                    path,
+                    &Expr::Prop(name.clone(), String::new()),
+                    params,
+                )?;
+                let param_name = format!("__exists_seed_{name}");
+                sub_params.insert(param_name.clone(), serde_json::Value::Array(vec![value]));
+                seeds.push(crate::ast::QueryPart::Unwind {
+                    expr: Expr::Param(param_name),
+                    variable: name,
+                });
+            }
+            query.parts.splice(0..0, seeds);
+            let result = super::read::execute_read_query(graph, &query, &sub_params, None)?;
+            Ok(serde_json::Value::Bool(!result.records.is_empty()))
+        }
         Expr::ExistsSubquery { pattern, predicate } => {
             let true_expr = Expr::Literal(crate::ast::Literal::Bool(true));
             let mut pat = (**pattern).clone();
@@ -925,19 +956,46 @@ pub(super) fn evaluate_expr<B: Bindings>(
             Some(GraphBinding::Scalar(serde_json::Value::Null)) | None => {
                 Ok(serde_json::Value::Null)
             }
-            // A node rebound as a value (UNWIND, a projected expression)
-            // arrives in its JSON wrapper form; resolve it to the stored node
-            // and check its labels like the direct binding above.
-            Some(GraphBinding::Scalar(v)) => {
-                if let Some((true, id)) = wrapped_graph_id(v) {
+            // `r:T` on a relationship tests its type, as openCypher's label
+            // expression on relationships does.
+            Some(GraphBinding::Edge(_)) => {
+                let type_name = eval_function_call(
+                    graph,
+                    path,
+                    "type",
+                    &[Expr::Prop(variable.clone(), String::new())],
+                    params,
+                )?;
+                Ok(serde_json::Value::Bool(
+                    type_name.as_str() == Some(label.as_str()),
+                ))
+            }
+            // A node or relationship rebound as a value (UNWIND, a projected
+            // expression) arrives in its JSON wrapper form; resolve it to the
+            // stored entity and check it like the direct binding above.
+            Some(GraphBinding::Scalar(v)) => match wrapped_graph_id(v) {
+                Some((true, id)) => {
                     if let Ok(node_labels) = node_labels_overlay(graph, id) {
                         return Ok(serde_json::Value::Bool(
                             node_labels.iter().any(|l| l == label),
                         ));
                     }
+                    Ok(serde_json::Value::Bool(false))
                 }
-                Ok(serde_json::Value::Bool(false))
-            }
+                Some((false, _)) => {
+                    let type_name = eval_function_call(
+                        graph,
+                        path,
+                        "type",
+                        &[Expr::Prop(variable.clone(), String::new())],
+                        params,
+                    )?;
+                    Ok(serde_json::Value::Bool(
+                        type_name.as_str() == Some(label.as_str()),
+                    ))
+                }
+                None => Ok(serde_json::Value::Bool(false)),
+            },
             _ => Ok(serde_json::Value::Bool(false)),
         },
         Expr::Prop(var, prop) => {

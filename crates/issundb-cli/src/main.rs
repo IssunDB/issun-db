@@ -236,8 +236,10 @@ enum ReplCommand {
     Set {
         /// Parameter name
         name: String,
-        /// Parameter value (JSON or string)
-        value: String,
+        /// Parameter value (JSON or string). The rest of the line is the value,
+        /// so a JSON list or map may contain spaces.
+        #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
+        value: Vec<String>,
     },
 
     /// Remove a query parameter (e.g., `:unset limit`)
@@ -942,7 +944,7 @@ fn main() {
 /// dispatcher and the completer so both stay in sync.
 const CYPHER_KEYWORDS: &[&str] = &[
     "MATCH", "CREATE", "MERGE", "WITH", "RETURN", "DELETE", "DETACH", "SET", "UNWIND", "CALL",
-    "OPTIONAL", "WHERE", "FOREACH", "EXPORT", "IMPORT",
+    "OPTIONAL", "WHERE", "FOREACH", "EXPORT", "IMPORT", "DROP", "COPY",
 ];
 
 /// REPL commands that take filesystem-path arguments, paired with the 1-based
@@ -1256,6 +1258,7 @@ fn execute_cmd(state: &mut State, cmd: ReplCommand) -> bool {
             }
         }
         ReplCommand::Set { name, value } => {
+            let value = value.join(" ");
             match serde_json::from_str::<serde_json::Value>(&value) {
                 Ok(v) => {
                     state.params.insert(name, v);
@@ -3597,6 +3600,24 @@ mod tests {
         // 2 through 4) are likewise not path-completed.
         let (_, cands) = complete_at_end(&helper, ":import-edges e.csv Person Person KNO");
         assert!(cands.is_empty());
+    }
+
+    /// Every statement kind the query layer accepts starts a bare statement at
+    /// the prompt, including the schema and bulk-load statements.
+    #[test]
+    fn bare_cypher_start_covers_ddl_and_bulk_load_statements() {
+        assert!(is_bare_cypher_start(
+            "DROP INDEX FOR (n:Person) ON (n.name)"
+        ));
+        assert!(is_bare_cypher_start(
+            "drop constraint on (n:A) assert n.x is unique"
+        ));
+        assert!(is_bare_cypher_start("COPY Person FROM 'people.csv'"));
+        assert!(is_bare_cypher_start(
+            "CREATE INDEX FOR (n:Person) ON (n.name)"
+        ));
+        assert!(!is_bare_cypher_start("add-node Person {}"));
+        assert!(!is_bare_cypher_start(":set limit 10"));
     }
 
     #[test]

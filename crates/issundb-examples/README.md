@@ -12,12 +12,14 @@
 
 ### Running Examples
 
+From the repository root:
+
 ```sh
-cargo run --example <name>
+cargo run -p issundb-examples --example <name>
 ```
 
 For instance:
 
 ```sh
-cargo run --example hybrid_retrieval_quickstart
+cargo run -p issundb-examples --example hybrid_retrieval_quickstart
 ```

@@ -182,7 +182,9 @@ impl SlotSchema {
             Sort { input, .. } | Limit { input, .. } | Distinct { input, .. } => {
                 self.collect(input)
             }
-            OptionalMatch { input, null_vars } => {
+            OptionalMatch {
+                input, null_vars, ..
+            } => {
                 self.collect(input);
                 for v in null_vars {
                     self.bind(v);

@@ -101,6 +101,13 @@ pub(super) fn execute_create_and_return(
                 let created = execute_create_internal_with_context(txn, pattern, &bindings, params)
                     .map_err(as_txn_error)?;
                 bindings.extend(created);
+                if let Some(pv) = &pattern.path_variable {
+                    if let Some(GraphBinding::Scalar(ids)) = bindings.get(&path_ids_var(pv)) {
+                        let path_value = super::read::written_path_value(txn.graph(), ids)
+                            .map_err(as_txn_error)?;
+                        bindings.insert(pv.clone(), GraphBinding::Scalar(path_value));
+                    }
+                }
             }
 
             // Project the RETURN clause over the created bindings, still
@@ -114,6 +121,7 @@ pub(super) fn execute_create_and_return(
                 let key = projected_key(&item.expr, &item.alias);
                 let val = evaluate_expr(txn.graph(), &bindings, &item.expr, params)
                     .map_err(as_txn_error)?;
+                let val = super::read::unpack_sentinels(txn.graph(), val);
                 let val = if val == serde_json::Value::Null {
                     if let Some(binding) = bindings.get(&key) {
                         binding_to_value(txn.graph(), Some(binding))
@@ -897,6 +905,7 @@ fn subst_loop_var_expr(expr: &Expr, var: &str) -> Expr {
             pattern: Box::new(subst_loop_var_pattern(pattern, var)),
             predicate: predicate.as_ref().map(|p| sub_box(p)),
         },
+        E::ExistsQuery(body) => E::ExistsQuery(body.clone()),
         E::Reduce {
             accumulator,
             initial,
@@ -1450,6 +1459,7 @@ pub(super) fn execute_create_internal_with_context(
     }
 
     let mut created_node_id = seed_id;
+    let mut element_ids: Vec<u64> = vec![seed_id];
 
     for (rel_pat, node_pat) in &pattern.rels {
         let target_id = if let Some(ref var) = node_pat.variable {
@@ -1513,10 +1523,33 @@ pub(super) fn execute_create_internal_with_context(
             combined_path.insert(var_name.clone(), GraphBinding::Edge(edge_id));
         }
 
+        element_ids.push(edge_id);
+        element_ids.push(target_id);
         created_node_id = target_id;
     }
 
+    if let Some(pv) = &pattern.path_variable {
+        bindings.insert(path_ids_var(pv), path_ids_binding(&element_ids));
+    }
+
     Ok(bindings)
+}
+
+/// The internal binding that carries a written pattern's element ids (node,
+/// relationship, node, ...) until the executor, which can read the elements
+/// through the pending-writes overlay, turns them into the path value bound to
+/// the pattern's path variable.
+pub(super) fn path_ids_var(path_variable: &str) -> String {
+    format!("_path_ids_{path_variable}")
+}
+
+fn path_ids_binding(element_ids: &[u64]) -> GraphBinding {
+    GraphBinding::Scalar(serde_json::Value::Array(
+        element_ids
+            .iter()
+            .map(|id| serde_json::Value::Number((*id).into()))
+            .collect(),
+    ))
 }
 
 /// Read a node's stored properties as a JSON object, returning an empty object
@@ -1648,13 +1681,15 @@ fn merge_match(
     // hops: openCypher relationship uniqueness forbids one relationship from
     // satisfying two hops of the same pattern, so a match that would reuse an
     // edge is not a match (and MERGE must create instead).
-    let mut partials: Vec<(super::PathMap, NodeId, Vec<EdgeId>)> = Vec::new();
+    // The fourth element is the node sequence, which with the edge ids gives
+    // the elements of the matched path.
+    let mut partials: Vec<(super::PathMap, NodeId, Vec<EdgeId>, Vec<NodeId>)> = Vec::new();
     for nid in seed_candidates {
         let mut pm = super::PathMap::new();
         if let Some(v) = &pattern.node.variable {
             pm.insert(v.clone(), GraphBinding::Node(nid));
         }
-        partials.push((pm, nid, Vec::new()));
+        partials.push((pm, nid, Vec::new(), vec![nid]));
     }
 
     for (rel_pat, node_pat) in &pattern.rels {
@@ -1663,8 +1698,8 @@ fn merge_match(
             .as_deref()
             .map(|t| t.split('|').collect())
             .unwrap_or_default();
-        let mut next: Vec<(super::PathMap, NodeId, Vec<EdgeId>)> = Vec::new();
-        for (pm, cur, used_edges) in &partials {
+        let mut next: Vec<(super::PathMap, NodeId, Vec<EdgeId>, Vec<NodeId>)> = Vec::new();
+        for (pm, cur, used_edges, nodes) in &partials {
             let mut combined = ctx.clone();
             for (k, v) in pm {
                 combined.insert(k.clone(), v.clone());
@@ -1725,13 +1760,30 @@ fn merge_match(
                 }
                 let mut nused = used_edges.clone();
                 nused.push(n.edge);
-                next.push((npm, n.node, nused));
+                let mut nnodes = nodes.clone();
+                nnodes.push(n.node);
+                next.push((npm, n.node, nused, nnodes));
             }
         }
         partials = next;
     }
 
-    Ok(partials.into_iter().map(|(pm, _, _)| pm).collect())
+    Ok(partials
+        .into_iter()
+        .map(|(mut pm, _, edges, nodes)| {
+            if let Some(pv) = &pattern.path_variable {
+                let mut element_ids = Vec::with_capacity(nodes.len() + edges.len());
+                for (i, nid) in nodes.iter().enumerate() {
+                    if i > 0 {
+                        element_ids.push(edges[i - 1]);
+                    }
+                    element_ids.push(*nid);
+                }
+                pm.insert(path_ids_var(pv), path_ids_binding(&element_ids));
+            }
+            pm
+        })
+        .collect())
 }
 
 /// Match-or-create a MERGE pattern within the given context. Returns one binding

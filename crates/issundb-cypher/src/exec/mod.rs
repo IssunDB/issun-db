@@ -76,6 +76,19 @@ enum GraphBinding {
     Scalar(serde_json::Value),
 }
 
+impl GraphBinding {
+    /// Bind an evaluated value. A node or relationship that traveled through
+    /// an expression arrives in its JSON wrapper form; it is rebound as the
+    /// graph element so a later pattern, DISTINCT, or CREATE treats it as one.
+    fn from_value(value: serde_json::Value) -> Self {
+        match expr::wrapped_graph_id(&value) {
+            Some((true, id)) => GraphBinding::Node(id),
+            Some((false, id)) => GraphBinding::Edge(id),
+            None => GraphBinding::Scalar(value),
+        }
+    }
+}
+
 impl std::hash::Hash for GraphBinding {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         match self {
@@ -833,24 +846,48 @@ mod tests {
         graph
             .add_node("Person", &serde_json::json!({"n": "A"}))
             .unwrap();
+        // An item unwound from a list of literal values is a value, so using it
+        // as a node is a type conflict in CREATE and MERGE alike.
         let create = execute(
             &graph,
-            "MATCH (a:Person) WITH collect(a) AS ps UNWIND ps AS p CREATE (p)-[:KNOWS]->(:Tag)",
+            "UNWIND [1, 2] AS p CREATE (p)-[:KNOWS]->(:Tag)",
             &HashMap::new(),
         );
         assert!(
             create.is_err(),
-            "CREATE rejects an unwound var used as a node"
+            "CREATE rejects an unwound value used as a node"
         );
         let merge = execute(
             &graph,
-            "MATCH (a:Person) WITH collect(a) AS ps UNWIND ps AS p MERGE (p)-[:KNOWS]->(:Tag)",
+            "UNWIND [1, 2] AS p MERGE (p)-[:KNOWS]->(:Tag)",
             &HashMap::new(),
         );
         assert!(
             merge.is_err(),
             "MERGE must reject it too, not silently misbehave"
         );
+        // An item unwound from collected nodes is a node (TCK Unwind1 [12]).
+        let created = execute(
+            &graph,
+            "MATCH (a:Person) WITH collect(a) AS ps UNWIND ps AS p CREATE (p)-[:KNOWS]->(:Tag) RETURN count(*)",
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(created.records[0].values[0], serde_json::json!(1));
+        let merged = execute(
+            &graph,
+            "MATCH (a:Person) WITH collect(a) AS ps UNWIND ps AS p MERGE (p)-[:KNOWS]->(:Tag) RETURN count(*)",
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(merged.records[0].values[0], serde_json::json!(1));
+        let edges = execute(
+            &graph,
+            "MATCH (:Person)-[r:KNOWS]->(:Tag) RETURN count(r)",
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(edges.records[0].values[0], serde_json::json!(1));
         // A node passed straight through WITH stays a graph element and is usable.
         let ok = execute(
             &graph,
@@ -7013,5 +7050,302 @@ mod tests {
         )
         .unwrap();
         assert_eq!(res.records[0].values[0], serde_json::json!([1, 2, 3]));
+    }
+
+    /// Row cells of a query over a fresh graph seeded by `setup`, for the
+    /// conformance-driven regressions below.
+    fn rows_after(setup: &str, query: &str) -> Vec<Vec<serde_json::Value>> {
+        let (_dir, graph) = setup_graph();
+        if !setup.is_empty() {
+            execute(&graph, setup, &HashMap::new()).unwrap();
+        }
+        execute(&graph, query, &HashMap::new())
+            .unwrap()
+            .records
+            .into_iter()
+            .map(|r| r.values)
+            .collect()
+    }
+
+    /// `<-->` without brackets lexes as two arrows and matches either direction.
+    #[test]
+    fn bare_both_arrows_pattern_is_undirected() {
+        let rows = rows_after(
+            "CREATE (a:A), (b:B) CREATE (a)-[:T1]->(b), (b)-[:T2]->(a)",
+            "MATCH p = (n)<-->(k)<--(n) RETURN p ORDER BY p",
+        );
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0][0],
+            serde_json::json!("<(:A)<-[:T2]-(:B)<-[:T1]-(:A)>")
+        );
+    }
+
+    /// `r:T` on a relationship tests its type.
+    #[test]
+    fn label_expression_on_relationship_tests_type() {
+        let rows = rows_after(
+            "CREATE ()-[:T1]->(), ()-[:T2]->(), ()-[:t2]->()",
+            "MATCH ()-[r]->() RETURN type(r), r:T2 ORDER BY type(r)",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec![serde_json::json!("T1"), serde_json::json!(false)],
+                vec![serde_json::json!("T2"), serde_json::json!(true)],
+                vec![serde_json::json!("t2"), serde_json::json!(false)],
+            ]
+        );
+    }
+
+    /// ORDER BY ranks types as openCypher does: map, node, relationship, list,
+    /// path, string, boolean, number, then null.
+    #[test]
+    fn order_by_ranks_distinct_types() {
+        let rows = rows_after(
+            "CREATE (:N)-[:REL]->()",
+            "MATCH p = (n:N)-[r:REL]->() \
+             UNWIND [n, r, p, 1.5, ['list'], 'text', null, false, {a: 'map'}] AS types \
+             RETURN types ORDER BY types",
+        );
+        let cells: Vec<serde_json::Value> = rows.into_iter().map(|r| r[0].clone()).collect();
+        assert_eq!(
+            cells,
+            vec![
+                serde_json::json!({"a": "map"}),
+                serde_json::json!("(:N)"),
+                serde_json::json!("[:REL]"),
+                serde_json::json!(["list"]),
+                serde_json::json!("<(:N)-[:REL]->()>"),
+                serde_json::json!("text"),
+                serde_json::json!(false),
+                serde_json::json!(1.5),
+                serde_json::Value::Null,
+            ]
+        );
+    }
+
+    /// A WITH may sort by a variable it does not project when it neither
+    /// aggregates nor deduplicates.
+    #[test]
+    fn with_order_by_non_projected_variable() {
+        let rows = rows_after(
+            "CREATE (:A {num: 1, num2: 4}), (:A {num: 5, num2: 2}), (:A {num: 9, num2: 0}), \
+             (:A {num: 3, num2: 3}), (:A {num: 7, num2: 1})",
+            "MATCH (a:A) WITH a, a.num + a.num2 AS sum WITH a.num AS num, a.num2 % 3 AS mod \
+             ORDER BY sum LIMIT 3 RETURN num, mod ORDER BY num",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec![serde_json::json!(1), serde_json::json!(1)],
+                vec![serde_json::json!(3), serde_json::json!(0)],
+                vec![serde_json::json!(5), serde_json::json!(2)],
+            ]
+        );
+    }
+
+    /// A node unwound from a collected list, or read out of a list by index,
+    /// is a node again: MATCH and CREATE use it as one.
+    #[test]
+    fn unwound_and_indexed_nodes_rebind_as_graph_elements() {
+        let rows = rows_after(
+            "CREATE (s:S), (n), (e:E), (s)-[:X]->(e), (s)-[:Y]->(e), (n)-[:Y]->(e)",
+            "MATCH (a:S)-[:X]->(b1) WITH a, collect(b1) AS bees UNWIND bees AS b2 \
+             MATCH (a)-[:Y]->(b2) RETURN a, b2",
+        );
+        assert_eq!(
+            rows,
+            vec![vec![serde_json::json!("(:S)"), serde_json::json!("(:E)")]]
+        );
+        let rows = rows_after(
+            "CREATE (a {var: 'start'}), (b {var: 'end'}) WITH a, b, [a, b] AS nodeList \
+             UNWIND range(0, 0) AS i WITH nodeList[i] AS n1, nodeList[i + 1] AS n2 \
+             CREATE (n1)-[:T]->(n2)",
+            "MATCH ({var: 'start'})-[:T]->(m) RETURN m.var",
+        );
+        assert_eq!(rows, vec![vec![serde_json::json!("end")]]);
+    }
+
+    /// The WHERE of an OPTIONAL MATCH may name variables bound before it; a
+    /// match the predicate rejects null-fills the row instead of dropping it.
+    #[test]
+    fn optional_match_where_over_outer_variables_null_fills() {
+        let rows = rows_after(
+            "CREATE (a:A {num: 1})-[:REL {name: 'r1'}]->(b:B {num: 2})-[:REL {name: 'r2'}]->(c:C {num: 3})",
+            "MATCH (a)-[r {name: 'r1'}]-(b) OPTIONAL MATCH (b)-[r2]-(c) WHERE r <> r2 \
+             RETURN a.num, b.num, c.num ORDER BY a.num",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec![
+                    serde_json::json!(1),
+                    serde_json::json!(2),
+                    serde_json::json!(3)
+                ],
+                vec![
+                    serde_json::json!(2),
+                    serde_json::json!(1),
+                    serde_json::Value::Null
+                ],
+            ]
+        );
+        let rows = rows_after(
+            "CREATE (:X {val: 1})-[:E1]->(:Y {val: 2})-[:E2]->(:Z {val: 3}), \
+             (:X {val: 4})-[:E1]->(:Y {val: 5}), (:X {val: 6})",
+            "MATCH (x:X) OPTIONAL MATCH (x)-[:E1]->(y:Y) OPTIONAL MATCH (y)-[:E2]->(z:Z) \
+             WHERE x.val < z.val RETURN x.val, y.val, z.val ORDER BY x.val",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec![
+                    serde_json::json!(1),
+                    serde_json::json!(2),
+                    serde_json::json!(3)
+                ],
+                vec![
+                    serde_json::json!(4),
+                    serde_json::json!(5),
+                    serde_json::Value::Null
+                ],
+                vec![
+                    serde_json::json!(6),
+                    serde_json::Value::Null,
+                    serde_json::Value::Null
+                ],
+            ]
+        );
+    }
+
+    /// An inline property map on a variable-length hop must hold for every
+    /// traversed relationship.
+    #[test]
+    fn var_length_inline_properties_apply_to_every_hop() {
+        let rows = rows_after(
+            "CREATE (a:Artist:A), (b:Artist:B), (c:Artist:C) \
+             CREATE (a)-[:WORKED_WITH {year: 1987}]->(b), (b)-[:WORKED_WITH {year: 1988}]->(c)",
+            "MATCH (a:Artist)-[:WORKED_WITH* {year: 1988}]->(b:Artist) RETURN a, b",
+        );
+        assert_eq!(
+            rows,
+            vec![vec![
+                serde_json::json!("(:Artist:B)"),
+                serde_json::json!("(:Artist:C)")
+            ]]
+        );
+    }
+
+    /// A relationship list bound before the pattern fixes the trail of a
+    /// variable-length hop, in pattern direction.
+    #[test]
+    fn var_length_over_bound_relationship_list() {
+        let setup = "CREATE (a:A), (b:B), (c:C) CREATE (a)-[:Y]->(b), (b)-[:Y]->(c)";
+        let rows = rows_after(
+            setup,
+            "MATCH ()-[r1]->()-[r2]->() WITH [r1, r2] AS rs LIMIT 1 \
+             MATCH (first)-[rs*]->(second) RETURN first, second",
+        );
+        assert_eq!(
+            rows,
+            vec![vec![serde_json::json!("(:A)"), serde_json::json!("(:C)")]]
+        );
+        let rows = rows_after(
+            setup,
+            "MATCH (a)-[r1]->()-[r2]->(b) WITH [r1, r2] AS rs, a AS second, b AS first LIMIT 1 \
+             MATCH (first)-[rs*]->(second) RETURN first, second",
+        );
+        assert!(rows.is_empty(), "wrong direction matches nothing: {rows:?}");
+    }
+
+    /// A named path keeps the hops before a variable-length hop, and a
+    /// zero-length hop contributes no elements.
+    #[test]
+    fn named_path_through_var_length_hops() {
+        let rows = rows_after(
+            "CREATE (a:A {name: 'A'})-[:KNOWS]->(b:B {name: 'B'})-[:FRIEND]->(c:C {name: 'C'})",
+            "MATCH p = (a {name: 'A'})-[:KNOWS*0..1]->(b)-[:FRIEND*0..1]->(c) RETURN p ORDER BY length(p)",
+        );
+        let cells: Vec<serde_json::Value> = rows.into_iter().map(|r| r[0].clone()).collect();
+        assert_eq!(
+            cells,
+            vec![
+                serde_json::json!("<(:A {name: 'A'})>"),
+                serde_json::json!("<(:A {name: 'A'})-[:KNOWS]->(:B {name: 'B'})>"),
+                serde_json::json!(
+                    "<(:A {name: 'A'})-[:KNOWS]->(:B {name: 'B'})-[:FRIEND]->(:C {name: 'C'})>"
+                ),
+            ]
+        );
+        // Parallel edges give the undirected three-hop trail two ways out
+        // and back on each side (relationship uniqueness forbids reusing one).
+        let rows = rows_after(
+            "CREATE (db1:Start), (db2:End), (mid), (other) \
+             CREATE (mid)-[:CONNECTED_TO]->(db1), (mid)-[:CONNECTED_TO]->(db2), \
+             (mid)-[:CONNECTED_TO]->(db2), (mid)-[:CONNECTED_TO]->(other), \
+             (mid)-[:CONNECTED_TO]->(other)",
+            "MATCH p = (:Start)<-[:CONNECTED_TO]-()-[:CONNECTED_TO*3..3]-(:End) RETURN p",
+        );
+        let expected = serde_json::json!(
+            "<(:Start)<-[:CONNECTED_TO]-()-[:CONNECTED_TO]->()<-[:CONNECTED_TO]-()-[:CONNECTED_TO]->(:End)>"
+        );
+        assert_eq!(rows, vec![vec![expected.clone()]; 4]);
+    }
+
+    /// CREATE and MERGE bind a path variable to the written pattern.
+    #[test]
+    fn create_and_merge_bind_path_variables() {
+        let rows = rows_after("", "CREATE p = (a {num: 1})-[:R]->(b {num: 2}) RETURN p");
+        assert_eq!(
+            rows,
+            vec![vec![serde_json::json!("<({num: 1})-[:R]->({num: 2})>")]]
+        );
+        let rows = rows_after("", "MERGE p = (a {num: 1}) RETURN p");
+        assert_eq!(rows, vec![vec![serde_json::json!("<({num: 1})>")]]);
+        let rows = rows_after(
+            "CREATE ({num: 1})-[:R]->({num: 2})",
+            "MERGE (a {num: 1}) MERGE (b {num: 2}) MERGE p = (a)-[:R]->(b) RETURN p",
+        );
+        assert_eq!(
+            rows,
+            vec![vec![serde_json::json!("<({num: 1})-[:R]->({num: 2})>")]]
+        );
+    }
+
+    /// A pattern comprehension that is a grouping key of an aggregation is read
+    /// from the group row, not re-evaluated on it.
+    #[test]
+    fn pattern_comprehension_as_grouping_key() {
+        let rows = rows_after(
+            "CREATE (a:A), (b:B) CREATE (a)-[:T]->(b), (b)-[:T]->(:C)",
+            "MATCH (n)-->(b) WITH [p = (n)-->() | p] AS ps, count(b) AS c RETURN ps, c ORDER BY ps",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec![
+                    serde_json::json!(["<(:A)-[:T]->(:B)>"]),
+                    serde_json::json!(1)
+                ],
+                vec![
+                    serde_json::json!(["<(:B)-[:T]->(:C)>"]),
+                    serde_json::json!(1)
+                ],
+            ]
+        );
+    }
+
+    /// An existential subquery with a WITH stage runs as a query per row, with
+    /// the outer bindings seeded in, so it can aggregate.
+    #[test]
+    fn existential_subquery_with_aggregation() {
+        let rows = rows_after(
+            "CREATE (a:A {prop: 1})-[:R]->(b:B {prop: 1}), (a)-[:R]->(:C {prop: 2}), \
+             (a)-[:R]->(d:D {prop: 3}), (b)-[:R]->(d)",
+            "MATCH (n) WHERE exists { MATCH (n)-->(m) WITH n, count(*) AS numConnections \
+             WHERE numConnections = 3 RETURN true } RETURN n",
+        );
+        assert_eq!(rows, vec![vec![serde_json::json!("(:A {prop: 1})")]]);
     }
 }

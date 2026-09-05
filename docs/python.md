@@ -1,6 +1,6 @@
 # Python Integration
 
-This guide covers installation, quickstart examples, vector, and text index configuration, and query execution using the `issundb` Python bindings.
+This guide covers installation, quickstart examples, vector and text index configuration, and query execution using the `issundb` Python bindings.
 
 ---
 
