@@ -802,6 +802,14 @@ impl Graph {
         )
     }
 
+    /// Size and entry count of every storage table, the breakdown behind the
+    /// on-disk footprint. One `stat` call per table on LMDB, so it is cheap; the
+    /// in-memory backend sums its entries instead.
+    pub fn storage_table_stats(&self) -> Result<Vec<crate::schema::TableStat>, Error> {
+        let rtxn = self.storage.env.read_txn()?;
+        self.storage.table_stats(&rtxn)
+    }
+
     /// Set the thread count for the parallel read passes, overriding the
     /// `ISSUNDB_NUM_THREADS` environment variable. Set to 0 to restore the default
     /// behavior, which resolves through `threads::resolve`: `ISSUNDB_NUM_THREADS`,

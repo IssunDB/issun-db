@@ -1135,4 +1135,33 @@ mod tests {
             "each open has its own nonce"
         );
     }
+
+    /// The table report names all twelve tables and counts what was written:
+    /// a node in `nodes`, one `label_idx` entry per label, one adjacency entry
+    /// per direction per edge, and one auto-index entry per scalar property
+    /// *per label*, so a two-label node with two properties costs four.
+    #[test]
+    fn storage_table_stats_count_records_indexes_and_adjacency() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let g = Graph::open(dir.path(), 1).unwrap();
+        let a = g
+            .add_node_multi(&["A", "B"], &serde_json::json!({"x": 1, "y": "s"}))
+            .unwrap();
+        let b = g.add_node("A", &serde_json::json!({"x": 2})).unwrap();
+        g.add_edge(a, b, "T", &serde_json::json!({"w": 1})).unwrap();
+        g.add_edge(b, a, "T", &serde_json::json!({})).unwrap();
+        let stats = g.storage_table_stats().unwrap();
+        let get = |name: &str| stats.iter().find(|t| t.name == name).unwrap();
+        assert_eq!(stats.len(), 12);
+        assert_eq!(get("nodes").entries, 2);
+        assert_eq!(get("edges").entries, 2);
+        assert_eq!(get("out_adj").entries, 2);
+        assert_eq!(get("in_adj").entries, 2);
+        assert_eq!(get("label_idx").entries, 3);
+        assert_eq!(get("type_idx").entries, 2);
+        assert_eq!(get("node_prop_idx").entries, 5);
+        assert_eq!(get("edge_prop_idx").entries, 0);
+        assert!(get("nodes").bytes > 0);
+        assert!(get("edge_prop_idx").bytes == 0 || get("edge_prop_idx").pages.is_some());
+    }
 }

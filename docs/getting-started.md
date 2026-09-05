@@ -94,7 +94,7 @@ The REPL also supports direct operations and queries to manipulate nodes and edg
 | `in`                  | Get all incoming neighbors and relationships of a node (e.g., `in 1`).                             |
 | `label`               | Find nodes carrying a specific label (e.g., `label Person`).                                       |
 | `etype`               | Find relationships of a specific type (e.g., `etype KNOWS`).                                       |
-| `stats`               | Display node and relationship count statistics.                                                    |
+| `stats`               | Display node, relationship, index, and per-storage-table size statistics.                          |
 | `bfs`                 | Run a breadth-first search traversal (e.g., `bfs 1 3`).                                            |
 | `dfs`                 | Run a depth-first search traversal (e.g., `dfs 1 3`).                                              |
 | `path`                | Find the shortest unweighted path between two nodes (e.g., `path 1 2`).                            |

@@ -426,6 +426,10 @@ The read-path and statistics methods carry non-obvious semantics:
   edge-level statistics. One pass over `label_idx` and one over `out_adj`, cached until a committed write advances the generation. It is what makes the
   expand-ratio estimates available at all, and it upgrades `schema_has_edge` from a budgeted probe to an exact lookup that also decides the questions the
   probe gives up on. A caller wanting the optimizer at full strength on a cold graph wants this and `materialize_property_columns`.
+- `storage_table_stats() -> Result<Vec<TableStat>, Error>`: size and entry count of each of the twelve storage tables, in declaration order. On LMDB
+  `bytes` is the table's pages times the page size, so the twelve sum to the live data in the file with the free-page slack excluded; the in-memory
+  backend reports summed key and value lengths and no page count. The CLI's `stats` command prints it, and it is how a footprint question is answered
+  by measurement rather than arithmetic.
 - `plan_generation() -> (u64, u64, u64)`: what a cached query plan is valid for: a per-open identity nonce, the committed write generation, and a
   schema generation that index and constraint DDL and the `materialize_*` builders advance. Those last two kinds of change alter plans without being
   data writes, and they do not advance the write generation because that would mark the CSR snapshot stale for nothing. The Cypher executor keys

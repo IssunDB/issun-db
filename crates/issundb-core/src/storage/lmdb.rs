@@ -53,6 +53,40 @@ pub struct Storage {
     pub db_id: [u8; 16],
 }
 
+impl Storage {
+    /// Page-level size and entry count of every table, in declaration order.
+    pub fn table_stats(&self, rtxn: &RoTxn) -> Result<Vec<crate::schema::TableStat>, Error> {
+        fn stat<K: 'static, V: 'static>(
+            name: &'static str,
+            db: &Database<K, V>,
+            rtxn: &RoTxn,
+        ) -> Result<crate::schema::TableStat, Error> {
+            let st = db.stat(rtxn)?;
+            let pages = (st.branch_pages + st.leaf_pages + st.overflow_pages) as u64;
+            Ok(crate::schema::TableStat {
+                name,
+                entries: st.entries as u64,
+                bytes: pages * st.page_size as u64,
+                pages: Some(pages),
+            })
+        }
+        Ok(vec![
+            stat("nodes", &self.nodes, rtxn)?,
+            stat("edges", &self.edges, rtxn)?,
+            stat("out_adj", &self.out_adj, rtxn)?,
+            stat("in_adj", &self.in_adj, rtxn)?,
+            stat("label_idx", &self.label_idx, rtxn)?,
+            stat("type_idx", &self.type_idx, rtxn)?,
+            stat("node_prop_idx", &self.node_prop_idx, rtxn)?,
+            stat("edge_prop_idx", &self.edge_prop_idx, rtxn)?,
+            stat("fts_postings", &self.fts_postings, rtxn)?,
+            stat("fts_docs", &self.fts_docs, rtxn)?,
+            stat("vectors", &self.vectors, rtxn)?,
+            stat("meta", &self.meta, rtxn)?,
+        ])
+    }
+}
+
 /// A read transaction as a *parameter*: what a function that only reads accepts.
 ///
 /// Aliased here rather than named at each of the ~90 use sites, so the engine is

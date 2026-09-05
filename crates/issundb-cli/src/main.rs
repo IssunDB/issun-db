@@ -2345,6 +2345,8 @@ struct GraphStats {
     edge_indexes: Vec<(String, String, u8)>,
     /// `(label, property, language)` full-text indexes.
     text_indexes: Vec<(String, String, String)>,
+    /// Per-table size and entry count, in storage declaration order.
+    tables: Vec<issundb::TableStat>,
     /// Number of persisted vector embeddings.
     vector_count: usize,
     /// Total size of the LMDB files on disk, when the path is known.
@@ -2400,6 +2402,7 @@ fn gather_stats(
 
     let vector_count = g.vector_bytes()?.len();
     let on_disk_bytes = db_path.and_then(dir_size);
+    let tables = g.storage_table_stats()?;
 
     Ok(GraphStats {
         node_count,
@@ -2411,6 +2414,7 @@ fn gather_stats(
         text_indexes,
         vector_count,
         on_disk_bytes,
+        tables,
         map_size_gb,
     })
 }
@@ -2509,6 +2513,34 @@ fn print_stats(s: &GraphStats) {
         for (label, prop, lang) in &s.text_indexes {
             println!("  {:<28}{}", format!("{label}.{prop}"), lang);
         }
+    }
+
+    // Where the footprint goes: the live bytes of each storage table, so an
+    // operator can see whether records, adjacency, or an index is the cost.
+    // The total is live data only; the on-disk size above also holds LMDB's
+    // free-page slack, which `:backup-compact` reclaims.
+    if !s.tables.is_empty() {
+        println!("{}", "Storage Tables".cyan().bold());
+        let total: u64 = s.tables.iter().map(|t| t.bytes).sum();
+        println!(
+            "  {:<16}{:>14}{:>12}{:>7}",
+            "table", "entries", "size", "share"
+        );
+        for t in &s.tables {
+            let share = if total == 0 {
+                0.0
+            } else {
+                t.bytes as f64 * 100.0 / total as f64
+            };
+            println!(
+                "  {:<16}{:>14}{:>12}{:>6.1}%",
+                t.name,
+                t.entries,
+                human_bytes(t.bytes),
+                share
+            );
+        }
+        println!("  {:<16}{:>14}{:>12}", "total", "", human_bytes(total));
     }
 }
 
@@ -3680,6 +3712,22 @@ mod tests {
         );
 
         assert_eq!(stats.vector_count, 1);
+        // Every storage table is reported, and the record tables carry what
+        // was written: three nodes, two edges, and one embedding.
+        assert_eq!(stats.tables.len(), 12);
+        let entries = |name: &str| {
+            stats
+                .tables
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap()
+                .entries
+        };
+        assert_eq!(entries("nodes"), 3);
+        assert_eq!(entries("edges"), 2);
+        assert_eq!(entries("out_adj"), 2);
+        assert_eq!(entries("vectors"), 1);
+        assert!(stats.tables.iter().all(|t| t.entries == 0 || t.bytes > 0));
         assert!(stats.on_disk_bytes.unwrap_or(0) > 0);
     }
 

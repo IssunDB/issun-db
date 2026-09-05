@@ -716,3 +716,45 @@ mod tests {
         wtxn.commit().unwrap();
     }
 }
+
+impl Storage {
+    /// Entry count and summed key and value bytes of every table, in the LMDB
+    /// backend's declaration order; this backend has no pages to count.
+    pub fn table_stats(&self, rtxn: &RoTxn<'_>) -> Result<Vec<crate::schema::TableStat>, Error> {
+        const NAMES: [&str; 12] = [
+            "nodes",
+            "edges",
+            "out_adj",
+            "in_adj",
+            "label_idx",
+            "type_idx",
+            "node_prop_idx",
+            "edge_prop_idx",
+            "fts_postings",
+            "fts_docs",
+            "vectors",
+            "meta",
+        ];
+        Ok(NAMES
+            .iter()
+            .enumerate()
+            .map(|(index, name)| {
+                let data = rtxn.table_data(index);
+                let mut entries = 0u64;
+                let mut bytes = 0u64;
+                for (k, values) in data.iter() {
+                    for v in values {
+                        entries += 1;
+                        bytes += (k.len() + v.len()) as u64;
+                    }
+                }
+                crate::schema::TableStat {
+                    name,
+                    entries,
+                    bytes,
+                    pages: None,
+                }
+            })
+            .collect())
+    }
+}
