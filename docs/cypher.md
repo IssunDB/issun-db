@@ -9,17 +9,17 @@ Conformance is tracked against a subset of the openCypher TCK (Technology Compat
 | Clause | Notes |
 |--------|-------|
 | `MATCH` | Comma-separated patterns; each `MATCH` may carry a `WHERE`. |
-| `OPTIONAL MATCH` | Unmatched rows are null-filled. |
+| `OPTIONAL MATCH` | Unmatched rows are null-filled. Its `WHERE` may name variables bound by earlier clauses; a match the predicate rejects null-fills the row rather than dropping it. |
 | `WHERE` | Full boolean expressions on `MATCH`, `OPTIONAL MATCH`, and `WITH`. |
 | `RETURN` | Supports `DISTINCT`, `*`, and `AS` aliases; an unaliased item's column name is its source text. |
-| `WITH` | Supports `DISTINCT`, `*`, `WHERE`, `ORDER BY`, `SKIP`, and `LIMIT`. |
-| `UNWIND` | `UNWIND expr AS var`. |
+| `WITH` | Supports `DISTINCT`, `*`, `WHERE`, `ORDER BY`, `SKIP`, and `LIMIT`. `ORDER BY` may sort by a variable in scope that the `WITH` does not project, unless the `WITH` aggregates or uses `DISTINCT`. |
+| `UNWIND` | `UNWIND expr AS var`. An item that is a node or relationship (for example from `collect(n)`) binds as one, so a later pattern or `CREATE` can use it. |
 | `CREATE` | Comma-separated patterns; a created relationship must be directed and carry exactly one type. |
-| `MERGE` | Supports `ON CREATE SET` and `ON MATCH SET`; relationship uniqueness applies to the match. |
-| `SET` | Property assignment (`SET n.prop = expr`) and label assignment (`SET n:Label1:Label2`). Setting a property to null removes it. |
+| `MERGE` | Supports `ON CREATE SET` and `ON MATCH SET`; relationship uniqueness applies to the match. `MERGE p = ...` binds the matched or created path. |
+| `SET` | Property assignment (`SET n.prop = expr`), whole-map replacement (`SET n = {map}`), map merge (`SET n += {map}`), and label assignment (`SET n:Label1:Label2`). Setting a property to null removes it. |
 | `REMOVE` | Removes properties (`REMOVE n.prop`) and labels (`REMOVE n:Label`). |
 | `DELETE` / `DETACH DELETE` | Targets are arbitrary expressions evaluating to nodes, relationships, or lists of them; deletion applies after the whole result is computed. |
-| `ORDER BY` | One or more sort keys, each `ASC` or `DESC`. |
+| `ORDER BY` | One or more sort keys, each `ASC` or `DESC`. Values of different types order as openCypher specifies: map, node, relationship, list, path, string, boolean, number, and null last. |
 | `SKIP` / `LIMIT` | Accept literals, parameters, and constant expressions (any expression that does not depend on variables). |
 | `UNION` / `UNION ALL` | Combines queries with matching column names. |
 | `FOREACH` | Applies a body of write clauses to each element of a list expression. |
@@ -31,10 +31,10 @@ Queries compose as pipelines: a sequence of clauses such as `MATCH ... WITH ... 
 
 - Node patterns support a variable, multiple labels, and an inline property map: `(n:Person:Admin {name: 'Alice'})`.
 - Relationship patterns support a variable, type alternation (`[:KNOWS|LIKES]`), and an inline property map.
-- Directions: outgoing `-[..]->`, incoming `<-[..]-`, and undirected `-[..]-`. The both-arrows form `<-[..]->` matches either direction, exactly like an undirected pattern; `CREATE` and `MERGE` reject it because a created relationship must be directed. Bare arrows (`-->`, `<--`, `--`) also parse.
-- Variable-length relationships support every range form: `*`, `*n`, `*n..m`, `*n..`, `*..m`, and `*..`. A variable on a variable-length relationship always binds a list of relationships, including for `*1`.
+- Directions: outgoing `-[..]->`, incoming `<-[..]-`, and undirected `-[..]-`. The both-arrows form `<-[..]->` matches either direction, exactly like an undirected pattern; `CREATE` and `MERGE` reject it because a created relationship must be directed. Bare arrows (`-->`, `<--`, `--`, and `<-->`) also parse.
+- Variable-length relationships support every range form: `*`, `*n`, `*n..m`, `*n..`, `*..m`, and `*..`. A variable on a variable-length relationship always binds a list of relationships, including for `*1`. An inline property map on a variable-length relationship must hold for every traversed relationship. A variable already bound to a list of relationships (`WITH [r1, r2] AS rs MATCH (a)-[rs*]->(b)`) matches exactly that trail, walked in the pattern's direction.
 - Relationship uniqueness follows openCypher: within one pattern match, a node may repeat but a relationship may not.
-- Named paths (`p = (a)-[:KNOWS]->(b)`) bind path values; `nodes(p)`, `relationships(p)` (alias `rels(p)`), and `length(p)` operate on them.
+- Named paths (`p = (a)-[:KNOWS]->(b)`) bind path values in `MATCH`, `CREATE`, and `MERGE`; `nodes(p)`, `relationships(p)` (alias `rels(p)`), and `length(p)` operate on them. A path through a zero-length variable-length hop contains only the node.
 - Because a variable-length relationship variable is a list rather than a path, its hop count is `size(r)`. `length()` applies to a named path, so
   `length(r)` on a relationship list is a type error.
 
@@ -52,7 +52,8 @@ Queries compose as pipelines: a sequence of clauses such as `MATCH ... WITH ... 
   determined side, as openCypher requires (`false AND 123` raises; `false AND (1 / 0)` is `false`).
 - `CASE` in both the simple (`CASE x WHEN ...`) and searched (`CASE WHEN ...`) forms, with an optional `ELSE`.
 - List comprehensions (`[x IN list WHERE pred | expr]`), pattern comprehensions (`[p = (a)-[r]->(b) WHERE pred | expr]`), the quantifiers `all`, `any`, `none`, and `single`, and `reduce(acc = init, x IN list | expr)`.
-- Label predicates in expression position: `n:Label` and `n:A:B` evaluate to booleans.
+- Label predicates in expression position: `n:Label` and `n:A:B` evaluate to booleans. On a relationship, `r:TYPE` tests the relationship type.
+- Pattern predicates in `WHERE` (`WHERE (a)-[:KNOWS]->(b)`, `WHERE NOT (a)-->(b)`), and existential subqueries: the pattern form `EXISTS { (a)-[:KNOWS]->(b) WHERE pred }`, the single-clause form `EXISTS { MATCH ... WHERE ... RETURN ... }`, and the multi-clause form with `WITH` stages (`EXISTS { MATCH (n)-->(m) WITH n, count(*) AS c WHERE c = 3 RETURN true }`), which runs as a query per row with the outer bindings in scope.
 
 ## Functions
 
@@ -78,11 +79,8 @@ The temporal constructors `date`, `time`, `localtime`, `datetime`, `localdatetim
 
 ## Unsupported Constructs
 
-- `SET n = {map}` and `SET n += {map}`: assign properties individually with `SET n.prop = value`.
-- `CALL { ... }` subqueries and `EXISTS { ... }` subqueries: `CALL` is procedure invocation only, and `exists()` is a scalar null check.
+- `CALL { ... }` subqueries: `CALL` is procedure invocation only.
 - `shortestPath(...)` and `allShortestPaths(...)` pattern functions: use the `shortest_path` and `all_shortest_paths` methods on the `Graph` API instead.
-- Pattern predicates in `WHERE` (`WHERE (a)-[:KNOWS]->(b)`, `WHERE NOT (a)-->(b)`). A pattern is matched, not tested, so express the positive case as
-  an additional `MATCH` and the negative case as an anti-join: `OPTIONAL MATCH (a)-[r:KNOWS]->(b) WITH a, b, r WHERE r IS NULL`.
 - Map projections (`n{.name, .age}`).
 - `MANDATORY MATCH`.
 

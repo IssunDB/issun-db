@@ -436,8 +436,16 @@ impl Optimizer {
             // preserved null rows. Leave the input subtree intact and report no filters to
             // the caller. `push_down_filters` never recurses into an OptionalMatch, so the
             // inner filters stay contained; `reorder_operators` handles them in place.
-            PhysicalOperator::OptionalMatch { input, null_vars } => (
-                PhysicalOperator::OptionalMatch { input, null_vars },
+            PhysicalOperator::OptionalMatch {
+                input,
+                null_vars,
+                predicate,
+            } => (
+                PhysicalOperator::OptionalMatch {
+                    input,
+                    null_vars,
+                    predicate,
+                },
                 Vec::new(),
             ),
             PhysicalOperator::Distinct { input, keys } => {
@@ -630,12 +638,15 @@ impl Optimizer {
                 skip,
                 count,
             },
-            PhysicalOperator::OptionalMatch { input, null_vars } => {
-                PhysicalOperator::OptionalMatch {
-                    input: Box::new(Self::reorder_operators(*input, stats, labels)),
-                    null_vars,
-                }
-            }
+            PhysicalOperator::OptionalMatch {
+                input,
+                null_vars,
+                predicate,
+            } => PhysicalOperator::OptionalMatch {
+                input: Box::new(Self::reorder_operators(*input, stats, labels)),
+                null_vars,
+                predicate,
+            },
             PhysicalOperator::Distinct { input, keys } => PhysicalOperator::Distinct {
                 keys,
                 input: Box::new(Self::reorder_operators(*input, stats, labels)),
@@ -1404,9 +1415,14 @@ impl Optimizer {
                 skip,
                 count,
             },
-            OptionalMatch { input, null_vars } => OptionalMatch {
+            OptionalMatch {
+                input,
+                null_vars,
+                predicate,
+            } => OptionalMatch {
                 input: Box::new(f(*input)),
                 null_vars,
+                predicate,
             },
             Distinct { input, keys } => Distinct {
                 input: Box::new(f(*input)),
@@ -1937,12 +1953,15 @@ impl Optimizer {
                 }
             }
             // Do not push filters into an OptionalMatch; they must remain outside.
-            PhysicalOperator::OptionalMatch { input, null_vars } => {
-                PhysicalOperator::OptionalMatch {
-                    input: Box::new(*input),
-                    null_vars,
-                }
-            }
+            PhysicalOperator::OptionalMatch {
+                input,
+                null_vars,
+                predicate,
+            } => PhysicalOperator::OptionalMatch {
+                input: Box::new(*input),
+                null_vars,
+                predicate,
+            },
             PhysicalOperator::Distinct { input, keys } => {
                 let optimized = Self::push_down_filters(*input, pending);
                 PhysicalOperator::Distinct {
@@ -2171,7 +2190,9 @@ impl Optimizer {
             PhysicalOperator::Sort { input, .. } | PhysicalOperator::Limit { input, .. } => {
                 Self::collect_bound_vars(input, vars);
             }
-            PhysicalOperator::OptionalMatch { input, null_vars } => {
+            PhysicalOperator::OptionalMatch {
+                input, null_vars, ..
+            } => {
                 Self::collect_bound_vars(input, vars);
                 for var in null_vars {
                     vars.insert(var.clone());
@@ -2427,6 +2448,7 @@ impl Optimizer {
             // correlated variable keeps the filter above its binder, and a name
             // bound nowhere leaves the filter wrapped above the root, where every
             // correlated variable is in scope.
+            Expr::ExistsQuery(body) => crate::parser::collect_query_vars(body, vars),
             Expr::ExistsSubquery { pattern, predicate } => {
                 if let Some(v) = &pattern.node.variable {
                     vars.insert(v.clone());
@@ -2908,12 +2930,15 @@ impl Optimizer {
                 input: Box::new(Self::optimize_index_scans(*input, stats)),
                 keys,
             },
-            PhysicalOperator::OptionalMatch { input, null_vars } => {
-                PhysicalOperator::OptionalMatch {
-                    input: Box::new(Self::optimize_index_scans(*input, stats)),
-                    null_vars,
-                }
-            }
+            PhysicalOperator::OptionalMatch {
+                input,
+                null_vars,
+                predicate,
+            } => PhysicalOperator::OptionalMatch {
+                input: Box::new(Self::optimize_index_scans(*input, stats)),
+                null_vars,
+                predicate,
+            },
             PhysicalOperator::WritePart { input, part } => PhysicalOperator::WritePart {
                 input: Box::new(Self::optimize_index_scans(*input, stats)),
                 part,
@@ -3632,9 +3657,14 @@ fn rewrite_join_to_expand(op: PhysicalOperator) -> PhysicalOperator {
             expr,
             variable,
         },
-        PhysicalOperator::OptionalMatch { input, null_vars } => PhysicalOperator::OptionalMatch {
+        PhysicalOperator::OptionalMatch {
+            input,
+            null_vars,
+            predicate,
+        } => PhysicalOperator::OptionalMatch {
             input: Box::new(rewrite_join_to_expand(*input)),
             null_vars,
+            predicate,
         },
         PhysicalOperator::WritePart { input, part } => PhysicalOperator::WritePart {
             input: Box::new(rewrite_join_to_expand(*input)),
@@ -3849,9 +3879,14 @@ fn rewrite_closing_expands(op: PhysicalOperator) -> PhysicalOperator {
             expr,
             variable,
         },
-        PhysicalOperator::OptionalMatch { input, null_vars } => PhysicalOperator::OptionalMatch {
+        PhysicalOperator::OptionalMatch {
+            input,
+            null_vars,
+            predicate,
+        } => PhysicalOperator::OptionalMatch {
             input: Box::new(rewrite_closing_expands(*input)),
             null_vars,
+            predicate,
         },
         PhysicalOperator::Distinct { input, keys } => PhysicalOperator::Distinct {
             keys,
@@ -6681,6 +6716,7 @@ mod tests {
         let optional = PhysicalOperator::OptionalMatch {
             input: Box::new(expand(scan("p", None), "p", "r1", "c", "LIVES_IN", false)),
             null_vars: vec!["c".to_string(), "r1".to_string()],
+            predicate: None,
         };
         let join = PhysicalOperator::HashJoin {
             left: Box::new(required),

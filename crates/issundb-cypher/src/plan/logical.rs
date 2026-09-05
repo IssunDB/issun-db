@@ -112,6 +112,11 @@ pub enum LogicalOperator {
     OptionalMatch {
         input: Box<LogicalOperator>,
         null_vars: Vec<String>,
+        /// The clause's WHERE when it names a variable bound outside the
+        /// optional pattern. It is evaluated on each joined row, so a match the
+        /// predicate rejects null-fills instead of dropping the outer row. A
+        /// WHERE over the pattern's own variables stays a `Filter` on `input`.
+        predicate: Option<FilterExpr>,
     },
     /// A write clause (CREATE, MERGE, SET, DELETE) in a pipeline query. Executed
     /// for each row produced by the input plan; new bindings are added to the PathMap.
@@ -323,6 +328,41 @@ impl LogicalPlanner {
                             }
                         }
 
+                        // ORDER BY may name a variable bound before this WITH
+                        // that the WITH does not project (`WITH a, x AS s ORDER BY
+                        // sum`). Such a sort runs before the barrier, over a
+                        // non-barrier projection that still holds the variable.
+                        // Aggregating and DISTINCT forms have no such variable.
+                        let sort_before_barrier = order_by_items
+                            .as_ref()
+                            .map(|items| {
+                                !*distinct
+                                    && items.iter().any(|si| {
+                                        let mut vars = std::collections::HashSet::new();
+                                        crate::parser::collect_expr_vars(&si.expr, &mut vars);
+                                        vars.iter().any(|v| {
+                                            !project_items.iter().any(|(e, alias)| {
+                                                alias.as_deref() == Some(v.as_str())
+                                                    || matches!(e, Expr::Prop(pv, pp) if pp.is_empty() && pv == v)
+                                            })
+                                        })
+                                    })
+                            })
+                            .unwrap_or(false);
+                        if sort_before_barrier {
+                            p = LogicalOperator::Project {
+                                input: Box::new(p),
+                                items: project_items.clone(),
+                                is_barrier: false,
+                            };
+                            if let Some(ref items) = order_by_items {
+                                p = LogicalOperator::Sort {
+                                    input: Box::new(p),
+                                    items: items.clone(),
+                                };
+                            }
+                        }
+
                         if let Some(wc) = where_clause {
                             let filter_expr = match wc {
                                 WhereClause::Eq(l, r) => FilterExpr::Eq(l.clone(), r.clone()),
@@ -375,11 +415,13 @@ impl LogicalPlanner {
 
                         // Apply optional ORDER BY attached to the WITH clause. ORDER BY scope
                         // validation happens at parse time in `validate_statement`.
-                        if let Some(ref items) = order_by_items {
-                            p = LogicalOperator::Sort {
-                                input: Box::new(p),
-                                items: items.clone(),
-                            };
+                        if !sort_before_barrier {
+                            if let Some(ref items) = order_by_items {
+                                p = LogicalOperator::Sort {
+                                    input: Box::new(p),
+                                    items: items.clone(),
+                                };
+                            }
                         }
 
                         // Apply optional SKIP / LIMIT attached to the WITH
@@ -455,6 +497,7 @@ impl LogicalPlanner {
                         let mut match_plan = part_match_plan.ok_or(CypherError::Plan(
                             "OPTIONAL MATCH part must contain at least one clause".to_string(),
                         ))?;
+                        let mut predicate = None;
                         if let Some(wc) = where_clause {
                             let filter_expr = match wc {
                                 WhereClause::Eq(l, r) => FilterExpr::Eq(l.clone(), r.clone()),
@@ -465,15 +508,24 @@ impl LogicalPlanner {
                                 WhereClause::Ge(l, r) => FilterExpr::Ge(l.clone(), r.clone()),
                                 WhereClause::Expr(e) => FilterExpr::Expr(e.clone()),
                             };
-                            match_plan = LogicalOperator::Filter {
-                                input: Box::new(match_plan),
-                                expression: filter_expr,
-                            };
+                            let mut where_vars = std::collections::HashSet::new();
+                            filter_expr_vars(&filter_expr, &mut where_vars);
+                            let names_outer_var = current_plan.is_some()
+                                && where_vars.iter().any(|v| !null_vars.contains(v));
+                            if names_outer_var {
+                                predicate = Some(filter_expr);
+                            } else {
+                                match_plan = LogicalOperator::Filter {
+                                    input: Box::new(match_plan),
+                                    expression: filter_expr,
+                                };
+                            }
                         }
 
                         let optional_plan = LogicalOperator::OptionalMatch {
                             input: Box::new(match_plan),
                             null_vars,
+                            predicate,
                         };
 
                         current_plan = match current_plan {
@@ -745,12 +797,27 @@ impl LogicalPlanner {
 
             if let Some(ref props) = rel_pat.properties {
                 for (k, v) in props {
+                    // On a variable-length hop the variable is the list of
+                    // traversed relationships, and the inline map must hold
+                    // for every one of them.
+                    let expression = if rel_pat.range.is_some() {
+                        let each = format!("__vl_{rel_var}");
+                        FilterExpr::Expr(Expr::Quantifier {
+                            kind: crate::ast::QuantifierKind::All,
+                            variable: each.clone(),
+                            list: Box::new(Expr::Prop(rel_var.clone(), String::new())),
+                            predicate: Box::new(Expr::BinaryOp {
+                                op: crate::ast::BinaryOperator::Eq,
+                                left: Box::new(Expr::Prop(each, k.clone())),
+                                right: Box::new(v.clone()),
+                            }),
+                        })
+                    } else {
+                        FilterExpr::Eq(Expr::Prop(rel_var.clone(), k.clone()), v.clone())
+                    };
                     plan = LogicalOperator::Filter {
                         input: Box::new(plan),
-                        expression: FilterExpr::Eq(
-                            Expr::Prop(rel_var.clone(), k.clone()),
-                            v.clone(),
-                        ),
+                        expression,
                     };
                 }
             }
@@ -1294,6 +1361,9 @@ fn rewrite_expr_with_aliases(expr: &mut Expr, projections: &[(Expr, String)]) {
                 rewrite_expr_with_aliases(p, projections);
             }
         }
+        // The body is a query with its own scope; an outer alias reaches it as
+        // a seeded binding under the same name, so nothing is rewritten.
+        Expr::ExistsQuery(_) => {}
         Expr::HasLabel { .. } => {}
     }
 }
@@ -1421,5 +1491,24 @@ mod tests {
             } => (min_hops, max_hops),
             other => panic!("unexpected operator: {:?}", other),
         }
+    }
+}
+
+/// Collect the free variables a `FilterExpr` references.
+pub(crate) fn filter_expr_vars(filter: &FilterExpr, out: &mut std::collections::HashSet<String>) {
+    match filter {
+        FilterExpr::Eq(l, r)
+        | FilterExpr::Ne(l, r)
+        | FilterExpr::Lt(l, r)
+        | FilterExpr::Gt(l, r)
+        | FilterExpr::Le(l, r)
+        | FilterExpr::Ge(l, r) => {
+            crate::parser::collect_expr_vars(l, out);
+            crate::parser::collect_expr_vars(r, out);
+        }
+        FilterExpr::HasLabel(var, _) => {
+            out.insert(var.clone());
+        }
+        FilterExpr::Expr(e) => crate::parser::collect_expr_vars(e, out),
     }
 }

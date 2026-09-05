@@ -345,6 +345,10 @@ pub enum Expr {
         pattern: Box<Pattern>,
         predicate: Option<Box<Expr>>,
     },
+    /// `EXISTS { MATCH ... WITH ... RETURN ... }` with more than one clause:
+    /// the body is a whole read query, run per row with the outer bindings
+    /// seeded in, and the expression is true when it yields a row.
+    ExistsQuery(Box<Query>),
     /// `reduce(accumulator = initial, variable IN list | expression)`
     Reduce {
         accumulator: String,

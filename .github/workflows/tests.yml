@@ -77,7 +77,7 @@ jobs:
       - name: Run openCypher TCK conformance tests
         env:
           ISSUNDB_CONFORMANCE: '1'
-          ISSUNDB_CONFORMANCE_MAX_FAILURES: '75'
+          ISSUNDB_CONFORMANCE_MAX_FAILURES: '1'
         run: cargo test -p issundb --test conformance -- --nocapture
 
       - name: Run the suites against the non-default storage and vector backends

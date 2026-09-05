@@ -147,6 +147,8 @@ pub enum PhysicalOperator {
     OptionalMatch {
         input: Box<PhysicalOperator>,
         null_vars: Vec<String>,
+        /// See `LogicalOperator::OptionalMatch::predicate`.
+        predicate: Option<FilterExpr>,
     },
     /// Deduplicate rows (DISTINCT). `keys` selects the binding names forming
     /// the dedup key; `None` dedups on the full row.
@@ -461,12 +463,15 @@ impl PhysicalPlanner {
                 skip: *skip,
                 count: *count,
             },
-            LogicalOperator::OptionalMatch { input, null_vars } => {
-                PhysicalOperator::OptionalMatch {
-                    input: Box::new(Self::plan(input)),
-                    null_vars: null_vars.clone(),
-                }
-            }
+            LogicalOperator::OptionalMatch {
+                input,
+                null_vars,
+                predicate,
+            } => PhysicalOperator::OptionalMatch {
+                input: Box::new(Self::plan(input)),
+                null_vars: null_vars.clone(),
+                predicate: predicate.clone(),
+            },
             LogicalOperator::Distinct { input, keys } => PhysicalOperator::Distinct {
                 input: Box::new(Self::plan(input)),
                 keys: keys.clone(),
@@ -696,11 +701,19 @@ pub fn format_physical_plan(op: &PhysicalOperator, depth: usize) -> String {
             ));
             buf.push_str(&format_physical_plan(input, depth + 1));
         }
-        PhysicalOperator::OptionalMatch { input, null_vars } => {
+        PhysicalOperator::OptionalMatch {
+            input,
+            null_vars,
+            predicate,
+        } => {
             buf.push_str(&format!(
-                "{}OptionalMatch null_vars=[{}]\n",
+                "{}OptionalMatch null_vars=[{}]{}\n",
                 pad,
-                null_vars.join(", ")
+                null_vars.join(", "),
+                match predicate {
+                    Some(p) => format!(" where={}", fmt_filter(p)),
+                    None => String::new(),
+                }
             ));
             buf.push_str(&format_physical_plan(input, depth + 1));
         }
