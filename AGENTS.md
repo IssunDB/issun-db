@@ -466,7 +466,8 @@ Implementation using red-green TDD:
 
 Clippy is pinned to the MSRV in `lints.yml`, and a current clippy reports lints the pinned one does not. A lint step belongs in `lints.yml` beside
 `make lint`, never in `tests.yml`, whose jobs run on stable. A clean local `make lint` says nothing about a newer clippy, so run `cargo +stable clippy`
-before adding a lint gate.
+before adding a lint gate. `make doc-check` runs there too: it builds the rustdoc with warnings denied, which is what catches a public doc comment
+linking to a private item (a dead link on docs.rs) or a `<placeholder>` rustdoc reads as HTML.
 
 Additional validation when relevant:
 
