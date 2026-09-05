@@ -526,9 +526,9 @@ pub struct Graph {
     pub(super) edge_fanout: Arc<parking_lot::Mutex<Option<crate::graph::stats::EdgeFanout>>>,
     /// Decided `schema_has_edge` verdicts for one write generation, keyed by
     /// `(src_label, type, dst_label)`. The type-inference pass asks the same questions
-    /// on every execution because there is no plan cache, and answering without the
-    /// statistics table means walking the graph, so a decided verdict is remembered
-    /// until a write invalidates the generation. See [`crate::graph::stats`].
+    /// on every plan, and answering without the statistics table means walking the
+    /// graph, so a decided verdict is remembered until a write invalidates the
+    /// generation. See [`crate::graph::stats`].
     pub(super) schema_probes: Arc<parking_lot::Mutex<SchemaProbeMemo>>,
     /// Cached id-indexed group codes, one shared array per grouped property,
     /// valid for exactly one write generation, which is what lets a grouped
@@ -538,9 +538,9 @@ pub struct Graph {
     /// Cached full label scans for the committed-read path, one shared sorted id
     /// vector per label, valid for exactly one write generation. Filters, the
     /// vectorized executor, and the counting kernels each enumerate a whole
-    /// label per query, and with no plan cache the same label is rescanned
-    /// through LMDB on every execution; this pins that scan until a committed
-    /// write moves the generation. Transaction-scoped label reads bypass it,
+    /// label per query, so the same label would be rescanned through LMDB on
+    /// every execution; this pins that scan until a committed write moves the
+    /// generation. Transaction-scoped label reads bypass it,
     /// because an open write transaction must see its own uncommitted labels.
     pub(super) label_scans: Arc<parking_lot::Mutex<index::LabelScanCache>>,
     pub(super) n_threads: Arc<std::sync::atomic::AtomicI32>,
@@ -748,7 +748,8 @@ impl Graph {
     /// the database is reopened with a larger value, which is safe to do and keeps
     /// the existing data. Size it for the eventual database, not the current one.
     ///
-    /// Opening builds none of the derived structures; see the comment inside.
+    /// Opening builds none of the derived structures (the CSR snapshot, the property
+    /// columns, the statistics); the first consumer that needs one builds it.
     pub fn open(path: &Path, map_size_gb: usize) -> Result<Self, Error> {
         let storage = Storage::open(path, map_size_gb)?;
         // Older versions persisted the CSR snapshot next to the LMDB files but
@@ -834,7 +835,7 @@ impl Graph {
     /// Served through the in-memory property columns once they exist, refreshing
     /// them against pending writes first; while they are absent the read goes
     /// straight to storage instead of building them (see
-    /// [`crate::columns::ColumnsCache::should_serve_directly`]).
+    /// `crate::columns::ColumnsCache::should_serve_directly`).
     pub fn node_prop_json(
         &self,
         id: NodeId,
@@ -973,7 +974,7 @@ impl Graph {
     /// in-memory property column, one keep flag per id in input order, without
     /// materializing a `Value` per row. The semantics are exactly the outcome a
     /// Cypher comparison filter keeps a row on; see
-    /// [`crate::columns::PropColumns::cmp_mask`] for the three rules. A
+    /// `crate::columns::PropColumns::cmp_mask` for the three rules. A
     /// nonexistent node is [`Error::NodeNotFound`].
     ///
     /// `Ok(None)` declines, and the caller falls back to gathering and
@@ -999,16 +1000,13 @@ impl Graph {
     ///
     /// Every reader either serves a small request without them or, for the advisory
     /// statistics, declines rather than pay for them, so nothing builds them as a
-    /// side effect of a small workload. That is deliberate: the build is one full
-    /// entity scan, and it used to dominate cold-start latency. This is the
-    /// deliberate way to ask for it, for a caller that wants the optimizer's
-    /// selectivity estimates and zone-map pruning available on a cold graph, or that
-    /// would rather pay the scan once up front than have a later bulk read pay it.
+    /// side effect of a small workload, because the build is one full entity scan.
+    /// This is the deliberate way to ask for it, for a caller that wants the
+    /// optimizer's selectivity estimates and zone-map pruning available on a cold
+    /// graph, or that would rather pay the scan once up front than have a later bulk
+    /// read pay it. No reader warms the columns as a side effect; warming them is
+    /// this call.
     ///
-    /// It replaces an accident: `node_prop_group_codes` used to build
-    /// unconditionally, so "call it and discard the result" was the idiom for
-    /// warming the columns. Grouping now follows the same size test as the other
-    /// readers, and warming them is this call.
     /// It is also the columns cache file's save site (the counterpart of
     /// `rebuild_csr` for the CSR cache file): materializing persists the built
     /// set next to the LMDB files, so a later process loads it instead of
@@ -1473,9 +1471,9 @@ impl Graph {
         f()
     }
 
-    /// Synchronously rebuild the CSR snapshot from LMDB. Useful after bulk
-    /// loads or when tests need a consistent read view before the threshold
-    /// has been crossed.
+    /// Synchronously rebuild the CSR snapshot from storage and save the CSR cache
+    /// file. Every bulk load ends with this call; an ordinary write does not need
+    /// it, since the next consumer refreshes the snapshot on demand.
     ///
     /// It deliberately does not *ask* for per-edge weights, though it keeps loading
     /// them once something else has. This is the call every bulk load makes (`COPY
@@ -1549,11 +1547,9 @@ impl Graph {
     ///
     /// Creates `dst_dir` if it does not exist, then copies `snapshot_file` into
     /// `dst_dir/data.mdb`. After this call succeeds the caller can open the
-    /// restored database with `Graph::open(dst_dir, map_size_gb)`.
-    /// Delegates to the storage backend, which is what makes the pair symmetric: a
-    /// backend that cannot produce a snapshot (`backup`) must not claim to consume
-    /// one. Leaving the copy here meant the in-memory backend reported a successful
-    /// restore having restored nothing, while its `backup` correctly refused.
+    /// restored database with `Graph::open(dst_dir, map_size_gb)`. The storage
+    /// backend performs the copy, so a backend that cannot produce a snapshot
+    /// (`backup`) does not claim to consume one either.
     pub fn restore(snapshot_file: &Path, dst_dir: &Path) -> Result<(), Error> {
         Storage::restore_from_file(snapshot_file, dst_dir)
     }

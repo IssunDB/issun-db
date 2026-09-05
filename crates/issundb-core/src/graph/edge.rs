@@ -264,10 +264,10 @@ impl Graph {
     /// Reads the `out_adj` store directly through the supplied transaction so
     /// the result always reflects committed (and, inside a [`WriteTxn`],
     /// uncommitted) writes. The CSR snapshot is deliberately not consulted here:
-    /// it lags writes until the background rebuild runs, so serving point
-    /// lookups from it would return deleted edges, hide newly added ones, and
+    /// it reflects a write only once a consumer refreshes it, so serving point
+    /// lookups from it could return deleted edges, hide newly added ones, and
     /// disagree with [`Self::in_neighbors`]. The snapshot remains the basis for
-    /// the CSR snapshot algorithms, which have explicit snapshot semantics.
+    /// the algorithms, which have explicit snapshot semantics.
     pub fn out_neighbors(&self, node: NodeId) -> Result<Vec<NeighborEntry>, Error> {
         let rtxn = self.storage.env.read_txn()?;
         self.out_neighbors_impl(&rtxn, node)
@@ -297,8 +297,8 @@ impl Graph {
 
     /// Returns whether the node has any incident relationship, reading both
     /// adjacency stores directly. Like [`Self::out_neighbors`] and
-    /// [`Self::in_neighbors`], this never consults the CSR snapshot, which lags
-    /// writes until the next rebuild. Write-time consistency checks (such as the
+    /// [`Self::in_neighbors`], this never consults the CSR snapshot, which
+    /// reflects a write only once a consumer refreshes it. Write-time consistency checks (such as the
     /// DELETE connected-node guard) must see just-applied edge deletions, so they
     /// rely on this method.
     pub fn node_has_relationships(&self, node: NodeId) -> Result<bool, Error> {

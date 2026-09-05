@@ -33,11 +33,11 @@ pub enum Statement {
     DeleteAndReturn(DeleteAndReturnStatement),
     /// MATCH ... REMOVE ... RETURN ...
     RemoveAndReturn(RemoveAndReturnStatement),
-    /// COPY <Label> FROM '<filepath>' [WITH <options>]
+    /// `COPY <Label> FROM '<filepath>' [WITH <options>]`
     Copy(CopyStatement),
-    /// EXPORT DATABASE '<path>' [WITH <options>]
+    /// `EXPORT DATABASE '<path>' [WITH <options>]`
     ExportDatabase(ExportDatabaseStatement),
-    /// IMPORT DATABASE '<path>'
+    /// `IMPORT DATABASE '<path>'`
     ImportDatabase(ImportDatabaseStatement),
     /// A sequence of independent statements. Each statement is executed in order;
     /// the result of the last statement is returned. This represents queries like

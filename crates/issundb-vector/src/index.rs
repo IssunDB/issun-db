@@ -302,7 +302,15 @@ pub trait VectorGraphExt {
     /// upserts and removes, which block for the duration of the rebuild.
     fn reindex_vector_index(&self, opts: VectorIndexOptions) -> Result<(), VectorError>;
 
-    /// Persist `v` under `n`.
+    /// Store `v` as the embedding of node `n`, replacing any existing one.
+    ///
+    /// The node must exist (`VectorError::NodeNotFound` otherwise), every component
+    /// must be finite, and `v` must match the index's dimension count once that is
+    /// fixed by the first upsert. The write is not transactional with graph writes:
+    /// the in-memory index is updated first and the bytes are then stored in their
+    /// own transaction, so it cannot join or roll back with a caller's
+    /// `Graph::update`. A caller that needs the bytes to land atomically with graph
+    /// writes stages them through `WriteTxn::put_vector_bytes`.
     fn upsert_vector(&self, n: NodeId, v: &[f32]) -> Result<(), VectorError>;
 
     /// Remove the embedding for `n` from the index and from persistent storage.

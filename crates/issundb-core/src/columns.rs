@@ -237,7 +237,7 @@ pub(crate) struct IdGroupCodesCache {
     pub(crate) by_prop: AHashMap<String, std::sync::Arc<IdGroupCodes>>,
 }
 
-/// A comparison operator for [`PropColumns::cmp_mask`], the typed in-column
+/// A comparison operator for `PropColumns::cmp_mask`, the typed in-column
 /// predicate evaluation behind `Graph::nodes_prop_cmp_mask`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PropCmp {

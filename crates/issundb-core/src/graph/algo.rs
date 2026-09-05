@@ -732,24 +732,27 @@ impl Graph {
     /// snapshot up to date.
     ///
     /// The counting kernels read the snapshot, so they must gate on
-    /// `ensure_snapshot_fresh`, which is an `O(nodes + edges)` rebuild when a write
-    /// has landed since the last build. Bulk expansion has always had an escape
-    /// hatch for that case: a handful of sources over a stale snapshot is served
-    /// from per-source adjacency with no rebuild. A caller choosing between a
-    /// kernel and a per-source path should consult this first, so an interleaved
-    /// write-then-count session does not pay a full rebuild per query.
+    /// `ensure_snapshot_fresh`, which patches or rebuilds the snapshot when a write
+    /// has landed since the last refresh. Bulk expansion has an escape hatch for
+    /// that case: a handful of sources over a stale snapshot is served from
+    /// per-source adjacency with no refresh. A caller choosing between a kernel and
+    /// a per-source path should consult this first, so an interleaved
+    /// write-then-count session does not pay a refresh per query.
     pub fn prefers_point_expansion(&self, sources: usize) -> bool {
         self.csr_cache.snapshot_is_stale()
             && sources <= crate::graph::kernels::traversal::STALE_POINT_EXPAND_MAX
     }
 
-    /// Total length of `sources`' adjacency rows in the given direction: an upper
-    /// bound on the edges [`Graph::typed_neighbor_counts`] would visit for them,
-    /// before any type or label narrowing.
+    /// Total length of `sources`' adjacency rows in the given direction, measured
+    /// over the installed CSR snapshot: the edges [`Graph::typed_neighbor_counts`]
+    /// would visit for them before any type or label narrowing, as of that snapshot.
     ///
-    /// This reads two array elements per source and no edge at all, so a caller
-    /// can size an expansion before choosing how to evaluate it. A source absent
-    /// from the snapshot contributes zero.
+    /// This reads two array elements per source and no edge at all, and it does not
+    /// refresh the snapshot, so a caller can size an expansion before choosing how
+    /// to evaluate it. The value is advisory: after a write, or before the first
+    /// build, it under-reports, and a caller treating a low span as cheap declines
+    /// an optimization rather than computing a wrong answer. A source absent from
+    /// the snapshot contributes zero.
     pub fn adjacency_span(&self, sources: &[NodeId], incoming: bool) -> Result<u64, Error> {
         // Deliberately no freshness gate. This measures the installed snapshot so a
         // caller can decide whether an expansion is worth doing, and callers use it
@@ -1015,7 +1018,7 @@ impl Graph {
     /// `spanning_forest`, this method does not take a weight-property argument.
     ///
     /// This is the one algorithm needing a *weighted* snapshot, which costs a second
-    /// scan of `edges` to load; see [`Graph::with_weighted_snapshot`].
+    /// scan of `edges` to load; see `Graph::with_weighted_snapshot`.
     pub fn shortest_path_dijkstra(
         &self,
         src: NodeId,
@@ -1024,7 +1027,9 @@ impl Graph {
         self.with_weighted_snapshot(|snap| self.shortest_path_dijkstra_kernel(snap, src, dst))
     }
 
-    /// Computes the Minimum or Maximum Spanning Forest (MSF) of the graph.
+    /// Computes the minimum (or, with `maximum`, the maximum) spanning forest of the
+    /// graph, weighting each edge by `weight_property` (default `1.0` when absent),
+    /// and returns the ids of the edges in the forest.
     pub fn spanning_forest(
         &self,
         weight_property: &str,
@@ -1050,7 +1055,7 @@ impl Graph {
 
     /// Computes the closeness centrality for all nodes, in the Wasserman-Faust form
     /// that stays meaningful on a disconnected graph. See
-    /// [`Graph::closeness_centrality_kernel`].
+    /// `Graph::closeness_centrality_kernel`.
     pub fn closeness_centrality(&self) -> Result<HashMap<NodeId, f64>, Error> {
         self.with_snapshot(|snap| self.closeness_centrality_kernel(snap))
     }
@@ -1059,7 +1064,7 @@ impl Graph {
     ///
     /// Bounded rather than fallible, it stops early once the L2 change falls below
     /// `tolerance` and otherwise returns the estimate after `iterations` rounds. See
-    /// [`Graph::eigenvector_centrality_kernel`].
+    /// `Graph::eigenvector_centrality_kernel`.
     pub fn eigenvector_centrality(
         &self,
         iterations: u32,
@@ -1071,7 +1076,7 @@ impl Graph {
     /// Computes the Katz centrality for all nodes.
     ///
     /// `alpha` must be below the reciprocal of the largest eigenvalue or the series
-    /// diverges; see [`Graph::katz_centrality_kernel`] for what happens if it is not.
+    /// diverges; see `Graph::katz_centrality_kernel` for what happens if it is not.
     pub fn katz_centrality(
         &self,
         alpha: f64,
@@ -1086,21 +1091,21 @@ impl Graph {
 
     /// Computes the local clustering coefficient for all nodes, reading the graph as
     /// undirected over distinct neighbors. See
-    /// [`Graph::clustering_coefficient_kernel`].
+    /// `Graph::clustering_coefficient_kernel`.
     pub fn clustering_coefficient(&self) -> Result<HashMap<NodeId, f64>, Error> {
         self.with_snapshot(|snap| self.clustering_coefficient_kernel(snap))
     }
 
     /// Detects communities by the Louvain method, returning the community of every
     /// node. The community id is the smallest node id it contains, and only the
-    /// induced partition is contractual. See [`Graph::louvain_kernel`].
+    /// induced partition is contractual. See `Graph::louvain_kernel`.
     pub fn louvain(&self) -> Result<HashMap<NodeId, u64>, Error> {
         self.with_snapshot(|snap| self.louvain_kernel(snap))
     }
 
     /// Scores how likely `a` and `b` are to become connected, under one of the
     /// neighborhood heuristics. A node the snapshot does not know scores zero rather
-    /// than erroring. See [`Graph::link_prediction_kernel`].
+    /// than erroring. See `Graph::link_prediction_kernel`.
     pub fn link_prediction_score(
         &self,
         a: NodeId,
@@ -1117,7 +1122,7 @@ impl Graph {
 
     /// Computes the degree centrality for all nodes in the graph based on the
     /// specified direction. Counts *distinct* neighbors; see
-    /// [`Graph::degree_centrality_kernel`].
+    /// `Graph::degree_centrality_kernel`.
     pub fn degree_centrality(
         &self,
         direction: DegreeDirection,
@@ -1125,7 +1130,8 @@ impl Graph {
         self.with_snapshot(|snap| self.degree_centrality_kernel(snap, direction))
     }
 
-    /// Computes the maximum flow from a source node to a sink node.
+    /// Computes the maximum flow from `source` to `sink`, reading each edge's capacity
+    /// from `capacity_property` (default `1.0` when absent).
     pub fn maximum_flow(
         &self,
         source: NodeId,
@@ -1135,7 +1141,9 @@ impl Graph {
         self.with_snapshot(|snap| self.maximum_flow_kernel(snap, source, sink, capacity_property))
     }
 
-    /// Computes the K shortest paths from a source node to a destination node using Yen's algorithm.
+    /// Computes the `k` shortest paths from `src` to `dst` by Yen's algorithm,
+    /// weighting each edge by `weight_property` (default `1.0` when absent), in
+    /// ascending total weight.
     pub fn shortest_path_top_k(
         &self,
         src: NodeId,
@@ -1358,7 +1366,7 @@ impl Graph {
     ///
     /// Returns a map from each node ID to a component ID. Only the induced
     /// partition is part of the contract; as it happens the id is the smallest node
-    /// id in the component (see [`Graph::connected_components_kernel`]), but a caller
+    /// id in the component (see `Graph::connected_components_kernel`), but a caller
     /// should compare membership rather than depend on the numbering.
     pub fn connected_components(&self) -> Result<HashMap<NodeId, u64>, Error> {
         self.with_snapshot(|snap| self.connected_components_kernel(snap))
