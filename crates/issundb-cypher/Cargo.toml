@@ -20,7 +20,7 @@ tracing.workspace = true
 thiserror.workspace = true
 chumsky = { workspace = true, features = ["pratt"] }
 serde.workspace = true
-serde_json = "1"
+serde_json.workspace = true
 rmp-serde.workspace = true
 regex = "1"
 chrono.workspace = true

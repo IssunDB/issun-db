@@ -1103,4 +1103,32 @@ mod tests {
         assert_eq!(props["x"], serde_json::json!(42));
         assert_eq!(g2.nodes_by_label("BackupTest").unwrap(), vec![kept]);
     }
+
+    /// The plan generation moves on a data write (second component) and on
+    /// index DDL or a statistics build (third component), never on a read.
+    #[test]
+    fn plan_generation_tracks_writes_and_schema_changes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let g = Graph::open(dir.path(), 1).unwrap();
+        let g0 = g.plan_generation();
+        let _ = g.nodes_by_label("Person").unwrap();
+        assert_eq!(g.plan_generation(), g0, "a read changes nothing");
+        g.add_node("Person", &serde_json::json!({"x": 1})).unwrap();
+        let g1 = g.plan_generation();
+        assert_eq!(g1.0, g0.0);
+        assert!(g1.1 > g0.1);
+        assert_eq!(g1.2, g0.2);
+        g.create_node_unique_constraint("Person", "x").unwrap();
+        let g2 = g.plan_generation();
+        assert_eq!(g2.1, g1.1);
+        assert!(g2.2 > g1.2);
+        g.materialize_edge_statistics().unwrap();
+        assert!(g.plan_generation().2 > g2.2);
+        let other = Graph::open(tempfile::TempDir::new().unwrap().path(), 1).unwrap();
+        assert_ne!(
+            other.plan_generation().0,
+            g0.0,
+            "each open has its own nonce"
+        );
+    }
 }

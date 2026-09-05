@@ -359,6 +359,7 @@ impl Graph {
     /// Holding the lock across the build was tolerable while this was an internal
     /// lazy helper; it is not now that a caller is told to invoke it on a live graph.
     pub fn materialize_edge_statistics(&self) -> Result<(), Error> {
+        self.plan_epoch.bump();
         let generation = {
             let guard = self.edge_fanout.lock();
             let generation = self.csr_cache.current_gen();

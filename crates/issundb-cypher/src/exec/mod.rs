@@ -7348,4 +7348,90 @@ mod tests {
         );
         assert_eq!(rows, vec![vec![serde_json::json!("(:A {prop: 1})")]]);
     }
+
+    /// A repeated statement is served from the plan cache, and a committed
+    /// write retires the cached plan: the pruning pass had proven the pattern
+    /// empty, so a plan kept past the write would answer zero forever.
+    #[test]
+    fn plan_cache_serves_repeats_and_retires_on_write() {
+        let (_dir, graph) = setup_graph();
+        execute(&graph, "CREATE (:A)-[:T]->(:C)", &HashMap::new()).unwrap();
+        super::read::reset_plan_cache();
+        let q = "MATCH (:A)-[:T]->(:B) RETURN count(*)";
+        let first = execute(&graph, q, &HashMap::new()).unwrap();
+        assert_eq!(first.records[0].values[0], serde_json::json!(0));
+        assert_eq!(super::read::plan_cache_len(), 1);
+        let second = execute(&graph, q, &HashMap::new()).unwrap();
+        assert_eq!(second.records[0].values[0], serde_json::json!(0));
+        assert_eq!(
+            super::read::plan_cache_len(),
+            1,
+            "a repeat is a hit, not a new entry"
+        );
+
+        execute(&graph, "CREATE (:A)-[:T]->(:B)", &HashMap::new()).unwrap();
+        let third = execute(&graph, q, &HashMap::new()).unwrap();
+        assert_eq!(third.records[0].values[0], serde_json::json!(1));
+    }
+
+    /// Index DDL and a statistics build change plans without a data write, so
+    /// each retires the cached plans through the schema generation.
+    #[test]
+    fn plan_cache_retires_on_ddl_and_statistics_builds() {
+        let (_dir, graph) = setup_graph();
+        execute(
+            &graph,
+            "CREATE (:A {x: 1})-[:T {w: 2}]->(:B {x: 2})",
+            &HashMap::new(),
+        )
+        .unwrap();
+        super::read::reset_plan_cache();
+        let q = "MATCH (a:A)-[r:T]->(b:B) WHERE r.w = 2 RETURN a.x, b.x";
+        let rows = |r: QueryResult| -> Vec<Vec<serde_json::Value>> {
+            r.records.into_iter().map(|rec| rec.values).collect()
+        };
+        let before = rows(execute(&graph, q, &HashMap::new()).unwrap());
+        assert_eq!(super::read::plan_cache_len(), 1);
+
+        execute(
+            &graph,
+            "CREATE INDEX FOR ()-[r:T]-() ON (r.w)",
+            &HashMap::new(),
+        )
+        .unwrap();
+        let after_ddl = rows(execute(&graph, q, &HashMap::new()).unwrap());
+        assert_eq!(after_ddl, before);
+        assert_eq!(super::read::plan_cache_len(), 2, "DDL retires the old plan");
+
+        graph.materialize_edge_statistics().unwrap();
+        let after_stats = rows(execute(&graph, q, &HashMap::new()).unwrap());
+        assert_eq!(after_stats, before);
+        assert_eq!(
+            super::read::plan_cache_len(),
+            3,
+            "a statistics build retires the old plan"
+        );
+    }
+
+    /// A parameter-driven LIMIT is resolved before planning, so the same text
+    /// with a different `$n` must not reuse the plan made for the first value.
+    #[test]
+    fn plan_cache_distinguishes_resolved_limit_parameters() {
+        let (_dir, graph) = setup_graph();
+        execute(
+            &graph,
+            "UNWIND range(1, 5) AS i CREATE (:N {i: i})",
+            &HashMap::new(),
+        )
+        .unwrap();
+        super::read::reset_plan_cache();
+        let q = "MATCH (n:N) RETURN n.i ORDER BY n.i LIMIT $n";
+        let mut params = HashMap::new();
+        params.insert("n".to_string(), serde_json::json!(2));
+        assert_eq!(execute(&graph, q, &params).unwrap().records.len(), 2);
+        params.insert("n".to_string(), serde_json::json!(4));
+        assert_eq!(execute(&graph, q, &params).unwrap().records.len(), 4);
+        params.insert("n".to_string(), serde_json::json!(2));
+        assert_eq!(execute(&graph, q, &params).unwrap().records.len(), 2);
+    }
 }

@@ -488,6 +488,7 @@ impl Graph {
         let mut wtxn = self.storage.env.write_txn()?;
         self.create_node_index_impl(&mut wtxn, label, property, 0x00)?;
         wtxn.commit()?;
+        self.plan_epoch.bump();
         Ok(())
     }
 
@@ -496,6 +497,7 @@ impl Graph {
         let mut wtxn = self.storage.env.write_txn()?;
         self.create_node_index_impl(&mut wtxn, label, property, 0x01)?;
         wtxn.commit()?;
+        self.plan_epoch.bump();
         Ok(())
     }
 
@@ -508,6 +510,7 @@ impl Graph {
         let mut wtxn = self.storage.env.write_txn()?;
         self.create_node_index_impl(&mut wtxn, label, property, 0x02)?;
         wtxn.commit()?;
+        self.plan_epoch.bump();
         Ok(())
     }
 
@@ -603,6 +606,7 @@ impl Graph {
         let mut wtxn = self.storage.env.write_txn()?;
         self.drop_node_index_impl(&mut wtxn, label, property, 0x00)?;
         wtxn.commit()?;
+        self.plan_epoch.bump();
         Ok(())
     }
 
@@ -611,6 +615,7 @@ impl Graph {
         let mut wtxn = self.storage.env.write_txn()?;
         self.drop_node_index_impl(&mut wtxn, label, property, 0x01)?;
         wtxn.commit()?;
+        self.plan_epoch.bump();
         Ok(())
     }
 
@@ -619,6 +624,7 @@ impl Graph {
         let mut wtxn = self.storage.env.write_txn()?;
         self.drop_node_index_impl(&mut wtxn, label, property, 0x02)?;
         wtxn.commit()?;
+        self.plan_epoch.bump();
         Ok(())
     }
 
@@ -673,6 +679,7 @@ impl Graph {
         let mut wtxn = self.storage.env.write_txn()?;
         self.create_edge_index_impl(&mut wtxn, etype, property, 0x00)?;
         wtxn.commit()?;
+        self.plan_epoch.bump();
         Ok(())
     }
 
@@ -681,6 +688,7 @@ impl Graph {
         let mut wtxn = self.storage.env.write_txn()?;
         self.create_edge_index_impl(&mut wtxn, etype, property, 0x01)?;
         wtxn.commit()?;
+        self.plan_epoch.bump();
         Ok(())
     }
 
@@ -693,6 +701,7 @@ impl Graph {
         let mut wtxn = self.storage.env.write_txn()?;
         self.create_edge_index_impl(&mut wtxn, etype, property, 0x02)?;
         wtxn.commit()?;
+        self.plan_epoch.bump();
         Ok(())
     }
 
@@ -785,6 +794,7 @@ impl Graph {
         let mut wtxn = self.storage.env.write_txn()?;
         self.drop_edge_index_impl(&mut wtxn, etype, property, 0x00)?;
         wtxn.commit()?;
+        self.plan_epoch.bump();
         Ok(())
     }
 
@@ -793,6 +803,7 @@ impl Graph {
         let mut wtxn = self.storage.env.write_txn()?;
         self.drop_edge_index_impl(&mut wtxn, etype, property, 0x01)?;
         wtxn.commit()?;
+        self.plan_epoch.bump();
         Ok(())
     }
 
@@ -801,6 +812,7 @@ impl Graph {
         let mut wtxn = self.storage.env.write_txn()?;
         self.drop_edge_index_impl(&mut wtxn, etype, property, 0x02)?;
         wtxn.commit()?;
+        self.plan_epoch.bump();
         Ok(())
     }
 

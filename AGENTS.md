@@ -208,11 +208,10 @@ second copy of both, so the same rule was stated in three places and the copies 
     - `workload`: the timed comparison. Its queries are shaped for measurement, so most return a single `count(...)`; a `DIVERGENT` verdict there is an
       attributed LadybugDB walk-semantics overcount and does not fail the run, but a `MISMATCH` does (`tests/lbug_trail_semantics.rs` pins the
       walk-versus-trail divergence). Add a correctness query to the differential corpus, not here.
-- `Cargo.toml`: workspace root with shared `[workspace.dependencies]`, 39 entries. A shared dependency belongs here and a crate should reach it with
-  `workspace = true`. The manifests have drifted from that: `serde_json` is declared independently in six crates, and `anyhow`, `rmp-serde`, `serde`,
-  and `tracing` in two each, all of them despite a root entry that those declarations bypass. A further four are pinned per crate with no root entry
-  at all (`clap` in three crates, and `axum`, `tokio`, and `tracing-subscriber` in `issundb-rest` and `issundb-mcp`), and the two `axum` pins disagree
-  on their version string. Consolidating is a manifest change nobody has made yet, so do not read the current layout as the intended one.
+- `Cargo.toml`: workspace root with shared `[workspace.dependencies]`, 43 entries. A shared dependency belongs here and a crate reaches it with
+  `workspace = true`; a dependency used by one crate only (`rustyline`, `regex`, `rmcp`, `utoipa`, `wasm-bindgen`) stays on that crate. The manifests
+  were consolidated on 2026-09-05, after six crates had grown independent `serde_json` pins and the two `axum` pins had drifted apart, so a new
+  declaration that bypasses a root entry is a regression rather than the local convention.
 - `Makefile`: developer workflow entry points.
 - Directory-scoped guides: `crates/issundb-core/AGENTS.md`, `crates/issundb-cypher/AGENTS.md`, `crates/issundb-text/AGENTS.md`, and
   `crates/issundb-vector/AGENTS.md` carry the crate-specific rules this file does not repeat: LMDB lifetime rules, the write-lock contract, the CSR
@@ -424,6 +423,10 @@ The read-path and statistics methods carry non-obvious semantics:
   edge-level statistics. One pass over `label_idx` and one over `out_adj`, cached until a committed write advances the generation. It is what makes the
   expand-ratio estimates available at all, and it upgrades `schema_has_edge` from a budgeted probe to an exact lookup that also decides the questions the
   probe gives up on. A caller wanting the optimizer at full strength on a cold graph wants this and `materialize_property_columns`.
+- `plan_generation() -> (u64, u64, u64)`: what a cached query plan is valid for: a per-open identity nonce, the committed write generation, and a
+  schema generation that index and constraint DDL and the `materialize_*` builders advance. Those last two kinds of change alter plans without being
+  data writes, and they do not advance the write generation because that would mark the CSR snapshot stale for nothing. The Cypher executor keys
+  its plan cache on this triple.
 - `schema_has_edge(src_label, rel_type, dst_label) -> Result<Option<bool>, Error>`: whether the committed data schema contains any directed edge
   `src_label --rel_type--> dst_label`. `Some(false)` means the directed pattern is provably unsatisfiable; `None` when any name is unknown or the
   question could not be settled within `SCHEMA_PROBE_BUDGET`. Backs the optimizer's type-inference pass. Unlike the fan-out estimates this one is not
@@ -432,7 +435,7 @@ The read-path and statistics methods carry non-obvious semantics:
   population. Every storage operation the walk performs is charged against the budget, visiting a node included, or a population whose nodes have no
   adjacency in the direction under test would walk to the end of the label for free. Only the choice of which side to walk reads the stored per-label
   counter; the emptiness shortcut asks `label_idx` instead, so a prune never rests on a counter being exact. A decided verdict is memoized against the
-  write generation, because the pass that asks runs on every execution (there is no plan cache) and would otherwise re-walk the graph per query.
+  write generation, because the pass that asks runs on every plan and would otherwise re-walk the graph per query.
 - `label_filter(nodes, label) -> Result<Vec<NodeId>, Error>`: subset of `nodes` carrying `label`, via one `label_idx` point lookup per candidate.
 - `nodes_by_label_arc(label) -> Result<Arc<Vec<NodeId>>, Error>`: `nodes_by_label` without the copy, served from a per-generation cache: repeated
   reads of one label within one write generation return the same shared vector, and any committed write discards the whole cache. `nodes_by_label`
@@ -595,6 +598,11 @@ outside `issundb`.
   therefore no evidence that a transaction did. A caller wanting several statements to succeed or fail together has no way to ask for it through this
   surface, which is what `statement_count` on `QueryResult` lets it at least notice. See the Architecture Constraints entry on `Graph::update` for the
   whole transaction boundary.
+
+Plans are cached per thread in `exec/read.rs` (`PlanCache`, 256 entries, least recently used out), keyed on the query's address, the graph's
+`plan_generation`, and the execution mode, and served only when the stored query equals the incoming one after SKIP and LIMIT parameter resolution,
+so an address reused by another statement or a different `$limit` plans afresh. A plan holding a resolved `CALL` is never cached, because it embeds
+the procedure's rows. The `EXISTS` subquery body, built per evaluation, uses the uncached entry point. Parsing is cached separately in the parser.
 
 The executor resolves patterns through the physical plan. Both typed and untyped expansion read the CSR snapshot in bulk behind
 `ensure_snapshot_fresh` (`Graph::expand_bulk`), falling back to per-source LMDB point reads when the snapshot is stale and the source set is small. Key optimizer behaviors,

@@ -101,6 +101,110 @@ fn validate_skip_limit_param(
 /// fails here with an evaluation error, matching the openCypher requirement
 /// that SKIP/LIMIT be variable-free. Returns `None` when every SKIP/LIMIT is
 /// already a literal, so the common case avoids the clone.
+/// Distinct plans held per thread. Like the parse cache, this bounds a server
+/// thread's working set of statements with room to spare.
+const PLAN_CACHE_CAPACITY: usize = 256;
+
+/// What a cached plan was built for. Two of the three parts are the graph's
+/// [`Graph::plan_generation`], so a committed write, a DDL statement, or a
+/// statistics build retires every plan made before it; the mode is part of
+/// the key because the fast paths exist under one mode and not the other.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct PlanKey {
+    query_addr: usize,
+    generation: (u64, u64, u64),
+    row_pipeline_only: bool,
+}
+
+struct PlanCacheEntry {
+    /// The query the plan was made from, after SKIP and LIMIT parameter
+    /// resolution. A hit requires equality with the incoming query, so an
+    /// address reused by a different statement, or the same statement run with
+    /// a different `$limit`, plans afresh rather than serving this plan.
+    query: Query,
+    plan: std::sync::Arc<PhysicalOperator>,
+    schema: std::sync::Arc<SlotSchema>,
+    tick: u64,
+}
+
+struct PlanCache {
+    entries: HashMap<PlanKey, PlanCacheEntry>,
+    clock: u64,
+}
+
+impl PlanCache {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            clock: 0,
+        }
+    }
+
+    fn get(
+        &mut self,
+        key: &PlanKey,
+        query: &Query,
+    ) -> Option<(std::sync::Arc<PhysicalOperator>, std::sync::Arc<SlotSchema>)> {
+        self.clock += 1;
+        let tick = self.clock;
+        let entry = self.entries.get_mut(key)?;
+        if entry.query != *query {
+            self.entries.remove(key);
+            return None;
+        }
+        entry.tick = tick;
+        Some((entry.plan.clone(), entry.schema.clone()))
+    }
+
+    fn insert(
+        &mut self,
+        key: PlanKey,
+        query: Query,
+        plan: std::sync::Arc<PhysicalOperator>,
+        schema: std::sync::Arc<SlotSchema>,
+    ) {
+        if self.entries.len() >= PLAN_CACHE_CAPACITY && !self.entries.contains_key(&key) {
+            // Evict the least recently used entry; the scan runs only when the
+            // cache is full, never on the hit path.
+            if let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, e)| e.tick)
+                .map(|(k, _)| *k)
+            {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.clock += 1;
+        let tick = self.clock;
+        self.entries.insert(
+            key,
+            PlanCacheEntry {
+                query,
+                plan,
+                schema,
+                tick,
+            },
+        );
+    }
+}
+
+thread_local! {
+    static PLAN_CACHE: std::cell::RefCell<PlanCache> = std::cell::RefCell::new(PlanCache::new());
+}
+
+/// Number of plans cached on this thread, for the cache-behavior tests.
+#[cfg(test)]
+pub(super) fn plan_cache_len() -> usize {
+    PLAN_CACHE.with(|c| c.borrow().entries.len())
+}
+
+/// Drop every cached plan on the current thread, for test isolation.
+#[cfg(test)]
+pub(super) fn reset_plan_cache() {
+    PLAN_CACHE.with(|c| *c.borrow_mut() = PlanCache::new());
+}
+
 fn resolve_skip_limit_params(
     graph: &Graph,
     query: &Query,
@@ -192,6 +296,34 @@ pub(super) fn execute_read_query(
     params: &HashMap<String, serde_json::Value>,
     write_txn: Option<&mut issundb_core::WriteTxn>,
 ) -> Result<QueryResult, String> {
+    execute_read_query_impl(graph, query, params, write_txn, true)
+}
+
+/// [`execute_read_query`] without the plan cache, for a query built on the
+/// fly for one evaluation (an `EXISTS` subquery body), which would otherwise
+/// churn the cache with entries nothing looks up again.
+pub(super) fn execute_read_query_uncached(
+    graph: &Graph,
+    query: &Query,
+    params: &HashMap<String, serde_json::Value>,
+    write_txn: Option<&mut issundb_core::WriteTxn>,
+) -> Result<QueryResult, String> {
+    execute_read_query_impl(graph, query, params, write_txn, false)
+}
+
+fn execute_read_query_impl(
+    graph: &Graph,
+    query: &Query,
+    params: &HashMap<String, serde_json::Value>,
+    write_txn: Option<&mut issundb_core::WriteTxn>,
+    use_plan_cache: bool,
+) -> Result<QueryResult, String> {
+    // The address of the caller's query is the plan-cache hash; the parsed
+    // statement it points into is held by the parse cache, so a repeated
+    // statement arrives at the same address. It is only a hash: the entry
+    // stores the query it was planned from and is served only on equality.
+    let query_addr = query as *const Query as usize;
+
     // Validate non-literal SKIP/LIMIT expressions at runtime and substitute
     // their values before planning.
     let resolved_query = resolve_skip_limit_params(graph, query, params)?;
@@ -203,13 +335,47 @@ pub(super) fn execute_read_query(
     // another if it ever moved between threads. See `crate::exec_mode`.
     let row_pipeline_only = crate::exec_mode::row_pipeline_only();
 
-    let logical = LogicalPlanner::plan(query).map_err(|e| e.to_string())?;
-    let physical = PhysicalPlanner::plan(&logical);
-    let optimized = Optimizer::optimize_with_mode(physical, Some(graph), row_pipeline_only);
-
-    // One slot schema per query, walked from the optimized plan: every row of
-    // this execution (join build sides included) binds against these slots.
-    let schema = std::sync::Arc::new(SlotSchema::from_plan(&optimized));
+    // A resolved `CALL` embeds the procedure's output rows in the plan, so
+    // such a plan is data, not a plan, and is never cached.
+    let cacheable = use_plan_cache
+        && !query
+            .parts
+            .iter()
+            .any(|p| matches!(p, QueryPart::Call { .. }));
+    let key = PlanKey {
+        query_addr,
+        generation: graph.plan_generation(),
+        row_pipeline_only,
+    };
+    let cached = if cacheable {
+        PLAN_CACHE.with(|c| c.borrow_mut().get(&key, query))
+    } else {
+        None
+    };
+    let (optimized, schema) = match cached {
+        Some(hit) => hit,
+        None => {
+            let logical = LogicalPlanner::plan(query).map_err(|e| e.to_string())?;
+            let physical = PhysicalPlanner::plan(&logical);
+            let optimized = std::sync::Arc::new(Optimizer::optimize_with_mode(
+                physical,
+                Some(graph),
+                row_pipeline_only,
+            ));
+            // One slot schema per query, walked from the optimized plan: every
+            // row of this execution (join build sides included) binds against
+            // these slots.
+            let schema = std::sync::Arc::new(SlotSchema::from_plan(&optimized));
+            if cacheable {
+                PLAN_CACHE.with(|c| {
+                    c.borrow_mut()
+                        .insert(key, query.clone(), optimized.clone(), schema.clone())
+                });
+            }
+            (optimized, schema)
+        }
+    };
+    let optimized: &PhysicalOperator = &optimized;
 
     // 2. Execute the optimized physical operator tree recursively.
     //    The top-level `PhysicalOperator::Project` in the plan has already
@@ -262,7 +428,7 @@ pub(super) fn execute_read_query(
     {
         if let Some(mut records) = super::vectorized::try_execute_vectorized(
             graph,
-            &optimized,
+            optimized,
             &query.return_clause,
             params,
             &schema,
@@ -279,7 +445,7 @@ pub(super) fn execute_read_query(
         }
     }
 
-    let resolved_paths = execute_physical(graph, &optimized, params, &schema, write_txn)?;
+    let resolved_paths = execute_physical(graph, optimized, params, &schema, write_txn)?;
 
     // A query with an empty RETURN clause is a write-only pipeline query.
     if query.return_clause.items.is_empty() {

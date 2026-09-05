@@ -486,6 +486,33 @@ pub(super) fn fts_stats_sum_dl_key(label_id: LabelId, prop_key_id: PropKeyId) ->
 }
 
 /// The graph database handle. It is cheap to clone, since all state is behind `Arc`.
+/// The part of a plan-cache key that the write generation does not cover.
+///
+/// `nonce` is drawn at open, so a plan cached against one `Graph` is never
+/// served to another that later occupies the same address. `schema_gen` counts
+/// the changes that alter a plan without being a data write: index and
+/// constraint DDL, and the deliberate statistics builds. Neither advances the
+/// write generation, because doing so would mark the CSR snapshot stale and
+/// force a rebuild the data does not need.
+pub(super) struct PlanEpoch {
+    nonce: u64,
+    schema_gen: std::sync::atomic::AtomicU64,
+}
+
+impl PlanEpoch {
+    fn new() -> Self {
+        Self {
+            nonce: ahash::RandomState::new().hash_one(0u64),
+            schema_gen: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    pub(super) fn bump(&self) {
+        self.schema_gen
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
 #[derive(Clone)]
 pub struct Graph {
     pub(super) storage: Arc<Storage>,
@@ -517,6 +544,10 @@ pub struct Graph {
     /// because an open write transaction must see its own uncommitted labels.
     pub(super) label_scans: Arc<parking_lot::Mutex<index::LabelScanCache>>,
     pub(super) n_threads: Arc<std::sync::atomic::AtomicI32>,
+    /// What a cached query plan is keyed on beyond the write generation: this
+    /// handle's identity and the count of schema changes. See
+    /// [`Graph::plan_generation`].
+    pub(super) plan_epoch: Arc<PlanEpoch>,
     /// Type-erased extension cache. Higher-level crates attach caches (e.g. the
     /// HNSW vector index) to a Graph without creating a circular dependency,
     /// through the `get_extension`, `set_extension`, and
@@ -745,10 +776,30 @@ impl Graph {
             )),
             label_scans: Arc::new(parking_lot::Mutex::new(index::LabelScanCache::default())),
             n_threads: Arc::new(std::sync::atomic::AtomicI32::new(0)),
+            plan_epoch: Arc::new(PlanEpoch::new()),
             extensions: Arc::new(parking_lot::Mutex::new(AHashMap::new())),
             #[cfg(test)]
             test_hooks: Arc::new(TestHooks::default()),
         })
+    }
+
+    /// The generation a cached query plan is valid for: a per-open identity
+    /// nonce, the committed write generation, and the schema generation.
+    ///
+    /// A plan is a function of the query and of what the optimizer read from
+    /// this graph: node and edge counts, the schema statistics, the declared
+    /// indexes, and the property-column estimates. Every committed data write
+    /// advances the second component; index and constraint DDL and the
+    /// `materialize_*` builders advance the third. A caller holding a plan for
+    /// an earlier triple must plan again.
+    pub fn plan_generation(&self) -> (u64, u64, u64) {
+        (
+            self.plan_epoch.nonce,
+            self.csr_cache.current_gen(),
+            self.plan_epoch
+                .schema_gen
+                .load(std::sync::atomic::Ordering::Acquire),
+        )
     }
 
     /// Set the thread count for the parallel read passes, overriding the
@@ -957,6 +1008,7 @@ impl Graph {
     /// lazy build saves, so a read-only workload never writes a file as a side
     /// effect of a query.
     pub fn materialize_property_columns(&self) -> Result<(), Error> {
+        self.plan_epoch.bump();
         #[cfg(feature = "lmdb")]
         {
             // Captured before the build, and under the write lock. Every
@@ -1080,6 +1132,7 @@ impl Graph {
     /// edge columns cache file's save site; a repeat at an unchanged generation
     /// rewrites nothing.
     pub fn materialize_edge_property_columns(&self) -> Result<(), Error> {
+        self.plan_epoch.bump();
         #[cfg(feature = "lmdb")]
         {
             // Captured under the write lock and before the build, for the

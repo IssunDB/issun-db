@@ -873,7 +873,8 @@ pub(super) fn evaluate_expr<B: Bindings>(
                 });
             }
             query.parts.splice(0..0, seeds);
-            let result = super::read::execute_read_query(graph, &query, &sub_params, None)?;
+            let result =
+                super::read::execute_read_query_uncached(graph, &query, &sub_params, None)?;
             Ok(serde_json::Value::Bool(!result.records.is_empty()))
         }
         Expr::ExistsSubquery { pattern, predicate } => {
