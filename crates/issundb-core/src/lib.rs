@@ -17,7 +17,7 @@ pub use graph::{
 };
 pub use schema::{
     DirectedNeighborEntry, EdgeId, EdgeRecord, LabelId, Language, NeighborEntry, NodeId,
-    NodeRecord, PropValue, TypeId, WeightedPath,
+    NodeRecord, PropValue, TableStat, TypeId, WeightedPath,
 };
 
 #[cfg(test)]

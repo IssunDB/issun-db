@@ -1,5 +1,6 @@
 use crate::ast::{
-    ConstraintKind, CreateConstraintStatement, DropConstraintStatement, SchemaTarget,
+    AutoIndexStatement, ConstraintKind, CreateConstraintStatement, DropConstraintStatement,
+    SchemaTarget,
 };
 
 use super::*;
@@ -37,6 +38,26 @@ pub(super) fn execute_drop_index(
             .drop_edge_property_index(&stmt.label, &stmt.property)
             .map_err(|e| e.to_string())?,
     }
+    Ok(QueryResult {
+        statement_count: 1,
+        columns: vec![],
+        records: vec![],
+    })
+}
+
+pub(super) fn execute_set_auto_index(
+    graph: &Graph,
+    stmt: &AutoIndexStatement,
+) -> Result<QueryResult, String> {
+    if stmt.label.starts_with("()-[") {
+        return Err(
+            "AUTO INDEX applies to node labels only; relationships have no property auto-index"
+                .to_string(),
+        );
+    }
+    graph
+        .set_label_auto_index(&stmt.label, stmt.enabled)
+        .map_err(|e| e.to_string())?;
     Ok(QueryResult {
         statement_count: 1,
         columns: vec![],

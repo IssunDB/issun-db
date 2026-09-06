@@ -22,13 +22,16 @@ mod write;
 use copy::{execute_copy, execute_export_db, execute_import_db};
 use ddl::{
     execute_create_constraint, execute_create_index, execute_drop_constraint, execute_drop_index,
+    execute_set_auto_index,
 };
 use read::execute_read_query;
 use write::{
-    as_txn_error, execute_create, execute_create_and_return, execute_create_internal_with_context,
-    execute_delete, execute_delete_and_return, execute_foreach, execute_merge,
-    execute_merge_and_return, execute_remove, execute_remove_and_return, execute_set,
-    execute_set_and_return, unwrap_txn_error,
+    as_txn_error, execute_create, execute_create_and_return, execute_create_and_return_in,
+    execute_create_internal_with_context, execute_delete, execute_delete_and_return,
+    execute_delete_and_return_in, execute_foreach, execute_foreach_in, execute_merge,
+    execute_merge_and_return, execute_merge_and_return_in, execute_remove,
+    execute_remove_and_return, execute_remove_and_return_in, execute_set, execute_set_and_return,
+    execute_set_and_return_in, unwrap_txn_error,
 };
 
 /// Stack size for the dedicated thread that executes a deeply nested query.
@@ -209,6 +212,15 @@ pub fn explain(graph: &Graph, cypher: &str) -> Result<String, CypherError> {
         Statement::MergeAndReturn(_) => Ok("MergeReturn\n".into()),
         Statement::CreateIndex(ref ci) => Ok(format!("CreateIndex {}:{}\n", ci.label, ci.property)),
         Statement::DropIndex(ref di) => Ok(format!("DropIndex {}:{}\n", di.label, di.property)),
+        Statement::SetAutoIndex(ref ai) => Ok(format!(
+            "{} {}\n",
+            if ai.enabled {
+                "CreateAutoIndex"
+            } else {
+                "DropAutoIndex"
+            },
+            ai.label
+        )),
         Statement::Remove(_) => Ok("Remove\n".into()),
         Statement::RemoveAndReturn(_) => Ok("RemoveReturn\n".into()),
         Statement::Union(_) => Ok("Union\n".into()),
@@ -307,6 +319,13 @@ fn to_cypher_error(err: String) -> CypherError {
 
 /// Execute a pipeline of statements, threading node/edge bindings created by
 /// CREATE statements so that later statements can reference nodes created earlier.
+///
+/// A pipeline of data statements (reads, writes, and `FOREACH`; no DDL and no
+/// bulk administration) runs in one transaction: every statement sees the
+/// earlier ones' writes through the pending-writes overlay, and an error in
+/// any statement rolls back all of them. A pipeline containing a schema or bulk
+/// statement runs statement by statement, each committing on its own, because
+/// those statements open their own transactions.
 fn execute_pipeline(
     graph: &Graph,
     stmts: &[Statement],
@@ -319,6 +338,29 @@ fn execute_pipeline(
         records: vec![],
         statement_count: 1,
     };
+
+    let atomic = stmts.iter().all(is_data_statement);
+    let has_write = stmts.iter().any(statement_writes);
+    if atomic && has_write {
+        last = graph
+            .update(|txn| {
+                let _pending = expr::PendingWrites::install();
+                let mut last = QueryResult {
+                    columns: vec![],
+                    records: vec![],
+                    statement_count: 1,
+                };
+                for stmt in stmts {
+                    last = execute_statement_in(txn, stmt, params, registry, &mut shared_bindings)
+                        .map_err(as_txn_error)?;
+                }
+                Ok(last)
+            })
+            .map_err(unwrap_txn_error)
+            .map_err(to_cypher_error)?;
+        last.statement_count = stmts.len();
+        return Ok(last);
+    }
 
     for stmt in stmts {
         match stmt {
@@ -352,12 +394,102 @@ fn execute_pipeline(
         }
     }
 
-    // Every statement in the pipeline ran (a CREATE's writes are not
-    // speculative), but `columns`/`records` reflect only the last one; report
-    // the true count so a caller does not mistake this for a single-statement
-    // result and silently miss the other statements' outcomes.
+    // Every statement in the pipeline ran, but `columns`/`records` reflect only
+    // the last one; report the true count so a caller does not mistake this for
+    // a single-statement result and silently miss the other statements' outcomes.
     last.statement_count = stmts.len();
     Ok(last)
+}
+
+/// Whether a statement may join an atomic pipeline: it reads or writes data
+/// through the shared transaction and never opens one of its own.
+fn is_data_statement(stmt: &Statement) -> bool {
+    matches!(
+        stmt,
+        Statement::Query(_)
+            | Statement::Create(_)
+            | Statement::CreateAndReturn(_)
+            | Statement::Set(_)
+            | Statement::SetAndReturn(_)
+            | Statement::Delete(_)
+            | Statement::DeleteAndReturn(_)
+            | Statement::Merge(_)
+            | Statement::MergeAndReturn(_)
+            | Statement::Remove(_)
+            | Statement::RemoveAndReturn(_)
+            | Statement::Foreach(_)
+            | Statement::Union(_)
+    )
+}
+
+/// Whether a statement writes, which is what makes a pipeline worth a transaction.
+fn statement_writes(stmt: &Statement) -> bool {
+    match stmt {
+        Statement::Query(q) => read::query_has_write_parts(q),
+        Statement::Union(_) => false,
+        other => is_data_statement(other),
+    }
+}
+
+/// One statement of an atomic pipeline, run against the caller's transaction.
+fn execute_statement_in(
+    txn: &mut issundb_core::WriteTxn,
+    stmt: &Statement,
+    params: &HashMap<String, serde_json::Value>,
+    registry: &crate::procedure::ProcedureRegistry,
+    shared_bindings: &mut PathMap,
+) -> Result<QueryResult, String> {
+    let graph = txn.graph();
+    let empty = || QueryResult {
+        statement_count: 1,
+        columns: vec![],
+        records: vec![],
+    };
+    match stmt {
+        Statement::Query(q) => {
+            let resolved_owner;
+            let q: &Query = if q.parts.iter().any(|p| matches!(p, QueryPart::Call { .. })) {
+                let mut resolved = q.clone();
+                read::resolve_call_parts(graph, &mut resolved, registry, params)?;
+                resolved_owner = resolved;
+                &resolved_owner
+            } else {
+                q
+            };
+            execute_read_query(graph, q, params, Some(txn))
+        }
+        Statement::Create(c) => {
+            for pattern in &c.patterns {
+                let created =
+                    execute_create_internal_with_context(txn, pattern, shared_bindings, params)?;
+                shared_bindings.extend(created);
+            }
+            Ok(empty())
+        }
+        Statement::CreateAndReturn(c) => execute_create_and_return_in(txn, c, params),
+        Statement::Set(s) => {
+            write::execute_set_in(txn, s, params)?;
+            Ok(empty())
+        }
+        Statement::SetAndReturn(s) => execute_set_and_return_in(txn, s, params),
+        Statement::Delete(d) => {
+            write::execute_delete_in(txn, d, params)?;
+            Ok(empty())
+        }
+        Statement::DeleteAndReturn(d) => execute_delete_and_return_in(txn, d, params),
+        Statement::Merge(m) => write::execute_merge_inner(txn, m, params),
+        Statement::MergeAndReturn(m) => execute_merge_and_return_in(txn, m, params),
+        Statement::Remove(r) => {
+            write::execute_remove_in(txn, r, params)?;
+            Ok(empty())
+        }
+        Statement::RemoveAndReturn(r) => execute_remove_and_return_in(txn, r, params),
+        Statement::Foreach(f) => execute_foreach_in(txn, f, params),
+        Statement::Union(u) => execute_union(graph, u, params, registry).map_err(|e| e.to_string()),
+        other => Err(format!(
+            "statement cannot run inside an atomic pipeline: {other:?}"
+        )),
+    }
 }
 
 fn execute_statement(
@@ -414,6 +546,7 @@ fn execute_statement(
         }
         Statement::CreateIndex(ci) => execute_create_index(graph, ci).map_err(to_cypher_error),
         Statement::DropIndex(di) => execute_drop_index(graph, di).map_err(to_cypher_error),
+        Statement::SetAutoIndex(ai) => execute_set_auto_index(graph, ai).map_err(to_cypher_error),
         Statement::Remove(r) => execute_remove(graph, r, params).map_err(to_cypher_error),
         Statement::RemoveAndReturn(r) => {
             execute_remove_and_return(graph, r, params).map_err(to_cypher_error)
@@ -2794,28 +2927,6 @@ mod tests {
 
         let res = execute(&graph, "MATCH (b:B) RETURN b.y", &params).unwrap();
         assert_eq!(res.records[0].values[0], serde_json::json!(1));
-    }
-
-    /// Documents a known, explicit boundary of this fix (not a bug): a
-    /// `MATCH`/label-scan after a same-statement `CREATE` does not see the
-    /// just-created node, because label scans read through the committed-only
-    /// `label_idx` index, not the still-open write transaction. Pinned down so
-    /// it cannot silently drift in either direction later.
-    #[test]
-    fn create_then_label_scan_in_same_statement_does_not_see_uncommitted_node() {
-        let params = HashMap::new();
-        let (_dir, graph) = setup_graph();
-        let res = execute(
-            &graph,
-            "CREATE (a:Foo) WITH a MATCH (m:Foo) RETURN count(m) AS c",
-            &params,
-        )
-        .unwrap();
-        assert_eq!(
-            res.records[0].values[0],
-            serde_json::json!(0),
-            "documents the boundary: label-scan reads are not txn-aware in this fix"
-        );
     }
 
     #[test]
@@ -7347,5 +7458,249 @@ mod tests {
              WHERE numConnections = 3 RETURN true } RETURN n",
         );
         assert_eq!(rows, vec![vec![serde_json::json!("(:A {prop: 1})")]]);
+    }
+
+    /// A repeated statement is served from the plan cache, and a committed
+    /// write retires the cached plan: the pruning pass had proven the pattern
+    /// empty, so a plan kept past the write would answer zero forever.
+    #[test]
+    fn plan_cache_serves_repeats_and_retires_on_write() {
+        let (_dir, graph) = setup_graph();
+        execute(&graph, "CREATE (:A)-[:T]->(:C)", &HashMap::new()).unwrap();
+        super::read::reset_plan_cache();
+        let q = "MATCH (:A)-[:T]->(:B) RETURN count(*)";
+        let first = execute(&graph, q, &HashMap::new()).unwrap();
+        assert_eq!(first.records[0].values[0], serde_json::json!(0));
+        assert_eq!(super::read::plan_cache_len(), 1);
+        let second = execute(&graph, q, &HashMap::new()).unwrap();
+        assert_eq!(second.records[0].values[0], serde_json::json!(0));
+        assert_eq!(
+            super::read::plan_cache_len(),
+            1,
+            "a repeat is a hit, not a new entry"
+        );
+
+        execute(&graph, "CREATE (:A)-[:T]->(:B)", &HashMap::new()).unwrap();
+        let third = execute(&graph, q, &HashMap::new()).unwrap();
+        assert_eq!(third.records[0].values[0], serde_json::json!(1));
+    }
+
+    /// Index DDL and a statistics build change plans without a data write, so
+    /// each retires the cached plans through the schema generation.
+    #[test]
+    fn plan_cache_retires_on_ddl_and_statistics_builds() {
+        let (_dir, graph) = setup_graph();
+        execute(
+            &graph,
+            "CREATE (:A {x: 1})-[:T {w: 2}]->(:B {x: 2})",
+            &HashMap::new(),
+        )
+        .unwrap();
+        super::read::reset_plan_cache();
+        let q = "MATCH (a:A)-[r:T]->(b:B) WHERE r.w = 2 RETURN a.x, b.x";
+        let rows = |r: QueryResult| -> Vec<Vec<serde_json::Value>> {
+            r.records.into_iter().map(|rec| rec.values).collect()
+        };
+        let before = rows(execute(&graph, q, &HashMap::new()).unwrap());
+        assert_eq!(super::read::plan_cache_len(), 1);
+
+        execute(
+            &graph,
+            "CREATE INDEX FOR ()-[r:T]-() ON (r.w)",
+            &HashMap::new(),
+        )
+        .unwrap();
+        let after_ddl = rows(execute(&graph, q, &HashMap::new()).unwrap());
+        assert_eq!(after_ddl, before);
+        assert_eq!(super::read::plan_cache_len(), 2, "DDL retires the old plan");
+
+        graph.materialize_edge_statistics().unwrap();
+        let after_stats = rows(execute(&graph, q, &HashMap::new()).unwrap());
+        assert_eq!(after_stats, before);
+        assert_eq!(
+            super::read::plan_cache_len(),
+            3,
+            "a statistics build retires the old plan"
+        );
+    }
+
+    /// A parameter-driven LIMIT is resolved before planning, so the same text
+    /// with a different `$n` must not reuse the plan made for the first value.
+    #[test]
+    fn plan_cache_distinguishes_resolved_limit_parameters() {
+        let (_dir, graph) = setup_graph();
+        execute(
+            &graph,
+            "UNWIND range(1, 5) AS i CREATE (:N {i: i})",
+            &HashMap::new(),
+        )
+        .unwrap();
+        super::read::reset_plan_cache();
+        let q = "MATCH (n:N) RETURN n.i ORDER BY n.i LIMIT $n";
+        let mut params = HashMap::new();
+        params.insert("n".to_string(), serde_json::json!(2));
+        assert_eq!(execute(&graph, q, &params).unwrap().records.len(), 2);
+        params.insert("n".to_string(), serde_json::json!(4));
+        assert_eq!(execute(&graph, q, &params).unwrap().records.len(), 4);
+        params.insert("n".to_string(), serde_json::json!(2));
+        assert_eq!(execute(&graph, q, &params).unwrap().records.len(), 2);
+    }
+
+    /// The DDL switch flips the auto-index per label; a filtered query answers
+    /// the same either way, and the plan changes from an index scan to a filter.
+    #[test]
+    fn auto_index_ddl_switches_the_label_and_keeps_query_results() {
+        let (_dir, graph) = setup_graph();
+        execute(
+            &graph,
+            "UNWIND range(1, 5) AS i CREATE (:P {age: 20 + i * 5})",
+            &HashMap::new(),
+        )
+        .unwrap();
+        let q = "MATCH (p:P) WHERE p.age > 30 RETURN count(p)";
+        let before = execute(&graph, q, &HashMap::new()).unwrap();
+        assert_eq!(before.records[0].values[0], serde_json::json!(3));
+        assert!(explain(&graph, q).unwrap().contains("NodeRangeScan"));
+
+        execute(&graph, "DROP AUTO INDEX FOR (n:P)", &HashMap::new()).unwrap();
+        assert!(!graph.label_auto_index_enabled("P").unwrap());
+        let plan = explain(&graph, q).unwrap();
+        assert!(!plan.contains("NodeRangeScan"), "{plan}");
+        let after = execute(&graph, q, &HashMap::new()).unwrap();
+        assert_eq!(after.records[0].values[0], serde_json::json!(3));
+        let eq = execute(
+            &graph,
+            "MATCH (p:P) WHERE p.age = 35 RETURN count(p)",
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(eq.records[0].values[0], serde_json::json!(1));
+
+        execute(&graph, "CREATE AUTO INDEX FOR (n:P)", &HashMap::new()).unwrap();
+        assert!(graph.label_auto_index_enabled("P").unwrap());
+        assert!(explain(&graph, q).unwrap().contains("NodeRangeScan"));
+
+        let rel = execute(&graph, "DROP AUTO INDEX FOR ()-[r:T]-()", &HashMap::new());
+        assert!(rel.is_err(), "relationships have no auto-index");
+    }
+
+    fn count(graph: &Graph, q: &str) -> serde_json::Value {
+        execute(graph, q, &HashMap::new())
+            .unwrap()
+            .records
+            .remove(0)
+            .values
+            .remove(0)
+    }
+
+    /// A pipeline of data statements is one transaction: a failure in the last
+    /// statement rolls back the writes of the earlier ones.
+    #[test]
+    fn pipeline_of_data_statements_is_atomic() {
+        let (_dir, graph) = setup_graph();
+        let err = execute(
+            &graph,
+            "CREATE (:A {x: 1}); CREATE (:B); RETURN 1 / 0",
+            &HashMap::new(),
+        );
+        assert!(err.is_err());
+        assert_eq!(
+            count(&graph, "MATCH (n) RETURN count(n)"),
+            serde_json::json!(0)
+        );
+
+        let ok = execute(
+            &graph,
+            "CREATE (:A {x: 1}); CREATE (:B); MATCH (n) RETURN count(n)",
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(ok.statement_count, 3);
+        assert_eq!(ok.records[0].values[0], serde_json::json!(2));
+    }
+
+    /// Every statement of an atomic pipeline sees the structural effect of the
+    /// statements before it: created nodes and edges, deletions, and label and
+    /// property changes, through label scans, expansions, and index scans.
+    #[test]
+    fn pipeline_statements_see_earlier_writes() {
+        let (_dir, graph) = setup_graph();
+        assert_eq!(
+            count(&graph, "CREATE (:P {x: 1}); MATCH (p:P) RETURN count(p)"),
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            count(
+                &graph,
+                "CREATE (:P {x: 2})-[:T]->(:Q); MATCH (:P)-[:T]->(q:Q) RETURN count(q)"
+            ),
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            count(
+                &graph,
+                "CREATE (:D); MATCH (n:D) DELETE n; MATCH (n:D) RETURN count(n)"
+            ),
+            serde_json::json!(0)
+        );
+        assert_eq!(
+            count(
+                &graph,
+                "CREATE (:A); MATCH (n:A) SET n:B; MATCH (m:B) RETURN count(m)"
+            ),
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            count(
+                &graph,
+                "MATCH (n:A) SET n.v = 7; MATCH (n:A) WHERE n.v = 7 RETURN count(n)"
+            ),
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            count(
+                &graph,
+                "MATCH (n:A) REMOVE n:B; MATCH (m:B) RETURN count(m)"
+            ),
+            serde_json::json!(0)
+        );
+        assert_eq!(
+            count(
+                &graph,
+                "MATCH (p:P)-[r:T]->() DELETE r; MATCH (:P)-[:T]->() RETURN count(*)"
+            ),
+            serde_json::json!(0)
+        );
+    }
+
+    /// Within one statement, a MATCH after a write clause sees the write's
+    /// structural effect, as openCypher's clause ordering requires.
+    #[test]
+    fn match_after_create_in_one_statement_sees_the_node() {
+        let (_dir, graph) = setup_graph();
+        assert_eq!(
+            count(
+                &graph,
+                "CREATE (a:Foo) WITH a MATCH (m:Foo) RETURN count(m)"
+            ),
+            serde_json::json!(1)
+        );
+    }
+
+    /// A schema statement in a pipeline keeps the statement-by-statement mode,
+    /// because it opens its own transaction; the earlier statements commit.
+    #[test]
+    fn pipeline_with_ddl_runs_statement_by_statement() {
+        let (_dir, graph) = setup_graph();
+        let err = execute(
+            &graph,
+            "CREATE (:A {name: 'x'}); CREATE INDEX FOR (n:A) ON (n.name); RETURN 1 / 0",
+            &HashMap::new(),
+        );
+        assert!(err.is_err());
+        assert_eq!(
+            count(&graph, "MATCH (n:A) RETURN count(n)"),
+            serde_json::json!(1)
+        );
     }
 }

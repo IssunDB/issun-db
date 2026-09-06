@@ -70,7 +70,7 @@ pub type StorageError = MemoryError;
 type TableData = BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>>;
 
 /// How many tables a `Storage` holds; see the index constants below.
-const TABLE_COUNT: usize = 12;
+const TABLE_COUNT: usize = 11;
 
 // Table indices. A `Table` handle is just one of these plus its type parameters, so
 // it stays `Copy` exactly as a `heed::Database` handle is.
@@ -79,13 +79,12 @@ const T_EDGES: usize = 1;
 const T_OUT_ADJ: usize = 2;
 const T_IN_ADJ: usize = 3;
 const T_LABEL_IDX: usize = 4;
-const T_TYPE_IDX: usize = 5;
-const T_NODE_PROP_IDX: usize = 6;
-const T_EDGE_PROP_IDX: usize = 7;
-const T_FTS_POSTINGS: usize = 8;
-const T_FTS_DOCS: usize = 9;
-const T_VECTORS: usize = 10;
-const T_META: usize = 11;
+const T_NODE_PROP_IDX: usize = 5;
+const T_EDGE_PROP_IDX: usize = 6;
+const T_FTS_POSTINGS: usize = 7;
+const T_FTS_DOCS: usize = 8;
+const T_VECTORS: usize = 9;
+const T_META: usize = 10;
 
 /// A key type a table can be declared over.
 ///
@@ -226,7 +225,7 @@ impl Env {
 
     pub fn write_txn(&self) -> Result<RwTxn<'_>, Error> {
         let guard = self.writer.lock();
-        // The working copy: twelve `Arc` clones, so nothing is deep-copied until a
+        // The working copy: eleven `Arc` clones, so nothing is deep-copied until a
         // table is actually mutated.
         let working = Arc::new((*self.published.load_full()).clone());
         Ok(RwTxn {
@@ -500,7 +499,6 @@ pub struct Storage {
     pub in_adj: Table<u64, [u8]>,
 
     pub label_idx: Table<[u8], ()>,
-    pub type_idx: Table<[u8], ()>,
 
     pub node_prop_idx: Table<[u8], ()>,
     pub edge_prop_idx: Table<[u8], ()>,
@@ -528,7 +526,6 @@ impl Storage {
             out_adj: Table::new(T_OUT_ADJ, true),
             in_adj: Table::new(T_IN_ADJ, true),
             label_idx: Table::new(T_LABEL_IDX, false),
-            type_idx: Table::new(T_TYPE_IDX, false),
             node_prop_idx: Table::new(T_NODE_PROP_IDX, false),
             edge_prop_idx: Table::new(T_EDGE_PROP_IDX, false),
             fts_postings: Table::new(T_FTS_POSTINGS, true),
@@ -714,5 +711,46 @@ mod tests {
         s.meta.put(&mut wtxn, "k", b"v".as_slice()).unwrap();
         assert_eq!(s.meta.get(&wtxn, "k").unwrap(), Some(b"v".as_slice()));
         wtxn.commit().unwrap();
+    }
+}
+
+impl Storage {
+    /// Entry count and summed key and value bytes of every table, in the LMDB
+    /// backend's declaration order; this backend has no pages to count.
+    pub fn table_stats(&self, rtxn: &RoTxn<'_>) -> Result<Vec<crate::schema::TableStat>, Error> {
+        const NAMES: [&str; 11] = [
+            "nodes",
+            "edges",
+            "out_adj",
+            "in_adj",
+            "label_idx",
+            "node_prop_idx",
+            "edge_prop_idx",
+            "fts_postings",
+            "fts_docs",
+            "vectors",
+            "meta",
+        ];
+        Ok(NAMES
+            .iter()
+            .enumerate()
+            .map(|(index, name)| {
+                let data = rtxn.table_data(index);
+                let mut entries = 0u64;
+                let mut bytes = 0u64;
+                for (k, values) in data.iter() {
+                    for v in values {
+                        entries += 1;
+                        bytes += (k.len() + v.len()) as u64;
+                    }
+                }
+                crate::schema::TableStat {
+                    name,
+                    entries,
+                    bytes,
+                    pages: None,
+                }
+            })
+            .collect())
     }
 }

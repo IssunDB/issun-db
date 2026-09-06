@@ -223,11 +223,39 @@ impl CsrSnapshot {
             .as_ref()
             .is_some_and(|weights| weights.iter().any(|w| *w < 0.0));
 
-        // Counting-sort transpose for the incoming view. Walking the outgoing
-        // rows in ascending source order keeps each incoming row ordered by
-        // ascending source dense index.
+        let (in_row_ptr, in_col_idx, in_edge_type, in_edge_id) =
+            Self::transpose(n, &row_ptr, &col_idx, &edge_type, &edge_id);
+
+        Ok(Self {
+            row_ptr,
+            col_idx,
+            edge_type,
+            edge_id,
+            edge_weight,
+            has_negative_weight,
+            in_row_ptr,
+            in_col_idx,
+            in_edge_type,
+            in_edge_id,
+            dense_to_id,
+            id_to_dense,
+        })
+    }
+
+    /// Counting-sort transpose of the outgoing arrays into the incoming view.
+    /// Walking the outgoing rows in ascending source order keeps each incoming
+    /// row ordered by ascending source dense index.
+    #[allow(clippy::type_complexity)]
+    fn transpose(
+        n: usize,
+        row_ptr: &[usize],
+        col_idx: &[u32],
+        edge_type: &[TypeId],
+        edge_id: &[EdgeId],
+    ) -> (Vec<usize>, Vec<u32>, Vec<TypeId>, Vec<EdgeId>) {
+        let total = col_idx.len();
         let mut in_row_ptr = vec![0usize; n + 1];
-        for &dst_d in &col_idx {
+        for &dst_d in col_idx {
             in_row_ptr[dst_d as usize + 1] += 1;
         }
         for i in 0..n {
@@ -246,8 +274,136 @@ impl CsrSnapshot {
                 in_edge_id[slot] = edge_id[k];
             }
         }
+        (in_row_ptr, in_col_idx, in_edge_type, in_edge_id)
+    }
 
-        Ok(Self {
+    /// This snapshot plus the nodes and edges of `change`, without reading the
+    /// adjacency: the incremental refresh. `None` when the change cannot be
+    /// applied and the caller must build from storage: a deletion (`full`), an
+    /// edge property update on a snapshot carrying weights (a weight may have
+    /// moved), or a node id out of allocation order (dense indices are the rank
+    /// of ascending node ids, so a new node must sort after every existing one).
+    ///
+    /// The cost is one pass over the arrays plus the transpose, with no LMDB
+    /// iteration, no per-entry decode, and no hash map construction beyond the
+    /// new nodes. Every row keeps its ascending edge-id order, so the result is
+    /// exactly what a full build would produce; the proptest in this module
+    /// pins that. `weight_of` supplies the weight of an added edge when the
+    /// snapshot carries weights.
+    pub fn with_additions(
+        &self,
+        change: &CsrChange,
+        mut weight_of: impl FnMut(EdgeId) -> Result<f64, Error>,
+    ) -> Result<Option<Self>, Error> {
+        if change.full || (change.edges_updated && self.edge_weight.is_some()) {
+            return Ok(None);
+        }
+        let mut added_nodes: Vec<NodeId> = change
+            .added_nodes
+            .iter()
+            .copied()
+            .filter(|id| !self.id_to_dense.contains_key(id))
+            .collect();
+        added_nodes.sort_unstable();
+        added_nodes.dedup();
+        if let (Some(&last), Some(&first_new)) = (self.dense_to_id.last(), added_nodes.first()) {
+            if first_new <= last {
+                return Ok(None);
+            }
+        }
+        let old_n = self.dense_to_id.len();
+        let mut dense_to_id = self.dense_to_id.clone();
+        dense_to_id.extend(added_nodes.iter().copied());
+        let mut id_to_dense = self.id_to_dense.clone();
+        for (i, &id) in added_nodes.iter().enumerate() {
+            id_to_dense.insert(id, (old_n + i) as u32);
+        }
+        let n = dense_to_id.len();
+
+        // Added entries keyed by (source dense index, edge id): sorted once, they
+        // arrive row by row in the order each row keeps.
+        let mut adds: Vec<(u32, EdgeId, u32, TypeId)> = change
+            .added_edges
+            .iter()
+            .filter_map(|e| {
+                let src_d = *id_to_dense.get(&e.src)?;
+                let dst_d = *id_to_dense.get(&e.dst)?;
+                Some((src_d, e.edge_id, dst_d, e.edge_type))
+            })
+            .collect();
+        adds.sort_unstable();
+        adds.dedup();
+
+        let total = self.col_idx.len() + adds.len();
+        let mut row_ptr = vec![0usize; n + 1];
+        let mut col_idx: Vec<u32> = Vec::with_capacity(total);
+        let mut edge_type: Vec<TypeId> = Vec::with_capacity(total);
+        let mut edge_id: Vec<EdgeId> = Vec::with_capacity(total);
+        let mut edge_weight: Option<Vec<f64>> =
+            self.edge_weight.as_ref().map(|_| Vec::with_capacity(total));
+        let mut has_negative_weight = self.has_negative_weight;
+
+        let mut next_add = 0usize;
+        let mut scratch: Vec<(EdgeId, u32, TypeId, f64)> = Vec::new();
+        for i in 0..n {
+            let row_start = col_idx.len();
+            if i < old_n {
+                let (start, end) = (self.row_ptr[i], self.row_ptr[i + 1]);
+                col_idx.extend_from_slice(&self.col_idx[start..end]);
+                edge_type.extend_from_slice(&self.edge_type[start..end]);
+                edge_id.extend_from_slice(&self.edge_id[start..end]);
+                if let (Some(w), Some(old_w)) = (edge_weight.as_mut(), self.edge_weight.as_ref()) {
+                    w.extend_from_slice(&old_w[start..end]);
+                }
+            }
+            let old_last = edge_id.last().copied();
+            let adds_start = next_add;
+            while next_add < adds.len() && adds[next_add].0 as usize == i {
+                let (_, eid, dst_d, ty) = adds[next_add];
+                col_idx.push(dst_d);
+                edge_type.push(ty);
+                edge_id.push(eid);
+                if let Some(w) = edge_weight.as_mut() {
+                    let weight = weight_of(eid)?;
+                    has_negative_weight |= weight < 0.0;
+                    w.push(weight);
+                }
+                next_add += 1;
+            }
+            // Edge ids are allocated monotonically, so the appended entries
+            // normally follow the row's last existing id; restore the order
+            // otherwise, exactly as the full build does.
+            let needs_sort =
+                adds_start < next_add && old_last.is_some_and(|last| last > adds[adds_start].1);
+            if needs_sort {
+                let end = col_idx.len();
+                scratch.clear();
+                scratch.extend((row_start..end).map(|k| {
+                    (
+                        edge_id[k],
+                        col_idx[k],
+                        edge_type[k],
+                        edge_weight.as_ref().map(|w| w[k]).unwrap_or(1.0),
+                    )
+                }));
+                scratch.sort_unstable_by_key(|&(eid, _, _, _)| eid);
+                for (slot, &(eid, col, ty, w)) in (row_start..end).zip(scratch.iter()) {
+                    edge_id[slot] = eid;
+                    col_idx[slot] = col;
+                    edge_type[slot] = ty;
+                    if let Some(weights) = edge_weight.as_mut() {
+                        weights[slot] = w;
+                    }
+                }
+            }
+            row_ptr[i + 1] = col_idx.len();
+        }
+        debug_assert_eq!(next_add, adds.len());
+
+        let (in_row_ptr, in_col_idx, in_edge_type, in_edge_id) =
+            Self::transpose(n, &row_ptr, &col_idx, &edge_type, &edge_id);
+
+        Ok(Some(Self {
             row_ptr,
             col_idx,
             edge_type,
@@ -260,7 +416,22 @@ impl CsrSnapshot {
             in_edge_id,
             dense_to_id,
             id_to_dense,
-        })
+        }))
+    }
+
+    /// The weight of one edge, read from its record: the first present of
+    /// the `weight`, `cost`, `capacity`, or `cap` property, default `1.0`, the
+    /// rule `load_weights` applies to every edge at once.
+    pub(crate) fn weight_of_edge(
+        storage: &Storage,
+        rtxn: &crate::storage::RoTxn,
+        eid: EdgeId,
+    ) -> Result<f64, Error> {
+        let Some(bytes) = storage.edges.get(rtxn, &eid)? else {
+            return Ok(1.0);
+        };
+        let rec: EdgeRecord = props::decode(bytes)?;
+        Ok(weight_in_props(&rec.props))
     }
 
     /// Read one weight per outgoing entry, in `col_idx` order.
@@ -290,19 +461,150 @@ impl CsrSnapshot {
             let Ok(offset) = edge_id[start..end].binary_search(&id) else {
                 continue;
             };
-            let val: serde_json::Value =
-                props::decode(&rec.props).unwrap_or(serde_json::Value::Null);
-            if let Some(w) = val
-                .get("weight")
-                .or_else(|| val.get("cost"))
-                .or_else(|| val.get("capacity"))
-                .or_else(|| val.get("cap"))
-                .and_then(|v| v.as_f64())
-            {
-                weights[start + offset] = w;
-            }
+            weights[start + offset] = weight_in_props(&rec.props);
         }
         Ok(weights)
+    }
+}
+
+/// The weight an encoded property blob carries: the first present of `weight`,
+/// `cost`, `capacity`, or `cap`, else `1.0`.
+fn weight_in_props(encoded: &[u8]) -> f64 {
+    let val: serde_json::Value = props::decode(encoded).unwrap_or(serde_json::Value::Null);
+    val.get("weight")
+        .or_else(|| val.get("cost"))
+        .or_else(|| val.get("capacity"))
+        .or_else(|| val.get("cap"))
+        .and_then(|v| v.as_f64())
+        .unwrap_or(1.0)
+}
+
+/// One edge added by a committed write, with every field the snapshot's arrays
+/// hold for it, so the incremental refresh needs no storage read to place it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AddedEdge {
+    pub src: NodeId,
+    pub dst: NodeId,
+    pub edge_type: TypeId,
+    pub edge_id: EdgeId,
+}
+
+/// The structural effect of one committed write on the CSR snapshot, recorded
+/// by `Graph::commit_and_publish` and consumed by the refresh gate.
+///
+/// Additions are listed, because a snapshot can absorb them without touching
+/// storage. A removal is only flagged: it reshuffles dense indices and row
+/// boundaries, and the refresh then builds from storage. `edges_updated` matters
+/// only to a snapshot carrying weights, whose per-edge weight may have changed.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CsrChange {
+    pub added_nodes: Vec<NodeId>,
+    pub added_edges: Vec<AddedEdge>,
+    pub edges_updated: bool,
+    pub full: bool,
+}
+
+impl CsrChange {
+    /// A write with no structural effect (a property or label update).
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// A write the snapshot cannot absorb (a node or edge removal).
+    pub fn full() -> Self {
+        Self {
+            full: true,
+            ..Self::default()
+        }
+    }
+
+    /// A property update on existing edges.
+    pub fn edges_updated() -> Self {
+        Self {
+            edges_updated: true,
+            ..Self::default()
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.added_nodes.is_empty()
+            && self.added_edges.is_empty()
+            && !self.edges_updated
+            && !self.full
+    }
+
+    fn absorb(&mut self, other: &CsrChange) {
+        self.added_nodes.extend_from_slice(&other.added_nodes);
+        self.added_edges.extend_from_slice(&other.added_edges);
+        self.edges_updated |= other.edges_updated;
+        self.full |= other.full;
+    }
+}
+
+/// Added edges held for the incremental refresh before it gives up and builds
+/// from storage. Past this many the pending list costs more to hold and apply
+/// than the scan it replaces; a bulk load ends in `rebuild_csr` anyway.
+pub const INCREMENTAL_MAX_EDGES: usize = 1 << 20;
+
+/// Committed structural changes the installed snapshot has not absorbed.
+///
+/// Each batch is tagged with the write generation *before* the commit that
+/// produced it advanced the counter, and a writer records its batch before that
+/// advance. A snapshot stamped at generation `B` was built from a storage read
+/// taken after the counter reached `B`, so it holds every write whose advance
+/// preceded that read, which is every batch tagged below `B`; those are dropped
+/// at install, and the batches tagged at or above `B` are what the next
+/// incremental refresh applies. A batch recorded after the refresh read the
+/// counter but before it drained the list is applied one generation early,
+/// which is harmless: its commit had already landed.
+#[derive(Default)]
+struct PendingChanges {
+    batches: Vec<(u64, CsrChange)>,
+    total_edges: usize,
+}
+
+impl PendingChanges {
+    fn record(&mut self, tag: u64, change: CsrChange) {
+        if change.is_empty() {
+            return;
+        }
+        if change.full || self.total_edges + change.added_edges.len() > INCREMENTAL_MAX_EDGES {
+            // One full marker stands for everything: the refresh must build
+            // from storage, and the storage read will cover these batches.
+            self.batches.clear();
+            self.total_edges = 0;
+            self.batches.push((tag, CsrChange::full()));
+            return;
+        }
+        self.total_edges += change.added_edges.len();
+        self.batches.push((tag, change));
+    }
+
+    /// Drop the batches a snapshot stamped `built_gen` is known to contain.
+    fn prune_below(&mut self, built_gen: u64) {
+        self.batches.retain(|(tag, _)| *tag >= built_gen);
+        self.total_edges = self.batches.iter().map(|(_, c)| c.added_edges.len()).sum();
+    }
+
+    /// Everything the snapshot stamped `snapshot_gen` still lacks, merged, with
+    /// the number of batches it covers; `None` when a full build is required.
+    fn applicable(&self, snapshot_gen: u64) -> Option<(CsrChange, usize)> {
+        let mut merged = CsrChange::default();
+        for (tag, change) in &self.batches {
+            if *tag < snapshot_gen {
+                continue;
+            }
+            if change.full {
+                return None;
+            }
+            merged.absorb(change);
+        }
+        Some((merged, self.batches.len()))
+    }
+
+    fn drain_applied(&mut self, applied: usize) {
+        self.batches.drain(..applied.min(self.batches.len()));
+        self.total_edges = self.batches.iter().map(|(_, c)| c.added_edges.len()).sum();
     }
 }
 
@@ -310,25 +612,25 @@ impl CsrSnapshot {
 /// commit so an aborted transaction never pollutes them.
 ///
 /// `Graph::update` drains this into the property-column caches, which absorb it on
-/// the spot. The CSR snapshot needs nothing from it: it is rebuilt whole rather
-/// than patched, and the committed-write generation alone tells a reader that its
-/// snapshot lags (see [`CsrCache::advance_write_gen`]).
+/// the spot, and turns it into the [`CsrChange`] the snapshot's incremental
+/// refresh applies; the committed-write generation is still what tells a reader
+/// that its snapshot lags (see [`CsrCache::advance_write_gen`]).
 ///
 /// `updated_nodes` records property updates on existing nodes, which the column
 /// cache drains to re-read those records.
 ///
 /// Every field here has a reader, and that is a size constraint rather than
 /// tidiness: one transaction can be a whole bulk load, so a per-edge `Vec` nobody
-/// drains costs 16 bytes per edge for the length of the load. The edge endpoints
-/// used to be collected for the incremental matrix patch; with that gone, an edge
-/// removal only has to be *noticed*, so `removed_edges` is a flag and not a list.
+/// drains costs its element size per edge for the length of the load. An edge
+/// removal only has to be *noticed*, so `removed_edge` is a flag and not a list.
 #[derive(Default)]
 pub struct GraphDelta {
     pub added_nodes: Vec<NodeId>,
     pub updated_nodes: Vec<NodeId>,
-    /// Edge ids of the edges added in this transaction. The edge property column
-    /// cache drains this to patch the new edges in without a full rebuild.
-    pub added_edge_ids: Vec<crate::schema::EdgeId>,
+    /// The edges added in this transaction, with the fields the CSR snapshot
+    /// holds for each. The edge property column cache patches the new edges in
+    /// by id, and the snapshot's incremental refresh appends them by endpoint.
+    pub added_edges: Vec<AddedEdge>,
     /// Edge ids updated (not added) in this transaction, so the edge property
     /// column cache can refresh them once, at commit, instead of per-call.
     pub updated_edges: Vec<crate::schema::EdgeId>,
@@ -366,6 +668,13 @@ pub struct CsrCache {
     /// does. Sticky once set, so a later unweighted refresh does not strip them out
     /// from under an alternating workload; see `Graph::weighted_snapshot`.
     weights_requested: AtomicBool,
+    /// Committed structural changes not yet absorbed by the installed snapshot,
+    /// for the incremental refresh. See [`PendingChanges`] for the tagging rule.
+    pending: parking_lot::Mutex<PendingChanges>,
+    /// Snapshots built from storage, for the tests that assert a refresh patched
+    /// rather than rebuilt.
+    #[cfg(test)]
+    pub full_builds: AtomicU64,
 }
 
 impl CsrCache {
@@ -379,7 +688,52 @@ impl CsrCache {
             write_gen: AtomicU64::new(0),
             snapshot_gen: AtomicU64::new(0),
             weights_requested: AtomicBool::new(false),
+            pending: parking_lot::Mutex::new(PendingChanges::default()),
+            #[cfg(test)]
+            full_builds: AtomicU64::new(0),
         }
+    }
+
+    /// The generation the installed snapshot reflects; `0` while it is still the
+    /// unbuilt placeholder, which no incremental refresh may extend.
+    pub fn snapshot_gen(&self) -> u64 {
+        self.snapshot_gen.load(Ordering::Acquire)
+    }
+
+    /// Record the structural effect of a write that has just committed. Call
+    /// this *before* [`CsrCache::advance_write_gen`]: the batch is tagged with
+    /// the generation before the advance, and a refresh that reads the counter
+    /// must find every batch the counter accounts for already recorded.
+    pub fn record_change(&self, change: CsrChange) {
+        if change.is_empty() {
+            return;
+        }
+        let tag = self.current_gen();
+        self.pending.lock().record(tag, change);
+    }
+
+    /// The changes the installed snapshot lacks, merged, plus how many pending
+    /// batches they span; `None` when a removal forces a build from storage.
+    /// Call under `maintenance`, and pass the same count to
+    /// [`CsrCache::install_incremental`] once the patched snapshot is ready.
+    pub fn pending_applicable(&self) -> Option<(CsrChange, usize)> {
+        self.pending.lock().applicable(self.snapshot_gen())
+    }
+
+    /// Install a snapshot the incremental refresh produced: drop exactly the
+    /// batches it applied (later ones stay for the next refresh), then stamp it.
+    pub fn install_incremental(&self, snap: Arc<CsrSnapshot>, built_gen: u64, applied: usize) {
+        {
+            let mut pending = self.pending.lock();
+            pending.drain_applied(applied);
+            pending.prune_below(built_gen);
+        }
+        self.snapshot.store(snap);
+        self.snapshot_gen.store(built_gen, Ordering::Release);
+    }
+
+    fn prune_pending(&self, built_gen: u64) {
+        self.pending.lock().prune_below(built_gen);
     }
 
     /// Cache for a graph opened without building anything: the snapshot is an
@@ -473,6 +827,7 @@ impl CsrCache {
     /// and the caller must build again; otherwise the claim is released.
     #[must_use]
     pub fn install(&self, snap: CsrSnapshot, built_gen: u64) -> bool {
+        self.prune_pending(built_gen);
         self.snapshot.store(Arc::new(snap));
         // `built_gen` was captured before the build, so the snapshot reflects at
         // least that generation. Writes that landed during the build keep
@@ -507,6 +862,7 @@ impl CsrCache {
     /// Install a foreground refresh: store the snapshot and the generation it was
     /// built at, leaving the dirty counter and any rebuild claim untouched, since
     /// this pass did not claim one.
+    #[cfg(test)]
     pub fn install_snapshot(&self, snap: CsrSnapshot, built_gen: u64) {
         self.install_snapshot_shared(Arc::new(snap), built_gen);
     }
@@ -516,6 +872,7 @@ impl CsrCache {
     /// the weighted gate avoids reloading a pointer another refresh may have
     /// replaced in between.
     pub fn install_snapshot_shared(&self, snap: Arc<CsrSnapshot>, built_gen: u64) {
+        self.prune_pending(built_gen);
         self.snapshot.store(snap);
         self.snapshot_gen.store(built_gen, Ordering::Release);
     }
@@ -524,6 +881,7 @@ impl CsrCache {
     /// committed state. Clears the dirty counter and any outstanding rebuild
     /// claim, since the new snapshot already reflects every prior write.
     pub fn install_full(&self, snap: CsrSnapshot, built_gen: u64) {
+        self.prune_pending(built_gen);
         self.snapshot.store(Arc::new(snap));
         self.snapshot_gen.store(built_gen, Ordering::Release);
         self.dirty.store(0, Ordering::Release);
@@ -678,6 +1036,344 @@ mod snapshot_tests {
     /// depend on the ones before it, so proptest's shrinker would replay candidate
     /// histories against a graph that had moved on and could report a minimal
     /// counterexample that does not reproduce on its own.
+    fn assert_same_snapshot(got: &CsrSnapshot, want: &CsrSnapshot) {
+        assert_eq!(got.dense_to_id, want.dense_to_id);
+        assert_eq!(got.id_to_dense, want.id_to_dense);
+        assert_eq!(got.row_ptr, want.row_ptr);
+        assert_eq!(got.col_idx, want.col_idx);
+        assert_eq!(got.edge_type, want.edge_type);
+        assert_eq!(got.edge_id, want.edge_id);
+        assert_eq!(got.edge_weight, want.edge_weight);
+        assert_eq!(got.has_negative_weight, want.has_negative_weight);
+        assert_eq!(got.in_row_ptr, want.in_row_ptr);
+        assert_eq!(got.in_col_idx, want.in_col_idx);
+        assert_eq!(got.in_edge_type, want.in_edge_type);
+        assert_eq!(got.in_edge_id, want.in_edge_id);
+    }
+
+    fn full_builds(g: &Graph) -> u64 {
+        g.csr_cache.full_builds.load(Ordering::Relaxed)
+    }
+
+    /// Additions through both write paths are absorbed without a build from
+    /// storage, and the result is array-for-array what a build produces; a
+    /// removal then forces the build.
+    #[test]
+    fn refresh_patches_additions_and_rebuilds_on_removal() {
+        let dir = TempDir::new().unwrap();
+        let g = Graph::open(dir.path(), 1).unwrap();
+        let a = g.add_node("P", &()).unwrap();
+        let b = g.add_node("P", &()).unwrap();
+        let ab = g.add_edge(a, b, "T", &()).unwrap();
+        g.ensure_snapshot_fresh().unwrap();
+        let builds = full_builds(&g);
+
+        let c = g.add_node("P", &()).unwrap();
+        g.add_edge(b, c, "T", &()).unwrap();
+        g.update(|t| {
+            let d = t.add_node("Q", &())?;
+            t.add_edge(c, d, "U", &())?;
+            t.add_edge(a, d, "T", &())?;
+            t.add_edge(d, a, "T", &())?;
+            Ok(())
+        })
+        .unwrap();
+        g.ensure_snapshot_fresh().unwrap();
+        assert_eq!(full_builds(&g), builds, "additions patch the snapshot");
+        assert_same_snapshot(
+            &g.csr_cache.snapshot.load(),
+            &CsrSnapshot::build(&g.storage).unwrap(),
+        );
+        assert!(!g.csr_cache.snapshot_is_stale());
+
+        g.delete_edge(ab).unwrap();
+        g.ensure_snapshot_fresh().unwrap();
+        assert_eq!(full_builds(&g), builds + 1, "a removal builds from storage");
+        assert_same_snapshot(
+            &g.csr_cache.snapshot.load(),
+            &CsrSnapshot::build(&g.storage).unwrap(),
+        );
+    }
+
+    /// A weighted snapshot absorbs an added edge with its weight read from the
+    /// record, and an edge property update makes it build from storage, since a
+    /// weight may have moved.
+    #[test]
+    fn weighted_refresh_patches_new_edges_and_rebuilds_on_edge_update() {
+        let dir = TempDir::new().unwrap();
+        let g = Graph::open(dir.path(), 1).unwrap();
+        let a = g.add_node("P", &()).unwrap();
+        let b = g.add_node("P", &()).unwrap();
+        let c = g.add_node("P", &()).unwrap();
+        let ab = g
+            .add_edge(a, b, "T", &serde_json::json!({ "weight": 5.0 }))
+            .unwrap();
+        g.add_edge(b, c, "T", &serde_json::json!({ "weight": 5.0 }))
+            .unwrap();
+        assert_eq!(
+            g.shortest_path_dijkstra(a, c)
+                .unwrap()
+                .unwrap()
+                .total_weight,
+            10.0
+        );
+        let builds = full_builds(&g);
+
+        g.add_edge(a, c, "T", &serde_json::json!({ "cost": 2.5 }))
+            .unwrap();
+        assert_eq!(
+            g.shortest_path_dijkstra(a, c)
+                .unwrap()
+                .unwrap()
+                .total_weight,
+            2.5
+        );
+        assert_eq!(full_builds(&g), builds, "the new weight was read per edge");
+        assert_same_snapshot(
+            &g.csr_cache.snapshot.load(),
+            &CsrSnapshot::build_weighted(&g.storage).unwrap(),
+        );
+
+        g.update_edge(ab, &serde_json::json!({ "weight": 0.5 }))
+            .unwrap();
+        g.update_edge(
+            g.edges_by_type("T").unwrap()[1],
+            &serde_json::json!({ "weight": 0.5 }),
+        )
+        .unwrap();
+        assert_eq!(
+            g.shortest_path_dijkstra(a, c)
+                .unwrap()
+                .unwrap()
+                .total_weight,
+            1.0
+        );
+        assert!(
+            full_builds(&g) > builds,
+            "an edge update rebuilds the weights"
+        );
+    }
+
+    /// A node deleted between refreshes forces a build from storage too, and a
+    /// pending list past the cap collapses to one.
+    #[test]
+    fn refresh_rebuilds_after_a_node_deletion_and_a_pending_overflow() {
+        let dir = TempDir::new().unwrap();
+        let g = Graph::open(dir.path(), 1).unwrap();
+        let a = g.add_node("P", &()).unwrap();
+        let b = g.add_node("P", &()).unwrap();
+        g.add_edge(a, b, "T", &()).unwrap();
+        g.ensure_snapshot_fresh().unwrap();
+        let builds = full_builds(&g);
+        g.delete_node(b).unwrap();
+        g.ensure_snapshot_fresh().unwrap();
+        assert_eq!(full_builds(&g), builds + 1);
+        assert_same_snapshot(
+            &g.csr_cache.snapshot.load(),
+            &CsrSnapshot::build(&g.storage).unwrap(),
+        );
+
+        let mut pending = PendingChanges::default();
+        let big = CsrChange {
+            added_edges: vec![
+                AddedEdge {
+                    src: 0,
+                    dst: 0,
+                    edge_type: 0,
+                    edge_id: 0
+                };
+                INCREMENTAL_MAX_EDGES + 1
+            ],
+            ..CsrChange::default()
+        };
+        pending.record(3, big);
+        pending.record(
+            4,
+            CsrChange {
+                added_nodes: vec![9],
+                ..CsrChange::default()
+            },
+        );
+        assert!(
+            pending.applicable(0).is_none(),
+            "overflow collapses to a full marker"
+        );
+        // The later addition is still recorded: a build stamped between the two
+        // tags drops the marker but must keep the addition.
+        assert_eq!(pending.batches.len(), 2);
+        pending.prune_below(4);
+        assert_eq!(
+            pending.applicable(4).map(|(c, _)| c.added_nodes),
+            Some(vec![9])
+        );
+        pending.prune_below(5);
+        assert!(pending.batches.is_empty());
+    }
+
+    /// Batches tagged below an installed generation are dropped at install, and
+    /// only the batches a patch applied are drained, so a batch recorded during
+    /// the patch survives for the next refresh.
+    #[test]
+    fn pending_changes_follow_the_generation_tagging_rule() {
+        let mut pending = PendingChanges::default();
+        let node = |id: NodeId| CsrChange {
+            added_nodes: vec![id],
+            ..CsrChange::default()
+        };
+        pending.record(1, node(1));
+        pending.record(2, node(2));
+        pending.record(3, node(3));
+        pending.prune_below(3);
+        let (change, applied) = pending.applicable(3).unwrap();
+        assert_eq!(change.added_nodes, vec![3]);
+        assert_eq!(applied, 1);
+        pending.record(3, node(4));
+        pending.drain_applied(applied);
+        let (rest, _) = pending.applicable(3).unwrap();
+        assert_eq!(rest.added_nodes, vec![4]);
+        pending.record(4, CsrChange::edges_updated());
+        let (rest, _) = pending.applicable(3).unwrap();
+        assert!(rest.edges_updated);
+        pending.record(5, CsrChange::full());
+        assert!(pending.applicable(3).is_none());
+    }
+
+    /// Over a random history of additions, removals, weight updates, and
+    /// refreshes, the snapshot the gate installs, patched or built, equals a
+    /// build from storage at every refresh, weights included.
+    #[test]
+    fn incremental_refresh_matches_a_full_build_over_a_random_history() {
+        #[derive(Debug, Clone)]
+        enum Op {
+            AddNode,
+            AddEdge {
+                src: usize,
+                dst: usize,
+                ty: usize,
+                weighted: bool,
+            },
+            DeleteEdge {
+                nth: usize,
+            },
+            UpdateEdge {
+                nth: usize,
+            },
+            DeleteNode {
+                nth: usize,
+            },
+            Refresh,
+            Batch {
+                count: usize,
+            },
+        }
+        let op = prop_oneof![
+            3 => Just(Op::AddNode),
+            10 => (0usize..12, 0usize..12, 0usize..3, any::<bool>())
+                .prop_map(|(src, dst, ty, weighted)| Op::AddEdge { src, dst, ty, weighted }),
+            2 => (0usize..16).prop_map(|nth| Op::DeleteEdge { nth }),
+            2 => (0usize..16).prop_map(|nth| Op::UpdateEdge { nth }),
+            1 => (0usize..8).prop_map(|nth| Op::DeleteNode { nth }),
+            6 => Just(Op::Refresh),
+            2 => (1usize..5).prop_map(|count| Op::Batch { count }),
+        ];
+        let config = ProptestConfig {
+            fork: false,
+            cases: 32,
+            ..Default::default()
+        };
+        proptest!(config, |(ops in proptest::collection::vec(op, 1..40), weighted in any::<bool>())| {
+            let dir = TempDir::new().map_err(|e| TestCaseError::fail(e.to_string()))?;
+            let g = Graph::open(dir.path(), 1).map_err(|e| TestCaseError::fail(e.to_string()))?;
+            let fail = |e: crate::Error| TestCaseError::fail(e.to_string());
+            let mut nodes: Vec<NodeId> = (0..3).map(|_| g.add_node("N", &()).unwrap()).collect();
+            let mut live: Vec<EdgeId> = Vec::new();
+            let refresh = |g: &Graph| -> Result<(), TestCaseError> {
+                if weighted {
+                    g.with_weighted_snapshot(|_| Ok(())).map_err(fail)?;
+                } else {
+                    g.ensure_snapshot_fresh().map_err(fail)?;
+                }
+                let want = if weighted {
+                    CsrSnapshot::build_weighted(&g.storage)
+                } else {
+                    CsrSnapshot::build(&g.storage)
+                }
+                .map_err(fail)?;
+                let got = g.csr_cache.snapshot.load();
+                prop_assert_eq!(&got.dense_to_id, &want.dense_to_id);
+                prop_assert_eq!(&got.row_ptr, &want.row_ptr);
+                prop_assert_eq!(&got.col_idx, &want.col_idx);
+                prop_assert_eq!(&got.edge_type, &want.edge_type);
+                prop_assert_eq!(&got.edge_id, &want.edge_id);
+                prop_assert_eq!(&got.edge_weight, &want.edge_weight);
+                prop_assert_eq!(got.has_negative_weight, want.has_negative_weight);
+                prop_assert_eq!(&got.in_row_ptr, &want.in_row_ptr);
+                prop_assert_eq!(&got.in_col_idx, &want.in_col_idx);
+                prop_assert_eq!(&got.in_edge_type, &want.in_edge_type);
+                prop_assert_eq!(&got.in_edge_id, &want.in_edge_id);
+                Ok(())
+            };
+            refresh(&g)?;
+            let mut i = 0;
+            while i < ops.len() {
+                match ops[i].clone() {
+                    Op::AddNode => nodes.push(g.add_node("N", &()).map_err(fail)?),
+                    Op::AddEdge { src, dst, ty, weighted: w } => {
+                        let props = if w {
+                            serde_json::json!({ "weight": (src as f64) - 3.0 })
+                        } else {
+                            serde_json::Value::Null
+                        };
+                        let (s, d) = (nodes[src % nodes.len()], nodes[dst % nodes.len()]);
+                        live.push(g.add_edge(s, d, ["t", "u", "v"][ty], &props).map_err(fail)?);
+                    }
+                    Op::DeleteEdge { nth } => {
+                        if !live.is_empty() {
+                            let victim = live.remove(nth % live.len());
+                            g.delete_edge(victim).map_err(fail)?;
+                        }
+                    }
+                    Op::UpdateEdge { nth } => {
+                        if !live.is_empty() {
+                            let e = live[nth % live.len()];
+                            g.update_edge(e, &serde_json::json!({ "cost": nth as f64 })).map_err(fail)?;
+                        }
+                    }
+                    Op::DeleteNode { nth } => {
+                        if nodes.len() > 1 {
+                            let victim = nodes.remove(nth % nodes.len());
+                            g.delete_node(victim).map_err(fail)?;
+                            // Incident edges went with it; drop any stale ids.
+                            live.retain(|e| g.get_edge(*e).ok().flatten().is_some());
+                        }
+                    }
+                    Op::Refresh => refresh(&g)?,
+                    Op::Batch { count } => {
+                        let snapshot_nodes = nodes.clone();
+                        let created = g
+                            .update(|t| {
+                                let mut made = Vec::new();
+                                for k in 0..count {
+                                    let n = t.add_node("B", &())?;
+                                    let from = snapshot_nodes[k % snapshot_nodes.len()];
+                                    let e = t.add_edge(from, n, "t", &serde_json::json!({ "weight": 2.0 }))?;
+                                    made.push((n, e));
+                                }
+                                Ok(made)
+                            })
+                            .map_err(fail)?;
+                        for (n, e) in created {
+                            nodes.push(n);
+                            live.push(e);
+                        }
+                    }
+                }
+                i += 1;
+            }
+            refresh(&g)?;
+        });
+    }
+
     #[test]
     fn build_matches_the_previous_builder_over_a_random_write_history() {
         /// One step of a generated history: connect two of the six nodes with one of

@@ -56,3 +56,6 @@ jobs:
 
       - name: Run linters against the non-default backends
         run: make lint-backends
+
+      - name: Check the rustdoc
+        run: make doc-check

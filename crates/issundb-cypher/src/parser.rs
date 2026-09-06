@@ -2001,6 +2001,8 @@ fn create_statement<'a>() -> impl Parser<'a, ParserInput<'a>, Statement, ParserE
             })
         });
 
+    let auto_index_ddl = auto_index_statement("CREATE", true);
+
     let constraint_ddl = keyword("CREATE")
         .ignore_then(keyword("CONSTRAINT"))
         .ignore_then(keyword("ON"))
@@ -2041,11 +2043,36 @@ fn create_statement<'a>() -> impl Parser<'a, ParserInput<'a>, Statement, ParserE
         )
         .map(|patterns| Statement::Create(CreateStatement { patterns }));
 
-    choice((index_ddl, constraint_ddl, normal_create))
+    choice((auto_index_ddl, index_ddl, constraint_ddl, normal_create))
+}
+
+/// `CREATE AUTO INDEX FOR (n:Label)` and `DROP AUTO INDEX FOR (n:Label)`: the
+/// per-label switch on the property auto-index. Only a node target makes sense,
+/// since relationships have no auto-index; a relationship target is rejected
+/// at execution with a message naming that.
+fn auto_index_statement<'a>(
+    verb: &'static str,
+    enabled: bool,
+) -> impl Parser<'a, ParserInput<'a>, Statement, ParserError<'a>> + Clone {
+    keyword(verb)
+        .ignore_then(keyword("AUTO"))
+        .ignore_then(keyword("INDEX"))
+        .ignore_then(keyword("FOR"))
+        .ignore_then(schema_target())
+        .map(move |(label, target)| {
+            let label = match target {
+                SchemaTarget::Node => label,
+                // Carried through so the executor can name the mistake.
+                SchemaTarget::Relationship => format!("()-[:{label}]-()"),
+            };
+            Statement::SetAutoIndex(AutoIndexStatement { label, enabled })
+        })
 }
 
 /// Parses a `DROP INDEX` or `DROP CONSTRAINT` statement
 fn drop_statement<'a>() -> impl Parser<'a, ParserInput<'a>, Statement, ParserError<'a>> + Clone {
+    let auto_index_ddl = auto_index_statement("DROP", false);
+
     let index_ddl = keyword("DROP")
         .ignore_then(keyword("INDEX"))
         .ignore_then(keyword("FOR"))
@@ -2095,7 +2122,7 @@ fn drop_statement<'a>() -> impl Parser<'a, ParserInput<'a>, Statement, ParserErr
             })
         });
 
-    choice((index_ddl, constraint_ddl))
+    choice((auto_index_ddl, index_ddl, constraint_ddl))
 }
 
 /// Parses a `COPY <LabelName> FROM '<filepath>' [WITH <options_map>]` statement
@@ -2410,21 +2437,26 @@ fn statement_union_parser(
                 })
             });
 
-        let foreach_stmt = keyword("FOREACH")
-            .ignore_then(sym(Tok::LParen))
-            .ignore_then(identifier())
-            .then_ignore(keyword("IN"))
-            .then(expr_parser())
-            .then_ignore(sym(Tok::Pipe))
-            .then(statement.clone())
-            .then_ignore(sym(Tok::RParen))
-            .map(|((variable, list), body_stmt)| {
-                Statement::Foreach(ForeachStatement {
-                    variable,
-                    list,
-                    body: vec![body_stmt],
+        // The body is its own alternative before the general statement, because
+        // a statement ends at a statement boundary and the `)` closing an outer
+        // FOREACH is not one; without it a FOREACH nests exactly one level.
+        let foreach_stmt = recursive(|foreach| {
+            keyword("FOREACH")
+                .ignore_then(sym(Tok::LParen))
+                .ignore_then(identifier())
+                .then_ignore(keyword("IN"))
+                .then(expr_parser())
+                .then_ignore(sym(Tok::Pipe))
+                .then(choice((foreach, statement.clone())))
+                .then_ignore(sym(Tok::RParen))
+                .map(|((variable, list), body_stmt)| {
+                    Statement::Foreach(ForeachStatement {
+                        variable,
+                        list,
+                        body: vec![body_stmt],
+                    })
                 })
-            });
+        });
 
         let set_stmt = match_clause()
             .repeated()
@@ -3395,35 +3427,51 @@ fn collect_non_agg_props_in_expr(expr: &Expr, props: &mut Vec<(String, String)>)
                 collect_non_agg_props_in_expr(e, props);
             }
         }
+        // The element variable of a list comprehension, a reduce, or a
+        // quantifier is bound by the expression itself, so a reference to it
+        // inside the body is not a grouping property read.
         Expr::ListComprehension {
+            variable,
             list,
             predicate,
             transform,
-            ..
         } => {
             collect_non_agg_props_in_expr(list, props);
+            let mut inner = Vec::new();
             if let Some(p) = predicate {
-                collect_non_agg_props_in_expr(p, props);
+                collect_non_agg_props_in_expr(p, &mut inner);
             }
             if let Some(t) = transform {
-                collect_non_agg_props_in_expr(t, props);
+                collect_non_agg_props_in_expr(t, &mut inner);
             }
+            inner.retain(|(v, _)| v != variable);
+            props.extend(inner);
         }
         Expr::Reduce {
+            accumulator,
             initial,
+            variable,
             list,
             expression,
-            ..
         } => {
             collect_non_agg_props_in_expr(initial, props);
             collect_non_agg_props_in_expr(list, props);
-            collect_non_agg_props_in_expr(expression, props);
+            let mut inner = Vec::new();
+            collect_non_agg_props_in_expr(expression, &mut inner);
+            inner.retain(|(v, _)| v != variable && v != accumulator);
+            props.extend(inner);
         }
         Expr::Quantifier {
-            list, predicate, ..
+            variable,
+            list,
+            predicate,
+            ..
         } => {
             collect_non_agg_props_in_expr(list, props);
-            collect_non_agg_props_in_expr(predicate, props);
+            let mut inner = Vec::new();
+            collect_non_agg_props_in_expr(predicate, &mut inner);
+            inner.retain(|(v, _)| v != variable);
+            props.extend(inner);
         }
         // A pattern predicate is legal only inside a WHERE clause, so it never
         // reaches a projection this collector inspects; it contributes no

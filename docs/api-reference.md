@@ -98,6 +98,8 @@ The `map_size_gb` argument to `Graph::open` sets the maximum size of the LMDB me
   Returns the count of nodes carrying the specified label.
 - `edge_count_by_type(etype: &str) -> Result<u64, Error>`  
   Returns the count of edges of the specified type.
+- `storage_table_stats() -> Result<Vec<TableStat>, Error>`  
+  Returns the entry count and size of each of the eleven storage tables (`nodes`, `edges`, `out_adj`, `in_adj`, `label_idx`, `node_prop_idx`, `edge_prop_idx`, `fts_postings`, `fts_docs`, `vectors`, and `meta`). On LMDB the size is the table's pages times the page size, so the eleven sizes sum to the live data in the file without its free-page slack. The CLI's `stats` command prints this breakdown.
 
 ### Property Lookups
 
@@ -124,6 +126,8 @@ These methods are the Rust equivalents of the Cypher DDL statements in the [Cyph
 
 - `create_node_property_index(label: &str, property: &str) -> Result<(), Error>` and `drop_node_property_index(...)`  
   Declares (or removes) a node property index. Because every scalar node property is auto-indexed, the declaration mainly matters as the anchor for constraints.
+- `set_label_auto_index(label: &str, enabled: bool) -> Result<(), Error>`, `label_auto_index_enabled(label: &str) -> Result<bool, Error>`, and `labels_without_auto_index() -> Result<Vec<String>, Error>`  
+  The per-label switch on the property auto-index, the Rust form of `DROP AUTO INDEX FOR (n:Label)` and `CREATE AUTO INDEX FOR (n:Label)`. Disabling removes the label's auto-index entries and makes lookups on it scan; enabling backfills them. Declared indexes and constraints are unaffected. The CLI's `stats` command lists the opted-out labels.
 - `create_node_unique_constraint(label: &str, property: &str) -> Result<(), Error>` and `drop_node_unique_constraint(...)`  
   Requires the property value to be unique across all nodes with the label; explicit nulls never conflict.
 - `create_node_required_constraint(label: &str, property: &str) -> Result<(), Error>` and `drop_node_required_constraint(...)`  
@@ -326,7 +330,7 @@ The supported query language surface is documented on the [Cypher Support](cyphe
 
 A query returns a `QueryResult` with `columns: Vec<String>` and `records: Vec<Record>`; each `Record` holds `values: Vec<serde_json::Value>` aligned row-major with the columns. Nodes, relationships, and paths project as openCypher display-literal strings (`(:A:B {k: 1})`, `[:T {k: 1}]`, and `<(:A)-[:T]->(:B)>`, with the arrow carrying the stored edge direction), and missing values project as JSON null. NaN and the two infinities have no JSON number representation, so a float result never collapses them to `null` (indistinguishable from a missing value); each projects as a tagged sentinel object instead: `{"__type__": "__NaN__"}`, `{"__type__": "__Infinity__"}`, or `{"__type__": "__-Infinity__"}`.
 
-A query string may contain several semicolon-separated top-level statements in one call (for example `CREATE (n:Person {name: 'Ada'}) RETURN n.name; MATCH (m) WHERE id(m) = 0 RETURN m.name`), which is useful for a CREATE that a later statement in the same call needs to reference. Every statement runs, but `columns`/`records` reflect only the last one: `QueryResult` carries a `statement_count: usize` field (always 1 outside this case) so a caller can tell a multi-statement query apart from an ordinary single-statement one instead of silently reading the final statement's result as if it were the whole query.
+A query string may contain several semicolon-separated top-level statements in one call (for example `CREATE (n:Person {name: 'Ada'}) RETURN n.name; MATCH (m) WHERE id(m) = 0 RETURN m.name`), which is useful for a CREATE that a later statement in the same call needs to reference. When every statement reads or writes data (no index, constraint, or bulk-load statement), the whole pipeline is one transaction: each statement sees the writes of the ones before it, and an error in any statement rolls back all of them. That is how a REST or MCP caller groups several writes; Cypher has no `BEGIN` or `COMMIT`, and a transaction never spans requests. A pipeline that contains a schema or bulk-load statement runs statement by statement, each committing on its own. Every statement runs, but `columns`/`records` reflect only the last one: `QueryResult` carries a `statement_count: usize` field (always 1 outside this case) so a caller can tell a multi-statement query apart from an ordinary single-statement one instead of silently reading the final statement's result as if it were the whole query.
 
 Each layer has one error type, and all of them implement `std::error::Error`: `Error` for storage and domain failures (including the `NodeNotFound` and `EdgeNotFound` variants), `CypherError` for parse, plan, and execution failures, `VectorError` for vector index failures (including `AlreadyConfigured` and `DimensionMismatch`), `TextError` for full-text index failures, and `RetrievalError` for hybrid retrieval failures.
 
@@ -404,6 +408,8 @@ Schema statements are executed through the query interface. A DDL statement targ
   Removes the full-text search index on a node property.
 - `DROP INDEX FOR ()-[r:TYPE]-() ON (r.property)`  
   Removes a relationship property index and its entries.
+- `DROP AUTO INDEX FOR (n:Label)` and `CREATE AUTO INDEX FOR (n:Label)`  
+  Turn the property auto-index off or back on for one label. Every scalar node property is indexed automatically, one entry per property per label, which is what makes equality and range lookups work without DDL. Turning it off for a label removes its entries in one pass and makes lookups on that label scan the label instead; declared indexes and constraints on the label keep their entries. Turning it back on backfills the entries. The switch is persisted and applies to nodes written later.
 
 ### Constraint Statements
 

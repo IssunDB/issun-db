@@ -331,8 +331,7 @@ impl<'a> WriteTxn<'a> {
         self.graph.delete_node_impl(&mut self.wtxn, id)?;
         self.mutations_count += 1;
         // A node deletion cascades to every incident edge, so the property columns
-        // rebuild rather than patch. The CSR snapshot needs no flag: it is rebuilt
-        // whole, and the committed-write generation is what marks it stale.
+        // and the CSR snapshot rebuild rather than patch.
         self.delta.force_full = true;
         Ok(())
     }
@@ -352,11 +351,16 @@ impl<'a> WriteTxn<'a> {
         etype: &str,
         props: &impl Serialize,
     ) -> Result<EdgeId, Error> {
-        let edge_id =
+        let (edge_id, edge_type) =
             self.graph
                 .add_edge_cached(&mut self.wtxn, &mut self.cache, src, dst, etype, props)?;
         self.mutations_count += 1;
-        self.delta.added_edge_ids.push(edge_id);
+        self.delta.added_edges.push(crate::csr::AddedEdge {
+            src,
+            dst,
+            edge_type,
+            edge_id,
+        });
         Ok(edge_id)
     }
 
@@ -549,6 +553,107 @@ mod tests {
             let e = txn.add_edge(a, b, "KNOWS", &json!({"since": 2020}))?;
             txn.update_edge(e, &json!({"since": 2021}))?;
             assert_eq!(txn.all_neighbors(a)?.len(), 1);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// The index lookups on a transaction answer from that transaction's view:
+    /// a write transaction finds its own uncommitted nodes and edges through the
+    /// property indexes, a reader opened meanwhile sees only committed state,
+    /// and after the commit a fresh reader sees everything.
+    #[test]
+    fn transaction_scoped_index_lookups_see_their_own_view() {
+        let (_dir, g) = open_tmp();
+        g.create_node_property_index("User", "age").unwrap();
+        g.create_edge_property_index("ROAD", "cost").unwrap();
+        let old = g.add_node("User", &json!({"age": 30})).unwrap();
+
+        let (a, b, e) = g
+            .update(|txn| {
+                assert!(txn.has_node_property_index("User", "age")?);
+                assert!(!txn.has_node_property_index("User", "nope")?);
+                let a = txn.add_node("User", &json!({"age": 41}))?;
+                let b = txn.add_node("User", &json!({"age": 52}))?;
+                let e = txn.add_edge(a, b, "ROAD", &json!({"cost": 7}))?;
+                txn.put_vector_bytes(a, &[1, 2, 3])?;
+
+                assert_eq!(
+                    txn.nodes_by_property("User", "age", PropValue::Int(41))?,
+                    vec![a]
+                );
+                assert_eq!(
+                    txn.nodes_by_property_range(
+                        "User",
+                        "age",
+                        Some(PropValue::Int(40)),
+                        true,
+                        None,
+                        true,
+                    )?,
+                    vec![a, b]
+                );
+                assert_eq!(
+                    txn.edges_by_property("ROAD", "cost", PropValue::Int(7))?,
+                    vec![e]
+                );
+                assert_eq!(
+                    txn.edges_by_property_range("ROAD", "cost", Some(PropValue::Int(1)), None)?,
+                    vec![e]
+                );
+                assert_eq!(txn.get_vector_bytes(a)?, Some(vec![1, 2, 3]));
+                assert_eq!(txn.vector_bytes()?, vec![(a, vec![1, 2, 3])]);
+
+                g.view(|rtxn| {
+                    assert!(rtxn.has_node_property_index("User", "age")?);
+                    assert_eq!(
+                        rtxn.nodes_by_property("User", "age", PropValue::Int(41))?,
+                        Vec::<NodeId>::new()
+                    );
+                    assert_eq!(
+                        rtxn.nodes_by_property_range(
+                            "User",
+                            "age",
+                            None,
+                            true,
+                            Some(PropValue::Int(100)),
+                            true,
+                        )?,
+                        vec![old]
+                    );
+                    assert!(
+                        rtxn.edges_by_property("ROAD", "cost", PropValue::Int(7))?
+                            .is_empty()
+                    );
+                    assert!(
+                        rtxn.edges_by_property_range("ROAD", "cost", None, None)?
+                            .is_empty()
+                    );
+                    assert_eq!(rtxn.get_vector_bytes(a)?, None);
+                    assert!(rtxn.vector_bytes()?.is_empty());
+                    Ok(())
+                })?;
+                Ok((a, b, e))
+            })
+            .unwrap();
+
+        g.view(|rtxn| {
+            assert_eq!(
+                rtxn.nodes_by_property_range(
+                    "User",
+                    "age",
+                    Some(PropValue::Int(31)),
+                    true,
+                    None,
+                    true,
+                )?,
+                vec![a, b]
+            );
+            assert_eq!(
+                rtxn.edges_by_property("ROAD", "cost", PropValue::Int(7))?,
+                vec![e]
+            );
+            assert_eq!(rtxn.get_vector_bytes(a)?, Some(vec![1, 2, 3]));
             Ok(())
         })
         .unwrap();
@@ -1102,5 +1207,196 @@ mod tests {
         let props: serde_json::Value = rmp_serde::from_slice(&rec.props).unwrap();
         assert_eq!(props["x"], serde_json::json!(42));
         assert_eq!(g2.nodes_by_label("BackupTest").unwrap(), vec![kept]);
+    }
+
+    /// The plan generation moves on a data write (second component) and on
+    /// index DDL or a statistics build (third component), never on a read.
+    #[test]
+    fn plan_generation_tracks_writes_and_schema_changes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let g = Graph::open(dir.path(), 1).unwrap();
+        let g0 = g.plan_generation();
+        let _ = g.nodes_by_label("Person").unwrap();
+        assert_eq!(g.plan_generation(), g0, "a read changes nothing");
+        g.add_node("Person", &serde_json::json!({"x": 1})).unwrap();
+        let g1 = g.plan_generation();
+        assert_eq!(g1.0, g0.0);
+        assert!(g1.1 > g0.1);
+        assert_eq!(g1.2, g0.2);
+        g.create_node_unique_constraint("Person", "x").unwrap();
+        let g2 = g.plan_generation();
+        assert_eq!(g2.1, g1.1);
+        assert!(g2.2 > g1.2);
+        g.materialize_edge_statistics().unwrap();
+        assert!(g.plan_generation().2 > g2.2);
+        let other = Graph::open(tempfile::TempDir::new().unwrap().path(), 1).unwrap();
+        assert_ne!(
+            other.plan_generation().0,
+            g0.0,
+            "each open has its own nonce"
+        );
+    }
+
+    /// The table report names all eleven tables and counts what was written:
+    /// a node in `nodes`, one `label_idx` entry per label, one adjacency entry
+    /// per direction per edge, and one auto-index entry per scalar property
+    /// *per label*, so a two-label node with two properties costs four.
+    #[test]
+    fn storage_table_stats_count_records_indexes_and_adjacency() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let g = Graph::open(dir.path(), 1).unwrap();
+        let a = g
+            .add_node_multi(&["A", "B"], &serde_json::json!({"x": 1, "y": "s"}))
+            .unwrap();
+        let b = g.add_node("A", &serde_json::json!({"x": 2})).unwrap();
+        g.add_edge(a, b, "T", &serde_json::json!({"w": 1})).unwrap();
+        g.add_edge(b, a, "T", &serde_json::json!({})).unwrap();
+        let stats = g.storage_table_stats().unwrap();
+        let get = |name: &str| stats.iter().find(|t| t.name == name).unwrap();
+        assert_eq!(stats.len(), 11);
+        assert_eq!(get("nodes").entries, 2);
+        assert_eq!(get("edges").entries, 2);
+        assert_eq!(get("out_adj").entries, 2);
+        assert_eq!(get("in_adj").entries, 2);
+        assert_eq!(get("label_idx").entries, 3);
+        assert_eq!(get("node_prop_idx").entries, 5);
+        assert_eq!(get("edge_prop_idx").entries, 0);
+        assert!(get("nodes").bytes > 0);
+        assert!(get("edge_prop_idx").bytes == 0 || get("edge_prop_idx").pages.is_some());
+    }
+
+    /// Opting a label out of the auto-index removes its entries and makes every
+    /// lookup on it scan, with results unchanged; a declared index on the label
+    /// keeps its entries; opting back in backfills them.
+    #[test]
+    fn label_auto_index_opt_out_removes_entries_and_keeps_lookups_correct() {
+        use crate::schema::PropValue;
+        let dir = tempfile::TempDir::new().unwrap();
+        let g = Graph::open(dir.path(), 1).unwrap();
+        let a = g
+            .add_node(
+                "P",
+                &serde_json::json!({"age": 30, "name": "ann", "ok": true}),
+            )
+            .unwrap();
+        let b = g
+            .add_node(
+                "P",
+                &serde_json::json!({"age": 41, "name": "bob", "ok": false}),
+            )
+            .unwrap();
+        g.add_node("Q", &serde_json::json!({"age": 30})).unwrap();
+        g.create_node_unique_constraint("P", "name").unwrap();
+        let entries = |g: &Graph| {
+            g.storage_table_stats()
+                .unwrap()
+                .into_iter()
+                .find(|t| t.name == "node_prop_idx")
+                .unwrap()
+                .entries
+        };
+        // P: 2 nodes x 3 props, Q: 1 node x 1 prop.
+        assert_eq!(entries(&g), 7);
+        assert!(g.label_auto_index_enabled("P").unwrap());
+        assert!(g.has_node_property_index("P", "age").unwrap());
+
+        g.set_label_auto_index("P", false).unwrap();
+        assert!(!g.label_auto_index_enabled("P").unwrap());
+        assert_eq!(
+            g.labels_without_auto_index().unwrap(),
+            vec!["P".to_string()]
+        );
+        // The declared `name` entries stay (2), the auto entries go; Q keeps its 1.
+        assert_eq!(entries(&g), 3);
+        assert!(!g.has_node_property_index("P", "age").unwrap());
+        assert!(g.has_node_property_index("P", "name").unwrap());
+
+        // Lookups on the opted-out label scan and agree with the indexed answers.
+        assert_eq!(
+            g.nodes_by_property("P", "age", PropValue::Int(30)).unwrap(),
+            vec![a]
+        );
+        assert_eq!(
+            g.nodes_by_property("P", "age", PropValue::Float(41.0))
+                .unwrap(),
+            vec![b]
+        );
+        assert_eq!(
+            g.nodes_by_property("P", "ok", PropValue::Bool(false))
+                .unwrap(),
+            vec![b]
+        );
+        assert_eq!(
+            g.nodes_by_property("P", "name", PropValue::Str("bob".into()))
+                .unwrap(),
+            vec![b]
+        );
+        assert_eq!(
+            g.nodes_by_property_range("P", "age", Some(PropValue::Int(35)), true, None, false)
+                .unwrap(),
+            vec![b]
+        );
+        assert_eq!(
+            g.nodes_by_property_range("P", "age", None, false, Some(PropValue::Float(30.0)), true)
+                .unwrap(),
+            vec![a]
+        );
+        assert_eq!(
+            g.nodes_by_property_range(
+                "P",
+                "age",
+                Some(PropValue::Int(30)),
+                false,
+                Some(PropValue::Int(41)),
+                false
+            )
+            .unwrap(),
+            Vec::<NodeId>::new()
+        );
+        assert!(
+            g.nodes_by_property_range(
+                "P",
+                "age",
+                Some(PropValue::Str("x".into())),
+                true,
+                None,
+                false
+            )
+            .unwrap()
+            .is_empty(),
+            "a string bound admits no numbers"
+        );
+
+        // A node written while opted out gets no auto entries either.
+        let c = g
+            .add_node("P", &serde_json::json!({"age": 52, "name": "cid"}))
+            .unwrap();
+        assert_eq!(entries(&g), 4);
+        assert_eq!(
+            g.nodes_by_property("P", "age", PropValue::Int(52)).unwrap(),
+            vec![c]
+        );
+        g.delete_node(c).unwrap();
+        assert_eq!(entries(&g), 3);
+
+        // Opting back in backfills every scalar property.
+        g.set_label_auto_index("P", true).unwrap();
+        assert_eq!(entries(&g), 7);
+        assert!(g.has_node_property_index("P", "age").unwrap());
+        assert_eq!(
+            g.nodes_by_property("P", "age", PropValue::Int(41)).unwrap(),
+            vec![b]
+        );
+        assert!(g.labels_without_auto_index().unwrap().is_empty());
+
+        // The setting survives for a label that has no nodes yet.
+        g.set_label_auto_index("Fresh", false).unwrap();
+        let f = g.add_node("Fresh", &serde_json::json!({"x": 1})).unwrap();
+        assert_eq!(entries(&g), 7);
+        assert_eq!(
+            g.nodes_by_property("Fresh", "x", PropValue::Int(1))
+                .unwrap(),
+            vec![f]
+        );
     }
 }

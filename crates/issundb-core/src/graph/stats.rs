@@ -342,7 +342,7 @@ impl Graph {
     /// Build the schema statistics table now, if it is not built and current
     /// already.
     ///
-    /// Nothing builds it as a side effect (see [`Self::with_current_fanout`]), so
+    /// Nothing builds it as a side effect (see `Self::with_current_fanout`), so
     /// this is the deliberate way to make the optimizer's expand-ratio estimates
     /// available, and to upgrade [`Graph::schema_has_edge`] from a budgeted probe to
     /// an exact lookup that also decides the cases the probe gives up on. It costs
@@ -356,9 +356,8 @@ impl Graph {
     ///
     /// The scan runs without the table lock held, so concurrent queries keep planning
     /// (on the probe and the global average) instead of blocking for its duration.
-    /// Holding the lock across the build was tolerable while this was an internal
-    /// lazy helper; it is not now that a caller is told to invoke it on a live graph.
     pub fn materialize_edge_statistics(&self) -> Result<(), Error> {
+        self.plan_epoch.bump();
         let generation = {
             let guard = self.edge_fanout.lock();
             let generation = self.csr_cache.current_gen();
@@ -394,7 +393,7 @@ impl Graph {
     /// Nothing builds the underlying table, so this also returns `None` on a graph
     /// where [`Graph::materialize_edge_statistics`] has not been called; a table the
     /// write generation has moved past is still served while that relationship type's
-    /// edge count has not grown past [`STALE_FANOUT_GROWTH_FACTOR`]. Because the
+    /// edge count has not grown past `STALE_FANOUT_GROWTH_FACTOR`. Because the
     /// result only weights plan choices, a stale or absent estimate never affects
     /// query correctness.
     pub fn estimate_expand_fanout(
@@ -476,7 +475,7 @@ impl Graph {
     /// dst_label`. Returns `Some(false)` when the labels and type are all known but
     /// no such edge exists (the directed pattern is unsatisfiable), and `None` when
     /// the caller cannot decide: any of the three names is unknown to the registry,
-    /// or the question could not be settled within [`SCHEMA_PROBE_BUDGET`].
+    /// or the question could not be settled within `SCHEMA_PROBE_BUDGET`.
     ///
     /// Unlike the fan-out estimates, this does not need the statistics table. A
     /// negative here prunes rows rather than weighting a choice, so answering only

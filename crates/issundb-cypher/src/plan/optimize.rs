@@ -1123,7 +1123,7 @@ impl Optimizer {
 
     /// True when any operator in the plan performs a write (`CREATE`, `MERGE`,
     /// `SET`, `DELETE`), so schema-based pruning must be skipped.
-    fn plan_has_write(op: &PhysicalOperator) -> bool {
+    pub(crate) fn plan_has_write(op: &PhysicalOperator) -> bool {
         match op {
             PhysicalOperator::WritePart { .. } => true,
             PhysicalOperator::SingleRow

@@ -486,6 +486,33 @@ pub(super) fn fts_stats_sum_dl_key(label_id: LabelId, prop_key_id: PropKeyId) ->
 }
 
 /// The graph database handle. It is cheap to clone, since all state is behind `Arc`.
+/// The part of a plan-cache key that the write generation does not cover.
+///
+/// `nonce` is drawn at open, so a plan cached against one `Graph` is never
+/// served to another that later occupies the same address. `schema_gen` counts
+/// the changes that alter a plan without being a data write: index and
+/// constraint DDL, and the deliberate statistics builds. Neither advances the
+/// write generation, because doing so would mark the CSR snapshot stale and
+/// force a rebuild the data does not need.
+pub(super) struct PlanEpoch {
+    nonce: u64,
+    schema_gen: std::sync::atomic::AtomicU64,
+}
+
+impl PlanEpoch {
+    fn new() -> Self {
+        Self {
+            nonce: ahash::RandomState::new().hash_one(0u64),
+            schema_gen: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    pub(super) fn bump(&self) {
+        self.schema_gen
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
 #[derive(Clone)]
 pub struct Graph {
     pub(super) storage: Arc<Storage>,
@@ -499,9 +526,9 @@ pub struct Graph {
     pub(super) edge_fanout: Arc<parking_lot::Mutex<Option<crate::graph::stats::EdgeFanout>>>,
     /// Decided `schema_has_edge` verdicts for one write generation, keyed by
     /// `(src_label, type, dst_label)`. The type-inference pass asks the same questions
-    /// on every execution because there is no plan cache, and answering without the
-    /// statistics table means walking the graph, so a decided verdict is remembered
-    /// until a write invalidates the generation. See [`crate::graph::stats`].
+    /// on every plan, and answering without the statistics table means walking the
+    /// graph, so a decided verdict is remembered until a write invalidates the
+    /// generation. See [`crate::graph::stats`].
     pub(super) schema_probes: Arc<parking_lot::Mutex<SchemaProbeMemo>>,
     /// Cached id-indexed group codes, one shared array per grouped property,
     /// valid for exactly one write generation, which is what lets a grouped
@@ -511,12 +538,16 @@ pub struct Graph {
     /// Cached full label scans for the committed-read path, one shared sorted id
     /// vector per label, valid for exactly one write generation. Filters, the
     /// vectorized executor, and the counting kernels each enumerate a whole
-    /// label per query, and with no plan cache the same label is rescanned
-    /// through LMDB on every execution; this pins that scan until a committed
-    /// write moves the generation. Transaction-scoped label reads bypass it,
+    /// label per query, so the same label would be rescanned through LMDB on
+    /// every execution; this pins that scan until a committed write moves the
+    /// generation. Transaction-scoped label reads bypass it,
     /// because an open write transaction must see its own uncommitted labels.
     pub(super) label_scans: Arc<parking_lot::Mutex<index::LabelScanCache>>,
     pub(super) n_threads: Arc<std::sync::atomic::AtomicI32>,
+    /// What a cached query plan is keyed on beyond the write generation: this
+    /// handle's identity and the count of schema changes. See
+    /// [`Graph::plan_generation`].
+    pub(super) plan_epoch: Arc<PlanEpoch>,
     /// Type-erased extension cache. Higher-level crates attach caches (e.g. the
     /// HNSW vector index) to a Graph without creating a circular dependency,
     /// through the `get_extension`, `set_extension`, and
@@ -717,7 +748,8 @@ impl Graph {
     /// the database is reopened with a larger value, which is safe to do and keeps
     /// the existing data. Size it for the eventual database, not the current one.
     ///
-    /// Opening builds none of the derived structures; see the comment inside.
+    /// Opening builds none of the derived structures (the CSR snapshot, the property
+    /// columns, the statistics); the first consumer that needs one builds it.
     pub fn open(path: &Path, map_size_gb: usize) -> Result<Self, Error> {
         let storage = Storage::open(path, map_size_gb)?;
         // Older versions persisted the CSR snapshot next to the LMDB files but
@@ -745,10 +777,38 @@ impl Graph {
             )),
             label_scans: Arc::new(parking_lot::Mutex::new(index::LabelScanCache::default())),
             n_threads: Arc::new(std::sync::atomic::AtomicI32::new(0)),
+            plan_epoch: Arc::new(PlanEpoch::new()),
             extensions: Arc::new(parking_lot::Mutex::new(AHashMap::new())),
             #[cfg(test)]
             test_hooks: Arc::new(TestHooks::default()),
         })
+    }
+
+    /// The generation a cached query plan is valid for: a per-open identity
+    /// nonce, the committed write generation, and the schema generation.
+    ///
+    /// A plan is a function of the query and of what the optimizer read from
+    /// this graph: node and edge counts, the schema statistics, the declared
+    /// indexes, and the property-column estimates. Every committed data write
+    /// advances the second component; index and constraint DDL and the
+    /// `materialize_*` builders advance the third. A caller holding a plan for
+    /// an earlier triple must plan again.
+    pub fn plan_generation(&self) -> (u64, u64, u64) {
+        (
+            self.plan_epoch.nonce,
+            self.csr_cache.current_gen(),
+            self.plan_epoch
+                .schema_gen
+                .load(std::sync::atomic::Ordering::Acquire),
+        )
+    }
+
+    /// Size and entry count of every storage table, the breakdown behind the
+    /// on-disk footprint. One `stat` call per table on LMDB, so it is cheap; the
+    /// in-memory backend sums its entries instead.
+    pub fn storage_table_stats(&self) -> Result<Vec<crate::schema::TableStat>, Error> {
+        let rtxn = self.storage.env.read_txn()?;
+        self.storage.table_stats(&rtxn)
     }
 
     /// Set the thread count for the parallel read passes, overriding the
@@ -775,7 +835,7 @@ impl Graph {
     /// Served through the in-memory property columns once they exist, refreshing
     /// them against pending writes first; while they are absent the read goes
     /// straight to storage instead of building them (see
-    /// [`crate::columns::ColumnsCache::should_serve_directly`]).
+    /// `crate::columns::ColumnsCache::should_serve_directly`).
     pub fn node_prop_json(
         &self,
         id: NodeId,
@@ -914,7 +974,7 @@ impl Graph {
     /// in-memory property column, one keep flag per id in input order, without
     /// materializing a `Value` per row. The semantics are exactly the outcome a
     /// Cypher comparison filter keeps a row on; see
-    /// [`crate::columns::PropColumns::cmp_mask`] for the three rules. A
+    /// `crate::columns::PropColumns::cmp_mask` for the three rules. A
     /// nonexistent node is [`Error::NodeNotFound`].
     ///
     /// `Ok(None)` declines, and the caller falls back to gathering and
@@ -940,16 +1000,13 @@ impl Graph {
     ///
     /// Every reader either serves a small request without them or, for the advisory
     /// statistics, declines rather than pay for them, so nothing builds them as a
-    /// side effect of a small workload. That is deliberate: the build is one full
-    /// entity scan, and it used to dominate cold-start latency. This is the
-    /// deliberate way to ask for it, for a caller that wants the optimizer's
-    /// selectivity estimates and zone-map pruning available on a cold graph, or that
-    /// would rather pay the scan once up front than have a later bulk read pay it.
+    /// side effect of a small workload, because the build is one full entity scan.
+    /// This is the deliberate way to ask for it, for a caller that wants the
+    /// optimizer's selectivity estimates and zone-map pruning available on a cold
+    /// graph, or that would rather pay the scan once up front than have a later bulk
+    /// read pay it. No reader warms the columns as a side effect; warming them is
+    /// this call.
     ///
-    /// It replaces an accident: `node_prop_group_codes` used to build
-    /// unconditionally, so "call it and discard the result" was the idiom for
-    /// warming the columns. Grouping now follows the same size test as the other
-    /// readers, and warming them is this call.
     /// It is also the columns cache file's save site (the counterpart of
     /// `rebuild_csr` for the CSR cache file): materializing persists the built
     /// set next to the LMDB files, so a later process loads it instead of
@@ -957,6 +1014,7 @@ impl Graph {
     /// lazy build saves, so a read-only workload never writes a file as a side
     /// effect of a query.
     pub fn materialize_property_columns(&self) -> Result<(), Error> {
+        self.plan_epoch.bump();
         #[cfg(feature = "lmdb")]
         {
             // Captured before the build, and under the write lock. Every
@@ -1080,6 +1138,7 @@ impl Graph {
     /// edge columns cache file's save site; a repeat at an unchanged generation
     /// rewrites nothing.
     pub fn materialize_edge_property_columns(&self) -> Result<(), Error> {
+        self.plan_epoch.bump();
         #[cfg(feature = "lmdb")]
         {
             // Captured under the write lock and before the build, for the
@@ -1306,12 +1365,23 @@ impl Graph {
                 // the caches claim to be current while LMDB already holds this
                 // write is one atomic increment wide rather than the width of
                 // the batch. See `CsrCache::advance_write_gen`.
-                self.commit_and_publish(wtxn, mutations_count)?;
+                let change = if delta.force_full || delta.removed_edge {
+                    crate::csr::CsrChange::full()
+                } else {
+                    crate::csr::CsrChange {
+                        added_nodes: delta.added_nodes.clone(),
+                        added_edges: delta.added_edges.clone(),
+                        edges_updated: !delta.updated_edges.is_empty(),
+                        full: false,
+                    }
+                };
+                self.commit_and_publish(wtxn, mutations_count, change)?;
                 #[cfg(test)]
                 TestHooks::fire(&self.test_hooks.after_commit_before_column_bookkeeping);
-                // Column bookkeeping next. The CSR snapshot needs nothing here: the
-                // generation bump above is what tells a reader its snapshot lags, and
-                // the refresh rebuilds from storage rather than from a delta.
+                // Column bookkeeping next. The CSR snapshot got its record inside
+                // `commit_and_publish`; the generation bump there is what tells a
+                // reader its snapshot lags, and the refresh either patches from
+                // the record or rebuilds from storage.
                 //
                 // The columns are still a window: for as long as this bookkeeping
                 // takes, a reader can see committed data through a column set that
@@ -1332,7 +1402,9 @@ impl Graph {
                 if delta.force_full || delta.removed_edge {
                     self.edge_columns.record_force_full();
                 } else {
-                    self.edge_columns.record_touched_many(&delta.added_edge_ids);
+                    let added_ids: Vec<EdgeId> =
+                        delta.added_edges.iter().map(|e| e.edge_id).collect();
+                    self.edge_columns.record_touched_many(&added_ids);
                     self.edge_columns.record_touched_many(&delta.updated_edges);
                 }
                 if mutations_count > 0 {
@@ -1367,6 +1439,7 @@ impl Graph {
         &self,
         mut wtxn: crate::storage::RwTxn<'_>,
         count: usize,
+        change: crate::csr::CsrChange,
     ) -> Result<(), Error> {
         // The persisted generation advances inside the transaction, so it is
         // atomic with the mutations it describes; it is what lets a later
@@ -1377,6 +1450,12 @@ impl Graph {
             crate::storage::ids::bump_commit_gen(&self.storage, &mut wtxn)?;
         }
         wtxn.commit()?;
+        // The one piece of bookkeeping that precedes the generation advance: the
+        // incremental refresh reads the counter and then drains the recorded
+        // changes, so a change the counter accounts for must already be recorded.
+        // See `CsrCache::record_change`. The cost is one mutex acquisition and a
+        // move of the change's vectors.
+        self.csr_cache.record_change(change);
         self.csr_cache.advance_write_gen(count as u64);
         Ok(())
     }
@@ -1392,9 +1471,9 @@ impl Graph {
         f()
     }
 
-    /// Synchronously rebuild the CSR snapshot from LMDB. Useful after bulk
-    /// loads or when tests need a consistent read view before the threshold
-    /// has been crossed.
+    /// Synchronously rebuild the CSR snapshot from storage and save the CSR cache
+    /// file. Every bulk load ends with this call; an ordinary write does not need
+    /// it, since the next consumer refreshes the snapshot on demand.
     ///
     /// It deliberately does not *ask* for per-edge weights, though it keeps loading
     /// them once something else has. This is the call every bulk load makes (`COPY
@@ -1423,6 +1502,10 @@ impl Graph {
         // Always the full scan, never the cache-file load: this method is the
         // file's save site, so serving the file here would write back whatever
         // it already claimed and a wrong file could never be repaired.
+        #[cfg(test)]
+        self.csr_cache
+            .full_builds
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let snap = self.build_snapshot_from_storage()?;
         // This is the one save site, chosen because every bulk load ends here:
         // the freshness gate's per-write refreshes must not pay a file write per
@@ -1464,11 +1547,9 @@ impl Graph {
     ///
     /// Creates `dst_dir` if it does not exist, then copies `snapshot_file` into
     /// `dst_dir/data.mdb`. After this call succeeds the caller can open the
-    /// restored database with `Graph::open(dst_dir, map_size_gb)`.
-    /// Delegates to the storage backend, which is what makes the pair symmetric: a
-    /// backend that cannot produce a snapshot (`backup`) must not claim to consume
-    /// one. Leaving the copy here meant the in-memory backend reported a successful
-    /// restore having restored nothing, while its `backup` correctly refused.
+    /// restored database with `Graph::open(dst_dir, map_size_gb)`. The storage
+    /// backend performs the copy, so a backend that cannot produce a snapshot
+    /// (`backup`) does not claim to consume one either.
     pub fn restore(snapshot_file: &Path, dst_dir: &Path) -> Result<(), Error> {
         Storage::restore_from_file(snapshot_file, dst_dir)
     }

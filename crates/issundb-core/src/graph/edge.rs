@@ -17,8 +17,17 @@ impl Graph {
         self.debug_assert_not_in_write_txn();
         let _guard = self._write_lock.lock();
         let mut wtxn = self.storage.env.write_txn()?;
-        let edge_id = self.add_edge_impl(&mut wtxn, src, dst, etype, props)?;
-        self.commit_and_publish(wtxn, 1)?;
+        let (edge_id, edge_type) = self.add_edge_impl(&mut wtxn, src, dst, etype, props)?;
+        let change = crate::csr::CsrChange {
+            added_edges: vec![crate::csr::AddedEdge {
+                src,
+                dst,
+                edge_type,
+                edge_id,
+            }],
+            ..crate::csr::CsrChange::default()
+        };
+        self.commit_and_publish(wtxn, 1, change)?;
         self.edge_columns.record_touched(edge_id);
         self.maybe_spawn_rebuild();
         Ok(edge_id)
@@ -35,7 +44,7 @@ impl Graph {
         dst: NodeId,
         etype: &str,
         props: &impl Serialize,
-    ) -> Result<EdgeId, Error> {
+    ) -> Result<(EdgeId, TypeId), Error> {
         self.add_edge_inner(wtxn, Some(cache), src, dst, etype, props)
     }
 
@@ -46,7 +55,7 @@ impl Graph {
         dst: NodeId,
         etype: &str,
         props: &impl Serialize,
-    ) -> Result<EdgeId, Error> {
+    ) -> Result<(EdgeId, TypeId), Error> {
         self.add_edge_inner(wtxn, None, src, dst, etype, props)
     }
 
@@ -58,7 +67,7 @@ impl Graph {
         dst: NodeId,
         etype: &str,
         props: &impl Serialize,
-    ) -> Result<EdgeId, Error> {
+    ) -> Result<(EdgeId, TypeId), Error> {
         // Both endpoints must already exist. Writing adjacency for a nonexistent
         // node id would leave a dangling `in_adj`/`out_adj` entry that a
         // later-allocated node would silently inherit, breaking adjacency
@@ -104,16 +113,13 @@ impl Graph {
         self.storage
             .edges
             .put(wtxn, &edge_id, &props::encode(&record)?)?;
-        self.storage
-            .type_idx
-            .put(wtxn, &composite_key(type_id, edge_id), &())?;
 
         self.append_adj(wtxn, src, dst, type_id, edge_id, true)?;
         self.append_adj(wtxn, dst, src, type_id, edge_id, false)?;
 
         adjust_type_count(&self.storage, wtxn, type_id, 1)?;
 
-        Ok(edge_id)
+        Ok((edge_id, type_id))
     }
 
     /// Update the properties of an existing edge, preserving src, dst, and type.
@@ -124,12 +130,12 @@ impl Graph {
         self.update_edge_impl(&mut wtxn, id, props)?;
         // Publishing matters even though no adjacency changed. A property change can
         // alter an edge's weight (`weight`/`cost`/`capacity`/`cap`), which the CSR
-        // snapshot's per-edge weights bake in, and those have no incremental
-        // maintenance. Advancing the generation here is
-        // what marks them stale so the next `ensure_csr_fresh` rebuilds before a
-        // weighted algorithm reads them; without it `shortest_path_dijkstra` and
-        // friends serve the pre-update weight.
-        self.commit_and_publish(wtxn, 1)?;
+        // snapshot's per-edge weights bake in. Advancing the generation here is
+        // what marks them stale, and the `edges_updated` record is what makes a
+        // weighted snapshot rebuild rather than patch before a weighted algorithm
+        // reads it; without both `shortest_path_dijkstra` and friends serve the
+        // pre-update weight.
+        self.commit_and_publish(wtxn, 1, crate::csr::CsrChange::edges_updated())?;
         self.edge_columns.record_touched(id);
         self.maybe_spawn_rebuild();
         Ok(())
@@ -195,7 +201,12 @@ impl Graph {
         let _guard = self._write_lock.lock();
         let mut wtxn = self.storage.env.write_txn()?;
         let endpoints = self.delete_edge_impl(&mut wtxn, id)?;
-        self.commit_and_publish(wtxn, 1)?;
+        let change = if endpoints.is_some() {
+            crate::csr::CsrChange::full()
+        } else {
+            crate::csr::CsrChange::none()
+        };
+        self.commit_and_publish(wtxn, 1, change)?;
         if endpoints.is_some() {
             // The deletion reshuffles the dense edge mapping; force a rebuild.
             self.edge_columns.record_force_full();
@@ -220,10 +231,6 @@ impl Graph {
         self.delete_edge_index_entries(wtxn, id, &record)?;
 
         self.storage.edges.delete(wtxn, &id)?;
-
-        self.storage
-            .type_idx
-            .delete(wtxn, &composite_key(record.edge_type, id))?;
 
         adjust_type_count(&self.storage, wtxn, record.edge_type, -1)?;
 
@@ -257,10 +264,10 @@ impl Graph {
     /// Reads the `out_adj` store directly through the supplied transaction so
     /// the result always reflects committed (and, inside a [`WriteTxn`],
     /// uncommitted) writes. The CSR snapshot is deliberately not consulted here:
-    /// it lags writes until the background rebuild runs, so serving point
-    /// lookups from it would return deleted edges, hide newly added ones, and
+    /// it reflects a write only once a consumer refreshes it, so serving point
+    /// lookups from it could return deleted edges, hide newly added ones, and
     /// disagree with [`Self::in_neighbors`]. The snapshot remains the basis for
-    /// the CSR snapshot algorithms, which have explicit snapshot semantics.
+    /// the algorithms, which have explicit snapshot semantics.
     pub fn out_neighbors(&self, node: NodeId) -> Result<Vec<NeighborEntry>, Error> {
         let rtxn = self.storage.env.read_txn()?;
         self.out_neighbors_impl(&rtxn, node)
@@ -290,8 +297,8 @@ impl Graph {
 
     /// Returns whether the node has any incident relationship, reading both
     /// adjacency stores directly. Like [`Self::out_neighbors`] and
-    /// [`Self::in_neighbors`], this never consults the CSR snapshot, which lags
-    /// writes until the next rebuild. Write-time consistency checks (such as the
+    /// [`Self::in_neighbors`], this never consults the CSR snapshot, which
+    /// reflects a write only once a consumer refreshes it. Write-time consistency checks (such as the
     /// DELETE connected-node guard) must see just-applied edge deletions, so they
     /// rely on this method.
     pub fn node_has_relationships(&self, node: NodeId) -> Result<bool, Error> {

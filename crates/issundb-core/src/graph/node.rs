@@ -12,7 +12,7 @@ impl Graph {
         let _guard = self._write_lock.lock();
         let mut wtxn = self.storage.env.write_txn()?;
         let id = self.add_node_impl(&mut wtxn, &[label], props)?;
-        self.commit_and_publish(wtxn, 1)?;
+        self.commit_and_publish(wtxn, 1, added_node_change(id))?;
         self.prop_columns.record_touched(id);
         self.maybe_spawn_rebuild();
         Ok(id)
@@ -25,7 +25,7 @@ impl Graph {
         let _guard = self._write_lock.lock();
         let mut wtxn = self.storage.env.write_txn()?;
         let id = self.add_node_impl(&mut wtxn, labels, props)?;
-        self.commit_and_publish(wtxn, 1)?;
+        self.commit_and_publish(wtxn, 1, added_node_change(id))?;
         self.prop_columns.record_touched(id);
         self.maybe_spawn_rebuild();
         Ok(id)
@@ -133,8 +133,10 @@ impl Graph {
         }
 
         // Auto-index: write every scalar property to node_prop_idx so the Cypher
-        // optimizer can use NodeIndexScan without a prior CREATE INDEX.
-        if let Some(obj) = props_json.as_object() {
+        // optimizer can use NodeIndexScan without a prior CREATE INDEX, unless the
+        // label opted out (`Graph::set_label_auto_index`).
+        let auto_index = !self.label_auto_index_disabled_impl(wtxn, label_id)?;
+        if let Some(obj) = props_json.as_object().filter(|_| auto_index) {
             for (prop_name, val) in obj {
                 if val.is_null() {
                     continue;
@@ -235,8 +237,9 @@ impl Graph {
             }
         }
 
-        // Auto-index cleanup.
-        if let Some(obj) = props_json.as_object() {
+        // Auto-index cleanup; an opted-out label has no entries to remove.
+        let auto_index = !self.label_auto_index_disabled_impl(wtxn, label_id)?;
+        if let Some(obj) = props_json.as_object().filter(|_| auto_index) {
             for (prop_name, val) in obj {
                 if val.is_null() {
                     continue;
@@ -302,7 +305,7 @@ impl Graph {
         let _guard = self._write_lock.lock();
         let mut wtxn = self.storage.env.write_txn()?;
         self.update_node_impl(&mut wtxn, id, props)?;
-        self.commit_and_publish(wtxn, 1)?;
+        self.commit_and_publish(wtxn, 1, crate::csr::CsrChange::none())?;
         self.prop_columns.record_touched(id);
         self.maybe_spawn_rebuild();
         Ok(())
@@ -352,7 +355,7 @@ impl Graph {
         let _guard = self._write_lock.lock();
         let mut wtxn = self.storage.env.write_txn()?;
         self.add_label_impl(&mut wtxn, id, label)?;
-        self.commit_and_publish(wtxn, 1)?;
+        self.commit_and_publish(wtxn, 1, crate::csr::CsrChange::none())?;
         self.maybe_spawn_rebuild();
         Ok(())
     }
@@ -391,7 +394,7 @@ impl Graph {
         let _guard = self._write_lock.lock();
         let mut wtxn = self.storage.env.write_txn()?;
         self.remove_label_impl(&mut wtxn, id, label)?;
-        self.commit_and_publish(wtxn, 1)?;
+        self.commit_and_publish(wtxn, 1, crate::csr::CsrChange::none())?;
         self.maybe_spawn_rebuild();
         Ok(())
     }
@@ -458,7 +461,7 @@ impl Graph {
         let _guard = self._write_lock.lock();
         let mut wtxn = self.storage.env.write_txn()?;
         self.delete_node_impl(&mut wtxn, id)?;
-        self.commit_and_publish(wtxn, 1)?;
+        self.commit_and_publish(wtxn, 1, crate::csr::CsrChange::full())?;
         // A node deletion cascades to every incident edge, so the edge property
         // columns must rebuild; without this a deleted edge stays readable
         // through `edge_prop_json` and the vectorized executor's edge reads.
@@ -508,9 +511,6 @@ impl Graph {
                 self.delete_edge_index_entries(wtxn, edge_id, &edge_rec)?;
             }
             self.storage.edges.delete(wtxn, &edge_id)?;
-            self.storage
-                .type_idx
-                .delete(wtxn, &composite_key(entry.edge_type, edge_id))?;
 
             adjust_type_count(&self.storage, wtxn, entry.edge_type, -1)?;
 
@@ -542,9 +542,6 @@ impl Graph {
                 self.delete_edge_index_entries(wtxn, edge_id, &edge_rec)?;
             }
             self.storage.edges.delete(wtxn, &edge_id)?;
-            self.storage
-                .type_idx
-                .delete(wtxn, &composite_key(entry.edge_type, edge_id))?;
 
             adjust_type_count(&self.storage, wtxn, entry.edge_type, -1)?;
 
@@ -566,6 +563,14 @@ impl Graph {
         self.storage.nodes.delete(wtxn, &id)?;
 
         Ok(())
+    }
+}
+
+/// The structural record of one added node, for `commit_and_publish`.
+fn added_node_change(id: NodeId) -> crate::csr::CsrChange {
+    crate::csr::CsrChange {
+        added_nodes: vec![id],
+        ..crate::csr::CsrChange::default()
     }
 }
 

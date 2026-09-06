@@ -30,7 +30,7 @@ lmdb = ["issundb-core/lmdb", "issundb-vector/lmdb", "issundb-text/lmdb"]
 
 [dev-dependencies]
 tempfile.workspace = true
-serde_json = "1"
+serde_json.workspace = true
 criterion.workspace = true
 parquet.workspace = true
 arrow-array.workspace = true

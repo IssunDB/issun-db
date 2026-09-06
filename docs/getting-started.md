@@ -58,7 +58,7 @@ The REPL supports meta commands (prefixed with `:`) to manage the session, take 
 | `:run`            | `:run /path/to/script.cypher`                   | Execute a script file; meta and data commands are one line each, and a Cypher statement may span lines and ends with `;`. |
 | `:!`              | `:! ls -la`                                     | Run a shell command from the REPL (alias `:shell`); rejected inside a script file.                                        |
 | `:save`           | `:save /path/to/output.txt`                     | Direct the output of the next query to a file.                                                                            |
-| `:timer`          | `:timer on`                                     | Report how long each Cypher statement takes, execution only; omit the argument to toggle. Also `--timer` at launch.        |
+| `:timer`          | `:timer on`                                     | Report how long each Cypher statement takes, execution only; omit the argument to toggle. Also `--timer` at launch.       |
 | `:params`         | `:params`                                       | List all current query parameters.                                                                                        |
 | `:set`            | `:set limit 10`                                 | Set a query parameter value (JSON or string); the rest of the line is the value, so `:set v [0.1, 0.2]` works.            |
 | `:unset`          | `:unset limit`                                  | Remove a query parameter.                                                                                                 |
@@ -94,7 +94,7 @@ The REPL also supports direct operations and queries to manipulate nodes and edg
 | `in`                  | Get all incoming neighbors and relationships of a node (e.g., `in 1`).                             |
 | `label`               | Find nodes carrying a specific label (e.g., `label Person`).                                       |
 | `etype`               | Find relationships of a specific type (e.g., `etype KNOWS`).                                       |
-| `stats`               | Display node and relationship count statistics.                                                    |
+| `stats`               | Display node, relationship, index, and per-storage-table size statistics.                          |
 | `bfs`                 | Run a breadth-first search traversal (e.g., `bfs 1 3`).                                            |
 | `dfs`                 | Run a depth-first search traversal (e.g., `dfs 1 3`).                                              |
 | `path`                | Find the shortest unweighted path between two nodes (e.g., `path 1 2`).                            |

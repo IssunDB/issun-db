@@ -178,6 +178,11 @@ lint: format ## Run the linters
 	@echo "Linting Rust files..."
 	@DEBUG_PROJ=$(DEBUG_PROJ) cargo clippy -- -D warnings -D clippy::unwrap_used -D clippy::expect_used
 
+.PHONY: doc-check
+doc-check: ## Build the rustdoc for the workspace and fail on warnings (dead intra-doc links, malformed HTML)
+	@echo "Checking the rustdoc..."
+	@RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+
 .PHONY: lint-backends
 lint-backends: ## Lint the libraries with the non-default storage and vector backends selected
 	@echo "Linting the in-memory storage and exact vector index configurations..."

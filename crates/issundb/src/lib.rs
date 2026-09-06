@@ -1,6 +1,6 @@
 //! IssunDB is an embedded graph database in Rust.
 //!
-//! Visit the [project repository](https://github.com/IssunDB/issun-db) for documentation and examples
+//! Visit the [project repository](https://github.com/IssunDB/issun-db) for documentation and examples.
 //!
 //! This is the main crate of IssunDB, and exposes the `Graph` type, Cypher query execution,
 //! vector search, full-text search, and hybrid retrieval APIs. Application code, bindings,
@@ -33,7 +33,7 @@
 pub use issundb_core::{
     DegreeDirection, DirectedNeighborEntry, EdgeId, EdgeRecord, Error, Graph, GroupedDegreeSpec,
     ID_GROUP_ABSENT, IdGroupCodes, LabelId, Language, LinkPredictionMetric, NeighborCountSpec,
-    NeighborEntry, NodeId, NodeRecord, PathCountSpec, PropCmp, PropValue, ReadTxn,
+    NeighborEntry, NodeId, NodeRecord, PathCountSpec, PropCmp, PropValue, ReadTxn, TableStat,
     TriangleCountSpec, TypeId, WeightedPath, WriteTxn,
 };
 pub use issundb_cypher::{

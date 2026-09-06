@@ -354,7 +354,7 @@ impl IssunMcp {
     }
 
     #[tool(
-        description = "Execute a Cypher query with optional parameters; returns columns and records. Use CREATE, SET, REMOVE, DELETE, and MERGE to mutate the graph. A semicolon-separated query runs every statement, but columns/records reflect only the last one; statement_count says how many actually ran, so more than 1 means earlier statements' own results were not returned here."
+        description = "Execute a Cypher query with optional parameters; returns columns and records. Use CREATE, SET, REMOVE, DELETE, and MERGE to mutate the graph. A semicolon-separated query of data statements runs as one transaction; each statement sees the earlier ones' writes and a failure rolls all of them back, so this is how to group several writes atomically. columns/records reflect only the last statement; statement_count says how many ran, so more than 1 means earlier statements' own results were not returned here."
     )]
     async fn cypher_query(
         &self,

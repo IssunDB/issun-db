@@ -137,15 +137,18 @@ impl Graph {
                 None => return Ok(vec![]),
             }
         };
-        let prefix = type_id.to_be_bytes();
-        let iter = self.storage.type_idx.prefix_iter(rtxn, &prefix)?;
+        // One pass over `edges`, which iterates in ascending edge id: the same
+        // order the dedicated type index used to give, without the 12 bytes per
+        // edge that index cost. A typed scan is a whole-type read, so the pass is
+        // proportionate to what it returns; the counting kernels and the Cypher
+        // executor never take this path (they read the CSR snapshot).
         let mut ids = Vec::new();
-        for result in iter {
-            let (key, _) = result?;
-            let id_bytes: [u8; 8] = key[4..]
-                .try_into()
-                .map_err(|_| Error::Corrupt("type_idx key has wrong length"))?;
-            ids.push(u64::from_be_bytes(id_bytes));
+        for result in self.storage.edges.iter(rtxn)? {
+            let (id, bytes) = result?;
+            let record: EdgeRecord = crate::storage::props::decode(bytes)?;
+            if record.edge_type == type_id {
+                ids.push(id);
+            }
         }
         Ok(ids)
     }
@@ -488,6 +491,7 @@ impl Graph {
         let mut wtxn = self.storage.env.write_txn()?;
         self.create_node_index_impl(&mut wtxn, label, property, 0x00)?;
         wtxn.commit()?;
+        self.plan_epoch.bump();
         Ok(())
     }
 
@@ -496,6 +500,7 @@ impl Graph {
         let mut wtxn = self.storage.env.write_txn()?;
         self.create_node_index_impl(&mut wtxn, label, property, 0x01)?;
         wtxn.commit()?;
+        self.plan_epoch.bump();
         Ok(())
     }
 
@@ -508,6 +513,7 @@ impl Graph {
         let mut wtxn = self.storage.env.write_txn()?;
         self.create_node_index_impl(&mut wtxn, label, property, 0x02)?;
         wtxn.commit()?;
+        self.plan_epoch.bump();
         Ok(())
     }
 
@@ -603,6 +609,7 @@ impl Graph {
         let mut wtxn = self.storage.env.write_txn()?;
         self.drop_node_index_impl(&mut wtxn, label, property, 0x00)?;
         wtxn.commit()?;
+        self.plan_epoch.bump();
         Ok(())
     }
 
@@ -611,6 +618,7 @@ impl Graph {
         let mut wtxn = self.storage.env.write_txn()?;
         self.drop_node_index_impl(&mut wtxn, label, property, 0x01)?;
         wtxn.commit()?;
+        self.plan_epoch.bump();
         Ok(())
     }
 
@@ -619,6 +627,7 @@ impl Graph {
         let mut wtxn = self.storage.env.write_txn()?;
         self.drop_node_index_impl(&mut wtxn, label, property, 0x02)?;
         wtxn.commit()?;
+        self.plan_epoch.bump();
         Ok(())
     }
 
@@ -673,6 +682,7 @@ impl Graph {
         let mut wtxn = self.storage.env.write_txn()?;
         self.create_edge_index_impl(&mut wtxn, etype, property, 0x00)?;
         wtxn.commit()?;
+        self.plan_epoch.bump();
         Ok(())
     }
 
@@ -681,6 +691,7 @@ impl Graph {
         let mut wtxn = self.storage.env.write_txn()?;
         self.create_edge_index_impl(&mut wtxn, etype, property, 0x01)?;
         wtxn.commit()?;
+        self.plan_epoch.bump();
         Ok(())
     }
 
@@ -693,6 +704,7 @@ impl Graph {
         let mut wtxn = self.storage.env.write_txn()?;
         self.create_edge_index_impl(&mut wtxn, etype, property, 0x02)?;
         wtxn.commit()?;
+        self.plan_epoch.bump();
         Ok(())
     }
 
@@ -785,6 +797,7 @@ impl Graph {
         let mut wtxn = self.storage.env.write_txn()?;
         self.drop_edge_index_impl(&mut wtxn, etype, property, 0x00)?;
         wtxn.commit()?;
+        self.plan_epoch.bump();
         Ok(())
     }
 
@@ -793,6 +806,7 @@ impl Graph {
         let mut wtxn = self.storage.env.write_txn()?;
         self.drop_edge_index_impl(&mut wtxn, etype, property, 0x01)?;
         wtxn.commit()?;
+        self.plan_epoch.bump();
         Ok(())
     }
 
@@ -801,6 +815,7 @@ impl Graph {
         let mut wtxn = self.storage.env.write_txn()?;
         self.drop_edge_index_impl(&mut wtxn, etype, property, 0x02)?;
         wtxn.commit()?;
+        self.plan_epoch.bump();
         Ok(())
     }
 
@@ -879,6 +894,15 @@ impl Graph {
             None => return Ok(Vec::new()),
         };
 
+        // A label opted out of the auto-index has no entries for this property
+        // unless an index or constraint was declared on it, so the lookup scans
+        // the label and compares stored values, exactly as for an over-long string.
+        if self.label_auto_index_disabled_impl(rtxn, label_id)?
+            && !self.has_declared_node_index_impl(rtxn, label_id, property)?
+        {
+            return self.scan_label_for_property_eq(rtxn, label, property, &val);
+        }
+
         let prop_key = format!("prop_key:{property}");
         let prop_key_id = match self.storage.meta.get(rtxn, &prop_key)? {
             Some(b) => {
@@ -919,11 +943,19 @@ impl Graph {
         property: &str,
         val: &serde_json::Value,
     ) -> Result<Vec<NodeId>, Error> {
+        // Numbers compare by value so `30` matches `30.0`, as the index's
+        // numeric encoding does; everything else compares structurally.
+        let matches = |stored: &serde_json::Value| match (stored, val) {
+            (serde_json::Value::Number(a), serde_json::Value::Number(b)) => {
+                a.as_f64() == b.as_f64()
+            }
+            _ => stored == val,
+        };
         let mut result = Vec::new();
         for id in self.nodes_by_label_impl(rtxn, label)? {
             if let Some(record) = self.get_node_impl(rtxn, id)? {
                 let props: serde_json::Value = props::decode(&record.props)?;
-                if props.get(property) == Some(val) {
+                if props.get(property).is_some_and(matches) {
                     result.push(id);
                 }
             }
@@ -981,6 +1013,245 @@ impl Graph {
         Ok(result)
     }
 
+    /// Range lookup fallback over a label with no index entries for the property
+    /// (a label opted out of the auto-index). Scans the label and compares the
+    /// stored value under the index's own rules: both bounds must belong to one
+    /// type family (number, string, or boolean) or nothing matches, and only
+    /// values of that family are compared.
+    #[allow(clippy::too_many_arguments)]
+    fn scan_label_for_property_range(
+        &self,
+        rtxn: &crate::storage::RoTxn,
+        label: &str,
+        property: &str,
+        min_val: Option<PropValue>,
+        min_inclusive: bool,
+        max_val: Option<PropValue>,
+        max_inclusive: bool,
+    ) -> Result<Vec<NodeId>, Error> {
+        #[derive(PartialEq, Clone, Copy)]
+        enum Family {
+            Number,
+            Str,
+            Bool,
+        }
+        fn family(v: &PropValue) -> Family {
+            match v {
+                PropValue::Int(_) | PropValue::Float(_) => Family::Number,
+                PropValue::Str(_) => Family::Str,
+                PropValue::Bool(_) => Family::Bool,
+            }
+        }
+        let fam = match (&min_val, &max_val) {
+            (Some(lo), Some(hi)) if family(lo) != family(hi) => return Ok(Vec::new()),
+            (Some(b), _) | (None, Some(b)) => Some(family(b)),
+            (None, None) => None,
+        };
+        if fam == Some(Family::Str) {
+            return self.scan_label_for_property_str_range(
+                rtxn,
+                label,
+                property,
+                min_val,
+                min_inclusive,
+                max_val,
+                max_inclusive,
+            );
+        }
+        let as_f64 = |v: &PropValue| match v {
+            PropValue::Int(i) => Some(*i as f64),
+            PropValue::Float(f) => Some(*f),
+            PropValue::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
+            PropValue::Str(_) => None,
+        };
+        let lo = min_val.as_ref().and_then(as_f64);
+        let hi = max_val.as_ref().and_then(as_f64);
+        let mut result = Vec::new();
+        for id in self.nodes_by_label_impl(rtxn, label)? {
+            let Some(record) = self.get_node_impl(rtxn, id)? else {
+                continue;
+            };
+            let props: serde_json::Value = props::decode(&record.props)?;
+            // No bound at all asks for every node holding the property, as the
+            // index path answers it, whatever the value's kind.
+            if fam.is_none() {
+                if props.get(property).is_some_and(|v| !v.is_null()) {
+                    result.push(id);
+                }
+                continue;
+            }
+            let value = match (fam, props.get(property)) {
+                (Some(Family::Bool), Some(serde_json::Value::Bool(b))) => {
+                    if *b {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                }
+                (Some(Family::Bool), _) => continue,
+                (_, Some(serde_json::Value::Number(n))) => match n.as_f64() {
+                    Some(f) => f,
+                    None => continue,
+                },
+                _ => continue,
+            };
+            let above_lo = match lo {
+                Some(l) if min_inclusive => value >= l,
+                Some(l) => value > l,
+                None => true,
+            };
+            let below_hi = match hi {
+                Some(h) if max_inclusive => value <= h,
+                Some(h) => value < h,
+                None => true,
+            };
+            if above_lo && below_hi {
+                result.push(id);
+            }
+        }
+        Ok(result)
+    }
+
+    // ------------------------------------------------------------------
+    // Auto-index opt-out
+    // ------------------------------------------------------------------
+
+    fn auto_index_off_key(label_id: LabelId) -> String {
+        format!("autoidx_off:l:{label_id}")
+    }
+
+    /// Whether the label has opted out of the property auto-index. Read on every
+    /// node write for the label, one `meta` point lookup.
+    pub(super) fn label_auto_index_disabled_impl(
+        &self,
+        txn: &crate::storage::RoTxn,
+        label_id: LabelId,
+    ) -> Result<bool, Error> {
+        Ok(self
+            .storage
+            .meta
+            .get(txn, &Self::auto_index_off_key(label_id))?
+            .is_some())
+    }
+
+    /// Whether an index or constraint was declared on `(label_id, property)`.
+    fn has_declared_node_index_impl(
+        &self,
+        txn: &crate::storage::RoTxn,
+        label_id: LabelId,
+        property: &str,
+    ) -> Result<bool, Error> {
+        let Some(prop_key_id) = get_prop_key(&self.storage, txn, property)? else {
+            return Ok(false);
+        };
+        let meta_key = format!("idx_meta:node:l:{label_id}:p:{prop_key_id}");
+        Ok(self.storage.meta.get(txn, &meta_key)?.is_some())
+    }
+
+    /// Whether nodes of `label` get an auto-index entry per scalar property.
+    /// True for every label by default, and for an unknown label.
+    pub fn label_auto_index_enabled(&self, label: &str) -> Result<bool, Error> {
+        let rtxn = self.storage.env.read_txn()?;
+        match get_label(&self.storage, &rtxn, label)? {
+            Some(label_id) => Ok(!self.label_auto_index_disabled_impl(&rtxn, label_id)?),
+            None => Ok(true),
+        }
+    }
+
+    /// The labels that have opted out of the property auto-index.
+    pub fn labels_without_auto_index(&self) -> Result<Vec<String>, Error> {
+        let rtxn = self.storage.env.read_txn()?;
+        let mut out = Vec::new();
+        for entry in self.storage.meta.prefix_iter(&rtxn, "autoidx_off:l:")? {
+            let (key, _) = entry?;
+            let Some(id) = key
+                .strip_prefix("autoidx_off:l:")
+                .and_then(|id| id.parse::<LabelId>().ok())
+            else {
+                continue;
+            };
+            if let Some(name) = self.label_name_impl(&rtxn, id)? {
+                out.push(name);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Turn the property auto-index on or off for one label.
+    ///
+    /// Every scalar property of every node is indexed by default, which is what
+    /// lets an equality or range lookup work with no DDL. The cost is one index
+    /// entry per scalar property per label, and turning it off for a label trades
+    /// that away: lookups on the label fall back to a label scan comparing stored
+    /// values, and the optimizer plans them as filters over the scan. Declared
+    /// indexes and constraints on the label are unaffected, since they keep their
+    /// own entries.
+    ///
+    /// The switch is persisted and applies to existing nodes as well: disabling
+    /// removes the label's auto-index entries in one pass, and enabling backfills
+    /// them. An unknown label is registered so the setting holds for its first
+    /// node.
+    pub fn set_label_auto_index(&self, label: &str, enabled: bool) -> Result<(), Error> {
+        self.debug_assert_not_in_write_txn();
+        let _guard = self._write_lock.lock();
+        let mut wtxn = self.storage.env.write_txn()?;
+        let label_id = get_or_create_label(&self.storage, &mut wtxn, label)?;
+        if enabled != self.label_auto_index_disabled_impl(&wtxn, label_id)? {
+            // Already in the requested state; nothing to rewrite.
+            wtxn.commit()?;
+            return Ok(());
+        }
+        let declared: Vec<PropKeyId> = self
+            .get_active_node_indexes(&wtxn, label_id)?
+            .into_iter()
+            .map(|(prop_key_id, _)| prop_key_id)
+            .collect();
+        let ids = self.nodes_by_label_impl(&wtxn, label)?;
+        for node_id in ids {
+            let Some(record) = self.get_node_impl(&wtxn, node_id)? else {
+                continue;
+            };
+            let props_json: serde_json::Value = props::decode(&record.props)?;
+            let Some(obj) = props_json.as_object() else {
+                continue;
+            };
+            for (prop_name, val) in obj {
+                if val.is_null() {
+                    continue;
+                }
+                let Some(encoded) = encode_property_value(val) else {
+                    continue;
+                };
+                let prop_key_id = if enabled {
+                    get_or_create_prop_key(&self.storage, &mut wtxn, prop_name)?
+                } else {
+                    match get_prop_key(&self.storage, &wtxn, prop_name)? {
+                        Some(id) => id,
+                        None => continue,
+                    }
+                };
+                if declared.contains(&prop_key_id) {
+                    continue;
+                }
+                let idx_key = node_prop_index_key(label_id, prop_key_id, &encoded, node_id);
+                if enabled {
+                    self.storage.node_prop_idx.put(&mut wtxn, &idx_key, &())?;
+                } else {
+                    self.storage.node_prop_idx.delete(&mut wtxn, &idx_key)?;
+                }
+            }
+        }
+        let key = Self::auto_index_off_key(label_id);
+        if enabled {
+            self.storage.meta.delete(&mut wtxn, &key)?;
+        } else {
+            self.storage.meta.put(&mut wtxn, &key, &[1u8])?;
+        }
+        wtxn.commit()?;
+        self.plan_epoch.bump();
+        Ok(())
+    }
+
     pub fn nodes_by_property_range(
         &self,
         label: &str,
@@ -1035,6 +1306,22 @@ impl Graph {
         if matches!(min_val, Some(PropValue::Str(_))) || matches!(max_val, Some(PropValue::Str(_)))
         {
             return self.scan_label_for_property_str_range(
+                rtxn,
+                label,
+                property,
+                min_val,
+                min_inclusive,
+                max_val,
+                max_inclusive,
+            );
+        }
+
+        // See `nodes_by_property_impl`: an opted-out label without a declared
+        // index on this property has no entries to range over.
+        if self.label_auto_index_disabled_impl(rtxn, label_id)?
+            && !self.has_declared_node_index_impl(rtxn, label_id, property)?
+        {
+            return self.scan_label_for_property_range(
                 rtxn,
                 label,
                 property,
@@ -2010,6 +2297,234 @@ mod tests {
             .create_edge_unique_constraint("ROAD", "toll_id")
             .unwrap_err();
         assert!(matches!(err, Error::UniqueConstraintViolation(..)));
+    }
+
+    /// Dropping a required constraint must stop enforcing it while leaving the
+    /// stored data and property lookups intact, on nodes and on edges alike.
+    #[test]
+    fn drop_required_constraint_stops_enforcement_and_keeps_lookups() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("User", &json!({"email": "a@b.c"})).unwrap();
+        g.create_node_required_constraint("User", "email").unwrap();
+        assert!(matches!(
+            g.add_node("User", &json!({})).unwrap_err(),
+            Error::RequiredConstraintViolation(..)
+        ));
+
+        g.drop_node_required_constraint("User", "email").unwrap();
+        let b = g.add_node("User", &json!({})).unwrap();
+        assert!(g.get_node(b).unwrap().is_some());
+        assert_eq!(
+            g.nodes_by_property("User", "email", PropValue::Str("a@b.c".into()))
+                .unwrap(),
+            vec![a]
+        );
+
+        g.create_edge_required_constraint("ROAD", "cost").unwrap();
+        assert!(matches!(
+            g.add_edge(a, b, "ROAD", &json!({})).unwrap_err(),
+            Error::RequiredConstraintViolation(..)
+        ));
+        g.drop_edge_required_constraint("ROAD", "cost").unwrap();
+        let e = g.add_edge(a, b, "ROAD", &json!({})).unwrap();
+        assert!(g.get_edge(e).unwrap().is_some());
+    }
+
+    /// Dropping an edge unique constraint must stop rejecting duplicates. Edges
+    /// have no auto-index, so the property lookup answers only while a declared
+    /// index or constraint exists; after the drop it is empty and the edges are
+    /// still there.
+    #[test]
+    fn drop_edge_unique_constraint_allows_duplicates_and_drops_index_entries() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("N", &()).unwrap();
+        let b = g.add_node("N", &()).unwrap();
+        let e1 = g.add_edge(a, b, "ROAD", &json!({"code": "r1"})).unwrap();
+        g.create_edge_unique_constraint("ROAD", "code").unwrap();
+        assert!(matches!(
+            g.add_edge(b, a, "ROAD", &json!({"code": "r1"}))
+                .unwrap_err(),
+            Error::UniqueConstraintViolation(..)
+        ));
+        assert_eq!(
+            g.edges_by_property("ROAD", "code", PropValue::Str("r1".into()))
+                .unwrap(),
+            vec![e1]
+        );
+
+        g.drop_edge_unique_constraint("ROAD", "code").unwrap();
+        let e2 = g.add_edge(b, a, "ROAD", &json!({"code": "r1"})).unwrap();
+        assert!(g.get_edge(e1).unwrap().is_some());
+        assert!(g.get_edge(e2).unwrap().is_some());
+        assert!(
+            g.edges_by_property("ROAD", "code", PropValue::Str("r1".into()))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// The listings report every declared index and constraint with its flag
+    /// byte (0 index, 1 unique, 2 required), the node and edge listings never
+    /// mix, and a drop removes the entry.
+    #[test]
+    fn list_indexes_and_constraints_reports_flags_and_tracks_drops() {
+        let (_dir, g) = open_tmp();
+        assert!(g.list_node_indexes_and_constraints().unwrap().is_empty());
+        assert!(g.list_edge_indexes_and_constraints().unwrap().is_empty());
+
+        g.create_node_property_index("User", "name").unwrap();
+        g.create_node_unique_constraint("User", "email").unwrap();
+        g.create_node_required_constraint("Order", "total").unwrap();
+        g.create_edge_property_index("ROAD", "name").unwrap();
+        g.create_edge_unique_constraint("ROAD", "code").unwrap();
+        g.create_edge_required_constraint("RAIL", "cost").unwrap();
+
+        let mut nodes = g.list_node_indexes_and_constraints().unwrap();
+        nodes.sort();
+        assert_eq!(
+            nodes,
+            vec![
+                ("Order".to_string(), "total".to_string(), 0x02),
+                ("User".to_string(), "email".to_string(), 0x01),
+                ("User".to_string(), "name".to_string(), 0x00),
+            ]
+        );
+        let mut edges = g.list_edge_indexes_and_constraints().unwrap();
+        edges.sort();
+        assert_eq!(
+            edges,
+            vec![
+                ("RAIL".to_string(), "cost".to_string(), 0x02),
+                ("ROAD".to_string(), "code".to_string(), 0x01),
+                ("ROAD".to_string(), "name".to_string(), 0x00),
+            ]
+        );
+
+        g.drop_node_unique_constraint("User", "email").unwrap();
+        g.drop_edge_property_index("ROAD", "name").unwrap();
+        let mut nodes = g.list_node_indexes_and_constraints().unwrap();
+        nodes.sort();
+        assert_eq!(
+            nodes,
+            vec![
+                ("Order".to_string(), "total".to_string(), 0x02),
+                ("User".to_string(), "name".to_string(), 0x00),
+            ]
+        );
+        let mut edges = g.list_edge_indexes_and_constraints().unwrap();
+        edges.sort();
+        assert_eq!(
+            edges,
+            vec![
+                ("RAIL".to_string(), "cost".to_string(), 0x02),
+                ("ROAD".to_string(), "code".to_string(), 0x01),
+            ]
+        );
+    }
+
+    /// On a label that opted out of the auto-index a range lookup scans the
+    /// label. The scan keeps the index's typing rules: a string bound compares
+    /// strings, a boolean bound compares booleans, a numeric bound compares
+    /// numbers, and bounds of two families match nothing.
+    #[test]
+    fn opted_out_label_range_scan_respects_value_families() {
+        let (_dir, g) = open_tmp();
+        g.set_label_auto_index("Item", false).unwrap();
+        let s1 = g.add_node("Item", &json!({"v": "apple"})).unwrap();
+        let s2 = g.add_node("Item", &json!({"v": "cherry"})).unwrap();
+        let n1 = g.add_node("Item", &json!({"v": 5})).unwrap();
+        let n2 = g.add_node("Item", &json!({"v": 7.5})).unwrap();
+        let bt = g.add_node("Item", &json!({"v": true})).unwrap();
+        let bf = g.add_node("Item", &json!({"v": false})).unwrap();
+        g.add_node("Item", &json!({})).unwrap();
+
+        let range = |lo: Option<PropValue>, lo_inc: bool, hi: Option<PropValue>, hi_inc: bool| {
+            g.nodes_by_property_range("Item", "v", lo, lo_inc, hi, hi_inc)
+                .unwrap()
+        };
+
+        assert_eq!(
+            range(Some(PropValue::Str("b".into())), true, None, true),
+            vec![s2]
+        );
+        assert_eq!(
+            range(None, true, Some(PropValue::Str("apple".into())), true),
+            vec![s1]
+        );
+        assert_eq!(
+            range(None, true, Some(PropValue::Str("apple".into())), false),
+            Vec::<NodeId>::new()
+        );
+        assert_eq!(range(Some(PropValue::Int(6)), true, None, true), vec![n2]);
+        assert_eq!(
+            range(
+                Some(PropValue::Float(4.0)),
+                true,
+                Some(PropValue::Int(5)),
+                true
+            ),
+            vec![n1]
+        );
+        assert_eq!(
+            range(Some(PropValue::Bool(true)), true, None, true),
+            vec![bt]
+        );
+        assert_eq!(
+            range(None, true, Some(PropValue::Bool(false)), true),
+            vec![bf]
+        );
+        assert_eq!(
+            range(
+                Some(PropValue::Int(0)),
+                true,
+                Some(PropValue::Str("z".into())),
+                true
+            ),
+            Vec::<NodeId>::new()
+        );
+        assert_eq!(range(None, true, None, true), vec![s1, s2, n1, n2, bt, bf]);
+    }
+
+    /// An edge string range always compares the stored strings, because a
+    /// string too long to index is absent from `edge_prop_idx`. Both bounds are
+    /// inclusive, ids come back ascending, and a non-string opposite bound
+    /// matches nothing.
+    #[test]
+    fn edge_string_range_lookup_scans_stored_values() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("N", &()).unwrap();
+        let b = g.add_node("N", &()).unwrap();
+        let long = "x".repeat(600);
+        let e1 = g.add_edge(a, b, "R", &json!({"code": "alpha"})).unwrap();
+        let e2 = g.add_edge(a, b, "R", &json!({"code": "beta"})).unwrap();
+        let e3 = g.add_edge(a, b, "R", &json!({"code": long})).unwrap();
+        g.add_edge(a, b, "R", &json!({"code": 3})).unwrap();
+        g.add_edge(a, b, "OTHER", &json!({"code": "beta"})).unwrap();
+
+        let range = |lo: Option<PropValue>, hi: Option<PropValue>| {
+            g.edges_by_property_range("R", "code", lo, hi).unwrap()
+        };
+        assert_eq!(range(Some(PropValue::Str("b".into())), None), vec![e2, e3]);
+        assert_eq!(
+            range(None, Some(PropValue::Str("beta".into()))),
+            vec![e1, e2]
+        );
+        assert_eq!(
+            range(
+                Some(PropValue::Str("alpha".into())),
+                Some(PropValue::Str("alpha".into()))
+            ),
+            vec![e1]
+        );
+        assert_eq!(
+            range(Some(PropValue::Str("a".into())), Some(PropValue::Int(9))),
+            Vec::<EdgeId>::new()
+        );
+        assert_eq!(
+            g.edges_by_property("R", "code", PropValue::Str(long.clone()))
+                .unwrap(),
+            vec![e3]
+        );
     }
 
     #[test]

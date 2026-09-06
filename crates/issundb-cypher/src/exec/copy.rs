@@ -776,12 +776,11 @@ pub(super) fn execute_export_db(
         .map_err(|e| e.to_string())?;
     for (label, prop, flags) in node_idx {
         match flags {
-            0x00 => writeln!(
-                schema_file,
-                "CREATE INDEX FOR (n:{}) ON (n.{});",
-                label, prop
-            )
-            .map_err(|e| e.to_string())?,
+            // A node `CREATE INDEX` in Cypher provisions the full-text index, so
+            // a declared node property index has no statement that recreates it;
+            // emitting one would turn it into a text index on import. Lookups on
+            // the property are served by the auto-index either way.
+            0x00 => {}
             0x01 => writeln!(
                 schema_file,
                 "CREATE CONSTRAINT ON (n:{}) ASSERT n.{} IS UNIQUE;",

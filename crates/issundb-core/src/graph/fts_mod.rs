@@ -576,3 +576,163 @@ impl Graph {
         Ok(postings)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    use super::*;
+
+    fn open_tmp() -> (TempDir, Graph) {
+        let dir = TempDir::new().unwrap();
+        let g = Graph::open(dir.path(), 1).unwrap();
+        (dir, g)
+    }
+
+    /// The tokenizer is what both indexing and querying go through, so its
+    /// three rules are pinned here: stop words drop out, words stem to one
+    /// term, and repeats accumulate a count.
+    #[test]
+    fn tokenize_text_drops_stop_words_and_stems_and_counts() {
+        let (_dir, g) = open_tmp();
+        let terms = g.tokenize_text("The runner runs and running runs", Language::English);
+        assert!(!terms.contains_key("the"));
+        assert!(!terms.contains_key("and"));
+        assert_eq!(terms.get("run"), Some(&3));
+        assert_eq!(terms.get("runner"), Some(&1));
+        assert_eq!(terms.len(), 2);
+    }
+
+    /// The stop-word list is per language: "the" is a stop word in English and
+    /// a plain term in Spanish, and the reverse holds for "los".
+    #[test]
+    fn tokenize_text_uses_the_language_stop_words() {
+        let (_dir, g) = open_tmp();
+        let en = g.tokenize_text("the los", Language::English);
+        let es = g.tokenize_text("the los", Language::Spanish);
+        assert!(!en.contains_key("the"));
+        assert_eq!(en.get("los"), Some(&1));
+        assert!(!es.contains_key("los"));
+        assert_eq!(es.get("the"), Some(&1));
+    }
+
+    /// The listing reports every active index with the language it was created
+    /// in, and a dropped index leaves it.
+    #[test]
+    fn active_text_indexes_lists_language_and_tracks_drops() {
+        let (_dir, g) = open_tmp();
+        assert!(g.active_text_indexes().unwrap().is_empty());
+
+        g.create_node_text_index("Doc", "body").unwrap();
+        g.create_node_text_index_with_language("Libro", "texto", Language::Spanish)
+            .unwrap();
+
+        let mut listed = g.active_text_indexes().unwrap();
+        listed.sort_by(|x, y| (&x.0, &x.1).cmp(&(&y.0, &y.1)));
+        assert_eq!(
+            listed,
+            vec![
+                ("Doc".to_string(), "body".to_string(), Language::English),
+                ("Libro".to_string(), "texto".to_string(), Language::Spanish),
+            ]
+        );
+
+        g.drop_node_text_index("Doc", "body").unwrap();
+        assert_eq!(
+            g.active_text_indexes().unwrap(),
+            vec![("Libro".to_string(), "texto".to_string(), Language::Spanish)]
+        );
+        assert!(!g.has_node_text_index("Doc", "body").unwrap());
+        assert!(g.has_node_text_index("Libro", "texto").unwrap());
+    }
+
+    /// The corpus statistics, the per-document length, and the postings must
+    /// agree with the tokenizer on what was indexed, and must follow the node
+    /// through an update and a delete, since the postings are maintained inside
+    /// the node's own write transaction.
+    #[test]
+    fn fts_stats_doc_len_and_postings_follow_the_node_lifecycle() {
+        let (_dir, g) = open_tmp();
+        g.create_node_text_index("Doc", "body").unwrap();
+        assert_eq!(g.fts_stats("Doc", "body").unwrap(), Some((0, 0)));
+        assert_eq!(g.fts_stats("Doc", "other").unwrap(), None);
+
+        let a = g
+            .add_node("Doc", &json!({"body": "graph databases store graphs"}))
+            .unwrap();
+        let b = g
+            .add_node("Doc", &json!({"body": "vector search"}))
+            .unwrap();
+        let untracked = g.add_node("Other", &json!({"body": "graph"})).unwrap();
+
+        // "graph databases store graphs" tokenizes to graph x2, databas, store.
+        assert_eq!(g.fts_stats("Doc", "body").unwrap(), Some((2, 6)));
+        assert_eq!(g.fts_doc_len("Doc", "body", a).unwrap(), Some(4));
+        assert_eq!(g.fts_doc_len("Doc", "body", b).unwrap(), Some(2));
+        assert_eq!(g.fts_doc_len("Doc", "body", untracked).unwrap(), None);
+        assert_eq!(g.fts_doc_len("Nope", "body", a).unwrap(), None);
+
+        assert_eq!(
+            g.fts_postings("Doc", "body", "graph").unwrap(),
+            vec![(a, 2)]
+        );
+        assert_eq!(
+            g.fts_postings("Doc", "body", "search").unwrap(),
+            vec![(b, 1)]
+        );
+        assert!(g.fts_postings("Doc", "body", "missing").unwrap().is_empty());
+        assert!(g.fts_postings("Nope", "body", "graph").unwrap().is_empty());
+
+        g.update_node(a, &json!({"body": "search engines"}))
+            .unwrap();
+        assert_eq!(g.fts_stats("Doc", "body").unwrap(), Some((2, 4)));
+        assert_eq!(g.fts_doc_len("Doc", "body", a).unwrap(), Some(2));
+        assert!(g.fts_postings("Doc", "body", "graph").unwrap().is_empty());
+        let mut search = g.fts_postings("Doc", "body", "search").unwrap();
+        search.sort();
+        assert_eq!(search, vec![(a, 1), (b, 1)]);
+
+        g.delete_node(b).unwrap();
+        assert_eq!(g.fts_stats("Doc", "body").unwrap(), Some((1, 2)));
+        assert_eq!(g.fts_doc_len("Doc", "body", b).unwrap(), None);
+        assert_eq!(
+            g.fts_postings("Doc", "body", "search").unwrap(),
+            vec![(a, 1)]
+        );
+    }
+
+    /// The same readers on a read transaction and a write transaction answer
+    /// from that transaction's view, so an index created inside an uncommitted
+    /// write is visible to it and not to a concurrent reader.
+    #[test]
+    fn transaction_scoped_fts_readers_see_their_own_view() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("Doc", &json!({"body": "alpha beta"})).unwrap();
+
+        g.update(|wtxn| {
+            wtxn.create_node_text_index_with_language("Doc", "body", Language::German)?;
+            assert_eq!(
+                wtxn.active_text_indexes()?,
+                vec![("Doc".to_string(), "body".to_string(), Language::German)]
+            );
+            assert_eq!(wtxn.fts_stats("Doc", "body")?, Some((1, 2)));
+            assert_eq!(wtxn.fts_doc_len("Doc", "body", a)?, Some(2));
+            assert_eq!(wtxn.fts_postings("Doc", "body", "alpha")?, vec![(a, 1)]);
+
+            g.view(|rtxn| {
+                assert!(rtxn.active_text_indexes()?.is_empty());
+                assert_eq!(rtxn.fts_stats("Doc", "body")?, None);
+                Ok(())
+            })
+        })
+        .unwrap();
+
+        g.view(|rtxn| {
+            assert_eq!(rtxn.fts_doc_len("Doc", "body", a)?, Some(2));
+            assert_eq!(rtxn.fts_postings("Doc", "body", "beta")?, vec![(a, 1)]);
+            Ok(())
+        })
+        .unwrap();
+    }
+}

@@ -428,6 +428,14 @@ fn boolean_candidate_set(
 
 /// Full-text search operations for `Graph`.
 pub trait TextGraphExt {
+    /// Rank the nodes that their indexed text matches `query`, best first, up to
+    /// `opts.limit`. With no `label` or `property` in `opts` every active index is
+    /// searched and a node's scores sum across them.
+    ///
+    /// A request that cannot match anything is an error rather than an empty
+    /// list: an empty query (`TextError::EmptyQuery`), a filter naming no active
+    /// index (`LabelNotIndexed`, `PropertyNotIndexed`, or `IndexNotFound`), or a
+    /// graph with no text indexes at all (`NoIndexes`).
     fn text_search(&self, query: &str, opts: &TextSearchOptions)
     -> Result<Vec<TextHit>, TextError>;
 }
@@ -639,15 +647,23 @@ impl TextGraphExt for Graph {
 /// Implement text index creation, removal, and discovery through this trait
 /// rather than calling the corresponding storage methods on `Graph` directly.
 pub trait TextIndexExt {
+    /// Create a full-text index over `property` of nodes labeled `label`, with
+    /// English stemming and stop words, indexing the existing nodes as well as
+    /// every later write. Creating an index that already exists is a no-op.
     fn create_text_index(&self, label: &str, property: &str) -> Result<(), TextError>;
+    /// [`TextIndexExt::create_text_index`] with the stemming and stop-word language
+    /// chosen explicitly.
     fn create_text_index_with_language(
         &self,
         label: &str,
         property: &str,
         lang: Language,
     ) -> Result<(), TextError>;
+    /// Remove the full-text index over `property` of `label` and its postings.
     fn drop_text_index(&self, label: &str, property: &str) -> Result<(), TextError>;
+    /// Whether a full-text index over `property` of `label` is active.
     fn has_text_index(&self, label: &str, property: &str) -> Result<bool, TextError>;
+    /// Every active full-text index as `(label, property, language)`.
     fn list_text_indexes(&self) -> Result<Vec<(String, String, Language)>, TextError>;
 }
 

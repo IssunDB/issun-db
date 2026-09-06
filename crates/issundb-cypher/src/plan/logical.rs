@@ -903,11 +903,23 @@ fn split_return_items(
     let mut count_index = 0;
 
     let mut rewritten_items = query.return_clause.items.clone();
+    let projections: Vec<(Expr, String)> = rewritten_items
+        .iter()
+        .filter(|item| !expr_has_aggregation(&item.expr))
+        .map(|item| {
+            let target = item
+                .alias
+                .clone()
+                .unwrap_or_else(|| expr_display_name(&item.expr));
+            (item.expr.clone(), target)
+        })
+        .collect();
     for item in &mut rewritten_items {
         if expr_has_aggregation(&item.expr) {
             if item.alias.is_none() {
                 item.alias = Some(expr_display_name(&item.expr));
             }
+            rewrite_grouping_refs(&mut item.expr, &projections);
             extract_and_replace_aggs(
                 &mut item.expr,
                 &mut aggregations,
@@ -994,11 +1006,23 @@ fn split_with_items(
     let mut count_index = 0;
 
     let mut rewritten_items = items.to_vec();
+    let projections: Vec<(Expr, String)> = rewritten_items
+        .iter()
+        .filter(|item| !expr_has_aggregation(&item.expr))
+        .map(|item| {
+            let target = item
+                .alias
+                .clone()
+                .unwrap_or_else(|| expr_display_name(&item.expr));
+            (item.expr.clone(), target)
+        })
+        .collect();
     for item in &mut rewritten_items {
         if expr_has_aggregation(&item.expr) {
             if item.alias.is_none() {
                 item.alias = Some(expr_display_name(&item.expr));
             }
+            rewrite_grouping_refs(&mut item.expr, &projections);
             extract_and_replace_aggs(
                 &mut item.expr,
                 &mut aggregations,
@@ -1255,6 +1279,19 @@ fn collect_ord_aggs(expr: &Expr, set: &mut std::collections::HashSet<String>) {
 }
 
 fn rewrite_expr_with_aliases(expr: &mut Expr, projections: &[(Expr, String)]) {
+    rewrite_aliases(expr, projections, true);
+}
+
+/// Rewrite a grouping expression reused outside the aggregates of an
+/// aggregating item to the variable the projection binds it to, as in
+/// `RETURN n.k AS k, count(*) + size(n.k)`. An aggregate's own argument is left
+/// alone: it is evaluated over the input rows, where the grouping expression is
+/// still the way to reach the value and the alias is not yet bound.
+fn rewrite_grouping_refs(expr: &mut Expr, projections: &[(Expr, String)]) {
+    rewrite_aliases(expr, projections, false);
+}
+
+fn rewrite_aliases(expr: &mut Expr, projections: &[(Expr, String)], into_aggs: bool) {
     // Check if the current expression matches any projected source expression exactly.
     for (source_expr, target_var) in projections {
         if expr == source_expr {
@@ -1266,23 +1303,28 @@ fn rewrite_expr_with_aliases(expr: &mut Expr, projections: &[(Expr, String)]) {
     // Otherwise, recursively rewrite child expressions.
     match expr {
         Expr::Prop(_, _) | Expr::Literal(_) | Expr::Param(_) | Expr::CountStar => {}
-        Expr::Agg(_, inner) | Expr::IsNull(inner) | Expr::IsNotNull(inner) | Expr::Not(inner) => {
-            rewrite_expr_with_aliases(inner, projections);
+        Expr::Agg(_, inner) => {
+            if into_aggs {
+                rewrite_aliases(inner, projections, into_aggs);
+            }
+        }
+        Expr::IsNull(inner) | Expr::IsNotNull(inner) | Expr::Not(inner) => {
+            rewrite_aliases(inner, projections, into_aggs);
         }
         Expr::BinaryOp { left, right, .. } => {
-            rewrite_expr_with_aliases(left, projections);
-            rewrite_expr_with_aliases(right, projections);
+            rewrite_aliases(left, projections, into_aggs);
+            rewrite_aliases(right, projections, into_aggs);
         }
         Expr::FunctionCall { args, .. } => {
             for arg in args {
-                rewrite_expr_with_aliases(arg, projections);
+                rewrite_aliases(arg, projections, into_aggs);
             }
         }
         Expr::Quantifier {
             list, predicate, ..
         } => {
-            rewrite_expr_with_aliases(list, projections);
-            rewrite_expr_with_aliases(predicate, projections);
+            rewrite_aliases(list, projections, into_aggs);
+            rewrite_aliases(predicate, projections, into_aggs);
         }
         Expr::Case {
             subject,
@@ -1290,31 +1332,31 @@ fn rewrite_expr_with_aliases(expr: &mut Expr, projections: &[(Expr, String)]) {
             else_expr,
         } => {
             if let Some(s) = subject {
-                rewrite_expr_with_aliases(s, projections);
+                rewrite_aliases(s, projections, into_aggs);
             }
             for arm in arms {
-                rewrite_expr_with_aliases(&mut arm.when, projections);
-                rewrite_expr_with_aliases(&mut arm.then, projections);
+                rewrite_aliases(&mut arm.when, projections, into_aggs);
+                rewrite_aliases(&mut arm.then, projections, into_aggs);
             }
             if let Some(e) = else_expr {
-                rewrite_expr_with_aliases(e, projections);
+                rewrite_aliases(e, projections, into_aggs);
             }
         }
         Expr::Subscript { expr: inner, index } => {
-            rewrite_expr_with_aliases(inner, projections);
-            rewrite_expr_with_aliases(index, projections);
+            rewrite_aliases(inner, projections, into_aggs);
+            rewrite_aliases(index, projections, into_aggs);
         }
         Expr::Slice {
             expr: inner,
             start,
             end,
         } => {
-            rewrite_expr_with_aliases(inner, projections);
+            rewrite_aliases(inner, projections, into_aggs);
             if let Some(s) = start {
-                rewrite_expr_with_aliases(s, projections);
+                rewrite_aliases(s, projections, into_aggs);
             }
             if let Some(e) = end {
-                rewrite_expr_with_aliases(e, projections);
+                rewrite_aliases(e, projections, into_aggs);
             }
         }
         Expr::ListComprehension {
@@ -1323,12 +1365,12 @@ fn rewrite_expr_with_aliases(expr: &mut Expr, projections: &[(Expr, String)]) {
             transform,
             ..
         } => {
-            rewrite_expr_with_aliases(list, projections);
+            rewrite_aliases(list, projections, into_aggs);
             if let Some(p) = predicate {
-                rewrite_expr_with_aliases(p, projections);
+                rewrite_aliases(p, projections, into_aggs);
             }
             if let Some(t) = transform {
-                rewrite_expr_with_aliases(t, projections);
+                rewrite_aliases(t, projections, into_aggs);
             }
         }
         Expr::Reduce {
@@ -1337,9 +1379,9 @@ fn rewrite_expr_with_aliases(expr: &mut Expr, projections: &[(Expr, String)]) {
             expression,
             ..
         } => {
-            rewrite_expr_with_aliases(initial, projections);
-            rewrite_expr_with_aliases(list, projections);
-            rewrite_expr_with_aliases(expression, projections);
+            rewrite_aliases(initial, projections, into_aggs);
+            rewrite_aliases(list, projections, into_aggs);
+            rewrite_aliases(expression, projections, into_aggs);
         }
         Expr::PatternComprehension {
             predicate,
@@ -1347,9 +1389,9 @@ fn rewrite_expr_with_aliases(expr: &mut Expr, projections: &[(Expr, String)]) {
             ..
         } => {
             if let Some(p) = predicate {
-                rewrite_expr_with_aliases(p, projections);
+                rewrite_aliases(p, projections, into_aggs);
             }
-            rewrite_expr_with_aliases(transform, projections);
+            rewrite_aliases(transform, projections, into_aggs);
         }
         // A pattern predicate names graph variables directly; like a pattern
         // comprehension's pattern, those names are not alias positions.
@@ -1358,13 +1400,32 @@ fn rewrite_expr_with_aliases(expr: &mut Expr, projections: &[(Expr, String)]) {
         // only its WHERE clause holds expressions an alias can appear in.
         Expr::ExistsSubquery { predicate, .. } => {
             if let Some(p) = predicate {
-                rewrite_expr_with_aliases(p, projections);
+                rewrite_aliases(p, projections, into_aggs);
             }
         }
         // The body is a query with its own scope; an outer alias reaches it as
         // a seeded binding under the same name, so nothing is rewritten.
         Expr::ExistsQuery(_) => {}
         Expr::HasLabel { .. } => {}
+    }
+}
+
+/// Collect the free variables a `FilterExpr` references.
+pub(crate) fn filter_expr_vars(filter: &FilterExpr, out: &mut std::collections::HashSet<String>) {
+    match filter {
+        FilterExpr::Eq(l, r)
+        | FilterExpr::Ne(l, r)
+        | FilterExpr::Lt(l, r)
+        | FilterExpr::Gt(l, r)
+        | FilterExpr::Le(l, r)
+        | FilterExpr::Ge(l, r) => {
+            crate::parser::collect_expr_vars(l, out);
+            crate::parser::collect_expr_vars(r, out);
+        }
+        FilterExpr::HasLabel(var, _) => {
+            out.insert(var.clone());
+        }
+        FilterExpr::Expr(e) => crate::parser::collect_expr_vars(e, out),
     }
 }
 
@@ -1491,24 +1552,5 @@ mod tests {
             } => (min_hops, max_hops),
             other => panic!("unexpected operator: {:?}", other),
         }
-    }
-}
-
-/// Collect the free variables a `FilterExpr` references.
-pub(crate) fn filter_expr_vars(filter: &FilterExpr, out: &mut std::collections::HashSet<String>) {
-    match filter {
-        FilterExpr::Eq(l, r)
-        | FilterExpr::Ne(l, r)
-        | FilterExpr::Lt(l, r)
-        | FilterExpr::Gt(l, r)
-        | FilterExpr::Le(l, r)
-        | FilterExpr::Ge(l, r) => {
-            crate::parser::collect_expr_vars(l, out);
-            crate::parser::collect_expr_vars(r, out);
-        }
-        FilterExpr::HasLabel(var, _) => {
-            out.insert(var.clone());
-        }
-        FilterExpr::Expr(e) => crate::parser::collect_expr_vars(e, out),
     }
 }
