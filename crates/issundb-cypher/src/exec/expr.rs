@@ -135,14 +135,25 @@ struct PendingWritesState {
 /// statement and restores the previous overlay on drop, so a nested subquery
 /// does not clear an outer statement's overlay.
 pub(crate) struct PendingWrites {
-    previous: Option<PendingWritesState>,
+    /// Whether this guard installed the overlay. A guard taken while an overlay
+    /// is already active joins it instead: an atomic pipeline installs one
+    /// overlay for every statement it runs, and a statement's own guard must
+    /// neither hide the earlier statements' writes nor drop them on exit.
+    owned: bool,
 }
 
 impl PendingWrites {
     pub(crate) fn install() -> Self {
-        let previous =
-            PENDING_WRITES.with(|c| c.borrow_mut().replace(PendingWritesState::default()));
-        PendingWrites { previous }
+        let owned = PENDING_WRITES.with(|c| {
+            let mut slot = c.borrow_mut();
+            if slot.is_some() {
+                false
+            } else {
+                *slot = Some(PendingWritesState::default());
+                true
+            }
+        });
+        PendingWrites { owned }
     }
 
     /// Record (or fully replace) a node's labels and properties, e.g. right
@@ -277,8 +288,80 @@ impl PendingWrites {
 
 impl Drop for PendingWrites {
     fn drop(&mut self) {
-        PENDING_WRITES.with(|c| *c.borrow_mut() = self.previous.take());
+        if self.owned {
+            PENDING_WRITES.with(|c| *c.borrow_mut() = None);
+        }
     }
+}
+
+/// Whether this statement (or the enclosing atomic pipeline) deleted the node.
+pub(crate) fn pending_node_deleted(id: NodeId) -> bool {
+    PENDING_WRITES.with(|c| {
+        c.borrow()
+            .as_ref()
+            .is_some_and(|s| s.deleted_nodes.contains(&id))
+    })
+}
+
+/// Edge counterpart to [`pending_node_deleted`].
+pub(crate) fn pending_edge_deleted(id: EdgeId) -> bool {
+    PENDING_WRITES.with(|c| {
+        c.borrow()
+            .as_ref()
+            .is_some_and(|s| s.deleted_edges.contains(&id))
+    })
+}
+
+/// The overlay's live nodes carrying `label` (every live overlay node when
+/// `label` is `None`): what a label scan inside a write transaction adds to the
+/// committed population. A node the overlay only touched (a property update on
+/// a committed node) is included too, since its overlay labels are authoritative;
+/// the caller deduplicates against the committed set.
+pub(crate) fn pending_nodes_with_label(label: Option<&str>) -> Vec<NodeId> {
+    PENDING_WRITES.with(|c| {
+        let slot = c.borrow();
+        let Some(s) = slot.as_ref() else {
+            return Vec::new();
+        };
+        s.nodes
+            .iter()
+            .filter(|(id, info)| {
+                !s.deleted_nodes.contains(id)
+                    && label.is_none_or(|l| info.labels.iter().any(|x| x == l))
+            })
+            .map(|(id, _)| *id)
+            .collect()
+    })
+}
+
+/// The overlay's live edges leaving `node` (or entering it, with `incoming`)
+/// whose type is one of `rel_types` (any type when `None`), as `(edge, other
+/// endpoint)`: what an expansion inside a write transaction adds to the
+/// committed adjacency. Includes committed edges the overlay touched, so the
+/// caller deduplicates against the committed rows.
+pub(crate) fn pending_edges_of(
+    node: NodeId,
+    incoming: bool,
+    rel_types: Option<&[&str]>,
+) -> Vec<(EdgeId, NodeId)> {
+    PENDING_WRITES.with(|c| {
+        let slot = c.borrow();
+        let Some(s) = slot.as_ref() else {
+            return Vec::new();
+        };
+        let mut out: Vec<(EdgeId, NodeId)> = s
+            .edges
+            .iter()
+            .filter(|(id, info)| {
+                !s.deleted_edges.contains(id)
+                    && (if incoming { info.dst } else { info.src }) == node
+                    && rel_types.is_none_or(|ts| ts.contains(&info.edge_type.as_str()))
+            })
+            .map(|(id, info)| (*id, if incoming { info.src } else { info.dst }))
+            .collect();
+        out.sort_unstable();
+        out
+    })
 }
 
 /// Current properties of a node already known to exist (used only to

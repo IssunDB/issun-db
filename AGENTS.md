@@ -153,6 +153,10 @@ section, and a public method's contract lives under Component APIs. Do not inven
 - Property indexes (`node_prop_idx`, `edge_prop_idx`) embed the encoded value in the LMDB key, so an indexable value is bounded by LMDB's 511-byte
   key limit. `encode_property_value` declines a string longer than `MAX_INDEXED_STRING_LEN`, leaving that value out of the index; the property is still
   stored, and equality lookups fall back to a scan that compares the stored value, so results stay correct. Long text belongs in a full-text index.
+  Every scalar node property is auto-indexed, one entry per property per label, unless the label opted out (`Graph::set_label_auto_index`, Cypher
+  `DROP AUTO INDEX FOR (n:Label)`); an opted-out label's lookups take the same scan fallback, declared indexes and constraints keep their entries, and
+  `has_node_property_index` answers false for the label, so the optimizer plans a filter over the scan. The scan fallback compares numbers by value
+  (`30` matches `30.0`), as the index encoding does.
 - The CSR snapshot backs the graph algorithms, pattern matching, and multi-source expansion. It is kept fresh on demand through one gate,
   `Graph::ensure_snapshot_fresh`, reached by `Graph::with_snapshot`; the one freshness condition is the installed `snapshot_gen` against the committed
   `write_gen`. A refresh after additions patches the installed snapshot from the `CsrChange` each commit recorded; a removal, an edge update against a
@@ -189,9 +193,10 @@ section, and a public method's contract lives under Component APIs. Do not inven
       transaction for the stored bytes, so an embedding can neither join a caller's `Graph::update` nor roll back with it. Index before storage is
       deliberate: a crash between the two loses an in-memory entry the next reopen rebuilds, where the reverse would make a rejected vector durable. A
       caller needing the bytes to land atomically with graph writes stages them through `WriteTxn::put_vector_bytes`.
-    - Atomicity is per statement, not per script. The Cypher grammar has no `BEGIN` or `COMMIT`, so a semicolon-separated pipeline runs each statement
-      in its own `Graph::update`, and only a Rust caller can group operations. Do not paper over this with a retry or a compensating write in a
-      consumer crate; multi-statement transactions belong in the query layer as a language feature.
+    - A semicolon-separated pipeline of data statements (reads, writes, and `FOREACH`) runs in one `Graph::update`: every statement sees the earlier
+      ones' writes and a failure anywhere rolls all of them back, which is how a REST or MCP consumer groups several writes. The Cypher grammar has no
+      `BEGIN` or `COMMIT`, and a transaction never spans requests. A pipeline holding a schema or bulk-administration statement runs statement by
+      statement, each committing on its own, because those statements open their own transactions.
     - Durability is what the in-memory backend gives up; atomicity, consistency, and isolation hold there.
 - `issundb-cli`, `issundb-rest`, and `issundb-mcp` relay `lmdb` and `hnsw` to the facade rather than naming them on the dependency, so a binary can be
   built without the C vector index (`release.yml` needs this for `aarch64-pc-windows-msvc`, where `usearch` does not compile). Do not put
@@ -263,6 +268,9 @@ Read-path and statistics methods:
   table it walks the smaller endpoint population through `label_idx`, charging every storage operation against the budget. Only the choice of side
   reads a stored counter; the emptiness shortcut asks `label_idx`, so a prune never rests on a counter being exact. Verdicts are memoized per write
   generation.
+- `set_label_auto_index(label, enabled)`, `label_auto_index_enabled(label)`, and `labels_without_auto_index()`: the per-label switch on the property
+  auto-index. Disabling removes the label's auto-index entries in one pass and enabling backfills them; the setting is persisted in `meta`
+  (`autoidx_off:l:{label_id}`), read by one point lookup per label on every node write, and bumps the schema generation.
 - `storage_table_stats() -> Result<Vec<TableStat>, Error>`: size and entry count of each storage table, in declaration order. On LMDB `bytes` is the
   table's pages times the page size, so the entries sum to the live data in the file without free-page slack; the in-memory backend reports summed key
   and value lengths and no page count. The CLI's `stats` command prints it.
@@ -337,11 +345,15 @@ Exposed through the `issundb` facade via the `GraphQueryExt` trait; do not call 
 - When one `AND`/`OR` operand alone determines the result, a runtime error in the other operand is suppressed, but a successfully evaluated
   non-boolean operand still raises, as the TCK requires (`false AND 123` raises, `false AND (1 / 0)` is `false`).
 - A single statement's write clauses and the `RETURN`/`WITH` that follows them share one `Graph::update`: an error anywhere rolls back every write of
-  the statement. A projection reading a variable bound by an earlier write in the same statement sees the fresh value through the pending-writes
-  overlay in `exec/expr.rs`. A `MATCH` after a write clause does not see that write's structural effect until the statement commits, because label
-  scans and the snapshot read committed state only.
-- Atomicity stops at the statement. Each top-level statement of a pipeline gets its own `Graph::update` in `execute_pipeline`; the binding
-  environment does cross statements, so a surviving variable is no evidence that a transaction did.
+  the statement. Inside a write transaction every read sees the transaction's own writes through the pending-writes overlay in `exec/expr.rs`: property
+  reads through `node_props`, and structure (a created or deleted node or edge, a changed label) through the label scan (`overlay_label_scan`), the
+  bulk expansion (`expand_multi_type`), the index seeks, and the bulk label filter. Such a statement always runs the row pipeline, since the columnar
+  path and the kernels read committed snapshots. A `HashJoin` whose left side writes builds that side first (`join_roles`), so a `MATCH` after a write
+  clause runs after the write.
+- A pipeline of data statements is one transaction (`execute_pipeline`, `is_data_statement`): one overlay is installed for the whole pipeline
+  (`PendingWrites::install` joins an active overlay rather than replacing it), each statement runs through its `_in` variant against the shared
+  `WriteTxn`, and an error rolls back every statement. `DELETE ... RETURN`, like `SET` and `REMOVE`, routes through the pipeline as a `Delete` part,
+  so the projection runs over the matched rows after the delete and a read of a deleted entity raises through the overlay's deletion marks.
 - Plans are cached per thread (`PlanCache` in `exec/read.rs`, 256 entries), keyed on the query's address, `Graph::plan_generation`, and the
   execution mode, and served only when the stored query equals the incoming one after SKIP and LIMIT parameter resolution. A plan holding a resolved
   `CALL` is never cached, because it embeds the procedure's rows; the `EXISTS` subquery body uses the uncached entry point. Parsing is cached

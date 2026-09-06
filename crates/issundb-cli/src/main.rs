@@ -2345,6 +2345,8 @@ struct GraphStats {
     edge_indexes: Vec<(String, String, u8)>,
     /// `(label, property, language)` full-text indexes.
     text_indexes: Vec<(String, String, String)>,
+    /// Labels that opted out of the property auto-index.
+    auto_index_off: Vec<String>,
     /// Per-table size and entry count, in storage declaration order.
     tables: Vec<issundb::TableStat>,
     /// Number of persisted vector embeddings.
@@ -2403,6 +2405,7 @@ fn gather_stats(
     let vector_count = g.vector_bytes()?.len();
     let on_disk_bytes = db_path.and_then(dir_size);
     let tables = g.storage_table_stats()?;
+    let auto_index_off = g.labels_without_auto_index()?;
 
     Ok(GraphStats {
         node_count,
@@ -2415,6 +2418,7 @@ fn gather_stats(
         vector_count,
         on_disk_bytes,
         tables,
+        auto_index_off,
         map_size_gb,
     })
 }
@@ -2512,6 +2516,12 @@ fn print_stats(s: &GraphStats) {
         println!("{}", "Text Indexes".cyan().bold());
         for (label, prop, lang) in &s.text_indexes {
             println!("  {:<28}{}", format!("{label}.{prop}"), lang);
+        }
+    }
+    if !s.auto_index_off.is_empty() {
+        println!("{}", "Auto-index Off".cyan().bold());
+        for label in &s.auto_index_off {
+            println!("  {label}");
         }
     }
 

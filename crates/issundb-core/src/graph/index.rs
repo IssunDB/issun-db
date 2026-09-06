@@ -894,6 +894,15 @@ impl Graph {
             None => return Ok(Vec::new()),
         };
 
+        // A label opted out of the auto-index has no entries for this property
+        // unless an index or constraint was declared on it, so the lookup scans
+        // the label and compares stored values, exactly as for an over-long string.
+        if self.label_auto_index_disabled_impl(rtxn, label_id)?
+            && !self.has_declared_node_index_impl(rtxn, label_id, property)?
+        {
+            return self.scan_label_for_property_eq(rtxn, label, property, &val);
+        }
+
         let prop_key = format!("prop_key:{property}");
         let prop_key_id = match self.storage.meta.get(rtxn, &prop_key)? {
             Some(b) => {
@@ -934,11 +943,19 @@ impl Graph {
         property: &str,
         val: &serde_json::Value,
     ) -> Result<Vec<NodeId>, Error> {
+        // Numbers compare by value so `30` matches `30.0`, as the index's
+        // numeric encoding does; everything else compares structurally.
+        let matches = |stored: &serde_json::Value| match (stored, val) {
+            (serde_json::Value::Number(a), serde_json::Value::Number(b)) => {
+                a.as_f64() == b.as_f64()
+            }
+            _ => stored == val,
+        };
         let mut result = Vec::new();
         for id in self.nodes_by_label_impl(rtxn, label)? {
             if let Some(record) = self.get_node_impl(rtxn, id)? {
                 let props: serde_json::Value = props::decode(&record.props)?;
-                if props.get(property) == Some(val) {
+                if props.get(property).is_some_and(matches) {
                     result.push(id);
                 }
             }
@@ -996,6 +1013,237 @@ impl Graph {
         Ok(result)
     }
 
+    /// Range lookup fallback over a label with no index entries for the property
+    /// (a label opted out of the auto-index). Scans the label and compares the
+    /// stored value under the index's own rules: both bounds must belong to one
+    /// type family (number, string, or boolean) or nothing matches, and only
+    /// values of that family are compared.
+    #[allow(clippy::too_many_arguments)]
+    fn scan_label_for_property_range(
+        &self,
+        rtxn: &crate::storage::RoTxn,
+        label: &str,
+        property: &str,
+        min_val: Option<PropValue>,
+        min_inclusive: bool,
+        max_val: Option<PropValue>,
+        max_inclusive: bool,
+    ) -> Result<Vec<NodeId>, Error> {
+        #[derive(PartialEq, Clone, Copy)]
+        enum Family {
+            Number,
+            Str,
+            Bool,
+        }
+        fn family(v: &PropValue) -> Family {
+            match v {
+                PropValue::Int(_) | PropValue::Float(_) => Family::Number,
+                PropValue::Str(_) => Family::Str,
+                PropValue::Bool(_) => Family::Bool,
+            }
+        }
+        let fam = match (&min_val, &max_val) {
+            (Some(lo), Some(hi)) if family(lo) != family(hi) => return Ok(Vec::new()),
+            (Some(b), _) | (None, Some(b)) => Some(family(b)),
+            (None, None) => None,
+        };
+        if fam == Some(Family::Str) {
+            return self.scan_label_for_property_str_range(
+                rtxn,
+                label,
+                property,
+                min_val,
+                min_inclusive,
+                max_val,
+                max_inclusive,
+            );
+        }
+        let as_f64 = |v: &PropValue| match v {
+            PropValue::Int(i) => Some(*i as f64),
+            PropValue::Float(f) => Some(*f),
+            PropValue::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
+            PropValue::Str(_) => None,
+        };
+        let lo = min_val.as_ref().and_then(as_f64);
+        let hi = max_val.as_ref().and_then(as_f64);
+        let mut result = Vec::new();
+        for id in self.nodes_by_label_impl(rtxn, label)? {
+            let Some(record) = self.get_node_impl(rtxn, id)? else {
+                continue;
+            };
+            let props: serde_json::Value = props::decode(&record.props)?;
+            let value = match (fam, props.get(property)) {
+                (Some(Family::Bool), Some(serde_json::Value::Bool(b))) => {
+                    if *b {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                }
+                (Some(Family::Bool), _) => continue,
+                (_, Some(serde_json::Value::Number(n))) => match n.as_f64() {
+                    Some(f) => f,
+                    None => continue,
+                },
+                _ => continue,
+            };
+            let above_lo = match lo {
+                Some(l) if min_inclusive => value >= l,
+                Some(l) => value > l,
+                None => true,
+            };
+            let below_hi = match hi {
+                Some(h) if max_inclusive => value <= h,
+                Some(h) => value < h,
+                None => true,
+            };
+            if above_lo && below_hi {
+                result.push(id);
+            }
+        }
+        Ok(result)
+    }
+
+    // ------------------------------------------------------------------
+    // Auto-index opt-out
+    // ------------------------------------------------------------------
+
+    fn auto_index_off_key(label_id: LabelId) -> String {
+        format!("autoidx_off:l:{label_id}")
+    }
+
+    /// Whether the label has opted out of the property auto-index. Read on every
+    /// node write for the label, one `meta` point lookup.
+    pub(super) fn label_auto_index_disabled_impl(
+        &self,
+        txn: &crate::storage::RoTxn,
+        label_id: LabelId,
+    ) -> Result<bool, Error> {
+        Ok(self
+            .storage
+            .meta
+            .get(txn, &Self::auto_index_off_key(label_id))?
+            .is_some())
+    }
+
+    /// Whether an index or constraint was declared on `(label_id, property)`.
+    fn has_declared_node_index_impl(
+        &self,
+        txn: &crate::storage::RoTxn,
+        label_id: LabelId,
+        property: &str,
+    ) -> Result<bool, Error> {
+        let Some(prop_key_id) = get_prop_key(&self.storage, txn, property)? else {
+            return Ok(false);
+        };
+        let meta_key = format!("idx_meta:node:l:{label_id}:p:{prop_key_id}");
+        Ok(self.storage.meta.get(txn, &meta_key)?.is_some())
+    }
+
+    /// Whether nodes of `label` get an auto-index entry per scalar property.
+    /// True for every label by default, and for an unknown label.
+    pub fn label_auto_index_enabled(&self, label: &str) -> Result<bool, Error> {
+        let rtxn = self.storage.env.read_txn()?;
+        match get_label(&self.storage, &rtxn, label)? {
+            Some(label_id) => Ok(!self.label_auto_index_disabled_impl(&rtxn, label_id)?),
+            None => Ok(true),
+        }
+    }
+
+    /// The labels that have opted out of the property auto-index.
+    pub fn labels_without_auto_index(&self) -> Result<Vec<String>, Error> {
+        let rtxn = self.storage.env.read_txn()?;
+        let mut out = Vec::new();
+        for entry in self.storage.meta.prefix_iter(&rtxn, "autoidx_off:l:")? {
+            let (key, _) = entry?;
+            let Some(id) = key
+                .strip_prefix("autoidx_off:l:")
+                .and_then(|id| id.parse::<LabelId>().ok())
+            else {
+                continue;
+            };
+            if let Some(name) = self.label_name_impl(&rtxn, id)? {
+                out.push(name);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Turn the property auto-index on or off for one label.
+    ///
+    /// Every scalar property of every node is indexed by default, which is what
+    /// lets an equality or range lookup work with no DDL. The cost is one index
+    /// entry per scalar property per label, and turning it off for a label trades
+    /// that away: lookups on the label fall back to a label scan comparing stored
+    /// values, and the optimizer plans them as filters over the scan. Declared
+    /// indexes and constraints on the label are unaffected, since they keep their
+    /// own entries.
+    ///
+    /// The switch is persisted and applies to existing nodes as well: disabling
+    /// removes the label's auto-index entries in one pass, and enabling backfills
+    /// them. An unknown label is registered so the setting holds for its first
+    /// node.
+    pub fn set_label_auto_index(&self, label: &str, enabled: bool) -> Result<(), Error> {
+        self.debug_assert_not_in_write_txn();
+        let _guard = self._write_lock.lock();
+        let mut wtxn = self.storage.env.write_txn()?;
+        let label_id = get_or_create_label(&self.storage, &mut wtxn, label)?;
+        if enabled != self.label_auto_index_disabled_impl(&wtxn, label_id)? {
+            // Already in the requested state; nothing to rewrite.
+            wtxn.commit()?;
+            return Ok(());
+        }
+        let declared: Vec<PropKeyId> = self
+            .get_active_node_indexes(&wtxn, label_id)?
+            .into_iter()
+            .map(|(prop_key_id, _)| prop_key_id)
+            .collect();
+        let ids = self.nodes_by_label_impl(&wtxn, label)?;
+        for node_id in ids {
+            let Some(record) = self.get_node_impl(&wtxn, node_id)? else {
+                continue;
+            };
+            let props_json: serde_json::Value = props::decode(&record.props)?;
+            let Some(obj) = props_json.as_object() else {
+                continue;
+            };
+            for (prop_name, val) in obj {
+                if val.is_null() {
+                    continue;
+                }
+                let Some(encoded) = encode_property_value(val) else {
+                    continue;
+                };
+                let prop_key_id = if enabled {
+                    get_or_create_prop_key(&self.storage, &mut wtxn, prop_name)?
+                } else {
+                    match get_prop_key(&self.storage, &wtxn, prop_name)? {
+                        Some(id) => id,
+                        None => continue,
+                    }
+                };
+                if declared.contains(&prop_key_id) {
+                    continue;
+                }
+                let idx_key = node_prop_index_key(label_id, prop_key_id, &encoded, node_id);
+                if enabled {
+                    self.storage.node_prop_idx.put(&mut wtxn, &idx_key, &())?;
+                } else {
+                    self.storage.node_prop_idx.delete(&mut wtxn, &idx_key)?;
+                }
+            }
+        }
+        let key = Self::auto_index_off_key(label_id);
+        if enabled {
+            self.storage.meta.delete(&mut wtxn, &key)?;
+        } else {
+            self.storage.meta.put(&mut wtxn, &key, &[1u8])?;
+        }
+        wtxn.commit()?;
+        self.plan_epoch.bump();
+        Ok(())
+    }
+
     pub fn nodes_by_property_range(
         &self,
         label: &str,
@@ -1050,6 +1298,22 @@ impl Graph {
         if matches!(min_val, Some(PropValue::Str(_))) || matches!(max_val, Some(PropValue::Str(_)))
         {
             return self.scan_label_for_property_str_range(
+                rtxn,
+                label,
+                property,
+                min_val,
+                min_inclusive,
+                max_val,
+                max_inclusive,
+            );
+        }
+
+        // See `nodes_by_property_impl`: an opted-out label without a declared
+        // index on this property has no entries to range over.
+        if self.label_auto_index_disabled_impl(rtxn, label_id)?
+            && !self.has_declared_node_index_impl(rtxn, label_id, property)?
+        {
+            return self.scan_label_for_property_range(
                 rtxn,
                 label,
                 property,

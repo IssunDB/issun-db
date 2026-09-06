@@ -1163,4 +1163,139 @@ mod tests {
         assert!(get("nodes").bytes > 0);
         assert!(get("edge_prop_idx").bytes == 0 || get("edge_prop_idx").pages.is_some());
     }
+
+    /// Opting a label out of the auto-index removes its entries and makes every
+    /// lookup on it scan, with results unchanged; a declared index on the label
+    /// keeps its entries; opting back in backfills them.
+    #[test]
+    fn label_auto_index_opt_out_removes_entries_and_keeps_lookups_correct() {
+        use crate::schema::PropValue;
+        let dir = tempfile::TempDir::new().unwrap();
+        let g = Graph::open(dir.path(), 1).unwrap();
+        let a = g
+            .add_node(
+                "P",
+                &serde_json::json!({"age": 30, "name": "ann", "ok": true}),
+            )
+            .unwrap();
+        let b = g
+            .add_node(
+                "P",
+                &serde_json::json!({"age": 41, "name": "bob", "ok": false}),
+            )
+            .unwrap();
+        g.add_node("Q", &serde_json::json!({"age": 30})).unwrap();
+        g.create_node_unique_constraint("P", "name").unwrap();
+        let entries = |g: &Graph| {
+            g.storage_table_stats()
+                .unwrap()
+                .into_iter()
+                .find(|t| t.name == "node_prop_idx")
+                .unwrap()
+                .entries
+        };
+        // P: 2 nodes x 3 props, Q: 1 node x 1 prop.
+        assert_eq!(entries(&g), 7);
+        assert!(g.label_auto_index_enabled("P").unwrap());
+        assert!(g.has_node_property_index("P", "age").unwrap());
+
+        g.set_label_auto_index("P", false).unwrap();
+        assert!(!g.label_auto_index_enabled("P").unwrap());
+        assert_eq!(
+            g.labels_without_auto_index().unwrap(),
+            vec!["P".to_string()]
+        );
+        // The declared `name` entries stay (2), the auto entries go; Q keeps its 1.
+        assert_eq!(entries(&g), 3);
+        assert!(!g.has_node_property_index("P", "age").unwrap());
+        assert!(g.has_node_property_index("P", "name").unwrap());
+
+        // Lookups on the opted-out label scan and agree with the indexed answers.
+        assert_eq!(
+            g.nodes_by_property("P", "age", PropValue::Int(30)).unwrap(),
+            vec![a]
+        );
+        assert_eq!(
+            g.nodes_by_property("P", "age", PropValue::Float(41.0))
+                .unwrap(),
+            vec![b]
+        );
+        assert_eq!(
+            g.nodes_by_property("P", "ok", PropValue::Bool(false))
+                .unwrap(),
+            vec![b]
+        );
+        assert_eq!(
+            g.nodes_by_property("P", "name", PropValue::Str("bob".into()))
+                .unwrap(),
+            vec![b]
+        );
+        assert_eq!(
+            g.nodes_by_property_range("P", "age", Some(PropValue::Int(35)), true, None, false)
+                .unwrap(),
+            vec![b]
+        );
+        assert_eq!(
+            g.nodes_by_property_range("P", "age", None, false, Some(PropValue::Float(30.0)), true)
+                .unwrap(),
+            vec![a]
+        );
+        assert_eq!(
+            g.nodes_by_property_range(
+                "P",
+                "age",
+                Some(PropValue::Int(30)),
+                false,
+                Some(PropValue::Int(41)),
+                false
+            )
+            .unwrap(),
+            Vec::<NodeId>::new()
+        );
+        assert!(
+            g.nodes_by_property_range(
+                "P",
+                "age",
+                Some(PropValue::Str("x".into())),
+                true,
+                None,
+                false
+            )
+            .unwrap()
+            .is_empty(),
+            "a string bound admits no numbers"
+        );
+
+        // A node written while opted out gets no auto entries either.
+        let c = g
+            .add_node("P", &serde_json::json!({"age": 52, "name": "cid"}))
+            .unwrap();
+        assert_eq!(entries(&g), 4);
+        assert_eq!(
+            g.nodes_by_property("P", "age", PropValue::Int(52)).unwrap(),
+            vec![c]
+        );
+        g.delete_node(c).unwrap();
+        assert_eq!(entries(&g), 3);
+
+        // Opting back in backfills every scalar property.
+        g.set_label_auto_index("P", true).unwrap();
+        assert_eq!(entries(&g), 7);
+        assert!(g.has_node_property_index("P", "age").unwrap());
+        assert_eq!(
+            g.nodes_by_property("P", "age", PropValue::Int(41)).unwrap(),
+            vec![b]
+        );
+        assert!(g.labels_without_auto_index().unwrap().is_empty());
+
+        // The setting survives for a label that has no nodes yet.
+        g.set_label_auto_index("Fresh", false).unwrap();
+        let f = g.add_node("Fresh", &serde_json::json!({"x": 1})).unwrap();
+        assert_eq!(entries(&g), 7);
+        assert_eq!(
+            g.nodes_by_property("Fresh", "x", PropValue::Int(1))
+                .unwrap(),
+            vec![f]
+        );
+    }
 }

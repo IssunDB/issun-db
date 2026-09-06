@@ -13,6 +13,8 @@ pub enum Statement {
     CreateIndex(CreateIndexStatement),
     /// DROP INDEX FOR (n:Label) ON (n.property)
     DropIndex(DropIndexStatement),
+    /// `CREATE AUTO INDEX FOR (n:Label)` or `DROP AUTO INDEX FOR (n:Label)`.
+    SetAutoIndex(AutoIndexStatement),
     /// REMOVE n.property or REMOVE n:Label
     Remove(RemoveStatement),
     /// `MATCH ... RETURN ... UNION [ALL] MATCH ... RETURN ...`
@@ -533,6 +535,14 @@ pub struct CreateIndexStatement {
     pub label: String,
     pub property: String,
     pub target: SchemaTarget,
+}
+
+/// Turns the property auto-index on (`CREATE AUTO INDEX`) or off (`DROP AUTO
+/// INDEX`) for one node label.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AutoIndexStatement {
+    pub label: String,
+    pub enabled: bool,
 }
 
 /// A DROP INDEX statement targeting a single label or relationship type

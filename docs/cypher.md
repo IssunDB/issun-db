@@ -25,7 +25,7 @@ Conformance is tracked against a subset of the openCypher TCK (Technology Compat
 | `FOREACH` | Applies a body of write clauses to each element of a list expression. |
 | `CALL ... YIELD` | Invokes built-in `issundb.*` procedures or a custom procedure registry; supports `YIELD field AS alias`, `YIELD *`, and the no-parentheses form that reads arguments from query parameters. |
 
-Queries compose as pipelines: a sequence of clauses such as `MATCH ... WITH ... UNWIND ... CREATE ... RETURN ...` executes in order, and standalone write statements may follow one another in a single query string.
+Queries compose as pipelines: a sequence of clauses such as `MATCH ... WITH ... UNWIND ... CREATE ... RETURN ...` executes in order, and a `MATCH` after a write clause sees what the write created, changed, or deleted. Semicolon-separated statements may follow one another in a single query string; when all of them read or write data, they run as one transaction, so a later statement sees the earlier ones' writes and a failure rolls back the whole string. A string that includes an index, constraint, or bulk-load statement runs statement by statement.
 
 ## Patterns
 
@@ -74,7 +74,7 @@ The temporal constructors `date`, `time`, `localtime`, `datetime`, `localdatetim
 ## Procedures and Schema Statements
 
 - Built-in graph data science procedures run through `CALL issundb.<name>(...)`; the full list is in the [Cypher Built-in Procedures](api-reference.md#cypher-built-in-procedures) reference, and custom procedures can be registered through `query_with_procedures`.
-- Index and constraint DDL (`CREATE INDEX`, `DROP INDEX`, `CREATE CONSTRAINT`, and `DROP CONSTRAINT`) is covered by the [Cypher DDL Reference](api-reference.md#cypher-ddl-reference).
+- Index and constraint DDL (`CREATE INDEX`, `DROP INDEX`, `CREATE CONSTRAINT`, `DROP CONSTRAINT`, and the per-label `CREATE AUTO INDEX` and `DROP AUTO INDEX` switch on the property auto-index) is covered by the [Cypher DDL Reference](api-reference.md#cypher-ddl-reference).
 - Bulk data administration statements are also available: `COPY <Label> FROM '<file>' [WITH ...]` bulk-imports nodes or relationships from a file, `EXPORT DATABASE '<path>' [WITH ...]` writes the database contents out, and `IMPORT DATABASE '<path>'` loads a previous export. A file classifies as a relationship import when its rows carry the `_from` and `_to` endpoint keys; rows with bare `from` and `to` keys and no node metadata key (`_id` or `_labels`) are rejected with a migration hint rather than silently imported as nodes. Both `COPY` and `IMPORT DATABASE` return one row per imported file with the columns `target`, `kind` (`nodes` or `relationships`), and `count`. Rows stream into a single transaction as the file decodes, so an import holds one row in memory rather than the whole file and a bad row rolls the whole import back. Both statements end by rebuilding the CSR snapshot and building the node property columns, persisting each as a cache file beside the LMDB files, so the imported database answers its first aggregation without a scan even in a later process.
 
 ## Unsupported Constructs

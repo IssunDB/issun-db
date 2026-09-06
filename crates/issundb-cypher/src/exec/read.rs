@@ -22,6 +22,45 @@ pub(super) fn expand_multi_type(
     rel_type: Option<&str>,
     is_incoming: bool,
 ) -> Result<Vec<(NodeId, EdgeId, NodeId)>, String> {
+    let committed = expand_multi_type_committed(graph, src_nodes, rel_type, is_incoming)?;
+    if !expr::pending_writes_active() {
+        return Ok(committed);
+    }
+    // Inside a write transaction the committed adjacency lags this statement's
+    // (or this pipeline's) own writes: drop the edges it deleted and add the
+    // ones it created, so a MATCH after a CREATE or DELETE sees them.
+    let types: Option<Vec<&str>> = rel_type.map(|t| {
+        t.split('|')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .collect()
+    });
+    let mut seen: ahash::AHashSet<EdgeId> = ahash::AHashSet::new();
+    let mut all: Vec<(NodeId, EdgeId, NodeId)> = committed
+        .into_iter()
+        .filter(|(_, eid, _)| !expr::pending_edge_deleted(*eid))
+        .inspect(|(_, eid, _)| {
+            seen.insert(*eid);
+        })
+        .collect();
+    for &src in src_nodes {
+        for (eid, other) in expr::pending_edges_of(src, is_incoming, types.as_deref()) {
+            if seen.insert(eid) {
+                all.push((src, eid, other));
+            }
+        }
+    }
+    Ok(all)
+}
+
+/// The committed adjacency behind [`expand_multi_type`], read from the CSR
+/// snapshot or per-source storage.
+fn expand_multi_type_committed(
+    graph: &Graph,
+    src_nodes: &[NodeId],
+    rel_type: Option<&str>,
+    is_incoming: bool,
+) -> Result<Vec<(NodeId, EdgeId, NodeId)>, String> {
     match rel_type {
         None => graph
             .expand_bulk(src_nodes, None, is_incoming)
@@ -48,6 +87,64 @@ pub(super) fn expand_multi_type(
                 }
             }
             Ok(all)
+        }
+    }
+}
+
+/// The population a label scan yields inside a write transaction: the
+/// committed nodes with the overlay applied (deleted nodes dropped, a touched
+/// node kept only if its overlay labels still carry `label`) plus the overlay's
+/// own nodes carrying it, in ascending id order. Outside a write transaction
+/// this is the committed population unchanged.
+pub(super) fn overlay_label_scan(committed: Vec<NodeId>, label: Option<&str>) -> Vec<NodeId> {
+    if !expr::pending_writes_active() {
+        return committed;
+    }
+    let mut out: Vec<NodeId> = committed
+        .into_iter()
+        .filter(|id| overlay_node_has_label(*id, label).unwrap_or(true))
+        .collect();
+    let present: ahash::AHashSet<NodeId> = out.iter().copied().collect();
+    out.extend(
+        expr::pending_nodes_with_label(label)
+            .into_iter()
+            .filter(|id| !present.contains(id)),
+    );
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// The overlay's verdict on whether `id` carries `label`: `Some(false)` for a
+/// node this transaction deleted or whose overlay labels lack it, `Some(true)`
+/// for an overlay node that has it, and `None` when the overlay knows nothing
+/// about the node, leaving the committed answer to stand.
+pub(super) fn overlay_node_has_label(id: NodeId, label: Option<&str>) -> Option<bool> {
+    if expr::pending_node_deleted(id) {
+        return Some(false);
+    }
+    let info = expr::pending_node(id)?;
+    Some(label.is_none_or(|l| info.labels.iter().any(|x| x == l)))
+}
+
+/// Apply the overlay to a committed label-membership set over `candidates`.
+fn overlay_adjust_label_set(
+    candidates: &[NodeId],
+    label: &str,
+    committed_pass: &mut ahash::AHashSet<NodeId>,
+) {
+    if !expr::pending_writes_active() {
+        return;
+    }
+    for &id in candidates {
+        match overlay_node_has_label(id, Some(label)) {
+            Some(true) => {
+                committed_pass.insert(id);
+            }
+            Some(false) => {
+                committed_pass.remove(&id);
+            }
+            None => {}
         }
     }
 }
@@ -333,7 +430,14 @@ fn execute_read_query_impl(
     // for both the plan and the executor choice below. Reading it separately in
     // each place would let a statement plan under one mode and execute under
     // another if it ever moved between threads. See `crate::exec_mode`.
-    let row_pipeline_only = crate::exec_mode::row_pipeline_only();
+    // Inside a write transaction, or under an active pending-writes overlay (a
+    // statement of an atomic pipeline, a FOREACH body, a subquery of a write
+    // statement), the fast paths read committed snapshots and columns that lag
+    // this transaction's own writes, so every such statement runs the row
+    // pipeline, whose leaf reads consult the overlay.
+    let row_pipeline_only = crate::exec_mode::row_pipeline_only()
+        || write_txn.is_some()
+        || expr::pending_writes_active();
 
     // A resolved `CALL` embeds the procedure's output rows in the plan, so
     // such a plan is data, not a plan, and is never cached.
@@ -1576,7 +1680,8 @@ fn filter_over_expand_batch(
             let filtered = graph
                 .label_filter(&active, label)
                 .map_err(|e| e.to_string())?;
-            let pass_set: ahash::AHashSet<NodeId> = filtered.into_iter().collect();
+            let mut pass_set: ahash::AHashSet<NodeId> = filtered.into_iter().collect();
+            overlay_adjust_label_set(&active, label, &mut pass_set);
 
             for path in &child_paths {
                 if let Some(GraphBinding::Node(n)) = path.get_binding(variable.as_str()) {
@@ -2483,6 +2588,12 @@ fn join_roles<'a>(
     } = right
     {
         (left, input.as_ref(), Some(null_vars), predicate.as_ref())
+    } else if Optimizer::plan_has_write(left) {
+        // The build side is materialized in full before the probe side streams.
+        // A left side that writes (a MATCH after a CREATE, SET, or DELETE in the
+        // same statement) must therefore be the build side, so the right side's
+        // scans run after those writes and see them through the overlay.
+        (right, left, None, None)
     } else {
         (left, right, None, None)
     }
@@ -3168,7 +3279,8 @@ pub(super) fn apply_filter(
         let filtered_nodes = graph
             .label_filter(&active_nodes, label)
             .map_err(|e| e.to_string())?;
-        let filtered_set: ahash::AHashSet<NodeId> = filtered_nodes.into_iter().collect();
+        let mut filtered_set: ahash::AHashSet<NodeId> = filtered_nodes.into_iter().collect();
+        overlay_adjust_label_set(&active_nodes, label, &mut filtered_set);
 
         for path in child_paths {
             if let Some(GraphBinding::Node(node)) = path.get_binding(variable) {
@@ -3787,23 +3899,21 @@ impl RowStream {
                     None => {
                         // Candidate set: the label's nodes (or all nodes),
                         // intersected with the SIP-allowed ids when present.
-                        let candidates: Vec<NodeId> = match (label.as_deref(), allowed.as_ref()) {
-                            (Some(lbl), Some(set)) => graph
-                                .nodes_by_label(lbl)
-                                .map_err(|e| e.to_string())?
-                                .into_iter()
-                                .filter(|id| set.contains(id))
-                                .collect(),
+                        let committed: Vec<NodeId> = match (label.as_deref(), allowed.as_ref()) {
+                            (Some(lbl), _) => {
+                                graph.nodes_by_label(lbl).map_err(|e| e.to_string())?
+                            }
                             (None, Some(set)) => {
                                 let mut v: Vec<NodeId> = set.iter().copied().collect();
                                 v.sort_unstable();
                                 v
                             }
-                            (Some(lbl), None) => {
-                                graph.nodes_by_label(lbl).map_err(|e| e.to_string())?
-                            }
                             (None, None) => graph.all_nodes().map_err(|e| e.to_string())?,
                         };
+                        let mut candidates = overlay_label_scan(committed, label.as_deref());
+                        if let Some(set) = allowed.as_ref() {
+                            candidates.retain(|id| set.contains(id));
+                        }
                         ids.insert(candidates.into_iter())
                     }
                 };
@@ -3912,11 +4022,16 @@ impl RowStream {
                 let st = match state {
                     Some(s) => s,
                     None => {
-                        // A join's build side arises only from a cross-product
-                        // within a single MATCH clause, before any write clause
-                        // in the sequential QueryPart chain, so it never needs
-                        // to observe this statement's own writes.
-                        let build_rows = execute_physical(graph, build_op, params, schema, None)?;
+                        // The build side may be the writing side of a MATCH that
+                        // follows a write clause (see `join_roles`), so it runs
+                        // against the statement's write transaction.
+                        let build_rows = execute_physical(
+                            graph,
+                            build_op,
+                            params,
+                            schema,
+                            write_txn.as_deref_mut(),
+                        )?;
                         let common_vars = join_common_vars(probe_op, build_op);
                         let (data, probe) = if common_vars.is_empty() {
                             (
@@ -4258,6 +4373,7 @@ impl RowStream {
                             let candidates = graph
                                 .nodes_by_property(label, prop, prop_val)
                                 .map_err(|e| e.to_string())?;
+                            let candidates = overlay_label_scan(candidates, Some(label));
                             for (cand, actual_val) in index_verify_values(graph, &candidates, prop)
                             {
                                 if json_vals_are_equal(&actual_val, &key_val) {
@@ -4273,28 +4389,32 @@ impl RowStream {
                             let Some(nid) = key_val.as_u64().map(|n| n as NodeId) else {
                                 continue;
                             };
-                            let matched = graph
-                                .view(|txn| {
-                                    let Some(record) = txn.get_node(nid)? else {
-                                        return Ok(false);
-                                    };
-                                    match label {
-                                        Some(lbl) => {
-                                            let mut found = false;
-                                            for lid in &record.labels {
-                                                if txn.label_name(*lid)?.as_deref()
-                                                    == Some(lbl.as_str())
-                                                {
-                                                    found = true;
-                                                    break;
+                            let overlay_verdict = overlay_node_has_label(nid, label.as_deref());
+                            let matched = match overlay_verdict {
+                                Some(v) => v,
+                                None => graph
+                                    .view(|txn| {
+                                        let Some(record) = txn.get_node(nid)? else {
+                                            return Ok(false);
+                                        };
+                                        match label {
+                                            Some(lbl) => {
+                                                let mut found = false;
+                                                for lid in &record.labels {
+                                                    if txn.label_name(*lid)?.as_deref()
+                                                        == Some(lbl.as_str())
+                                                    {
+                                                        found = true;
+                                                        break;
+                                                    }
                                                 }
+                                                Ok(found)
                                             }
-                                            Ok(found)
+                                            None => Ok(true),
                                         }
-                                        None => Ok(true),
-                                    }
-                                })
-                                .map_err(|e| e.to_string())?;
+                                    })
+                                    .map_err(|e| e.to_string())?,
+                            };
                             if matched {
                                 let mut new_path = path.clone();
                                 new_path.bind_local(variable, GraphBinding::Node(nid));
@@ -4967,6 +5087,17 @@ fn index_verify_values(
     candidates: &[NodeId],
     property: &str,
 ) -> Vec<(NodeId, serde_json::Value)> {
+    if expr::pending_writes_active() {
+        // The overlay holds this transaction's own property writes, which the
+        // columns and the committed records do not.
+        return candidates
+            .iter()
+            .filter_map(|&cand| {
+                let props = expr::node_props(graph, cand).ok()??;
+                Some((cand, props.get(property).cloned()?))
+            })
+            .collect();
+    }
     match graph.node_prop_json_column(candidates, property) {
         Ok(col) => candidates.iter().copied().zip(col).collect(),
         Err(_) => candidates
@@ -5074,6 +5205,7 @@ pub(super) fn eval_leaf(
             let candidates = graph
                 .nodes_by_property(label, property, prop_val)
                 .map_err(|e| e.to_string())?;
+            let candidates = overlay_label_scan(candidates, Some(label));
 
             let mut filtered = Vec::new();
             for (cand, actual_val) in index_verify_values(graph, &candidates, property) {
@@ -5123,6 +5255,7 @@ pub(super) fn eval_leaf(
                     *hi_inclusive,
                 )
                 .map_err(|e| e.to_string())?;
+            let candidates = overlay_label_scan(candidates, Some(label));
 
             let mut filtered = Vec::new();
             for (cand, actual_val) in index_verify_values(graph, &candidates, property) {
@@ -5164,28 +5297,32 @@ pub(super) fn eval_leaf(
                 None => return Ok(vec![]),
             };
             // Fetch the node and resolve its label in a single read transaction,
-            // enforcing the label predicate the seek replaced.
-            let matched = graph
-                .view(|txn| {
-                    let Some(record) = txn.get_node(nid)? else {
-                        return Ok(false);
-                    };
-                    match label {
-                        Some(lbl) => {
-                            // A node matches the predicate if any of its labels is `lbl`.
-                            let mut found = false;
-                            for lid in &record.labels {
-                                if txn.label_name(*lid)?.as_deref() == Some(lbl.as_str()) {
-                                    found = true;
-                                    break;
+            // enforcing the label predicate the seek replaced. The overlay answers
+            // first for a node this transaction created, relabeled, or deleted.
+            let matched = match overlay_node_has_label(nid, label.as_deref()) {
+                Some(v) => v,
+                None => graph
+                    .view(|txn| {
+                        let Some(record) = txn.get_node(nid)? else {
+                            return Ok(false);
+                        };
+                        match label {
+                            Some(lbl) => {
+                                // A node matches the predicate if any of its labels is `lbl`.
+                                let mut found = false;
+                                for lid in &record.labels {
+                                    if txn.label_name(*lid)?.as_deref() == Some(lbl.as_str()) {
+                                        found = true;
+                                        break;
+                                    }
                                 }
+                                Ok(found)
                             }
-                            Ok(found)
+                            None => Ok(true),
                         }
-                        None => Ok(true),
-                    }
-                })
-                .map_err(|e| e.to_string())?;
+                    })
+                    .map_err(|e| e.to_string())?,
+            };
             if matched {
                 let mut path = SlotRow::empty(schema.clone());
                 path.bind_local(variable, GraphBinding::Node(nid));

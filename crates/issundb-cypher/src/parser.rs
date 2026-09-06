@@ -2001,6 +2001,8 @@ fn create_statement<'a>() -> impl Parser<'a, ParserInput<'a>, Statement, ParserE
             })
         });
 
+    let auto_index_ddl = auto_index_statement("CREATE", true);
+
     let constraint_ddl = keyword("CREATE")
         .ignore_then(keyword("CONSTRAINT"))
         .ignore_then(keyword("ON"))
@@ -2041,11 +2043,36 @@ fn create_statement<'a>() -> impl Parser<'a, ParserInput<'a>, Statement, ParserE
         )
         .map(|patterns| Statement::Create(CreateStatement { patterns }));
 
-    choice((index_ddl, constraint_ddl, normal_create))
+    choice((auto_index_ddl, index_ddl, constraint_ddl, normal_create))
+}
+
+/// `CREATE AUTO INDEX FOR (n:Label)` and `DROP AUTO INDEX FOR (n:Label)`: the
+/// per-label switch on the property auto-index. Only a node target makes sense,
+/// since relationships have no auto-index; a relationship target is rejected
+/// at execution with a message naming that.
+fn auto_index_statement<'a>(
+    verb: &'static str,
+    enabled: bool,
+) -> impl Parser<'a, ParserInput<'a>, Statement, ParserError<'a>> + Clone {
+    keyword(verb)
+        .ignore_then(keyword("AUTO"))
+        .ignore_then(keyword("INDEX"))
+        .ignore_then(keyword("FOR"))
+        .ignore_then(schema_target())
+        .map(move |(label, target)| {
+            let label = match target {
+                SchemaTarget::Node => label,
+                // Carried through so the executor can name the mistake.
+                SchemaTarget::Relationship => format!("()-[:{label}]-()"),
+            };
+            Statement::SetAutoIndex(AutoIndexStatement { label, enabled })
+        })
 }
 
 /// Parses a `DROP INDEX` or `DROP CONSTRAINT` statement
 fn drop_statement<'a>() -> impl Parser<'a, ParserInput<'a>, Statement, ParserError<'a>> + Clone {
+    let auto_index_ddl = auto_index_statement("DROP", false);
+
     let index_ddl = keyword("DROP")
         .ignore_then(keyword("INDEX"))
         .ignore_then(keyword("FOR"))
@@ -2095,7 +2122,7 @@ fn drop_statement<'a>() -> impl Parser<'a, ParserInput<'a>, Statement, ParserErr
             })
         });
 
-    choice((index_ddl, constraint_ddl))
+    choice((auto_index_ddl, index_ddl, constraint_ddl))
 }
 
 /// Parses a `COPY <LabelName> FROM '<filepath>' [WITH <options_map>]` statement

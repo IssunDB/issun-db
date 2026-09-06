@@ -420,6 +420,16 @@ impl PyGraph {
             .map_err(rt)
     }
 
+    /// Turn the property auto-index on or off for one node label. Every scalar
+    /// property of every node is indexed by default; turning it off for a label
+    /// removes its entries and makes lookups on that label scan instead. The
+    /// same switch is `CREATE AUTO INDEX FOR (n:Label)` and `DROP AUTO INDEX
+    /// FOR (n:Label)` in Cypher.
+    fn set_label_auto_index(&self, py: Python<'_>, label: &str, enabled: bool) -> PyResult<()> {
+        py.detach(|| self.graph.set_label_auto_index(label, enabled))
+            .map_err(rt)
+    }
+
     /// List all active full-text indexes as a JSON array of
     /// `{"label", "property", "language"}`.
     fn list_text_indexes(&self, py: Python<'_>) -> PyResult<String> {

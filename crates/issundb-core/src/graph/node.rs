@@ -133,8 +133,10 @@ impl Graph {
         }
 
         // Auto-index: write every scalar property to node_prop_idx so the Cypher
-        // optimizer can use NodeIndexScan without a prior CREATE INDEX.
-        if let Some(obj) = props_json.as_object() {
+        // optimizer can use NodeIndexScan without a prior CREATE INDEX, unless the
+        // label opted out (`Graph::set_label_auto_index`).
+        let auto_index = !self.label_auto_index_disabled_impl(wtxn, label_id)?;
+        if let Some(obj) = props_json.as_object().filter(|_| auto_index) {
             for (prop_name, val) in obj {
                 if val.is_null() {
                     continue;
@@ -235,8 +237,9 @@ impl Graph {
             }
         }
 
-        // Auto-index cleanup.
-        if let Some(obj) = props_json.as_object() {
+        // Auto-index cleanup; an opted-out label has no entries to remove.
+        let auto_index = !self.label_auto_index_disabled_impl(wtxn, label_id)?;
+        if let Some(obj) = props_json.as_object().filter(|_| auto_index) {
             for (prop_name, val) in obj {
                 if val.is_null() {
                     continue;

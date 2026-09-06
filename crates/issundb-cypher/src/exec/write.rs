@@ -1,9 +1,7 @@
 use super::expr::evaluate_expr;
 use super::read::{
-    binding_to_value, column_name, execute_physical, execute_physical_pathmaps, execute_read_query,
-    projected_key,
+    binding_to_value, column_name, execute_physical_pathmaps, execute_read_query, projected_key,
 };
-use super::row::{Bindings, SlotSchema};
 use super::*;
 use crate::ast::{
     CreateAndReturnStatement, DeleteAndReturnStatement, ForeachStatement, MergeAndReturnStatement,
@@ -93,75 +91,90 @@ pub(super) fn execute_create_and_return(
     params: &HashMap<String, serde_json::Value>,
 ) -> Result<QueryResult, String> {
     graph
-        .update(|txn| {
-            let _pending = expr::PendingWrites::install();
-            // Thread bindings across patterns within the same CREATE clause.
-            let mut bindings = PathMap::new();
-            for pattern in &stmt.patterns {
-                let created = execute_create_internal_with_context(txn, pattern, &bindings, params)
-                    .map_err(as_txn_error)?;
-                bindings.extend(created);
-                if let Some(pv) = &pattern.path_variable {
-                    if let Some(GraphBinding::Scalar(ids)) = bindings.get(&path_ids_var(pv)) {
-                        let path_value = super::read::written_path_value(txn.graph(), ids)
-                            .map_err(as_txn_error)?;
-                        bindings.insert(pv.clone(), GraphBinding::Scalar(path_value));
-                    }
-                }
-            }
-
-            // Project the RETURN clause over the created bindings, still
-            // inside this transaction: a failure here (e.g. a division by
-            // zero) rolls back the CREATE above rather than leaving it
-            // committed with no visible result.
-            let columns: Vec<String> = stmt.return_clause.items.iter().map(column_name).collect();
-
-            let mut values = Vec::new();
-            for item in &stmt.return_clause.items {
-                let key = projected_key(&item.expr, &item.alias);
-                let val = evaluate_expr(txn.graph(), &bindings, &item.expr, params)
-                    .map_err(as_txn_error)?;
-                let val = super::read::unpack_sentinels(txn.graph(), val);
-                let val = if val == serde_json::Value::Null {
-                    if let Some(binding) = bindings.get(&key) {
-                        binding_to_value(txn.graph(), Some(binding))
-                            .unwrap_or(serde_json::Value::Null)
-                    } else {
-                        val
-                    }
-                } else {
-                    val
-                };
-                values.push(val);
-            }
-
-            let records = if values.is_empty() {
-                vec![]
-            } else {
-                vec![Record { values }]
-            };
-
-            let mut result_records = records;
-            if let Some(skip_expr) = &stmt.skip {
-                let skip_val = evaluate_expr(txn.graph(), &PathMap::new(), skip_expr, params)
-                    .map_err(as_txn_error)?;
-                let skip = skip_val.as_i64().unwrap_or(0).max(0) as usize;
-                result_records = result_records.into_iter().skip(skip).collect();
-            }
-            if let Some(limit_expr) = &stmt.limit {
-                let limit_val = evaluate_expr(txn.graph(), &PathMap::new(), limit_expr, params)
-                    .map_err(as_txn_error)?;
-                let limit = limit_val.as_i64().unwrap_or(0).max(0) as usize;
-                result_records = result_records.into_iter().take(limit).collect();
-            }
-
-            Ok(QueryResult {
-                statement_count: 1,
-                columns,
-                records: result_records,
-            })
-        })
+        .update(|txn| execute_create_and_return_body(txn, stmt, params))
         .map_err(unwrap_txn_error)
+}
+
+/// [`execute_create_and_return`] inside a transaction the caller already holds, for the atomic
+/// pipeline; the caller also owns the pending-writes overlay.
+pub(super) fn execute_create_and_return_in(
+    txn: &mut issundb_core::WriteTxn,
+    stmt: &CreateAndReturnStatement,
+    params: &HashMap<String, serde_json::Value>,
+) -> Result<QueryResult, String> {
+    execute_create_and_return_body(txn, stmt, params).map_err(unwrap_txn_error)
+}
+
+fn execute_create_and_return_body(
+    txn: &mut issundb_core::WriteTxn,
+    stmt: &CreateAndReturnStatement,
+    params: &HashMap<String, serde_json::Value>,
+) -> Result<QueryResult, issundb_core::Error> {
+    let _pending = expr::PendingWrites::install();
+    // Thread bindings across patterns within the same CREATE clause.
+    let mut bindings = PathMap::new();
+    for pattern in &stmt.patterns {
+        let created = execute_create_internal_with_context(txn, pattern, &bindings, params)
+            .map_err(as_txn_error)?;
+        bindings.extend(created);
+        if let Some(pv) = &pattern.path_variable {
+            if let Some(GraphBinding::Scalar(ids)) = bindings.get(&path_ids_var(pv)) {
+                let path_value =
+                    super::read::written_path_value(txn.graph(), ids).map_err(as_txn_error)?;
+                bindings.insert(pv.clone(), GraphBinding::Scalar(path_value));
+            }
+        }
+    }
+
+    // Project the RETURN clause over the created bindings, still
+    // inside this transaction: a failure here (e.g. a division by
+    // zero) rolls back the CREATE above rather than leaving it
+    // committed with no visible result.
+    let columns: Vec<String> = stmt.return_clause.items.iter().map(column_name).collect();
+
+    let mut values = Vec::new();
+    for item in &stmt.return_clause.items {
+        let key = projected_key(&item.expr, &item.alias);
+        let val =
+            evaluate_expr(txn.graph(), &bindings, &item.expr, params).map_err(as_txn_error)?;
+        let val = super::read::unpack_sentinels(txn.graph(), val);
+        let val = if val == serde_json::Value::Null {
+            if let Some(binding) = bindings.get(&key) {
+                binding_to_value(txn.graph(), Some(binding)).unwrap_or(serde_json::Value::Null)
+            } else {
+                val
+            }
+        } else {
+            val
+        };
+        values.push(val);
+    }
+
+    let records = if values.is_empty() {
+        vec![]
+    } else {
+        vec![Record { values }]
+    };
+
+    let mut result_records = records;
+    if let Some(skip_expr) = &stmt.skip {
+        let skip_val =
+            evaluate_expr(txn.graph(), &PathMap::new(), skip_expr, params).map_err(as_txn_error)?;
+        let skip = skip_val.as_i64().unwrap_or(0).max(0) as usize;
+        result_records = result_records.into_iter().skip(skip).collect();
+    }
+    if let Some(limit_expr) = &stmt.limit {
+        let limit_val = evaluate_expr(txn.graph(), &PathMap::new(), limit_expr, params)
+            .map_err(as_txn_error)?;
+        let limit = limit_val.as_i64().unwrap_or(0).max(0) as usize;
+        result_records = result_records.into_iter().take(limit).collect();
+    }
+
+    Ok(QueryResult {
+        statement_count: 1,
+        columns,
+        records: result_records,
+    })
 }
 
 pub(super) fn execute_set_and_return(
@@ -169,6 +182,26 @@ pub(super) fn execute_set_and_return(
     stmt: &SetAndReturnStatement,
     params: &HashMap<String, serde_json::Value>,
 ) -> Result<QueryResult, String> {
+    graph
+        .update(|txn| execute_set_and_return_body(txn, stmt, params))
+        .map_err(unwrap_txn_error)
+}
+
+/// [`execute_set_and_return`] inside a transaction the caller already holds, for the atomic
+/// pipeline; the caller also owns the pending-writes overlay.
+pub(super) fn execute_set_and_return_in(
+    txn: &mut issundb_core::WriteTxn,
+    stmt: &SetAndReturnStatement,
+    params: &HashMap<String, serde_json::Value>,
+) -> Result<QueryResult, String> {
+    execute_set_and_return_body(txn, stmt, params).map_err(unwrap_txn_error)
+}
+
+fn execute_set_and_return_body(
+    txn: &mut issundb_core::WriteTxn,
+    stmt: &SetAndReturnStatement,
+    params: &HashMap<String, serde_json::Value>,
+) -> Result<QueryResult, issundb_core::Error> {
     // Route through the read-query pipeline with the SET as a write part. The SET runs
     // per matched row, then the RETURN projection (including aggregation, ORDER BY, SKIP,
     // and LIMIT) operates on those same post-mutation rows. The rows are not re-matched,
@@ -192,11 +225,8 @@ pub(super) fn execute_set_and_return(
         skip: stmt.skip.clone(),
         limit: stmt.limit.clone(),
     };
-    graph
-        .update(|txn| {
-            execute_read_query(graph, &synthetic_query, params, Some(txn)).map_err(as_txn_error)
-        })
-        .map_err(unwrap_txn_error)
+    let graph = txn.graph();
+    execute_read_query(graph, &synthetic_query, params, Some(txn)).map_err(as_txn_error)
 }
 
 pub(super) fn execute_set(
@@ -499,54 +529,54 @@ pub(super) fn execute_delete_and_return(
     // deletion marks in the pending-writes overlay instead of serving the
     // committed value.
     graph
-        .update(|txn| {
-            let _pending = expr::PendingWrites::install();
-            let binding_query = Query {
-                match_clauses: stmt.match_clauses.clone(),
-                where_clause: stmt.where_clause.clone(),
-                return_clause: ReturnClause {
-                    items: vec![],
-                    distinct: false,
-                },
-                parts: Vec::new(),
-                // DELETE affects every matched element; ORDER BY, SKIP, and LIMIT
-                // restrict only the RETURN projection (computed above in
-                // `return_query`), not the set of rows fed to the delete.
-                order_by: None,
-                skip: None,
-                limit: None,
-            };
-            let logical =
-                LogicalPlanner::plan(&binding_query).map_err(|e| as_txn_error(e.to_string()))?;
-            let physical = PhysicalPlanner::plan(&logical);
-            let optimized = Optimizer::optimize(physical, Some(graph));
-            let binding_plan = match &optimized {
-                PhysicalOperator::Project { input, items, .. } if items.is_empty() => {
-                    input.as_ref().clone()
-                }
-                other => other.clone(),
-            };
-
-            let schema = std::sync::Arc::new(SlotSchema::from_plan(&binding_plan));
-            let bound_rows = execute_physical(graph, &binding_plan, params, &schema, None)
-                .map_err(as_txn_error)?;
-
-            let bound_paths: Vec<PathMap> = bound_rows.iter().map(|r| r.to_path_map()).collect();
-            delete_over_paths_in(txn, &bound_paths, &stmt.targets, stmt.detach, params)
-                .map_err(as_txn_error)?;
-
-            let return_query = Query {
-                match_clauses: stmt.match_clauses.clone(),
-                where_clause: stmt.where_clause.clone(),
-                return_clause: stmt.return_clause.clone(),
-                parts: Vec::new(),
-                order_by: stmt.order_by.clone(),
-                skip: stmt.skip.clone(),
-                limit: stmt.limit.clone(),
-            };
-            execute_read_query(graph, &return_query, params, None).map_err(as_txn_error)
-        })
+        .update(|txn| execute_delete_and_return_body(txn, stmt, params))
         .map_err(unwrap_txn_error)
+}
+
+/// [`execute_delete_and_return`] inside a transaction the caller already holds, for the atomic
+/// pipeline; the caller also owns the pending-writes overlay.
+pub(super) fn execute_delete_and_return_in(
+    txn: &mut issundb_core::WriteTxn,
+    stmt: &DeleteAndReturnStatement,
+    params: &HashMap<String, serde_json::Value>,
+) -> Result<QueryResult, String> {
+    execute_delete_and_return_body(txn, stmt, params).map_err(unwrap_txn_error)
+}
+
+fn execute_delete_and_return_body(
+    txn: &mut issundb_core::WriteTxn,
+    stmt: &DeleteAndReturnStatement,
+    params: &HashMap<String, serde_json::Value>,
+) -> Result<QueryResult, issundb_core::Error> {
+    // Route through the read-query pipeline with the DELETE as a write part, as
+    // SET and REMOVE do: the rows are matched once, every matched target is
+    // deleted in one batch (edges before nodes, so an undirected expansion that
+    // binds one edge twice still succeeds), and the RETURN projection runs over
+    // those same rows. A property, label, or key read of a deleted entity raises
+    // through the deletion marks in the pending-writes overlay; `type()` of a
+    // deleted relationship stays legal. ORDER BY, SKIP, and LIMIT restrict only
+    // the projection: the write part drains its whole input before applying the
+    // delete, so a LIMIT above it cannot leave a matched element undeleted.
+    let graph = txn.graph();
+    let synthetic_query = Query {
+        match_clauses: Vec::new(),
+        where_clause: None,
+        return_clause: stmt.return_clause.clone(),
+        parts: vec![
+            QueryPart::Match {
+                match_clauses: stmt.match_clauses.clone(),
+                where_clause: stmt.where_clause.clone(),
+            },
+            QueryPart::Delete {
+                targets: stmt.targets.clone(),
+                detach: stmt.detach,
+            },
+        ],
+        order_by: stmt.order_by.clone(),
+        skip: stmt.skip.clone(),
+        limit: stmt.limit.clone(),
+    };
+    execute_read_query(graph, &synthetic_query, params, Some(txn)).map_err(as_txn_error)
 }
 
 #[instrument(skip_all)]
@@ -582,6 +612,26 @@ pub(super) fn execute_merge_and_return(
     stmt: &MergeAndReturnStatement,
     params: &HashMap<String, serde_json::Value>,
 ) -> Result<QueryResult, String> {
+    graph
+        .update(|txn| execute_merge_and_return_body(txn, stmt, params))
+        .map_err(unwrap_txn_error)
+}
+
+/// [`execute_merge_and_return`] inside a transaction the caller already holds, for the atomic
+/// pipeline; the caller also owns the pending-writes overlay.
+pub(super) fn execute_merge_and_return_in(
+    txn: &mut issundb_core::WriteTxn,
+    stmt: &MergeAndReturnStatement,
+    params: &HashMap<String, serde_json::Value>,
+) -> Result<QueryResult, String> {
+    execute_merge_and_return_body(txn, stmt, params).map_err(unwrap_txn_error)
+}
+
+fn execute_merge_and_return_body(
+    txn: &mut issundb_core::WriteTxn,
+    stmt: &MergeAndReturnStatement,
+    params: &HashMap<String, serde_json::Value>,
+) -> Result<QueryResult, issundb_core::Error> {
     // Route through the read-query pipeline with the MERGE clauses as a write
     // part. Each MERGE binds its pattern variables into the row, then the RETURN
     // projection (including aggregation, ORDER BY, SKIP, and LIMIT) operates on
@@ -598,11 +648,8 @@ pub(super) fn execute_merge_and_return(
         skip: stmt.skip.clone(),
         limit: stmt.limit.clone(),
     };
-    graph
-        .update(|txn| {
-            execute_read_query(graph, &synthetic_query, params, Some(txn)).map_err(as_txn_error)
-        })
-        .map_err(unwrap_txn_error)
+    let graph = txn.graph();
+    execute_read_query(graph, &synthetic_query, params, Some(txn)).map_err(as_txn_error)
 }
 
 /// Apply a single REMOVE item to the element bound in `path`.
@@ -719,6 +766,26 @@ pub(super) fn execute_remove_and_return(
     stmt: &RemoveAndReturnStatement,
     params: &HashMap<String, serde_json::Value>,
 ) -> Result<QueryResult, String> {
+    graph
+        .update(|txn| execute_remove_and_return_body(txn, stmt, params))
+        .map_err(unwrap_txn_error)
+}
+
+/// [`execute_remove_and_return`] inside a transaction the caller already holds, for the atomic
+/// pipeline; the caller also owns the pending-writes overlay.
+pub(super) fn execute_remove_and_return_in(
+    txn: &mut issundb_core::WriteTxn,
+    stmt: &RemoveAndReturnStatement,
+    params: &HashMap<String, serde_json::Value>,
+) -> Result<QueryResult, String> {
+    execute_remove_and_return_body(txn, stmt, params).map_err(unwrap_txn_error)
+}
+
+fn execute_remove_and_return_body(
+    txn: &mut issundb_core::WriteTxn,
+    stmt: &RemoveAndReturnStatement,
+    params: &HashMap<String, serde_json::Value>,
+) -> Result<QueryResult, issundb_core::Error> {
     // Route through the read-query pipeline with the REMOVE as a write part, so the
     // RETURN observes the post-removal state while the matched rows (and therefore the
     // result cardinality) are fixed at MATCH time. Re-matching would wrongly drop rows
@@ -740,11 +807,8 @@ pub(super) fn execute_remove_and_return(
         skip: stmt.skip.clone(),
         limit: stmt.limit.clone(),
     };
-    graph
-        .update(|txn| {
-            execute_read_query(graph, &synthetic_query, params, Some(txn)).map_err(as_txn_error)
-        })
-        .map_err(unwrap_txn_error)
+    let graph = txn.graph();
+    execute_read_query(graph, &synthetic_query, params, Some(txn)).map_err(as_txn_error)
 }
 
 pub(super) fn execute_foreach(
@@ -756,42 +820,58 @@ pub(super) fn execute_foreach(
     // transaction, so a failure partway through rolls back every mutation
     // FOREACH already made in earlier iterations.
     graph
-        .update(|txn| {
-            let _pending = expr::PendingWrites::install();
-            let list_val = evaluate_expr(txn.graph(), &PathMap::new(), &stmt.list, params)
-                .map_err(as_txn_error)?;
-            let items = match list_val {
-                serde_json::Value::Array(arr) => arr,
-                serde_json::Value::Null => vec![],
-                other => vec![other],
-            };
-
-            // The body statements reference the loop variable as a plain variable,
-            // but the body executors evaluate expressions against fresh rows that do
-            // not bind it. Rewrite the body once, replacing every loop-variable
-            // reference with a parameter access, and carry the element value in the
-            // per-iteration parameter map under the same name.
-            let body: Vec<crate::ast::Statement> = stmt
-                .body
-                .iter()
-                .map(|s| subst_loop_var_stmt(s, &stmt.variable))
-                .collect();
-
-            for element in items {
-                let mut inner_params = params.clone();
-                inner_params.insert(stmt.variable.clone(), element);
-                for body_stmt in &body {
-                    execute_foreach_body(txn, body_stmt, &inner_params).map_err(as_txn_error)?;
-                }
-            }
-
-            Ok(QueryResult {
-                statement_count: 1,
-                columns: vec![],
-                records: vec![],
-            })
-        })
+        .update(|txn| execute_foreach_txn(txn, stmt, params))
         .map_err(unwrap_txn_error)
+}
+
+/// [`execute_foreach`] inside a transaction the caller already holds, for the atomic
+/// pipeline; the caller also owns the pending-writes overlay.
+pub(super) fn execute_foreach_in(
+    txn: &mut issundb_core::WriteTxn,
+    stmt: &ForeachStatement,
+    params: &HashMap<String, serde_json::Value>,
+) -> Result<QueryResult, String> {
+    execute_foreach_txn(txn, stmt, params).map_err(unwrap_txn_error)
+}
+
+fn execute_foreach_txn(
+    txn: &mut issundb_core::WriteTxn,
+    stmt: &ForeachStatement,
+    params: &HashMap<String, serde_json::Value>,
+) -> Result<QueryResult, issundb_core::Error> {
+    let _pending = expr::PendingWrites::install();
+    let list_val =
+        evaluate_expr(txn.graph(), &PathMap::new(), &stmt.list, params).map_err(as_txn_error)?;
+    let items = match list_val {
+        serde_json::Value::Array(arr) => arr,
+        serde_json::Value::Null => vec![],
+        other => vec![other],
+    };
+
+    // The body statements reference the loop variable as a plain variable,
+    // but the body executors evaluate expressions against fresh rows that do
+    // not bind it. Rewrite the body once, replacing every loop-variable
+    // reference with a parameter access, and carry the element value in the
+    // per-iteration parameter map under the same name.
+    let body: Vec<crate::ast::Statement> = stmt
+        .body
+        .iter()
+        .map(|s| subst_loop_var_stmt(s, &stmt.variable))
+        .collect();
+
+    for element in items {
+        let mut inner_params = params.clone();
+        inner_params.insert(stmt.variable.clone(), element);
+        for body_stmt in &body {
+            execute_foreach_body(txn, body_stmt, &inner_params).map_err(as_txn_error)?;
+        }
+    }
+
+    Ok(QueryResult {
+        statement_count: 1,
+        columns: vec![],
+        records: vec![],
+    })
 }
 
 /// Replace every reference to the FOREACH loop variable in `expr` with a
