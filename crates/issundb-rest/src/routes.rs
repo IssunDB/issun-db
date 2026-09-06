@@ -305,8 +305,10 @@ pub struct QueryResponse {
     /// known.
     pub records: Vec<Vec<Value>>,
     /// Number of semicolon-separated top-level statements the query contained.
-    /// Always 1 except for a multi-statement query, where every statement runs but
-    /// `columns`/`records` reflect only the last one.
+    /// Always 1 except for a multi-statement query, where every statement runs
+    /// (a pipeline of data statements as one transaction, so it is how several
+    /// writes are grouped atomically) but `columns`/`records` reflect only the
+    /// last one.
     pub statement_count: usize,
 }
 

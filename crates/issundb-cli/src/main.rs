@@ -2264,12 +2264,13 @@ fn format_query_result(qr: &issundb::QueryResult, color: bool) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
 
-    // Every statement in a semicolon-separated pipeline runs, but only the
-    // last one's columns/records are returned; make that explicit rather than
-    // letting the earlier statements' outcomes silently vanish.
+    // Every statement in a semicolon-separated pipeline runs (as one transaction
+    // when all of them are data statements), but only the last one's
+    // columns/records are returned; make that explicit rather than letting the
+    // earlier statements' outcomes silently vanish.
     let pipeline_note = if qr.statement_count > 1 {
         Some(format!(
-            "(query contained {} statements; all ran, but only the last one's result is shown)",
+            "(query contained {} statements; all ran, and only the last one's result is shown)",
             qr.statement_count
         ))
     } else {
