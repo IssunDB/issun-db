@@ -1232,6 +1232,9 @@ fn execute_foreach_body(
         Statement::Remove(r) => {
             execute_remove_in(txn, r, params)?;
         }
+        Statement::Foreach(inner) => {
+            execute_foreach_txn(txn, inner, params).map_err(|e| e.to_string())?;
+        }
         // Write-only pipeline query (e.g., standalone CREATE parsed as Statement::Query).
         Statement::Query(q) if q.return_clause.items.is_empty() => {
             super::read::execute_read_query(txn.graph(), q, params, Some(txn))

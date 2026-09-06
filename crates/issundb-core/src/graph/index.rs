@@ -2356,10 +2356,11 @@ mod tests {
         let e2 = g.add_edge(b, a, "ROAD", &json!({"code": "r1"})).unwrap();
         assert!(g.get_edge(e1).unwrap().is_some());
         assert!(g.get_edge(e2).unwrap().is_some());
-        assert!(g
-            .edges_by_property("ROAD", "code", PropValue::Str("r1".into()))
-            .unwrap()
-            .is_empty());
+        assert!(
+            g.edges_by_property("ROAD", "code", PropValue::Str("r1".into()))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// The listings report every declared index and constraint with its flag
@@ -2454,12 +2455,14 @@ mod tests {
             range(None, true, Some(PropValue::Str("apple".into())), false),
             Vec::<NodeId>::new()
         );
+        assert_eq!(range(Some(PropValue::Int(6)), true, None, true), vec![n2]);
         assert_eq!(
-            range(Some(PropValue::Int(6)), true, None, true),
-            vec![n2]
-        );
-        assert_eq!(
-            range(Some(PropValue::Float(4.0)), true, Some(PropValue::Int(5)), true),
+            range(
+                Some(PropValue::Float(4.0)),
+                true,
+                Some(PropValue::Int(5)),
+                true
+            ),
             vec![n1]
         );
         assert_eq!(
@@ -2471,7 +2474,12 @@ mod tests {
             vec![bf]
         );
         assert_eq!(
-            range(Some(PropValue::Int(0)), true, Some(PropValue::Str("z".into())), true),
+            range(
+                Some(PropValue::Int(0)),
+                true,
+                Some(PropValue::Str("z".into())),
+                true
+            ),
             Vec::<NodeId>::new()
         );
         assert_eq!(range(None, true, None, true), vec![s1, s2, n1, n2, bt, bf]);
@@ -2496,16 +2504,16 @@ mod tests {
         let range = |lo: Option<PropValue>, hi: Option<PropValue>| {
             g.edges_by_property_range("R", "code", lo, hi).unwrap()
         };
-        assert_eq!(
-            range(Some(PropValue::Str("b".into())), None),
-            vec![e2, e3]
-        );
+        assert_eq!(range(Some(PropValue::Str("b".into())), None), vec![e2, e3]);
         assert_eq!(
             range(None, Some(PropValue::Str("beta".into()))),
             vec![e1, e2]
         );
         assert_eq!(
-            range(Some(PropValue::Str("alpha".into())), Some(PropValue::Str("alpha".into()))),
+            range(
+                Some(PropValue::Str("alpha".into())),
+                Some(PropValue::Str("alpha".into()))
+            ),
             vec![e1]
         );
         assert_eq!(

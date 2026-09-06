@@ -2437,21 +2437,26 @@ fn statement_union_parser(
                 })
             });
 
-        let foreach_stmt = keyword("FOREACH")
-            .ignore_then(sym(Tok::LParen))
-            .ignore_then(identifier())
-            .then_ignore(keyword("IN"))
-            .then(expr_parser())
-            .then_ignore(sym(Tok::Pipe))
-            .then(statement.clone())
-            .then_ignore(sym(Tok::RParen))
-            .map(|((variable, list), body_stmt)| {
-                Statement::Foreach(ForeachStatement {
-                    variable,
-                    list,
-                    body: vec![body_stmt],
+        // The body is its own alternative before the general statement, because
+        // a statement ends at a statement boundary and the `)` closing an outer
+        // FOREACH is not one; without it a FOREACH nests exactly one level.
+        let foreach_stmt = recursive(|foreach| {
+            keyword("FOREACH")
+                .ignore_then(sym(Tok::LParen))
+                .ignore_then(identifier())
+                .then_ignore(keyword("IN"))
+                .then(expr_parser())
+                .then_ignore(sym(Tok::Pipe))
+                .then(choice((foreach, statement.clone())))
+                .then_ignore(sym(Tok::RParen))
+                .map(|((variable, list), body_stmt)| {
+                    Statement::Foreach(ForeachStatement {
+                        variable,
+                        list,
+                        body: vec![body_stmt],
+                    })
                 })
-            });
+        });
 
         let set_stmt = match_clause()
             .repeated()
@@ -3422,35 +3427,51 @@ fn collect_non_agg_props_in_expr(expr: &Expr, props: &mut Vec<(String, String)>)
                 collect_non_agg_props_in_expr(e, props);
             }
         }
+        // The element variable of a list comprehension, a reduce, or a
+        // quantifier is bound by the expression itself, so a reference to it
+        // inside the body is not a grouping property read.
         Expr::ListComprehension {
+            variable,
             list,
             predicate,
             transform,
-            ..
         } => {
             collect_non_agg_props_in_expr(list, props);
+            let mut inner = Vec::new();
             if let Some(p) = predicate {
-                collect_non_agg_props_in_expr(p, props);
+                collect_non_agg_props_in_expr(p, &mut inner);
             }
             if let Some(t) = transform {
-                collect_non_agg_props_in_expr(t, props);
+                collect_non_agg_props_in_expr(t, &mut inner);
             }
+            inner.retain(|(v, _)| v != variable);
+            props.extend(inner);
         }
         Expr::Reduce {
+            accumulator,
             initial,
+            variable,
             list,
             expression,
-            ..
         } => {
             collect_non_agg_props_in_expr(initial, props);
             collect_non_agg_props_in_expr(list, props);
-            collect_non_agg_props_in_expr(expression, props);
+            let mut inner = Vec::new();
+            collect_non_agg_props_in_expr(expression, &mut inner);
+            inner.retain(|(v, _)| v != variable && v != accumulator);
+            props.extend(inner);
         }
         Expr::Quantifier {
-            list, predicate, ..
+            variable,
+            list,
+            predicate,
+            ..
         } => {
             collect_non_agg_props_in_expr(list, props);
-            collect_non_agg_props_in_expr(predicate, props);
+            let mut inner = Vec::new();
+            collect_non_agg_props_in_expr(predicate, &mut inner);
+            inner.retain(|(v, _)| v != variable);
+            props.extend(inner);
         }
         // A pattern predicate is legal only inside a WHERE clause, so it never
         // reaches a projection this collector inspects; it contributes no

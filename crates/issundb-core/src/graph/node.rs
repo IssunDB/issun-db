@@ -566,6 +566,14 @@ impl Graph {
     }
 }
 
+/// The structural record of one added node, for `commit_and_publish`.
+fn added_node_change(id: NodeId) -> crate::csr::CsrChange {
+    crate::csr::CsrChange {
+        added_nodes: vec![id],
+        ..crate::csr::CsrChange::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -826,13 +834,5 @@ mod tests {
                 .is_err(),
             "duplicate value for a uniquely constrained property must be rejected"
         );
-    }
-}
-
-/// The structural record of one added node, for `commit_and_publish`.
-fn added_node_change(id: NodeId) -> crate::csr::CsrChange {
-    crate::csr::CsrChange {
-        added_nodes: vec![id],
-        ..crate::csr::CsrChange::default()
     }
 }
