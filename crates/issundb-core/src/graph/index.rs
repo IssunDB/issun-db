@@ -1072,6 +1072,14 @@ impl Graph {
                 continue;
             };
             let props: serde_json::Value = props::decode(&record.props)?;
+            // No bound at all asks for every node holding the property, as the
+            // index path answers it, whatever the value's kind.
+            if fam.is_none() {
+                if props.get(property).is_some_and(|v| !v.is_null()) {
+                    result.push(id);
+                }
+                continue;
+            }
             let value = match (fam, props.get(property)) {
                 (Some(Family::Bool), Some(serde_json::Value::Bool(b))) => {
                     if *b {
@@ -2289,6 +2297,226 @@ mod tests {
             .create_edge_unique_constraint("ROAD", "toll_id")
             .unwrap_err();
         assert!(matches!(err, Error::UniqueConstraintViolation(..)));
+    }
+
+    /// Dropping a required constraint must stop enforcing it while leaving the
+    /// stored data and property lookups intact, on nodes and on edges alike.
+    #[test]
+    fn drop_required_constraint_stops_enforcement_and_keeps_lookups() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("User", &json!({"email": "a@b.c"})).unwrap();
+        g.create_node_required_constraint("User", "email").unwrap();
+        assert!(matches!(
+            g.add_node("User", &json!({})).unwrap_err(),
+            Error::RequiredConstraintViolation(..)
+        ));
+
+        g.drop_node_required_constraint("User", "email").unwrap();
+        let b = g.add_node("User", &json!({})).unwrap();
+        assert!(g.get_node(b).unwrap().is_some());
+        assert_eq!(
+            g.nodes_by_property("User", "email", PropValue::Str("a@b.c".into()))
+                .unwrap(),
+            vec![a]
+        );
+
+        g.create_edge_required_constraint("ROAD", "cost").unwrap();
+        assert!(matches!(
+            g.add_edge(a, b, "ROAD", &json!({})).unwrap_err(),
+            Error::RequiredConstraintViolation(..)
+        ));
+        g.drop_edge_required_constraint("ROAD", "cost").unwrap();
+        let e = g.add_edge(a, b, "ROAD", &json!({})).unwrap();
+        assert!(g.get_edge(e).unwrap().is_some());
+    }
+
+    /// Dropping an edge unique constraint must stop rejecting duplicates. Edges
+    /// have no auto-index, so the property lookup answers only while a declared
+    /// index or constraint exists; after the drop it is empty and the edges are
+    /// still there.
+    #[test]
+    fn drop_edge_unique_constraint_allows_duplicates_and_drops_index_entries() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("N", &()).unwrap();
+        let b = g.add_node("N", &()).unwrap();
+        let e1 = g.add_edge(a, b, "ROAD", &json!({"code": "r1"})).unwrap();
+        g.create_edge_unique_constraint("ROAD", "code").unwrap();
+        assert!(matches!(
+            g.add_edge(b, a, "ROAD", &json!({"code": "r1"}))
+                .unwrap_err(),
+            Error::UniqueConstraintViolation(..)
+        ));
+        assert_eq!(
+            g.edges_by_property("ROAD", "code", PropValue::Str("r1".into()))
+                .unwrap(),
+            vec![e1]
+        );
+
+        g.drop_edge_unique_constraint("ROAD", "code").unwrap();
+        let e2 = g.add_edge(b, a, "ROAD", &json!({"code": "r1"})).unwrap();
+        assert!(g.get_edge(e1).unwrap().is_some());
+        assert!(g.get_edge(e2).unwrap().is_some());
+        assert!(g
+            .edges_by_property("ROAD", "code", PropValue::Str("r1".into()))
+            .unwrap()
+            .is_empty());
+    }
+
+    /// The listings report every declared index and constraint with its flag
+    /// byte (0 index, 1 unique, 2 required), the node and edge listings never
+    /// mix, and a drop removes the entry.
+    #[test]
+    fn list_indexes_and_constraints_reports_flags_and_tracks_drops() {
+        let (_dir, g) = open_tmp();
+        assert!(g.list_node_indexes_and_constraints().unwrap().is_empty());
+        assert!(g.list_edge_indexes_and_constraints().unwrap().is_empty());
+
+        g.create_node_property_index("User", "name").unwrap();
+        g.create_node_unique_constraint("User", "email").unwrap();
+        g.create_node_required_constraint("Order", "total").unwrap();
+        g.create_edge_property_index("ROAD", "name").unwrap();
+        g.create_edge_unique_constraint("ROAD", "code").unwrap();
+        g.create_edge_required_constraint("RAIL", "cost").unwrap();
+
+        let mut nodes = g.list_node_indexes_and_constraints().unwrap();
+        nodes.sort();
+        assert_eq!(
+            nodes,
+            vec![
+                ("Order".to_string(), "total".to_string(), 0x02),
+                ("User".to_string(), "email".to_string(), 0x01),
+                ("User".to_string(), "name".to_string(), 0x00),
+            ]
+        );
+        let mut edges = g.list_edge_indexes_and_constraints().unwrap();
+        edges.sort();
+        assert_eq!(
+            edges,
+            vec![
+                ("RAIL".to_string(), "cost".to_string(), 0x02),
+                ("ROAD".to_string(), "code".to_string(), 0x01),
+                ("ROAD".to_string(), "name".to_string(), 0x00),
+            ]
+        );
+
+        g.drop_node_unique_constraint("User", "email").unwrap();
+        g.drop_edge_property_index("ROAD", "name").unwrap();
+        let mut nodes = g.list_node_indexes_and_constraints().unwrap();
+        nodes.sort();
+        assert_eq!(
+            nodes,
+            vec![
+                ("Order".to_string(), "total".to_string(), 0x02),
+                ("User".to_string(), "name".to_string(), 0x00),
+            ]
+        );
+        let mut edges = g.list_edge_indexes_and_constraints().unwrap();
+        edges.sort();
+        assert_eq!(
+            edges,
+            vec![
+                ("RAIL".to_string(), "cost".to_string(), 0x02),
+                ("ROAD".to_string(), "code".to_string(), 0x01),
+            ]
+        );
+    }
+
+    /// On a label that opted out of the auto-index a range lookup scans the
+    /// label. The scan keeps the index's typing rules: a string bound compares
+    /// strings, a boolean bound compares booleans, a numeric bound compares
+    /// numbers, and bounds of two families match nothing.
+    #[test]
+    fn opted_out_label_range_scan_respects_value_families() {
+        let (_dir, g) = open_tmp();
+        g.set_label_auto_index("Item", false).unwrap();
+        let s1 = g.add_node("Item", &json!({"v": "apple"})).unwrap();
+        let s2 = g.add_node("Item", &json!({"v": "cherry"})).unwrap();
+        let n1 = g.add_node("Item", &json!({"v": 5})).unwrap();
+        let n2 = g.add_node("Item", &json!({"v": 7.5})).unwrap();
+        let bt = g.add_node("Item", &json!({"v": true})).unwrap();
+        let bf = g.add_node("Item", &json!({"v": false})).unwrap();
+        g.add_node("Item", &json!({})).unwrap();
+
+        let range = |lo: Option<PropValue>, lo_inc: bool, hi: Option<PropValue>, hi_inc: bool| {
+            g.nodes_by_property_range("Item", "v", lo, lo_inc, hi, hi_inc)
+                .unwrap()
+        };
+
+        assert_eq!(
+            range(Some(PropValue::Str("b".into())), true, None, true),
+            vec![s2]
+        );
+        assert_eq!(
+            range(None, true, Some(PropValue::Str("apple".into())), true),
+            vec![s1]
+        );
+        assert_eq!(
+            range(None, true, Some(PropValue::Str("apple".into())), false),
+            Vec::<NodeId>::new()
+        );
+        assert_eq!(
+            range(Some(PropValue::Int(6)), true, None, true),
+            vec![n2]
+        );
+        assert_eq!(
+            range(Some(PropValue::Float(4.0)), true, Some(PropValue::Int(5)), true),
+            vec![n1]
+        );
+        assert_eq!(
+            range(Some(PropValue::Bool(true)), true, None, true),
+            vec![bt]
+        );
+        assert_eq!(
+            range(None, true, Some(PropValue::Bool(false)), true),
+            vec![bf]
+        );
+        assert_eq!(
+            range(Some(PropValue::Int(0)), true, Some(PropValue::Str("z".into())), true),
+            Vec::<NodeId>::new()
+        );
+        assert_eq!(range(None, true, None, true), vec![s1, s2, n1, n2, bt, bf]);
+    }
+
+    /// An edge string range always compares the stored strings, because a
+    /// string too long to index is absent from `edge_prop_idx`. Both bounds are
+    /// inclusive, ids come back ascending, and a non-string opposite bound
+    /// matches nothing.
+    #[test]
+    fn edge_string_range_lookup_scans_stored_values() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("N", &()).unwrap();
+        let b = g.add_node("N", &()).unwrap();
+        let long = "x".repeat(600);
+        let e1 = g.add_edge(a, b, "R", &json!({"code": "alpha"})).unwrap();
+        let e2 = g.add_edge(a, b, "R", &json!({"code": "beta"})).unwrap();
+        let e3 = g.add_edge(a, b, "R", &json!({"code": long})).unwrap();
+        g.add_edge(a, b, "R", &json!({"code": 3})).unwrap();
+        g.add_edge(a, b, "OTHER", &json!({"code": "beta"})).unwrap();
+
+        let range = |lo: Option<PropValue>, hi: Option<PropValue>| {
+            g.edges_by_property_range("R", "code", lo, hi).unwrap()
+        };
+        assert_eq!(
+            range(Some(PropValue::Str("b".into())), None),
+            vec![e2, e3]
+        );
+        assert_eq!(
+            range(None, Some(PropValue::Str("beta".into()))),
+            vec![e1, e2]
+        );
+        assert_eq!(
+            range(Some(PropValue::Str("alpha".into())), Some(PropValue::Str("alpha".into()))),
+            vec![e1]
+        );
+        assert_eq!(
+            range(Some(PropValue::Str("a".into())), Some(PropValue::Int(9))),
+            Vec::<EdgeId>::new()
+        );
+        assert_eq!(
+            g.edges_by_property("R", "code", PropValue::Str(long.clone()))
+                .unwrap(),
+            vec![e3]
+        );
     }
 
     #[test]

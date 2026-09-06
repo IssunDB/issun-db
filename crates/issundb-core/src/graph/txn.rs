@@ -558,6 +558,107 @@ mod tests {
         .unwrap();
     }
 
+    /// The index lookups on a transaction answer from that transaction's view:
+    /// a write transaction finds its own uncommitted nodes and edges through the
+    /// property indexes, a reader opened meanwhile sees only committed state,
+    /// and after the commit a fresh reader sees everything.
+    #[test]
+    fn transaction_scoped_index_lookups_see_their_own_view() {
+        let (_dir, g) = open_tmp();
+        g.create_node_property_index("User", "age").unwrap();
+        g.create_edge_property_index("ROAD", "cost").unwrap();
+        let old = g.add_node("User", &json!({"age": 30})).unwrap();
+
+        let (a, b, e) = g
+            .update(|txn| {
+                assert!(txn.has_node_property_index("User", "age")?);
+                assert!(!txn.has_node_property_index("User", "nope")?);
+                let a = txn.add_node("User", &json!({"age": 41}))?;
+                let b = txn.add_node("User", &json!({"age": 52}))?;
+                let e = txn.add_edge(a, b, "ROAD", &json!({"cost": 7}))?;
+                txn.put_vector_bytes(a, &[1, 2, 3])?;
+
+                assert_eq!(
+                    txn.nodes_by_property("User", "age", PropValue::Int(41))?,
+                    vec![a]
+                );
+                assert_eq!(
+                    txn.nodes_by_property_range(
+                        "User",
+                        "age",
+                        Some(PropValue::Int(40)),
+                        true,
+                        None,
+                        true,
+                    )?,
+                    vec![a, b]
+                );
+                assert_eq!(
+                    txn.edges_by_property("ROAD", "cost", PropValue::Int(7))?,
+                    vec![e]
+                );
+                assert_eq!(
+                    txn.edges_by_property_range("ROAD", "cost", Some(PropValue::Int(1)), None)?,
+                    vec![e]
+                );
+                assert_eq!(txn.get_vector_bytes(a)?, Some(vec![1, 2, 3]));
+                assert_eq!(txn.vector_bytes()?, vec![(a, vec![1, 2, 3])]);
+
+                g.view(|rtxn| {
+                    assert!(rtxn.has_node_property_index("User", "age")?);
+                    assert_eq!(
+                        rtxn.nodes_by_property("User", "age", PropValue::Int(41))?,
+                        Vec::<NodeId>::new()
+                    );
+                    assert_eq!(
+                        rtxn.nodes_by_property_range(
+                            "User",
+                            "age",
+                            None,
+                            true,
+                            Some(PropValue::Int(100)),
+                            true,
+                        )?,
+                        vec![old]
+                    );
+                    assert!(
+                        rtxn.edges_by_property("ROAD", "cost", PropValue::Int(7))?
+                            .is_empty()
+                    );
+                    assert!(
+                        rtxn.edges_by_property_range("ROAD", "cost", None, None)?
+                            .is_empty()
+                    );
+                    assert_eq!(rtxn.get_vector_bytes(a)?, None);
+                    assert!(rtxn.vector_bytes()?.is_empty());
+                    Ok(())
+                })?;
+                Ok((a, b, e))
+            })
+            .unwrap();
+
+        g.view(|rtxn| {
+            assert_eq!(
+                rtxn.nodes_by_property_range(
+                    "User",
+                    "age",
+                    Some(PropValue::Int(31)),
+                    true,
+                    None,
+                    true,
+                )?,
+                vec![a, b]
+            );
+            assert_eq!(
+                rtxn.edges_by_property("ROAD", "cost", PropValue::Int(7))?,
+                vec![e]
+            );
+            assert_eq!(rtxn.get_vector_bytes(a)?, Some(vec![1, 2, 3]));
+            Ok(())
+        })
+        .unwrap();
+    }
+
     #[test]
     fn write_txn_update_edge_sees_own_uncommitted_edge() {
         let (_dir, g) = open_tmp();
