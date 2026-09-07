@@ -259,7 +259,9 @@ Read-path and statistics methods:
 - `plan_generation() -> (u64, u64, u64)`: what a cached query plan is valid for: a per-open identity nonce, the committed write generation, and a
   schema generation that index and constraint DDL and the `materialize_*` builders advance. Those changes alter plans without being data writes, and
   they do not advance the write generation because that would mark the CSR snapshot stale for nothing.
-- `label_filter(nodes, label)`: the subset of `nodes` carrying `label`, one `label_idx` point lookup per candidate.
+- `label_filter(nodes, label)` and `nodes_have_label(nodes, label)`: the subset of `nodes` carrying `label`, and the per-candidate answer. A request
+  of `LABEL_FILTER_BITMAP_MIN` or more candidates reads a per-id bitmap cached per write generation beside the label scan; smaller ones are one
+  `label_idx` point lookup each.
 - `nodes_by_label_arc(label)`: `nodes_by_label` without the copy, served from a per-generation cache that any committed write discards;
   transaction-scoped label reads bypass it, because an open write transaction must see its own uncommitted labels.
 - `nodes_prop_cmp_mask(ids, prop, op, rhs) -> Result<Option<Vec<bool>>, Error>`: the per-id outcome of `prop <op> rhs` against the typed column, with

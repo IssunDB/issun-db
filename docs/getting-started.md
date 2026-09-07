@@ -102,8 +102,8 @@ The REPL also supports direct operations and queries to manipulate nodes and edg
 | `pagerank`            | Compute PageRank centrality scores (e.g., `pagerank 20 0.85`).                                     |
 | `components`          | Find weakly connected components in the graph.                                                     |
 | `degree`              | Compute degree centrality (e.g., `degree out`).                                                    |
-| `rebuild-csr`         | Rebuild the in-memory CSR snapshot cache.                                                          |
-| `materialize-columns` | Build the in-memory node and edge property columns and persist them beside the database.           |
+| `rebuild-csr`         | Rebuild the CSR snapshot and persist it as a cache file beside the database.                       |
+| `materialize-columns` | Build the node and edge property columns and persist them as cache files beside the database.      |
 | `upsert-vec`          | Attach/upsert a vector embedding on a node (e.g., `upsert-vec 1 0.1 0.2 0.3`).                     |
 | `remove-vec`          | Remove the vector embedding from a node (e.g., `remove-vec 1`).                                    |
 | `vsearch`             | Query the vector index for k-nearest neighbors (e.g., `vsearch 5 0.1 0.2 0.3`).                    |
@@ -111,6 +111,8 @@ The REPL also supports direct operations and queries to manipulate nodes and edg
 | `configure-vec`       | Configure vector index metric and quantization (e.g., `configure-vec cosine int8`).                |
 | `text-index`          | Configure and manage full-text indexes (e.g., `text-index create Book title`).                     |
 | `text-search`         | Query the BM25 full-text search index (e.g., `text-search "query" Book summary 5`).                |
+
+The cache files (`csr.cache`, `node_columns.cache`, and `edge_columns.cache`) are memory-mapped when a database opens, so a process reads only the parts of the snapshot and columns its queries touch. They are keyed by the database identity and the last committed write, and any mismatch, including a file written by an earlier IssunDB release, is refused and rebuilt from storage on the first query that needs it. A bulk import writes fresh ones, and `rebuild-csr` and `materialize-columns` do so on demand.
 
 ---
 
@@ -120,7 +122,7 @@ To use IssunDB as an embedded database in a Rust project, add the `issundb` libr
 
 ```toml
 [dependencies]
-issundb = "0.1.0-alpha.27"   # Update to match the latest version on Crates.io
+issundb = "0.1.0-alpha.29"   # Update to match the latest version on Crates.io
 serde_json = "1.0"           # This is used to construct property maps
 ```
 

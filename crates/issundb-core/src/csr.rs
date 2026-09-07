@@ -89,18 +89,25 @@ pub enum DenseIndex {
 }
 
 impl DenseIndex {
-    /// The index of `dense_to_id`, which must be sorted ascending and free of
-    /// duplicates (a snapshot's node array always is).
+    /// The index of `dense_to_id`, which must hold distinct ids (a snapshot's
+    /// node array always does). Contiguous when `dense_to_id[d] == first + d`
+    /// for every slot, whatever the array's order otherwise.
     pub fn from_sorted(dense_to_id: &[NodeId]) -> Self {
+        Self::from_ids(dense_to_id)
+    }
+
+    /// [`DenseIndex::from_sorted`] under its general name; the property
+    /// columns index entities in storage order, which is the same test.
+    pub fn from_ids(dense_to_id: &[NodeId]) -> Self {
         let n = dense_to_id.len();
         if n <= u32::MAX as usize {
-            if let (Some(&first), Some(&last)) = (dense_to_id.first(), dense_to_id.last()) {
-                if last - first + 1 == n as u64 {
-                    return Self::Contiguous { first, n: n as u32 };
-                }
-            }
-            if n == 0 {
-                return Self::Contiguous { first: 0, n: 0 };
+            let first = dense_to_id.first().copied().unwrap_or(0);
+            if dense_to_id
+                .iter()
+                .enumerate()
+                .all(|(d, &id)| id == first.wrapping_add(d as u64))
+            {
+                return Self::Contiguous { first, n: n as u32 };
             }
         }
         Self::Map(
@@ -110,6 +117,26 @@ impl DenseIndex {
                 .map(|(d, &id)| (id, d as u32))
                 .collect(),
         )
+    }
+
+    /// Record that `id` now has dense index `len()`. The contiguous form
+    /// survives when `id` continues the run; otherwise the index becomes a map.
+    pub fn push(&mut self, id: NodeId) {
+        let dense = self.len() as u32;
+        match self {
+            Self::Contiguous { first, n } if *first + *n as u64 == id && *n < u32::MAX => {
+                *n += 1;
+            }
+            Self::Contiguous { first, n } => {
+                let mut map: AHashMap<NodeId, u32> =
+                    (0..*n).map(|d| (*first + d as u64, d)).collect();
+                map.insert(id, dense);
+                *self = Self::Map(map);
+            }
+            Self::Map(map) => {
+                map.insert(id, dense);
+            }
+        }
     }
 
     #[inline]

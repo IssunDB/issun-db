@@ -238,8 +238,56 @@ pub(crate) fn save_csr(
         w.finish()
     };
     write().map_err(Error::Io)?;
-    std::fs::rename(&tmp, csr_path(dir)).map_err(Error::Io)?;
+    publish_cache_file(&tmp, &csr_path(dir)).map_err(Error::Io)?;
     Ok(())
+}
+
+/// Move a finished temporary file over `target`.
+///
+/// On Linux and macOS the rename replaces the target whether or not a process
+/// has it mapped; the mapping keeps the old inode. On Windows a rename onto a
+/// file with a live mapping is refused, so the old file is moved aside first
+/// (the standard library opens files with delete sharing, which allows that),
+/// the new one takes its place, and the set-aside copy is deleted when the
+/// mapping allows it or by [`remove_set_aside_files`] at the next open.
+fn publish_cache_file(tmp: &Path, target: &Path) -> std::io::Result<()> {
+    let first = match std::fs::rename(tmp, target) {
+        Ok(()) => return Ok(()),
+        Err(e) => e,
+    };
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let aside = target.with_file_name(format!(
+        "{}.old-{}",
+        target
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("cache"),
+        stamp
+    ));
+    if std::fs::rename(target, &aside).is_err() {
+        return Err(first);
+    }
+    std::fs::rename(tmp, target)?;
+    let _ = std::fs::remove_file(&aside);
+    Ok(())
+}
+
+/// Delete the set-aside cache files a Windows replace could not remove while
+/// they were mapped. Best effort: a file still mapped by another process is
+/// left for a later open.
+pub(crate) fn remove_set_aside_files(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if name.to_str().is_some_and(|n| n.contains(".cache.old-")) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// Total bytes a CSR cache file with `n` nodes and `e` edges must hold, or
@@ -587,7 +635,7 @@ pub(crate) fn save_columns<S: crate::columns::ColumnSource<Id = u64>>(
         w.finish().map_err(io)
     };
     write()?;
-    std::fs::rename(&tmp, path).map_err(Error::Io)?;
+    publish_cache_file(&tmp, &path).map_err(Error::Io)?;
     Ok(())
 }
 
@@ -1234,6 +1282,34 @@ mod tests {
             whole,
             "a trailing zero changes the sum"
         );
+    }
+
+    /// When the target cannot be replaced in place (here a directory stands in
+    /// for a Windows file with a live mapping), the publish moves it aside,
+    /// installs the new file, and a later open removes what was set aside.
+    #[test]
+    fn publish_falls_back_to_setting_the_old_file_aside() {
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("x.cache");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("inner"), b"old").unwrap();
+        let tmp = dir.path().join("x.cache.tmp");
+        std::fs::write(&tmp, b"new").unwrap();
+
+        publish_cache_file(&tmp, &target).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"new");
+        assert!(!tmp.exists());
+        let aside: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_str().unwrap().contains(".cache.old-"))
+            .collect();
+        assert_eq!(aside.len(), 1, "the unremovable old target is set aside");
+        // A plain file set aside is removed at the next open.
+        let stale = dir.path().join("y.cache.old-1");
+        std::fs::write(&stale, b"stale").unwrap();
+        remove_set_aside_files(dir.path());
+        assert!(!stale.exists());
     }
 
     /// The exact arrays survive a save and load, weights included.

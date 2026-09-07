@@ -83,7 +83,9 @@ All mutations to the graph go through the `Graph` API. Inside `Graph`:
   adjustment is clamped at zero against a stored count that has not absorbed the batch's additions. `WriteTxn::node_count_by_label` and
   `edge_count_by_type` add the pending deltas, so a count read inside the transaction sees its own writes.
 - `WriteTxn::begin_bulk_load` (used by `COPY ... FROM` and `IMPORT DATABASE`) additionally buffers the adjacency entries and writes each direction
-  sorted by node id, in chunks of `ADJ_FLUSH_THRESHOLD` and at commit. One random `in_adj` put per edge dirtied a B-tree leaf per edge, and past a
+  sorted by node id and duplicate order, in chunks of `ADJ_FLUSH_THRESHOLD` and at commit, through one cursor per direction
+  (`storage::put_sorted_duplicates`, one of the two backend-specific helpers beside the table aliases): LMDB descends from the root on every plain
+  `put`, and a positioned cursor whose next key lands on the same leaf skips that descent. One random `in_adj` put per edge dirtied a B-tree leaf per edge, and past a
   few million edges the per-edge cost had grown 3.4x. The mode changes cost only: the neighbor reads on `WriteTxn` merge the buffer into the
   stored entries in store order, and a deletion flushes the buffer before it walks the stores.
 
@@ -174,7 +176,8 @@ on any mismatch, truncation, oversized length claim, or checksum failure. The id
 coincidentally matching generation, which a restore into a directory with leftover cache files would otherwise serve; `restore_from_file` also removes
 such leftovers. The arrays sit at 8-byte-aligned offsets in a fixed order, which is what makes the mapping possible; a host that is not 64-bit
 little-endian refuses the file and builds from storage. A save writes a temporary file and renames it into place, so a live mapping keeps serving the
-inode it opened (on Windows the rename fails while a mapping is alive and the save is skipped; the next process rebuilds). The refresh's
+inode it opened. On Windows that rename is refused while a mapping is alive, so `publish_cache_file` moves the old file aside first and deletes it
+when the mapping allows; `Graph::open` removes any `.cache.old-*` file a previous process could not. The refresh's
 `with_additions` copies a mapped snapshot's rows into owned arrays, the copy-on-write the `Array` type exists for. `Graph::rebuild_csr` is the only
 save site, chosen because every bulk load ends there, and it always builds from storage rather than
 loading the file it is about to overwrite, or a wrong file could never be repaired; the gate's per-write refreshes never write a file. The generation is
@@ -206,7 +209,9 @@ where a full build's bytes come from and nothing about the within-process freshn
 It is derived from LMDB, like the CSR snapshot, and follows the same write-LMDB-first rule.
 
 - `PropColumns<S: ColumnSource>` stores one typed column per property (Int, Float, Bool, dict-encoded Str, or a JSON fallback) over a dense
-  `id -> index` map. `NodeSource` and `EdgeSource` implement `ColumnSource`, so nodes and edges share one generic store; `Graph` holds
+  `id -> index` mapping, the same `DenseIndex` the CSR snapshot uses: a subtraction when the entity ids run without gaps, a hash map otherwise.
+  Replacing the hash map cut the per-row cost of every bulk gather and comparison mask; the four-hop chains in the benchmark dropped from 185 ms to
+  27 ms at 2M persons with this and the cached label bitmap together. `NodeSource` and `EdgeSource` implement `ColumnSource`, so nodes and edges share one generic store; `Graph` holds
   `prop_columns: ColumnsCache<NodeSource>` and `edge_columns: ColumnsCache<EdgeSource>`.
 - A column is `Int`, `Float`, `Bool`, a dictionary-encoded `Str`, or the exact-semantics `Json` fallback, and single-property reads come through
   `Graph::node_prop_json`. The typed variants are plain arrays behind `Array<T>` (see the CSR section): `Nullable<T>` is a presence bitmap beside a

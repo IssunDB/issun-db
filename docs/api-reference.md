@@ -148,9 +148,9 @@ but results never change.
 - `materialize_edge_statistics() -> Result<(), Error>`  
   Builds the `(label, type)` and `(src_label, type, dst_label)` tables behind the expand-ratio estimates, and upgrades the type-inference pruning pass from a budgeted probe to an exact lookup. One pass over the label index and one over the adjacency, cached until the next committed write. Cheap enough to call freely in a long-lived process.
 - `materialize_property_columns() -> Result<(), Error>`  
-  Builds the in-memory property columns, which back the selectivity estimates and zone-map pruning. This is one full node scan whose result holds every scalar node property in memory for the life of the handle, so treat it as a memory commitment rather than a warm-up. It also persists the built set as a cache file beside the LMDB files, so a later process's build loads it instead of scanning, and a repeat at an unchanged write generation rewrites nothing.
+  Builds the in-memory property columns, which back the selectivity estimates and zone-map pruning. This is one full node scan. It persists the built set as a cache file beside the LMDB files, and a later process memory-maps that file instead of scanning, so only the columns a query reads become resident; a set built in the process itself, or patched after a write, lives on the heap. A repeat at an unchanged write generation rewrites nothing.
 - `materialize_edge_property_columns() -> Result<(), Error>`  
-  The edge counterpart, with the same contract and its own cache file: one full edge scan, and the columns hold every scalar edge property in memory for the life of the handle.
+  The edge counterpart, with the same contract and its own cache file: one full edge scan, persisted and memory-mapped the same way.
 
 The CLI performs the first of these on every open (pass `--no-warm-statistics` to skip it), and so do the REST and MCP servers, on a background thread. The
 Python and Rust surfaces leave the warm-ups to the caller, with one exception: a bulk import (`COPY ... FROM` or `IMPORT DATABASE`) ends by building and

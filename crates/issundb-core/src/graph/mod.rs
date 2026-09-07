@@ -819,7 +819,9 @@ impl WriteBatchCache {
     }
 
     /// Write the buffered adjacency entries, each direction sorted by node id
-    /// so that consecutive puts land on the same B-tree pages.
+    /// and then by the store's duplicate order, through one cursor per
+    /// direction (`storage::put_sorted_duplicates`), so consecutive entries
+    /// land on the same B-tree page without a descent from the root each.
     pub(super) fn flush_adjacency(
         &mut self,
         storage: &Storage,
@@ -829,10 +831,13 @@ impl WriteBatchCache {
             (&mut self.pending_out, &storage.out_adj),
             (&mut self.pending_in, &storage.in_adj),
         ] {
-            pending.sort_unstable_by_key(|(node, _)| *node);
-            for (node, entry) in pending.drain(..) {
-                db.put(wtxn, &node, entry.as_bytes())?;
-            }
+            pending.sort_unstable_by(|(a, ea), (b, eb)| {
+                a.cmp(b).then_with(|| ea.as_bytes().cmp(eb.as_bytes()))
+            });
+            let entries: Vec<(NodeId, &[u8])> =
+                pending.iter().map(|(n, e)| (*n, e.as_bytes())).collect();
+            crate::storage::put_sorted_duplicates(db, wtxn, &entries)?;
+            pending.clear();
         }
         Ok(())
     }
@@ -935,6 +940,8 @@ impl Graph {
         // Older versions persisted the CSR snapshot next to the LMDB files but
         // never read it back; remove the stale artifact if one is present.
         let _ = std::fs::remove_file(path.join("csr_snapshot.bin"));
+        #[cfg(feature = "lmdb")]
+        crate::cache_file::remove_set_aside_files(path);
         let storage = Arc::new(storage);
         // Opening builds nothing. The CSR snapshot is built by the freshness gate
         // (`ensure_snapshot_fresh`) when a consumer that needs it first runs, and
@@ -1034,7 +1041,7 @@ impl Graph {
             ));
         }
         self.prop_columns.with_fresh(&self.storage, |cols| {
-            cols.id_to_dense.get(&id).map(|&d| {
+            cols.id_to_dense.get(&id).map(|d| {
                 cols.cols
                     .get(prop)
                     .and_then(|c| c.get_json_opt(d as usize))
@@ -1141,7 +1148,7 @@ impl Graph {
         self.prop_columns.with_fresh(&self.storage, |cols| {
             ids.iter()
                 .map(|id| match (cols.id_to_dense.get(id), cols.cols.get(prop)) {
-                    (Some(&d), Some(col)) => col.is_present(d as usize),
+                    (Some(d), Some(col)) => col.is_present(d as usize),
                     // Either the columns never saw this entity or no such property
                     // exists anywhere; both read as null.
                     _ => false,
@@ -1362,7 +1369,7 @@ impl Graph {
         prop: &str,
     ) -> Result<Option<serde_json::Value>, Error> {
         self.edge_columns.with_fresh(&self.storage, |cols| {
-            cols.id_to_dense.get(&id).map(|&d| {
+            cols.id_to_dense.get(&id).map(|d| {
                 cols.cols
                     .get(prop)
                     .and_then(|c| c.get_json_opt(d as usize))
@@ -1413,10 +1420,7 @@ impl Graph {
     ) -> Result<Option<(serde_json::Value, serde_json::Value)>, Error> {
         Ok(self
             .prop_columns
-            .with_existing_mut(&self.storage, |cols| {
-                cols.prop_stats(prop)
-                    .map(|s| (s.min.clone(), s.max.clone()))
-            })?
+            .with_existing_mut(&self.storage, |cols| cols.min_max(prop))?
             .flatten())
     }
 

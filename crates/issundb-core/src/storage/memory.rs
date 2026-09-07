@@ -754,3 +754,17 @@ impl Storage {
             .collect())
     }
 }
+
+/// The in-memory counterpart of the LMDB backend's sorted cursor write: the
+/// same signature, one ordinary insert per entry, since a `BTreeMap` has no
+/// cursor to keep positioned.
+pub(crate) fn put_sorted_duplicates(
+    db: &Table<u64, [u8]>,
+    txn: &mut RwTxn<'_>,
+    entries: &[(u64, &[u8])],
+) -> Result<(), Error> {
+    for (key, value) in entries {
+        db.put(txn, key, value)?;
+    }
+    Ok(())
+}

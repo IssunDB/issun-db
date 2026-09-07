@@ -668,10 +668,10 @@ impl PropColumn {
 }
 
 /// Lazily computed distribution statistics over one typed column's non-null
-/// values: bounds, an equi-depth histogram, and the most common values.
+/// values: an equi-depth histogram and the most common values. The bounds live
+/// in their own cache (`PropColumns::min_max`), because they cost one pass
+/// where the histogram costs a sort.
 pub(crate) struct PropStats {
-    pub(crate) min: Value,
-    pub(crate) max: Value,
     pub(crate) histogram: crate::histogram::Histogram,
     /// Up to [`MCV_LIMIT`] `(value, row_count)` pairs, most frequent first.
     pub(crate) mcvs: Vec<(Value, u64)>,
@@ -697,7 +697,7 @@ impl PropStats {
 /// The materialized column set with its own dense entity mapping. Generic over
 /// the [`ColumnSource`] that supplies the entities (nodes or edges).
 pub(crate) struct PropColumns<S: ColumnSource> {
-    pub(crate) id_to_dense: AHashMap<S::Id, u32>,
+    pub(crate) id_to_dense: crate::csr::DenseIndex,
     pub(crate) dense_to_id: Array<S::Id>,
     pub(crate) cols: AHashMap<String, PropColumn>,
     /// Per-property stats, computed on first access through [`prop_stats`]
@@ -706,6 +706,11 @@ pub(crate) struct PropColumns<S: ColumnSource> {
     /// `None` is cached for columns with no usable stats (`Json` fallback
     /// columns and all-null columns).
     stats: AHashMap<String, Option<PropStats>>,
+    /// Per-property bounds, computed on first access by one pass over the
+    /// column and cached like `stats`. The zone-map prune asks for these on
+    /// every query that filters a property, and computing them through
+    /// `prop_stats` cost a sort of every value for a question one pass answers.
+    bounds: AHashMap<String, Option<(Value, Value)>>,
 }
 
 /// The cache file's view of a column set. Compiled only with `lmdb`, because the
@@ -729,16 +734,13 @@ impl<S: ColumnSource<Id = u64>> PropColumns<S> {
             }
             map.insert(name, col);
         }
-        let id_to_dense = dense_to_id
-            .iter()
-            .enumerate()
-            .map(|(d, &id)| (id, d as u32))
-            .collect();
+        let id_to_dense = crate::csr::DenseIndex::from_ids(&dense_to_id);
         Some(Self {
             id_to_dense,
             dense_to_id,
             cols: map,
             stats: AHashMap::new(),
+            bounds: AHashMap::new(),
         })
     }
 
@@ -751,18 +753,16 @@ impl<S: ColumnSource<Id = u64>> PropColumns<S> {
     }
 }
 
-impl<S: ColumnSource> PropColumns<S> {
+impl<S: ColumnSource<Id = u64>> PropColumns<S> {
     /// Build columns for every property name present, from one full scan,
     /// streaming: each entity's decoded properties go straight into the
     /// per-property builders and are dropped before the next entity is read.
     fn build(storage: &Storage) -> Result<Self, Error> {
         let mut dense_to_id: Vec<S::Id> = Vec::new();
-        let mut id_to_dense: AHashMap<S::Id, u32> = AHashMap::new();
         let mut builders: AHashMap<String, ColumnBuilder> = AHashMap::new();
         S::for_each(storage, &mut |id, json| {
             let dense = dense_to_id.len();
             dense_to_id.push(id);
-            id_to_dense.insert(id, dense as u32);
             if let Value::Object(map) = json {
                 for (k, v) in map {
                     builders
@@ -778,11 +778,13 @@ impl<S: ColumnSource> PropColumns<S> {
             .into_iter()
             .map(|(k, b)| (k, b.finish(n)))
             .collect();
+        let id_to_dense = crate::csr::DenseIndex::from_ids(&dense_to_id);
         Ok(Self {
             id_to_dense,
             dense_to_id: dense_to_id.into(),
             cols,
             stats: AHashMap::new(),
+            bounds: AHashMap::new(),
         })
     }
 
@@ -805,12 +807,8 @@ impl<S: ColumnSource> PropColumns<S> {
     /// thirty columns to use one, once per group-by expression.
     pub(crate) fn from_items_for(items: Vec<(S::Id, Value)>, only: Option<&str>) -> Self {
         let n = items.len();
-        let mut dense_to_id = Vec::with_capacity(n);
-        let mut id_to_dense: AHashMap<S::Id, u32> = AHashMap::with_capacity(n);
-        for (i, (id, _)) in items.iter().enumerate() {
-            dense_to_id.push(*id);
-            id_to_dense.insert(*id, i as u32);
-        }
+        let dense_to_id: Vec<S::Id> = items.iter().map(|(id, _)| *id).collect();
+        let id_to_dense = crate::csr::DenseIndex::from_ids(&dense_to_id);
 
         let mut builders: AHashMap<String, ColumnBuilder> = AHashMap::new();
         for (dense, (_, json)) in items.into_iter().enumerate() {
@@ -835,6 +833,7 @@ impl<S: ColumnSource> PropColumns<S> {
             dense_to_id: dense_to_id.into(),
             cols,
             stats: AHashMap::new(),
+            bounds: AHashMap::new(),
         }
     }
 
@@ -847,6 +846,18 @@ impl<S: ColumnSource> PropColumns<S> {
             self.stats.insert(prop.to_string(), computed);
         }
         self.stats.get(prop).and_then(|s| s.as_ref())
+    }
+
+    /// The smallest and largest non-null value of `prop`, by one pass over the
+    /// column, cached until the next patch. `None` for a missing property, the
+    /// `Json` fallback, or an all-null column; the same cases `prop_stats`
+    /// declines.
+    pub(crate) fn min_max(&mut self, prop: &str) -> Option<(Value, Value)> {
+        if !self.bounds.contains_key(prop) {
+            let computed = self.cols.get(prop).and_then(column_bounds);
+            self.bounds.insert(prop.to_string(), computed);
+        }
+        self.bounds.get(prop).and_then(|b| b.clone())
     }
 
     /// Gather `props` for each id in `ids`, row-major: `out[i][j]` is the
@@ -862,7 +873,7 @@ impl<S: ColumnSource> PropColumns<S> {
         let cols: Vec<Option<&PropColumn>> = props.iter().map(|p| self.cols.get(*p)).collect();
         let mut out = Vec::with_capacity(ids.len());
         for &id in ids {
-            let dense = *self.id_to_dense.get(&id).ok_or_else(|| S::not_found(id))? as usize;
+            let dense = self.id_to_dense.get(&id).ok_or_else(|| S::not_found(id))? as usize;
             out.push(
                 cols.iter()
                     .map(|c| c.and_then(|c| c.get_json_opt(dense)).unwrap_or(Value::Null))
@@ -882,7 +893,7 @@ impl<S: ColumnSource> PropColumns<S> {
         let col = self.cols.get(prop);
         let mut out = Vec::with_capacity(ids.len());
         for &id in ids {
-            let dense = *self.id_to_dense.get(&id).ok_or_else(|| S::not_found(id))? as usize;
+            let dense = self.id_to_dense.get(&id).ok_or_else(|| S::not_found(id))? as usize;
             out.push(
                 col.and_then(|c| c.get_json_opt(dense))
                     .unwrap_or(Value::Null),
@@ -943,8 +954,7 @@ impl<S: ColumnSource> PropColumns<S> {
             PropColumn::Int(v) => {
                 let mut seen: AHashMap<i64, u32> = AHashMap::with_capacity(seen_capacity);
                 for &id in ids {
-                    let dense =
-                        *self.id_to_dense.get(&id).ok_or_else(|| S::not_found(id))? as usize;
+                    let dense = self.id_to_dense.get(&id).ok_or_else(|| S::not_found(id))? as usize;
                     codes.push(match v.get(dense) {
                         None => intern_null(&mut reps),
                         Some(n) => *seen.entry(n).or_insert_with(|| {
@@ -960,8 +970,7 @@ impl<S: ColumnSource> PropColumns<S> {
                 // identity is serialization identity.
                 let mut seen: AHashMap<u64, u32> = AHashMap::with_capacity(seen_capacity);
                 for &id in ids {
-                    let dense =
-                        *self.id_to_dense.get(&id).ok_or_else(|| S::not_found(id))? as usize;
+                    let dense = self.id_to_dense.get(&id).ok_or_else(|| S::not_found(id))? as usize;
                     codes.push(match v.get(dense) {
                         None => intern_null(&mut reps),
                         Some(f) => *seen.entry(f.to_bits()).or_insert_with(|| {
@@ -974,8 +983,7 @@ impl<S: ColumnSource> PropColumns<S> {
             PropColumn::Bool(v) => {
                 let mut seen: [Option<u32>; 2] = [None, None];
                 for &id in ids {
-                    let dense =
-                        *self.id_to_dense.get(&id).ok_or_else(|| S::not_found(id))? as usize;
+                    let dense = self.id_to_dense.get(&id).ok_or_else(|| S::not_found(id))? as usize;
                     codes.push(match v.get(dense) {
                         None => intern_null(&mut reps),
                         Some(b) => *seen[(b != 0) as usize].get_or_insert_with(|| {
@@ -990,8 +998,7 @@ impl<S: ColumnSource> PropColumns<S> {
                 // per-row work is two array reads.
                 let mut dict_code: Vec<u32> = vec![u32::MAX; dict.len()];
                 for &id in ids {
-                    let dense =
-                        *self.id_to_dense.get(&id).ok_or_else(|| S::not_found(id))? as usize;
+                    let dense = self.id_to_dense.get(&id).ok_or_else(|| S::not_found(id))? as usize;
                     codes.push(match idx[dense] {
                         STR_NULL => intern_null(&mut reps),
                         i => {
@@ -1009,8 +1016,7 @@ impl<S: ColumnSource> PropColumns<S> {
                 // identity the executor's string-keyed fold uses.
                 let mut seen: AHashMap<String, u32> = AHashMap::with_capacity(seen_capacity);
                 for &id in ids {
-                    let dense =
-                        *self.id_to_dense.get(&id).ok_or_else(|| S::not_found(id))? as usize;
+                    let dense = self.id_to_dense.get(&id).ok_or_else(|| S::not_found(id))? as usize;
                     codes.push(match &v[dense] {
                         None => intern_null(&mut reps),
                         Some(val) => *seen.entry(val.to_string()).or_insert_with(|| {
@@ -1076,7 +1082,7 @@ impl<S: ColumnSource> PropColumns<S> {
         };
 
         let dense_of = |id: S::Id| -> Result<usize, Error> {
-            Ok(*self.id_to_dense.get(&id).ok_or_else(|| S::not_found(id))? as usize)
+            Ok(self.id_to_dense.get(&id).ok_or_else(|| S::not_found(id))? as usize)
         };
 
         let mask = match col {
@@ -1154,7 +1160,7 @@ impl<S: ColumnSource> PropColumns<S> {
     ) -> Result<Vec<bool>, Error> {
         ids.iter()
             .map(|&id| {
-                let dense = *self.id_to_dense.get(&id).ok_or_else(|| S::not_found(id))? as usize;
+                let dense = self.id_to_dense.get(&id).ok_or_else(|| S::not_found(id))? as usize;
                 Ok(keeps && present(dense))
             })
             .collect()
@@ -1168,6 +1174,7 @@ impl<S: ColumnSource> PropColumns<S> {
         // including ones whose property the new records no longer carry.
         if !touched.is_empty() {
             self.stats.clear();
+            self.bounds.clear();
         }
         // Read in chunks, not all at once. One transaction per entity would charge
         // the next refresh a begin/end pair for each, but one gather over the whole
@@ -1185,11 +1192,11 @@ impl<S: ColumnSource> PropColumns<S> {
                     None => continue,
                 };
                 let dense = match self.id_to_dense.get(&id) {
-                    Some(&d) => d as usize,
+                    Some(d) => d as usize,
                     None => {
                         let d = self.dense_to_id.len();
                         self.dense_to_id.with_mut(|v| v.push(id));
-                        self.id_to_dense.insert(id, d as u32);
+                        self.id_to_dense.push(id);
                         d
                     }
                 };
@@ -1243,12 +1250,47 @@ fn sorted_non_null_values(col: &PropColumn) -> Option<Vec<Value>> {
     Some(vals)
 }
 
+/// The bounds of a typed column's non-null values in one pass. A `Float` NaN
+/// is skipped as `sorted_non_null_values` skips it.
+fn column_bounds(col: &PropColumn) -> Option<(Value, Value)> {
+    fn fold<T: Copy + PartialOrd>(it: impl Iterator<Item = T>) -> Option<(T, T)> {
+        it.fold(None, |acc, x| match acc {
+            None => Some((x, x)),
+            Some((lo, hi)) => Some((if x < lo { x } else { lo }, if x > hi { x } else { hi })),
+        })
+    }
+    match col {
+        PropColumn::Int(v) => {
+            fold(v.iter().flatten()).map(|(a, b)| (Value::from(a), Value::from(b)))
+        }
+        PropColumn::Float(v) => fold(v.iter().flatten().filter(|x| !x.is_nan()))
+            .map(|(a, b)| (Value::from(a), Value::from(b))),
+        PropColumn::Bool(v) => {
+            fold(v.iter().flatten()).map(|(a, b)| (Value::Bool(a != 0), Value::Bool(b != 0)))
+        }
+        PropColumn::Str { dict, idx } => {
+            let mut lo: Option<&str> = None;
+            let mut hi: Option<&str> = None;
+            for &i in idx.iter().filter(|&&i| i != STR_NULL) {
+                let s = dict.get(i as usize);
+                if lo.is_none_or(|l| s < l) {
+                    lo = Some(s);
+                }
+                if hi.is_none_or(|h| s > h) {
+                    hi = Some(s);
+                }
+            }
+            Some((Value::String(lo?.to_owned()), Value::String(hi?.to_owned())))
+        }
+        PropColumn::Json(_) => None,
+    }
+}
+
 fn compute_prop_stats(col: &PropColumn) -> Option<PropStats> {
     let vals = sorted_non_null_values(col)?;
-    let (min, max) = match (vals.first(), vals.last()) {
-        (Some(mn), Some(mx)) => (mn.clone(), mx.clone()),
-        _ => return None,
-    };
+    if vals.is_empty() {
+        return None;
+    }
     let histogram = crate::histogram::Histogram::build(&vals, HISTOGRAM_BUCKETS);
 
     let mut runs: Vec<(Value, u64)> = Vec::new();
@@ -1264,8 +1306,6 @@ fn compute_prop_stats(col: &PropColumn) -> Option<PropStats> {
     runs.truncate(MCV_LIMIT);
 
     Some(PropStats {
-        min,
-        max,
         histogram,
         mcvs: runs,
     })

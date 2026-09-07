@@ -1062,8 +1062,9 @@ fn cmp_keeps(structured: bool, op: CmpOp, lv: &Value, rv: &Value) -> bool {
 
 /// Builds the per-row label-membership mask for `ids` in bulk. A label smaller
 /// than the column is tested by binary search against the cached sorted label
-/// scan (no per-query set build), a larger one by point lookups on the
-/// distinct ids.
+/// scan (no per-query set build); a larger one goes through the engine's bulk
+/// membership test, which reads the label's cached per-id bitmap for a request
+/// this size.
 fn label_keep_mask(graph: &Graph, ids: &[NodeId], label: &str) -> Result<Vec<bool>, String> {
     let label_count = graph
         .node_count_by_label(label)
@@ -1075,15 +1076,9 @@ fn label_keep_mask(graph: &Graph, ids: &[NodeId], label: &str) -> Result<Vec<boo
             .map(|id| members.binary_search(id).is_ok())
             .collect())
     } else {
-        let mut distinct = ids.to_vec();
-        distinct.sort_unstable();
-        distinct.dedup();
-        let pass: ahash::AHashSet<NodeId> = graph
-            .label_filter(&distinct, label)
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .collect();
-        Ok(ids.iter().map(|id| pass.contains(id)).collect())
+        graph
+            .nodes_have_label(ids, label)
+            .map_err(|e| e.to_string())
     }
 }
 
