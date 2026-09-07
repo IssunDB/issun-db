@@ -331,7 +331,7 @@ impl Graph {
                 // one contiguous row.
                 let mut indeg: u64 = 0;
                 for idx in snap.in_row_ptr[b]..snap.in_row_ptr[b + 1] {
-                    if type_ok(t1, snap.in_edge_type[idx])
+                    if type_ok(t1, snap.in_edge_type(idx))
                         && label_ok(&masks[0], snap.in_col_idx[idx] as usize)
                     {
                         indeg += 1;
@@ -850,10 +850,28 @@ impl Graph {
             intersect(&mut label_mask, mask);
         }
 
-        let (row_ptr, col_idx, edge_type) = if spec.incoming {
-            (&snap.in_row_ptr, &snap.in_col_idx, &snap.in_edge_type)
+        // The incoming view carries no type array of its own; an incoming entry's
+        // type sits at its outgoing position, reached through `in_pos`.
+        struct Direction<'a> {
+            row_ptr: &'a [usize],
+            col_idx: &'a [u32],
+            edge_type: &'a [TypeId],
+            in_pos: Option<&'a [u32]>,
+        }
+        let dir = if spec.incoming {
+            Direction {
+                row_ptr: &snap.in_row_ptr,
+                col_idx: &snap.in_col_idx,
+                edge_type: &snap.edge_type,
+                in_pos: Some(&snap.in_pos),
+            }
         } else {
-            (&snap.row_ptr, &snap.col_idx, &snap.edge_type)
+            Direction {
+                row_ptr: &snap.row_ptr,
+                col_idx: &snap.col_idx,
+                edge_type: &snap.edge_type,
+                in_pos: None,
+            }
         };
 
         // One pass over one source's qualifying neighbors. A nested `fn` generic
@@ -863,20 +881,19 @@ impl Graph {
         // walks below so their type and label filters cannot drift apart.
         fn walk_source<F: FnMut(usize)>(
             d: usize,
-            row_ptr: &[usize],
-            col_idx: &[u32],
-            edge_type: &[TypeId],
+            dir: &Direction<'_>,
             type_id: Option<TypeId>,
             label_mask: &Option<Vec<bool>>,
             mut visit: F,
         ) {
-            for k in row_ptr[d]..row_ptr[d + 1] {
+            for k in dir.row_ptr[d]..dir.row_ptr[d + 1] {
                 if let Some(tid) = type_id {
-                    if edge_type[k] != tid {
+                    let p = dir.in_pos.map_or(k, |pos| pos[k] as usize);
+                    if dir.edge_type[p] != tid {
                         continue;
                     }
                 }
-                let other = col_idx[k] as usize;
+                let other = dir.col_idx[k] as usize;
                 if label_mask.as_ref().is_none_or(|m| m[other]) {
                     visit(other);
                 }
@@ -901,28 +918,12 @@ impl Graph {
             };
             let mut qualifying = 0u64;
             if spec.neighbor_nonnull_prop.is_none() {
-                walk_source(
-                    d as usize,
-                    row_ptr,
-                    col_idx,
-                    edge_type,
-                    type_id,
-                    &label_mask,
-                    |_| qualifying += 1,
-                );
+                walk_source(d as usize, &dir, type_id, &label_mask, |_| qualifying += 1);
             } else {
-                walk_source(
-                    d as usize,
-                    row_ptr,
-                    col_idx,
-                    edge_type,
-                    type_id,
-                    &label_mask,
-                    |other| {
-                        qualifying += 1;
-                        visited[other] = true;
-                    },
-                );
+                walk_source(d as usize, &dir, type_id, &label_mask, |other| {
+                    qualifying += 1;
+                    visited[other] = true;
+                });
             }
             out[i] = (qualifying, qualifying);
         }
@@ -936,19 +937,11 @@ impl Graph {
                         continue;
                     };
                     let mut counted = 0u64;
-                    walk_source(
-                        d as usize,
-                        row_ptr,
-                        col_idx,
-                        edge_type,
-                        type_id,
-                        &label_mask,
-                        |other| {
-                            if mask[other] {
-                                counted += 1;
-                            }
-                        },
-                    );
+                    walk_source(d as usize, &dir, type_id, &label_mask, |other| {
+                        if mask[other] {
+                            counted += 1;
+                        }
+                    });
                     out[i].1 = counted;
                 }
             }

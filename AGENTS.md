@@ -58,8 +58,10 @@ section, and a public method's contract lives under Component APIs. Do not inven
 - `crates/issundb-core/`: storage engine. Public surface is `Graph` and the schema types; the source tree is the module map. Only the files below carry a
   rule the module name does not show.
     - `src/bin/gen_testdata.rs`: the `gen_testdata` binary that regenerates the versioned LMDB storage-format snapshot (`make testdata`).
+    - `src/array.rs`: `Array<T>`, the owned-or-mapped array behind the CSR snapshot and the property columns. Mutate one only through `with_mut`,
+      which copies a mapped view onto the heap; a mapped cache file is never written through.
     - `src/cache_file.rs`: the on-disk cache files for the CSR snapshot and the property columns (`lmdb` feature only), keyed by database identity and
-      commit generation and refused on any mismatch. The only save sites are `Graph::rebuild_csr` and the `materialize_*_columns` methods; no lazy
+      commit generation, refused on any mismatch, and memory-mapped rather than read on load. The only save sites are `Graph::rebuild_csr` and the `materialize_*_columns` methods; no lazy
       build writes a file as a side effect of a query.
 - `crates/issundb-cypher/`: Cypher parser, AST, logical planner, physical planner, optimizer, and executor. Only the files below carry a rule the
   module name does not show.

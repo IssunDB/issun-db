@@ -28,34 +28,91 @@
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use crate::array::{Array, MappedFile};
 use crate::csr::CsrSnapshot;
 use crate::error::Error;
+use crate::schema::{EdgeId, NodeId, TypeId};
 
-const MAGIC: &[u8; 8] = b"ISSNCSR2";
+const MAGIC: &[u8; 8] = b"ISSNCSR3";
 const FLAG_WEIGHTED: u64 = 1;
 const FLAG_NEGATIVE_WEIGHT: u64 = 2;
 
-/// FNV-1a folded over bytes. Corruption detection, not cryptography.
-struct Fnv(u64);
+/// A 64-bit checksum folded over the file's words. Corruption detection, not
+/// cryptography, and word-wise rather than byte-wise so that verifying a
+/// mapped file of a few hundred megabytes on every open runs at memory speed.
+struct Sum64 {
+    h: u64,
+    buf: [u8; 8],
+    buf_len: usize,
+    total: u64,
+}
 
-impl Fnv {
+impl Sum64 {
     fn new() -> Self {
-        Fnv(0xcbf2_9ce4_8422_2325)
-    }
-
-    fn update(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.0 ^= b as u64;
-            self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
+        Sum64 {
+            h: 0x9E37_79B9_7F4A_7C15,
+            buf: [0; 8],
+            buf_len: 0,
+            total: 0,
         }
     }
+
+    #[inline]
+    fn mix(&mut self, word: u64) {
+        let mut h = self.h ^ word;
+        h = h.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+        h ^= h >> 32;
+        self.h = h;
+    }
+
+    fn update(&mut self, mut bytes: &[u8]) {
+        self.total += bytes.len() as u64;
+        if self.buf_len > 0 {
+            let take = (8 - self.buf_len).min(bytes.len());
+            self.buf[self.buf_len..self.buf_len + take].copy_from_slice(&bytes[..take]);
+            self.buf_len += take;
+            bytes = &bytes[take..];
+            if self.buf_len < 8 {
+                return;
+            }
+            self.mix(u64::from_le_bytes(self.buf));
+            self.buf_len = 0;
+        }
+        let mut words = bytes.chunks_exact(8);
+        for w in &mut words {
+            let mut word = [0u8; 8];
+            word.copy_from_slice(w);
+            self.mix(u64::from_le_bytes(word));
+        }
+        let rest = words.remainder();
+        self.buf[..rest.len()].copy_from_slice(rest);
+        self.buf_len = rest.len();
+    }
+
+    fn finish(mut self) -> u64 {
+        if self.buf_len > 0 {
+            let mut tail = [0u8; 8];
+            tail[..self.buf_len].copy_from_slice(&self.buf[..self.buf_len]);
+            self.mix(u64::from_le_bytes(tail));
+        }
+        self.mix(self.total);
+        self.h
+    }
+}
+
+/// The checksum of `bytes` in one pass, for a mapped file.
+fn checksum_of(bytes: &[u8]) -> u64 {
+    let mut sum = Sum64::new();
+    sum.update(bytes);
+    sum.finish()
 }
 
 /// Checksumming writer wrapper.
 struct SumWriter<W: Write> {
     inner: W,
-    sum: Fnv,
+    sum: Sum64,
 }
 
 impl<W: Write> SumWriter<W> {
@@ -95,89 +152,49 @@ impl<W: Write> SumWriter<W> {
         }
         Ok(())
     }
-}
 
-/// Checksumming reader wrapper. Every getter reads exactly its width, so a
-/// truncated file surfaces as an `io` error the caller maps to "no cache file".
-struct SumReader<R: Read> {
-    inner: R,
-    sum: Fnv,
-}
-
-impl<R: Read> SumReader<R> {
-    fn get<const N: usize>(&mut self) -> std::io::Result<[u8; N]> {
-        let mut buf = [0u8; N];
-        self.inner.read_exact(&mut buf)?;
-        self.sum.update(&buf);
-        Ok(buf)
+    /// Zero bytes up to the next multiple of 8 after `written` bytes.
+    fn pad_to_8(&mut self, written: usize) -> std::io::Result<()> {
+        let pad = align8(written) - written;
+        self.put(&[0u8; 8][..pad])
     }
 
-    fn get_u64(&mut self) -> std::io::Result<u64> {
-        Ok(u64::from_le_bytes(self.get::<8>()?))
-    }
-
-    fn get_u64s(&mut self, n: usize) -> std::io::Result<Vec<u64>> {
-        let mut out = Vec::with_capacity(n);
-        for _ in 0..n {
-            out.push(self.get_u64()?);
-        }
-        Ok(out)
-    }
-
-    fn get_usizes(&mut self, n: usize) -> std::io::Result<Vec<usize>> {
-        let mut out = Vec::with_capacity(n);
-        for _ in 0..n {
-            out.push(self.get_u64()? as usize);
-        }
-        Ok(out)
-    }
-
-    fn get_u32s(&mut self, n: usize) -> std::io::Result<Vec<u32>> {
-        let mut out = Vec::with_capacity(n);
-        for _ in 0..n {
-            out.push(u32::from_le_bytes(self.get::<4>()?));
-        }
-        Ok(out)
-    }
-
-    fn get_f64s(&mut self, n: usize) -> std::io::Result<Vec<f64>> {
-        let mut out = Vec::with_capacity(n);
-        for _ in 0..n {
-            out.push(f64::from_le_bytes(self.get::<8>()?));
-        }
-        Ok(out)
-    }
-}
-
-/// Streaming forms for the msgpack-encoded columns payload; each hashes
-/// exactly the bytes that pass through.
-impl<W: Write> Write for SumWriter<W> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let n = self.inner.write(buf)?;
-        self.sum.update(&buf[..n]);
-        Ok(n)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
+    /// Write the checksum of everything put so far and flush.
+    fn finish(mut self) -> std::io::Result<()> {
+        let sum = self.sum.finish();
+        self.inner.write_all(&sum.to_le_bytes())?;
         self.inner.flush()
     }
 }
 
-impl<R: Read> Read for SumReader<R> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let n = self.inner.read(buf)?;
-        self.sum.update(&buf[..n]);
-        Ok(n)
-    }
+/// Little-endian `u64` at `offset`, or `None` past the end.
+fn u64_at(bytes: &[u8], offset: usize) -> Option<u64> {
+    let slice = bytes.get(offset..offset.checked_add(8)?)?;
+    Some(u64::from_le_bytes(slice.try_into().ok()?))
+}
+
+/// Whether this target can map a cache file directly: the arrays are stored as
+/// little-endian 64-bit words for `usize` fields, so a big-endian or 32-bit
+/// host reads them wrongly and falls back to building from storage instead.
+const fn can_map_files() -> bool {
+    cfg!(all(target_pointer_width = "64", target_endian = "little"))
 }
 
 fn csr_path(dir: &Path) -> PathBuf {
     dir.join("csr.cache")
 }
 
+/// Bytes of the fixed CSR header: magic, database identity, generation, flags,
+/// and the two array lengths.
+const CSR_HEADER_LEN: usize = 8 + 16 + 8 + 8 + 8 + 8;
+
 /// Persist `snap` for `commit_gen`, atomically: the bytes go to a temp file in
 /// the same directory and the rename publishes them, so a crash mid-write
-/// leaves either the previous cache file or none, never a torn one.
+/// leaves either the previous cache file or none, never a torn one. The
+/// arrays follow the header in a fixed order at 8-byte-aligned offsets (the two
+/// 4-byte arrays of each direction are adjacent, so every 8-byte array starts
+/// aligned), which is what lets a later process map the file and point the
+/// snapshot's arrays straight into it.
 pub(crate) fn save_csr(
     dir: &Path,
     snap: &CsrSnapshot,
@@ -188,7 +205,7 @@ pub(crate) fn save_csr(
     let write = || -> std::io::Result<()> {
         let mut w = SumWriter {
             inner: BufWriter::new(File::create(&tmp)?),
-            sum: Fnv::new(),
+            sum: Sum64::new(),
         };
         w.put(MAGIC)?;
         w.put(&db_id)?;
@@ -210,15 +227,11 @@ pub(crate) fn save_csr(
         w.put_u64s(&snap.edge_id)?;
         w.put_usizes(&snap.in_row_ptr)?;
         w.put_u32s(&snap.in_col_idx)?;
-        w.put_u32s(&snap.in_edge_type)?;
-        w.put_u64s(&snap.in_edge_id)?;
+        w.put_u32s(&snap.in_pos)?;
         if let Some(weights) = &snap.edge_weight {
             w.put_f64s(weights)?;
         }
-        let sum = w.sum.0;
-        w.inner.write_all(&sum.to_le_bytes())?;
-        w.inner.flush()?;
-        Ok(())
+        w.finish()
     };
     write().map_err(Error::Io)?;
     std::fs::rename(&tmp, csr_path(dir)).map_err(Error::Io)?;
@@ -227,20 +240,18 @@ pub(crate) fn save_csr(
 
 /// Total bytes a CSR cache file with `n` nodes and `e` edges must hold, or
 /// `None` when the arithmetic overflows, which no real file can cause. The
-/// lengths come from the file itself and feed `Vec::with_capacity` before the
-/// checksum can vouch for them, so a corrupt length field has to be refused
-/// against the file's actual size instead of trusted into an allocation that
-/// panics ("capacity overflow") or aborts the process.
+/// lengths come from the file itself and decide where every array starts
+/// before the checksum can vouch for them, so a corrupt length field has to be
+/// refused against the file's actual size instead of trusted.
 fn csr_file_len(n: u64, e: u64, weighted: bool) -> Option<u64> {
-    // Header (magic, db id, generation, flags, and the two lengths) plus the
-    // trailing checksum.
-    let mut total = 8u64 + 16 + 8 + 8 + 8 + 8 + 8;
-    // `dense_to_id`, the two `(n + 1)`-long row-pointer arrays, `edge_id`, and
-    // `in_edge_id` are 8 bytes per element; the four type and column arrays
-    // are 4 bytes per element.
+    // Header plus the trailing checksum.
+    let mut total = CSR_HEADER_LEN as u64 + 8;
+    // `dense_to_id`, the two `(n + 1)`-long row-pointer arrays, and `edge_id`
+    // are 8 bytes per element; `col_idx`, `edge_type`, `in_col_idx`, and
+    // `in_pos` are 4 bytes per element.
     let u64_elems = n
         .checked_add(n.checked_add(1)?.checked_mul(2)?)?
-        .checked_add(e.checked_mul(2)?)?;
+        .checked_add(e)?;
     total = total.checked_add(u64_elems.checked_mul(8)?)?;
     total = total.checked_add(e.checked_mul(4)?.checked_mul(4)?)?;
     if weighted {
@@ -249,104 +260,141 @@ fn csr_file_len(n: u64, e: u64, weighted: bool) -> Option<u64> {
     Some(total)
 }
 
-/// Load the cache file if it exists, carries `db_id`, and reflects
+/// Map the cache file if it exists, carries `db_id`, and reflects
 /// `expected_gen`, carrying weights when `want_weights` asks for them. `None`
 /// on a missing, stale, truncated, corrupt, foreign, or version-mismatched
-/// file, and on an unweighted cache file when weights are wanted. Every
-/// refusal means "build from storage instead", never an error, because the
-/// file is a cache and storage can always answer.
+/// file, on an unweighted cache file when weights are wanted, and on a target
+/// that cannot map the format. Every refusal means "build from storage
+/// instead", never an error, because the file is a cache and storage can
+/// always answer.
+///
+/// The checksum is verified over the whole file before any array is served,
+/// which reads every page once, sequentially; after that the pages belong to
+/// the page cache and only the ones a query touches stay resident.
 pub(crate) fn load_csr(
     dir: &Path,
     db_id: [u8; 16],
     expected_gen: u64,
     want_weights: bool,
 ) -> Option<CsrSnapshot> {
-    let file = File::open(csr_path(dir)).ok()?;
-    let file_len = file.metadata().ok()?.len();
-    let mut r = SumReader {
-        inner: BufReader::new(file),
-        sum: Fnv::new(),
+    if !can_map_files() {
+        return None;
+    }
+    let file = Arc::new(MappedFile::open(&csr_path(dir)).ok()?);
+    let bytes = file.bytes();
+    if bytes.len() < CSR_HEADER_LEN + 8 {
+        return None;
+    }
+    if &bytes[..8] != MAGIC || bytes[8..24] != db_id {
+        return None;
+    }
+    if u64_at(bytes, 24)? != expected_gen {
+        return None;
+    }
+    let flags = u64_at(bytes, 32)?;
+    let weighted = flags & FLAG_WEIGHTED != 0;
+    if want_weights && !weighted {
+        return None;
+    }
+    let n64 = u64_at(bytes, 40)?;
+    let e64 = u64_at(bytes, 48)?;
+    // Before anything is served: the claimed lengths must describe exactly the
+    // bytes the file has.
+    if csr_file_len(n64, e64, weighted)? != bytes.len() as u64 {
+        return None;
+    }
+    let body_len = bytes.len() - 8;
+    if checksum_of(&bytes[..body_len]) != u64_at(bytes, body_len)? {
+        return None;
+    }
+    let n = usize::try_from(n64).ok()?;
+    let e = usize::try_from(e64).ok()?;
+    if e > crate::csr::MAX_SNAPSHOT_EDGES {
+        return None;
+    }
+
+    let mut offset = CSR_HEADER_LEN;
+    let mut take = |len: usize, width: usize| -> Option<usize> {
+        let at = offset;
+        offset = offset.checked_add(len.checked_mul(width)?)?;
+        Some(at)
     };
-    let read = |r: &mut SumReader<BufReader<File>>| -> std::io::Result<Option<CsrSnapshot>> {
-        let magic = r.get::<8>()?;
-        if &magic != MAGIC {
-            return Ok(None);
-        }
-        if r.get::<16>()? != db_id {
-            return Ok(None);
-        }
-        let file_gen = r.get_u64()?;
-        if file_gen != expected_gen {
-            return Ok(None);
-        }
-        let flags = r.get_u64()?;
-        let weighted = flags & FLAG_WEIGHTED != 0;
-        if want_weights && !weighted {
-            return Ok(None);
-        }
-        let n64 = r.get_u64()?;
-        let e64 = r.get_u64()?;
-        // Before any allocation: the claimed lengths must fit the bytes the
-        // file actually has.
-        match csr_file_len(n64, e64, weighted) {
-            Some(required) if required <= file_len => {}
-            _ => return Ok(None),
-        }
-        let n = n64 as usize;
-        let e = e64 as usize;
-        let dense_to_id = r.get_u64s(n)?;
-        let row_ptr = r.get_usizes(n + 1)?;
-        let col_idx = r.get_u32s(e)?;
-        let edge_type = r.get_u32s(e)?;
-        let edge_id = r.get_u64s(e)?;
-        let in_row_ptr = r.get_usizes(n + 1)?;
-        let in_col_idx = r.get_u32s(e)?;
-        let in_edge_type = r.get_u32s(e)?;
-        let in_edge_id = r.get_u64s(e)?;
-        let edge_weight = if weighted { Some(r.get_f64s(e)?) } else { None };
-        let expected_sum = r.sum.0;
-        let mut sum_buf = [0u8; 8];
-        r.inner.read_exact(&mut sum_buf)?;
-        if u64::from_le_bytes(sum_buf) != expected_sum {
-            return Ok(None);
-        }
-        let id_to_dense = dense_to_id
-            .iter()
-            .enumerate()
-            .map(|(d, &id)| (id, d as u32))
-            .collect();
-        Ok(Some(CsrSnapshot {
-            row_ptr,
-            col_idx,
-            edge_type,
-            edge_id,
-            edge_weight,
-            has_negative_weight: flags & FLAG_NEGATIVE_WEIGHT != 0,
-            in_row_ptr,
-            in_col_idx,
-            in_edge_type,
-            in_edge_id,
-            dense_to_id,
-            id_to_dense,
-        }))
+    let dense_to_id: Array<NodeId> = Array::mapped(&file, take(n, 8)?, n)?;
+    let row_ptr: Array<usize> = Array::mapped(&file, take(n + 1, 8)?, n + 1)?;
+    let col_idx: Array<u32> = Array::mapped(&file, take(e, 4)?, e)?;
+    let edge_type: Array<TypeId> = Array::mapped(&file, take(e, 4)?, e)?;
+    let edge_id: Array<EdgeId> = Array::mapped(&file, take(e, 8)?, e)?;
+    let in_row_ptr: Array<usize> = Array::mapped(&file, take(n + 1, 8)?, n + 1)?;
+    let in_col_idx: Array<u32> = Array::mapped(&file, take(e, 4)?, e)?;
+    let in_pos: Array<u32> = Array::mapped(&file, take(e, 4)?, e)?;
+    let edge_weight = if weighted {
+        Some(Array::<f64>::mapped(&file, take(e, 8)?, e)?)
+    } else {
+        None
     };
-    read(&mut r).ok().flatten()
+    debug_assert_eq!(offset, body_len);
+
+    let id_to_dense = dense_to_id
+        .iter()
+        .enumerate()
+        .map(|(d, &id)| (id, d as u32))
+        .collect();
+    Some(CsrSnapshot {
+        row_ptr,
+        col_idx,
+        edge_type,
+        edge_id,
+        edge_weight,
+        has_negative_weight: flags & FLAG_NEGATIVE_WEIGHT != 0,
+        in_row_ptr,
+        in_col_idx,
+        in_pos,
+        dense_to_id,
+        id_to_dense,
+    })
 }
 
-const COL_MAGIC: &[u8; 8] = b"ISSNCOL2";
+const COL_MAGIC: &[u8; 8] = b"ISSNCOL3";
 
-/// The msgpack shape of a columns cache file payload; the borrowed form writes
-/// and the owned form reads, so a save never clones a column.
-#[derive(serde::Serialize)]
-struct ColumnsPayloadRef<'a> {
-    dense_to_id: &'a Vec<u64>,
-    cols: Vec<(&'a String, &'a crate::columns::PropColumn)>,
+/// Bytes of the fixed columns header: magic, database identity, generation,
+/// entity count, column count, and the directory length.
+const COL_HEADER_LEN: usize = 8 + 16 + 8 + 8 + 8 + 8;
+
+/// Column kinds as stored in the directory.
+const KIND_INT: u8 = 0;
+const KIND_FLOAT: u8 = 1;
+const KIND_BOOL: u8 = 2;
+const KIND_STR: u8 = 3;
+const KIND_JSON: u8 = 4;
+
+/// One column's entry in the directory: its arrays as `(offset, length)`
+/// pairs, offsets relative to the start of the data region and lengths in
+/// elements. `Int` and `Float` hold the presence words and the values, `Bool`
+/// the presence words and the byte values, `Str` the index, the dictionary
+/// offsets, and the dictionary bytes, and `Json` one msgpack byte run.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ColumnEntry {
+    name: String,
+    kind: u8,
+    parts: Vec<(u64, u64)>,
 }
 
-#[derive(serde::Deserialize)]
-struct ColumnsPayload {
-    dense_to_id: Vec<u64>,
-    cols: Vec<(String, crate::columns::PropColumn)>,
+fn align8(n: usize) -> usize {
+    n.div_ceil(8) * 8
+}
+
+/// Lays out the data region: each array gets an 8-byte-aligned offset in the
+/// order it will be written.
+struct Layout {
+    next: usize,
+}
+
+impl Layout {
+    fn place(&mut self, byte_len: usize) -> u64 {
+        let at = self.next;
+        self.next = align8(at + byte_len);
+        at as u64
+    }
 }
 
 /// The generation an existing cache file claims, or `None` when there is no
@@ -369,11 +417,19 @@ fn cache_file_gen(path: &Path, db_id: [u8; 16]) -> Option<u64> {
 /// rename; a save whose file already claims `commit_gen` is skipped, so a
 /// warm-up that materializes on every boot rewrites nothing while the graph
 /// is unchanged.
+///
+/// The typed columns are written as their plain arrays at 8-byte-aligned
+/// offsets, described by a directory the loader reads first, so a later
+/// process maps the file and each column becomes a view of it; a column no
+/// query touches never leaves the disk. The `Json` fallback columns are the
+/// one heap-decoded part.
 pub(crate) fn save_columns<S: crate::columns::ColumnSource<Id = u64>>(
     storage: &crate::storage::Storage,
     cols: &crate::columns::PropColumns<S>,
     commit_gen: u64,
 ) -> Result<(), Error> {
+    use crate::columns::PropColumn;
+
     let dir = storage.env.path();
     let path = dir.join(S::CACHE_FILE);
     if cache_file_gen(&path, storage.db_id) == Some(commit_gen) {
@@ -381,63 +437,263 @@ pub(crate) fn save_columns<S: crate::columns::ColumnSource<Id = u64>>(
     }
     let tmp = dir.join(format!("{}.tmp", S::CACHE_FILE));
     let (dense_to_id, col_list) = cols.cache_file_parts();
-    let payload = ColumnsPayloadRef {
-        dense_to_id,
-        cols: col_list,
-    };
+
+    // Lay out the data region and build the directory before writing anything,
+    // since the directory's length decides where the data region starts.
+    let mut layout = Layout { next: 0 };
+    let dense_off = layout.place(dense_to_id.len() * 8);
+    let mut entries = Vec::with_capacity(col_list.len());
+    let mut json_blobs: Vec<Vec<u8>> = Vec::new();
+    for (name, col) in &col_list {
+        let (kind, parts) = match col {
+            PropColumn::Int(v) => (
+                KIND_INT,
+                vec![
+                    (
+                        layout.place(v.present().words().len() * 8),
+                        v.present().words().len() as u64,
+                    ),
+                    (layout.place(v.len() * 8), v.len() as u64),
+                ],
+            ),
+            PropColumn::Float(v) => (
+                KIND_FLOAT,
+                vec![
+                    (
+                        layout.place(v.present().words().len() * 8),
+                        v.present().words().len() as u64,
+                    ),
+                    (layout.place(v.len() * 8), v.len() as u64),
+                ],
+            ),
+            PropColumn::Bool(v) => (
+                KIND_BOOL,
+                vec![
+                    (
+                        layout.place(v.present().words().len() * 8),
+                        v.present().words().len() as u64,
+                    ),
+                    (layout.place(v.len()), v.len() as u64),
+                ],
+            ),
+            PropColumn::Str { dict, idx } => (
+                KIND_STR,
+                vec![
+                    (layout.place(idx.len() * 4), idx.len() as u64),
+                    (
+                        layout.place(dict.offsets().len() * 8),
+                        dict.offsets().len() as u64,
+                    ),
+                    (layout.place(dict.bytes().len()), dict.bytes().len() as u64),
+                ],
+            ),
+            PropColumn::Json(v) => {
+                let blob = rmp_serde::to_vec(v)?;
+                let part = (layout.place(blob.len()), blob.len() as u64);
+                json_blobs.push(blob);
+                (KIND_JSON, vec![part])
+            }
+        };
+        entries.push(ColumnEntry {
+            name: (*name).clone(),
+            kind,
+            parts,
+        });
+    }
+    let directory = rmp_serde::to_vec(&entries)?;
+
     let write = || -> Result<(), Error> {
         let mut w = SumWriter {
             inner: BufWriter::new(File::create(&tmp).map_err(Error::Io)?),
-            sum: Fnv::new(),
+            sum: Sum64::new(),
         };
-        w.put(COL_MAGIC).map_err(Error::Io)?;
-        w.put(&storage.db_id).map_err(Error::Io)?;
-        w.put_u64(commit_gen).map_err(Error::Io)?;
-        rmp_serde::encode::write(&mut w, &payload)?;
-        let sum = w.sum.0;
-        w.inner.write_all(&sum.to_le_bytes()).map_err(Error::Io)?;
-        w.inner.flush().map_err(Error::Io)?;
-        Ok(())
+        let io = Error::Io;
+        w.put(COL_MAGIC).map_err(io)?;
+        w.put(&storage.db_id).map_err(io)?;
+        w.put_u64(commit_gen).map_err(io)?;
+        w.put_u64(dense_to_id.len() as u64).map_err(io)?;
+        w.put_u64(col_list.len() as u64).map_err(io)?;
+        w.put_u64(directory.len() as u64).map_err(io)?;
+        w.put(&directory).map_err(io)?;
+        w.pad_to_8(COL_HEADER_LEN + directory.len()).map_err(io)?;
+
+        // The data region, in the layout's order; each array is padded to 8.
+        let mut written = 0usize;
+        let mut pad_after = |w: &mut SumWriter<BufWriter<File>>, byte_len: usize| {
+            written += byte_len;
+            let padded = align8(written);
+            let pad = padded - written;
+            written = padded;
+            w.put(&[0u8; 8][..pad])
+        };
+        debug_assert_eq!(dense_off, 0);
+        w.put_u64s(dense_to_id).map_err(io)?;
+        pad_after(&mut w, dense_to_id.len() * 8).map_err(io)?;
+        let mut json_blobs = json_blobs.iter();
+        for (_, col) in &col_list {
+            match col {
+                PropColumn::Int(v) => {
+                    w.put_u64s(v.present().words()).map_err(io)?;
+                    pad_after(&mut w, v.present().words().len() * 8).map_err(io)?;
+                    for &x in v.values().iter() {
+                        w.put(&x.to_le_bytes()).map_err(io)?;
+                    }
+                    pad_after(&mut w, v.len() * 8).map_err(io)?;
+                }
+                PropColumn::Float(v) => {
+                    w.put_u64s(v.present().words()).map_err(io)?;
+                    pad_after(&mut w, v.present().words().len() * 8).map_err(io)?;
+                    w.put_f64s(v.values()).map_err(io)?;
+                    pad_after(&mut w, v.len() * 8).map_err(io)?;
+                }
+                PropColumn::Bool(v) => {
+                    w.put_u64s(v.present().words()).map_err(io)?;
+                    pad_after(&mut w, v.present().words().len() * 8).map_err(io)?;
+                    w.put(v.values()).map_err(io)?;
+                    pad_after(&mut w, v.len()).map_err(io)?;
+                }
+                PropColumn::Str { dict, idx } => {
+                    w.put_u32s(idx).map_err(io)?;
+                    pad_after(&mut w, idx.len() * 4).map_err(io)?;
+                    w.put_u64s(dict.offsets()).map_err(io)?;
+                    pad_after(&mut w, dict.offsets().len() * 8).map_err(io)?;
+                    w.put(dict.bytes()).map_err(io)?;
+                    pad_after(&mut w, dict.bytes().len()).map_err(io)?;
+                }
+                PropColumn::Json(_) => {
+                    let Some(blob) = json_blobs.next() else {
+                        return Err(Error::Corrupt("columns save: a Json column has no blob"));
+                    };
+                    w.put(blob).map_err(io)?;
+                    pad_after(&mut w, blob.len()).map_err(io)?;
+                }
+            }
+        }
+        debug_assert_eq!(written, layout.next);
+        w.finish().map_err(io)
     };
     write()?;
     std::fs::rename(&tmp, path).map_err(Error::Io)?;
     Ok(())
 }
 
-/// Load the columns cache file if it exists and reflects storage's current
+/// Map the columns cache file if it exists and reflects storage's current
 /// persisted generation. As with the CSR cache file, every refusal (missing,
-/// stale, truncated, corrupt, or inconsistent file) means "scan instead" and
-/// never an error.
+/// stale, truncated, corrupt, or inconsistent file, or a target that cannot
+/// map the format) means "scan instead" and never an error. The checksum is
+/// verified over the whole file first; after that each typed column is a view
+/// of the mapping and only the pages a query reads become resident.
 pub(crate) fn load_columns<S: crate::columns::ColumnSource<Id = u64>>(
     storage: &crate::storage::Storage,
 ) -> Option<crate::columns::PropColumns<S>> {
+    use crate::columns::{Bitmap, Nullable, PropColumn, StrDict};
+
+    if !can_map_files() {
+        return None;
+    }
     let expected_gen = {
         let rtxn = storage.env.read_txn().ok()?;
         crate::storage::ids::commit_gen(storage, &rtxn).ok()?
     };
     let path = storage.env.path().join(S::CACHE_FILE);
-    let mut r = SumReader {
-        inner: BufReader::new(File::open(path).ok()?),
-        sum: Fnv::new(),
+    let file = Arc::new(MappedFile::open(&path).ok()?);
+    let bytes = file.bytes();
+    if bytes.len() < COL_HEADER_LEN + 8 {
+        return None;
+    }
+    if &bytes[..8] != COL_MAGIC || bytes[8..24] != storage.db_id {
+        return None;
+    }
+    if u64_at(bytes, 24)? != expected_gen {
+        return None;
+    }
+    let body_len = bytes.len() - 8;
+    if checksum_of(&bytes[..body_len]) != u64_at(bytes, body_len)? {
+        return None;
+    }
+    let n = usize::try_from(u64_at(bytes, 32)?).ok()?;
+    let ncols = usize::try_from(u64_at(bytes, 40)?).ok()?;
+    let dir_len = usize::try_from(u64_at(bytes, 48)?).ok()?;
+    let dir_end = COL_HEADER_LEN.checked_add(dir_len)?;
+    let entries: Vec<ColumnEntry> =
+        rmp_serde::from_slice(bytes.get(COL_HEADER_LEN..dir_end)?).ok()?;
+    if entries.len() != ncols {
+        return None;
+    }
+    let data_start = align8(dir_end);
+    // Every part must lie inside the data region, which ends at the checksum.
+    let region_len = body_len.checked_sub(data_start)?;
+    let part = |(off, len): (u64, u64), width: usize| -> Option<(usize, usize)> {
+        let off = usize::try_from(off).ok()?;
+        let len = usize::try_from(len).ok()?;
+        let end = off.checked_add(len.checked_mul(width)?)?;
+        (end <= region_len).then_some((data_start + off, len))
     };
-    let magic = r.get::<8>().ok()?;
-    if &magic != COL_MAGIC {
-        return None;
+    let mapped = |p: (u64, u64), width: usize| -> Option<(usize, usize)> { part(p, width) };
+
+    let (dense_off, _) = mapped((0, n as u64), 8)?;
+    let dense_to_id: Array<u64> = Array::mapped(&file, dense_off, n)?;
+
+    let mut cols = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let parts = entry.parts.as_slice();
+        let col = match (entry.kind, parts) {
+            (KIND_INT, [words, values]) => {
+                let (wo, wl) = mapped(*words, 8)?;
+                let (vo, vl) = mapped(*values, 8)?;
+                let present = Bitmap::from_words(Array::mapped(&file, wo, wl)?, vl)?;
+                PropColumn::Int(Nullable::from_parts(
+                    present,
+                    Array::<i64>::mapped(&file, vo, vl)?,
+                )?)
+            }
+            (KIND_FLOAT, [words, values]) => {
+                let (wo, wl) = mapped(*words, 8)?;
+                let (vo, vl) = mapped(*values, 8)?;
+                let present = Bitmap::from_words(Array::mapped(&file, wo, wl)?, vl)?;
+                PropColumn::Float(Nullable::from_parts(
+                    present,
+                    Array::<f64>::mapped(&file, vo, vl)?,
+                )?)
+            }
+            (KIND_BOOL, [words, values]) => {
+                let (wo, wl) = mapped(*words, 8)?;
+                let (vo, vl) = mapped(*values, 1)?;
+                let present = Bitmap::from_words(Array::mapped(&file, wo, wl)?, vl)?;
+                let values: Array<u8> = Array::mapped(&file, vo, vl)?;
+                if values.iter().any(|&b| b > 1) {
+                    return None;
+                }
+                PropColumn::Bool(Nullable::from_parts(present, values)?)
+            }
+            (KIND_STR, [idx, offsets, dict_bytes]) => {
+                let (io, il) = mapped(*idx, 4)?;
+                let (oo, ol) = mapped(*offsets, 8)?;
+                let (bo, bl) = mapped(*dict_bytes, 1)?;
+                let idx: Array<u32> = Array::mapped(&file, io, il)?;
+                let dict = StrDict::from_parts(
+                    Array::mapped(&file, oo, ol)?,
+                    Array::mapped(&file, bo, bl)?,
+                )?;
+                if idx
+                    .iter()
+                    .any(|&i| i != crate::columns::STR_NULL && i as usize >= dict.len())
+                {
+                    return None;
+                }
+                PropColumn::Str { dict, idx }
+            }
+            (KIND_JSON, [blob]) => {
+                let (bo, bl) = mapped(*blob, 1)?;
+                let values: Vec<Option<serde_json::Value>> =
+                    rmp_serde::from_slice(bytes.get(bo..bo + bl)?).ok()?;
+                PropColumn::Json(values)
+            }
+            _ => return None,
+        };
+        cols.push((entry.name, col));
     }
-    if r.get::<16>().ok()? != storage.db_id {
-        return None;
-    }
-    if r.get_u64().ok()? != expected_gen {
-        return None;
-    }
-    let payload: ColumnsPayload = rmp_serde::decode::from_read(&mut r).ok()?;
-    let expected_sum = r.sum.0;
-    let mut sum_buf = [0u8; 8];
-    r.inner.read_exact(&mut sum_buf).ok()?;
-    if u64::from_le_bytes(sum_buf) != expected_sum {
-        return None;
-    }
-    crate::columns::PropColumns::from_cache_file(payload.dense_to_id, payload.cols)
+    crate::columns::PropColumns::from_cache_file(dense_to_id, cols)
 }
 
 #[cfg(test)]
@@ -609,6 +865,159 @@ mod tests {
         assert!(load_columns::<EdgeSource>(&g.storage).is_none());
     }
 
+    /// A loaded column set views the mapped file: the typed arrays and the
+    /// dense mapping are mapped, every kind reads back exactly, and the first
+    /// patch copies the touched column onto the heap while the file and any
+    /// other holder of the mapped set stay untouched.
+    #[test]
+    fn loaded_columns_are_mapped_and_patch_onto_the_heap() {
+        use crate::columns::{ColumnSource, NodeSource, PropColumn};
+
+        let dir = TempDir::new().unwrap();
+        let ids: Vec<u64>;
+        {
+            let g = Graph::open(dir.path(), 1).unwrap();
+            ids = vec![
+                g.add_node(
+                    "N",
+                    &json!({ "i": 1, "f": 0.5, "b": false, "s": "a", "m": 1 }),
+                )
+                .unwrap(),
+                g.add_node("N", &json!({ "i": -7, "b": true, "s": "bb", "m": "x" }))
+                    .unwrap(),
+                g.add_node("N", &json!({ "f": 2.5, "s": "a" })).unwrap(),
+            ];
+            g.materialize_property_columns().unwrap();
+        }
+        let g = Graph::open(dir.path(), 1).unwrap();
+        let loaded = load_columns::<NodeSource>(&g.storage).expect("a fresh file loads");
+        assert!(loaded.dense_to_id.is_mapped());
+        match &loaded.cols["i"] {
+            PropColumn::Int(v) => {
+                assert!(v.values().is_mapped() && v.present().words().is_mapped());
+                assert_eq!(v.iter().collect::<Vec<_>>(), vec![Some(1), Some(-7), None]);
+            }
+            _ => panic!("i is an Int column"),
+        }
+        match &loaded.cols["f"] {
+            PropColumn::Float(v) => {
+                assert_eq!(
+                    v.iter().collect::<Vec<_>>(),
+                    vec![Some(0.5), None, Some(2.5)]
+                );
+            }
+            _ => panic!("f is a Float column"),
+        }
+        match &loaded.cols["b"] {
+            PropColumn::Bool(v) => {
+                assert_eq!(v.iter().collect::<Vec<_>>(), vec![Some(0), Some(1), None]);
+            }
+            _ => panic!("b is a Bool column"),
+        }
+        match &loaded.cols["s"] {
+            PropColumn::Str { dict, idx } => {
+                assert!(idx.is_mapped() && dict.offsets().is_mapped() && dict.bytes().is_mapped());
+                assert_eq!(dict.iter().collect::<Vec<_>>(), vec!["a", "bb"]);
+                assert_eq!(&idx[..], &[0, 1, 0]);
+            }
+            _ => panic!("s is a Str column"),
+        }
+        assert!(matches!(&loaded.cols["m"], PropColumn::Json(_)));
+        let file_before = std::fs::read(dir.path().join(NodeSource::CACHE_FILE)).unwrap();
+
+        // The graph's own columns come from the same file; a write patches them
+        // onto the heap, interning a new string into the mapped dictionary.
+        g.update_node(ids[2], &json!({ "i": 3, "s": "ccc" }))
+            .unwrap();
+        assert_eq!(
+            g.node_prop_json_column(&ids, "i").unwrap(),
+            vec![json!(1), json!(-7), json!(3)]
+        );
+        assert_eq!(
+            g.node_prop_json_column(&ids, "s").unwrap(),
+            vec![json!("a"), json!("bb"), json!("ccc")]
+        );
+        assert_eq!(
+            g.node_prop_json_column(&ids, "f").unwrap(),
+            vec![json!(0.5), serde_json::Value::Null, serde_json::Value::Null]
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join(NodeSource::CACHE_FILE)).unwrap(),
+            file_before,
+            "a patch never writes through the mapping"
+        );
+        match &loaded.cols["s"] {
+            PropColumn::Str { dict, .. } => {
+                assert_eq!(dict.len(), 2, "the mapped set is immutable")
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// A columns file whose directory or arrays are damaged is refused, never
+    /// served: a flipped payload byte fails the checksum, and a directory that
+    /// points a column past the data region or lists a dictionary index out of
+    /// range is rejected even with a matching checksum.
+    #[test]
+    fn a_damaged_columns_file_is_refused() {
+        use crate::columns::{ColumnSource, NodeSource};
+
+        let dir = TempDir::new().unwrap();
+        let g = Graph::open(dir.path(), 1).unwrap();
+        g.add_node("N", &json!({ "s": "abc", "i": 4 })).unwrap();
+        g.add_node("N", &json!({ "s": "de" })).unwrap();
+        g.materialize_property_columns().unwrap();
+        let path = dir.path().join(NodeSource::CACHE_FILE);
+        let good = std::fs::read(&path).unwrap();
+        assert!(load_columns::<NodeSource>(&g.storage).is_some());
+
+        // A flipped byte in the data region.
+        let mut bytes = good.clone();
+        let mid = COL_HEADER_LEN + (bytes.len() - COL_HEADER_LEN) / 2;
+        bytes[mid] ^= 0x40;
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(load_columns::<NodeSource>(&g.storage).is_none(), "checksum");
+
+        // A truncated file.
+        std::fs::write(&path, &good[..good.len() - 16]).unwrap();
+        assert!(
+            load_columns::<NodeSource>(&g.storage).is_none(),
+            "truncated"
+        );
+
+        // A directory pointing past the data region, re-checksummed so only the
+        // bounds check can catch it.
+        let dir_len = u64_at(&good, 48).unwrap() as usize;
+        let mut entries: Vec<ColumnEntry> =
+            rmp_serde::from_slice(&good[COL_HEADER_LEN..COL_HEADER_LEN + dir_len]).unwrap();
+        for e in &mut entries {
+            for part in &mut e.parts {
+                part.0 += 1 << 20;
+            }
+        }
+        let bad_dir = rmp_serde::to_vec(&entries).unwrap();
+        // Reassemble the file around the longer directory: header with the new
+        // directory length, the directory padded to 8, the original data
+        // region, and a fresh checksum.
+        let data_start = align8(COL_HEADER_LEN + dir_len);
+        let mut bytes = good[..48].to_vec();
+        bytes.extend_from_slice(&(bad_dir.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&bad_dir);
+        bytes.resize(align8(bytes.len()), 0);
+        bytes.extend_from_slice(&good[data_start..good.len() - 8]);
+        let sum = checksum_of(&bytes);
+        bytes.extend_from_slice(&sum.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(
+            load_columns::<NodeSource>(&g.storage).is_none(),
+            "out of bounds"
+        );
+
+        // The good file still loads, and the graph answers through it.
+        std::fs::write(&path, &good).unwrap();
+        assert!(load_columns::<NodeSource>(&g.storage).is_some());
+    }
+
     /// A repeated materialize at an unchanged generation must not rewrite the
     /// file.
     #[test]
@@ -737,6 +1146,82 @@ mod tests {
         assert_eq!(g.shortest_path(a, c).unwrap(), Some(vec![a, b, c]));
     }
 
+    /// A loaded snapshot views the mapped file rather than copying it, answers
+    /// exactly what a build from storage answers, and the first patch after a
+    /// write copies onto the heap while the mapped pages stay untouched. The
+    /// file may be replaced under a live mapping (a later `rebuild_csr` does
+    /// exactly that), so the old mapping must keep serving.
+    #[test]
+    fn a_loaded_snapshot_maps_the_file_and_patches_onto_the_heap() {
+        let dir = TempDir::new().unwrap();
+        let (a, b, c);
+        {
+            let g = Graph::open(dir.path(), 1).unwrap();
+            a = g.add_node("N", &json!({})).unwrap();
+            b = g.add_node("N", &json!({})).unwrap();
+            c = g.add_node("N", &json!({})).unwrap();
+            g.add_edge(a, b, "R", &json!({})).unwrap();
+            g.add_edge(c, b, "R", &json!({})).unwrap();
+            g.rebuild_csr().unwrap();
+        }
+        let g = Graph::open(dir.path(), 1).unwrap();
+        g.ensure_snapshot_fresh().unwrap();
+        let loaded = g.csr_cache.snapshot.load_full();
+        assert!(loaded.col_idx.is_mapped(), "the load must map, not copy");
+        assert!(loaded.row_ptr.is_mapped());
+        assert!(loaded.in_pos.is_mapped());
+        assert!(loaded.dense_to_id.is_mapped());
+        let built = CsrSnapshot::build(&g.storage).unwrap();
+        assert_eq!(loaded.col_idx, built.col_idx);
+        assert_eq!(loaded.in_col_idx, built.in_col_idx);
+        assert_eq!(loaded.in_pos, built.in_pos);
+        assert_eq!(loaded.id_to_dense, built.id_to_dense);
+
+        // A write is absorbed by the incremental refresh: the patched snapshot is
+        // owned, the mapped one is unchanged, and both read correctly.
+        let e = g.add_edge(b, c, "R", &json!({})).unwrap();
+        g.ensure_snapshot_fresh().unwrap();
+        let patched = g.csr_cache.snapshot.load_full();
+        assert!(!patched.col_idx.is_mapped(), "a patch copies onto the heap");
+        assert_eq!(patched.col_idx.len(), 3);
+        assert!(patched.edge_id.contains(&e));
+        assert_eq!(loaded.col_idx.len(), 2, "the mapped snapshot is immutable");
+        let first_in_of_c = patched.in_row_ptr[patched.id_to_dense[&c] as usize];
+        assert_eq!(patched.edge_id[patched.in_pos[first_in_of_c] as usize], e);
+
+        // Replacing the file under the live mapping (what `rebuild_csr` does)
+        // must not disturb it.
+        g.rebuild_csr().unwrap();
+        assert_eq!(loaded.col_idx.len(), 2);
+        assert_eq!(loaded.dense_to_id[0], a);
+        assert_eq!(g.shortest_path(a, c).unwrap(), Some(vec![a, b, c]));
+    }
+
+    /// The word checksum is independent of how the bytes are chunked, covers a
+    /// partial trailing word, and changes when any byte does.
+    #[test]
+    fn the_checksum_is_chunking_independent_and_sensitive() {
+        let data: Vec<u8> = (0..37u8).collect();
+        let whole = checksum_of(&data);
+        let mut chunked = Sum64::new();
+        chunked.update(&data[..3]);
+        chunked.update(&data[3..20]);
+        chunked.update(&data[20..]);
+        assert_eq!(chunked.finish(), whole);
+        for i in 0..data.len() {
+            let mut flipped = data.clone();
+            flipped[i] ^= 0x01;
+            assert_ne!(checksum_of(&flipped), whole, "byte {i}");
+        }
+        let mut longer = data.clone();
+        longer.push(0);
+        assert_ne!(
+            checksum_of(&longer),
+            whole,
+            "a trailing zero changes the sum"
+        );
+    }
+
     /// The exact arrays survive a save and load, weights included.
     #[test]
     fn arrays_round_trip_exactly() {
@@ -771,8 +1256,7 @@ mod tests {
         assert!(loaded.has_negative_weight);
         assert_eq!(loaded.in_row_ptr, snap.in_row_ptr);
         assert_eq!(loaded.in_col_idx, snap.in_col_idx);
-        assert_eq!(loaded.in_edge_type, snap.in_edge_type);
-        assert_eq!(loaded.in_edge_id, snap.in_edge_id);
+        assert_eq!(loaded.in_pos, snap.in_pos);
         assert_eq!(loaded.dense_to_id, snap.dense_to_id);
         assert_eq!(loaded.id_to_dense, snap.id_to_dense);
 

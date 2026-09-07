@@ -217,15 +217,18 @@ impl Graph {
 
         self.ensure_snapshot_fresh()?;
         let snap = self.csr_cache.snapshot.load();
-        let (row_ptr, col_idx, edge_type, edge_id) = if is_incoming {
-            (
-                &snap.in_row_ptr,
-                &snap.in_col_idx,
-                &snap.in_edge_type,
-                &snap.in_edge_id,
-            )
+        let (row_ptr, col_idx) = if is_incoming {
+            (&snap.in_row_ptr, &snap.in_col_idx)
         } else {
-            (&snap.row_ptr, &snap.col_idx, &snap.edge_type, &snap.edge_id)
+            (&snap.row_ptr, &snap.col_idx)
+        };
+        // An incoming entry's type and id live at its outgoing position.
+        let pos = |k: usize| {
+            if is_incoming {
+                snap.in_pos[k] as usize
+            } else {
+                k
+            }
         };
         let mut results = Vec::new();
         for &src in src_nodes {
@@ -234,12 +237,9 @@ impl Graph {
                 None => continue,
             };
             for k in row_ptr[d]..row_ptr[d + 1] {
-                if let Some(tid) = type_id {
-                    if edge_type[k] == tid {
-                        results.push((src, edge_id[k], snap.dense_to_id[col_idx[k] as usize]));
-                    }
-                } else {
-                    results.push((src, edge_id[k], snap.dense_to_id[col_idx[k] as usize]));
+                let p = pos(k);
+                if type_id.is_none_or(|tid| snap.edge_type[p] == tid) {
+                    results.push((src, snap.edge_id[p], snap.dense_to_id[col_idx[k] as usize]));
                 }
             }
         }
